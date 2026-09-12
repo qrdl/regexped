@@ -58,9 +58,16 @@ const (
 	BTStackOverflow = -2
 
 	// OverlapCacheMalformed is returned when an overlapping `find` is handed an
-	// answer cache whose HEADER contradicts itself — a stride of zero, a stride
-	// wider than the span being swept, or a layout that does not fit the
-	// `cache_len` the same call declared.
+	// answer cache whose HEADER contradicts itself: a stride BELOW 1, or — on a
+	// call after the sweep — a layout that is not the one a pass would have
+	// written (a floor past the input, a cntOff that does not follow from
+	// numBlocks, a block buffer the declared cache_len cannot hold).
+	//
+	// Two things that look similar are NOT this. A stride WIDER than the span
+	// being swept is ordinary and is clamped: `init` sizes the stride for the
+	// whole input, and a drive that engages late has fewer positions left than
+	// that. A region merely TOO SMALL is refused with -1 and the drive walks —
+	// same answer, slower — which is what lets a caller cap what it allocates.
 	//
 	// It is an ERROR and not a silent decline, which is the whole point of it.
 	// The region is CALLER-OWNED memory: the generated `init` fills it correctly

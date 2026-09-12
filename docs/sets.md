@@ -249,7 +249,7 @@ cache** for the duration of one scan:
 | patterns | input | region |
 |---|---|---|
 | 3 patterns | 100 KB | 1.6 MiB |
-| 3 patterns | 10 MB | 143 KB |
+| 3 patterns | 10 MB | 143 KiB |
 | 32 patterns | 100 KB | 12.9 MiB |
 | 32 patterns | 10 MB | 2.7 MiB |
 
@@ -323,11 +323,15 @@ remaining calls out of the result. A scan the walk handles cheaply never
 sweeps and costs exactly what it did before. `hints: [batch-find]` is not
 required for any of that — the cache is read by the plain `find` too.
 
-The generated JS and TypeScript stubs reserve that region for you and size it
-from the input, for their batching iterator; every other caller opts in by
-passing a region in the scratch descriptor (see "The overlapping answer cache"
-in [wasm.md](wasm.md)). It is optional everywhere, and declining it — or
-offering too little — changes the speed and never the answer.
+EVERY generated stub reserves that region for you and sizes it from the input,
+whether or not the set carries the batching hint; a caller driving the raw ABI
+opts in by passing a region in the scratch descriptor (see "The overlapping
+answer cache" in [wasm.md](wasm.md)). It is optional everywhere, and declining
+it — or offering too little — changes the speed and never the answer.
+
+The one exception is C, which is the only target whose allocator lives outside
+the toolchain's output: the header enables the cache where `<stdlib.h>` exists
+and declines it in a freestanding build. See [c-api.md](c-api.md).
 
 `overlapping` affects `find` and nothing else. On a set without it the key is
 silently ignored — there is no find body for it to select, so it has no

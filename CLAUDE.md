@@ -75,6 +75,14 @@ regexped/
 │   │                          #   cache has to be read before the walk and the drive's work
 │   │                          #   counter charged after it, and an epilogue cannot be
 │   │                          #   spliced into a body that returns from several places
+│   ├── overlap_shape.go      # What a STUB GENERATOR may learn about a compiled set:
+│   │                          #   the sweep column's WIDTH in cells and the bucket's pattern
+│   │                          #   count, which together size the answer cache. Cells and not
+│   │                          #   states because lever C decides which the column holds, and
+│   │                          #   a caller must not have to know. It RECOMPILES the set, so
+│   │                          #   the options it builds must be the ones CompileFile builds —
+│   │                          #   a shape looked up from a reduced config names a different
+│   │                          #   automaton, and the region is then sized for the wrong sweep
 │   ├── set_overlap_dp.go      # The overlapping answer cache's SHARED half: the trigger,
 │   │                          #   the sweep call, its refusal-vs-ERROR split, and the
 │   │                          #   block-ensure both find entries call. Only SERVING is
@@ -103,10 +111,16 @@ regexped/
 │   │                          #   with identical per-pattern behaviour share a cell —
 │   │                          #   which is what a Moore partition refinement computes from
 │   │                          #   the transition table and the two accept masks the bucket
-│   │                          #   already has. NO surgery in engine_dfa.go: retaining NFA
-│   │                          #   sets through the subset construction was the sketched
-│   │                          #   route and is unnecessary. 1.7x-3.3x fewer cells measured,
-│   │                          #   and the ratio GROWS with the state count
+│   │                          #   already has. No NFA-SET RETENTION through the subset
+│   │                          #   construction — the sketched route, and unnecessary;
+│   │                          #   engine_dfa.go hands over the raw accept masks it already
+│   │                          #   builds and nothing else changes there. 1.7x-3.3x fewer
+│   │                          #   cells measured, and the ratio GROWS with the state count.
+│   │                          #   The correctness argument is MOORE EQUIVALENCE: a cell is a
+│   │                          #   function of the (mid, eof) output sequence, so equivalent
+│   │                          #   states hold equal cells. It is NOT that a pattern's classes
+│   │                          #   number its minimized single-pattern DFA's states — measured
+│   │                          #   false, and must not be asserted
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
 │   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 32
 │   │                          #   bytes at a time (16 for the last stretch, which is also what

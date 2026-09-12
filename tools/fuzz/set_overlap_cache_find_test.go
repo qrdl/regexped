@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"testing"
@@ -50,10 +51,51 @@ func driveCacheFind(t *testing.T, pats []string, input string, offset, outCap in
 // that is what makes the block-boundary paths reachable. At the size the
 // formula picks, a short test input is ONE block and every boundary case is
 // unreachable; at a stride of 1 or 7 the same input has dozens.
+// cacheDriveOpt steers a cache drive past what the plain arguments reach, and
+// reports what the region looked like when it finished.
+//
+// The work PRE-ARM exists because the adaptive trigger cannot be reached any
+// other way for the degenerate spans: `work > len * costPerByte` needs a drive
+// that has genuinely delivered that many matched bytes, and an input of one or
+// two positions never will. Writing the counter's own saturation value into
+// the header is what a drive that had spent everything would have left there.
+type cacheDriveOpt struct {
+	stride *int32 // nil: the formula's own. A pointer, so that 0 and a
+	// negative — the two MALFORMED strides — are expressible: they are the
+	// whole of what the header-validation tests drive, and an int32 field
+	// cannot tell "force zero" from "unset".
+	preArmWork  bool  // make the FIRST call sweep, whatever it costs
+	canaryBytes int32 // bytes of 0xA5 to lay down immediately BELOW the region
+	canaryAfter int32 // and immediately ABOVE it
+
+	// Filled in by the drive.
+	lastResult int32 // the raw return of the LAST call, negative codes included
+	region     int32
+	header     []uint32
+	cum        []uint32
+	canaryBad  int
+}
+
 func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap int32,
 	useCache bool, scratchLen int32, want engageWant, strideOverride int32,
 ) [][3]int {
 	t.Helper()
+	k := strideOverride
+	opt := &cacheDriveOpt{}
+	if k > 0 {
+		opt.stride = &k
+	}
+	return driveCacheFindOpt(t, pats, input, offset, outCap, useCache, scratchLen, want, opt)
+}
+
+func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap int32,
+	useCache bool, scratchLen int32, want engageWant, opt *cacheDriveOpt,
+) [][3]int {
+	t.Helper()
+	if opt == nil {
+		opt = &cacheDriveOpt{}
+	}
+	strideOverride := opt.stride
 	entries := make([]config.RegexEntry, len(pats))
 	for i, p := range pats {
 		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
@@ -91,10 +133,22 @@ func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap i
 		t.Fatalf("parse data section: %v", err)
 	}
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	gatePtr := inBase + pageSize
+	// The input gets as many pages as it needs: the megabyte-scale shapes that
+	// reach the layout arithmetic's 32-bit edges do not fit in one.
+	inSpan := int32((len(input) + pageSize - 1) / pageSize * pageSize)
+	if inSpan == 0 {
+		inSpan = pageSize
+	}
+	gatePtr := inBase + inSpan
 	outPtr := gatePtr + pageSize
 	scratchPtr := outPtr + pageSize
-	needed := uint64((int64(scratchPtr) + int64(scratchLen) + 2*pageSize) / pageSize)
+	if opt.canaryBytes > 0 {
+		// A page of its own beneath the region: the output buffer occupies the
+		// one immediately below, and a sweep writing over THAT would look like
+		// ordinary tuple traffic rather than the out-of-bounds write it is.
+		scratchPtr += pageSize
+	}
+	needed := uint64((int64(scratchPtr) + int64(scratchLen) + int64(opt.canaryAfter) + 2*pageSize) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
 			t.Fatalf("grow: %v", err)
@@ -108,16 +162,27 @@ func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap i
 	for i := int32(0); i < scratchLen; i++ {
 		buf[scratchPtr+i] = 0
 	}
+	for i := int32(0); i < opt.canaryBytes; i++ {
+		buf[scratchPtr-opt.canaryBytes+i] = 0xA5
+	}
+	for i := int32(0); i < opt.canaryAfter; i++ {
+		buf[scratchPtr+scratchLen+i] = 0xA5
+	}
+	opt.region = scratchPtr
 
 	passScratch, passLen := scratchPtr, scratchLen
 	if !useCache {
 		passScratch, passLen = 0, 0
 	}
 	_, stride := overlapCacheFor(input, pats)
-	if strideOverride > 0 {
-		stride = strideOverride
+	if strideOverride != nil {
+		stride = *strideOverride
 	}
 	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
+	if opt.preArmWork && passScratch != 0 {
+		buf = mem.UnsafeData(store)
+		binary.LittleEndian.PutUint32(buf[passScratch+12:], 0x7FFFFFFF)
+	}
 
 	var out [][3]int
 	from := offset
@@ -130,6 +195,7 @@ func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap i
 			t.Fatalf("set_find: %v", err)
 		}
 		n := res.(int32)
+		opt.lastResult = n
 		if n <= 0 {
 			break
 		}
@@ -181,8 +247,47 @@ func driveCacheFindK(t *testing.T, pats []string, input string, offset, outCap i
 				"sweeping here is the regression an earlier attempt was reverted for")
 		}
 	}
+	for i := int32(0); i < opt.canaryBytes; i++ {
+		if buf[scratchPtr-opt.canaryBytes+i] != 0xA5 {
+			opt.canaryBad++
+		}
+	}
+	for i := int32(0); i < opt.canaryAfter; i++ {
+		if buf[scratchPtr+scratchLen+i] != 0xA5 {
+			opt.canaryBad++
+		}
+	}
+	if useCache {
+		opt.header = make([]uint32, config.SetOverlapCheckpointHeaderBytes/4)
+		for i := range opt.header {
+			opt.header[i] = readU32(buf, int(scratchPtr)+4*i)
+		}
+		// cum[0..nb]: the block counts, prefix-summed, which is where a block's
+		// tuple total is read from now that the header carries no count.
+		nb := int32(opt.header[overlapHdrNumBlocksWord])
+		cntOff := int32(opt.header[overlapHdrCntOffWord])
+		if nb > 0 && nb < 1<<20 && cntOff > 0 && cntOff+(nb+1)*4 <= scratchLen {
+			opt.cum = make([]uint32, nb+1)
+			for i := range opt.cum {
+				opt.cum[i] = readU32(buf, int(scratchPtr+cntOff)+4*i)
+			}
+		}
+	}
 	return out
 }
+
+// Header word indices the harness reads. compile/ keeps the constants
+// unexported, and a drive that could not see `ready` was how three tests came
+// to assert the walk against itself.
+const (
+	overlapHdrNumBlocksWord = 6  // byte 24
+	overlapHdrCntOffWord    = 9  // byte 36
+	overlapHdrStrideWord    = 4  // byte 16
+	overlapHdrFloorWord     = 5  // byte 20
+	overlapHdrCkptOffWord   = 8  // byte 32
+	overlapHdrBlockOffWord  = 0  // byte 0
+	overlapHdrRowBaseWord   = 10 // byte 40
+)
 
 func cacheFindScratchLen(input string, pats []string) int32 {
 	n, _ := overlapCacheFor(input, pats)

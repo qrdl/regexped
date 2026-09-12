@@ -343,7 +343,6 @@ func main() {
 	verify := flag.Bool("verify", false, "cross-engine correctness on the honest pairings")
 	compareFuel := flag.String("compare-fuel", "", "compare our fuel against a baseline file; exit 1 on any change")
 	compareSize := flag.String("compare-size", "", "compare module sizes against a baseline file; exit 1 on any change")
-	cacheSize := flag.Bool("cache-size", false, "report the overlapping answer cache region each design would reserve")
 	hints := flag.String("hints", "", "set-level LikelyMode hint applied to every case: prefer-match, prefer-no-match, or empty for neutral")
 	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend for every case (teddy, ac, scalar, packed-pair); empty lets the chooser decide")
 	flag.Parse()
@@ -374,12 +373,6 @@ func main() {
 	cases := buildMatrix()
 
 	switch {
-	case *cacheSize:
-		if err := reportCacheSizes(); err != nil {
-			fmt.Fprintln(os.Stderr, "cache-size:", err)
-			os.Exit(1)
-		}
-		return
 	case *compareFuel != "":
 		os.Exit(runCompare(*compareFuel, cases, measureFuelRow, "fuel"))
 	case *compareSize != "":
@@ -912,7 +905,7 @@ type rxInstance struct {
 	cachePtr int32
 	cacheLen int32
 	// The checkpointed cache's stride, which the CALLER picks and the sweep
-	// validates (plans §9.2 decision 2). A generated `init` computes it from
+	// validates. A generated `init` computes it from
 	// the same config helper; this harness is that init's stand-in.
 	cacheStride int32
 	npat        int32
@@ -982,13 +975,15 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	// The checkpointed region, sized from the sweep column the compiler
 	// actually built. Falls back to a nominal region when the set gets no
 	// sweep: the descriptor still carries a pointer, and the drive declines it.
-	cells, cacheStride := 0, int32(0)
+	// The region and the stride from ONE helper: the region is sized from the
+	// stride, and the sweep validates the stride against the region, so a
+	// harness computing them apart would be handed -4. It also sizes off the
+	// BUCKET's pattern count rather than the set's declared one — a set whose
+	// members were dropped or packed elsewhere has fewer.
+	cacheStride := int32(0)
 	cacheLen := int32(config.SetOverlapCheckpointHeaderBytes)
-	if sh, err := overlapShapeFor(c); err == nil && sh.Eligible {
-		cells = sh.Cells
-		k := config.SetOverlapCheckpointStride(len(c.input), sh.Cells, sh.Patterns, true)
-		cacheStride = int32(k)
-		cacheLen = int32(config.SetOverlapCheckpointBytes(len(c.input), cells, int(npat), true))
+	if bytes, k, err := overlapSizingFor(c); err == nil {
+		cacheLen, cacheStride = int32(bytes), int32(k)
 	}
 	top := int64(cachePtr) + int64(cacheLen) + 4096
 	needed := uint64((top + pageSize - 1) / pageSize)
@@ -1033,6 +1028,18 @@ func (r *rxInstance) writeScratch(cache bool) {
 	}
 	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
 	runtime.KeepAlive(r.store)
+}
+
+// cacheReady is what the sweep did with the region the last drive offered:
+// 1 swept, -1 asked and refused, 0 never asked. Reading it is what stops a
+// cached leg passing for verified when it silently walked.
+func (r *rxInstance) cacheReady() int32 {
+	if r.cachePtr == 0 {
+		return 0
+	}
+	v := int32(binary.LittleEndian.Uint32(r.mem.UnsafeData(r.store)[r.cachePtr+8:]))
+	runtime.KeepAlive(r.store)
+	return v
 }
 
 // zeroBitmap clears the >64-pattern bitmap before a wide `_all` call.
@@ -2319,6 +2326,28 @@ func verifyOverlapping(engine *wasmtime.Engine, ra *raHarness, c setCase) int {
 			c.name, c.inputLbl, len(ourFind), len(cached))
 		bad++
 	}
+	// Did the cache leg SWEEP, or did it quietly fall back to the walk? A
+	// declined region answers identically — the walk is correct too — so the
+	// comparison above passes either way and the cache goes unverified. The
+	// header's `ready` is the one field a caller may read, and it is the only
+	// thing that tells the two apart.
+	//
+	// A shape the cache cannot serve legitimately reports 0 here (never asked)
+	// or -1 (asked and refused); what must not pass unnoticed is a shape the
+	// board TIMES as a cached row reporting either.
+	if r.cacheStride > 0 {
+		switch ready := r.cacheReady(); ready {
+		case 1:
+		case 0:
+			fmt.Printf("UNSWEPT %s/%s overlapping find: the cache leg never engaged "+
+				"(the walk stayed below the work threshold), so the cached row is the walk\n",
+				c.name, c.inputLbl)
+		default:
+			fmt.Printf("MISMATCH %s/%s overlapping find: the cache leg REFUSED the region "+
+				"(ready=%d) — it was sized by config and must fit\n", c.name, c.inputLbl, ready)
+			bad++
+		}
+	}
 	if theirs, complete := raFindOverlapping(ra, int32(len(c.input))); !complete {
 		// Same rule as the gated pairing: the harness buffer is fixed and the
 		// export truncates rather than growing it, so a short list is not a
@@ -2688,4 +2717,52 @@ func fmtFuel(v uint64) string {
 		s = s[:len(s)-3]
 	}
 	return strings.Join(append([]string{s}, parts...), ",")
+}
+
+// overlapSizingFor is the region and stride a case's answer cache needs.
+func overlapSizingFor(c setCase) (bytes, stride int, err error) {
+	sc, cfg := overlapSetConfigFor(c)
+	return compile.SetOverlapCacheSizing(sc, cfg, len(c.input))
+}
+
+// overlapSetConfigFor reports the sweep column a case's set compiles to, which
+// is what sizes its answer cache.
+//
+// It recompiles the set — the same route a stub generator takes — because the
+// column width falls out of the DFA construction and nothing in the case's
+// pattern list implies it.
+func overlapSetConfigFor(c setCase) (config.SetConfig, config.BuildConfig) {
+	entries := make([]config.RegexEntry, len(c.patterns))
+	pnames := make([]string, len(c.patterns))
+	for i, p := range c.patterns {
+		pnames[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: pnames[i], Pattern: p}
+	}
+	// The set MUST be declared exactly as compileCase declares it — every
+	// capability, the batch hint, the forced frontend. The bucket a set packs
+	// into depends on what it has to serve, so a shape looked up from a
+	// reduced config can name a different automaton than the module actually
+	// contains, and the region would be sized and strided for the wrong sweep.
+	// That is not hypothetical: looking it up from a find-only config made the
+	// 256-byte overlap-shape row disagree with the walk while every other row
+	// passed.
+	hints := []string{"batch-find"}
+	if setHints != "" {
+		hints = append(hints, setHints)
+	}
+	cfg := config.BuildConfig{
+		Regexps: entries,
+		Sets: []config.SetConfig{{
+			Name:        "s",
+			MatchAny:    "cap_match_any",
+			MatchAll:    "cap_match_all",
+			ScanAny:     "cap_scan_any",
+			ScanAll:     "cap_scan_all",
+			Find:        "cap_find",
+			Hints:       hints,
+			Overlapping: true,
+			Patterns:    config.PatternSelector{Names: pnames},
+		}},
+	}
+	return cfg.Sets[0], cfg
 }

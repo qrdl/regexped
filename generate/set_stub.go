@@ -466,13 +466,13 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "SetMatch", "PatternName"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
-		"RX_ERR_BT_OVERFLOW", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED",
 	},
 	// Rust is deliberately absent: `pub mod <import_module>` already isolates
@@ -613,4 +613,37 @@ func anySetWantsCache(cfg config.BuildConfig) bool {
 		}
 	}
 	return false
+}
+
+// overlapCacheConsts are the numbers a stub's cache-sizing prelude needs as
+// LITERALS, derived once from the compiled shape.
+//
+// Six languages spell that prelude, and each spelled these three itself:
+// `4 + 4*P` for a row, `cells*4 + 4` for a checkpoint column, and the header
+// beside them. The arithmetic that remains language-specific is only the
+// stride and the block count — a square root and a ceiling — because those are
+// the parts that need the input length, which exists only at call time.
+//
+// A stub that computes any of these differently from config does not merely
+// allocate oddly: the sweep validates the stride against the region and reports
+// a header it cannot parse, so the set's overlapping find stops working.
+type overlapCacheConsts struct {
+	// Row is one position's block-buffer row, Cell one checkpoint column plus
+	// its cum[] word, Hdr the header, and Base the fixed part of a single-block
+	// region (Hdr + Cell + 4), which is what the budget test compares against
+	// m*Row.
+	Row, Cell, Hdr, Base, Max int
+	// Cells is the column width itself, for the square root's numerator.
+	Cells int
+}
+
+func overlapCacheConstsFor(sh compile.OverlapCacheShape) overlapCacheConsts {
+	return overlapCacheConsts{
+		Row:   config.SetOverlapBlockRowBytes(sh.Patterns),
+		Cell:  sh.Cells*4 + 4,
+		Hdr:   config.SetOverlapCheckpointHeaderBytes,
+		Base:  config.SetOverlapCheckpointHeaderBytes + sh.Cells*4 + 4 + 4,
+		Max:   config.SetOverlapCacheMaxBytes,
+		Cells: sh.Cells,
+	}
 }

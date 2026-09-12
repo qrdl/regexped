@@ -390,43 +390,19 @@ func SetCursorMaxCount(patternCount int) int32 {
 // tables inside a 4 GiB wasm32 memory.
 const SetCursorOverflowPos = 0xFFFFFFFE
 
-// SetOverlapCacheHeaderBytes is the size of the header at the front of the
-// answer cache an `overlapping: true` batching `find` may be handed.
+// SetCursorMalformedPos is the resume-position word reserved to mean "the
+// overlapping answer cache's header contradicted itself, and this scan's
+// result is UNKNOWN". Its count field is zero and no tuples were written.
 //
-// It lives here, beside the cursor layout, for the same reason that does: it
-// is an ABI fact the compiler and every stub generator must agree on
-// independently, and two spellings of it would drift. The compiler's own
-// field offsets are checked against it.
+// It is the second reserved position word, for the same reason the first one
+// exists: the count half is countBits wide and every decoder MASKS it, so a
+// negative packed into it reads back as a large positive tuple count. A
+// decoder must test both reserved words BEFORE the 0xFFFFFFFF done test, since
+// all three have the high bit set.
 //
-// The caller zeroes the header to start a drive, exactly as it zeroes the gate
-// array, so a zero "ready" slot IS "this drive has not swept yet" and no magic
-// value is needed. The TUPLE AREA needs no zeroing: it is written before it is
-// read, and it is read only once "ready" says so.
-const SetOverlapCacheHeaderBytes = 16
-
-// SetOverlapCacheBytes is the WHOLE-DRIVE cache size: the region the cache
-// needed before it was checkpointed, twelve bytes per tuple with one tuple per
-// pattern per start position.
-//
-// NOTHING SHIPS THIS ANY MORE. The compiler, every stub and both harnesses size
-// with SetOverlapCheckpointBytes. It survives because it is the baseline the
-// checkpointed design is measured against, and a formula quoted from memory in
-// a benchmark is a formula that drifts from the one it is compared with.
-//
-// Historic form, for an input of inputLen bytes and patternCount patterns.
-//
-// Twelve bytes per tuple, and the worst case is one tuple per pattern per
-// START POSITION. That is not pessimism: a pattern whose automaton never dies
-// matches from nearly every start, which is the very shape the cache exists
-// for.
-//
-// Offering LESS is legal and is not an error. The sweep refuses a region it
-// cannot fill and the drive falls back to walking position by position — the
-// same answer, only slower — which is what lets a stub cap what it will
-// allocate.
-func SetOverlapCacheBytes(inputLen, patternCount int) int {
-	return SetOverlapCacheHeaderBytes + (inputLen+1)*patternCount*12
-}
+// A generated `init` cannot produce this: it writes the stride from the same
+// formula that sized the region. A hand-written caller can.
+const SetCursorMalformedPos = 0xFFFFFFFD
 
 // SetOverlapCacheMaxBytes is the ceiling a GENERATED STUB puts on that
 // allocation before it declines to offer a cache at all.
@@ -875,20 +851,25 @@ func ExpandHome(path string) string {
 // then writes the stride, exactly as it zeroes the gate array.
 const SetOverlapCheckpointHeaderBytes = 48
 
-// SetOverlapTupleBytes is one match in the block buffer under the TUPLE form
-// (id, start, end). Lever B replaces this with a per-position row.
-const SetOverlapTupleBytes = 12
-
-// SetOverlapBlockRowBytes is one position's worth of block buffer.
+// SetOverlapBlockRowOffsets is the row's shape, stated once: the mask at 0 and
+// pattern k's end four bytes into the row plus 4k.
 //
-// Tuple form: the worst case is one match per pattern at one start position,
-// so P tuples. Lever B's row form is a mask plus one end per pattern, and is
-// selected by rowForm.
-func SetOverlapBlockRowBytes(patterns int, rowForm bool) int {
-	if rowForm {
-		return 4 + 4*patterns
-	}
-	return patterns * SetOverlapTupleBytes
+// The writer and both readers spelled `4 + k*4` separately, which is the kind
+// of arithmetic that is right in two places and wrong in the third.
+const SetOverlapRowMaskOff = 0
+
+// SetOverlapRowEndOff is the byte offset of pattern k's END within a row.
+func SetOverlapRowEndOff(k int) int { return 4 + 4*k }
+
+// SetOverlapBlockRowBytes is one position's worth of block buffer: a mask word
+// plus one end per pattern.
+//
+// A row is indexed by POSITION, so `id` and `start` are its own coordinates and
+// are not stored — that is the whole of the saving over the tuple form this
+// replaced, and it is why a dead cell may hold garbage: every reader consults
+// the mask first.
+func SetOverlapBlockRowBytes(patterns int) int {
+	return 4 + 4*patterns
 }
 
 // SetOverlapCheckpointStride is the k an init should choose: the one that
@@ -897,7 +878,7 @@ func SetOverlapBlockRowBytes(patterns int, rowForm bool) int {
 // Computed in float64 on purpose. m*cells reaches 2^43 on a large input and
 // wraps in int32, and every stub language must reproduce this exactly or it
 // allocates a region the sweep's validation rejects.
-func SetOverlapCheckpointStride(inputLen, cells, patterns int, rowForm bool) int {
+func SetOverlapCheckpointStride(inputLen, cells, patterns int) int {
 	m := inputLen + 1
 	if m < 1 {
 		m = 1
@@ -916,11 +897,11 @@ func SetOverlapCheckpointStride(inputLen, cells, patterns int, rowForm bool) int
 	// The budget is SetOverlapCacheMaxBytes. Above it the stride drops to the
 	// square-root optimum and the region becomes sqrt-sized, which is the whole
 	// point; below it nothing changes but a column's worth of bytes.
-	if n := singleBlockBytes(m, cells, patterns, rowForm); n > 0 && n <= SetOverlapCacheMaxBytes {
+	if n := singleBlockBytes(m, cells, patterns); n > 0 && n <= SetOverlapCacheMaxBytes {
 		return m
 	}
 	c := float64(cells) * 4
-	bb := float64(SetOverlapBlockRowBytes(patterns, rowForm))
+	bb := float64(SetOverlapBlockRowBytes(patterns))
 	k := int(math.Sqrt(float64(m) * c / bb))
 	if k < 16 {
 		k = 16
@@ -934,8 +915,8 @@ func SetOverlapCheckpointStride(inputLen, cells, patterns int, rowForm bool) int
 // singleBlockBytes is the region a one-block (whole-drive) cache needs, or 0
 // when it overflows an int on this platform — which is itself a reason to
 // checkpoint.
-func singleBlockBytes(m, cells, patterns int, rowForm bool) int {
-	b := SetOverlapBlockRowBytes(patterns, rowForm)
+func singleBlockBytes(m, cells, patterns int) int {
+	b := SetOverlapBlockRowBytes(patterns)
 	if b > 0 && m > (1<<62)/b {
 		return 0
 	}
@@ -953,7 +934,7 @@ func singleBlockBytes(m, cells, patterns int, rowForm bool) int {
 // because no column is ever copied and nothing is re-swept. Everything between
 // trades one for the other, and this is what lets a caller sit anywhere on that
 // curve rather than at one of its ends.
-func SetOverlapCheckpointBytesForStride(inputLen, cells, patterns, k int, rowForm bool) int {
+func SetOverlapCheckpointBytesForStride(inputLen, cells, patterns, k int) int {
 	m := inputLen + 1
 	if m < 1 {
 		m = 1
@@ -966,19 +947,19 @@ func SetOverlapCheckpointBytesForStride(inputLen, cells, patterns, k int, rowFor
 	}
 	nb := (m + k - 1) / k
 	return SetOverlapCheckpointHeaderBytes +
-		nb*(cells*4+4) + 4 + k*SetOverlapBlockRowBytes(patterns, rowForm)
+		nb*(cells*4+4) + 4 + k*SetOverlapBlockRowBytes(patterns)
 }
 
 // SetOverlapCheckpointBytes is the region for that stride.
-func SetOverlapCheckpointBytes(inputLen, cells, patterns int, rowForm bool) int {
+func SetOverlapCheckpointBytes(inputLen, cells, patterns int) int {
 	m := inputLen + 1
 	if m < 1 {
 		m = 1
 	}
-	k := SetOverlapCheckpointStride(inputLen, cells, patterns, rowForm)
+	k := SetOverlapCheckpointStride(inputLen, cells, patterns)
 	nb := (m + k - 1) / k
 	return SetOverlapCheckpointHeaderBytes +
 		nb*(cells*4+4) + // checkpoints, plus one cumulative count each
 		4 + // the final cum[nb] total
-		k*SetOverlapBlockRowBytes(patterns, rowForm)
+		k*SetOverlapBlockRowBytes(patterns)
 }

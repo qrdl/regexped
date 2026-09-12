@@ -1,15 +1,13 @@
 package compile
 
 import (
-	"math"
-
 	"github.com/qrdl/regexped/internal/abi"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// The CHECKPOINTED answer cache (plans §9.2).
+// The CHECKPOINTED answer cache.
 //
 // WHAT CHANGES FROM THE WHOLE-DRIVE FORM. The sweep in set_overlap_dp.go
 // computes every answer in one right-to-left pass holding ONE column, and then
@@ -30,31 +28,39 @@ import (
 // and is the ONE copy of it; every stub and both harnesses call it, and the
 // sweep VALIDATES what they computed rather than deriving it itself.
 //
-// WHY NOT THE DESIGN set_overlap_dp.go's HEADER REJECTS. That comment rejects
-// "periodic column snapshots re-swept on each call", and it is right about
-// that design: a drive at capacity 1 re-sweeps up to k positions PER CALL, so
-// the input is re-swept Theta(n) times. The difference here is that a block is
-// materialised ONCE and then served out of, not re-swept per call — `curBlock`
-// in the header is what makes that true across calls, and it is the caller's
-// memory for the same reason the gate array is.
+// WHY A DRIVE AT CAPACITY 1 IS NOT QUADRATIC. The obvious objection to
+// checkpointing is that each call re-sweeps up to k positions, so a drive of
+// one tuple per call re-sweeps the input Theta(n) times. It does not: a block
+// is materialised ONCE and then served out of, which `curBlock` in the header
+// is what makes true across calls — and the header is the caller's memory for
+// the same reason the gate array is.
 //
-// WHAT IS DELIBERATELY NOT HERE. The per-position step, the recurrence and the
-// table reads are set_overlap_dp.go's and are CALLED, not copied: a second
-// implementation of the per-position semantics is the failure this whole file
-// family is organised to avoid.
+// WHAT IS DELIBERATELY NOT HERE. The trigger, the sweep call, its
+// refusal-versus-error split and the block-ensure are set_overlap_dp.go's and
+// are CALLED, not copied. The RECURRENCE itself lives here, in emitAdvance and
+// the two EOF-column emitters, because the checkpointed form needs it per CELL
+// rather than per (state, pattern); what is shared with the forward body is
+// the TABLES it reads, which is the part a second implementation would get
+// wrong.
 
 // Header layout, i32 slots at cache_ptr. 48 bytes: eleven fields plus one
 // spare word, 4-byte aligned.
 //
 // The caller zeroes the header to start a drive and then writes `stride`, so a
 // zero `ready` still means "not swept yet" and needs no magic value. `stride`
-// is the one field the CALLER computes (plans §9.2 decision 2): `init` sizes
+// is the one field the CALLER computes, because the caller is what sized the
+// allocation from it: `init` sizes
 // the allocation and picks k from the same formula, so the two cannot
 // disagree — and the sweep validates it, because the header is caller-owned
 // memory and a hand-written caller can write anything.
 const (
-	ckptHdrBlockOff  = 0  // byte offset of the block buffer from cache_ptr
-	ckptHdrCount     = 4  // tuples in the CURRENT block
+	ckptHdrBlockOff = 0 // byte offset of the block buffer from cache_ptr
+	// Slot +4 is RESERVED and unread. It held the materialised block's tuple
+	// count, which nothing consulted: under lever B a block is a row per
+	// position and the row masks are the truth, so serving scans them rather
+	// than trusting a count. cum[] at ckptHdrCntOff carries what a caller
+	// actually wants — cum[j+1]-cum[j] is block j's total — and the tests read
+	// it there.
 	ckptHdrReady     = 8  // 0 not swept, 1 swept, -1 refused
 	ckptHdrWork      = 12 // the drive's accumulated matched bytes
 	ckptHdrStride    = 16 // k, written by the CALLER
@@ -67,12 +73,6 @@ const (
 	ckptHdrBytes     = config.SetOverlapCheckpointHeaderBytes
 )
 
-// overlapCkptHeaderBytes is ckptHdrBytes by a name the component adapters can
-// use without importing config a second time.
-const overlapCkptHeaderBytes = ckptHdrBytes
-
-const ()
-
 // ckptEmit carries every index and constant the checkpoint bodies share, so
 // the two of them and the per-position step cannot disagree about a local.
 //
@@ -82,7 +82,6 @@ const ()
 type ckptEmit struct {
 	dp       overlapDPTables
 	tableMem int
-	ids      []int
 
 	numPat    int
 	numStates int
@@ -94,11 +93,11 @@ type ckptEmit struct {
 	pPtr, pLen, pScratch byte
 
 	// Working locals.
-	lCur, lPrev, lPos, lByte, lCell, lState, lNext, lVal     byte
-	lCount, lWrite, lLimit, lCurRow, lPrevRow, lSwap, lStart byte
-	lFloor, lStride, lNumBlocks, lCkptOff, lCntOff, lBlkOff  byte
-	lTmp, lHi, lLo                                           byte
-	lMidMask, lEofMask                                       byte
+	lCur, lPrev, lPos, lByte, lCell, lState, lNext, lVal    byte
+	lCount, lWrite, lCurRow, lPrevRow, lSwap, lStart        byte
+	lFloor, lStride, lNumBlocks, lCkptOff, lCntOff, lBlkOff byte
+	lTmp, lHi, lLo                                          byte
+	lMidMask, lEofMask                                      byte
 
 	// lRowBase is the POSITION that row 0 of the block buffer stands for, and
 	// lBlkBase the buffer's address. Lever B indexes the buffer by position
@@ -106,13 +105,21 @@ type ckptEmit struct {
 	// the position and nothing has to be searched to find it.
 	lRowBase, lBlkBase, lMask byte
 
+	// lSum is the prefix sum's running total. Its own local rather than a
+	// borrowed row pointer: the two have nothing to do with each other, and a
+	// reader tracing lPrevRow through this file should not find it holding a
+	// count.
+	lSum byte
+
 	// proj is lever C's projection, or nil when the column stays one cell per
 	// (state, pattern). When set, the column is indexed by CELL and a runtime
 	// successor table stands between the state loop and the update.
-	proj      *overlapProj
-	projOff   int32 // data-segment offset of projTab: P*numWASM u16 byte offsets
-	succOff   int32 // scratch array, one byte per state, in table memory
-	lSuccBase byte
+	proj    *overlapProj
+	projOff int32 // data-segment offset of projTab: P*numWASM u16 byte offsets
+	// succOff is the scratch array's offset in TABLE memory, one byte per
+	// state. No local holds its base: every access is at a compile-time
+	// constant address, which is what the full unroll buys.
+	succOff int32
 }
 
 // colBytes is one working column: cells under lever C, states x patterns
@@ -124,11 +131,15 @@ func (e *ckptEmit) colBytes() int32 {
 	return int32(e.numStates * e.numPat * 4)
 }
 
-// rowBytes is one position's row under lever B: a mask word plus one end per
-// pattern. `id` and `start` are the row's own coordinates and are not stored —
-// that is the whole of the saving, and it is why a dead cell may hold garbage:
-// every reader consults the mask first.
-func (e *ckptEmit) rowBytesB() int32 { return int32(config.SetOverlapBlockRowBytes(e.numPat, true)) }
+// rowBytesB is one BLOCK-BUFFER row: a mask word plus one end per pattern.
+// `id` and `start` are the row's own coordinates and are not stored — that is
+// the whole of the saving, and it is why a dead cell may hold garbage: every
+// reader consults the mask first.
+//
+// Not to be confused with e.rowBytes, which is a COLUMN row (one i32 per
+// pattern) in the unprojected sweep. Two different widths, and the names have
+// been one letter apart since the block buffer stopped holding tuples.
+func (e *ckptEmit) rowBytesB() int32 { return int32(config.SetOverlapBlockRowBytes(e.numPat)) }
 
 // newCkptEmit derives the geometry from the compiled bucket.
 func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
@@ -137,12 +148,11 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 	e := &ckptEmit{
 		dp:        bkt.dp,
 		tableMem:  tableMemIdx,
-		ids:       cs.patternIDs[bi],
 		numPat:    len(cs.patternIDs[bi]),
 		numStates: bkt.dp.numWASM,
 	}
 	e.rowBytes = int32(e.numPat * 4)
-	e.proj = cs.overlapProjFor(bi)
+	e.proj = cs.overlapProjFor()
 	e.projOff = cs.overlapProjTabOff
 	e.succOff = cs.overlapSuccOff
 	e.colA = colOff
@@ -163,14 +173,58 @@ func (e *ckptEmit) konst64(b []byte, v uint64) []byte {
 func (e *ckptEmit) get(b []byte, l byte) []byte { return append(b, 0x20, l) }
 func (e *ckptEmit) set(b []byte, l byte) []byte { return append(b, 0x21, l) }
 func (e *ckptEmit) tee(b []byte, l byte) []byte { return append(b, 0x22, l) }
-func (e *ckptEmit) hdrLoad(b []byte, off byte) []byte {
+
+// The two header accessors take an INT offset and encode it, rather than a
+// byte emitted raw. Every header slot is under 128 today, so the two spellings
+// agree — but the memarg offset is a ULEB128, and a bare byte of 128 or more is
+// read as a continuation. That exact bug shipped once in this file, in the row
+// writer at 32 patterns, and there is no reason to keep the shape that caused
+// it anywhere it could recur.
+func (e *ckptEmit) hdrLoad(b []byte, off int) []byte {
 	b = e.get(b, e.pScratch)
-	return append(b, 0x28, 0x02, off)
+	b = append(b, 0x28, 0x02)
+	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
 }
-func (e *ckptEmit) hdrStore(b []byte, off byte, push func([]byte) []byte) []byte {
+func (e *ckptEmit) hdrStore(b []byte, off int, push func([]byte) []byte) []byte {
 	b = e.get(b, e.pScratch)
 	b = push(b)
-	return append(b, 0x36, 0x02, off)
+	b = append(b, 0x36, 0x02)
+	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
+}
+
+// storeConstAt writes a constant i32 at a byte offset from the region base.
+//
+// Separate from hdrStore because the offset is not a header slot and can pass
+// 127, where a bare byte would be read as the first byte of a multi-byte
+// ULEB128 and silently address somewhere else entirely.
+func (e *ckptEmit) storeConstAt(b []byte, off, val int32) []byte {
+	b = e.get(b, e.pScratch)
+	b = e.konst(b, val)
+	b = append(b, 0x36, 0x02)
+	return utils.AppendULEB128(b, uint32(off))
+}
+
+// emitFitsOrRefuse returns -1 when the region cannot hold the layout, where
+// pushBlkOff64 pushes the block buffer's i64 offset.
+//
+// EVERYTHING IS i64 AND THE COMPARISON IS UNSIGNED. The products here reach
+// 2^31 on legal inputs and cache_len is a u32; a signed i32 test read a wrapped
+// product as "fits" and let the sweep write outside the region.
+func (e *ckptEmit) emitFitsOrRefuse(b []byte, pScratchLen byte, pushBlkOff64 func([]byte) []byte) []byte {
+	b = pushBlkOff64(b)
+	b = e.get(b, e.lStride)
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = e.konst64(b, uint64(e.rowBytesB()))
+	b = append(b, 0x7E) // i64.mul
+	b = append(b, 0x7C) // i64.add
+	b = e.get(b, pScratchLen)
+	b = append(b, 0xAD)
+	b = append(b, 0x56) // i64.gt_u
+	b = append(b, 0x04, 0x40)
+	b = e.konst(b, -1)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+	return b
 }
 
 // loadMask64 pushes the i64 accept mask for the state in stateLocal.
@@ -314,11 +368,12 @@ func (e *ckptEmit) emitAdvance(b []byte) []byte {
 // emitAtPosition emits the per-position ACTION for the position in lPos,
 // reading the start-state row of the current column.
 //
-// write=false only counts into lCount; write=true also stores tuples DOWNWARD
-// from lWrite, which is what makes the finished block ascending without a
-// counting pass. Both are emitted from one function so the "which patterns
-// match here" test cannot fork between counting and writing — a block whose
-// count and contents disagree would over- or under-run the buffer.
+// write=false only counts into lCount; write=true also writes the position's
+// ROW, at the row's own address — rowBase + (pos - rowBase) * rowBytes — so
+// there is no fill order to get right and nothing to sort afterwards. Both are
+// emitted from one function so the "which patterns match here" test cannot fork
+// between counting and writing: a block whose count and contents disagree would
+// make cum[] describe a block that is not there.
 func (e *ckptEmit) emitAtPosition(b []byte, atZero bool, write bool) []byte {
 	startState := e.dp.wasmMidStart
 	if atZero {
@@ -371,7 +426,7 @@ func (e *ckptEmit) emitAtPosition(b []byte, atZero bool, write bool) []byte {
 			b = e.get(b, e.lWrite)
 			b = e.get(b, e.lVal)
 			b = append(b, 0x36, 0x02)
-			b = utils.AppendULEB128(b, uint32(4+k*4))
+			b = utils.AppendULEB128(b, uint32(config.SetOverlapRowEndOff(k))) //nolint:gosec // a row offset
 			b = e.get(b, e.lMask)
 			b = e.konst(b, int32(1)<<uint(k))
 			b = append(b, 0x72) // i32.or
@@ -408,6 +463,23 @@ func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
 	return b
 }
 
+// allocCommon allocates the locals BOTH checkpoint bodies use, in one order.
+//
+// The two allocated the same thirteen by hand, in the same sequence, and the
+// declaration vector is generated from the allocation — so a body that added
+// one in the middle would renumber every local after it in itself alone. The
+// order is the emitted order and is load-bearing; nothing here may be
+// reordered without regenerating both sweep fixtures.
+func (e *ckptEmit) allocCommon(a *localAlloc) {
+	e.lCur, e.lPrev = a.I32(), a.I32()
+	e.lPos, e.lByte, e.lCell = a.I32(), a.I32(), a.I32()
+	e.lState, e.lNext, e.lVal = a.I32(), a.I32(), a.I32()
+	e.lCount, e.lWrite = a.I32(), a.I32()
+	e.lCurRow, e.lPrevRow, e.lSwap, e.lStart = a.I32(), a.I32(), a.I32(), a.I32()
+	e.lFloor, e.lStride, e.lNumBlocks = a.I32(), a.I32(), a.I32()
+	e.lCkptOff, e.lCntOff, e.lBlkOff = a.I32(), a.I32(), a.I32()
+}
+
 // emitCkptPassBody emits the CHECKPOINT PASS.
 //
 //	(ptr, len, from, scratch, scratchLen) -> i32
@@ -419,9 +491,9 @@ func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
 //
 // Returns the tuple count of block 0, or -1 when the region is too small (a
 // FALLBACK signal: the caller walks, same answer, slower), or -4 when the
-// header contradicts itself (an ERROR, surfaced to the caller — plans §9.2
-// decision 3, because a silently-declined cache is indistinguishable from the
-// engine legitimately refusing the shape).
+// header contradicts itself (an ERROR, surfaced to the caller, because a
+// silently-declined cache is indistinguishable from the engine legitimately
+// refusing the shape).
 //
 // THE SWEEP IS TWO LOOPS, NOT ONE WITH A MODE BIT. Block 0 is the LAST block
 // visited, so "count above it, count and write inside it" is a split in the
@@ -430,6 +502,202 @@ func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
 // At nb == 1 loop A is empty and loop B covers everything, which is the
 // degenerate case that a mode bit would have had to get right at every
 // position instead of once.
+// emitCkptPassPrologue validates the caller's header, derives the layout and
+// seeds the sweep's working state.
+//
+// Split out because it is a UNIT and the rest of the pass is a different one:
+// everything here is about what the caller handed in — is the region big
+// enough, is the stride sane, does the layout fit — and nothing about the
+// recurrence. It is also what the serving paths' own validator has to agree
+// with, field for field, which is easier to see when it is one function.
+//
+// Returns early (a WASM `return`) on every refusal, so the caller's code after
+// it runs only on a header the sweep accepted.
+func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratchLen byte,
+	lM, lBlkIdx, lBound, lBlk0End, lCnt64, lBlk64 byte, cellBytes int32,
+) []byte {
+	// ---- prologue: validate, then derive the layout ----
+	//
+	// The order is load-bearing. A region too small to hold the header is
+	// refused before one byte of it is written; the stride is validated before
+	// EITHER arm uses it, so a malformed header reports -4 whatever the resume
+	// position is; and only then does `from > len` take its shortcut.
+
+	// Unsigned, because cache_len is a u32 byte count in the ABI.
+	b = e.get(b, pScratchLen)
+	b = e.konst(b, ckptHdrBytes)
+	b = append(b, 0x49) // i32.lt_u
+	b = append(b, 0x04, 0x40)
+	b = e.konst(b, -1)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// A stride BELOW 1 is a header the caller got wrong, and is reported rather
+	// than guessed at: zero would divide by zero and a negative one would index
+	// backwards out of the region.
+	b = e.hdrLoad(b, ckptHdrStride)
+	b = e.tee(b, e.lStride)
+	b = e.konst(b, 1)
+	b = append(b, 0x48) // i32.lt_s
+	b = append(b, 0x04, 0x40)
+	b = e.konst(b, int32(abi.OverlapCacheMalformed))
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// `from` above `len` is not an error: the ABI defines it as "nothing
+	// found". It still has to leave a LAYOUT behind, because it publishes
+	// `ready` and serving validates the header it then reads. What it writes is
+	// the empty ONE-BLOCK layout a real single-position sweep would have
+	// produced, so the validator needs no special case — a `cntOff` of 48 here
+	// would contradict `cntOff == ckptOff + numBlocks*cellBytes` and turn every
+	// such call into -4.
+	b = e.get(b, pFrom)
+	b = e.get(b, pLen)
+	b = append(b, 0x4A) // i32.gt_s
+	b = append(b, 0x04, 0x40)
+	// The stride becomes 1 and is stored: this layout spans ONE position that
+	// does not exist, so one row is all it could ever need, and the caller's k
+	// — sized for the whole input — would otherwise demand a block buffer the
+	// region need not have and turn a legal resume into a refusal.
+	b = e.konst(b, 1)
+	b = e.set(b, e.lStride)
+	b = e.emitFitsOrRefuse(b, pScratchLen, func(b []byte) []byte {
+		return e.konst64(b, uint64(ckptHdrBytes+cellBytes+8))
+	})
+	b = e.hdrStore(b, ckptHdrStride, func(b []byte) []byte { return e.konst(b, 1) })
+	b = e.hdrStore(b, ckptHdrCkptOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes) })
+	b = e.hdrStore(b, ckptHdrCntOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes+cellBytes) })
+	b = e.hdrStore(b, ckptHdrBlockOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes+cellBytes+8) })
+	b = e.hdrStore(b, ckptHdrCurBlock, func(b []byte) []byte { return e.konst(b, 1) })
+	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.konst(b, 1) })
+	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, pFrom) })
+	b = e.hdrStore(b, ckptHdrRowBase, func(b []byte) []byte { return e.get(b, pFrom) })
+	// cum[0] = cum[1] = 0: an empty block 0 and a zero total.
+	b = e.storeConstAt(b, ckptHdrBytes+cellBytes, 0)
+	b = e.storeConstAt(b, ckptHdrBytes+cellBytes+4, 0)
+	b = e.hdrStore(b, ckptHdrReady, func(b []byte) []byte { return e.konst(b, 1) })
+	b = e.konst(b, 0)
+	b = append(b, 0x0F) // return 0
+	b = append(b, 0x0B)
+
+	b = e.get(b, pFrom)
+	b = e.set(b, e.lFloor)
+	b = e.get(b, pLen)
+	b = e.get(b, e.lFloor)
+	b = append(b, 0x6B) // i32.sub
+	b = e.konst(b, 1)
+	b = append(b, 0x6A)
+	b = e.set(b, lM) // m = len - from + 1
+
+	// A stride WIDER than the span being swept is NOT an error, and treating it
+	// as one broke every drive that engaged late. `init` sizes the stride for
+	// the WHOLE input, because that is all it knows at allocation time, but the
+	// sweep runs over [from, len] and engages only once the walk has proven
+	// expensive — so by the time it runs, `from` may leave fewer positions than
+	// one stride. Clamp to m, which is the single-block case, and the region
+	// sized for the full input is necessarily large enough for it.
+	b = e.get(b, e.lStride)
+	b = e.get(b, lM)
+	b = append(b, 0x4A) // i32.gt_s
+	b = append(b, 0x04, 0x40)
+	b = e.get(b, lM)
+	b = e.set(b, e.lStride)
+	b = append(b, 0x0B)
+	// The clamped value goes BACK to the header. Serving divides by the
+	// header's copy to locate a block, so a pass that kept a different stride
+	// to itself would have the two disagree about where every block starts.
+	b = e.hdrStore(b, ckptHdrStride, func(b []byte) []byte { return e.get(b, e.lStride) })
+
+	// nb = ceil(m / stride)
+	b = e.get(b, lM)
+	b = e.get(b, e.lStride)
+	b = append(b, 0x6A)
+	b = e.konst(b, 1)
+	b = append(b, 0x6B)
+	b = e.get(b, e.lStride)
+	b = append(b, 0x6E) // i32.div_u
+	b = e.set(b, e.lNumBlocks)
+
+	// Layout: ckpt | cum | block buffer, computed in i64.
+	//
+	// nb*cellBytes passes 2^31 at a legal stride of 1 — a 131 KB input with a
+	// 16 KB column, or a 1.5 KB column at 1.4 MB — and an i32 product wraps
+	// NEGATIVE, which a signed "too small" test reads as "fits". Every
+	// checkpoint then lands at a wrapped address in the caller's memory, which
+	// is precisely what this check exists to prevent.
+	b = e.konst64(b, uint64(ckptHdrBytes))
+	b = e.get(b, e.lNumBlocks)
+	b = append(b, 0xAD) // i64.extend_i32_u
+	b = e.konst64(b, uint64(cellBytes))
+	b = append(b, 0x7E) // i64.mul
+	b = append(b, 0x7C) // i64.add
+	b = e.set(b, lCnt64)
+	b = e.get(b, lCnt64)
+	b = e.get(b, e.lNumBlocks)
+	b = append(b, 0xAD)
+	b = e.konst64(b, 1)
+	b = append(b, 0x7C)
+	b = e.konst64(b, 4)
+	b = append(b, 0x7E)
+	b = append(b, 0x7C)
+	b = e.set(b, lBlk64)
+
+	// Too small: refuse, and let the drive walk.
+	b = e.emitFitsOrRefuse(b, pScratchLen, func(b []byte) []byte { return e.get(b, lBlk64) })
+
+	// Past the check the three offsets are below cache_len and are used as i32
+	// addresses from here on, exactly as every other address in this file is.
+	b = e.konst(b, ckptHdrBytes)
+	b = e.set(b, e.lCkptOff)
+	b = e.get(b, lCnt64)
+	b = append(b, 0xA7) // i32.wrap_i64
+	b = e.set(b, e.lCntOff)
+	b = e.get(b, lBlk64)
+	b = append(b, 0xA7)
+	b = e.set(b, e.lBlkOff)
+
+	// Header fields the serving paths read.
+	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, e.lFloor) })
+	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.get(b, e.lNumBlocks) })
+	b = e.hdrStore(b, ckptHdrCkptOff, func(b []byte) []byte { return e.get(b, e.lCkptOff) })
+	b = e.hdrStore(b, ckptHdrCntOff, func(b []byte) []byte { return e.get(b, e.lCntOff) })
+	b = e.hdrStore(b, ckptHdrBlockOff, func(b []byte) []byte { return e.get(b, e.lBlkOff) })
+
+	// block0End = min(floor + stride - 1, len)
+	b = e.get(b, e.lFloor)
+	b = e.get(b, e.lStride)
+	b = append(b, 0x6A)
+	b = e.konst(b, 1)
+	b = append(b, 0x6B)
+	b = e.tee(b, lBlk0End)
+	b = e.get(b, pLen)
+	b = append(b, 0x4A)
+	b = append(b, 0x04, 0x40)
+	b = e.get(b, pLen)
+	b = e.set(b, lBlk0End)
+	b = append(b, 0x0B)
+
+	// Rows are written AT their own address, in whatever order the sweep
+	// reaches them, so there is no downward fill and no ordering trick: row r
+	// stands for position rowBase + r and nothing else can occupy it.
+	b = e.get(b, pScratch)
+	b = e.get(b, e.lBlkOff)
+	b = append(b, 0x6A)
+	b = e.set(b, e.lBlkBase)
+	b = e.get(b, e.lFloor)
+	b = e.set(b, e.lRowBase)
+
+	b = e.konst(b, 0)
+	b = e.set(b, e.lCount)
+	b = e.konst(b, e.colA)
+	b = e.set(b, e.lCur)
+	b = e.konst(b, e.colB)
+	b = e.set(b, e.lPrev)
+	b = e.emitSeedDeadCell(b)
+
+	return b
+}
+
 func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	e := newCkptEmit(cs, tableMemIdx, colOff)
 
@@ -444,22 +712,15 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	e.pPtr, e.pLen, e.pScratch = pPtr, pLen, pScratch
 
 	a := newLocalAlloc(nparams)
-	e.lCur, e.lPrev = a.I32(), a.I32()
-	e.lPos, e.lByte, e.lCell = a.I32(), a.I32(), a.I32()
-	e.lState, e.lNext, e.lVal = a.I32(), a.I32(), a.I32()
-	e.lCount, e.lWrite, e.lLimit = a.I32(), a.I32(), a.I32()
-	e.lCurRow, e.lPrevRow, e.lSwap, e.lStart = a.I32(), a.I32(), a.I32(), a.I32()
-	e.lFloor, e.lStride, e.lNumBlocks = a.I32(), a.I32(), a.I32()
-	e.lCkptOff, e.lCntOff, e.lBlkOff = a.I32(), a.I32(), a.I32()
+	e.allocCommon(a)
 	e.lTmp, e.lHi, e.lLo = a.I32(), a.I32(), a.I32()
 	lM, lBlkIdx, lBound, lBlk0End := a.I32(), a.I32(), a.I32(), a.I32()
 	e.lRowBase, e.lBlkBase, e.lMask = a.I32(), a.I32(), a.I32()
-	// Block 0's count has to be captured BEFORE emitStoreBlockCount resets the
-	// running counter, and before the prefix sum overwrites cnt[0] with the
-	// cumulative zero. The header's `count` is what serving reads to know how
-	// many tuples the materialised block holds.
-	lBlk0Count := a.I32()
+	e.lSum = a.I32()
 	e.lMidMask, e.lEofMask = a.I64(), a.I64()
+	// The layout is computed in i64 (see the prologue): nb*cellBytes passes
+	// 2^31 at a stride of 1 on a large input with a wide column.
+	lCnt64, lBlk64 := a.I64(), a.I64()
 
 	cellBytes := e.colBytes()
 
@@ -469,137 +730,9 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	konst := func(v int32) { b = e.konst(b, v) }
 	get := func(l byte) { b = e.get(b, l) }
 	set := func(l byte) { b = e.set(b, l) }
-	tee := func(l byte) { b = e.tee(b, l) }
 
-	// ---- prologue: read the caller's stride, derive the layout ----
-	//
-	// `from` above `len` is not an error: the ABI defines it as "nothing
-	// found", so clamp and let the pass produce an empty block 0.
-	get(pFrom)
-	get(pLen)
-	b = append(b, 0x4A) // i32.gt_s
-	b = append(b, 0x04, 0x40)
-	b = e.hdrStore(b, ckptHdrReady, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrCount, func(b []byte) []byte { return e.konst(b, 0) })
-	b = e.hdrStore(b, ckptHdrCurBlock, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, pFrom) })
-	konst(0)
-	b = append(b, 0x0F) // return 0
-	b = append(b, 0x0B)
-
-	get(pFrom)
-	set(e.lFloor)
-	get(pLen)
-	get(e.lFloor)
-	b = append(b, 0x6B) // i32.sub
-	konst(1)
-	b = append(b, 0x6A)
-	set(lM) // m = len - from + 1
-
-	b = e.hdrLoad(b, ckptHdrStride)
-	tee(e.lStride)
-	// A stride BELOW 1 is a header the caller got wrong, and is reported rather
-	// than guessed at: zero would divide by zero and a negative one would index
-	// backwards out of the region.
-	konst(1)
-	b = append(b, 0x48) // i32.lt_s
-	b = append(b, 0x04, 0x40)
-	konst(int32(abi.OverlapCacheMalformed))
-	b = append(b, 0x0F)
-	b = append(b, 0x0B)
-
-	// A stride WIDER than the span being swept is NOT an error, and treating it
-	// as one broke every drive that engaged late. `init` sizes the stride for
-	// the WHOLE input, because that is all it knows at allocation time, but the
-	// sweep runs over [from, len] and engages only once the walk has proven
-	// expensive — so by the time it runs, `from` may leave fewer positions than
-	// one stride. Clamp to m, which is the single-block case, and the region
-	// sized for the full input is necessarily large enough for it.
-	get(e.lStride)
-	get(lM)
-	b = append(b, 0x4A) // i32.gt_s
-	b = append(b, 0x04, 0x40)
-	get(lM)
-	set(e.lStride)
-	b = append(b, 0x0B)
-
-	// nb = ceil(m / stride)
-	get(lM)
-	get(e.lStride)
-	b = append(b, 0x6A)
-	konst(1)
-	b = append(b, 0x6B)
-	get(e.lStride)
-	b = append(b, 0x6E) // i32.div_u
-	set(e.lNumBlocks)
-
-	// Layout: ckpt | cum | block buffer.
-	konst(ckptHdrBytes)
-	set(e.lCkptOff)
-	get(e.lCkptOff)
-	get(e.lNumBlocks)
-	konst(cellBytes)
-	b = append(b, 0x6C, 0x6A)
-	set(e.lCntOff)
-	get(e.lCntOff)
-	get(e.lNumBlocks)
-	konst(1)
-	b = append(b, 0x6A)
-	konst(4)
-	b = append(b, 0x6C, 0x6A)
-	set(e.lBlkOff)
-
-	// Too small: refuse, and let the drive walk.
-	get(e.lBlkOff)
-	get(e.lStride)
-	konst(e.rowBytesB())
-	b = append(b, 0x6C, 0x6A)
-	get(pScratchLen)
-	b = append(b, 0x4A) // i32.gt_s
-	b = append(b, 0x04, 0x40)
-	konst(-1)
-	b = append(b, 0x0F)
-	b = append(b, 0x0B)
-
-	// Header fields the serving paths read.
-	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, e.lFloor) })
-	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.get(b, e.lNumBlocks) })
-	b = e.hdrStore(b, ckptHdrCkptOff, func(b []byte) []byte { return e.get(b, e.lCkptOff) })
-	b = e.hdrStore(b, ckptHdrCntOff, func(b []byte) []byte { return e.get(b, e.lCntOff) })
-	b = e.hdrStore(b, ckptHdrBlockOff, func(b []byte) []byte { return e.get(b, e.lBlkOff) })
-
-	// block0End = min(floor + stride - 1, len)
-	get(e.lFloor)
-	get(e.lStride)
-	b = append(b, 0x6A)
-	konst(1)
-	b = append(b, 0x6B)
-	tee(lBlk0End)
-	get(pLen)
-	b = append(b, 0x4A)
-	b = append(b, 0x04, 0x40)
-	get(pLen)
-	set(lBlk0End)
-	b = append(b, 0x0B)
-
-	// Rows are written AT their own address, in whatever order the sweep
-	// reaches them, so there is no downward fill and no ordering trick: row r
-	// stands for position rowBase + r and nothing else can occupy it.
-	get(pScratch)
-	get(e.lBlkOff)
-	b = append(b, 0x6A)
-	set(e.lBlkBase)
-	get(e.lFloor)
-	set(e.lRowBase)
-
-	konst(0)
-	set(e.lCount)
-	konst(e.colA)
-	set(e.lCur)
-	konst(e.colB)
-	set(e.lPrev)
-	b = e.emitSeedDeadCell(b)
+	b = e.emitCkptPassPrologue(b, pFrom, pLen, pScratch, pScratchLen,
+		lM, lBlkIdx, lBound, lBlk0End, lCnt64, lBlk64, cellBytes)
 
 	// ---- the EOF column, and checkpoint nb ----
 	b = e.emitEOFColumn(b)
@@ -637,26 +770,23 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	b = e.emitCloseBlockAt(b, lBlkIdx, lBound)
 
 	// ---- loop A: t = len-1 .. block0End+1, COUNT ONLY ----
-	b = e.emitSweepLoop(b, lBlk0End, lBlkIdx, lBound, false, cellBytes)
+	b = e.emitSweepLoop(b, lBlk0End, lBlkIdx, lBound, cellBytes)
 
 	// ---- loop B: t = min(len, block0End) .. floor, COUNT AND WRITE ----
 	// Position len was already handled above, so B starts one below it when
 	// block 0 reaches the end of the input.
 	b = e.emitSweepLoopBlockZero(b)
 
-	// cnt[0] is block 0's, and it is the count `find` serves on the first call.
-	get(e.lCount)
-	set(lBlk0Count)
+	// cnt[0] is block 0's.
 	b = e.emitStoreBlockCount(b, lBlkIdx)
 
 	// ---- epilogue: prefix-sum cum[], publish the materialised block ----
 	b = e.emitPrefixSumCounts(b)
 	b = e.hdrStore(b, ckptHdrCurBlock, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrCount, func(b []byte) []byte { return e.get(b, lBlk0Count) })
 	b = e.hdrStore(b, ckptHdrRowBase, func(b []byte) []byte { return e.get(b, e.lRowBase) })
 	b = e.hdrStore(b, ckptHdrReady, func(b []byte) []byte { return e.konst(b, 1) })
 
-	get(lBlk0Count)
+	get(e.lCount)
 	b = append(b, 0x0B)
 
 	body := utils.AppendULEB128(nil, uint32(len(b)))
@@ -724,7 +854,7 @@ func (e *ckptEmit) emitStoreBlockCount(b []byte, idxLocal byte) []byte {
 
 // emitSweepLoop is loop A: t from len-1 down to just above block 0, counting
 // only, saving a checkpoint and closing a block whenever it crosses a boundary.
-func (e *ckptEmit) emitSweepLoop(b []byte, lBlk0End, lBlkIdx, lBound byte, write bool, cellBytes int32) []byte {
+func (e *ckptEmit) emitSweepLoop(b []byte, lBlk0End, lBlkIdx, lBound byte, cellBytes int32) []byte {
 	b = e.get(b, e.pLen)
 	b = e.konst(b, 1)
 	b = append(b, 0x6B)
@@ -743,7 +873,9 @@ func (e *ckptEmit) emitSweepLoop(b []byte, lBlk0End, lBlkIdx, lBound byte, write
 	// block start it is exactly the checkpoint the block BELOW needs.
 	b = e.emitCheckpointAt(b, lBlkIdx, lBound, cellBytes)
 
-	b = e.emitAtPositionGuarded(b, write)
+	// COUNT ONLY: loop A runs above block 0, and only block 0 is materialised
+	// by the pass. Everything above it is rebuilt on demand.
+	b = e.emitAtPositionGuarded(b, false)
 
 	// Closing a block: lPos has just been counted into it, and the next
 	// position down belongs to the block beneath.
@@ -811,11 +943,11 @@ func (e *ckptEmit) emitPrefixSumCounts(b []byte) []byte {
 	b = append(b, 0x28, 0x02, 0x00)
 	b = e.get(b, e.lTmp)
 	b = append(b, 0x6A)
-	b = e.set(b, e.lPrevRow) // reuse as scratch: next
+	b = e.set(b, e.lSum) // the running total
 	b = e.get(b, e.lHi)
 	b = e.get(b, e.lTmp)
 	b = append(b, 0x36, 0x02, 0x00)
-	b = e.get(b, e.lPrevRow)
+	b = e.get(b, e.lSum)
 	b = e.set(b, e.lTmp)
 
 	b = e.get(b, e.lLo)
@@ -865,14 +997,8 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	e.pPtr, e.pLen, e.pScratch = pPtr, pLen, pScratch
 
 	a := newLocalAlloc(nparams)
-	e.lCur, e.lPrev = a.I32(), a.I32()
-	e.lPos, e.lByte, e.lCell = a.I32(), a.I32(), a.I32()
-	e.lState, e.lNext, e.lVal = a.I32(), a.I32(), a.I32()
-	e.lCount, e.lWrite, e.lLimit = a.I32(), a.I32(), a.I32()
-	e.lCurRow, e.lPrevRow, e.lSwap, e.lStart = a.I32(), a.I32(), a.I32(), a.I32()
-	e.lFloor, e.lStride, e.lNumBlocks = a.I32(), a.I32(), a.I32()
-	e.lCkptOff, e.lCntOff, e.lBlkOff = a.I32(), a.I32(), a.I32()
-	e.lTmp, e.lHi, e.lLo = a.I32(), a.I32(), a.I32()
+	e.allocCommon(a)
+	e.lHi, e.lLo = a.I32(), a.I32()
 	lNextCkpt := a.I32()
 	e.lRowBase, e.lBlkBase, e.lMask = a.I32(), a.I32(), a.I32()
 	e.lMidMask, e.lEofMask = a.I64(), a.I64()
@@ -976,7 +1102,6 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 		b = e.konst(b, 1)
 		return append(b, 0x6A)
 	})
-	b = e.hdrStore(b, ckptHdrCount, func(b []byte) []byte { return e.get(b, e.lCount) })
 	b = e.hdrStore(b, ckptHdrRowBase, func(b []byte) []byte { return e.get(b, e.lRowBase) })
 
 	get(e.lCount)
@@ -988,10 +1113,22 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 
 // emitCheckpointAt saves the current column when lPos is the start of block
 // lBlkIdx, which is precisely the column the block BELOW it re-sweeps from.
+//
+// BLOCK 0 IS EXCLUDED, and the guard is not cosmetic. Checkpoint indices are
+// 1-based — checkpoint j is stored at (j-1)*cellBytes — because block 0's
+// lower boundary is the floor and nothing re-sweeps from it. A span of one
+// position makes nb == 1, so lBlkIdx is 0 while lPos == lBound == floor, and
+// without the guard the column is copied to ckptOff - cellBytes: over the
+// header for a narrow column, and up to 16 KiB BEFORE the caller's region for
+// a wide one.
 func (e *ckptEmit) emitCheckpointAt(b []byte, lBlkIdx, lBound byte, cellBytes int32) []byte {
 	b = e.get(b, e.lPos)
 	b = e.get(b, lBound)
 	b = append(b, 0x46) // i32.eq
+	b = e.get(b, lBlkIdx)
+	b = e.konst(b, 0)
+	b = append(b, 0x4A) // i32.gt_s
+	b = append(b, 0x71) // i32.and
 	b = append(b, 0x04, 0x40)
 	b = e.emitCopyColumnToCkpt(b, lBlkIdx, cellBytes)
 	b = append(b, 0x0B)
@@ -1011,10 +1148,18 @@ func (e *ckptEmit) emitCheckpointAt(b []byte, lBlkIdx, lBound byte, cellBytes in
 // every block as empty, and a drive that engaged the cache silently ended at
 // the position it engaged on. It cost 240 of 256 matches on the shape that
 // caught it and nothing at all on the shapes that did not.
+// Block 0 is excluded for the reason emitCheckpointAt gives: it is closed by
+// the epilogue's emitStoreBlockCount, not by crossing a boundary, and letting
+// it close here at nb == 1 decremented lBlkIdx to -1 and wrote cnt[-1] over
+// the last checkpoint cell while resetting the counter the header publishes.
 func (e *ckptEmit) emitCloseBlockAt(b []byte, lBlkIdx, lBound byte) []byte {
 	b = e.get(b, e.lPos)
 	b = e.get(b, lBound)
 	b = append(b, 0x46)
+	b = e.get(b, lBlkIdx)
+	b = e.konst(b, 0)
+	b = append(b, 0x4A) // i32.gt_s
+	b = append(b, 0x71) // i32.and
 	b = append(b, 0x04, 0x40)
 	b = e.emitStoreBlockCount(b, lBlkIdx)
 	b = e.get(b, lBlkIdx)
@@ -1045,10 +1190,10 @@ func (e *ckptEmit) emitEOFColumnProj(b []byte) []byte {
 	for pat := 0; pat < e.numPat; pat++ {
 		bit := uint64(1) << uint(pat)
 		for c := 1; c < e.proj.cells; c++ {
-			w := int(e.proj.rep[c])
-			if e.proj.cellOf[pat][w] != int32(c) {
+			if e.proj.owner[c] != int32(pat) {
 				continue // this cell belongs to another pattern
 			}
+			w := int(e.proj.rep[c])
 			b = e.get(b, e.lCur)
 			if e.dp.eofMasks[w]&bit != 0 {
 				b = e.get(b, e.pLen)
@@ -1069,7 +1214,7 @@ func (e *ckptEmit) emitEOFColumnProj(b []byte) []byte {
 // representative's successor at a constant offset, the successor's cell through
 // the projection table, and the old column there.
 //
-// The unroll is the user's decision (plans §19.13 decision 3): every address
+// The column is unrolled rather than looped: every address
 // bar the projection lookup is a compile-time constant, at the price of a
 // module that grows with the cell count.
 func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
@@ -1113,10 +1258,10 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 	for pat := 0; pat < e.numPat; pat++ {
 		bit := uint64(1) << uint(pat)
 		for c := 1; c < e.proj.cells; c++ {
-			w := int(e.proj.rep[c])
-			if e.proj.cellOf[pat][w] != int32(c) {
+			if e.proj.owner[c] != int32(pat) {
 				continue
 			}
+			w := int(e.proj.rep[c])
 			b = e.get(b, e.lCur)
 
 			// w' = succ[rep], at a constant address.
@@ -1169,19 +1314,6 @@ func (e *ckptEmit) emitSeedDeadCell(b []byte) []byte {
 		b = e.konst(b, col)
 		b = e.konst(b, -1)
 		b = appendTableStore32(b, e.tableMem, 0)
-	}
-	return b
-}
-
-// overlapCacheMaxBytes is config.SetOverlapCacheMaxBytes as an i64, for the
-// emitters that compare a 64-bit region size against it.
-const overlapCacheMaxBytes = int64(config.SetOverlapCacheMaxBytes)
-
-// appendF64 emits an f64.const with its IEEE-754 bits, little-endian.
-func appendF64(b []byte, v float64) []byte {
-	bits := math.Float64bits(v)
-	for i := 0; i < 8; i++ {
-		b = append(b, byte(bits>>uint(i*8)))
 	}
 	return b
 }

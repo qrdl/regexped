@@ -301,8 +301,8 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				cacheField = "\t// The overlapping answer cache; see docs/wasm.md.\n\tcache []uint32\n"
 				gateDecl += fmt.Sprintf(`		if iter.cache == nil {
 			m := uint64(len(iter.input)) + 1
-			row := uint64(4 + 4*%[2]d)
-			cell := uint64(%[1]d*4 + 4)
+			row := uint64(%[5]d)
+			cell := uint64(%[6]d)
 			k := m
 			if %[3]d+cell+4+m*row > %[4]d {
 				k = uint64(math.Sqrt(float64(m) * %[1]d * 4 / float64(row)))
@@ -327,7 +327,8 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			iter.scratch[2] = uint32(uintptr(unsafe.Pointer(&iter.cache[0])))
 			iter.scratch[3] = uint32(len(iter.cache) * 4)
 		}
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes,
+					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
 			} else {
 				gateDecl += "\t\titer.scratch[2], iter.scratch[3] = 0, 0\n"
 			}
@@ -406,6 +407,13 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 				iter.done = true
 				return
 			}
+			// And -4 the same way: the answer cache's header is malformed, so
+			// the drive is not finished and cannot say what is left.
+			if tupleCount == %[11]d {
+				iter.err = ErrMalformedCache
+				iter.done = true
+				return
+			}
 			if tupleCount <= 0 {
 				iter.done = true
 				return
@@ -415,7 +423,8 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 	}
 }
 
-`, pub, gateDoc, "", konst, gateDecl, s.Find, gateArg, konst, btOverflow, cacheField)
+`, pub, gateDoc, "", konst, gateDecl, s.Find, gateArg, konst, btOverflow, cacheField,
+				malformedCache)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -872,6 +881,7 @@ func %s() []string {
 func goErrorPreamble(cfg config.BuildConfig, needsSpan bool) string {
 	var sb strings.Builder
 	errName := namespaced(cfg, "ErrBacktrackOverflow")
+	cacheErrName := namespaced(cfg, "ErrMalformedCache")
 	fmt.Fprintf(&sb, `// %s means the Backtracking engine exhausted its frame
 // budget mid-search. The result is UNKNOWN — NOT "no match". Reporting it as
 // "no" would be a false negative that scales with input length and carries no
@@ -882,7 +892,19 @@ var %s = errors.New("regexped: backtracking stack overflow — " +
 	"input too large for this pattern's frame budget; the match result is unknown, " +
 	"not negative (see docs/engines.md)")
 
-`, errName, errName)
+// %s means the overlapping answer cache handed to an overlapping set's find
+// had a malformed header — a stride below 1, or a layout that does not
+// describe what the sweep would have written. The scan is UNKNOWN, not
+// finished. The generated iterator cannot produce it: it sizes the region and
+// writes the stride from one formula. A caller driving the raw ABI, or sharing
+// one region between two scanners, can.
+//
+// Test for it with errors.Is.
+var %s = errors.New("regexped: the overlapping answer cache's header is " +
+	"malformed; the scan result is unknown, not finished — a generated iterator " +
+	"cannot produce this (see docs/sets.md)")
+
+`, errName, errName, cacheErrName, cacheErrName)
 	if needsSpan {
 		fmt.Fprintf(&sb, `// %s is one capture group's extent, in absolute byte offsets.
 //

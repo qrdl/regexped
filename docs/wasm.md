@@ -140,8 +140,9 @@ element option<tuple<u32,u32>>                           size 12, align 4
   @8   u32  end
 ```
 
-The `-1` and `-2` sentinels are translated here, and only here: `-1` becomes
-`ok(none)`, `-2` becomes `err(backtrack-overflow)`. A group is unset iff its
+The `-1`, `-2` and `-4` sentinels are translated here: `-1` becomes `ok(none)`,
+`-2` becomes `err(backtrack-overflow)` and `-4` — which only a set `find`
+returns — becomes `err(malformed-cache)`. A group is unset iff its
 START slot is negative, which is the same test the generated stubs apply, so all
 six languages and the component agree on which groups participated.
 
@@ -515,9 +516,24 @@ The returned `i64` is both the answer and the resume token:
 
 | Bits | Field | Public? |
 |---|---|---|
-| 63..32 | resume position, or `0xFFFFFFFF` when the scan is finished | only the sentinel |
+| 63..32 | resume position, or one of the three reserved words below | only the sentinels |
 | 31..`countBits` | `k`, the intra-position resume index | no — opaque |
 | `countBits`-1..0 | `count` — valid tuples in the buffer | yes |
+
+THREE values of the position word are reserved, and all three have the high bit
+set — so a decoder must test them BEFORE it decides the scan finished:
+
+| word | meaning | `count` |
+|---|---|---|
+| `0xFFFFFFFF` | the scan is finished | the final matches, if any |
+| `0xFFFFFFFE` | UNKNOWN: a Backtracking member ran out of frames | 0, nothing written |
+| `0xFFFFFFFD` | UNKNOWN: the answer cache's header is malformed | 0, nothing written |
+
+The two error words live in the POSITION field rather than in the return value
+as a whole because there is nowhere else: every done return already has bit 63
+set, so "negative means unknown" cannot work, and `count` is `countBits` wide
+and MASKED by every decoder — a negative packed into it reads back as a large
+positive number of tuples nobody wrote.
 
 `countBits` is `32 - kBits`, where `kBits` is the smallest width holding
 `[0, patterns_in_set]`. Treat everything but the sentinel and `count` as opaque
@@ -601,8 +617,10 @@ STRIDE into the word at offset 16. Everything else is the engine's. The stride
 is the one field you own because it is what you sized the allocation from, and
 the engine validates rather than trusts it.
 
-**Sizing.** Call `<find>_cache_bytes`-equivalent arithmetic, which every
-generated stub already does for you:
+**Sizing.** The arithmetic below, which every generated `init` embeds. There is
+no exported sizing function to call — the column width is a compile-time
+property of the set, so `generate` recompiles the set to learn it and bakes
+`CELLS` in:
 
     row    = 4 + 4 * PATTERNS          one position's row
     cell   = CELLS * 4 + 4             one column snapshot, plus its count
@@ -627,8 +645,8 @@ Measured region sizes, for shapes the sweep accepts:
 
 | shape | 100 KB input | 10 MB input |
 |---|---|---|
-| 3 patterns, 7 cells | 1.6 MiB | 143 KB |
-| 3 patterns, 12 cells | 1.6 MiB | 183 KB |
+| 3 patterns, 7 cells | 1.6 MiB | 143 KiB |
+| 3 patterns, 12 cells | 1.6 MiB | 183 KiB |
 | 32 patterns, 353 cells | 12.9 MiB | 2.7 MiB |
 
 The rules:
@@ -641,11 +659,22 @@ The rules:
 - **Too small is not an error.** The sweep refuses a region it cannot fill and
   the drive falls back to walking. The answer is identical, only slower. This
   is the same rule `out_cap` underflow has.
-- **A header that contradicts itself IS an error.** A stride below 1, or a
-  layout that does not fit the `cache_len` you declared, returns
-  **`-4`** rather than degrading quietly — a mistake in caller-owned memory is
-  otherwise indistinguishable from the engine legitimately declining the shape,
-  on precisely the inputs the cache exists for.
+- **A header that contradicts itself IS an error.** A stride below 1 — or, on a
+  later call, a layout that is not the one a sweep would have written (a floor
+  past the input, offsets that do not follow from `numBlocks`, a block buffer
+  the declared `cache_len` cannot hold) — returns **`-4`** rather than degrading
+  quietly. A mistake in caller-owned memory is otherwise indistinguishable from
+  the engine legitimately declining the shape, on precisely the inputs the cache
+  exists for. The header is re-checked on EVERY call, not only the one that
+  sweeps: it is your memory, and the engine reads it again each time.
+- **A stride wider than the span is not an error.** `init` sizes the stride for
+  the whole input; a drive that engages late has fewer positions left than that,
+  and the engine clamps.
+- **`ready` at offset 8 is yours to READ.** It is `0` before the sweep is asked,
+  `1` once it has run, and `-1` when it was asked and refused the region. It is
+  the only way to tell a cached drive from one that quietly fell back to the
+  walk — both answer correctly — and both the fuzz drivers and the corpus
+  harnesses assert on it for exactly that reason.
 - **The cache belongs to one drive.** It holds the answer for one `(input,
   pattern set)` pair; re-zero the header to start a new drive.
 - **Same region on every call of a drive, or none.** Later calls address the

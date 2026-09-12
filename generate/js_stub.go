@@ -183,12 +183,28 @@ export function %s(input, from = 0) {
 		if s.Find != "" {
 			// Every set with `find` owns a gate array, overlapping included
 			//, so this is unconditional.
+			//
+			// So is the ANSWER CACHE, and that is not a detail: the cache is
+			// read by the plain `find` exactly as it is by the batch entry —
+			// an overlapping set whose shape qualifies emits the sweep whether
+			// or not it batches. Building it only under the batching hint left
+			// JS and TS the two languages whose plain overlapping find stayed
+			// quadratic, against a documented promise that every generated
+			// stub reserves one.
+			plainGateRegion := jsFindGateRegion(s, cfg, idN)
+			plainCachePre, plainCacheReserve, plainCachePost, plainCacheArgs :=
+				jsOverlapCacheBlock(s, cfg, plainGateRegion)
+			// The find region is sized from the SAME span the cache offset is
+			// taken from, alignment padding included. `reserve` above omits
+			// that padding, and the cache would then begin a few bytes past
+			// the end of what _open handed out.
+			findReserve := 12*n + plainGateRegion
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
-    // The scratch descriptor: magic, the gate pointer, and no answer cache.
+`, gateBase, idKonst) + plainCachePost + fmt.Sprintf(`    // The scratch descriptor: magic, the gate pointer, and the cache.
     const scratchBase = %s;
-    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, 0, 0]);
-`, gateBase, idKonst, scratchBase, abi.FindScratchMagic)
+    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+`, scratchBase, abi.FindScratchMagic, plainCacheArgs)
 			gateArg := "scratchBase, "
 			gateDoc := "// The generator owns the gate array for its lifetime: dropping it and\n" +
 				"// creating a new one restarts the scan with clean gates.\n"
@@ -199,9 +215,9 @@ export function %s(input, from = 0) {
 				// matching position.
 				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
 %sexport function* %s(input, offset = 0) {
-    // The region is this iterator's own for its whole lifetime, so another
+%s    // The region is this iterator's own for its whole lifetime, so another
     // stub call cannot land on its input, its tuple buffer or its gates.
-    const [_inBase, _outBase, len] = _open(input, %d);
+    const [_inBase, _outBase, len] = _open(input, %d%s);
     try {
 %s    let pos = offset;
     // Hoisted rather than rebuilt per position, which allocated one typed
@@ -215,6 +231,10 @@ export function %s(input, from = 0) {
         // -2 is UNKNOWN, not a count: a Backtracking member gave up here. It
         // has to be tested before the break below, which reads every
         // non-positive n as a clean end of scan.
+        if (n === %d) throw new Error("%s");
+        // -4 is the other unknowable answer: the overlapping answer cache's
+        // header contradicts itself, so this drive is not finished — the
+        // engine cannot say what is left.
         if (n === %d) throw new Error("%s");
         if (n <= 0) break;
         buf = _att(buf, Int32Array, _outBase, 3*%s);
@@ -230,12 +250,13 @@ export function %s(input, from = 0) {
     }
     } finally { _close(); }
 }
-`, gateDoc, s.Find, reserve, gateSetup, konst, s.Find,
+`, gateDoc, s.Find, plainCachePre, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
 						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
-					btOverflow, btOverflowMsg(s.Find), konst, konst)
+					btOverflow, btOverflowMsg(s.Find),
+					malformedCache, malformedCacheMsg(s.Find), konst, konst)
 			} else {
 				// `hints: [batch-find]`: the same matches in the same order,
 				// but batchSize positions of work per host crossing. That is
@@ -265,63 +286,8 @@ export function %s(input, from = 0) {
 				// only policy whose drive the sweep can answer. The engine
 				// may still decline — the sweep refuses shapes it cannot
 				// reproduce exactly — and declining costs nothing but speed.
-				cachePre, cacheReserve, cachePost, cacheArgs := "", "", "", "0, 0"
-				// The gate array and the >64-pattern bitmap sit between the
-				// tuple buffer and the cache, and the bitmap's width is
-				// ceil(ID_SPACE/8) — not a multiple of 4. The cache header is
-				// read through a Uint32Array, and a typed-array view whose
-				// byte offset is not a multiple of its element size THROWS, so
-				// the gap is rounded up to the same 8 _align uses.
-				batchGateRegion := 4*idN + scratchDescriptorBytes + bitmapBytes(s, cfg)
-				if s.Overlapping {
-					batchGateRegion = (batchGateRegion + 7) &^ 7
-				}
-				if sh := overlapCacheShapeFor(s, cfg); s.Overlapping && sh.Eligible {
-					// The CHECKPOINTED answer cache. Its size depends on the
-					// sweep column's width, which comes from the compiler (the
-					// set was recompiled to learn it) and is baked in here as a
-					// constant; everything else is arithmetic on the input
-					// length, which only exists at call time.
-					//
-					// Below the budget the stride is the WHOLE SPAN, which is a
-					// single block: one sweep, nothing re-swept, and the same
-					// behaviour and very nearly the same bytes as the
-					// whole-drive cache this replaced. Above it the stride
-					// falls to the square-root optimum and the region becomes
-					// sqrt-sized, at the cost of sweeping each position twice.
-					//
-					// This arithmetic MUST match config.SetOverlapCheckpoint*
-					// exactly: the sweep validates the stride it is handed and
-					// reports a header it cannot make sense of.
-					cachePre = fmt.Sprintf(`    const _m = _inCap(input) + 1;
-    const _row = 4 + 4 * %[2]d;
-    const _cell = %[1]d * 4 + 4;
-    const _single = %[3]d + _cell + 4 + _m * _row;
-    let _k;
-    if (_single > 0 && _single <= %[4]d) {
-        _k = _m;
-    } else {
-        _k = Math.floor(Math.sqrt(_m * %[1]d * 4 / _row));
-        if (_k < 16) _k = 16;
-        if (_k > _m) _k = _m;
-    }
-    const _nb = Math.ceil(_m / _k);
-    const cacheNeeded = %[3]d + _nb * _cell + 4 + _k * _row;
-    const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
-					cacheReserve = " + cacheBytes"
-					// The header is zeroed and then the STRIDE written into it:
-					// it is the one field the caller owns, because the caller
-					// is what sized the allocation from it.
-					cachePost = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
-    if (cacheBase !== 0) {
-        const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
-        _hdr.fill(0);
-        _hdr[4] = _k;
-    }
-`, batchGateRegion, config.SetOverlapCheckpointHeaderBytes/4)
-					cacheArgs = "cacheBase, cacheBytes"
-				}
+				batchGateRegion := jsFindGateRegion(s, cfg, idN)
+				cachePre, cacheReserve, cachePost, cacheArgs := jsOverlapCacheBlock(s, cfg, batchGateRegion)
 				// The descriptor, written last: it carries the cache pointer,
 				// which the block above may have declined.
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
@@ -352,6 +318,10 @@ export function %s(input, from = 0) {
         // UNKNOWN — a Backtracking member gave up, and this call reported
         // nothing. Tested beside the done word so it cannot pass for a finish.
         if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
+        // And 0x%X, the second reserved word: the answer cache's header is
+        // malformed. Both are tested before the done word, since all three
+        // have the high bit set.
+        if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
             // Re-checked each step: the yield hands control back, and whatever
@@ -369,7 +339,8 @@ export function %s(input, from = 0) {
 					camelSet(s.Name)+"BatchMaxSize", cachePre, batchGateRegion, cacheReserve,
 					batchGateSetup, cachePost,
 					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
-					config.SetCursorOverflowPos, config.SetCursorOverflowPos, btOverflowMsg(s.Find))
+					config.SetCursorOverflowPos, config.SetCursorOverflowPos, btOverflowMsg(s.Find),
+					config.SetCursorMalformedPos, config.SetCursorMalformedPos, malformedCacheMsg(s.Find))
 			}
 		}
 		out.WriteString("\n")
@@ -752,4 +723,80 @@ export const %s = Object.freeze({
 	}
 	out.WriteString("});\n\n")
 	return out.String()
+}
+
+// jsFindGateRegion is the byte span between a `find` region's tuple buffer and
+// its answer cache: the gate array, the scratch descriptor and, for a wide set,
+// the id bitmap.
+//
+// Rounded up to 8 for an overlapping set because the bitmap's width is
+// ceil(ID_SPACE/8) and need not be a multiple of 4, while the cache header is
+// read through a Uint32Array — and a typed-array view whose byte offset is not
+// a multiple of its element size THROWS.
+func jsFindGateRegion(s config.SetConfig, cfg config.BuildConfig, idN int) int {
+	r := 4*idN + scratchDescriptorBytes + bitmapBytes(s, cfg)
+	if s.Overlapping {
+		r = (r + 7) &^ 7
+	}
+	return r
+}
+
+// jsOverlapCacheBlock emits the answer cache's sizing, reservation and header
+// seeding — the three pieces BOTH of a set's `find` shapes need.
+//
+// ONE emitter, because the plain and batching generators are otherwise
+// independent and drifted: the batching one built a cache and the plain one
+// wrote a descriptor saying there was none, so a JS or TS caller iterating an
+// overlapping set without the hint got the quadratic walk the cache exists to
+// retire.
+//
+// The arithmetic MUST match config.SetOverlapCheckpoint* exactly: the sweep
+// validates the stride it is handed and reports a header it cannot parse.
+// Below the budget the stride is the WHOLE SPAN, which is a single block: one
+// sweep, nothing re-swept. Above it the stride falls to the square-root
+// optimum and the region becomes sqrt-sized, at the cost of sweeping each
+// position twice.
+//
+// The returned strings are, in order: the prelude (before _open, since it
+// sizes the region), the reserve expression to append to _open's argument, the
+// post-open seeding, and the descriptor's cache arguments.
+func jsOverlapCacheBlock(s config.SetConfig, cfg config.BuildConfig, gateRegion int) (pre, reserve, post, args string) {
+	args = "0, 0"
+	sh := overlapCacheShapeFor(s, cfg)
+	if !s.Overlapping || !sh.Eligible {
+		return pre, reserve, post, args
+	}
+	// The sweep column's width comes from the compiler — the set is recompiled
+	// to learn it — and is baked in as a constant; everything else is
+	// arithmetic on the input length, which only exists at call time.
+	k := overlapCacheConstsFor(sh)
+	pre = fmt.Sprintf(`    const _m = _inCap(input) + 1;
+    const _row = %[1]d;
+    const _cell = %[2]d;
+    const _single = %[3]d + _m * _row;
+    let _k;
+    if (_single > 0 && _single <= %[4]d) {
+        _k = _m;
+    } else {
+        _k = Math.floor(Math.sqrt(_m * %[5]d * 4 / _row));
+        if (_k < 16) _k = 16;
+        if (_k > _m) _k = _m;
+    }
+    const _nb = Math.ceil(_m / _k);
+    const cacheNeeded = %[6]d + _nb * _cell + 4 + _k * _row;
+    const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+`, k.Row, k.Cell, k.Base, k.Max, k.Cells, k.Hdr)
+	reserve = " + cacheBytes"
+	// The header is zeroed and then the STRIDE written into it: it is the one
+	// field the caller owns, because the caller is what sized the allocation
+	// from it.
+	post = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
+    if (cacheBase !== 0) {
+        const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
+        _hdr.fill(0);
+        _hdr[4] = _k;
+    }
+`, gateRegion, config.SetOverlapCheckpointHeaderBytes/4)
+	args = "cacheBase, cacheBytes"
+	return pre, reserve, post, args
 }

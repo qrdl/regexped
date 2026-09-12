@@ -11,10 +11,9 @@ import (
 // WHY THIS EXISTS AT ALL. The checkpointed cache's size depends on the sweep
 // column's width, which falls out of the DFA subset construction and is not
 // derivable from the YAML: `generate` can count patterns but cannot know how
-// many states their merged automaton has. The decision (plans §9.2 decision 1)
-// was that `generate` RECOMPILES the set and reads the number off the result,
-// rather than the compiler exporting a sizing function into the module or the
-// stub baking in a constant that goes stale.
+// many states their merged automaton has. So `generate` RECOMPILES the set and
+// reads the number off the result, rather than the compiler exporting a sizing
+// function into the module or the stub baking in a constant that goes stale.
 //
 // WHY IT RETURNS CELLS AND NOT A STATE COUNT. `cells` is the column WIDTH —
 // states x patterns today, projected states under §19's lever C. Returning the
@@ -59,16 +58,35 @@ func SetOverlapCacheShape(sc config.SetConfig, cfg config.BuildConfig) (OverlapC
 		return OverlapCacheShape{}, nil
 	}
 	bkt := cs.buckets[bi]
-	cells := bkt.dp.numWASM * len(bkt.patterns)
-	if pr := cs.overlapProjFor(bi); pr != nil {
-		// Lever C: the column is one cell per PROJECTION, not per
-		// (state, pattern). Reporting the unprojected width here would size
-		// every caller's region for a column the sweep does not have.
-		cells = pr.cells
-	}
+	// Lever C makes the column one cell per PROJECTION rather than per
+	// (state, pattern); overlapCells is the one place that decides which, so a
+	// caller cannot size a region for a column the sweep does not have.
 	return OverlapCacheShape{
 		Eligible: true,
-		Cells:    cells,
+		Cells:    cs.overlapCells(),
 		Patterns: len(bkt.patterns),
 	}, nil
+}
+
+// SetOverlapCacheSizing is the region and stride a caller should reserve for one
+// set's answer cache over an input of inputLen bytes.
+//
+// The pair belongs together and is asked for together: the region is sized FROM
+// the stride, and the sweep validates the stride against the region it was
+// given, so a caller that computed one of them differently is handed back -4.
+// Both harnesses and every stub generator want exactly this, and each had its
+// own copy of the two config calls.
+//
+// A set with no sweep gets (header, 1): a nominal region the drive declines,
+// which keeps the descriptor's shape the same on every path.
+func SetOverlapCacheSizing(sc config.SetConfig, cfg config.BuildConfig, inputLen int) (bytes, stride int, err error) {
+	sh, err := SetOverlapCacheShape(sc, cfg)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !sh.Eligible {
+		return config.SetOverlapCheckpointHeaderBytes, 1, nil
+	}
+	return config.SetOverlapCheckpointBytes(inputLen, sh.Cells, sh.Patterns),
+		config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns), nil
 }

@@ -2905,32 +2905,15 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		if err != nil {
 			return err
 		}
-		spec := SetSpec{
-			Name:        sc.Name,
-			MatchAny:    sc.MatchAny,
-			MatchAll:    sc.MatchAll,
-			ScanAny:     sc.ScanAny,
-			ScanAll:     sc.ScanAll,
-			Find:        sc.Find,
-			BatchFind:   sc.BatchFind(),
-			Overlapping: sc.Overlapping,
-			Patterns:    infos,
-			PatternIDs:  globalIDs,
-
-			DeclaredPatternCount: sc.PatternCount(cfg),
-		}
-		// Same budget the real compile uses (set_emit.go's setOpts). Without
-		// it --diag-json reports drops under the default 1024 while the build
-		// it is describing kept those patterns.
-		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{
-			MaxFallbackStates: cfg.MaxFallbackStates,
-			// The set's own hint. Omitting it made this re-run NEUTRAL
-			// whatever the config said, so --diag-json reported the frontend,
-			// union-scan body and member-skip counts of a compilation the user
-			// was not asking about — and those are hint-dependent selections
-			// for which this file is the only window.
-			LikelyMode: resolveHints(sc.Hints),
-		})
+		// THE SAME spec and options the real compile builds, through the same
+		// helper. This function RE-RUNS CompileSet rather than threading the
+		// build's own diagnostics out, so every field it gets wrong describes a
+		// compilation the user is not asking about — and it has: the set's
+		// LikelyMode was omitted, so the frontend, the union-scan body and the
+		// member-skip counts were all reported NEUTRAL whatever `hints:` said,
+		// and this file is the only window onto those.
+		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
+		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)

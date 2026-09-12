@@ -63,11 +63,41 @@ func overlapCacheFor(input string, pats []string) (length, stride int32) {
 			Patterns: config.PatternSelector{Names: names},
 		}},
 	}
-	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
-	if err != nil || !sh.Eligible {
-		// Not eligible: any region will do, the sweep declines it.
+	// One helper for both numbers: the region is sized FROM the stride, and a
+	// harness that computed them separately would hand the sweep a header it
+	// reports as malformed.
+	bytes, k, err := compile.SetOverlapCacheSizing(cfg.Sets[0], cfg, len(input))
+	if err != nil {
 		return int32(config.SetOverlapCheckpointHeaderBytes), 1
 	}
-	return int32(config.SetOverlapCheckpointBytes(len(input), sh.Cells, sh.Patterns, true)),
-		int32(config.SetOverlapCheckpointStride(len(input), sh.Cells, sh.Patterns, true))
+	return int32(bytes), int32(k)
+}
+
+// overlapCacheForK sizes a region for a CHOSEN stride rather than the formula's.
+//
+// The block-boundary tests force tiny strides, and a region sized at the
+// formula's stride does not hold one: at k = 1 the checkpoint array is a column
+// per position, which for a 4 KB input is three times the single-block region.
+// Sizing it the other way made the sweep refuse, the drive walk, and the test
+// compare the walk with itself at every stride below 5.
+func overlapCacheForK(input string, pats []string, k int32) int32 {
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	cfg := config.BuildConfig{
+		Regexps: entries,
+		Sets: []config.SetConfig{{
+			Name: "s", Find: "find", Overlapping: true,
+			Patterns: config.PatternSelector{Names: names},
+		}},
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || !sh.Eligible {
+		return int32(config.SetOverlapCheckpointHeaderBytes)
+	}
+	return int32(config.SetOverlapCheckpointBytesForStride(
+		len(input), sh.Cells, sh.Patterns, int(k)))
 }

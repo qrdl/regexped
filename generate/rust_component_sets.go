@@ -99,6 +99,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
         Ok(Some(id)) => Ok(Some(id as i32)),
         Ok(None) => Ok(None),
         Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
+        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
     }
 }
 
@@ -118,6 +119,7 @@ pub fn %s(input: &[u8], offset: usize) -> Result<Option<i32>> {
         Ok(Some(id)) => Ok(Some(id as i32)),
         Ok(None) => Ok(None),
         Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
+        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
     }
 }
 
@@ -144,6 +146,7 @@ pub fn %s(input: &[u8]) -> Result<impl Iterator<Item = i32> + '_> {
     match sets::%s(input) {
         Ok(ids) => Ok(ids.into_iter().map(|id| id as i32)),
         Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
+        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
     }
 }
 
@@ -155,6 +158,7 @@ pub fn %s(input: &[u8], offset: usize) -> Result<impl Iterator<Item = i32> + '_>
     match sets::%s(input, offset as u32) {
         Ok(ids) => Ok(ids.into_iter().map(|id| id as i32)),
         Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
+        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
     }
 }
 
@@ -203,6 +207,10 @@ impl Iterator for %[1]s<'_> {
                 Err(sets::ErrorCode::BacktrackOverflow) => {
                     self.done = true;
                     return Some(Err(Error::BacktrackOverflow));
+                }
+                Err(sets::ErrorCode::MalformedCache) => {
+                    self.done = true;
+                    return Some(Err(Error::MalformedCache));
                 }
                 Ok(batch) => {
                     if batch.is_empty() { self.done = true; return None; }

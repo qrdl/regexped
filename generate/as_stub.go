@@ -65,6 +65,12 @@ func asSentinelPreamble() string {
  *  NOT "no match". Returned by the scalar and i64-returning exports. */
 export const RX_ERR_BT_OVERFLOW: i32 = -2;
 
+/** The overlapping answer cache's header is malformed — a stride below 1, or
+ *  a layout that does not describe what the sweep would have written. The scan
+ *  is UNKNOWN, not finished. A generated scanner cannot produce this: it sizes
+ *  the region and writes the stride from one formula. */
+export const RX_ERR_MALFORMED_CACHE: i32 = -4;
+
 /** The same condition from an export whose return is a POINTER, where 0
  *  already means "finished" and there is no negative value to spend. */
 export const RX_ITER_ERROR: u32 = 0xFFFFFFFF;
@@ -233,11 +239,15 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 				// caller is what sized the allocation from it. This arithmetic
 				// MUST match config.SetOverlapCheckpoint*: the sweep validates
 				// what it is handed and reports a header it cannot parse.
-				gateField += "    cache: StaticArray<u32>;\n"
+				// A zero-length array is "no cache", and it is the field's
+				// INITIALISER rather than an else-branch assignment: asc's
+				// definite-assignment analysis does not see through the
+				// conditional below and rejects the class outright (TS2564).
+				gateField += "    cache: StaticArray<u32> = new StaticArray<u32>(0);\n"
 				gateInit += fmt.Sprintf(`        {
-            const m: u64 = <u64>input.length + 1;
-            const row: u64 = 4 + 4 * %[2]d;
-            const cell: u64 = %[1]d * 4 + 4;
+            const m: u64 = <u64>input.byteLength + 1;
+            const row: u64 = %[5]d;
+            const cell: u64 = %[6]d;
             let k: u64 = m;
             if (%[3]d + cell + 4 + m * row > %[4]d) {
                 k = <u64>Math.sqrt(<f64>m * %[1]d * 4 / <f64>row);
@@ -249,11 +259,10 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
             if (bytes <= %[4]d) {
                 this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
                 this.cache[4] = <u32>k;
-            } else {
-                this.cache = new StaticArray<u32>(0);
             }
         }
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes,
+					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
 				cacheSet = "this.scratch[2] = (this.cache.length == 0 ? 0 : changetype<usize>(this.cache) as u32), " +
 					"this.scratch[3] = <u32>(this.cache.length * 4)"
 			}
@@ -270,7 +279,7 @@ export class %[1]s {
     private input: ArrayBuffer;
     private from: i32;
     private done: bool = false;
-    private overflowed: bool = false;
+    private overflowed: i32 = 0;
     private n: i32 = 0;
     private i: i32 = 0;
     private buf: StaticArray<i32>;
@@ -294,7 +303,10 @@ export class %[1]s {
             // scan when the rest of the input was never answered. It is
             // RECORDED rather than thrown — asc cannot catch — and read back
             // with err() after the loop.
-            if (got == %[7]d) { this.done = true; this.overflowed = true; return null; }
+            if (got == %[7]d) { this.done = true; this.overflowed = RX_ERR_BT_OVERFLOW; return null; }
+            // And -4: the answer cache's header is malformed, so the drive is
+            // not finished and cannot say what is left.
+            if (got == %[8]d) { this.done = true; this.overflowed = RX_ERR_MALFORMED_CACHE; return null; }
             if (got <= 0) { this.done = true; return null; }
             this.n = got;
             this.i = 0;
@@ -302,11 +314,12 @@ export class %[1]s {
             this.from = this.buf[1] + 1;
         }
     }
-    /** RX_ERR_BT_OVERFLOW if the scan stopped because the engine gave up and
-     *  what remained was UNKNOWN, 0 if it ran to completion. Check it after
-     *  the loop: an unchecked err() means a silently truncated match list. */
+    /** RX_ERR_BT_OVERFLOW or RX_ERR_MALFORMED_CACHE if the scan stopped
+     *  because the engine could not answer and what remained was UNKNOWN, 0 if
+     *  it ran to completion. Check it after the loop: an unchecked err() means
+     *  a silently truncated match list. */
     err(): i32 {
-        return this.overflowed ? RX_ERR_BT_OVERFLOW : 0;
+        return this.overflowed;
     }
 }
 
@@ -314,7 +327,7 @@ export class %[1]s {
 export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
     return new %[1]s(input, offset);
 }
-`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, btOverflowMsg(s.Find))
+`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, malformedCache)
 		}
 		out.WriteString("\n")
 	}

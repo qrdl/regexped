@@ -256,6 +256,7 @@ pub fn %s(input: &[u8]) -> Result<Option<usize>> {
         Ok(Some(end)) => Ok(Some(end as usize)),
         Ok(None) => Ok(None),
         Err(matcher::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
+        Err(matcher::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
     }
 }
 
@@ -291,6 +292,10 @@ impl<'a> Iterator for %s<'a> {
             Err(matcher::ErrorCode::BacktrackOverflow) => {
                 self.done = true;
                 Some(Err(Error::BacktrackOverflow))
+            }
+            Err(matcher::ErrorCode::MalformedCache) => {
+                self.done = true;
+                Some(Err(Error::MalformedCache))
             }
             Ok(None) => {
                 self.done = true;
@@ -351,6 +356,10 @@ impl<'a> Iterator for %s<'a> {
             Err(matcher::ErrorCode::BacktrackOverflow) => {
                 self.done = true;
                 Some(Err(Error::BacktrackOverflow))
+            }
+            Err(matcher::ErrorCode::MalformedCache) => {
+                self.done = true;
+                Some(Err(Error::MalformedCache))
             }
             Ok(None) => {
                 self.done = true;

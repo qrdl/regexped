@@ -315,7 +315,7 @@ The generated wrapper returns **`Err(Error::BacktrackOverflow)`**. It used to pa
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Error { BacktrackOverflow }
+pub enum Error { BacktrackOverflow, MalformedCache }
 
 pub type Result<T> = std::result::Result<T, Error>;
 ```
@@ -329,3 +329,17 @@ The enum is `#[non_exhaustive]`, so a future sentinel is a non-breaking addition
 **`match_all` and `scan_all` differ deliberately**: their FFI call happens once at function entry, so the `Result` sits on the call — `Result<impl Iterator<Item = i32>>` — and the iterator itself cannot fail. `std::fs::read_dir` carries both levels in one API for the same reason.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated code cannot produce it. `init` sizes the region and writes the
+stride from one formula, so seeing this means the descriptor was built by hand,
+or one region was shared between two scanners.
+
+The wrapper returns **`Err(Error::MalformedCache)`**.

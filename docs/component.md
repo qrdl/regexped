@@ -31,8 +31,8 @@ the interface text, and a component does not hand it over in a form they take.
 package regexped:secrets;
 
 interface matcher {
-    /// The Backtracking engine exhausted its frame budget; the answer is unknown.
-    enum error-code { backtrack-overflow }
+    /// Why a matcher could not answer. Neither member means "no match".
+    enum error-code { backtrack-overflow, malformed-cache }
 
     /// Leftmost match starting at or after `start`. Positions are absolute.
     find-github-token: func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>;
@@ -59,14 +59,21 @@ because `from` is a WIT keyword.
 
 ### The error case is not "no match"
 
-`error-code` has one member, and it is the only thing that distinguishes
-"there is no match" from "I could not tell":
+`error-code` is the only thing that distinguishes "there is no match" from
+"I could not tell":
 
 ```
 ok(none)                  — there is definitely no match at or after `start`
 err(backtrack-overflow)   — the Backtracking engine ran out of frames and
                             ABANDONED part of the search space
+err(malformed-cache)      — an overlapping set's answer cache had a header the
+                            engine could not parse, so the scan is UNFINISHED
 ```
+
+The second is reachable only through a set's `find` resource, and a consumer
+cannot provoke it: the constructor builds that header itself. It is in the enum
+because the engine can still report it, and reporting it AS a backtracking
+overflow would point at the wrong thing entirely.
 
 Treating the second as the first is the dangerous mistake this type exists to
 prevent — a secret scanner that reports "clean" because the engine gave up is
@@ -309,7 +316,7 @@ exports only the interfaces that exist, so a config of only sets gets no empty
 
 ```wit
 interface sets {
-    enum error-code { backtrack-overflow }
+    enum error-code { backtrack-overflow, malformed-cache }
     record set-match { id: u32, start: u32, end: u32 }
 
     which-matches: func(input: list<u8>) -> result<option<u32>, error-code>;

@@ -77,6 +77,13 @@ func cTypesPreamble(wantCache bool) string {
 	hb.WriteString("   plain < 0 check reports \"unknown\" as a confident \"no\".\n")
 	hb.WriteString("   See docs/engines.md. */\n")
 	fmt.Fprintf(&hb, "#define RX_ERR_BT_OVERFLOW (%d)\n", btOverflow)
+	hb.WriteString("/* The overlapping answer cache's header is malformed -- a stride below 1,\n")
+	hb.WriteString("   or a layout that does not describe what the sweep would have written.\n")
+	hb.WriteString("   The scan is UNKNOWN, not finished. A scanner initialised by this\n")
+	hb.WriteString("   header's _init cannot produce it: the region and the stride come from\n")
+	hb.WriteString("   one formula. A caller building its own descriptor, or sharing one\n")
+	hb.WriteString("   region between two scanners, can. See docs/sets.md. */\n")
+	fmt.Fprintf(&hb, "#define RX_ERR_MALFORMED_CACHE (%d)\n", malformedCache)
 	hb.WriteString("/* Argument errors from the scanner initialisers. */\n")
 	hb.WriteString("#define RX_ERR_NULL_ARG    (-3)\n")
 	hb.WriteString("#define RX_ERR_RANGE       (-5)\n")
@@ -106,7 +113,13 @@ func cTypesPreamble(wantCache bool) string {
    ON  -> an overlapping set's find is linear.
    OFF -> it walks, quadratic, with identical answers.
 
-   Your build decides this, not your source. */
+   Your build decides this, not your source.
+
+   A -nostdlib BUILD MUST PASS -DRX_SET_CACHE=0. The preprocessor cannot see
+   link flags: -nostdlib removes libc from the LINK, not <stdlib.h> from the
+   include path, and a wasi-sdk clang always finds that header. Without the
+   define this file then references malloc and free and the link fails on
+   undefined symbols. */
 #ifndef RX_SET_CACHE
 #  if defined(__has_include)
 #    if __has_include(<stdlib.h>)
@@ -121,16 +134,15 @@ func cTypesPreamble(wantCache bool) string {
 
 #if RX_SET_CACHE
 #include <stdlib.h>
-/* The stride is a square root, and <math.h> is a heavier dependency than the
-   one value needed. Newton on a double converges in a handful of steps and is
-   exact enough: the stride only has to MATCH what the other stubs compute, and
-   every one of them rounds the same way — toward zero — before clamping. */
-static double rx_sqrt_(double x) {
-    if (x <= 0) return 0;
-    double r = x, prev = 0;
-    for (int i = 0; i < 64 && r != prev; i++) { prev = r; r = 0.5 * (r + x / r); }
-    return r;
-}
+/* The stride is a square root, and it has to be THE square root: every other
+   stub computes it in IEEE double and truncates, and a stride one apart from
+   the region it sized is a header the sweep reports as malformed. A Newton
+   iteration stood here and is not IEEE sqrt -- it can land an ulp away, which
+   trunc() then turns into a different integer.
+
+   __builtin_sqrt lowers to the wasm f64.sqrt instruction with no libm and no
+   call, so this costs nothing and is exact. */
+#define rx_sqrt_(x) __builtin_sqrt(x)
 #endif
 
 `)
@@ -320,9 +332,10 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// entry reads one, and this stub does not expose it).
 			//
 			// Built before EACH call rather than in _init, because field 1 is a
-			// pointer INTO the scanner: a caller that copied the struct — which
-			// nothing forbids, it is a by-value type — would otherwise leave the
-			// copy pointing at the original's gates.
+			// pointer INTO the scanner: a struct that was moved or copied would
+			// otherwise leave the copy pointing at the original's gates. Copying
+			// an INITIALISED scanner is not sanctioned any more — with an owned
+			// cache it double-frees — and the header says so.
 			cacheSet := "s->scratch[2] = 0, s->scratch[3] = 0"
 			cacheField, cacheAlloc, cacheFree := "", "", ""
 			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
@@ -362,8 +375,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 #if RX_SET_CACHE
     {
         unsigned long long m = (unsigned long long)len + 1;
-        unsigned long long row = 4 + 4 * %[2]dULL;
-        unsigned long long cell = %[1]dULL * 4 + 4;
+        unsigned long long row = %[6]dULL;
+        unsigned long long cell = %[7]dULL;
         unsigned long long k = m;
         if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
             k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
@@ -382,7 +395,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
         }
     }
 #endif
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes, abi.FindScratchMagic)
+`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes, abi.FindScratchMagic,
+					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
 				cacheFree = `#if RX_SET_CACHE
     if (s->cache) { free(s->cache); s->cache = 0; s->cache_words = 0; }
 #endif
@@ -429,10 +443,12 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
     if (s->done) return 0;
     int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
-    /* Negative is RX_ERR_BT_OVERFLOW, not a count: a Backtracking member of
-       this set exhausted its frame budget, so what remains is UNKNOWN rather
-       than nothing. Folding it into the "0 means finished" test below would
-       end the scan silently and report success. */
+    /* Negative is RX_ERR_BT_OVERFLOW or RX_ERR_MALFORMED_CACHE, not a count:
+       a Backtracking member exhausted its frame budget, or the answer cache's
+       header contradicts itself. Either way what remains is UNKNOWN rather
+       than nothing, and the code is passed through to the caller. Folding
+       either into the "0 means finished" test below would end the scan
+       silently and report success. */
     if (got < 0) { s->done = 1; return got; }
     if (got == 0) { s->done = 1; return 0; }
     /* Over capacity: nothing was recorded and the scan did not advance, so the
@@ -904,6 +920,12 @@ func cSetScanAllDecl(name, konst string) string {
 func cSetScannerDecls(find, konst, gateField, scannerType string) string {
 	return fmt.Sprintf(`/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
    re-initialising the struct restarts a scan.
+
+   NOT COPYABLE once initialised. For an overlapping set the scanner OWNS a
+   heap region, so a copy plus two _free calls frees it twice; and the
+   descriptor it builds holds a pointer INTO itself, so a copy left behind by a
+   move would drive the original's gate array. Declare it where it lives, pass
+   its ADDRESS, and let _free end it.
 
    The scanner holds the INPUT as well as the position (decision (5)): the
    input never changes during a scan while the position changes every step, so

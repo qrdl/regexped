@@ -66,6 +66,8 @@ that reads one table through another's bytes.
 | `set_scan` | the scan pair: non-anchored, offset-taking, no positions | packed-pair |
 | `set_overlap` | `overlapping: true` — every-start enumeration, same signature as gated find | packed-pair |
 | `set_batch` | `hints: [batch-find]` — a second entry point over ONE shared worker | packed-pair |
+| `set_overlap_sweep` | `overlapping: true` over LITERAL-LESS patterns, which is what puts a SWEEP in the module: the checkpoint pass, the block materialiser, the projection table and the successor scratch. `set_overlap` above is eight literals and contains none of them | scalar |
+| `set_overlap_sweep_batch` | the same sweep with `hints: [batch-find]`. Only SERVING is per-entry — `find` returns a position's total where the batch entry returns what it wrote — so the two serving paths are separate code and are pinned separately | scalar |
 
 `TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
 capability list from the diagnostics on every run, for the same reason the

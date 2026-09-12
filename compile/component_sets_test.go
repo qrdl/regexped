@@ -249,11 +249,11 @@ func TestSetAdapterBodyFraming(t *testing.T) {
 		{"scan_all narrow", buildSetAllNarrowAdapterBody(9, 3, 3)},
 		{"match_all wide", buildSetAllWideAdapterBody(9, 3, 2, 70)},
 		{"scan_all wide", buildSetAllWideAdapterBody(9, 3, 3, 70)},
-		{"constructor (no cache)", buildSetScannerCtorBody(9, 0, 1, 12, 0, 0)},
+		{"constructor (no cache)", buildSetScannerCtorBody(setScannerCtor{reallocIdx: 9, callListGlobal: 1, idSpace: 12})},
 		// With a cache the constructor grows a whole sizing block, so both
 		// shapes are checked: the arithmetic is emitted only when the set has a
 		// sweep, and an empty or malformed body would be invisible otherwise.
-		{"constructor (with cache)", buildSetScannerCtorBody(9, 0, 1, 12, 33, 3)},
+		{"constructor (with cache)", buildSetScannerCtorBody(setScannerCtor{reallocIdx: 9, callListGlobal: 1, idSpace: 12, cells: 33, pats: 3})},
 		{"next", buildSetScannerNextBody(9, 3, 12)},
 		{"dtor", buildSetScannerDtorBody(10)},
 	} {

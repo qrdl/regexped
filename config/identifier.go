@@ -417,13 +417,13 @@ func quoteAll(names []string) []string {
 // (TestSharedSymbolsMirrorIsInStep), which is the only thing that keeps a copy
 // honest.
 var stubSharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "SetMatch", "PatternName"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
-		"RX_ERR_BT_OVERFLOW", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED",
 	},
 	// Rust is deliberately absent from the SHARED list for the same reason it

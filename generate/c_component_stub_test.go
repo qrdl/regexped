@@ -18,6 +18,9 @@ func cComponentCfg() config.BuildConfig {
 			{Pattern: `(?P<scheme>https?)://(?P<host>[^/:?#\s]+)`, GroupsFunc: "parse_url"},
 			{Pattern: `AKIA[A-Z0-9]{16}`, FindFunc: "find_aws_key"},
 			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
+			{Name: "lower", Pattern: `[a-z]+`},
+			{Name: "digits", Pattern: `[0-9]+`},
+			{Name: "upper", Pattern: `[A-Z]+`},
 		},
 		// A SET too, so the header-parity check covers every capability and the
 		// find scanner — the one place the component mechanism differs most
@@ -31,6 +34,16 @@ func cComponentCfg() config.BuildConfig {
 			ScanAny:  "any_secret",
 			ScanAll:  "all_secret_hits",
 			Find:     "scan_secrets",
+		}, {
+			// CACHE-ELIGIBLE: an overlapping set over literal-less patterns is
+			// the only shape whose module scanner struct carries the two
+			// answer-cache fields, and the component struct lacked them. With
+			// only the set above, the parity test compared two headers that
+			// happened to agree.
+			Name:        "runs",
+			Patterns:    config.PatternSelector{Names: []string{"lower", "digits", "upper"}},
+			Find:        "scan_runs",
+			Overlapping: true,
 		}},
 	}
 }

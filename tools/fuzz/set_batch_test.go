@@ -89,7 +89,8 @@ type batchRunner struct {
 	outPtr   int32
 	cachePtr int32
 	cacheLen int32
-	// The checkpointed cache's caller-written stride (plans §9.2 decision 2).
+	// The checkpointed cache's stride, which the CALLER writes because the
+	// caller is what sized the region from it.
 	cacheStride int32
 }
 
@@ -169,7 +170,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 	passCache, passCacheLen := int32(0), int32(0)
 	if withCache {
 		passCache, passCacheLen = r.cachePtr, r.cacheLen
-		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+		for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
 			buf[passCache+i] = 0
 		}
 	}

@@ -46,6 +46,20 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		idN := idSpaceSize(s, cfg)
 		scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
 		gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
+		// The two answer-cache fields the MODULE header declares for a
+		// cache-eligible overlapping set. They stay zero here — the resource
+		// owns the cache, inside the component — but the struct is part of the
+		// PUBLIC header, and the two formats promise an identical one. Omitting
+		// them made the headers differ for exactly the configs the parity test
+		// did not cover.
+		if sh := overlapCacheShapeFor(s, cfg); s.Overlapping && sh.Eligible && s.Find != "" {
+			// Byte-for-byte what c_stub.go emits, comments included: the parity
+			// test compares header TEXT, and a field that explains itself
+			// differently in the two formats is a difference. They are simply
+			// unused here — the resource inside the component owns the cache —
+			// and a caller never touches them in either format.
+			gateField += "    unsigned *cache;\n    size_t cache_words;\n"
+		}
 
 		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 
@@ -224,9 +238,15 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     __attribute__((aligned(4))) unsigned char area[12] = {0};
     %[4]s((int)s->scratch[0], area);
     /* Negative would be a count in the module format; here the error is the
-       result's discriminant. Either way it means UNKNOWN, so the scan ends AND
-       says so rather than reporting "no more matches". */
-    if (area[0] != 0) { s->done = 1; return RX_ERR_BT_OVERFLOW; }
+       result's discriminant, and WHICH error is the payload beside it -- the
+       error-code enum, 0 = backtrack-overflow, 1 = malformed-cache. Either
+       means UNKNOWN, so the scan ends AND says which rather than reporting
+       "no more matches"; reading only the discriminant reported a malformed
+       cache as a backtracking overflow. */
+    if (area[0] != 0) {
+        s->done = 1;
+        return *(unsigned int *)(area + 4) == 1 ? RX_ERR_MALFORMED_CACHE : RX_ERR_BT_OVERFLOW;
+    }
     const unsigned int *raw = *(const unsigned int **)(area + 4);
     unsigned int count = *(unsigned int *)(area + 8);
     if (count == 0) { s->done = 1; return 0; }

@@ -250,6 +250,18 @@ type setCapStats struct {
 	// match": an engine that wrongly gives up when nothing further matches
 	// would otherwise be scored as a PASS.
 	btUnknown int
+	// engagedCache counts cache legs where the sweep actually RAN — `ready`
+	// came back 1. A region that is offered and then refused, or never asked
+	// for, makes the drive walk, and a walking drive answers correctly: the
+	// two legs then compare the same engine with itself and every check passes
+	// while the cache is untested. Nothing here read `ready` at all, so a
+	// corpus run could not tell those apart.
+	engagedCache int
+	// refusedCache counts legs where the sweep was asked and declined the
+	// region (-1). Legitimate — the answer is identical, only slower — but it
+	// must be visible rather than inferred from a count that does not move.
+	refusedCache int
+
 	// skippedCache counts find / find_batch legs that asked for the answer cache and
 	// got no region, so the leg was identical to the nocache one and would
 	// have been recorded under the wrong label.
@@ -336,6 +348,10 @@ func (s *setCapStats) report() {
 	}
 	if s.skippedCache > 0 {
 		fmt.Printf("  find cache legs skipped (no region offered): %d\n", s.skippedCache)
+	}
+	if s.engagedCache > 0 || s.refusedCache > 0 {
+		fmt.Printf("  find cache legs that SWEPT: %d (refused the region: %d)\n",
+			s.engagedCache, s.refusedCache)
 	}
 	if s.dropped > 0 {
 		// Documented behaviour, not a failure — but it means those patterns
@@ -803,6 +819,27 @@ func (r *setRunner) offerCache(cachePtr, cacheLen int32) {
 //
 // Call it AFTER zeroGates, which rewrites the descriptor with the cache
 // declined.
+// cacheReady reports what the sweep did with the region this drive offered:
+// 1 swept, -1 asked and refused, 0 never asked. It is the ONE header field a
+// caller may read, and without reading it a harness cannot tell a cache leg
+// from the walk it falls back to.
+func (r *setRunner) cacheReady() int32 {
+	if r.cachePtr == 0 {
+		return 0
+	}
+	return int32(binary.LittleEndian.Uint32(r.buf()[r.cachePtr+8:]))
+}
+
+// recordCacheLeg tallies what the leg just driven actually exercised.
+func (r *setRunner) recordCacheLeg() {
+	switch r.cacheReady() {
+	case 1:
+		setStats.engagedCache++
+	case -1:
+		setStats.refusedCache++
+	}
+}
+
 func (r *setRunner) startCacheDrive() {
 	buf := r.buf()
 	for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
@@ -1106,11 +1143,13 @@ func newSetRunner(
 	// route a stub generator takes too. A set that gets no sweep declines, and
 	// the drive walks.
 	cacheLen, cacheStride := int32(0), int32(0)
-	if sh := overlapShapeForSet(cfg); sh.Eligible {
-		want := config.SetOverlapCheckpointBytes(maxLen, sh.Cells, sh.Patterns, true)
-		if want <= config.SetOverlapCacheMaxBytes {
-			cacheLen = int32(want)
-			cacheStride = int32(config.SetOverlapCheckpointStride(maxLen, sh.Cells, sh.Patterns, true))
+	if len(cfg.Sets) > 0 && cfg.Sets[0].Find != "" && cfg.Sets[0].Overlapping {
+		// ONE helper for both numbers: the region is sized from the stride and
+		// the sweep validates the stride against the region, so computing them
+		// apart is how a harness hands itself a header the engine rejects.
+		if want, k, err := compile.SetOverlapCacheSizing(cfg.Sets[0], cfg, maxLen); err == nil &&
+			want > config.SetOverlapCheckpointHeaderBytes && want <= config.SetOverlapCacheMaxBytes {
+			cacheLen, cacheStride = int32(want), int32(k)
 		}
 	}
 	if cacheLen == 0 {
@@ -1378,6 +1417,9 @@ func runSetProfile(
 				}
 				for _, withCache := range cacheLegs {
 					gotM, hang, e := r.driveFind(c.find, text, c.spec.overlapping, withCache)
+					if withCache {
+						r.recordCacheLeg()
+					}
 					if errors.Is(e, errBTUnknown) {
 						// The engine said "unknown"; there is nothing to
 						// compare against. Counted, not scored.
@@ -1456,6 +1498,9 @@ func runSetProfile(
 							continue
 						}
 						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
+						if withCache {
+							r.recordCacheLeg()
+						}
 						if errors.Is(e, errBTUnknown) {
 							e, hang = nil, true
 						} else if e != nil {
@@ -1764,6 +1809,13 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		if uint32(packed>>32) == config.SetCursorOverflowPos {
 			setStats.btUnknown++
 			return nil, false, errBTUnknown
+		}
+		// The SECOND reserved position word says the answer cache's header is
+		// malformed. In a harness that is a HARNESS BUG — this code writes the
+		// header itself — so it fails rather than being tolerated.
+		if uint32(packed>>32) == config.SetCursorMalformedPos {
+			return nil, false, fmt.Errorf("find_batch reported a malformed answer-cache header; " +
+				"the harness wrote that header, so this is a bug here")
 		}
 		count := int32(packed & countMask)
 		if count < 0 || count > outCap {
@@ -2136,27 +2188,4 @@ func setChunksOf(pats []string, orig []int, cols [][]string) []setChunk {
 		out = append(out, c)
 	}
 	return out
-}
-
-// overlapShapeForSet reports the sweep column an overlapping set compiles to.
-//
-// It recompiles, which is what a stub generator does for the same reason: the
-// column width falls out of the DFA construction and nothing in the config
-// implies it. The cost is one extra set compilation per runner, against a
-// corpus run that compiles thousands — and unlike the wide-`_all` question just
-// above, there is no diagnostics field carrying this number, so there is
-// nothing already in hand to read.
-func overlapShapeForSet(cfg config.BuildConfig) compile.OverlapCacheShape {
-	if len(cfg.Sets) == 0 {
-		return compile.OverlapCacheShape{}
-	}
-	s := cfg.Sets[0]
-	if s.Find == "" || !s.Overlapping {
-		return compile.OverlapCacheShape{}
-	}
-	sh, err := compile.SetOverlapCacheShape(s, cfg)
-	if err != nil {
-		return compile.OverlapCacheShape{}
-	}
-	return sh
 }

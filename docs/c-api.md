@@ -2,10 +2,10 @@
 
 Regexped generates a pair of C stub files (`.h` and `.c`) that declare and implement
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
-the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`. One optional
-feature uses an allocator when one is present — see
-[The overlapping answer cache](#the-overlapping-answer-cache) — and is disabled
-automatically when it is not.
+the stubs compile cleanly with `--target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0`.
+One optional feature uses an allocator when one is present — see
+[The overlapping answer cache](#the-overlapping-answer-cache) — and that define is
+how a freestanding build declines it.
 
 > **Component format:** `stub_type: c` works under `wasm_format: component` too, and the **API is identical** — the same `rx_match_t`, `rx_group_t`, caller-owned iterators and group-index constants — because the header is produced by the same generator. What differs is the `.c`: canonical-ABI imports with a caller-supplied return area instead of a packed `long long`, plus a `cabi_realloc` when a pattern exports groups (a returned list is allocated in *your* memory). A `wit/` directory is generated beside the stub for `wasm-tools component embed`. See [component.md](component.md).
 
@@ -21,7 +21,7 @@ The generator produces two files derived from `stub_file` in the config:
 Compile both alongside your application:
 
 ```sh
-clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o main.wasm main.c stub.c
+clang --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry -o main.wasm main.c stub.c
 ```
 
 Include only the header in your application code:
@@ -52,7 +52,7 @@ happens and therefore in which tools you need. Both produce the same artefact.
 ```sh
 regexped compile
 regexped generate
-clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm main.c stub.c
+clang --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry -o core.wasm main.c stub.c
 wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
 wasm-tools component new embedded.wasm -o guest.wasm
 regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
@@ -78,7 +78,7 @@ resolves `deps/`.
 
 ```sh
 wit-bindgen c wit --out-dir wb          # for ONE file: the component-type object
-clang --target=wasm32-wasip2 -nostdlib -Wl,--no-entry \
+clang --target=wasm32-wasip2 -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry \
       -o guest.wasm main.c stub.c wb/*_component_type.o
 regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 ```
@@ -234,6 +234,7 @@ int <func>_next(rx_<func>_iter_t *iter, rx_group_t out_groups[static <FUNC_UPPER
 | `1` | a match was written |
 | `0` | the scan is finished |
 | `RX_ERR_BT_OVERFLOW` | the engine gave up; what remains is **unknown** |
+| `RX_ERR_MALFORMED_CACHE` | the overlapping answer cache's header is malformed; the scan is **unfinished** |
 
 The status is the return value rather than something written into `out_groups`, so `0` stays unambiguously "finished".
 
@@ -481,6 +482,14 @@ has nothing. So the feature is DETECTED rather than demanded:
 
 Define `RX_SET_CACHE` yourself to force it either way.
 
+**A `-nostdlib` build must pass `-DRX_SET_CACHE=0`.** The preprocessor cannot see
+link flags. `-nostdlib` removes libc from the *link*, not `<stdlib.h>` from the
+include path, and a wasi-sdk clang — the only one carrying a `wasm32-wasi`
+sysroot — always finds that header. So `__has_include` says yes, the stub
+references `malloc` and `free`, and the link fails on undefined symbols. The
+define is what tells it what the link flags already decided; every `-nostdlib`
+command line in this document carries it.
+
 **Your build decides this, not your source.** The same file, compiled two ways,
 gives identical answers at different speeds. If an overlapping scan is slower
 than you expect, check which of the two you got.
@@ -488,3 +497,18 @@ than you expect, check which of the two you got.
 Re-initialising a scanner frees what it held and starts again, so
 "re-initialising restarts a scan" holds whether or not a cache is in play. A
 second `<find>_free` is a no-op.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated code cannot produce it. `init` sizes the region and writes the
+stride from one formula, so seeing this means the descriptor was built by hand,
+or one region was shared between two scanners.
+
+`_next` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`). Test the status EXACTLY:
+a plain `< 0` check reports "unknown" as a confident "no".

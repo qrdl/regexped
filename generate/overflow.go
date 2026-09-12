@@ -66,3 +66,33 @@ func btOverflowMsg(funcName string) string {
 // source. Named so generated code reads as a deliberate sentinel comparison
 // rather than a magic -2.
 const btOverflow = abi.BTStackOverflow
+
+// ---------------------------------------------------------------------------
+// abi.OverlapCacheMalformed handling in generated stubs.
+//
+// The second unknowable answer, and it travels the same channels for the same
+// reason: a `find` on an `overlapping: true` set returns -4 when the answer
+// cache's header contradicts itself — a stride below 1, or a layout that does
+// not describe what a sweep would have written. The drive has NOT finished; it
+// cannot tell whether more matches exist.
+//
+// Every stub folded it into "n <= 0 means the scan is over", which is the same
+// silent-wrong-answer the backtracking sentinel exists to prevent, on a code
+// path a hand-written caller can reach by building its own descriptor.
+//
+// A generated `init` cannot produce it: it writes the stride from the same
+// formula that sized the region. That is worth saying in each message, because
+// a user who sees this has either built the descriptor themselves or reused one
+// region for two scanners.
+
+// malformedCacheMsg is the diagnostic text embedded in generated stubs, naming
+// the public function the caller invoked.
+func malformedCacheMsg(funcName string) string {
+	return fmt.Sprintf("regexped: %s: the overlapping answer cache's header is "+
+		"malformed; the scan result is unknown, not finished — a generated init "+
+		"cannot produce this, so the descriptor was built by hand or shared "+
+		"between two scanners (see docs/sets.md)", funcName)
+}
+
+// malformedCache is abi.OverlapCacheMalformed, for embedding as a literal.
+const malformedCache = abi.OverlapCacheMalformed

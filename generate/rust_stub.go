@@ -224,8 +224,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				cacheField = "    cache: Vec<u32>,\n"
 				cacheInit = fmt.Sprintf(` cache: {
             let m = (input.len() + 1) as u64;
-            let row = (4 + 4 * %[2]d) as u64;
-            let cell = (%[1]d * 4 + 4) as u64;
+            let row = %[5]d as u64;
+            let cell = %[6]d as u64;
             let single = %[3]d + cell + 4 + m * row;
             let k = if single <= %[4]d {
                 m
@@ -244,7 +244,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
                 v[4] = k as u32;
                 v
             }
-        },`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes)
+        },`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes,
+					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
 				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
 					"(self.cache.len() * 4) as u32"
 			}
@@ -285,6 +286,9 @@ impl<'a> Iterator for %s<'a> {
             // Before the scan-finished test: -2 means the engine gave up and
             // does not know, so ending iteration here would report success.
             if n == %d { self.done = true; return Some(Err(Error::BacktrackOverflow)); }
+            // And -4 the same way: the answer cache's header is malformed, so
+            // the drive is not finished and cannot say what is left.
+            if n == %d { self.done = true; return Some(Err(Error::MalformedCache)); }
             if n <= 0 { self.done = true; return None; }
             // The buffer is sized at the set's pattern count, the exact worst
             // case for a single position, so n can never exceed it.
@@ -296,7 +300,8 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst, btOverflow)
+`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst,
+				btOverflow, malformedCache)
 			fmt.Fprintf(&out, "impl std::iter::FusedIterator for %s<'_> {}\n\n", iterName)
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
 				"///\n"+
@@ -766,6 +771,13 @@ pub enum Error {
     /// false negative that scales with input length and carries no diagnostic,
     /// which is the failure this type exists to prevent.
     BacktrackOverflow,
+    /// The overlapping answer cache handed to an overlapping set's find had a
+    /// malformed header — a stride below 1, or a layout that does not
+    /// describe what the sweep would have written. The scan is
+    /// UNKNOWN, not finished. The generated iterator cannot produce this: it
+    /// sizes the region and writes the stride from one formula. A caller
+    /// driving the raw ABI, or sharing one region between two scanners, can.
+    MalformedCache,
 }
 
 impl std::fmt::Display for Error {
@@ -776,6 +788,12 @@ impl std::fmt::Display for Error {
                 "regexped: backtracking stack overflow — input too large for this \
                  pattern's frame budget; the match result is unknown, not negative \
                  (see docs/engines.md)"
+            ),
+            Error::MalformedCache => write!(
+                f,
+                "regexped: the overlapping answer cache's header is malformed; the \
+                 scan result is unknown, not finished — a generated iterator cannot \
+                 produce this (see docs/sets.md)"
             ),
             #[allow(unreachable_patterns)]
             _ => write!(f, "regexped: unknown error"),
