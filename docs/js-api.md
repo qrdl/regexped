@@ -2,6 +2,8 @@
 
 Regexped generates a JavaScript ES module stub that loads a compiled WASM regexp module and exports wrapper functions. This document explains how to initialise the module and use the generated functions.
 
+> **Component format:** this stub is for `wasm_format: module`, and there is no component equivalent — `stub_type: js` is refused permanently under `wasm_format: component`. No JavaScript runtime loads a component (`WebAssembly.instantiate` accepts core modules only), so consuming one from JS needs `jco transpile`, whose output is a core module plus glue — which is what this stub already gives you directly, without the extra tool. See [component.md](component.md).
+
 ## Including stubs in your project
 
 The stub is a single `.js` ES module file. Import it directly from your application:
@@ -284,3 +286,17 @@ member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
 `-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated code cannot produce it. `init` sizes the region and writes the
+stride from one formula, so seeing this means the descriptor was built by hand,
+or one region was shared between two scanners.
+
+The generator **throws**, before the loop can read it as a finished scan.

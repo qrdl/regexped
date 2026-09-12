@@ -1,0 +1,26 @@
+# The COMPONENT build of the same patterns.
+#
+# A separate config so both builds coexist in one directory: `make` builds the
+# module, `make component` builds this. Everything it emits goes under
+# component/, including the stub — which is still called stub.h, so main.c
+# includes the same name either way and is compiled unchanged. That is the point
+# of the example: the generated stub's API does not depend on the format.
+#
+# What differs from regexped.yaml: `wasm_format: component`, and an `output:`
+# naming what `regexped merge` composes rather than what wasm-merge links. The
+# key means the same thing in both formats — the merge target — and the memory
+# mode it also drives for modules is not a choice here: a component always owns
+# and exports its own memory.
+#
+# This directory builds the guest TWICE (wasip1 and wasip2), and `output:` can
+# only name one of them, so the wasip2 target passes --output on the command
+# line instead. That override works the same way for either format.
+wasm_format:   component
+wasm_file:     "component/url_parts.wasm"
+output:        "component/composed.wasm"
+import_module: "url_parts"
+stub_file:     "component/stub.h"
+
+regexps:
+  - pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#\s]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#\s]*)?(?:\?(?P<query>[^#\s]*))?(?:#(?P<fragment>[^\s]*))?'
+    groups_func: "parse_url"

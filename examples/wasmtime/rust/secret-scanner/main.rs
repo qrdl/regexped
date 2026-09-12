@@ -12,23 +12,9 @@
 use anyhow::{anyhow, Result};
 use wasmtime::{Engine, Instance, Module, Store};
 
-// Pattern names — must match the order of `regexps:` in regexped.yaml.
-const PATTERN_NAMES: &[&str] = &[
-    "aws_key",
-    "aws_secret",
-    "github_pat",
-    "github_oauth",
-    "github_app",
-    "jwt",
-    "slack_token",
-    "stripe_live",
-    "stripe_test",
-    "google_api",
-];
-
-fn pattern_name(id: i32) -> &'static str {
-    PATTERN_NAMES.get(id as usize).copied().unwrap_or("unknown")
-}
+// Pattern names: shared with the component host in this directory, since a
+// native host has no stub to generate them for it either way.
+include!("pattern_names.rs");
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -65,12 +51,17 @@ fn main() -> Result<()> {
     const PATTERN_COUNT: i32 = 10;
 
     // Derive input/output bases from the module's actual initial memory size.
-    // The initial pages cover all DFA table data; input, output and the gate
-    // array go in the two pages grown immediately after.
+    // The initial pages cover all DFA table data; input, output, the gate array
+    // and the scratch descriptor go in the two pages grown immediately after.
     let in_base: i32 = (memory.size(&store) * 65536) as i32;
-    memory.grow(&mut store, 2)?; // 1 page for input, 1 page for output + gates
+    memory.grow(&mut store, 2)?; // 1 page for input, 1 for output + scratch
     let out_base: i32 = in_base + 65536;
     let gate_base: i32 = out_base + PATTERN_COUNT * 12;
+    // The SCRATCH DESCRIPTOR the export takes in place of a bare gate pointer:
+    // four u32s holding a magic word, the gate array's address, and the
+    // overlapping answer cache (declined here — this set is not overlapping).
+    // See docs/wasm.md, "The scratch descriptor".
+    let scratch_base: i32 = gate_base + PATTERN_COUNT * 4;
 
     // Write input into WASM memory (input page: [in_base, out_base)).
     let max_input = (out_base - in_base) as usize;
@@ -85,6 +76,16 @@ fn main() -> Result<()> {
     memory.write(&mut store, gate_base as usize, &vec![0u8; (PATTERN_COUNT * 4) as usize])
         .map_err(|e| anyhow!("gate array init failed: {}", e))?;
 
+    // The descriptor. The magic word is not decoration: the parameter has the
+    // same type a bare gate pointer had, so passing one would have gate[0] read
+    // as an address. The module compares this and traps instead.
+    let mut scratch = Vec::with_capacity(16);
+    for word in [0x5258_4653u32, gate_base as u32, 0, 0] {
+        scratch.extend_from_slice(&word.to_le_bytes());
+    }
+    memory.write(&mut store, scratch_base as usize, &scratch)
+        .map_err(|e| anyhow!("scratch descriptor init failed: {}", e))?;
+
     // Scan: each call returns every match at the next matching position.
     let mut from: i32 = 0;
     let mut total_matches = 0;
@@ -92,7 +93,7 @@ fn main() -> Result<()> {
     loop {
         let count = scan_fn.call(
             &mut store,
-            (in_base, input.len() as i32, from, gate_base, out_base, PATTERN_COUNT),
+            (in_base, input.len() as i32, from, scratch_base, out_base, PATTERN_COUNT),
         )?;
         if count == 0 {
             break;

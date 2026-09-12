@@ -677,24 +677,28 @@ func TestSetTwoPhaseScanAllWideBody(t *testing.T) {
 	}
 }
 
-// TestSetEmitBatchPosFnOffsetWithoutBatching covers the "not batching" answer
-// of batchPosFnOffset.
+// TestSetEmitFindInnerFnOffsetWithoutWrapping covers the "not wrapped" answer
+// of findInnerFnOffset.
 //
-// The offset is the index of the shared per-position worker, and on a set that
-// does not batch there is no worker to point at. -1 rather than a plausible
-// index is what keeps a caller from emitting a call to whatever function
-// happens to sit at len(capFns()).
-func TestSetEmitBatchPosFnOffsetWithoutBatching(t *testing.T) {
+// The offset is the index of the hidden body the exported `find` forwards
+// into, and on a set whose `find` IS that body there is nothing to point at.
+// -1 rather than a plausible index is what keeps a caller from emitting a call
+// to whatever function happens to sit at len(capFns()).
+//
+// The set below is non-batching AND non-overlapping, which is what makes it
+// unwrapped: an overlapping set whose shape qualifies for the answer cache is
+// wrapped too, batching or not.
+func TestSetEmitFindInnerFnOffsetWithoutWrapping(t *testing.T) {
 	spec := SetSpec{Name: "s", Find: "s_find"}
 	compiled := setEmitCovCompileSet(t, spec, []string{`alpha`, `bravo`}, CompileSetOptions{})
-	if got := compiled.batchPosFnOffset(); got != -1 {
-		t.Errorf("batchPosFnOffset() = %d on a non-batching set, want -1", got)
+	if got := compiled.findInnerFnOffset(); got != -1 {
+		t.Errorf("findInnerFnOffset() = %d on an unwrapped set, want -1", got)
 	}
 
 	batching := SetSpec{Name: "s", Find: "s_find", BatchFind: true}
 	batched := setEmitCovCompileSet(t, batching, []string{`alpha`, `bravo`}, CompileSetOptions{})
-	if got := batched.batchPosFnOffset(); got != len(batched.capFns()) {
-		t.Errorf("batchPosFnOffset() = %d, want %d (immediately after the exported capabilities)",
+	if got := batched.findInnerFnOffset(); got != len(batched.capFns()) {
+		t.Errorf("findInnerFnOffset() = %d, want %d (immediately after the exported capabilities)",
 			got, len(batched.capFns()))
 	}
 }
@@ -711,8 +715,8 @@ func TestSetEmitBatchPosFnOffsetWithoutBatching(t *testing.T) {
 // producing different bytes.
 func TestSetEmitAssembleWithNoSetsMatchesAssembleModule(t *testing.T) {
 	for _, standalone := range []bool{true, false} {
-		viaSets := assembleModuleWithSets(nil, nil, 1, standalone, nil)
-		direct := assembleModule(nil, 1, standalone, nil)
+		viaSets := assembleModuleWithSets(nil, nil, 1, standalone, nil, asmOpts{})
+		direct := assembleModule(nil, 1, standalone, nil, asmOpts{})
 		if string(viaSets) != string(direct) {
 			t.Errorf("standalone=%v: assembleModuleWithSets(sets=nil) produced %d bytes, "+
 				"assembleModule %d — the delegation no longer matches",

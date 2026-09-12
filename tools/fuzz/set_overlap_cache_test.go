@@ -265,11 +265,23 @@ func driveOverlapCacheEngage(t *testing.T, pats []string, input string, offset, 
 	t.Helper()
 	// Generous scratch: one tuple per pattern per start, which is the worst
 	// case the sweep can produce.
-	scratchLen := int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	scratchLen, _ := overlapCacheFor(input, pats)
 	return driveOverlapCacheScratch(t, pats, input, offset, outCap, useCache, scratchLen, want)
 }
 
 func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset, outCap int32, useCache bool, scratchLen int32, want engageWant) [][3]int {
+	t.Helper()
+	return driveOverlapCacheStride(t, pats, input, offset, outCap, useCache, scratchLen, want, nil)
+}
+
+// driveOverlapCacheStride is the same drive with the header's STRIDE under the
+// test's control: nil takes the formula's, a value forces that many positions
+// per block. Forcing it is the only way to reach the multi-block paths on an
+// input a test can afford — at the formula's stride a few kilobytes is one
+// block, and one block never loads a checkpoint or crosses a boundary.
+func driveOverlapCacheStride(t *testing.T, pats []string, input string, offset, outCap int32,
+	useCache bool, scratchLen int32, want engageWant, strideOverride *int32,
+) [][3]int {
 	t.Helper()
 	entries := make([]config.RegexEntry, len(pats))
 	for i, p := range pats {
@@ -329,6 +341,14 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 	if !useCache {
 		passScratch, passLen = 0, 0
 	}
+	// The DESCRIPTOR the export takes in place of a bare gate pointer: it
+	// carries the gate array and the answer cache, so what used to be two
+	// trailing arguments is now two fields (internal/abi).
+	_, stride := overlapCacheFor(input, pats)
+	if strideOverride != nil {
+		stride = *strideOverride
+	}
+	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
@@ -339,11 +359,18 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 		if calls > 4*(len(input)+2)*len(pats)+16 {
 			t.Fatalf("drive did not terminate over %q (cap %d)", input, outCap)
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, passScratch, passLen)
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, descPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}
 		ret := res.(int64)
+		// Both reserved position words are read BEFORE the count: all three
+		// high halves have the top bit set, and a -4 packed into the count
+		// half would decode as a large positive number of tuples nobody wrote.
+		if uint32(ret>>32) == config.SetCursorMalformedPos {
+			t.Fatalf("find_batch reported a malformed answer-cache header; this test writes "+
+				"that header (stride %d), so this is a bug in the harness", stride)
+		}
 		n := int32(ret & countMask)
 		buf = mem.UnsafeData(store)
 		for i := int32(0); i < n; i++ {
@@ -380,6 +407,6 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 
 // overlapDPReadyOffset is the byte offset of the cache header's "ready" slot.
 // Stated here rather than imported because compile/ keeps it unexported; the
-// header width itself is config.SetOverlapCacheHeaderBytes, which the drive
-// zeroes.
+// header width itself is config.SetOverlapCheckpointHeaderBytes, which the
+// drive zeroes.
 const overlapDPReadyOffset = 8

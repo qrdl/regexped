@@ -4938,9 +4938,33 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// Hand the backward sweep the same geometry this body walks forward.
 	// Populated unconditionally: usesOverlapDP decides, and
 	// deriving the offsets a second time is exactly how the two would drift.
+	// The RAW per-state accept masks and the transition table, for lever C's
+	// projection (compile/set_overlap_proj.go). The sweep reads the emitted
+	// tables at run time; the PROJECTION is computed at compile time and needs
+	// the same data as values, not as offsets into a data segment.
+	//
+	// DERIVED FROM THE EMITTED BYTES rather than re-walking the maps
+	// writeBitmask walked: "computed on the same table the sweep reads" is
+	// then true by construction, where two loops over the same source can
+	// drift on a renumbering and merge states the projection must keep apart.
+	readBitmask := func(bs []byte) []uint64 {
+		out := make([]uint64, l.numWASM)
+		for w := range out {
+			var v uint64
+			for i := 0; i < 8; i++ {
+				v |= uint64(bs[w*8+i]) << uint(i*8)
+			}
+			out[w] = v
+		}
+		return out
+	}
+	dpMid := readBitmask(writeBitmask(t.midAcceptStates))
+	dpEOF := readBitmask(writeBitmask(t.acceptStates))
 	art.dp = overlapDPTables{
 		ok:                 true,
 		l:                  l,
+		midMasks:           dpMid,
+		eofMasks:           dpEOF,
 		midBitmaskOff:      midBitmaskOff,
 		eofBitmaskOff:      eofBitmaskOff,
 		numWASM:            l.numWASM,

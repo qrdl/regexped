@@ -7,6 +7,14 @@ edition = "2021"
 name = "secret-scanner"
 path = "main.rs"
 
+# The COMPONENT route. A separate binary rather than a flag, because its
+# `bindgen!` reads component/secrets.wit at compile time: a config that has not
+# run `regexped compile` yet would fail the MODULE build too if the two shared
+# one binary. The Makefile builds each with --bin for the same reason.
+[[bin]]
+name = "secret-scanner-component"
+path = "main_component.rs"
+
 [dependencies]
 wasmtime = "36"
 anyhow = "1"

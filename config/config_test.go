@@ -712,3 +712,34 @@ func TestValidateSets_NoCapabilityIsError(t *testing.T) {
 		t.Fatal("a set declaring no capability must be rejected")
 	}
 }
+
+// TestLoadConfigToolPathsAreNotConfigRelative pins the deliberate difference
+// between `wasm_merge:` and the two component-era tool keys.
+//
+// Strict YAML means a key has to be DECLARED to load at all, so this also
+// proves `wac:` is accepted rather than a line-numbered error.
+//
+// `wasm_merge` is joined to the config directory, which turns the bare name
+// "wasm-merge" into "<dir>/wasm-merge" — see TestLoadConfigWasmMergeResolution.
+// `wasm_tools` and `wac` are NOT, because a bare tool name has to stay a bare
+// name for the $PATH lookup in their resolvers to find it. Joining them would
+// make `wac: wac` mean "a wac binary sitting next to my config", which is never
+// what it means.
+func TestLoadConfigToolPathsAreNotConfigRelative(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "wasm_tools: wasm-tools\nwac: wac\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	path := filepath.Join(dir, "regexped.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.WasmTools != "wasm-tools" {
+		t.Errorf("WasmTools = %q, want the bare name", cfg.WasmTools)
+	}
+	if cfg.Wac != "wac" {
+		t.Errorf("Wac = %q, want the bare name", cfg.Wac)
+	}
+}

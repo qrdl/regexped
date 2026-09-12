@@ -29,8 +29,31 @@
 //                 find is *per-pattern*; pairing those directly would produce
 //                 a confidently wrong number.
 //
-// `find` with `overlapping: true` has no equivalent and is deliberately
-// absent — setperf prints "no comparison" for it.
+//   find(overlapping)
+//              -> per START POSITION, an ANCHORED leftmost-first search at that
+//                 position, over each pattern. See ra_bench_find_overlapping.
+//
+// That last pairing needs its own justification, because regex-automata HAS an
+// overlapping search and it is deliberately not the one used.
+// `try_search_overlapping_fwd` yields HALF MATCHES — a pattern id and an END
+// offset, no start — and requires MatchKind::All, which the API will not let be
+// leftmost-first. Three consequences, each verified on a tiny input:
+//
+//   `a|aa` over "aa": we report [0,1) and [1,2); it reports ends 1 and 2, the
+//   second being "aa" from 0 — an extent we never produce, since leftmost-first
+//   takes the first alternative.
+//
+//   `ab|b` over "ab": we report two spans, [0,2) and [1,2); it reports ONE
+//   half-match, because both matches share an end and a half-match is per
+//   (pattern, end).
+//
+//   And no starts at all: recovering them costs a reverse scan per match.
+//
+// So it answers a different question. The anchored per-start construction below
+// answers OURS — "at each position, what does an RE2 match starting here look
+// like" — and it is what a regex-automata user would write to get it. Same
+// reasoning as the gated-find row above: pair the construction a user would
+// write, not the function with the closest name.
 
 use std::sync::OnceLock;
 
@@ -248,6 +271,41 @@ pub extern "C" fn ra_find_gated(len: i32, from: i32) -> i32 {
     n as i32
 }
 
+/// The ONE-SHOT overlapping pairing: every (pattern, start) match, written to
+/// RA_OUT_BUF as (pattern, start, end) triples.
+///
+/// One anchored leftmost-first search per start position per pattern — the
+/// construction that reproduces our `overlapping: true` answer set exactly. See
+/// the module header for why their own overlapping search is not used.
+///
+/// The fuel target for capFindOverlapping, on the same terms as ra_find_gated:
+/// one whole-input operation, no timing loop.
+#[no_mangle]
+pub extern "C" fn ra_find_overlapping(len: i32, from: i32) -> i32 {
+    let st = state();
+    let h = haystack(len);
+    if from as usize > h.len() {
+        return 0;
+    }
+    let out = unsafe { &mut *core::ptr::addr_of_mut!(RA_OUT_BUF) };
+    let mut n = 0usize;
+    for start in from as usize..=h.len() {
+        for (k, re) in st.each.iter().enumerate() {
+            let input = Input::new(h).span(start..h.len()).anchored(Anchored::Yes);
+            if let Some(m) = re.find(input) {
+                if n * 3 + 2 >= out.len() {
+                    return n as i32;
+                }
+                out[n * 3] = k as i32;
+                out[n * 3 + 1] = m.start() as i32;
+                out[n * 3 + 2] = m.end() as i32;
+                n += 1;
+            }
+        }
+    }
+    n as i32
+}
+
 /// find, LAZILY: the single leftmost match at or after `from`, packed as
 /// `(start << 32) | end`, or -1 when there is none.
 ///
@@ -343,6 +401,38 @@ pub extern "C" fn ra_bench_match_all(len: i32, iters: i32) {
             ));
             if st.full.is_match(input) {
                 n += 1;
+            }
+        }
+        let _ = std::hint::black_box(n);
+    });
+}
+
+/// The `find(overlapping)` pairing: for every START position, an anchored
+/// leftmost-first search at that position, per pattern.
+///
+/// This is the construction that produces OUR answer set — one match per
+/// (pattern, start), extents chosen leftmost-first — and it is what a
+/// regex-automata user would write to get it. Their own overlapping search
+/// answers a different question; see the header for why.
+///
+/// It is quadratic on their side, as ours is without the backward sweep: n start
+/// positions, each search up to O(n). That is the point of the row. Sweeping
+/// input LENGTH over one set is what shows the shape rather than a ratio.
+#[no_mangle]
+pub extern "C" fn ra_bench_find_overlapping(len: i32, iters: i32) {
+    let st = state();
+    let h = haystack(len);
+    timed!(iters, {
+        let mut n = 0usize;
+        for start in 0..=h.len() {
+            for re in st.each.iter() {
+                let input = Input::new(std::hint::black_box(h))
+                    .span(start..h.len())
+                    .anchored(Anchored::Yes);
+                if let Some(m) = re.find(input) {
+                    let _ = std::hint::black_box((m.start(), m.end()));
+                    n += 1;
+                }
             }
         }
         let _ = std::hint::black_box(n);

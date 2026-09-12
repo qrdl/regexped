@@ -258,6 +258,14 @@ type compiledSet struct {
 	// sweep.
 	overlapDPColOff int32
 
+	// Lever C: the projection, computed once, plus the addresses of the tables
+	// it needs — projTab (pattern x state -> cell byte offset) and a one-byte
+	// per state successor scratch the per-position step fills before updating.
+	overlapProj       *overlapProj
+	overlapProjDone   bool
+	overlapProjTabOff int32
+	overlapSuccOff    int32
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -373,19 +381,53 @@ const (
 
 	// find_batch. The cursor is an i64 in and an i64 out: the value the
 	// export returns is passed back verbatim as the next call's cursor.
-	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch
-	//                          ptr, len, cursor, gate, out, cap, scratch, scratch_len
+	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32)→i64  find_batch
+	//                          ptr, len, cursor, SCRATCH, out, cap
+	//
+	// SIX parameters since 2026-09-11, not eight. The answer cache used to
+	// arrive as a trailing (ptr, len) pair; it now comes from the scratch
+	// descriptor the fourth parameter points at, which is the same place the
+	// gate pointer comes from.
 	//
 	// There is no separate type for the OVERLAPPING batch entry. Both overlap
 	// policies share ONE signature, so the second type was declared in every
 	// set module and referenced by none.
+
+	// Component-only, APPENDED so the indices above do not move. Emitted only
+	// under `wasm_format: component`; a module build declares neither.
+	setTypeCompVoid = 11 // (i32)→()      cm_free, cm_post, [dtor]<res>
+	setTypeCompNext = 12 // (i32)→i32     [method]<res>.next, [resource-new]<res>
 )
 
-// batchPosFnOffset returns the index of the set's shared per-position worker,
-// or -1 when the set does not batch. It sits immediately after the exported
+// numSetTypesBase is how many types the set assembler always declares. The two
+// component types sit past it.
+const numSetTypesBase = 11
+
+// findWrapped reports whether the exported `find` is a thin WRAPPER over a
+// hidden inner body rather than being that body itself.
+//
+// Two independent reasons put a wrapper there, and they compose:
+//
+//   - batching, since decision (11a): both entries drive ONE per-position
+//     worker, so the module carries one set of bucket code rather than two.
+//   - the overlapping answer cache: `find` has to read the cache header, test
+//     the trigger, possibly sweep and serve — all BEFORE the walk — and then
+//     charge the walk's matched bytes to the drive's work counter AFTER it. An
+//     epilogue cannot be spliced into a body that returns from several places,
+//     so the body becomes a callee.
+func (cs *compiledSet) findWrapped() bool {
+	return cs.hasFind() && (cs.batchFind || cs.usesOverlapDP())
+}
+
+// findInnerFnOffset returns the index of the hidden body the exported `find`
+// wraps, or -1 when `find` IS the body. It sits immediately after the exported
 // capability functions.
-func (cs *compiledSet) batchPosFnOffset() int {
-	if !cs.batchFind {
+//
+// A batching set's inner body is the shared per-position worker (`find`'s
+// signature plus the batch-only trailing argument); a non-batching one's is the
+// ordinary find body, unchanged and still taking a bare gate pointer.
+func (cs *compiledSet) findInnerFnOffset() int {
+	if !cs.findWrapped() {
 		return -1
 	}
 	return len(cs.capFns())
@@ -395,14 +437,19 @@ func (cs *compiledSet) batchPosFnOffset() int {
 // its capability functions and its suffix functions.
 func (cs *compiledSet) hiddenFnCount() int {
 	n := 0
-	if cs.batchFind {
+	if cs.findWrapped() {
 		n++
 	}
 	// Two per split capability: phase 1 (the frontend over the literal
 	// buckets) and phase 2 (the union walk over the fallback patterns).
 	n += 2 * len(cs.twoPhaseCaps())
 	if cs.usesOverlapDP() {
-		n++
+		// TWO now: the checkpoint pass and the block materialiser. The
+		// checkpointed cache splits what the whole-drive sweep did in one
+		// function — sweep-and-store — into sweep-and-checkpoint plus
+		// materialise-on-demand, because storing every tuple is the only
+		// reason the region was linear in the input.
+		n += 2
 	}
 	return n
 }
@@ -415,10 +462,19 @@ func (cs *compiledSet) overlapDPFnOffset() int {
 		return -1
 	}
 	n := len(cs.capFns())
-	if cs.batchFind {
+	if cs.findWrapped() {
 		n++
 	}
 	return n + 2*len(cs.twoPhaseCaps())
+}
+
+// overlapBlockFnOffset is the block materialiser, immediately after the
+// checkpoint pass.
+func (cs *compiledSet) overlapBlockFnOffset() int {
+	if off := cs.overlapDPFnOffset(); off >= 0 {
+		return off + 1
+	}
+	return -1
 }
 
 // gatedFind reports whether this set emits the default (per-pattern
@@ -1544,6 +1600,24 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		cs.startableDataBytes = append(cs.startableDataBytes,
 			appendDataSegment(nil, cs.overlapDPColOff, make([]byte, n))...)
 		cs.startableDataSegs++
+
+		// Lever C's two tables, placed the same way and for the same reason.
+		if tab := cs.overlapProjTabBytes(); len(tab) > 0 {
+			cs.overlapProjTabOff = ra.Bump("overlap-proj-tab", int32(len(tab)), 2)
+			cs.startableDataBytes = append(cs.startableDataBytes,
+				appendDataSegment(nil, cs.overlapProjTabOff, tab)...)
+			cs.startableDataSegs++
+
+			// One byte per state: delta(state, byte) for the position being
+			// swept. The projected update reads it at a CONSTANT offset per
+			// cell, which is what lets every other address in the step be a
+			// compile-time constant.
+			ns := int32(cs.buckets[cs.overlapDPBucket()].dp.numWASM)
+			cs.overlapSuccOff = ra.Bump("overlap-succ", ns, 1)
+			cs.startableDataBytes = append(cs.startableDataBytes,
+				appendDataSegment(nil, cs.overlapSuccOff, make([]byte, ns))...)
+			cs.startableDataSegs++
+		}
 	}
 
 	// First-position routing data, derived from the finished bucket list.
@@ -1612,6 +1686,24 @@ func CompileFileOpts(cfg config.BuildConfig, output string, over CompileSetOptio
 	return compileFileDiag(cfg, output, over)
 }
 
+// CompileFileComponent is CompileFile for `wasm_format: component`, including
+// configs that declare `sets:`.
+//
+// The names come in rather than being derived here: they are the WIT's, and
+// generate/ imports compile/, so compile/ cannot reach the derivation. The
+// component/ package sits above both and is what calls this.
+func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[string]string,
+	setNames map[string]ComponentSetNames, rep *Reporter,
+) ([]byte, int64, error) {
+	w, top, _, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, asmOpts{
+		Component:        true,
+		ComponentPackage: pkg,
+		ExportNames:      exportNames,
+		SetNames:         setNames,
+	})
+	return w, top, err
+}
+
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
@@ -1638,11 +1730,23 @@ func compileFileDiag(cfg config.BuildConfig, output string, over CompileSetOptio
 // compileFileDiagReport is compileFileDiag with an optional verbose Reporter.
 // nil on every path but `regexped compile --verbose`.
 func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter) ([]byte, int64, []SetDiag, error) {
+	return compileFileComponentReport(cfg, output, over, rep, asmOpts{})
+}
+
+// compileFileComponentReport is compileFileDiagReport plus the component
+// options. `comp` is the zero value — meaning MODULE — on every path but
+// CompileFileComponent, which is the arm component/ drives.
+func compileFileComponentReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter, comp asmOpts) ([]byte, int64, []SetDiag, error) {
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
+	if err := comp.validate(); err != nil {
+		return nil, 0, nil, err
+	}
 
-	standalone := cfg.Output == ""
+	// A component owns and exports its own memory, so the embedded shape — and
+	// the `output:` key that selects it for a module — has no meaning here.
+	standalone := cfg.Output == "" || comp.Component
 
 	// No sets: delegate to Compile so the output is byte-identical (including
 	// per-pattern page alignment and final memory page count). Replicating
@@ -1650,9 +1754,12 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
-			MaxDFAStates: cfg.MaxDFAStates,
-			MaxTDFARegs:  cfg.MaxTDFARegs,
-			Report:       rep,
+			MaxDFAStates:         cfg.MaxDFAStates,
+			MaxTDFARegs:          cfg.MaxTDFARegs,
+			Report:               rep,
+			Component:            comp.Component,
+			ComponentPackage:     comp.ComponentPackage,
+			ComponentExportNames: comp.ExportNames,
 		})
 		return w, top, nil, err
 	}
@@ -1732,43 +1839,7 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 			return nil, 0, nil, err
 		}
 
-		spec := SetSpec{
-			Name:                 sc.Name,
-			MatchAny:             sc.MatchAny,
-			MatchAll:             sc.MatchAll,
-			ScanAny:              sc.ScanAny,
-			ScanAll:              sc.ScanAll,
-			Find:                 sc.Find,
-			BatchFind:            sc.BatchFind(),
-			DeclaredPatternCount: sc.PatternCount(cfg),
-			Overlapping:          sc.Overlapping,
-			IDSpaceSize:          sc.IDSpaceSize(cfg),
-			Patterns:             infos,
-			PatternIDs:           globalIDs,
-		}
-		setOpts := CompileSetOptions{
-			// Set-level LikelyMode precedence: set hints > neutral.
-			// Used by H.3 (frontend density gate).
-			LikelyMode: resolveHints(sc.Hints),
-			// The knob that decides whether a pattern survives into the set at
-			// all: a fallback bucket over this limit is DROPPED, not demoted to
-			// another engine. It was unreachable before — CompileSetOptions was
-			// built without it, so the default 1024 always won and the drop
-			// warning's own "raise max_dfa_states" hint pointed at a field that
-			// does not feed this budget.
-			MaxFallbackStates: cfg.MaxFallbackStates,
-			// Test-only overrides (CompileFileOpts); zero everywhere else.
-			ACBudgetBytes: over.ACBudgetBytes,
-			// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
-			ForceFrontend: over.ForceFrontend,
-			forceFrontend: over.forceFrontend,
-			// Test-only Shufti density-switch pin; see
-			// CompileSetOptions.ForceShuftiAdaptive.
-			ForceShuftiAdaptive: over.ForceShuftiAdaptive,
-			forceShuftiAdaptive: over.forceShuftiAdaptive,
-			// The module's allocator, shared with the per-pattern entries above.
-			globals: globals,
-		}
+		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, globals)
 		if !standalone {
 			setOpts.TableMemIdx = 1
 		}
@@ -1814,18 +1885,18 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 	// caller trusting it on a set-bearing module wrote its input over the
 	// first set's tables. tools/perftest already worked around this by
 	// re-parsing the data section; nothing else did.
-	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals), dataTop, diags, nil
+	return assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals, comp), dataTop, diags, nil
 }
 
 // assembleModuleWithSets builds a WASM module from per-pattern compilations
 // plus per-set compiled sets. When sets is empty it produces the same bytes
 // as assembleModule.
-func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool, globals *moduleGlobals) []byte {
+func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, memPages int32, standalone bool, globals *moduleGlobals, opts asmOpts) []byte {
 	if globals == nil {
 		globals = &moduleGlobals{}
 	}
 	if len(sets) == 0 {
-		return assembleModule(patterns, memPages, standalone, globals)
+		return assembleModule(patterns, memPages, standalone, globals, opts)
 	}
 
 	// Reuse assembleModule for the base (patterns only), then we'll handle sets separately.
@@ -1847,9 +1918,40 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 	}
 
+	// A set-bearing COMPONENT imports the `[resource-new]` canon builtin once
+	// per `find` resource, and a function import occupies a function index. So
+	// every DEFINED function here starts past them — including the pattern
+	// bodies, whose internal `call` targets are all derived from baseIdx, so the
+	// offset reaches them without any emitter knowing about it.
+	//
+	// resNewIdx[si] is set-si's builtin, or -1 when the set has no `find`.
+	resNewIdx := make([]int, len(sets))
+	for si := range resNewIdx {
+		// -1 is "this set imports nothing", and it has to be the DEFAULT rather
+		// than something the component arm fills in: the import and export
+		// sections both skip on it, and a zero value made a MODULE build emit a
+		// fourth-byte-perfect but entirely bogus import for every set.
+		resNewIdx[si] = -1
+	}
+	numFuncImports := 0
+	if opts.Component {
+		for si, cs := range sets {
+			// BOTH conditions. The name table having a resource is not enough:
+			// the set must actually declare `find`, or the module imports a
+			// builtin for a resource the WIT does not define and `component new`
+			// refuses. Production callers keep the two in step; this does not
+			// depend on it.
+			n, ok := opts.SetNames[cs.name]
+			if ok && n.ResourceNew != "" && cs.find != "" {
+				resNewIdx[si] = numFuncImports
+				numFuncImports++
+			}
+		}
+	}
+
 	// Assign function indices.
 	baseIdx := make([]int, len(patterns))
-	total := 0
+	total := numFuncImports
 	for i, p := range patterns {
 		baseIdx[i] = total
 		total += p.funcCount()
@@ -1875,6 +1977,29 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	prefixFnBase := make([]int, len(sets))
 	for si, cs := range sets {
 		prefixFnBase[si] = setBaseIdx[si] + cs.prefixFnBaseOffset()
+	}
+
+	// Component machinery, APPENDED after every pattern and set function so no
+	// index above moves: cabi_realloc, cm_free, cm_post, then one adapter per
+	// exported capability.
+	var patAdapters []componentAdapter
+	var setAdapters []setAdapter
+	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
+	if opts.Component {
+		reallocIdx = total
+		freeIdx = total + 1
+		postIdx = total + 2
+		firstAdapterIdx = total + 3
+		// A config may declare BOTH single patterns and sets, and this assembler
+		// is the only one such a config reaches. The pattern adapters come first
+		// and are exactly the ones assembleModule emits — omitting them made a
+		// mixed config lose every single-pattern export while the WIT still
+		// declared them, which `component new` then refused as a missing
+		// interface function.
+		patAdapters = componentAdapters(patterns, opts.ExportNames, numFuncImports)
+		setAdapters = componentSetAdapters(sets, setBaseIdx, resNewIdx, opts.SetNames,
+			setTypeI32I32ToI32, setTypeI32x3ToI32, setTypeCompNext, setTypeCompVoid)
+		total += 3 + len(patAdapters) + len(setAdapters)
 	}
 
 	var out []byte
@@ -1913,17 +2038,42 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 7
 		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 8
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
-		0x60, 0x08, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
+		0x60, 0x06, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
+	}
+	if opts.Component {
+		typeSection[0] = numSetTypesBase + 2
+		typeSection = append(typeSection,
+			0x60, 0x01, 0x7F, 0x00, // type 11: (i32)→()
+			0x60, 0x01, 0x7F, 0x01, 0x7F) // type 12: (i32)→i32
 	}
 	out = appendSection(out, 1, typeSection)
 
-	// Import section.
-	if !standalone {
+	// Import section. A module build imports the host memory when embedded; a
+	// component imports one `[resource-new]` canon builtin per find resource
+	// and never imports memory, since `component` forces standalone.
+	if !standalone || numFuncImports > 0 {
 		var importSec []byte
-		importSec = utils.AppendULEB128(importSec, 1)
-		importSec = appendString(importSec, "main")
-		importSec = appendString(importSec, "memory")
-		importSec = append(importSec, 0x02, 0x00, 0x00)
+		n := 0
+		if !standalone {
+			n++
+		}
+		n += numFuncImports
+		importSec = utils.AppendULEB128(importSec, uint32(n))
+		if !standalone {
+			importSec = appendString(importSec, "main")
+			importSec = appendString(importSec, "memory")
+			importSec = append(importSec, 0x02, 0x00, 0x00)
+		}
+		for si, cs := range sets {
+			if resNewIdx[si] < 0 {
+				continue
+			}
+			nm := opts.SetNames[cs.name]
+			importSec = appendString(importSec, nm.ResourceImport)
+			importSec = appendString(importSec, nm.ResourceNew)
+			importSec = append(importSec, 0x00) // kind: function
+			importSec = utils.AppendULEB128(importSec, uint32(setTypeCompNext))
+		}
 		out = appendSection(out, 2, importSec)
 	}
 
@@ -1952,7 +2102,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotGroupsFromWrapper: setTypeI32x4ToI32, // (i32×4)→i32
 	}
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(total))
+	// `total` counts every function index INCLUDING the imported builtins; the
+	// function section declares only the defined ones.
+	fs = utils.AppendULEB128(fs, uint32(total-numFuncImports))
 	for _, p := range patterns {
 		for _, slot := range p.funcLayout() {
 			t, ok := setSlotType[slot.kind]
@@ -1966,11 +2118,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			fs = append(fs, c.typeIdx)
 		}
-		// The hidden per-position batch worker. Gated it is `find`'s own
-		// signature; ungated it is that signature plus the batch `skip` — which
-		// is the same arity, so both are type 8.
-		if cs.batchFind {
-			fs = append(fs, byte(cs.workerTypeIdx()))
+		// The hidden body the exported `find` wraps. A batching set's is the
+		// per-position worker — gated, `find`'s own signature; ungated, that
+		// signature plus the batch `skip`, which is the same arity. A set
+		// wrapped only for the answer cache calls the ordinary find body, so
+		// its type IS `find`'s.
+		if cs.findWrapped() {
+			t := byte(setTypeI32x6ToI32)
+			if cs.batchFind {
+				t = byte(cs.workerTypeIdx())
+			}
+			fs = append(fs, t)
 		}
 		// The split's hidden phase bodies take and return exactly what the
 		// capability they serve does, so they reuse its type.
@@ -1986,9 +2144,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 			fs = append(fs, t, t)
 		}
-		// The backward sweep: (ptr, len, from, scratch_ptr, scratch_len) -> i32.
+		// The checkpointed sweep, two functions:
+		//   the pass:        (ptr, len, from, scratch, scratch_len) -> i32
+		//   materialise:     (ptr, len, scratch, block)             -> i32
 		if cs.usesOverlapDP() {
-			fs = append(fs, byte(setTypeI32x5ToI32))
+			fs = append(fs, byte(setTypeI32x5ToI32), byte(setTypeI32x4ToI32))
 		}
 		suffixType := byte(setMatchTypeSuffix)
 		if cs.gatedFind() || cs.suffixHasSkip {
@@ -2014,17 +2174,50 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			fs = append(fs, byte(setTypeI32x3ToI32))
 		}
 	}
+	if opts.Component {
+		// cabi_realloc reuses the (i32×4)→i32 probe type; cm_free and cm_post
+		// share (i32)→().
+		fs = append(fs, byte(setTypeI32x4ToI32), byte(setTypeCompVoid), byte(setTypeCompVoid))
+		for _, a := range patAdapters {
+			if a.kind == adapterMatch {
+				fs = append(fs, byte(setTypeI32I32ToI32))
+			} else {
+				// find and groups alike: (ptr, len, start) → retptr.
+				fs = append(fs, byte(setTypeI32x3ToI32))
+			}
+		}
+		for _, a := range setAdapters {
+			fs = append(fs, a.typeIdx)
+		}
+	}
 	out = appendSection(out, 3, fs)
 
 	// No function table needed: suffix DFAs are called via direct call, not call_indirect.
 	// This avoids multi-table conflicts when merging with host modules (e.g. Go WASM).
 
-	// Memory section.
+	// Memory section. A component declares one page more: the allocator's
+	// free-list heads sit at the static top and are written without a bounds
+	// check, so the page has to exist before the first allocation.
 	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
-		mem = utils.AppendULEB128(mem, uint32(memPages))
+		declPages := memPages
+		if opts.Component {
+			declPages++
+		}
+		mem = utils.AppendULEB128(mem, uint32(declPages))
 		out = appendSection(out, 5, mem)
+	}
+
+	// The component allocator's two globals, on the same terms as the
+	// single-pattern assembler: the bump frontier starts past the free-list
+	// head array, which sits at the static top.
+	heapGlobal, callListGlobal := uint32(0), uint32(0)
+	staticTop := memPages * 65536
+	classHeadsBase := staticTop
+	if opts.Component {
+		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		callListGlobal = globals.AllocInit(0)
 	}
 
 	// Global section: the find-from channel (see find_from.go), on the same
@@ -2064,6 +2257,19 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	for _, cs := range sets {
 		numExports += len(cs.capFns())
+	}
+	if opts.Component {
+		// cabi_realloc, plus each adapter under its canonical name and — for
+		// the ones returning a result area — a `cabi_post_` alias of the single
+		// shared post-return.
+		numExports++
+		numExports += 2 * len(patAdapters) // each carries a cabi_post_ alias
+		for _, a := range setAdapters {
+			numExports++
+			if a.post {
+				numExports++
+			}
+		}
 	}
 
 	var es []byte
@@ -2113,11 +2319,39 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = utils.AppendULEB128(es, uint32(base+i))
 		}
 	}
+	if opts.Component {
+		// The raw set exports above are KEPT, for the reason the single-pattern
+		// assembler keeps its own: they are unreachable from a component host,
+		// and they leave the core module drivable by the module-path harnesses
+		// after `wasm-tools component unbundle`.
+		es = appendString(es, "cabi_realloc")
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(reallocIdx))
+		for i, a := range patAdapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			es = appendString(es, "cabi_post_"+a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(postIdx))
+		}
+		for i, a := range setAdapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+len(patAdapters)+i))
+			if a.post {
+				es = appendString(es, "cabi_post_"+a.export)
+				es = append(es, 0x00)
+				es = utils.AppendULEB128(es, uint32(postIdx))
+			}
+		}
+	}
 	out = appendSection(out, 7, es)
 
 	// Code section.
 	var cs_bytes []byte
-	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total))
+	// Defined functions only — `total` counts the imported canon builtins too.
+	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total-numFuncImports))
 	for i, p := range patterns {
 		base := baseIdx[i]
 		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
@@ -2216,23 +2450,34 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		base := setBaseIdx[si]
 		scanProbeBase := base + cs.scanProbeBaseOffset()
 		anchoredProbeBase := base + cs.anchoredProbeBaseOffset()
+		// The backward sweep, shared by BOTH position-reporting entries since
+		// the cache logic became common code.
+		dpIdx, blkIdx := -1, -1
+		if off := cs.overlapDPFnOffset(); off >= 0 {
+			dpIdx = base + off
+			blkIdx = base + cs.overlapBlockFnOffset()
+		}
 		for _, c := range cs.capFns() {
 			switch c.kind {
 			case capFind:
-				if cs.batchFind {
+				if cs.findWrapped() {
 					// Decision (11a): the export forwards into the shared
 					// worker instead of carrying its own copy of the bucket
-					// code.
-					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.batchPosFnOffset())...)
+					// code. A non-batching set is wrapped for the answer cache
+					// alone, and forwards into the ordinary find body.
+					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
 				} else {
-					cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+					// The EXPORTED find takes a scratch descriptor where the
+					// body reads a gate pointer, so the prologue converts one
+					// into the other in the parameter itself. The batching
+					// set's export is the wrapper above, which does the same
+					// thing by hand; the shared worker keeps taking a gate,
+					// because both of its callers have already dereferenced.
+					cs_bytes = append(cs_bytes, injectScratchPrologue(
+						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3)...)
 				}
 			case capFindBatch:
-				dpIdx := -1
-				if off := cs.overlapDPFnOffset(); off >= 0 {
-					dpIdx = base + off
-				}
-				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset(), dpIdx)...)
+				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					cs_bytes = append(cs_bytes,
@@ -2266,8 +2511,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				cs_bytes = append(cs_bytes, body...)
 			}
 		}
-		if cs.batchFind {
-			cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+		if cs.findWrapped() {
+			if cs.batchFind {
+				cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+			} else {
+				// Wrapped for the answer cache alone: the inner body is the
+				// ordinary find body, emitted unchanged. It keeps taking a
+				// BARE gate pointer — the wrapper has already dereferenced the
+				// descriptor, exactly as the batching worker's callers have.
+				cs_bytes = append(cs_bytes,
+					rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+			}
 		}
 		// The split's hidden bodies, in twoPhaseCaps order so they line up
 		// with twoPhaseFnOffset. Phase 1 is the ordinary frontend emitter
@@ -2285,7 +2539,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 		if cs.usesOverlapDP() {
-			cs_bytes = append(cs_bytes, emitOverlapDPBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			cs_bytes = append(cs_bytes, emitCkptPassBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			cs_bytes = append(cs_bytes, emitCkptBlockBody(cs, tableMemIdx, cs.overlapDPColOff)...)
 		}
 		// A Backtracking fallback bucket's suffix body CALLS its driver, so it
 		// can only be built here, where function indices exist. Everything
@@ -2313,6 +2568,24 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// Backtracking drivers last, matching btFnBaseOffset.
 		for _, bb := range cs.btFnBodies {
 			cs_bytes = append(cs_bytes, bb...)
+		}
+	}
+	if opts.Component {
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentPostBody(callListGlobal, freeIdx))
+		for _, a := range patAdapters {
+			switch a.kind {
+			case adapterMatch:
+				cs_bytes = appendCodeEntry(cs_bytes, buildMatchAdapterBody(reallocIdx, a.funcIdx))
+			case adapterFind:
+				cs_bytes = appendCodeEntry(cs_bytes, buildFindAdapterBody(reallocIdx, a.funcIdx))
+			case adapterGroups:
+				cs_bytes = appendCodeEntry(cs_bytes, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			}
+		}
+		for _, a := range setAdapters {
+			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
 		}
 	}
 	out = appendSection(out, 10, cs_bytes)
@@ -4240,4 +4513,96 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	funcBody := utils.AppendULEB128(nil, uint32(len(b)))
 	funcBody = append(funcBody, b...)
 	return funcBody
+}
+
+// setSpecAndOptions builds the SetSpec and CompileSetOptions for one `sets:`
+// entry.
+//
+// EXTRACTED so there is exactly ONE of it. Any second construction of these two
+// values is a place where a real build and an inspection of that build can
+// disagree about which automaton the set has — `CmdWriteDiagJSON` built its own
+// and omitted `LikelyMode`, and therefore reported the NEUTRAL frontend, union
+// scan body and member-skip counts whatever the config's `hints:` said. The
+// checkpointed cache makes that class of divergence worse than a wrong report:
+// `SetOverlapCacheShape` sizes a caller's memory from it, so a different
+// automaton is a region sized for the wrong sweep.
+//
+// TableBase and TableMemIdx are deliberately NOT set here. They are placement,
+// not identity: they move every table's address without changing the automaton,
+// and only the emitting caller knows them.
+func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*PatternInfo, globalIDs []int, over CompileSetOptions, globals *moduleGlobals) (SetSpec, CompileSetOptions) {
+	spec := SetSpec{
+		Name:                 sc.Name,
+		MatchAny:             sc.MatchAny,
+		MatchAll:             sc.MatchAll,
+		ScanAny:              sc.ScanAny,
+		ScanAll:              sc.ScanAll,
+		Find:                 sc.Find,
+		BatchFind:            sc.BatchFind(),
+		DeclaredPatternCount: sc.PatternCount(cfg),
+		Overlapping:          sc.Overlapping,
+		IDSpaceSize:          sc.IDSpaceSize(cfg),
+		Patterns:             infos,
+		PatternIDs:           globalIDs,
+	}
+	setOpts := CompileSetOptions{
+		// Set-level LikelyMode precedence: set hints > neutral.
+		// Used by H.3 (frontend density gate).
+		LikelyMode: resolveHints(sc.Hints),
+		// The knob that decides whether a pattern survives into the set at
+		// all: a fallback bucket over this limit is DROPPED, not demoted to
+		// another engine. It was unreachable before — CompileSetOptions was
+		// built without it, so the default 1024 always won and the drop
+		// warning's own "raise max_dfa_states" hint pointed at a field that
+		// does not feed this budget.
+		MaxFallbackStates: cfg.MaxFallbackStates,
+		// Test-only overrides (CompileFileOpts); zero everywhere else.
+		ACBudgetBytes: over.ACBudgetBytes,
+		// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
+		ForceFrontend: over.ForceFrontend,
+		forceFrontend: over.forceFrontend,
+		// Test-only Shufti density-switch pin; see
+		// CompileSetOptions.ForceShuftiAdaptive.
+		ForceShuftiAdaptive: over.ForceShuftiAdaptive,
+		forceShuftiAdaptive: over.forceShuftiAdaptive,
+		// The module's allocator, shared with the per-pattern entries above.
+		globals: globals,
+	}
+
+	return spec, setOpts
+}
+
+// compileSetForInspection compiles one `sets:` entry the way a real build
+// would, for callers that need to LOOK at the result rather than emit it.
+//
+// Standalone placement (TableBase 0, memory 0) because nothing here reads a
+// table address; the automaton is identical either way.
+func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig) (*compiledSet, error) {
+	nameIdx := make(map[string]int, len(cfg.Regexps))
+	for i, re := range cfg.Regexps {
+		if re.Name != "" {
+			nameIdx[re.Name] = i
+		}
+	}
+	var selectedIdx []int
+	if sc.Patterns.All {
+		for i := range cfg.Regexps {
+			selectedIdx = append(selectedIdx, i)
+		}
+	} else {
+		for _, name := range sc.Patterns.Names {
+			idx, ok := nameIdx[name]
+			if !ok {
+				return nil, fmt.Errorf("set %q: unknown pattern %q", sc.Name, name)
+			}
+			selectedIdx = append(selectedIdx, idx)
+		}
+	}
+	var prefixPool, suffixPool dfaPool
+	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+	if err != nil {
+		return nil, err
+	}
+	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, &moduleGlobals{})
+	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
 }

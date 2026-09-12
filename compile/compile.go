@@ -355,6 +355,23 @@ func hasBatchHint(hints []string) bool {
 
 // CompileOptions contains optional parameters for engine selection.
 type CompileOptions struct {
+	// Component emits the canonical-ABI adapters (cabi_realloc, the
+	// post-return, one lifted adapter per export) so the module can be wrapped
+	// into a Component Model component by `wasm-tools component new`. It FORCES
+	// standalone memory: the allocator grows memory 0, which is the module's
+	// own only when standalone. Off means today's bytes, unchanged.
+	//
+	// Filled from the config's `wasm_format` by CmdCompile, the way
+	// MaxDFAStates is filled from max_dfa_states.
+	Component bool
+	// ComponentPackage is the WIT interface prefix every canonical export name
+	// is built from, e.g. "regexped:regexps/matcher".
+	ComponentPackage string
+	// ComponentExportNames maps a pattern's configured func name to the
+	// canonical export name for its adapter. Supplied by the caller (generate
+	// derives it from the same WIT it writes) so the .wit and the core module
+	// cannot disagree.
+	ComponentExportNames map[string]string
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
 	// (match/find) or TDFA (capture groups). If the DFA/TDFA exceeds this limit
 	// the engine falls back to Backtracking. 0 means use the default (1024).
@@ -2252,7 +2269,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 // standalone=false: module imports memory from "main" (for wasm-merge).
 // Both modes emit active data segments; in non-standalone mode the host stub's
 // reservation variable ensures the host runtime declares enough initial memory.
-func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool, globals *moduleGlobals) []byte {
+// assembleModule emits the core WASM module.
+//
+// opts carries the component configuration; its ZERO VALUE MEANS MODULE, so
+// every call site that predates components passes asmOpts{} and gets today's
+// bytes exactly — which `make byteident` is the proof of.
+func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool, globals *moduleGlobals, opts asmOpts) []byte {
 	// Pre-collect data segments.
 	totalSegs := 0
 	var rawData []byte
@@ -2262,11 +2284,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 
 	// Pass 1: assign base function indices.
-	baseIdx := make([]int, len(patterns))
-	total := 0
-	for i, p := range patterns {
-		baseIdx[i] = total
-		total += p.funcCount()
+	baseIdx, total := patternBaseIndices(patterns)
+
+	// Component adapters are APPENDED after every pattern function, so no
+	// baseIdx and no per-pattern offset moves. Their own indices start at
+	// `total`: cabi_realloc, then cm_post, then one adapter each.
+	var adapters []componentAdapter
+	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
+	if opts.Component {
+		// No function imports on this path, so the defined functions start at 0.
+		adapters = componentAdapters(patterns, opts.ExportNames, 0)
+		reallocIdx = total
+		freeIdx = total + 1
+		postIdx = total + 2
+		firstAdapterIdx = total + 3
+		total += 3 + len(adapters)
 	}
 
 	var out []byte
@@ -2311,6 +2343,22 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		groupsFromTypeIdx = numTypes
 		typeSection = append(typeSection,
 			0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+		numTypes++
+	}
+	// cabi_realloc has the same (i32,i32,i32,i32)→i32 shape as the groups-from
+	// wrapper, so it reuses that type when one is already declared and adds it
+	// otherwise. cm_post's (i32)→() has no existing equivalent.
+	reallocTypeIdx, postTypeIdx := -1, -1
+	if opts.Component {
+		reallocTypeIdx = groupsFromTypeIdx
+		if reallocTypeIdx < 0 {
+			reallocTypeIdx = numTypes
+			typeSection = append(typeSection,
+				0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+			numTypes++
+		}
+		postTypeIdx = numTypes
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x00)
 		numTypes++
 	}
 	typeSection[0] = byte(numTypes)
@@ -2362,6 +2410,18 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			fs = append(fs, t)
 		}
 	}
+	if opts.Component {
+		// cm_free and cm_post share the (i32)→() shape.
+		fs = append(fs, byte(reallocTypeIdx), byte(postTypeIdx), byte(postTypeIdx))
+		for _, a := range adapters {
+			switch a.kind {
+			case adapterMatch:
+				fs = append(fs, 0x00) // (i32,i32)→i32
+			default:
+				fs = append(fs, 0x02) // (i32,i32,i32)→i32 — find and groups alike
+			}
+		}
+	}
 	out = appendSection(out, 3, fs)
 
 	// Memory section: own memory for both standalone and embedded.
@@ -2369,7 +2429,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
-		mem = utils.AppendULEB128(mem, uint32(memPages))
+		declPages := memPages
+		if opts.Component {
+			// One page for the allocator's free-list heads, which sit at the
+			// static top and are written without a bounds check.
+			declPages++
+		}
+		mem = utils.AppendULEB128(mem, uint32(declPages))
 		out = appendSection(out, 5, mem)
 	}
 
@@ -2380,6 +2446,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// harness, rather than a silent read of the wrong thing.
 	if globals == nil {
 		globals = &moduleGlobals{}
+	}
+	// The component allocator's two globals, allocated here so they land in the
+	// section emitted immediately below. See component.go for the layout.
+	//
+	// classHeadsBase is the static top — everything BELOW it is DFA tables
+	// written by data segments — and the heap proper starts past the free-list
+	// head array. The memory section above declares one extra page for
+	// components precisely so that array is in bounds before the first
+	// allocation grows anything.
+	heapGlobal, callListGlobal := uint32(0), uint32(0)
+	staticTop := memPages * 65536
+	classHeadsBase := staticTop
+	if opts.Component {
+		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		callListGlobal = globals.AllocInit(0)
 	}
 	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
 		out = appendSection(out, 6, globals.Section())
@@ -2407,6 +2488,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		if p.batchGroupsExport != "" {
 			numExports++
 		}
+	}
+	if opts.Component {
+		// cabi_realloc, plus one canonical name and one cabi_post_ name per
+		// adapter. Every post name points at the SAME function: a WASM function
+		// may be exported under any number of names, so one shared reset body
+		// serves them all.
+		numExports += 1 + 2*len(adapters)
 	}
 	var es []byte
 	es = utils.AppendULEB128(es, uint32(numExports))
@@ -2446,6 +2534,23 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = appendString(es, p.batchGroupsExport)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(base+batchGroupsOff))
+		}
+	}
+	if opts.Component {
+		// The raw exports above are KEPT. They are unreachable from a component
+		// host — `component new` exposes only what the WIT declares — but they
+		// cost a few bytes and they keep the core module drivable by the
+		// module-path harnesses after `wasm-tools component unbundle`.
+		es = appendString(es, "cabi_realloc")
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(reallocIdx))
+		for i, a := range adapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			es = appendString(es, "cabi_post_"+a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(postIdx))
 		}
 	}
 	out = appendSection(out, 7, es)
@@ -2551,6 +2656,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly)
 		}
 	}
+	if opts.Component {
+		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentFreeBody(classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentPostBody(callListGlobal, freeIdx))
+		for _, a := range adapters {
+			switch a.kind {
+			case adapterMatch:
+				cs = appendCodeEntry(cs, buildMatchAdapterBody(reallocIdx, a.funcIdx))
+			case adapterFind:
+				cs = appendCodeEntry(cs, buildFindAdapterBody(reallocIdx, a.funcIdx))
+			case adapterGroups:
+				cs = appendCodeEntry(cs, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			}
+		}
+	}
 	out = appendSection(out, 10, cs)
 
 	// Data section: active segments targeting the correct memory index.
@@ -2616,6 +2736,17 @@ func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone boo
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
 	if !standalone {
 		opts.tableMemIdx = 1
+		// A component's allocator grows memory 0 and its exported "memory" is
+		// what the canonical ABI lowers into; embedded modules IMPORT memory 0
+		// from the host and keep their own as memory 1, so neither holds. This
+		// is a caller error, not a config one: CmdCompile forces standalone
+		// under `wasm_format: component`.
+		if opts.Component {
+			return nil, 0, errComponentNeedsStandalone
+		}
+	}
+	if err := opts.asmOpts().validate(); err != nil {
+		return nil, 0, err
 	}
 	// One allocator per module, created before the loop so every pattern draws
 	// from the same counter and the assembler below declares exactly what they
@@ -2655,7 +2786,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone, globals), lastTableEnd, nil
+	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts()), lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a
@@ -2774,32 +2905,15 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		if err != nil {
 			return err
 		}
-		spec := SetSpec{
-			Name:        sc.Name,
-			MatchAny:    sc.MatchAny,
-			MatchAll:    sc.MatchAll,
-			ScanAny:     sc.ScanAny,
-			ScanAll:     sc.ScanAll,
-			Find:        sc.Find,
-			BatchFind:   sc.BatchFind(),
-			Overlapping: sc.Overlapping,
-			Patterns:    infos,
-			PatternIDs:  globalIDs,
-
-			DeclaredPatternCount: sc.PatternCount(cfg),
-		}
-		// Same budget the real compile uses (set_emit.go's setOpts). Without
-		// it --diag-json reports drops under the default 1024 while the build
-		// it is describing kept those patterns.
-		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{
-			MaxFallbackStates: cfg.MaxFallbackStates,
-			// The set's own hint. Omitting it made this re-run NEUTRAL
-			// whatever the config said, so --diag-json reported the frontend,
-			// union-scan body and member-skip counts of a compilation the user
-			// was not asking about — and those are hint-dependent selections
-			// for which this file is the only window.
-			LikelyMode: resolveHints(sc.Hints),
-		})
+		// THE SAME spec and options the real compile builds, through the same
+		// helper. This function RE-RUNS CompileSet rather than threading the
+		// build's own diagnostics out, so every field it gets wrong describes a
+		// compilation the user is not asking about — and it has: the set's
+		// LikelyMode was omitted, so the frontend, the union-scan body and the
+		// member-skip counts were all reported NEUTRAL whatever `hints:` said,
+		// and this file is the only window onto those.
+		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
+		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)

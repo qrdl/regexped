@@ -22,7 +22,7 @@ import (
 
 func allABIParams() []abiParam {
 	return []abiParam{
-		abiInputPtr, abiInputLen, abiFrom, abiGatePtr,
+		abiInputPtr, abiInputLen, abiFrom, abiScratchPtr,
 		abiBitmapPtr, abiTuplePtr, abiOutCap, abiCursor,
 	}
 }

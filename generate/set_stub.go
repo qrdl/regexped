@@ -6,6 +6,7 @@ import (
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // hasSetExports reports whether cfg has any sets with at least one declared
@@ -253,10 +254,23 @@ const (
 	abiInputLen
 	// abiFrom is the position the search starts at.
 	abiFrom
-	// abiGatePtr is the caller-owned gate array: ID_SPACE u32s, zeroed to
-	// start a drive. Sized by ID_SPACE and never by PATTERN_COUNT — a set of
-	// two patterns can report id 69. This is the R1 hazard.
-	abiGatePtr
+	// abiScratchPtr is the caller-owned SCRATCH DESCRIPTOR (internal/abi):
+	// four u32s holding a magic word, the gate-array pointer, and the
+	// overlapping answer cache or 0.
+	//
+	// It replaced a bare gate pointer in the same position. The gate array is
+	// still the caller's and still zeroed to start a drive, and is still sized
+	// by ID_SPACE and never by PATTERN_COUNT — a set of two patterns can report
+	// id 69, which is the R1 hazard. What changed is only that its address
+	// travels inside a descriptor, so the answer cache has somewhere to travel
+	// with it: the cache is what makes an overlapping drive linear instead of
+	// quadratic, and it needs caller-owned memory for the same reason the gates
+	// do.
+	//
+	// The magic word is why a caller that misses this change fails loudly: the
+	// parameter has the same type as before, so a bare gate pointer would have
+	// gate[0] read as an address. The module compares the magic and traps.
+	abiScratchPtr
 	// abiBitmapPtr is the caller-owned `_all` bitmap, ceil(ID_SPACE/8) bytes.
 	// Present only in the WIDE form (see wideAllForm).
 	abiBitmapPtr
@@ -267,10 +281,9 @@ const (
 	abiOutCap
 	// abiCursor is the batch entry's opaque i64 resume cursor.
 	abiCursor
-	// The batching entry's caller-owned answer cache has NO abiParam of its own. Only JS and TS expose that entry, and
-	// they build its call directly rather than through this descriptor, so a
-	// pair of scratch params here would be spelled by four generators and
-	// produced by none.
+	// The batching entry's answer cache has NO abiParam of its own, and since
+	// 2026-09-11 it needs none: it travels in the scratch descriptor above,
+	// which is also how the plain `find` reaches it.
 )
 
 // abiRet is a capability's WASM return type.
@@ -326,7 +339,7 @@ func setCapabilities(s config.SetConfig, cfg config.BuildConfig) []setCapability
 	} else {
 		add("scan_all", s.ScanAll, []abiParam{abiInputPtr, abiInputLen, abiFrom}, abiRetI64)
 	}
-	add("find", s.Find, []abiParam{abiInputPtr, abiInputLen, abiFrom, abiGatePtr, abiTuplePtr, abiOutCap}, abiRetI32)
+	add("find", s.Find, []abiParam{abiInputPtr, abiInputLen, abiFrom, abiScratchPtr, abiTuplePtr, abiOutCap}, abiRetI32)
 	return caps
 }
 
@@ -453,13 +466,13 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "SetMatch", "PatternName"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
-		"RX_ERR_BT_OVERFLOW", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED",
 	},
 	// Rust is deliberately absent: `pub mod <import_module>` already isolates
@@ -534,7 +547,7 @@ func spellJSArgs(c *setCapability, s jsArgSpelling) string {
 			return s.inLen
 		case abiFrom:
 			return s.from
-		case abiGatePtr:
+		case abiScratchPtr:
 			return s.gate
 		case abiBitmapPtr:
 			return s.bitmap
@@ -547,4 +560,90 @@ func spellJSArgs(c *setCapability, s jsArgSpelling) string {
 		}
 		panic("generate: no JS spelling for an ABI parameter")
 	}, ", ")
+}
+
+// scratchDescriptorBytes is the size of the scratch descriptor a stub reserves
+// beside the gate array (internal/abi).
+//
+// A local alias rather than the constant itself, because the generators reserve
+// memory in EXPRESSIONS built as text — `_outBase + 12*N + 4*M + 16` — and an
+// untyped constant reads better there than a qualified name repeated four
+// times. It is one line and it is checked by a test that compares the two.
+const scratchDescriptorBytes = abi.FindScratchBytes
+
+// overlapCacheShapeFor reports the sizing an overlapping set's `find` needs, or
+// a zero shape when the set gets no backward sweep.
+//
+// IT RECOMPILES THE SET, which is the route decision 1 of the checkpointed
+// cache task chose over exporting a sizing function from the module or baking a
+// constant into the stub. The column width falls out of the DFA subset
+// construction and is not derivable from the YAML, so a generator that wants it
+// has to build the automaton; doing that in the SAME RUN that writes the stub
+// is what stops the number going stale between `compile` and `generate`.
+//
+// The YAML alone excludes most sets — no `find`, or not `overlapping`, means no
+// sweep and nothing to size — and that filter is applied FIRST so stub
+// generation does not compile a set it has no question about. A set that passes
+// it may still come back ineligible, which is ordinary and not an error.
+func overlapCacheShapeFor(s config.SetConfig, cfg config.BuildConfig) compile.OverlapCacheShape {
+	if s.Find == "" || !s.Overlapping {
+		return compile.OverlapCacheShape{}
+	}
+	sh, err := compile.SetOverlapCacheShape(s, cfg)
+	if err != nil {
+		// A set that cannot be compiled here cannot be compiled by `compile`
+		// either, and that path reports it properly. Declining the cache is the
+		// safe answer: the drive walks.
+		return compile.OverlapCacheShape{}
+	}
+	return sh
+}
+
+// anySetWantsCache reports whether any set in this config gets an overlapping
+// answer cache, which is what decides whether the C header carries the
+// allocator machinery at all.
+//
+// A config with no sets, or none overlapping, must not: the header documents
+// itself as needing no libc, and emitting the feature test would pull
+// <stdlib.h> into builds that rely on that.
+func anySetWantsCache(cfg config.BuildConfig) bool {
+	for _, s := range cfg.Sets {
+		if overlapCacheShapeFor(s, cfg).Eligible {
+			return true
+		}
+	}
+	return false
+}
+
+// overlapCacheConsts are the numbers a stub's cache-sizing prelude needs as
+// LITERALS, derived once from the compiled shape.
+//
+// Six languages spell that prelude, and each spelled these three itself:
+// `4 + 4*P` for a row, `cells*4 + 4` for a checkpoint column, and the header
+// beside them. The arithmetic that remains language-specific is only the
+// stride and the block count — a square root and a ceiling — because those are
+// the parts that need the input length, which exists only at call time.
+//
+// A stub that computes any of these differently from config does not merely
+// allocate oddly: the sweep validates the stride against the region and reports
+// a header it cannot parse, so the set's overlapping find stops working.
+type overlapCacheConsts struct {
+	// Row is one position's block-buffer row, Cell one checkpoint column plus
+	// its cum[] word, Hdr the header, and Base the fixed part of a single-block
+	// region (Hdr + Cell + 4), which is what the budget test compares against
+	// m*Row.
+	Row, Cell, Hdr, Base, Max int
+	// Cells is the column width itself, for the square root's numerator.
+	Cells int
+}
+
+func overlapCacheConstsFor(sh compile.OverlapCacheShape) overlapCacheConsts {
+	return overlapCacheConsts{
+		Row:   config.SetOverlapBlockRowBytes(sh.Patterns),
+		Cell:  sh.Cells*4 + 4,
+		Hdr:   config.SetOverlapCheckpointHeaderBytes,
+		Base:  config.SetOverlapCheckpointHeaderBytes + sh.Cells*4 + 4 + 4,
+		Max:   config.SetOverlapCacheMaxBytes,
+		Cells: sh.Cells,
+	}
 }

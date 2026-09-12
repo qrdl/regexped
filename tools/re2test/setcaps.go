@@ -26,6 +26,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -249,7 +250,19 @@ type setCapStats struct {
 	// match": an engine that wrongly gives up when nothing further matches
 	// would otherwise be scored as a PASS.
 	btUnknown int
-	// skippedCache counts find_batch legs that asked for the answer cache and
+	// engagedCache counts cache legs where the sweep actually RAN — `ready`
+	// came back 1. A region that is offered and then refused, or never asked
+	// for, makes the drive walk, and a walking drive answers correctly: the
+	// two legs then compare the same engine with itself and every check passes
+	// while the cache is untested. Nothing here read `ready` at all, so a
+	// corpus run could not tell those apart.
+	engagedCache int
+	// refusedCache counts legs where the sweep was asked and declined the
+	// region (-1). Legitimate — the answer is identical, only slower — but it
+	// must be visible rather than inferred from a count that does not move.
+	refusedCache int
+
+	// skippedCache counts find / find_batch legs that asked for the answer cache and
 	// got no region, so the leg was identical to the nocache one and would
 	// have been recorded under the wrong label.
 	skippedCache int
@@ -334,7 +347,11 @@ func (s *setCapStats) report() {
 		fmt.Printf("  backtracking gave up (input skipped): %d\n", s.btUnknown)
 	}
 	if s.skippedCache > 0 {
-		fmt.Printf("  find_batch cache legs skipped (no region offered): %d\n", s.skippedCache)
+		fmt.Printf("  find cache legs skipped (no region offered): %d\n", s.skippedCache)
+	}
+	if s.engagedCache > 0 || s.refusedCache > 0 {
+		fmt.Printf("  find cache legs that SWEPT: %d (refused the region: %d)\n",
+			s.engagedCache, s.refusedCache)
 	}
 	if s.dropped > 0 {
 		// Documented behaviour, not a failure — but it means those patterns
@@ -694,19 +711,27 @@ type setRunner struct {
 	inBase  int32
 	outBase int32
 	gatePtr int32
-	bmpPtr  int32
+	// scratchPtr is the DESCRIPTOR the find exports take in place of a bare
+	// gate pointer (internal/abi): magic, gate pointer, answer cache.
+	scratchPtr int32
+	bmpPtr     int32
 	// cachePtr/cacheLen are the OVERLAPPING answer cache (see the
 	// stage C). Sized for the LONGEST input in the chunk so one region serves
 	// every drive, and zero when that would exceed the ceiling the generated
 	// stubs use — declining is legal and costs speed, not correctness.
 	cachePtr int32
 	cacheLen int32
-	npat     int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
-	idSpace  int    // largest reportable global id + 1 — sizes gates and bitmaps
-	inSet    []bool // by chunk index: is this pattern a member of the set?
-	outCap   int32  // = npat: the exact worst case for one position
-	bmpLen   int32
-	wide     bool // idSpace > 64: the `_all` capabilities take an out_ptr
+	// cacheStride is the checkpointed cache's ONE caller-written header field.
+	// A generated `init` computes it from the same config helper that sized the
+	// allocation; this harness is that init's stand-in, and leaving it zero is
+	// a malformed header the sweep reports rather than guesses at.
+	cacheStride int32
+	npat        int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
+	idSpace     int    // largest reportable global id + 1 — sizes gates and bitmaps
+	inSet       []bool // by chunk index: is this pattern a member of the set?
+	outCap      int32  // = npat: the exact worst case for one position
+	bmpLen      int32
+	wide        bool // idSpace > 64: the `_all` capabilities take an out_ptr
 
 	// Patterns this compile excluded; see the dropHandler comment.
 	droppedFind     map[int]bool
@@ -765,7 +790,13 @@ func (r *setRunner) call(fn *wasmtime.Func, args ...interface{}) (interface{}, b
 
 func (r *setRunner) buf() []byte { return r.mem.UnsafeData(r.store) }
 
-// zeroGates restores the all-zero gate array that means "a clean scan".
+// zeroGates restores the all-zero gate array that means "a clean scan", and
+// rewrites the scratch descriptor that points at it.
+//
+// The descriptor is rewritten here rather than once at setup because this is
+// the function every drive calls to declare itself fresh, and a descriptor
+// whose cache fields survived from a previous drive would hand the sweep a
+// half-filled region.
 func (r *setRunner) zeroGates() {
 	b := r.buf()
 	// Sized from the ID SPACE, not the pattern count: the array is indexed by
@@ -773,6 +804,49 @@ func (r *setRunner) zeroGates() {
 	for i := int32(0); i < int32(r.idSpace)*4; i++ {
 		b[r.gatePtr+i] = 0
 	}
+	abi.WriteFindScratch(b, r.scratchPtr, r.gatePtr, 0, 0)
+}
+
+// offerCache rewrites the descriptor with the answer cache attached, for the
+// overlapping drives that can use it — BOTH find entries read it.
+func (r *setRunner) offerCache(cachePtr, cacheLen int32) {
+	abi.WriteFindScratch(r.buf(), r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
+}
+
+// startCacheDrive zeroes the cache header and points the descriptor at it. The
+// caller zeroes the header to start a drive, exactly as it zeroes the gate
+// array, so a stale one would hand the sweep a half-filled region.
+//
+// Call it AFTER zeroGates, which rewrites the descriptor with the cache
+// declined.
+// cacheReady reports what the sweep did with the region this drive offered:
+// 1 swept, -1 asked and refused, 0 never asked. It is the ONE header field a
+// caller may read, and without reading it a harness cannot tell a cache leg
+// from the walk it falls back to.
+func (r *setRunner) cacheReady() int32 {
+	if r.cachePtr == 0 {
+		return 0
+	}
+	return int32(binary.LittleEndian.Uint32(r.buf()[r.cachePtr+8:]))
+}
+
+// recordCacheLeg tallies what the leg just driven actually exercised.
+func (r *setRunner) recordCacheLeg() {
+	switch r.cacheReady() {
+	case 1:
+		setStats.engagedCache++
+	case -1:
+		setStats.refusedCache++
+	}
+}
+
+func (r *setRunner) startCacheDrive() {
+	buf := r.buf()
+	for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
+		buf[r.cachePtr+i] = 0
+	}
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+16:], uint32(r.cacheStride))
+	r.offerCache(r.cachePtr, r.cacheLen)
 }
 
 // zeroBitmap clears the wide `_all` output. The module only ORs bits in and
@@ -1060,13 +1134,25 @@ func newSetRunner(
 
 	outBase := inBase + span
 	gatePtr := outBase + int32(patternCount)*int32(setOutTupleBytes)
+	scratchPtr := gatePtr + int32(idSpace)*4
 	bmpLen := int32((idSpace + 7) / 8)
-	bmpPtr := gatePtr + int32(idSpace)*4
+	bmpPtr := scratchPtr + abi.FindScratchBytes
 	cachePtr := (bmpPtr + bmpLen + 15) &^ 7
-	cacheLen := int32(0)
-	if want := config.SetOverlapCacheBytes(maxLen, patternCount); want <= config.SetOverlapCacheMaxBytes {
-		cacheLen = int32(want)
-	} else {
+	// The CHECKPOINTED cache. Its size needs the sweep column's width, which
+	// comes from the compiler: the set is recompiled to learn it, which is the
+	// route a stub generator takes too. A set that gets no sweep declines, and
+	// the drive walks.
+	cacheLen, cacheStride := int32(0), int32(0)
+	if len(cfg.Sets) > 0 && cfg.Sets[0].Find != "" && cfg.Sets[0].Overlapping {
+		// ONE helper for both numbers: the region is sized from the stride and
+		// the sweep validates the stride against the region, so computing them
+		// apart is how a harness hands itself a header the engine rejects.
+		if want, k, err := compile.SetOverlapCacheSizing(cfg.Sets[0], cfg, maxLen); err == nil &&
+			want > config.SetOverlapCheckpointHeaderBytes && want <= config.SetOverlapCacheMaxBytes {
+			cacheLen, cacheStride = int32(want), int32(k)
+		}
+	}
+	if cacheLen == 0 {
 		cachePtr = 0
 	}
 	// The top is the LAYOUT's true end, not the cache's. Deriving it from
@@ -1090,8 +1176,8 @@ func newSetRunner(
 	}
 	return &setRunner{
 		store: store, inst: inst, mem: mem, wd: wd, release: release,
-		inBase: inBase, outBase: outBase, gatePtr: gatePtr, bmpPtr: bmpPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		inBase: inBase, outBase: outBase, gatePtr: gatePtr, scratchPtr: scratchPtr, bmpPtr: bmpPtr,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: patternCount, idSpace: idSpace, inSet: inSet,
 		outCap: int32(patternCount), bmpLen: bmpLen,
 		wide:        wideAll,
@@ -1313,20 +1399,45 @@ func runSetProfile(
 
 			// ---- find ----------------------------------------------------
 			if c.find != nil {
-				gotM, hang, e := r.driveFind(c.find, text, c.spec.overlapping)
-				if errors.Is(e, errBTUnknown) {
-					// The engine said "unknown"; there is nothing to compare
-					// against. Counted, not scored.
-					e = nil
-					hang = true
-				} else if e != nil {
-					return e
+				// Two engines behind the one export on an OVERLAPPING set:
+				// without the cache (the ordinary walk) and with it. `find`
+				// reads the cache too since that logic became common code, and
+				// on the corpus's short inputs the adaptive trigger will almost
+				// never fire — which is exactly the leg worth checking here,
+				// since "offered and declined" runs on EVERY call and must cost
+				// nothing but a header read. The engaging path needs inputs the
+				// corpus does not have and is covered in tools/fuzz.
+				cacheLegs := []bool{false}
+				if c.spec.overlapping {
+					if r.cachePtr != 0 {
+						cacheLegs = append(cacheLegs, true)
+					} else {
+						setStats.skippedCache++
+					}
 				}
-				if hang {
-					setStats.timeouts++
-				} else {
-					compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping,
-						"find/"+mode, verbose, r.findEligible)
+				for _, withCache := range cacheLegs {
+					gotM, hang, e := r.driveFind(c.find, text, c.spec.overlapping, withCache)
+					if withCache {
+						r.recordCacheLeg()
+					}
+					if errors.Is(e, errBTUnknown) {
+						// The engine said "unknown"; there is nothing to
+						// compare against. Counted, not scored.
+						e = nil
+						hang = true
+					} else if e != nil {
+						return e
+					}
+					cacheLbl := "nocache"
+					if withCache {
+						cacheLbl = "cache"
+					}
+					if hang {
+						setStats.timeouts++
+					} else {
+						compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping,
+							"find/"+mode+"/"+cacheLbl, verbose, r.findEligible)
+					}
 				}
 				// The same scan through an under-sized buffer, checking
 				// out_cap=0 and the transactional-overflow rule at every
@@ -1387,6 +1498,9 @@ func runSetProfile(
 							continue
 						}
 						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
+						if withCache {
+							r.recordCacheLeg()
+						}
 						if errors.Is(e, errBTUnknown) {
 							e, hang = nil, true
 						} else if e != nil {
@@ -1436,7 +1550,7 @@ func (r *setRunner) driveUnicodePinned(
 		if c.find == nil || c.spec.overlapping {
 			continue
 		}
-		got, hang, e := r.driveFind(c.find, text, false)
+		got, hang, e := r.driveFind(c.find, text, false, false)
 		if errors.Is(e, errBTUnknown) {
 			continue
 		}
@@ -1548,7 +1662,7 @@ func (r *setRunner) callAll(fn *wasmtime.Func, tlen, from int32) ([]int, bool, e
 
 // driveFind iterates a `find` export to exhaustion: call, record, resume at
 // start+1. Returns the matches keyed by pattern id.
-func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) (map[int32][][2]int, bool, error) {
+func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping, withCache bool) (map[int32][][2]int, bool, error) {
 	got := make(map[int32][][2]int)
 	// Zeroed for BOTH flavours. An overlapping `find` records no match gates,
 	// but it now reads the array as the per-drive home of
@@ -1556,12 +1670,15 @@ func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping bool) 
 	// drive. A driver that skipped this would carry one corpus line's verdict
 	// into the next.
 	r.zeroGates()
+	if withCache && r.cachePtr != 0 {
+		r.startCacheDrive()
+	}
 	from := int32(0)
 	for {
 		var res interface{}
 		var hang bool
 		var err error
-		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, r.outCap)
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.scratchPtr, r.outBase, r.outCap)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1616,7 +1733,7 @@ func (r *setRunner) driveFindFrom(fn *wasmtime.Func, text string, from int32) (m
 	r.zeroGates()
 	pos := from
 	for {
-		res, hang, err := r.call(fn, r.inBase, int32(len(text)), pos, r.gatePtr, r.outBase, r.outCap)
+		res, hang, err := r.call(fn, r.inBase, int32(len(text)), pos, r.scratchPtr, r.outBase, r.outCap)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1668,17 +1785,8 @@ func (r *setRunner) driveFindFrom(fn *wasmtime.Func, text string, from int32) (m
 func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping bool, outCap int32, withCache bool) (map[int32][][2]int, bool, error) {
 	got := make(map[int32][][2]int)
 	r.zeroGates()
-	cachePtr, cacheLen := int32(0), int32(0)
-	if withCache {
-		cachePtr, cacheLen = r.cachePtr, r.cacheLen
-		if cachePtr != 0 {
-			// The caller zeroes the header to start a drive, exactly as it
-			// zeroes the gate array.
-			buf := r.buf()
-			for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
-				buf[cachePtr+i] = 0
-			}
-		}
+	if withCache && r.cachePtr != 0 {
+		r.startCacheDrive()
 	}
 	countMask := int64(1)<<uint(config.SetCursorCountBits(r.npat)) - 1
 	cursor := int64(0)
@@ -1690,7 +1798,7 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		var res interface{}
 		var hang bool
 		var err error
-		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.gatePtr, r.outBase, outCap, cachePtr, cacheLen)
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), cursor, r.scratchPtr, r.outBase, outCap)
 		if err != nil || hang {
 			return nil, hang, err
 		}
@@ -1701,6 +1809,13 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		if uint32(packed>>32) == config.SetCursorOverflowPos {
 			setStats.btUnknown++
 			return nil, false, errBTUnknown
+		}
+		// The SECOND reserved position word says the answer cache's header is
+		// malformed. In a harness that is a HARNESS BUG — this code writes the
+		// header itself — so it fails rather than being tolerated.
+		if uint32(packed>>32) == config.SetCursorMalformedPos {
+			return nil, false, fmt.Errorf("find_batch reported a malformed answer-cache header; " +
+				"the harness wrote that header, so this is a bug here")
 		}
 		count := int32(packed & countMask)
 		if count < 0 || count > outCap {
@@ -1751,7 +1866,7 @@ func (r *setRunner) driveFindOverflow(fn *wasmtime.Func, text string, overlappin
 		var res interface{}
 		var hang bool
 		var err error
-		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.gatePtr, r.outBase, outCap)
+		res, hang, err = r.call(fn, r.inBase, int32(len(text)), from, r.scratchPtr, r.outBase, outCap)
 		if err != nil || hang {
 			return 0, hang, err
 		}
@@ -1870,7 +1985,7 @@ func (r *setRunner) checkFromOutOfRange(
 			var res interface{}
 			var hang bool
 			var err error
-			res, hang, err = r.call(find, r.inBase, tlen, from, r.gatePtr, r.outBase, r.outCap)
+			res, hang, err = r.call(find, r.inBase, tlen, from, r.scratchPtr, r.outBase, r.outCap)
 			if err != nil {
 				return err
 			}
@@ -1889,7 +2004,7 @@ func (r *setRunner) checkFromOutOfRange(
 			var res interface{}
 			var hang bool
 			var err error
-			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.gatePtr, r.outBase, r.outCap, int32(0), int32(0))
+			res, hang, err = r.call(findBatch, r.inBase, tlen, cursor, r.scratchPtr, r.outBase, r.outCap)
 			if err != nil {
 				return err
 			}

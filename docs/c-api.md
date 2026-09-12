@@ -2,7 +2,12 @@
 
 Regexped generates a pair of C stub files (`.h` and `.c`) that declare and implement
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
-the stubs compile cleanly with `--target=wasm32-wasi -nostdlib`.
+the stubs compile cleanly with `--target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0`.
+One optional feature uses an allocator when one is present — see
+[The overlapping answer cache](#the-overlapping-answer-cache) — and that define is
+how a freestanding build declines it.
+
+> **Component format:** `stub_type: c` works under `wasm_format: component` too, and the **API is identical** — the same `rx_match_t`, `rx_group_t`, caller-owned iterators and group-index constants — because the header is produced by the same generator. What differs is the `.c`: canonical-ABI imports with a caller-supplied return area instead of a packed `long long`, plus a `cabi_realloc` when a pattern exports groups (a returned list is allocated in *your* memory). A `wit/` directory is generated beside the stub for `wasm-tools component embed`. See [component.md](component.md).
 
 ## Including stubs in your project
 
@@ -16,7 +21,7 @@ The generator produces two files derived from `stub_file` in the config:
 Compile both alongside your application:
 
 ```sh
-clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o main.wasm main.c stub.c
+clang --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry -o main.wasm main.c stub.c
 ```
 
 Include only the header in your application code:
@@ -26,6 +31,104 @@ Include only the header in your application code:
 ```
 
 ---
+
+## Building for the component format
+
+Under `wasm_format: component` the API below is unchanged — same `rx_match_t`,
+`rx_group_t`, caller-owned `_init`/`_next` iterators and group-index constants,
+because the header is produced by the same generator. `main.c` compiles unchanged.
+
+`regexped generate` emits **three** things under this format:
+
+```
+stub.h  stub.c  wit/          <- wit/consumer.wit + wit/deps/<pkg>/matcher.wit
+```
+
+There are **two routes** to a component, differing only in when the wrapping
+happens and therefore in which tools you need. Both produce the same artefact.
+
+### Route 1 — wasip1, wrap after linking
+
+```sh
+regexped compile
+regexped generate
+clang --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry -o core.wasm main.c stub.c
+wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
+wasm-tools component new embedded.wasm -o guest.wasm
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
+```
+
+The two `wasm-tools` lines wrap YOUR code and are yours to run — regexped never
+sees it, and only this route needs them (route 2 below emits a component
+directly). The last line is the same `regexped merge` a module build runs: it
+dispatches on `wasm_format` and shells out to `wac` here, so `wac` never has to
+be typed. See [component.md](component.md#why-the-wasip1-target-needs-two-extra-commands).
+
+Needs `wasm-tools` (yours) and `wac` (regexped's, resolved as config `wac:` →
+`$WAC` → `$PATH`). Add
+`--adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm` to
+`component new` **if your program uses preview1 WASI imports directly** (`_start`,
+`fd_write`, `args_get`); a component that exports a plain function instead needs no
+adapter. The adapter ships in the `wasi-preview1-component-adapter-provider` crate.
+
+Note `component embed` takes the `wit` **directory**, not one file — that is how it
+resolves `deps/`.
+
+### Route 2 — wasip2, wrap at link time
+
+```sh
+wit-bindgen c wit --out-dir wb          # for ONE file: the component-type object
+clang --target=wasm32-wasip2 -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry \
+      -o guest.wasm main.c stub.c wb/*_component_type.o
+regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
+```
+
+Fewer steps: clang wraps into a component itself, so there is no `embed`, no
+`component new` and no adapter flag — `wasm-component-ld` bundles the adapter.
+Needs `wit-bindgen` and `wasm-component-ld` (rustup ships the latter inside the
+toolchain rather than on PATH).
+
+Discard wit-bindgen's `.c` and `.h`: only the object is linked, and the bindings
+come from regexped's stub. The object exists because this route needs the
+component-type metadata *in the objects before the linker runs*, which regexped
+cannot emit — that is the whole reason route 1 exists.
+
+The generated stub is byte-identical between the two routes. Nothing in regexped's
+output chooses one; your build does.
+
+`examples/wasmtime/c/url-parts` implements all three builds — module, route 1 and
+route 2 — from one unchanged `main.c`.
+
+### `cabi_realloc` and its heap
+
+When a pattern exports groups, the stub also defines `cabi_realloc`. The canonical
+ABI allocates a returned `list` in *your* component's memory, so something must
+provide it.
+
+Three things to know about the one you get:
+
+- it is the **whole component's** allocator, not the stub's private scratch — the
+  wasip1 adapter calls it too. The generated wrappers therefore save and restore a
+  bump mark around their own call instead of resetting it;
+- its size is `REGEXPED_CABI_HEAP_BYTES`, **256 KB** by default, chosen by
+  measurement because the adapter's stack takes the bulk of it. Define it smaller
+  for a component that pulls in no adapter;
+- it is **weak**, so your own `cabi_realloc` wins if you have one.
+
+It traps rather than overruns, so too small a heap fails loudly.
+
+### The consumer world needs your exports
+
+`wit/consumer.wit` arrives with the import declared and nothing exported:
+
+```wit
+world <name>-consumer {
+    import regexped:<pkg>/matcher;
+}
+```
+
+Add your own exports to it. A component with no exports can be composed but not
+run.
 
 ## Shared types
 
@@ -131,6 +234,7 @@ int <func>_next(rx_<func>_iter_t *iter, rx_group_t out_groups[static <FUNC_UPPER
 | `1` | a match was written |
 | `0` | the scan is finished |
 | `RX_ERR_BT_OVERFLOW` | the engine gave up; what remains is **unknown** |
+| `RX_ERR_MALFORMED_CACHE` | the overlapping answer cache's header is malformed; the scan is **unfinished** |
 
 The status is the return value rather than something written into `out_groups`, so `0` stays unambiguously "finished".
 
@@ -221,6 +325,7 @@ typedef struct {
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
 int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
+void <find>_free(rx_<set>_scanner_t *s);   /* a no-op here; see below */
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
@@ -233,7 +338,25 @@ if (<find>_init(&s, input, len, 0) != 0) { /* RX_ERR_* */ }
 for (int n; (n = <find>(&s, buf, <SET>_PATTERN_COUNT)) > 0; )
     for (int i = 0; i < n; i++)
         printf("%d %td..%td\n", buf[i].pattern_id, buf[i].start, buf[i].end);
+<find>_free(&s);
 ```
+
+Under `wasm_format: component` every one of these declarations is the same — the
+header comes from the same generator — and the bodies change: the `_all` pair
+receives a ready-made list of ids rather than scanning a bitmask, and the scanner
+holds a handle to a scan living inside the regexp component. See
+[component.md](component.md#sets).
+
+**`<find>_free` is mandatory in the component format, and here it depends.** On
+an `overlapping: true` set built with a sysroot the scanner OWNS a heap region
+and abandoning one leaks it; otherwise this scanner is caller-owned, by value,
+and holds only a borrowed input pointer and the gate array inline, so abandoning
+it leaks nothing. Call it either way. Under `wasm_format:
+component` the scan's state lives inside the regexp component behind a handle,
+and dropping that handle is what releases it — so the call is required there.
+It is emitted in both formats, and calling it costs nothing here, so the same
+source compiles and behaves correctly against either. Safe to call twice, and on
+a scanner that already finished.
 
 **`find` is fill-and-count, not an iterator.** C has no iterator protocol, and
 the raw ABI already fills a buffer and returns a count — which is also the C
@@ -309,7 +432,9 @@ surface.
 - The `#define <FUNC_UPPER>_GROUPS` constant gives the total number of groups
   including group 0 (full match). Use it to size loops or slot arrays.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
-  for embedded WASM environments.
+  for embedded WASM environments. The one exception is an `overlapping: true`
+  set's answer cache, which is enabled only when `<stdlib.h>` is available and
+  declined otherwise.
 - The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for C: it's effective for the JS and TS generators only. Setting it does not change the generated header or its performance.
 
 ---
@@ -333,3 +458,57 @@ C has no unwinding, so the sentinel is returned to the caller instead. The heade
 Check for it wherever you currently check for `-1`: a plain `< 0` test silently treats overflow as "no match", which is the exact failure the sentinel exists to prevent. The iterators make that harder to get wrong — a `while (… == 1)` loop leaves the failing status in the variable for you to test afterwards.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+## The overlapping answer cache
+
+An `overlapping: true` set reports every start position, so a pattern whose
+automaton never dies walks to the end of the input from each one and the drive
+is quadratic. The engine can avoid that given a scratch region, and on every
+other language's stub it simply takes one.
+
+C is different, because it is the only target whose allocator lives outside the
+toolchain's own output: Rust, Go and AssemblyScript ship runtimes that allocate
+and JavaScript has an engine, while a freestanding `wasm32` build of this header
+has nothing. So the feature is DETECTED rather than demanded:
+
+```c
+#if __has_include(<stdlib.h>)   /* what the generated header tests */
+```
+
+| your build | behaviour |
+|---|---|
+| with a sysroot (`wasi-sdk`, a host compiler) | `<find>_init` reserves the cache, an overlapping drive is **linear**, and `<find>_free` releases it |
+| freestanding (`-nostdlib`, no sysroot) | no cache, the drive **walks** — same answers, quadratic |
+
+Define `RX_SET_CACHE` yourself to force it either way.
+
+**A `-nostdlib` build must pass `-DRX_SET_CACHE=0`.** The preprocessor cannot see
+link flags. `-nostdlib` removes libc from the *link*, not `<stdlib.h>` from the
+include path, and a wasi-sdk clang — the only one carrying a `wasm32-wasi`
+sysroot — always finds that header. So `__has_include` says yes, the stub
+references `malloc` and `free`, and the link fails on undefined symbols. The
+define is what tells it what the link flags already decided; every `-nostdlib`
+command line in this document carries it.
+
+**Your build decides this, not your source.** The same file, compiled two ways,
+gives identical answers at different speeds. If an overlapping scan is slower
+than you expect, check which of the two you got.
+
+Re-initialising a scanner frees what it held and starts again, so
+"re-initialising restarts a scan" holds whether or not a cache is in play. A
+second `<find>_free` is a no-op.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated code cannot produce it. `init` sizes the region and writes the
+stride from one formula, so seeing this means the descriptor was built by hand,
+or one region was shared between two scanners.
+
+`_next` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`). Test the status EXACTLY:
+a plain `< 0` check reports "unknown" as a confident "no".

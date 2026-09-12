@@ -97,6 +97,7 @@ func TestSparseGatedBatchDeliversEveryPattern(t *testing.T) {
 				for i := 0; i < n*4; i++ {
 					d[int(gatePtr)+i] = 0
 				}
+				scratchPtr := writeFindScratch(store, mem, gatePtr, int32(n), 0, 0)
 				seen := map[int]int{}
 				total := 0
 				cursor := int64(0)
@@ -105,7 +106,7 @@ func TestSparseGatedBatchDeliversEveryPattern(t *testing.T) {
 					if calls > maxCalls {
 						t.Fatalf("cap=%d: batch did not terminate after %d calls", outCap, calls)
 					}
-					res, err := fn.Call(store, inBase, int32(0), cursor, gatePtr, outPtr, outCap, int32(0), int32(0))
+					res, err := fn.Call(store, inBase, int32(0), cursor, scratchPtr, outPtr, outCap)
 					if err != nil {
 						t.Fatalf("cap=%d: %v", outCap, err)
 					}

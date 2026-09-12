@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // tsStub generates a TypeScript ES module stub file for all regexp entries in cfg.
@@ -203,9 +204,12 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		// Standalone layout: tuples (12 x pattern count), gate array
 		// (4 x ID SPACE), >64-pattern bitmap (ceil(idSpace/8)). The two counts
 		// differ for a named-subset set.
-		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
+		// … then the SCRATCH DESCRIPTOR the find exports take in place of a
+		// bare gate pointer (internal/abi).
+		reserve := 12*n + 4*idN + scratchDescriptorBytes + bitmapBytes(s, cfg)
 		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
-		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
+		scratchBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
+		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s + %d", konst, idKonst, scratchDescriptorBytes)
 
 		// Argument ORDER comes from the R12 descriptor, not from the templates
 		// below — the one place the compiler's ABI is written down
@@ -214,7 +218,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		caps := setCapabilities(s, cfg)
 		spell := jsArgSpelling{
 			inPtr: "_inBase", inLen: "len", from: "from",
-			gate: gateBase, bitmap: "bitmapBase",
+			gate: "scratchBase", bitmap: "bitmapBase",
 			tuple: "_outBase", outCap: konst, cursor: "cursor",
 		}
 		args := func(kind string) string { return spellJSArgs(capByKind(caps, kind), spell) }
@@ -324,19 +328,31 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		}
 		if s.Find != "" {
 			// Every set with `find` owns a gate array, overlapping included
-			//, so this is unconditional.
+			//, so this is unconditional — and so is the ANSWER CACHE, which
+			// the plain find reads exactly as the batch entry does. Building
+			// it only under the batching hint left this generator and the JS
+			// one the two whose plain overlapping find stayed quadratic.
+			plainGateRegion := jsFindGateRegion(s, cfg, idN)
+			plainCachePre, plainCacheReserve, plainCachePost, plainCacheArgs :=
+				tsOverlapCacheBlock(s, cfg, plainGateRegion)
+			// Sized from the SAME span the cache offset is taken from,
+			// alignment padding included.
+			findReserve := 12*n + plainGateRegion
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
-`, gateBase, idKonst)
-			gateArg := "gateBase, "
+`, gateBase, idKonst) + plainCachePost + fmt.Sprintf(`    // The scratch descriptor: magic, the gate pointer, and the cache.
+    const scratchBase = %s;
+    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+`, scratchBase, abi.FindScratchMagic, plainCacheArgs)
+			gateArg := "scratchBase, "
 			if !s.BatchFind() {
 				// Without the hint there is no batchSize parameter at all, so
 				// TypeScript rejects find(input, 0, 64) at build time and no
 				// runtime check is needed.
 				fmt.Fprintf(&out, `export function* %s(input: string | Uint8Array, offset: number = 0): Generator<SetMatch> {
-    // The region is this iterator's own for its whole lifetime, so another
+%s    // The region is this iterator's own for its whole lifetime, so another
     // stub call cannot land on its input, its tuple buffer or its gates.
-    const [_inBase, _outBase, len] = _open(input, %d);
+    const [_inBase, _outBase, len] = _open(input, %d%s);
     try {
 %s    let pos = offset;
     // Hoisted rather than rebuilt per position, which allocated one typed
@@ -347,6 +363,9 @@ func genTSSetSection(cfg config.BuildConfig) string {
         const n = (_exp['%s'] as Function)(%s) as number;
         // Before the "scan finished" test: -2 is the engine abandoning the
         // search, so ending the generator here would report success.
+        if (n === %d) throw new Error("%s");
+        // -4 says the same thing about the overlapping answer cache: its
+        // header contradicts itself, so the drive is not finished.
         if (n === %d) throw new Error("%s");
         if (n <= 0) break;
         buf = _att(buf, Int32Array, _outBase, 3*%s);
@@ -362,12 +381,13 @@ func genTSSetSection(cfg config.BuildConfig) string {
     }
     } finally { _close(); }
 }
-`, s.Find, reserve, gateSetup, konst, s.Find,
+`, s.Find, plainCachePre, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
-						gate: gateBase, tuple: "_outBase", outCap: konst,
+						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
-					btOverflow, btOverflowMsg(s.Find), konst, konst)
+					btOverflow, btOverflowMsg(s.Find),
+					malformedCache, malformedCacheMsg(s.Find), konst, konst)
 			} else {
 				// The BATCH entry's argument order stays spelled out here:
 				// setCapabilities describes the five DECLARED capabilities,
@@ -375,6 +395,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// descriptor entry to derive from. Its
 				// signature is pinned instead by
 				// compile/set_emit.go's setTypeBatchGated and the goldens.
+				batchScratchBase := fmt.Sprintf("gateBase + 4*%s", idKonst)
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
@@ -395,24 +416,14 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// read through a Uint32Array, and a typed-array view whose
 				// byte offset is not a multiple of its element size THROWS, so
 				// the gap is rounded up to the same 8 _align uses.
-				batchGateRegion := 4*idN + bitmapBytes(s, cfg)
-				cachePre, cacheReserve, cachePost, cacheArgs := "", "", "", "0, 0"
-				if s.Overlapping {
-					batchGateRegion = (batchGateRegion + 7) &^ 7
-					cachePre = fmt.Sprintf(`    // Twelve bytes per tuple, and the worst case really is one tuple per
-    // pattern per start: a pattern that never dies matches from nearly
-    // every position, which is the case this exists for. Past the ceiling
-    // the engine is offered nothing and walks position by position, which
-    // is what it did before this existed.
-    const cacheNeeded = %d + (_inCap(input) + 1) * %s * 12;
-    const cacheBytes = cacheNeeded <= %d ? cacheNeeded : 0;
-`, config.SetOverlapCacheHeaderBytes, konst, config.SetOverlapCacheMaxBytes)
-					cacheReserve = " + cacheBytes"
-					cachePost = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
-    if (cacheBase !== 0) new Uint32Array(_mem.buffer, cacheBase, %d).fill(0);
-`, batchGateRegion, config.SetOverlapCacheHeaderBytes/4)
-					cacheArgs = "cacheBase, cacheBytes"
-				}
+				batchGateRegion := jsFindGateRegion(s, cfg, idN)
+				cachePre, cacheReserve, cachePost, cacheArgs := tsOverlapCacheBlock(s, cfg, batchGateRegion)
+				// Written last: the descriptor carries the cache pointer, which
+				// the block above may have declined.
+				cachePost += fmt.Sprintf(`    const scratchBase = %s;
+    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+`, batchScratchBase, abi.FindScratchMagic, cacheArgs)
+				cacheArgs = ""
 				fmt.Fprintf(&out, `// batchSize is how many tuples one WASM call may fill: 1 is a call per
 // matching position, larger values amortise the host crossing over a
 // bufferful. The matches and their order are identical either way — the only
@@ -428,7 +439,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
     // re-attached by _att when an interleaved call grows memory.
     let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
-        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize, %s) as bigint;
+        const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize) as bigint;%s
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.
@@ -437,6 +448,9 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
         // packed cursor has no spare value of its own, and a done cursor
         // already has bit 63 set. It must be read before the done test —
         // it means the scan's result is unknown, not that it finished.
+        if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
+        // The second reserved word says the answer cache's header is
+        // malformed, and is read in the same place for the same reason.
         if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
@@ -455,7 +469,8 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 					camelSet(s.Name)+"BatchMaxSize", cachePre, batchGateRegion, cacheReserve,
 					batchGateSetup, cachePost,
 					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
-					config.SetCursorOverflowPos, btOverflowMsg(s.Find))
+					config.SetCursorOverflowPos, btOverflowMsg(s.Find),
+					config.SetCursorMalformedPos, malformedCacheMsg(s.Find))
 			}
 		}
 		out.WriteString("\n")
@@ -683,4 +698,15 @@ export const %s = {
 	}
 	out.WriteString("} as const;\n\n")
 	return out.String()
+}
+
+// tsOverlapCacheBlock is jsOverlapCacheBlock with TypeScript's one annotation.
+//
+// The two generators are near-copies by design, and this is the one line that
+// differs: `let _k: number`, which TypeScript needs because the variable is
+// assigned in both arms of a branch rather than initialised.
+func tsOverlapCacheBlock(s config.SetConfig, cfg config.BuildConfig, gateRegion int) (pre, reserve, post, args string) {
+	pre, reserve, post, args = jsOverlapCacheBlock(s, cfg, gateRegion)
+	pre = strings.Replace(pre, "    let _k;\n", "    let _k: number;\n", 1)
+	return pre, reserve, post, args
 }

@@ -5,6 +5,8 @@ functions and re-exports them with a higher-level interface. Because AssemblyScr
 compiles to WASM itself, the stubs are merged with the regexp modules via
 `wasm-merge` into a single final `.wasm` binary.
 
+> **Component format:** AssemblyScript is **not** a component target. `stub_type: as` under `wasm_format: component` is refused permanently, not "yet" — there is no planned route. These stubs are for `wasm_format: module`. See [component.md](component.md).
+
 ## Requirements
 
 - [AssemblyScript](https://www.assemblyscript.org/) 0.27 or later
@@ -273,3 +275,18 @@ member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
 `-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated code cannot produce it. `init` sizes the region and writes the
+stride from one formula, so seeing this means the descriptor was built by hand,
+or one region was shared between two scanners.
+
+`err()` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`) beside
+`RX_ERR_BT_OVERFLOW`; AssemblyScript cannot throw, so check it after the loop.

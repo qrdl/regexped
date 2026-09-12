@@ -1,0 +1,20 @@
+# Capability shape: `overlapping: true` over LITERAL-LESS patterns, which is
+# what puts a sweep in the module.
+#
+# set_overlap beside this one is eight literals: they pack into literal buckets,
+# `overlapDPBucket()` is -1, and the module contains no pass body, no block
+# body, no projection table and no successor scratch. So none of the
+# checkpointed cache was pinned by anything — "only set_batch moved" proved
+# nothing about the half of this work that lives in those two bodies.
+regexps:
+  - name: p0
+    pattern: '[a-z]+'
+  - name: p1
+    pattern: '[0-9]+'
+  - name: p2
+    pattern: '[A-Z]+'
+sets:
+  - name: s
+    find: s_find
+    overlapping: true
+    patterns: all

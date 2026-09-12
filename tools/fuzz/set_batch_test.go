@@ -89,6 +89,9 @@ type batchRunner struct {
 	outPtr   int32
 	cachePtr int32
 	cacheLen int32
+	// The checkpointed cache's stride, which the CALLER writes because the
+	// caller is what sized the region from it.
+	cacheStride int32
 }
 
 func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool) *batchRunner {
@@ -130,7 +133,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 	// asks. Sized at the sweep's own worst case so "too small" is never the
 	// reason a drive declines — that path has its own test.
 	cachePtr := outPtr + pageSize
-	cacheLen := int32(config.SetOverlapCacheBytes(len(input), len(pats)))
+	cacheLen, cacheStride := overlapCacheFor(input, pats)
 	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -146,7 +149,7 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 		store: store, inst: inst, mem: mem, release: release, fn: fn,
 		pats: pats, input: input,
 		inBase: inBase, gatePtr: gatePtr, outPtr: outPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 	}
 }
 
@@ -167,10 +170,14 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 	passCache, passCacheLen := int32(0), int32(0)
 	if withCache {
 		passCache, passCacheLen = r.cachePtr, r.cacheLen
-		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
+		for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
 			buf[passCache+i] = 0
 		}
 	}
+	// The scratch descriptor the export takes in place of the bare gate
+	// pointer: it carries the gate array AND the cache, so it is written after
+	// the cache has been decided (internal/abi).
+	scratchPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passCache, passCacheLen, r.cacheStride)
 	runtime.KeepAlive(store)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
@@ -191,7 +198,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 		// overlapping entry records no match gates but takes the array as the
 		// per-drive home of its preflight verdict.
 		res, err := fn.Call(store, inBase, int32(len(input)), cursor,
-			gatePtr, outPtr, outCap, passCache, passCacheLen)
+			scratchPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}
@@ -443,7 +450,8 @@ func TestFindBatchZeroCap(t *testing.T) {
 
 			// The `from` of the very first call is 0, which is also a legal
 			// resume position — the value the pre-fix body handed back.
-			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0), int32(0), int32(0))
+			desc := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), desc, outPtr, int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}

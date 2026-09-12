@@ -98,6 +98,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 	for i := int32(0); i < pageSize; i++ {
 		mem.UnsafeData(store)[gatePtr+i] = 0
 	}
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
 	}
@@ -113,7 +114,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 			t.Fatalf("%v on %q cap=%d: batch did not terminate after %d calls",
 				pats, input, outCap, calls)
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, int32(0), int32(0))
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, scratchPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,11 +16,49 @@ import (
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
 	WasmMerge    string `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
+	WasmTools    string `yaml:"wasm_tools"`    // optional; defaults to $WASM_TOOLS, then "wasm-tools" in $PATH (used by wasm_format: component)
+	Wac          string `yaml:"wac"`           // optional; defaults to $WAC, then "wac" in $PATH (the merge tool for wasm_format: component)
 	Output       string `yaml:"output"`        // output path for merge command; overridable with -o
 	WasmFile     string `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
 	ImportModule string `yaml:"import_module"` // WASM import module name used by wasm-merge and Rust FFI
 	StubFile     string `yaml:"stub_file"`     // stub output file (Rust, Go, JS, TS, AS, or C)
 	StubType     string `yaml:"stub_type"`     // stub type: "rust", "go", "js", "ts", "c", "as"; inferred from stub_file extension if absent
+
+	// WasmFormat selects the OUTPUT KIND: "module" (default, today's core WASM
+	// module, unchanged bytes) or "component" (a Component Model component with
+	// a WIT interface). Empty means "module". It is a config key rather than a
+	// CLI flag because `generate` has to make the same choice as `compile`; a
+	// flag would let the two diverge.
+	WasmFormat string `yaml:"wasm_format"`
+
+	// ImportModule above is the WASM import-module name — a WIRE string, which
+	// WASM lets be almost any UTF-8. The keys below are the SOURCE IDENTIFIER
+	// roles it used to serve alone, split out because their rules conflict: WIT
+	// demands hyphens where Rust and Go forbid them, `url_ipv6` is a fine WASM
+	// name and a lint-flagged Go package, and `import_module: match` was a hard
+	// error purely because it became `pub mod match`.
+	//
+	// All are OPTIONAL and fall back to ImportModule, so a config that sets
+	// none of them behaves exactly as it always has.
+	RustModule string `yaml:"rust_module"` // Rust `pub mod` name; default ImportModule
+	GoPackage  string `yaml:"go_package"`  // Go `package` name; default ImportModule
+
+	// WitPackage names the WIT package (component only); default
+	// kebab(ImportModule). WitWorld names the WORLD, falling back to
+	// WitPackage — it gets its own key because it is the one name here that no
+	// ABI depends on: it is absent from every export name and only names the
+	// consumer's generated bindings, so changing it is always safe, while
+	// changing the package renames every export.
+	WitPackage string `yaml:"wit_package"`
+	WitWorld   string `yaml:"wit_world"`
+
+	// WitVersion is the OPTIONAL interface version. UNSET MEANS NO VERSION:
+	// the package is `package regexped:<name>;` and exports are
+	// `…/matcher#<func>`. Set, it is appended as `@<value>` to the package and
+	// therefore to every canonical export name — so adding, removing or
+	// changing it renames every export and breaks that user's consumers. One
+	// time, opt-in, and loud.
+	WitVersion string `yaml:"wit_version"`
 
 	// Namespace prefixes the symbols a stub generates that are NOT named by
 	// the user — Span, SetMatch, the error type, the pattern-name helper, C's
@@ -351,35 +390,19 @@ func SetCursorMaxCount(patternCount int) int32 {
 // tables inside a 4 GiB wasm32 memory.
 const SetCursorOverflowPos = 0xFFFFFFFE
 
-// SetOverlapCacheHeaderBytes is the size of the header at the front of the
-// answer cache an `overlapping: true` batching `find` may be handed.
+// SetCursorMalformedPos is the resume-position word reserved to mean "the
+// overlapping answer cache's header contradicted itself, and this scan's
+// result is UNKNOWN". Its count field is zero and no tuples were written.
 //
-// It lives here, beside the cursor layout, for the same reason that does: it
-// is an ABI fact the compiler and every stub generator must agree on
-// independently, and two spellings of it would drift. The compiler's own
-// field offsets are checked against it.
+// It is the second reserved position word, for the same reason the first one
+// exists: the count half is countBits wide and every decoder MASKS it, so a
+// negative packed into it reads back as a large positive tuple count. A
+// decoder must test both reserved words BEFORE the 0xFFFFFFFF done test, since
+// all three have the high bit set.
 //
-// The caller zeroes the header to start a drive, exactly as it zeroes the gate
-// array, so a zero "ready" slot IS "this drive has not swept yet" and no magic
-// value is needed. The TUPLE AREA needs no zeroing: it is written before it is
-// read, and it is read only once "ready" says so.
-const SetOverlapCacheHeaderBytes = 16
-
-// SetOverlapCacheBytes is the cache size a drive over an input of inputLen
-// bytes wants, for a set of patternCount patterns.
-//
-// Twelve bytes per tuple, and the worst case is one tuple per pattern per
-// START POSITION. That is not pessimism: a pattern whose automaton never dies
-// matches from nearly every start, which is the very shape the cache exists
-// for.
-//
-// Offering LESS is legal and is not an error. The sweep refuses a region it
-// cannot fill and the drive falls back to walking position by position — the
-// same answer, only slower — which is what lets a stub cap what it will
-// allocate.
-func SetOverlapCacheBytes(inputLen, patternCount int) int {
-	return SetOverlapCacheHeaderBytes + (inputLen+1)*patternCount*12
-}
+// A generated `init` cannot produce this: it writes the stride from the same
+// formula that sized the region. A hand-written caller can.
+const SetCursorMalformedPos = 0xFFFFFFFD
 
 // SetOverlapCacheMaxBytes is the ceiling a GENERATED STUB puts on that
 // allocation before it declines to offer a cache at all.
@@ -759,6 +782,17 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 		}
 	}
+	// wasm_format and the keys that only mean anything under it. Checked here
+	// rather than per-command so that `compile` and `generate` cannot disagree
+	// about the output kind — the reason it is a config key and not a flag.
+	if err := validateFormat(&cfg, warnToStderr); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	if stubType, err := ResolveStubType(cfg); err == nil {
+		if err := validateStubTypeForFormat(&cfg, stubType); err != nil {
+			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+		}
+	}
 
 	return cfg, nil
 }
@@ -790,4 +824,142 @@ func ExpandHome(path string) string {
 		}
 	}
 	return path
+}
+
+// ---------------------------------------------------------------------------
+// The CHECKPOINTED answer cache (plans: §9.2 + §19). One place, because the
+// compiler's sweep VALIDATES what the stubs compute, and six stub languages
+// plus two harnesses each spell it independently — exactly the drift the
+// find_batch cursor layout is kept here to avoid.
+//
+// The region is
+//
+//	hdr + nb*(C + 4) + k*B      nb = ceil(m/k), C = cells*4, B = per-position bytes
+//
+// minimised at k = sqrt(m*C/B), giving ~ 2*sqrt(m*C*B): SQUARE-ROOT in the
+// input where the whole-drive tuple cache is linear in it.
+//
+// `cells` is the sweep's column width — states x patterns today, projected
+// states under §19's lever C — and comes from the compiler, never from the
+// YAML: it falls out of the DFA subset construction. generate/ obtains it by
+// recompiling the set (§9.2 decision 1).
+
+// SetOverlapCheckpointHeaderBytes is the header of the checkpointed cache.
+//
+// Eleven i32 fields is 44; 48 leaves one spare word and keeps the 4-byte
+// alignment set_abi_test asserts. The caller zeroes it to start a drive and
+// then writes the stride, exactly as it zeroes the gate array.
+const SetOverlapCheckpointHeaderBytes = 48
+
+// SetOverlapBlockRowOffsets is the row's shape, stated once: the mask at 0 and
+// pattern k's end four bytes into the row plus 4k.
+//
+// The writer and both readers spelled `4 + k*4` separately, which is the kind
+// of arithmetic that is right in two places and wrong in the third.
+const SetOverlapRowMaskOff = 0
+
+// SetOverlapRowEndOff is the byte offset of pattern k's END within a row.
+func SetOverlapRowEndOff(k int) int { return 4 + 4*k }
+
+// SetOverlapBlockRowBytes is one position's worth of block buffer: a mask word
+// plus one end per pattern.
+//
+// A row is indexed by POSITION, so `id` and `start` are its own coordinates and
+// are not stored — that is the whole of the saving over the tuple form this
+// replaced, and it is why a dead cell may hold garbage: every reader consults
+// the mask first.
+func SetOverlapBlockRowBytes(patterns int) int {
+	return 4 + 4*patterns
+}
+
+// SetOverlapCheckpointStride is the k an init should choose: the one that
+// minimises the region.
+//
+// Computed in float64 on purpose. m*cells reaches 2^43 on a large input and
+// wraps in int32, and every stub language must reproduce this exactly or it
+// allocates a region the sweep's validation rejects.
+func SetOverlapCheckpointStride(inputLen, cells, patterns int) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	// SINGLE-BLOCK MODE, and it is what makes checkpointing free when memory is
+	// not the problem.
+	//
+	// A stride equal to the whole span IS the whole-drive cache: one block, so
+	// the pass sweeps once and materialises it on the way, nothing is ever
+	// re-swept, and serving binary-searches the one block exactly as the
+	// whole-drive form searched the whole region. So the two designs need not
+	// both exist in the module — the second sweep that checkpointing costs is
+	// bought only when the region would otherwise be too large, and below the
+	// budget a drive pays exactly what it paid before any of this.
+	//
+	// The budget is SetOverlapCacheMaxBytes. Above it the stride drops to the
+	// square-root optimum and the region becomes sqrt-sized, which is the whole
+	// point; below it nothing changes but a column's worth of bytes.
+	if n := singleBlockBytes(m, cells, patterns); n > 0 && n <= SetOverlapCacheMaxBytes {
+		return m
+	}
+	c := float64(cells) * 4
+	bb := float64(SetOverlapBlockRowBytes(patterns))
+	k := int(math.Sqrt(float64(m) * c / bb))
+	if k < 16 {
+		k = 16
+	}
+	if k > m {
+		k = m
+	}
+	return k
+}
+
+// singleBlockBytes is the region a one-block (whole-drive) cache needs, or 0
+// when it overflows an int on this platform — which is itself a reason to
+// checkpoint.
+func singleBlockBytes(m, cells, patterns int) int {
+	b := SetOverlapBlockRowBytes(patterns)
+	if b > 0 && m > (1<<62)/b {
+		return 0
+	}
+	n := SetOverlapCheckpointHeaderBytes + (cells*4 + 4) + 4 + m*b
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// SetOverlapCheckpointBytesForStride is the region for a CHOSEN stride.
+//
+// The stride is a continuous knob, not a switch. At the square-root optimum it
+// minimises MEMORY; at the whole span it is one block, which minimises FUEL
+// because no column is ever copied and nothing is re-swept. Everything between
+// trades one for the other, and this is what lets a caller sit anywhere on that
+// curve rather than at one of its ends.
+func SetOverlapCheckpointBytesForStride(inputLen, cells, patterns, k int) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	if k < 1 {
+		k = 1
+	}
+	if k > m {
+		k = m
+	}
+	nb := (m + k - 1) / k
+	return SetOverlapCheckpointHeaderBytes +
+		nb*(cells*4+4) + 4 + k*SetOverlapBlockRowBytes(patterns)
+}
+
+// SetOverlapCheckpointBytes is the region for that stride.
+func SetOverlapCheckpointBytes(inputLen, cells, patterns int) int {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	k := SetOverlapCheckpointStride(inputLen, cells, patterns)
+	nb := (m + k - 1) / k
+	return SetOverlapCheckpointHeaderBytes +
+		nb*(cells*4+4) + // checkpoints, plus one cumulative count each
+		4 + // the final cum[nb] total
+		k*SetOverlapBlockRowBytes(patterns)
 }

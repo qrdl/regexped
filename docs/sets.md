@@ -98,6 +98,22 @@ valid identifier in all six stub languages (see
 >   That is a parameter, not a name.
 > - **`find_any`, `find_all`, `batch_size`** were retired earlier and stay so.
 
+### Sets under `wasm_format: component`
+
+Everything below describes the module format's ABI and stubs. A component build
+supports every capability, with the same generated API in Rust and C — the
+differences are in the interface, not in what you call:
+
+| | module | component |
+|---|---|---|
+| `match_all` / `scan_all` | an i64 bitmask, or a count plus a caller-owned bitmap | `list<u32>` of pattern ids, ascending |
+| `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
+| `<find>_free` in C | a no-op | MANDATORY — it drops the handle |
+| `hints: [batch-find]` | a second entry point | refused at load |
+| `overlapping: true` answer cache | read by both find entries; every generated stub reserves one | reserved by the `find` resource's constructor and freed with the handle |
+
+See [component.md](component.md#sets).
+
 ### What "anchored" means here
 
 `match_any` and `match_all` require **full consumption**: the pattern
@@ -148,7 +164,14 @@ rx_secret_scanner_scanner_t sc;
 if (scan_secrets_init(&sc, input, len, 0) != 0) { /* RX_ERR_* */ }
 for (int n; (n = scan_secrets(&sc, buf, SECRET_SCANNER_PATTERN_COUNT)) > 0; )
     for (int i = 0; i < n; i++) { /* buf[i] */ }
+scan_secrets_free(&sc);
 ```
+
+That last call is a no-op for `wasm_format: module` — the scanner is
+caller-owned and holds nothing that needs releasing — and MANDATORY for
+`wasm_format: component`, where the scan's state lives inside the regexp
+component behind a handle. It is emitted in both, so one source compiles against
+either.
 
 The scanner holds the INPUT as well as the position: the input never changes
 during a scan while the position changes every step, so remembering the
@@ -220,16 +243,36 @@ export function* scan_secrets(input, offset?, batchSize?): Generator<SetMatch>
 `[1, <set>BatchMaxSize]`. The limit is the cursor layout rather than a policy,
 and never binds in practice — 524,287 tuples is a 6 MB buffer.
 
-**On an `overlapping: true` set the JS/TS iterator also reserves an answer
-cache** for the duration of one iteration, and that reservation is large: 12
-bytes per pattern per input byte, so 3 patterns over a 100 KB input is about
-3.6 MB. It is a reservation, not a cost: the sweep described under "Overlap
-policy" runs only when the drive proves expensive, and on the scans where the
-walk is already fast the memory is never touched. What it buys, when it does
-run, is the difference between a linear drive and a quadratic one on
-unbounded-tail patterns. Past 64 MiB the stub reserves nothing and the drive
-walks instead, so the memory is bounded even on very large inputs. Sets without
-`overlapping: true` reserve none of this.
+**On an `overlapping: true` set every generated stub also reserves an answer
+cache** for the duration of one scan:
+
+| patterns | input | region |
+|---|---|---|
+| 3 patterns | 100 KB | 1.6 MiB |
+| 3 patterns | 10 MB | 143 KiB |
+| 32 patterns | 100 KB | 12.9 MiB |
+| 32 patterns | 10 MB | 2.7 MiB |
+
+The region is the SQUARE ROOT of the input length, not a multiple of it,
+because the cache stores periodic column snapshots rather than every match and
+rebuilds one block at a time. Every position is swept at most twice, so the
+drive stays linear. Below a 64 MiB budget the stride covers the whole input,
+which is one block and behaves exactly as storing everything did; above it the
+stride drops and the region shrinks to its square root.
+
+**Your stub does this for you.** It is generated with the sweep column's width
+baked in — that number comes from the compiler, not from your config — and sizes
+and seeds the region at construction. A C consumer is the one exception: the
+header needs no libc, so the cache is enabled only when a sysroot is present,
+and a freestanding build declines it and walks. See
+[wasm.md](wasm.md#the-overlapping-answer-cache) for the arithmetic and the
+header layout if you are driving the raw ABI.
+
+It is a reservation, not a cost: the sweep described under "Overlap policy" runs
+only when the drive proves expensive, and on the scans where the walk is already
+fast the memory is never touched. What it buys, when it does run, is the
+difference between a linear drive and a quadratic one on unbounded-tail
+patterns. Sets without `overlapping: true` reserve none of this.
 
 #### The cursor
 
@@ -272,18 +315,23 @@ unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
 
 Adding `hints: [batch-find]` to an overlapping set removes most of that
-quadratic cost. The batching entry can be handed a scratch region, and it will
+quadratic cost. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
 counting the bytes it has matched, and once that exceeds what a single backward
 sweep would cost it sweeps the rest of the input in one pass and answers the
 remaining calls out of the result. A scan the walk handles cheaply never
-sweeps and costs exactly what it did before.
+sweeps and costs exactly what it did before. `hints: [batch-find]` is not
+required for any of that — the cache is read by the plain `find` too.
 
-The generated JS and TypeScript stubs reserve that region for you and size it
-from the input; the other stubs do not expose the batching entry, and a direct
-WASM caller opts in by passing a region (see "The overlapping answer cache" in
-[wasm.md](wasm.md)). It is optional everywhere, and declining it — or offering
-too little — changes the speed and never the answer.
+EVERY generated stub reserves that region for you and sizes it from the input,
+whether or not the set carries the batching hint; a caller driving the raw ABI
+opts in by passing a region in the scratch descriptor (see "The overlapping
+answer cache" in [wasm.md](wasm.md)). It is optional everywhere, and declining
+it — or offering too little — changes the speed and never the answer.
+
+The one exception is C, which is the only target whose allocator lives outside
+the toolchain's output: the header enables the cache where `<stdlib.h>` exists
+and declines it in a freestanding build. See [c-api.md](c-api.md).
 
 `overlapping` affects `find` and nothing else. On a set without it the key is
 silently ignored — there is no find body for it to select, so it has no
@@ -302,14 +350,22 @@ pattern may match again. That state lives in a **caller-owned array**, not
 inside the module:
 
 ```
-find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
+find(ptr, len, from, scratch_ptr, out_ptr, out_cap) -> i32
 ```
+
+`scratch_ptr` points at a four-word DESCRIPTOR holding a magic word, the gate
+array's address and the overlapping answer cache (or 0). The gate array is
+still the caller's and still zeroed to start a drive; what changed is that its
+address travels inside a descriptor, so the cache has somewhere to travel with
+it. See [wasm.md](wasm.md#the-scratch-descriptor) — and note that a caller
+passing a bare gate pointer now traps immediately rather than reading `gate[0]`
+as an address.
 
 The parameter is present for **every** `find`, `overlapping: true` included —
 see the end of this section for what the overlapping body keeps there instead
 of gates. One signature, whatever the patterns turn out to compile to.
 
-- `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
+- the descriptor's `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
   is indexed by global pattern id, so it is sized from the id space and not
   from the pattern count (see the constants table below).
 - **All zeros means a clean scan.** That is the only operation a caller ever

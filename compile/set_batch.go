@@ -97,30 +97,332 @@ func (cs *compiledSet) workerTypeIdx() int {
 	return setMatchTypeSuffix // (i32 x 7) -> i32
 }
 
-// emitSetFindWrapperBody emits the exported `find` of a batching set: a
-// forwarding call into the shared worker with the batch-only argument zeroed.
+// emitSetFindWrapperBody emits the exported `find` when it is a WRAPPER: a
+// forwarding call into a hidden inner body, with the answer cache read in front
+// of it and the drive's work counter charged behind it.
 //
-// Gated:       find(ptr,len,from,gate,out,cap) -> worker(..., batch_mode = 0)
-// Overlapping: find(ptr,len,from,gate,out,cap) -> worker(..., skip = 0)
+// Two independent reasons put a wrapper here (see findWrapped), and they
+// compose into one body:
 //
-// The two signatures are identical since item 11 gave the overlapping body the
-// gate slot for its preflight verdict; only the trailing argument's meaning
-// differs, and `find` zeroes it either way.
-func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
+//	batching:    find(ptr,len,from,scratch,out,cap) -> worker(..., batch_mode/skip = 0)
+//	cache only:  find(ptr,len,from,scratch,out,cap) -> the ordinary find body
+//
+// The two inner signatures differ by exactly the batch-only trailing argument,
+// which `find` zeroes either way.
+//
+// dpIdx is the backward sweep's function index, or -1 when this set has no
+// answer cache — in which case NOTHING below the forwarding call is emitted and
+// the body is the bare forwarder it has always been.
+//
+// # Serving a call out of the cache
+//
+// The cache holds one ROW per position — a mask of which patterns match there,
+// and one end per pattern — in blocks of `stride` positions, of which exactly
+// one is materialised at a time. So `find`'s answer is found in two steps:
+// which block covers `from` (arithmetic on the floor and the stride, with empty
+// blocks skipped on their cumulative counts without being materialised), then
+// which row (arithmetic again, since a row's address IS its position). Neither
+// step searches. An earlier form packed tuples end to end and bisected them;
+// indexing by position retired the search along with the tuple form.
+//
+// `find` needs no cursor to do this and is given none: `from` IS the position. The transactional rule is the walk's,
+// unchanged — a run longer than out_cap writes nothing and returns the total,
+// so the documented "grow the buffer and retry from the same position" still
+// holds on this path.
+func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte {
 	// SIX parameters, always. findGateSlot() is hasFind() by another name and
 	// this wrapper is only emitted for a set with `find`, so the 5-parameter
 	// branch that used to stand here could not be taken.
 	if !cs.findGateSlot() {
 		panic("compile: the find wrapper was emitted for a set with no gate slot")
 	}
-	const nparams = 6
-	b := []byte{0x00} // no locals
+	const (
+		pInPtr = iota
+		pInLen
+		pFrom
+		// The SCRATCH DESCRIPTOR on entry. With a cache it is overwritten with
+		// the gate pointer below, the same way injectScratchPrologue converts
+		// a non-wrapped body's parameter in place.
+		pScratch
+		pOutPtr
+		pOutCap
+		nparams
+	)
+
+	// The block-buffer geometry the cache path reads: one row per position, a
+	// mask word plus one end per pattern, and the pattern ids the row's set
+	// bits stand for.
+	numPat, ids, rowBytes, sweepCostPerByte := cs.overlapCacheGeometry()
+
+	// Locals only when there is a cache to read, so a set without one emits the
+	// same empty declaration vector — and the same bytes — it always has.
+	a := newLocalAlloc(nparams)
+	var (
+		lCache, lCacheLen, lReady, lWork byte
+		// lRows is how many rows the materialised block holds, lRow the one
+		// being looked at, lDst where the tuple is written and lMask the row's
+		// mask word. They were lTotal/lLo/lMid/lRun — a binary search's names,
+		// kept after lever B replaced the search with arithmetic on the
+		// position, so the code read as if it were still bisecting.
+		lRows, lRow, lDst, lIdx       byte
+		lStart, lSrc, lMask, lN, lTmp byte
+		lJ, lNb                       byte
+		lSweepRet                     byte
+	)
+	if dpIdx >= 0 {
+		lCache, lCacheLen = a.I32(), a.I32()
+		lReady, lWork = a.I32(), a.I32()
+		lRows, lRow, lDst, lIdx = a.I32(), a.I32(), a.I32(), a.I32()
+		lStart, lSrc, lMask, lN, lTmp = a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
+		lJ, lNb = a.I32(), a.I32()
+		lSweepRet = a.I32()
+	}
+
+	var b []byte
+	b = a.EmitDecls(b)
+
+	// The export takes a SCRATCH DESCRIPTOR where the inner body takes a gate
+	// pointer, so the wrapper checks the magic and dereferences — the same two
+	// steps injectScratchPrologue splices into a non-wrapped set's body. The
+	// inner body is left taking a gate, because every one of its callers has
+	// dereferenced.
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
+	b = append(b, 0x47)       // i32.ne
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end
+
+	cache := overlapCacheCtx{
+		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
+		pInPtr: pInPtr, pInLen: pInLen,
+		pCache: lCache, pCacheLen: lCacheLen,
+		lReady: lReady, lWork: lWork, lSweepRet: lSweepRet,
+	}
+
+	if dpIdx >= 0 {
+		b = append(b, 0x20, pScratch)
+		b = append(b, 0x28, 0x02, abi.FindScratchCacheOff)
+		b = append(b, 0x21, lCache)
+		b = append(b, 0x20, pScratch)
+		b = append(b, 0x28, 0x02, abi.FindScratchCacheLenOff)
+		b = append(b, 0x21, lCacheLen)
+		b = append(b, 0x20, pScratch)
+		b = append(b, 0x28, 0x02, abi.FindScratchGateOff)
+		b = append(b, 0x21, pScratch)
+
+		b = cache.emitDefaults(b)
+		b = append(b, 0x20, lCache)
+		b = append(b, 0x45)       // i32.eqz -> no cache offered
+		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x05)       // else: the cache is present
+		b = cache.emitHeaderRead(b)
+		// from = this call's own position. Sweeping only [from, len] is what
+		// lets a drive switch mid-flight: every position below `from` was
+		// delivered by the walk already, so cache index 0 is the first tuple
+		// still owed. `find` has no cursor, so no entry-sweep flag either.
+		b = cache.emitEntrySweep(b, func(b []byte) []byte {
+			return append(b, 0x20, pFrom)
+		})
+
+		b = append(b, 0x20, lReady)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x4A)       // i32.gt_s -> the cache is live
+		b = append(b, 0x04, 0x40) // if
+
+		// The header is CALLER memory and is re-read on every call, so it is
+		// re-checked on every call. Without this a stride zeroed after the
+		// sweep divided by zero, which traps, where the ABI says -4.
+		b = cache.emitValidateHeader(b, lTmp)
+
+		// LOCATE THE BLOCK. The checkpointed cache holds one materialised
+		// block at a time, so a served position is found in two steps: which
+		// block covers it, then where in that block. `find` never spans
+		// blocks — it answers ONE position — but it may have to SKIP blocks
+		// that hold no tuples, and skipping them on their cumulative counts is
+		// what keeps a sparse drive from materialising every block in turn.
+		//
+		// j = (from - floor) / stride, floored at 0: a `from` below the floor
+		// is a caller resuming before the sweep's own start, and block 0 is
+		// the first thing it could be served.
+		b = append(b, 0x20, lCache)
+		b = append(b, 0x28, 0x02, ckptHdrNumBlocks)
+		b = append(b, 0x21, lNb)
+		b = cache.emitLocateBlock(b, pFrom, lJ, lTmp)
+
+		b = append(b, 0x02, 0x40) // block $found
+		b = append(b, 0x02, 0x40) // block $none
+		b = append(b, 0x03, 0x40) // loop  $blocks
+
+		// Out of blocks: the drive is over.
+		b = append(b, 0x20, lJ, 0x20, lNb, 0x4E, 0x0D, 0x01)
+
+		// An EMPTY block is skipped without materialising it, which is the
+		// difference between a sparse drive costing one re-sweep per block and
+		// costing none.
+		b = cache.emitBlockIsEmpty(b, lJ, lTmp)
+		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x20, lJ, 0x41, 0x01, 0x6A, 0x21, lJ)
+		b = append(b, 0x0C, 0x01) // continue $blocks
+		b = append(b, 0x0B)
+
+		b = cache.emitEnsureBlock(b, lJ)
+
+		// SCAN THE BLOCK'S MASK WORDS. Lever B indexes the block by POSITION,
+		// so there is nothing to search for: the row for `from` is arithmetic,
+		// and the next matching position is the next non-zero mask. Runs of
+		// non-matching positions cost one load each, and whole EMPTY BLOCKS are
+		// skipped above without being materialised at all.
+		//
+		// rowsInBlock = min(stride, len - rowBase + 1): the last block is
+		// partial, and reading past it would read another region's bytes.
+		b = append(b, 0x20, lCache)
+		b = append(b, 0x28, 0x02, ckptHdrRowBase)
+		b = append(b, 0x21, lStart)
+		b = append(b, 0x20, pInLen)
+		b = append(b, 0x20, lStart)
+		b = append(b, 0x6B, 0x41, 0x01, 0x6A)
+		b = append(b, 0x21, lRows)
+		b = append(b, 0x20, lCache)
+		b = append(b, 0x28, 0x02, ckptHdrStride)
+		b = append(b, 0x21, lTmp)
+		b = append(b, 0x20, lRows)
+		b = append(b, 0x20, lTmp)
+		b = append(b, 0x20, lRows)
+		b = append(b, 0x20, lTmp)
+		b = append(b, 0x4C) // total <= stride
+		b = append(b, 0x1B) // select -> min
+		b = append(b, 0x21, lRows)
+
+		// r = max(from - rowBase, 0)
+		b = append(b, 0x20, pFrom)
+		b = append(b, 0x20, lStart)
+		b = append(b, 0x6B)
+		b = append(b, 0x22, lRow)
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x4C) // r <= 0
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x00, 0x21, lRow)
+		b = append(b, 0x0B)
+
+		b = append(b, 0x02, 0x40)                                // block $rowFound
+		b = append(b, 0x03, 0x40)                                // loop  $rows
+		b = append(b, 0x20, lRow, 0x20, lRows, 0x4E, 0x0D, 0x01) // past the block
+		b = append(b, 0x20, lCache)
+		b = append(b, 0x28, 0x02, ckptHdrBlockOff)
+		b = append(b, 0x20, lCache, 0x6A)
+		b = append(b, 0x20, lRow, 0x41)
+		b = utils.AppendSLEB128(b, rowBytes)
+		b = append(b, 0x6C, 0x6A)
+		b = append(b, 0x22, lSrc)
+		b = append(b, 0x28, 0x02, 0x00) // the mask
+		b = append(b, 0x22, lMask)
+		b = append(b, 0x0D, 0x01) // non-zero: this position matches
+		b = append(b, 0x20, lRow, 0x41, 0x01, 0x6A, 0x21, lRow)
+		b = append(b, 0x0C, 0x00)
+		b = append(b, 0x0B, 0x0B)
+
+		// The block held nothing at or after `from`: try the next one.
+		b = append(b, 0x20, lRow, 0x20, lRows, 0x48) // r < rows -> we have one
+		b = append(b, 0x0D, 0x02)                    // br $found
+		b = append(b, 0x20, lJ, 0x41, 0x01, 0x6A, 0x21, lJ)
+		b = append(b, 0x0C, 0x00) // continue $blocks
+		b = append(b, 0x0B)       // end loop $blocks
+		b = append(b, 0x0B)       // end block $none
+
+		// Out of blocks: the drive is over, which `find` says with a zero
+		// count exactly as the walk does.
+		b = append(b, 0x41, 0x00)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B) // end block $found
+
+		// lMask holds the mask, lSrc the row, lRow the row index. The position's
+		// total is its popcount, and the transactional rule is the walk's,
+		// unchanged: a position that does not fit writes NOTHING and reports
+		// its total, so out_cap = 0 is still a size probe.
+		b = append(b, 0x20, lMask, 0x69) // i32.popcnt
+		b = append(b, 0x21, lN)
+		b = append(b, 0x20, lN, 0x20, pOutCap, 0x4A) // n > cap
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, lN)
+		b = append(b, 0x0F)
+		b = append(b, 0x0B)
+
+		// Materialise the tuples into the caller's buffer, unrolled over the
+		// patterns so every id is a constant and every end a static offset.
+		b = append(b, 0x20, lStart, 0x20, lRow, 0x6A, 0x21, lStart) // the position
+		b = append(b, 0x41, 0x00, 0x21, lIdx)
+		for k := 0; k < numPat; k++ {
+			b = append(b, 0x20, lMask, 0x41)
+			b = utils.AppendSLEB128(b, int32(1)<<uint(k))
+			b = append(b, 0x71)       // i32.and
+			b = append(b, 0x04, 0x40) // if this pattern matched here
+			b = append(b, 0x20, pOutPtr)
+			b = append(b, 0x20, lIdx, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+			b = append(b, 0x22, lDst)
+			b = cache.emitStoreTuple(b, k, ids[k], lDst, lSrc, func(b []byte) []byte {
+				return append(b, 0x20, lStart)
+			})
+			b = append(b, 0x20, lIdx, 0x41, 0x01, 0x6A, 0x21, lIdx)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x20, lN)
+		b = append(b, 0x0F) // return
+
+		b = append(b, 0x0B) // end if the cache is live
+		b = append(b, 0x0B) // end if/else the cache is present
+	}
+
+	// The walk.
 	for i := 0; i < nparams; i++ {
+		if i == pScratch {
+			b = append(b, 0x20, pScratch)
+			if dpIdx < 0 {
+				// No cache block ran, so the parameter is still the descriptor.
+				b = append(b, 0x28, 0x02, abi.FindScratchGateOff)
+			}
+			continue
+		}
 		b = append(b, 0x20, byte(i))
 	}
-	b = append(b, 0x41, 0x00) // the trailing argument: batch_mode / skip = 0
+	if cs.batchFind {
+		// The worker's trailing argument: batch_mode when gated, the batch
+		// skip when not. `find` zeroes it either way. A set wrapped only for
+		// the cache calls the ordinary find body, which has no such parameter.
+		b = append(b, 0x41, 0x00)
+	}
 	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(workerIdx))
+	b = utils.AppendULEB128(b, uint32(innerIdx))
+
+	if dpIdx >= 0 {
+		// Charge the drive for what the walk just delivered, so the trigger can
+		// fire on a later call. ready == 0 is "a cache exists and has not swept
+		// yet" — it is -1 when none was offered or the sweep refused one, and
+		// the live case returned above — which is what makes "offer nothing,
+		// pay nothing" true rather than nearly true.
+		//
+		// Only tuples actually WRITTEN are charged: a count over out_cap is the
+		// transactional overflow, which wrote none, and a Backtracking bucket
+		// answers with a negative sentinel instead of a count.
+		b = append(b, 0x21, lN)
+		b = append(b, 0x20, lReady)
+		b = append(b, 0x45)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, lN, 0x41, 0x00, 0x4A)
+		b = append(b, 0x20, lN, 0x20, pOutCap, 0x4C)
+		b = append(b, 0x71) // i32.and
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x41, 0x00, 0x21, lIdx)
+		b = cache.emitAccumulateWork(b, pOutPtr, lIdx, lN, lTmp)
+		b = cache.emitStoreWork(b)
+		b = append(b, 0x0B) // end if anything was written
+		b = append(b, 0x0B) // end if ready == 0
+		b = append(b, 0x20, lN)
+	}
+
 	b = append(b, 0x0B)
 	body := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(body, b...)
@@ -128,17 +430,471 @@ func emitSetFindWrapperBody(cs *compiledSet, workerIdx int) []byte {
 
 // emitSetFindBatchBody emits the exported find_batch loop.
 //
-// Signature, both flavours: (ptr, len, cursor i64, gate_ptr, out_ptr, out_cap,
-// scratch_ptr, scratch_len) -> i64 — EIGHT parameters. The scratch pair is on
-// both flavours (only the overlapping sweep reads it), and listing six here
-// was simply out of date.
+// Signature, both flavours: (ptr, len, cursor i64, scratch_ptr, out_ptr,
+// out_cap) -> i64 — SIX parameters. The answer cache used to arrive as a
+// trailing pair; it arrives in the SCRATCH DESCRIPTOR instead, which is where
+// the gate pointer comes from too — one description of the caller's scratch
+// rather than two.
 //
 // The overlapping form records no match gates; its array carries the
 // once-per-drive preflight verdict.
 //
 // workerIdx is the function index of the per-position worker emitted by
 // emitSetBatchPosBody.
-func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
+// batchCacheLocals is the frame emitBatchCacheServe reads. A struct because the
+// block needs twenty-five of them and a positional list that long is a
+// transposition waiting to happen — every one is a byte.
+type batchCacheLocals struct {
+	// lResumePos is the POSITION the cursor resumes at and lCacheRows how many
+	// rows the materialised block holds. They were lIdx and lCacheTotal — an
+	// index and a total, from when the block held tuples and both were counts.
+	lReady, lResumePos, lCacheRows, lCacheNb, lCacheJ, lCacheRow byte
+	lCacheFloor, lCacheNext, lCacheStride, lCacheOrd             byte
+	lCacheSkip, lCacheMask, lCacheDone, lCacheDel                byte
+	lCacheSweepRet, lSrc, lWork, lWorkIdx, lWorkTmp              byte
+	lStart, lDeliver, lCap, lTuple, lPos, lCount                 byte
+}
+
+// emitBatchCacheServe is the CACHE half of the batching entry: the trigger, the
+// entry sweep, and serving a bounded slice of rows out of one materialised
+// block. It returns from the function on every path that answers; falling
+// through means "no cache to read", and the walk below takes over.
+//
+// Split from the walk because the two are different machines that happen to
+// share an export — one reads a region the sweep filled, the other steps the
+// automaton — and the body was six hundred lines of them interleaved.
+func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x batchCacheLocals,
+	pCursor, pScratch, pOutPtr, pInLen byte, ids []int, numPat, countBits int, kMask int32, rowBytes int32,
+) []byte {
+	b = cache.emitDefaults(b)
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x45)       // i32.eqz -> no scratch offered
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x05)       // else: scratch is present
+	b = cache.emitHeaderRead(b)
+
+	// from = the resume position. Sweeping only [from, len] is what lets a
+	// drive switch mid-flight: the walk has already delivered everything
+	// below it, so cache index 0 is the first tuple still owed.
+	//
+	// Unreachable today: every walk-path return leaves work <= threshold or
+	// ready != 0, so an entry with work over the line and ready == 0 cannot
+	// happen. Emitted anyway, because the rule belongs to the drive rather
+	// than to whichever entry the caller used, and because the mid-flight
+	// sweep below is what a pure batching drive actually crosses on.
+	b = cache.emitEntrySweep(b, func(b []byte) []byte {
+		return append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
+	})
+
+	b = append(b, 0x20, x.lReady)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x4A) // i32.gt_s -> the cache is live
+	b = append(b, 0x04, 0x40)
+
+	// Re-checked on every call, for the reason `find`'s copy gives.
+	b = cache.emitValidateHeader(b, x.lCacheOrd)
+
+	// THE CURSOR STAYS IN POSITION FORM on this path — the same form the
+	// walk uses — which is what lever B buys besides the bytes. The tuple
+	// INDEX form existed only because the old block held tuples packed end
+	// to end, so a resume point had to be an ordinal into them; rows are
+	// indexed by position, so the walk's own (pos, skip) pair addresses
+	// them directly. That retires the two-way decode, and with it the
+	// entry-swept flag that existed to tell the two apart.
+	b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
+	b = append(b, 0x21, x.lResumePos) // the POSITION to resume at
+	b = append(b, 0x20, pCursor, 0xA7, 0x41)
+	b = utils.AppendSLEB128(b, int32(countBits))
+	b = append(b, 0x76, 0x41)
+	b = utils.AppendSLEB128(b, kMask)
+	b = append(b, 0x71, 0x21, x.lCacheSkip) // tuples already taken at it
+
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, ckptHdrNumBlocks)
+	b = append(b, 0x21, x.lCacheNb)
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, ckptHdrFloor)
+	b = append(b, 0x21, x.lCacheFloor)
+
+	// Which block holds that position.
+	b = cache.emitLocateBlock(b, x.lResumePos, x.lCacheJ, x.lCacheFloor)
+
+	b = append(b, 0x41, 0x00, 0x21, x.lDeliver)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheDone)
+
+	b = append(b, 0x02, 0x40) // block $batchDone
+	b = append(b, 0x03, 0x40) // loop  $batchBlocks
+	// Out of blocks is the DRIVE finishing, which is a different exit from
+	// the buffer filling: one returns the sentinel cursor, the other a
+	// resume point. Conflating them ended a drive early whenever the last
+	// call happened to exhaust the blocks.
+	b = append(b, 0x20, x.lCacheJ, 0x20, x.lCacheNb, 0x4E)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x01, 0x21, x.lCacheDone)
+	b = append(b, 0x0C, 0x02)
+	b = append(b, 0x0B)
+
+	// Empty blocks are skipped without materialising them.
+	b = cache.emitBlockIsEmpty(b, x.lCacheJ, x.lCacheNext)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, x.lCacheJ, 0x41, 0x01, 0x6A, 0x21, x.lCacheJ)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheSkip)
+	b = append(b, 0x0C, 0x01)
+	b = append(b, 0x0B)
+
+	b = cache.emitEnsureBlock(b, x.lCacheJ)
+
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, ckptHdrRowBase)
+	b = append(b, 0x21, x.lStart)
+	// rowsInBlock = min(stride, len - rowBase + 1)
+	b = append(b, 0x20, pInLen)
+	b = append(b, 0x20, x.lStart)
+	b = append(b, 0x6B, 0x41, 0x01, 0x6A)
+	b = append(b, 0x21, x.lCacheRows)
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, ckptHdrStride)
+	b = append(b, 0x21, x.lCacheStride)
+	b = append(b, 0x20, x.lCacheRows)
+	b = append(b, 0x20, x.lCacheStride)
+	b = append(b, 0x20, x.lCacheRows)
+	b = append(b, 0x20, x.lCacheStride)
+	b = append(b, 0x4C)
+	b = append(b, 0x1B) // select -> min
+	b = append(b, 0x21, x.lCacheRows)
+
+	// r = max(pos - rowBase, 0)
+	b = append(b, 0x20, x.lResumePos)
+	b = append(b, 0x20, x.lStart)
+	b = append(b, 0x6B)
+	b = append(b, 0x22, x.lCacheRow)
+	b = append(b, 0x41, 0x00)
+	// STRICTLY less than zero. A resume position that lands on the block's
+	// FIRST row gives r == 0, which is an ordinary resume and keeps its
+	// skip; only a position BELOW the block — a caller resuming before the
+	// sweep's floor — has no skip to carry. Testing `<=` wiped the skip at
+	// every position that happened to start a block, so the same tuple was
+	// delivered again on every call and a capacity-1 drive never finished.
+	b = append(b, 0x48) // i32.lt_s
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheRow)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheSkip)
+	b = append(b, 0x0B)
+
+	// Walk the rows of this block, emitting each position's set bits until
+	// the caller's buffer is full.
+	b = append(b, 0x02, 0x40) // block $rowsDone
+	b = append(b, 0x03, 0x40) // loop  $rows
+	b = append(b, 0x20, x.lCacheRow, 0x20, x.lCacheRows, 0x4E, 0x0D, 0x01)
+	b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x4E, 0x0D, 0x01)
+
+	b = append(b, 0x20, pScratch)
+	b = append(b, 0x28, 0x02, ckptHdrBlockOff)
+	b = append(b, 0x20, pScratch, 0x6A)
+	b = append(b, 0x20, x.lCacheRow, 0x41)
+	b = utils.AppendSLEB128(b, rowBytes)
+	b = append(b, 0x6C, 0x6A)
+	b = append(b, 0x22, x.lSrc)
+	b = append(b, 0x28, 0x02, 0x00)
+	b = append(b, 0x21, x.lCacheMask)
+
+	// TWO counters, and the distinction is load-bearing. x.lCacheOrd is the
+	// ORDINAL of the set bit within this position; x.lCacheDel is how many of
+	// this position's tuples have actually been DELIVERED, across calls.
+	// They diverge exactly when the caller's buffer fills mid-position, and
+	// the cursor has to carry the delivered count — recording the ordinal
+	// instead told the next call to skip tuples that were never handed
+	// over, which silently dropped them.
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheOrd)
+	b = append(b, 0x20, x.lCacheSkip, 0x21, x.lCacheDel)
+	for k := 0; k < numPat; k++ {
+		b = append(b, 0x20, x.lCacheMask, 0x41)
+		b = utils.AppendSLEB128(b, int32(1)<<uint(k))
+		b = append(b, 0x71)
+		b = append(b, 0x04, 0x40)
+		// Skip the ones a previous call already delivered at this position.
+		b = append(b, 0x20, x.lCacheOrd, 0x20, x.lCacheSkip, 0x4E) // ordinal >= skip
+		b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x48)        // and room
+		b = append(b, 0x71)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, pOutPtr)
+		b = append(b, 0x20, x.lDeliver, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x22, x.lTuple)
+		b = cache.emitStoreTuple(b, k, ids[k], x.lTuple, x.lSrc, func(b []byte) []byte {
+			return append(b, 0x20, x.lStart, 0x20, x.lCacheRow, 0x6A)
+		})
+		b = append(b, 0x20, x.lDeliver, 0x41, 0x01, 0x6A, 0x21, x.lDeliver)
+		b = append(b, 0x20, x.lCacheDel, 0x41, 0x01, 0x6A, 0x21, x.lCacheDel)
+		b = append(b, 0x0B)
+		b = append(b, 0x20, x.lCacheOrd, 0x41, 0x01, 0x6A, 0x21, x.lCacheOrd)
+		b = append(b, 0x0B)
+	}
+
+	// The position is finished when as many tuples have been delivered as
+	// it has set bits. Anything less means the buffer filled inside it, and
+	// the cursor must come back to it.
+	b = append(b, 0x20, x.lCacheDel, 0x20, x.lCacheOrd, 0x4E) // delivered >= bits
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, x.lCacheRow, 0x41, 0x01, 0x6A, 0x21, x.lCacheRow)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheSkip)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheDel)
+	// The seen counter belongs to the position just left. Leaving it set
+	// made a cursor that stopped at the TOP of the loop, on a full buffer,
+	// carry the previous position's count as the new position's skip.
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheOrd)
+	b = append(b, 0x0B)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B, 0x0B)
+
+	// Out of rows in this block and still room: step to the next.
+	b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x4E)
+	b = append(b, 0x0D, 0x01) // buffer full -> stop here
+	b = append(b, 0x20, x.lCacheJ, 0x41, 0x01, 0x6A, 0x21, x.lCacheJ)
+	b = append(b, 0x41, 0x00, 0x21, x.lCacheSkip)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B, 0x0B)
+
+	// The drive ran out of blocks: sentinel cursor, plus whatever this call
+	// managed to deliver. A zero count with the sentinel is the ordinary
+	// "finished" answer.
+	b = append(b, 0x20, x.lCacheDone)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86)
+	b = append(b, 0x20, x.lDeliver, 0xAD, 0x84)
+	b = append(b, 0x0F)
+	b = append(b, 0x0B)
+
+	// Otherwise the buffer filled: resume where the walk would, at the
+	// position last touched, with the tuples already taken at it recorded
+	// in the cursor's k field.
+	b = append(b, 0x20, x.lStart, 0x20, x.lCacheRow, 0x6A, 0xAD, 0x42, 0x20, 0x86)
+	b = append(b, 0x20, x.lCacheDel, 0x41)
+	b = utils.AppendSLEB128(b, int32(countBits))
+	b = append(b, 0x74, 0xAD, 0x84)
+	b = append(b, 0x20, x.lDeliver, 0xAD, 0x84)
+	b = append(b, 0x0F)
+
+	b = append(b, 0x0B) // end if cache-live
+	b = append(b, 0x0B) // end if/else scratch present
+	return b
+}
+
+// batchWalkLocals is the frame emitBatchWalk reads.
+type batchWalkLocals struct {
+	lPos, lK, lCount, lTotal, lStart, lAvail, lDeliver, lDone, lCap byte
+	lWork, lWorkIdx, lWorkTmp, lReady, lCacheSweepRet               byte
+}
+
+// emitBatchWalk is the WALK half of the batching entry: call the per-position
+// worker, deliver what fits, advance, and cross into the cache when the drive
+// has proven expensive. It is the machine the cache half replaces, and the two
+// are separated for that reason — one steps the automaton, the other reads a
+// region the sweep filled.
+func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWalkLocals,
+	pInPtr, pInLen, pGate, pOutPtr, pScratch byte,
+	workerIdx, dpIdx, countBits int, maxCount int32, gated bool,
+) []byte {
+	b = append(b, 0x02, 0x40) // block $exit
+	b = append(b, 0x03, 0x40) // loop  $L
+
+	// if count >= cap: br $exit  (buffer full — more may remain)
+	b = append(b, 0x20, x.lCount, 0x20, x.lCap, 0x4E, 0x0D, 0x01)
+
+	// if pos > len: done
+	b = append(b, 0x20, x.lPos, 0x20, pInLen, 0x4A, 0x04, 0x40)
+	b = append(b, 0x41, 0x01, 0x21, x.lDone)
+	b = append(b, 0x0C, 0x02)
+	b = append(b, 0x0B)
+
+	// avail = cap - count
+	b = append(b, 0x20, x.lCap, 0x20, x.lCount, 0x6B, 0x21, x.lAvail)
+
+	// total = worker(ptr, len, pos, gate, out_ptr + (count-k)*12,
+	//                avail + k [, k])
+	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, x.lPos)
+	b = append(b, 0x20, pGate)
+	b = append(b, 0x20, pOutPtr, 0x20, x.lCount)
+	if !gated {
+		b = append(b, 0x20, x.lK, 0x6B)
+	}
+	b = append(b, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+	b = append(b, 0x20, x.lAvail)
+	if !gated {
+		b = append(b, 0x20, x.lK, 0x6A)
+	}
+	if gated {
+		// batch_mode = 1: gate what is DELIVERED rather than only a position
+		// that fitted whole (decision (11a) made this a runtime argument, so
+		// the exported `find` can share this worker by passing 0).
+		b = append(b, 0x41, 0x01)
+	} else {
+		b = append(b, 0x20, x.lK)
+	}
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(workerIdx))
+	b = append(b, 0x21, x.lTotal)
+
+	// The worker can return abi.BTStackOverflow instead of a count when a
+	// Backtracking bucket exhausted its frame budget. Both exits below treat a
+	// small total as "nothing more to find", so without this guard "I don't
+	// know" would be delivered to the caller as "the scan finished" — the exact
+	// silent-wrong-answer this sentinel exists to prevent.
+	//
+	// The reply is the reserved position word with an all-zero low half, so a
+	// caller that decodes before testing still reads a count of zero rather
+	// than tuples that were never written.
+	//
+	// But ONLY when this call has delivered nothing yet. config.SetCursorOverflowPos'
+	// contract — "a call returning it has answered nothing, no tuples were
+	// written" — is a promise about the CALL, and tuples already written and
+	// GATED earlier in this same call cannot be unwritten. Reporting count 0
+	// over them loses them for good (the stub throws before yielding, a direct
+	// caller reads zero) while the gate array has advanced for matches nobody
+	// saw. So a call that has tuples in hand returns them under the ordinary
+	// resume cursor, leaving x.lPos where it is; the next call re-enters at the
+	// same position, the worker overflows again with nothing delivered, and
+	// the sentinel goes out with a genuinely-zero count and untouched gates.
+	if cs.hasBTMember() {
+		b = append(b, 0x20, x.lTotal)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
+		b = append(b, 0x46)                             // i32.eq
+		b = append(b, 0x04, 0x40)                       // if (void)
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A) // count > 0
+		b = append(b, 0x04, 0x40)                       // if
+		// br 3: 0 = this if, 1 = the overflow if, 2 = loop $L, 3 = block $exit.
+		b = append(b, 0x0C, 0x03)
+		b = append(b, 0x0B) // end if count > 0
+		// The work charged by positions delivered EARLIER in this call goes
+		// back before the return, like every other walk-path exit: this one
+		// bypasses the epilogue's store, so without it a drive that overflows
+		// forgets what it had already spent and the trigger is delayed.
+		if dpIdx >= 0 {
+			b = append(b, 0x20, pScratch)
+			b = append(b, 0x04, 0x40)
+			b = cache.emitStoreWork(b)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(config.SetCursorOverflowPos))
+		b = append(b, 0x42, 0x20, 0x86) // << 32
+		b = append(b, 0x0F)             // return
+		b = append(b, 0x0B)
+	}
+
+	// if total <= k: nothing left at or after pos → done. Gated, k is 0 and
+	// this is the ordinary "no match" exit.
+	// For k == 0 this is the ordinary "no match" exit; for k > 0 it can only
+	// fire if a re-entered position enumerated differently, which the resume
+	// argument above rules out — the test is what keeps that a truncation
+	// rather than a hang if it ever did.
+	if gated {
+		b = append(b, 0x20, x.lTotal, 0x41, 0x00, 0x4C, 0x04, 0x40)
+	} else {
+		b = append(b, 0x20, x.lTotal, 0x20, x.lK, 0x4C, 0x04, 0x40)
+	}
+	b = append(b, 0x41, 0x01, 0x21, x.lDone)
+	b = append(b, 0x0C, 0x02)
+	b = append(b, 0x0B)
+
+	// start = out[count].start — every tuple of one position shares it, and
+	// the tuple at buffer index `count` is the first one this call delivered.
+	b = append(b, 0x20, pOutPtr, 0x20, x.lCount, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+	b = append(b, 0x28, 0x02, 0x04)
+	b = append(b, 0x21, x.lStart)
+
+	// deliver = total - k. Gated, k is structurally 0, so the subtraction and
+	// its local are skipped and x.lTotal IS the deliverable count — this loop
+	// runs once per POSITION, so its constant matters on a dense input.
+	deliver := x.lTotal
+	if !gated {
+		b = append(b, 0x20, x.lTotal, 0x20, x.lK, 0x6B, 0x21, x.lDeliver)
+		deliver = x.lDeliver
+	}
+
+	// if deliver > avail: the position is split here.
+	b = append(b, 0x20, deliver, 0x20, x.lAvail, 0x4A, 0x04, 0x40)
+	b = append(b, 0x20, x.lCap, 0x21, x.lCount)
+	if !gated {
+		b = append(b, 0x20, x.lK, 0x20, x.lAvail, 0x6A, 0x21, x.lK)
+	}
+	b = append(b, 0x20, x.lStart, 0x21, x.lPos)
+	b = append(b, 0x0C, 0x02) // br $exit
+	b = append(b, 0x0B)
+
+	// Whole position delivered: advance one past its start, exactly as a
+	// `find` caller does.
+	if dpIdx >= 0 {
+		// The first tuple index of this position, for the work sum below.
+		b = append(b, 0x20, x.lCount, 0x21, x.lWorkIdx)
+	}
+	b = append(b, 0x20, x.lCount, 0x20, deliver, 0x6A, 0x21, x.lCount)
+	if !gated {
+		b = append(b, 0x41, 0x00, 0x21, x.lK)
+	}
+	b = append(b, 0x20, x.lStart, 0x41, 0x01, 0x6A, 0x21, x.lPos)
+
+	if dpIdx >= 0 {
+		// Accumulate the bytes this position matched, then decide whether to
+		// stop walking and sweep the rest.
+		//
+		// HERE and nowhere else, for two reasons. The work counter only
+		// changes when tuples are delivered, so no other point can cross the
+		// line; and this is a POSITION BOUNDARY — k is back to 0 — which the
+		// switch requires. Switching mid-position would hand the cache a
+		// window whose first tuples the walk had already reported.
+		// Only while a switch is still possible. ready is -1 when the caller
+		// offered no cache or the sweep refused one, and 1 once it has swept —
+		// in all three the counter can change nothing. This is the ONE place
+		// the adaptive machinery could otherwise charge a caller who declined
+		// it, so guarding here is what makes "offer nothing, pay nothing"
+		// true rather than nearly true.
+		b = append(b, 0x20, x.lReady)
+		b = append(b, 0x45)       // ready == 0
+		b = append(b, 0x04, 0x40) // if
+		b = cache.emitAccumulateWork(b, pOutPtr, x.lWorkIdx, x.lCount, x.lWorkTmp)
+
+		b = cache.emitWorkExceedsSweep(b)
+		b = append(b, 0x04, 0x40)
+		// from = the next position, already advanced.
+		b = cache.emitSweepCall(b, func(b []byte) []byte {
+			return append(b, 0x20, x.lPos)
+		})
+		b = append(b, 0x04, 0x40)
+		// A MALFORMED header is reported here too, and is tested BEFORE the
+		// refusal: this arm is the only one a pure `find_batch` drive can
+		// reach (the entry sweep runs on a cursor this entry never receives),
+		// so without it a caller who wrote a nonsense stride was silently
+		// given a walk — the degradation the sentinel exists to prevent.
+		b = cache.emitMalformedReturn(b, cache.i64Ret)
+		b = cache.emitMarkRefused(b)
+		b = append(b, 0x41, 0x7F, 0x21, x.lReady) // and stop asking
+		b = append(b, 0x05)
+		// Swept. Hand back what this call has already delivered, with the
+		// cursor at the position the sweep started from: the next call enters
+		// through the cache block and is served the first start at or after
+		// x.lPos, which is exactly the first one still owed. The cursor is a
+		// POSITION on both paths now — under the retired index form a zero
+		// worked only because it fell below the floor and the clamps landed it
+		// on block 0 row 0, which is a coincidence, not a contract. The count
+		// is at least 1 because a position was just delivered, so the caller's
+		// "count == 0 means finished" test cannot misfire.
+		b = cache.emitStoreWork(b)
+		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x84)
+		b = append(b, 0x0F) // return (x.lPos << 32) | count
+		b = append(b, 0x0B)
+		b = append(b, 0x0B) // end if the work exceeds the sweep
+		b = append(b, 0x0B) // end if ready == 0
+	}
+
+	b = append(b, 0x0C, 0x00) // continue $L
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end block $exit
+	return b
+}
+
+func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte {
 	gated := cs.gatedFind()
 	countBits := setCursorCountBits(cs.patternCount)
 	maxCount := setCursorMaxCount(cs.patternCount)
@@ -151,35 +907,68 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// than two tight ones: the stubs, the descriptor and the docs each stop
 	// carrying a fork. Only the overlapping backward sweep
 	// reads it, and it treats a null pointer as "not offered".
-	var pInPtr, pInLen, pCursor, pGate, pOutPtr, pOutCap, pScratch, pScratchLen byte
+	var pInPtr, pInLen, pCursor, pGate, pOutPtr, pOutCap byte
 	pInPtr, pInLen, pCursor = 0, 1, 2
 	pGate, pOutPtr, pOutCap = 3, 4, 5
-	pScratch, pScratchLen = 6, 7
+	// pGate is the DESCRIPTOR on entry and the gate pointer after the prologue
+	// below overwrites it, which is what lets every reference to it stand.
 	// Locals come from the allocator, in declaration order (task 67): the index
 	// and the declaration are one statement rather than two that must agree.
-	a := newLocalAlloc(8) // eight parameters, above
+	a := newLocalAlloc(6)
+	// ONE name each. They were allocated as pScratch/pScratchLen and then
+	// aliased to pScratch/pScratchLen on the next line, so every reader had to
+	// hold two names for one local and grep found half the uses.
+	pScratch := a.I32()    // cache_ptr, from the descriptor
+	pScratchLen := a.I32() // cache_len
 	var (
-		lPos        = a.I32()
-		lK          = a.I32()
-		lCount      = a.I32()
-		lTotal      = a.I32()
-		lStart      = a.I32()
-		lAvail      = a.I32()
-		lDeliver    = a.I32()
-		lDone       = a.I32()
-		lCap        = a.I32() // out_cap, clamped to the cursor's count field
-		lReady      = a.I32()
-		lIdx        = a.I32()
-		lCacheTotal = a.I32()
-		lSrc        = a.I32()
+		lPos   = a.I32()
+		lK     = a.I32()
+		lCount = a.I32()
+		lTotal = a.I32()
+		lStart = a.I32()
+		lAvail = a.I32()
+		// lTuple is the ADDRESS of the tuple being written. It was lAvail,
+		// which elsewhere holds how much room is left in the caller's buffer —
+		// two unrelated things under one name, in the one place a wrong
+		// address writes over the caller's memory.
+		lTuple   = a.I32()
+		lDeliver = a.I32()
+		lDone    = a.I32()
+		lCap     = a.I32() // out_cap, clamped to the cursor's count field
+	)
+
+	// Cache-only locals, allocated ONLY when there is a cache to read — the
+	// same rule the `find` wrapper follows. Allocating them unconditionally
+	// changed the declaration vector of every gated batching set, which is the
+	// whole of why the gated byteident fixture moved when this landed.
+	var (
+		lReady, lIdx, lCacheTotal byte
+		// Block location for the checkpointed cache: which block the cursor's
+		// position falls in, and scratch for walking cum[].
+		// ONE LOCAL PER MEANING. lCacheOrd was reused as the floor, then a
+		// block index, then the stride, then the bit ordinal — four things in
+		// one name, in a body where the allocator makes locals free.
+		lCacheNb, lCacheJ, lCacheRow                  byte
+		lCacheFloor, lCacheNext, lCacheStride         byte
+		lCacheOrd                                     byte
+		lCacheSkip, lCacheMask, lCacheDone, lCacheDel byte
+		lCacheSweepRet, lSrc                          byte
+		lWork, lWorkIdx, lWorkTmp                     byte
+	)
+	if dpIdx >= 0 {
+		lReady, lIdx, lCacheTotal = a.I32(), a.I32(), a.I32()
+		lCacheNb, lCacheJ = a.I32(), a.I32()
+		lCacheRow = a.I32()
+		lCacheFloor, lCacheNext, lCacheStride = a.I32(), a.I32(), a.I32()
+		lCacheOrd = a.I32()
+		lCacheSkip, lCacheMask = a.I32(), a.I32()
+		lCacheDone, lCacheDel = a.I32(), a.I32()
+		lCacheSweepRet, lSrc = a.I32(), a.I32()
 		// The adaptive trigger's working locals.
-		lWork    = a.I32() // matched bytes this drive has delivered
+		lWork = a.I32()    // matched bytes this drive has delivered
 		lWorkIdx = a.I32() // cursor over the tuples just delivered
 		lWorkTmp = a.I32()
-		// 1 when the ENTRY-TIME sweep just ran, so the cursor's high half is
-		// still a text POSITION and the cache must be served from tuple 0.
-		lEntrySwept = a.I32()
-	)
+	}
 
 	//
 	// The sweep costs a flat numStates x patterns per input byte. The walk's
@@ -195,25 +984,48 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// work already spent, and it removes a quadratic tail. A drive that never
 	// crosses the line never sweeps and keeps the walk's fuel to the
 	// instruction.
-	sweepCostPerByte := int64(1)
-	if bi := cs.overlapDPBucket(); bi >= 0 {
-		sweepCostPerByte = int64(cs.buckets[bi].dp.numWASM * len(cs.buckets[bi].patterns))
+	// Block-buffer geometry for the cache path, from the same helper `find`
+	// uses: the two entries serve one region and must agree about its shape.
+	numPat, ids, rowBytes, sweepCostPerByte := cs.overlapCacheGeometry()
+
+	// The cache logic is COMMON code (set_overlap_dp.go): the same emitters
+	// serve the exported `find`, which reaches a cache through the same
+	// descriptor this entry does.
+	cache := overlapCacheCtx{
+		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
+		pInPtr: pInPtr, pInLen: pInLen,
+		pCache: pScratch, pCacheLen: pScratchLen,
+		lReady: lReady, lWork: lWork, lSweepRet: lCacheSweepRet,
+		// The batch export returns an i64 cursor+count, so an error is a
+		// RESERVED RESUME POSITION rather than a negative count.
+		i64Ret: true,
 	}
 
 	var b []byte
-	b = a.EmitDecls(b) // 17 x i32, from the allocation above
+	b = a.EmitDecls(b) // the i32 locals allocated above
 
-	// emitWorkExceedsSweep pushes 1 when the walk has already spent more than
-	// the sweep would cost. Computed in i64 because len * cost overflows i32
-	// on a large input, which would make the test wrap and fire at random.
-	emitWorkExceedsSweep := func() {
-		b = append(b, 0x20, lWork, 0xAD) // (u64) work
-		b = append(b, 0x20, pInLen, 0xAD)
-		b = append(b, 0x42)
-		b = utils.AppendSLEB128_64(b, sweepCostPerByte)
-		b = append(b, 0x7E) // i64.mul
-		b = append(b, 0x56) // i64.gt_u
-	}
+	// The scratch prologue, and it has to come FIRST: pGate holds the
+	// descriptor on entry, so the cache fields are read before the gate pointer
+	// overwrites it. The magic check turns a caller still passing a bare gate
+	// array into an immediate trap rather than a pointer read out of gate[0].
+	b = append(b, 0x20, pGate)
+	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
+	b = append(b, 0x47)       // i32.ne
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end
+	b = append(b, 0x20, pGate)
+	b = append(b, 0x28, 0x02, abi.FindScratchCacheOff)
+	b = append(b, 0x21, pScratch)
+	b = append(b, 0x20, pGate)
+	b = append(b, 0x28, 0x02, abi.FindScratchCacheLenOff)
+	b = append(b, 0x21, pScratchLen)
+	b = append(b, 0x20, pGate)
+	b = append(b, 0x28, 0x02, abi.FindScratchGateOff)
+	b = append(b, 0x21, pGate)
 
 	// lCap = min(out_cap, maxCount).
 	b = append(b, 0x20, pOutCap)
@@ -254,145 +1066,15 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// too small. That is the same rule `out_cap` underflow has: the answer is
 	// never wrong, only slower.
 	if dpIdx >= 0 {
-		// -1 is "this drive has no cache", which is what the walk-loop
-		// trigger below tests. Set unconditionally so the two paths read one
-		// local rather than each deciding for itself.
-		b = append(b, 0x41, 0x7F, 0x21, lReady)
-		b = append(b, 0x41, 0x00, 0x21, lWork)
-		b = append(b, 0x41, 0x00, 0x21, lEntrySwept)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x45)       // i32.eqz -> no scratch offered
-		b = append(b, 0x04, 0x40) // if
-		b = append(b, 0x05)       // else: scratch is present
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x28, 0x02, overlapDPHdrReady)
-		b = append(b, 0x21, lReady)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x28, 0x02, overlapDPHdrWork)
-		b = append(b, 0x21, lWork)
-
-		// Not swept yet AND the walk has already cost more than the sweep
-		// would. The second half is the whole of stage C's engagement rule:
-		// without it this is the unconditional sweep that measured 2 wins and
-		// 5 regressions. The caller zeroed the scratch to start the drive, so
-		// a zero `ready` IS "not swept yet" — the same contract the gate array
-		// has, and the reason no magic value is needed.
-		b = append(b, 0x20, lReady)
-		b = append(b, 0x45)
-		emitWorkExceedsSweep()
-		b = append(b, 0x71) // i32.and
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, pInPtr)
-		b = append(b, 0x20, pInLen)
-		// from = the resume position. Sweeping only [from, len] is what lets a
-		// drive switch mid-flight: the walk has already delivered everything
-		// below it, so cache index 0 is the first tuple still owed.
-		b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x20, pScratchLen)
-		b = append(b, 0x10) // call
-		b = utils.AppendULEB128(b, uint32(dpIdx))
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x48) // i32.lt_s -> the sweep refused
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x41, 0x7F) // -1: refused, and this drive must not retry
-		b = append(b, 0x36, 0x02, overlapDPHdrReady)
-		b = append(b, 0x0B) // end if the sweep refused
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x28, 0x02, overlapDPHdrReady)
-		b = append(b, 0x21, lReady)
-		// Remember that THIS call is the one that swept. The cursor it was
-		// handed still carries a text POSITION in its high half, and the
-		// block below reads that half as a tuple INDEX — so without this the
-		// serve would start from tuple P (or report "done") for a resume
-		// position P. Unreachable today (every walk-path return leaves
-		// work <= threshold or ready != 0, so an entry with work over the
-		// line and ready == 0 cannot happen), which is precisely why it must
-		// not be left armed for the first change that makes it reachable.
-		b = append(b, 0x41, 0x01, 0x21, lEntrySwept)
-		b = append(b, 0x0B) // end if not swept yet
-
-		b = append(b, 0x20, lReady)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x4A) // i32.gt_s -> the cache is live
-		b = append(b, 0x04, 0x40)
-
-		// The cursor's high half carries a TUPLE INDEX on this path rather
-		// than a text position. Both are opaque to the caller (docs/wasm.md:
-		// "treat everything but the sentinel and count as opaque"), and a
-		// drive never mixes the two — `ready` is decided on its first call.
-		//
-		// EXCEPT on the call that swept at entry: its cursor is still the
-		// position form, and everything below that position was delivered
-		// before, so cache index 0 is the first tuple still owed.
-		b = append(b, 0x20, lEntrySwept)
-		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x05)
-		b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
-		b = append(b, 0x0B)
-		b = append(b, 0x21, lIdx)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x28, 0x02, overlapDPHdrCount)
-		b = append(b, 0x21, lCacheTotal)
-
-		b = append(b, 0x20, lIdx)
-		b = append(b, 0x20, lCacheTotal)
-		b = append(b, 0x4E) // i32.ge_s -> nothing left
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86) // (i64)-1 << 32: done, zero tuples
-		b = append(b, 0x0F)
-		b = append(b, 0x0B)
-
-		// deliver = min(total - idx, cap)
-		b = append(b, 0x20, lCacheTotal)
-		b = append(b, 0x20, lIdx)
-		b = append(b, 0x6B)
-		b = append(b, 0x21, lDeliver)
-		b = append(b, 0x20, lDeliver)
-		b = append(b, 0x20, lCap)
-		b = append(b, 0x20, lDeliver)
-		b = append(b, 0x20, lCap)
-		b = append(b, 0x4C) // deliver <= cap
-		b = append(b, 0x1B) // select
-		b = append(b, 0x21, lDeliver)
-
-		// src = scratch + dataOff + idx*12
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x28, 0x02, overlapDPHdrDataOff)
-		b = append(b, 0x6A)
-		b = append(b, 0x20, lIdx)
-		b = append(b, 0x41, 0x0C, 0x6C) // * 12
-		b = append(b, 0x6A)
-		b = append(b, 0x21, lSrc)
-
-		b = append(b, 0x20, pOutPtr)
-		b = append(b, 0x20, lSrc)
-		b = append(b, 0x20, lDeliver)
-		b = append(b, 0x41, 0x0C, 0x6C)
-		b = append(b, 0xFC, 0x0A, 0x00, 0x00) // memory.copy
-
-		b = append(b, 0x20, lIdx)
-		b = append(b, 0x20, lDeliver)
-		b = append(b, 0x6A)
-		b = append(b, 0x21, lIdx)
-
-		// ret = (idx or sentinel) << 32 | count
-		b = append(b, 0x20, lIdx)
-		b = append(b, 0x20, lCacheTotal)
-		b = append(b, 0x4E)
-		b = append(b, 0x04, 0x7E)
-		b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86)
-		b = append(b, 0x05)
-		b = append(b, 0x20, lIdx, 0xAD, 0x42, 0x20, 0x86)
-		b = append(b, 0x0B)
-		b = append(b, 0x20, lDeliver, 0xAD, 0x84)
-		b = append(b, 0x0F)
-
-		b = append(b, 0x0B) // end if cache-live
-		b = append(b, 0x0B) // end if/else scratch present
+		b = cs.emitBatchCacheServe(b, cache, batchCacheLocals{
+			lReady: lReady, lResumePos: lIdx, lCacheRows: lCacheTotal, lCacheNb: lCacheNb,
+			lCacheJ: lCacheJ, lCacheRow: lCacheRow, lCacheFloor: lCacheFloor,
+			lCacheNext: lCacheNext, lCacheStride: lCacheStride, lCacheOrd: lCacheOrd,
+			lCacheSkip: lCacheSkip, lCacheMask: lCacheMask, lCacheDone: lCacheDone,
+			lCacheDel: lCacheDel, lCacheSweepRet: lCacheSweepRet, lSrc: lSrc,
+			lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lStart: lStart,
+			lDeliver: lDeliver, lCap: lCap, lTuple: lTuple, lPos: lPos, lCount: lCount,
+		}, pCursor, pScratch, pOutPtr, pInLen, ids, numPat, countBits, kMask, rowBytes)
 	}
 
 	// lPos = cursor >> 32
@@ -419,214 +1101,12 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	// it can, because it returns a count rather than a resumable cursor.
 	b = append(b, 0x20, lCap, 0x41, 0x01, 0x48, 0x21, lDone)
 
-	b = append(b, 0x02, 0x40) // block $exit
-	b = append(b, 0x03, 0x40) // loop  $L
-
-	// if count >= cap: br $exit  (buffer full — more may remain)
-	b = append(b, 0x20, lCount, 0x20, lCap, 0x4E, 0x0D, 0x01)
-
-	// if pos > len: done
-	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4A, 0x04, 0x40)
-	b = append(b, 0x41, 0x01, 0x21, lDone)
-	b = append(b, 0x0C, 0x02)
-	b = append(b, 0x0B)
-
-	// avail = cap - count
-	b = append(b, 0x20, lCap, 0x20, lCount, 0x6B, 0x21, lAvail)
-
-	// total = worker(ptr, len, pos, gate, out_ptr + (count-k)*12,
-	//                avail + k [, k])
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, lPos)
-	b = append(b, 0x20, pGate)
-	b = append(b, 0x20, pOutPtr, 0x20, lCount)
-	if !gated {
-		b = append(b, 0x20, lK, 0x6B)
-	}
-	b = append(b, 0x41, 12, 0x6C, 0x6A)
-	b = append(b, 0x20, lAvail)
-	if !gated {
-		b = append(b, 0x20, lK, 0x6A)
-	}
-	if gated {
-		// batch_mode = 1: gate what is DELIVERED rather than only a position
-		// that fitted whole (decision (11a) made this a runtime argument, so
-		// the exported `find` can share this worker by passing 0).
-		b = append(b, 0x41, 0x01)
-	} else {
-		b = append(b, 0x20, lK)
-	}
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(workerIdx))
-	b = append(b, 0x21, lTotal)
-
-	// The worker can return abi.BTStackOverflow instead of a count when a
-	// Backtracking bucket exhausted its frame budget. Both exits below treat a
-	// small total as "nothing more to find", so without this guard "I don't
-	// know" would be delivered to the caller as "the scan finished" — the exact
-	// silent-wrong-answer this sentinel exists to prevent.
-	//
-	// The reply is the reserved position word with an all-zero low half, so a
-	// caller that decodes before testing still reads a count of zero rather
-	// than tuples that were never written.
-	//
-	// But ONLY when this call has delivered nothing yet. config.SetCursorOverflowPos'
-	// contract — "a call returning it has answered nothing, no tuples were
-	// written" — is a promise about the CALL, and tuples already written and
-	// GATED earlier in this same call cannot be unwritten. Reporting count 0
-	// over them loses them for good (the stub throws before yielding, a direct
-	// caller reads zero) while the gate array has advanced for matches nobody
-	// saw. So a call that has tuples in hand returns them under the ordinary
-	// resume cursor, leaving lPos where it is; the next call re-enters at the
-	// same position, the worker overflows again with nothing delivered, and
-	// the sentinel goes out with a genuinely-zero count and untouched gates.
-	if cs.hasBTMember() {
-		b = append(b, 0x20, lTotal)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
-		b = append(b, 0x46)                           // i32.eq
-		b = append(b, 0x04, 0x40)                     // if (void)
-		b = append(b, 0x20, lCount, 0x41, 0x00, 0x4A) // count > 0
-		b = append(b, 0x04, 0x40)                     // if
-		// br 3: 0 = this if, 1 = the overflow if, 2 = loop $L, 3 = block $exit.
-		b = append(b, 0x0C, 0x03)
-		b = append(b, 0x0B) // end if count > 0
-		b = append(b, 0x42)
-		b = utils.AppendSLEB128_64(b, int64(config.SetCursorOverflowPos))
-		b = append(b, 0x42, 0x20, 0x86) // << 32
-		b = append(b, 0x0F)             // return
-		b = append(b, 0x0B)
-	}
-
-	// if total <= k: nothing left at or after pos → done. Gated, k is 0 and
-	// this is the ordinary "no match" exit.
-	// For k == 0 this is the ordinary "no match" exit; for k > 0 it can only
-	// fire if a re-entered position enumerated differently, which the resume
-	// argument above rules out — the test is what keeps that a truncation
-	// rather than a hang if it ever did.
-	if gated {
-		b = append(b, 0x20, lTotal, 0x41, 0x00, 0x4C, 0x04, 0x40)
-	} else {
-		b = append(b, 0x20, lTotal, 0x20, lK, 0x4C, 0x04, 0x40)
-	}
-	b = append(b, 0x41, 0x01, 0x21, lDone)
-	b = append(b, 0x0C, 0x02)
-	b = append(b, 0x0B)
-
-	// start = out[count].start — every tuple of one position shares it, and
-	// the tuple at buffer index `count` is the first one this call delivered.
-	b = append(b, 0x20, pOutPtr, 0x20, lCount, 0x41, 12, 0x6C, 0x6A)
-	b = append(b, 0x28, 0x02, 0x04)
-	b = append(b, 0x21, lStart)
-
-	// deliver = total - k. Gated, k is structurally 0, so the subtraction and
-	// its local are skipped and lTotal IS the deliverable count — this loop
-	// runs once per POSITION, so its constant matters on a dense input.
-	deliver := lTotal
-	if !gated {
-		b = append(b, 0x20, lTotal, 0x20, lK, 0x6B, 0x21, lDeliver)
-		deliver = lDeliver
-	}
-
-	// if deliver > avail: the position is split here.
-	b = append(b, 0x20, deliver, 0x20, lAvail, 0x4A, 0x04, 0x40)
-	b = append(b, 0x20, lCap, 0x21, lCount)
-	if !gated {
-		b = append(b, 0x20, lK, 0x20, lAvail, 0x6A, 0x21, lK)
-	}
-	b = append(b, 0x20, lStart, 0x21, lPos)
-	b = append(b, 0x0C, 0x02) // br $exit
-	b = append(b, 0x0B)
-
-	// Whole position delivered: advance one past its start, exactly as a
-	// `find` caller does.
-	if dpIdx >= 0 {
-		// The first tuple index of this position, for the work sum below.
-		b = append(b, 0x20, lCount, 0x21, lWorkIdx)
-	}
-	b = append(b, 0x20, lCount, 0x20, deliver, 0x6A, 0x21, lCount)
-	if !gated {
-		b = append(b, 0x41, 0x00, 0x21, lK)
-	}
-	b = append(b, 0x20, lStart, 0x41, 0x01, 0x6A, 0x21, lPos)
-
-	if dpIdx >= 0 {
-		// Accumulate the bytes this position matched, then decide whether to
-		// stop walking and sweep the rest.
-		//
-		// HERE and nowhere else, for two reasons. The work counter only
-		// changes when tuples are delivered, so no other point can cross the
-		// line; and this is a POSITION BOUNDARY — k is back to 0 — which the
-		// switch requires. Switching mid-position would hand the cache a
-		// window whose first tuples the walk had already reported.
-		// Only while a switch is still possible. ready is -1 when the caller
-		// offered no cache or the sweep refused one, and 1 once it has swept —
-		// in all three the counter can change nothing. This is the ONE place
-		// the adaptive machinery could otherwise charge a caller who declined
-		// it, so guarding here is what makes "offer nothing, pay nothing"
-		// true rather than nearly true.
-		b = append(b, 0x20, lReady)
-		b = append(b, 0x45)                                           // ready == 0
-		b = append(b, 0x04, 0x40)                                     // if
-		b = append(b, 0x02, 0x40)                                     // block $sumDone
-		b = append(b, 0x03, 0x40)                                     // loop  $sum
-		b = append(b, 0x20, lWorkIdx, 0x20, lCount, 0x4E, 0x0D, 0x01) // idx >= count
-		b = append(b, 0x20, pOutPtr, 0x20, lWorkIdx, 0x41, 12, 0x6C, 0x6A)
-		b = append(b, 0x22, lWorkTmp)
-		b = append(b, 0x28, 0x02, 0x08) // tuple.end
-		b = append(b, 0x20, lWorkTmp)
-		b = append(b, 0x28, 0x02, 0x04) // tuple.start
-		b = append(b, 0x6B)             // end - start
-		b = append(b, 0x20, lWork, 0x6A)
-		// Saturate. The counter only ever grows and is compared unsigned, so
-		// a wrap would read as "cheap" on the most expensive drive there is.
-		b = append(b, 0x22, lWorkTmp)
-		b = append(b, 0x41, 0x00, 0x48) // < 0 -> it wrapped
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x21, lWork) // 0x7FFFFFFF
-		b = append(b, 0x05)
-		b = append(b, 0x20, lWorkTmp, 0x21, lWork)
-		b = append(b, 0x0B)
-		b = append(b, 0x20, lWorkIdx, 0x41, 0x01, 0x6A, 0x21, lWorkIdx)
-		b = append(b, 0x0C, 0x00)
-		b = append(b, 0x0B) // end loop
-		b = append(b, 0x0B) // end block
-
-		emitWorkExceedsSweep()
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, pInPtr)
-		b = append(b, 0x20, pInLen)
-		b = append(b, 0x20, lPos) // from = the next position, already advanced
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x20, pScratchLen)
-		b = append(b, 0x10)
-		b = utils.AppendULEB128(b, uint32(dpIdx))
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x48) // the sweep refused
-		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x41, 0x7F)
-		b = append(b, 0x36, 0x02, overlapDPHdrReady)
-		b = append(b, 0x41, 0x7F, 0x21, lReady) // and stop asking
-		b = append(b, 0x05)
-		// Swept. Hand back what this call has already delivered with an
-		// INDEX-form cursor: the sweep set ready = 1, so the next call enters
-		// through the cache block and reads from tuple 0 — the first start at
-		// or after lPos, which is exactly the first one still owed. The count
-		// is at least 1 because a position was just delivered, so the caller's
-		// "count == 0 means finished" test cannot misfire.
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x20, lWork)
-		b = append(b, 0x36, 0x02, overlapDPHdrWork)
-		b = append(b, 0x20, lCount, 0xAD)
-		b = append(b, 0x0F) // return (0 << 32) | count
-		b = append(b, 0x0B)
-		b = append(b, 0x0B) // end if the work exceeds the sweep
-		b = append(b, 0x0B) // end if ready == 0
-	}
-
-	b = append(b, 0x0C, 0x00) // continue $L
-	b = append(b, 0x0B)       // end loop
-	b = append(b, 0x0B)       // end block $exit
+	b = cs.emitBatchWalk(b, cache, batchWalkLocals{
+		lPos: lPos, lK: lK, lCount: lCount, lTotal: lTotal, lStart: lStart,
+		lAvail: lAvail, lDeliver: lDeliver, lDone: lDone, lCap: lCap,
+		lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lReady: lReady,
+		lCacheSweepRet: lCacheSweepRet,
+	}, pInPtr, pInLen, pGate, pOutPtr, pScratch, workerIdx, dpIdx, countBits, maxCount, gated)
 
 	// The work counter is drive state, so it goes back to the caller's scratch
 	// before every walk-path return — otherwise each call would start from
@@ -634,9 +1114,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx int) []byte {
 	if dpIdx >= 0 {
 		b = append(b, 0x20, pScratch)
 		b = append(b, 0x04, 0x40)
-		b = append(b, 0x20, pScratch)
-		b = append(b, 0x20, lWork)
-		b = append(b, 0x36, 0x02, overlapDPHdrWork)
+		b = cache.emitStoreWork(b)
 		b = append(b, 0x0B)
 	}
 

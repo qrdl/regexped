@@ -100,12 +100,22 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/...
+	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 
 docker: regexped
 	./get_wasm_merge.sh
+	# wasm-tools and wac are needed inside the image for `wasm_format:
+	# component`, the same way wasm-merge is needed for a module `regexped
+	# merge`: wasm-tools wraps the core module into a component, wac composes it
+	# with the consumer. Both fetch scripts short-circuit when the tool is
+	# already on PATH, which is right for CI but leaves nothing in the build
+	# CONTEXT — hence the copy fallbacks.
+	./get_wasm_tools.sh
+	@test -f wasm-tools || cp "$$(command -v wasm-tools)" ./wasm-tools
+	./get_wac.sh
+	@test -f wac || cp "$$(command -v wac)" ./wac
 	docker build -t regexped .
 
 lint:

@@ -11,15 +11,6 @@ import (
 	"github.com/qrdl/regexped/config"
 )
 
-// CmdMerge merges the main WASM module with the regexp WASM modules using wasm-merge.
-// mainWasm is the path to the host main module.
-// regexWasms are the regexp WASM files to merge (at least one required).
-//
-// This is a thin wrapper around wasm-merge. Users may invoke wasm-merge directly:
-//
-//	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regexp.wasm> <module> \
-//	           --rename-export-conflicts -o output
-//
 // resolveWasmMerge returns the wasm-merge binary path using the lookup order:
 // config field → $WASM_MERGE env var → "wasm-merge" in $PATH.
 func resolveWasmMerge(cfg config.BuildConfig) string {
@@ -32,7 +23,94 @@ func resolveWasmMerge(cfg config.BuildConfig) string {
 	return "wasm-merge"
 }
 
+// resolveWac returns the wac binary path, in the same lookup order the other two
+// external tools use: config field → $WAC → "wac" in $PATH.
+//
+// Like wasm_tools: and unlike wasm_merge:, the config value is NOT resolved
+// against the config file's directory. A bare tool name must stay a bare name
+// for $PATH lookup to find it.
+func resolveWac(cfg config.BuildConfig) string {
+	if cfg.Wac != "" {
+		return expandHome(cfg.Wac)
+	}
+	if env := os.Getenv("WAC"); env != "" {
+		return expandHome(env)
+	}
+	return "wac"
+}
+
+// CmdMerge links the main WASM artifact with the regexp artifacts and writes
+// output. mainWasm is the host's own binary; regexWasms are regexped's
+// (at least one required).
+//
+// WHICH TOOL depends on the output kind, and that is the whole point of this
+// function: a caller runs `regexped merge` and does not have to know whether
+// its config compiled modules or components.
+//
+//	wasm_format: module     → wasm-merge, which links two core modules into one
+//	wasm_format: component  → wac plug, which satisfies the socket component's
+//	                          imports from the plug components' exports
+//
+// Composition is NOT merging: the output keeps two instances with two memories
+// and the call between them goes through the canonical ABI, where wasm-merge
+// produces a single module whose regexp code reads the host's memory directly.
+// The command is the same; the cost model is not. See docs/component.md.
 func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
+	if cfg.Component() {
+		return composeComponents(cfg, mainWasm, output, regexWasms)
+	}
+	return mergeModules(cfg, mainWasm, output, regexWasms)
+}
+
+// composeComponents is `wac plug` — the component-format arm of CmdMerge.
+//
+//	wac plug --plug <regexp1.wasm> ... -o <output> <main.wasm>
+//
+// The main component is the SOCKET (the one with unsatisfied imports) and every
+// regexp component is a PLUG. `--plug` may be repeated: wac is documented as
+// plugging "the exports of any number of 'plug' components", so several regexp
+// components compose in one call, with no intermediate files.
+//
+// ONE ASYMMETRY WITH THE MODULE PATH, and it is worth stating because the
+// module path's comment says the opposite (see moduleNameForWasm): every regexp
+// MODULE may safely share one import_module name, because nothing imports it.
+// Components are matched by their WIT INTERFACE name — regexped:<wit_package>/
+// matcher — which the socket genuinely imports, so two regexp components built
+// from configs sharing a wit_package export the same interface and wac cannot
+// tell which should satisfy the import. Multi-plug therefore requires DISTINCT
+// wit_package values, where multi-module merging requires nothing.
+func composeComponents(cfg config.BuildConfig, mainWasm, output string, plugs []string) error {
+	wacCmd := resolveWac(cfg)
+	if err := checkTool(wacCmd); err != nil {
+		return fmt.Errorf("%w (needed for wasm_format: component)", err)
+	}
+
+	args := []string{"plug"}
+	for _, path := range plugs {
+		args = append(args, "--plug", path)
+	}
+	args = append(args, "-o", output, mainWasm)
+
+	slog.Debug("Composing components")
+	if err := runCmd(wacCmd, args, "", nil); err != nil {
+		return fmt.Errorf("wac plug: %w", err)
+	}
+
+	info, err := os.Stat(output)
+	if err != nil {
+		return fmt.Errorf("stat output: %w", err)
+	}
+	slog.Info("Composed", "output", output, "bytes", info.Size(), "plugs", len(plugs))
+	return nil
+}
+
+// mergeModules is `wasm-merge` — the module-format arm of CmdMerge, and what
+// this package did unconditionally before components existed. Users may invoke
+// wasm-merge directly:
+//
+//	wasm-merge --enable-multimemory --enable-simd <main.wasm> main <regexp.wasm> <module> \
+//	           --rename-export-conflicts -o output
+func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
 	wasmMergeCmd := resolveWasmMerge(cfg)
 
 	// Verify tool is available before doing any work.

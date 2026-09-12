@@ -61,6 +61,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/benchshim"
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -521,8 +522,11 @@ type memPlan struct {
 	inputBase int32
 	outBase   int32 // find tuples, 12 bytes each
 	gatePtr   int32 // id_space u32s
-	bitmapPtr int32 // ceil(id_space/8) bytes, for the wide _all ABI
-	needTop   int64
+	// scratchPtr is the DESCRIPTOR the find exports take in place of a bare
+	// gate pointer (internal/abi).
+	scratchPtr int32
+	bitmapPtr  int32 // ceil(id_space/8) bytes, for the wide _all ABI
+	needTop    int64
 }
 
 func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int) (memPlan, error) {
@@ -533,14 +537,16 @@ func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int) (memPlan,
 	inBase := (top + pageSize - 1) / pageSize * pageSize
 	outBase := inBase + int64(maxInputLen) + 4096
 	gate := outBase + int64(patternCount)*12 + 64
-	bitmap := gate + int64(idSpace)*4 + 64
+	scratch := gate + int64(idSpace)*4 + 64
+	bitmap := scratch + abi.FindScratchBytes + 64
 	need := bitmap + int64((idSpace+7)/8) + 64
 	return memPlan{
-		inputBase: int32(inBase),
-		outBase:   int32(outBase),
-		gatePtr:   int32(gate),
-		bitmapPtr: int32(bitmap),
-		needTop:   need,
+		inputBase:  int32(inBase),
+		outBase:    int32(outBase),
+		gatePtr:    int32(gate),
+		scratchPtr: int32(scratch),
+		bitmapPtr:  int32(bitmap),
+		needTop:    need,
 	}, nil
 }
 
@@ -684,9 +690,11 @@ func (r *runner) drive(inputLen int32) (bool, error) {
 func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 	p := r.plan
 	r.zero(p.gatePtr, int32(r.idSpace)*4)
+	// No answer cache: this drives the plain `find`, which never reads one.
+	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, 0, 0)
 	found := false
 	for from := int32(0); ; {
-		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.gatePtr, p.outBase, r.outCap)
+		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.scratchPtr, p.outBase, r.outCap)
 		if err != nil {
 			return found, err
 		}

@@ -7,7 +7,43 @@ MAIN_WASM  := main.wasm
 REGEX_WASM := url_parts.wasm
 FINAL_WASM := final.wasm
 
-.PHONY: all generate build compile merge run clean
+# --- the COMPONENT build -------------------------------------------------------
+# Same patterns, same main.c, different output KIND. Everything it produces lives
+# under component/ so the two builds cannot collide.
+COMP_CFG    := regexped-component.yaml
+COMP_DIR    := component
+COMP_STUB   := $(COMP_DIR)/stub.h
+COMP_REGEX  := $(COMP_DIR)/url_parts.wasm
+COMP_CORE   := $(COMP_DIR)/core.wasm
+COMP_GUEST  := $(COMP_DIR)/guest.wasm
+COMP_FINAL  := $(COMP_DIR)/composed.wasm
+
+# The wasip1 adapter, needed because main.c talks wasi_snapshot_preview1 directly
+# (args_get, fd_write, proc_exit) while a component speaks wasi:cli. It ships in
+# the wasi-preview1-component-adapter-provider crate; override ADAPTER to point
+# at your own copy.
+ADAPTER ?= $(firstword $(wildcard $(HOME)/.cargo/registry/src/*/wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.command.wasm))
+
+# --- the wasip2 COMPONENT build ------------------------------------------------
+# Same patterns, same main.c, same generated stub — a third BUILD, not a third
+# output kind. clang wraps into a component at LINK time here, so there is no
+# embed/new step and no adapter flag: wasm-component-ld bundles the adapter.
+#
+# The price is `wit-bindgen c`, needed for ONE file: the component-type object.
+# That metadata has to be in the objects before the linker runs, and regexped
+# cannot emit a wasm object file — which is exactly why the wasip1 route above
+# exists and needs no code generator.
+P2_DIR   := wasip2
+P2_TYPES := $(P2_DIR)/wb/url_parts_consumer_component_type.o
+P2_GUEST := $(P2_DIR)/guest.wasm
+P2_FINAL := $(P2_DIR)/composed.wasm
+
+# wasm-component-ld is clang's linker for this target. rustup ships it inside the
+# toolchain rather than on PATH; override WASM_COMPONENT_LD_DIR if yours is
+# elsewhere, or drop the PATH prefix if it is already on PATH.
+WASM_COMPONENT_LD_DIR ?= $(firstword $(wildcard $(HOME)/.rustup/toolchains/*/lib/rustlib/*/bin))
+
+.PHONY: all generate build compile merge run clean component component-run wasip2 wasip2-run
 
 all: run
 
@@ -51,5 +87,80 @@ run: $(FINAL_WASM)
 	@echo "=== no URLs ==="
 	wasmtime run $(FINAL_WASM) "nothing here"
 
+# --- component targets --------------------------------------------------------
+
+# Step 1 – compile the patterns into a component, and generate its stub. Both
+# land under component/; the stub is called stub.h there too, so main.c includes
+# the same name and needs no change.
+$(COMP_REGEX) $(COMP_STUB): $(COMP_CFG) $(REGEXPED)
+	$(REGEXPED) compile  --config=$(COMP_CFG)
+	$(REGEXPED) generate --config=$(COMP_CFG)
+
+# Step 2 – compile main.c against the COMPONENT stub. -I$(COMP_DIR) is the only
+# difference from the module build's compile line.
+$(COMP_CORE): main.c $(COMP_STUB)
+	$(CC) $(CFLAGS) -I$(COMP_DIR) -o $@ main.c $(COMP_DIR)/stub.c
+
+# Step 3 – wrap the core module into a component. `component embed` needs the WIT
+# DIRECTORY (that is how it resolves deps/), and the adapter bridges main.c's
+# wasi_snapshot_preview1 imports to wasi:cli.
+$(COMP_GUEST): $(COMP_CORE)
+	@test -n "$(ADAPTER)" || { echo "no wasip1 adapter found; set ADAPTER=/path/to/wasi_snapshot_preview1.command.wasm" >&2; exit 1; }
+	wasm-tools component embed $(COMP_DIR)/wit $(COMP_CORE) --world url-parts-consumer -o $(COMP_DIR)/embedded.wasm
+	wasm-tools component new $(COMP_DIR)/embedded.wasm --adapt wasi_snapshot_preview1=$(ADAPTER) -o $@
+
+# Step 4 – compose guest and regexp component. The SAME `regexped merge` the
+# module build runs: it dispatches on wasm_format and shells out to `wac` here
+# where the module build gets `wasm-merge`. Without it the guest has an
+# unsatisfied import. The output path comes from the config.
+$(COMP_FINAL): $(COMP_GUEST) $(COMP_REGEX)
+	$(REGEXPED) merge --config=$(COMP_CFG) --main=$(COMP_GUEST) $(COMP_REGEX)
+
+component: $(COMP_FINAL)
+
+# Step 5 – run the component build with the same inputs as the module build. The
+# output should be identical: same patterns, same main.c, same generated API.
+component-run: $(COMP_FINAL)
+	@echo "=== single URL (component) ==="
+	wasmtime run $(COMP_FINAL) "https://example.com:8080/path/to/page?q=1&r=2#section"
+	@echo ""
+	@echo "=== two URLs in one string (component) ==="
+	wasmtime run $(COMP_FINAL) "visit https://example.com/page or http://api.example.org/v2?fmt=json"
+	@echo ""
+	@echo "=== no URLs (component) ==="
+	wasmtime run $(COMP_FINAL) "nothing here"
+
+# --- wasip2 targets -----------------------------------------------------------
+
+# Step 1 – the component-type object, the only thing wit-bindgen is used for.
+# Its .c/.h are DISCARDED: the bindings come from regexped's stub.
+$(P2_TYPES): $(COMP_STUB)
+	@mkdir -p $(P2_DIR)
+	wit-bindgen c $(COMP_DIR)/wit --out-dir $(P2_DIR)/wb
+
+# Step 2 – compile AND wrap in one step. Note what is absent: no
+# `wasm-tools component embed`, no `component new`, no --adapt.
+$(P2_GUEST): main.c $(COMP_STUB) $(P2_TYPES)
+	@test -n "$(WASM_COMPONENT_LD_DIR)" || { echo "wasm-component-ld not found; set WASM_COMPONENT_LD_DIR" >&2; exit 1; }
+	PATH="$(WASM_COMPONENT_LD_DIR):$$PATH" $(CC) --target=wasm32-wasip2 -nostdlib -Wl,--no-entry 		-I$(COMP_DIR) -o $@ main.c $(COMP_DIR)/stub.c $(P2_TYPES)
+
+# Step 3 – compose, exactly as the wasip1 route does. --output overrides the
+# config, which names the wasip1 route's target.
+$(P2_FINAL): $(P2_GUEST) $(COMP_REGEX)
+	$(REGEXPED) merge --config=$(COMP_CFG) --main=$(P2_GUEST) --output=$@ $(COMP_REGEX)
+
+wasip2: $(P2_FINAL)
+
+wasip2-run: $(P2_FINAL)
+	@echo "=== single URL (wasip2 component) ==="
+	wasmtime run $(P2_FINAL) "https://example.com:8080/path/to/page?q=1&r=2#section"
+	@echo ""
+	@echo "=== two URLs in one string (wasip2 component) ==="
+	wasmtime run $(P2_FINAL) "visit https://example.com/page or http://api.example.org/v2?fmt=json"
+	@echo ""
+	@echo "=== no URLs (wasip2 component) ==="
+	wasmtime run $(P2_FINAL) "nothing here"
+
 clean:
 	rm -f stub.h stub.c $(MAIN_WASM) $(REGEX_WASM) $(FINAL_WASM)
+	rm -rf $(COMP_DIR) $(P2_DIR)

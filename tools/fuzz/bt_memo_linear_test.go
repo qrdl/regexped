@@ -8,6 +8,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -194,7 +195,9 @@ func TestSetBTMemoIsLinearInInputLength(t *testing.T) {
 		copy(mem.UnsafeData(store)[inBase:], in[:n])
 		fn := inst.GetFunc(store, "set_find")
 		before, _ := store.GetFuel()
-		res, callErr := fn.Call(store, inBase, int32(n), int32(0), gateBase, outBase, int32(1))
+		scratchBase := gateBase + 64
+		abi.WriteFindScratch(mem.UnsafeData(store), scratchBase, gateBase, 0, 0)
+		res, callErr := fn.Call(store, inBase, int32(n), int32(0), scratchBase, outBase, int32(1))
 		if callErr != nil {
 			t.Fatalf("len=%d: %v", n, callErr)
 		}
