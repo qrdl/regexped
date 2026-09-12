@@ -831,7 +831,7 @@ func TestWideUnionDoesNotArmFindPreflight(t *testing.T) {
 				r.resetGates()
 				wantPos, wantIDs := oracleFirstPosition(pats, input, from, dropped)
 				total := int(r.call(t, "cap_find", r.inBase, in, int32(from),
-					r.gatePtr, r.outPtr, int32(r.npat)).(int32))
+					r.scratchPtr(), r.outPtr, int32(r.npat)).(int32))
 				if wantPos < 0 {
 					if total != 0 {
 						t.Fatalf("find(from=%d) = %d tuples, want 0", from, total)

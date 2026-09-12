@@ -96,13 +96,16 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	for i := int32(0); i < int32(4*len(pats)); i++ {
 		buf[gatePtr+i] = 0
 	}
+	// The scratch descriptor the export takes in place of the bare gate
+	// pointer (internal/abi).
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
 
 	var run gatedRun
 	from := int32(0)
 	outCap := int32(len(pats))
 	prevStart := -1
 	for {
-		res, err := fn.Call(store, inBase, int32(len(input)), from, gatePtr, outPtr, outCap)
+		res, err := fn.Call(store, inBase, int32(len(input)), from, scratchPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("gated_find: %v", err)
 		}
@@ -302,17 +305,18 @@ func TestGatedOverflowStoresNoState(t *testing.T) {
 		mem.Grow(store, needed-cur) //nolint:errcheck
 	}
 	copy(mem.UnsafeData(store)[inBase:], input)
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
 
 	var got []setMatch
 	from := int32(0)
 	for {
 		// Undersized probes first — these must not touch the gate array.
 		for _, cap := range []int32{0, 1} {
-			if _, err := fn.Call(store, inBase, int32(len(input)), from, gatePtr, outPtr, cap); err != nil {
+			if _, err := fn.Call(store, inBase, int32(len(input)), from, scratchPtr, outPtr, cap); err != nil {
 				t.Fatal(err)
 			}
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), from, gatePtr, outPtr, int32(len(pats)))
+		res, err := fn.Call(store, inBase, int32(len(input)), from, scratchPtr, outPtr, int32(len(pats)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -428,12 +432,13 @@ func TestGatedLadderFuel(t *testing.T) {
 		for i := int32(0); i < 4; i++ {
 			buf[gatePtr+i] = 0
 		}
+		scratchPtr := writeFindScratch(store, mem, gatePtr, 1, 0, 0)
 		fn := inst.GetFunc(store, "gated_find")
 		var total uint64
 		from := int32(0)
 		for {
 			before, _ := store.GetFuel()
-			res, err := fn.Call(store, inBase, int32(n), from, gatePtr, outPtr, int32(1))
+			res, err := fn.Call(store, inBase, int32(n), from, scratchPtr, outPtr, int32(1))
 			if err != nil {
 				t.Fatalf("gated_find: %v", err)
 			}

@@ -321,13 +321,18 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[inBase:], input)
 	}
+	// The scratch descriptor the export takes in place of the bare gate
+	// pointer, placed above the array inside the page reserved for it
+	// (internal/abi). No answer cache: this drives the plain `find`.
+	scratchBase := gateBase + int32(numPatterns)*4
+	abi.WriteFindScratch(mem.UnsafeData(store), scratchBase, gateBase, 0, 0)
 
 	_, wd := sharedEngine()
 	from := int32(0)
 	prevStart := -1
 	for {
 		wd.Arm(store)
-		res, callErr := fn.Call(store, inBase, int32(len(input)), from, gateBase, outBase, outCap)
+		res, callErr := fn.Call(store, inBase, int32(len(input)), from, scratchBase, outBase, outCap)
 		wd.Disarm()
 		if callErr != nil {
 			if isTimeout(callErr) {

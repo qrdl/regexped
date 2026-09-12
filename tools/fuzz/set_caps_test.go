@@ -12,6 +12,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -127,7 +128,15 @@ func (r *capRunner) resetGates() {
 	for i := int32(0); i < 65536; i++ {
 		buf[r.gatePtr+i] = 0
 	}
+	// The descriptor the export takes in place of the bare gate pointer, laid
+	// out above the array inside the same page. Rewritten here, with the gates,
+	// because this is what declares a fresh drive (internal/abi).
+	abi.WriteFindScratch(buf, r.scratchPtr(), r.gatePtr, 0, 0)
 }
+
+// scratchPtr is where the descriptor lives: above the gate array, inside the
+// page reserved for it.
+func (r *capRunner) scratchPtr() int32 { return r.gatePtr + int32(r.npat)*4 + 64 }
 
 func (r *capRunner) call(t *testing.T, name string, args ...interface{}) interface{} {
 	t.Helper()
@@ -391,7 +400,7 @@ func checkCapsAgainstOracle(t *testing.T, r *capRunner, pats []string, input str
 		}
 
 		// find: every tuple at the first matching position.
-		total := int(r.call(t, "cap_find", r.inBase, n, f, r.gatePtr, r.outPtr, int32(r.npat)).(int32))
+		total := int(r.call(t, "cap_find", r.inBase, n, f, r.scratchPtr(), r.outPtr, int32(r.npat)).(int32))
 		if wantPos < 0 {
 			if total != 0 {
 				t.Fatalf("find(from=%d) = %d, want 0", from, total)
@@ -469,19 +478,19 @@ func TestSetFindOverflowContract(t *testing.T) {
 	defer r.Close()
 	n := int32(len(input))
 
-	full := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, int32(len(pats))).(int32))
+	full := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.scratchPtr(), r.outPtr, int32(len(pats))).(int32))
 	if full != 3 {
 		t.Fatalf("expected all three patterns at position 0, got %d", full)
 	}
 	for _, cap := range []int32{0, 1, 2} {
-		got := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, cap).(int32))
+		got := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.scratchPtr(), r.outPtr, cap).(int32))
 		if got != full {
 			t.Fatalf("find with out_cap=%d returned %d, want the total %d", cap, got, full)
 		}
 	}
 	// Idempotence: after the undersized probes, the full-size call must be
 	// identical to calling it first.
-	again := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.gatePtr, r.outPtr, int32(len(pats))).(int32))
+	again := int(r.call(t, "cap_find", r.inBase, n, int32(0), r.scratchPtr(), r.outPtr, int32(len(pats))).(int32))
 	if again != full {
 		t.Fatalf("full-size call after undersized probes returned %d, want %d", again, full)
 	}
@@ -498,7 +507,7 @@ func TestSetFromOutOfRange(t *testing.T) {
 	if got := r.call(t, "cap_scan_all", r.inBase, n, int32(99)).(int64); got != 0 {
 		t.Errorf("scan_all(from>len) = %d, want 0", got)
 	}
-	if got := r.call(t, "cap_find", r.inBase, n, int32(99), r.gatePtr, r.outPtr, int32(2)).(int32); got != 0 {
+	if got := r.call(t, "cap_find", r.inBase, n, int32(99), r.scratchPtr(), r.outPtr, int32(2)).(int32); got != 0 {
 		t.Errorf("find(from>len) = %d, want 0", got)
 	}
 }

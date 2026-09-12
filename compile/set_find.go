@@ -1589,3 +1589,79 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 	// overwritten by the other four.
 	return c
 }
+
+// --- the scratch descriptor prologue ---------------------------------------
+
+// injectScratchPrologue rewrites an already-emitted `find` body so that its
+// fourth parameter is a SCRATCH DESCRIPTOR pointer rather than a bare gate
+// pointer (internal/abi).
+//
+// It splices rather than threading the change through the four frontend
+// emitters, and that is the point: every one of them reads the gate through
+// `c.pGate`, so replacing the PARAMETER'S VALUE at entry leaves all of them
+// correct without a single edit. WASM parameters are mutable locals, which is
+// what makes that possible.
+//
+//	if load(p+0) != MAGIC { unreachable }
+//	p = load(p+4)
+//
+// The trap is the whole reason for the magic word: the descriptor replaces a
+// parameter of the same type, so a caller still passing a bare gate array would
+// otherwise have gate[0] — zero on a clean scan — read as a pointer, and
+// corrupt memory quietly. Here it fails on the first call instead.
+//
+// The input is a complete CODE ENTRY — a ULEB128 byte count, then
+// [locals vector][code] — so both the size prefix and the locals vector are
+// parsed, and the prefix is re-emitted at the new length. Splicing without
+// rewriting the count produces a module whose code section is off by the
+// prologue's length from the first spliced function onward.
+func injectScratchPrologue(entry []byte, pScratch byte) []byte {
+	size, n, err := utils.DecodeULEB128(entry)
+	if err != nil || int(size)+n != len(entry) {
+		panic("compile: injectScratchPrologue given something that is not one code entry")
+	}
+	body := entry[n:]
+	off := localsVectorEnd(body)
+	var p []byte
+	p = append(p, 0x20, pScratch)
+	p = append(p, 0x28, 0x02, abi.FindScratchMagicOff) // i32.load align=4
+	p = append(p, 0x41)
+	p = utils.AppendSLEB128(p, abi.FindScratchMagic)
+	p = append(p, 0x47)       // i32.ne
+	p = append(p, 0x04, 0x40) // if
+	p = append(p, 0x00)       // unreachable
+	p = append(p, 0x0B)       // end
+	p = append(p, 0x20, pScratch)
+	p = append(p, 0x28, 0x02, abi.FindScratchGateOff)
+	p = append(p, 0x21, pScratch)
+
+	out := make([]byte, 0, len(body)+len(p))
+	out = append(out, body[:off]...)
+	out = append(out, p...)
+	out = append(out, body[off:]...)
+	return append(utils.AppendULEB128(nil, uint32(len(out))), out...)
+}
+
+// localsVectorEnd returns the offset just past a function body's locals
+// declaration vector: a ULEB128 group count, then that many (ULEB128 count,
+// valtype) pairs.
+//
+// Parsed rather than assumed. Bodies here declare anywhere from zero groups to
+// several, and a hardcoded offset would splice the prologue into the middle of
+// a declaration — which produces a module that still validates when the bytes
+// happen to read as something, and misbehaves.
+func localsVectorEnd(body []byte) int {
+	groups, n, err := utils.DecodeULEB128(body)
+	if err != nil {
+		panic("compile: malformed locals vector in an emitted find body")
+	}
+	off := n
+	for i := uint64(0); i < groups; i++ {
+		_, n, err := utils.DecodeULEB128(body[off:])
+		if err != nil {
+			panic("compile: malformed local group in an emitted find body")
+		}
+		off += n + 1 // the count, then its valtype byte
+	}
+	return off
+}

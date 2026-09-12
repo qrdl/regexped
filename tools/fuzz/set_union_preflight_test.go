@@ -130,12 +130,15 @@ func runUnionPreflightFind(t *testing.T, w []byte, pats []string, input string, 
 	for i := int32(0); i < int32(4*len(pats)); i++ {
 		buf[gatePtr+i] = 0
 	}
+	// The scratch descriptor the export takes in place of the bare gate
+	// pointer (internal/abi).
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
 
 	var out []setMatch
 	pos := from
 	outCap := int32(len(pats))
 	for {
-		res, err := fn.Call(store, inBase, int32(len(input)), pos, gatePtr, outPtr, outCap)
+		res, err := fn.Call(store, inBase, int32(len(input)), pos, scratchPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("gated_find: %v", err)
 		}

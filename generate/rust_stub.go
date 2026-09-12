@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // rustStub generates a Rust stub file for all regexp entries and sets in cfg.
@@ -190,7 +191,19 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				gateField = "    gates: Box<[u32]>,\n"
 				gateInit = " gates: vec![0u32; " + idKonst + "].into_boxed_slice(),"
 			}
-			gateArg := "self.gates.as_mut_ptr(), "
+			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
+			// pointer: magic, gate pointer, and the answer cache (declined —
+			// only the batching entry's sweep reads one, and this stub does not
+			// expose that entry).
+			//
+			// Filled immediately before EACH call rather than once at
+			// construction, because field 1 is a pointer into `self`: an
+			// iterator that was moved after construction would otherwise carry
+			// a stale address. Four stores against a call that walks the input.
+			gateField += "    scratch: [u32; 4],\n"
+			gateInit += " scratch: [0u32; 4],"
+			gateArg := "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagic) +
+				"u32, self.gates.as_mut_ptr() as u32, 0, 0]; self.scratch.as_mut_ptr() }, "
 			gateDoc := " and a zeroed gate array"
 			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
 /// refills at each matching position and yields that position's matches one
@@ -596,8 +609,8 @@ func rustABIParam(p abiParam) string {
 		return "len: i32"
 	case abiFrom:
 		return "from: i32"
-	case abiGatePtr:
-		return "gates: *mut u32"
+	case abiScratchPtr:
+		return "scratch: *mut u32"
 	case abiBitmapPtr:
 		return "out: *mut u8"
 	case abiTuplePtr:

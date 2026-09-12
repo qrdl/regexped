@@ -171,6 +171,10 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 			buf[passCache+i] = 0
 		}
 	}
+	// The scratch descriptor the export takes in place of the bare gate
+	// pointer: it carries the gate array AND the cache, so it is written after
+	// the cache has been decided (internal/abi).
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), passCache, passCacheLen)
 	runtime.KeepAlive(store)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
@@ -191,7 +195,7 @@ func (r *batchRunner) drive(t *testing.T, outCap int32, withCache bool) []setMat
 		// overlapping entry records no match gates but takes the array as the
 		// per-drive home of its preflight verdict.
 		res, err := fn.Call(store, inBase, int32(len(input)), cursor,
-			gatePtr, outPtr, outCap, passCache, passCacheLen)
+			scratchPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}
@@ -443,7 +447,8 @@ func TestFindBatchZeroCap(t *testing.T) {
 
 			// The `from` of the very first call is 0, which is also a legal
 			// resume position — the value the pre-fix body handed back.
-			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gatePtr, outPtr, int32(0), int32(0), int32(0))
+			desc := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), desc, outPtr, int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}

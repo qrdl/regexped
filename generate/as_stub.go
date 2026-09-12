@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // asStub generates an AssemblyScript stub file for all regexp entries in cfg.
@@ -211,9 +212,18 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			// — the branch that omitted it was unreachable
 			// and is gone.
 			decl(s.Find, sig("find"))
-			gateField := "    gates: StaticArray<u32>;\n"
-			gateInit := "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"
-			gateArg := "changetype<usize>(this.gates), "
+			gateField := "    gates: StaticArray<u32>;\n    scratch: StaticArray<u32>;\n"
+			gateInit := "        this.gates = new StaticArray<u32>(" + idKonst + ");\n" +
+				"        this.scratch = new StaticArray<u32>(4);\n"
+			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
+			// pointer: magic, gate pointer, cache (declined — only the batching
+			// entry reads one, and this stub does not expose it).
+			//
+			// Written before EACH call: field 1 is the address of a managed
+			// array, and a descriptor written once could outlive a compaction.
+			gateArg := "(this.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
+				", this.scratch[1] = changetype<usize>(this.gates) as u32, this.scratch[2] = 0, " +
+				"this.scratch[3] = 0, changetype<usize>(this.scratch)), "
 			// AssemblyScript has no generators, so `find` is an explicit
 			// iterator object — caller-owned, so two scans can be in flight
 			// and re-creating it restarts the scan.
@@ -505,8 +515,8 @@ func asABIParam(p abiParam) string {
 		return "len: i32"
 	case abiFrom:
 		return "from: i32"
-	case abiGatePtr:
-		return "gates: usize"
+	case abiScratchPtr:
+		return "scratch: usize"
 	case abiBitmapPtr, abiTuplePtr:
 		return "out: usize"
 	case abiOutCap:

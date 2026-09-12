@@ -22,6 +22,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -2365,16 +2366,23 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
+// gatePtr points at the gate array; the SCRATCH DESCRIPTOR the export actually
+// takes is built immediately above it (internal/abi), so one argument still
+// describes all of the caller's scratch.
 func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
 	inBase, inLen, gatePtr, outBase, outCap int32) int {
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < outCap*4; i++ {
 		buf[gatePtr+i] = 0
 	}
+	scratchPtr := gatePtr + outCap*4
+	// No answer cache: this harness drives the plain `find`, which never reads
+	// one — only the batching entry's sweep does.
+	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 	total := 0
 	from := int32(0)
 	for {
-		res, err := wcall(findFn, store, inBase, inLen, from, gatePtr, outBase, outCap)
+		res, err := wcall(findFn, store, inBase, inLen, from, scratchPtr, outBase, outCap)
 		if err != nil {
 			return total
 		}

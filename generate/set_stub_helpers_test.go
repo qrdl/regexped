@@ -59,7 +59,7 @@ func TestSpellJSArgs(t *testing.T) {
 	})
 	t.Run("every parameter has a spelling", func(t *testing.T) {
 		all := &setCapability{Kind: "find", Params: []abiParam{
-			abiInputPtr, abiInputLen, abiFrom, abiGatePtr,
+			abiInputPtr, abiInputLen, abiFrom, abiScratchPtr,
 			abiBitmapPtr, abiTuplePtr, abiOutCap, abiCursor,
 		}}
 		got := spellJSArgs(all, s)

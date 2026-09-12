@@ -38,6 +38,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -2725,20 +2726,25 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 // runSetExhaust drives the set `find` export to exhaustion, the way a
 // generated iterator does: zero the gate array, then call
 //
-//	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
+//	find(ptr, len, from, scratch_ptr, out_ptr, out_cap) -> total at that position
+//
+// where scratch_ptr is the descriptor holding the gate pointer and (declined
+// here) the overlapping answer cache — see internal/abi.
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
 func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) error {
 	gatePtr := plan.outputBase + setOutCap*12
+	scratchPtr := gatePtr + setOutCap*4
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < setOutCap*4; i++ {
 		buf[gatePtr+i] = 0
 	}
+	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
-		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
+		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, scratchPtr, plan.outputBase, setOutCap)
 		if err != nil {
 			return err
 		}

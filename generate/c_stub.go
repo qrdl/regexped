@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // cStub generates C stub files (.h and .c) for all regexp entries in cfg.
@@ -259,9 +260,18 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// — the branch that omitted it was unreachable
 			// and is gone.
 			imp(s.Find, decl("find"))
-			gateField := fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+			gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
 			gateInit := fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
-			gateArg := "s->gates, "
+			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
+			// pointer: magic, gate pointer, cache (declined — only the batching
+			// entry reads one, and this stub does not expose it).
+			//
+			// Built before EACH call rather than in _init, because field 1 is a
+			// pointer INTO the scanner: a caller that copied the struct — which
+			// nothing forbids, it is a by-value type — would otherwise leave the
+			// copy pointing at the original's gates.
+			gateArg := "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
+				"u, s->scratch[1] = (unsigned)(size_t)s->gates, s->scratch[2] = 0, s->scratch[3] = 0, s->scratch), "
 			// D17: the scanner is CALLER-owned, so two scans can be in flight
 			// and re-initialising the struct restarts one. The static
 			// _next/_reset pair this replaces could do neither.
@@ -685,8 +695,8 @@ func cABIParam(p abiParam) string {
 		return "int len"
 	case abiFrom:
 		return "int from"
-	case abiGatePtr:
-		return "unsigned *gates"
+	case abiScratchPtr:
+		return "unsigned *scratch"
 	case abiBitmapPtr:
 		return "unsigned char *bits"
 	case abiTuplePtr:

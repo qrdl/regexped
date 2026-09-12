@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // jsStub generates a JS ES module stub file for all regexp entries and sets in cfg.
@@ -54,9 +55,13 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		// SPACE), then the >64-pattern bitmap (ceil(idSpace/8)). The two
 		// counts differ for a set that selects a named subset — see
 		// idSpaceSize.
-		reserve := 12*n + 4*idN + bitmapBytes(s, cfg)
+		// … then the SCRATCH DESCRIPTOR the find exports take in place of a
+		// bare gate pointer: four u32s holding a magic word, the gate pointer
+		// and the answer cache (internal/abi).
+		reserve := 12*n + 4*idN + scratchDescriptorBytes + bitmapBytes(s, cfg)
 		gateBase := fmt.Sprintf("_outBase + 12*%s", konst)
-		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
+		scratchBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
+		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s + %d", konst, idKonst, scratchDescriptorBytes)
 
 		// Argument ORDER comes from the R12 descriptor, not from the templates
 		// below — the one place the compiler's ABI is written down
@@ -65,7 +70,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		caps := setCapabilities(s, cfg)
 		spell := jsArgSpelling{
 			inPtr: "_inBase", inLen: "len", from: "from",
-			gate: gateBase, bitmap: "bitmapBase",
+			gate: "scratchBase", bitmap: "bitmapBase",
 			tuple: "_outBase", outCap: konst, cursor: "cursor",
 		}
 		args := func(kind string) string { return spellJSArgs(capByKind(caps, kind), spell) }
@@ -180,8 +185,11 @@ export function %s(input, from = 0) {
 			//, so this is unconditional.
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
-`, gateBase, idKonst)
-			gateArg := "gateBase, "
+    // The scratch descriptor: magic, the gate pointer, and no answer cache.
+    const scratchBase = %s;
+    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, 0, 0]);
+`, gateBase, idKonst, scratchBase, abi.FindScratchMagic)
+			gateArg := "scratchBase, "
 			gateDoc := "// The generator owns the gate array for its lifetime: dropping it and\n" +
 				"// creating a new one restarts the scan with clean gates.\n"
 			if !s.BatchFind() {
@@ -225,7 +233,7 @@ export function %s(input, from = 0) {
 `, gateDoc, s.Find, reserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
-						gate: gateBase, tuple: "_outBase", outCap: konst,
+						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
 					btOverflow, btOverflowMsg(s.Find), konst, konst)
 			} else {
@@ -243,6 +251,10 @@ export function %s(input, from = 0) {
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
     new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
 `, idKonst)
+				// The scratch descriptor sits above the gate array and below
+				// the bitmap, and is written AFTER the cache is sized: the
+				// cache pointer is one of its fields.
+				batchScratchBase := fmt.Sprintf("gateBase + 4*%s", idKonst)
 				// The overlapping answer cache. An OVERLAPPING drive reports
 				// every start position, so a pattern whose automaton never
 				// dies is quadratic: each position walks to the end of the
@@ -260,7 +272,7 @@ export function %s(input, from = 0) {
 				// read through a Uint32Array, and a typed-array view whose
 				// byte offset is not a multiple of its element size THROWS, so
 				// the gap is rounded up to the same 8 _align uses.
-				batchGateRegion := 4*idN + bitmapBytes(s, cfg)
+				batchGateRegion := 4*idN + scratchDescriptorBytes + bitmapBytes(s, cfg)
 				if s.Overlapping {
 					batchGateRegion = (batchGateRegion + 7) &^ 7
 				}
@@ -279,6 +291,12 @@ export function %s(input, from = 0) {
 `, batchGateRegion, config.SetOverlapCacheHeaderBytes/4)
 					cacheArgs = "cacheBase, cacheBytes"
 				}
+				// The descriptor, written last: it carries the cache pointer,
+				// which the block above may have declined.
+				cachePost += fmt.Sprintf(`    const scratchBase = %s;
+    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+`, batchScratchBase, abi.FindScratchMagic, cacheArgs)
+				cacheArgs = ""
 				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
 //
 // batchSize is how many tuples one WASM call may fill: 1 is a call per
@@ -294,7 +312,7 @@ export function %s(input, from = 0) {
     // re-attached by _att when an interleaved call grows memory.
     let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
     while (true) {
-        const packed = _exp['%s'](_inBase, len, cursor, %s_outBase, batchSize, %s);
+        const packed = _exp['%s'](_inBase, len, cursor, %s_outBase, batchSize);%s
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
         // are public — all ones means the scan is finished, and that arrives
         // on the same call as the last matches.

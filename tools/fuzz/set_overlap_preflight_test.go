@@ -139,7 +139,7 @@ func TestOverlappingPreflightRunsOncePerDrive(t *testing.T) {
 			t.Fatalf("gate[%d] = %d before the drive, want 0", i, v)
 		}
 	}
-	r.call(t, "cap_find", r.inBase, int32(len(input)), int32(0), r.gatePtr, r.outPtr, int32(r.npat))
+	r.call(t, "cap_find", r.inBase, int32(len(input)), int32(0), r.scratchPtr(), r.outPtr, int32(r.npat))
 
 	buf = r.mem.UnsafeData(r.store)
 	var zero []int
@@ -191,7 +191,7 @@ func driveOverlapFindFrom(t *testing.T, r *capRunner, input string, from int32) 
 	prevStart := -1
 	for {
 		n := r.call(t, "cap_find", r.inBase, int32(len(input)), from,
-			r.gatePtr, r.outPtr, int32(r.npat)).(int32)
+			r.scratchPtr(), r.outPtr, int32(r.npat)).(int32)
 		if n <= 0 {
 			return out
 		}

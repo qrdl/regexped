@@ -2248,11 +2248,11 @@ func (cs *compiledSet) twoPhaseCaps() []setCapKind {
 // within the set's functions; phase 2 is the next one. -1 when the capability
 // is not split.
 //
-// The hidden bodies sit immediately after the batch worker, which itself sits
-// immediately after the exported capabilities.
+// The hidden bodies sit immediately after the body the exported `find` wraps,
+// which itself sits immediately after the exported capabilities.
 func (cs *compiledSet) twoPhaseFnOffset(kind setCapKind) int {
 	base := len(cs.capFns())
-	if cs.batchFind {
+	if cs.findWrapped() {
 		base++
 	}
 	for _, k := range cs.twoPhaseCaps() {

@@ -202,11 +202,12 @@ func runFindEmbedded(t *testing.T, w []byte, input string) [][2]int {
 	for i := int32(0); i < 4; i++ {
 		buf[gatePtr+i] = 0
 	}
+	scratchPtr := writeFindScratch(store, hostMem, gatePtr, 1, 0, 0)
 	fn := inst.GetFunc(store, "s_find")
 	var out [][2]int
 	from := int32(0)
 	for {
-		res, err := fn.Call(store, inBase, int32(len(input)), from, gatePtr, outPtr, int32(1))
+		res, err := fn.Call(store, inBase, int32(len(input)), from, scratchPtr, outPtr, int32(1))
 		if err != nil {
 			t.Fatalf("find (embedded): %v", err)
 		}

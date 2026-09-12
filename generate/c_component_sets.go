@@ -45,7 +45,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		idN := idSpaceSize(s, cfg)
 		scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
-		gateField := fmt.Sprintf("    unsigned gates[%s];\n", idKonst)
+		gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
 
 		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 
@@ -181,13 +181,14 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
 // The scanner struct is the module one, unchanged, because the header is shared —
 // so this body reuses its fields for what it actually needs:
 //
-//	gates[0]  the resource HANDLE, which is the only state that matters here
-//	done      as before
+//	scratch[0]  the resource HANDLE, which is the only state that matters here
+//	done        as before
 //
-// Putting the handle in gates[0] is not a trick played on the caller: the gate
-// array is documented as opaque, the only operation on it is zeroing, and a
-// component consumer has no gate array to own — the real one lives inside the
-// regexp component with the rest of the scan.
+// `scratch` is the same field the MODULE stub builds its ABI descriptor in, and
+// the struct is shared because the header is. Neither format uses both: a module
+// scanner fills the descriptor and owns the gates, a component scanner holds a
+// handle and owns neither — the gate array lives inside the regexp component
+// with the rest of the scan.
 func cComponentSetFindBody(module, kebab, name, scannerType, konst string) string {
 	ctor := "_ffi_" + name + "_new"
 	next := "_ffi_" + name + "_next"
@@ -211,7 +212,7 @@ extern int %s(const unsigned char *ptr, unsigned int len, unsigned int start);
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
     /* gates[0] holds the resource handle: the real gate array is inside the
        regexp component, along with the input and the position. */
-    s->gates[0] = (unsigned)%[3]s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);
+    s->scratch[0] = (unsigned)%[3]s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);
     return 0;
 }
 
@@ -221,7 +222,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (s->done) return 0;
     /* result<list<set-match>, error-code>: @0 disc, @4 list ptr, @8 list len */
     __attribute__((aligned(4))) unsigned char area[12] = {0};
-    %[4]s((int)s->gates[0], area);
+    %[4]s((int)s->scratch[0], area);
     /* Negative would be a count in the module format; here the error is the
        result's discriminant. Either way it means UNKNOWN, so the scan ends AND
        says so rather than reporting "no more matches". */
@@ -249,11 +250,11 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 }
 
 void %[1]s_free(%[2]s *s) {
-    if (!s || s->gates[0] == 0) return;
-    %[6]s((int)s->gates[0]);
+    if (!s || s->scratch[0] == 0) return;
+    %[6]s((int)s->scratch[0]);
     /* Idempotent: a second call, or a call on a finished scan, must do nothing
        rather than drop a handle twice. */
-    s->gates[0] = 0;
+    s->scratch[0] = 0;
     s->done = 1;
 }
 

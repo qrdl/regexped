@@ -373,8 +373,13 @@ const (
 
 	// find_batch. The cursor is an i64 in and an i64 out: the value the
 	// export returns is passed back verbatim as the next call's cursor.
-	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch
-	//                          ptr, len, cursor, gate, out, cap, scratch, scratch_len
+	setTypeBatchGated = 10 // (i32,i32,i64,i32,i32,i32)→i64  find_batch
+	//                          ptr, len, cursor, SCRATCH, out, cap
+	//
+	// SIX parameters since 2026-09-11, not eight. The answer cache used to
+	// arrive as a trailing (ptr, len) pair; it now comes from the scratch
+	// descriptor the fourth parameter points at, which is the same place the
+	// gate pointer comes from.
 	//
 	// There is no separate type for the OVERLAPPING batch entry. Both overlap
 	// policies share ONE signature, so the second type was declared in every
@@ -390,11 +395,31 @@ const (
 // component types sit past it.
 const numSetTypesBase = 11
 
-// batchPosFnOffset returns the index of the set's shared per-position worker,
-// or -1 when the set does not batch. It sits immediately after the exported
+// findWrapped reports whether the exported `find` is a thin WRAPPER over a
+// hidden inner body rather than being that body itself.
+//
+// Two independent reasons put a wrapper there, and they compose:
+//
+//   - batching, since decision (11a): both entries drive ONE per-position
+//     worker, so the module carries one set of bucket code rather than two.
+//   - the overlapping answer cache: `find` has to read the cache header, test
+//     the trigger, possibly sweep and serve — all BEFORE the walk — and then
+//     charge the walk's matched bytes to the drive's work counter AFTER it. An
+//     epilogue cannot be spliced into a body that returns from several places,
+//     so the body becomes a callee.
+func (cs *compiledSet) findWrapped() bool {
+	return cs.hasFind() && (cs.batchFind || cs.usesOverlapDP())
+}
+
+// findInnerFnOffset returns the index of the hidden body the exported `find`
+// wraps, or -1 when `find` IS the body. It sits immediately after the exported
 // capability functions.
-func (cs *compiledSet) batchPosFnOffset() int {
-	if !cs.batchFind {
+//
+// A batching set's inner body is the shared per-position worker (`find`'s
+// signature plus the batch-only trailing argument); a non-batching one's is the
+// ordinary find body, unchanged and still taking a bare gate pointer.
+func (cs *compiledSet) findInnerFnOffset() int {
+	if !cs.findWrapped() {
 		return -1
 	}
 	return len(cs.capFns())
@@ -404,7 +429,7 @@ func (cs *compiledSet) batchPosFnOffset() int {
 // its capability functions and its suffix functions.
 func (cs *compiledSet) hiddenFnCount() int {
 	n := 0
-	if cs.batchFind {
+	if cs.findWrapped() {
 		n++
 	}
 	// Two per split capability: phase 1 (the frontend over the literal
@@ -424,7 +449,7 @@ func (cs *compiledSet) overlapDPFnOffset() int {
 		return -1
 	}
 	n := len(cs.capFns())
-	if cs.batchFind {
+	if cs.findWrapped() {
 		n++
 	}
 	return n + 2*len(cs.twoPhaseCaps())
@@ -2009,7 +2034,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 7
 		0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 8
 		0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F, // type 9
-		0x60, 0x08, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
+		0x60, 0x06, 0x7F, 0x7F, 0x7E, 0x7F, 0x7F, 0x7F, 0x01, 0x7E, // type 10
 	}
 	if opts.Component {
 		typeSection[0] = numSetTypesBase + 2
@@ -2089,11 +2114,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			fs = append(fs, c.typeIdx)
 		}
-		// The hidden per-position batch worker. Gated it is `find`'s own
-		// signature; ungated it is that signature plus the batch `skip` — which
-		// is the same arity, so both are type 8.
-		if cs.batchFind {
-			fs = append(fs, byte(cs.workerTypeIdx()))
+		// The hidden body the exported `find` wraps. A batching set's is the
+		// per-position worker — gated, `find`'s own signature; ungated, that
+		// signature plus the batch `skip`, which is the same arity. A set
+		// wrapped only for the answer cache calls the ordinary find body, so
+		// its type IS `find`'s.
+		if cs.findWrapped() {
+			t := byte(setTypeI32x6ToI32)
+			if cs.batchFind {
+				t = byte(cs.workerTypeIdx())
+			}
+			fs = append(fs, t)
 		}
 		// The split's hidden phase bodies take and return exactly what the
 		// capability they serve does, so they reuse its type.
@@ -2413,23 +2444,33 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		base := setBaseIdx[si]
 		scanProbeBase := base + cs.scanProbeBaseOffset()
 		anchoredProbeBase := base + cs.anchoredProbeBaseOffset()
+		// The backward sweep, shared by BOTH position-reporting entries since
+		// the cache logic became common code.
+		dpIdx := -1
+		if off := cs.overlapDPFnOffset(); off >= 0 {
+			dpIdx = base + off
+		}
 		for _, c := range cs.capFns() {
 			switch c.kind {
 			case capFind:
-				if cs.batchFind {
+				if cs.findWrapped() {
 					// Decision (11a): the export forwards into the shared
 					// worker instead of carrying its own copy of the bucket
-					// code.
-					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.batchPosFnOffset())...)
+					// code. A non-batching set is wrapped for the answer cache
+					// alone, and forwards into the ordinary find body.
+					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx)...)
 				} else {
-					cs_bytes = append(cs_bytes, rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+					// The EXPORTED find takes a scratch descriptor where the
+					// body reads a gate pointer, so the prologue converts one
+					// into the other in the parameter itself. The batching
+					// set's export is the wrapper above, which does the same
+					// thing by hand; the shared worker keeps taking a gate,
+					// because both of its callers have already dereferenced.
+					cs_bytes = append(cs_bytes, injectScratchPrologue(
+						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3)...)
 				}
 			case capFindBatch:
-				dpIdx := -1
-				if off := cs.overlapDPFnOffset(); off >= 0 {
-					dpIdx = base + off
-				}
-				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.batchPosFnOffset(), dpIdx)...)
+				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), dpIdx)...)
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					cs_bytes = append(cs_bytes,
@@ -2463,8 +2504,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				cs_bytes = append(cs_bytes, body...)
 			}
 		}
-		if cs.batchFind {
-			cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+		if cs.findWrapped() {
+			if cs.batchFind {
+				cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+			} else {
+				// Wrapped for the answer cache alone: the inner body is the
+				// ordinary find body, emitted unchanged. It keeps taking a
+				// BARE gate pointer — the wrapper has already dereferenced the
+				// descriptor, exactly as the batching worker's callers have.
+				cs_bytes = append(cs_bytes,
+					rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
+			}
 		}
 		// The split's hidden bodies, in twoPhaseCaps order so they line up
 		// with twoPhaseFnOffset. Phase 1 is the ordinary frontend emitter

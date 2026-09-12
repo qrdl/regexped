@@ -329,6 +329,10 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 	if !useCache {
 		passScratch, passLen = 0, 0
 	}
+	// The DESCRIPTOR the export takes in place of a bare gate pointer: it
+	// carries the gate array and the answer cache, so what used to be two
+	// trailing arguments is now two fields (internal/abi).
+	descPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), passScratch, passLen)
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
@@ -339,7 +343,7 @@ func driveOverlapCacheScratch(t *testing.T, pats []string, input string, offset,
 		if calls > 4*(len(input)+2)*len(pats)+16 {
 			t.Fatalf("drive did not terminate over %q (cap %d)", input, outCap)
 		}
-		res, err := fn.Call(store, inBase, int32(len(input)), cursor, gatePtr, outPtr, outCap, passScratch, passLen)
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, descPtr, outPtr, outCap)
 		if err != nil {
 			t.Fatalf("set_find_batch: %v", err)
 		}

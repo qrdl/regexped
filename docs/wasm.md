@@ -428,12 +428,15 @@ WASM functions for multi-pattern matching.
 (func $scan_all (param $in_ptr i32) (param $in_len i32) (param $from i32) (param $out_ptr i32) (result i32))
 
 ;; find — ONE signature for both overlap policies. The default body records
-;; per-pattern non-overlapping gates in $gate_ptr; the overlapping body
+;; per-pattern non-overlapping gates in the descriptor's gate array; the overlapping body
 ;; records none and uses the array to carry its once-per-drive "matches
 ;; nowhere" verdict instead. See "The gate array" below.
+;;
+;; An overlapping `find` also reads the descriptor's answer cache, on the same
+;; adaptive rule the batch entry uses. See "The overlapping answer cache" below.
 (func $find
     (param $in_ptr i32) (param $in_len i32) (param $from i32)
-    (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
+    (param $scratch_ptr i32) (param $out_ptr i32) (param $out_cap i32)
     (result i32))   ;; TOTAL matches at the reported position
 
 ;; <find>_batch — emitted ONLY under `hints: [batch-find]` on the set, alongside
@@ -444,14 +447,49 @@ WASM functions for multi-pattern matching.
 ;; Both entries are driven by ONE shared per-position worker, so a batching set
 ;; carries one set of bucket code rather than two.
 ;;
-;; $cache_ptr/$cache_len are OPTIONAL scratch — pass 0, 0 to decline. See "The
+;; The answer cache travels in $scratch_ptr, as it does for $find. See "The
 ;; overlapping answer cache" below.
 (func $<find>_batch                                  ;; both overlap policies
     (param $in_ptr i32) (param $in_len i32) (param $cursor i64)
-    (param $gate_ptr i32) (param $out_ptr i32) (param $out_cap i32)
-    (param $cache_ptr i32) (param $cache_len i32)
+    (param $scratch_ptr i32) (param $out_ptr i32) (param $out_cap i32)
     (result i64))
 ```
+
+### The scratch descriptor
+
+`scratch_ptr` points at four u32s in CALLER-owned memory. It replaced a bare
+gate-array pointer in the same position, and both find entries take it:
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `magic` | `0x52584653` ("RXFS"). The module compares it and executes `unreachable` otherwise |
+| +4 | `gate_ptr` | the gate array, `ID_SPACE` u32s, zeroed to start a drive — exactly as before |
+| +8 | `cache_ptr` | the overlapping answer cache, or 0 to decline |
+| +12 | `cache_len` | its length in bytes |
+
+**Why a descriptor.** The answer cache is what makes an overlapping drive linear
+instead of quadratic, and it has to live in caller-owned memory for the same
+reason the gate array does — a region held inside the module would carry one
+scan's answers into the next. A descriptor gives it somewhere to travel that the
+next piece of scratch can reuse without changing a signature again, and it
+collapsed `find_batch` from eight parameters to six: the cache is described in
+one place rather than two.
+
+**Why the magic word.** The parameter has the same type it had before, so a
+caller still passing a bare gate array would have `gate[0]` — zero on a clean
+scan — read as a pointer, and corrupt memory quietly. The compare turns that into
+a trap on the first call. One compare per call buys a loud failure instead of a
+silent one.
+
+The generated stubs build and pass the descriptor for you; it never appears in
+their public surface. Only a direct WASM caller sees it.
+
+**The magic guards one direction, not both.** A stale CALLER against a current
+module traps, which is the case it was added for. A current caller against a
+stale MODULE does not — the old module has no magic to compare, reads the
+descriptor's first word as a gate, and answers wrongly rather than failing.
+Rebuild the module from the same tree as the caller; `regexped` is a prerequisite
+of every example's compile rule for exactly this reason.
 
 `in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
 search. Zero-width assertions (`\b`, `\B`, `(?m:^)`, `(?m:$)`) therefore see
@@ -516,12 +554,26 @@ can use, while the batch entry returns a resumable cursor, which a probe cannot.
 never dies — `[^\n]*ERROR` on newline-free input — walks to the end of the
 input from every one of them, and the drive is quadratic in the input length.
 
-The last two parameters of the batch entry let the caller break that. Given a
+The descriptor's `cache_ptr` / `cache_len` let the caller break that. Given a
 region it can fill, the engine may sweep the input **once**, right to left,
 computing every `(start, pattern, extent)` tuple in one pass, and then serve
 the rest of the drive by copying out of it. The sweep reads the same forward
 transition and accept tables the ordinary body reads and emits no tables of its
 own.
+
+**BOTH find entries read it**, on the same rule and out of the same header, so
+an overlapping drive is linear through `find` as well as through the batch
+entry — `hints: [batch-find]` is not required to get the cache, and never was
+required to get a correct answer. Only what each entry does with a served
+position differs, which is their protocols and not the cache's:
+
+| entry | serves |
+|---|---|
+| `find` | the tuples at the first cached position at or after `from`, all of them, returning the total — its ordinary transactional rule, so `out_cap = 0` is still a size probe and a run that does not fit still writes nothing |
+| `<find>_batch` | tuples from its cursor onward, up to `out_cap`, splitting a position where it must |
+
+`find` needs no cursor to do that and is given none: the cache is indexed by
+position and `from` IS the position.
 
 **Engagement is adaptive, and that is the point.** The sweep costs a flat
 `states x patterns` per input byte, while the walk's cost depends on the data —
@@ -539,7 +591,7 @@ to the caller: matches keep arriving in the same order with none repeated or
 dropped. A drive that never crosses the line never sweeps, and costs what it
 cost before the cache existed.
 
-| Parameter | Meaning |
+| Descriptor field | Meaning |
 |---|---|
 | `cache_ptr` | Caller-owned region, or **0 to decline** |
 | `cache_len` | Its size in bytes |
@@ -560,10 +612,27 @@ The rules:
   tuple, and the worst case really is one tuple per pattern per start position:
   a pattern that never dies matches from nearly every start, which is the case
   the cache exists for.
+
+  **That grows fast, and the numbers decide whether you can offer one at all:**
+
+  | patterns | input | region |
+  |---|---|---|
+  | 3 | 100 KB | 3.5 MiB |
+  | 100 | 16 KB | 18.8 MiB |
+  | 8 | 1 MiB | 96 MiB |
+  | 100 | 100 KB | 117 MiB |
+
+  The formula hides this; the numbers do not. A hundred patterns over 16 KB of
+  input is nearly 19 MiB, because the worst case is 1.6 million matches. Most
+  inputs produce a small fraction of that — but the sweep cannot know in
+  advance. It fills the region as it goes and refuses when it runs out, so the
+  safe size is the worst case and there is no smaller one to compute.
 - **Offer all of it or none of it.** A short region makes the sweep run and
   *then* discover it cannot finish — the one outcome strictly worse than never
-  sweeping. The generated JS/TS stubs cap what they will reserve at 64 MiB and
-  pass `0, 0` beyond that rather than pass a truncated region.
+  sweeping. The generated JS/TS stubs cap what they will reserve at **64 MiB**
+  and pass `0, 0` beyond that rather than pass a truncated region, which is why
+  the last two rows above get no cache from a stub: the drive walks instead, at
+  the cost the drive had before the cache existed.
 - **The cache belongs to one drive.** It holds the answer for one `(input,
   pattern set)` pair; re-zero the header to start a new drive.
 - **Same region on every call of a drive, or none.** The sweep writes its
@@ -579,8 +648,9 @@ bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
 no Backtracking member). Declining is invisible from the caller's side and
 costs nothing but speed.
 
-While the cache is live the cursor's high half carries a **tuple index** rather
-than a text position. Both are opaque, which is what lets a drive change from
+The rest of this section is the BATCH entry's alone, because it is about the
+cursor. While the cache is live the cursor's high half carries a **tuple index**
+rather than a text position. Both are opaque, which is what lets a drive change from
 one to the other when it switches: the call that switches returns the first
 index-form cursor, and every later call reads it as an index. Pass the value
 back unchanged and the change is invisible.
@@ -619,7 +689,8 @@ position, never a truncated one.
 
 ### The gate array
 
-Every `find` body takes `gate_ptr`, pointing at `id_space_size` u32s in
+Every `find` body reaches a gate array through the scratch descriptor's
+`gate_ptr`, pointing at `id_space_size` u32s in
 the **caller's** memory (`memory[0]` — the same memory the input lives in).
 The parameter does not depend on `overlapping:` — see "Under `overlapping:
 true`" below for what changes, which is what the array holds and nothing a
@@ -673,7 +744,7 @@ so no answer changes — but the array is not byte-for-byte untouched.
   `scan_all` 0, `find` 0.
 - `len == 0`: position 0 is evaluated.
 - Zero-length matches are ordinary matches; `find` reports them as `(id, p, p)`.
-- `out_ptr` and `gate_ptr` must be 4-byte aligned.
+- `out_ptr`, `scratch_ptr` and the `gate_ptr` inside it must be 4-byte aligned.
 - The `>64` bitmap at `out_ptr` is `ceil(P/8)` bytes, little-endian bit order
   (bit k = byte `k/8`, bit `k%8`), where **P is the set's id space**, not its
   pattern count — a set that selects patterns 68 and 69 of seventy needs a

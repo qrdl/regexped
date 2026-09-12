@@ -74,8 +74,10 @@ func TestBatchZeroCapTerminates(t *testing.T) {
 			// there is nowhere to put it.
 			copy(mem.UnsafeData(store)[inBase:], input)
 
-			// Both flavours take the gate array.
-			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), gate, out, int32(0), int32(0), int32(0))
+			// Both flavours take the scratch descriptor, which carries the
+			// gate array and (declined here) the answer cache.
+			desc := writeFindScratch(store, mem, gate, 4, 0, 0)
+			res, err := fn.Call(store, inBase, int32(len(input)), int64(0), desc, out, int32(0))
 			if err != nil {
 				t.Fatalf("set_find_batch: %v", err)
 			}

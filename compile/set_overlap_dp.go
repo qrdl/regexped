@@ -119,7 +119,11 @@ type overlapDPTables struct {
 // the whole sweep as well as its memory.
 const overlapDPMaxColumn = 4096
 
-// usesOverlapDP reports whether this set's batching `find` carries the sweep.
+// usesOverlapDP reports whether this set's `find` carries the sweep.
+//
+// BOTH position-reporting entries, since 2026-09-11: the cache logic is common
+// code and `find` calls it, so the sweep is emitted for any overlapping set
+// whose shape qualifies rather than only for one that asked for batching.
 func (cs *compiledSet) usesOverlapDP() bool { return cs.overlapDPBucket() >= 0 }
 
 // overlapDPBucket returns the index of the single bucket the sweep would run
@@ -131,10 +135,15 @@ func (cs *compiledSet) usesOverlapDP() bool { return cs.overlapDPBucket() >= 0 }
 // to reproduce a SECOND time, and a second copy of a semantics is how R4
 // diverged.
 func (cs *compiledSet) overlapDPBucket() int {
-	// The sweep only ever runs from the batching entry of an OVERLAPPING set:
-	// it enumerates every start position, which is that policy's contract and
-	// nobody else's.
-	if cs.find == "" || !cs.overlapping || !cs.batchFind {
+	// The sweep only ever runs on an OVERLAPPING set: it enumerates every
+	// start position, which is that policy's contract and nobody else's.
+	//
+	// `hints: [batch-find]` is NOT required. It used to be, because the code
+	// that reads a cache lived inside the batching loop; that code is now
+	// shared and `find` calls it too, so requiring the hint would be requiring
+	// a second entry point nobody asked for in order to make the first one
+	// linear.
+	if cs.find == "" || !cs.overlapping {
 		return -1
 	}
 	// ONE bucket. With several, a position's tuples come from several DFAs and
@@ -677,4 +686,175 @@ func emitOverlapDPBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 
 	body := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(body, b...)
+}
+
+// --- the shared cache logic -------------------------------------------------
+//
+// Reading a cache is COMMON code, called from both `find` and `find_batch`.
+// It used to live inside emitSetFindBatchBody, which is the only reason `find`
+// ignored a cache the caller had already handed it: the descriptor carries
+// cache_ptr and cache_len and `find` takes the descriptor.
+//
+// Serving is the one piece that does NOT come out whole, because the two
+// entries ask different questions — `find` wants the tuples at the first
+// cached position at or after `from` and how many there are, `find_batch`
+// wants a bounded slice from its cursor. So the trigger, the sweep call, its
+// refusal handling and the work accumulation are here, and each entry keeps
+// only its own protocol.
+
+// overlapCacheCtx bundles the local and parameter indices the shared cache
+// emitters read. Locals rather than a fixed convention: the two callers
+// allocate their frames independently, and threading indices is what lets the
+// SAME bytes come out of both.
+type overlapCacheCtx struct {
+	// dpIdx is the function index of the backward sweep.
+	dpIdx int
+	// costPerByte is what one input byte of sweeping costs, in the same
+	// currency the work counter uses (matched bytes).
+	costPerByte int64
+
+	pInPtr    byte // input pointer parameter
+	pInLen    byte // input length parameter
+	pCache    byte // cache_ptr, from the scratch descriptor
+	pCacheLen byte // cache_len
+	lReady    byte // the header's `ready`, cached for this call
+	lWork     byte // the header's `work`, cached for this call
+}
+
+// emitWorkExceedsSweep pushes 1 when the walk has already spent more than the
+// sweep would cost.
+//
+// Computed in i64 because len * cost overflows i32 on a large input, which
+// would make the test wrap and fire at random.
+func (c overlapCacheCtx) emitWorkExceedsSweep(b []byte) []byte {
+	b = append(b, 0x20, c.lWork, 0xAD) // (u64) work
+	b = append(b, 0x20, c.pInLen, 0xAD)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, c.costPerByte)
+	b = append(b, 0x7E) // i64.mul
+	b = append(b, 0x56) // i64.gt_u
+	return b
+}
+
+// emitDefaults seeds the two cached header fields for a call that may find no
+// cache at all. -1 is "this drive has no cache", which is what every trigger
+// below tests, so both paths read one local rather than each deciding for
+// itself.
+func (c overlapCacheCtx) emitDefaults(b []byte) []byte {
+	b = append(b, 0x41, 0x7F, 0x21, c.lReady)
+	b = append(b, 0x41, 0x00, 0x21, c.lWork)
+	return b
+}
+
+// emitHeaderRead loads `ready` and `work` out of the cache header. Valid only
+// where the cache pointer is known non-zero.
+func (c overlapCacheCtx) emitHeaderRead(b []byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x28, 0x02, overlapDPHdrReady)
+	b = append(b, 0x21, c.lReady)
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x28, 0x02, overlapDPHdrWork)
+	b = append(b, 0x21, c.lWork)
+	return b
+}
+
+// emitSweepCall emits the sweep call itself and leaves 1 on the stack when it
+// REFUSED — the scratch could not hold the tuples, which is a fallback signal
+// rather than an error.
+func (c overlapCacheCtx) emitSweepCall(b []byte, pushFrom func([]byte) []byte) []byte {
+	b = append(b, 0x20, c.pInPtr)
+	b = append(b, 0x20, c.pInLen)
+	b = pushFrom(b)
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x20, c.pCacheLen)
+	b = append(b, 0x10) // call
+	b = utils.AppendULEB128(b, uint32(c.dpIdx))
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x48) // i32.lt_s -> the sweep refused
+	return b
+}
+
+// emitMarkRefused records that this drive must not ask again.
+func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x41, 0x7F)
+	b = append(b, 0x36, 0x02, overlapDPHdrReady)
+	return b
+}
+
+// emitStoreWork writes the work counter back to the caller's cache header.
+//
+// Drive state, so it goes back before every walk-path return — otherwise each
+// call would start from zero and a drive of many short calls could never cross
+// the line.
+func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x20, c.lWork)
+	b = append(b, 0x36, 0x02, overlapDPHdrWork)
+	return b
+}
+
+// emitEntrySweep is the ENTRY-TIME half of the adaptive trigger: not swept yet
+// AND the walk has already cost more than the sweep would.
+//
+// The second half is the whole of the engagement rule: without it this is the
+// unconditional sweep that measured 2 wins and 5 regressions. The caller zeroed
+// the scratch to start the drive, so a zero `ready` IS "not swept yet" — the
+// same contract the gate array has, and the reason no magic value is needed.
+//
+// lEntrySwept, when >= 0, is set to 1 inside the taken arm: `find_batch` needs
+// to know that THIS call is the one that swept, because the cursor it was
+// handed still carries a text position where the cache path reads a tuple
+// index. `find` has no cursor and passes -1.
+func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte, lEntrySwept int) []byte {
+	b = append(b, 0x20, c.lReady)
+	b = append(b, 0x45)
+	b = c.emitWorkExceedsSweep(b)
+	b = append(b, 0x71) // i32.and
+	b = append(b, 0x04, 0x40)
+	b = c.emitSweepCall(b, pushFrom)
+	b = append(b, 0x04, 0x40)
+	b = c.emitMarkRefused(b)
+	b = append(b, 0x0B) // end if the sweep refused
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x28, 0x02, overlapDPHdrReady)
+	b = append(b, 0x21, c.lReady)
+	if lEntrySwept >= 0 {
+		b = append(b, 0x41, 0x01, 0x21, byte(lEntrySwept))
+	}
+	b = append(b, 0x0B) // end if not swept yet
+	return b
+}
+
+// emitAccumulateWork adds the matched bytes of out[idx..count) to the work
+// counter, saturating.
+//
+// The counter only ever grows and is compared unsigned, so a wrap would read as
+// "cheap" on the most expensive drive there is.
+//
+// idxLocal is consumed as the loop cursor and must already hold the first tuple
+// index to charge for.
+func (c overlapCacheCtx) emitAccumulateWork(b []byte, pOutPtr, idxLocal, countLocal, tmpLocal byte) []byte {
+	b = append(b, 0x02, 0x40)                                          // block $sumDone
+	b = append(b, 0x03, 0x40)                                          // loop  $sum
+	b = append(b, 0x20, idxLocal, 0x20, countLocal, 0x4E, 0x0D, 0x01)  // idx >= count
+	b = append(b, 0x20, pOutPtr, 0x20, idxLocal, 0x41, 12, 0x6C, 0x6A) //nolint:mnd // tuple stride
+	b = append(b, 0x22, tmpLocal)
+	b = append(b, 0x28, 0x02, 0x08) // tuple.end
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x28, 0x02, 0x04) // tuple.start
+	b = append(b, 0x6B)             // end - start
+	b = append(b, 0x20, c.lWork, 0x6A)
+	b = append(b, 0x22, tmpLocal)
+	b = append(b, 0x41, 0x00, 0x48) // < 0 -> it wrapped
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x21, c.lWork) // 0x7FFFFFFF
+	b = append(b, 0x05)
+	b = append(b, 0x20, tmpLocal, 0x21, c.lWork)
+	b = append(b, 0x0B)
+	b = append(b, 0x20, idxLocal, 0x41, 0x01, 0x6A, 0x21, idxLocal)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+	return b
 }

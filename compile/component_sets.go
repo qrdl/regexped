@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -46,7 +47,13 @@ const (
 	repPos   = 8  // the next position to search from
 	repGate  = 12 // the gate array, id_space u32s
 	repDone  = 16 // set once the drive has reported its last position
-	repBytes = 20
+	// The SCRATCH DESCRIPTOR the `find` export takes in place of a bare gate
+	// pointer (internal/abi), carried INLINE here rather than allocated
+	// separately: the representation never moves — it is ours, and the handle
+	// holds it — so the gate pointer it contains cannot go stale, and the
+	// constructor can fill it once.
+	repScratch = 20
+	repBytes   = repScratch + abi.FindScratchBytes
 )
 
 // setMatchTupleBytes is one raw find tuple: {id, start, end} as three i32.
@@ -429,6 +436,22 @@ func buildSetScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, i
 	b = append(b, 0x20, lRep, 0x41, 0x00)
 	b = storeI32(b, repDone)
 
+	// The descriptor, filled once: magic, the gate array, and no answer cache.
+	// The cache is what makes an overlapping drive linear, and the `find` this
+	// resource drives READS one when offered — so what is missing here is the
+	// region, not the plumbing: whether a component should reserve one, and out
+	// of whose budget, is an open question (memory.grow is one-way, so a
+	// reservation stays in the process footprint after the handle is dropped).
+	b = append(b, 0x20, lRep, 0x41)
+	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
+	b = storeI32(b, repScratch+abi.FindScratchMagicOff)
+	b = append(b, 0x20, lRep, 0x20, lGate)
+	b = storeI32(b, repScratch+abi.FindScratchGateOff)
+	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = storeI32(b, repScratch+abi.FindScratchCacheOff)
+	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = storeI32(b, repScratch+abi.FindScratchCacheLenOff)
+
 	// Detach: the chain goes back to what it held on entry, so the blocks above
 	// belong to the handle and not to this call.
 	b = append(b, 0x20, lChain)
@@ -492,8 +515,11 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	b = loadI32(b, repLen)
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, repPos)
+	// The descriptor's ADDRESS, not the gate pointer: the export dereferences.
 	b = append(b, 0x20, pRep)
-	b = loadI32(b, repGate)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, repScratch)
+	b = append(b, 0x6A) // i32.add
 	b = append(b, 0x20, lOut)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(patternCount))

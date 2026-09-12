@@ -173,11 +173,11 @@ func TestCComponentSetParts(t *testing.T) {
 		// The ids arrive as a list; the body copies rather than scanning bits.
 		"const unsigned int *ids = *(const unsigned int **)(area + 4);",
 		"patterns[i] = (int)ids[i];",
-		// The handle lives in gates[0]; the real gate array is inside the
-		// component.
-		"s->gates[0] = (unsigned)_ffi_scan_it_new(",
+		// The handle lives in scratch[0] — the same field the MODULE stub
+		// builds its ABI descriptor in; neither format uses both.
+		"s->scratch[0] = (unsigned)_ffi_scan_it_new(",
 		// Dropping is idempotent: a second free must not drop twice.
-		"if (!s || s->gates[0] == 0) return;",
+		"if (!s || s->scratch[0] == 0) return;",
 		"_pattern_names[] = {",
 	} {
 		if !strings.Contains(c, want) {

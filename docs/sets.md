@@ -110,7 +110,7 @@ differences are in the interface, not in what you call:
 | `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
 | `<find>_free` in C | a no-op | MANDATORY — it drops the handle |
 | `hints: [batch-find]` | a second entry point | refused at load |
-| `overlapping: true` answer cache | JS/TS stubs reserve one | none, as for a C or Rust module consumer |
+| `overlapping: true` answer cache | read by both find entries; the JS/TS stubs reserve one, other module callers pass their own | none, as for a C or Rust module consumer |
 
 See [component.md](component.md#sets).
 
@@ -244,15 +244,29 @@ export function* scan_secrets(input, offset?, batchSize?): Generator<SetMatch>
 and never binds in practice — 524,287 tuples is a 6 MB buffer.
 
 **On an `overlapping: true` set the JS/TS iterator also reserves an answer
-cache** for the duration of one iteration, and that reservation is large: 12
-bytes per pattern per input byte, so 3 patterns over a 100 KB input is about
-3.6 MB. It is a reservation, not a cost: the sweep described under "Overlap
-policy" runs only when the drive proves expensive, and on the scans where the
-walk is already fast the memory is never touched. What it buys, when it does
-run, is the difference between a linear drive and a quadratic one on
-unbounded-tail patterns. Past 64 MiB the stub reserves nothing and the drive
-walks instead, so the memory is bounded even on very large inputs. Sets without
-`overlapping: true` reserve none of this.
+cache** for the duration of one iteration, and that reservation is large:
+
+| patterns | input | region |
+|---|---|---|
+| 3 | 100 KB | 3.5 MiB |
+| 100 | 16 KB | 18.8 MiB |
+| 8 | 1 MiB | 96 MiB — over the cap, nothing reserved |
+| 100 | 100 KB | 117 MiB — over the cap, nothing reserved |
+
+The rule is `16 + (input_len + 1) * PATTERN_COUNT * 12` bytes, because the worst
+case is one match per pattern at every start position and a match is 12 bytes.
+A hundred patterns over 16 KB is nearly 19 MiB for that reason: 1.6 million
+matches. Most inputs produce far fewer, but the sweep fills the region as it
+goes and gives up when it runs out, so the size that is safe is the worst case.
+
+**The stub caps what it will reserve at 64 MiB** and passes nothing beyond it,
+so the memory is bounded on large inputs and those drives simply walk.
+
+It is a reservation, not a cost: the sweep described under "Overlap policy" runs
+only when the drive proves expensive, and on the scans where the walk is already
+fast the memory is never touched. What it buys, when it does run, is the
+difference between a linear drive and a quadratic one on unbounded-tail
+patterns. Sets without `overlapping: true` reserve none of this.
 
 #### The cursor
 
@@ -295,18 +309,19 @@ unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
 
 Adding `hints: [batch-find]` to an overlapping set removes most of that
-quadratic cost. The batching entry can be handed a scratch region, and it will
+quadratic cost. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
 counting the bytes it has matched, and once that exceeds what a single backward
 sweep would cost it sweeps the rest of the input in one pass and answers the
 remaining calls out of the result. A scan the walk handles cheaply never
-sweeps and costs exactly what it did before.
+sweeps and costs exactly what it did before. `hints: [batch-find]` is not
+required for any of that — the cache is read by the plain `find` too.
 
 The generated JS and TypeScript stubs reserve that region for you and size it
-from the input; the other stubs do not expose the batching entry, and a direct
-WASM caller opts in by passing a region (see "The overlapping answer cache" in
-[wasm.md](wasm.md)). It is optional everywhere, and declining it — or offering
-too little — changes the speed and never the answer.
+from the input, for their batching iterator; every other caller opts in by
+passing a region in the scratch descriptor (see "The overlapping answer cache"
+in [wasm.md](wasm.md)). It is optional everywhere, and declining it — or
+offering too little — changes the speed and never the answer.
 
 `overlapping` affects `find` and nothing else. On a set without it the key is
 silently ignored — there is no find body for it to select, so it has no
@@ -325,14 +340,22 @@ pattern may match again. That state lives in a **caller-owned array**, not
 inside the module:
 
 ```
-find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> i32
+find(ptr, len, from, scratch_ptr, out_ptr, out_cap) -> i32
 ```
+
+`scratch_ptr` points at a four-word DESCRIPTOR holding a magic word, the gate
+array's address and the overlapping answer cache (or 0). The gate array is
+still the caller's and still zeroed to start a drive; what changed is that its
+address travels inside a descriptor, so the cache has somewhere to travel with
+it. See [wasm.md](wasm.md#the-scratch-descriptor) — and note that a caller
+passing a bare gate pointer now traps immediately rather than reading `gate[0]`
+as an address.
 
 The parameter is present for **every** `find`, `overlapping: true` included —
 see the end of this section for what the overlapping body keeps there instead
 of gates. One signature, whatever the patterns turn out to compile to.
 
-- `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
+- the descriptor's `gate_ptr` points at `id_space_size` u32s in the caller's memory — the array
   is indexed by global pattern id, so it is sized from the id space and not
   from the pattern count (see the constants table below).
 - **All zeros means a clean scan.** That is the only operation a caller ever

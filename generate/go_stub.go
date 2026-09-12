@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // goStub generates a Go stub file (//go:build wasip1) for all regexp entries in cfg.
@@ -258,7 +259,17 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			// re-yielding tuples the caller had already seen. This is the
 			// shape the Rust and AS iterators already have.
 			gateDecl := "\t\tif iter.gates == nil {\n\t\t\titer.gates = make([]uint32, " + idKonst + ")\n\t\t}\n"
-			gateArg := "unsafe.Pointer(&iter.gates[0]), "
+			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
+			// pointer: magic, gate pointer, cache (declined — only the batching
+			// entry reads one, and this stub does not expose it).
+			//
+			// Rebuilt before EACH call: field 1 is the address of a slice the
+			// garbage collector is free to move, so a descriptor written once
+			// at construction could point at memory the gates have left.
+			gateDecl += "\t\titer.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) + "\n" +
+				"\t\titer.scratch[1] = uint32(uintptr(unsafe.Pointer(&iter.gates[0])))\n" +
+				"\t\titer.scratch[2], iter.scratch[3] = 0, 0\n"
+			gateArg := "unsafe.Pointer(&iter.scratch[0]), "
 			gateDoc := " and a zeroed gate array"
 			fmt.Fprintf(&out, `// %[1]sIter iterates the set's matches from position offset. It owns a
 // reusable tuple buffer%[2]s; each step yields one match, and each WASM call
@@ -274,7 +285,10 @@ type %[1]sIter struct {
 	// Drive state, held here rather than in the Matches() closure so that
 	// breaking out and ranging again resumes exactly where it stopped.
 	gates []uint32
-	buf   [][3]int32
+	// The scratch descriptor the find export takes (internal/abi). Rebuilt
+	// before each call, because field 1 is the address of the gates slice.
+	scratch [4]uint32
+	buf     [][3]int32
 	// tuples still owed at iter.offset, and how many of them were consumed.
 	pending  int32
 	consumed int32
@@ -700,8 +714,8 @@ func goABIParam(p abiParam) string {
 		return "length int32"
 	case abiFrom:
 		return "from int32"
-	case abiGatePtr:
-		return "gatePtr unsafe.Pointer"
+	case abiScratchPtr:
+		return "scratchPtr unsafe.Pointer"
 	case abiBitmapPtr, abiTuplePtr:
 		return "outPtr unsafe.Pointer"
 	case abiOutCap:
