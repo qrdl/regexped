@@ -2331,7 +2331,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	// out_cap is patterns_in_set: the exact worst case for a single position,
 	// so the exhaustion loop never overflows.
 	outCap := int32(len(sc.patterns))
-	gatePtr := outBase + outCap*12
+	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
 
 	// Warmup: exhaust all matches a few times.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
@@ -2451,7 +2451,7 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	copy(buf[inBase:], []byte(input))
 
 	outCap := int32(len(sc.patterns))
-	gatePtr := outBase + outCap*12
+	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
 
 	// Warmup call (uncounted).
 	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)

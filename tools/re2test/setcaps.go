@@ -266,6 +266,12 @@ type setCapStats struct {
 	// got no region, so the leg was identical to the nocache one and would
 	// have been recorded under the wrong label.
 	skippedCache int
+	// cacheByProfile splits the three cache counts by capability profile, in
+	// first-seen order. The totals alone hid that the default `all` profile
+	// never offered a region at all: its overlapping set is not the first one,
+	// and only the single-set profiles were sweeping.
+	cacheByProfile map[string]*cacheLegCounts
+	cacheProfiles  []string
 	// eligible is the denominator for the drop ceiling: every pattern offered
 	// to a chunk's compile, counted once per compile so it lines up with
 	// `dropped`.
@@ -291,7 +297,27 @@ const setMaxDropFraction = 0.01
 // lifted there — see gateProblems.
 const setMaxTimeoutFraction = 0.001
 
-var setStats = setCapStats{pass: map[string]int{}, fail: map[string]int{}}
+var setStats = setCapStats{pass: map[string]int{}, fail: map[string]int{}, cacheByProfile: map[string]*cacheLegCounts{}}
+
+// cacheLegCounts is one profile's share of the answer-cache counts.
+type cacheLegCounts struct{ swept, refused, skipped int }
+
+// cacheLeg returns the counts for a profile, creating them on first use.
+func (s *setCapStats) cacheLeg(profile string) *cacheLegCounts {
+	c, ok := s.cacheByProfile[profile]
+	if !ok {
+		c = &cacheLegCounts{}
+		s.cacheByProfile[profile] = c
+		s.cacheProfiles = append(s.cacheProfiles, profile)
+	}
+	return c
+}
+
+// skipCacheLeg records a cache leg that got no region.
+func (s *setCapStats) skipCacheLeg(profile string) {
+	s.skippedCache++
+	s.cacheLeg(profile).skipped++
+}
 
 func (s *setCapStats) note(label string) {
 	if _, seen := s.pass[label]; !seen {
@@ -352,6 +378,11 @@ func (s *setCapStats) report() {
 	if s.engagedCache > 0 || s.refusedCache > 0 {
 		fmt.Printf("  find cache legs that SWEPT: %d (refused the region: %d)\n",
 			s.engagedCache, s.refusedCache)
+	}
+	for _, prof := range s.cacheProfiles {
+		c := s.cacheByProfile[prof]
+		fmt.Printf("    profile %-10s cache legs: swept %d, refused %d, skipped (no region) %d\n",
+			prof+":", c.swept, c.refused, c.skipped)
 	}
 	if s.dropped > 0 {
 		// Documented behaviour, not a failure — but it means those patterns
@@ -702,6 +733,9 @@ type capFns struct {
 
 // setRunner is an instantiated profile module plus its memory layout.
 type setRunner struct {
+	// profile names the capability profile the runner was built for, which keys
+	// the per-profile answer-cache counts.
+	profile string
 	store   *wasmtime.Store
 	inst    *wasmtime.Instance
 	mem     *wasmtime.Memory
@@ -827,7 +861,7 @@ func (r *setRunner) cacheReady() int32 {
 	if r.cachePtr == 0 {
 		return 0
 	}
-	return int32(binary.LittleEndian.Uint32(r.buf()[r.cachePtr+8:]))
+	return int32(binary.LittleEndian.Uint32(r.buf()[r.cachePtr+config.SetOverlapHdrReadyOff:]))
 }
 
 // recordCacheLeg tallies what the leg just driven actually exercised.
@@ -835,8 +869,10 @@ func (r *setRunner) recordCacheLeg() {
 	switch r.cacheReady() {
 	case 1:
 		setStats.engagedCache++
+		setStats.cacheLeg(r.profile).swept++
 	case -1:
 		setStats.refusedCache++
+		setStats.cacheLeg(r.profile).refused++
 	}
 }
 
@@ -845,7 +881,7 @@ func (r *setRunner) startCacheDrive() {
 	for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
 		buf[r.cachePtr+i] = 0
 	}
-	binary.LittleEndian.PutUint32(buf[r.cachePtr+16:], uint32(r.cacheStride))
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
 	r.offerCache(r.cachePtr, r.cacheLen)
 }
 
@@ -1142,15 +1178,24 @@ func newSetRunner(
 	// comes from the compiler: the set is recompiled to learn it, which is the
 	// route a stub generator takes too. A set that gets no sweep declines, and
 	// the drive walks.
+	//
+	// Sized from THE OVERLAPPING SET, wherever it sits in the profile. It used to
+	// be sized from Sets[0] only when that set was overlapping, and in the
+	// default `all` profile Sets[0] is the gated one: every overlapping leg of
+	// the profile that runs by default was counted as "no region offered".
 	cacheLen, cacheStride := int32(0), int32(0)
-	if len(cfg.Sets) > 0 && cfg.Sets[0].Find != "" && cfg.Sets[0].Overlapping {
+	for _, sc := range cfg.Sets {
+		if !sc.Overlapping || sc.Find == "" {
+			continue
+		}
 		// ONE helper for both numbers: the region is sized from the stride and
 		// the sweep validates the stride against the region, so computing them
 		// apart is how a harness hands itself a header the engine rejects.
-		if want, k, err := compile.SetOverlapCacheSizing(cfg.Sets[0], cfg, maxLen); err == nil &&
+		if want, k, err := compile.SetOverlapCacheSizing(sc, cfg, maxLen); err == nil &&
 			want > config.SetOverlapCheckpointHeaderBytes && want <= config.SetOverlapCacheMaxBytes {
 			cacheLen, cacheStride = int32(want), int32(k)
 		}
+		break
 	}
 	if cacheLen == 0 {
 		cachePtr = 0
@@ -1175,7 +1220,7 @@ func newSetRunner(
 		}
 	}
 	return &setRunner{
-		store: store, inst: inst, mem: mem, wd: wd, release: release,
+		store: store, inst: inst, mem: mem, wd: wd, release: release, profile: prof.name,
 		inBase: inBase, outBase: outBase, gatePtr: gatePtr, scratchPtr: scratchPtr, bmpPtr: bmpPtr,
 		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: patternCount, idSpace: idSpace, inSet: inSet,
@@ -1412,7 +1457,7 @@ func runSetProfile(
 					if r.cachePtr != 0 {
 						cacheLegs = append(cacheLegs, true)
 					} else {
-						setStats.skippedCache++
+						setStats.skipCacheLeg(r.profile)
 					}
 				}
 				for _, withCache := range cacheLegs {
@@ -1490,11 +1535,19 @@ func runSetProfile(
 					// Both engines behind the one export: without the cache
 					// (the ordinary walk) and with it.
 					for _, withCache := range []bool{false, true} {
+						// Only an OVERLAPPING set reads a cache. Before the
+						// region was sized from the profile's overlapping set,
+						// a gated set's batch never had one to be offered; now
+						// that the default profile carries both, its cache leg
+						// would be the nocache drive under the wrong label.
+						if withCache && !c.spec.overlapping {
+							continue
+						}
 						// A declined cache makes the two legs the same drive,
 						// and recording the second under the `cache` label
 						// claims coverage that did not happen.
 						if withCache && r.cachePtr == 0 {
-							setStats.skippedCache++
+							setStats.skipCacheLeg(r.profile)
 							continue
 						}
 						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
@@ -1816,6 +1869,13 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 		if uint32(packed>>32) == config.SetCursorMalformedPos {
 			return nil, false, fmt.Errorf("find_batch reported a malformed answer-cache header; " +
 				"the harness wrote that header, so this is a bug here")
+		}
+		// The THIRD says the cursor resumed below the engaged cache's floor. This
+		// harness only ever hands back the cursor it was given, so that too is a
+		// bug here rather than a result to score.
+		if uint32(packed>>32) == config.SetCursorOutOfOrderPos {
+			return nil, false, fmt.Errorf("find_batch reported a resume below the answer " +
+				"cache's floor; the harness only moves forward, so this is a bug here")
 		}
 		count := int32(packed & countMask)
 		if count < 0 || count > outCap {

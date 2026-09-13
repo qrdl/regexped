@@ -28,6 +28,18 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	if err != nil {
 		return err
 	}
+	return generateStub(cfg, stubType, out)
+}
+
+// generateStub dispatches a RESOLVED stub type.
+//
+// Split from CmdGenerateStub so that the unknown-type arm is reachable from a
+// test. config.ResolveStubType cannot produce one today — it returns exactly
+// one of the seven names below, or an error — but the arm is the net under
+// adding an eighth there and forgetting it here, and an arm nothing can call is
+// an arm nothing can prove still reports rather than silently writing the wrong
+// language.
+func generateStub(cfg config.BuildConfig, stubType, out string) error {
 	switch stubType {
 	case "rust":
 		// The component stub has the same public API and a different body; see

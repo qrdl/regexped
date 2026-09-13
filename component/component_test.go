@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/tools"
 )
 
 // needWasmTools skips a test when the tool is absent, the same convention the
@@ -22,6 +23,26 @@ func needWasmTools(t *testing.T) string {
 	return tool
 }
 
+func TestResolveWasmTools(t *testing.T) {
+	// wasm_tools_path as a DIRECTORY: the tool name is appended. $WASM_TOOLS is
+	// ignored, set to garbage to prove it.
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "wasm-tools")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WASM_TOOLS", "/garbage/wasm-tools")
+	if got, err := resolveWasmTools(config.BuildConfig{WasmToolsPath: dir}); err != nil || got != fake {
+		t.Errorf("resolveWasmTools(directory) = %q, %v; want %q", got, err, fake)
+	}
+	// Omitted: $PATH only.
+	t.Setenv("WASM_TOOLS", fake)
+	t.Setenv("PATH", t.TempDir())
+	if _, err := resolveWasmTools(config.BuildConfig{}); err == nil || !strings.Contains(err.Error(), "$PATH") {
+		t.Errorf("err = %v; with wasm_tools_path omitted only $PATH is consulted, never $WASM_TOOLS", err)
+	}
+}
+
 func findCfg(name string) config.BuildConfig {
 	return config.BuildConfig{
 		WasmFormat:   "component",
@@ -31,65 +52,6 @@ func findCfg(name string) config.BuildConfig {
 			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
 			{Pattern: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
 		},
-	}
-}
-
-func TestResolveWasmTools(t *testing.T) {
-	// The config field wins over everything.
-	cfg := config.BuildConfig{WasmTools: "/opt/wasm-tools"}
-	if got := resolveWasmTools(cfg); got != "/opt/wasm-tools" {
-		t.Errorf("config field: got %q", got)
-	}
-	// A leading ~ is expanded rather than passed through: every caller feeds the
-	// result to exec, which does no shell expansion.
-	cfg.WasmTools = "~/bin/wasm-tools"
-	if got := resolveWasmTools(cfg); strings.HasPrefix(got, "~") {
-		t.Errorf("~ not expanded: %q", got)
-	}
-	// Then $WASM_TOOLS.
-	t.Setenv("WASM_TOOLS", "/env/wasm-tools")
-	if got := resolveWasmTools(config.BuildConfig{}); got != "/env/wasm-tools" {
-		t.Errorf("env: got %q", got)
-	}
-	t.Setenv("WASM_TOOLS", "~/env/wasm-tools")
-	if got := resolveWasmTools(config.BuildConfig{}); strings.HasPrefix(got, "~") {
-		t.Errorf("~ not expanded from env: %q", got)
-	}
-	// Then the bare name, resolved from PATH at exec time.
-	t.Setenv("WASM_TOOLS", "")
-	if got := resolveWasmTools(config.BuildConfig{}); got != "wasm-tools" {
-		t.Errorf("default: got %q", got)
-	}
-}
-
-func TestCheckTool(t *testing.T) {
-	dir := t.TempDir()
-
-	missing := filepath.Join(dir, "nope")
-	if err := checkTool(missing); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Errorf("absolute missing: %v", err)
-	}
-
-	notExec := filepath.Join(dir, "plain")
-	if err := os.WriteFile(notExec, []byte("#!/bin/sh\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := checkTool(notExec); err == nil || !strings.Contains(err.Error(), "not executable") {
-		t.Errorf("absolute non-executable: %v", err)
-	}
-	if err := os.Chmod(notExec, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := checkTool(notExec); err != nil {
-		t.Errorf("absolute executable: %v", err)
-	}
-
-	if err := checkTool("definitely-not-a-real-tool-xyz"); err == nil ||
-		!strings.Contains(err.Error(), "not found in PATH") {
-		t.Errorf("relative missing: %v", err)
-	}
-	if err := checkTool("sh"); err != nil {
-		t.Errorf("relative present: %v", err)
 	}
 }
 
@@ -107,27 +69,18 @@ func TestWitPathFor(t *testing.T) {
 	}
 }
 
-func TestExpandHome(t *testing.T) {
-	if got := expandHome("/abs/path"); got != "/abs/path" {
-		t.Errorf("absolute path changed: %q", got)
-	}
-	if got := expandHome("~/x"); strings.HasPrefix(got, "~") {
-		t.Errorf("~ not expanded: %q", got)
-	}
-}
-
 func TestRunToolFailureSurfaces(t *testing.T) {
-	if err := runTool("sh", "-c", "exit 3"); err == nil {
+	if err := tools.Run("sh", []string{"-c", "exit 3"}, "", nil); err == nil {
 		t.Error("a non-zero tool exit must be an error")
 	}
-	if err := runTool("sh", "-c", "exit 0"); err != nil {
+	if err := tools.Run("sh", []string{"-c", "exit 0"}, "", nil); err != nil {
 		t.Errorf("a zero tool exit must not be: %v", err)
 	}
 }
 
 func TestWrapMissingTool(t *testing.T) {
 	cfg := findCfg("secrets")
-	cfg.WasmTools = filepath.Join(t.TempDir(), "absent")
+	cfg.WasmToolsPath = filepath.Join(t.TempDir(), "absent")
 	err := Wrap(cfg, []byte{0, 'a', 's', 'm'}, "package regexped:x;\n", filepath.Join(t.TempDir(), "o.wasm"))
 	if err == nil || !strings.Contains(err.Error(), "wasm_format: component") {
 		t.Errorf("err = %v, want one naming the format that needs the tool", err)
@@ -291,7 +244,11 @@ func TestCmdCompileToStdout(t *testing.T) {
 func TestWrapTempDirFailure(t *testing.T) {
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "no", "such", "dir"))
 	cfg := findCfg("secrets")
-	cfg.WasmTools = "sh" // a tool that exists, so the failure is the temp dir
+	sh, lerr := exec.LookPath("sh")
+	if lerr != nil {
+		t.Skip("sh not on PATH")
+	}
+	cfg.WasmToolsPath = sh // a tool that exists, so the failure is the temp dir
 	err := Wrap(cfg, []byte{0}, "x", filepath.Join(t.TempDir(), "o.wasm"))
 	if err == nil || !strings.Contains(err.Error(), "temp dir") {
 		t.Errorf("err = %v, want the temp-dir failure", err)
@@ -334,7 +291,10 @@ func TestWrapPropagatesComponentNewFailure(t *testing.T) {
 }
 
 // The sibling .wit cannot be written when something already occupies its path as
-// a directory.
+// a directory. It is written FIRST: it is pure text from the config and cannot
+// fail for a reason the component would not, so a .wit that cannot be written
+// must stop the build before a fresh .wasm lands beside a stale or missing
+// interface file — the half-updated output `--diag-json` is already refused for.
 func TestCmdCompileWitWriteFailure(t *testing.T) {
 	needWasmTools(t)
 	dir := t.TempDir()
@@ -346,14 +306,35 @@ func TestCmdCompileWitWriteFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "write") {
 		t.Errorf("err = %v, want the .wit write failure", err)
 	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("a fresh .wasm was left beside a .wit that could not be written")
+	}
+}
+
+// The sibling .wit's directory cannot be created when a regular file sits where
+// one of its parents should be. That too stops the build before anything is
+// wrapped, so no .wasm is left behind.
+func TestCmdCompileWitDirFailure(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(blocker, "sub", "secrets.wasm")
+	err := CmdCompile(findCfg("secrets"), out, nil)
+	if err == nil || !strings.Contains(err.Error(), "mkdir "+filepath.Dir(WitPathFor(out))) {
+		t.Errorf("err = %v, want the failure to create the .wit's directory", err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("a .wasm was written although the .wit's directory could not be created")
+	}
 }
 
 // Wrap's failure must propagate out of CmdCompile rather than being swallowed.
 func TestCmdCompileSurfacesWrapFailure(t *testing.T) {
 	cfg := findCfg("secrets")
-	cfg.WasmTools = filepath.Join(t.TempDir(), "absent")
+	cfg.WasmToolsPath = filepath.Join(t.TempDir(), "absent")
 	if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), nil); err == nil ||
-		!strings.Contains(err.Error(), "tool not found") {
+		!strings.Contains(err.Error(), "no such file or directory") {
 		t.Errorf("err = %v, want the missing-tool failure", err)
 	}
 }
@@ -453,5 +434,42 @@ func TestCmdCompileVersionedComponent(t *testing.T) {
 	}
 	if !strings.Contains(string(witBytes), "package regexped:secrets@2.3.0;") {
 		t.Errorf("sibling .wit is not versioned:\n%s", witBytes)
+	}
+}
+
+// TestCmdCompileWritesSetComponent runs `wasm-tools component new` on a
+// SET-bearing core — the `[resource-new]` import, the `[dtor]` binding and the
+// `sets` interface — in the ordinary suite, rather than only in a manual run.
+func TestCmdCompileWritesSetComponent(t *testing.T) {
+	tool := needWasmTools(t)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "runs.wasm")
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "runs", WitPackage: "runs",
+		Regexps: []config.RegexEntry{
+			{Name: "lower", Pattern: `[a-z]+`},
+			{Name: "digits", Pattern: `[0-9]+`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "runs", Patterns: config.PatternSelector{All: true},
+			MatchAny: "runs_match_any", MatchAll: "runs_match_all",
+			ScanAny: "runs_scan_any", ScanAll: "runs_scan_all",
+			Find: "scan_runs", Overlapping: true,
+		}},
+	}
+	if err := CmdCompile(cfg, out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if o, err := exec.Command(tool, "validate", out).CombinedOutput(); err != nil {
+		t.Fatalf("wasm-tools rejected the set component: %v\n%s", err, o)
+	}
+	printed, err := exec.Command(tool, "component", "wit", out).CombinedOutput()
+	if err != nil {
+		t.Fatalf("component wit: %v\n%s", err, printed)
+	}
+	for _, want := range []string{"interface sets", "resource scan-runs", "runs-scan-all"} {
+		if !strings.Contains(string(printed), want) {
+			t.Errorf("the set component's interface is missing %q:\n%s", want, printed)
+		}
 	}
 }

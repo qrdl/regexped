@@ -19,7 +19,7 @@ Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 - **Pattern sets** — compile multiple patterns into a single merged DFA and declare which of five questions you need answered (`match_any`/`match_all` anchored, `scan_any`/`scan_all` non-anchored, `find` for positions and extents); one call scans for all patterns simultaneously, and `find` returns `(pattern_id, start, end)` tuples; a packed-pair SIMD probe (≤16 literals with a usable two-column window), bucketed SIMD Teddy (≤64 literals, given ≥2-byte literals and ≥4 distinct first bytes), Aho-Corasick (the rest, under a 512 KB table budget — it wins where first-byte diversity is low), or a density/hint-selected SIMD Shufti prefilter keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups)
 - **Two output kinds** — a core WASM module (the default) or a **WASM Component Model component** with a generated WIT interface, selected by `wasm_format:` in the config
-- WASM module merging via `wasm-merge` (module format); component wrapping via `wasm-tools` (component format)
+- WASM module merging via `wasm-merge` (module format); component wrapping via `wasm-tools` and composition via `wac` (component format), all driven by `regexped merge` and `regexped compile`
 - Configurable via YAML
 
 ## Installation
@@ -85,7 +85,7 @@ Examples are available for the following environments: wasmtime, native Rust hos
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-Most build a core WASM module. **[`wasmtime/rust/secrets`](../examples/wasmtime/rust/secrets) 🧩** builds a **Component Model component** instead, consumed through a generated Rust stub and composed with `wac` — see [component.md](component.md).
+Most build a core WASM module. **[`wasmtime/rust/secrets`](../examples/wasmtime/rust/secrets) 🧩** builds a **Component Model component** instead, consumed through a generated Rust stub and composed by `regexped merge` — see [component.md](component.md).
 
 See [`examples/README.md`](../examples/README.md) for more details, including which format each example builds.
 
@@ -112,7 +112,7 @@ See [`examples/README.md`](../examples/README.md) for more details, including wh
 ## Limitations
 
 - **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
-- **Component Model support is partial** — `wasm_format: component` produces a component with a WIT interface for single patterns (`match_func`, `find_func`, `groups_func`), with generated **Rust and C** stubs whose API is identical to the module-format ones. Not covered: pattern **sets**; and Go, AssemblyScript, JavaScript and TypeScript are not component targets — for JS/TS because no runtime loads a component natively, so the module format already serves them better. See [component.md](component.md).
+- **Component Model support is partial** — `wasm_format: component` produces a component with a WIT interface for single patterns (`match_func`, `find_func`, `groups_func`) and for pattern **sets** (a second `sets` interface, where `match_all`/`scan_all` return a `list<u32>` of ids and `find` becomes a WIT resource), with generated **Rust and C** stubs whose API is identical to the module-format ones. Not covered: `hints: [batch-find]` on a set, since the find resource exposes one position per call; and Go, AssemblyScript, JavaScript and TypeScript are not component targets — for JS/TS because no runtime loads a component natively, so the module format already serves them better. See [component.md](component.md).
 - **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
 
 ## Dependencies

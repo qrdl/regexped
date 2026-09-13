@@ -288,11 +288,11 @@ func TestModuleGlobalsAllocInit(t *testing.T) {
 func TestCompileOptionsProjection(t *testing.T) {
 	names := map[string]string{"f": "regexped:x/matcher#f"}
 	o := CompileOptions{Component: true, ComponentPackage: "regexped:x/matcher", ComponentExportNames: names}
-	got := o.asmOpts()
+	got := o.asmOpts(nil)
 	if !got.Component || got.ComponentPackage != o.ComponentPackage || got.ExportNames["f"] != names["f"] {
 		t.Errorf("projection lost something: %+v", got)
 	}
-	if (CompileOptions{}).asmOpts().Component {
+	if (CompileOptions{}).asmOpts(nil).Component {
 		t.Error("a plain CompileOptions must project to module")
 	}
 }

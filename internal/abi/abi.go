@@ -81,6 +81,23 @@ const (
 	// internally), because a caller is allowed to offer less than the optimum.
 	// Only a self-contradictory header lands here.
 	OverlapCacheMalformed = -4
+
+	// OverlapCacheOutOfOrder is returned when an overlapping `find` is asked
+	// for a `from` BELOW the floor its ENGAGED answer cache was swept from.
+	// Within one scan `from` must never go backwards — the gate array and the
+	// overlapping preflight already assume it — and a cache served from its
+	// floor would silently drop every match in [from, floor).
+	//
+	// Detection is BEST EFFORT, with no guarantee: only an engaged cache has a
+	// floor to compare against. Before the cache engages, with no region
+	// offered, or on a set with no cache, a backwards `from` is not detected.
+	//
+	// -6 rather than -5, and -3 and -5 are RESERVED: the C stubs return
+	// RX_ERR_NULL_ARG (-3) and RX_ERR_RANGE (-5) from their own argument
+	// checks, and C passes an engine code straight through. Every error code
+	// means the same thing in every language, so a new code takes the next
+	// value no layer uses.
+	OverlapCacheOutOfOrder = -6
 )
 
 // --- the `find` scratch descriptor -----------------------------------------
@@ -122,6 +139,16 @@ const (
 	FindScratchCacheOff    = 8
 	FindScratchCacheLenOff = 12
 )
+
+// SetMatchTupleBytes is one set match as the find exports write it: {pattern
+// id, start, end}, three i32. Every writer of a tuple buffer and every reader
+// that sizes or indexes one takes the stride from here.
+//
+// It is EXACTLY the canonical layout of the component interface's `record
+// set-match { id: u32, start: u32, end: u32 }` — size 12, align 4 — so the
+// buffer a find body fills IS that list's element array, and the component's
+// `next` hands it over without converting anything.
+const SetMatchTupleBytes = 12
 
 // WriteFindScratch fills a descriptor at buf[off:] — magic, gate pointer, and
 // either the answer cache or a declined one (pass 0, 0).

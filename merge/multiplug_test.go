@@ -168,6 +168,20 @@ regexps:
 		t.Fatalf("composed component still has an unsatisfied regexped import:\n%s", wit)
 	}
 
+	// The same interface from two plugs is refused by name. wac alone reports it
+	// with the text a genuine mismatch gives.
+	aCopy := filepath.Join(dir, "a-copy.wasm")
+	if data, err := os.ReadFile(filepath.Join(dir, "a.wasm")); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(aCopy, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = CmdMerge(mergeCfg, filepath.Join(dir, "socket.wasm"), filepath.Join(dir, "dup.wasm"),
+		[]string{filepath.Join(dir, "a.wasm"), aCopy})
+	if err == nil || !strings.Contains(err.Error(), "both export regexped:pkg-a/matcher") {
+		t.Errorf("two plugs exporting regexped:pkg-a/matcher: err = %v", err)
+	}
+
 	// Answers, not just linkage: "123" matches pkg-a only (3*100), "abcd"
 	// matches pkg-b only (4).
 	for _, c := range []struct{ invoke, want string }{

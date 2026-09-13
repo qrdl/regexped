@@ -464,10 +464,10 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 func allPatternsMask(cs *compiledSet) uint64 {
 	var m uint64
 	for bi, ids := range cs.patternIDs {
-		// Under phase1Only the fallback buckets belong to phase 2, so their
+		// Under phase1Only the fallback buckets belong to the union pass, so their
 		// ids can never appear in this body's accumulator. Including them
 		// would make `scan_all`'s "every pattern seen" exit unreachable and
-		// run phase 1 to end of input on every call — correct, but it throws
+		// run the frontend pass to end of input on every call — correct, but it throws
 		// away the exit for exactly the sets the split exists to speed up.
 		if cs.phase1Only && cs.buckets[bi].isFallback {
 			continue

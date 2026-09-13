@@ -121,8 +121,8 @@ func TestBatchFindKeepsTheAnswerCache(t *testing.T) {
 // to agree on the boundary.
 //
 // The generated TEXT is what runs, not a transcription of it: the prelude is
-// lifted out of the stub and evaluated as written, with only `_inCap(input)`
-// replaced by the length under test.
+// lifted out of the stub's _cacheFor and evaluated as written, with the length
+// under test as its argument.
 func TestGeneratedJSSizingMatchesConfig(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs node; skipped in -short")
@@ -152,7 +152,7 @@ func TestGeneratedJSSizingMatchesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	const first = "    const _m = _inCap(input) + 1;\n"
+	const first = "        const _m = _len + 1;\n"
 	const last = " ? cacheNeeded : 0;\n"
 	i := strings.Index(src, first)
 	j := strings.Index(src[i:], last)
@@ -341,5 +341,154 @@ func TestGoStubDeclaresMalformedCacheError(t *testing.T) {
 		if !strings.Contains(src, want) {
 			t.Errorf("the generated Go stub is missing %q", want)
 		}
+	}
+}
+
+// TestOutOfOrderReachesTheCaller is TestMalformedCacheReachesTheCaller for the
+// third sentinel. A stand-in module whose find returns -6, and one whose batch
+// entry returns the 0xFFFFFFFC position word, are handed to the generated JS,
+// and each must THROW the out-of-order message — not the malformed-cache one,
+// not the backtracking one — rather than end the scan as though it finished.
+func TestOutOfOrderReachesTheCaller(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node; skipped in -short")
+	}
+	for _, tool := range []string{"node", "wasm-tools"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH; this check is a no-op here", tool)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		batch bool
+		wat   string
+	}{
+		{"find", false, `(module
+  (memory (export "memory") 2)
+  (func (export "scan_ov") (param i32 i32 i32 i32 i32 i32) (result i32)
+    i32.const -6))
+`},
+		{"batch", true, fmt.Sprintf(`(module
+  (memory (export "memory") 2)
+  (func (export %q) (param i32 i32 i64 i32 i32 i32) (result i64)
+    i64.const 0x%X00000000))
+`, config.SetBatchExportName("scan_ov"), uint32(config.SetCursorOutOfOrderPos))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := config.SetConfig{
+				Name: "ov", Find: "scan_ov",
+				Patterns: config.PatternSelector{All: true}, Overlapping: true,
+			}
+			if tc.batch {
+				set.Hints = []string{"batch-find"}
+			}
+			cfg := config.BuildConfig{
+				Output:       "merged.wasm",
+				ImportModule: "demo",
+				Regexps: []config.RegexEntry{
+					{Name: "lower", Pattern: `[a-z]+`},
+					{Name: "word", Pattern: `\w+`},
+				},
+				Sets: []config.SetConfig{set},
+			}
+			dir := t.TempDir()
+			if err := jsStub(cfg, filepath.Join(dir, "stubs.js")); err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			watPath := filepath.Join(dir, "fake.wat")
+			if err := os.WriteFile(watPath, []byte(tc.wat), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("wasm-tools", "parse", watPath, "-o",
+				filepath.Join(dir, "fake.wasm")).CombinedOutput(); err != nil {
+				t.Fatalf("wasm-tools parse: %v\n%s", err, out)
+			}
+			driver := `import { readFileSync } from 'node:fs';
+import { init, scan_ov } from './stubs.js';
+await init(readFileSync('./fake.wasm'));
+try {
+    for (const m of scan_ov("abc")) { }
+    console.log("NO-THROW");
+} catch (e) {
+    console.log("THREW: " + e.message);
+}
+`
+			if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("node", "drive.mjs")
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("node: %v\n%s", err, out)
+			}
+			got := strings.TrimSpace(string(out))
+			if !strings.HasPrefix(got, "THREW: ") {
+				t.Fatalf("the generated JS reported out-of-order as a finished scan: %q", got)
+			}
+			if !strings.Contains(got, "backwards") {
+				t.Fatalf("it threw, but not about the offset going backwards: %q", got)
+			}
+			if strings.Contains(got, "malformed") || strings.Contains(got, "backtracking") {
+				t.Fatalf("out-of-order was reported as a different error: %q", got)
+			}
+		})
+	}
+}
+
+// TestOutOfOrderIsDeclaredInEveryStub requires every generated language to name
+// the third sentinel and act on it where it reads the other two. -6 in C and AS
+// is the ENGINE value unchanged: every error code means the same thing in every
+// language, and C already owns -3 and -5 for its argument errors.
+func TestOutOfOrderIsDeclaredInEveryStub(t *testing.T) {
+	mk := func(batch bool) config.BuildConfig {
+		set := config.SetConfig{
+			Name: "ov", Find: "scan_ov",
+			Patterns: config.PatternSelector{All: true}, Overlapping: true,
+		}
+		if batch {
+			set.Hints = []string{"batch-find"}
+		}
+		return config.BuildConfig{
+			Output: "merged.wasm", ImportModule: "demo",
+			Regexps: []config.RegexEntry{
+				{Name: "lower", Pattern: `[a-z]+`},
+				{Name: "word", Pattern: `\w+`},
+			},
+			Sets: []config.SetConfig{set},
+		}
+	}
+	word := fmt.Sprintf("0x%Xn", uint32(config.SetCursorOutOfOrderPos))
+	for _, tc := range []struct {
+		name  string
+		gen   func(config.BuildConfig, string) error
+		file  string
+		batch bool
+		want  []string
+	}{
+		{"go", goStub, "stubs.go", false, []string{"var ErrOutOfOrder = errors.New(", "iter.err = ErrOutOfOrder"}},
+		{"rust", rustStub, "stubs.rs", false, []string{"    OutOfOrder,", "Some(Err(Error::OutOfOrder))"}},
+		{"as", asStub, "stubs.ts", false, []string{"export const RX_ERR_OUT_OF_ORDER: i32 = -6;", "this.overflowed = RX_ERR_OUT_OF_ORDER"}},
+		{"c", cStub, "stubs.h", false, []string{"#define RX_ERR_OUT_OF_ORDER (-6)"}},
+		{"js", jsStub, "stubs.js", false, []string{"if (n === -6) throw new Error("}},
+		{"ts", tsStub, "stubs.ts", false, []string{"if (n === -6) throw new Error("}},
+		{"js-batch", jsStub, "stubs.js", true, []string{word}},
+		{"ts-batch", tsStub, "stubs.ts", true, []string{word}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tc.file)
+			if err := tc.gen(mk(tc.batch), path); err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(string(raw), w) {
+					t.Errorf("the generated %s stub is missing %q", tc.name, w)
+				}
+			}
+		})
 	}
 }

@@ -108,11 +108,19 @@ differences are in the interface, not in what you call:
 |---|---|---|
 | `match_all` / `scan_all` | an i64 bitmask, or a count plus a caller-owned bitmap | `list<u32>` of pattern ids, ascending |
 | `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
-| `<find>_free` in C | a no-op | MANDATORY — it drops the handle |
+| `<find>_free` in C | frees the scanner's answer cache, if it owns one | MANDATORY — it drops the handle |
 | `hints: [batch-find]` | a second entry point | refused at load |
 | `overlapping: true` answer cache | read by both find entries; every generated stub reserves one | reserved by the `find` resource's constructor and freed with the handle |
 
 See [component.md](component.md#sets).
+
+### Set names
+
+A set's `name:` is yours, and so are the symbols derived from it —
+`<SET>_PATTERN_COUNT`, `<SET>_ID_SPACE`, `rx_<set>_scanner_t`,
+`<Set>PatternCount` — which `namespace:` does not prefix. Two stubs generated
+into one package, or included in one C translation unit, therefore need distinct
+set names. Choosing them is up to you, as it is for func and capability names.
 
 ### What "anchored" means here
 
@@ -133,6 +141,14 @@ with count 0 — rather than being an error or wrapping around.
 search.
 That is what lets `^`, `\A`, `\b` and `(?m:^)` judge their real neighbours when
 you resume a scan mid-input, instead of treating `from` as a new start of text.
+
+**Within one scan the offset must never go backwards.** Every generated iterator
+only moves forward; a caller driving the raw ABI must too, on every set, cache or
+no cache. A backwards offset is unsupported and may lose matches. Detection is
+best effort, with no guarantee: only an overlapping set whose answer cache has
+engaged notices, and then `find` reports `out-of-order` (`-6`) — see
+[wasm.md](wasm.md#the-overlapping-answer-cache). Anywhere else it goes
+undetected.
 
 ### `find` — the positional capability
 
@@ -167,9 +183,13 @@ for (int n; (n = scan_secrets(&sc, buf, SECRET_SCANNER_PATTERN_COUNT)) > 0; )
 scan_secrets_free(&sc);
 ```
 
-That last call is a no-op for `wasm_format: module` — the scanner is
-caller-owned and holds nothing that needs releasing — and MANDATORY for
-`wasm_format: component`, where the scan's state lives inside the regexp
+`cap` must be at least `<SET>_PATTERN_COUNT` — every pattern can report once at
+one position — and a smaller `cap` is `RX_ERR_RANGE`, with nothing written and
+the scan not advanced.
+
+That last call frees an overlapping scanner's answer cache under `wasm_format:
+module` — on any other set the scanner holds nothing that needs releasing — and
+it is MANDATORY for `wasm_format: component`, where the scan's state lives inside the regexp
 component behind a handle. It is emitted in both, so one source compiles against
 either.
 
@@ -253,9 +273,10 @@ cache** for the duration of one scan:
 | 32 patterns | 100 KB | 12.9 MiB |
 | 32 patterns | 10 MB | 2.7 MiB |
 
-The region is the SQUARE ROOT of the input length, not a multiple of it,
-because the cache stores periodic column snapshots rather than every match and
-rebuilds one block at a time. Every position is swept at most twice, so the
+Up to a 64 MiB budget the region is linear in the input — one block holding
+every answer — and above it the region is the SQUARE ROOT of the input length,
+because the cache then stores periodic column snapshots rather than every match
+and rebuilds one block at a time. Every position is swept at most twice, so the
 drive stays linear. Below a 64 MiB budget the stride covers the whole input,
 which is one block and behaves exactly as storing everything did; above it the
 stride drops and the region shrinks to its square root.
@@ -263,8 +284,10 @@ stride drops and the region shrinks to its square root.
 **Your stub does this for you.** It is generated with the sweep column's width
 baked in — that number comes from the compiler, not from your config — and sizes
 and seeds the region at construction. A C consumer is the one exception: the
-header needs no libc, so the cache is enabled only when a sysroot is present,
-and a freestanding build declines it and walks. See
+header needs no libc, so it enables the cache only where `<stdlib.h>` can be
+included, and a build without it walks. A `-nostdlib` build that still has a
+sysroot on its include path must pass `-DRX_SET_CACHE=0`, or supply `malloc` and
+`free`: the header then finds `<stdlib.h>`, but nothing links against it. See
 [wasm.md](wasm.md#the-overlapping-answer-cache) for the arithmetic and the
 header layout if you are driving the raw ABI.
 
@@ -314,14 +337,13 @@ it is measurably faster to *emit* (no gating code at all) — but on greedy or
 unbounded-tail patterns it is quadratic in the input, because every start runs
 a DFA to its own extent. The default exists to avoid that.
 
-Adding `hints: [batch-find]` to an overlapping set removes most of that
-quadratic cost. Either find entry can be handed a scratch region, and it will
+The answer cache removes most of that quadratic cost, with or without
+`hints: [batch-find]`. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
 counting the bytes it has matched, and once that exceeds what a single backward
 sweep would cost it sweeps the rest of the input in one pass and answers the
 remaining calls out of the result. A scan the walk handles cheaply never
-sweeps and costs exactly what it did before. `hints: [batch-find]` is not
-required for any of that — the cache is read by the plain `find` too.
+sweeps and costs exactly what it did before.
 
 EVERY generated stub reserves that region for you and sizes it from the input,
 whether or not the set carries the batching hint; a caller driving the raw ABI

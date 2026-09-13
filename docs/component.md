@@ -31,8 +31,8 @@ the interface text, and a component does not hand it over in a form they take.
 package regexped:secrets;
 
 interface matcher {
-    /// Why a matcher could not answer. Neither member means "no match".
-    enum error-code { backtrack-overflow, malformed-cache }
+    /// Why a matcher could not answer. No member means "no match".
+    enum error-code { backtrack-overflow, malformed-cache, out-of-order }
 
     /// Leftmost match starting at or after `start`. Positions are absolute.
     find-github-token: func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>;
@@ -68,14 +68,21 @@ err(backtrack-overflow)   — the Backtracking engine ran out of frames and
                             ABANDONED part of the search space
 err(malformed-cache)      — an overlapping set's answer cache had a header the
                             engine could not parse, so the scan is UNFINISHED
+err(out-of-order)         — an overlapping set's scan was asked for a position
+                            below where its answer cache was built: it went
+                            backwards, so the scan is UNFINISHED
 ```
 
-The second is reachable only through a set's `find` resource, and a consumer
-cannot provoke it: the constructor builds that header itself. It is in the enum
-because the engine can still report it, and reporting it AS a backtracking
-overflow would point at the wrong thing entirely.
+The last two are reachable only through a set's `find` resource, and a consumer
+cannot provoke either: the constructor builds that header itself, and the
+resource only ever moves forward. They are in the enum because the engine can
+still report them, and reporting either AS a backtracking overflow would point at
+the wrong thing entirely. The rule behind `out-of-order` — within one scan the
+position must never go backwards — is a limitation of the module ABI, and its
+detection there is best effort with no guarantee; see
+[wasm.md](wasm.md#the-overlapping-answer-cache).
 
-Treating the second as the first is the dangerous mistake this type exists to
+Treating any error as `ok(none)` is the dangerous mistake this type exists to
 prevent — a secret scanner that reports "clean" because the engine gave up is
 worse than one that fails. Only patterns compiled to the Backtracking engine can
 produce it (see [engines.md](engines.md)), but every function's return type
@@ -113,7 +120,7 @@ whereas changing the package renames every export.
 
 ```
 unset:            package regexped:secrets;          exports  regexped:secrets/matcher#find-x
-wit_version: 2.3.0  package regexped:secrets@2.3.0;  exports  regexped:secrets@2.3.0/matcher#find-x
+wit_version: 2.3.0  package regexped:secrets@2.3.0;  exports  regexped:secrets/matcher@2.3.0#find-x
 ```
 
 Because the version is part of every export name, adding, removing or changing it
@@ -138,7 +145,7 @@ let matcher = secrets.regexped_secrets_matcher();
 match matcher.call_find_github_token(&mut store, input, 0)? {
     Ok(Some((start, end))) => println!("match at {start}..{end}"),
     Ok(None) => println!("no match"),
-    Err(ErrorCode::BacktrackOverflow) => eprintln!("cannot decide"),
+    Err(e) => eprintln!("cannot decide: {e:?}"),
 }
 ```
 
@@ -189,7 +196,7 @@ plain core module, so the component metadata is attached afterwards.
 ```sh
 regexped compile          # component + sibling .wit
 regexped generate         # stub.h, stub.c, and a wit/ directory
-clang --target=wasm32-wasi -nostdlib -Wl,--no-entry -o core.wasm your.c stub.c
+clang --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry -o core.wasm your.c stub.c
 wasm-tools component embed wit core.wasm --world <name>-consumer -o embedded.wasm
 wasm-tools component new embedded.wasm -o guest.wasm
 regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
@@ -207,10 +214,12 @@ Three things to know:
 - **`component embed` needs the `wit` DIRECTORY**, not one file: that is how it
   finds `deps/`.
 
-If a pattern exports groups, the stub also defines `cabi_realloc`, because the
-canonical ABI allocates a returned list in *your* memory. It is a bump allocator
-reset per call, sized by `REGEXPED_CABI_HEAP_BYTES` (8 KB default) — raise that
-if a pattern has a very large number of groups.
+If a pattern exports groups, or a set returns a list, the stub also defines
+`cabi_realloc`, because the canonical ABI allocates a returned list in *your*
+memory. It is a bump allocator that the generated wrappers mark and restore
+around their own calls, sized by `REGEXPED_CABI_HEAP_BYTES` (256 KB default) —
+raise that if a pattern has a very large number of groups. See
+[c-api.md](c-api.md).
 
 ### Composing — `regexped merge`
 
@@ -227,8 +236,12 @@ regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 | `module` | `wasm-merge` | the host module |
 | `component` | `wac plug` | the **socket** — the component with the unsatisfied import |
 
-`wac` is resolved as config `wac:` → `$WAC` → `$PATH`, the same order the other
-two tools use. `output:` in the config names the result; `--output` overrides it,
+`wac` is found through `wac_path:` in the config, else in `$PATH` — the rule all
+three tool keys share: a file is the tool itself (so it may carry any name), a
+directory gets the tool name appended, a relative path is relative to the config
+file, and `~` / `~/dir` expand to the home directory. No environment variable is
+read. Before composing, `merge` runs `wasm-tools component wit` on every plug, so
+a component merge needs `wasm-tools` too (`wasm_tools_path:`, else `$PATH`). `output:` in the config names the result; `--output` overrides it,
 which is what a directory building the guest twice needs.
 
 **Composing is not merging.** `wasm-merge` produces ONE module whose regexp code
@@ -243,7 +256,10 @@ matched by their interface name, `regexped:<wit_package>/matcher`, which the
 socket genuinely imports, so two components built from configs sharing a
 `wit_package` export the same interface and `wac` cannot tell which should
 satisfy the import. **Composing several therefore requires distinct
-`wit_package` values.**
+`wit_package` values.** `merge` checks this before `wac` runs and names both
+plugs and the interface ("plugs a.wasm and b.wasm both export
+regexped:pkg/matcher"); `wac` alone reports it with the text a genuine name
+mismatch gives.
 
 ### Why the wasip1 target needs two extra commands
 
@@ -316,7 +332,7 @@ exports only the interfaces that exist, so a config of only sets gets no empty
 
 ```wit
 interface sets {
-    enum error-code { backtrack-overflow, malformed-cache }
+    enum error-code { backtrack-overflow, malformed-cache, out-of-order }
     record set-match { id: u32, start: u32, end: u32 }
 
     which-matches: func(input: list<u8>) -> result<option<u32>, error-code>;
@@ -369,10 +385,13 @@ resource <find-name> {
 ```
 
 `next` answers the matches at ONE position — they all share a start — and an
-empty list means the scan is finished. The constructor copies the input in ONCE,
-which is the point: a stateless per-position export would copy the whole input on
-every call, and measurement put that at 2800 ns against 230-400 ns for a
-resource `next` on a 4 KB input.
+empty list means the scan is finished. The input crosses into the component
+ONCE, through the canonical ABI's own lowering, and the constructor takes over the
+block it was lowered into rather than copying it again: the input is held for the
+scanner's lifetime and released by `[dtor]`. That single crossing is the point —
+a stateless per-position export would copy the whole input on every call, and
+measurement put that at 2800 ns against 230-400 ns for a resource `next` on a
+4 KB input.
 
 Two scans can be in flight at once, each with its own handle and its own state —
 the same property the module-format C scanner has.
@@ -380,7 +399,8 @@ the same property the module-format C scanner has.
 **Dropping the handle is what frees the scan.** Rust hides that entirely: the
 iterator owns the handle and drops it. C cannot, because its scanner has no
 destructor to hang the drop on — which is why `<func>_free` exists in BOTH
-formats, a no-op for a module and mandatory here. See
+formats: for a module it frees an overlapping scanner's answer cache, if it
+owns one, and here it drops the handle, which is mandatory. See
 [c-api.md](c-api.md#sets).
 
 ### What a set costs here
@@ -388,15 +408,15 @@ formats, a no-op for a module and mandatory here. See
 - `overlapping: true` sets get the ANSWER CACHE here as everywhere else, so an
   overlapping drive is linear rather than quadratic. A component consumer has no
   pointer to hand in and nothing to free, so the `find` resource's CONSTRUCTOR
-  reserves the region and `[dtor]` releases it with the input copy and the
+  reserves the region and `[dtor]` releases it with the input block and the
   gates. You never see it.
 
-  It is sized from the input length at construction, and it is the square root
-  of that length rather than a multiple of it — a few hundred kilobytes for a
+  It is sized from the input length at construction: linear in it up to a 64 MiB
+  budget, and the square root of it above that — a few hundred kilobytes for a
   ten-megabyte scan. A region over budget is simply declined and the drive
   walks, with identical answers.
-- Every `next` is a cross-component call, but NOT a copy of the input: the
-  constructor did that once.
+- Every `next` is a cross-component call, but NOT a copy of the input: the input
+  crossed once, when the scanner was constructed.
 - The `_all` pair allocates a list of ids per call, bounded by the number of
   matching patterns rather than by the input.
 
@@ -405,8 +425,13 @@ formats, a no-op for a module and mandatory here. See
 - **Every call copies the input** into guest memory, as the canonical ABI
   requires. The same is true of the JS/TS module stubs today; it is not true of
   the Rust/Go/C embedded path, which shares the host's memory.
-- One allocation per call for the result area, two more for `groups`. Negligible
-  against a scan of any real length.
+- A few allocations per call, each freed by the post-return or the destructor:
+  the result area alone for `match`, `find` and the `any` pair; three for
+  `groups` (the area, the slots and the element list); two for a narrow `_all`
+  and three for a wide one, whose bitmap is allocated too; two for `next`; and
+  two or three for the constructor — its state and gate array, plus the cache
+  when one is offered — with one more, a copy of the input, only when it cannot
+  take over the lowered block. Negligible against a scan of any real length.
 - Memory grows to fit a large input and is never given back to the OS —
   `memory.grow` is one-way. It IS reused: the allocator keeps per-size-class free
   lists, and the post-return returns the call's blocks to them, so a repeated
@@ -429,7 +454,7 @@ same engines, same bodies, same signatures — and **appends** the canonical-ABI
 machinery: a `cabi_realloc` with per-size-class free lists, one shared
 post-return that returns the call's blocks to them,
 and one adapter per exported function that allocates a result area, calls the
-existing body, and translates the `-1` / `-2` sentinels into the discriminated
+existing body, and translates the `-1` / `-2` / `-4` / `-6` sentinels into the discriminated
 layouts. Because they are appended, no pattern function moves, and a
 `wasm_format: module` build is byte-for-byte what it always was.
 
@@ -440,7 +465,7 @@ wasm-tools component embed <wit> <core> --world <world> -o <tmp>
 wasm-tools component new <tmp> -o <out>
 ```
 
-It is resolved as config `wasm_tools:` → `$WASM_TOOLS` → `$PATH`, and it is a
+It is found through `wasm_tools_path:` in the config, else in `$PATH`, and it is a
 hard requirement of this format: a `module` build needs no external binary,
 a `component` build cannot finish without this one. Composing later needs `wac`
 the same way. Both ship in the Docker image — see [docker.md](docker.md).

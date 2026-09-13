@@ -1777,7 +1777,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// a leading `^`/`(?m:^)` followed by nothing that can consume a
 			// '\n' makes the backward scan's stop-at-'\n' exact rather than
 			// premature, and the forward continuation is already newline-aware
-			// (phase 3 picks wasmMidStartNewline; the forward loop emits
+			// (its third step picks wasmMidStartNewline; the forward loop emits
 			// emitNLPreAcceptCheck). See lineAnchoredPrefixSafe.
 			lineAnchorOK := false
 			if lap != nil {
@@ -2288,7 +2288,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 
 	// Component adapters are APPENDED after every pattern function, so no
 	// baseIdx and no per-pattern offset moves. Their own indices start at
-	// `total`: cabi_realloc, then cm_post, then one adapter each.
+	// `total`: cabi_realloc, then cm_free, then cm_post, then one adapter each.
 	var adapters []componentAdapter
 	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
 	if opts.Component {
@@ -2745,7 +2745,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 			return nil, 0, errComponentNeedsStandalone
 		}
 	}
-	if err := opts.asmOpts().validate(); err != nil {
+	if err := opts.asmOpts(nil).validate(); err != nil {
 		return nil, 0, err
 	}
 	// One allocator per module, created before the loop so every pattern draws
@@ -2786,7 +2786,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts()), lastTableEnd, nil
+	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts(nil)), lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a

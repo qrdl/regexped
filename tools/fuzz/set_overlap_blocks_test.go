@@ -67,8 +67,8 @@ func TestOverlapCacheSkipsEmptyBlocks(t *testing.T) {
 	pats := []string{`a+`, `[^\n]*ERROR`}
 	// The leading run is what CROSSES THE TRIGGER, and it has to be long
 	// enough to: `engageAlways` asserts engagement, it cannot force it, and the
-	// rule is `work > len * numWASM * P` where work is the delivered match
-	// bytes. With this shape (numWASM 9, P 2) a 300-byte run delivers 45,150
+	// rule is `work > len * 2 * cells` where work is the delivered match
+	// bytes. With this shape (9 cells) a 300-byte run delivers 45,150
 	// against a threshold of 99,000 and the sweep never runs — which is how the
 	// earlier version of this test drove the walk at every stride and compared
 	// it with itself. 500 delivers 125,250 and crosses inside the run, so the
@@ -76,7 +76,7 @@ func TestOverlapCacheSkipsEmptyBlocks(t *testing.T) {
 	const lead, tail = 500, 200
 	input := strings.Repeat("a", lead) + strings.Repeat(".", 5000) + strings.Repeat("a", tail)
 	work := lead*(lead+1)/2 + tail*(tail+1)/2
-	if threshold := len(input) * 9 * len(pats); work <= threshold {
+	if threshold := len(input) * 2 * overlapShapeOf(t, pats).Cells; work <= threshold {
 		t.Fatalf("this shape can no longer cross the trigger: %d delivered bytes against a "+
 			"threshold of %d — lengthen the leading run", work, threshold)
 	}
@@ -269,16 +269,14 @@ func TestOverlapCacheRefusesWrappedLayout(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("the corpus matches nothing, but the drive returned %d tuples", len(got))
 	}
-	// The second constraint is read off the RESULT rather than recomputed: the
-	// work counter saturates at 0x7FFFFFFF, so if len*numWASM*P ever passes
-	// that the pre-armed counter cannot cross the threshold and the sweep is
-	// never attempted at all. `ready` tells the two apart — 0 is "never
-	// asked", -1 is "asked and refused" — so a shape that drifts out of range
-	// fails here with its own message instead of quietly testing the walk.
+	// `ready` tells "never asked" (0) from "asked and refused" (-1), and the
+	// difference is the whole test. The pre-armed counter is SATURATED, which
+	// the trigger treats as over the line whatever the threshold, so 0 here
+	// means the trigger is broken rather than that the shape drifted.
 	ready := int32(opt.header[2])
 	if ready == 0 {
-		t.Fatal("the sweep was never attempted: the pre-armed work counter no longer " +
-			"exceeds len*numWASM*P for this shape — lower the input length")
+		t.Fatal("the sweep was never attempted, though the pre-armed work counter is " +
+			"saturated and a saturated counter must trigger it")
 	}
 	if ready != -1 {
 		t.Fatalf("ready=%d, want -1: a region this much too small must be REFUSED, "+

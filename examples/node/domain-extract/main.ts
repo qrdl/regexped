@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { init, extract_domain, extract_domain_indices } from './regexp.ts';
 
-// Load and instantiate the WASM module.
-const wasmPath = fileURLToPath(new URL('./urls.wasm', import.meta.url));
+// Load and instantiate the WASM module. tsc emits this file into dist/, so the
+// .wasm beside main.ts is one level up.
+const wasmPath = fileURLToPath(new URL('../urls.wasm', import.meta.url));
 await init(readFileSync(wasmPath));
 
 // Read text from stdin as a Buffer (subtype of Uint8Array — no re-encoding needed).

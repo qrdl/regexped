@@ -3,7 +3,6 @@ package generate
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -42,7 +41,7 @@ func rustComponentCfg() config.BuildConfig {
 // change that drops an iterator, a constant or the error type shows up here even
 // if both files still compile.
 func TestRustComponentStubHasIdenticalPublicAPI(t *testing.T) {
-	component := rustComponentCfg()
+	component := rustParityCfg()
 	module := component
 	module.WasmFormat = ""
 
@@ -69,12 +68,78 @@ func TestRustComponentStubHasIdenticalPublicAPI(t *testing.T) {
 	}
 }
 
-var pubItem = regexp.MustCompile(`pub (fn [a-z_0-9]+\([^)]*\)(?: -> [^{]+)?|struct [A-Za-z0-9_]+|enum [A-Za-z0-9_]+|type [A-Za-z0-9_]+|mod [a-z_0-9]+)`)
+// rustParityCfg exercises every naming and capability path the public surface
+// has: camelCase and snake_case func names, groups with names, and two sets
+// declaring all five capabilities, one of them overlapping.
+func rustParityCfg() config.BuildConfig {
+	return config.BuildConfig{
+		WasmFormat:   "component",
+		ImportModule: "parity",
+		WasmFile:     "parity.wasm",
+		Regexps: []config.RegexEntry{
+			{Name: "tok", Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "findAwsKey", MatchFunc: "matchToken"},
+			{Name: "mail", Pattern: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mailGroups"},
+			{Name: "lower", Pattern: `[a-z]+`, MatchFunc: "lower_match"},
+			{Name: "digits", Pattern: `[0-9]+`},
+		},
+		Sets: []config.SetConfig{
+			{
+				Name: "secret_scanner", Patterns: config.PatternSelector{Names: []string{"tok", "lower"}},
+				MatchAny: "whichSecret", MatchAll: "allSecrets", ScanAny: "anySecret",
+				ScanAll: "allSecretHits", Find: "scanSecrets",
+			},
+			{
+				Name: "runs", Patterns: config.PatternSelector{Names: []string{"lower", "digits"}},
+				MatchAny: "runs_match_any", MatchAll: "runs_match_all", ScanAny: "runs_scan_any",
+				ScanAll: "runs_scan_all", Find: "scan_runs", Overlapping: true,
+			},
+		},
+	}
+}
 
+// publicAPI lists every public item of a generated Rust stub with its FULL
+// signature, whitespace-normalised: functions of any casing, constants with
+// their types and values, structs with their public fields, enums with their
+// variants, type aliases, and each iterator's `type Item`. Compared by name
+// alone, a component stub with a different constant value, field type or
+// iterator item would pass as identical.
 func publicAPI(src string) []string {
+	norm := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	lines := strings.Split(src, "\n")
 	var out []string
-	for _, m := range pubItem.FindAllString(src, -1) {
-		out = append(out, strings.TrimSpace(m))
+	for i := 0; i < len(lines); i++ {
+		t := strings.TrimSpace(lines[i])
+		switch {
+		case (strings.HasPrefix(t, "pub struct ") || strings.HasPrefix(t, "pub enum ")) && strings.HasSuffix(t, "{"):
+			kind := strings.Fields(t)[1]
+			head := norm(strings.TrimSuffix(t, "{"))
+			out = append(out, head)
+			for i++; i < len(lines); i++ {
+				f := strings.TrimSpace(lines[i])
+				if f == "}" {
+					break
+				}
+				if f == "" || strings.HasPrefix(f, "//") || strings.HasPrefix(f, "#[") {
+					continue
+				}
+				if kind == "struct" && !strings.HasPrefix(f, "pub ") {
+					continue
+				}
+				out = append(out, head+" :: "+norm(strings.TrimSuffix(f, ",")))
+			}
+		case strings.HasPrefix(t, "pub "):
+			sig := t
+			for !strings.ContainsAny(sig, "{;") && i+1 < len(lines) {
+				i++
+				sig += " " + strings.TrimSpace(lines[i])
+			}
+			if k := strings.IndexAny(sig, "{;"); k >= 0 {
+				sig = sig[:k]
+			}
+			out = append(out, norm(sig))
+		case strings.HasPrefix(t, "type Item = "):
+			out = append(out, norm(strings.TrimSuffix(t, ";")))
+		}
 	}
 	sort.Strings(out)
 	return uniq(out)
@@ -279,5 +344,45 @@ func TestRustComponentStubWriteFailure(t *testing.T) {
 	}
 	if err := rustComponentStub(rustComponentCfg(), filepath.Join(blocker, "stubs.rs")); err == nil {
 		t.Error("want an error writing under a regular file")
+	}
+}
+
+// TestRustComponentStubBindsCamelCaseNames: a camelCase name reaches the WIT in
+// kebab case and the wit-bindgen binding as that name's snake_case — match_it —
+// which is not a Rust keyword, so it binds normally while the public wrapper
+// keeps the config's own spelling. Config load refuses only a TRUE keyword
+// collision (Match -> match).
+func TestRustComponentStubBindsCamelCaseNames(t *testing.T) {
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "t",
+		Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "matchIt"}},
+	}
+	text, err := genRustComponentStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{"matcher::match_it(", "pub fn matchIt("} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the Rust component stub is missing %q", want)
+		}
+	}
+}
+
+// TestRustComponentSetFindConstructsLazily: the module-format iterator allocates
+// nothing until it is driven, so the component one must not construct its
+// resource — a full copy of the input into the regexp component — in the
+// function that returns it. A caller that builds an iterator and drops it
+// undriven pays nothing in either format.
+func TestRustComponentSetFindConstructsLazily(t *testing.T) {
+	text := genRustComponentSetFind("scan_it", "ScanIt")
+	i := strings.Index(text, "pub fn scan_it(")
+	if i < 0 {
+		t.Fatalf("no scan_it function in:\n%s", text)
+	}
+	if body := text[i:]; strings.Contains(body, "sets::ScanIt::new(") {
+		t.Errorf("scan_it constructs the resource eagerly:\n%s", body)
+	}
+	if !strings.Contains(text, "inner: Option<sets::ScanIt>,") {
+		t.Error("the iterator does not hold its resource as an Option created on first use")
 	}
 }

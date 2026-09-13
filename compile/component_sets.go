@@ -20,11 +20,11 @@ import (
 //	                       a caller-owned gate array   → a resource that owns the drive
 //
 // Two of those hand the caller a pointer into its own memory, which a component
-// consumer cannot provide — the same reason phase 1's result areas are allocated
+// consumer cannot provide — the same reason the single-pattern adapters' result areas are allocated
 // here. So the adapters allocate both, and the `_all` pair converts.
 //
 // The id list is measured, not assumed: it beat handing the bitmap over in all
-// twelve shapes tried (§9.2). The scan is what costs, and a bitmap does not
+// twelve shapes tried. The scan is what costs, and a bitmap does not
 // avoid it — it moves it to the consumer and adds the transfer on top. Which is
 // also why every scan below uses ctz plus `v &= v-1` and visits only SET bits: a
 // bit-by-bit scan measured up to eleven times the whole call.
@@ -45,12 +45,12 @@ const (
 // frees it; a resource outlives its constructor's call, so borrowing it would
 // leave the scanner reading freed memory from its second `next` onwards.
 const (
-	repInput = 0  // the copy of the input
+	repInput = 0  // the input block: the lowered one taken over, or its copy
 	repLen   = 4  // its length
 	repPos   = 8  // the next position to search from
 	repGate  = 12 // the gate array, id_space u32s
 	// repDone is a STATE, not a flag: 0 live, 1 finished, 2 backtracking
-	// overflow, 3 malformed cache. A scanner that reported an error and was
+	// overflow, 3 malformed cache, 4 out of order. A scanner that reported an error and was
 	// then called again answered "ok, no more matches" — the silent
 	// degradation the sentinels exist to prevent, reachable by any raw WIT
 	// consumer (the Rust and C stubs latch a `done` of their own and never see
@@ -73,13 +73,6 @@ const (
 	repBytes   = repScratch + abi.FindScratchBytes
 )
 
-// setMatchTupleBytes is one raw find tuple: {id, start, end} as three i32.
-//
-// It is EXACTLY the canonical layout of `record set-match { id: u32, start: u32,
-// end: u32 }` — size 12, align 4 — so the buffer the find body fills IS the
-// list's element array, and `next` hands it over without converting anything.
-const setMatchTupleBytes = 12
-
 // buildSetAnyAdapterBody emits the adapter for `match_any` or `scan_any`:
 //
 //	(ptr, len[, start]) → retptr
@@ -93,11 +86,12 @@ const setMatchTupleBytes = 12
 // here it is a pattern id, and 0 is a legitimate id where it would be a
 // degenerate end. Keeping them apart means neither grows a flag.
 func buildSetAnyAdapterBody(reallocIdx, innerIdx, nParams int) []byte {
-	lR := byte(nParams)
-	lRet := byte(nParams + 1)
+	alloc := newLocalAlloc(uint32(nParams)) //nolint:gosec // 2 or 3
+	lR := alloc.I32()
+	lRet := alloc.I32()
 
 	var b []byte
-	b = append(b, 0x01, 0x02, 0x7F) // 2 i32 locals: r, ret
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaSetAny)
 	b = append(b, 0x21, lRet)
@@ -139,19 +133,22 @@ func buildSetAnyAdapterBody(reallocIdx, innerIdx, nParams int) []byte {
 //
 //	(ptr, len[, start]) → retptr        inner: same params → i64
 //
-// A bitmask of 0 is a legitimate answer meaning "none", so only -2 is an error.
+// The narrow form has NO error path. It is emitted only for a set with no
+// Backtracking member — one selects the wide form — so every i64 its export
+// returns is an answer: 0 means none, and -2 is ids 1..63 without id 0, not the
+// Backtracking sentinel it shares a bit pattern with.
 // The list is sized by popcount and filled by ctz, so the loop runs once per HIT
 // rather than once per id.
 func buildSetAllNarrowAdapterBody(reallocIdx, innerIdx, nParams int) []byte {
-	lM := byte(nParams)       // i64: the bitmask, consumed as it is scanned
-	lRet := byte(nParams + 1) // i32
-	lOut := byte(nParams + 2) // i32: the id array
-	lN := byte(nParams + 3)   // i32: how many ids
-	lI := byte(nParams + 4)   // i32: write cursor
+	alloc := newLocalAlloc(uint32(nParams)) //nolint:gosec // 2 or 3
+	lM := alloc.I64()                       // the bitmask, consumed as it is scanned
+	lRet := alloc.I32()
+	lOut := alloc.I32() // the id array
+	lN := alloc.I32()   // how many ids
+	lI := alloc.I32()   // write cursor
 
 	var b []byte
-	// Two local groups: one i64, then four i32.
-	b = append(b, 0x02, 0x01, 0x7E, 0x04, 0x7F)
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaSetAll)
 	b = append(b, 0x21, lRet)
@@ -163,17 +160,7 @@ func buildSetAllNarrowAdapterBody(reallocIdx, innerIdx, nParams int) []byte {
 	b = utils.AppendULEB128(b, uint32(innerIdx))
 	b = append(b, 0x21, lM)
 
-	// m == -2 (sign-extended): the Backtracking sentinel.
-	b = append(b, 0x20, lM)
-	b = append(b, 0x42, 0x7E) // i64.const -2
-	b = append(b, 0x51)       // i64.eq
-	b = append(b, 0x04, 0x40)
-	b = storeDisc(b, lRet, 0, 1)
-	b = storeDisc(b, lRet, 4, 0)
-	b = append(b, 0x20, lRet, 0x0F)
-	b = append(b, 0x0B)
-
-	b = storeDisc(b, lRet, 0, 0) // ok
+	b = storeDisc(b, lRet, 0, 0) // ok, always
 
 	// n = popcount(m)
 	b = append(b, 0x20, lM)
@@ -258,16 +245,17 @@ func buildSetAllWideAdapterBody(reallocIdx, innerIdx, nParams, idSpace int) []by
 	words := (idSpace + 31) / 32
 	bmBytes := words * 4
 
-	lRet := byte(nParams)
-	lBM := byte(nParams + 1)
-	lN := byte(nParams + 2)
-	lOut := byte(nParams + 3)
-	lI := byte(nParams + 4) // write cursor into out
-	lW := byte(nParams + 5) // word index
-	lV := byte(nParams + 6) // the word being scanned
+	alloc := newLocalAlloc(uint32(nParams)) //nolint:gosec // 2 or 3
+	lRet := alloc.I32()
+	lBM := alloc.I32()
+	lN := alloc.I32()
+	lOut := alloc.I32()
+	lI := alloc.I32() // write cursor into out
+	lW := alloc.I32() // word index
+	lV := alloc.I32() // the word being scanned
 
 	var b []byte
-	b = append(b, 0x01, 0x07, 0x7F) // 7 i32 locals
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaSetAll)
 	b = append(b, 0x21, lRet)
@@ -388,9 +376,11 @@ func buildSetAllWideAdapterBody(reallocIdx, innerIdx, nParams, idSpace int) []by
 //   - It must return a HANDLE, obtained from the imported `[resource-new]`
 //     builtin. Returning the representation instead type-checks, builds, and
 //     traps at the first use with "unknown handle index <pointer>".
-//   - The input is COPIED. The block the canonical ABI lowered belongs to the
-//     constructor's call, and some later call's post-return frees it; a scanner
-//     reading it would be reading freed memory.
+//   - The input block is TAKEN OVER, not borrowed. The block the canonical ABI
+//     lowered is linked on the constructor's call chain, and a later call's
+//     post-return would free it under a scanner still reading it — so the
+//     constructor unlinks it and the destructor frees it. When that block is not
+//     the newest on the chain the constructor copies the input instead.
 //   - The call chain is RESTORED to what it was on entry, which detaches the
 //     scanner's own blocks from it. Everything this function allocates outlives
 //     the call and is freed by the destructor instead. Without that, the next
@@ -425,27 +415,51 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	callListGlobal, idSpace := c.callListGlobal, c.idSpace
 	cells, pats := c.cells, c.pats
 	const (
-		pPtr      = 0x00
-		pLen      = 0x01
-		pStart    = 0x02
-		lRep      = 0x03
-		lGate     = 0x04
-		lCopy     = 0x05
-		lChain    = 0x06
-		lCache    = 0x07
-		lCacheLen = 0x08
-		// i64 working values for the cache sizing, declared after every i32.
-		lM     = 0x09
-		lK     = 0x0A
-		lBytes = 0x0B
+		pPtr   = 0x00
+		pLen   = 0x01
+		pStart = 0x02
+	)
+	alloc := newLocalAlloc(3)
+	var (
+		lRep      = alloc.I32()
+		lGate     = alloc.I32()
+		lCopy     = alloc.I32()
+		lChain    = alloc.I32()
+		lCache    = alloc.I32()
+		lCacheLen = alloc.I32()
+		// i64 working values for the cache sizing.
+		lM     = alloc.I64()
+		lK     = alloc.I64()
+		lBytes = alloc.I64()
 	)
 	var b []byte
-	b = append(b, 0x02, 0x06, 0x7F, 0x03, 0x7E) // 6 i32 locals, 3 i64
+	b = alloc.EmitDecls(b)
 
-	// Remember the chain, so the blocks below can be taken off it.
+	// TAKE OVER THE LOWERED INPUT. The canonical ABI lowers `input` through this
+	// component's own cabi_realloc immediately before the call, so on this
+	// signature the newest block on the per-call chain IS the input. Unlink it
+	// and keep it as the scanner's input, instead of copying it and leaving the
+	// lowered block for some later call's post-return to free — which held every
+	// lowered input at once for a host that built many scanners before driving
+	// any. Anything else (a zero-length list the host did not allocate, a
+	// signature whose input is not the newest allocation) falls back to the copy
+	// below, with the lowered block left on the chain as before.
+	//
+	// lChain ends up as the chain the blocks allocated below detach back to:
+	// the chain as found, or its next link once the input is unlinked.
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, callListGlobal)
-	b = append(b, 0x21, lChain)
+	b = append(b, 0x22, lChain)                 // local.tee: the chain as found
+	b = append(b, 0x20, pPtr, 0x46)             // head == input
+	b = append(b, 0x20, pPtr, 0x41, 0x00, 0x47) // input != 0
+	b = append(b, 0x71)                         // i32.and
+	b = append(b, 0x04, 0x40)                   // if
+	b = appendLoadMinus(b, pPtr, 4)             // the input block's chain link
+	b = append(b, 0x22, lChain)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x20, pPtr, 0x21, lCopy) // the input is the scanner's own block
+	b = append(b, 0x0B)
 
 	b = callRealloc(b, reallocIdx, 4, repBytes)
 	b = append(b, 0x21, lRep)
@@ -460,7 +474,10 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = utils.AppendSLEB128(b, int32(idSpace*4))
 	b = append(b, 0xFC, 0x0B, 0x00) // memory.fill
 
-	// copy = realloc(1, len) ; copy <- input
+	// The FALLBACK: copy = realloc(1, len) ; copy <- input — only when the input
+	// was not taken over above (locals start at zero).
+	b = append(b, 0x20, lCopy, 0x45) // i32.eqz
+	b = append(b, 0x04, 0x40)        // if
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x41, 0x01)
@@ -475,6 +492,7 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = append(b, 0x20, pPtr)
 	b = append(b, 0x20, pLen)
 	b = append(b, 0xFC, 0x0A, 0x00, 0x00)
+	b = append(b, 0x0B)
 
 	b = append(b, 0x20, lRep, 0x20, lCopy)
 	b = storeI32(b, repInput)
@@ -601,7 +619,7 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
 		b = append(b, 0xFC, 0x0B, 0x00) // memory.fill
 		b = append(b, 0x20, lCache, 0x20, lK, 0xA7)
-		b = append(b, 0x36, 0x02, ckptHdrStride)
+		b = storeI32(b, ckptHdrStride)
 		b = append(b, 0x0B)
 	}
 
@@ -644,14 +662,11 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 // The advance is the module stubs' rule: every tuple in one call shares a start,
 // so the next search begins one past it.
 func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
-	const (
-		pRep = 0x00
-		lRet = 0x01
-		lOut = 0x02
-		lN   = 0x03
-	)
+	const pRep = 0x00
+	alloc := newLocalAlloc(1)
+	lRet, lOut, lN := alloc.I32(), alloc.I32(), alloc.I32()
 	var b []byte
-	b = append(b, 0x01, 0x03, 0x7F) // 3 i32 locals
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaSetAll)
 	b = append(b, 0x21, lRet)
@@ -662,8 +677,8 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	//
 	// A scanner that reported an ERROR re-reports THAT error instead, for as
 	// long as it is called: the state says which (2 backtracking overflow, 3
-	// malformed cache), and the error-code discriminants are 0 and 1, so the
-	// byte to write back is state - 2.
+	// malformed cache, 4 out of order), and the error-code discriminants are 0,
+	// 1 and 2, so the byte to write back is state - 2.
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, repDone)
 	b = append(b, 0x22, lN)
@@ -683,7 +698,7 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
 
-	b = callRealloc(b, reallocIdx, 4, int32(patternCount*setMatchTupleBytes))
+	b = callRealloc(b, reallocIdx, 4, int32(patternCount*abi.SetMatchTupleBytes))
 	b = append(b, 0x21, lOut)
 
 	// find(input, len, pos, gate, out, PATTERN_COUNT)
@@ -708,21 +723,27 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	// Negative is a SENTINEL, not a count: what remains is UNKNOWN, so the scan
 	// ends AND reports an error.
 	//
-	// TWO of them now, and they must not be conflated. -2 is the Backtracking
+	// THREE of them now, and they must not be conflated. -2 is the Backtracking
 	// engine out of frames; -4 is an answer cache whose header contradicts
-	// itself. A consumer cannot provoke the second — the constructor builds the
+	// itself; -6 is a position below the floor of the engaged cache. A consumer cannot provoke the second — the constructor builds the
 	// header — so reaching it means the engine did, and reporting it as a
 	// Backtracking overflow would point at the wrong thing entirely.
 	b = append(b, 0x20, lN)
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x48) // i32.lt_s
 	b = append(b, 0x04, 0x40)
-	// The error-code discriminant: 0 backtrack-overflow, 1 malformed-cache.
-	// Computed once and used twice — written into the result area now, and
-	// stored as repDone state 2 or 3 so a later call can re-report it.
+	// The error-code discriminant: 0 backtrack-overflow, 1 malformed-cache,
+	// 2 out-of-order. Computed once and used twice — written into the result
+	// area now, and stored as repDone state 2, 3 or 4 so a later call can
+	// re-report it.
 	b = append(b, 0x20, lN, 0x41)
 	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
-	b = append(b, 0x46) // n == -4 -> 1, else 0
+	b = append(b, 0x46) // n == -4 -> 1
+	b = append(b, 0x20, lN, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheOutOfOrder))
+	b = append(b, 0x46)             // n == -6 -> 1
+	b = append(b, 0x41, 0x01, 0x74) // << 1 -> 2
+	b = append(b, 0x6A)             // i32.add: 0, 1 or 2
 	b = append(b, 0x21, lN)
 	b = append(b, 0x20, pRep, 0x20, lN, 0x41, 0x02, 0x6A)
 	b = storeI32(b, repDone)
@@ -773,9 +794,9 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 func buildSetScannerDtorBody(freeIdx int) []byte {
 	const pRep = 0x00
 	var b []byte
-	b = append(b, 0x00) // no locals
+	b = newLocalAlloc(1).EmitDecls(b) // no locals
 
-	// The input copy and the gate array are ALWAYS allocated; the answer cache
+	// The input block and the gate array are ALWAYS present; the answer cache
 	// may not be — a set with no sweep, or a region over budget, leaves it null
 	// — so it is the one slot that needs a guard.
 	//
@@ -850,13 +871,20 @@ const (
 
 // setAdapter is one emitted component function for a set capability.
 type setAdapter struct {
-	kind    setAdapterKind
-	inner   int    // the raw set function it wraps; unused by ctor and dtor
-	export  string // canonical export name
-	nParams int    // raw parameter count, for the `any` and `_all` shapes
-	idSpace int    // one past the largest reportable id, for the bitmap and gates
-	count   int    // PATTERN_COUNT, the worst case at one position
-	typeIdx byte   // WASM type index of the ADAPTER's own signature
+	kind setAdapterKind
+	// innerFunc is the DEFINED function index of the raw set function an any,
+	// _all or next adapter wraps.
+	innerFunc int
+	// resNewImport is the IMPORT index of the `[resource-new]` builtin the
+	// constructor calls. One `inner` field used to hold both, meaning a
+	// different kind of index per adapter kind, and was documented as unused
+	// by the one kind that read it.
+	resNewImport int
+	export       string // canonical export name
+	nParams      int    // raw parameter count, for the `any` and `_all` shapes
+	idSpace      int    // one past the largest reportable id, for the bitmap and gates
+	count        int    // PATTERN_COUNT, the worst case at one position
+	typeIdx      byte   // WASM type index of the ADAPTER's own signature
 	// post reports whether this export needs a post-return. Everything that
 	// returns a result area does; the constructor, which returns a bare handle,
 	// does not — and giving it one would free the scanner's state.
@@ -897,6 +925,14 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 		}
 		for i, c := range cs.capFns() {
 			inner := setBase[si] + i
+			// A capability with no canonical name is SKIPPED, as the pattern
+			// path skips a pattern with none. An export named "" builds, and
+			// fails only inside `wasm-tools component new`.
+			capName, named := n.Caps[c.name]
+			if !named && (c.kind == capMatchAny || c.kind == capScanAny ||
+				c.kind == capMatchAll || c.kind == capScanAll) {
+				continue
+			}
 			switch c.kind {
 			case capFind:
 				if resNewIdx[si] < 0 {
@@ -907,18 +943,18 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 				}
 				out = append(out,
 					setAdapter{kind: setAdapterCtor, export: n.Constructor, idSpace: cs.idSpaceSize(),
-						inner: resNewIdx[si], typeIdx: anyTypeIdx3,
+						resNewImport: resNewIdx[si], typeIdx: anyTypeIdx3,
 						cacheCells: cacheCells, cachePatterns: cachePats},
-					setAdapter{kind: setAdapterNext, export: n.Next, inner: inner,
+					setAdapter{kind: setAdapterNext, export: n.Next, innerFunc: inner,
 						count: cs.patternCount, typeIdx: nextTypeIdx, post: true},
 					setAdapter{kind: setAdapterDtor, export: n.Dtor, typeIdx: dtorTypeIdx},
 				)
 			case capMatchAny:
-				out = append(out, setAdapter{kind: setAdapterAny, inner: inner,
-					export: n.Caps[c.name], nParams: 2, typeIdx: anyTypeIdx2, post: true})
+				out = append(out, setAdapter{kind: setAdapterAny, innerFunc: inner,
+					export: capName, nParams: 2, typeIdx: anyTypeIdx2, post: true})
 			case capScanAny:
-				out = append(out, setAdapter{kind: setAdapterAny, inner: inner,
-					export: n.Caps[c.name], nParams: 3, typeIdx: anyTypeIdx3, post: true})
+				out = append(out, setAdapter{kind: setAdapterAny, innerFunc: inner,
+					export: capName, nParams: 3, typeIdx: anyTypeIdx3, post: true})
 			case capMatchAll, capScanAll:
 				nParams := 2
 				typeIdx := anyTypeIdx2
@@ -932,7 +968,7 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 					// that bitmap itself.
 					kind = setAdapterAllWide
 				}
-				out = append(out, setAdapter{kind: kind, inner: inner, export: n.Caps[c.name],
+				out = append(out, setAdapter{kind: kind, innerFunc: inner, export: capName,
 					nParams: nParams, idSpace: cs.idSpaceSize(), typeIdx: typeIdx, post: true})
 			case capFindBatch:
 				// Refused at config load for components: the interface exposes
@@ -948,18 +984,18 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal uint32) []byte {
 	switch a.kind {
 	case setAdapterAny:
-		return buildSetAnyAdapterBody(reallocIdx, a.inner, a.nParams)
+		return buildSetAnyAdapterBody(reallocIdx, a.innerFunc, a.nParams)
 	case setAdapterAllNarrow:
-		return buildSetAllNarrowAdapterBody(reallocIdx, a.inner, a.nParams)
+		return buildSetAllNarrowAdapterBody(reallocIdx, a.innerFunc, a.nParams)
 	case setAdapterAllWide:
-		return buildSetAllWideAdapterBody(reallocIdx, a.inner, a.nParams, a.idSpace)
+		return buildSetAllWideAdapterBody(reallocIdx, a.innerFunc, a.nParams, a.idSpace)
 	case setAdapterCtor:
 		return buildSetScannerCtorBody(setScannerCtor{
-			reallocIdx: reallocIdx, resNewIdx: a.inner, callListGlobal: callListGlobal,
+			reallocIdx: reallocIdx, resNewIdx: a.resNewImport, callListGlobal: callListGlobal,
 			idSpace: a.idSpace, cells: a.cacheCells, pats: a.cachePatterns,
 		})
 	case setAdapterNext:
-		return buildSetScannerNextBody(reallocIdx, a.inner, a.count)
+		return buildSetScannerNextBody(reallocIdx, a.innerFunc, a.count)
 	case setAdapterDtor:
 		return buildSetScannerDtorBody(freeIdx)
 	}

@@ -10,7 +10,7 @@ compiles to WASM itself, the stubs are merged with the regexp modules via
 ## Requirements
 
 - [AssemblyScript](https://www.assemblyscript.org/) 0.27 or later
-- [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen) in `$PATH` or set via `wasm_merge` in config
+- [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen) in `$PATH` or located by `wasm_merge_path` in config
 - The config must have an `output` field so that `regexped merge` knows where to write the merged module
 
 ## Project setup
@@ -284,9 +284,18 @@ stride below 1, or a layout that is not one a sweep would have written. Like the
 backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
 knowing what remained.
 
-The generated code cannot produce it. `init` sizes the region and writes the
-stride from one formula, so seeing this means the descriptor was built by hand,
-or one region was shared between two scanners.
+The generated iterator cannot produce it: it sizes the region and writes the stride
+from one formula when it is created, so seeing it means something outside the
+stub wrote into the region.
 
 `err()` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`) beside
 `RX_ERR_BT_OVERFLOW`; AssemblyScript cannot throw, so check it after the loop.
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The generated iterators only
+move forward, so they never do; the rule matters to a caller driving the raw ABI,
+on every set. A backwards offset is unsupported and may lose matches. Detection
+is best effort, with no guarantee: the engine notices only once an overlapping
+set's answer cache has engaged and a position falls below where it was built,
+and then `err()` returns **`RX_ERR_OUT_OF_ORDER`** (`-6`) after the loop ends. Anywhere else it goes undetected.

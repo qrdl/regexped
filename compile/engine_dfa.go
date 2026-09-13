@@ -2,6 +2,7 @@ package compile
 
 import (
 	"encoding/binary"
+	"github.com/qrdl/regexped/internal/abi"
 	"regexp/syntax"
 	"sort"
 	"strings"
@@ -4938,7 +4939,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// Hand the backward sweep the same geometry this body walks forward.
 	// Populated unconditionally: usesOverlapDP decides, and
 	// deriving the offsets a second time is exactly how the two would drift.
-	// The RAW per-state accept masks and the transition table, for lever C's
+	// The RAW per-state accept masks and the transition table, for the overlap column's
 	// projection (compile/set_overlap_proj.go). The sweep reads the emitted
 	// tables at run time; the PROJECTION is computed at compile time and needs
 	// the same data as values, not as offsets into a data segment.
@@ -5458,7 +5459,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		} else {
 			b = append(b, 0x20, lOutCount, 0x20, paramOutCap, 0x48, 0x04, 0x40) // if outCount < cap (signed)
 		}
-		b = append(b, 0x20, paramOutPtr, 0x20, lOutCount, 0x41, 12, 0x6C, 0x6A, 0x21, lOutBase)
+		b = append(b, 0x20, paramOutPtr, 0x20, lOutCount, 0x41)
+		b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
+		b = append(b, 0x6C, 0x6A, 0x21, lOutBase)
 		b = append(b, 0x20, lOutBase, 0x41)
 		b = utils.AppendSLEB128(b, int32(globalID))
 		b = append(b, 0x36, 0x02, 0x00)
@@ -7909,7 +7912,7 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	// The accept recorded here is the REVERSED prefix's, and it says nothing
 	// about whether a BEGIN- or LINE-anchored prefix is satisfied at `floor`:
 	// this walk carries no begin-of-text or previous-byte context. That is
-	// sound only because phase 3's forward verify re-runs the whole pattern
+	// sound only because the third step's forward verify re-runs the whole pattern
 	// from the reported start and rejects it if the anchor does not hold — a
 	// cross-function reliance worth stating, since a future caller that
 	// trusted the start without verifying would accept `^abc` at a nonzero

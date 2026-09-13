@@ -7,9 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
 // The batching overlapping `find` may sweep the
@@ -170,21 +168,6 @@ func TestOverlapCacheEngagesOnQuadraticDrives(t *testing.T) {
 	}
 }
 
-// TestOverlapCacheFallsBackWhenScratchTooSmall pins the rule that makes the
-// cache safe to offer at all: too little scratch is a SLOWER answer, never a
-// wrong or partial one. Driven on a QUADRATIC shape, because a cheap one
-// would never ask for the sweep and the fallback would go untested.
-func TestOverlapCacheFallsBackWhenScratchTooSmall(t *testing.T) {
-	shape := quadraticShapes()[0]
-	want := canonCache(driveOverlapCache2(t, shape.pats, shape.input, 0, 8, false))
-	// 32 bytes holds the header and at most one tuple: the sweep must refuse
-	// and the drive must still be complete and correct.
-	got := canonCache(driveOverlapCacheScratch(t, shape.pats, shape.input, 0, 8, true, 32, engageNever))
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("undersized scratch changed the answer: %d tuples vs %d", len(got), len(want))
-	}
-}
-
 // assertAscending checks the ACROSS-position contract: starts never go
 // backwards over a drive. This is what a mid-drive switch could break, and no
 // per-call check would catch it.
@@ -283,72 +266,15 @@ func driveOverlapCacheStride(t *testing.T, pats []string, input string, offset, 
 	useCache bool, scratchLen int32, want engageWant, strideOverride *int32,
 ) [][3]int {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
-	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
-	}
-	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets: []config.SetConfig{{
-			Name:        "s",
-			Find:        "set_find",
-			Patterns:    config.PatternSelector{All: true},
-			Overlapping: true,
-			Hints:       []string{"batch-find"},
-		}},
-	}
-	w, _, err := compile.CompileFile(cfg, "")
-	if err != nil {
-		t.Fatalf("compile %v: %v", pats, err)
-	}
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	fn := inst.GetFunc(store, "set_find_batch")
-	if fn == nil {
-		t.Fatal("module missing set_find_batch export")
-	}
-
-	const pageSize = 65536
-	dataTop, err := utils.ParseDataSectionBytes(w)
-	if err != nil {
-		t.Fatalf("parse data section: %v", err)
-	}
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	gatePtr := inBase + pageSize
-	outPtr := gatePtr + pageSize
-	scratchPtr := outPtr + pageSize
-	needed := uint64((int64(scratchPtr) + int64(scratchLen) + 2*pageSize) / pageSize)
-	if cur := mem.Size(store); needed > cur {
-		if _, err := mem.Grow(store, needed-cur); err != nil {
-			t.Fatalf("grow: %v", err)
-		}
-	}
-	buf := mem.UnsafeData(store)
-	copy(buf[inBase:], input)
-	// The caller zeroes BOTH regions to start a drive — that is the whole
-	// contract, for the gates and for the cache header alike.
-	for i := int32(0); i < int32(4*len(pats)); i++ {
-		buf[gatePtr+i] = 0
-	}
-	for i := int32(0); i < scratchLen; i++ {
-		buf[scratchPtr+i] = 0
-	}
-
-	passScratch, passLen := scratchPtr, scratchLen
-	if !useCache {
-		passScratch, passLen = 0, 0
-	}
-	// The DESCRIPTOR the export takes in place of a bare gate pointer: it
-	// carries the gate array and the answer cache, so what used to be two
-	// trailing arguments is now two fields (internal/abi).
 	_, stride := overlapCacheFor(input, pats)
 	if strideOverride != nil {
 		stride = *strideOverride
 	}
-	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
+	d := newCacheDrive(t, pats, input, cacheLayout{batch: true, scratchLen: scratchLen, offer: useCache, stride: stride})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	var buf []byte
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
@@ -409,4 +335,32 @@ func driveOverlapCacheStride(t *testing.T, pats []string, input string, offset, 
 // Stated here rather than imported because compile/ keeps it unexported; the
 // header width itself is config.SetOverlapCheckpointHeaderBytes, which the
 // drive zeroes.
-const overlapDPReadyOffset = 8
+const overlapDPReadyOffset = config.SetOverlapHdrReadyOff
+
+// A drive whose threshold is ABOVE what the work counter can hold still
+// engages once the counter saturates.
+//
+// work is an i32 that saturates at 0x7FFFFFFF, and the trigger compares it with
+// `len * 2 * cells` in i64. For classchain-32 any input past about 3 MB has a
+// threshold the counter can never exceed, so the cache was offered, sized and
+// reserved — and never engaged, leaving the drive quadratic with nothing to say
+// so. A saturated counter now counts as over the line.
+func TestOverlapCacheEngagesPastCounterSaturation(t *testing.T) {
+	pats := classChain32()
+	sh := overlapShapeOf(t, pats)
+	inputLen := int(int64(0x7FFFFFFF)/int64(2*sh.Cells)) + 4096
+	unit := "the quick brown fox " // no digit follows a letter run: nothing matches
+	input := strings.Repeat(unit, inputLen/len(unit)+1)[:inputLen]
+	if th := int64(len(input)) * int64(2*sh.Cells); th <= 0x7FFFFFFF {
+		t.Fatalf("threshold %d is reachable by the counter: lengthen the input", th)
+	}
+	full, stride := overlapCacheFor(input, pats)
+	if full <= int32(config.SetOverlapCheckpointHeaderBytes) {
+		t.Fatalf("no region could be sized for a %d-byte input (%d bytes)", len(input), full)
+	}
+	opt := &cacheDriveOpt{stride: &stride, preArmWork: true}
+	got := driveCacheFindOpt(t, pats, input, 0, int32(len(pats)), true, full, engageAlways, opt)
+	if len(got) != 0 {
+		t.Fatalf("the corpus matches nothing, but the drive returned %d tuples", len(got))
+	}
+}

@@ -1,12 +1,15 @@
 package generate
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 func cComponentCfg() config.BuildConfig {
@@ -131,7 +134,7 @@ func TestCComponentImportsUseKebabNames(t *testing.T) {
 
 // A returned list is allocated in the CONSUMER's memory, so a stub that receives
 // one must export an allocator — and one that never does must not carry it.
-func TestCComponentAllocatorOnlyWhenGroupsExist(t *testing.T) {
+func TestCComponentAllocatorOnlyWhenAListIsReturned(t *testing.T) {
 	_, withGroups, err := genCComponentStubFiles(cComponentCfg(), "stub.h")
 	if err != nil {
 		t.Fatal(err)
@@ -143,11 +146,11 @@ func TestCComponentAllocatorOnlyWhenGroupsExist(t *testing.T) {
 	// allocator — the wasip1 adapter calls it too — so resetting it would hand
 	// out memory something else is still using. That trapped in
 	// `adapter!allocate_stack` when the C example was first built as a command.
-	if !strings.Contains(withGroups, "_rx_cabi_mark()") ||
-		!strings.Contains(withGroups, "_rx_cabi_release(_mark)") {
+	if !strings.Contains(withGroups, "regexped_cabi_mark()") ||
+		!strings.Contains(withGroups, "regexped_cabi_release(_mark)") {
 		t.Error("the groups wrapper must save and restore the bump mark")
 	}
-	if strings.Contains(withGroups, "_rx_cabi_reset") {
+	if strings.Contains(withGroups, "cabi_reset") {
 		t.Error("a wholesale reset is unsafe: the adapter's allocations live in the same heap")
 	}
 	// Weak, so a program with its own allocator wins.
@@ -156,9 +159,9 @@ func TestCComponentAllocatorOnlyWhenGroupsExist(t *testing.T) {
 	}
 	// Every exit from the loop body must release, or a suppressed empty match
 	// leaks the list it allocated.
-	if strings.Count(withGroups, "_rx_cabi_release(_mark)") < 5 {
+	if strings.Count(withGroups, "regexped_cabi_release(_mark)") < 5 {
 		t.Errorf("only %d release sites; every exit from the loop body needs one",
-			strings.Count(withGroups, "_rx_cabi_release(_mark)"))
+			strings.Count(withGroups, "regexped_cabi_release(_mark)"))
 	}
 
 	cfg := cComponentCfg()
@@ -194,7 +197,7 @@ func TestCComponentLoweredSignatures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cContent, "extern void _ffi_lower_match(const unsigned char *ptr, unsigned int len, unsigned char *ret);") {
+	if !strings.Contains(cContent, "extern void ffi_lower_match(const unsigned char *ptr, unsigned int len, unsigned char *ret);") {
 		t.Error("the anchored import must take (ptr, len, retptr)")
 	}
 	if !strings.Contains(cContent, "unsigned int start,\n               unsigned char *ret);") {
@@ -343,4 +346,177 @@ func TestStripExportWorld(t *testing.T) {
 	if !strings.Contains(got, "interface matcher {") || !strings.Contains(got, "package regexped:x;") {
 		t.Errorf("stripping removed too much:\n%s", got)
 	}
+}
+
+// cFunctionBody returns the body of the C function whose definition line starts
+// with `prefix`, up to its closing brace at column 0.
+func cFunctionBody(t *testing.T, src, prefix string) string {
+	t.Helper()
+	i := strings.Index(src, "\n"+prefix)
+	if i < 0 {
+		t.Fatalf("no function starting %q in the generated source", prefix)
+	}
+	body := src[i+1:]
+	if j := strings.Index(body, "\n}\n"); j >= 0 {
+		body = body[:j+2]
+	}
+	return body
+}
+
+// The set wrappers that RECEIVE a list — the `_all` pair and the scanner — must
+// release it on every return after the call, as the groups wrapper does. The
+// composition glue allocates the returned list in this component's memory
+// through cabi_realloc, and without the mark and release every call leaked it
+// from the bump heap for the life of the process.
+func TestCComponentSetListsAreReleasedPerCall(t *testing.T) {
+	_, c, err := genCComponentStubFiles(cComponentCfg(), "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"int all_secret_hits(", "int all_secrets(", "int scan_secrets(rx_secrets_scanner_t"} {
+		body := cFunctionBody(t, c, prefix)
+		mark := strings.Index(body, "cabi_mark(")
+		if mark < 0 || strings.Count(body, "cabi_mark(") != 1 {
+			t.Errorf("%s: want exactly one mark before the call, got %d", prefix, strings.Count(body, "cabi_mark("))
+			continue
+		}
+		after := body[mark:]
+		if r, n := strings.Count(after, "cabi_release("), strings.Count(after, "return "); r != n {
+			t.Errorf("%s: %d releases for %d return paths after the mark:\n%s", prefix, r, n, body)
+		}
+	}
+}
+
+// A scanner call whose buffer cannot hold one position's worst case is refused
+// with RX_ERR_RANGE before anything is written or advanced — in BOTH formats,
+// since they share the header that states the rule. The module call used to be
+// transactional and the component one silently discarded what did not fit.
+func TestCScannerRefusesABufferBelowPatternCount(t *testing.T) {
+	const want = "if (cap < (size_t)SECRETS_PATTERN_COUNT) return RX_ERR_RANGE;"
+	h, c, err := genCComponentStubFiles(cComponentCfg(), "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(c, want) {
+		t.Errorf("the component scanner does not refuse a small buffer: missing %q", want)
+	}
+	mod := cComponentCfg()
+	mod.WasmFormat = ""
+	dir := t.TempDir()
+	if err := cStub(mod, filepath.Join(dir, "stub.h")); err != nil {
+		t.Fatal(err)
+	}
+	mc, err := os.ReadFile(filepath.Join(dir, "stub.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mc), want) {
+		t.Errorf("the module scanner does not refuse a small buffer: missing %q", want)
+	}
+	if strings.Contains(h, "transactional") {
+		t.Error("the shared header still promises a transactional overflow")
+	}
+}
+
+// Re-initialising a LIVE component scanner drops the resource it held before
+// constructing a new one; the header promises it. A magic word tells a live
+// scanner from an uninitialised struct, as the module scanner's does.
+func TestCComponentReinitDropsTheLiveHandle(t *testing.T) {
+	_, c, err := genCComponentStubFiles(cComponentCfg(), "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := cFunctionBody(t, c, "int scan_secrets_init(")
+	if !strings.Contains(body, fmt.Sprint(abi.FindScratchMagic)) {
+		t.Errorf("_init does not test the scanner's magic word:\n%s", body)
+	}
+	drop, ctor := strings.Index(body, "_drop("), strings.Index(body, "_new(")
+	if drop < 0 || ctor < 0 || drop > ctor {
+		t.Errorf("_init must drop a live handle BEFORE constructing (drop at %d, construct at %d):\n%s",
+			drop, ctor, body)
+	}
+}
+
+// Two component C stubs in ONE guest must link. The allocator's mark and release
+// were strong, non-static definitions, so a second stub was a duplicate symbol;
+// and a per-stub copy of the heap state would let one stub rewind a counter the
+// winning cabi_realloc never advanced. Every allocator symbol is WEAK, shared by
+// name, so the linker keeps one of each.
+func TestTwoCComponentStubsLinkInOneGuest(t *testing.T) {
+	for _, tool := range []string{"cc", "nm"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH", tool)
+		}
+	}
+	dir := t.TempDir()
+	mk := func(ns, pkg, set string) config.BuildConfig {
+		return config.BuildConfig{
+			WasmFormat: "component", ImportModule: pkg, WitPackage: pkg, Namespace: ns,
+			Regexps: []config.RegexEntry{{Name: "a", Pattern: `[a-z]+`}, {Name: "d", Pattern: `[0-9]+`}},
+			Sets: []config.SetConfig{{
+				Name: set, Patterns: config.PatternSelector{All: true},
+				ScanAll: set + "_hits", Find: "scan_" + set,
+			}},
+		}
+	}
+	var objs []string
+	for _, s := range []struct{ ns, pkg, set string }{{"nsa", "pkg-a", "ova"}, {"nsb", "pkg-b", "ovb"}} {
+		sub := filepath.Join(dir, s.ns)
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := cComponentStub(mk(s.ns, s.pkg, s.set), filepath.Join(sub, "stub.h")); err != nil {
+			t.Fatalf("generate %s: %v", s.ns, err)
+		}
+		obj := filepath.Join(dir, s.ns+".o")
+		run(t, sub, nil, "cc", "-c", "-Wno-attributes", "-o", obj, "stub.c")
+		objs = append(objs, obj)
+	}
+	main := "#include \"nsa/stub.h\"\n#include \"nsb/stub.h\"\nint main(void) { return 0; }\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, nil, "cc", "-fsyntax-only", "-Wno-attributes", "main.c")
+
+	strong := map[string][]string{}
+	for _, obj := range objs {
+		out, err := exec.Command("nm", obj).CombinedOutput()
+		if err != nil {
+			t.Fatalf("nm %s: %v\n%s", obj, err, out)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) == 3 && (f[1] == "T" || f[1] == "D" || f[1] == "B") && strings.Contains(f[2], "cabi") {
+				strong[f[2]] = append(strong[f[2]], filepath.Base(obj))
+			}
+		}
+	}
+	for sym, in := range strong {
+		if len(in) > 1 {
+			t.Errorf("%s is a strong definition in %v: two stubs in one guest cannot link", sym, in)
+		}
+	}
+}
+
+// A capability named like the resource's own imports must not collide with
+// them. The resource imports were `_ffi_<find>_next` and friends, so a
+// `scan_all: scan_it_next` beside `find: scan_it` declared one symbol twice with
+// two signatures.
+func TestCComponentCapabilityNamedLikeTheResourceImport(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("cc not on PATH")
+	}
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "t", WitPackage: "t",
+		Regexps: []config.RegexEntry{{Name: "a", Pattern: `[a-z]+`}, {Name: "d", Pattern: `[0-9]+`}},
+		Sets: []config.SetConfig{{
+			Name: "s", Patterns: config.PatternSelector{All: true},
+			ScanAll: "scan_it_next", Find: "scan_it",
+		}},
+	}
+	dir := t.TempDir()
+	if err := cComponentStub(cfg, filepath.Join(dir, "stub.h")); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	run(t, dir, nil, "cc", "-fsyntax-only", "-Wno-attributes", "stub.c")
 }

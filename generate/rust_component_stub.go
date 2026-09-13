@@ -155,26 +155,13 @@ func consumerWorld(world string) string { return world + "-consumer" }
 func nestPackage(witText string) string {
 	var pkg string
 	var body []string
-	lines := strings.Split(witText, "\n")
-	skipWorld := 0
-	for _, l := range lines {
+	for _, l := range dropWorld(witText) {
 		t := strings.TrimSpace(l)
 		switch {
 		case strings.HasPrefix(t, "//"):
 			continue
 		case strings.HasPrefix(t, "package ") && strings.HasSuffix(t, ";"):
 			pkg = strings.TrimSuffix(strings.TrimPrefix(t, "package "), ";")
-			continue
-		case strings.HasPrefix(t, "world "):
-			skipWorld = 1
-			continue
-		}
-		if skipWorld > 0 {
-			// The export world is one brace-balanced block.
-			skipWorld += strings.Count(t, "{") - strings.Count(t, "}")
-			if skipWorld <= 0 {
-				skipWorld = 0
-			}
 			continue
 		}
 		body = append(body, l)
@@ -240,6 +227,28 @@ func bindingPaths(pkg string, patterns, sets bool) string {
 		fmt.Fprintf(&b, "use %ssets;\n", base)
 	}
 	b.WriteString("\n")
+	// ONE conversion per interface from its error enum into the stub's Error,
+	// so every wrapper converts with Error::from and a new enum case changes
+	// this and nothing else. There were eight identical match blocks.
+	for _, iface := range []struct {
+		name string
+		used bool
+	}{{"matcher", patterns}, {"sets", sets}} {
+		if !iface.used {
+			continue
+		}
+		fmt.Fprintf(&b, `impl From<%[1]s::ErrorCode> for Error {
+    fn from(e: %[1]s::ErrorCode) -> Self {
+        match e {
+            %[1]s::ErrorCode::BacktrackOverflow => Error::BacktrackOverflow,
+            %[1]s::ErrorCode::MalformedCache => Error::MalformedCache,
+            %[1]s::ErrorCode::OutOfOrder => Error::OutOfOrder,
+        }
+    }
+}
+
+`, iface.name)
+	}
 	return b.String()
 }
 
@@ -255,8 +264,7 @@ pub fn %s(input: &[u8]) -> Result<Option<usize>> {
     match matcher::%s(input) {
         Ok(Some(end)) => Ok(Some(end as usize)),
         Ok(None) => Ok(None),
-        Err(matcher::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
-        Err(matcher::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -289,13 +297,9 @@ impl<'a> Iterator for %s<'a> {
         // leading \b, \B or (?m:^) is judged against the real preceding byte.
         // Positions come back absolute.
         match matcher::%s(self.input, self.offset as u32) {
-            Err(matcher::ErrorCode::BacktrackOverflow) => {
+            Err(e) => {
                 self.done = true;
-                Some(Err(Error::BacktrackOverflow))
-            }
-            Err(matcher::ErrorCode::MalformedCache) => {
-                self.done = true;
-                Some(Err(Error::MalformedCache))
+                Some(Err(Error::from(e)))
             }
             Ok(None) => {
                 self.done = true;
@@ -353,13 +357,9 @@ impl<'a> Iterator for %s<'a> {
             return None;
         }
         match matcher::%s(self.input, self.offset as u32) {
-            Err(matcher::ErrorCode::BacktrackOverflow) => {
+            Err(e) => {
                 self.done = true;
-                Some(Err(Error::BacktrackOverflow))
-            }
-            Err(matcher::ErrorCode::MalformedCache) => {
-                self.done = true;
-                Some(Err(Error::MalformedCache))
+                Some(Err(Error::from(e)))
             }
             Ok(None) => {
                 self.done = true;

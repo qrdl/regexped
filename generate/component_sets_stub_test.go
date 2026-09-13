@@ -65,13 +65,13 @@ func TestRustComponentSetInner(t *testing.T) {
 		"pub fn any_hit(input: &[u8], offset: usize) -> Result<Option<i32>>",
 		"pub fn all_hits(input: &[u8], offset: usize) -> Result<impl Iterator<Item = i32> + '_>",
 		"pub struct ScanItIter<'a> {",
-		"inner: sets::ScanIt,",
-		"sets::ScanIt::new(input, offset as u32)",
+		"inner: Option<sets::ScanIt>,",
+		"sets::ScanIt::new(input, offset)",
 		"impl std::iter::FusedIterator for ScanItIter<'_> {}",
 		"pub fn pattern_name(id: i32) -> &'static str {",
 		// The error arm must come BEFORE the finished test, or an engine that
 		// gave up ends the iteration and reports success.
-		"Err(sets::ErrorCode::BacktrackOverflow) => {",
+		"Err(e) => {",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Rust set stub is missing %q", want)
@@ -150,7 +150,7 @@ func TestWitSetKebabPanicsOnDisagreement(t *testing.T) {
 // trio. The declarations are the module stub's, checked by the header-parity test.
 func TestCComponentSetParts(t *testing.T) {
 	cfg0 := setStubCfg()
-	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets")
+	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets", newSetShapes(cfg0))
 	for _, want := range []string{
 		"#define S_PATTERN_COUNT 2",
 		"#define S_ID_SPACE 2",
@@ -169,16 +169,19 @@ func TestCComponentSetParts(t *testing.T) {
 		`__import_name__("[resource-drop]scan-it")`,
 		// The constructor RETURNS a handle, so it is the one import that is not
 		// void and takes no return area.
-		"extern int _ffi_scan_it_new(const unsigned char *ptr, unsigned int len, unsigned int start);",
-		// The ids arrive as a list; the body copies rather than scanning bits.
-		"const unsigned int *ids = *(const unsigned int **)(area + 4);",
-		"patterns[i] = (int)ids[i];",
+		"extern int ffi_scan_it__res_new(const unsigned char *ptr, unsigned int len, unsigned int start);",
+		// The ids arrive as a list; the body copies rather than scanning bits,
+		// reading each u32 by its bytes rather than through a cast pointer.
+		"const unsigned char *ids = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);",
+		"patterns[i] = (int)rx_cabi_u32(ids + 4 * i);",
 		// The handle lives in scratch[0] — the same field the MODULE stub
 		// builds its ABI descriptor in; neither format uses both.
-		"s->scratch[0] = (unsigned)_ffi_scan_it_new(",
-		// Dropping is idempotent: a second free must not drop twice.
-		"if (!s || s->scratch[0] == 0) return;",
-		"_pattern_names[] = {",
+		"s->scratch[0] = (unsigned)ffi_scan_it__res_new(",
+		// Dropping is idempotent: a second free must not drop twice, so free
+		// needs a live handle and clears both words.
+		"|| s->scratch[0] == 0) return;",
+		"s->scratch[1] = 0;",
+		"rx_pattern_names[] = {",
 	} {
 		if !strings.Contains(c, want) {
 			t.Errorf("C set body is missing %q", want)
@@ -187,7 +190,7 @@ func TestCComponentSetParts(t *testing.T) {
 
 	cfg := setStubCfg()
 	cfg.Sets = nil
-	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets"); h != "" || c != "" {
+	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets", newSetShapes(cfg)); h != "" || c != "" {
 		t.Errorf("genCComponentSetParts(no sets) = %q/%q, want empty", h, c)
 	}
 }

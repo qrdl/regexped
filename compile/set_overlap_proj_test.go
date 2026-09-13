@@ -209,21 +209,27 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 		// nonDead, when > 0, pins the class count: the cells MINUS the shared
 		// dead cell 0, which every column reserves.
 		nonDead int
+		// decline is the outcome a shape is EXPECTED to have when it is not
+		// projected: "nosweep" when the set gets no sweep at all, "nosaving"
+		// when the projection would save nothing and is declined. Empty means
+		// the shape must project. A skip here used to let a shape that stopped
+		// projecting pass as a shape that never could.
+		decline string
 	}{
-		{"greedy-3", []string{`a+`, `[^\n]*ERROR`, `x?y`}, 11},
-		{"overlap-shape-3", []string{`[a-z]+`, `[0-9]+`, `[A-Z]+`}, 6},
-		{"classchain-32", overlapProjClassChain(32), 352},
+		{"greedy-3", []string{`a+`, `[^\n]*ERROR`, `x?y`}, 11, ""},
+		{"overlap-shape-3", []string{`[a-z]+`, `[0-9]+`, `[A-Z]+`}, 6, ""},
+		{"classchain-32", overlapProjClassChain(32), 352, ""},
 		// A COMPRESSED table (byte classes), which changes how the model and
 		// the sweep index the transition table and nothing else.
-		{"compressed", []string{`(?:[0-9][a-c]){70}`}, 0},
-		{"compressed-multi", []string{`(?:[0-9][a-c]){40}`, `[0-9]+`, `[a-c]+`}, 0},
+		{"compressed", []string{`(?:[0-9][a-c]){70}`}, 0, "nosaving"},
+		{"compressed-multi", []string{`(?:[0-9][a-c]){40}`, `[0-9]+`, `[a-c]+`}, 0, ""},
 		// Empty matches, aliases and anchors: the shapes where a merged class
 		// is most tempting and most wrong.
-		{"empty-and-aliases", []string{`a*`, `a+`, ``, `b?`, `(?:)`, `a|`, `[ab]{0,2}`}, 0},
-		{"non-greedy", []string{`a+?`, `a+`}, 0},
-		{"prefix-pair", []string{`ab|abc`, `b`, `c`}, 0},
-		{"anchors", []string{`^a+`, `a+$`, `^$`}, 0},
-		{"lazy-alternation", []string{`(?:ab|cd)*?x`, `a|ab`, `(a|b)*?c`}, 0},
+		{"empty-and-aliases", []string{`a*`, `a+`, ``, `b?`, `(?:)`, `a|`, `[ab]{0,2}`}, 0, ""},
+		{"non-greedy", []string{`a+?`, `a+`}, 0, ""},
+		{"prefix-pair", []string{`ab|abc`, `b`, `c`}, 0, "nosweep"},
+		{"anchors", []string{`^a+`, `a+$`, `^$`}, 0, ""},
+		{"lazy-alternation", []string{`(?:ab|cd)*?x`, `a|ab`, `(a|b)*?c`}, 0, "nosweep"},
 	}
 	// Bytes drawn from every shape's alphabet plus a newline, so `[^\n]*` and
 	// `(?m:^)` see what they are about.
@@ -236,13 +242,22 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 			cs := setEmitCovCompileSet(t, spec, shape.pats, CompileSetOptions{})
 			bi := cs.overlapDPBucket()
 			if bi < 0 {
-				t.Skip("this shape gets no sweep, so there is no column to project")
+				if shape.decline != "nosweep" {
+					t.Fatalf("this shape gets no sweep; want %q", shape.decline)
+				}
+				return
 			}
 			bkt := cs.buckets[bi]
 			numPat := len(bkt.patterns)
 			pr := buildOverlapProj(bkt.dp, numPat)
 			if pr == nil {
-				t.Skip("the projection saved nothing here and was declined")
+				if shape.decline != "nosaving" {
+					t.Fatalf("the projection saved nothing and was declined; want %q", shape.decline)
+				}
+				return
+			}
+			if shape.decline != "" {
+				t.Fatalf("the shape projected; it was expected to decline (%s)", shape.decline)
 			}
 			if shape.nonDead > 0 && pr.cells-1 != shape.nonDead {
 				t.Errorf("%d non-dead classes, want %d (cells %d, which counts the dead cell)",

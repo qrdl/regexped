@@ -14,6 +14,9 @@ import (
 // and exits 0 — mimicking a successful wasm-merge run without the real binary.
 func TestMain(m *testing.M) {
 	if os.Getenv("REGEXPED_MOCK_WASM_MERGE") == "1" {
+		if argvFile := os.Getenv("REGEXPED_MOCK_ARGV"); argvFile != "" {
+			_ = os.WriteFile(argvFile, []byte(strings.Join(os.Args[1:], " ")), 0o644)
+		}
 		args := os.Args
 		for i, a := range args {
 			if a == "-o" && i+1 < len(args) {
@@ -47,121 +50,6 @@ func TestModuleNameForWasm(t *testing.T) {
 	}
 }
 
-func TestExpandHome(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("cannot determine home directory:", err)
-	}
-	cases := []struct {
-		input string
-		want  string
-	}{
-		{"~/foo/bar", filepath.Join(home, "foo/bar")},
-		{"/absolute/path", "/absolute/path"},
-		{"relative/path", "relative/path"},
-	}
-	for _, c := range cases {
-		got := expandHome(c.input)
-		if got != c.want {
-			t.Errorf("expandHome(%q) = %q, want %q", c.input, got, c.want)
-		}
-	}
-}
-
-func TestExpandHomeNoTilde(t *testing.T) {
-	input := "~user/foo"
-	got := expandHome(input)
-	if strings.HasPrefix(got, "/") {
-		t.Errorf("expandHome(%q) = %q, should not expand ~user", input, got)
-	}
-}
-
-func TestRunCmd(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		if err := runCmd("/bin/true", nil, "", nil); err != nil {
-			t.Errorf("runCmd(/bin/true): unexpected error: %v", err)
-		}
-	})
-
-	t.Run("failure", func(t *testing.T) {
-		if err := runCmd("/bin/false", nil, "", nil); err == nil {
-			t.Error("runCmd(/bin/false): expected error, got nil")
-		}
-	})
-
-	t.Run("extra env", func(t *testing.T) {
-		if err := runCmd("/bin/true", nil, "", []string{"REGEXPED_TEST=1"}); err != nil {
-			t.Errorf("runCmd with extra env: unexpected error: %v", err)
-		}
-	})
-}
-
-func TestCheckTool(t *testing.T) {
-	t.Run("abs path exists and executable", func(t *testing.T) {
-		if err := checkTool("/bin/sh"); err != nil {
-			t.Errorf("checkTool(/bin/sh): unexpected error: %v", err)
-		}
-	})
-
-	t.Run("abs path not found", func(t *testing.T) {
-		if err := checkTool("/nonexistent/path/to/tool_regexped_test_xyz"); err == nil {
-			t.Error("checkTool: expected error for non-existent absolute path")
-		}
-	})
-
-	t.Run("abs path not executable", func(t *testing.T) {
-		f, err := os.CreateTemp("", "regexped-test-noexec-*")
-		if err != nil {
-			t.Skip("cannot create temp file:", err)
-		}
-		defer os.Remove(f.Name())
-		f.Close()
-		// leave permissions as 0600 (not executable)
-		if err := os.Chmod(f.Name(), 0o600); err != nil {
-			t.Skip("cannot chmod:", err)
-		}
-		if err := checkTool(f.Name()); err == nil {
-			t.Error("checkTool: expected error for non-executable file")
-		}
-	})
-
-	t.Run("name in PATH", func(t *testing.T) {
-		if err := checkTool("sh"); err != nil {
-			t.Errorf("checkTool(sh): unexpected error: %v", err)
-		}
-	})
-
-	t.Run("name not in PATH", func(t *testing.T) {
-		if err := checkTool("nonexistent_tool_regexped_xyz_test"); err == nil {
-			t.Error("checkTool: expected error for non-existent tool name")
-		}
-	})
-}
-
-func TestResolveWasmMerge(t *testing.T) {
-	t.Run("config takes precedence over env", func(t *testing.T) {
-		t.Setenv("WASM_MERGE", "/from/env")
-		got := resolveWasmMerge(config.BuildConfig{WasmMerge: "/from/config"})
-		if got != "/from/config" {
-			t.Errorf("got %q, want /from/config", got)
-		}
-	})
-	t.Run("env var used when config empty", func(t *testing.T) {
-		t.Setenv("WASM_MERGE", "/from/env")
-		got := resolveWasmMerge(config.BuildConfig{})
-		if got != "/from/env" {
-			t.Errorf("got %q, want /from/env", got)
-		}
-	})
-	t.Run("falls back to wasm-merge", func(t *testing.T) {
-		t.Setenv("WASM_MERGE", "")
-		got := resolveWasmMerge(config.BuildConfig{})
-		if got != "wasm-merge" {
-			t.Errorf("got %q, want wasm-merge", got)
-		}
-	})
-}
-
 func TestCmdMerge(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -189,11 +77,37 @@ func TestCmdMerge(t *testing.T) {
 		}
 	}
 
-	t.Run("binary from config", func(t *testing.T) {
-		run(t, config.BuildConfig{WasmMerge: exe})
+	// The test binary is the mock, and it is NOT named wasm-merge: pointing the
+	// key at a file uses that file whatever it is called.
+	t.Run("binary from config, under another name", func(t *testing.T) {
+		run(t, config.BuildConfig{WasmMergePath: exe})
 	})
-	t.Run("binary from env var", func(t *testing.T) {
+	t.Run("the environment is ignored", func(t *testing.T) {
+		t.Setenv("WASM_MERGE", "/garbage/wasm-merge")
+		run(t, config.BuildConfig{WasmMergePath: exe})
+
 		t.Setenv("WASM_MERGE", exe)
-		run(t, config.BuildConfig{})
+		t.Setenv("PATH", t.TempDir())
+		dir := t.TempDir()
+		err := CmdMerge(config.BuildConfig{}, filepath.Join(dir, "main.wasm"),
+			filepath.Join(dir, "out.wasm"), []string{filepath.Join(dir, "re.wasm")})
+		if err == nil || !strings.Contains(err.Error(), "$PATH") {
+			t.Errorf("err = %v; with the key omitted only $PATH is consulted, never $WASM_MERGE", err)
+		}
 	})
+}
+
+// The world block is read up to its closing brace; text that never closes it, or
+// has no world at all, yields what was seen rather than nothing or a panic.
+func TestRegexpedExportsWithoutAClosedWorld(t *testing.T) {
+	for _, c := range []struct{ name, wit, want string }{
+		{"empty", "", ""},
+		{"no world", "package regexped:a;\n\ninterface matcher {\n}\n", ""},
+		{"unterminated world", "world root {\n  import wasi:io/streams;\n  export regexped:a/matcher;\n  export regexped:a/sets;\n",
+			"regexped:a/matcher,regexped:a/sets"},
+	} {
+		if got := strings.Join(regexpedExports(c.wit), ","); got != c.want {
+			t.Errorf("%s: regexpedExports = %q, want %q", c.name, got, c.want)
+		}
+	}
 }

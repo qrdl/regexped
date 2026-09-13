@@ -1,7 +1,7 @@
 # regexped must be built first: run `make` in the repo root.
 REGEXPED   := ../../../../regexped
 CC         := clang-19
-CFLAGS     := --target=wasm32-wasi -nostdlib -Wl,--no-entry
+CFLAGS     := --target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0 -Wl,--no-entry
 
 MAIN_WASM  := main.wasm
 REGEX_WASM := url_parts.wasm
@@ -92,9 +92,16 @@ run: $(FINAL_WASM)
 # Step 1 – compile the patterns into a component, and generate its stub. Both
 # land under component/; the stub is called stub.h there too, so main.c includes
 # the same name and needs no change.
-$(COMP_REGEX) $(COMP_STUB): $(COMP_CFG) $(REGEXPED)
+#
+# One recipe makes both, so they hang off a stamp. A rule naming two targets
+# runs its recipe once PER TARGET — twice at once under -j, racing on the same
+# files.
+$(COMP_DIR)/.built: $(COMP_CFG) $(REGEXPED)
 	$(REGEXPED) compile  --config=$(COMP_CFG)
 	$(REGEXPED) generate --config=$(COMP_CFG)
+	@touch $@
+
+$(COMP_REGEX) $(COMP_STUB): $(COMP_DIR)/.built ;
 
 # Step 2 – compile main.c against the COMPONENT stub. -I$(COMP_DIR) is the only
 # difference from the module build's compile line.

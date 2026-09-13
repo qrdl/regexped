@@ -80,7 +80,7 @@ Under `wasm_format: component` the compiler emits that same core module and
 | Export | Signature | Role |
 |---|---|---|
 | `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; segregated free lists by power-of-two size class, growing memory when a class is empty and no space is left, and trapping if growth fails or the alignment exceeds 8 |
-| `cabi_post_<canonical>` | `(i32) → ()` | post-return; returns every block THIS call allocated to its class's free list. One shared function, exported under one name per adapter |
+| `cabi_post_<canonical>` | `(i32) → ()` | post-return; returns every block THIS call allocated to its class's free list. One shared function, exported under one name per adapter that returns a result area — a set's constructor and destructor have none |
 | `<canonical>` | see below | one adapter per exported pattern function |
 | the raw exports | unchanged | kept alongside, so `wasm-tools component unbundle` yields a core module the module-format tooling can drive |
 
@@ -92,9 +92,9 @@ A canonical export name is `regexped:<wit_package>[@<wit_version>]/matcher#<keba
 |---|---|
 | `…/sets#<kebab>` | `match_any` / `scan_any`: the raw id or -1 becomes `option<u32>` |
 | `…/sets#<kebab>` | `match_all` / `scan_all`: the i64 bitmask, or the count plus a bitmap the adapter allocates AND ZEROES, becomes `list<u32>` of ids. The scan uses `i64.ctz` + `v &= v-1`, so it runs once per HIT — a bit-by-bit scan measured up to 11x the whole call at 4096 patterns |
-| `…/sets#[constructor]<res>` | the `find` resource: allocates the scanner state, COPIES the input, zeroes the gate array, and returns a handle from the imported `[resource-new]` builtin |
+| `…/sets#[constructor]<res>` | the `find` resource: allocates the scanner state, TAKES OVER the block the input was lowered into (copying it only when that block is not the newest on the per-call chain), zeroes the gate array, reserves the answer cache when the set has one, and returns a handle from the imported `[resource-new]` builtin |
 | `…/sets#[method]<res>.next` | one position per call, into a `PATTERN_COUNT`-tuple buffer — the exact worst case for one start, so the raw ABI's transactional overflow cannot fire |
-| `…/sets#[dtor]<res>` | frees the input copy, the gate array and the state. Not in the WIT: `component new` binds it by name, and a component without it TRAPS when a handle is dropped |
+| `…/sets#[dtor]<res>` | frees the input block, the gate array, the answer cache and the state. Not in the WIT: `component new` binds it by name, and a component without it TRAPS when a handle is dropped |
 
 A set-bearing component therefore has a function IMPORT — `[resource-new]<res>`
 from the synthetic module `[export]regexped:<pkg>/sets` — which shifts every
@@ -140,9 +140,9 @@ element option<tuple<u32,u32>>                           size 12, align 4
   @8   u32  end
 ```
 
-The `-1`, `-2` and `-4` sentinels are translated here: `-1` becomes `ok(none)`,
-`-2` becomes `err(backtrack-overflow)` and `-4` — which only a set `find`
-returns — becomes `err(malformed-cache)`. A group is unset iff its
+The `-1`, `-2`, `-4` and `-6` sentinels are translated here: `-1` becomes
+`ok(none)`, `-2` becomes `err(backtrack-overflow)`, and `-4` and `-6` — which
+only a set `find` returns — become `err(malformed-cache)` and `err(out-of-order)`. A group is unset iff its
 START slot is negative, which is the same test the generated stubs apply, so all
 six languages and the component agree on which groups participated.
 
@@ -165,9 +165,10 @@ Block layout, two header words below the payload:
 ```
 
 The word at `ptr-4` is reused for both links because a block is never live and
-free at once. Payloads are 8-aligned, which is the widest alignment the
-canonical ABI asks for here (`list<u64>`); a wider request traps rather than
-returning a pointer the host would read through misaligned.
+free at once. Payloads are 8-aligned, wider than anything these interfaces
+allocate (lists of `u8` and `u32`, and 4-aligned records such as `set-match`); a
+wider request traps rather than returning a pointer the host would read through
+misaligned.
 
 Memory grows to fit a large input and is never returned to the OS —
 `memory.grow` is one-way — but it IS reused: a repeated identical call is flat,
@@ -527,7 +528,8 @@ set — so a decoder must test them BEFORE it decides the scan finished:
 |---|---|---|
 | `0xFFFFFFFF` | the scan is finished | the final matches, if any |
 | `0xFFFFFFFE` | UNKNOWN: a Backtracking member ran out of frames | 0, nothing written |
-| `0xFFFFFFFD` | UNKNOWN: the answer cache's header is malformed | 0, nothing written |
+| `0xFFFFFFFD` | UNKNOWN: the answer cache's header is malformed | 0; tuples for earlier positions may already be in the buffer, and the call's whole output is unknown |
+| `0xFFFFFFFC` | UNKNOWN: the resume position is below where the answer cache was built — the scan went backwards (best-effort detection; see "The rules" below) | 0, nothing written |
 
 The two error words live in the POSITION field rather than in the return value
 as a whole because there is nowhere else: every done return already has bit 63
@@ -660,9 +662,9 @@ The rules:
   the drive falls back to walking. The answer is identical, only slower. This
   is the same rule `out_cap` underflow has.
 - **A header that contradicts itself IS an error.** A stride below 1 — or, on a
-  later call, a layout that is not the one a sweep would have written (a floor
-  past the input, offsets that do not follow from `numBlocks`, a block buffer
-  the declared `cache_len` cannot hold) — returns **`-4`** rather than degrading
+  later call, a header no sweep could have written (a floor past the input, a
+  block count other than the one the input length, floor and stride imply, a
+  block buffer the declared `cache_len` cannot hold) — returns **`-4`** rather than degrading
   quietly. A mistake in caller-owned memory is otherwise indistinguishable from
   the engine legitimately declining the shape, on precisely the inputs the cache
   exists for. The header is re-checked on EVERY call, not only the one that
@@ -682,11 +684,22 @@ The rules:
   region that no longer holds what it names.
 - **One entry per drive.** A drive is served by `find` or by the batch entry,
   never both: the two read the same header and resume differently.
+- **`from` must never go backwards within a drive.** Within one scan — one
+  zeroed descriptor over one unchanging input — each call's `from`, and each
+  resume cursor, must be at or after the one before. This is a LIMITATION, on
+  every set and with or without a cache: a backwards `from` is unsupported and may
+  give an answer that is missing matches. Detection is best effort, with NO
+  guarantee: the engine notices only once an overlapping set's cache has engaged
+  (`ready == 1`) and the position falls below the floor the sweep started from,
+  and then `find` returns **`-6`** and the batch entry returns the reserved
+  position word `0xFFFFFFFC` with nothing written. Anywhere else a backwards
+  `from` goes undetected.
 
 The engine may decline even when offered a large enough region: the sweep is
 emitted only where it reproduces the per-position semantics exactly (one
 bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
-no Backtracking member, at most 32 patterns). Declining is invisible from the
+no Backtracking member, and no more patterns than the row mask's 32 bits —
+`bucketMaskBits`). Declining is invisible from the
 caller's side and costs nothing but speed.
 
 ### find return value and overflow

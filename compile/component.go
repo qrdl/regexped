@@ -12,8 +12,11 @@ import (
 // untouched; this file APPENDS a small fixed set of functions after all pattern
 // functions, so no baseIdx or per-pattern offset moves:
 //
-//	cabi_realloc  (i32,i32,i32,i32)→i32   bump allocator
-//	cm_post       (i32)→()                post-return: reset the bump pointer
+//	cabi_realloc  (i32,i32,i32,i32)→i32   size-class free lists over a bump
+//	                                      heap; links each block onto the
+//	                                      per-call chain
+//	cm_free       (i32)→()                returns one block to its class
+//	cm_post       (i32)→()                post-return: frees the per-call chain
 //	one adapter per exported pattern function, retptr-shaped
 //
 // `wasm-tools component new` then lifts those adapters into a component. The
@@ -43,7 +46,7 @@ type asmOpts struct {
 	// .wit and the core module cannot disagree about a single name.
 	ExportNames map[string]string
 	// SetNames is the same thing for `sets:`, keyed by set name. Empty for a
-	// config with no sets, which is every config before phase 3.2.
+	// config with no sets.
 	SetNames map[string]ComponentSetNames
 }
 
@@ -119,14 +122,14 @@ func componentAdapters(patterns []*compiledPattern, names map[string]string, fir
 	baseIdx, _ := patternBaseIndices(patterns)
 	for i, p := range patterns {
 		base := firstFuncIdx + baseIdx[i]
-		matchOff, _, _, captureOff, _ := p.offsets()
+		matchOff, _, findOff, _, _ := p.offsets()
 		if p.matchExport != "" && matchOff >= 0 {
 			if name, ok := names[p.matchExport]; ok {
 				out = append(out, componentAdapter{kind: adapterMatch, funcIdx: base + matchOff, export: name})
 			}
 		}
 		if p.findExport != "" {
-			if _, _, findOff, _, _ := p.offsets(); findOff >= 0 {
+			if findOff >= 0 {
 				if name, ok := names[p.findExport]; ok {
 					// The (ptr,len,from) wrapper, exactly what the raw export
 					// points at — not the two-argument body it fronts.
@@ -137,7 +140,6 @@ func componentAdapters(patterns []*compiledPattern, names map[string]string, fir
 		if p.hasGroupsFromWrapper() {
 			if name, ok := names[p.groupsExport]; ok {
 				inner := base + p.groupsFromWrapperOffsets()
-				_ = captureOff
 				out = append(out, componentAdapter{
 					kind: adapterGroups, funcIdx: inner, export: name, numGroups: p.numGroups,
 				})
@@ -176,9 +178,9 @@ func patternBaseIndices(patterns []*compiledPattern) ([]int, int) {
 //	block:  [ptr-8] class   [ptr-4] call-chain next / free-list next   [ptr] payload…
 //
 // Two header words, so the payload of an 8-aligned block is itself 8-aligned —
-// the widest alignment the canonical ABI asks of us (`list<u64>`; a `set-match`
-// record is 4, a string is 1). A wider request TRAPS rather than returning a
-// misaligned pointer the host would then read through.
+// wider than anything these interfaces allocate: lists of u8 and u32, and
+// 4-aligned records such as `set-match`. A wider request TRAPS rather than
+// returning a misaligned pointer the host would then read through.
 //
 // The word at ptr-4 carries the one piece of cleverness: while the block is
 // live it links the per-call chain, and while it is free it links its class's
@@ -227,17 +229,33 @@ func buildComponentReallocBody(heapGlobal, callListGlobal uint32, classHeadsBase
 	const (
 		pAlign = 0x02 // param 2: align
 		pSize  = 0x03 // param 3: new_size
-		lP     = 0x04 // local: the payload pointer
-		lClass = 0x05 // local: the size-class exponent
-		lHead  = 0x06 // local: &classHeads[class]
-		lEnd   = 0x07 // local: end of a freshly carved block
+	)
+	alloc := newLocalAlloc(4)
+	var (
+		lP     = alloc.I32() // the payload pointer
+		lClass = alloc.I32() // the size-class exponent
+		lHead  = alloc.I32() // &classHeads[class]
+		lEnd   = alloc.I32() // end of a freshly carved block
 	)
 	var b []byte
-	b = append(b, 0x01, 0x04, 0x7F) // 1 local group: four i32
+	b = alloc.EmitDecls(b)
 
 	// An alignment wider than the header can promise traps.
 	b = append(b, 0x20, pAlign)
 	b = append(b, 0x41, 0x08)
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end if
+
+	// A size the classes cannot represent TRAPS. Above 0x7FFFFFF0 the class
+	// below would pass 31, so the carve `1 << class` wraps — and past
+	// 0xFFFFFFF8 new_size + 7 wraps first. Both used to return a pointer into
+	// live memory, one of them inside the DFA table, and the next carve then
+	// overlapped it. Only a host lowering a list of 2 GiB or more gets here.
+	b = append(b, 0x20, pSize)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 0x7FFFFFF0)
 	b = append(b, 0x4B)       // i32.gt_u
 	b = append(b, 0x04, 0x40) // if
 	b = append(b, 0x00)       // unreachable
@@ -259,6 +277,14 @@ func buildComponentReallocBody(heapGlobal, callListGlobal uint32, classHeadsBase
 	b = append(b, 0x41, minClassShift)
 	b = append(b, 0x21, lClass)
 	b = append(b, 0x0B) // end if
+	// And the class itself stays below 32, so no carve can wrap even if the
+	// size guard above is ever loosened.
+	b = append(b, 0x20, lClass)
+	b = append(b, 0x41, 0x1F) // i32.const 31
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end if
 
 	// head = &classHeads[class]
 	b = append(b, 0x41)
@@ -368,12 +394,11 @@ func appendMemBytes(b []byte) []byte {
 //
 //	*(ptr-4) = classHeads[class] ; classHeads[class] = ptr
 func buildComponentFreeBody(classHeadsBase int32) []byte {
-	const (
-		pP    = 0x00 // param 0: the block
-		lHead = 0x01 // local: &classHeads[class]
-	)
+	const pP = 0x00 // param 0: the block
+	alloc := newLocalAlloc(1)
+	lHead := alloc.I32() // &classHeads[class]
 	var b []byte
-	b = append(b, 0x01, 0x01, 0x7F) // 1 local group: one i32
+	b = alloc.EmitDecls(b)
 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, classHeadsBase)
@@ -404,12 +429,13 @@ func buildComponentFreeBody(classHeadsBase int32) []byte {
 // One function serves every export: a WASM function may be exported under any
 // number of names.
 func buildComponentPostBody(callListGlobal uint32, freeIdx int) []byte {
-	const (
-		lP    = 0x01 // local: the block being freed
-		lNext = 0x02 // local: the next block, read BEFORE the free clobbers that word
+	alloc := newLocalAlloc(1) // param 0: the result area, not read
+	var (
+		lP    = alloc.I32() // the block being freed
+		lNext = alloc.I32() // the next block, read BEFORE the free clobbers that word
 	)
 	var b []byte
-	b = append(b, 0x01, 0x02, 0x7F) // 1 local group: two i32
+	b = alloc.EmitDecls(b)
 
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, callListGlobal)
@@ -465,7 +491,6 @@ func loadI32(b []byte, off int) []byte {
 	return utils.AppendULEB128(b, uint32(off))
 }
 
-// callRealloc pushes a cabi_realloc(0, 0, align, size) call.
 // callReallocDyn is callRealloc with the size in a LOCAL rather than a
 // constant, for the one allocation whose size is not known until the call runs:
 // the overlapping answer cache, which is a function of the input length.
@@ -479,6 +504,7 @@ func callReallocDyn(b []byte, reallocIdx int, align int32, sizeLocal byte) []byt
 	return utils.AppendULEB128(b, uint32(reallocIdx))
 }
 
+// callRealloc pushes a cabi_realloc(0, 0, align, size) call.
 func callRealloc(b []byte, reallocIdx int, align, size int32) []byte {
 	b = append(b, 0x41, 0x00) // old_ptr
 	b = append(b, 0x41, 0x00) // old_size
@@ -500,11 +526,11 @@ func buildMatchAdapterBody(reallocIdx, innerIdx int) []byte {
 	const (
 		pPtr = 0x00
 		pLen = 0x01
-		lR   = 0x02
-		lRet = 0x03
 	)
+	alloc := newLocalAlloc(2)
+	lR, lRet := alloc.I32(), alloc.I32()
 	var b []byte
-	b = append(b, 0x01, 0x02, 0x7F) // 2 i32 locals: r, ret
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaMatch)
 	b = append(b, 0x21, lRet)
@@ -552,12 +578,12 @@ func buildFindAdapterBody(reallocIdx, innerIdx int) []byte {
 		pPtr   = 0x00
 		pLen   = 0x01
 		pStart = 0x02
-		lR     = 0x03 // i64
-		lRet   = 0x04 // i32
 	)
+	alloc := newLocalAlloc(3)
+	lR := alloc.I64() // the packed (start << 32 | end), or a sentinel
+	lRet := alloc.I32()
 	var b []byte
-	// Two local groups: one i64 then one i32, so r is local 3 and ret local 4.
-	b = append(b, 0x02, 0x01, 0x7E, 0x01, 0x7F)
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaFind)
 	b = append(b, 0x21, lRet)
@@ -617,13 +643,16 @@ func buildGroupsAdapterBody(reallocIdx, innerIdx, numGroups int) []byte {
 		pPtr   = 0x00
 		pLen   = 0x01
 		pStart = 0x02
-		lR     = 0x03
-		lRet   = 0x04
-		lSlots = 0x05
-		lElems = 0x06
+	)
+	alloc := newLocalAlloc(3)
+	var (
+		lR     = alloc.I32()
+		lRet   = alloc.I32()
+		lSlots = alloc.I32()
+		lElems = alloc.I32()
 	)
 	var b []byte
-	b = append(b, 0x01, 0x04, 0x7F) // 4 i32 locals: r, ret, slots, elems
+	b = alloc.EmitDecls(b)
 
 	b = callRealloc(b, reallocIdx, 4, areaGroups)
 	b = append(b, 0x21, lRet)
@@ -696,12 +725,15 @@ func appendCodeEntry(cs []byte, body []byte) []byte {
 }
 
 // asmOpts projects the component fields of CompileOptions onto the assembler's
-// options. Keeping the projection in one place means a new component option is
-// added once, not at each assembler.
-func (o CompileOptions) asmOpts() asmOpts {
+// options, together with the set name tables. Keeping the projection in one
+// place means a new component option is added once, not at each assembler: the
+// set path used to build its asmOpts by hand, and this projection omitted the
+// set names it needed. setNames is nil for a config with no sets.
+func (o CompileOptions) asmOpts(setNames map[string]ComponentSetNames) asmOpts {
 	return asmOpts{
 		Component:        o.Component,
 		ComponentPackage: o.ComponentPackage,
 		ExportNames:      o.ComponentExportNames,
+		SetNames:         setNames,
 	}
 }

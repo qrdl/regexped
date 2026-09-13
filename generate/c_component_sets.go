@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // The C COMPONENT stub for sets.
@@ -18,13 +19,13 @@ import (
 //
 //   - the `_all` pair receives a LIST OF IDS, not a bitmask or a bitmap, so the
 //     body copies rather than scanning bits. The conversion happens inside the
-//     regexp component, where it was measured cheaper (§9.2).
+//     regexp component, where it was measured cheaper.
 //   - `find` is a RESOURCE. The scanner struct is still caller-owned and still
 //     the same type, but what it holds is a HANDLE: the input, the position and
 //     the gates all live inside the regexp component now.
-//   - `<func>_free` does something. In the module format it is a no-op; here it
-//     drops the handle, and skipping it strands the scan's state for the life of
-//     the process.
+//   - `<func>_free` drops the handle, and skipping it strands the scan's state
+//     for the life of the process. In the module format it frees only the
+//     answer cache an overlapping scanner may own.
 
 // genCComponentSetParts renders the set half of the component C stub.
 //
@@ -32,7 +33,7 @@ import (
 // every kebab name here is one the WIT document also contains and nothing can
 // fail. Re-deriving them from the config would add an error branch for a failure
 // witSets has already ruled out.
-func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string) (hPart, cPart string) {
+func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string, shapes *setShapes) (hPart, cPart string) {
 	if len(wsets) == 0 {
 		return "", ""
 	}
@@ -52,7 +53,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		// PUBLIC header, and the two formats promise an identical one. Omitting
 		// them made the headers differ for exactly the configs the parity test
 		// did not cover.
-		if sh := overlapCacheShapeFor(s, cfg); s.Overlapping && sh.Eligible && s.Find != "" {
+		if sh := shapes.cacheShape(si); s.Overlapping && sh.Eligible && s.Find != "" {
 			// Byte-for-byte what c_stub.go emits, comments included: the parity
 			// test compares header TEXT, and a field that explains itself
 			// differently in the two formats is a difference. They are simply
@@ -65,7 +66,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 
 		for _, c := range s.Capabilities() {
 			kebab := witSetKebab(ws, c)
-			ffi := "_ffi_" + c.Name
+			ffi := "ffi_" + c.Name
 			switch c.Field {
 			case "match_any":
 				hb.WriteString(cSetMatchAnyDecl(c.Name))
@@ -110,7 +111,11 @@ func witSetKebab(ws witSet, c config.SetCapability) string {
 	panic("generate: capability " + c.Field + " " + c.Name + " has no WIT name — witSets and Capabilities disagree")
 }
 
-// cComponentImportDecl is one lowered import declaration.
+// cComponentPosParams is the lowered parameter list of an import taking an input
+// and a start position: `find` and `groups`.
+const cComponentPosParams = "const unsigned char *ptr, unsigned int len, unsigned int start,\n               unsigned char *ret"
+
+// cComponentImportDecl is one lowered import declaration, for every shape.
 func cComponentImportDecl(module, field, ffi, params string) string {
 	return fmt.Sprintf(`__attribute__((__import_module__("%s"), __import_name__("%s")))
 extern void %s(%s);
@@ -140,7 +145,7 @@ func cComponentSetAnyBody(module, kebab, name, ffi string, hasOffset bool) strin
        confident negative the engine never established. */
     if (area[0] != 0) return RX_ERR_BT_OVERFLOW;
     if (area[4] == 0) return -1;
-    return (int)(*(unsigned int *)(area + 8));
+    return (int)rx_cabi_u32(area + 8);
 }
 
 `, name, ffi, callArgs)
@@ -172,16 +177,21 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
 	// the clamp came out as the call's argument list.
 	fmt.Fprintf(&b, sig+` {
     __attribute__((aligned(4))) unsigned char area[12] = {0};
+    /* The id list is lowered into OUR memory through cabi_realloc. Rewind only
+       what THIS call allocates, on every return: without it each call leaked
+       the list from the heap for the life of the process. */
+    unsigned mark = regexped_cabi_mark();
     %[3]s(%[4]s);
-    if (area[0] != 0) return RX_ERR_BT_OVERFLOW; /* result unknown, not empty */
-    const unsigned int *ids = *(const unsigned int **)(area + 4);
-    unsigned int count = *(unsigned int *)(area + 8);
+    if (area[0] != 0) { regexped_cabi_release(mark); return RX_ERR_BT_OVERFLOW; } /* result unknown, not empty */
+    const unsigned char *ids = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
+    unsigned int count = rx_cabi_u32(area + 8);
     /* The interface cannot report more ids than the set has patterns, and the
        declaration promises the caller's array is at least that long. The clamp
        is here anyway: it costs nothing and it bounds the write by something
        this translation unit can see. */
     if (count > (unsigned int)%[2]s) count = (unsigned int)%[2]s;
-    for (unsigned int i = 0; i < count; i++) patterns[i] = (int)ids[i];
+    for (unsigned int i = 0; i < count; i++) patterns[i] = (int)rx_cabi_u32(ids + 4 * i);
+    regexped_cabi_release(mark);
     return (int)count;
 }
 
@@ -196,6 +206,7 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
 // so this body reuses its fields for what it actually needs:
 //
 //	scratch[0]  the resource HANDLE, which is the only state that matters here
+//	scratch[1]  FindScratchMagic while the handle is live
 //	done        as before
 //
 // `scratch` is the same field the MODULE stub builds its ABI descriptor in, and
@@ -204,9 +215,13 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
 // handle and owns neither — the gate array lives inside the regexp component
 // with the rest of the scan.
 func cComponentSetFindBody(module, kebab, name, scannerType, konst string) string {
-	ctor := "_ffi_" + name + "_new"
-	next := "_ffi_" + name + "_next"
-	drop := "_ffi_" + name + "_drop"
+	// ffi_<find>__res_*: a double underscore and a suffix no WIT name can
+	// produce, so a capability named like `<find>_next` cannot collide with the
+	// resource's own imports — and no leading underscore, which C reserves at
+	// file scope.
+	ctor := "ffi_" + name + "__res_new"
+	next := "ffi_" + name + "__res_next"
+	drop := "ffi_" + name + "__res_drop"
 	var b strings.Builder
 
 	// The constructor RETURNS the handle, so it does not take a return area and
@@ -223,61 +238,76 @@ extern int %s(const unsigned char *ptr, unsigned int len, unsigned int start);
     if (!s || !input) return RX_ERR_NULL_ARG;
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
+    /* Re-initialising a LIVE scanner drops the resource it held first, as the
+       header promises: overwriting the handle stranded the input, the gates and
+       the cache inside the regexp component for good. The magic word in
+       scratch[1] is what tells a live scanner from an uninitialised struct. */
+    if (s->scratch[1] == %[7]du && s->scratch[0] != 0) %[6]s((int)s->scratch[0]);
+    s->scratch[0] = 0;
+    s->scratch[1] = 0;
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
-    /* gates[0] holds the resource handle: the real gate array is inside the
+    /* scratch[0] holds the resource handle: the real gate array is inside the
        regexp component, along with the input and the position. */
     s->scratch[0] = (unsigned)%[3]s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);
+    s->scratch[1] = %[7]du; /* stamped last: the struct reads as live only once it is */
     return 0;
 }
 
 int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (!s || !buf) return RX_ERR_NULL_ARG;
     if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
+    /* One position's worst case is one match per pattern, and the resource moves
+       past a position as it answers it: a smaller buffer could be neither grown
+       nor asked again, so it is refused before anything is called. */
+    if (cap < (size_t)%[5]s) return RX_ERR_RANGE;
     if (s->done) return 0;
     /* result<list<set-match>, error-code>: @0 disc, @4 list ptr, @8 list len */
     __attribute__((aligned(4))) unsigned char area[12] = {0};
+    /* The tuple list is lowered into OUR memory; rewind it on every return. */
+    unsigned mark = regexped_cabi_mark();
     %[4]s((int)s->scratch[0], area);
     /* Negative would be a count in the module format; here the error is the
        result's discriminant, and WHICH error is the payload beside it -- the
-       error-code enum, 0 = backtrack-overflow, 1 = malformed-cache. Either
-       means UNKNOWN, so the scan ends AND says which rather than reporting
-       "no more matches"; reading only the discriminant reported a malformed
-       cache as a backtracking overflow. */
+       error-code enum, 0 = backtrack-overflow, 1 = malformed-cache,
+       2 = out-of-order, one byte. Any of them means UNKNOWN, so the scan ends
+       AND says which rather than reporting "no more matches". */
     if (area[0] != 0) {
+        unsigned char code = area[4];
         s->done = 1;
-        return *(unsigned int *)(area + 4) == 1 ? RX_ERR_MALFORMED_CACHE : RX_ERR_BT_OVERFLOW;
+        regexped_cabi_release(mark);
+        return code == 2 ? RX_ERR_OUT_OF_ORDER
+             : code == 1 ? RX_ERR_MALFORMED_CACHE
+             : RX_ERR_BT_OVERFLOW;
     }
-    const unsigned int *raw = *(const unsigned int **)(area + 4);
-    unsigned int count = *(unsigned int *)(area + 8);
-    if (count == 0) { s->done = 1; return 0; }
-    /* Unlike the module format there is no transactional overflow to resume
-       from: the component sized its own buffer at PATTERN_COUNT, the exact
-       worst case for one position, so every match of this position is here.
-       A caller that offers less than it asked for gets what fits, and the rest
-       are DISCARDED rather than re-reported — which is why cap should be
-       %[5]s, exactly as in the module format. */
-    unsigned int take = count;
-    if (take > (unsigned int)cap) take = (unsigned int)cap;
-    for (unsigned int i = 0; i < take; i++) {
-        buf[i].pattern_id = (int)raw[i * 3];
-        buf[i].start = (ptrdiff_t)raw[i * 3 + 1];
-        buf[i].end = (ptrdiff_t)raw[i * 3 + 2];
+    const unsigned char *raw = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
+    unsigned int count = rx_cabi_u32(area + 8);
+    if (count == 0) { s->done = 1; regexped_cabi_release(mark); return 0; }
+    /* cap >= %[5]s >= count, so every match of this position fits. */
+    for (unsigned int i = 0; i < count; i++) {
+        buf[i].pattern_id = (int)rx_cabi_u32(raw + %[8]d * i);
+        buf[i].start = (ptrdiff_t)rx_cabi_u32(raw + %[8]d * i + 4);
+        buf[i].end = (ptrdiff_t)rx_cabi_u32(raw + %[8]d * i + 8);
     }
-    /* Every tuple in one call shares a start; the component already advanced
-       its own position, and this mirrors it so the struct stays informative. */
-    s->offset = (size_t)raw[1];
+    /* Every tuple in one call shares a start. The component already advanced
+       its own position; the struct records the MODULE format's meaning, the
+       next position to try — one past this start — so it reads the same in
+       both formats. */
+    s->offset = (size_t)rx_cabi_u32(raw + 4) + 1;
+    regexped_cabi_release(mark);
     return (int)count;
 }
 
 void %[1]s_free(%[2]s *s) {
-    if (!s || s->scratch[0] == 0) return;
+    if (!s || s->scratch[1] != %[7]du || s->scratch[0] == 0) return;
     %[6]s((int)s->scratch[0]);
-    /* Idempotent: a second call, or a call on a finished scan, must do nothing
-       rather than drop a handle twice. */
+    /* Idempotent: both words are cleared, so a second call, or a call on a
+       struct that was never initialised, does nothing rather than drop a handle
+       twice. */
     s->scratch[0] = 0;
+    s->scratch[1] = 0;
     s->done = 1;
 }
 
-`, name, scannerType, ctor, next, konst, drop)
+`, name, scannerType, ctor, next, konst, drop, abi.FindScratchMagic, abi.SetMatchTupleBytes)
 	return b.String()
 }

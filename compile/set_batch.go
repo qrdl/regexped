@@ -162,12 +162,13 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		// lRows is how many rows the materialised block holds, lRow the one
 		// being looked at, lDst where the tuple is written and lMask the row's
 		// mask word. They were lTotal/lLo/lMid/lRun — a binary search's names,
-		// kept after lever B replaced the search with arithmetic on the
+		// kept after the row-per-position layout replaced the search with arithmetic on the
 		// position, so the code read as if it were still bisecting.
 		lRows, lRow, lDst, lIdx       byte
 		lStart, lSrc, lMask, lN, lTmp byte
 		lJ, lNb                       byte
 		lSweepRet                     byte
+		lCumBase, lBlockBase          byte
 	)
 	if dpIdx >= 0 {
 		lCache, lCacheLen = a.I32(), a.I32()
@@ -176,6 +177,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		lStart, lSrc, lMask, lN, lTmp = a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
 		lJ, lNb = a.I32(), a.I32()
 		lSweepRet = a.I32()
+		lCumBase, lBlockBase = a.I32(), a.I32()
 	}
 
 	var b []byte
@@ -201,6 +203,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: lCache, pCacheLen: lCacheLen,
 		lReady: lReady, lWork: lWork, lSweepRet: lSweepRet,
+		lCumBase: lCumBase, lBlockBase: lBlockBase,
 	}
 
 	if dpIdx >= 0 {
@@ -238,6 +241,11 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		// sweep divided by zero, which traps, where the ABI says -4.
 		b = cache.emitValidateHeader(b, lTmp)
 
+		// A `from` below the floor is a scan that went BACKWARDS, and serving it
+		// from the floor would drop every match in [from, floor). -6, best
+		// effort: only an engaged cache has a floor to compare with.
+		b = cache.emitOutOfOrderCheck(b, pFrom)
+
 		// LOCATE THE BLOCK. The checkpointed cache holds one materialised
 		// block at a time, so a served position is found in two steps: which
 		// block covers it, then where in that block. `find` never spans
@@ -245,12 +253,12 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		// that hold no tuples, and skipping them on their cumulative counts is
 		// what keeps a sparse drive from materialising every block in turn.
 		//
-		// j = (from - floor) / stride, floored at 0: a `from` below the floor
-		// is a caller resuming before the sweep's own start, and block 0 is
-		// the first thing it could be served.
+		// j = (from - floor) / stride. `from` is at or above the floor here:
+		// the out-of-order check above answered anything below it.
 		b = append(b, 0x20, lCache)
-		b = append(b, 0x28, 0x02, ckptHdrNumBlocks)
+		b = hdrLoadOp(b, ckptHdrNumBlocks)
 		b = append(b, 0x21, lNb)
+		b = cache.emitLayoutBases(b, lNb)
 		b = cache.emitLocateBlock(b, pFrom, lJ, lTmp)
 
 		b = append(b, 0x02, 0x40) // block $found
@@ -279,23 +287,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		//
 		// rowsInBlock = min(stride, len - rowBase + 1): the last block is
 		// partial, and reading past it would read another region's bytes.
-		b = append(b, 0x20, lCache)
-		b = append(b, 0x28, 0x02, ckptHdrRowBase)
-		b = append(b, 0x21, lStart)
-		b = append(b, 0x20, pInLen)
-		b = append(b, 0x20, lStart)
-		b = append(b, 0x6B, 0x41, 0x01, 0x6A)
-		b = append(b, 0x21, lRows)
-		b = append(b, 0x20, lCache)
-		b = append(b, 0x28, 0x02, ckptHdrStride)
-		b = append(b, 0x21, lTmp)
-		b = append(b, 0x20, lRows)
-		b = append(b, 0x20, lTmp)
-		b = append(b, 0x20, lRows)
-		b = append(b, 0x20, lTmp)
-		b = append(b, 0x4C) // total <= stride
-		b = append(b, 0x1B) // select -> min
-		b = append(b, 0x21, lRows)
+		b = cache.emitBlockRowCount(b, lStart, lRows, lTmp)
 
 		// r = max(from - rowBase, 0)
 		b = append(b, 0x20, pFrom)
@@ -311,12 +303,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		b = append(b, 0x02, 0x40)                                // block $rowFound
 		b = append(b, 0x03, 0x40)                                // loop  $rows
 		b = append(b, 0x20, lRow, 0x20, lRows, 0x4E, 0x0D, 0x01) // past the block
-		b = append(b, 0x20, lCache)
-		b = append(b, 0x28, 0x02, ckptHdrBlockOff)
-		b = append(b, 0x20, lCache, 0x6A)
-		b = append(b, 0x20, lRow, 0x41)
-		b = utils.AppendSLEB128(b, rowBytes)
-		b = append(b, 0x6C, 0x6A)
+		b = cache.emitRowAddr(b, lRow)
 		b = append(b, 0x22, lSrc)
 		b = append(b, 0x28, 0x02, 0x00) // the mask
 		b = append(b, 0x22, lMask)
@@ -361,7 +348,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x71)       // i32.and
 			b = append(b, 0x04, 0x40) // if this pattern matched here
 			b = append(b, 0x20, pOutPtr)
-			b = append(b, 0x20, lIdx, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+			b = append(b, 0x20, lIdx, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 			b = append(b, 0x22, lDst)
 			b = cache.emitStoreTuple(b, k, ids[k], lDst, lSrc, func(b []byte) []byte {
 				return append(b, 0x20, lStart)
@@ -453,6 +440,10 @@ type batchCacheLocals struct {
 	lCacheSkip, lCacheMask, lCacheDone, lCacheDel                byte
 	lCacheSweepRet, lSrc, lWork, lWorkIdx, lWorkTmp              byte
 	lStart, lDeliver, lCap, lTuple, lPos, lCount                 byte
+	// lCacheLocate is emitLocateBlock's own scratch. The block used to be
+	// located with lCacheFloor as scratch, one instruction after the floor was
+	// stored there.
+	lCacheLocate byte
 }
 
 // emitBatchCacheServe is the CACHE half of the batching entry: the trigger, the
@@ -495,7 +486,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = cache.emitValidateHeader(b, x.lCacheOrd)
 
 	// THE CURSOR STAYS IN POSITION FORM on this path — the same form the
-	// walk uses — which is what lever B buys besides the bytes. The tuple
+	// walk uses — which is what the row-per-position layout buys besides the bytes. The tuple
 	// INDEX form existed only because the old block held tuples packed end
 	// to end, so a resume point had to be an ordinal into them; rows are
 	// indexed by position, so the walk's own (pos, skip) pair addresses
@@ -509,15 +500,21 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = utils.AppendSLEB128(b, kMask)
 	b = append(b, 0x71, 0x21, x.lCacheSkip) // tuples already taken at it
 
+	// A resume below the floor is a scan that went backwards: the reserved
+	// out-of-order position word, with nothing written, exactly as `find`
+	// reports -6.
+	b = cache.emitOutOfOrderCheck(b, x.lResumePos)
+
 	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, ckptHdrNumBlocks)
+	b = hdrLoadOp(b, ckptHdrNumBlocks)
 	b = append(b, 0x21, x.lCacheNb)
+	b = cache.emitLayoutBases(b, x.lCacheNb)
 	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, ckptHdrFloor)
+	b = hdrLoadOp(b, ckptHdrFloor)
 	b = append(b, 0x21, x.lCacheFloor)
 
 	// Which block holds that position.
-	b = cache.emitLocateBlock(b, x.lResumePos, x.lCacheJ, x.lCacheFloor)
+	b = cache.emitLocateBlock(b, x.lResumePos, x.lCacheJ, x.lCacheLocate)
 
 	b = append(b, 0x41, 0x00, 0x21, x.lDeliver)
 	b = append(b, 0x41, 0x00, 0x21, x.lCacheDone)
@@ -544,24 +541,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 
 	b = cache.emitEnsureBlock(b, x.lCacheJ)
 
-	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, ckptHdrRowBase)
-	b = append(b, 0x21, x.lStart)
-	// rowsInBlock = min(stride, len - rowBase + 1)
-	b = append(b, 0x20, pInLen)
-	b = append(b, 0x20, x.lStart)
-	b = append(b, 0x6B, 0x41, 0x01, 0x6A)
-	b = append(b, 0x21, x.lCacheRows)
-	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, ckptHdrStride)
-	b = append(b, 0x21, x.lCacheStride)
-	b = append(b, 0x20, x.lCacheRows)
-	b = append(b, 0x20, x.lCacheStride)
-	b = append(b, 0x20, x.lCacheRows)
-	b = append(b, 0x20, x.lCacheStride)
-	b = append(b, 0x4C)
-	b = append(b, 0x1B) // select -> min
-	b = append(b, 0x21, x.lCacheRows)
+	b = cache.emitBlockRowCount(b, x.lStart, x.lCacheRows, x.lCacheStride)
 
 	// r = max(pos - rowBase, 0)
 	b = append(b, 0x20, x.lResumePos)
@@ -571,8 +551,9 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x41, 0x00)
 	// STRICTLY less than zero. A resume position that lands on the block's
 	// FIRST row gives r == 0, which is an ordinary resume and keeps its
-	// skip; only a position BELOW the block — a caller resuming before the
-	// sweep's floor — has no skip to carry. Testing `<=` wiped the skip at
+	// skip; only a position BELOW the block has no skip to carry — and since
+	// the out-of-order check above answers any resume below the floor, that
+	// arm is now a guard rather than a path. Testing `<=` wiped the skip at
 	// every position that happened to start a block, so the same tuple was
 	// delivered again on every call and a capacity-1 drive never finished.
 	b = append(b, 0x48) // i32.lt_s
@@ -588,12 +569,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x20, x.lCacheRow, 0x20, x.lCacheRows, 0x4E, 0x0D, 0x01)
 	b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x4E, 0x0D, 0x01)
 
-	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, ckptHdrBlockOff)
-	b = append(b, 0x20, pScratch, 0x6A)
-	b = append(b, 0x20, x.lCacheRow, 0x41)
-	b = utils.AppendSLEB128(b, rowBytes)
-	b = append(b, 0x6C, 0x6A)
+	b = cache.emitRowAddr(b, x.lCacheRow)
 	b = append(b, 0x22, x.lSrc)
 	b = append(b, 0x28, 0x02, 0x00)
 	b = append(b, 0x21, x.lCacheMask)
@@ -618,7 +594,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 		b = append(b, 0x71)
 		b = append(b, 0x04, 0x40)
 		b = append(b, 0x20, pOutPtr)
-		b = append(b, 0x20, x.lDeliver, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x20, x.lDeliver, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 		b = append(b, 0x22, x.lTuple)
 		b = cache.emitStoreTuple(b, k, ids[k], x.lTuple, x.lSrc, func(b []byte) []byte {
 			return append(b, 0x20, x.lStart, 0x20, x.lCacheRow, 0x6A)
@@ -717,14 +693,14 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 	if !gated {
 		b = append(b, 0x20, x.lK, 0x6B)
 	}
-	b = append(b, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+	b = append(b, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 	b = append(b, 0x20, x.lAvail)
 	if !gated {
 		b = append(b, 0x20, x.lK, 0x6A)
 	}
 	if gated {
 		// batch_mode = 1: gate what is DELIVERED rather than only a position
-		// that fitted whole (decision (11a) made this a runtime argument, so
+		// that fitted whole (sharing this worker between both entries made this a runtime argument, so
 		// the exported `find` can share this worker by passing 0).
 		b = append(b, 0x41, 0x01)
 	} else {
@@ -799,7 +775,7 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 
 	// start = out[count].start — every tuple of one position shares it, and
 	// the tuple at buffer index `count` is the first one this call delivered.
-	b = append(b, 0x20, pOutPtr, 0x20, x.lCount, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+	b = append(b, 0x20, pOutPtr, 0x20, x.lCount, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 	b = append(b, 0x28, 0x02, 0x04)
 	b = append(b, 0x21, x.lStart)
 
@@ -954,6 +930,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 		lCacheSkip, lCacheMask, lCacheDone, lCacheDel byte
 		lCacheSweepRet, lSrc                          byte
 		lWork, lWorkIdx, lWorkTmp                     byte
+		lCumBase, lBlockBase                          byte
+		lCacheLocate                                  byte
 	)
 	if dpIdx >= 0 {
 		lReady, lIdx, lCacheTotal = a.I32(), a.I32(), a.I32()
@@ -968,6 +946,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 		lWork = a.I32()    // matched bytes this drive has delivered
 		lWorkIdx = a.I32() // cursor over the tuples just delivered
 		lWorkTmp = a.I32()
+		lCumBase, lBlockBase = a.I32(), a.I32()
+		lCacheLocate = a.I32()
 	}
 
 	//
@@ -997,6 +977,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: pScratch, pCacheLen: pScratchLen,
 		lReady: lReady, lWork: lWork, lSweepRet: lCacheSweepRet,
+		lCumBase: lCumBase, lBlockBase: lBlockBase,
 		// The batch export returns an i64 cursor+count, so an error is a
 		// RESERVED RESUME POSITION rather than a negative count.
 		i64Ret: true,
@@ -1074,6 +1055,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 			lCacheDel: lCacheDel, lCacheSweepRet: lCacheSweepRet, lSrc: lSrc,
 			lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lStart: lStart,
 			lDeliver: lDeliver, lCap: lCap, lTuple: lTuple, lPos: lPos, lCount: lCount,
+			lCacheLocate: lCacheLocate,
 		}, pCursor, pScratch, pOutPtr, pInLen, ids, numPat, countBits, kMask, rowBytes)
 	}
 

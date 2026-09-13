@@ -83,7 +83,6 @@ func TestLoadConfigNoRegexes(t *testing.T) {
 		t.Fatal("expected error for config with no regexps, got nil")
 	}
 }
-
 func TestLoadConfigPathResolution(t *testing.T) {
 	dir := t.TempDir()
 	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
@@ -103,40 +102,6 @@ func TestLoadConfigPathResolution(t *testing.T) {
 	}
 	if cfg.Output != filepath.Join(dir, "final.wasm") {
 		t.Errorf("Output = %q, want %q", cfg.Output, filepath.Join(dir, "final.wasm"))
-	}
-}
-
-func TestLoadConfigWasmMergeResolution(t *testing.T) {
-	dir := t.TempDir()
-	cases := []struct {
-		name      string
-		wasmMerge string
-		want      string
-	}{
-		{"relative path", "tools/wasm-merge", filepath.Join(dir, "tools/wasm-merge")},
-		{"bare command", "wasm-merge", filepath.Join(dir, "wasm-merge")},
-		{"absolute path", "/usr/local/bin/wasm-merge", "/usr/local/bin/wasm-merge"},
-		{"home relative", "~/bin/wasm-merge", homeJoin("bin/wasm-merge")},
-		{"empty", "", ""},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			yaml := "wasm_merge: " + c.wasmMerge + "\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
-			if c.wasmMerge == "" {
-				yaml = "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
-			}
-			path := filepath.Join(dir, "regexped.yaml")
-			if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
-				t.Fatal(err)
-			}
-			cfg, err := LoadConfig(path)
-			if err != nil {
-				t.Fatalf("LoadConfig: %v", err)
-			}
-			if cfg.WasmMerge != c.want {
-				t.Errorf("WasmMerge = %q, want %q", cfg.WasmMerge, c.want)
-			}
-		})
 	}
 }
 
@@ -696,7 +661,8 @@ func TestValidateSets_AllCapabilityNamesValidated(t *testing.T) {
 	// exactly like the per-pattern _func fields.
 	for _, key := range []string{"match_any", "match_all", "scan_any", "scan_all", "find"} {
 		t.Run(key, func(t *testing.T) {
-			yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
+			// A Go stub, so `struct` is reserved in the generated language.
+			yaml := "stub_file: x.go\nregexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
 			_, err := LoadConfig(writeCfg(t, yaml))
 			if err == nil {
 				t.Fatalf("%s: a reserved word must be rejected as an export name", key)
@@ -713,33 +679,58 @@ func TestValidateSets_NoCapabilityIsError(t *testing.T) {
 	}
 }
 
-// TestLoadConfigToolPathsAreNotConfigRelative pins the deliberate difference
-// between `wasm_merge:` and the two component-era tool keys.
-//
-// Strict YAML means a key has to be DECLARED to load at all, so this also
-// proves `wac:` is accepted rather than a line-numbered error.
-//
-// `wasm_merge` is joined to the config directory, which turns the bare name
-// "wasm-merge" into "<dir>/wasm-merge" — see TestLoadConfigWasmMergeResolution.
-// `wasm_tools` and `wac` are NOT, because a bare tool name has to stay a bare
-// name for the $PATH lookup in their resolvers to find it. Joining them would
-// make `wac: wac` mean "a wac binary sitting next to my config", which is never
-// what it means.
-func TestLoadConfigToolPathsAreNotConfigRelative(t *testing.T) {
-	dir := t.TempDir()
-	yaml := "wasm_tools: wasm-tools\nwac: wac\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
-	path := filepath.Join(dir, "regexped.yaml")
-	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
-		t.Fatal(err)
+// TestLoadConfigRetiredToolKeys: `wasm_merge:`, `wasm_tools:` and `wac:` are
+// retired. Strict YAML makes each a line-numbered unknown-field error naming it.
+func TestLoadConfigRetiredToolKeys(t *testing.T) {
+	for _, key := range []string{"wasm_merge", "wasm_tools", "wac"} {
+		_, err := LoadConfig(writeCfg(t, key+": x\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"))
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s: err = %v, want an unknown-field error naming it", key, err)
+		}
 	}
-	cfg, err := LoadConfig(path)
+}
+
+// TestLoadConfigToolPathKeys pins how a tool path key resolves at load: an
+// absolute value as is, `~` and `~/dir` against the home directory, and anything
+// else against the CONFIG FILE's directory — not the working directory, which is
+// why the load runs from somewhere else. `~user` is not expanded: it is taken
+// literally, as a relative path. The value as written is kept for messages.
+func TestLoadConfigToolPathKeys(t *testing.T) {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Skip("no home directory:", err)
 	}
-	if cfg.WasmTools != "wasm-tools" {
-		t.Errorf("WasmTools = %q, want the bare name", cfg.WasmTools)
-	}
-	if cfg.Wac != "wac" {
-		t.Errorf("Wac = %q, want the bare name", cfg.Wac)
+	dir := t.TempDir()
+	t.Chdir(t.TempDir())
+	for _, key := range []string{"wasm_merge_path", "wasm_tools_path", "wac_path"} {
+		for _, c := range []struct{ value, want string }{
+			{"/usr/local/bin", "/usr/local/bin"},
+			{"/usr/local/bin/wasm-merge-118", "/usr/local/bin/wasm-merge-118"},
+			{"tools", filepath.Join(dir, "tools")},
+			{"~", home},
+			{"~/bin", filepath.Join(home, "bin")},
+			{"~bob/bin", filepath.Join(dir, "~bob/bin")},
+		} {
+			path := filepath.Join(dir, "regexped.yaml")
+			yaml := key + ": '" + c.value + "'\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("%s %q: %v", key, c.value, err)
+			}
+			got := map[string]string{
+				"wasm_merge_path": cfg.WasmMergePath,
+				"wasm_tools_path": cfg.WasmToolsPath,
+				"wac_path":        cfg.WacPath,
+			}[key]
+			if got != c.want {
+				t.Errorf("%s %q resolved to %q, want %q", key, c.value, got, c.want)
+			}
+			if w := cfg.ToolPathAsWritten(key); w != c.value {
+				t.Errorf("%s %q: value as written = %q", key, c.value, w)
+			}
+		}
 	}
 }

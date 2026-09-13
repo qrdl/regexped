@@ -64,8 +64,8 @@ directly). The last line is the same `regexped merge` a module build runs: it
 dispatches on `wasm_format` and shells out to `wac` here, so `wac` never has to
 be typed. See [component.md](component.md#why-the-wasip1-target-needs-two-extra-commands).
 
-Needs `wasm-tools` (yours) and `wac` (regexped's, resolved as config `wac:` →
-`$WAC` → `$PATH`). Add
+Needs `wasm-tools` and `wac`. `regexped merge` finds them through
+`wasm_tools_path:` and `wac_path:` in the config, else in `$PATH`. Add
 `--adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm` to
 `component new` **if your program uses preview1 WASI imports directly** (`_start`,
 `fd_write`, `args_get`); a component that exports a plain function instead needs no
@@ -234,7 +234,6 @@ int <func>_next(rx_<func>_iter_t *iter, rx_group_t out_groups[static <FUNC_UPPER
 | `1` | a match was written |
 | `0` | the scan is finished |
 | `RX_ERR_BT_OVERFLOW` | the engine gave up; what remains is **unknown** |
-| `RX_ERR_MALFORMED_CACHE` | the overlapping answer cache's header is malformed; the scan is **unfinished** |
 
 The status is the return value rather than something written into `out_groups`, so `0` stays unambiguously "finished".
 
@@ -321,11 +320,14 @@ typedef struct {
     size_t len, offset;
     int done;
     unsigned gates[<SET>_ID_SPACE];        /* every set with find, either policy */
+    unsigned scratch[4];                   /* the descriptor the export takes    */
+    unsigned *cache;                       /* a cache-eligible overlapping set:  */
+    size_t cache_words;                    /*   its answer cache                 */
 } rx_<set>_scanner_t;
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
 int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
-void <find>_free(rx_<set>_scanner_t *s);   /* a no-op here; see below */
+void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache, if any */
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
@@ -340,6 +342,11 @@ for (int n; (n = <find>(&s, buf, <SET>_PATTERN_COUNT)) > 0; )
         printf("%d %td..%td\n", buf[i].pattern_id, buf[i].start, buf[i].end);
 <find>_free(&s);
 ```
+
+**The scanner is not copyable once initialised.** An overlapping set's scanner
+owns a heap region, so a copy freed twice frees it twice, and the descriptor it
+builds points into the struct itself. Declare it where it lives, pass its
+address, and end it with `<find>_free`.
 
 Under `wasm_format: component` every one of these declarations is the same — the
 header comes from the same generator — and the bodies change: the `_all` pair
@@ -364,11 +371,10 @@ idiom (`read`, `getdents`, `recv`). One call reports every match at the FIRST
 position at or after the scanner's offset (they all share that start) and
 returns how many. `0` means the scan is finished.
 
-The return is the position's TOTAL, which may exceed `cap`: the underlying call
-is transactional, so it writes `min(total, cap)`, records no gate and does not
-advance, and `n > cap` means "grow and call again, same position". Sizing `cap`
-at `<SET>_PATTERN_COUNT` — one position's worst case, since every pattern can
-report once at a single start — makes overflow impossible.
+`cap` must be at least `<SET>_PATTERN_COUNT` — one position's worst case, since
+every pattern can report once at a single start — so every call fits whatever it
+finds. A smaller `cap` is refused with `RX_ERR_RANGE`: nothing is written and the
+scan does not advance.
 
 **The scanner holds the input** (not just the position). The input never
 changes during a scan while the position changes every step, so the old split
@@ -510,5 +516,15 @@ The generated code cannot produce it. `init` sizes the region and writes the
 stride from one formula, so seeing this means the descriptor was built by hand,
 or one region was shared between two scanners.
 
-`_next` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`). Test the status EXACTLY:
+`<find>` returns **`RX_ERR_MALFORMED_CACHE`** (`-4`). Test the status EXACTLY:
 a plain `< 0` check reports "unknown" as a confident "no".
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The scanner only moves
+forward, so it never does; a caller driving the raw ABI must hold to the same
+rule, on every set. A backwards offset is unsupported and may lose matches.
+Detection is best effort, with no guarantee: the engine notices only once an
+overlapping set's answer cache has engaged and a position falls below where it
+was built, and then `<find>` returns **`RX_ERR_OUT_OF_ORDER`** (`-6`). Anywhere
+else it goes undetected.

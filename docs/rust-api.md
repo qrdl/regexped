@@ -38,8 +38,8 @@ wasmtime run composed.wasm        # the `output:` from your config
 
 The merge step is the SAME command the module format uses. It dispatches on
 `wasm_format` and shells out to `wac` here, to `wasm-merge` there, so you do not
-have to remember which tool your config implies. `wac` is resolved as config
-`wac:` → `$WAC` → `$PATH`.
+have to remember which tool your config implies. `wac` is found through
+`wac_path:` in the config, else in `$PATH`.
 
 Sets work too, with the same public API: `match_any`/`scan_any` return
 `Result<Option<i32>>`, the `_all` pair returns `Result<impl Iterator<Item = i32>>`,
@@ -315,14 +315,14 @@ The generated wrapper returns **`Err(Error::BacktrackOverflow)`**. It used to pa
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Error { BacktrackOverflow, MalformedCache }
+pub enum Error { BacktrackOverflow, MalformedCache, OutOfOrder }
 
 pub type Result<T> = std::result::Result<T, Error>;
 ```
 
 `Result<Option<T>>` rather than `Result<T>` with a `NoMatch` variant: **no-match is an ordinary answer, not an error**, and flattening it would make `?` propagate "didn't match" as a failure at nearly every call site.
 
-The enum is `#[non_exhaustive]`, so a future sentinel is a non-breaking addition.
+Match it with a `_` arm. The stub is generated into your own crate, where `#[non_exhaustive]` does not force one, and a regenerated stub can gain variants.
 
 **The lazy iterators put the error on the item and are fused.** After yielding an `Err` they yield nothing further — which is required, not decorative: the overflow is deterministic and the failing call does not advance the offset, so an un-fused iterator would re-run the identical call forever. Collect with `.collect::<Result<Vec<_>>>()` and `?`, which cannot be skipped by accident.
 
@@ -338,8 +338,17 @@ stride below 1, or a layout that is not one a sweep would have written. Like the
 backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
 knowing what remained.
 
-The generated code cannot produce it. `init` sizes the region and writes the
-stride from one formula, so seeing this means the descriptor was built by hand,
-or one region was shared between two scanners.
+The generated iterator cannot produce it: it sizes the region and writes the stride
+from one formula when it is created, so seeing it means something outside the
+stub wrote into the region.
 
 The wrapper returns **`Err(Error::MalformedCache)`**.
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The generated iterators only
+move forward, so they never do; the rule matters to a caller driving the raw ABI,
+on every set. A backwards offset is unsupported and may lose matches. Detection
+is best effort, with no guarantee: the engine notices only once an overlapping
+set's answer cache has engaged and a position falls below where it was built,
+and then the iterator yields **`Err(Error::OutOfOrder)`** and stops. Anywhere else it goes undetected.

@@ -53,7 +53,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 
 	// ---- component only, from here down.
 
-	// Sets ARE supported as of phase 3.2. Their raw ABI — the caller-owned gate
+	// Sets ARE supported. Their raw ABI — the caller-owned gate
 	// array, the bitmask/bitmap `_all` split — does not cross the component
 	// boundary: `_all` lifts to a list of ids, and `find` becomes a resource
 	// that owns the drive. One thing is still refused, below.
@@ -63,6 +63,20 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 	// declared on the SET, so it cannot be silently ignored the way an inert
 	// key can: the user asked for a second entry point that the component
 	// interface does not expose.
+	// The same for a REGEXP's batch-find: the batch groups export it adds has no
+	// WIT form, and its only consumers, JS and TS, are refused under component.
+	for i, re := range cfg.Regexps {
+		for _, h := range re.Hints {
+			if h == "batch-find" {
+				label := re.Name
+				if label == "" {
+					label = fmt.Sprintf("#%d", i)
+				}
+				return fmt.Errorf("regexp %s: hints: [batch-find] is not supported for wasm_format: %s — the batch groups export it adds has no WIT form",
+					label, formatComponent)
+			}
+		}
+	}
 	for _, s := range cfg.Sets {
 		for _, h := range s.Hints {
 			if h == "batch-find" {
@@ -94,7 +108,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 // validateStubTypeForFormat rejects the stub types that cannot be generated
 // for the configured output kind.
 //
-// ONE message, not two. Until phase 2 there was a second one ending in "yet",
+// ONE message, not two. There used to be a second one ending in "yet",
 // for types that were merely deferred; after it shipped there are none, and the
 // arm that produced it was unreachable — ResolveStubType returns exactly one of
 // the seven known types or an error, and all seven are named below. It was
@@ -144,6 +158,9 @@ func validateSemver(v string) error {
 	for _, p := range parts {
 		if p == "" {
 			return fmt.Errorf("has an empty component (expected MAJOR.MINOR.PATCH)")
+		}
+		if len(p) > 1 && p[0] == '0' {
+			return fmt.Errorf("has the component %q with a leading zero, which semver forbids", p)
 		}
 		if _, err := strconv.ParseUint(p, 10, 32); err != nil {
 			return fmt.Errorf("has the non-numeric component %q (expected MAJOR.MINOR.PATCH)", p)

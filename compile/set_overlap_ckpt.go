@@ -1,6 +1,8 @@
 package compile
 
 import (
+	"fmt"
+
 	"github.com/qrdl/regexped/internal/abi"
 
 	"github.com/qrdl/regexped/config"
@@ -43,8 +45,8 @@ import (
 // the TABLES it reads, which is the part a second implementation would get
 // wrong.
 
-// Header layout, i32 slots at cache_ptr. 48 bytes: eleven fields plus one
-// spare word, 4-byte aligned.
+// Header layout, i32 slots at cache_ptr. 48 bytes: eight fields and four
+// reserved words, 4-byte aligned.
 //
 // The caller zeroes the header to start a drive and then writes `stride`, so a
 // zero `ready` still means "not swept yet" and needs no magic value. `stride`
@@ -54,22 +56,27 @@ import (
 // disagree — and the sweep validates it, because the header is caller-owned
 // memory and a hand-written caller can write anything.
 const (
-	ckptHdrBlockOff = 0 // byte offset of the block buffer from cache_ptr
+	// Slots +0, +32 and +36 are RESERVED and unread. They held the byte offsets
+	// of the block buffer, of checkpoint 1 and of cum[], and the serving
+	// validator re-checked all three on every call. All three are fixed by nb
+	// and the compile-time column width — checkpoint 1 follows the header,
+	// cum[] follows nb columns, the block buffer follows nb+1 counts — so
+	// every reader derives them instead, and the per-call check is left with
+	// what the engine actually reads. The header keeps its 48 bytes, so no
+	// caller's sizing changes.
+	//
 	// Slot +4 is RESERVED and unread. It held the materialised block's tuple
-	// count, which nothing consulted: under lever B a block is a row per
+	// count, which nothing consulted: a block is a row per
 	// position and the row masks are the truth, so serving scans them rather
-	// than trusting a count. cum[] at ckptHdrCntOff carries what a caller
-	// actually wants — cum[j+1]-cum[j] is block j's total — and the tests read
-	// it there.
-	ckptHdrReady     = 8  // 0 not swept, 1 swept, -1 refused
-	ckptHdrWork      = 12 // the drive's accumulated matched bytes
-	ckptHdrStride    = 16 // k, written by the CALLER
-	ckptHdrFloor     = 20 // the `from` the checkpoint pass used
-	ckptHdrNumBlocks = 24 // nb
-	ckptHdrCurBlock  = 28 // materialised block index, stored +1 (0 = none)
-	ckptHdrCkptOff   = 32 // byte offset of checkpoint 1
-	ckptHdrCntOff    = 36 // byte offset of cum[0..nb]
-	ckptHdrRowBase   = 40 // the POSITION row 0 of the block buffer stands for
+	// than trusting a count. cum[] carries what a caller actually wants —
+	// cum[j+1]-cum[j] is block j's total — and the tests read it there.
+	ckptHdrReady     = config.SetOverlapHdrReadyOff  // 0 not swept, 1 swept, -1 refused
+	ckptHdrWork      = config.SetOverlapHdrWorkOff   // the drive's accumulated matched bytes
+	ckptHdrStride    = config.SetOverlapHdrStrideOff // k, written by the CALLER
+	ckptHdrFloor     = 20                            // the `from` the checkpoint pass used
+	ckptHdrNumBlocks = 24                            // nb
+	ckptHdrCurBlock  = 28                            // materialised block index, stored +1 (0 = none)
+	ckptHdrRowBase   = 40                            // the POSITION row 0 of the block buffer stands for
 	ckptHdrBytes     = config.SetOverlapCheckpointHeaderBytes
 )
 
@@ -111,7 +118,7 @@ type ckptEmit struct {
 	// count.
 	lSum byte
 
-	// proj is lever C's projection, or nil when the column stays one cell per
+	// proj is the column's projection, or nil when the column stays one cell per
 	// (state, pattern). When set, the column is indexed by CELL and a runtime
 	// successor table stands between the state loop and the update.
 	proj    *overlapProj
@@ -122,7 +129,7 @@ type ckptEmit struct {
 	succOff int32
 }
 
-// colBytes is one working column: cells under lever C, states x patterns
+// colBytes is one working column: cells when projected, states x patterns
 // otherwise.
 func (e *ckptEmit) colBytes() int32 {
 	if e.proj != nil {
@@ -144,11 +151,23 @@ func (e *ckptEmit) rowBytesB() int32 { return int32(config.SetOverlapBlockRowByt
 // newCkptEmit derives the geometry from the compiled bucket.
 func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 	bi := cs.overlapDPBucket()
+	if bi < 0 {
+		panic("compile: newCkptEmit called for a set with no sweep bucket")
+	}
+	// The block row's mask is an i32 (`1 << k`), so a bucket wider than
+	// bucketMaskBits would drop its high patterns from every row. overlapDPBucket
+	// refuses one; this refuses it again at the one place the mask width is
+	// assumed, so a gate that drifts cannot reach it silently.
+	numPat := len(cs.patternIDs[bi])
+	if numPat > bucketMaskBits {
+		panic(fmt.Sprintf("compile: a sweep bucket of %d patterns: the block row's mask "+
+			"is an i32, so a bucket may hold at most bucketMaskBits (%d)", numPat, bucketMaskBits))
+	}
 	bkt := cs.buckets[bi]
 	e := &ckptEmit{
 		dp:        bkt.dp,
 		tableMem:  tableMemIdx,
-		numPat:    len(cs.patternIDs[bi]),
+		numPat:    numPat,
 		numStates: bkt.dp.numWASM,
 	}
 	e.rowBytes = int32(e.numPat * 4)
@@ -158,6 +177,30 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 	e.colA = colOff
 	e.colB = colOff + e.colBytes()
 	return e
+}
+
+// emitBlockCount emits ceil(m / stride) as `(m + stride - 1) / stride`,
+// unsigned: the number of blocks a span of m positions holds. pushM and
+// pushStride push the operands in the chosen width; wide selects i64 opcodes.
+//
+// ONE spelling for the two sites that must agree: the pass sizes the layout
+// with it, and the serving validator recomputes the count a pass would have
+// written with it, so a change to one cannot leave the other checking a
+// different number.
+func emitBlockCount(b []byte, wide bool, pushM, pushStride func([]byte) []byte) []byte {
+	add, sub, div := byte(0x6A), byte(0x6B), byte(0x6E)
+	one := []byte{0x41, 0x01}
+	if wide {
+		add, sub, div = 0x7C, 0x7D, 0x80
+		one = []byte{0x42, 0x01}
+	}
+	b = pushM(b)
+	b = pushStride(b)
+	b = append(b, add)
+	b = append(b, one...)
+	b = append(b, sub)
+	b = pushStride(b)
+	return append(b, div)
 }
 
 // ---- small emit helpers, shared by both bodies ----
@@ -182,14 +225,12 @@ func (e *ckptEmit) tee(b []byte, l byte) []byte { return append(b, 0x22, l) }
 // it anywhere it could recur.
 func (e *ckptEmit) hdrLoad(b []byte, off int) []byte {
 	b = e.get(b, e.pScratch)
-	b = append(b, 0x28, 0x02)
-	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
+	return hdrLoadOp(b, off)
 }
 func (e *ckptEmit) hdrStore(b []byte, off int, push func([]byte) []byte) []byte {
 	b = e.get(b, e.pScratch)
 	b = push(b)
-	b = append(b, 0x36, 0x02)
-	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
+	return hdrStoreOp(b, off)
 }
 
 // storeConstAt writes a constant i32 at a byte offset from the region base.
@@ -489,7 +530,9 @@ func (e *ckptEmit) allocCommon(a *localAlloc) {
 // goes, since the pass ENDS inside block 0 and the first call of a drive would
 // otherwise have to re-sweep it immediately.
 //
-// Returns the tuple count of block 0, or -1 when the region is too small (a
+// Returns 0 when it swept — the counts land in cum[], and emitStoreBlockCount
+// resets the running count before the return reads it — or -1 when the region
+// is too small (a
 // FALLBACK signal: the caller walks, same answer, slower), or -4 when the
 // header contradicts itself (an ERROR, surfaced to the caller, because a
 // silently-declined cache is indistinguishable from the engine legitimately
@@ -548,9 +591,8 @@ func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratc
 	// found". It still has to leave a LAYOUT behind, because it publishes
 	// `ready` and serving validates the header it then reads. What it writes is
 	// the empty ONE-BLOCK layout a real single-position sweep would have
-	// produced, so the validator needs no special case — a `cntOff` of 48 here
-	// would contradict `cntOff == ckptOff + numBlocks*cellBytes` and turn every
-	// such call into -4.
+	// produced, so the validator needs no special case: numBlocks 1 and a stride
+	// of 1 describe exactly the layout every reader derives from them.
 	b = e.get(b, pFrom)
 	b = e.get(b, pLen)
 	b = append(b, 0x4A) // i32.gt_s
@@ -565,13 +607,21 @@ func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratc
 		return e.konst64(b, uint64(ckptHdrBytes+cellBytes+8))
 	})
 	b = e.hdrStore(b, ckptHdrStride, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrCkptOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes) })
-	b = e.hdrStore(b, ckptHdrCntOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes+cellBytes) })
-	b = e.hdrStore(b, ckptHdrBlockOff, func(b []byte) []byte { return e.konst(b, ckptHdrBytes+cellBytes+8) })
 	b = e.hdrStore(b, ckptHdrCurBlock, func(b []byte) []byte { return e.konst(b, 1) })
 	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.konst(b, 1) })
-	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, pFrom) })
-	b = e.hdrStore(b, ckptHdrRowBase, func(b []byte) []byte { return e.get(b, pFrom) })
+	// floor and rowBase are len + 1, NOT `from`. This arm serves every
+	// from > len, and serving validates floor <= len + 1: storing `from` made
+	// from = len + 2 sweep, publish ready = 1, and then report its own header as
+	// malformed on the same call. len + 1 is the one position past the end a
+	// layout can describe, and a later from past it locates a block beyond the
+	// last and answers 0.
+	pastEnd := func(b []byte) []byte {
+		b = e.get(b, pLen)
+		b = e.konst(b, 1)
+		return append(b, 0x6A) // i32.add
+	}
+	b = e.hdrStore(b, ckptHdrFloor, pastEnd)
+	b = e.hdrStore(b, ckptHdrRowBase, pastEnd)
 	// cum[0] = cum[1] = 0: an empty block 0 and a zero total.
 	b = e.storeConstAt(b, ckptHdrBytes+cellBytes, 0)
 	b = e.storeConstAt(b, ckptHdrBytes+cellBytes+4, 0)
@@ -608,14 +658,10 @@ func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratc
 	// to itself would have the two disagree about where every block starts.
 	b = e.hdrStore(b, ckptHdrStride, func(b []byte) []byte { return e.get(b, e.lStride) })
 
-	// nb = ceil(m / stride)
-	b = e.get(b, lM)
-	b = e.get(b, e.lStride)
-	b = append(b, 0x6A)
-	b = e.konst(b, 1)
-	b = append(b, 0x6B)
-	b = e.get(b, e.lStride)
-	b = append(b, 0x6E) // i32.div_u
+	// nb = ceil(m / stride), spelled once for this and the serving validator.
+	b = emitBlockCount(b, false,
+		func(b []byte) []byte { return e.get(b, lM) },
+		func(b []byte) []byte { return e.get(b, e.lStride) })
 	b = e.set(b, e.lNumBlocks)
 
 	// Layout: ckpt | cum | block buffer, computed in i64.
@@ -659,9 +705,6 @@ func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratc
 	// Header fields the serving paths read.
 	b = e.hdrStore(b, ckptHdrFloor, func(b []byte) []byte { return e.get(b, e.lFloor) })
 	b = e.hdrStore(b, ckptHdrNumBlocks, func(b []byte) []byte { return e.get(b, e.lNumBlocks) })
-	b = e.hdrStore(b, ckptHdrCkptOff, func(b []byte) []byte { return e.get(b, e.lCkptOff) })
-	b = e.hdrStore(b, ckptHdrCntOff, func(b []byte) []byte { return e.get(b, e.lCntOff) })
-	b = e.hdrStore(b, ckptHdrBlockOff, func(b []byte) []byte { return e.get(b, e.lBlkOff) })
 
 	// block0End = min(floor + stride - 1, len)
 	b = e.get(b, e.lFloor)
@@ -1018,11 +1061,21 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	set(e.lFloor)
 	b = e.hdrLoad(b, ckptHdrNumBlocks)
 	set(e.lNumBlocks)
-	b = e.hdrLoad(b, ckptHdrCkptOff)
+	// The layout is DERIVED from numBlocks, exactly as the pass laid it out; the
+	// header does not store it. Serving has validated numBlocks against the span
+	// and the region against this layout before calling here.
+	konst(ckptHdrBytes)
 	set(e.lCkptOff)
-	b = e.hdrLoad(b, ckptHdrCntOff)
-	set(e.lCntOff)
-	b = e.hdrLoad(b, ckptHdrBlockOff)
+	konst(ckptHdrBytes)
+	get(e.lNumBlocks)
+	konst(cellBytes)
+	b = append(b, 0x6C, 0x6A) // + nb*cellBytes
+	b = e.tee(b, e.lCntOff)
+	get(e.lNumBlocks)
+	konst(1)
+	b = append(b, 0x6A)
+	konst(4)
+	b = append(b, 0x6C, 0x6A) // + (nb+1)*4
 	set(e.lBlkOff)
 
 	// lo = floor + j*stride ; hi = min(floor + (j+1)*stride - 1, len)
@@ -1073,6 +1126,15 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	get(e.lHi)
 	get(pLen)
 	b = append(b, 0x46) // i32.eq
+	// ...and only when the block STARTS at or below len. A block past the last
+	// real one has lo > len, so its row index len - lo is negative and the write
+	// would land below the block buffer. The validator refuses any header that
+	// could locate such a block; this keeps one that slipped past it from
+	// writing outside the region.
+	get(e.lLo)
+	get(pLen)
+	b = append(b, 0x4C) // i32.le_s
+	b = append(b, 0x71) // i32.and
 	b = append(b, 0x04, 0x40)
 	b = e.emitAtPositionGuarded(b, true)
 	get(pLen)
@@ -1174,7 +1236,7 @@ func (e *ckptEmit) emitCloseBlockAt(b []byte, lBlkIdx, lBound byte) []byte {
 	return b
 }
 
-// --- lever C: the projected column -----------------------------------------
+// --- the projected column ---------------------------------------------------
 
 // cellFor returns the column BYTE OFFSET pattern p's answer for WASM state w
 // lives at. Compile-time, so every start-state read is a constant.

@@ -84,6 +84,13 @@ func cTypesPreamble(wantCache bool) string {
 	hb.WriteString("   one formula. A caller building its own descriptor, or sharing one\n")
 	hb.WriteString("   region between two scanners, can. See docs/sets.md. */\n")
 	fmt.Fprintf(&hb, "#define RX_ERR_MALFORMED_CACHE (%d)\n", malformedCache)
+	hb.WriteString("/* An overlapping set's find was asked for an offset BELOW where its\n")
+	hb.WriteString("   answer cache was built: the scan went backwards, and its result is\n")
+	hb.WriteString("   UNKNOWN. Offsets must never go backwards within one scan. Detection is\n")
+	hb.WriteString("   best effort, so its absence is not a guarantee. The engine's own value,\n")
+	hb.WriteString("   passed through unchanged -- every error code means the same thing in\n")
+	hb.WriteString("   every language, which is why it is not -5. See docs/sets.md. */\n")
+	fmt.Fprintf(&hb, "#define RX_ERR_OUT_OF_ORDER (%d)\n", outOfOrder)
 	hb.WriteString("/* Argument errors from the scanner initialisers. */\n")
 	hb.WriteString("#define RX_ERR_NULL_ARG    (-3)\n")
 	hb.WriteString("#define RX_ERR_RANGE       (-5)\n")
@@ -155,7 +162,7 @@ func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string, 
 	type entryParts struct{ h, c string }
 	var parts []entryParts
 	for _, re := range entries {
-		h, c, e := genCPartsForEntry(re, importModule)
+		h, c, _, e := genCPartsForEntry(re, importModule)
 		if e != nil {
 			return "", "", e
 		}
@@ -192,7 +199,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	if !hasIndividual && !hasSetExports(cfg) {
 		return "", "", nil
 	}
-	hContent, cContent, err = genCStubFiles(cfg.Regexps, cfg.ImportModule, hBasename, anySetWantsCache(cfg))
+	shapes := newSetShapes(cfg)
+	hContent, cContent, err = genCStubFiles(cfg.Regexps, cfg.ImportModule, hBasename, shapes.anyWantsCache())
 	if err != nil {
 		return
 	}
@@ -202,12 +210,12 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	var hb, cb strings.Builder
 	hb.WriteString(hContent)
 	cb.WriteString(cContent)
-	for _, s := range cfg.Sets {
+	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
 		idN := idSpaceSize(s, cfg)
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
-		wide := wideAllForm(s, cfg)
+		wide := shapes.wideAll(setIdx)
 
 		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 
@@ -218,12 +226,9 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 		// the C spelling of each is decided here (R12). C puts the return type
 		// FIRST, which is why this builds the whole declaration rather than
 		// just a parameter list.
-		setCaps := setCapabilities(s, cfg)
+		setCaps := setCapabilities(s, cfg, wide)
 		decl := func(kind string) string {
-			capability := capByKind(setCaps, kind)
-			if capability == nil {
-				panic("generate: C stub asked for the signature of an undeclared capability " + kind)
-			}
+			capability := mustCapByKind(setCaps, kind, "C")
 			return fmt.Sprintf("%s ffi_%s(%s);", cABIRet(capability.Ret), capability.Export,
 				capability.render(cABIParam, ", "))
 		}
@@ -328,8 +333,9 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
 			gateInit := fmt.Sprintf("    for (size_t k = 0; k < %s; k++) s->gates[k] = 0;\n", idKonst)
 			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
-			// pointer: magic, gate pointer, cache (declined — only the batching
-			// entry reads one, and this stub does not expose it).
+			// pointer: magic, gate pointer, and the answer cache — the region
+			// allocated below for a cache-eligible overlapping set, zero
+			// otherwise.
 			//
 			// Built before EACH call rather than in _init, because field 1 is a
 			// pointer INTO the scanner: a struct that was moved or copied would
@@ -338,7 +344,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// cache it double-frees — and the header says so.
 			cacheSet := "s->scratch[2] = 0, s->scratch[3] = 0"
 			cacheField, cacheAlloc, cacheFree := "", "", ""
-			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, and the ONE place the C stub
 				// allocates.
 				//
@@ -388,15 +395,19 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
         if (bytes <= %[4]dULL) {
             s->cache = (unsigned *)malloc((size_t)bytes);
             if (s->cache) {
-                for (size_t w = 0; w < (size_t)((bytes + 3) / 4); w++) s->cache[w] = 0;
-                s->cache[4] = (unsigned)k;
+                /* The header only: the engine reads nothing past it before the
+                   pass writes it, so zeroing the whole region was a pass over
+                   memory the cache is about to fill anyway. */
+                for (size_t w = 0; w < %[8]d; w++) s->cache[w] = 0;
+                s->cache[%[9]d] = (unsigned)k;
                 s->cache_words = (size_t)((bytes + 3) / 4);
             }
         }
     }
 #endif
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes, abi.FindScratchMagic,
-					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max, abi.FindScratchMagic,
+					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes/4,
+					config.SetOverlapHdrStrideOff/4)
 				cacheFree = `#if RX_SET_CACHE
     if (s->cache) { free(s->cache); s->cache = 0; s->cache_words = 0; }
 #endif
@@ -441,19 +452,22 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (!s || !buf) return RX_ERR_NULL_ARG;
     if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
+    /* One match per pattern is the most a position can report, so a buffer that
+       holds %[7]s can never overflow — and the same header serves the component
+       format, whose scan cannot re-ask a position. One rule for both. */
+    if (cap < (size_t)%[7]s) return RX_ERR_RANGE;
     if (s->done) return 0;
     int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
-    /* Negative is RX_ERR_BT_OVERFLOW or RX_ERR_MALFORMED_CACHE, not a count:
-       a Backtracking member exhausted its frame budget, or the answer cache's
-       header contradicts itself. Either way what remains is UNKNOWN rather
+    /* Negative is RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or
+       RX_ERR_OUT_OF_ORDER, not a count: a Backtracking member exhausted its
+       frame budget, the answer cache's header contradicts itself, or the
+       offset went below where that cache was built. Either way what remains is
+       UNKNOWN rather
        than nothing, and the code is passed through to the caller. Folding
        either into the "0 means finished" test below would end the scan
        silently and report success. */
     if (got < 0) { s->done = 1; return got; }
     if (got == 0) { s->done = 1; return 0; }
-    /* Over capacity: nothing was recorded and the scan did not advance, so the
-       caller can grow and repeat at this same position. */
-    if ((size_t)got > cap) return got;
     /* The module writes 12-byte {id, start, end} tuples. On wasm32 ptrdiff_t
        is 4 bytes, rx_set_match_t IS that layout, and the answer is already in
        place — the branch below folds away. Anywhere else (a host build for an
@@ -481,7 +495,7 @@ void %[1]s_free(%[2]s *s) {
        a no-op and a re-init after one allocates rather than double-freeing. */
     s->scratch[0] = 0;
 }
-`, s.Find, scannerType, gateInit, gateArg, cacheFree, abi.FindScratchMagic)
+`, s.Find, scannerType, gateInit, gateArg, cacheFree, abi.FindScratchMagic, konst)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -493,8 +507,20 @@ void %[1]s_free(%[2]s *s) {
 	return
 }
 
+// entryGroups is what a `groups_func` entry's pattern yields: the slot count
+// and the named-group map. Its zero value means the entry exports no groups.
+type entryGroups struct {
+	num   int
+	named map[string]int
+}
+
 // genCPartsForEntry generates the .h and .c fragments for one regexp entry.
-func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, err error) {
+//
+// It RETURNS the group info it parsed. The component generator needs the same
+// numbers for its own .c bodies, and parsing the pattern a second time there
+// gave that call an error branch no config could reach — genCPartsForEntry has
+// already failed on exactly the same pattern by then.
+func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, groups entryGroups, err error) {
 	var hb, cb strings.Builder
 
 	if re.MatchFunc != "" {
@@ -509,13 +535,14 @@ func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart 
 		exportName := re.GroupsExportName()
 		numGroups, namedGroups, e := extractGroupInfo(re.Pattern)
 		if e != nil {
-			return "", "", e
+			return "", "", entryGroups{}, e
 		}
+		groups = entryGroups{num: numGroups, named: namedGroups}
 		h, c := genCGroupsStubParts(importModule, re.GroupsFunc, exportName, numGroups, namedGroups)
 		hb.WriteString(h)
 		cb.WriteString(c)
 	}
-	return hb.String(), cb.String(), nil
+	return hb.String(), cb.String(), groups, nil
 }
 
 // genCMatchHPart generates the .h prototype for an anchored-match function.
@@ -911,12 +938,13 @@ func cSetScanAllDecl(name, konst string) string {
 // cSetScannerDecls is the `find` scanner: its doc comment, its caller-owned
 // struct, and the init / step / free triple.
 //
-// `<func>_free` is emitted in BOTH formats. Here it is a no-op — the struct holds
-// only a borrowed input pointer and the gate array inline, so abandoning it leaks
-// nothing — and under `wasm_format: component` the scan's state lives inside the
-// regexp component behind a handle that has to be dropped. A caller must be able
-// to switch formats without editing code, so the call exists in both and costs
-// nothing here.
+// `<func>_free` is emitted in BOTH formats. Here it frees the answer cache an
+// overlapping set's scanner owns when the header was built with RX_SET_CACHE on,
+// and does nothing otherwise — the struct then holds only a borrowed input
+// pointer and the gate array inline. Under `wasm_format: component` the scan's
+// state lives inside the regexp component behind a handle that has to be
+// dropped. A caller must be able to switch formats without editing code, so the
+// call exists in both.
 func cSetScannerDecls(find, konst, gateField, scannerType string) string {
 	return fmt.Sprintf(`/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
    re-initialising the struct restarts a scan.
@@ -927,7 +955,7 @@ func cSetScannerDecls(find, konst, gateField, scannerType string) string {
    move would drive the original's gate array. Declare it where it lives, pass
    its ADDRESS, and let _free end it.
 
-   The scanner holds the INPUT as well as the position (decision (5)): the
+   The scanner holds the INPUT as well as the position: the
    input never changes during a scan while the position changes every step, so
    the old split — remembering the position and taking the input on every
    step — was backwards, and let a caller pass a DIFFERENT buffer on a later
@@ -935,10 +963,9 @@ func cSetScannerDecls(find, konst, gateField, scannerType string) string {
 
    %[1]s fills your array with every match at the FIRST position at or after
    the scanner's offset — they all share that start — and returns HOW MANY.
-   0 means the scan is finished. The return is the position's TOTAL, which may
-   exceed cap: the underlying call is transactional, so it writes min(total,
-   cap), records nothing and does not advance, and n > cap means "grow and call
-   again, same position". Sizing cap at %[2]s makes overflow impossible.
+   0 means the scan is finished. cap must be at least %[2]s — one match per
+   pattern, the most a single position can report — and a smaller cap is
+   RX_ERR_RANGE, with nothing written and the scan not advanced.
 
        rx_set_match_t buf[%[2]s];
        %[4]s sc;
@@ -947,7 +974,8 @@ func cSetScannerDecls(find, konst, gateField, scannerType string) string {
            for (int i = 0; i < n; i++) { ... buf[i] ... }
        %[1]s_free(&sc);
 
-   That last call is a no-op here and REQUIRED for wasm_format: component. */
+   That last call frees an overlapping scanner's answer cache, and is REQUIRED
+   for wasm_format: component. */
 typedef struct {
     const char *input;
     size_t len, offset;
@@ -985,13 +1013,13 @@ void %[1]s_free(%[4]s *s);
 // kind.
 func cPatternNameTable(cfg config.BuildConfig) string {
 	var b strings.Builder
-	b.WriteString("static const char *_pattern_names[] = {")
+	b.WriteString("static const char *rx_pattern_names[] = {")
 	for i, re := range cfg.Regexps {
 		if i > 0 {
 			b.WriteString(", ")
 		}
 		fmt.Fprintf(&b, "%q", re.Name)
 	}
-	b.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(_pattern_names)/sizeof(*_pattern_names); return (id>=0&&id<n)?_pattern_names[id]:\"\"; }\n")
+	b.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(rx_pattern_names)/sizeof(*rx_pattern_names); return (id>=0&&id<n)?rx_pattern_names[id]:\"\"; }\n")
 	return b.String()
 }

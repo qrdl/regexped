@@ -362,3 +362,203 @@ func TestPatternSelectorUnmarshalError(t *testing.T) {
 		t.Errorf("err = %v, want it propagated", err)
 	}
 }
+
+// witKeywordList is WIT's full keyword set, every one of which wasm-tools
+// rejects as a function name.
+var witKeywordList = []string{
+	"as", "bool", "borrow", "char", "constructor", "enum", "export", "f32", "f64",
+	"flags", "from", "func", "future", "import", "include", "interface", "list",
+	"option", "own", "package", "record", "resource", "result", "s8", "s16", "s32",
+	"s64", "static", "stream", "string", "tuple", "type", "u8", "u16", "u32", "u64",
+	"use", "variant", "with", "world",
+}
+
+// Under wasm_format: component every func and capability name becomes a WIT
+// identifier, so a WIT keyword is refused at LOAD, naming the key — not later,
+// inside `wasm-tools component embed`. A module build with no stub produces no
+// WIT and no source, so the same name loads there.
+func TestComponentRefusesWITKeywordNames(t *testing.T) {
+	for _, kw := range witKeywordList {
+		for _, key := range []string{"match_func", "find_func"} {
+			comp := "wasm_format: component\nimport_module: t\nregexps:\n  - pattern: 'abc'\n    " +
+				key + ": " + kw + "\n"
+			if _, err := loadCfgSrc(t, comp); err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("component %s %q: err = %v, want a refusal naming %s", key, kw, err, key)
+			}
+			if _, err := loadCfgSrc(t, strings.Replace(comp, "wasm_format: component\n", "", 1)); err != nil {
+				t.Errorf("module %s %q with no stub must load: %v", key, kw, err)
+			}
+		}
+		set := "wasm_format: component\nimport_module: t\nregexps:\n  - name: a\n    pattern: 'abc'\n" +
+			"sets:\n  - name: s\n    scan_all: " + kw + "\n    patterns: all\n"
+		if _, err := loadCfgSrc(t, set); err == nil || !strings.Contains(err.Error(), "scan_all") {
+			t.Errorf("component set capability %q: err = %v, want a refusal naming scan_all", kw, err)
+		}
+	}
+	for _, c := range []struct{ key, src string }{
+		{"wit_package", "wasm_format: component\nwit_package: world\n" + onePattern},
+		{"wit_world", "wasm_format: component\nimport_module: t\nwit_world: record\n" + onePattern},
+		{"groups_func", "wasm_format: component\nimport_module: t\nregexps:\n  - pattern: '(a)'\n    groups_func: list\n"},
+	} {
+		if _, err := loadCfgSrc(t, c.src); err == nil || !strings.Contains(err.Error(), c.key) {
+			t.Errorf("%s as a WIT keyword: err = %v, want a refusal naming it", c.key, err)
+		}
+	}
+}
+
+// Two names are not keywords but collide with a TYPE the interface defines:
+// `error-code` in both interfaces and `set-match` in `sets`. Escaping cannot fix
+// a duplicate, so they are refused under the same gate.
+func TestComponentRefusesWITTypeNames(t *testing.T) {
+	if _, err := loadCfgSrc(t, "wasm_format: component\nimport_module: t\n"+
+		"regexps:\n  - pattern: 'abc'\n    find_func: error_code\n"); err == nil ||
+		!strings.Contains(err.Error(), "error-code") {
+		t.Errorf("find_func error_code: err = %v, want a refusal naming error-code", err)
+	}
+	if _, err := loadCfgSrc(t, "wasm_format: component\nimport_module: t\n"+
+		"regexps:\n  - name: a\n    pattern: 'abc'\nsets:\n  - name: s\n    match_all: set_match\n    patterns: all\n"); err == nil ||
+		!strings.Contains(err.Error(), "set-match") {
+		t.Errorf("set match_all set_match: err = %v, want a refusal naming set-match", err)
+	}
+	if _, err := loadCfgSrc(t, "wasm_format: component\nimport_module: t\n"+
+		"regexps:\n  - pattern: 'abc'\n    find_func: record_x\n"); err != nil {
+		t.Errorf("record_x is not a keyword and must load: %v", err)
+	}
+	if _, err := loadCfgSrc(t, "regexps:\n  - pattern: 'abc'\n    find_func: error_code\n"); err != nil {
+		t.Errorf("a module build defines no error-code type, so error_code must load: %v", err)
+	}
+}
+
+// wit_version is a strict MAJOR.MINOR.PATCH: a component with a leading zero is
+// not semver, and ParseUint accepted it.
+func TestWitVersionRejectsLeadingZeros(t *testing.T) {
+	base := "wasm_format: component\nimport_module: t\n" + onePattern
+	for _, v := range []string{"01.2.3", "1.02.3", "1.2.03"} {
+		if _, err := loadCfgSrc(t, "wit_version: '"+v+"'\n"+base); err == nil {
+			t.Errorf("wit_version %q loaded; a leading zero is not semver", v)
+		}
+	}
+	for _, v := range []string{"0.0.0", "10.20.30"} {
+		if _, err := loadCfgSrc(t, "wit_version: '"+v+"'\n"+base); err != nil {
+			t.Errorf("wit_version %q must load: %v", v, err)
+		}
+	}
+}
+
+// The world shares the package's item namespace with its interfaces, so a world
+// named `matcher` or `sets` is a duplicate item wasm-tools refuses.
+func TestWitWorldMayNotNameAnInterface(t *testing.T) {
+	for _, w := range []string{"matcher", "sets"} {
+		src := "wasm_format: component\nimport_module: t\nwit_world: " + w + "\n" + onePattern
+		if _, err := loadCfgSrc(t, src); err == nil || !strings.Contains(err.Error(), "wit_world") {
+			t.Errorf("wit_world %q: err = %v, want a refusal naming wit_world", w, err)
+		}
+	}
+}
+
+// Regexp-level `hints: [batch-find]` has no component form either: the batch
+// groups export it asks for has no WIT shape, and its only consumers, JS and TS,
+// are refused under component. Ignoring it silently is what the set-level
+// refusal exists to prevent.
+func TestComponentRejectsRegexpBatchFindHint(t *testing.T) {
+	src := "wasm_format: component\nimport_module: t\nregexps:\n" +
+		"  - pattern: '(a)b'\n    groups_func: g\n    hints: [batch-find]\n"
+	if _, err := loadCfgSrc(t, src); err == nil || !strings.Contains(err.Error(), "batch-find") {
+		t.Errorf("err = %v, want the batch-find refusal", err)
+	}
+	if _, err := loadCfgSrc(t, strings.Replace(src, "wasm_format: component\n", "", 1)); err != nil {
+		t.Errorf("batch-find must stay valid for a module: %v", err)
+	}
+}
+
+// The Rust COMPONENT stub reaches every export through the wit-bindgen binding,
+// whose name is the snake_case of the WIT name — not the config spelling. So
+// `match_func: Match` passes the case-sensitive Rust list, and the stub then
+// calls `matcher::match(...)`; a keyword package produces `use
+// super::regexped::loop::matcher;`. Refused where a Rust component stub is
+// generated, and only there: WIT itself and C never spell these as Rust.
+func TestRustComponentRefusesKeywordBindingNames(t *testing.T) {
+	rust := "wasm_format: component\nimport_module: t\nstub_type: rust\n"
+	for _, c := range []struct{ key, name string }{
+		{"match_func", "Match"}, {"find_func", "Type"}, {"match_func", "Loop"},
+	} {
+		src := rust + "regexps:\n  - pattern: 'abc'\n    " + c.key + ": " + c.name + "\n"
+		if _, err := loadCfgSrc(t, src); err == nil || !strings.Contains(err.Error(), c.key) {
+			t.Errorf("%s %q with a Rust component stub: err = %v, want a refusal naming %s", c.key, c.name, err, c.key)
+		}
+	}
+	pkg := "wasm_format: component\nimport_module: loop\nrust_module: m\nstub_type: rust\n" + onePattern
+	if _, err := loadCfgSrc(t, pkg); err == nil || !strings.Contains(err.Error(), "import_module") {
+		t.Errorf("a keyword package with a Rust component stub: err = %v, want a refusal naming import_module", err)
+	}
+	if _, err := loadCfgSrc(t, rust+"regexps:\n  - pattern: 'abc'\n    match_func: matchIt\n"); err != nil {
+		t.Errorf("matchIt binds as match_it and must load: %v", err)
+	}
+	for _, st := range []string{"c", "wit"} {
+		src := "wasm_format: component\nimport_module: t\nstub_type: " + st +
+			"\nregexps:\n  - pattern: 'abc'\n    match_func: Match\n"
+		if _, err := loadCfgSrc(t, src); err != nil {
+			t.Errorf("Match with stub_type %s never becomes a Rust identifier and must load: %v", st, err)
+		}
+	}
+}
+
+// TestKebabEdgesPerKey pins the naming edge cases to the DOCUMENTED rules, per
+// key, because three keys take three routes. A func name must pass the
+// identifier shape and then convert with KebabIdent; import_module converts with
+// KebabIdent (and, for a Rust stub, must also be a Rust identifier, since it is
+// the `pub mod` name); wit_package must already BE a WIT identifier. An empty
+// want means the load is refused. A disagreement here is a finding, not a test
+// to bend. wit_package refuses every row, so it has no column.
+func TestKebabEdgesPerKey(t *testing.T) {
+	for _, c := range []struct {
+		in                              string
+		findFunc, importWit, importRust string
+	}{
+		{"My-Mod", "", "my-mod", ""},
+		{"a--b", "", "", ""},
+		{"aBC", "a-bc", "a-bc", "a-bc"},
+		{"A", "a", "a", "a"},
+		{"x_", "", "", ""},
+		{"_x", "", "", ""},
+		{"URLMatch", "urlmatch", "urlmatch", "urlmatch"},
+	} {
+		src := "wasm_format: component\nimport_module: t\nstub_type: wit\n" +
+			"regexps:\n  - pattern: 'abc'\n    find_func: '" + c.in + "'\n"
+		_, err := loadCfgSrc(t, src)
+		switch {
+		case c.findFunc == "" && err == nil:
+			t.Errorf("find_func %q loaded; want it refused", c.in)
+		case c.findFunc == "" && !strings.Contains(err.Error(), "find_func"):
+			t.Errorf("find_func %q refused by a message that does not name the key: %v", c.in, err)
+		case c.findFunc != "" && err != nil:
+			t.Errorf("find_func %q: %v; want the WIT name %q", c.in, err, c.findFunc)
+		case c.findFunc != "":
+			if k, _ := KebabIdent(c.in); k != c.findFunc {
+				t.Errorf("find_func %q becomes %q, want %q", c.in, k, c.findFunc)
+			}
+		}
+
+		for _, route := range []struct{ stub, want string }{{"wit", c.importWit}, {"rust", c.importRust}} {
+			cfg, err := loadCfgSrc(t, "wasm_format: component\nimport_module: '"+c.in+"'\nstub_type: "+route.stub+"\n"+onePattern)
+			switch {
+			case route.want == "" && err == nil:
+				t.Errorf("import_module %q (stub_type %s) loaded; want it refused", c.in, route.stub)
+			case route.want == "" && !strings.Contains(err.Error(), "import_module"):
+				t.Errorf("import_module %q (stub_type %s) refused by a message that does not name the key: %v", c.in, route.stub, err)
+			case route.want != "" && err != nil:
+				t.Errorf("import_module %q (stub_type %s): %v; want package %q", c.in, route.stub, err, route.want)
+			case route.want != "":
+				if p, _ := cfg.WitPackageName(); p != route.want {
+					t.Errorf("import_module %q (stub_type %s) gives package %q, want %q", c.in, route.stub, p, route.want)
+				}
+			}
+		}
+
+		if _, err := loadCfgSrc(t, "wasm_format: component\nwit_package: '"+c.in+"'\nstub_type: wit\n"+onePattern); err == nil {
+			t.Errorf("wit_package %q loaded; it is not a WIT identifier", c.in)
+		} else if !strings.Contains(err.Error(), "wit_package") {
+			t.Errorf("wit_package %q refused by a message that does not name the key: %v", c.in, err)
+		}
+	}
+}

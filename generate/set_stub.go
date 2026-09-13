@@ -221,7 +221,7 @@ const setInlineByteLimit = 4096
 // inline (0 when the buffer is the caller's), gateSlots the number of 4-byte
 // gate entries (0 when the set's find is not gated).
 func boxSetBuffers(tupleSlots, gateSlots int) bool {
-	return tupleSlots*12+gateSlots*4 > setInlineByteLimit
+	return tupleSlots*abi.SetMatchTupleBytes+gateSlots*4 > setInlineByteLimit
 }
 
 // ---------------------------------------------------------------------------
@@ -317,8 +317,10 @@ type setCapability struct {
 //     `overlapping: true` flavours — one signature, both bodies. The overlapping body records no match gates and uses the array
 //     as the per-drive home of its "matches nowhere" preflight verdict, which
 //     is indistinguishable from the stub's side.
-func setCapabilities(s config.SetConfig, cfg config.BuildConfig) []setCapability {
-	wide := wideAllForm(s, cfg)
+//
+// wide is wideAllForm's answer for s, which the caller already holds: it is a
+// compile of the set, and see setShapes for why it is asked once.
+func setCapabilities(s config.SetConfig, cfg config.BuildConfig, wide bool) []setCapability {
 	var caps []setCapability
 	add := func(kind, export string, params []abiParam, ret abiRet) {
 		if export == "" {
@@ -364,6 +366,22 @@ func capByKind(caps []setCapability, kind string) *setCapability {
 		}
 	}
 	return nil
+}
+
+// mustCapByKind is capByKind for the three stub generators that ask for a
+// signature only inside `if s.<Cap> != ""`, where the capability is present by
+// construction: a nil there means setCapabilities and the emitter disagree
+// about what a set declares, and a nil dereference would report that as a
+// crash in whichever spelling function ran next.
+//
+// ONE copy. The three generators spelled this check separately, which is the
+// kind of guard that is right in two places and wrong in the third.
+func mustCapByKind(caps []setCapability, kind, language string) *setCapability {
+	c := capByKind(caps, kind)
+	if c == nil {
+		panic("generate: " + language + " stub asked for the signature of an undeclared capability " + kind)
+	}
+	return c
 }
 
 // ---------------------------------------------------------------------------
@@ -466,13 +484,13 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ITER_ERROR"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
-		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED",
 	},
 	// Rust is deliberately absent: `pub mod <import_module>` already isolates
@@ -599,16 +617,63 @@ func overlapCacheShapeFor(s config.SetConfig, cfg config.BuildConfig) compile.Ov
 	return sh
 }
 
-// anySetWantsCache reports whether any set in this config gets an overlapping
+// setShapes holds, per set, the two facts a generator can only learn by
+// compiling the set: the answer cache's geometry and whether the `_all` pair
+// takes the wide form.
+//
+// Each is a full compile of the set, and generators used to ask for each several
+// times per set — the Go and C generators once to decide an import or a header
+// feature and again inside the set loop, `setCapabilities` again for the wide
+// form, and a batching set's JS and TS `find` built its cache block twice — so a
+// several-thousand-pattern set paid several whole compiles per `generate`. A
+// generator makes ONE of these and asks it. Each answer is computed on first use,
+// so a generator that never needs the wide form never compiles for it.
+type setShapes struct {
+	cfg   config.BuildConfig
+	cache []*compile.OverlapCacheShape
+	wide  []*bool
+}
+
+// cacheShape names the answer cache's geometry for the generators, which
+// otherwise have no reason to import compile/.
+type cacheShape = compile.OverlapCacheShape
+
+func newSetShapes(cfg config.BuildConfig) *setShapes {
+	return &setShapes{
+		cfg:   cfg,
+		cache: make([]*compile.OverlapCacheShape, len(cfg.Sets)),
+		wide:  make([]*bool, len(cfg.Sets)),
+	}
+}
+
+// cacheShape is overlapCacheShapeFor for cfg.Sets[i], computed once.
+func (p *setShapes) cacheShape(i int) cacheShape {
+	if p.cache[i] == nil {
+		sh := overlapCacheShapeFor(p.cfg.Sets[i], p.cfg)
+		p.cache[i] = &sh
+	}
+	return *p.cache[i]
+}
+
+// wideAll is wideAllForm for cfg.Sets[i], computed once.
+func (p *setShapes) wideAll(i int) bool {
+	if p.wide[i] == nil {
+		w := wideAllForm(p.cfg.Sets[i], p.cfg)
+		p.wide[i] = &w
+	}
+	return *p.wide[i]
+}
+
+// anyWantsCache reports whether any set in this config gets an overlapping
 // answer cache, which is what decides whether the C header carries the
-// allocator machinery at all.
+// allocator machinery at all, and whether the Go stub imports `math`.
 //
 // A config with no sets, or none overlapping, must not: the header documents
 // itself as needing no libc, and emitting the feature test would pull
 // <stdlib.h> into builds that rely on that.
-func anySetWantsCache(cfg config.BuildConfig) bool {
-	for _, s := range cfg.Sets {
-		if overlapCacheShapeFor(s, cfg).Eligible {
+func (p *setShapes) anyWantsCache() bool {
+	for i := range p.cfg.Sets {
+		if p.cacheShape(i).Eligible {
 			return true
 		}
 	}

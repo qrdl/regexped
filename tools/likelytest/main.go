@@ -2734,7 +2734,7 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
 func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) error {
-	gatePtr := plan.outputBase + setOutCap*12
+	gatePtr := plan.outputBase + setOutCap*abi.SetMatchTupleBytes
 	scratchPtr := gatePtr + setOutCap*4
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < setOutCap*4; i++ {

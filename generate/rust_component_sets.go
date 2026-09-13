@@ -98,8 +98,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
     match sets::%s(input) {
         Ok(Some(id)) => Ok(Some(id as i32)),
         Ok(None) => Ok(None),
-        Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
-        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -118,8 +117,7 @@ pub fn %s(input: &[u8], offset: usize) -> Result<Option<i32>> {
     match sets::%s(input, offset as u32) {
         Ok(Some(id)) => Ok(Some(id as i32)),
         Ok(None) => Ok(None),
-        Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
-        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -145,8 +143,7 @@ func genRustComponentSetAll(field, funcName, witName string) string {
 pub fn %s(input: &[u8]) -> Result<impl Iterator<Item = i32> + '_> {
     match sets::%s(input) {
         Ok(ids) => Ok(ids.into_iter().map(|id| id as i32)),
-        Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
-        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -157,8 +154,7 @@ pub fn %s(input: &[u8]) -> Result<impl Iterator<Item = i32> + '_> {
 pub fn %s(input: &[u8], offset: usize) -> Result<impl Iterator<Item = i32> + '_> {
     match sets::%s(input, offset as u32) {
         Ok(ids) => Ok(ids.into_iter().map(|id| id as i32)),
-        Err(sets::ErrorCode::BacktrackOverflow) => Err(Error::BacktrackOverflow),
-        Err(sets::ErrorCode::MalformedCache) => Err(Error::MalformedCache),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -180,13 +176,15 @@ func genRustComponentSetFind(funcName, resType string) string {
 /// they run out. Dropping it ends the scan and releases what the component held
 /// for it; dropping and re-creating restarts from the beginning.
 pub struct %[1]s<'a> {
-    inner: sets::%[2]s,
+    /// The scan inside the regexp component, created by the first call to next. The
+    /// module-format iterator allocates nothing until it is driven, and neither
+    /// does this one: an iterator built and dropped undriven costs no copy of
+    /// the input into the component.
+    inner: Option<sets::%[2]s>,
+    input: &'a [u8],
+    offset: u32,
     done: bool,
     buf: std::vec::IntoIter<sets::SetMatch>,
-    /// The iterator no longer borrows the input — the scan copied it in — but
-    /// the lifetime is part of the public type in the module-format stub, so it
-    /// stays.
-    _input: core::marker::PhantomData<&'a [u8]>,
 }
 
 impl Iterator for %[1]s<'_> {
@@ -201,16 +199,14 @@ impl Iterator for %[1]s<'_> {
                 }));
             }
             if self.done { return None; }
-            match self.inner.next() {
-                // Before the finished test: the engine gave up and does not
-                // know, so ending iteration here would report success.
-                Err(sets::ErrorCode::BacktrackOverflow) => {
+            let (input, offset) = (self.input, self.offset);
+            let inner = self.inner.get_or_insert_with(|| sets::%[2]s::new(input, offset));
+            match inner.next() {
+                // Before the finished test: the engine gave up or cannot answer,
+                // so ending iteration here would report success.
+                Err(e) => {
                     self.done = true;
-                    return Some(Err(Error::BacktrackOverflow));
-                }
-                Err(sets::ErrorCode::MalformedCache) => {
-                    self.done = true;
-                    return Some(Err(Error::MalformedCache));
+                    return Some(Err(Error::from(e)));
                 }
                 Ok(batch) => {
                     if batch.is_empty() { self.done = true; return None; }
@@ -233,10 +229,11 @@ impl std::iter::FusedIterator for %[1]s<'_> {}
 /// after that.
 pub fn %[3]s(input: &[u8], offset: usize) -> %[1]s<'_> {
     %[1]s {
-        inner: sets::%[2]s::new(input, offset as u32),
+        inner: None,
+        input,
+        offset: offset as u32,
         done: false,
         buf: Vec::new().into_iter(),
-        _input: core::marker::PhantomData,
     }
 }
 

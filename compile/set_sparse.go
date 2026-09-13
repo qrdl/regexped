@@ -93,7 +93,7 @@ type sparseScratch struct {
 // only happen on a state whose flag let one through, so a per-state period
 // longer than the per-bucket one starves the verdict of evidence.
 //
-// 32 and 64 were the original pair. LM-BENCH §7.8 attributes the residual
+// 32 and 64 were the original pair. The measurement that set these attributes the residual
 // ~9,000 fuel above neutral on `sparse-member-skip-norun` to the stale flags
 // and the dispatch INSIDE these re-probe walks rather than to the entry test,
 // which is what makes lengthening the periods the remedy for that row.

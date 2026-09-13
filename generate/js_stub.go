@@ -44,12 +44,13 @@ func genJSSetSection(cfg config.BuildConfig) string {
 	out.WriteString("// live iterator owns its input and scratch region for its whole lifetime,\n")
 	out.WriteString("// the same guarantee the Rust and Go stubs get from passing a host pointer.\n")
 	out.WriteString("\n")
-	for _, s := range cfg.Sets {
+	shapes := newSetShapes(cfg)
+	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
 		idN := idSpaceSize(s, cfg)
 		idKonst := camelSet(s.Name) + "IdSpace"
-		wide := wideAllForm(s, cfg)
+		wide := shapes.wideAll(setIdx)
 		// Standalone layout, all above _outBase: the tuple buffer
 		// (12 bytes x pattern count), then the gate array (4 bytes x ID
 		// SPACE), then the >64-pattern bitmap (ceil(idSpace/8)). The two
@@ -67,7 +68,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		// below — the one place the compiler's ABI is written down
 		//. Only the SPELLING of each parameter is decided
 		// here; `args` names the list for one capability.
-		caps := setCapabilities(s, cfg)
+		caps := setCapabilities(s, cfg, wide)
 		spell := jsArgSpelling{
 			inPtr: "_inBase", inLen: "len", from: "from",
 			gate: "scratchBase", bitmap: "bitmapBase",
@@ -192,8 +193,8 @@ export function %s(input, from = 0) {
 			// quadratic, against a documented promise that every generated
 			// stub reserves one.
 			plainGateRegion := jsFindGateRegion(s, cfg, idN)
-			plainCachePre, plainCacheReserve, plainCachePost, plainCacheArgs :=
-				jsOverlapCacheBlock(s, cfg, plainGateRegion)
+			plainCachePre, plainCacheDest, plainCacheReserve, plainCachePost, plainCacheArgs :=
+				jsOverlapCacheBlock(s, shapes.cacheShape(setIdx), plainGateRegion)
 			// The find region is sized from the SAME span the cache offset is
 			// taken from, alignment padding included. `reserve` above omits
 			// that padding, and the cache would then begin a few bytes past
@@ -217,7 +218,7 @@ export function %s(input, from = 0) {
 %sexport function* %s(input, offset = 0) {
 %s    // The region is this iterator's own for its whole lifetime, so another
     // stub call cannot land on its input, its tuple buffer or its gates.
-    const [_inBase, _outBase, len] = _open(input, %d%s);
+    const [_inBase, _outBase, len%s] = _open(input, %d%s);
     try {
 %s    let pos = offset;
     // Hoisted rather than rebuilt per position, which allocated one typed
@@ -236,6 +237,9 @@ export function %s(input, from = 0) {
         // header contradicts itself, so this drive is not finished — the
         // engine cannot say what is left.
         if (n === %d) throw new Error("%s");
+        // -6: the offset went below where the answer cache was built. This
+        // generator never moves backwards, so only shared state produces it.
+        if (n === %d) throw new Error("%s");
         if (n <= 0) break;
         buf = _att(buf, Int32Array, _outBase, 3*%s);
         // Every tuple in one call shares a start; resume one past it.
@@ -250,13 +254,14 @@ export function %s(input, from = 0) {
     }
     } finally { _close(); }
 }
-`, gateDoc, s.Find, plainCachePre, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
+`, gateDoc, s.Find, plainCachePre, plainCacheDest, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
 						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
 					btOverflow, btOverflowMsg(s.Find),
-					malformedCache, malformedCacheMsg(s.Find), konst, konst)
+					malformedCache, malformedCacheMsg(s.Find),
+					outOfOrder, outOfOrderMsg(s.Find), konst, konst)
 			} else {
 				// `hints: [batch-find]`: the same matches in the same order,
 				// but batchSize positions of work per host crossing. That is
@@ -287,7 +292,7 @@ export function %s(input, from = 0) {
 				// may still decline — the sweep refuses shapes it cannot
 				// reproduce exactly — and declining costs nothing but speed.
 				batchGateRegion := jsFindGateRegion(s, cfg, idN)
-				cachePre, cacheReserve, cachePost, cacheArgs := jsOverlapCacheBlock(s, cfg, batchGateRegion)
+				cachePre, cacheDest, cacheReserve, cachePost, cacheArgs := jsOverlapCacheBlock(s, shapes.cacheShape(setIdx), batchGateRegion)
 				// The descriptor, written last: it carries the cache pointer,
 				// which the block above may have declined.
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
@@ -302,7 +307,7 @@ export function %s(input, from = 0) {
 %sexport function* %s(input, offset = 0, batchSize = %d) {
     batchSize = Math.min(Math.max(batchSize | 0, 1), %s);
 %s    // This iterator's own region, held until it finishes — see _open.
-    const [_inBase, _outBase, len] = _open(input, 12*batchSize + %d%s);
+    const [_inBase, _outBase, len%s] = _open(input, 12*batchSize + %d%s);
     try {
 %s%s    let cursor = BigInt(offset) << 32n;
     // Hoisted for the same reason the per-position shape hoists its view, and
@@ -319,8 +324,11 @@ export function %s(input, from = 0) {
         // nothing. Tested beside the done word so it cannot pass for a finish.
         if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         // And 0x%X, the second reserved word: the answer cache's header is
-        // malformed. Both are tested before the done word, since all three
-        // have the high bit set.
+        // malformed. All reserved words are tested before the done word, since
+        // every one of them has the high bit set.
+        if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
+        // And 0x%X, the third: the cursor resumed below where the answer cache
+        // was built, a scan that went backwards.
         if ((BigInt.asUintN(64, packed) >> 32n) === 0x%Xn) throw new Error("%s");
         const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;
         for (let i = 0; i < n; i++) {
@@ -336,11 +344,12 @@ export function %s(input, from = 0) {
     } finally { _close(); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", gateDoc, s.Find, defaultBatchCap(s, cfg),
-					camelSet(s.Name)+"BatchMaxSize", cachePre, batchGateRegion, cacheReserve,
+					camelSet(s.Name)+"BatchMaxSize", cachePre, cacheDest, batchGateRegion, cacheReserve,
 					batchGateSetup, cachePost,
 					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
 					config.SetCursorOverflowPos, config.SetCursorOverflowPos, btOverflowMsg(s.Find),
-					config.SetCursorMalformedPos, config.SetCursorMalformedPos, malformedCacheMsg(s.Find))
+					config.SetCursorMalformedPos, config.SetCursorMalformedPos, malformedCacheMsg(s.Find),
+					config.SetCursorOutOfOrderPos, config.SetCursorOutOfOrderPos, outOfOrderMsg(s.Find))
 			}
 		}
 		out.WriteString("\n")
@@ -458,16 +467,39 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("}\n\n")
 	}
 	if hasSuspendableExports(cfg) {
-		sb.WriteString("function _open(input, outBytes) {\n")
-		sb.WriteString("    // For generators, which DO suspend. The region is reserved for the\n")
-		sb.WriteString("    // iterator's whole lifetime, so no other call can land on its input or\n")
-		sb.WriteString("    // its scratch. Release with _close() from a finally.\n")
-		sb.WriteString("    const at = _bump, out = _align(at + _inCap(input));\n")
-		sb.WriteString("    _bump = out + (outBytes > 0 ? outBytes : 65536);\n")
-		sb.WriteString("    _grow(_bump);\n")
-		sb.WriteString("    _live++;\n")
-		sb.WriteString("    return [at, out, _write(input, at)];\n")
-		sb.WriteString("}\n\n")
+		sb.WriteString(`function _open(input, outBytes, cacheFor) {
+    // For generators, which DO suspend. The region is reserved for the
+    // iterator's whole lifetime, so no other call can land on its input or
+    // its scratch. Release with _close() from a finally.
+    //
+    // Nothing is reserved until every grow has succeeded. A grow that throws
+    // leaves _bump and _live as they were, so the instance stays usable; when
+    // _bump moved first, a grow refused under a memory ceiling left it past the
+    // end of memory with no iterator alive to reset it, and every later call
+    // threw.
+    //
+    // The answer cache is sized by cacheFor from the bytes the input actually
+    // took — a string reserves three per UTF-16 unit, which is no measure of
+    // the cache it needs — and grown for separately. Under a ceiling that
+    // grow only DECLINES the cache: a zero-length cache is the documented
+    // "walk" signal, so the drive is slower instead of failing.
+    const at = _bump, out = _align(at + _inCap(input));
+    const top = out + (outBytes > 0 ? outBytes : 65536);
+    _grow(top);
+    const len = _write(input, at);
+    let k = 0, cache = 0;
+    if (cacheFor) {
+        [k, cache] = cacheFor(len);
+        if (cache > 0) {
+            try { _grow(top + cache); } catch (e) { if (!(e instanceof RangeError)) throw e; cache = 0; }
+        }
+    }
+    _bump = top + cache;
+    _live++;
+    return [at, out, len, cache, k];
+}
+
+`)
 		sb.WriteString("function _close() { if (--_live === 0) _bump = _staticTop; }\n\n")
 		sb.WriteString("function _att(view, Ctor, at, len) {\n")
 		sb.WriteString("    // A view survives its own iterator's lifetime EXCEPT across a grow, which\n")
@@ -757,36 +789,44 @@ func jsFindGateRegion(s config.SetConfig, cfg config.BuildConfig, idN int) int {
 // optimum and the region becomes sqrt-sized, at the cost of sweeping each
 // position twice.
 //
-// The returned strings are, in order: the prelude (before _open, since it
-// sizes the region), the reserve expression to append to _open's argument, the
-// post-open seeding, and the descriptor's cache arguments.
-func jsOverlapCacheBlock(s config.SetConfig, cfg config.BuildConfig, gateRegion int) (pre, reserve, post, args string) {
+// The returned strings are, in order: the prelude defining _cacheFor (before
+// _open, which calls it once the input is written and its byte count known),
+// the names to add to _open's destructuring, the argument to append to _open's
+// call, the post-open seeding, and the descriptor's cache arguments.
+func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre, dest, reserve, post, args string) {
 	args = "0, 0"
-	sh := overlapCacheShapeFor(s, cfg)
 	if !s.Overlapping || !sh.Eligible {
-		return pre, reserve, post, args
+		return pre, dest, reserve, post, args
 	}
 	// The sweep column's width comes from the compiler — the set is recompiled
 	// to learn it — and is baked in as a constant; everything else is
 	// arithmetic on the input length, which only exists at call time.
 	k := overlapCacheConstsFor(sh)
-	pre = fmt.Sprintf(`    const _m = _inCap(input) + 1;
-    const _row = %[1]d;
-    const _cell = %[2]d;
-    const _single = %[3]d + _m * _row;
-    let _k;
-    if (_single > 0 && _single <= %[4]d) {
-        _k = _m;
-    } else {
-        _k = Math.floor(Math.sqrt(_m * %[5]d * 4 / _row));
-        if (_k < 16) _k = 16;
-        if (_k > _m) _k = _m;
-    }
-    const _nb = Math.ceil(_m / _k);
-    const cacheNeeded = %[6]d + _nb * _cell + 4 + _k * _row;
-    const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+	pre = fmt.Sprintf(`    // [stride, bytes] of the answer cache for an input of _len bytes; _open
+    // calls it with the count the input actually took.
+    const _cacheFor = (_len) => {
+        const _m = _len + 1;
+        const _row = %[1]d;
+        const _cell = %[2]d;
+        const _single = %[3]d + _m * _row;
+        let _k;
+        if (_single > 0 && _single <= %[4]d) {
+            _k = _m;
+        } else {
+            _k = Math.floor(Math.sqrt(_m * %[5]d * 4 / _row));
+            if (_k < 16) _k = 16;
+            if (_k > _m) _k = _m;
+        }
+        const _nb = Math.ceil(_m / _k);
+        const cacheNeeded = %[6]d + _nb * _cell + 4 + _k * _row;
+        const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+        return [_k, cacheBytes];
+    };
 `, k.Row, k.Cell, k.Base, k.Max, k.Cells, k.Hdr)
-	reserve = " + cacheBytes"
+	// _open returns the cache it could actually reserve — 0 when a memory
+	// ceiling refused the grow — and the stride it was sized with.
+	dest = ", cacheBytes, _k"
+	reserve = ", _cacheFor"
 	// The header is zeroed and then the STRIDE written into it: it is the one
 	// field the caller owns, because the caller is what sized the allocation
 	// from it.
@@ -794,9 +834,9 @@ func jsOverlapCacheBlock(s config.SetConfig, cfg config.BuildConfig, gateRegion 
     if (cacheBase !== 0) {
         const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
         _hdr.fill(0);
-        _hdr[4] = _k;
+        _hdr[%d] = _k;
     }
-`, gateRegion, config.SetOverlapCheckpointHeaderBytes/4)
+`, gateRegion, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrStrideOff/4)
 	args = "cacheBase, cacheBytes"
-	return pre, reserve, post, args
+	return pre, dest, reserve, post, args
 }

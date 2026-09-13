@@ -21,11 +21,11 @@ package component
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/tools"
 )
 
 // Test seams. The error paths guarded by these are real — a full disk, a revoked
@@ -39,16 +39,10 @@ var (
 	statFile  = os.Stat
 )
 
-// resolveWasmTools returns the wasm-tools binary path, in the same lookup order
-// merge uses for wasm-merge: config field → $WASM_TOOLS → $PATH.
-func resolveWasmTools(cfg config.BuildConfig) string {
-	if cfg.WasmTools != "" {
-		return expandHome(cfg.WasmTools)
-	}
-	if env := os.Getenv("WASM_TOOLS"); env != "" {
-		return expandHome(env)
-	}
-	return "wasm-tools"
+// resolveWasmTools finds wasm-tools the way merge finds its tools:
+// wasm_tools_path, else $PATH, and no environment variable. See tools.Resolve.
+func resolveWasmTools(cfg config.BuildConfig) (string, error) {
+	return tools.Resolve("wasm_tools_path", cfg.ToolPathAsWritten("wasm_tools_path"), cfg.WasmToolsPath, "wasm-tools")
 }
 
 // Wrap turns core (a module compiled with CompileOptions.Component) plus witText
@@ -58,8 +52,8 @@ func resolveWasmTools(cfg config.BuildConfig) string {
 // wasmtime's bindgen! all need the interface text and a component alone does not
 // hand it over in a form those tools take.
 func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
-	tool := resolveWasmTools(cfg)
-	if err := checkTool(tool); err != nil {
+	tool, err := resolveWasmTools(cfg)
+	if err != nil {
 		return fmt.Errorf("%w (needed for wasm_format: component)", err)
 	}
 	world, err := cfg.WitWorldName()
@@ -83,14 +77,14 @@ func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 	}
 	embedPath := filepath.Join(dir, "embed.wasm")
 
-	if err := runTool(tool, "component", "embed", witPath, corePath, "--world", world, "-o", embedPath); err != nil {
+	if err := tools.Run(tool, []string{"component", "embed", witPath, corePath, "--world", world, "-o", embedPath}, "", nil); err != nil {
 		return fmt.Errorf("wasm-tools component embed: %w", err)
 	}
 	if out == "-" {
 		// `new` cannot write to a pipe, so produce a file and stream it, the
 		// way the compile command already streams a module.
 		tmpOut := filepath.Join(dir, "component.wasm")
-		if err := runTool(tool, "component", "new", embedPath, "-o", tmpOut); err != nil {
+		if err := tools.Run(tool, []string{"component", "new", embedPath, "-o", tmpOut}, "", nil); err != nil {
 			return fmt.Errorf("wasm-tools component new: %w", err)
 		}
 		data, err := readFile(tmpOut)
@@ -103,7 +97,7 @@ func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(out), err)
 	}
-	if err := runTool(tool, "component", "new", embedPath, "-o", out); err != nil {
+	if err := tools.Run(tool, []string{"component", "new", embedPath, "-o", out}, "", nil); err != nil {
 		return fmt.Errorf("wasm-tools component new: %w", err)
 	}
 	return nil
@@ -117,31 +111,3 @@ func WitPathFor(out string) string {
 	}
 	return strings.TrimSuffix(out, filepath.Ext(out)) + ".wit"
 }
-
-// runTool runs wasm-tools, letting its stderr through: its diagnostics name the
-// offending export or type, and paraphrasing them would lose that.
-func runTool(tool string, args ...string) error {
-	cmd := exec.Command(tool, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func checkTool(path string) error {
-	if filepath.IsAbs(path) {
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("tool not found: %s", path)
-		}
-		if info.Mode()&0o111 == 0 {
-			return fmt.Errorf("tool not executable: %s", path)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath(path); err != nil {
-		return fmt.Errorf("tool not found in PATH: %s", path)
-	}
-	return nil
-}
-
-func expandHome(path string) string { return config.ExpandHome(path) }

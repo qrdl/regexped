@@ -60,20 +60,46 @@ func (c BuildConfig) WitPackageName() (string, error) {
 	return name, nil
 }
 
+// WitPackageRaw is the value the WIT package name comes from, as written: the
+// wit_package key when set, else import_module. For error messages that must
+// name what the user wrote.
+func (c BuildConfig) WitPackageRaw() string {
+	if c.WitPackage != "" {
+		return c.WitPackage
+	}
+	return c.ImportModule
+}
+
 // WitWorldName is the WIT world name: wit_world, else the package name.
 //
 // The world is the one name in this file that no ABI depends on. It is absent
 // from every canonical export name and only names the consumer's generated
 // bindings — `<world>.c`, `<world>.h`, the `bindgen!` struct — so changing it
 // is always safe, whereas changing the package renames every export.
+//
+// It may not be `matcher` or `sets`: the world shares the package's item
+// namespace with the interfaces, so either is a duplicate item wasm-tools
+// refuses. That holds for a world that defaults to the package name too.
 func (c BuildConfig) WitWorldName() (string, error) {
-	if c.WitWorld != "" {
-		if err := validateWitIdent(c.WitWorld); err != nil {
-			return "", fmt.Errorf("wit_world %q %v", c.WitWorld, err)
+	name := c.WitWorld
+	if name != "" {
+		if err := validateWitIdent(name); err != nil {
+			return "", fmt.Errorf("wit_world %q %v", name, err)
 		}
-		return c.WitWorld, nil
+	} else {
+		pkg, err := c.WitPackageName()
+		if err != nil {
+			return "", err
+		}
+		name = pkg
 	}
-	return c.WitPackageName()
+	if name == "matcher" || name == "sets" {
+		if c.WitWorld != "" {
+			return "", fmt.Errorf("wit_world %q is the name of an interface the package defines; pick another world name", name)
+		}
+		return "", fmt.Errorf("the WIT world defaults to the package name %q, which is the name of an interface the package defines; set wit_world", name)
+	}
+	return name, nil
 }
 
 // KebabIdent converts a config name to a WIT identifier: split on '_' and on
@@ -93,7 +119,7 @@ func KebabIdent(s string) (string, error) {
 	var cur strings.Builder
 	// A separator ALWAYS ends a word, even an empty one, so `_x`, `x__y` and
 	// `x_` produce an empty word and are rejected below. Collapsing them
-	// instead would silently rename `_x` to `x`, and §4's rule is that an
+	// instead would silently rename `_x` to `x`, and the naming rule is that an
 	// unrepresentable name is an error the user resolves by setting the key —
 	// never a rename we invent.
 	for i := 0; i < len(s); i++ {

@@ -46,12 +46,13 @@ func genRustSetInner(cfg config.BuildConfig) string {
 	}
 	var out strings.Builder
 	out.WriteString(rustSetMatchType())
-	for _, s := range cfg.Sets {
+	shapes := newSetShapes(cfg)
+	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
 		idN := idSpaceSize(s, cfg)
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
-		wide := wideAllForm(s, cfg)
+		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
@@ -59,7 +60,7 @@ func genRustSetInner(cfg config.BuildConfig) string {
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
 		// the Rust spelling of each is decided here (R12).
-		for _, capability := range setCapabilities(s, cfg) {
+		for _, capability := range setCapabilities(s, cfg, wide) {
 			fmt.Fprintf(&out, "    #[link_name = %q]\n    fn ffi_%s(%s) -> %s;\n",
 				capability.Export, capability.Export,
 				capability.render(rustABIParam, ", "), rustABIRet(capability.Ret))
@@ -192,9 +193,9 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				gateInit = " gates: vec![0u32; " + idKonst + "].into_boxed_slice(),"
 			}
 			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
-			// pointer: magic, gate pointer, and the answer cache (declined —
-			// only the batching entry's sweep reads one, and this stub does not
-			// expose that entry).
+			// pointer: magic, gate pointer, and the answer cache — the region
+			// reserved below for a cache-eligible overlapping set, zero
+			// otherwise.
 			//
 			// Filled immediately before EACH call rather than once at
 			// construction, because field 1 is a pointer into `self`: an
@@ -204,7 +205,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			gateInit += " scratch: [0u32; 4],"
 			cacheField, cacheInit := "", ""
 			cacheArgs := "0, 0"
-			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache. Without one an overlapping
 				// drive is quadratic — every start position walks to its own
 				// extent — and `find` reads a cache exactly as the batching
@@ -241,11 +243,11 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
                 Vec::new()
             } else {
                 let mut v = vec![0u32; (bytes as usize).div_ceil(4)];
-                v[4] = k as u32;
+                v[%[7]d] = k as u32;
                 v
             }
-        },`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes,
-					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
+        },`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
 				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
 					"(self.cache.len() * 4) as u32"
 			}
@@ -289,6 +291,8 @@ impl<'a> Iterator for %s<'a> {
             // And -4 the same way: the answer cache's header is malformed, so
             // the drive is not finished and cannot say what is left.
             if n == %d { self.done = true; return Some(Err(Error::MalformedCache)); }
+            // And -6: the offset went below where the answer cache was built.
+            if n == %d { self.done = true; return Some(Err(Error::OutOfOrder)); }
             if n <= 0 { self.done = true; return None; }
             // The buffer is sized at the set's pattern count, the exact worst
             // case for a single position, so n can never exceed it.
@@ -301,7 +305,7 @@ impl<'a> Iterator for %s<'a> {
 }
 
 `, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst,
-				btOverflow, malformedCache)
+				btOverflow, malformedCache, outOfOrder)
 			fmt.Fprintf(&out, "impl std::iter::FusedIterator for %s<'_> {}\n\n", iterName)
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
 				"///\n"+
@@ -758,9 +762,10 @@ pub fn %s() -> &'static [&'static str] {
 // is a hard process abort, and a server taking user input cannot have a
 // data-dependent abort in its matcher.
 //
-// The enum is #[non_exhaustive] because internal/abi says adding a sentinel
-// means updating every generator; this makes the Rust half of that a
-// non-breaking change.
+// The enum carries #[non_exhaustive], but the stub is generated into the
+// consumer's own crate, where the attribute does not force a wildcard arm. The
+// docs therefore tell users to match with a `_` arm, so that a regenerated stub
+// can gain a variant — internal/abi's new sentinels — without breaking them.
 func rustErrorPreamble() string {
 	return `/// Why a matcher could not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -778,6 +783,12 @@ pub enum Error {
     /// sizes the region and writes the stride from one formula. A caller
     /// driving the raw ABI, or sharing one region between two scanners, can.
     MalformedCache,
+    /// An overlapping set's find was asked for an offset BELOW where its
+    /// answer cache was built: the scan went backwards, and its result is
+    /// UNKNOWN. Offsets must never go backwards within one scan; the generated
+    /// iterator never does. Detection is best effort, so its absence is not a
+    /// guarantee.
+    OutOfOrder,
 }
 
 impl std::fmt::Display for Error {
@@ -794,6 +805,12 @@ impl std::fmt::Display for Error {
                 "regexped: the overlapping answer cache's header is malformed; the \
                  scan result is unknown, not finished — a generated iterator cannot \
                  produce this (see docs/sets.md)"
+            ),
+            Error::OutOfOrder => write!(
+                f,
+                "regexped: the scan offset went backwards within one scan; the scan \
+                 result is unknown. Offsets must never go backwards within a scan, and \
+                 this is detected only on a best-effort basis (see docs/sets.md)"
             ),
             #[allow(unreachable_patterns)]
             _ => write!(f, "regexped: unknown error"),

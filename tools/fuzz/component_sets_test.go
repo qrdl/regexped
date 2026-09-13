@@ -50,6 +50,19 @@ func newSetHarness(t *testing.T, cfgYAML string) *setHarness {
 	if err != nil {
 		t.Fatalf("component core: %v", err)
 	}
+	store, inst, mem := instantiateCore(t, core)
+	return &setHarness{t: t, store: store, inst: inst, mem: mem, pkg: "regexped:t/sets"}
+}
+
+// instantiateCore instantiates a component CORE module in the shared engine and
+// returns its store, instance and exported memory. Each function import is
+// supplied as a [resource-new] stand-in that hands back its argument, which is
+// what the real builtin does as far as the guest can observe (see above); a
+// core with no imports gets none. The epoch deadline is set far out: the shared
+// engine interrupts a store with no deadline immediately, and these are adapter
+// and allocator calls, not pattern drives, so there is nothing to time out.
+func instantiateCore(t *testing.T, core []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory) {
+	t.Helper()
 	engine, _ := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, core)
 	if err != nil {
@@ -57,15 +70,12 @@ func newSetHarness(t *testing.T, cfgYAML string) *setHarness {
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1 << 40)
-
-	// Supply a [resource-new] for every import the module declares, in order.
 	var externs []wasmtime.AsExtern
 	for _, imp := range mod.Imports() {
 		if imp.Type().FuncType() == nil {
 			t.Fatalf("unexpected non-function import %v", imp.Name())
 		}
-		fn := wasmtime.WrapFunc(store, func(rep int32) int32 { return rep })
-		externs = append(externs, fn)
+		externs = append(externs, wasmtime.WrapFunc(store, func(rep int32) int32 { return rep }))
 	}
 	inst, err := wasmtime.NewInstance(store, mod, externs)
 	if err != nil {
@@ -75,7 +85,7 @@ func newSetHarness(t *testing.T, cfgYAML string) *setHarness {
 	if memExp == nil || memExp.Memory() == nil {
 		t.Fatal("component core module does not export its memory")
 	}
-	return &setHarness{t: t, store: store, inst: inst, mem: memExp.Memory(), pkg: "regexped:t/sets"}
+	return store, inst, memExp.Memory()
 }
 
 func (h *setHarness) fn(name string) *wasmtime.Func {
@@ -367,5 +377,52 @@ func TestComponentSetWideAll(t *testing.T) {
 	want := [][3]uint32{{3, 0, 7}, {41, 12, 19}, {69, 24, 31}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("wide find drive = %v, want %v", got, want)
+	}
+}
+
+// TestComponentNarrowAllReportsBit63: a narrow `_all` answer whose mask equals
+// the Backtracking sentinel's bit pattern — ids 1..63 matched, id 0 did not, so
+// the i64 is -2 — is a LEGAL answer. The narrow form is emitted only for a set
+// with no Backtracking member (one selects the wide form), so its export cannot
+// return the sentinel at all, and the adapter used to turn this mask into
+// err(backtrack-overflow).
+func TestComponentNarrowAllReportsBit63(t *testing.T) {
+	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n  - pattern: 'zzz'\n"
+	for i := 1; i < 64; i++ {
+		cfg += fmt.Sprintf("  - pattern: 'a{1,%d}'\n", i)
+	}
+	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n"
+	h := newSetHarness(t, cfg)
+	want := make([]uint32, 0, 63)
+	for i := uint32(1); i < 64; i++ {
+		want = append(want, i)
+	}
+	ptr, n := h.writeInput("a")
+	matchRet := h.call(h.pkg+"#all-matches", ptr, n)
+	scanRet := h.call(h.pkg+"#all-hits", ptr, n, int32(0))
+	for _, c := range []struct {
+		name string
+		ret  int32
+	}{{"match_all", matchRet}, {"scan_all", scanRet}} {
+		got, errored := h.list(c.ret)
+		if errored {
+			t.Errorf("%s over \"a\" reported an error; the mask of ids 1..63 is -2 and is a legal answer", c.name)
+			continue
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s = %v, want ids 1..63", c.name, got)
+		}
+	}
+
+	// And the ordinary case beside it: one pattern of two matching, mask 2.
+	h2 := newSetHarness(t, "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n"+
+		"  - pattern: 'zzz'\n  - pattern: 'a'\nsets:\n  - name: s\n    patterns: all\n"+
+		"    match_all: all_matches\n    scan_all: all_hits\n")
+	p2, n2 := h2.writeInput("a")
+	if got, errored := h2.list(h2.call(h2.pkg+"#all-matches", p2, n2)); errored || fmt.Sprint(got) != "[1]" {
+		t.Errorf("match_all over a two-pattern set = %v (errored=%v), want [1]", got, errored)
+	}
+	if got, errored := h2.list(h2.call(h2.pkg+"#all-hits", p2, n2, int32(0))); errored || fmt.Sprint(got) != "[1]" {
+		t.Errorf("scan_all over a two-pattern set = %v (errored=%v), want [1]", got, errored)
 	}
 }

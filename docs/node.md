@@ -33,7 +33,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { init, extract_domain, extract_domain_indices } from './regexp.ts';
 
-const wasmPath = fileURLToPath(new URL('./urls.wasm', import.meta.url));
+const wasmPath = fileURLToPath(new URL('../urls.wasm', import.meta.url));
 await init(readFileSync(wasmPath));
 
 const text = readFileSync('/dev/stdin');
@@ -45,13 +45,42 @@ for (const match of extract_domain(text)) {
 
 Node `Buffer` is a subtype of `Uint8Array` — no re-encoding needed when reading files or request bodies.
 
-Run with Node.js 22+ (`--experimental-strip-types`) or `tsx`:
+Compile it with `tsc` and run the JavaScript it emits. Install TypeScript and
+Node's type definitions globally:
 
 ```bash
-node --experimental-strip-types main.ts
-# or
-npx tsx main.ts
+npm install -g typescript @types/node
 ```
+
+A `tsconfig.json` beside `main.ts`, with `{ "type": "module" }` in `package.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "rewriteRelativeImportExtensions": true,
+    "outDir": "dist"
+  },
+  "files": ["main.ts"]
+}
+```
+
+`tsc` does not look in the global `node_modules` for type definitions, so point it
+there:
+
+```bash
+tsc -p . --typeRoots "$(npm root -g)/@types" --types node && node dist/main.js
+```
+
+`rewriteRelativeImportExtensions` turns `./regexp.ts` into `./regexp.js` in the
+output. The compiled `main.js` runs from `dist/`, so a URL built from
+`import.meta.url` is relative to `dist/` — which is why the example above loads
+`../urls.wasm`. The generated stub compiles cleanly under these strict flags.
 
 See [`examples/node/domain-extract/`](../examples/node/domain-extract/) for the complete example above (a single pattern with `groups_func` and a named group).
 

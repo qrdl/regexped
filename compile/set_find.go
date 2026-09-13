@@ -203,7 +203,7 @@ type setFindCtx struct {
 	pSkip   byte
 	// pBatchMode names the gated worker's trailing parameter: 0 selects
 	// `find`'s transactional gate rule, non-zero the batch loop's
-	// deliver-and-gate rule (decision (11a)). Valid only when batch && gated.
+	// deliver-and-gate rule. Valid only when batch && gated.
 	pBatchMode byte
 
 	// Locals.
@@ -243,7 +243,7 @@ type setFindCtx struct {
 	//
 	// G8's `scan_any` preflight also used it, to intersect every bucket's
 	// validMask and make the liveness exit fire. That is gone with
-	// decision (10): `scan_any` is the union walk now, so there is no
+	// `scan_any` reporting no start: it is the union walk now, so there is no
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
 	// went with it.
 	aliveMask byte
@@ -607,7 +607,7 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	//
 	// The second half is `find`'s transactional rule and the batch loop's
 	// absence of one, selected at RUNTIME because both callers share this
-	// body (decision (11a)). A non-batching set has no batch_mode parameter
+	// body. A non-batching set has no batch_mode parameter
 	// and keeps the compile-time form, so its `find` is unchanged.
 	b = append(b, 0x20, c.lTotal, 0x41, 0x00, 0x4A) // total > 0 (signed)
 	if c.batch && c.gated {
@@ -635,7 +635,9 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 		// batch_mode.
 		b = append(b, 0x20, lPos, 0x20, c.pOutCap, 0x4E, 0x0D, 0x01) // idx >= cap → done
 	}
-	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41, 12, 0x6C, 0x6A, 0x21, c.lOutBase)
+	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
+	b = append(b, 0x6C, 0x6A, 0x21, c.lOutBase)
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x00, 0x21, c.lTmp)   // id
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x04, 0x21, c.lStart) // start
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x08, 0x21, c.lBase)  // end
@@ -1028,7 +1030,9 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	}
 	b = append(b, 0x20, c.pInLen)
 	b = append(b, 0x20, posLocal)
-	b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 12, 0x6C, 0x6A)
+	b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41)
+	b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
+	b = append(b, 0x6C, 0x6A)
 	b = append(b, 0x20, c.pOutCap, 0x20, c.lBase, 0x6B)
 	b = append(b, 0x20, c.lValidMask, 0x41)
 	b = utils.AppendSLEB128(b, int32(mask))

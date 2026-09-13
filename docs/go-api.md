@@ -276,9 +276,18 @@ stride below 1, or a layout that is not one a sweep would have written. Like the
 backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
 knowing what remained.
 
-The generated code cannot produce it. `init` sizes the region and writes the
-stride from one formula, so seeing this means the descriptor was built by hand,
-or one region was shared between two scanners.
+The generated iterator cannot produce it: it sizes the region and writes the stride
+from one formula when it is created, so seeing it means something outside the
+stub wrote into the region.
 
 The `find` iterator records **`ErrMalformedCache`** and stops; read it with
 `Err()` after the loop, exactly as for the backtracking sentinel.
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The generated iterators only
+move forward, so they never do; the rule matters to a caller driving the raw ABI,
+on every set. A backwards offset is unsupported and may lose matches. Detection
+is best effort, with no guarantee: the engine notices only once an overlapping
+set's answer cache has engaged and a position falls below where it was built,
+and then the `find` iterator records **`ErrOutOfOrder`** and stops. Anywhere else it goes undetected.

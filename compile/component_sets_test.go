@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"github.com/qrdl/regexped/internal/utils"
 	"strings"
 	"testing"
 
@@ -185,13 +186,88 @@ func TestSetComponentIgnoresOutputForMemoryMode(t *testing.T) {
 	cfg := setComponentCfg(3)
 	cfg.Output = "composed.wasm"
 	core := buildSetComponent(t, cfg)
-	if !strings.Contains(string(core), "memory") {
-		t.Error("the component core module must export its own memory")
+	if imports, exported := memoryImportsExports(t, core); imports != 0 || !exported {
+		t.Errorf("the component core imports %d memories and exports one: %v; a component owns and exports its own",
+			imports, exported)
 	}
-	// An embedded module would IMPORT "main"."memory" instead.
-	if strings.Contains(string(core), "main") && strings.Contains(string(core), "\x02\x00\x00") {
-		t.Log("note: checked structurally below rather than by byte search")
+
+	// The control: an EMBEDDED module imports its memory, and the walk must say
+	// so, or the assertion above would pass on a parser that finds nothing.
+	embedded, _, err := Compile([]config.RegexEntry{{Pattern: `a+`, MatchFunc: "m"}}, 0, false, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if imports, _ := memoryImportsExports(t, embedded); imports != 1 {
+		t.Errorf("an embedded module imports %d memories by this walk, want 1", imports)
+	}
+}
+
+// memoryImportsExports walks a module's import and export sections: how many
+// MEMORIES it imports, and whether it exports one named "memory". A byte search
+// cannot tell those apart — an embedded module carries the string "memory" too,
+// in the name of the memory it imports.
+func memoryImportsExports(t *testing.T, mod []byte) (memImports int, memExported bool) {
+	t.Helper()
+	uleb := func(i int) (uint64, int) {
+		v, n, err := utils.DecodeULEB128(mod[i:])
+		if err != nil {
+			t.Fatalf("malformed LEB128 at %d: %v", i, err)
+		}
+		return v, i + n
+	}
+	name := func(i int) (string, int) {
+		n, j := uleb(i)
+		return string(mod[j : j+int(n)]), j + int(n)
+	}
+	limits := func(i int) int {
+		flags := mod[i]
+		_, i = uleb(i + 1)
+		if flags&1 != 0 {
+			_, i = uleb(i)
+		}
+		return i
+	}
+	for i := 8; i < len(mod); {
+		id := mod[i]
+		size, j := uleb(i + 1)
+		end := j + int(size)
+		switch id {
+		case 2: // imports
+			cnt, k := uleb(j)
+			for e := uint64(0); e < cnt; e++ {
+				_, k = name(k)
+				_, k = name(k)
+				kind := mod[k]
+				k++
+				switch kind {
+				case 0x00:
+					_, k = uleb(k)
+				case 0x01:
+					k = limits(k + 1)
+				case 0x02:
+					memImports++
+					k = limits(k)
+				case 0x03:
+					k += 2
+				default:
+					t.Fatalf("unknown import kind %#x", kind)
+				}
+			}
+		case 7: // exports
+			cnt, k := uleb(j)
+			for e := uint64(0); e < cnt; e++ {
+				var nm string
+				nm, k = name(k)
+				kind := mod[k]
+				_, k = uleb(k + 1)
+				if kind == 0x02 && nm == "memory" {
+					memExported = true
+				}
+			}
+		}
+		i = end
+	}
+	return memImports, memExported
 }
 
 // TestSetComponentRefusesWithoutPackage: the interface prefix is what every
@@ -334,5 +410,24 @@ func TestSetComponentMixedWithoutResource(t *testing.T) {
 	}
 	if strings.Contains(string(core), "[resource-new]") {
 		t.Error("no find means no imported builtin")
+	}
+}
+
+// TestSetComponentSkipsMissingCapabilityName: a capability with no canonical
+// name in the table is SKIPPED, the way the pattern path skips a pattern with no
+// name — not exported under the empty string, which builds and then fails only
+// inside `wasm-tools component new`.
+func TestSetComponentSkipsMissingCapabilityName(t *testing.T) {
+	names := setComponentNames("s")
+	delete(names["s"].Caps, "any_hit")
+	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil, names, nil)
+	if err != nil {
+		t.Fatalf("CompileFileComponent: %v", err)
+	}
+	if moduleExports(core, "") {
+		t.Error("a capability with no canonical name was exported under the empty string")
+	}
+	if !moduleExports(core, "regexped:t/sets#which-matches") {
+		t.Error("the capabilities that do have names must still be exported")
 	}
 }

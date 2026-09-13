@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("WASM module has no 'memory' export"))?;
 
-    // The default (gated) `find` body: (ptr, len, from, gate_ptr, out_ptr, out_cap) -> total
+    // The default (gated) `find` body: (ptr, len, from, scratch_ptr, out_ptr, out_cap) -> total
     let scan_fn = instance
         .get_typed_func::<(i32, i32, i32, i32, i32, i32), i32>(&mut store, "scan_secrets")
         .map_err(|e| anyhow!("'scan_secrets' export not found: {}", e))?;

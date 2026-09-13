@@ -38,7 +38,7 @@ compiler emits only the machinery the declared capabilities need, so the
 specialised emissions are unreachable from a set that declares everything.
 
 Two make targets wrap these: `make sets` (sampled, part of `make test`) and
-`make sets-exhaustive` (every chunk, hours). See
+`make sets-exhaustive` (every chunk). See
 [docs/re2.md](../../docs/re2.md) for what each capability is checked against.
 
 ### Test files

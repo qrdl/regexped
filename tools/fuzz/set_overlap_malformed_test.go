@@ -3,12 +3,11 @@ package fuzz
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 
-	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
 // A cache header the caller got WRONG must be REPORTED, not degraded into a
@@ -81,9 +80,6 @@ func TestOverlapCacheLaterCallValidatesHeader(t *testing.T) {
 	}{
 		{"stride zeroed", 16, 0},
 		{"numBlocks zeroed", 24, 0},
-		{"ckptOff moved", 32, 64},
-		{"cntOff moved", 36, 48},
-		{"blockOff moved", 0, 8},
 		{"floor past the input", 20, uint32(len(input)) + 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,18 +112,6 @@ func TestOverlapCachePastEndLeavesAValidLayout(t *testing.T) {
 		true, full, engageAlways, opt)
 	if len(got) != 0 {
 		t.Fatalf("from past the end returned %d tuples, want none", len(got))
-	}
-	cellBytes := uint32(overlapShapeOf(t, pats).Cells * 4)
-	hdrBytes := uint32(config.SetOverlapCheckpointHeaderBytes)
-	if got, want := opt.header[overlapHdrCntOffWord], hdrBytes+cellBytes; got != want {
-		t.Fatalf("cntOff = %d, want %d: the arm must write the layout the serving "+
-			"validator expects, or every such call reports -4", got, want)
-	}
-	if got, want := opt.header[overlapHdrCkptOffWord], hdrBytes; got != want {
-		t.Fatalf("ckptOff = %d, want %d", got, want)
-	}
-	if got, want := opt.header[overlapHdrBlockOffWord], hdrBytes+cellBytes+8; got != want {
-		t.Fatalf("blockOff = %d, want %d", got, want)
 	}
 	if got := opt.header[overlapHdrNumBlocksWord]; got != 1 {
 		t.Fatalf("numBlocks = %d, want 1", got)
@@ -162,54 +146,11 @@ func driveCacheFindCorrupt(t *testing.T, pats []string, input string,
 	scratchLen, stride, word int32, val uint32,
 ) int32 {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
-	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
-	}
-	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets: []config.SetConfig{{
-			Name: "s", Find: "set_find",
-			Patterns: config.PatternSelector{All: true}, Overlapping: true,
-		}},
-	}
-	w, _, err := compile.CompileFile(cfg, "")
-	if err != nil {
-		t.Fatalf("compile: %v", err)
-	}
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	fn := inst.GetFunc(store, "set_find")
-	if fn == nil {
-		t.Fatal("module missing set_find export")
-	}
-	const pageSize = 65536
-	dataTop, err := utils.ParseDataSectionBytes(w)
-	if err != nil {
-		t.Fatalf("parse data section: %v", err)
-	}
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	gatePtr := inBase + pageSize
-	outPtr := gatePtr + pageSize
-	scratchPtr := outPtr + pageSize
-	needed := uint64((int64(scratchPtr) + int64(scratchLen) + 2*pageSize) / pageSize)
-	if cur := mem.Size(store); needed > cur {
-		if _, err := mem.Grow(store, needed-cur); err != nil {
-			t.Fatalf("grow: %v", err)
-		}
-	}
-	buf := mem.UnsafeData(store)
-	copy(buf[inBase:], input)
-	for i := int32(0); i < int32(4*len(pats)); i++ {
-		buf[gatePtr+i] = 0
-	}
-	for i := int32(0); i < scratchLen; i++ {
-		buf[scratchPtr+i] = 0
-	}
-	desc := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), scratchPtr, scratchLen, stride)
+	d := newCacheDrive(t, pats, input, cacheLayout{scratchLen: scratchLen, offer: true, stride: stride})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	buf := d.buf()
 
 	from, corrupted := int32(0), false
 	for calls := 0; calls < 4*(len(input)+2)*len(pats)+16; calls++ {
@@ -292,59 +233,12 @@ func driveBatchMalformed(t *testing.T, pats []string, input string,
 	scratchLen, stride int32, preArm bool,
 ) (uint32, int32) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
-	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
-	}
-	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets: []config.SetConfig{{
-			Name: "s", Find: "set_find",
-			Patterns: config.PatternSelector{All: true}, Overlapping: true,
-			Hints: []string{"batch-find"},
-		}},
-	}
-	w, _, err := compile.CompileFile(cfg, "")
-	if err != nil {
-		t.Fatalf("compile: %v", err)
-	}
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	fn := inst.GetFunc(store, "set_find_batch")
-	if fn == nil {
-		t.Fatal("module missing set_find_batch export")
-	}
-	const pageSize = 65536
-	dataTop, err := utils.ParseDataSectionBytes(w)
-	if err != nil {
-		t.Fatalf("parse data section: %v", err)
-	}
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	gatePtr := inBase + pageSize
-	outPtr := gatePtr + pageSize
-	scratchPtr := outPtr + pageSize
-	needed := uint64((int64(scratchPtr) + int64(scratchLen) + 2*pageSize) / pageSize)
-	if cur := mem.Size(store); needed > cur {
-		if _, err := mem.Grow(store, needed-cur); err != nil {
-			t.Fatalf("grow: %v", err)
-		}
-	}
-	buf := mem.UnsafeData(store)
-	copy(buf[inBase:], input)
-	for i := int32(0); i < int32(4*len(pats)); i++ {
-		buf[gatePtr+i] = 0
-	}
-	for i := int32(0); i < scratchLen; i++ {
-		buf[scratchPtr+i] = 0
-	}
-	desc := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), scratchPtr, scratchLen, stride)
-	if preArm {
-		buf = mem.UnsafeData(store)
-		binary.LittleEndian.PutUint32(buf[scratchPtr+12:], 0x7FFFFFFF)
-	}
+	d := newCacheDrive(t, pats, input, cacheLayout{
+		batch: true, scratchLen: scratchLen, offer: true, stride: stride, preArmWork: preArm,
+	})
+	defer d.release()
+	store, fn := d.store, d.fn
+	inBase, outPtr, desc := d.inBase, d.outPtr, d.desc
 
 	countMask := int64(config.SetCursorMaxCount(len(pats)))
 	outCap := int32(len(pats))
@@ -363,4 +257,266 @@ func driveBatchMalformed(t *testing.T, pats []string, input string,
 	}
 	t.Fatal("drive did not terminate")
 	return 0, 0
+}
+
+// A header whose block count is INFLATED, with every offset recomputed to
+// agree with it, must be -4 — and must not write one byte outside the region.
+//
+// The validator checked each offset against numBlocks but never numBlocks
+// against the span, so this header passed every check it made. Serving then
+// located a block past the real last one, and that block's rebuild computed a
+// row index below zero and wrote a row's mask and ends BELOW the block buffer —
+// below the region itself, for a small block index.
+func TestOverlapCacheRejectsInflatedBlockCount(t *testing.T) {
+	pats := []string{`a*`, `b+`}
+	input := strings.Repeat("a", 200)
+	const stride = 200
+	cellBytes := uint32(overlapShapeOf(t, pats).Cells * 4)
+	hdrBytes := uint32(config.SetOverlapCheckpointHeaderBytes)
+	// Room for a THREE-block layout plus slack, so the region-fits check is not
+	// what catches the lie.
+	scratchLen := overlapCacheForK(input, pats, stride) + int32(cellBytes) + 4 + 4096
+	hook := func(r []byte) {
+		le := binary.LittleEndian
+		if nb := le.Uint32(r[overlapHdrNumBlocksWord*4:]); nb != 2 {
+			t.Fatalf("a %d-position span at stride %d swept into %d blocks, want 2",
+				len(input)+1, stride, nb)
+		}
+		const nb = 3
+		cntOff := hdrBytes + nb*cellBytes
+		le.PutUint32(r[overlapHdrNumBlocksWord*4:], nb)
+		le.PutUint32(r[28:], 0) // no block materialised, so serving rebuilds
+		for i := uint32(0); i <= nb; i++ {
+			le.PutUint32(r[cntOff+4*i:], 0)
+		}
+		le.PutUint32(r[cntOff+4*nb:], 1) // cum[3] = 1: block 2 claims a tuple
+	}
+	got, canaryBad := driveCacheFindSequence(t, pats, input, scratchLen, stride, 4096, hook,
+		[]int32{0, 400, 250})
+	for i, n := range got {
+		if n != abi.OverlapCacheMalformed {
+			t.Errorf("call %d returned %d through an inflated numBlocks, want %d",
+				i+1, n, abi.OverlapCacheMalformed)
+		}
+	}
+	if canaryBad != 0 {
+		t.Errorf("%d canary bytes below the region were overwritten", canaryBad)
+	}
+}
+
+// driveCacheFindSequence engages the sweep on the FIRST call — work is
+// pre-armed, so froms[0] sweeps whatever it costs — hands the region to hook,
+// and returns what each later call in froms[1:] reports, negative codes
+// included. canaryBad counts the bytes of the canary laid immediately below the
+// region that no longer hold 0xA5.
+func driveCacheFindSequence(t *testing.T, pats []string, input string,
+	scratchLen, stride, canary int32, hook func(region []byte), froms []int32,
+) (results []int32, canaryBad int) {
+	t.Helper()
+	// scratchLen == 0 offers NO region, which is the drive the best-effort
+	// detection cannot see into.
+	d := newCacheDrive(t, pats, input, cacheLayout{
+		scratchLen: scratchLen, offer: scratchLen != 0, stride: stride, preArmWork: true, canaryBelow: canary,
+	})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	buf := d.buf()
+
+	call := func(from int32) int32 {
+		res, err := fn.Call(store, inBase, int32(len(input)), from, desc, outPtr, int32(len(pats)))
+		if err != nil {
+			t.Fatalf("set_find(from=%d): %v", from, err)
+		}
+		return res.(int32)
+	}
+	call(froms[0])
+	if scratchLen != 0 {
+		buf = mem.UnsafeData(store)
+		if ready := int32(readU32(buf, int(scratchPtr)+overlapDPReadyOffset)); ready != 1 {
+			t.Fatalf("the first call did not engage the sweep (ready=%d)", ready)
+		}
+		hook(buf[scratchPtr : scratchPtr+scratchLen])
+	}
+	for _, from := range froms[1:] {
+		results = append(results, call(from))
+	}
+	buf = mem.UnsafeData(store)
+	for i := int32(0); i < canary; i++ {
+		if buf[scratchPtr-canary+i] != 0xA5 {
+			canaryBad++
+		}
+	}
+	return results, canaryBad
+}
+
+// A `from` BELOW the floor of an ENGAGED cache is reported as out of order
+// rather than served from the floor, which silently dropped every match in
+// [from, floor).
+//
+// Detection is BEST EFFORT: it exists only while the cache is engaged, because
+// only then is there a floor to compare with. Both halves are pinned — the
+// report, and the absence of a false positive on a drive that offered no
+// region at all.
+func TestOverlapCacheRejectsBackwardsFrom(t *testing.T) {
+	pats := []string{`a*`, `b+`}
+	input := "aaab"
+	full, stride := overlapCacheFor(input, pats)
+	noHook := func([]byte) {}
+
+	got, _ := driveCacheFindSequence(t, pats, input, full, stride, 0, noHook, []int32{2, 0, 2})
+	if got[0] != abi.OverlapCacheOutOfOrder {
+		t.Errorf("find(0) after the sweep engaged at 2 returned %d, want %d (out of order)",
+			got[0], abi.OverlapCacheOutOfOrder)
+	}
+	if got[1] <= 0 {
+		t.Errorf("find(2), EQUAL to the floor, returned %d; want that position's matches", got[1])
+	}
+
+	walk, _ := driveCacheFindSequence(t, pats, input, 0, stride, 0, noHook, []int32{2, 0})
+	if walk[0] == abi.OverlapCacheOutOfOrder {
+		t.Error("a drive offering no region reported out of order: the check needs an engaged cache")
+	}
+}
+
+// The batch entry reports a backwards resume exactly as `find` reports a
+// backwards `from`: the reserved position word, a zero count, and nothing
+// written into the caller's buffer.
+func TestOverlapCacheBatchRejectsBackwardsResume(t *testing.T) {
+	pats := []string{`a*`, `b+`}
+	input := "aaab"
+	full, stride := overlapCacheFor(input, pats)
+	countMask := int64(config.SetCursorMaxCount(len(pats)))
+
+	res, touched := driveBatchSequence(t, pats, input, full, stride, []int64{2 << 32, 0, 2 << 32})
+	if pos := uint32(res[0] >> 32); pos != config.SetCursorOutOfOrderPos {
+		t.Errorf("resuming at 0 below a floor of 2: position word 0x%X, want 0x%X",
+			pos, uint32(config.SetCursorOutOfOrderPos))
+	}
+	if n := res[0] & countMask; n != 0 {
+		t.Errorf("the out-of-order cursor carried a count of %d; nothing was written", n)
+	}
+	if touched[0] {
+		t.Error("the out-of-order call wrote into the caller's buffer")
+	}
+	if pos, n := uint32(res[1]>>32), res[1]&countMask; pos == config.SetCursorOutOfOrderPos || n == 0 {
+		t.Errorf("resuming AT the floor answered position word 0x%X, count %d; want its matches", pos, n)
+	}
+}
+
+// driveBatchSequence engages the sweep on the first batch call — work is
+// pre-armed — and returns what each later cursor in cursors[1:] answers,
+// with whether that call changed any byte of the caller's buffer.
+func driveBatchSequence(t *testing.T, pats []string, input string,
+	scratchLen, stride int32, cursors []int64,
+) (results []int64, touched []bool) {
+	t.Helper()
+	d := newCacheDrive(t, pats, input, cacheLayout{
+		batch: true, scratchLen: scratchLen, offer: true, stride: stride, preArmWork: true,
+	})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	buf := d.buf()
+
+	outCap := int32(len(pats))
+	span := int(outCap) * 12
+	call := func(cursor int64) int64 {
+		res, err := fn.Call(store, inBase, int32(len(input)), cursor, desc, outPtr, outCap)
+		if err != nil {
+			t.Fatalf("set_find_batch(cursor=0x%X): %v", cursor, err)
+		}
+		return res.(int64)
+	}
+	call(cursors[0])
+	buf = mem.UnsafeData(store)
+	if ready := int32(readU32(buf, int(scratchPtr)+overlapDPReadyOffset)); ready != 1 {
+		t.Fatalf("the first call did not engage the sweep (ready=%d)", ready)
+	}
+	for _, c := range cursors[1:] {
+		buf = mem.UnsafeData(store)
+		for i := 0; i < span; i++ {
+			buf[int(outPtr)+i] = 0xEE
+		}
+		results = append(results, call(c))
+		buf = mem.UnsafeData(store)
+		changed := false
+		for i := 0; i < span; i++ {
+			if buf[int(outPtr)+i] != 0xEE {
+				changed = true
+				break
+			}
+		}
+		touched = append(touched, changed)
+	}
+	return results, touched
+}
+
+// driveCacheFindHooked runs a whole overlapping drive with the cache offered,
+// calling hook ONCE when the sweep first publishes `ready`, and returns every
+// tuple the drive reported — or the negative code that ended it.
+func driveCacheFindHooked(t *testing.T, pats []string, input string,
+	scratchLen, stride int32, hook func(buf []byte, scratchPtr int32),
+) ([][3]int32, int32) {
+	t.Helper()
+	d := newCacheDrive(t, pats, input, cacheLayout{scratchLen: scratchLen, offer: true, stride: stride})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	buf := d.buf()
+
+	var out [][3]int32
+	from, hooked := int32(0), false
+	for calls := 0; calls < 4*(len(input)+2)*len(pats)+16; calls++ {
+		res, err := fn.Call(store, inBase, int32(len(input)), from, desc, outPtr, int32(len(pats)))
+		if err != nil {
+			t.Fatalf("set_find: %v", err)
+		}
+		n := res.(int32)
+		if n <= 0 {
+			if !hooked && hook != nil {
+				t.Fatal("the drive finished without the sweep ever engaging")
+			}
+			return out, n
+		}
+		buf = mem.UnsafeData(store)
+		for i := int32(0); i < n; i++ {
+			base := int(outPtr) + int(i)*12
+			out = append(out, [3]int32{int32(readU32(buf, base)), int32(readU32(buf, base+4)), int32(readU32(buf, base+8))})
+		}
+		from = int32(readU32(buf, int(outPtr)+4)) + 1
+		if !hooked && hook != nil && int32(readU32(buf, int(scratchPtr)+overlapDPReadyOffset)) == 1 {
+			hook(buf, scratchPtr)
+			hooked = true
+		}
+	}
+	t.Fatal("drive did not terminate")
+	return nil, 0
+}
+
+// TestOverlapCacheIgnoresReservedHeaderSlots: the checkpoint, count and block
+// offsets are DERIVED from the block count by every reader, so their three
+// header slots are reserved and unread. Garbage there must not change an answer
+// or be reported as a malformed header — the validator checks what the engine
+// actually reads, and nothing else.
+func TestOverlapCacheIgnoresReservedHeaderSlots(t *testing.T) {
+	shape := quadraticShapes()[0]
+	pats, input := shape.pats, shape.input
+	full, stride := overlapCacheFor(input, pats)
+
+	want, code := driveCacheFindHooked(t, pats, input, full, stride, nil)
+	if code != 0 {
+		t.Fatalf("the clean drive ended with %d", code)
+	}
+	got, code := driveCacheFindHooked(t, pats, input, full, stride, func(buf []byte, scratchPtr int32) {
+		for _, off := range []int32{0, 4, 32, 36, 44} {
+			binary.LittleEndian.PutUint32(buf[scratchPtr+off:], 0xDEADBEEF)
+		}
+	})
+	if code != 0 {
+		t.Fatalf("garbage in the reserved header slots ended the drive with %d", code)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("garbage in the reserved header slots changed the answer: %d tuples, want %d", len(got), len(want))
+	}
 }

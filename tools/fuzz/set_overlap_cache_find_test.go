@@ -1,14 +1,13 @@
 package fuzz
 
 import (
-	"encoding/binary"
 	"fmt"
+	"regexp"
+	"regexp/syntax"
 	"strings"
 	"testing"
 
-	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/utils"
 )
 
 // The answer cache is COMMON code, called from `find` as well as from the
@@ -96,93 +95,19 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 		opt = &cacheDriveOpt{}
 	}
 	strideOverride := opt.stride
-	entries := make([]config.RegexEntry, len(pats))
-	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
-	}
-	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets: []config.SetConfig{{
-			Name:        "s",
-			Find:        "set_find",
-			Patterns:    config.PatternSelector{All: true},
-			Overlapping: true,
-			// No `hints: [batch-find]`: this set exports find and nothing else.
-		}},
-	}
-	w, _, err := compile.CompileFile(cfg, "")
-	if err != nil {
-		t.Fatalf("compile %v: %v", pats, err)
-	}
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	if inst.GetFunc(store, "set_find_batch") != nil {
-		t.Fatal("the set declared no batch hint but a batch entry was exported")
-	}
-	fn := inst.GetFunc(store, "set_find")
-	if fn == nil {
-		t.Fatal("module missing set_find export")
-	}
-
-	const pageSize = 65536
-	dataTop, err := utils.ParseDataSectionBytes(w)
-	if err != nil {
-		t.Fatalf("parse data section: %v", err)
-	}
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	// The input gets as many pages as it needs: the megabyte-scale shapes that
-	// reach the layout arithmetic's 32-bit edges do not fit in one.
-	inSpan := int32((len(input) + pageSize - 1) / pageSize * pageSize)
-	if inSpan == 0 {
-		inSpan = pageSize
-	}
-	gatePtr := inBase + inSpan
-	outPtr := gatePtr + pageSize
-	scratchPtr := outPtr + pageSize
-	if opt.canaryBytes > 0 {
-		// A page of its own beneath the region: the output buffer occupies the
-		// one immediately below, and a sweep writing over THAT would look like
-		// ordinary tuple traffic rather than the out-of-bounds write it is.
-		scratchPtr += pageSize
-	}
-	needed := uint64((int64(scratchPtr) + int64(scratchLen) + int64(opt.canaryAfter) + 2*pageSize) / pageSize)
-	if cur := mem.Size(store); needed > cur {
-		if _, err := mem.Grow(store, needed-cur); err != nil {
-			t.Fatalf("grow: %v", err)
-		}
-	}
-	buf := mem.UnsafeData(store)
-	copy(buf[inBase:], input)
-	for i := int32(0); i < int32(4*len(pats)); i++ {
-		buf[gatePtr+i] = 0
-	}
-	for i := int32(0); i < scratchLen; i++ {
-		buf[scratchPtr+i] = 0
-	}
-	for i := int32(0); i < opt.canaryBytes; i++ {
-		buf[scratchPtr-opt.canaryBytes+i] = 0xA5
-	}
-	for i := int32(0); i < opt.canaryAfter; i++ {
-		buf[scratchPtr+scratchLen+i] = 0xA5
-	}
-	opt.region = scratchPtr
-
-	passScratch, passLen := scratchPtr, scratchLen
-	if !useCache {
-		passScratch, passLen = 0, 0
-	}
 	_, stride := overlapCacheFor(input, pats)
 	if strideOverride != nil {
 		stride = *strideOverride
 	}
-	descPtr := writeFindScratchStride(store, mem, gatePtr, int32(len(pats)), passScratch, passLen, stride)
-	if opt.preArmWork && passScratch != 0 {
-		buf = mem.UnsafeData(store)
-		binary.LittleEndian.PutUint32(buf[passScratch+12:], 0x7FFFFFFF)
-	}
+	d := newCacheDrive(t, pats, input, cacheLayout{
+		scratchLen: scratchLen, offer: useCache, stride: stride, preArmWork: opt.preArmWork,
+		canaryBelow: opt.canaryBytes, canaryAbove: opt.canaryAfter,
+	})
+	defer d.release()
+	store, mem, fn := d.store, d.mem, d.fn
+	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
+	opt.region = scratchPtr
+	buf := d.buf()
 
 	var out [][3]int
 	from := offset
@@ -265,11 +190,17 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 		// cum[0..nb]: the block counts, prefix-summed, which is where a block's
 		// tuple total is read from now that the header carries no count.
 		nb := int32(opt.header[overlapHdrNumBlocksWord])
-		cntOff := int32(opt.header[overlapHdrCntOffWord])
-		if nb > 0 && nb < 1<<20 && cntOff > 0 && cntOff+(nb+1)*4 <= scratchLen {
-			opt.cum = make([]uint32, nb+1)
-			for i := range opt.cum {
-				opt.cum[i] = readU32(buf, int(scratchPtr+cntOff)+4*i)
+		// cum[] follows the header and nb checkpoint columns. The header does
+		// not store where; every reader derives it from nb. Only a pass writes
+		// nb, and only an eligible set has one, so the shape is looked up
+		// only then — a drive over a set that declines has no column to size.
+		if nb > 0 && nb < 1<<20 {
+			cntOff := int32(config.SetOverlapCheckpointHeaderBytes) + nb*int32(overlapShapeOf(t, pats).Cells*4)
+			if cntOff > 0 && cntOff+(nb+1)*4 <= scratchLen {
+				opt.cum = make([]uint32, nb+1)
+				for i := range opt.cum {
+					opt.cum[i] = readU32(buf, int(scratchPtr+cntOff)+4*i)
+				}
 			}
 		}
 	}
@@ -280,12 +211,9 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 // unexported, and a drive that could not see `ready` was how three tests came
 // to assert the walk against itself.
 const (
-	overlapHdrNumBlocksWord = 6  // byte 24
-	overlapHdrCntOffWord    = 9  // byte 36
-	overlapHdrStrideWord    = 4  // byte 16
+	overlapHdrNumBlocksWord = 6 // byte 24
+	overlapHdrStrideWord    = config.SetOverlapHdrStrideOff / 4
 	overlapHdrFloorWord     = 5  // byte 20
-	overlapHdrCkptOffWord   = 8  // byte 32
-	overlapHdrBlockOffWord  = 0  // byte 0
 	overlapHdrRowBaseWord   = 10 // byte 40
 )
 
@@ -316,6 +244,11 @@ func TestOverlapCacheFindEngagesOnQuadraticDrives(t *testing.T) {
 				}
 				if len(withCache) == 0 {
 					t.Fatal("no matches at all: this shape cannot exercise the switch")
+				}
+				// Cache and walk agreeing is not agreeing with the contract: both
+				// could share a bug. Go is the third opinion.
+				if want := overlapSuffixOracle(t, shape.pats, shape.input, int(offset)); fmt.Sprint(canonCache(withCache)) != fmt.Sprint(want) {
+					t.Fatalf("the cache disagrees with Go: %d tuples vs %d", len(withCache), len(want))
 				}
 				assertAscending(t, withCache)
 			})
@@ -364,19 +297,75 @@ func TestOverlapCacheFindHonoursTheTransactionalRule(t *testing.T) {
 	}
 }
 
-// TestOverlapCacheFindFallsBackWhenScratchTooSmall pins the rule that makes
-// the cache safe to offer at all: too little scratch is a SLOWER answer, never
-// a wrong or partial one. Driven on a quadratic shape, because a cheap one
-// would never ask for the sweep and the refusal would go untested.
-func TestOverlapCacheFindFallsBackWhenScratchTooSmall(t *testing.T) {
-	shape := quadraticShapes()[0]
-	outCap := int32(len(shape.pats))
-	full := cacheFindScratchLen(shape.input, shape.pats)
-	want := canonCache(driveCacheFind(t, shape.pats, shape.input, 0, outCap, false, full, engageAny))
-	// 32 bytes holds the header and at most one tuple: the sweep must refuse
-	// and the drive must still be complete and correct.
-	got := canonCache(driveCacheFind(t, shape.pats, shape.input, 0, outCap, true, 32, engageNever))
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("undersized scratch changed the answer: %d tuples vs %d", len(got), len(want))
+// An armed drive asked for a position PAST the end answers 0 — "nothing found"
+// — whatever the position, not only len+1.
+//
+// The pass's past-the-end arm stored `floor = from` unclamped while serving
+// validates `floor <= len + 1`, so from = len+2 swept, published ready = 1, and
+// the same call then reported its own header as malformed.
+func TestOverlapCacheArmedPastTheEnd(t *testing.T) {
+	pats := []string{`a*`, `b+`}
+	input := "aaab"
+	full, stride := overlapCacheFor(input, pats)
+	for _, from := range []int32{int32(len(input)) + 1, int32(len(input)) + 2,
+		int32(len(input)) + 100, 0x7FFFFFF0} {
+		opt := &cacheDriveOpt{stride: &stride, preArmWork: true}
+		got := driveCacheFindOpt(t, pats, input, from, int32(len(pats)), true, full, engageAlways, opt)
+		if len(got) != 0 || opt.lastResult != 0 {
+			t.Errorf("from=%d: %d tuples, last return %d; want none and 0",
+				from, len(got), opt.lastResult)
+		}
 	}
+}
+
+// overlapSuffixOracle is overlapCacheOracle for inputs past a thousand bytes,
+// from position `from` on. The whole-input probe cannot reach them: Go's regexp
+// refuses a repeat count over 1000, and `\A(?s:.{start})` needs one per start.
+// An anchored match on the suffix is the same answer ONLY for a pattern that
+// never looks LEFT of where it starts — right context such as `$` still sees the
+// real end — so a pattern with a line or text start, or a word boundary, is
+// refused rather than answered wrongly.
+func overlapSuffixOracle(t *testing.T, pats []string, input string, from int) [][3]int {
+	t.Helper()
+	var res []*regexp.Regexp
+	for _, p := range pats {
+		if looksLeft(t, p) {
+			t.Fatalf("pattern %q has left context; a suffix match cannot stand in for it", p)
+		}
+		res = append(res, regexp.MustCompile(`^(?:`+p+`)`))
+	}
+	var out [][3]int
+	for start := from; start <= len(input); start++ {
+		for k, re := range res {
+			if loc := re.FindStringIndex(input[start:]); loc != nil {
+				out = append(out, [3]int{k, start, start + loc[1]})
+			}
+		}
+	}
+	return canonCache(out)
+}
+
+// looksLeft reports whether a pattern can assert anything about the bytes BEFORE
+// its start: a line or text start, or a word boundary. It walks the parse tree,
+// because a `^` inside a negated class is not an anchor.
+func looksLeft(t *testing.T, pat string) bool {
+	t.Helper()
+	re, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		t.Fatalf("parse %q: %v", pat, err)
+	}
+	var walk func(*syntax.Regexp) bool
+	walk = func(r *syntax.Regexp) bool {
+		switch r.Op {
+		case syntax.OpBeginLine, syntax.OpBeginText, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+			return true
+		}
+		for _, sub := range r.Sub {
+			if walk(sub) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(re)
 }

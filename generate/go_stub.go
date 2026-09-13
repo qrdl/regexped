@@ -32,7 +32,8 @@ func goStub(cfg config.BuildConfig, out string) error {
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
-	setBody, setNeedsIter := genGoSetBody(cfg)
+	shapes := newSetShapes(cfg)
+	setBody, setNeedsIter := genGoSetBody(cfg, shapes)
 	if singleBody == "" && setBody == "" {
 		return nil
 	}
@@ -45,13 +46,7 @@ func goStub(cfg config.BuildConfig, out string) error {
 	// `math` is needed only by an overlapping set's cache sizing (the square
 	// root), so it is imported only when one is emitted — an unused import is a
 	// compile error in Go, which makes this conditional rather than cosmetic.
-	needsMath := false
-	for _, st := range cfg.Sets {
-		if overlapCacheShapeFor(st, cfg).Eligible {
-			needsMath = true
-			break
-		}
-	}
+	needsMath := shapes.anyWantsCache()
 	imports := []string{"errors"}
 	if needsIter {
 		imports = append(imports, "iter")
@@ -81,7 +76,7 @@ func goStub(cfg config.BuildConfig, out string) error {
 // genGoSetBody generates Go set wrappers (body only, no file header or imports).
 // Returns (body string, needsIter bool).
 // Uses unified SetMatch for all match ops; SetAnchorMatch is removed.
-func genGoSetBody(cfg config.BuildConfig) (string, bool) {
+func genGoSetBody(cfg config.BuildConfig, shapes *setShapes) (string, bool) {
 	if !hasSetExports(cfg) {
 		return "", false
 	}
@@ -94,12 +89,12 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		"// nothing here needs a -1. PatternID stays signed because it is an id, not\n"+
 		"// an offset.\ntype SetMatch struct {\n\tPatternID  int\n\tStart, End uint\n}\n\n")
 	needsIter := false
-	for _, s := range cfg.Sets {
+	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := pascalSet(s.Name) + "PatternCount"
 		idN := idSpaceSize(s, cfg)
 		idKonst := pascalSet(s.Name) + "IDSpace"
-		wide := wideAllForm(s, cfg)
+		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
 		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
@@ -109,12 +104,9 @@ func genGoSetBody(cfg config.BuildConfig) (string, bool) {
 		}
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
 		// the Go spelling of each is decided here (R12).
-		setCaps := setCapabilities(s, cfg)
+		setCaps := setCapabilities(s, cfg, wide)
 		sig := func(kind string) string {
-			capability := capByKind(setCaps, kind)
-			if capability == nil {
-				panic("generate: Go stub asked for the signature of an undeclared capability " + kind)
-			}
+			capability := mustCapByKind(setCaps, kind, "Go")
 			return "(" + capability.render(goABIParam, ", ") + ") " + goABIRet(capability.Ret)
 		}
 
@@ -278,8 +270,9 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			// shape the Rust and AS iterators already have.
 			gateDecl := "\t\tif iter.gates == nil {\n\t\t\titer.gates = make([]uint32, " + idKonst + ")\n\t\t}\n"
 			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
-			// pointer: magic, gate pointer, cache (declined — only the batching
-			// entry reads one, and this stub does not expose it).
+			// pointer: magic, gate pointer, and the answer cache — the region
+			// reserved below for a cache-eligible overlapping set, zero
+			// otherwise.
 			//
 			// Rebuilt before EACH call: field 1 is the address of a slice the
 			// garbage collector is free to move, so a descriptor written once
@@ -287,7 +280,8 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			gateDecl += "\t\titer.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) + "\n" +
 				"\t\titer.scratch[1] = uint32(uintptr(unsafe.Pointer(&iter.gates[0])))\n"
 			cacheField := ""
-			if sh := overlapCacheShapeFor(s, cfg); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, allocated ONCE for the scan.
 				// Without one an overlapping drive is quadratic, and `find`
 				// reads a cache exactly as the batching entry does.
@@ -316,7 +310,7 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			nb := (m + k - 1) / k
 			if n := %[3]d + nb*cell + 4 + k*row; n <= %[4]d {
 				iter.cache = make([]uint32, (n+3)/4)
-				iter.cache[4] = uint32(k)
+				iter.cache[%[7]d] = uint32(k)
 			} else {
 				iter.cache = []uint32{}
 			}
@@ -327,8 +321,8 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			iter.scratch[2] = uint32(uintptr(unsafe.Pointer(&iter.cache[0])))
 			iter.scratch[3] = uint32(len(iter.cache) * 4)
 		}
-`, sh.Cells, sh.Patterns, config.SetOverlapCheckpointHeaderBytes, config.SetOverlapCacheMaxBytes,
-					overlapCacheConstsFor(sh).Row, overlapCacheConstsFor(sh).Cell)
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
 			} else {
 				gateDecl += "\t\titer.scratch[2], iter.scratch[3] = 0, 0\n"
 			}
@@ -414,6 +408,13 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 				iter.done = true
 				return
 			}
+			// And -6: the offset went below where the answer cache was built,
+			// a scan that went backwards.
+			if tupleCount == %[12]d {
+				iter.err = ErrOutOfOrder
+				iter.done = true
+				return
+			}
 			if tupleCount <= 0 {
 				iter.done = true
 				return
@@ -424,7 +425,7 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 }
 
 `, pub, gateDoc, "", konst, gateDecl, s.Find, gateArg, konst, btOverflow, cacheField,
-				malformedCache)
+				malformedCache, outOfOrder)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -442,7 +443,7 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 
 // genGoSetSection is kept for backward compatibility with tests.
 func genGoSetSection(cfg config.BuildConfig, _ string) string {
-	body, needsIter := genGoSetBody(cfg)
+	body, needsIter := genGoSetBody(cfg, newSetShapes(cfg))
 	if body == "" {
 		return ""
 	}
@@ -882,6 +883,7 @@ func goErrorPreamble(cfg config.BuildConfig, needsSpan bool) string {
 	var sb strings.Builder
 	errName := namespaced(cfg, "ErrBacktrackOverflow")
 	cacheErrName := namespaced(cfg, "ErrMalformedCache")
+	orderErrName := namespaced(cfg, "ErrOutOfOrder")
 	fmt.Fprintf(&sb, `// %s means the Backtracking engine exhausted its frame
 // budget mid-search. The result is UNKNOWN — NOT "no match". Reporting it as
 // "no" would be a false negative that scales with input length and carries no
@@ -904,7 +906,18 @@ var %s = errors.New("regexped: the overlapping answer cache's header is " +
 	"malformed; the scan result is unknown, not finished — a generated iterator " +
 	"cannot produce this (see docs/sets.md)")
 
-`, errName, errName, cacheErrName, cacheErrName)
+// %s means an overlapping set's find was asked for an offset BELOW where
+// its answer cache was built: the scan went backwards, and its result is
+// UNKNOWN. Offsets must never go backwards within one scan; the generated
+// iterator never does. Detection is best effort — only an engaged cache can see
+// it — so its absence is not a guarantee.
+//
+// Test for it with errors.Is.
+var %s = errors.New("regexped: the scan offset went backwards within one scan; " +
+	"the scan result is unknown. Offsets must never go backwards within a scan, " +
+	"and this is detected only on a best-effort basis (see docs/sets.md)")
+
+`, errName, errName, cacheErrName, cacheErrName, orderErrName, orderErrName)
 	if needsSpan {
 		fmt.Fprintf(&sb, `// %s is one capture group's extent, in absolute byte offsets.
 //

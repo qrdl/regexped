@@ -51,29 +51,13 @@ func newAllocHarness(t *testing.T) *allocHarness {
 	if err != nil {
 		t.Fatalf("compile component core: %v", err)
 	}
-	engine, _ := sharedEngine()
-	mod, err := wasmtime.NewModule(engine, core)
-	if err != nil {
-		t.Fatalf("module: %v", err)
-	}
-	store := wasmtime.NewStore(engine)
-	// The shared engine runs with epoch interruption on (wasmrun.go), so a store
-	// with no deadline is interrupted immediately. These calls are allocator
-	// calls, not pattern drives: there is nothing to time out, so the deadline
-	// is set far out rather than armed per call.
-	store.SetEpochDeadline(1 << 40)
-	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	h := &allocHarness{t: t, store: store}
+	store, inst, mem := instantiateCore(t, core)
+	h := &allocHarness{t: t, store: store, mem: mem}
 	h.alloc = inst.GetFunc(store, "cabi_realloc")
 	h.post = inst.GetFunc(store, "cabi_post_token-find")
-	memExp := inst.GetExport(store, "memory")
-	if h.alloc == nil || h.post == nil || memExp == nil || memExp.Memory() == nil {
-		t.Fatalf("core module is missing cabi_realloc, the post-return or memory")
+	if h.alloc == nil || h.post == nil {
+		t.Fatalf("core module is missing cabi_realloc or the post-return")
 	}
-	h.mem = memExp.Memory()
 	return h
 }
 
@@ -227,5 +211,28 @@ func TestComponentAllocSurvivesMixedSizes(t *testing.T) {
 			}
 		}
 		h.freeAll()
+	}
+}
+
+// TestCabiReallocTrapsOnHugeSizes: a size the size classes cannot represent
+// must TRAP. The class was 32 - clz(new_size + 7) with no upper bound, so near
+// 2 GiB it named a class whose carve wrapped, and 0xFFFFFFF0 / 0xFFFFFFFF
+// wrapped the + 7 itself: each returned a pointer — one of them inside the DFA
+// table — and the next carve overlapped live data. Only a host lowering a list
+// of 2 GiB or more reaches it, and that copy traps anyway, but the allocator's
+// state was corrupted before it did.
+func TestCabiReallocTrapsOnHugeSizes(t *testing.T) {
+	for _, size := range []uint32{0x7FFFFFF9, 0x7FFFFFFF, 0xFFFFFFF0, 0xFFFFFFFF} {
+		// A fresh instance each time: a trap may leave the last one unusable.
+		h := newAllocHarness(t)
+		if r, err := h.alloc.Call(h.store, int32(0), int32(0), int32(8), int32(size)); err == nil {
+			t.Errorf("cabi_realloc(size=0x%X) returned %v; want a trap", size, r)
+		}
+	}
+	// The boundary itself still allocates: the largest request whose block fits
+	// the top class.
+	h := newAllocHarness(t)
+	if _, err := h.alloc.Call(h.store, int32(0), int32(0), int32(8), int32(0x7FFFFFF0-8)); err != nil {
+		t.Errorf("cabi_realloc(size=0x%X), the largest size the classes hold, trapped: %v", 0x7FFFFFF0-8, err)
 	}
 }

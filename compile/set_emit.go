@@ -25,7 +25,7 @@ type compiledSet struct {
 	scanAny  string // non-anchored, pattern id or -1
 	scanAll  string // non-anchored, bitmask / bitmap of ids
 	find     string // non-anchored, tuples at the next matching position
-	// batchFind is `hints: [batch-find]` on the set (decision (11)). It adds
+	// batchFind is `hints: [batch-find]` on the set. It adds
 	// the batching multi-position export ALONGSIDE `find` — it is no longer a
 	// capability of its own, so it cannot be declared without `find`.
 	batchFind bool
@@ -38,7 +38,7 @@ type compiledSet struct {
 	// `find` body. Set and cleared around one emitSetMatchFnFinal call by
 	// emitSetWorkerBody; never read outside emission.
 	//
-	// Under decision (11a) the worker is what BOTH the exported `find` and the
+	// The worker is what BOTH the exported `find` and the
 	// batch loop call, so a batching set carries ONE set of bucket code rather
 	// than two. The gate rule that used to be chosen here at compile time is
 	// now a runtime parameter — see setFindCtx.pBatchMode.
@@ -149,8 +149,8 @@ type compiledSet struct {
 	// WHOLE scan, so `error` and `warning` crawl because `[0-9]{16}` is in the
 	// same set. Measured ~102 fuel/byte against 27 for a union walk.
 	//
-	// The split refuses to interleave them: phase 1 runs the literal frontend
-	// with its skip intact over the literal buckets alone, phase 2 walks the
+	// The split refuses to interleave them: the frontend pass runs the literal
+	// frontend with its skip intact over the literal buckets alone, the union pass walks the
 	// fallback patterns in one pass. Nil when the set is not mixed, when the
 	// fallback subset cannot be determinised (word boundaries, (?m) anchors,
 	// ids >= 64, state budget), or when no capability wants it.
@@ -408,7 +408,7 @@ const numSetTypesBase = 11
 //
 // Two independent reasons put a wrapper there, and they compose:
 //
-//   - batching, since decision (11a): both entries drive ONE per-position
+//   - batching: both entries drive ONE per-position
 //     worker, so the module carries one set of bucket code rather than two.
 //   - the overlapping answer cache: `find` has to read the cache header, test
 //     the trigger, possibly sweep and serve — all BEFORE the walk — and then
@@ -440,8 +440,8 @@ func (cs *compiledSet) hiddenFnCount() int {
 	if cs.findWrapped() {
 		n++
 	}
-	// Two per split capability: phase 1 (the frontend over the literal
-	// buckets) and phase 2 (the union walk over the fallback patterns).
+	// Two per split capability: the frontend pass over the literal buckets and
+	// the union pass over the fallback patterns.
 	n += 2 * len(cs.twoPhaseCaps())
 	if cs.usesOverlapDP() {
 		// TWO now: the checkpoint pass and the block materialiser. The
@@ -516,7 +516,7 @@ type SetSpec struct {
 	ScanAny  string
 	ScanAll  string
 	Find     string
-	// BatchFind is `hints: [batch-find]` on the set (decision (11)): emit the
+	// BatchFind is `hints: [batch-find]` on the set: emit the
 	// Multi-position batch entry alongside Find, both driven by one shared
 	// per-position worker. Meaningless without Find, and rejected at config
 	// load in that case.
@@ -1512,7 +1512,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the block above cannot serve: a literal frontend plus at least one
 	// fallback bucket, where today the fallback's every-position obligation
 	// costs the whole set its skip. The automaton covers the FALLBACK
-	// patterns only; phase 1 is the frontend over the literal buckets.
+	// patterns only; the frontend pass covers the literal buckets.
 	//
 	// `scan` is not consulted: it is a retired key.
 	//
@@ -1521,7 +1521,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// has no out_ptr parameter at all — it implements the NARROW `_all` ABI
 	// only — while a BT member forces every `_all` capability into the memory
 	// form, so emitTwoPhaseScanBody would be composing two phases of different
-	// shapes. Skipping the split costs those sets phase 1's skip and nothing
+	// shapes. Skipping the split costs those sets the frontend pass's skip and nothing
 	// else: the ordinary bucketed path serves every pattern, BT buckets
 	// included. A set that pays for Backtracking is already the slow case.
 	if fe != frontendScalar && (spec.ScanAny != "" || spec.ScanAll != "") &&
@@ -1529,7 +1529,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		!hasBTBucketIn(buckets) {
 		p2Base := ra.Reserve("phase2-union", 8) // 8-aligned, see anchoredTableBase
 		sub := fallbackSubSpec(spec, buckets)
-		// No accept rows on request: phase 2 serves the scan pair only, and
+		// No accept rows on request: the union pass serves the scan pair only, and
 		// `find` — the preflight's capability — is excluded from the split.
 		cs.phase2Union = buildUnionScanDFA(sub, p2Base, false)
 		if cs.phase2Union != nil && cs.phase2Union.tableEnd > p2Base {
@@ -1640,7 +1640,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 	if spec.BatchFind {
-		// Not a capability any more (decision (11)), but the module does emit
+		// Not a capability any more, but the module does emit
 		// an extra entry for it, so --diag-json must still say so.
 		diag.Capabilities = append(diag.Capabilities, "find+batch-find")
 	}
@@ -1695,12 +1695,11 @@ func CompileFileOpts(cfg config.BuildConfig, output string, over CompileSetOptio
 func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[string]string,
 	setNames map[string]ComponentSetNames, rep *Reporter,
 ) ([]byte, int64, error) {
-	w, top, _, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, asmOpts{
-		Component:        true,
-		ComponentPackage: pkg,
-		ExportNames:      exportNames,
-		SetNames:         setNames,
-	})
+	w, top, _, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, CompileOptions{
+		Component:            true,
+		ComponentPackage:     pkg,
+		ComponentExportNames: exportNames,
+	}.asmOpts(setNames))
 	return w, top, err
 }
 
@@ -2525,7 +2524,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		// The split's hidden bodies, in twoPhaseCaps order so they line up
 		// with twoPhaseFnOffset. Phase 1 is the ordinary frontend emitter
-		// run against the phase-1 VIEW of the set; phase 2 is the union walk
+		// run against the frontend VIEW of the set; the union pass is the union walk
 		// over the fallback patterns.
 		for _, kind := range cs.twoPhaseCaps() {
 			cs.phase1Only = true
@@ -2678,7 +2677,7 @@ func emittedFrontend(cs *compiledSet) frontendKind {
 // every position for a fallback bucket.
 //
 // It answers for the VIEW being emitted, not for the set: under phase1Only the
-// fallback buckets belong to phase 2 and are not this body's problem, so the
+// fallback buckets belong to the union pass and are not this body's problem, so the
 // prefilters that a fallback bucket would otherwise disable stay on. That is
 // the entire mechanism of the two-phase split — the skip is not made safe, the
 // work that made it unsafe is moved to a pass of its own.
@@ -3078,7 +3077,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 
 	// Fallback buckets first: they have no literal gate, so they must be
 	// evaluated at every position. Skipped entirely under phase1Only, where
-	// they are phase 2's pass instead.
+	// they are the union pass's job instead.
 	if !cs.phase1Only {
 		for bi, bkt := range cs.buckets {
 			if !bkt.isFallback {
@@ -3446,7 +3445,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, st.Depth("batch_done")) // lPos > pInLen
 	b = c.emitDrainCheck(b, lPos, 0x01)
 
-	// Fallback buckets at every position — phase 2's job under phase1Only.
+	// Fallback buckets at every position — the union pass's job under phase1Only.
 	if !cs.phase1Only {
 		for bi, bkt := range cs.buckets {
 			if !bkt.isFallback {
@@ -4576,8 +4575,9 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 // would, for callers that need to LOOK at the result rather than emit it.
 //
 // Standalone placement (TableBase 0, memory 0) because nothing here reads a
-// table address; the automaton is identical either way.
-func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig) (*compiledSet, error) {
+// table address; the automaton is identical either way. `over` carries the same
+// overrides CompileFileOpts takes, and is the zero value on every real build.
+func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over CompileSetOptions) (*compiledSet, error) {
 	nameIdx := make(map[string]int, len(cfg.Regexps))
 	for i, re := range cfg.Regexps {
 		if re.Name != "" {
@@ -4603,6 +4603,6 @@ func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig) (*comp
 	if err != nil {
 		return nil, err
 	}
-	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, &moduleGlobals{})
+	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, &moduleGlobals{})
 	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
 }

@@ -86,7 +86,7 @@ Expected output (abbreviated, identical either way):
 exports its own memory and
 
 ```
-scan_secrets(ptr, len, from, gate_ptr, out_ptr, out_cap) → total
+scan_secrets(ptr, len, from, scratch_ptr, out_ptr, out_cap) → total
 ```
 
 Everything that signature needs is the CALLER's, so the host does all of it
@@ -100,7 +100,11 @@ Everything that signature needs is the CALLER's, so the host does all of it
 4. **Zeroes the gate array**, `<SET>_ID_SPACE` u32s. Its contents are opaque;
    zeroing is the only operation a caller ever performs on it, and it is what
    makes a scan resumable at any position.
-5. Calls in a loop, reading `(pattern_id, start, end)` tuples — 12 bytes each —
+5. Writes the **scratch descriptor** — four u32s: a magic word, the gate array's
+   address, and the answer cache's pointer and length (0 and 0 here, since this
+   set is not overlapping) — and passes its address where a bare gate pointer
+   used to go.
+6. Calls in a loop, reading `(pattern_id, start, end)` tuples — 12 bytes each —
    out of the output buffer and resuming one past the reported position, until
    a call returns 0.
 

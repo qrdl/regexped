@@ -44,13 +44,14 @@ func exportMap(t *testing.T, tool string, wasm []byte) map[string]string {
 // artifacts is generate.ComponentArtifacts, wrapped for tests.
 func artifacts(t *testing.T, cfg config.BuildConfig) (string, map[string]string, string, error) {
 	t.Helper()
-	return generate.ComponentArtifacts(cfg)
+	text, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
+	return text, names, prefix, err
 }
 
 // realCore builds a core module WITH the component adapters.
 func realCore(t *testing.T, cfg config.BuildConfig) ([]byte, string) {
 	t.Helper()
-	witText, names, prefix, err := generate.ComponentArtifacts(cfg)
+	witText, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

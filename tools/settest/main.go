@@ -536,7 +536,7 @@ func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int) (memPlan,
 	}
 	inBase := (top + pageSize - 1) / pageSize * pageSize
 	outBase := inBase + int64(maxInputLen) + 4096
-	gate := outBase + int64(patternCount)*12 + 64
+	gate := outBase + int64(patternCount)*abi.SetMatchTupleBytes + 64
 	scratch := gate + int64(idSpace)*4 + 64
 	bitmap := scratch + abi.FindScratchBytes + 64
 	need := bitmap + int64((idSpace+7)/8) + 64

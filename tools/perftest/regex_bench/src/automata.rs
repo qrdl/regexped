@@ -280,10 +280,14 @@ pub extern "C" fn ra_find_gated(len: i32, from: i32) -> i32 {
 ///
 /// The fuel target for capFindOverlapping, on the same terms as ra_find_gated:
 /// one whole-input operation, no timing loop.
+///
+/// PAGED for --verify: when RA_OUT_BUF fills, the call returns only COMPLETE
+/// positions and records the first incomplete one in RA_OVERLAP_RESUME.
 #[no_mangle]
 pub extern "C" fn ra_find_overlapping(len: i32, from: i32) -> i32 {
     let st = state();
     let h = haystack(len);
+    unsafe { RA_OVERLAP_RESUME = -1 };
     if from as usize > h.len() {
         return 0;
     }
@@ -294,6 +298,17 @@ pub extern "C" fn ra_find_overlapping(len: i32, from: i32) -> i32 {
             let input = Input::new(h).span(start..h.len()).anchored(Anchored::Yes);
             if let Some(m) = re.find(input) {
                 if n * 3 + 2 >= out.len() {
+                    // The buffer is full in the middle of `start`. Every tuple
+                    // written for it carries it as its start — the searches are
+                    // anchored there — so drop those and end the page on a
+                    // whole position, which is what lets the caller resume at
+                    // `start` without losing its remaining patterns. Found by
+                    // walking back rather than tracked per start, so a call that
+                    // never fills pays nothing for it.
+                    while n > 0 && out[(n - 1) * 3 + 1] == start as i32 {
+                        n -= 1;
+                    }
+                    unsafe { RA_OVERLAP_RESUME = start as i32 };
                     return n as i32;
                 }
                 out[n * 3] = k as i32;
@@ -304,6 +319,17 @@ pub extern "C" fn ra_find_overlapping(len: i32, from: i32) -> i32 {
         }
     }
     n as i32
+}
+
+/// Where the last ra_find_overlapping call stopped: the start position whose
+/// tuples did not fit, or -1 when it reached the end of the input. A page ends
+/// on a whole position, so calling again with `from` set to this value
+/// continues the enumeration exactly.
+static mut RA_OVERLAP_RESUME: i32 = -1;
+
+#[no_mangle]
+pub extern "C" fn ra_overlap_resume() -> i32 {
+    unsafe { RA_OVERLAP_RESUME }
 }
 
 /// find, LAZILY: the single leftmost match at or after `from`, packed as

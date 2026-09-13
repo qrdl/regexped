@@ -19,8 +19,14 @@ all: run
 # Step 1 – compile the patterns into a component, plus the sibling .wit.
 # $(REGEXPED) is a prerequisite because the component depends on the COMPILER as
 # much as on the config.
-$(COMPONENT) $(WIT): regexped.yaml $(REGEXPED)
+#
+# Both come from ONE compile, so they hang off a stamp: a rule naming two targets
+# runs its recipe once per target, and twice at once under -j.
+.component.stamp: regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
+	@touch $@
+
+$(COMPONENT) $(WIT): .component.stamp ;
 
 compile: $(COMPONENT)
 
@@ -65,4 +71,4 @@ run: $(FINAL)
 
 clean:
 	cargo clean
-	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL)
+	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL) .component.stamp

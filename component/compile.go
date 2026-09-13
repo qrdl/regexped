@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
@@ -17,8 +19,8 @@ import (
 // This package sits above both.
 //
 // The sequence: derive the WIT and the canonical export names from ONE source
-// (generate), compile a core module carrying the matching adapters, wrap it, and
-// write the .wit beside the binary. Deriving the names once is what keeps the
+// (generate), compile a core module carrying the matching adapters, write the
+// .wit, and wrap the module beside it. Deriving the names once is what keeps the
 // interface and the module from disagreeing about a single export.
 func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if !cfg.Component() {
@@ -35,19 +37,29 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "sets", len(cfg.Sets), "output", output, "format", "component")
 	rep.Render(report)
 
-	if err := Wrap(cfg, core, witText, output); err != nil {
-		return err
-	}
 	if output == "-" {
-		return nil
+		// The binary goes to stdout and there is nowhere beside it for the
+		// interface text, which a consumer cannot build without. Say so rather
+		// than lose it silently.
+		fmt.Fprintln(os.Stderr, "regexped: no sibling .wit written for `-`; run `regexped generate` with `stub_type: wit`")
+		return Wrap(cfg, core, witText, output)
 	}
 
 	// The WIT rides alongside the binary: jco, wit-bindgen and wasmtime's
 	// bindgen! all need the interface text, and a component does not hand it
-	// over in a form they take.
+	// over in a form they take. It is written FIRST: it is pure text from the
+	// config and cannot fail for a reason the component would not, so a .wit
+	// that cannot be written stops the build before a fresh .wasm lands beside
+	// a stale or missing interface file.
 	witPath := WitPathFor(output)
+	if err := os.MkdirAll(filepath.Dir(witPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(witPath), err)
+	}
 	if err := writeFile(witPath, []byte(witText), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", witPath, err)
+	}
+	if err := Wrap(cfg, core, witText, output); err != nil {
+		return err
 	}
 	info, err := statFile(output)
 	if err != nil {

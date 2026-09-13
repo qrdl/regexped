@@ -50,7 +50,7 @@ import (
 // ONE right-to-left sweep keeping only the CURRENT COLUMN answers every start
 // at once, in O(n * |Q|) time and O(|Q|) space, reading the SAME forward
 // transition and bitmask tables the ordinary body reads. The only tables it
-// adds are lever C's projection table and a one-byte-per-state successor
+// adds are the column's projection table and a one-byte-per-state successor
 // scratch; the automaton itself is the forward body's, which is the reason a
 // second implementation of the per-position semantics is defensible at all.
 //
@@ -202,9 +202,13 @@ func (cs *compiledSet) overlapDPBucket() int {
 	if bkt.btFallback != nil {
 		return -1
 	}
-	// The mask is i64, so more than 64 patterns cannot be expressed in it.
-	// The column bound below is stricter in practice.
-	if len(bkt.patterns) == 0 || len(bkt.patterns) > wideBitmapThreshold {
+	// A block row's MASK is an i32 — `1 << k` in the checkpoint bodies and in
+	// the batch serve — so a pattern k >= bucketMaskBits would vanish from
+	// every row, silently. The dense packer already caps a bucket at
+	// bucketMaskBits and a larger one goes sparse, refused above, so this cannot
+	// fire today; it is here so the invariant is enforced where the mask is
+	// written, not only in set.go.
+	if len(bkt.patterns) == 0 || len(bkt.patterns) > bucketMaskBits {
 		return -1
 	}
 	// Anchors and the word-boundary / newline channels change which START
@@ -250,7 +254,7 @@ func (cs *compiledSet) overlapSweepCostPerByte() int64 {
 //
 // Both entries computed it separately from the same bucket, which is how they
 // came to disagree about the sweep's cost per byte: one spelling said states x
-// patterns and the other the same thing again, and lever C had made both wrong.
+// patterns and the other the same thing again, and the projection had made both wrong.
 func (cs *compiledSet) overlapCacheGeometry() (numPat int, ids []int, rowBytes int32, costPerByte int64) {
 	costPerByte = 1
 	bi := cs.overlapDPBucket()
@@ -263,8 +267,8 @@ func (cs *compiledSet) overlapCacheGeometry() (numPat int, ids []int, rowBytes i
 	return numPat, ids, rowBytes, cs.overlapSweepCostPerByte()
 }
 
-// overlapCells is the sweep column's WIDTH in cells: one per projection under
-// lever C, one per (state, pattern) otherwise.
+// overlapCells is the sweep column's WIDTH in cells: one per projection class
+// when the column is projected, one per (state, pattern) otherwise.
 //
 // ONE definition, because the column sizing, the emitted projection table, the
 // two sweep bodies, the serving validator and every stub's region arithmetic
@@ -298,7 +302,7 @@ func (cs *compiledSet) overlapDPColumnBytes() int32 {
 	return int32(2 * dp.numWASM * len(cs.buckets[bi].patterns) * 4)
 }
 
-// overlapProjFor returns lever C's projection for a bucket, computing it once.
+// overlapProjFor returns the column projection for a bucket, computing it once.
 //
 // Cached on the compiledSet because three places need the SAME answer — the
 // column sizing, the emitted projection table and the sweep bodies — and a
@@ -455,9 +459,33 @@ type overlapCacheCtx struct {
 	// (the region is too small — walk, same answer) from a MALFORMED header
 	// (the caller got it wrong — report it).
 	lSweepRet byte
+	// lCumBase and lBlockBase are the ABSOLUTE addresses of cum[] and of the
+	// block buffer, derived from nb once per call by emitLayoutBases, so the
+	// per-block and per-row reads each start from a local.
+	lCumBase   byte
+	lBlockBase byte
 	// i64Ret marks the entry whose export returns an i64, which changes only
 	// how the error is packed.
 	i64Ret bool
+}
+
+// hdrLoadOp appends an i32.load of the cache header field at byte offset off;
+// the region's base must already be on the stack. hdrStoreOp is the matching
+// i32.store, with the base and the value on the stack.
+//
+// EVERY header access goes through these two, in both serving entries and the
+// checkpoint bodies. The memarg offset is a ULEB128: every slot is under 128
+// today, so a raw byte and the encoding agree — but a bare byte of 128 or more
+// is read as a continuation, which is exactly the bug that once shipped in the
+// row writer, and nothing should keep the shape that caused it.
+func hdrLoadOp(b []byte, off int) []byte {
+	b = append(b, 0x28, 0x02)
+	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
+}
+
+func hdrStoreOp(b []byte, off int) []byte {
+	b = append(b, 0x36, 0x02)
+	return utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a header offset
 }
 
 // emitWorkExceedsSweep pushes 1 when the walk has already spent more than the
@@ -465,13 +493,23 @@ type overlapCacheCtx struct {
 //
 // Computed in i64 because len * cost overflows i32 on a large input, which
 // would make the test wrap and fire at random.
+//
+// A SATURATED counter counts as over the line. work is an i32 that stops at
+// 0x7FFFFFFF while len * cost is not bounded by it: past about 3 MB on a
+// 353-cell column the threshold is out of the counter's reach, and the cache
+// was then offered, sized and reserved — and never engaged, leaving the drive
+// quadratic with nothing to tell it from a cheap one.
 func (c overlapCacheCtx) emitWorkExceedsSweep(b []byte) []byte {
-	b = append(b, 0x20, c.lWork, 0xAD) // (u64) work
+	b = append(b, 0x20, c.lWork)
+	b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // 0x7FFFFFFF
+	b = append(b, 0x46)                               // i32.eq -> saturated
+	b = append(b, 0x20, c.lWork, 0xAD)                // (u64) work
 	b = append(b, 0x20, c.pInLen, 0xAD)
 	b = append(b, 0x42)
 	b = utils.AppendSLEB128_64(b, c.costPerByte)
 	b = append(b, 0x7E) // i64.mul
 	b = append(b, 0x56) // i64.gt_u
+	b = append(b, 0x72) // i32.or: saturated, or over the threshold
 	return b
 }
 
@@ -489,10 +527,10 @@ func (c overlapCacheCtx) emitDefaults(b []byte) []byte {
 // where the cache pointer is known non-zero.
 func (c overlapCacheCtx) emitHeaderRead(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrReady)
+	b = hdrLoadOp(b, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrWork)
+	b = hdrLoadOp(b, ckptHdrWork)
 	b = append(b, 0x21, c.lWork)
 	return b
 }
@@ -570,52 +608,73 @@ func malformedCursor() int64 {
 // The pass validates what it is handed and then publishes a layout; nothing
 // re-checked that layout on the calls that followed, so a caller that zeroed or
 // rewrote the header mid-drive got a division by zero (a TRAP, not an answer)
-// or a block located outside the region. The fields are all derivable from nb
-// and the compile-time geometry, so the check is exact rather than a range
-// guess: anything that does not match what a pass would have written is -4.
+// or a block located outside the region. It checks what serving READS: a
+// stride of at least 1, the floor, nb exactly as a pass derives it from (len,
+// floor, stride), and a region large enough for the layout nb implies. The
+// layout itself is not stored — every reader derives it from nb — so there is no
+// offset to check, and nothing a pass could not have written gets past: -4.
 func (c overlapCacheCtx) emitValidateHeader(b []byte, tmp byte) []byte {
-	hdr := func(b []byte, off byte) []byte {
+	hdr := func(b []byte, off int) []byte {
 		b = append(b, 0x20, c.pCache)
-		return append(b, 0x28, 0x02, off)
+		return hdrLoadOp(b, off)
 	}
 	b = hdr(b, ckptHdrNumBlocks)
 	b = append(b, 0x21, tmp)
 
+	// The stride and numBlocks are tested FIRST, on their own: the block count
+	// below divides by the stride, and a chain of i32.or evaluates every
+	// operand whatever the earlier ones said.
 	b = hdr(b, ckptHdrStride)
 	b = append(b, 0x41, 0x01, 0x48) // stride < 1
 	b = append(b, 0x20, tmp, 0x41, 0x01, 0x48)
-	b = append(b, 0x72) // or numBlocks < 1
-
-	b = hdr(b, ckptHdrCkptOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
-	b = append(b, 0x47) // ckptOff != 48
-	b = append(b, 0x72)
-
-	b = hdr(b, ckptHdrCntOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
-	b = append(b, 0x20, tmp, 0x41)
-	b = utils.AppendSLEB128(b, c.cellBytes)
-	b = append(b, 0x6C, 0x6A)
-	b = append(b, 0x47) // cntOff != 48 + nb*cellBytes
-	b = append(b, 0x72)
-
-	b = hdr(b, ckptHdrBlockOff)
-	b = hdr(b, ckptHdrCntOff)
-	b = append(b, 0x20, tmp, 0x41, 0x01, 0x6A, 0x41, 0x04, 0x6C, 0x6A)
-	b = append(b, 0x47) // blockOff != cntOff + (nb+1)*4
-	b = append(b, 0x72)
+	b = append(b, 0x72)       // or numBlocks < 1
+	b = append(b, 0x04, 0x40) // if
+	b = c.emitMalformedNow(b, c.i64Ret)
+	b = append(b, 0x0B)
 
 	b = hdr(b, ckptHdrFloor)
 	b = append(b, 0x20, c.pInLen, 0x41, 0x01, 0x6A)
 	b = append(b, 0x4A) // floor > len+1
+
+	// numBlocks must be the count a pass would have derived from (len, floor,
+	// stride). Every reader derives the layout FROM numBlocks, so an inflated
+	// count moves the whole layout with it and nothing else here would notice —
+	// serving would locate a block past the real last one, whose rebuild wrote
+	// a row BELOW the block buffer. In i64 with the floor sign-extended, so a
+	// negative floor cannot wrap the span into agreement.
+	b = hdr(b, ckptHdrFloor)
+	b = append(b, 0x20, c.pInLen)
+	b = append(b, 0x4A)       // floor > len: the past-the-end layout
+	b = append(b, 0x04, 0x7E) // if (result i64)
+	b = append(b, 0x42, 0x01) // is one block
+	b = append(b, 0x05)       // else
+	b = emitBlockCount(b, true,
+		func(b []byte) []byte { // m = len - floor + 1
+			b = append(b, 0x20, c.pInLen, 0xAC) // i64.extend_i32_s
+			b = hdr(b, ckptHdrFloor)
+			b = append(b, 0xAC)
+			b = append(b, 0x7D)       // i64.sub
+			b = append(b, 0x42, 0x01) // + 1
+			return append(b, 0x7C)
+		},
+		func(b []byte) []byte {
+			b = hdr(b, ckptHdrStride)
+			return append(b, 0xAD) // i64.extend_i32_u: >= 1, tested above
+		})
+	b = append(b, 0x0B)
+	b = append(b, 0x20, tmp, 0xAD)
+	b = append(b, 0x52) // i64.ne -> numBlocks is not the pass's
 	b = append(b, 0x72)
 
 	// The region still has to hold what the header describes, in i64 for the
 	// reason the pass computes its layout that way.
-	b = hdr(b, ckptHdrBlockOff)
-	b = append(b, 0xAD)
+	// blockOff = 48 + nb*cellBytes + (nb+1)*4 = 52 + nb*(cellBytes+4), derived
+	// as every reader derives it.
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes)+4)
+	b = append(b, 0x20, tmp, 0xAD, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(c.cellBytes)+4)
+	b = append(b, 0x7E, 0x7C) // i64.mul, i64.add
 	b = hdr(b, ckptHdrStride)
 	b = append(b, 0xAD)
 	b = append(b, 0x42)
@@ -631,11 +690,49 @@ func (c overlapCacheCtx) emitValidateHeader(b []byte, tmp byte) []byte {
 	return b
 }
 
+// emitOutOfOrderCheck reports a position BELOW the floor of the engaged cache
+// as abi.OverlapCacheOutOfOrder — `find`'s -6, or the batch entry's reserved
+// position word — instead of serving it from the floor, which silently dropped
+// every match in [pos, floor).
+//
+// Valid only once the cache is live and its header validated, since it reads
+// the floor. Detection is BEST EFFORT: this is the one place a backwards
+// position is visible, so a drive that has not engaged, or offered no region,
+// is not checked at all. No legitimate drive reaches it: every sweep takes its
+// floor from the position the drive is at, and both entries only move forward
+// from there.
+func (c overlapCacheCtx) emitOutOfOrderCheck(b []byte, posLocal byte) []byte {
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x20, c.pCache)
+	b = hdrLoadOp(b, ckptHdrFloor)
+	b = append(b, 0x48)       // i32.lt_s -> below the floor
+	b = append(b, 0x04, 0x40) // if
+	if c.i64Ret {
+		// The batch entry's cursor cannot carry a negative, so the error is a
+		// reserved POSITION word with a zero count, as the other two are.
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, outOfOrderCursor())
+	} else {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheOutOfOrder))
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B)
+	return b
+}
+
+// outOfOrderCursor is the packed i64 the batch entry returns for a resume below
+// the floor: the reserved position word on top, a zero count below.
+func outOfOrderCursor() int64 {
+	var w uint64 = config.SetCursorOutOfOrderPos
+	return int64(w << 32) //nolint:gosec // a reserved bit pattern, not a count
+}
+
 // emitMarkRefused records that this drive must not ask again.
 func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
 	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x36, 0x02, ckptHdrReady)
+	b = hdrStoreOp(b, ckptHdrReady)
 	return b
 }
 
@@ -647,7 +744,7 @@ func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
 	b = append(b, 0x20, c.lWork)
-	b = append(b, 0x36, 0x02, ckptHdrWork)
+	b = hdrStoreOp(b, ckptHdrWork)
 	return b
 }
 
@@ -676,7 +773,7 @@ func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte) 
 	b = c.emitMarkRefused(b)
 	b = append(b, 0x0B) // end if the sweep did not deliver
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrReady)
+	b = hdrLoadOp(b, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
 	b = append(b, 0x0B) // end if not swept yet
 	return b
@@ -694,7 +791,7 @@ func (c overlapCacheCtx) emitAccumulateWork(b []byte, pOutPtr, idxLocal, countLo
 	b = append(b, 0x02, 0x40)                                         // block $sumDone
 	b = append(b, 0x03, 0x40)                                         // loop  $sum
 	b = append(b, 0x20, idxLocal, 0x20, countLocal, 0x4E, 0x0D, 0x01) // idx >= count
-	b = append(b, 0x20, pOutPtr, 0x20, idxLocal, 0x41, setMatchTupleBytes, 0x6C, 0x6A)
+	b = append(b, 0x20, pOutPtr, 0x20, idxLocal, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 	b = append(b, 0x22, tmpLocal)
 	b = append(b, 0x28, 0x02, 0x08) // tuple.end
 	b = append(b, 0x20, tmpLocal)
@@ -718,16 +815,16 @@ func (c overlapCacheCtx) emitAccumulateWork(b []byte, pOutPtr, idxLocal, countLo
 // emitLocateBlock computes which block a POSITION falls in and leaves it in
 // jLocal: `(pos - floor) / stride`, floored at 0.
 //
-// The floor is not decoration. A caller may resume BELOW the sweep's own start
-// — the walk delivered those positions before the trigger crossed — and block 0
-// is the first thing the cache could serve it.
+// The floor clamp is a GUARD, not a path. Both entries run emitOutOfOrderCheck
+// first, which reports a position below the floor as out of order — serving it
+// from block 0 was what silently dropped the matches below the floor.
 //
 // Shared, because the two entries located a block with the same arithmetic
 // written twice and one of them had already drifted into a different if-shape.
 func (c overlapCacheCtx) emitLocateBlock(b []byte, posLocal, jLocal, tmpLocal byte) []byte {
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrFloor)
+	b = hdrLoadOp(b, ckptHdrFloor)
 	b = append(b, 0x6B) // pos - floor
 	b = append(b, 0x22, tmpLocal)
 	b = append(b, 0x41, 0x00)
@@ -737,10 +834,47 @@ func (c overlapCacheCtx) emitLocateBlock(b []byte, posLocal, jLocal, tmpLocal by
 	b = append(b, 0x05)
 	b = append(b, 0x20, tmpLocal)
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrStride)
+	b = hdrLoadOp(b, ckptHdrStride)
 	b = append(b, 0x6E) // i32.div_u
 	b = append(b, 0x0B)
 	b = append(b, 0x21, jLocal)
+	return b
+}
+
+// emitBlockRowCount loads the materialised block's row base into rowBaseLocal
+// and leaves min(stride, len - rowBase + 1) in rowsLocal: the last block is
+// partial, and reading past it would read another region's bytes. strideLocal
+// is scratch, left holding the stride.
+//
+// This and emitRowAddr are the pieces of the two serving loops that were the
+// same instructions written twice. What stays per entry differs on purpose:
+// `find` clamps a row below the block with `<=` and has no skip, while the
+// batch entry must test `<` and reset its skip there, and the two leave their
+// loops for different reasons (one position answered, or a buffer full).
+func (c overlapCacheCtx) emitBlockRowCount(b []byte, rowBaseLocal, rowsLocal, strideLocal byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = hdrLoadOp(b, ckptHdrRowBase)
+	b = append(b, 0x21, rowBaseLocal)
+	b = append(b, 0x20, c.pInLen)
+	b = append(b, 0x20, rowBaseLocal)
+	b = append(b, 0x6B, 0x41, 0x01, 0x6A)
+	b = append(b, 0x21, rowsLocal)
+	b = append(b, 0x20, c.pCache)
+	b = hdrLoadOp(b, ckptHdrStride)
+	b = append(b, 0x21, strideLocal)
+	b = append(b, 0x20, rowsLocal, 0x20, strideLocal, 0x20, rowsLocal, 0x20, strideLocal)
+	b = append(b, 0x4C) // rows <= stride
+	b = append(b, 0x1B) // select -> min
+	b = append(b, 0x21, rowsLocal)
+	return b
+}
+
+// emitRowAddr pushes the address of row rowLocal of the materialised block.
+func (c overlapCacheCtx) emitRowAddr(b []byte, rowLocal byte) []byte {
+	b = append(b, 0x20, c.lBlockBase)
+	b = append(b, 0x20, rowLocal, 0x41)
+	b = utils.AppendSLEB128(b, c.rowBytes)
+	b = append(b, 0x6C, 0x6A)
 	return b
 }
 
@@ -787,7 +921,7 @@ func (c overlapCacheCtx) emitStoreTuple(b []byte, k, id int, dstLocal, srcLocal 
 // while sharing one header to say so.
 func (c overlapCacheCtx) emitEnsureBlock(b []byte, jLocal byte) []byte {
 	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrCurBlock)
+	b = hdrLoadOp(b, ckptHdrCurBlock)
 	b = append(b, 0x20, jLocal)
 	b = append(b, 0x41, 0x01, 0x6A) // j+1
 	b = append(b, 0x47)             // i32.ne
@@ -803,11 +937,30 @@ func (c overlapCacheCtx) emitEnsureBlock(b []byte, jLocal byte) []byte {
 	return b
 }
 
+// emitLayoutBases derives, from nb in nbLocal, the absolute addresses of cum[]
+// (into lCumBase) and of the block buffer (into lBlockBase). The header stores
+// no offsets: checkpoint 1 follows the header, cum[] follows nb columns, and the
+// block buffer follows nb+1 counts.
+//
+// Valid once the header is validated, which bounds nb and proves the region
+// holds this layout, so the i32 arithmetic cannot wrap.
+func (c overlapCacheCtx) emitLayoutBases(b []byte, nbLocal byte) []byte {
+	b = append(b, 0x20, c.pCache)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+	b = append(b, 0x6A)
+	b = append(b, 0x20, nbLocal, 0x41)
+	b = utils.AppendSLEB128(b, c.cellBytes)
+	b = append(b, 0x6C, 0x6A)       // + nb*cellBytes
+	b = append(b, 0x22, c.lCumBase) // local.tee
+	b = append(b, 0x20, nbLocal, 0x41, 0x01, 0x6A, 0x41, 0x04, 0x6C, 0x6A)
+	b = append(b, 0x21, c.lBlockBase) // + (nb+1)*4
+	return b
+}
+
 // emitBlockCum pushes cum[idxLocal] — the number of tuples in blocks below it.
 func (c overlapCacheCtx) emitBlockCum(b []byte, idxLocal byte) []byte {
-	b = append(b, 0x20, c.pCache)
-	b = append(b, 0x28, 0x02, ckptHdrCntOff)
-	b = append(b, 0x20, c.pCache, 0x6A)
+	b = append(b, 0x20, c.lCumBase)
 	b = append(b, 0x20, idxLocal)
 	b = append(b, 0x41, 0x04, 0x6C, 0x6A)
 	b = append(b, 0x28, 0x02, 0x00)

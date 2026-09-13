@@ -16,7 +16,8 @@ import (
 // function into the module or the stub baking in a constant that goes stale.
 //
 // WHY IT RETURNS CELLS AND NOT A STATE COUNT. `cells` is the column WIDTH —
-// states x patterns today, projected states under §19's lever C. Returning the
+// states x patterns, or fewer cells when the column is projected (see
+// set_overlap_proj.go). Returning the
 // width rather than its factors keeps every stub and both harnesses indifferent
 // to which of those the compiler is doing.
 type OverlapCacheShape struct {
@@ -37,6 +38,13 @@ type OverlapCacheShape struct {
 	// id space: a set whose members were dropped or packed elsewhere has fewer
 	// here, and sizing off the wrong one over-reserves or under-reserves.
 	Patterns int
+
+	// CostPerByte is what sweeping one input byte costs in the drive's work
+	// units. The engine engages the sweep once the walk's accumulated work
+	// passes inputLen × CostPerByte (strictly), or once the counter saturates,
+	// so a harness asking whether a drive SHOULD have engaged reads it here
+	// rather than re-deriving the engine's rule.
+	CostPerByte int64
 }
 
 // SetOverlapCacheShape compiles `sc` and reports what sizing its `find` needs.
@@ -49,7 +57,14 @@ type OverlapCacheShape struct {
 // So the options are built by setCompileOptions, the SAME helper CompileFile
 // uses, rather than assembled here.
 func SetOverlapCacheShape(sc config.SetConfig, cfg config.BuildConfig) (OverlapCacheShape, error) {
-	cs, err := compileSetForInspection(sc, cfg)
+	return SetOverlapCacheShapeOpts(sc, cfg, CompileSetOptions{})
+}
+
+// SetOverlapCacheShapeOpts is SetOverlapCacheShape for a module compiled through
+// CompileFileOpts with the same overrides. A harness that pins a frontend must
+// inspect under that pin too: the bucket a set packs into depends on it.
+func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over CompileSetOptions) (OverlapCacheShape, error) {
+	cs, err := compileSetForInspection(sc, cfg, over)
 	if err != nil {
 		return OverlapCacheShape{}, err
 	}
@@ -62,9 +77,10 @@ func SetOverlapCacheShape(sc config.SetConfig, cfg config.BuildConfig) (OverlapC
 	// (state, pattern); overlapCells is the one place that decides which, so a
 	// caller cannot size a region for a column the sweep does not have.
 	return OverlapCacheShape{
-		Eligible: true,
-		Cells:    cs.overlapCells(),
-		Patterns: len(bkt.patterns),
+		Eligible:    true,
+		Cells:       cs.overlapCells(),
+		Patterns:    len(bkt.patterns),
+		CostPerByte: cs.overlapSweepCostPerByte(),
 	}, nil
 }
 
@@ -80,7 +96,13 @@ func SetOverlapCacheShape(sc config.SetConfig, cfg config.BuildConfig) (OverlapC
 // A set with no sweep gets (header, 1): a nominal region the drive declines,
 // which keeps the descriptor's shape the same on every path.
 func SetOverlapCacheSizing(sc config.SetConfig, cfg config.BuildConfig, inputLen int) (bytes, stride int, err error) {
-	sh, err := SetOverlapCacheShape(sc, cfg)
+	return SetOverlapCacheSizingOpts(sc, cfg, inputLen, CompileSetOptions{})
+}
+
+// SetOverlapCacheSizingOpts is SetOverlapCacheSizing under CompileFileOpts'
+// overrides; see SetOverlapCacheShapeOpts.
+func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inputLen int, over CompileSetOptions) (bytes, stride int, err error) {
+	sh, err := SetOverlapCacheShapeOpts(sc, cfg, over)
 	if err != nil {
 		return 0, 0, err
 	}

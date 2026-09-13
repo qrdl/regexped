@@ -20,7 +20,7 @@ import (
 // here, because WIT identifiers cannot carry an underscore).
 //
 // `find` is the exception, and not by choice: it is a RESOURCE, because the
-// drive it feeds needs state that outlives one call (§9.2). The resource takes
+// drive it feeds needs state that outlives one call. The resource takes
 // the configured name and its method is `next`, so `find: scan_secrets` becomes
 // `resource scan-secrets { constructor(...); next: ... }`.
 
@@ -132,14 +132,17 @@ func renderWitSets(sets []witSet) string {
 	// map the two enums onto one error type, so a consumer never sees the
 	// duplication.
 	b.WriteString("    /// The Backtracking engine exhausted its frame budget; the answer is unknown.\n")
-	// TWO cases, and the second is only reachable on a set.
+	// THREE cases, and the last two are only reachable on a set.
 	//
 	// `malformed-cache` is what an overlapping `find` answers when the answer
 	// cache it was handed contradicts itself. A component consumer cannot
 	// provoke it — the resource builds its own header — but the enum is the
 	// interface's error type and hiding a case the core module can return
 	// would leave the adapter with nothing to lift it into.
-	b.WriteString("    enum error-code { backtrack-overflow, malformed-cache }\n")
+	// `out-of-order` is a position below the floor of the engaged cache — a
+	// scan that went backwards. The resource only moves forward, so a consumer
+	// cannot provoke it either; it is here for the same reason.
+	b.WriteString("    enum error-code { backtrack-overflow, malformed-cache, out-of-order }\n")
 	b.WriteString("\n    /// One match: which pattern, and where.\n")
 	b.WriteString("    record set-match { id: u32, start: u32, end: u32 }\n")
 
@@ -158,8 +161,9 @@ func renderWitSets(sets []witSet) string {
     ///
     /// It is a resource rather than a function because the drive needs state
     /// between calls: the input, the position, and the per-pattern gates. The
-    /// input is copied in ONCE, by the constructor, which is what makes the
-    /// per-position cost a call rather than a call plus a copy of the input.
+    /// input crosses into the component ONCE, when the scanner is constructed,
+    /// which is what makes the per-position cost a call rather than a call plus
+    /// a copy of the input.
     resource %s {
         constructor(input: list<u8>, start: u32);
         next: func() -> result<list<set-match>, error-code>;

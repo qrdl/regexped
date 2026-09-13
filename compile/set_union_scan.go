@@ -261,7 +261,7 @@ const maxUnionScanIDs = 256
 //
 // Hence the threshold rather than always-on: a small automaton keeps the
 // faster uncompressed row, and only the tables big enough to matter pay the
-// extra load. Every mixed set measured has an 18-state phase 2 (4,608 bytes
+// extra load. Every mixed set measured has an 18-state union pass (4,608 bytes
 // under u8) and stays uncompressed; the 632-state ones are 323,584 bytes and
 // always compress.
 const unionTableBudget = 32 * 1024
@@ -1614,7 +1614,7 @@ func (cs *compiledSet) dataTop() int64 {
 // usesUnionScan reports whether capability kind is served by the one-pass
 // automaton rather than the per-position bucket walk.
 //
-// `scan_any` qualifies since decision (10) dropped its start: it needs no id
+// `scan_any` qualifies since it stopped reporting a start: it needs no id
 // space check of its own because buildUnionScanDFA already refuses any set with
 // an id >= 64. The wide `scan_all` ABI is excluded because it writes a
 // caller-provided bitmap.
@@ -1639,7 +1639,7 @@ func (cs *compiledSet) usesUnionScan(kind setCapKind) bool {
 		// i.e. a module that does not validate.
 		//
 		// The WIDE union body writes the caller's bitmap itself, so it serves
-		// the memory ABI directly (item 21 phase 1). Its rows are emitted only
+		// the memory ABI directly. Its rows are emitted only
 		// for a set that exports `scan_all`, so that is checked and not
 		// assumed. A set made wide by a BT member alone keeps a narrow
 		// automaton and stays on the walk.
@@ -1894,7 +1894,7 @@ func (cs *compiledSet) usesGatedFindPreflight() bool {
 	if cs.unionScan == nil && !cs.usesAbsencePrefilter() {
 		return false
 	}
-	// A WIDE automaton emits no acceptOff/eofOff u64 pair (item 21 phase 1), so
+	// A WIDE automaton emits no acceptOff/eofOff u64 pair, so
 	// what it must have instead is the per-state accept ROWS the wide alive walk
 	// reads (item 22 fix 2a-wide). Requiring them by their offsets rather than
 	// by re-deriving who asked for them is the point: the rows are emitted for
@@ -2174,10 +2174,10 @@ func emitFindPreflight(b []byte, cs *compiledSet, lPos, lState, aliveLocal, pGat
 // FALLBACK buckets, preserving their global ids.
 //
 // Built from the BUCKETS rather than from spec.Patterns on purpose: bucket
-// placement is what decides which patterns phase 1 can reach, and it is also
+// placement is what decides which patterns the frontend pass can reach, and it is also
 // where a pattern dropped for exceeding max_fallback_states has already been
 // removed. Filtering the spec directly would put a dropped pattern back into
-// phase 2 and make the set report a pattern its `find` cannot.
+// the union pass and make the set report a pattern its `find` cannot.
 func fallbackSubSpec(spec SetSpec, buckets []*bucket) SetSpec {
 	sub := spec
 	sub.Patterns = nil
@@ -2195,7 +2195,7 @@ func fallbackSubSpec(spec SetSpec, buckets []*bucket) SetSpec {
 }
 
 // hasLiteralBuckets reports whether any bucket carries a literal gate — the
-// half of a mixed set that phase 1 serves.
+// half of a mixed set that the frontend pass serves.
 func hasLiteralBuckets(buckets []*bucket) bool {
 	for _, bkt := range buckets {
 		if !bkt.isFallback {
@@ -2205,10 +2205,10 @@ func hasLiteralBuckets(buckets []*bucket) bool {
 	return false
 }
 
-// usesTwoPhaseScan reports whether this capability is emitted as phase 1 plus
-// phase 2 instead of one interleaved per-position walk.
+// usesTwoPhaseScan reports whether this capability is emitted as a frontend pass
+// plus a union pass instead of one interleaved per-position walk.
 //
-// `find` is excluded: it reports positions and extents, which phase 2's
+// `find` is excluded: it reports positions and extents, which the union pass's
 // automaton does not carry — it knows only WHICH patterns match, which is
 // exactly what the scan trio asks. `scan` is not listed because it is retired.
 func (cs *compiledSet) usesTwoPhaseScan(kind setCapKind) bool {
@@ -2219,11 +2219,11 @@ func (cs *compiledSet) usesTwoPhaseScan(kind setCapKind) bool {
 	case capScanAny:
 		return true
 	case capScanAll:
-		// Same reason as usesUnionScan, and the same two bodies: phase 2's
+		// Same reason as usesUnionScan, and the same two bodies: the union pass's
 		// automaton serves the memory ABI when it is wide and the accumulator
 		// ABI when it is not. Keyed on wideAll() for the same reason too — a
 		// Backtracking member selects the wide form at any id space, and such
-		// a set never reaches here (phase 2 is not built for it at all).
+		// a set never reaches here (the union pass is not built for it at all).
 		if cs.phase2Union.isWide() {
 			return cs.wideAll() && cs.phase2Union.midWordsOff >= 0
 		}
@@ -2245,7 +2245,7 @@ func (cs *compiledSet) twoPhaseCaps() []setCapKind {
 }
 
 // twoPhaseFnOffset returns the index of this capability's hidden PHASE 1 body
-// within the set's functions; phase 2 is the next one. -1 when the capability
+// within the set's functions; the union pass is the next one. -1 when the capability
 // is not split.
 //
 // The hidden bodies sit immediately after the body the exported `find` wraps,
@@ -2264,8 +2264,8 @@ func (cs *compiledSet) twoPhaseFnOffset(kind setCapKind) int {
 	return -1
 }
 
-// phase2Mask is the set of ids phase 2 can report: exactly the fallback
-// patterns. `scan_all` ORs it with phase 1's accumulator, and the two are
+// phase2Mask is the set of ids the union pass can report: exactly the fallback
+// patterns. `scan_all` ORs it with the frontend pass's accumulator, and the two are
 // disjoint by construction because a pattern is in one bucket only.
 func (cs *compiledSet) phase2Mask() uint64 {
 	var m uint64
@@ -2290,9 +2290,10 @@ func (cs *compiledSet) phase2Mask() uint64 {
 //
 // `scan_any` short-circuits because either phase's id is a complete answer —
 // it reports no start, so there is nothing a second phase could improve. That
-// is the whole reason decision (10) is what makes this split worth building:
-// with a start to report, phase 1's hit could not be returned without checking
-// whether phase 2 had an earlier one, and both phases would always run.
+// is the whole reason `scan_any` reporting no start is what makes this split
+// worth building: with a start to report, the frontend pass's hit could not be
+// returned without checking whether the union pass had an earlier one, and both
+// passes would always run.
 func emitTwoPhaseScanBody(cs *compiledSet, kind setCapKind, phase1Idx int) []byte {
 	const (
 		pInPtr  = 0
@@ -2316,7 +2317,7 @@ func emitTwoPhaseScanBody(cs *compiledSet, kind setCapKind, phase1Idx int) []byt
 	if wide {
 		// Both phases write the SAME caller bitmap and each returns how many
 		// bits it set, so the answer is their sum. They cannot double-count: a
-		// pattern lives in exactly one bucket, so phase 1's ids and phase 2's
+		// pattern lives in exactly one bucket, so the frontend pass's ids and the union pass's
 		// are disjoint — the same argument phase2Mask rests on.
 		b = append(b, 0x00) // no locals
 		b = call(b, phase1Idx)

@@ -29,7 +29,7 @@ import (
 func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string) {
 	t.Helper()
 	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Regexps: entries}
-	_, names, prefix, err := generate.ComponentArtifacts(cfg)
+	_, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatalf("component artifacts: %v", err)
 	}

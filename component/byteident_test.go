@@ -23,6 +23,10 @@ var updateFixture = flag.Bool("update-component-core", false,
 // entirely ours — adapters, allocator, post-return, export names — and it is
 // where a regression in this work would actually show.
 //
+// It moves when the allocator or an adapter changes on purpose — cabi_realloc's
+// trap on a size its classes cannot represent moved it — and is then regenerated
+// with -update-component-core; any other move is a regression.
+//
 // It lives in this package rather than beside compile/testdata/byteident because
 // building it needs the WIT-derived export names, and generate/ already imports
 // compile/, so compile/ cannot import generate/.

@@ -4,7 +4,7 @@
 //
 //	regexped [--debug] generate [--config=<file>] [--output=<file>|-]
 //	regexped [--debug] compile  [--config=<file>] [--output=<file>|-] [--verbose]
-//	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+//	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>] <regex1.wasm> ...
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
 // Global flags (--debug) must appear before the subcommand name.
@@ -120,9 +120,9 @@ Global flags:
   --debug   Enable debug logging (default: warnings only)
 
 Commands:
-  generate  Generate language stubs (Rust/Go/JS/TS/C/AS) from a config file
-  compile   Compile regexp patterns to a standalone WASM module
-  merge     Merge WASM modules into a single binary (thin wrapper around wasm-merge)
+  generate  Generate language stubs (Rust/Go/JS/TS/C/AS) or a WIT interface from a config file
+  compile   Compile regexp patterns to a WASM module, or to a component plus its .wit
+  merge     Link your binary with the regexp artifacts: wasm-merge for modules, wac plug for components
 
 Run 'regexped <command> -h' for command-specific options.
 `)
@@ -156,14 +156,23 @@ func runGenerateCmd(args []string) {
 		failf(exitCompile, "%v", err)
 	}
 
-	// Rust, Go, C, and AS stubs require a module name for the FFI/WASM import
-	// module name. Config content rather than command line, hence exitCompile.
+	// A stub that declares WASM imports needs a name to import FROM, and a
+	// Rust or Go stub needs one for its `pub mod` / `package`. Config content
+	// rather than command line, hence exitCompile.
 	//
-	// The `component` case is NOT checked here: it is required for the format
-	// itself, not for one stub type, so config.LoadConfig enforces it and both
-	// commands get the same verdict.
-	if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
-		failf(exitCompile, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
+	// MODULE format only. A component imports nothing by module name: its
+	// imports are the WIT interface `regexped:<wit_package>/...`, which
+	// config.LoadConfig already requires — from `import_module` OR from
+	// `wit_package`, so demanding `import_module` here would reject a
+	// wit_package-only config that compiles fine. The one name a component
+	// stub still needs is Rust's module identifier, which has its own key.
+	switch {
+	case !cfg.Component():
+		if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
+			failf(exitCompile, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
+		}
+	case stubType == "rust" && cfg.RustModuleName() == "":
+		failf(exitCompile, "generate: rust_module (or import_module) is required in config for Rust stubs: it names the generated `pub mod`")
 	}
 
 	if err := generate.CmdGenerateStub(cfg, outPath); err != nil {

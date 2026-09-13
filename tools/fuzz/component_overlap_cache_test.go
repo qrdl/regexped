@@ -65,6 +65,15 @@ func TestComponentOverlapCacheAnswersCorrectly(t *testing.T) {
 			t.Fatalf("position %d reported start %d: the enumeration is not in order", i, s)
 		}
 	}
+	// A correct answer is no evidence that the cache produced it — the walk
+	// answers identically. `ready` says which engine did.
+	cachePtr := int32(h.u32(sc + 20))
+	if cachePtr == 0 {
+		t.Fatal("the constructor reserved no answer cache for a 4 KB overlapping drive")
+	}
+	if ready := int32(h.u32(cachePtr + config.SetOverlapHdrReadyOff)); ready != 1 {
+		t.Fatalf("the cache header's ready is %d after the drive: it walked", ready)
+	}
 }
 
 // The gate, from the other side of it. The test above uses 4 KB, where the
@@ -161,11 +170,11 @@ func TestComponentScannerRepeatsItsError(t *testing.T) {
 		if _, errored := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc)); errored {
 			t.Fatalf("position %d errored before the header was touched", i)
 		}
-		if int32(h.u32(cachePtr+8)) == 1 {
+		if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) == 1 {
 			break
 		}
 	}
-	if int32(h.u32(cachePtr+8)) != 1 {
+	if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) != 1 {
 		t.Fatal("the sweep never engaged, so the header being corrupted proves nothing")
 	}
 
@@ -224,4 +233,108 @@ func overlapSetCfgBuild(t *testing.T) config.BuildConfig {
 func overlapSetCfgSet(t *testing.T) config.SetConfig {
 	t.Helper()
 	return overlapSetCfgBuild(t).Sets[0]
+}
+
+// A scanner whose position went BACKWARDS below the floor of its engaged cache
+// reports out-of-order — the error-code's third case, discriminant 2 — and
+// keeps reporting it, as every other error does.
+//
+// A consumer cannot provoke this through the resource, which only moves
+// forward. The harness rewinds the representation's position field directly,
+// which is what a corrupted or shared scanner amounts to, and which checks the
+// half that matters here: the adapter lifts -6 into its own case, not into
+// malformed-cache or backtrack-overflow.
+func TestComponentScannerReportsOutOfOrder(t *testing.T) {
+	h := newSetHarness(t, overlapSetCfg)
+	text := strings.Repeat("a", 200000)
+	p, ln := h.writeInput(text)
+	sc := h.call(h.pkg+"#[constructor]scan-it", p, ln, int32(0))
+
+	cachePtr := int32(h.u32(sc + 20))
+	if cachePtr == 0 {
+		t.Fatal("the constructor reserved no cache, so there is no floor to fall below")
+	}
+	for i := 0; i < 200; i++ {
+		if _, errored := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc)); errored {
+			t.Fatalf("position %d errored before the position was touched", i)
+		}
+		if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) == 1 {
+			break
+		}
+	}
+	if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) != 1 {
+		t.Fatal("the sweep never engaged, so nothing has a floor to fall below")
+	}
+	if floor := int32(h.u32(cachePtr + 20)); floor <= 0 {
+		t.Fatalf("the sweep engaged at floor %d, so no position lies below it", floor)
+	}
+
+	// repPos, the representation's next-position field.
+	binary.LittleEndian.PutUint32(h.mem.UnsafeData(h.store)[sc+8:], 0)
+
+	code, errored := h.nextErr(sc)
+	if !errored {
+		t.Fatal("a position below the floor was served: the call answered normally")
+	}
+	// error-code { backtrack-overflow = 0, malformed-cache = 1, out-of-order = 2 }
+	if code != 2 {
+		t.Fatalf("error-code %d, want 2 (out-of-order)", code)
+	}
+	for i := 0; i < 3; i++ {
+		again, stillErrored := h.nextErr(sc)
+		if !stillErrored || again != code {
+			t.Fatalf("call %d after the error answered errored=%v code=%d; the first reported %d",
+				i+2, stillErrored, again, code)
+		}
+	}
+	h.call(h.pkg+"#[dtor]scan-it", sc)
+}
+
+const geometrySetCfg = `wasm_format: component
+import_module: t
+wit_package: t
+regexps:
+  - name: p0
+    pattern: '[^\n]*[0-2]'
+  - name: p1
+    pattern: '[^\n]*[3-5]'
+sets:
+  - name: s
+    patterns: all
+    overlapping: true
+    find: scan_it
+`
+
+// TestComponentCacheGeometryMatchesConfig DRIVES the constructor and compares
+// the region it reserved — its length, and the stride it wrote into the header —
+// with what config computes from the compiler's shape. The same numbers are
+// stamped into the adapter at compile time, and a test that only checks the
+// exports exist cannot tell a constructor sizing for the wrong column from one
+// sizing for the right one.
+func TestComponentCacheGeometryMatchesConfig(t *testing.T) {
+	var cfg config.BuildConfig
+	if err := yaml.Unmarshal([]byte(geometrySetCfg), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || !sh.Eligible {
+		t.Fatalf("shape = %+v, %v: this set must get a sweep", sh, err)
+	}
+	h := newSetHarness(t, geometrySetCfg)
+	for _, n := range []int{100, 1000, 4096} {
+		p, l := h.writeInput(strings.Repeat("x1y4", n/4))
+		sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
+		cachePtr, cacheLen := int32(h.u32(sc+20)), int(h.u32(sc+24))
+		if cachePtr == 0 {
+			t.Errorf("len %d: the constructor reserved no cache", l)
+		} else {
+			if want := config.SetOverlapCheckpointBytes(int(l), sh.Cells, sh.Patterns); cacheLen != want {
+				t.Errorf("len %d: region is %d bytes, config computes %d", l, cacheLen, want)
+			}
+			if got, want := int(h.u32(cachePtr+config.SetOverlapHdrStrideOff)), config.SetOverlapCheckpointStride(int(l), sh.Cells, sh.Patterns); got != want {
+				t.Errorf("len %d: stride is %d, config computes %d", l, got, want)
+			}
+		}
+		h.call(h.pkg+"#[dtor]scan-it", sc)
+	}
 }

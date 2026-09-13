@@ -15,9 +15,20 @@ import (
 
 // BuildConfig is the top-level structure of the YAML config file.
 type BuildConfig struct {
-	WasmMerge    string `yaml:"wasm_merge"`    // optional; defaults to "wasm-merge" in $PATH
-	WasmTools    string `yaml:"wasm_tools"`    // optional; defaults to $WASM_TOOLS, then "wasm-tools" in $PATH (used by wasm_format: component)
-	Wac          string `yaml:"wac"`           // optional; defaults to $WAC, then "wac" in $PATH (the merge tool for wasm_format: component)
+	// The external tools regexped shells out to. Each key is a PATH: a directory
+	// holding the tool, or the executable itself (so a tool installed under
+	// another name can be used). Omitted, the tool is looked up in $PATH. There
+	// is no environment variable. Resolved at load — see resolveToolPath — and
+	// used through internal/tools.Resolve.
+	WasmMergePath string `yaml:"wasm_merge_path"` // `regexped merge` under wasm_format: module
+	WasmToolsPath string `yaml:"wasm_tools_path"` // wrapping a component under wasm_format: component
+	WacPath       string `yaml:"wac_path"`        // `regexped merge` under wasm_format: component
+
+	// toolPathsAsWritten keeps the three tool path keys as the user wrote them,
+	// before load-time resolution, so an error can quote them. Unset for a
+	// config built in code, whose values are as written already.
+	toolPathsAsWritten toolPaths
+
 	Output       string `yaml:"output"`        // output path for merge command; overridable with -o
 	WasmFile     string `yaml:"wasm_file"`     // output WASM file for compile command; overridable with -o
 	ImportModule string `yaml:"import_module"` // WASM import module name used by wasm-merge and Rust FFI
@@ -104,7 +115,7 @@ type BuildConfig struct {
 // TWO KEYS WERE RETIRED, and both are load errors rather than
 // silently-accepted no-ops (strict YAML decoding does that for free):
 //
-//   - `match:` and `scan:` — decision (2). `match_any(...) >= 0` is exactly
+//   - `match:` and `scan:`. `match_any(...) >= 0` is exactly
 //     what `match` returned and `scan_any(...) >= 0` what `scan` returned, and
 //     the redundancy measured at 1-3% of module size. They are DROPPED rather
 //     than repurposed: a surviving `match:` with match_any semantics would
@@ -112,7 +123,7 @@ type BuildConfig struct {
 //     switched from reading 0/1 to reading an id — and id 0 would read as "no
 //     match". A removed key fails at build; a redefined one fails in
 //     production.
-//   - `find_batch:` — decision (11). Batching is no longer a second
+//   - `find_batch:`. Batching is no longer a second
 //     capability but a property of `find`, requested with
 //     `hints: [batch-find]` on the set. At the API level the two were never
 //     distinguishable — both iterate the same matches in the same order, and
@@ -299,7 +310,7 @@ func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
 // It lives here, next to the cursor layout, for the same reason: the compiler
 // and all six stub generators must agree on it exactly, and a second
 // definition anywhere is a module whose stub calls an export that does not
-// exist. It is derived rather than configured because decision (11) hides
+// exist. It is derived rather than configured because the stubs hide
 // batching behind `find`'s optional batchSize parameter — the user never
 // writes this name.
 func SetBatchExportName(find string) string { return find + "_batch" }
@@ -392,7 +403,11 @@ const SetCursorOverflowPos = 0xFFFFFFFE
 
 // SetCursorMalformedPos is the resume-position word reserved to mean "the
 // overlapping answer cache's header contradicted itself, and this scan's
-// result is UNKNOWN". Its count field is zero and no tuples were written.
+// result is UNKNOWN". Its count field is zero. Tuples for earlier positions may
+// already have been written THIS call — the batch entry can meet a malformed
+// header after serving some — and a decoder discards them: -4 aborts the
+// drive, so the call's output is unknown as a whole and there is nothing to
+// gain by reporting it one call later.
 //
 // It is the second reserved position word, for the same reason the first one
 // exists: the count half is countBits wide and every decoder MASKS it, so a
@@ -403,6 +418,14 @@ const SetCursorOverflowPos = 0xFFFFFFFE
 // A generated `init` cannot produce this: it writes the stride from the same
 // formula that sized the region. A hand-written caller can.
 const SetCursorMalformedPos = 0xFFFFFFFD
+
+// SetCursorOutOfOrderPos is the THIRD reserved resume-position word: the cursor
+// handed to the batch entry resumes BELOW the floor its engaged answer cache was
+// swept from — the batch form of abi.OverlapCacheOutOfOrder. Its count field is
+// zero and no tuples were written: the check runs before the call serves
+// anything. Like the other two it must be tested BEFORE the 0xFFFFFFFF done
+// test, and detection is best effort exactly as it is for `find`.
+const SetCursorOutOfOrderPos = 0xFFFFFFFC
 
 // SetOverlapCacheMaxBytes is the ceiling a GENERATED STUB puts on that
 // allocation before it declines to offer a cache at all.
@@ -760,7 +783,12 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	cfg.Output = resolveFilePath(configDir, cfg.Output)
 	cfg.WasmFile = resolveFilePath(configDir, cfg.WasmFile)
 	cfg.StubFile = resolveFilePath(configDir, cfg.StubFile)
-	cfg.WasmMerge = resolveFilePath(configDir, cfg.WasmMerge)
+	cfg.toolPathsAsWritten = toolPaths{
+		set: true, merge: cfg.WasmMergePath, tools: cfg.WasmToolsPath, wac: cfg.WacPath,
+	}
+	cfg.WasmMergePath = resolveToolPath(configDir, cfg.WasmMergePath)
+	cfg.WasmToolsPath = resolveToolPath(configDir, cfg.WasmToolsPath)
+	cfg.WacPath = resolveToolPath(configDir, cfg.WacPath)
 
 	// Identifier validation runs first: every later stage interpolates these
 	// names into generated source, so nothing should touch them until they are
@@ -797,6 +825,54 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	return cfg, nil
 }
 
+// toolPaths is the three tool path keys as written; set records that a load
+// captured them.
+type toolPaths struct {
+	set               bool
+	merge, tools, wac string
+}
+
+// ToolPathAsWritten returns a tool path key's value as the user wrote it:
+// "wasm_merge_path", "wasm_tools_path" or "wac_path". For a config built in code
+// that is the field itself.
+func (c BuildConfig) ToolPathAsWritten(key string) string {
+	merge, tools, wac := c.WasmMergePath, c.WasmToolsPath, c.WacPath
+	if c.toolPathsAsWritten.set {
+		merge, tools, wac = c.toolPathsAsWritten.merge, c.toolPathsAsWritten.tools, c.toolPathsAsWritten.wac
+	}
+	switch key {
+	case "wasm_merge_path":
+		return merge
+	case "wasm_tools_path":
+		return tools
+	case "wac_path":
+		return wac
+	}
+	return ""
+}
+
+// resolveToolPath resolves a tool path key at load: an absolute value as is,
+// `~` and `~/…` against the home directory, and anything else against the
+// config file's directory. `~user/…` is NOT expanded — it is taken literally, as
+// a relative path — because only the shell knows another user's home.
+func resolveToolPath(base, p string) string {
+	switch {
+	case p == "":
+		return ""
+	case p == "~":
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return p
+	case strings.HasPrefix(p, "~/"):
+		return ExpandHome(p)
+	case filepath.IsAbs(p):
+		return p
+	default:
+		return filepath.Join(base, p)
+	}
+}
+
 // resolveFilePath resolves path relative to base unless path is empty or
 // absolute. A leading "~/" is expanded to the user's home directory rather
 // than being passed through: every caller of this function feeds the result
@@ -827,7 +903,7 @@ func ExpandHome(path string) string {
 }
 
 // ---------------------------------------------------------------------------
-// The CHECKPOINTED answer cache (plans: §9.2 + §19). One place, because the
+// The CHECKPOINTED answer cache. One place, because the
 // compiler's sweep VALIDATES what the stubs compute, and six stub languages
 // plus two harnesses each spell it independently — exactly the drift the
 // find_batch cursor layout is kept here to avoid.
@@ -839,17 +915,29 @@ func ExpandHome(path string) string {
 // minimised at k = sqrt(m*C/B), giving ~ 2*sqrt(m*C*B): SQUARE-ROOT in the
 // input where the whole-drive tuple cache is linear in it.
 //
-// `cells` is the sweep's column width — states x patterns today, projected
-// states under §19's lever C — and comes from the compiler, never from the
-// YAML: it falls out of the DFA subset construction. generate/ obtains it by
-// recompiling the set (§9.2 decision 1).
+// `cells` is the sweep's column width — states x patterns, or fewer cells when
+// the column is projected — and comes from the compiler, never from the YAML: it
+// falls out of the DFA subset construction. generate/ obtains it by recompiling
+// the set.
 
 // SetOverlapCheckpointHeaderBytes is the header of the checkpointed cache.
 //
-// Eleven i32 fields is 44; 48 leaves one spare word and keeps the 4-byte
-// alignment set_abi_test asserts. The caller zeroes it to start a drive and
-// then writes the stride, exactly as it zeroes the gate array.
+// Eight i32 fields and four reserved words (the layout is in
+// compile/set_overlap_ckpt.go), which keeps the 4-byte alignment set_abi_test
+// asserts. The caller zeroes it to start a drive and then writes the stride,
+// exactly as it zeroes the gate array.
 const SetOverlapCheckpointHeaderBytes = 48
+
+// The header fields a CALLER touches, by byte offset. A caller zeroes the
+// header and writes the stride; afterwards it may read `ready` (1 swept, -1
+// asked and refused, 0 never asked) and `work` (the matched bytes the walk
+// accumulated). Every other field is the engine's own. Stubs, harnesses and
+// the emitters all name these offsets rather than spelling them.
+const (
+	SetOverlapHdrReadyOff  = 8
+	SetOverlapHdrWorkOff   = 12
+	SetOverlapHdrStrideOff = 16
+)
 
 // SetOverlapBlockRowOffsets is the row's shape, stated once: the mask at 0 and
 // pattern k's end four bytes into the row plus 4k.

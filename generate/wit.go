@@ -3,7 +3,6 @@ package generate
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/qrdl/regexped/config"
@@ -81,12 +80,15 @@ func renderWit(cfg config.BuildConfig, pkg, world string, funcs []witFunc, sets 
 		// Emitted whenever the interface has any function: every return type
 		// carries it, DFA-only patterns included. A uniform ABI beats a
 		// per-pattern one and the adapter costs one compare.
-		b.WriteString("    /// The Backtracking engine exhausted its frame budget; the answer is unknown.\n")
-		// A single-pattern export cannot return the second case — the answer
-		// cache belongs to sets — but the two interfaces share the error type's
+		b.WriteString("    /// Why an answer is unknown. backtrack-overflow: the Backtracking engine\n")
+		b.WriteString("    /// exhausted its frame budget. malformed-cache and out-of-order are never\n")
+		b.WriteString("    /// returned by these functions — they belong to a set's overlapping find —\n")
+		b.WriteString("    /// and are listed so both interfaces share one error type.\n")
+		// A single-pattern export cannot return the second or third case — the
+		// answer cache belongs to sets — but the two interfaces share the error type's
 		// NAME, and a consumer that used both would see one enum with two
 		// different shapes. One spelling, both interfaces.
-		b.WriteString("    enum error-code { backtrack-overflow, malformed-cache }\n")
+		b.WriteString("    enum error-code { backtrack-overflow, malformed-cache, out-of-order }\n")
 		for _, f := range funcs {
 			b.WriteString("\n")
 			for _, line := range strings.Split(f.doc, "\n") {
@@ -184,29 +186,45 @@ func kebabNames(funcs []witFunc) map[string]string {
 func snakeNames(funcs []witFunc) map[string]string {
 	out := make(map[string]string, len(funcs))
 	for _, f := range funcs {
-		out[f.origin] = strings.ReplaceAll(f.kebab, "-", "_")
+		out[f.origin] = rustWitFuncName(f.kebab)
 	}
 	return out
 }
 
-// ComponentArtifacts derives everything a component build needs from ONE place:
-// the WIT text, the canonical export name per configured func name, and the
-// interface prefix those names are built from.
+// dropWorld returns the lines of generated WIT without its `world … { … }`
+// block. A dependency package supplies the interfaces only, and an exporting
+// world left in one makes the document describe something else. The block is
+// brace-balanced; a world that opens and closes on its own line is dropped
+// alone. The Rust stub nests what remains and the C stub writes it to a deps
+// directory, and each used to carry its own copy of this walk.
+func dropWorld(witText string) []string {
+	var out []string
+	depth, inWorld := 0, false
+	for _, l := range strings.Split(witText, "\n") {
+		t := strings.TrimSpace(l)
+		if !inWorld && strings.HasPrefix(t, "world ") {
+			depth = strings.Count(t, "{") - strings.Count(t, "}")
+			inWorld = depth > 0
+			continue
+		}
+		if inWorld {
+			depth += strings.Count(t, "{") - strings.Count(t, "}")
+			inWorld = depth > 0
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// ComponentArtifactsWithSets derives everything a component build needs from ONE
+// place: the WIT text, the canonical export name per configured func name, the
+// per-set name table, and the interface prefix those names are built from.
 //
 // One call rather than three because the three derivations share every failure
 // mode — an unrepresentable package name, a func name that is not a WIT
 // identifier, two names colliding — so three separate calls would give a caller
 // two error branches that the first call has already made unreachable.
-func ComponentArtifacts(cfg config.BuildConfig) (witText string, exportNames map[string]string, prefix string, err error) {
-	text, names, _, prefix, err := ComponentArtifactsWithSets(cfg)
-	return text, names, prefix, err
-}
-
-// ComponentArtifactsWithSets is ComponentArtifacts plus the per-set name table.
-//
-// Kept as a separate entry point so the pattern-only callers — and there are
-// several, including the tests that predate sets — are not made to thread a nil
-// map they never read.
 func ComponentArtifactsWithSets(cfg config.BuildConfig) (
 	witText string, exportNames map[string]string, setNames map[string]SetExportNames, prefix string, err error,
 ) {
@@ -264,20 +282,10 @@ func interfacePrefix(pkg, version string) string {
 	//                                         "failed to find export of interface"
 	// This was wrong when wit_version shipped, and the unit test asserted the
 	// wrong form too, so nothing caught it until a versioned component was
-	// actually built. §3.1's proof-of-concept had it right all along.
+	// actually built. The original proof of concept had it right all along.
 	prefix := "regexped:" + pkg + "/matcher"
 	if version != "" {
 		prefix += "@" + version
 	}
 	return prefix
-}
-
-// sortedNames is a small helper for deterministic error output in tests.
-func sortedNames(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

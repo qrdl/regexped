@@ -38,32 +38,22 @@ func TestValidateIdentifier_Shape(t *testing.T) {
 }
 
 func TestValidateIdentifier_ReservedWords(t *testing.T) {
-	// One representative per language, plus `match`, which is the name the
-	// project used to special-case.
-	reserved := []string{
-		"match",     // Rust
-		"fn",        // Rust
-		"unsafe",    // Rust
-		"func",      // Go
-		"select",    // Go
-		"chan",      // Go
-		"int",       // C
-		"typedef",   // C
-		"_Atomic",   // C
-		"delete",    // JS
-		"class",     // JS
-		"function",  // JS
-		"namespace", // TS/AS
-		"readonly",  // TS/AS
+	// Reserved words are applied PER GENERATED LANGUAGE (see
+	// TestReservedWordsArePerLanguage), so ValidateIdentifier checks shape only.
+	// One representative per language, each in its own language's set.
+	reserved := []struct{ name, lang string }{
+		{"match", "rust"}, {"fn", "rust"}, {"unsafe", "rust"},
+		{"func", "go"}, {"select", "go"}, {"chan", "go"},
+		{"int", "c"}, {"typedef", "c"}, {"_Atomic", "c"},
+		{"delete", "js"}, {"class", "js"}, {"function", "js"},
+		{"namespace", "ts"}, {"readonly", "as"},
 	}
-	for _, name := range reserved {
-		err := ValidateIdentifier(name)
-		if err == nil {
-			t.Errorf("ValidateIdentifier(%q) = nil, want reserved-word error", name)
-			continue
+	for _, r := range reserved {
+		if !keywordSets[r.lang][r.name] {
+			t.Errorf("%q is not in the %s keyword set", r.name, r.lang)
 		}
-		if !strings.Contains(err.Error(), "reserved word") {
-			t.Errorf("ValidateIdentifier(%q) = %v, want a reserved-word error", name, err)
+		if err := ValidateIdentifier(r.name); err != nil {
+			t.Errorf("ValidateIdentifier(%q) = %v; it checks shape only", r.name, err)
 		}
 	}
 
@@ -88,6 +78,11 @@ func TestValidateIdentifier_ReservedWords(t *testing.T) {
 		if err := ValidateIdentifier(name); err != nil {
 			t.Errorf("ValidateIdentifier(%q) = %v, want nil (not a reserved word)", name, err)
 		}
+		for lang, set := range keywordSets {
+			if set[name] {
+				t.Errorf("%q is in the %s keyword set, but is a legal function name there", name, lang)
+			}
+		}
 	}
 }
 
@@ -109,7 +104,9 @@ func TestValidateConfig_RejectsInjection(t *testing.T) {
 }
 
 func TestValidateConfig_ReportsAllProblems(t *testing.T) {
+	// A Rust stub, so both keywords below are reserved in the generated language.
 	cfg := BuildConfig{
+		StubFile: "x.rs",
 		Regexps: []RegexEntry{
 			{Name: "p1", Pattern: "a", MatchFunc: "bad name"},
 			{Name: "p2", Pattern: "b", FindFunc: "9lives"},
@@ -117,7 +114,7 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 			{Name: "p4", Pattern: "d", GroupsFunc: "fine_name"},
 		},
 		Sets: []SetConfig{
-			{Name: "s1", ScanAll: "delete"},
+			{Name: "s1", ScanAll: "loop"},
 		},
 	}
 	err := ValidateConfig(&cfg)
@@ -125,7 +122,7 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 		t.Fatal("ValidateConfig = nil, want error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"bad name", "9lives", `"match"`, `"delete"`} {
+	for _, want := range []string{"bad name", "9lives", `"match"`, `"loop"`} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q; got:\n%s", want, msg)
 		}
@@ -245,11 +242,19 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 // Per-stub-type validation
 
 func TestValidateIdentifier_StrictModeRestrictedNames(t *testing.T) {
-	// B33: not reserved words, but unbindable in strict-mode code, which every
-	// generated ES module is. Verified with `node --check`.
+	// Not reserved words, but unbindable in strict-mode code, which every
+	// generated ES module is (verified with `node --check`). Refused for a JS
+	// stub, and — per language — legal for a Go one.
 	for _, name := range []string{"eval", "arguments"} {
-		if err := ValidateIdentifier(name); err == nil {
-			t.Errorf("ValidateIdentifier(%q) = nil, want error", name)
+		mk := func(stub string) *BuildConfig {
+			return &BuildConfig{ImportModule: "m", StubFile: stub,
+				Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: name}}}
+		}
+		if err := ValidateConfig(mk("x.js")); err == nil {
+			t.Errorf("%q with a JS stub = nil, want error", name)
+		}
+		if err := ValidateConfig(mk("x.go")); err != nil {
+			t.Errorf("%q with a Go stub: %v, want nil", name, err)
 		}
 	}
 }
@@ -331,6 +336,14 @@ func TestValidateExports_HelperCollisions(t *testing.T) {
 		// Go declares Span and the error value for every stub.
 		{"go", "Span", true},
 		{"go", "ErrBacktrackOverflow", true},
+		// The out-of-order sentinel, declared beside the other two.
+		{"go", "ErrOutOfOrder", true},
+		{"c", "RX_ERR_OUT_OF_ORDER", true},
+		{"as", "RX_ERR_OUT_OF_ORDER", true},
+		// C emits ffi_<export> too, and the component stub's resource imports
+		// are ffi_<find>__res_new / __res_next / __res_drop.
+		{"c", "ffi_x__res_new", true},
+		{"c", "ffi_url", true},
 		{"js", "url_match", false},
 	}
 	for _, c := range cases {
@@ -641,5 +654,33 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	}
 	if err := ValidateConfig(cfg); err == nil {
 		t.Error("accepted a capture group named \"index\", want error")
+	}
+}
+
+// TestReservedWordsArePerLanguage: a name is checked against the keywords of the
+// language whose stub is GENERATED, not against the union of all six. The union
+// refused `match_func: defer` for a Rust stub, where it is a perfectly good
+// function name; the consequence — the same config failing once stub_type
+// switches to Go — is accepted.
+func TestReservedWordsArePerLanguage(t *testing.T) {
+	for _, c := range []struct{ name, okStub, badStub string }{
+		{"defer", "x.rs", "x.go"},    // Go only
+		{"loop", "x.go", "x.rs"},     // Rust only
+		{"register", "x.go", "x.h"},  // C only
+		{"debugger", "x.go", "x.js"}, // JS only
+		{"declare", "x.js", "x.ts"},  // TS / AS only
+	} {
+		cfg := func(stub string) *BuildConfig {
+			return &BuildConfig{
+				ImportModule: "m", StubFile: stub,
+				Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: c.name}},
+			}
+		}
+		if err := ValidateConfig(cfg(c.okStub)); err != nil {
+			t.Errorf("%q with stub_file %s is not reserved there and must be accepted: %v", c.name, c.okStub, err)
+		}
+		if err := ValidateConfig(cfg(c.badStub)); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("%q with stub_file %s: err = %v, want a reserved-word refusal", c.name, c.badStub, err)
+		}
 	}
 }

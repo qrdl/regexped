@@ -2,6 +2,7 @@ package generate
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,9 +102,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		{"c", "stubs.h", cStub, "cc", compileCModule},
 		{"js", "stubs.js", jsStub, "node", checkJS},
 		{"as", "stubs.ts", asStub, "asc", compileAS},
-		// TypeScript has no check here: `tsc` is not a toolchain this repo
-		// otherwise needs, and the TS generator is a near-copy of the JS one
-		// whose output IS checked. Add it if tsc ever becomes a dependency.
+		{"ts", "stubs.ts", tsStub, "tsc", compileTS},
 	} {
 		t.Run(lang.name, func(t *testing.T) {
 			if lang.compiler != "" {
@@ -329,14 +328,9 @@ func TestGeneratedCLinksFreestanding(t *testing.T) {
 	if testing.Short() {
 		t.Skip("compiling generated stubs is slow; skipped in -short")
 	}
-	clang, err := exec.LookPath("clang")
-	if err != nil {
-		t.Skip("no clang on PATH: the documented -nostdlib link is unchecked here")
-	}
-	probe := exec.Command(clang, "--target=wasm32-wasi", "-nostdlib", "-E", "-x", "c", "-")
-	probe.Stdin = strings.NewReader("#include <stddef.h>\n")
-	if out, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("clang has no wasm32-wasi sysroot: the documented -nostdlib link is unchecked here\n%s", out)
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi: the documented -nostdlib link is unchecked here")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stubs.h")
@@ -399,8 +393,115 @@ func writeESMPackageJSON(t *testing.T, dir string) {
 	}
 }
 
+// compileTS type-checks with the global `tsc` under the options the Node
+// examples build with — strict, and no unused locals or parameters — so this arm
+// and the examples check the same thing. The stub's own documentation promises it
+// compiles under exactly those flags.
+func compileTS(t *testing.T, dir, path string) {
+	t.Helper()
+	writeESMPackageJSON(t, dir)
+	tsconfig := `{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true
+  },
+  "files": ["` + filepath.Base(path) + `"]
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "tsconfig.json"), []byte(tsconfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, nil, "tsc", "-p", ".")
+}
+
 // compileAS type-checks with the AssemblyScript compiler.
 func compileAS(t *testing.T, dir, path string) {
 	t.Helper()
 	run(t, dir, nil, "asc", path, "--noEmit")
+}
+
+// wasiClang finds a clang that can target wasm32-wasi: `clang`, then the
+// versioned binaries a distribution installs instead of it — this machine has
+// only clang-19 — then $CLANG. Every candidate is probed rather than trusted,
+// and the one used is logged, so a green run records which compiler it checked.
+func wasiClang(t *testing.T) string {
+	t.Helper()
+	cands := []string{"clang"}
+	for v := 19; v >= 17; v-- {
+		cands = append(cands, fmt.Sprintf("clang-%d", v))
+	}
+	if env := os.Getenv("CLANG"); env != "" {
+		cands = append(cands, env)
+	}
+	for _, c := range cands {
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		probe := exec.Command(p, "--target=wasm32-wasi", "-nostdlib", "-E", "-x", "c", "-")
+		probe.Stdin = strings.NewReader("#include <stddef.h>\n")
+		if out, err := probe.CombinedOutput(); err != nil {
+			t.Logf("%s cannot target wasm32-wasi:\n%s", p, out)
+			continue
+		}
+		t.Logf("wasm32-wasi C compiler: %s", p)
+		return p
+	}
+	return ""
+}
+
+// TestGeneratedCComponentBuildsWithItsOwnRecipe compiles the COMPONENT C stub
+// for a cache-eligible set with EXACTLY the flags its header's "Build:" line
+// documents. That header shares the module preamble, so it carries the
+// __has_include(<stdlib.h>) detection; on a clang with no wasi sysroot the
+// probe finds the HOST's stdlib.h, and the documented line died on it.
+func TestGeneratedCComponentBuildsWithItsOwnRecipe(t *testing.T) {
+	if testing.Short() {
+		t.Skip("compiling generated stubs is slow; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi: the component recipe is unchecked here")
+	}
+	dir := t.TempDir()
+	cfg := freestandingCfg()
+	cfg.WasmFormat = "component"
+	cfg.StubFile = "stubs.h"
+	cfg.WasmFile = "demo.wasm"
+	if err := cComponentStub(cfg, filepath.Join(dir, "stubs.h")); err != nil {
+		t.Fatalf("generate C component stub: %v", err)
+	}
+	h, err := os.ReadFile(filepath.Join(dir, "stubs.h"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flags []string
+	for _, line := range strings.Split(string(h), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "clang" || !strings.Contains(line, "wasm32-wasi") {
+			continue
+		}
+		for _, f := range fields[1:] {
+			if f == "-o" {
+				break
+			}
+			flags = append(flags, f)
+		}
+		break
+	}
+	if len(flags) == 0 {
+		t.Fatalf("the component header documents no clang build line:\n%s", h)
+	}
+	main := "#include \"stubs.h\"\nint run(void) { return 0; }\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := append(append([]string{}, flags...), "-o", filepath.Join(dir, "core.wasm"),
+		filepath.Join(dir, "main.c"), filepath.Join(dir, "stubs.c"))
+	run(t, dir, nil, clang, args...)
 }

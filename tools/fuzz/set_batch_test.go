@@ -118,21 +118,13 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 		t.Fatal("module missing set_find_batch export")
 	}
 	const pageSize = 65536
-	dataTop, err := utils.ParseDataSectionBytes(w)
-	if err != nil {
-		t.Fatalf("parse data section: %v", err)
-	}
-	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	span := int32((len(input) + pageSize - 1) / pageSize * pageSize)
-	if span < pageSize {
-		span = pageSize
-	}
-	gatePtr := inBase + span
-	outPtr := gatePtr + pageSize
 	// The overlapping answer cache, offered only when the caller
 	// asks. Sized at the sweep's own worst case so "too small" is never the
 	// reason a drive declines — that path has its own test.
-	cachePtr := outPtr + pageSize
+	inBase, gatePtr, outPtr, cachePtr, err := cacheDriveAddrs(w, len(input), false)
+	if err != nil {
+		t.Fatalf("parse data section: %v", err)
+	}
 	cacheLen, cacheStride := overlapCacheFor(input, pats)
 	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {

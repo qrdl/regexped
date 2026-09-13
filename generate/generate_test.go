@@ -1442,9 +1442,14 @@ func TestSetFindCScannerShape(t *testing.T) {
 	if strings.Contains(c, "len == 0") {
 		t.Error("C set scanner: an empty input is a legitimate scan and must not be refused")
 	}
-	// (4): the transactional overflow rule is reported, not hidden.
-	if !strings.Contains(c, "if ((size_t)got > cap) return got;") {
-		t.Error("C set scanner: over-capacity must return the position's total without advancing")
+	// (4): a buffer below one position's worst case is REFUSED, the rule the
+	// component format shares through the same header; the transactional
+	// over-capacity arm it replaces is gone.
+	if !strings.Contains(c, "if (cap < (size_t)SCANNER_PATTERN_COUNT) return RX_ERR_RANGE;") {
+		t.Error("C set scanner: a cap below PATTERN_COUNT must be refused with RX_ERR_RANGE")
+	}
+	if strings.Contains(c, "if ((size_t)got > cap) return got;") {
+		t.Error("C set scanner: the transactional over-capacity arm is still emitted")
 	}
 }
 
@@ -1464,7 +1469,7 @@ func TestNamespacePrefixesOnlySharedSymbols(t *testing.T) {
 			{Name: "sec", Find: "scan_secrets", Patterns: config.PatternSelector{All: true}, EmitNameMap: true},
 		},
 	}
-	body, needsIter := genGoSetBody(cfg)
+	body, needsIter := genGoSetBody(cfg, newSetShapes(cfg))
 	single, _, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
 	if err != nil {
 		t.Fatalf("genGoStubsBody: %v", err)
