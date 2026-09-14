@@ -4645,6 +4645,18 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// probeFlags[3]: the tuple-writing body carries the batch `skip` parameter.
 	// Independent of needProbes — it is about the WRITE path, not the probes.
 	needSkip := len(probeFlags) > 3 && probeFlags[3]
+	// probeFlags[4]: the tuple-writing body records how far its walk reached,
+	// for the overlapping answer cache's trigger. Allocated here rather than by
+	// the caller for the reason the member-skip global is: a body that reads a
+	// global its assembler never declared fails WASM validation, so the two
+	// decisions are one.
+	art.walkEndGlobal = -1
+	if len(probeFlags) > 4 && probeFlags[4] {
+		if globals == nil {
+			panic("compile: a walk-extent bucket needs the module's global allocator")
+		}
+		art.walkEndGlobal = int32(globals.Alloc()) //nolint:gosec // a global index
+	}
 	scanExit := probeExitMaskComplete
 	if soleFirstHit {
 		scanExit = probeExitFirstHit
@@ -4842,6 +4854,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		tableMemIdx:         tableMemIdx,
 		gated:               gated,
 		hasSkip:             needSkip,
+		walkEndGlobal:       art.walkEndGlobal,
 	}
 	if t.hasWordBoundary && l.needWordCharTable {
 		p.hasWordChar = true
@@ -5011,9 +5024,16 @@ type suffixArtifacts struct {
 	// when the bucket is neutral or has no eligible state.
 	memberStates int
 	memberSets   int
-	dp           overlapDPTables
-	fnBody       []byte
-	scanProbe    []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
+	// walkEndGlobal is the module global the tuple-writing body stamps with the
+	// FARTHEST input position its walk reached, or -1 when this bucket does not
+	// carry the store. It is the overlapping answer cache's trigger input: the
+	// counter charges the drive for bytes WALKED, which a pattern whose match
+	// is empty or short never pays through its delivered extent. See
+	// overlapCacheCtx.emitChargeWalk.
+	walkEndGlobal int32
+	dp            overlapDPTables
+	fnBody        []byte
+	scanProbe     []byte // (ptr, start, len, validMask) -> i32 bits: patterns matching from `start`
 	// scanProbeAny is the same probe with a first-hit exit, for `scan` and
 	// `scan_any`. Nil unless the set declares one of
 	// them; `scan_all` must keep using scanProbe.
@@ -5076,6 +5096,17 @@ type setSuffixParams struct {
 	// means "this call is entirely past the resume point, write everything".
 	// Mutually exclusive with gated: no set needs both.
 	hasSkip bool
+
+	// walkEndGlobal is a module global this body stamps with the FARTHEST
+	// input position its walk reached, or -1 to emit no store at all.
+	//
+	// It exists for the overlapping answer cache's trigger, which charges a
+	// drive for the work it has done and then sweeps once that passes what a
+	// sweep would cost. Charging DELIVERED extent alone cannot see a pattern
+	// whose walk is long and whose match is empty — `(?:a*b)?` over a run of
+	// `a`s walks to the end from every start and delivers a zero-length match
+	// at each — so such a drive stayed quadratic with the counter reading 0.
+	walkEndGlobal int32
 }
 
 // appendInputLoad8u emits i32.load8_u against the INPUT memory, which is always
@@ -5832,6 +5863,32 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block
+
+	// --- how far this walk reached ---
+	//
+	// Every exit of the loop above converges here — dead state, EOF, immediate
+	// accept, liveness exit — so lScanPos holds the farthest position this
+	// candidate's walk touched. Keep the MAXIMUM across the candidates of one
+	// `find` call: the wrapper seeds the global with the call's `from` and reads
+	// the difference back as the bytes this call walked.
+	//
+	// Unsigned compare, though both values are ordinary positions: it is the
+	// same instruction either way and leaves nothing to reason about.
+	//
+	// Emitted ONLY for a bucket whose set can carry the answer cache, so a
+	// module that has no sweep is byte-for-byte what it always was.
+	if p.walkEndGlobal >= 0 {
+		g := uint32(p.walkEndGlobal) //nolint:gosec // a global index
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, g)
+		b = append(b, 0x20, lScanPos)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x20, lScanPos)
+		b = append(b, 0x24)
+		b = utils.AppendULEB128(b, g)
+		b = append(b, 0x0B) // end if
+	}
 
 	// --- EOF check ---
 	// eofBitmaskOff's startState slot holds the correct value for whichever

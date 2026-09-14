@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -1459,4 +1460,26 @@ func unionSegBytes(t *testing.T, u *unionScanDFA, off int32) []byte {
 	}
 	t.Fatalf("no data segment at offset %d", off)
 	return nil
+}
+
+// TestCacheEmittersWithoutWalkEnd: a context carrying no walk-extent global emits
+// nothing for the seed and the charge, and the past-end check differs between
+// the i32 `find` return and the batch entry's i64 cursor.
+func TestCacheEmittersWithoutWalkEnd(t *testing.T) {
+	none := overlapCacheCtx{walkEndGlobal: -1}
+	if got := none.emitSeedWalkEnd([]byte{0xAA}, 3); !bytes.Equal(got, []byte{0xAA}) {
+		t.Errorf("seed without a global emitted %x", got)
+	}
+	if got := none.emitChargeWalkExtent([]byte{0xAA}, 3, 4); !bytes.Equal(got, []byte{0xAA}) {
+		t.Errorf("charge without a global emitted %x", got)
+	}
+	with := overlapCacheCtx{walkEndGlobal: 2}
+	if got := with.emitSeedWalkEnd(nil, 3); len(got) == 0 {
+		t.Error("seed with a global emitted nothing")
+	}
+	i32 := overlapCacheCtx{pInLen: 1}.emitPastEndCheck(nil, 2)
+	i64 := overlapCacheCtx{pInLen: 1, i64Ret: true}.emitPastEndCheck(nil, 2)
+	if bytes.Equal(i32, i64) {
+		t.Error("the past-end check must answer differently for find (0) and the batch entry (the done cursor)")
+	}
 }

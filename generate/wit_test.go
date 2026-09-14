@@ -37,12 +37,28 @@ interface matcher {
     /// Anchored match against the whole input. some(end) on a match.
     email-match: func(input: list<u8>) -> result<option<u32>, error-code>;
 
-    /// Leftmost match starting at or after ` + "`start`" + `. Positions are absolute.
-    email-find: func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>;
+    /// A scan in progress. ` + "`next`" + ` answers the leftmost match at or after the
+    /// position the scan has reached, and none means it is finished. Positions
+    /// are absolute.
+    ///
+    /// A resource rather than a function because the scan needs state between
+    /// calls — the input and the position — and a function would be handed the
+    /// input again on every step, which the canonical ABI copies. Constructed
+    /// once, the input crosses once.
+    resource email-find {
+        constructor(input: list<u8>, start: u32);
+        next: func() -> result<option<tuple<u32, u32>>, error-code>;
+    }
 
-    /// Captures of the leftmost match at or after ` + "`start`" + `; index 0 is the whole
-    /// match, an unset group is none. The list length is fixed per pattern.
-    url-groups: func(input: list<u8>, start: u32) -> result<option<list<option<tuple<u32, u32>>>>, error-code>;
+    /// A scan in progress, reporting each match's capture groups. Index 0 is
+    /// the whole match and an unset group is none, so the list length is fixed
+    /// per pattern. An empty list means the scan is finished.
+    ///
+    /// A resource for the same reason find is: the input crosses once.
+    resource url-groups {
+        constructor(input: list<u8>, start: u32);
+        next: func() -> result<list<option<tuple<u32, u32>>>, error-code>;
+    }
 }
 
 world url-ipv6 {
@@ -83,8 +99,29 @@ func TestWitVersionAppears(t *testing.T) {
 	}
 	// EXACTLY one placement: the version after the INTERFACE name. The other
 	// spellings build plausible-looking names and fail `component new`.
-	if got := names["email_find"]; got != "regexped:url-ipv6/matcher@2.3.0#email-find" {
-		t.Errorf("export name = %q, want regexped:url-ipv6/matcher@2.3.0#email-find", got)
+	if got := names["email_match"]; got != "regexped:url-ipv6/matcher@2.3.0#email-match" {
+		t.Errorf("export name = %q, want regexped:url-ipv6/matcher@2.3.0#email-match", got)
+	}
+	// An ITERATING export is a resource, so its version rides on the same
+	// interface name in all three of the names it contributes.
+	_, _, resources, _, _, err := ComponentArtifactsWithSets(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	find, ok := resources["email_find"]
+	if !ok {
+		t.Fatal("find_func produced no resource names")
+	}
+	for _, want := range []struct{ label, got, expect string }{
+		{"constructor", find.Constructor, "regexped:url-ipv6/matcher@2.3.0#[constructor]email-find"},
+		{"next", find.Next, "regexped:url-ipv6/matcher@2.3.0#[method]email-find.next"},
+		{"dtor", find.Dtor, "regexped:url-ipv6/matcher@2.3.0#[dtor]email-find"},
+		{"resource import", find.ResourceImport, "[export]regexped:url-ipv6/matcher@2.3.0"},
+		{"resource new", find.ResourceNew, "[resource-new]email-find"},
+	} {
+		if want.got != want.expect {
+			t.Errorf("%s = %q, want %q", want.label, want.got, want.expect)
+		}
 	}
 	for k, v := range names {
 		if i := strings.Index(v, "#"); i >= 0 && strings.Contains(v[i:], "@") {
@@ -351,7 +388,7 @@ func TestWriteStubWriteFailure(t *testing.T) {
 // componentArtifacts is ComponentArtifactsWithSets without the set table, for
 // the tests that predate sets.
 func componentArtifacts(cfg config.BuildConfig) (string, map[string]string, string, error) {
-	text, names, _, prefix, err := ComponentArtifactsWithSets(cfg)
+	text, names, _, _, prefix, err := ComponentArtifactsWithSets(cfg)
 	return text, names, prefix, err
 }
 
@@ -442,7 +479,7 @@ func TestWitSetsOnlyOmitsMatcher(t *testing.T) {
 // resource's three are NOT interchangeable, and the dtor has no counterpart in
 // the interface at all — `component new` binds it by name.
 func TestSetExportNames(t *testing.T) {
-	_, _, setNames, _, err := ComponentArtifactsWithSets(witSetsCfg())
+	_, _, _, setNames, _, err := ComponentArtifactsWithSets(witSetsCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +516,7 @@ func TestSetExportNames(t *testing.T) {
 func TestSetExportNamesVersioned(t *testing.T) {
 	cfg := witSetsCfg()
 	cfg.WitVersion = "2.3.0"
-	_, _, setNames, _, err := ComponentArtifactsWithSets(cfg)
+	_, _, _, setNames, _, err := ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

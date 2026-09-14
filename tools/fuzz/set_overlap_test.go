@@ -144,6 +144,17 @@ func quadraticShapes() []struct {
 		{"runs", []string{`a+`}, strings.Repeat(strings.Repeat("a", 500)+"b", 8)},
 		{"runs-mixed", []string{`a+`, `b+`, `[ab]+`},
 			strings.Repeat(strings.Repeat("a", 200)+strings.Repeat("b", 60), 12)},
+
+		// LONG WALK, EMPTY MATCH. The trigger used to charge a drive for the
+		// bytes it DELIVERED, and these deliver nothing: the greedy branch
+		// walks to the end of the input from every start and then falls back to
+		// the empty alternative, so every match is zero-length. The counter
+		// stayed at 0 for the whole drive, `ready` stayed 0, and the walk ran
+		// quadratic with nothing to signal it — measured at 31/76/268 ms for
+		// 2,000/4,000/8,000 bytes, against 20/33/75 ms for `a*`, which engages
+		// on its first call because its matches have extent.
+		{"empty-alt-long-walk", []string{`(?:a*b)?`}, strings.Repeat("a", 4000)},
+		{"empty-alt-mixed", []string{`(?:a*b)?`, `a+`}, strings.Repeat("a", 3000)},
 	}
 }
 
@@ -1506,6 +1517,34 @@ func TestOverlapCacheRejectsBackwardsFrom(t *testing.T) {
 	walk, _ := driveCacheFindSequence(t, pats, input, 0, stride, 0, noHook, []int32{2, 0})
 	if walk[0] == abi.OverlapCacheOutOfOrder {
 		t.Error("a drive offering no region reported out of order: the check needs an engaged cache")
+	}
+}
+
+// TestOverlapCacheHighFromIsPastTheEnd pins that the out-of-order check reads
+// `from` as the UNSIGNED position the ABI says it is.
+//
+// A `from` at or above 2^31 is past the end of any input that fits a wasm32
+// memory, so the contract's answer is "nothing found" — 0. Read SIGNED it is
+// negative, lands below the floor of an ENGAGED cache, and came back as -6:
+// an ERROR, and the one code that tells a caller its scan went backwards.
+// That is strictly worse than an unspecified answer, which is why the compare
+// is unsigned even though nothing generated can reach it (the C stubs refuse a
+// length or offset over 0x7FFFFFFF with RX_ERR_RANGE).
+//
+// The cache must be ENGAGED first — the check reads the floor, so it exists
+// only after a sweep — which is what the leading 0 in the sequence does.
+func TestOverlapCacheHighFromIsPastTheEnd(t *testing.T) {
+	pats := []string{`a*`, `b+`}
+	input := "aaab"
+	full, stride := overlapCacheFor(input, pats)
+
+	got, _ := driveCacheFindSequence(t, pats, input, full, stride, 0, func([]byte) {},
+		[]int32{0, int32(-0x80000000), int32(-16)})
+	for i, from := range []int64{0x80000000, 0xFFFFFFF0} {
+		if got[i] != 0 {
+			t.Errorf("find(from=%#x) on an engaged cache returned %d, want 0 (past the end)",
+				from, got[i])
+		}
 	}
 }
 

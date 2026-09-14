@@ -578,6 +578,10 @@ func genCFindHPart(funcName string) string {
 			"    const char *input;\n"+
 			"    size_t len, offset, prev_end;\n"+
 			"    int done;\n"+
+			"    /* Opaque. Under wasm_format: component this carries the resource\n"+
+			"       handle the scan lives behind and a word marking it live; under\n"+
+			"       wasm_format: module it stays zero. Never read or write it. */\n"+
+			"    unsigned scratch[2];\n"+
 			"} %[2]s;\n\n"+
 			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
 			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
@@ -587,7 +591,19 @@ func genCFindHPart(funcName string) string {
 			"     RX_ERR_BT_OVERFLOW  the engine gave up; what remains is UNKNOWN\n"+
 			"   The status is the RETURN value, not something written into out_match,\n"+
 			"   so 0 stays unambiguously \"finished\". */\n"+
-			"int %[1]s_next(%[2]s *iter, rx_match_t *out_match);\n\n",
+			"int %[1]s_next(%[2]s *iter, rx_match_t *out_match);\n\n"+
+			"/* Releases whatever the iterator holds. Under wasm_format: component it drops\n"+
+			"   the resource handle the scan lives behind, and is REQUIRED: abandoning an\n"+
+			"   iterator strands the input copy and the scan state inside the regexp\n"+
+			"   component for the life of the process. Under wasm_format: module it is a\n"+
+			"   no-op — the iterator is caller-owned, by value, and holds a borrowed input\n"+
+			"   pointer — and is emitted anyway so the SAME source compiles against either\n"+
+			"   format.\n\n"+
+			"   Call it on every exit path, not just the last one: a break or an early\n"+
+			"   return out of the loop leaks under component. Re-initialising frees what\n"+
+			"   the iterator held first, a second call is a no-op, and so is a call on an\n"+
+			"   iterator that finished. */\n"+
+			"void %[1]s_free(%[2]s *iter);\n\n",
 		funcName, iterType)
 }
 
@@ -613,7 +629,20 @@ func genCFindCPart(importModule, funcName string) string {
     iter->offset = offset;
     iter->prev_end = (size_t)-1;
     iter->done = (offset > len);
+    /* Cleared so the struct reads the same in both formats. Nothing here uses
+       it; the component build keeps its resource handle in it. */
+    iter->scratch[0] = 0;
+    iter->scratch[1] = 0;
     return 0;
+}
+
+/* A no-op for wasm_format: module — the iterator is caller-owned, by value, and
+   holds a borrowed input pointer, so there is nothing to give back. It exists
+   so the same source compiles against a COMPONENT, where the scan lives behind
+   a resource handle that must be dropped. */
+void %[1]s_free(%[2]s *iter) {
+    if (!iter) return;
+    iter->done = 1;
 }
 
 int %[1]s_next(%[2]s *iter, rx_match_t *out_match) {
@@ -774,6 +803,8 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"    const char *input;\n"+
 			"    size_t len, offset, prev_end;\n"+
 			"    int done;\n"+
+			"    /* Opaque — see the find iterator. */\n"+
+			"    unsigned scratch[2];\n"+
 			"} %[2]s;\n\n"+
 			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
 			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
@@ -784,7 +815,10 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"     1  a match was written\n"+
 			"     0  the scan is finished\n"+
 			"     RX_ERR_BT_OVERFLOW  the engine gave up; what remains is UNKNOWN */\n"+
-			"int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[3]s_GROUPS]);\n\n",
+			"int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[3]s_GROUPS]);\n\n"+
+			"/* Releases whatever the iterator holds — see the find iterator; under\n"+
+			"   wasm_format: component it drops the resource handle and is REQUIRED. */\n"+
+			"void %[1]s_free(%[2]s *iter);\n\n",
 		funcName, cIterTypeName(funcName), funcUpper)
 
 	// .c: the index-aligned name table, plus the lookup. Shared with the
@@ -811,7 +845,15 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
     iter->offset = offset;
     iter->prev_end = (size_t)-1;
     iter->done = (offset > len);
+    iter->scratch[0] = 0;
+    iter->scratch[1] = 0;
     return 0;
+}
+
+/* A no-op here; under wasm_format: component it drops the resource handle. */
+void %[1]s_free(%[2]s *iter) {
+    if (!iter) return;
+    iter->done = 1;
 }
 
 int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[5]d]) {

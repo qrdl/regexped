@@ -91,7 +91,16 @@ regexped/
 │   │                          #   block-ensure both find entries call. Only SERVING is
 │   │                          #   per-entry, because `find` returns a position's TOTAL
 │   │                          #   where the batch entry returns what it WROTE — which is
-│   │                          #   why `find` does not forward into the batch entry
+│   │                          #   why `find` does not forward into the batch entry.
+│   │                          #   The trigger charges bytes WALKED as well as matched: the
+│   │                          #   dense suffix body stamps its farthest position into a
+│   │                          #   `walkEnd` global (allocated only for a sweep-capable
+│   │                          #   bucket), because `(?:a*b)?` walks to EOF and matches
+│   │                          #   empty, and a matched-bytes counter stayed at 0 while the
+│   │                          #   drive ran quadratic. The batch entry's ENTRY sweep fires
+│   │                          #   only at k == 0: walk and cache order one position's
+│   │                          #   tuples differently, so an ordinal taken in one and spent
+│   │                          #   in the other duplicated a tuple and dropped another
 │   ├── set_overlap_ckpt.go    # The CHECKPOINTED cache itself: the pass that snapshots a
 │   │                          #   column every `stride` positions, and the body that
 │   │                          #   rebuilds one block on demand. The region is the SQUARE
@@ -181,9 +190,15 @@ regexped/
 │   │                          #   canonical ABI lowers arguments BEFORE the callee runs,
 │   │                          #   so a mark taken at entry cannot cover them — hence the
 │   │                          #   per-call chain the post-return walks), ONE shared
-│   │                          #   post-return that frees that chain, and one
-│   │                          #   retptr-shaped adapter per export, all APPENDED after every
-│   │                          #   pattern function so no baseIdx or per-pattern offset moves.
+│   │                          #   post-return that frees that chain, a retptr-shaped
+│   │                          #   adapter for each `match`, and a constructor / `next` /
+│   │                          #   dtor trio for each `find` and `groups` — those two are
+│   │                          #   RESOURCES, because an iterating function would have the
+│   │                          #   input copied on every step. All APPENDED after every
+│   │                          #   pattern function; each resource IMPORTS one
+│   │                          #   `[resource-new]` builtin, which shifts every defined index
+│   │                          #   by the same amount (orderedPatternResources is the one
+│   │                          #   authority for that order).
 │   │                          #   Holds asmOpts, whose ZERO VALUE MEANS MODULE — which is why
 │   │                          #   it is a struct and not two positional params next to the
 │   │                          #   adjacent `standalone` bool. It VALIDATES: Component with no
@@ -970,11 +985,19 @@ that same core module into a Component Model component:
   2800 ns against 230-400 ns for `next` at 4 KB), and `[dtor]` frees it. ONE set
   feature is refused: `hints: [batch-find]`, since the interface exposes one
   position per call.
+- **A single pattern's `find_func` and `groups_func` are resources too**, for the
+  same reason: as functions the input would cross — and be copied — once per
+  match. The Rust stub's public API does not change (the iterator holds the
+  resource and drops it); the C header gains `scratch[2]` in each iterator struct
+  and a `<func>_free`, mandatory under `component` and a no-op under `module`.
+  `next` advances itself; Go's adjacent-empty suppression stays in the stubs.
+  `groups`' `next` returns a plain list, empty meaning finished.
 - **A `wasm_format: module` build is byte-identical to what it always was**, and
   that is the gate: `make byteident`, plus `component/byteident_test.go` pinning
   the component CORE module's bytes (not the wrapped component, whose bytes
   belong to whichever `wasm-tools` is installed) and asserting that every raw
-  export keeps its function index — adapters are APPENDED, never interleaved.
+  export shifts by the SAME amount — adapters are APPENDED, never interleaved, and
+  the only shift is the one `[resource-new]` import each resource adds.
 
 Component STUBS exist for `rust` and `c`, with the same public API as their
 module-format counterparts — SETS included — so switching `wasm_format` changes
@@ -1170,7 +1193,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-09-13
+**Last Updated:** 2026-09-14
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

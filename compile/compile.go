@@ -372,6 +372,11 @@ type CompileOptions struct {
 	// derives it from the same WIT it writes) so the .wit and the core module
 	// cannot disagree.
 	ComponentExportNames map[string]string
+	// ComponentPatternResources is the name table for the ITERATING exports.
+	// `find` and `groups` are WIT resources — the input crosses into the
+	// component once, in the constructor, instead of on every step — so they
+	// carry a constructor/next/dtor trio rather than one function name.
+	ComponentPatternResources map[string]ComponentPatternResource
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
 	// (match/find) or TDFA (capture groups). If the DFA/TDFA exceeds this limit
 	// the engine falls back to Backtracking. 0 means use the default (1024).
@@ -2283,8 +2288,24 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		rawData = append(rawData, p.dataBytes...)
 	}
 
-	// Pass 1: assign base function indices.
-	baseIdx, total := patternBaseIndices(patterns)
+	// A component with an ITERATING export imports the `[resource-new]` canon
+	// builtin once per resource, and a function import occupies a function
+	// index — so every DEFINED function starts past them, pattern bodies
+	// included. Their internal `call` targets all derive from baseIdx, so the
+	// offset reaches them without any emitter knowing about it.
+	numFuncImports := 0
+	var resources []patternResource
+	if opts.Component {
+		resources = orderedPatternResources(patterns, opts.PatternResources, 0)
+		numFuncImports = len(resources)
+	}
+
+	// Pass 1: assign base function indices, past the imports.
+	baseIdx, definedTotal := patternBaseIndices(patterns)
+	for i := range baseIdx {
+		baseIdx[i] += numFuncImports
+	}
+	total := numFuncImports + definedTotal
 
 	// Component adapters are APPENDED after every pattern function, so no
 	// baseIdx and no per-pattern offset moves. Their own indices start at
@@ -2292,8 +2313,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	var adapters []componentAdapter
 	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
 	if opts.Component {
-		// No function imports on this path, so the defined functions start at 0.
-		adapters = componentAdapters(patterns, opts.ExportNames, 0)
+		adapters = componentAdapters(patterns, opts.ExportNames, opts.PatternResources, numFuncImports)
 		reallocIdx = total
 		freeIdx = total + 1
 		postIdx = total + 2
@@ -2361,20 +2381,50 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x00)
 		numTypes++
 	}
+	// (i32)→i32 — a resource's `next`, and the `[resource-new]` builtin it is
+	// imported with. Declared only when the config has an iterating export, so
+	// a component with nothing but `match` is unchanged.
+	nextTypeIdx := -1
+	if opts.Component && numFuncImports > 0 {
+		nextTypeIdx = numTypes
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x01, 0x7F)
+		numTypes++
+	}
 	typeSection[0] = byte(numTypes)
 	out = appendSection(out, 1, typeSection)
 
 	// Import section (embedded only): import "main" memory as memory[0].
 	// In the merged binary, main keeps memory[0] and our own memory becomes memory[1].
 	// Input data loads use implicit memory[0]; DFA table loads use explicit memory[1].
-	if !standalone {
+	//
+	// A COMPONENT never imports memory — it owns its own — but it does import
+	// one `[resource-new]` canon builtin per iterating export, which is what a
+	// constructor calls to turn its representation into a handle. Returning the
+	// representation instead type-checks, builds, and traps at the first use
+	// with "unknown handle index".
+	if !standalone || numFuncImports > 0 {
 		var importSec []byte
-		importSec = utils.AppendULEB128(importSec, 1) // 1 import
-		importSec = appendString(importSec, "main")   // module name
-		importSec = appendString(importSec, "memory") // field name
-		importSec = append(importSec, 0x02)           // kind: memory
-		importSec = append(importSec, 0x00)           // limits flags: no max
-		importSec = append(importSec, 0x00)           // min = 0 pages
+		n := 0
+		if !standalone {
+			n++
+		}
+		n += numFuncImports
+		importSec = utils.AppendULEB128(importSec, uint32(n))
+		if !standalone {
+			importSec = appendString(importSec, "main")   // module name
+			importSec = appendString(importSec, "memory") // field name
+			importSec = append(importSec, 0x02)           // kind: memory
+			importSec = append(importSec, 0x00)           // limits flags: no max
+			importSec = append(importSec, 0x00)           // min = 0 pages
+		}
+		// Same order as orderedPatternResources, which is what makes each
+		// constructor's import index the one the adapter list assigned it.
+		for _, r := range resources {
+			importSec = appendString(importSec, r.res.ResourceImport)
+			importSec = appendString(importSec, r.res.ResourceNew)
+			importSec = append(importSec, 0x00) // kind: function
+			importSec = utils.AppendULEB128(importSec, uint32(nextTypeIdx))
+		}
 		out = appendSection(out, 2, importSec)
 	}
 
@@ -2400,7 +2450,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotGroupsFromWrapper: byte(groupsFromTypeIdx), // (i32×4)→i32
 	}
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(total))
+	// `total` counts every function index INCLUDING the imported builtins; the
+	// function section declares only the defined ones.
+	fs = utils.AppendULEB128(fs, uint32(total-numFuncImports))
 	for _, p := range patterns {
 		for _, slot := range p.funcLayout() {
 			t, ok := singlePatternSlotType[slot.kind]
@@ -2417,6 +2469,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			switch a.kind {
 			case adapterMatch:
 				fs = append(fs, 0x00) // (i32,i32)→i32
+			case adapterPatCtor:
+				fs = append(fs, 0x02) // (ptr, len, start) → handle
+			case adapterPatFindNext, adapterPatGroupsNext:
+				fs = append(fs, byte(nextTypeIdx)) // (rep) → retptr
+			case adapterPatDtor:
+				fs = append(fs, byte(postTypeIdx)) // (rep) → ()
 			default:
 				fs = append(fs, 0x02) // (i32,i32,i32)→i32 — find and groups alike
 			}
@@ -2494,7 +2552,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		// adapter. Every post name points at the SAME function: a WASM function
 		// may be exported under any number of names, so one shared reset body
 		// serves them all.
-		numExports += 1 + 2*len(adapters)
+		numExports++
+		for _, a := range adapters {
+			numExports++
+			if a.kind.needsPost() {
+				numExports++
+			}
+		}
 	}
 	var es []byte
 	es = utils.AppendULEB128(es, uint32(numExports))
@@ -2548,6 +2612,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = appendString(es, a.export)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			if !a.kind.needsPost() {
+				continue
+			}
 			es = appendString(es, "cabi_post_"+a.export)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(postIdx))
@@ -2555,9 +2622,10 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	out = appendSection(out, 7, es)
 
-	// Code section.
+	// Code section. Defined functions only — `total` counts the imported canon
+	// builtins too.
 	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(total))
+	cs = utils.AppendULEB128(cs, uint32(total-numFuncImports))
 	for i, p := range patterns {
 		base := baseIdx[i]
 		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
@@ -2668,6 +2736,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				cs = appendCodeEntry(cs, buildFindAdapterBody(reallocIdx, a.funcIdx))
 			case adapterGroups:
 				cs = appendCodeEntry(cs, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			default:
+				cs = appendCodeEntry(cs, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
 			}
 		}
 	}

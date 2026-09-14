@@ -19,13 +19,37 @@ import (
 // both, because silently renaming one of them would change which WASM export a
 // caller reaches.
 
-// witFunc is one emitted WIT function.
+// witKind says which SHAPE a configured export takes in the interface.
+//
+// `match_func` is a plain function: one call, one answer, nothing to carry
+// between calls. `find_func` and `groups_func` ITERATE, and an iterating
+// function has to be handed the input again on every step — which the
+// canonical ABI copies. So they are RESOURCES: the constructor takes the input
+// once, `next` takes only the handle, and `[dtor]` releases it. That is the
+// same reason a set's `find` is a resource, and the cost it removes was
+// measured there at 2,800 ns per stateless call against 230-400 ns for a
+// resource `next` over 4 KB.
+type witKind int
+
+const (
+	witKindMatch witKind = iota
+	witKindFind
+	witKindGroups
+)
+
+// iterates reports whether this export is a resource rather than a function.
+func (k witKind) iterates() bool { return k != witKindMatch }
+
+// witFunc is one emitted WIT item: a function, or a resource when it iterates.
 type witFunc struct {
-	kebab  string // WIT name
+	kebab  string // WIT name — of the function, or of the resource
 	origin string // the config value it came from, for error messages
 	field  string // match_func / find_func / groups_func
+	kind   witKind
 	doc    string
-	sig    string
+	// sig is the function's signature for witKindMatch, and the RETURN type of
+	// `next` for a resource.
+	sig string
 }
 
 // witParts validates and derives, in ONE place, everything the WIT and the
@@ -92,9 +116,27 @@ func renderWit(cfg config.BuildConfig, pkg, world string, funcs []witFunc, sets 
 		for _, f := range funcs {
 			b.WriteString("\n")
 			for _, line := range strings.Split(f.doc, "\n") {
+				if line == "" {
+					b.WriteString("    ///\n")
+					continue
+				}
 				fmt.Fprintf(&b, "    /// %s\n", line)
 			}
-			fmt.Fprintf(&b, "    %s: %s;\n", f.kebab, f.sig)
+			if !f.kind.iterates() {
+				fmt.Fprintf(&b, "    %s: %s;\n", f.kebab, f.sig)
+				continue
+			}
+			// An iterating export is a RESOURCE: the constructor takes the
+			// input, `next` takes only the handle, and dropping it ends the
+			// scan. The constructor's `start` bounds where the FIRST step
+			// searches from; it never truncates what the engine can see behind
+			// that point, so a leading \b or (?m:^) still judges a real
+			// preceding byte.
+			fmt.Fprintf(&b, `    resource %s {
+        constructor(input: list<u8>, start: u32);
+        next: func() -> %s;
+    }
+`, f.kebab, f.sig)
 		}
 		b.WriteString("}\n\n")
 	}
@@ -121,16 +163,19 @@ func witFuncs(cfg config.BuildConfig) ([]witFunc, error) {
 	claimed := map[string]witFunc{}
 
 	for _, re := range cfg.Regexps {
-		for _, c := range []struct{ field, name, doc, sig string }{
+		for _, c := range []struct {
+			field, name, doc, sig string
+			kind                  witKind
+		}{
 			{"match_func", re.MatchFunc,
 				"Anchored match against the whole input. some(end) on a match.",
-				"func(input: list<u8>) -> result<option<u32>, error-code>"},
+				"func(input: list<u8>) -> result<option<u32>, error-code>", witKindMatch},
 			{"find_func", re.FindFunc,
-				"Leftmost match starting at or after `start`. Positions are absolute.",
-				"func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>"},
+				"A scan in progress. `next` answers the leftmost match at or after the\nposition the scan has reached, and none means it is finished. Positions\nare absolute.\n\nA resource rather than a function because the scan needs state between\ncalls — the input and the position — and a function would be handed the\ninput again on every step, which the canonical ABI copies. Constructed\nonce, the input crosses once.",
+				"result<option<tuple<u32, u32>>, error-code>", witKindFind},
 			{"groups_func", re.GroupsFunc,
-				"Captures of the leftmost match at or after `start`; index 0 is the whole\nmatch, an unset group is none. The list length is fixed per pattern.",
-				"func(input: list<u8>, start: u32) -> result<option<list<option<tuple<u32, u32>>>>, error-code>"},
+				"A scan in progress, reporting each match's capture groups. Index 0 is\nthe whole match and an unset group is none, so the list length is fixed\nper pattern. An empty list means the scan is finished.\n\nA resource for the same reason find is: the input crosses once.",
+				"result<list<option<tuple<u32, u32>>>, error-code>", witKindGroups},
 		} {
 			if c.name == "" {
 				continue
@@ -140,7 +185,7 @@ func witFuncs(cfg config.BuildConfig) ([]witFunc, error) {
 				return nil, fmt.Errorf("%s %q cannot be used as a WIT function name (%v): rename it, or use wasm_format: module",
 					c.field, c.name, err)
 			}
-			f := witFunc{kebab: kebab, origin: c.name, field: c.field, doc: c.doc, sig: c.sig}
+			f := witFunc{kebab: kebab, origin: c.name, field: c.field, kind: c.kind, doc: c.doc, sig: c.sig}
 			if prev, dup := claimed[kebab]; dup {
 				return nil, fmt.Errorf("%s %q and %s %q both map to the WIT name %q: rename one of them",
 					prev.field, prev.origin, c.field, c.name, kebab)
@@ -180,17 +225,6 @@ func kebabNames(funcs []witFunc) map[string]string {
 	return out
 }
 
-// snakeNames is kebabNames in the form wit-bindgen's Rust macro produces: it
-// lowercases the kebab identifier and joins with underscores, so
-// `find-github-token` becomes `find_github_token`.
-func snakeNames(funcs []witFunc) map[string]string {
-	out := make(map[string]string, len(funcs))
-	for _, f := range funcs {
-		out[f.origin] = rustWitFuncName(f.kebab)
-	}
-	return out
-}
-
 // dropWorld returns the lines of generated WIT without its `world … { … }`
 // block. A dependency package supplies the interfaces only, and an exporting
 // world left in one makes the document describe something else. The block is
@@ -226,15 +260,17 @@ func dropWorld(witText string) []string {
 // identifier, two names colliding — so three separate calls would give a caller
 // two error branches that the first call has already made unreachable.
 func ComponentArtifactsWithSets(cfg config.BuildConfig) (
-	witText string, exportNames map[string]string, setNames map[string]SetExportNames, prefix string, err error,
+	witText string, exportNames map[string]string, resourceNames map[string]PatternResourceNames,
+	setNames map[string]SetExportNames, prefix string, err error,
 ) {
 	pkg, world, funcs, sets, err := witParts(cfg)
 	if err != nil {
-		return "", nil, nil, "", err
+		return "", nil, nil, nil, "", err
 	}
 	prefix = interfacePrefix(pkg, cfg.WitVersion)
 	return renderWit(cfg, pkg, world, funcs, sets),
 		exportNamesFrom(prefix, funcs),
+		resourceNamesFrom(prefix, funcs),
 		setExportNames(setsInterfacePrefix(pkg, cfg.WitVersion), sets),
 		prefix, nil
 }
@@ -254,12 +290,64 @@ func witExportNames(cfg config.BuildConfig) (map[string]string, error) {
 }
 
 // exportNamesFrom keys the canonical name by the config's own func name.
+//
+// Only the FUNCTION-shaped exports appear here. An iterating export is a
+// resource and contributes three names plus an imported builtin, which
+// PatternResourceNames carries — see resourceNamesFrom.
 func exportNamesFrom(prefix string, funcs []witFunc) map[string]string {
 	names := make(map[string]string, len(funcs))
 	for _, f := range funcs {
+		if f.kind.iterates() {
+			continue
+		}
 		names[f.origin] = prefix + "#" + f.kebab
 	}
 	return names
+}
+
+// PatternResourceNames is every canonical name ONE iterating pattern export
+// contributes, keyed so compile/ can stamp its adapters without re-deriving a
+// single one.
+//
+// It is the single-pattern twin of SetExportNames, and deliberately the same
+// shape: the two resources differ in what `next` answers, not in how they are
+// named, imported or destroyed.
+type PatternResourceNames struct {
+	// Groups marks the groups shape, whose `next` returns a list of capture
+	// spans where find's returns one span pair. The adapters differ only
+	// there, and compile/ needs to know which body to emit.
+	Groups      bool
+	Constructor string
+	Next        string
+	Dtor        string
+	// ResourceImport is the synthetic module the canon builtins come from:
+	// "[export]regexped:<pkg>/matcher[@<ver>]". ResourceNew is the field name
+	// of the resource.new builtin within it.
+	ResourceImport string
+	ResourceNew    string
+}
+
+// resourceNamesFrom builds the per-resource name table for the iterating
+// exports, keyed by the config's own func name.
+func resourceNamesFrom(prefix string, funcs []witFunc) map[string]PatternResourceNames {
+	var out map[string]PatternResourceNames
+	for _, f := range funcs {
+		if !f.kind.iterates() {
+			continue
+		}
+		if out == nil {
+			out = map[string]PatternResourceNames{}
+		}
+		out[f.origin] = PatternResourceNames{
+			Groups:         f.kind == witKindGroups,
+			Constructor:    prefix + "#[constructor]" + f.kebab,
+			Next:           prefix + "#[method]" + f.kebab + ".next",
+			Dtor:           prefix + "#[dtor]" + f.kebab,
+			ResourceImport: "[export]" + prefix,
+			ResourceNew:    "[resource-new]" + f.kebab,
+		}
+	}
+	return out
 }
 
 // WitInterfacePrefix is `regexped:<pkg>[@<ver>]/matcher` — everything before

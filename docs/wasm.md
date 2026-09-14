@@ -75,16 +75,40 @@ Everything above describes `wasm_format: module`, and is unchanged by the
 component work — a module build is byte-for-byte what it always was.
 
 Under `wasm_format: component` the compiler emits that same core module and
-**appends** the canonical-ABI machinery, so no pattern function index moves:
+**appends** the canonical-ABI machinery. No pattern function is reordered or
+interleaved; a component with an iterating export also IMPORTS one canon builtin
+per resource, which shifts every defined function index by the same amount (see
+below):
 
 | Export | Signature | Role |
 |---|---|---|
 | `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; segregated free lists by power-of-two size class, growing memory when a class is empty and no space is left, and trapping if growth fails or the alignment exceeds 8 |
 | `cabi_post_<canonical>` | `(i32) → ()` | post-return; returns every block THIS call allocated to its class's free list. One shared function, exported under one name per adapter that returns a result area — a set's constructor and destructor have none |
-| `<canonical>` | see below | one adapter per exported pattern function |
+| `…/matcher#<kebab>` | `(ptr, len) → retptr` | `match_func` only: the end position, -1 or -2 lifted to `result<option<u32>, error-code>` |
+| `…/matcher#[constructor]` / `[method]….next` / `[dtor]` | see below | the resource trio for each `find_func` and `groups_func` |
 | the raw exports | unchanged | kept alongside, so `wasm-tools component unbundle` yields a core module the module-format tooling can drive |
 
-A canonical export name is `regexped:<wit_package>[@<wit_version>]/matcher#<kebab-func>`.
+A canonical export name is `regexped:<wit_package>[@<wit_version>]/matcher#<name>`,
+where `<name>` is the kebab func name for `match` and one of the three resource
+forms below for `find` and `groups`.
+
+**`find_func` and `groups_func` are resources.** An iterating function would be
+handed the input on every step, and the canonical ABI copies it each time — a
+scan reporting m matches would copy the input m+1 times. A resource takes it once:
+
+| Export | Role |
+|---|---|
+| `…/matcher#[constructor]<res>` | `(ptr, len, start) → handle`: allocates `{input, len, pos, done}` — plus the capture slots for groups — TAKES OVER the lowered input block (copying only when that block is not the newest on the per-call chain), and returns a handle from the imported `[resource-new]` builtin. No post-return |
+| `…/matcher#[method]<res>.next` | `(rep) → retptr`: calls the raw `(ptr, len, from)` wrapper at the stored position and advances by the stub rule — past the end of a non-empty match, one past the start of an empty one. find lifts to `result<option<tuple<u32,u32>>, error-code>`; groups to `result<list<option<tuple<u32,u32>>>, error-code>`, where an EMPTY list means finished. An error is re-reported on every later call rather than turning into "finished" |
+| `…/matcher#[dtor]<res>` | frees the input block and the state. Bound by name; not in the WIT |
+
+Go's adjacent-empty suppression is NOT applied inside `next`: it decides what a
+caller reports rather than where the scan goes, so the resource answers exactly
+the matches the raw export does and each stub filters.
+
+Each `[resource-new]<res>` is imported from `[export]regexped:<pkg>/matcher[@<ver>]`.
+In a config that also has sets, the pattern resources' imports come first, so
+their indices are `0..n-1` and only the set imports shift.
 
 **Sets add a second interface**, `sets`, and its own adapters:
 
@@ -789,6 +813,11 @@ so no answer changes — but the array is not byte-for-byte untouched.
   evaluated — end-anchored and empty-matchable patterns can match there.
 - `from > len` yields the capability's "nothing": `scan_any` −1,
   `scan_all` 0, `find` 0.
+- **`len` and `from` are below 2³¹.** They are u32 in the ABI and are compared
+  unsigned, but a wasm32 memory holding both the input and a set's tables leaves
+  no room for a 2 GiB input, and nothing above that bound is tested. The
+  generated C stubs refuse it outright with `RX_ERR_RANGE`; every other language
+  cannot express an input that large. Above the bound the answer is unspecified.
 - `len == 0`: position 0 is evaluated.
 - Zero-length matches are ordinary matches; `find` reports them as `(id, p, p)`.
 - `out_ptr`, `scratch_ptr` and the `gate_ptr` inside it must be 4-byte aligned.

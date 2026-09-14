@@ -41,7 +41,7 @@ because the header is produced by the same generator. `main.c` compiles unchange
 `regexped generate` emits **three** things under this format:
 
 ```
-stub.h  stub.c  wit/          <- wit/consumer.wit + wit/deps/<pkg>/matcher.wit
+stub.h  stub.c  wit/          <- wit/consumer.wit + wit/deps/regexped-<pkg>/<pkg>.wit
 ```
 
 There are **two routes** to a component, differing only in when the wrapping
@@ -186,10 +186,12 @@ typedef struct {
     const char *input;
     size_t len, offset, prev_end;
     int done;
+    unsigned scratch[2];   /* opaque: the component build's resource handle */
 } rx_<func>_iter_t;
 
 int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
 int <func>_next(rx_<func>_iter_t *iter, rx_match_t *out_match);
+void <func>_free(rx_<func>_iter_t *iter);
 ```
 
 Scans for non-overlapping matches at or after `offset`. The whole input stays visible to the engine — `offset` bounds where the search starts, it does not truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against. Positions are absolute.
@@ -208,9 +210,12 @@ while ((status = find_token_next(&iter, &match)) == 1) {
 if (status == RX_ERR_BT_OVERFLOW) {
     /* the result is unknown, not "no more matches" */
 }
+find_token_free(&iter);
 ```
 
 The iterator owns the advance past a zero-length match and Go's `FindAllIndex` rule — an empty match beginning exactly where the previous reported match ended is not reported. Both used to be your job, copied from this document.
+
+**`_free` is a no-op under `wasm_format: module` and MANDATORY under `component`.** There the scan lives inside the regexp component behind a resource handle, and abandoning an iterator strands the input copy and the scan state for the life of the process. Call it on every exit path — each `break`, `return` and `goto` out of the loop, not only the last one. Re-initialising an iterator frees what it held first, a second `_free` does nothing, and so does one on an iterator that never started. Writing it unconditionally is what lets the same source compile against either format.
 
 ---
 
@@ -221,10 +226,12 @@ typedef struct {
     const char *input;
     size_t len, offset, prev_end;
     int done;
+    unsigned scratch[2];   /* opaque: the component build's resource handle */
 } rx_<func>_iter_t;
 
 int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
 int <func>_next(rx_<func>_iter_t *iter, rx_group_t out_groups[static <FUNC_UPPER>_GROUPS]);
+void <func>_free(rx_<func>_iter_t *iter);
 ```
 
 `_next` writes this match's groups into **your** array and returns:
@@ -256,7 +263,10 @@ while ((status = parse_url_next(&iter, groups)) == 1) {
 if (status == RX_ERR_BT_OVERFLOW) {
     /* the result is unknown, not "no more matches" */
 }
+parse_url_free(&iter);
 ```
+
+`_free` carries the same obligation it does for `find`: a no-op for a module, mandatory for a component.
 
 ---
 

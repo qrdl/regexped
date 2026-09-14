@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -110,15 +111,43 @@ func TestComponentKeepsModuleExportsAtTheSameIndices(t *testing.T) {
 	if len(plainExports) == 0 {
 		t.Fatal("the module build exported nothing; the fixture is not exercising anything")
 	}
+	// Every raw export shifts by the SAME amount, and that amount is the number
+	// of function IMPORTS the component build adds — one `[resource-new]` canon
+	// builtin per iterating export, since `find` and `groups` are resources. A
+	// function import occupies a function index, so the defined functions start
+	// past them.
+	//
+	// What is being pinned is not "nothing moves" but "nothing moves RELATIVE to
+	// anything else": the adapters are still APPENDED, so no pattern function is
+	// reordered, inserted between, or dropped. A single uniform delta is exactly
+	// that property, and it is what a per-pattern offset bug would break.
+	delta := -1
 	for name, idx := range plainExports {
 		got, ok := componentExports[name]
 		if !ok {
 			t.Errorf("component build dropped the raw export %q", name)
 			continue
 		}
-		if got != idx {
-			t.Errorf("raw export %q moved from function %s to %s — adapters must be APPENDED, "+
-				"so no pattern function index changes", name, idx, got)
+		plainIdx, err := strconv.Atoi(idx)
+		if err != nil {
+			t.Fatalf("module export %q has a non-numeric index %q", name, idx)
+		}
+		compIdx, err := strconv.Atoi(got)
+		if err != nil {
+			t.Fatalf("component export %q has a non-numeric index %q", name, got)
+		}
+		d := compIdx - plainIdx
+		if d < 0 {
+			t.Errorf("raw export %q moved BACKWARDS, from %s to %s", name, idx, got)
+			continue
+		}
+		if delta < 0 {
+			delta = d
+			continue
+		}
+		if d != delta {
+			t.Errorf("raw export %q shifted by %d where another shifted by %d — adapters must be "+
+				"APPENDED and the imports must offset every defined function alike", name, d, delta)
 		}
 	}
 }

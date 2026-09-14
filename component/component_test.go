@@ -550,6 +550,41 @@ func TestCmdCompileWritesSetComponent(t *testing.T) {
 	}
 }
 
+// TestCmdCompileVerboseReportsSets pins what `regexped compile --verbose`
+// prints for a set-bearing COMPONENT.
+//
+// The set diagnostics reach the Reporter from the compile that produced them,
+// and the component path used to drop them on the floor: `CompileFileComponent`
+// discarded the `[]SetDiag` its own callee returned, so --verbose listed the
+// patterns and then stopped, while the module path printed every set's
+// frontend, capabilities and buckets. Asserting the SET section specifically,
+// because the pattern rows were never the part that went missing.
+func TestCmdCompileVerboseReportsSets(t *testing.T) {
+	needWasmTools(t)
+	dir := t.TempDir()
+	var report bytes.Buffer
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "runs", WitPackage: "runs",
+		Regexps: []config.RegexEntry{
+			{Name: "lower", Pattern: `[a-z]+`},
+			{Name: "digits", Pattern: `[0-9]+`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "runs", Patterns: config.PatternSelector{All: true},
+			ScanAny: "runs_scan_any", Find: "scan_runs",
+		}},
+	}
+	if err := CmdCompile(cfg, filepath.Join(dir, "runs.wasm"), &report); err != nil {
+		t.Fatal(err)
+	}
+	got := report.String()
+	for _, want := range []string{`Set "runs"`, "frontend:", "capabilities:", "buckets:"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("--verbose output is missing %q:\n%s", want, got)
+		}
+	}
+}
+
 // Core is the seam between the WIT derivation and the compiler, and it is the one
 // place a set-bearing config takes the second assembler. These tests cover both
 // arms and the refusals, because a caller that rebuilt the join would be free to
@@ -774,21 +809,25 @@ func exportMap(t *testing.T, tool string, wasm []byte) map[string]string {
 // artifacts is generate.ComponentArtifacts, wrapped for tests.
 func artifacts(t *testing.T, cfg config.BuildConfig) (string, map[string]string, string, error) {
 	t.Helper()
-	text, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
+	text, names, _, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	return text, names, prefix, err
 }
 
 // realCore builds a core module WITH the component adapters.
 func realCore(t *testing.T, cfg config.BuildConfig) ([]byte, string) {
 	t.Helper()
-	witText, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
+	witText, names, resources, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The RESOURCES matter as much as the plain names: find and groups are
+	// resources, so a core built without them exports no constructor and
+	// `component new` refuses the WIT beside it.
 	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{
-		Component:            true,
-		ComponentPackage:     prefix,
-		ComponentExportNames: names,
+		Component:                 true,
+		ComponentPackage:          prefix,
+		ComponentExportNames:      names,
+		ComponentPatternResources: toCompilePatternResources(resources),
 	})
 	if err != nil {
 		t.Fatal(err)

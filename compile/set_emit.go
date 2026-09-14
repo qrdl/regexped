@@ -266,6 +266,13 @@ type compiledSet struct {
 	overlapProjTabOff int32
 	overlapSuccOff    int32
 
+	// walkEndGlobal is the module global the tuple-writing suffix body stamps
+	// with the farthest position its walk reached, or -1 when no body carries
+	// the store. The answer cache's trigger reads it: charging a drive for the
+	// extent it DELIVERED cannot see a pattern that walks far and matches
+	// empty, and such a drive stayed quadratic with the counter reading zero.
+	walkEndGlobal int32
+
 	// litToBuckets[litID] = list of bucket indices sharing this literal.
 	// Multiple buckets can share a literal when bin-packing splits large groups.
 	litToBuckets [][]int
@@ -872,6 +879,10 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		base int32
 	}
 	suffixDedup := map[uint64][]suffixSlot{}
+	// The module global the tuple-writing body stamps with its walk's reach, or
+	// -1 when no bucket carries the store. At most one bucket ever does — the
+	// sweep runs on a single-bucket set — so one variable holds it.
+	walkEndGlobal := int32(-1)
 	for bi, bkt := range buckets {
 		// A Backtracking fallback bucket has no table at all — that is the
 		// point of it. Its suffix body is emitted later,
@@ -892,8 +903,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip())
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), wantsWalkExtent(spec, buckets, bi))
 		bkt.dp = art.dp
+		if art.walkEndGlobal >= 0 {
+			walkEndGlobal = art.walkEndGlobal
+		}
 		if art.sparseProbeReady {
 			// The scratch address is decided by the emitter; the driver reads
 			// probe results from it, so it is written back here rather than
@@ -1309,6 +1323,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		patternCount:        spec.patternCount(),
 		suffixHasSkip:       spec.suffixNeedsSkip(),
 		overlapping:         spec.Overlapping,
+		walkEndGlobal:       walkEndGlobal,
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
 		scanProbeBodies:     scanProbeBodies,
@@ -1693,13 +1708,21 @@ func CompileFileOpts(cfg config.BuildConfig, output string, over CompileSetOptio
 // generate/ imports compile/, so compile/ cannot reach the derivation. The
 // component/ package sits above both and is what calls this.
 func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[string]string,
-	setNames map[string]ComponentSetNames, rep *Reporter,
+	resources map[string]ComponentPatternResource, setNames map[string]ComponentSetNames, rep *Reporter,
 ) ([]byte, int64, error) {
-	w, top, _, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, CompileOptions{
-		Component:            true,
-		ComponentPackage:     pkg,
-		ComponentExportNames: exportNames,
+	w, top, diags, err := compileFileComponentReport(cfg, "", CompileSetOptions{}, rep, CompileOptions{
+		Component:                 true,
+		ComponentPackage:          pkg,
+		ComponentExportNames:      exportNames,
+		ComponentPatternResources: resources,
 	}.asmOpts(setNames))
+	// The twin of CmdCompileVerbose's own line: the diags belong to the
+	// Reporter, and dropping them here is why `compile --verbose` printed the
+	// patterns of a set-bearing COMPONENT and then stopped, where the module
+	// path printed every set's frontend, capabilities and buckets.
+	if rep != nil {
+		rep.Sets = diags
+	}
 	return w, top, err
 }
 
@@ -1753,12 +1776,13 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
-			MaxDFAStates:         cfg.MaxDFAStates,
-			MaxTDFARegs:          cfg.MaxTDFARegs,
-			Report:               rep,
-			Component:            comp.Component,
-			ComponentPackage:     comp.ComponentPackage,
-			ComponentExportNames: comp.ExportNames,
+			MaxDFAStates:              cfg.MaxDFAStates,
+			MaxTDFARegs:               cfg.MaxTDFARegs,
+			Report:                    rep,
+			Component:                 comp.Component,
+			ComponentPackage:          comp.ComponentPackage,
+			ComponentExportNames:      comp.ExportNames,
+			ComponentPatternResources: comp.PatternResources,
 		})
 		return w, top, nil, err
 	}
@@ -1932,7 +1956,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// fourth-byte-perfect but entirely bogus import for every set.
 		resNewIdx[si] = -1
 	}
-	numFuncImports := 0
+	// The PATTERN resources come first in the import section, so their builtin
+	// indices are 0..n-1 — which is exactly what componentAdapters assigns them
+	// — and only the set indices below have to shift. Ordering them the other
+	// way round would make both sides carry an offset.
+	var patResources []patternResource
+	if opts.Component {
+		patResources = orderedPatternResources(patterns, opts.PatternResources, 0)
+	}
+	numFuncImports := len(patResources)
 	if opts.Component {
 		for si, cs := range sets {
 			// BOTH conditions. The name table having a resource is not enough:
@@ -1995,7 +2027,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// mixed config lose every single-pattern export while the WIT still
 		// declared them, which `component new` then refused as a missing
 		// interface function.
-		patAdapters = componentAdapters(patterns, opts.ExportNames, numFuncImports)
+		patAdapters = componentAdapters(patterns, opts.ExportNames, opts.PatternResources, numFuncImports)
 		setAdapters = componentSetAdapters(sets, setBaseIdx, resNewIdx, opts.SetNames,
 			setTypeI32I32ToI32, setTypeI32x3ToI32, setTypeCompNext, setTypeCompVoid)
 		total += 3 + len(patAdapters) + len(setAdapters)
@@ -2015,16 +2047,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// 1: (i32,i32)→i64          find
 	// 2: (i32,i32,i32)→i32      capture/groups
 	// 3: (i32×7)→i32            suffix DFA (ptr,start,len,lPos,out_ptr,out_cap,validMask)→count
-	// 4: (i32,i32)→i32          prefix backward DFA (same as 0, kept for clarity)
+	// 4: (i32,i32)→i32          UNREFERENCED duplicate of 0 (see above)
 	// 5: (i32×5)→i32            per-pattern batch wrappers; the DP sweep
 	// 6: (i32×4)→i32            bucket probe / bitmap-form _all
 	// 7: (i32×3)→i64            scan_any, scan_all (<= 64 patterns)
 	// 8: (i32×6)→i32            set find body, gated (default)
 	// 9: (i32×8)→i32            suffix DFA with a gate pointer; also the
 	//                            ungated suffix DFA carrying the batch `skip`
-	// 10: (i32,i32,i64,i32,i32,i32,i32,i32)→i64  find_batch, BOTH overlap
-	//                                             policies (one signature
-	//                                             policies)
+	// 10: (i32,i32,i64,i32,i32,i32)→i64  find_batch: ptr, len, cursor,
+	//                                     scratch, out, cap — ONE signature
+	//                                     for both overlap policies
 	typeSection := []byte{
 		0x0B,
 		0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, // type 0
@@ -2062,6 +2094,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			importSec = appendString(importSec, "main")
 			importSec = appendString(importSec, "memory")
 			importSec = append(importSec, 0x02, 0x00, 0x00)
+		}
+		for _, r := range patResources {
+			importSec = appendString(importSec, r.res.ResourceImport)
+			importSec = appendString(importSec, r.res.ResourceNew)
+			importSec = append(importSec, 0x00) // kind: function
+			importSec = utils.AppendULEB128(importSec, uint32(setTypeCompNext))
 		}
 		for si, cs := range sets {
 			if resNewIdx[si] < 0 {
@@ -2178,9 +2216,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// share (i32)→().
 		fs = append(fs, byte(setTypeI32x4ToI32), byte(setTypeCompVoid), byte(setTypeCompVoid))
 		for _, a := range patAdapters {
-			if a.kind == adapterMatch {
+			switch a.kind {
+			case adapterMatch:
 				fs = append(fs, byte(setTypeI32I32ToI32))
-			} else {
+			case adapterPatCtor:
+				fs = append(fs, byte(setTypeI32x3ToI32)) // (ptr, len, start) → handle
+			case adapterPatFindNext, adapterPatGroupsNext:
+				fs = append(fs, byte(setTypeCompNext)) // (rep) → retptr
+			case adapterPatDtor:
+				fs = append(fs, byte(setTypeCompVoid)) // (rep) → ()
+			default:
 				// find and groups alike: (ptr, len, start) → retptr.
 				fs = append(fs, byte(setTypeI32x3ToI32))
 			}
@@ -2262,7 +2307,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// the ones returning a result area — a `cabi_post_` alias of the single
 		// shared post-return.
 		numExports++
-		numExports += 2 * len(patAdapters) // each carries a cabi_post_ alias
+		for _, a := range patAdapters {
+			numExports++
+			if a.kind.needsPost() {
+				numExports++
+			}
+		}
 		for _, a := range setAdapters {
 			numExports++
 			if a.post {
@@ -2330,6 +2380,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			es = appendString(es, a.export)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			if !a.kind.needsPost() {
+				continue
+			}
 			es = appendString(es, "cabi_post_"+a.export)
 			es = append(es, 0x00)
 			es = utils.AppendULEB128(es, uint32(postIdx))
@@ -2581,6 +2634,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				cs_bytes = appendCodeEntry(cs_bytes, buildFindAdapterBody(reallocIdx, a.funcIdx))
 			case adapterGroups:
 				cs_bytes = appendCodeEntry(cs_bytes, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			default:
+				cs_bytes = appendCodeEntry(cs_bytes, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
 			}
 		}
 		for _, a := range setAdapters {
@@ -4605,4 +4660,27 @@ func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over C
 	}
 	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, &moduleGlobals{})
 	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
+}
+
+// wantsWalkExtent reports whether this bucket's tuple-writing body should
+// record how far its walk reached, for the overlapping answer cache's trigger.
+//
+// It is a PRE-CONDITION, deliberately weaker than overlapDPBucket's full test:
+// the suffix body is emitted before `bkt.dp` exists, so the table-level
+// conditions the sweep also requires — u8 ids, no word-boundary or newline
+// channel, a column within its bound — cannot be consulted yet. Everything
+// knowable at emission time is checked here, which is what keeps a set that
+// could never carry a sweep byte-for-byte unchanged; a set that passes this and
+// then fails a table-level test carries a store nothing reads, which costs a
+// global and a handful of bytes and answers exactly as before.
+//
+// Keep in step with overlapDPBucket: a condition that moves from "knowable
+// late" to "knowable here" belongs in both.
+func wantsWalkExtent(spec SetSpec, buckets []*bucket, bi int) bool {
+	if spec.Find == "" || !spec.Overlapping || len(buckets) != 1 || bi != 0 {
+		return false
+	}
+	bkt := buckets[0]
+	return bkt.isFallback && !bkt.sparse && bkt.btFallback == nil &&
+		len(bkt.patterns) > 0 && len(bkt.patterns) <= bucketMaskBits
 }

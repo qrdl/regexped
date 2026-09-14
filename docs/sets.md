@@ -340,10 +340,17 @@ a DFA to its own extent. The default exists to avoid that.
 The answer cache removes most of that quadratic cost, with or without
 `hints: [batch-find]`. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
-counting the bytes it has matched, and once that exceeds what a single backward
-sweep would cost it sweeps the rest of the input in one pass and answers the
+counting the bytes it has covered — the extent it matched, plus how far each
+call's walk actually ran — and once that exceeds what a single backward sweep
+would cost it sweeps the rest of the input in one pass and answers the
 remaining calls out of the result. A scan the walk handles cheaply never
 sweeps and costs exactly what it did before.
+
+Both halves of that count are needed. Matched extent alone cannot see a pattern
+whose walk is long and whose match is short or empty — `(?:a*b)?` over a run of
+`a`s runs to the end of the input from every start and reports a zero-length
+match at each, so a counter watching only what it delivered stays at zero while
+the drive is quadratic.
 
 EVERY generated stub reserves that region for you and sizes it from the input,
 whether or not the set carries the batching hint; a caller driving the raw ABI

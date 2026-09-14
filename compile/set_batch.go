@@ -204,6 +204,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		pCache: lCache, pCacheLen: lCacheLen,
 		lReady: lReady, lWork: lWork, lSweepRet: lSweepRet,
 		lCumBase: lCumBase, lBlockBase: lBlockBase,
+		walkEndGlobal: cs.walkEndGlobal,
 	}
 
 	if dpIdx >= 0 {
@@ -240,6 +241,10 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		// re-checked on every call. Without this a stride zeroed after the
 		// sweep divided by zero, which traps, where the ABI says -4.
 		b = cache.emitValidateHeader(b, lTmp)
+
+		// Past the end of the input answers "nothing", exactly as the walk
+		// does — before the block arithmetic, which cannot represent it.
+		b = cache.emitPastEndCheck(b, pFrom)
 
 		// A `from` below the floor is a scan that went BACKWARDS, and serving it
 		// from the floor would drop every match in [from, floor). -6, best
@@ -381,6 +386,11 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		// the cache calls the ordinary find body, which has no such parameter.
 		b = append(b, 0x41, 0x00)
 	}
+	if dpIdx >= 0 {
+		// Seeded BEFORE the call, so whatever the suffix body leaves in the
+		// global is a position at or above this call's `from`.
+		b = cache.emitSeedWalkEnd(b, pFrom)
+	}
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(innerIdx))
 
@@ -404,8 +414,12 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		b = append(b, 0x04, 0x40)
 		b = append(b, 0x41, 0x00, 0x21, lIdx)
 		b = cache.emitAccumulateWork(b, pOutPtr, lIdx, lN, lTmp)
-		b = cache.emitStoreWork(b)
 		b = append(b, 0x0B) // end if anything was written
+		// The WALK's own extent, charged whatever the call delivered — a
+		// position that walked to the end of the input and matched empty
+		// delivers nothing and is the shape the trigger could not see.
+		b = cache.emitChargeWalkExtent(b, pFrom, lTmp)
+		b = cache.emitStoreWork(b)
 		b = append(b, 0x0B) // end if ready == 0
 		b = append(b, 0x20, lN)
 	}
@@ -464,18 +478,44 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x05)       // else: scratch is present
 	b = cache.emitHeaderRead(b)
 
+	// The cursor, decoded BEFORE the entry sweep because the sweep's
+	// eligibility depends on the resume index.
+	b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
+	b = append(b, 0x21, x.lResumePos) // the POSITION to resume at
+	b = append(b, 0x20, pCursor, 0xA7, 0x41)
+	b = utils.AppendSLEB128(b, int32(countBits))
+	b = append(b, 0x76, 0x41)
+	b = utils.AppendSLEB128(b, kMask)
+	b = append(b, 0x71, 0x21, x.lCacheSkip) // tuples already taken at it
+
 	// from = the resume position. Sweeping only [from, len] is what lets a
 	// drive switch mid-flight: the walk has already delivered everything
 	// below it, so cache index 0 is the first tuple still owed.
 	//
-	// Unreachable today: every walk-path return leaves work <= threshold or
-	// ready != 0, so an entry with work over the line and ready == 0 cannot
-	// happen. Emitted anyway, because the rule belongs to the drive rather
-	// than to whichever entry the caller used, and because the mid-flight
-	// sweep below is what a pure batching drive actually crosses on.
+	// ONLY AT A POSITION BOUNDARY — k == 0 — and that guard is load-bearing.
+	// The resume index is an ordinal into a position's tuples, and the two
+	// producers do not enumerate a position in the same order: the walk emits
+	// them in the order its suffix body's accept channels fire, the cache in
+	// ascending pattern index. Both are legal, because docs/sets.md leaves the
+	// order WITHIN a position unspecified — but an ordinal taken against one
+	// order and spent against the other names a different tuple.
+	//
+	// Measured on {(?:a*b)?, a+} over 20 `a`s at capacity 1: the walk split
+	// position 7 after delivering [1 7 20] and returned k = 1; this sweep then
+	// re-served position 7 from the cache, where k = 1 means "skip pattern 0",
+	// so [1 7 20] came out twice and [0 7 7] was never delivered. Correct
+	// count, wrong contents.
+	//
+	// With the guard the mid-position call simply walks: it finishes the
+	// position, and the walk-path trigger — which fires only once k is back to
+	// 0 — hands the drive over cleanly on the call after.
+	b = append(b, 0x20, x.lCacheSkip)
+	b = append(b, 0x45)       // i32.eqz -> at a position boundary
+	b = append(b, 0x04, 0x40) // if
 	b = cache.emitEntrySweep(b, func(b []byte) []byte {
-		return append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
+		return append(b, 0x20, x.lResumePos)
 	})
+	b = append(b, 0x0B) // end if k == 0
 
 	b = append(b, 0x20, x.lReady)
 	b = append(b, 0x41, 0x00)
@@ -492,13 +532,12 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	// indexed by position, so the walk's own (pos, skip) pair addresses
 	// them directly. That retires the two-way decode, and with it the
 	// entry-swept flag that existed to tell the two apart.
-	b = append(b, 0x20, pCursor, 0x42, 0x20, 0x88, 0xA7)
-	b = append(b, 0x21, x.lResumePos) // the POSITION to resume at
-	b = append(b, 0x20, pCursor, 0xA7, 0x41)
-	b = utils.AppendSLEB128(b, int32(countBits))
-	b = append(b, 0x76, 0x41)
-	b = utils.AppendSLEB128(b, kMask)
-	b = append(b, 0x71, 0x21, x.lCacheSkip) // tuples already taken at it
+	//
+	// Decoded above, before the entry sweep, which needs the resume index to
+	// decide whether it may sweep at all.
+
+	// Past the end answers "finished", as the walk does.
+	b = cache.emitPastEndCheck(b, x.lResumePos)
 
 	// A resume below the floor is a scan that went backwards: the reserved
 	// out-of-order position word, with nothing written, exactly as `find`
@@ -706,6 +745,9 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 	} else {
 		b = append(b, 0x20, x.lK)
 	}
+	// Seeded with the position this call walks from, immediately before the
+	// call, so the global comes back holding a position at or above it.
+	b = cache.emitSeedWalkEnd(b, x.lPos)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(workerIdx))
 	b = append(b, 0x21, x.lTotal)
@@ -755,6 +797,19 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = utils.AppendSLEB128_64(b, int64(config.SetCursorOverflowPos))
 		b = append(b, 0x42, 0x20, 0x86) // << 32
 		b = append(b, 0x0F)             // return
+		b = append(b, 0x0B)
+	}
+
+	// The WALK's extent for this position, charged before any exit below: a
+	// call that walked to the end of the input and delivered nothing is exactly
+	// the shape the delivered-extent counter cannot see, and both exits below
+	// leave the loop. Guarded by ready == 0 for the reason the delivered charge
+	// is — a caller who offered no cache must pay nothing for the machinery.
+	if dpIdx >= 0 {
+		b = append(b, 0x20, x.lReady)
+		b = append(b, 0x45)       // ready == 0
+		b = append(b, 0x04, 0x40) // if
+		b = cache.emitChargeWalkExtent(b, x.lPos, x.lWorkTmp)
 		b = append(b, 0x0B)
 	}
 
@@ -978,6 +1033,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 		pCache: pScratch, pCacheLen: pScratchLen,
 		lReady: lReady, lWork: lWork, lSweepRet: lCacheSweepRet,
 		lCumBase: lCumBase, lBlockBase: lBlockBase,
+		walkEndGlobal: cs.walkEndGlobal,
 		// The batch export returns an i64 cursor+count, so an error is a
 		// RESERVED RESUME POSITION rather than a negative count.
 		i64Ret: true,

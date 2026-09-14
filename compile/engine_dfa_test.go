@@ -2200,3 +2200,33 @@ func TestParseDataSegmentsRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// The walk-extent global the overlapping answer cache's trigger reads.
+//
+// genSuffixWASM allocates it before it looks at the table at all, so a nil table
+// is enough to pin the allocation contract: requested, it takes a global from
+// the module's allocator; requested with no allocator, it refuses loudly rather
+// than handing a body an index the assembler never declared — a module that
+// would fail validation far from the cause.
+func TestSuffixWalkExtentGlobal(t *testing.T) {
+	// probeFlags: firstHit, soleFirstHit, liveness, skip, WALK EXTENT.
+	art, _, _, _ := genSuffixWASM(nil, 0, 0, []int{1}, []int{0}, LikelyNeutral, false, false,
+		&moduleGlobals{}, false, false, false, false, true)
+	if art.walkEndGlobal < 0 {
+		t.Errorf("walk extent requested with an allocator: walkEndGlobal = %d, want an index", art.walkEndGlobal)
+	}
+
+	art, _, _, _ = genSuffixWASM(nil, 0, 0, []int{1}, []int{0}, LikelyNeutral, false, false,
+		&moduleGlobals{}, false, false, false, false, false)
+	if art.walkEndGlobal != -1 {
+		t.Errorf("walk extent NOT requested: walkEndGlobal = %d, want -1 (no global, no store)", art.walkEndGlobal)
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Error("a walk-extent bucket with no global allocator must panic")
+		}
+	}()
+	genSuffixWASM(nil, 0, 0, []int{1}, []int{0}, LikelyNeutral, false, false,
+		nil, false, false, false, false, true)
+}

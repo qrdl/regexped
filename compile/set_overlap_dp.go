@@ -467,6 +467,12 @@ type overlapCacheCtx struct {
 	// i64Ret marks the entry whose export returns an i64, which changes only
 	// how the error is packed.
 	i64Ret bool
+
+	// walkEndGlobal is the module global the suffix body stamps with the
+	// farthest position its walk reached, or -1 when this set's bucket carries
+	// no such store. Seeded with the call's `from` before the walk and read
+	// back after it, so the difference is the bytes this call WALKED.
+	walkEndGlobal int32
 }
 
 // hdrLoadOp appends an i32.load of the cache header field at byte offset off;
@@ -705,7 +711,14 @@ func (c overlapCacheCtx) emitOutOfOrderCheck(b []byte, posLocal byte) []byte {
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x20, c.pCache)
 	b = hdrLoadOp(b, ckptHdrFloor)
-	b = append(b, 0x48)       // i32.lt_s -> below the floor
+	// UNSIGNED. `from` is a u32 in the ABI, and the floor a pass wrote is
+	// always in [0, len+1], so the comparison is between two values a signed
+	// test agrees with everywhere below 2^31 — and disagrees with above it,
+	// where a `from` the ABI defines as "nothing found" reads as negative and
+	// is reported as a scan that went backwards. Nothing generated can reach
+	// that (the C stubs refuse a length or offset over 0x7FFFFFFF outright),
+	// which is why it was latent rather than a live defect.
+	b = append(b, 0x49)       // i32.lt_u -> below the floor
 	b = append(b, 0x04, 0x40) // if
 	if c.i64Ret {
 		// The batch entry's cursor cannot carry a negative, so the error is a
@@ -726,6 +739,43 @@ func (c overlapCacheCtx) emitOutOfOrderCheck(b []byte, posLocal byte) []byte {
 func outOfOrderCursor() int64 {
 	var w uint64 = config.SetCursorOutOfOrderPos
 	return int64(w << 32) //nolint:gosec // a reserved bit pattern, not a count
+}
+
+// emitPastEndCheck answers a position beyond the input the way the WALK does —
+// "nothing found" — instead of letting it reach the block arithmetic.
+//
+// The ABI defines `from > len` as the capability's nothing, and the walk
+// implements it directly. The cache path had no such test: it relied on the
+// located block landing past the last one, which is true for a `from` a few
+// positions past the end and FALSE once `from` is large enough that
+// `(from - floor) / stride` overflows into a negative i32 — the block loop's
+// `j >= nb` is signed, so a huge j reads as "not yet at the end" and the drive
+// then indexes cum[] at a wild offset.
+//
+// Measured before this existed, on an engaged cache over a 4-byte input:
+// the walk answered 0 for `from` = 2^31 and 2^32-16, and the cache answered 1 —
+// the matches at position 0, because the row clamp folded a negative difference
+// back to row zero. Cache and walk disagreeing is the one thing this whole path
+// may not do.
+//
+// UNSIGNED, because `from` is a u32. Placed before emitOutOfOrderCheck, which
+// can then only ever see a position inside the input: a floor is at most
+// len + 1, so `from > len` already implies `from >= floor`.
+func (c overlapCacheCtx) emitPastEndCheck(b []byte, posLocal byte) []byte {
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x20, c.pInLen)
+	b = append(b, 0x4B)       // i32.gt_u
+	b = append(b, 0x04, 0x40) // if
+	if c.i64Ret {
+		// The batch entry says "finished" with the sentinel resume word and a
+		// zero count, which is what a caller's `count == 0` loop expects.
+		b = append(b, 0x42, 0x7F, 0x42, 0x20, 0x86) // (i64)-1 << 32
+	} else {
+		b = append(b, 0x41, 0x00)
+	}
+	b = append(b, 0x0F) // return
+	b = append(b, 0x0B)
+	return b
 }
 
 // emitMarkRefused records that this drive must not ask again.
@@ -787,6 +837,56 @@ func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte) 
 //
 // idxLocal is consumed as the loop cursor and must already hold the first tuple
 // index to charge for.
+// emitSeedWalkEnd stamps the global with the position the walk is about to
+// start from, so whatever the suffix body leaves there is a position at or
+// above it and the difference is this call's walk.
+//
+// Emitted only where a charge follows, and only for a set whose bucket carries
+// the store — a module without one declares no such global.
+func (c overlapCacheCtx) emitSeedWalkEnd(b []byte, fromLocal byte) []byte {
+	if c.walkEndGlobal < 0 {
+		return b
+	}
+	b = append(b, 0x20, fromLocal)
+	b = append(b, 0x24)
+	return utils.AppendULEB128(b, uint32(c.walkEndGlobal)) //nolint:gosec // a global index
+}
+
+// emitChargeWalkExtent adds the bytes this call WALKED to the work counter,
+// saturating, where fromLocal is the position it started from.
+//
+// THE REASON THE COUNTER CANNOT BE DELIVERED EXTENT ALONE. The trigger exists
+// to spot a drive whose walks are quadratic, and a walk's cost is how far it
+// ran — not how much of what it found was reported. `(?:a*b)?` over a run of
+// `a`s walks to the end of the input from every start and delivers a
+// zero-length match at each, so the delivered sum stays 0 for ever: measured at
+// 8,000 bytes the counter read 0, `ready` stayed 0 and the drive ran 268 ms,
+// against 75 ms for `a*` — the same shape with a non-empty match — which
+// engaged on its first call.
+//
+// Charged in ADDITION to the delivered extent rather than instead of it: the
+// two measure different halves of the same call (a position that matched long
+// and one that walked far), and taking the larger of the two would let a dense
+// drive under-report.
+func (c overlapCacheCtx) emitChargeWalkExtent(b []byte, fromLocal, tmpLocal byte) []byte {
+	if c.walkEndGlobal < 0 {
+		return b
+	}
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(c.walkEndGlobal)) //nolint:gosec // a global index
+	b = append(b, 0x20, fromLocal)
+	b = append(b, 0x6B) // walkEnd - from
+	b = append(b, 0x20, c.lWork, 0x6A)
+	b = append(b, 0x22, tmpLocal)
+	b = append(b, 0x41, 0x00, 0x48) // < 0 -> it wrapped
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x21, c.lWork) // saturate
+	b = append(b, 0x05)
+	b = append(b, 0x20, tmpLocal, 0x21, c.lWork)
+	b = append(b, 0x0B)
+	return b
+}
+
 func (c overlapCacheCtx) emitAccumulateWork(b []byte, pOutPtr, idxLocal, countLocal, tmpLocal byte) []byte {
 	b = append(b, 0x02, 0x40)                                         // block $sumDone
 	b = append(b, 0x03, 0x40)                                         // loop  $sum

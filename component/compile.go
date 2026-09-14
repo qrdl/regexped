@@ -107,34 +107,51 @@ func Core(cfg config.BuildConfig, rep *compile.Reporter) (core []byte, witText s
 	if !cfg.Component() {
 		return nil, "", fmt.Errorf("component.Core called for wasm_format: %q", cfg.WasmFormat)
 	}
-	witText, names, setNames, prefix, err := generate.ComponentArtifactsWithSets(cfg)
+	witText, names, resources, setNames, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		return nil, "", err
 	}
-	if len(names) == 0 && len(setNames) == 0 {
+	if len(names) == 0 && len(resources) == 0 && len(setNames) == 0 {
 		return nil, "", fmt.Errorf("no exports to build a component from: every regexp entry needs at least one of match_func, find_func or groups_func, or a sets: entry needs a capability")
 	}
 
-	// Standalone is FORCED whichever path runs: a component owns and exports
-	// its own memory, so `output:` — which selects the embedded shape for a
-	// module, and is the merge target for both — must not reach that choice.
-	if len(cfg.Sets) > 0 {
-		// The set path is a second assembler and needs the set names too.
-		core, _, err = compile.CompileFileComponent(cfg, prefix, names, toCompileSetNames(setNames), rep)
-	} else {
-		core, _, err = compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{
-			MaxDFAStates:         cfg.MaxDFAStates,
-			MaxTDFARegs:          cfg.MaxTDFARegs,
-			Report:               rep,
-			Component:            true,
-			ComponentPackage:     prefix,
-			ComponentExportNames: names,
-		})
-	}
+	// ONE path, for a config with sets and for one without. CompileFileComponent
+	// delegates to Compile when cfg.Sets is empty and is byte-identical to
+	// calling it directly (TestSetComponentNoSetsDelegates is the standing
+	// proof), so dispatching here as well only gave the same CompileOptions two
+	// construction sites — and a field added to one and not the other is silent.
+	//
+	// Standalone is FORCED down there: a component owns and exports its own
+	// memory, so `output:` — which selects the embedded shape for a module, and
+	// is the merge target for both — must not reach that choice.
+	core, _, err = compile.CompileFileComponent(cfg, prefix, names,
+		toCompilePatternResources(resources), toCompileSetNames(setNames), rep)
 	if err != nil {
 		return nil, "", fmt.Errorf("compile: %w", err)
 	}
 	return core, witText, nil
+}
+
+// toCompilePatternResources converts generate/'s per-resource name table into
+// compile/'s, for the same reason toCompileSetNames exists: compile/ cannot
+// import generate/, so this function is the seam and the only place the two
+// shapes have to agree.
+func toCompilePatternResources(in map[string]generate.PatternResourceNames) map[string]compile.ComponentPatternResource {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]compile.ComponentPatternResource, len(in))
+	for name, n := range in {
+		out[name] = compile.ComponentPatternResource{
+			Groups:         n.Groups,
+			Constructor:    n.Constructor,
+			Next:           n.Next,
+			Dtor:           n.Dtor,
+			ResourceImport: n.ResourceImport,
+			ResourceNew:    n.ResourceNew,
+		}
+	}
+	return out
 }
 
 // toCompileSetNames converts generate/'s per-set name table into compile/'s.

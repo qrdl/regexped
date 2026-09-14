@@ -495,17 +495,28 @@ func TestCComponentImportsUseKebabNames(t *testing.T) {
 	}
 	for _, want := range []string{
 		`__import_module__("regexped:urlparts/matcher")`,
-		`__import_name__("parse-url")`,
-		`__import_name__("find-aws-key")`,
+		// `match` is a plain function; the two ITERATING exports are resources,
+		// so each contributes a constructor, a method and a drop.
 		`__import_name__("lower-match")`,
+		`__import_name__("[constructor]parse-url")`,
+		`__import_name__("[method]parse-url.next")`,
+		`__import_name__("[resource-drop]parse-url")`,
+		`__import_name__("[constructor]find-aws-key")`,
+		`__import_name__("[method]find-aws-key.next")`,
+		`__import_name__("[resource-drop]find-aws-key")`,
 	} {
 		if !strings.Contains(cContent, want) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	for _, bad := range []string{`__import_name__("parse_url")`, `__import_name__("find_aws_key")`} {
+	for _, bad := range []string{
+		`__import_name__("parse_url")`, `__import_name__("find_aws_key")`,
+		// The FUNCTION forms are gone: importing one would ask the component
+		// for an export the interface no longer declares.
+		`__import_name__("parse-url")`, `__import_name__("find-aws-key")`,
+	} {
 		if strings.Contains(cContent, bad) {
-			t.Errorf("snake_case import name %q must not appear", bad)
+			t.Errorf("import name %q must not appear", bad)
 		}
 	}
 }
@@ -578,8 +589,16 @@ func TestCComponentLoweredSignatures(t *testing.T) {
 	if !strings.Contains(cContent, "extern void ffi_lower_match(const unsigned char *ptr, unsigned int len, unsigned char *ret);") {
 		t.Error("the anchored import must take (ptr, len, retptr)")
 	}
-	if !strings.Contains(cContent, "unsigned int start,\n               unsigned char *ret);") {
-		t.Error("the non-anchored imports must take a start and a retptr")
+	// An iterating export is a resource: its constructor takes the input and
+	// answers a handle, and its `next` takes only that handle.
+	if !strings.Contains(cContent, "extern int ffi_parse_url__res_new(const unsigned char *ptr, unsigned int len, unsigned int start);") {
+		t.Error("a resource constructor must take (ptr, len, start) and return a handle")
+	}
+	if !strings.Contains(cContent, "extern void ffi_parse_url(int handle, unsigned char *ret);") {
+		t.Error("a resource method must take (handle, retptr)")
+	}
+	if !strings.Contains(cContent, "extern void ffi_parse_url__res_drop(int handle);") {
+		t.Error("a resource must be droppable")
 	}
 	// The result areas are read, not unpacked from an i64 as the module stub does.
 	if strings.Contains(cContent, "long long") {
@@ -615,7 +634,7 @@ func TestCComponentWritesWitDirectory(t *testing.T) {
 	if err := cComponentStub(cComponentCfg(), out); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"stub.h", "stub.c", "wit/consumer.wit", "wit/deps/regexped-urlparts/matcher.wit"} {
+	for _, f := range []string{"stub.h", "stub.c", "wit/consumer.wit", "wit/deps/regexped-urlparts/urlparts.wit"} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
 			t.Errorf("missing generated file %s: %v", f, err)
 		}
@@ -628,7 +647,7 @@ func TestCComponentWritesWitDirectory(t *testing.T) {
 		!strings.Contains(string(consumer), "import regexped:urlparts/matcher;") {
 		t.Errorf("consumer world is wrong:\n%s", consumer)
 	}
-	dep, err := os.ReadFile(filepath.Join(dir, "wit", "deps", "regexped-urlparts", "matcher.wit"))
+	dep, err := os.ReadFile(filepath.Join(dir, "wit", "deps", "regexped-urlparts", "urlparts.wit"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1127,7 +1146,7 @@ func TestCComponentSetWitDirAndAllocator(t *testing.T) {
 			t.Errorf("consumer.wit is missing %q:\n%s", want, consumer)
 		}
 	}
-	dep, err := os.ReadFile(filepath.Join(dir, "wit", "deps", "regexped-t", "matcher.wit"))
+	dep, err := os.ReadFile(filepath.Join(dir, "wit", "deps", "regexped-t", "t.wit"))
 	if err != nil {
 		t.Fatal(err)
 	}

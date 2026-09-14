@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // The C stub for `wasm_format: component`.
@@ -68,8 +69,8 @@ func cComponentStub(cfg config.BuildConfig, out string) error {
 
 // writeComponentWitDir lays out the WIT the consumer's build needs:
 //
-//	<dir>/consumer.wit            a world importing our interface
-//	<dir>/deps/<pkg>/matcher.wit  our interface, with the export world stripped
+//	<dir>/consumer.wit                    a world importing our interface
+//	<dir>/deps/regexped-<pkg>/<pkg>.wit   our interface, export world stripped
 func writeComponentWitDir(cfg config.BuildConfig, dir string) error {
 	// ONE derivation again: the package, the world, and which interfaces exist.
 	pkg, world, funcs, sets, err := witParts(cfg)
@@ -109,8 +110,9 @@ world %s {
 	depDir := filepath.Join(dir, "deps", "regexped-"+pkg)
 	// One file for the whole package: it may define `matcher`, `sets`, or both,
 	// and splitting them would buy nothing — WIT resolves a package from its
-	// directory, not from file names.
-	return writeStub(filepath.Join(depDir, "matcher.wit"), []byte(stripExportWorld(witText)))
+	// directory, not from file names. Named for the PACKAGE rather than for one
+	// of the interfaces, since a sets-only config defines no `matcher` at all.
+	return writeStub(filepath.Join(depDir, pkg+".wit"), []byte(stripExportWorld(witText)))
 }
 
 // stripExportWorld removes the `world … { export … }` block from generated WIT.
@@ -342,54 +344,101 @@ extern void %s(const unsigned char *ptr, unsigned int len, unsigned char *ret);
 	return sb.String()
 }
 
-// cComponentIterInit is the `_init` of a single-pattern find or groups iterator:
-// the two shapes' iterators hold the same fields and start the same way.
-func cComponentIterInit(funcName, iterType string) string {
-	return fmt.Sprintf(`int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
+// cComponentIterInit is the `_init` and `_free` of a single-pattern find or
+// groups iterator. The two shapes hold the same fields, start the same way and
+// end the same way — only their `next` differs.
+//
+// The scan lives behind a RESOURCE here, so `_init` constructs one and `_free`
+// drops it. scratch[0] carries the handle and scratch[1] a magic word marking
+// it live; the struct is the MODULE format's, shared because the header is, and
+// neither format uses both halves of it — a module iterator walks the input
+// itself and leaves the scratch zero.
+//
+// The handle is taken IN `_init`, not lazily on the first `next`. Laziness would
+// save the input copy for an iterator that is built and never driven — which is
+// what the Rust stub does — but it puts a CONSTRUCTOR call inside `next`, and
+// the C set scanner, which is the shape known to work end to end, constructs in
+// `_init` for the same reason. Matching it keeps one story for both resources.
+func cComponentIterInit(module, kebab, funcName, iterType, ctor, drop string) string {
+	return fmt.Sprintf(`__attribute__((__import_module__("%[3]s"), __import_name__("[constructor]%[4]s")))
+extern int %[5]s(const unsigned char *ptr, unsigned int len, unsigned int start);
+
+__attribute__((__import_module__("%[3]s"), __import_name__("[resource-drop]%[4]s")))
+extern void %[6]s(int handle);
+
+int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
     if (!iter || !input) return RX_ERR_NULL_ARG;
+    /* The interface is u32. */
+    if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
+    /* Re-initialising a LIVE iterator drops what it held first, as the header
+       promises: overwriting the handle would strand the input copy and the scan
+       state inside the regexp component for good. */
+    if (iter->scratch[1] == %[7]du && iter->scratch[0] != 0) %[6]s((int)iter->scratch[0]);
+    iter->scratch[0] = 0;
+    iter->scratch[1] = 0;
     iter->input = input;
     iter->len = len;
     iter->offset = offset;
     iter->prev_end = (size_t)-1;
     iter->done = (offset > len);
+    iter->scratch[0] = (unsigned)%[5]s((const unsigned char *)input,
+                                       (unsigned int)len, (unsigned int)offset);
+    iter->scratch[1] = %[7]du; /* stamped last: live only once it is */
     return 0;
 }
 
-`, funcName, iterType)
+void %[1]s_free(%[2]s *iter) {
+    if (!iter) return;
+    if (iter->scratch[1] == %[7]du && iter->scratch[0] != 0) %[6]s((int)iter->scratch[0]);
+    /* Idempotent: both words are cleared, so a second call — or a call on an
+       iterator that was never initialised — does nothing rather than drop a
+       handle twice. */
+    iter->scratch[0] = 0;
+    iter->scratch[1] = 0;
+    iter->done = 1;
+}
+
+`, funcName, iterType, module, kebab, ctor, drop, abi.FindScratchMagic)
 }
 
 func genCComponentFind(importModule, funcName, witFunc string) string {
 	ffi := "ffi_" + funcName
+	// ffi_<name>__res_*: a double underscore and a suffix no WIT name can
+	// produce, so an export named like `<name>_next` cannot collide with the
+	// resource's own imports — and no leading underscore, which C reserves at
+	// file scope.
+	ctor := "ffi_" + funcName + "__res_new"
+	drop := "ffi_" + funcName + "__res_drop"
 	iterType := cIterTypeName(funcName)
 	var sb strings.Builder
-	sb.WriteString(cComponentImportDecl(importModule, witFunc, ffi, cComponentPosParams))
-	sb.WriteString(cComponentIterInit(funcName, iterType))
+	sb.WriteString(cComponentImportDecl(importModule, "[method]"+witFunc+".next", ffi,
+		"int handle, unsigned char *ret"))
+	sb.WriteString(cComponentIterInit(importModule, witFunc, funcName, iterType, ctor, drop))
 	fmt.Fprintf(&sb, `int %[1]s_next(%[2]s *iter, rx_match_t *out_match) {
     if (!iter || !out_match) return RX_ERR_NULL_ARG;
-    while (!iter->done && iter->offset <= iter->len) {
+    while (!iter->done) {
         /* result<option<tuple<u32,u32>>, error-code>:
            @0 result disc, @4 option disc, @8 start, @12 end.
-           The WHOLE input plus a start position: offset bounds where the search
-           begins, it does not truncate what the engine can see behind it. */
+           The scan lives inside the component and advances itself, so this
+           passes only the handle — the input crossed once, at construction. */
         __attribute__((aligned(4))) unsigned char area[16] = {0};
-        %[3]s((const unsigned char *)iter->input, (unsigned int)iter->len,
-              (unsigned int)iter->offset, area);
+        %[3]s((int)iter->scratch[0], area);
         if (area[0] != 0) { iter->done = 1; return RX_ERR_BT_OVERFLOW; }
         if (area[4] == 0) { iter->done = 1; return 0; }
         size_t start = (size_t)rx_cabi_u32(area + 8);
         size_t end   = (size_t)rx_cabi_u32(area + 12);
-        /* Advance first, so an empty match cannot spin the scan. */
-        iter->offset = (end > start) ? end : start + 1;
         /* Go's FindAllIndex rule: an EMPTY match beginning exactly where the
-           previous REPORTED match ended is suppressed. Only whether it is
-           reported changes; the advance above is unchanged. */
+           previous REPORTED match ended is suppressed. The component has already
+           advanced past it, so this only decides whether it is reported. */
         if (start == end && iter->prev_end == start) continue;
         iter->prev_end = end;
+        /* Kept in step with the component's own position, so a caller reading
+           it sees the module format's meaning: the next position to try. */
+        iter->offset = (end > start) ? end : start + 1;
         out_match->start = (ptrdiff_t)start;
         out_match->end   = (ptrdiff_t)end;
         return 1;
     }
-    iter->done = 1;
     return 0;
 }
 
@@ -399,42 +448,51 @@ func genCComponentFind(importModule, funcName, witFunc string) string {
 
 func genCComponentGroups(importModule, funcName, witFunc string, numGroups int, namedGroups map[string]int) string {
 	ffi := "ffi_" + funcName
+	ctor := "ffi_" + funcName + "__res_new"
+	drop := "ffi_" + funcName + "__res_drop"
 	iterType := cIterTypeName(funcName)
 	funcUpper := toUpperIdent(funcName)
 	var sb strings.Builder
-	sb.WriteString(cComponentImportDecl(importModule, witFunc, ffi, cComponentPosParams))
+	sb.WriteString(cComponentImportDecl(importModule, "[method]"+witFunc+".next", ffi,
+		"int handle, unsigned char *ret"))
 
 	// The index-aligned name table and lookup are IDENTICAL to the module
 	// format's, so they are generated by the same code path.
 	sb.WriteString(cGroupsNameTable(funcName, numGroups, namedGroups))
 
-	sb.WriteString(cComponentIterInit(funcName, iterType))
+	sb.WriteString(cComponentIterInit(importModule, witFunc, funcName, iterType, ctor, drop))
 	fmt.Fprintf(&sb, `int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[4]s_GROUPS]) {
     if (!iter || !out_groups) return RX_ERR_NULL_ARG;
-    while (!iter->done && iter->offset <= iter->len) {
-        /* result<option<list<option<tuple<u32,u32>>>>, error-code>:
-           @0 result disc, @4 option disc, @8 list ptr, @12 list len.
-           Each element is 12 bytes: @0 option disc, @4 start, @8 end. */
-        __attribute__((aligned(4))) unsigned char area[16] = {0};
+    while (!iter->done) {
+        /* result<list<option<tuple<u32,u32>>>, error-code>:
+           @0 disc, @4 list ptr, @8 list len. Each element is 12 bytes:
+           @0 option disc, @4 start, @8 end. An EMPTY list means finished. */
+        __attribute__((aligned(4))) unsigned char area[12] = {0};
+        /* The handle is taken BEFORE the mark, and that ordering is
+           load-bearing. Constructing the scanner is a call whose effects
+           OUTLIVE it — the composition glue allocates in this component's
+           memory for it — so rewinding over it hands that memory back while it
+           is still owned, and the next write through a stack pointer lands in
+           reused bytes. Observed as the guest's own argv buffer going out of
+           bounds two calls later. */
+        int _h = (int)iter->scratch[0];
         /* Rewind only what THIS call allocates: cabi_realloc is the whole
            component's allocator, and a wholesale reset would hand out memory
            something else is still using. */
         unsigned _mark = regexped_cabi_mark();
-        %[3]s((const unsigned char *)iter->input, (unsigned int)iter->len,
-              (unsigned int)iter->offset, area);
+        %[3]s(_h, area);
         if (area[0] != 0) { iter->done = 1; regexped_cabi_release(_mark); return RX_ERR_BT_OVERFLOW; }
-        if (area[4] == 0) { iter->done = 1; regexped_cabi_release(_mark); return 0; }
-        const unsigned char *elems = (const unsigned char *)(size_t)rx_cabi_u32(area + 8);
-        unsigned int n = rx_cabi_u32(area + 12);
+        const unsigned char *elems = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
+        unsigned int n = rx_cabi_u32(area + 8);
         if (!elems || n == 0) { iter->done = 1; regexped_cabi_release(_mark); return 0; }
         /* Group 0 is the whole match and is always set when the engine reported
-           one; its extent drives the advance. */
+           one; its extent drives the empty-match rule. */
         if (elems[0] == 0) { iter->done = 1; regexped_cabi_release(_mark); return 0; }
         size_t start = (size_t)rx_cabi_u32(elems + 4);
         size_t end   = (size_t)rx_cabi_u32(elems + 8);
-        iter->offset = (end > start) ? end : start + 1;
         if (start == end && iter->prev_end == start) { regexped_cabi_release(_mark); continue; }
         iter->prev_end = end;
+        iter->offset = (end > start) ? end : start + 1;
         for (unsigned int i = 0; i < %[4]s_GROUPS; i++) {
             if (i >= n) {
                 /* Shorter list than the pattern's group count cannot happen, but
@@ -456,7 +514,6 @@ func genCComponentGroups(importModule, funcName, witFunc string, numGroups int, 
         regexped_cabi_release(_mark);
         return 1;
     }
-    iter->done = 1;
     return 0;
 }
 

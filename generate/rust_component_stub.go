@@ -63,7 +63,11 @@ func genRustComponentStubFile(cfg config.BuildConfig) (string, error) {
 		return "", err
 	}
 	witText := renderWit(cfg, pkg, world, funcs, sets)
-	inner, err := genRustComponentInner(cfg, snakeNames(funcs))
+	// KEBAB names, not the snake ones: `match` binds as a snake function, but
+	// the two ITERATING exports bind as RESOURCE TYPES, whose Rust spelling is
+	// the UpperCamel of the same kebab. One map, converted per shape at the use
+	// site, rather than two that could disagree about which export is which.
+	inner, err := genRustComponentInner(cfg, kebabNames(funcs))
 	if err != nil {
 		return "", err
 	}
@@ -191,17 +195,17 @@ func genRustComponentInner(cfg config.BuildConfig, names map[string]string) (str
 	var b strings.Builder
 	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
-			b.WriteString(genRustComponentMatch(re.MatchFunc, names[re.MatchFunc]))
+			b.WriteString(genRustComponentMatch(re.MatchFunc, rustWitFuncName(names[re.MatchFunc])))
 		}
 		if re.FindFunc != "" {
-			b.WriteString(genRustComponentFind(re.FindFunc, names[re.FindFunc]))
+			b.WriteString(genRustComponentFind(re.FindFunc, rustResourceType(names[re.FindFunc])))
 		}
 		if re.GroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
 				return "", fmt.Errorf("regexp %q: %w", re.Pattern, err)
 			}
-			b.WriteString(genRustComponentGroups(re.GroupsFunc, names[re.GroupsFunc], numGroups))
+			b.WriteString(genRustComponentGroups(re.GroupsFunc, rustResourceType(names[re.GroupsFunc]), numGroups))
 			b.WriteString(genRustGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups))
 		}
 	}
@@ -271,141 +275,168 @@ pub fn %s(input: &[u8]) -> Result<Option<usize>> {
 `, funcName, witFunc)
 }
 
-func genRustComponentFind(funcName, witFunc string) string {
+func genRustComponentFind(funcName, resType string) string {
 	iterName := iterTypeName(funcName)
-	return fmt.Sprintf(`pub struct %s<'a> {
+	return fmt.Sprintf(`pub struct %[1]s<'a> {
+    /// The scan inside the regexp component, created by the first call to next.
+    /// The module-format iterator allocates nothing until it is driven, and
+    /// neither does this one: an iterator built and dropped undriven costs no
+    /// copy of the input into the component.
+    ///
+    /// The resource holds the input and the POSITION, which is why this struct
+    /// no longer tracks an offset of its own past construction — the advance is
+    /// the component's, and it is the same rule the module stub applies.
+    inner: Option<matcher::%[2]s>,
     input: &'a [u8],
-    offset: usize,
-    /// End of the last REPORTED match, for Go's adjacent-empty rule.
+    offset: u32,
+    /// End of the last REPORTED match, for Go's adjacent-empty rule. It stays
+    /// HERE rather than moving into the component: it decides what is reported,
+    /// not where the scan goes, and the raw resource must answer the same
+    /// matches the raw module export does.
     prev_end: Option<usize>,
     /// Set once the iterator has finished, whether by exhausting the input or
     /// by reporting an error. Without it a caller who logs the Err and keeps
     /// pulling re-runs the identical call for ever, because the overflow is
-    /// deterministic and the offset never advanced.
+    /// deterministic and the position never advanced.
     done: bool,
 }
 
-impl<'a> Iterator for %s<'a> {
+impl Iterator for %[1]s<'_> {
     type Item = Result<(usize, usize)>;
 
     fn next(&mut self) -> Option<Result<(usize, usize)>> {
-        if self.done || self.offset > self.input.len() {
-            return None;
-        }
-        // The WHOLE input plus a start position: offset bounds where the search
-        // begins, it does not truncate what the engine can see behind it, so a
-        // leading \b, \B or (?m:^) is judged against the real preceding byte.
-        // Positions come back absolute.
-        match matcher::%s(self.input, self.offset as u32) {
-            Err(e) => {
-                self.done = true;
-                Some(Err(Error::from(e)))
+        loop {
+            if self.done {
+                return None;
             }
-            Ok(None) => {
-                self.done = true;
-                None
-            }
-            Ok(Some((start, end))) => {
-                let (abs_start, abs_end) = (start as usize, end as usize);
-                self.offset = if abs_end > abs_start { abs_end } else { abs_start + 1 };
-                // Go's FindAllIndex rule: an EMPTY match beginning exactly where
-                // the previous match ended is suppressed. The advance above is
-                // unchanged — it still steps past a zero-length match, which is
-                // what stops the loop spinning; only whether the match is
-                // REPORTED changes.
-                if abs_start == abs_end && self.prev_end == Some(abs_start) {
-                    return self.next();
+            let (input, offset) = (self.input, self.offset);
+            let inner = self.inner.get_or_insert_with(|| matcher::%[2]s::new(input, offset));
+            match inner.next() {
+                // Before the finished test: the engine gave up and cannot say
+                // whether more matches exist, so ending iteration would report
+                // success.
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(Error::from(e)));
                 }
-                self.prev_end = Some(abs_end);
-                Some(Ok((abs_start, abs_end)))
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(Some((start, end))) => {
+                    let (abs_start, abs_end) = (start as usize, end as usize);
+                    // Go's FindAllIndex rule: an EMPTY match beginning exactly
+                    // where the previous match ended is suppressed. The scan has
+                    // already advanced past it inside the component, so this only
+                    // decides whether it is REPORTED.
+                    if abs_start == abs_end && self.prev_end == Some(abs_start) {
+                        continue;
+                    }
+                    self.prev_end = Some(abs_end);
+                    return Some(Ok((abs_start, abs_end)));
+                }
             }
         }
     }
 }
 
-impl std::iter::FusedIterator for %s<'_> {}
+impl std::iter::FusedIterator for %[1]s<'_> {}
 
 /// Returns an iterator over all non-overlapping matches at or after offset.
 /// Each item is an absolute (start, end) byte range.
+///
+/// The input crosses into the regexp component ONCE, when the scan starts.
+/// Dropping the iterator ends the scan and releases what the component held.
 ///
 /// # Errors
 /// An item is Err(Error::BacktrackOverflow) if the pattern compiled to the
 /// Backtracking engine and the input exhausted its frame budget: the engine
 /// cannot tell whether more matches exist, so simply ending iteration would be
 /// a lie. The iterator is fused, so it yields nothing after that.
-pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
-    %s { input, offset, prev_end: None, done: false }
+pub fn %[3]s(input: &[u8], offset: usize) -> %[1]s<'_> {
+    %[1]s { inner: None, input, offset: offset as u32, prev_end: None, done: false }
 }
 
-`, iterName, iterName, witFunc, iterName, funcName, iterName, iterName)
+`, iterName, resType, funcName)
 }
 
-func genRustComponentGroups(funcName, witFunc string, numGroups int) string {
+func genRustComponentGroups(funcName, resType string, numGroups int) string {
 	iterName := iterTypeName(funcName)
-	return fmt.Sprintf(`pub struct %s<'a> {
+	return fmt.Sprintf(`pub struct %[1]s<'a> {
+    /// See the find iterator: the scan lives in the component, created lazily,
+    /// and dropping this ends it.
+    inner: Option<matcher::%[2]s>,
     input: &'a [u8],
-    offset: usize,
+    offset: u32,
     prev_end: Option<usize>,
     done: bool,
 }
 
-impl<'a> Iterator for %s<'a> {
+impl Iterator for %[1]s<'_> {
     type Item = Result<Vec<Option<Span>>>;
 
     fn next(&mut self) -> Option<Result<Vec<Option<Span>>>> {
-        if self.done || self.offset > self.input.len() {
-            return None;
-        }
-        match matcher::%s(self.input, self.offset as u32) {
-            Err(e) => {
-                self.done = true;
-                Some(Err(Error::from(e)))
+        loop {
+            if self.done {
+                return None;
             }
-            Ok(None) => {
-                self.done = true;
-                None
-            }
-            Ok(Some(slots)) => {
-                // Slot 0 is the whole match and is always present when the
-                // engine reported one.
-                let (abs_start, abs_end) = match slots.first().copied().flatten() {
-                    Some((s, e)) => (s as usize, e as usize),
-                    None => {
-                        self.done = true;
-                        return None;
-                    }
-                };
-                self.offset = if abs_end > abs_start { abs_end } else { abs_start + 1 };
-                if abs_start == abs_end && self.prev_end == Some(abs_start) {
-                    return self.next();
+            let (input, offset) = (self.input, self.offset);
+            let inner = self.inner.get_or_insert_with(|| matcher::%[2]s::new(input, offset));
+            match inner.next() {
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(Error::from(e)));
                 }
-                self.prev_end = Some(abs_end);
-                let groups: Vec<Option<Span>> = slots
-                    .into_iter()
-                    .map(|g| g.map(|(s, e)| Span { start: s as usize, end: e as usize }))
-                    .collect();
-                Some(Ok(groups))
+                // An EMPTY list is how this shape says "finished", where find
+                // says none: a list is already an option of sorts, and one more
+                // discriminant would carry a distinction no caller can act on.
+                Ok(slots) if slots.is_empty() => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(slots) => {
+                    // Slot 0 is the whole match and is always present when the
+                    // engine reported one.
+                    let (abs_start, abs_end) = match slots.first().copied().flatten() {
+                        Some((s, e)) => (s as usize, e as usize),
+                        None => {
+                            self.done = true;
+                            return None;
+                        }
+                    };
+                    if abs_start == abs_end && self.prev_end == Some(abs_start) {
+                        continue;
+                    }
+                    self.prev_end = Some(abs_end);
+                    let groups: Vec<Option<Span>> = slots
+                        .into_iter()
+                        .map(|g| g.map(|(s, e)| Span { start: s as usize, end: e as usize }))
+                        .collect();
+                    return Some(Ok(groups));
+                }
             }
         }
     }
 }
 
-impl std::iter::FusedIterator for %s<'_> {}
+impl std::iter::FusedIterator for %[1]s<'_> {}
 
 /// Iterates the non-overlapping matches at or after offset: each item is one
 /// MATCH, represented by its capture groups.
 ///
-/// The Vec always holds one entry per group (%d here), index 0 being the whole
+/// The Vec always holds one entry per group (%[4]d here), index 0 being the whole
 /// match, so its length does not depend on which groups participated — a group
 /// that did not is None. Address a named group with the generated index
 /// constant. Positions are absolute byte offsets.
 ///
+/// The input crosses into the regexp component ONCE, when the scan starts.
+///
 /// # Errors
 /// An item is Err(Error::BacktrackOverflow) if the pattern compiled to the
 /// Backtracking engine and the input exhausted its frame budget.
-pub fn %s(input: &[u8], offset: usize) -> %s<'_> {
-    %s { input, offset, prev_end: None, done: false }
+pub fn %[3]s(input: &[u8], offset: usize) -> %[1]s<'_> {
+    %[1]s { inner: None, input, offset: offset as u32, prev_end: None, done: false }
 }
 
-`, iterName, iterName, witFunc, iterName, numGroups, funcName, iterName, iterName)
+`, iterName, resType, funcName, numGroups)
 }

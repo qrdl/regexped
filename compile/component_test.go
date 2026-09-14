@@ -137,7 +137,7 @@ func TestComponentAdaptersSelection(t *testing.T) {
 	compiled := compileForTest(t, entries)
 	names := canonicalNames(entries)
 
-	got := componentAdapters(compiled, names, 0)
+	got := componentAdapters(compiled, names, nil, 0)
 	if len(got) != 3 {
 		t.Fatalf("got %d adapters, want 3: %+v", len(got), got)
 	}
@@ -156,11 +156,11 @@ func TestComponentAdaptersSelection(t *testing.T) {
 
 	// Drop one name: that function keeps its raw export and gains no adapter.
 	delete(names, "f")
-	if got := componentAdapters(compiled, names, 0); len(got) != 2 {
+	if got := componentAdapters(compiled, names, nil, 0); len(got) != 2 {
 		t.Errorf("with one name missing, got %d adapters, want 2", len(got))
 	}
 	// No names at all: no adapters.
-	if got := componentAdapters(compiled, nil, 0); len(got) != 0 {
+	if got := componentAdapters(compiled, nil, nil, 0); len(got) != 0 {
 		t.Errorf("with no names, got %d adapters", len(got))
 	}
 }
@@ -356,7 +356,7 @@ func setComponentCfg(n int) config.BuildConfig {
 
 func buildSetComponent(t *testing.T, cfg config.BuildConfig) []byte {
 	t.Helper()
-	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", nil, setComponentNames("s"), nil)
+	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", nil, nil, setComponentNames("s"), nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
 	}
@@ -458,7 +458,7 @@ func TestSetComponentFindOnly(t *testing.T) {
 // table contributes nothing rather than panicking or emitting a nameless export.
 // That is the state a config reaches when generate/ declined to name it.
 func TestSetComponentNamelessSetEmitsNoAdapters(t *testing.T) {
-	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil,
+	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil, nil,
 		map[string]ComponentSetNames{"someone-else": {}}, nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
@@ -564,7 +564,7 @@ func memoryImportsExports(t *testing.T, mod []byte) (memImports int, memExported
 // canonical export name is built from, so a missing one is refused here rather
 // than surfacing from wasm-tools as a complaint about the WIT.
 func TestSetComponentRefusesWithoutPackage(t *testing.T) {
-	_, _, err := CompileFileComponent(setComponentCfg(3), "", nil, setComponentNames("s"), nil)
+	_, _, err := CompileFileComponent(setComponentCfg(3), "", nil, nil, setComponentNames("s"), nil)
 	if err == nil {
 		t.Fatal("a component with no package prefix was accepted")
 	}
@@ -582,7 +582,7 @@ func TestSetComponentNoSetsDelegates(t *testing.T) {
 		Regexps:      []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}},
 	}
 	names := map[string]string{"m": "regexped:t/matcher#m"}
-	viaSets, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, nil)
+	viaSets, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +661,7 @@ func TestSetComponentMixedWithPatterns(t *testing.T) {
 		"token_match": "regexped:t/matcher#token-match",
 		"token_find":  "regexped:t/matcher#token-find",
 	}
-	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, setComponentNames("s"), nil)
+	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, setComponentNames("s"), nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
 	}
@@ -690,7 +690,7 @@ func TestSetComponentMixedWithoutResource(t *testing.T) {
 	cfg.Regexps[0].MatchFunc = "token_match"
 	cfg.Sets[0].Find = ""
 	names := map[string]string{"token_match": "regexped:t/matcher#token-match"}
-	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, setComponentNames("s"), nil)
+	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, setComponentNames("s"), nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
 	}
@@ -710,7 +710,7 @@ func TestSetComponentMixedWithoutResource(t *testing.T) {
 func TestSetComponentSkipsMissingCapabilityName(t *testing.T) {
 	names := setComponentNames("s")
 	delete(names["s"].Caps, "any_hit")
-	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil, names, nil)
+	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil, nil, names, nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
 	}
@@ -719,5 +719,211 @@ func TestSetComponentSkipsMissingCapabilityName(t *testing.T) {
 	}
 	if !moduleExports(core, "regexped:t/sets#which-matches") {
 		t.Error("the capabilities that do have names must still be exported")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The single-pattern find/groups RESOURCES, from the compile package's side.
+//
+// tools/fuzz drives these adapters over the real ABI; these tests pin what the
+// ASSEMBLER does with them — imports, type and function sections, exports and
+// the dispatch of each body — which is where an off-by-one import index or a
+// post-return on the wrong export would hide.
+
+// patternResourceNames builds the resource name table for every find and groups
+// export in entries, in the canonical form generate/ derives, so these tests do
+// not need generate/ (which imports this package).
+func patternResourceNames(entries []config.RegexEntry) map[string]ComponentPatternResource {
+	const prefix = "regexped:test/matcher"
+	out := map[string]ComponentPatternResource{}
+	add := func(name string, groups bool) {
+		if name == "" {
+			return
+		}
+		k := strings.ReplaceAll(name, "_", "-")
+		out[name] = ComponentPatternResource{
+			Groups:         groups,
+			Constructor:    prefix + "#[constructor]" + k,
+			Next:           prefix + "#[method]" + k + ".next",
+			Dtor:           prefix + "#[dtor]" + k,
+			ResourceImport: "[export]" + prefix,
+			ResourceNew:    "[resource-new]" + k,
+		}
+	}
+	for _, e := range entries {
+		add(e.FindFunc, false)
+		add(e.GroupsFunc, true)
+	}
+	return out
+}
+
+// matchOnlyNames keeps the plain function names for the MATCH exports only:
+// find and groups travel in the resource table.
+func matchOnlyNames(entries []config.RegexEntry) map[string]string {
+	names := map[string]string{}
+	for _, e := range entries {
+		if e.MatchFunc != "" {
+			names[e.MatchFunc] = "regexped:test/matcher#" + strings.ReplaceAll(e.MatchFunc, "_", "-")
+		}
+	}
+	return names
+}
+
+// TestComponentPatternResourcesAssembleAndValidate builds a single-pattern
+// component with a match, a find resource and a groups resource, and checks the
+// result is VALID WASM — the check that catches an import that shifted one call
+// target but not another — and carries exactly the exports the WIT expects.
+func TestComponentPatternResourcesAssembleAndValidate(t *testing.T) {
+	entries := []config.RegexEntry{
+		{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
+		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+		{Pattern: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
+	}
+	wasm, _, err := Compile(entries, 0, true, CompileOptions{
+		Component:                 true,
+		ComponentPackage:          "regexped:test/matcher",
+		ComponentExportNames:      matchOnlyNames(entries),
+		ComponentPatternResources: patternResourceNames(entries),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, wasm)
+
+	s := string(wasm)
+	for _, want := range []string{
+		"regexped:test/matcher#lower-match",
+		"cabi_post_regexped:test/matcher#lower-match",
+		"regexped:test/matcher#[constructor]token-find",
+		"regexped:test/matcher#[method]token-find.next",
+		"cabi_post_regexped:test/matcher#[method]token-find.next",
+		"regexped:test/matcher#[dtor]token-find",
+		"regexped:test/matcher#[constructor]opt-groups",
+		"regexped:test/matcher#[method]opt-groups.next",
+		"regexped:test/matcher#[dtor]opt-groups",
+		// One [resource-new] import per resource, from the synthetic module.
+		"[export]regexped:test/matcher",
+		"[resource-new]token-find",
+		"[resource-new]opt-groups",
+		// The raw exports are kept.
+		"lower_match", "token_find", "opt_groups",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("module is missing %q", want)
+		}
+	}
+	// A constructor returns a bare handle and a destructor nothing: giving
+	// either a post-return would free the scanner's own state.
+	for _, bad := range []string{
+		"cabi_post_regexped:test/matcher#[constructor]token-find",
+		"cabi_post_regexped:test/matcher#[dtor]token-find",
+		"cabi_post_regexped:test/matcher#[constructor]opt-groups",
+		"cabi_post_regexped:test/matcher#[dtor]opt-groups",
+	} {
+		if strings.Contains(s, bad) {
+			t.Errorf("module exports %q, which must have no post-return", bad)
+		}
+	}
+}
+
+// TestSetComponentMixedWithPatternResources is the mixed config: a set with its
+// own find resource beside a single pattern's find resource. Both kinds import a
+// [resource-new] builtin, and the pattern ones come FIRST; a module that got the
+// two orders wrong still assembles, and fails validation because an adapter
+// calls the wrong import. The Reporter is non-nil so the set diagnostics reach it.
+func TestSetComponentMixedWithPatternResources(t *testing.T) {
+	cfg := setComponentCfg(3)
+	cfg.Regexps[1].FindFunc = "token_find"
+	resources := patternResourceNames(cfg.Regexps)
+	rep := &Reporter{}
+	core, _, err := CompileFileComponent(cfg, "regexped:test/matcher", nil, resources, setComponentNames("s"), rep)
+	if err != nil {
+		t.Fatalf("CompileFileComponent: %v", err)
+	}
+	validateWASM(t, core)
+	s := string(core)
+	for _, want := range []string{
+		"regexped:test/matcher#[constructor]token-find",
+		"regexped:test/matcher#[method]token-find.next",
+		"regexped:test/matcher#[dtor]token-find",
+		"[resource-new]token-find",
+		"regexped:t/sets#[constructor]scan-it",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("core module is missing %q", want)
+		}
+	}
+	// The pattern resource's builtin is imported BEFORE the set's.
+	if p, q := strings.Index(s, "[resource-new]token-find"), strings.Index(s, "[resource-new]scan-it"); p < 0 || q < 0 || p > q {
+		t.Errorf("import order: pattern resource at %d, set resource at %d — the pattern ones must come first", p, q)
+	}
+	if len(rep.Sets) != 1 {
+		t.Errorf("the Reporter holds %d set diagnostics, want 1 — --verbose would print no set section", len(rep.Sets))
+	}
+}
+
+func TestAdapterKindNeedsPost(t *testing.T) {
+	for kind, want := range map[adapterKind]bool{
+		adapterMatch:         true,
+		adapterFind:          true,
+		adapterGroups:        true,
+		adapterPatCtor:       false,
+		adapterPatFindNext:   true,
+		adapterPatGroupsNext: true,
+		adapterPatDtor:       false,
+	} {
+		if got := kind.needsPost(); got != want {
+			t.Errorf("adapterKind(%d).needsPost() = %v, want %v", kind, got, want)
+		}
+	}
+}
+
+func TestPatternAdapterBodyUnknownKindPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("a function-shaped kind reached the resource dispatcher without a panic")
+		}
+	}()
+	buildPatternAdapterBody(componentAdapter{kind: adapterMatch}, 0, 0, 0)
+}
+
+func TestPatRepSize(t *testing.T) {
+	if got := patRepSize(false, 0); got != patRepBytes {
+		t.Errorf("find representation = %d, want %d", got, patRepBytes)
+	}
+	if got, want := patRepSize(true, 3), int32(patRepBytes+3*slotPairLen); got != want {
+		t.Errorf("groups representation with 3 groups = %d, want %d", got, want)
+	}
+}
+
+// TestOrderedPatternResources pins the skips: no table at all, a name with no
+// entry, and a name whose Groups flag contradicts the export it is attached to
+// — each emits no resource rather than a mis-shaped one.
+func TestOrderedPatternResources(t *testing.T) {
+	entries := []config.RegexEntry{
+		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
+	}
+	compiled := compileForTest(t, entries)
+	if got := orderedPatternResources(compiled, nil, 0); got != nil {
+		t.Errorf("no table: got %d resources, want none", len(got))
+	}
+	res := patternResourceNames(entries)
+	got := orderedPatternResources(compiled, res, 5)
+	if len(got) != 2 || got[0].funcName != "token_find" || got[1].funcName != "opt_groups" {
+		t.Fatalf("got %+v, want token_find then opt_groups", got)
+	}
+	if got[0].inner < 5 || got[1].numGroups == 0 {
+		t.Errorf("find inner index %d (want past the offset 5), groups numGroups %d (want > 0)",
+			got[0].inner, got[1].numGroups)
+	}
+	// Swap the Groups flags: neither export matches its entry's shape.
+	flipped := map[string]ComponentPatternResource{}
+	for k, v := range res {
+		v.Groups = !v.Groups
+		flipped[k] = v
+	}
+	if got := orderedPatternResources(compiled, flipped, 0); len(got) != 0 {
+		t.Errorf("contradicting Groups flags: got %d resources, want none", len(got))
 	}
 }

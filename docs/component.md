@@ -34,8 +34,11 @@ interface matcher {
     /// Why a matcher could not answer. No member means "no match".
     enum error-code { backtrack-overflow, malformed-cache, out-of-order }
 
-    /// Leftmost match starting at or after `start`. Positions are absolute.
-    find-github-token: func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>;
+    /// A scan in progress: the input crosses once, `next` steps it.
+    resource find-github-token {
+        constructor(input: list<u8>, start: u32);
+        next: func() -> result<option<tuple<u32, u32>>, error-code>;
+    }
 }
 
 world secrets {
@@ -43,19 +46,39 @@ world secrets {
 }
 ```
 
-One config is one WIT package is one component. Function names come from your own
-`_func` values, kebab-cased:
+One config is one WIT package is one component. Names come from your own `_func`
+values, kebab-cased:
 
-| Config field | WIT signature |
+| Config field | WIT shape |
 |---|---|
 | `match_func` | `func(input: list<u8>) -> result<option<u32>, error-code>` |
-| `find_func` | `func(input: list<u8>, start: u32) -> result<option<tuple<u32, u32>>, error-code>` |
-| `groups_func` | `func(input: list<u8>, start: u32) -> result<option<list<option<tuple<u32, u32>>>>, error-code>` |
+| `find_func` | `resource { constructor(input: list<u8>, start: u32); next: func() -> result<option<tuple<u32, u32>>, error-code> }` |
+| `groups_func` | `resource { constructor(input: list<u8>, start: u32); next: func() -> result<list<option<tuple<u32, u32>>>, error-code> }` |
 
-`match` answers `some(end)`; `find` answers `some((start, end))`; `groups` answers
-one entry per capture group, index 0 being the whole match, with `none` for a
-group that did not participate. `start` is named `start` rather than `from`
-because `from` is a WIT keyword.
+`match` answers `some(end)`. `find`'s `next` answers `some((start, end))` and
+`none` when the scan is finished; `groups`' `next` answers one entry per capture
+group, index 0 being the whole match, with `none` for a group that did not
+participate, and an EMPTY list when the scan is finished. `start` is named
+`start` rather than `from` because `from` is a WIT keyword.
+
+### Why the two iterating exports are resources
+
+`match` is one call and one answer. `find` and `groups` ITERATE, and a function
+that iterates has to be handed the input again on every step — which the
+canonical ABI copies. Scanning n bytes for m matches would copy `n × (m+1)`
+bytes where the module stub copies none: a 1 MB log with 500 matches means
+500 MB of copying.
+
+A resource takes the input ONCE, in its constructor, and `next` carries only the
+handle. That is the same move a set's `find` makes, and the measurement that
+justified it there applies unchanged: 2,800 ns per stateless call against
+230-400 ns for a resource `next` over a 4 KB input.
+
+The generated Rust stub hides the resource completely — its public API is the
+module stub's, iterator for iterator — so a Rust caller sees no difference. The
+generated C stub keeps the handle inside the iterator struct and adds one
+obligation, `<func>_free`; see [c-api.md](c-api.md). A consumer binding the WIT
+DIRECTLY, with `bindgen!` or `jco`, calls the constructor and `next` itself.
 
 ### The error case is not "no match"
 
@@ -119,8 +142,8 @@ whereas changing the package renames every export.
 `wit_version` is optional, and **unset means no version at all**:
 
 ```
-unset:            package regexped:secrets;          exports  regexped:secrets/matcher#find-x
-wit_version: 2.3.0  package regexped:secrets@2.3.0;  exports  regexped:secrets/matcher@2.3.0#find-x
+unset:            package regexped:secrets;          exports  regexped:secrets/matcher#match-x
+wit_version: 2.3.0  package regexped:secrets@2.3.0;  exports  regexped:secrets/matcher@2.3.0#match-x
 ```
 
 Because the version is part of every export name, adding, removing or changing it
@@ -142,11 +165,17 @@ let mut store = Store::new(&engine, ());
 let secrets = Secrets::instantiate(&mut store, &component, &Linker::new(&engine))?;
 let matcher = secrets.regexped_secrets_matcher();
 
-match matcher.call_find_github_token(&mut store, input, 0)? {
-    Ok(Some((start, end))) => println!("match at {start}..{end}"),
-    Ok(None) => println!("no match"),
-    Err(e) => eprintln!("cannot decide: {e:?}"),
+// `find` is a RESOURCE: construct once with the input, then step it.
+let res = matcher.find_github_token();
+let scan = res.call_constructor(&mut store, input, 0)?;
+loop {
+    match res.call_next(&mut store, scan)? {
+        Ok(Some((start, end))) => println!("match at {start}..{end}"),
+        Ok(None) => break,                       // the scan is finished
+        Err(e) => { eprintln!("cannot decide: {e:?}"); break; }
+    }
 }
+res.call_drop(&mut store, scan)?;                // ends the scan, frees its state
 ```
 
 That is the **WIT-only** route: `stub_type` unset, no generated stub, the host
@@ -202,12 +231,17 @@ wasm-tools component new embedded.wasm -o guest.wasm
 regexped merge --config=regexped.yaml --main=guest.wasm regexps.wasm
 ```
 
-Three things to know:
+Four things to know:
 
 - **The two `wasm-tools` lines are yours, not regexped's**, and only the wasip1
   target needs them — see [Why the wasip1 target needs two extra
   commands](#why-the-wasip1-target-needs-two-extra-commands) below.
 
+- **Call `<func>_free(&iter)` on every exit from a find or groups loop** — each
+  `break`, `return` and `goto`, not only the last. The scan lives inside the
+  regexp component behind a resource handle, so an abandoned iterator strands its
+  input copy and state for the life of the process. The same call is a no-op under
+  `wasm_format: module`, which is what lets one source build both ways.
 - **Add your own exports** to the generated `wit/consumer.wit`. It arrives with
   the import declared and nothing exported, and a component with no exports can
   be composed but not run.
@@ -297,20 +331,29 @@ the wasip1 target.
 
 ### Iteration, and the rule a hand-written loop gets wrong
 
-`find` reports **one** match, so something has to drive it. The generated stubs
-do, and they carry two rules worth knowing about if you ever write the loop
-yourself — as a WIT-only host must:
+`next` reports **one** match, so something has to drive it. The generated stubs
+do, and one rule is worth knowing about if you ever write the loop yourself — as
+a WIT-only host must:
 
-- **the advance rule** — `start = if end > start { end } else { start + 1 }`;
-  without the second arm a zero-length match spins for ever;
 - **Go's adjacent-empty rule** — an empty match beginning exactly where the
   previous REPORTED match ended is suppressed. Omit it and `(a?)` over `"ab"`
   gives you `(0,1),(1,1),(2,2)` where every regexped stub gives `(0,1),(2,2)`.
   Same pattern, same input, different answers.
 
-Passing the **whole** input every time is not an inefficiency to optimise away:
-`\b`, `\B` and `(?m:^)` are judged against the real preceding byte, so a sliced
-input would silently change the answer at the seam.
+The other rule a module-format caller has to write — the ADVANCE,
+`start = if end > start { end } else { start + 1 }`, without whose second arm a
+zero-length match spins for ever — is the resource's own now. It steps itself,
+so there is no position to carry and no way to get that wrong.
+
+The adjacent-empty rule stays OUTSIDE, in the consumer, and that placement is
+deliberate: it decides what is REPORTED rather than where the scan goes, so the
+raw resource answers exactly the matches the raw module export does, and a stub
+subtracts from that.
+
+Handing the constructor the **whole** input is not an inefficiency to optimise
+away: `\b`, `\B` and `(?m:^)` are judged against the real preceding byte, so a
+sliced input would silently change the answer at the seam. `start` bounds where
+the first step searches from; it never truncates what the engine sees behind it.
 
 ### Other languages
 
@@ -423,8 +466,12 @@ owns one, and here it drops the handle, which is mandatory. See
 ## Costs
 
 - **Every call copies the input** into guest memory, as the canonical ABI
-  requires. The same is true of the JS/TS module stubs today; it is not true of
-  the Rust/Go/C embedded path, which shares the host's memory.
+  requires — but an ITERATING export is a resource, so that is once per SCAN
+  rather than once per match, for a set's `find` and for a single pattern's
+  `find` and `groups` alike. `match` and the set's stateless capabilities are one
+  call and so one copy. The same per-call copy is true of the JS/TS module stubs
+  today; it is not true of the Rust/Go/C embedded path, which shares the host's
+  memory.
 - A few allocations per call, each freed by the post-return or the destructor:
   the result area alone for `match`, `find` and the `any` pair; three for
   `groups` (the area, the slots and the element list); two for a narrow `_all`
@@ -453,10 +500,12 @@ The compiler emits the core module exactly as it does for `wasm_format: module` 
 same engines, same bodies, same signatures — and **appends** the canonical-ABI
 machinery: a `cabi_realloc` with per-size-class free lists, one shared
 post-return that returns the call's blocks to them,
-and one adapter per exported function that allocates a result area, calls the
-existing body, and translates the `-1` / `-2` / `-4` / `-6` sentinels into the discriminated
-layouts. Because they are appended, no pattern function moves, and a
-`wasm_format: module` build is byte-for-byte what it always was.
+and one adapter per exported function — a constructor, a `next` and a destructor
+for each resource — that allocates a result area, calls the existing body, and
+translates the `-1` / `-2` / `-4` / `-6` sentinels into the discriminated layouts.
+Because they are appended, no pattern function is reordered; each resource adds one
+imported `[resource-new]` builtin, which shifts every defined function index by the
+same amount. A `wasm_format: module` build is byte-for-byte what it always was.
 
 `wasm-tools` then does the wrapping:
 

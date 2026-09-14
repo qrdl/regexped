@@ -464,7 +464,7 @@ func TestSetComponentCacheGeometry(t *testing.T) {
 		t.Fatal("this set gets no sweep, so the constructor has no cache geometry to carry")
 	}
 
-	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", nil, setComponentNames("s"), nil)
+	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", nil, nil, setComponentNames("s"), nil)
 	if err != nil {
 		t.Fatalf("CompileFileComponent: %v", err)
 	}

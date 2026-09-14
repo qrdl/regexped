@@ -692,21 +692,31 @@ func TestCabiReallocTrapsWhenTheCarveWrapsTheAddressSpace(t *testing.T) {
 
 // componentWasm compiles entries as a component core module and returns the
 // bytes plus the canonical export name for each configured func name.
-func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string) {
+func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string, map[string]generate.PatternResourceNames) {
 	t.Helper()
 	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Regexps: entries}
-	_, names, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
+	_, names, resources, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatalf("component artifacts: %v", err)
 	}
 	opts.Component = true
 	opts.ComponentPackage = prefix
 	opts.ComponentExportNames = names
+	// find and groups are RESOURCES, so their names travel in this second table.
+	// A build without it emits no constructor and no `next` for them.
+	compiled := map[string]compile.ComponentPatternResource{}
+	for k, v := range resources {
+		compiled[k] = compile.ComponentPatternResource{
+			Groups: v.Groups, Constructor: v.Constructor, Next: v.Next, Dtor: v.Dtor,
+			ResourceImport: v.ResourceImport, ResourceNew: v.ResourceNew,
+		}
+	}
+	opts.ComponentPatternResources = compiled
 	w, _, err := compile.Compile(entries, pathsTableBase, true, opts)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	return w, names
+	return w, names, resources
 }
 
 // adapterResult is one decoded result area.
@@ -726,29 +736,38 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
 		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
 	}
-	w, names := componentWasm(t, entries, compile.CompileOptions{})
+	w, names, res := componentWasm(t, entries, compile.CompileOptions{})
+	// instantiateCore, not instantiate: every find and groups resource imports a
+	// `[resource-new]` builtin, which instantiateCore supplies as the identity
+	// function — what the real builtin does as far as the guest can observe.
+	store, inst, mem := instantiateCore(t, w)
 
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	call := func(export, input string, extra ...int32) adapterResult {
-		fn := inst.GetFunc(store, export)
-		if fn == nil {
+	fn := func(export string) *wasmtime.Func {
+		t.Helper()
+		f := inst.GetFunc(store, export)
+		if f == nil {
 			t.Fatalf("no %q export", export)
 		}
+		return f
+	}
+	i32 := func(r any, err error) int32 {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.(int32)
+	}
+	u32 := func(addr uint32) uint32 { return binary.LittleEndian.Uint32(mem.UnsafeData(store)[addr:]) }
+
+	call := func(export, input string, extra ...int32) adapterResult {
+		t.Helper()
 		buf := mem.UnsafeData(store)
 		copy(buf[pathsInputBase:], input)
 		args := []any{any(int32(pathsInputBase)), any(int32(len(input)))}
 		for _, e := range extra {
 			args = append(args, any(e))
 		}
-		res, err := fn.Call(store, args...)
-		if err != nil {
-			t.Fatalf("%s(%q): %v", export, input, err)
-		}
-		ret := uint32(res.(int32))
+		ret := uint32(i32(fn(export).Call(store, args...)))
 		buf = mem.UnsafeData(store)
 		r := adapterResult{
 			retptr:   ret,
@@ -756,10 +775,36 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 			some:     buf[ret+4] == 1,
 			memPages: uint32(mem.Size(store) / 65536),
 		}
-		r.a = binary.LittleEndian.Uint32(buf[ret+8:])
-		r.b = binary.LittleEndian.Uint32(buf[ret+12:])
-		r.listPtr, r.listLen = r.a, r.b
+		r.a = u32(ret + 8)
+		r.b = u32(ret + 12)
 		return r
+	}
+	// construct lowers the input to the static input window and builds a
+	// scanner. The constructor does not find that block at the head of the
+	// per-call chain, so it takes its COPY path; the take-over path is pinned by
+	// the constructor tests further down.
+	construct := func(r generate.PatternResourceNames, input string, start int32) int32 {
+		t.Helper()
+		copy(mem.UnsafeData(store)[pathsInputBase:], input)
+		return i32(fn(r.Constructor).Call(store, int32(pathsInputBase), int32(len(input)), start))
+	}
+	next := func(r generate.PatternResourceNames, handle int32) uint32 {
+		t.Helper()
+		return uint32(i32(fn(r.Next).Call(store, handle)))
+	}
+	// drop runs the destructor, which returns NOTHING — so its result is not an
+	// int32 and must not go through i32.
+	drop := func(r generate.PatternResourceNames, handle int32) {
+		t.Helper()
+		if _, err := fn(r.Dtor).Call(store, handle); err != nil {
+			t.Fatalf("%s: %v", r.Dtor, err)
+		}
+	}
+	// find's next: result<option<tuple<u32,u32>>, error-code>, 16 bytes.
+	readFind := func(ret uint32) adapterResult {
+		b := mem.UnsafeData(store)
+		return adapterResult{retptr: ret, err: b[ret] == 1, some: b[ret+4] == 1,
+			a: u32(ret + 8), b: u32(ret + 12), memPages: uint32(mem.Size(store) / 65536)}
 	}
 
 	t.Run("match", func(t *testing.T) {
@@ -774,84 +819,108 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 
 	t.Run("find", func(t *testing.T) {
 		const in = "xxghp_ab12yy"
-		got := call(names["f"], in, 0)
-		if got.err || !got.some || got.a != 2 || got.b != 10 {
-			t.Errorf("f(%q,0) = %+v, want ok(some((2,10)))", in, got)
+		f := res["f"]
+		h := construct(f, in, 0)
+		if got := readFind(next(f, h)); got.err || !got.some || got.a != 2 || got.b != 10 {
+			t.Errorf("next over %q from 0 = %+v, want ok(some((2,10)))", in, got)
 		}
-		// start beyond any match, at len, and past len: all ok(none), no trap.
+		if got := readFind(next(f, h)); got.err || got.some {
+			t.Errorf("second next = %+v, want ok(none): the scan has one match", got)
+		}
+		drop(f, h)
+		// Started beyond any match, at len, and past len: all ok(none), no trap.
 		for _, start := range []int32{3, int32(len(in)), int32(len(in)) + 1} {
-			if got := call(names["f"], in, start); got.err || got.some {
-				t.Errorf("f(%q,%d) = %+v, want ok(none)", in, start, got)
+			h := construct(f, in, start)
+			if got := readFind(next(f, h)); got.err || got.some {
+				t.Errorf("next over %q from %d = %+v, want ok(none)", in, start, got)
 			}
+			drop(f, h)
 		}
 	})
 
 	t.Run("groups with an unset group", func(t *testing.T) {
-		buf := func() []byte { return mem.UnsafeData(store) }
+		g := res["g"]
+		// groups' next: result<list<option<tuple<u32,u32>>>, error-code> —
+		// @0 disc, @4 list ptr, @8 list len — and an EMPTY list is "finished".
+		readList := func(ret uint32) (ptr, n uint32, errored bool) {
+			return u32(ret + 4), u32(ret + 8), mem.UnsafeData(store)[ret] == 1
+		}
 		// "xy": both groups participate.
-		got := call(names["g"], "xy", 0)
-		if got.err || !got.some || got.listLen != 2 {
-			t.Fatalf("g(xy) = %+v, want ok(some(list of 2))", got)
+		h := construct(g, "xy", 0)
+		ptr, n, errored := readList(next(g, h))
+		if errored || n != 2 {
+			t.Fatalf("next over %q = (%d elements, errored %v), want a list of 2", "xy", n, errored)
 		}
-		b := buf()
-		if b[got.listPtr] != 1 || binary.LittleEndian.Uint32(b[got.listPtr+4:]) != 0 ||
-			binary.LittleEndian.Uint32(b[got.listPtr+8:]) != 2 {
-			t.Errorf("g(xy) group 0 = %v, want some((0,2))", b[got.listPtr:got.listPtr+12])
+		b := mem.UnsafeData(store)
+		if b[ptr] != 1 || u32(ptr+4) != 0 || u32(ptr+8) != 2 {
+			t.Errorf("group 0 over %q = %v, want some((0,2))", "xy", b[ptr:ptr+12])
 		}
-		if b[got.listPtr+12] != 1 {
-			t.Errorf("g(xy) group 1 must be some")
+		if b[ptr+12] != 1 {
+			t.Errorf("group 1 over %q must be some", "xy")
 		}
+		if _, n, errored := readList(next(g, h)); errored || n != 0 {
+			t.Errorf("second next over %q = (%d elements, errored %v), want an empty list", "xy", n, errored)
+		}
+		drop(g, h)
+
 		// "y": the optional group is UNSET, and must be `none` — the element
 		// path a happy-path test never reaches.
-		got = call(names["g"], "y", 0)
-		if got.err || !got.some || got.listLen != 2 {
-			t.Fatalf("g(y) = %+v", got)
+		h = construct(g, "y", 0)
+		ptr, n, errored = readList(next(g, h))
+		if errored || n != 2 {
+			t.Fatalf("next over %q = (%d elements, errored %v)", "y", n, errored)
 		}
-		b = buf()
-		if b[got.listPtr] != 1 {
-			t.Errorf("g(y) group 0 must be some")
+		b = mem.UnsafeData(store)
+		if b[ptr] != 1 {
+			t.Errorf("group 0 over %q must be some", "y")
 		}
-		if b[got.listPtr+12] != 0 {
-			t.Errorf("g(y) group 1 disc = %d, want 0 (none)", b[got.listPtr+12])
+		if b[ptr+12] != 0 {
+			t.Errorf("group 1 disc over %q = %d, want 0 (none)", "y", b[ptr+12])
 		}
+		drop(g, h)
 	})
 
-	// The post-return resets the bump pointer to the static top. Without it
-	// every call leaks its result area and memory grows without bound; with it,
-	// repeated calls land at the SAME retptr and memory never grows.
+	// A full scanner lifecycle — construct, next, post-return, destroy — repeated
+	// a thousand times must be FLAT: the same result area every time and no
+	// memory growth. The post-return returns next's result area to its class's
+	// free list and the destructor returns the scanner's state and input copy, so
+	// every iteration pops exactly the blocks the previous one pushed. Drop either
+	// and a block is carved fresh each time, which moves the retptr.
 	t.Run("post-return reset", func(t *testing.T) {
-		post := inst.GetFunc(store, "cabi_post_"+names["f"])
-		if post == nil {
-			t.Fatalf("no post-return export for %q", names["f"])
-		}
+		f := res["f"]
+		post := fn("cabi_post_" + f.Next)
 		// Prime one reset first. The subtests above ran on this same store
-		// without ever calling the post-return, so the heap has legitimately
-		// advanced; rewinding lands BELOW where they left it, and a baseline
-		// taken before the first reset would differ from every later call for
-		// that reason alone. The post-return ignores its argument — it resets
-		// the bump pointer wholesale — so 0 is a fine retptr here.
+		// without ever calling the post-return, so blocks are still on the
+		// per-call chain; a baseline taken before freeing them would differ from
+		// every later iteration for that reason alone. The post-return ignores
+		// its argument — it frees whatever is on the chain — so 0 is a fine
+		// retptr here.
 		if _, err := post.Call(store, any(int32(0))); err != nil {
 			t.Fatalf("priming post: %v", err)
 		}
 		var baseRetptr, basePages uint32
 		for i := 0; i < 1000; i++ {
-			got := call(names["f"], "xxghp_ab12yy", 0)
+			h := construct(f, "xxghp_ab12yy", 0)
+			got := readFind(next(f, h))
 			if !got.some || got.a != 2 || got.b != 10 {
-				t.Fatalf("call %d answered %+v, want ok(some((2,10)))", i, got)
+				t.Fatalf("iteration %d answered %+v, want ok(some((2,10)))", i, got)
 			}
 			if i == 0 {
 				baseRetptr, basePages = got.retptr, got.memPages
 			} else {
 				if got.retptr != baseRetptr {
-					t.Fatalf("call %d landed at %d, the first reset call at %d — the bump pointer is not being reset",
+					t.Fatalf("iteration %d landed at %d, the first at %d — a block is not being returned",
 						i, got.retptr, baseRetptr)
 				}
 				if got.memPages != basePages {
-					t.Fatalf("call %d grew memory from %d to %d pages", i, basePages, got.memPages)
+					t.Fatalf("iteration %d grew memory from %d to %d pages", i, basePages, got.memPages)
 				}
 			}
 			if _, err := post.Call(store, any(int32(got.retptr))); err != nil {
 				t.Fatalf("post %d: %v", i, err)
+			}
+			if _, err := fn(f.Dtor).Call(store, h); err != nil {
+				t.Fatalf("dtor %d: %v", i, err)
 			}
 		}
 	})
@@ -866,16 +935,14 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 	const pattern = `Z(?:a?)+?xyz`
 	const length = 60000
 	entries := []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}
-	w, names := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096})
+	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096})
 
-	store, inst, mem, release, err := instantiate(w)
-	defer release()
-	if err != nil {
-		t.Fatalf("instantiate: %v", err)
-	}
-	fn := inst.GetFunc(store, names["f"])
-	if fn == nil {
-		t.Fatalf("no %q export", names["f"])
+	store, inst, mem := instantiateCore(t, w)
+	f := res["f"]
+	ctor := inst.GetFunc(store, f.Constructor)
+	next := inst.GetFunc(store, f.Next)
+	if ctor == nil || next == nil {
+		t.Fatalf("missing resource exports: constructor %v, next %v", ctor != nil, next != nil)
 	}
 	raw := inst.GetFunc(store, "f")
 	if raw == nil {
@@ -903,19 +970,34 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 		t.Skipf("this shape no longer overflows (raw find returned %d); the -2 arm needs a new one", got)
 	}
 
-	wd.Arm(store)
-	res, err := fn.Call(store, any(int32(pathsInputBase)), any(int32(length)), any(int32(0)))
-	wd.Disarm()
+	h, err := ctor.Call(store, any(int32(pathsInputBase)), any(int32(length)), any(int32(0)))
 	if err != nil {
-		t.Fatalf("adapter: %v", err)
+		t.Fatalf("constructor: %v", err)
 	}
-	ret := uint32(res.(int32))
-	buf = mem.UnsafeData(store)
-	if buf[ret] != 1 {
-		t.Errorf("result discriminant = %d, want 1 (err) — an UNKNOWN answer must not lift to ok(none)", buf[ret])
-	}
-	if buf[ret+4] != 0 {
-		t.Errorf("error enum index = %d, want 0 (backtrack-overflow)", buf[ret+4])
+	handle := h.(int32)
+
+	// The resource's `next` has its OWN copy of the -2 arm — the function-shaped
+	// adapter it replaced is gone — so this is the only place that proves an
+	// unknown answer is lifted to err(backtrack-overflow) rather than to
+	// ok(none), a definite "no more matches" the engine never established.
+	// Called twice: a scanner that reported an error must KEEP reporting it,
+	// not settle into "finished" on the next pull.
+	for call := 0; call < 2; call++ {
+		wd.Arm(store)
+		r, err := next.Call(store, any(handle))
+		wd.Disarm()
+		if err != nil {
+			t.Fatalf("next %d: %v", call, err)
+		}
+		ret := uint32(r.(int32))
+		buf = mem.UnsafeData(store)
+		if buf[ret] != 1 {
+			t.Errorf("next %d: result discriminant = %d, want 1 (err) — an UNKNOWN answer must not lift to ok(none)",
+				call, buf[ret])
+		}
+		if buf[ret+4] != 0 {
+			t.Errorf("next %d: error enum index = %d, want 0 (backtrack-overflow)", call, buf[ret+4])
+		}
 	}
 }
 
@@ -1378,4 +1460,201 @@ func TestComponentCacheGeometryMatchesConfig(t *testing.T) {
 		}
 		h.call(h.pkg+"#[dtor]scan-it", sc)
 	}
+}
+
+// --- the single-pattern find/groups RESOURCES -------------------------------
+//
+// `find` and `groups` are resources rather than functions, for the reason a
+// set's `find` is: an iterating function is handed the input again on every
+// step and the canonical ABI copies it, so a scan of n bytes reporting m
+// matches copied n*(m+1) bytes. The constructor takes it once.
+//
+// Driven here over the RAW core ABI, exactly as the set resources are, with the
+// `[resource-new]` builtin stubbed by instantiateCore's identity function.
+
+// patternResourceHarness is setHarness pointed at the `matcher` interface.
+func newPatternResourceHarness(t *testing.T, entries []config.RegexEntry) (*setHarness, map[string]generate.PatternResourceNames) {
+	t.Helper()
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "t", WitPackage: "t", Regexps: entries,
+	}
+	_, _, resources, _, _, err := generate.ComponentArtifactsWithSets(cfg)
+	if err != nil {
+		t.Fatalf("component artifacts: %v", err)
+	}
+	core, _, err := component.Core(cfg, nil)
+	if err != nil {
+		t.Fatalf("component core: %v", err)
+	}
+	store, inst, mem := instantiateCore(t, core)
+	return &setHarness{t: t, store: store, inst: inst, mem: mem, pkg: "regexped:t/matcher"}, resources
+}
+
+// spans reads a result<option<tuple<u32,u32>>, error-code> area.
+func (h *setHarness) spans(ret int32) (start, end uint32, some, errored bool) {
+	data := h.mem.UnsafeData(h.store)
+	if data[ret] == 1 {
+		return 0, 0, false, true
+	}
+	if data[ret+4] == 0 {
+		return 0, 0, false, false
+	}
+	return h.u32(ret + 8), h.u32(ret + 12), true, false
+}
+
+// TestComponentPatternFindResource drives a find resource to exhaustion and
+// checks the positions AND the advance rule: every match is reported once, in
+// order, and a scan over an empty-matchable pattern terminates.
+func TestComponentPatternFindResource(t *testing.T) {
+	h, res := newPatternResourceHarness(t, []config.RegexEntry{
+		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Pattern: `a*`, FindFunc: "empties"},
+	})
+
+	drive := func(funcName, input string) [][2]uint32 {
+		n := res[funcName]
+		if n.Constructor == "" {
+			t.Fatalf("%s has no resource names", funcName)
+		}
+		ptr, length := h.writeInput(input)
+		handle := h.call(n.Constructor, ptr, length, int32(0))
+		var out [][2]uint32
+		for i := 0; i < 4*len(input)+8; i++ {
+			ret := h.call(n.Next, handle)
+			start, end, some, errored := h.spans(ret)
+			if errored {
+				t.Fatalf("%s.next reported an error", funcName)
+			}
+			if !some {
+				h.call("cabi_post_"+n.Next, ret)
+				h.call(n.Dtor, handle)
+				return out
+			}
+			out = append(out, [2]uint32{start, end})
+			h.call("cabi_post_"+n.Next, ret)
+		}
+		t.Fatalf("%s did not terminate: the advance rule does not step past a zero-length match", funcName)
+		return nil
+	}
+
+	got := drive("f", "xxghp_ab12 and ghp_cd34yy")
+	want := [][2]uint32{{2, 10}, {15, 23}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("find over two tokens = %v, want %v", got, want)
+	}
+
+	// `a*` matches empty everywhere, so this is the shape that hangs if the
+	// advance does not step past a zero-length match.
+	if got := drive("empties", "ab"); len(got) != 3 {
+		t.Errorf("a* over %q reported %v; want one match at each of 0, 1, 2", "ab", got)
+	}
+
+	// A finished scanner keeps answering `none` rather than restarting.
+	n := res["f"]
+	ptr, length := h.writeInput("nothing")
+	handle := h.call(n.Constructor, ptr, length, int32(0))
+	for i := 0; i < 3; i++ {
+		if _, _, some, errored := h.spans(h.call(n.Next, handle)); some || errored {
+			t.Fatalf("call %d on a non-matching input: some=%v errored=%v", i, some, errored)
+		}
+	}
+	h.call(n.Dtor, handle)
+}
+
+// TestComponentPatternGroupsResource drives a groups resource, including the
+// UNSET group — the element path a happy-path test never reaches — and the
+// empty list that means the scan is finished.
+func TestComponentPatternGroupsResource(t *testing.T) {
+	h, res := newPatternResourceHarness(t, []config.RegexEntry{
+		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
+	})
+	n := res["g"]
+	if !n.Groups {
+		t.Fatal("a groups_func must be marked as the groups shape")
+	}
+
+	// groups' next answers result<list<option<tuple<u32,u32>>>, error-code>:
+	// @0 disc, @4 list ptr, @8 list len. An empty list is "finished".
+	readGroups := func(ret int32) [][3]int64 {
+		data := h.mem.UnsafeData(h.store)
+		if data[ret] == 1 {
+			t.Fatalf("next reported an error")
+		}
+		ptr := int32(h.u32(ret + 4))
+		count := int32(h.u32(ret + 8))
+		var out [][3]int64
+		for i := int32(0); i < count; i++ {
+			el := ptr + i*12
+			out = append(out, [3]int64{
+				int64(h.mem.UnsafeData(h.store)[el]),
+				int64(h.u32(el + 4)), int64(h.u32(el + 8)),
+			})
+		}
+		return out
+	}
+
+	ptr, length := h.writeInput("xy y")
+	handle := h.call(n.Constructor, ptr, length, int32(0))
+
+	// "xy" at 0: both groups participate.
+	first := readGroups(h.call(n.Next, handle))
+	if len(first) != 2 || first[0][0] != 1 || first[0][1] != 0 || first[0][2] != 2 {
+		t.Fatalf("first match groups = %v, want group 0 some(0,2) and two entries", first)
+	}
+	if first[1][0] != 1 {
+		t.Errorf("group 1 must be some for %q", "xy")
+	}
+
+	// "y" at 3: the optional group is UNSET and must come back as none.
+	second := readGroups(h.call(n.Next, handle))
+	if len(second) != 2 || second[0][0] != 1 || second[0][1] != 3 || second[0][2] != 4 {
+		t.Fatalf("second match groups = %v, want group 0 some(3,4)", second)
+	}
+	if second[1][0] != 0 {
+		t.Errorf("group 1 disc = %d for %q, want 0 (none)", second[1][0], "y")
+	}
+
+	// Finished: an EMPTY list, and it stays empty.
+	for i := 0; i < 2; i++ {
+		if got := readGroups(h.call(n.Next, handle)); len(got) != 0 {
+			t.Errorf("call %d after the last match returned %v, want an empty list", i, got)
+		}
+	}
+	h.call(n.Dtor, handle)
+}
+
+// TestComponentPatternScannersAreIndependent: two scanners over the same
+// pattern, interleaved, must not share a position — the property the resource
+// exists to provide and the one a module-level global would break.
+func TestComponentPatternScannersAreIndependent(t *testing.T) {
+	h, res := newPatternResourceHarness(t, []config.RegexEntry{
+		{Pattern: `[0-9]+`, FindFunc: "nums"},
+	})
+	n := res["nums"]
+	pa, la := h.writeInput("1 22 333")
+	pb, lb := h.writeInput("44 5")
+	a := h.call(n.Constructor, pa, la, int32(0))
+	b := h.call(n.Constructor, pb, lb, int32(0))
+
+	next := func(handle int32) (uint32, uint32, bool) {
+		start, end, some, errored := h.spans(h.call(n.Next, handle))
+		if errored {
+			t.Fatal("next reported an error")
+		}
+		return start, end, some
+	}
+	if s, e, _ := next(a); s != 0 || e != 1 {
+		t.Errorf("scanner A first = (%d,%d), want (0,1)", s, e)
+	}
+	if s, e, _ := next(b); s != 0 || e != 2 {
+		t.Errorf("scanner B first = (%d,%d), want (0,2)", s, e)
+	}
+	if s, e, _ := next(a); s != 2 || e != 4 {
+		t.Errorf("scanner A second = (%d,%d), want (2,4) — B moved A's position", s, e)
+	}
+	if s, e, _ := next(b); s != 3 || e != 4 {
+		t.Errorf("scanner B second = (%d,%d), want (3,4)", s, e)
+	}
+	h.call(n.Dtor, a)
+	h.call(n.Dtor, b)
 }

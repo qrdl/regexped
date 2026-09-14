@@ -111,10 +111,6 @@ func witSetKebab(ws witSet, c config.SetCapability) string {
 	panic("generate: capability " + c.Field + " " + c.Name + " has no WIT name — witSets and Capabilities disagree")
 }
 
-// cComponentPosParams is the lowered parameter list of an import taking an input
-// and a start position: `find` and `groups`.
-const cComponentPosParams = "const unsigned char *ptr, unsigned int len, unsigned int start,\n               unsigned char *ret"
-
 // cComponentImportDecl is one lowered import declaration, for every shape.
 func cComponentImportDecl(module, field, ffi, params string) string {
 	return fmt.Sprintf(`__attribute__((__import_module__("%s"), __import_name__("%s")))
