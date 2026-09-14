@@ -313,6 +313,19 @@ func buildComponentReallocBody(heapGlobal, callListGlobal uint32, classHeadsBase
 	b = append(b, 0x74) // i32.shl
 	b = append(b, 0x6A) // i32.add
 	b = append(b, 0x21, lEnd)
+	// The carve must not wrap the address space. Past 4 GiB `end` comes back as
+	// a LOW address, which then PASSES the unsigned fit check below: the grow is
+	// skipped, `heap` is reset to near zero, and the next carve overlaps the
+	// static data instead of trapping on exhaustion. It takes a live heap over
+	// 2 GiB — the size guard above bounds a single carve at 2 GiB, so no one
+	// request can do it — and the failure is silent corruption, not a trap.
+	b = append(b, 0x20, lEnd)
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x00)       // unreachable
+	b = append(b, 0x0B)       // end if
 	// grow if it does not fit; a failed grow traps rather than handing back a
 	// pointer the host would read through.
 	b = append(b, 0x02, 0x40) // block

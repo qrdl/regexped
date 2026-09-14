@@ -12,7 +12,7 @@ import (
 )
 
 // The shim modules are hand-assembled WASM. That makes a structural check
-// ("starts with the magic header") worthless — compile/compile_test.go's B15
+// ("starts with the magic header") worthless — compile/compile_api_test.go's B15
 // note records a module that passed exactly such a check while containing a
 // function body that never once type-checked. So the primary test here is a
 // real validator, and the secondary ones pin the link-time contract: the
@@ -32,7 +32,7 @@ var shims = []struct {
 }
 
 // wasmValidator locates a WASM validator once per test binary. Copied in shape
-// from compile/compile_test.go: this module has no wasmtime dependency
+// from compile/compile_api_test.go: this module has no wasmtime dependency
 // (CLAUDE.md lists it under tools/ only), so validation shells out.
 var wasmValidator = sync.OnceValue(func() []string {
 	if p, err := exec.LookPath("wasm-tools"); err == nil {

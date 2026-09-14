@@ -56,7 +56,7 @@ from-coverage:
 
 # Set-emitter reach. Same question as from-coverage, for compile/set_*.go:
 # which emitters do the tests that CHECK ANSWERS actually drive? The smoke
-# matrix in compile/set_matrix_coverage_test.go proves a shape still COMPILES,
+# matrix in compile/set_module_test.go proves a shape still COMPILES,
 # which is a different claim — see that file's opening comment for the gap it
 # describes, and this target for the other side of it.
 #

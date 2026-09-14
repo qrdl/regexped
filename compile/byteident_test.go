@@ -182,7 +182,7 @@ func TestByteIdenticalSetShapesAreDistinct(t *testing.T) {
 	}
 	// Shufti is deliberately absent: it is selected only when Aho-Corasick
 	// declines on budget, which no YAML config can arrange. See
-	// tools/fuzz/set_shufti_test.go, which reaches it through CompileFileOpts.
+	// tools/fuzz/set_caps_test.go, which reaches it through CompileFileOpts.
 	if acceptKinds["sparse"] == 0 {
 		t.Error("no set fixture produces a SPARSE accept bucket — G17's " +
 			"per-state pattern lists are unpinned")

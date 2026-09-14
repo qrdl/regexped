@@ -1,8 +1,11 @@
 package generate
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1540,4 +1543,1331 @@ func TestDerivedNameMatchesGenerator(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ── The set-stub descriptor helpers ────────────────────────────────────────
+//
+// The six language templates each used to hand-roll the argument list of every
+// set export. They agreed at the time; what the shared descriptor removes is
+// FORWARD drift — the cross-batch empty-match suppression that ended up in the
+// find path and not the groups path is what that looks like when it happens.
+//
+// These helpers are pure functions over the config, so their refusals and
+// their boundaries are testable directly rather than through six generated
+// files.
+
+// TestCapByKind covers the lookup, including the miss.
+//
+// A nil result means "the set did not declare this capability", and every
+// caller must handle it — spellJSArgs is handed one directly. Returning a
+// zero-valued capability instead would spell an argument list for an export
+// that does not exist.
+func TestCapByKind(t *testing.T) {
+	caps := []setCapability{
+		{Kind: "find", Export: "s_find"},
+		{Kind: "scan_any", Export: "s_scan_any"},
+	}
+	if got := capByKind(caps, "find"); got == nil || got.Export != "s_find" {
+		t.Errorf("capByKind(find) = %+v, want the find capability", got)
+	}
+	if got := capByKind(caps, "match_all"); got != nil {
+		t.Errorf("capByKind(undeclared) = %+v, want nil", got)
+	}
+	if got := capByKind(nil, "find"); got != nil {
+		t.Errorf("capByKind over no capabilities = %+v, want nil", got)
+	}
+}
+
+// TestSpellJSArgs covers the renderer, every ABI parameter it can be handed,
+// and both of its refusals.
+//
+// The nil guard matters because capByKind returns nil for an undeclared
+// capability and the templates call straight through; the panic matters
+// because a new ABI parameter with no JS spelling must stop the build rather
+// than silently render an argument list one short.
+func TestSpellJSArgs(t *testing.T) {
+	s := jsArgSpelling{
+		inPtr: "inPtr", inLen: "inLen", from: "from", gate: "gatePtr",
+		bitmap: "bitmapPtr", tuple: "tuplePtr", outCap: "outCap", cursor: "cursor",
+	}
+	t.Run("nil capability spells nothing", func(t *testing.T) {
+		if got := spellJSArgs(nil, s); got != "" {
+			t.Errorf("spellJSArgs(nil) = %q, want the empty string", got)
+		}
+	})
+	t.Run("every parameter has a spelling", func(t *testing.T) {
+		all := &setCapability{Kind: "find", Params: []abiParam{
+			abiInputPtr, abiInputLen, abiFrom, abiScratchPtr,
+			abiBitmapPtr, abiTuplePtr, abiOutCap, abiCursor,
+		}}
+		got := spellJSArgs(all, s)
+		want := "inPtr, inLen, from, gatePtr, bitmapPtr, tuplePtr, outCap, cursor"
+		if got != want {
+			t.Errorf("spellJSArgs = %q, want %q", got, want)
+		}
+	})
+	t.Run("order follows the ABI, not the spelling struct", func(t *testing.T) {
+		// Reversing the params must reverse the output: the renderer walks the
+		// capability's list, which IS the export's signature.
+		rev := &setCapability{Params: []abiParam{abiCursor, abiInputLen, abiInputPtr}}
+		if got := spellJSArgs(rev, s); got != "cursor, inLen, inPtr" {
+			t.Errorf("spellJSArgs = %q, want the parameters in ABI order", got)
+		}
+	})
+	t.Run("an unspellable parameter stops the build", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("an unknown ABI parameter rendered instead of panicking")
+			}
+			if msg, ok := r.(string); !ok || !strings.Contains(msg, "JS spelling") {
+				t.Errorf("panic %v does not name the cause", r)
+			}
+		}()
+		// A parameter value no case handles. If a real one is ever added past
+		// abiCursor this test starts passing for the wrong reason, which the
+		// message above is there to make obvious.
+		bogus := &setCapability{Params: []abiParam{abiCursor + 99}}
+		_ = spellJSArgs(bogus, s)
+	})
+}
+
+// TestDerivedFuncName covers the naming rule that keeps every generated symbol
+// in the config's own casing: url_groups + index -> url_groups_index, but
+// urlGroups + index -> urlGroupsIndex.
+//
+// The empty-suffix arm is the one no generator reaches today; it exists so a
+// caller asking for the base name gets it rather than a trailing separator.
+func TestDerivedFuncName(t *testing.T) {
+	cases := []struct{ base, suffix, want string }{
+		{"url_groups", "index", "url_groups_index"},
+		{"url_groups", "", "url_groups"},
+		{"urlGroups", "index", "urlGroupsIndex"},
+		{"urlGroups", "", "urlGroups"},
+		{"p", "names", "p_names"},
+	}
+	for _, c := range cases {
+		if got := derivedFuncName(c.base, c.suffix); got != c.want {
+			t.Errorf("derivedFuncName(%q, %q) = %q, want %q",
+				c.base, c.suffix, got, c.want)
+		}
+	}
+}
+
+// TestDefaultBatchCapBounds covers the batch buffer sizing, which is clamped from
+// BELOW by a floor and from ABOVE by what the cursor's count field can encode.
+//
+// The upper clamp is the interesting one: a buffer larger than the cursor can
+// count would let a call report more matches than the resume cursor could
+// describe, and the next call would restart in the wrong place.
+func TestDefaultBatchCapBounds(t *testing.T) {
+	mk := func(n int) (config.SetConfig, config.BuildConfig) {
+		entries := make([]config.RegexEntry, n)
+		for i := range entries {
+			entries[i] = config.RegexEntry{
+				Name: string(rune('a'+i%26)) + string(rune('0'+i/26)), Pattern: `x`,
+			}
+		}
+		s := config.SetConfig{
+			Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
+		}
+		return s, config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{s}}
+	}
+	t.Run("small sets take the floor", func(t *testing.T) {
+		s, cfg := mk(3)
+		if got := defaultBatchCap(s, cfg); got != 256 {
+			t.Errorf("defaultBatchCap for 3 patterns = %d, want the 256 floor", got)
+		}
+	})
+	t.Run("never exceeds what the cursor can count", func(t *testing.T) {
+		s, cfg := mk(40)
+		got := defaultBatchCap(s, cfg)
+		if max := int(cursorMaxCount(s, cfg)); got > max {
+			t.Errorf("defaultBatchCap = %d exceeds the cursor's maximum count %d", got, max)
+		}
+		if got < 1 {
+			t.Errorf("defaultBatchCap = %d, want at least 1", got)
+		}
+	})
+}
+
+// The four per-language ABI SPELLERS, exercised over every parameter the
+// descriptor can hand them.
+//
+// The descriptor in set_stub.go decides WHICH parameters a capability takes
+// and in what order; each speller decides only how one is written. That split
+// is the whole point of R12 — the generators stopped deciding the ABI — and it
+// means a speller is a pure lookup, so the honest test is to hand it every
+// value rather than wait for a set shape that happens to produce one.
+//
+// The gap that hid here: `abiBitmapPtr` is only produced by the WIDE `_all`
+// form, so until a >64-id set appeared in some other test, a quarter of every
+// speller was unwritten. A missing arm is not a compile error — the switch
+// falls through to its panic — so nothing would have said so until a user with
+// seventy patterns generated a stub.
+
+func allABIParams() []abiParam {
+	return []abiParam{
+		abiInputPtr, abiInputLen, abiFrom, abiScratchPtr,
+		abiBitmapPtr, abiTuplePtr, abiOutCap, abiCursor,
+	}
+}
+
+func TestABISpellersHandleEveryParam(t *testing.T) {
+	spellers := map[string]func(abiParam) string{
+		"rust": rustABIParam,
+		"go":   goABIParam,
+		"c":    cABIParam,
+		"as":   asABIParam,
+	}
+	for lang, spell := range spellers {
+		t.Run(lang, func(t *testing.T) {
+			seen := map[string]abiParam{}
+			for _, p := range allABIParams() {
+				got := func() (s string) {
+					defer func() {
+						if r := recover(); r != nil {
+							t.Errorf("%s: param %d panicked: %v", lang, p, r)
+						}
+					}()
+					return spell(p)
+				}()
+				if strings.TrimSpace(got) == "" {
+					t.Errorf("%s: param %d spelled as empty", lang, p)
+					continue
+				}
+				// Two parameters may share a spelling only when they share a
+				// slot by design — Go and AssemblyScript write the bitmap and
+				// the tuple buffer the same way, because both are just a
+				// pointer there. Anything else is two ABI positions that would
+				// be indistinguishable in a generated signature.
+				if prev, dup := seen[got]; dup {
+					sharedSlot := (prev == abiBitmapPtr && p == abiTuplePtr) ||
+						(prev == abiTuplePtr && p == abiBitmapPtr)
+					if !sharedSlot {
+						t.Errorf("%s: params %d and %d both spell as %q", lang, prev, p, got)
+					}
+				}
+				seen[got] = p
+			}
+		})
+	}
+}
+
+// TestABISpellersRejectUnknownParam: the switches end in a panic on purpose.
+// A new abiParam that a speller has not learned must stop the build loudly
+// rather than emit a signature missing an argument, which would fail much
+// later as an arity mismatch in someone else's compiler.
+func TestABISpellersRejectUnknownParam(t *testing.T) {
+	unknown := abiParam(9999)
+	for lang, spell := range map[string]func(abiParam) string{
+		"rust": rustABIParam,
+		"go":   goABIParam,
+		"c":    cABIParam,
+		"as":   asABIParam,
+	} {
+		t.Run(lang, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Error("an unknown abiParam was spelled instead of rejected")
+				}
+			}()
+			spell(unknown)
+		})
+	}
+}
+
+// TestABIRetSpellers covers the return-type half, which is only two values but
+// decides whether a capability hands back a bitmask or a count.
+func TestABIRetSpellers(t *testing.T) {
+	for lang, spell := range map[string]func(abiRet) string{
+		"rust": rustABIRet,
+		"go":   goABIRet,
+		"c":    cABIRet,
+		"as":   asABIRet,
+	} {
+		t.Run(lang, func(t *testing.T) {
+			i32, i64 := spell(abiRetI32), spell(abiRetI64)
+			if i32 == "" || i64 == "" {
+				t.Fatalf("empty return spelling: i32=%q i64=%q", i32, i64)
+			}
+			if i32 == i64 {
+				t.Errorf("i32 and i64 both spell as %q; a 64-bit bitmask would "+
+					"be truncated to a count with no diagnostic", i32)
+			}
+		})
+	}
+}
+
+// TestMustCapByKindPanicsOnDisagreement covers the guard the C, Go and AS set
+// generators share. Nothing a config can express reaches it — each generator
+// asks only inside `if s.<Cap> != ""`, where setCapabilities has added the
+// capability by construction — so it is driven directly: a nil return there
+// means the two have drifted, and a nil dereference would report that as a
+// crash somewhere downstream instead.
+func TestMustCapByKindPanicsOnDisagreement(t *testing.T) {
+	capSet := config.SetConfig{
+		Name:     "s",
+		Patterns: config.PatternSelector{All: true},
+		Find:     "s_find",
+	}
+	capCfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "a"}}}
+	caps := setCapabilities(capSet, capCfg, wideAllForm(capSet, capCfg))
+
+	if got := mustCapByKind(caps, "find", "C"); got == nil || got.Export != "s_find" {
+		t.Fatalf("mustCapByKind(find) = %+v, want the declared find", got)
+	}
+
+	for _, lang := range []string{"C", "Go", "AS"} {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Errorf("%s: mustCapByKind on an undeclared capability did not panic", lang)
+					return
+				}
+				msg, _ := r.(string)
+				if !strings.Contains(msg, lang) || !strings.Contains(msg, "match_any") {
+					t.Errorf("%s: panic = %q, want it to name the language and the kind", lang, msg)
+				}
+			}()
+			mustCapByKind(caps, "match_any", lang)
+		}()
+	}
+}
+
+// TestGenerateStubRejectsUnknownType covers the dispatch arm that exists as the
+// net under adding a stub type to config.ResolveStubType and forgetting it here.
+func TestGenerateStubRejectsUnknownType(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "m",
+		Regexps:      []config.RegexEntry{{Pattern: "a", MatchFunc: "a_match"}},
+	}
+	err := generateStub(cfg, "kotlin", filepath.Join(t.TempDir(), "stub.kt"))
+	if err == nil {
+		t.Fatal("generateStub with an unknown type succeeded")
+	}
+	if !strings.Contains(err.Error(), "unknown stub type") {
+		t.Errorf("error = %v, want it to name the unknown type", err)
+	}
+}
+
+// TestCmdGenerateStubDispatchesEveryResolvableType is the other half: every type
+// config.ResolveStubType can return must reach a generator, not the arm above.
+func TestCmdGenerateStubDispatchesEveryResolvableType(t *testing.T) {
+	for _, tc := range []struct{ stubType, ext string }{
+		{"rust", ".rs"}, {"js", ".js"}, {"ts", ".ts"},
+		{"go", ".go"}, {"c", ".h"}, {"as", ".ts"}, {"wit", ".wit"},
+	} {
+		t.Run(tc.stubType, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.BuildConfig{
+				ImportModule: "m",
+				StubType:     tc.stubType,
+				Output:       "merged.wasm",
+				WasmFile:     "m.wasm",
+				Regexps:      []config.RegexEntry{{Pattern: "a", MatchFunc: "a_match"}},
+			}
+			if tc.stubType == "wit" {
+				cfg.WasmFormat = "component"
+			}
+			err := CmdGenerateStub(cfg, filepath.Join(dir, "stub"+tc.ext))
+			if err != nil && strings.Contains(err.Error(), "unknown stub type") {
+				t.Fatalf("%s is resolvable but not dispatched: %v", tc.stubType, err)
+			}
+			if err != nil {
+				t.Fatalf("CmdGenerateStub: %v", err)
+			}
+		})
+	}
+}
+
+// TestDefaultBatchCapClampsToCursorCount covers the clamp. The cursor packs the
+// per-position index k and the tuple count into one 32-bit word, so a set wide
+// enough to need many k bits leaves fewer count bits than the 256 default — and
+// a buffer larger than the count field can report would have the iterator
+// believe a short call was a full one.
+func TestDefaultBatchCapClampsToCursorCount(t *testing.T) {
+	small := config.SetConfig{Name: "s", Patterns: config.PatternSelector{Names: []string{"a", "b"}}}
+	cfg := config.BuildConfig{}
+	if got := defaultBatchCap(small, cfg); got != 256 {
+		t.Errorf("defaultBatchCap(2 patterns) = %d, want the 256 default", got)
+	}
+
+	// 70_000 patterns: 17 k bits leave 15 count bits, so the count field tops
+	// out at 32767 — below the pattern count, which is what the default would
+	// otherwise be.
+	wide := config.SetConfig{Name: "w", Patterns: config.PatternSelector{Names: make([]string, 70_000)}}
+	max := int(config.SetCursorMaxCount(70_000))
+	if max >= 70_000 {
+		t.Fatalf("cursor max count %d is not below the pattern count; the clamp is unreachable", max)
+	}
+	if got := defaultBatchCap(wide, cfg); got != max {
+		t.Errorf("defaultBatchCap(70000 patterns) = %d, want the cursor maximum %d", got, max)
+	}
+}
+
+// TestGenGoSetSectionWithoutIter covers the no-iterator arm of the
+// backward-compatible wrapper: a set declaring no `find` needs no `iter` import,
+// and emitting one would not compile.
+func TestGenGoSetSectionWithoutIter(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "m",
+		Regexps:      []config.RegexEntry{{Name: "a", Pattern: "[a-z]+"}, {Name: "b", Pattern: "[0-9]+"}},
+		Sets: []config.SetConfig{{
+			Name:     "s",
+			Patterns: config.PatternSelector{All: true},
+			MatchAny: "s_which",
+		}},
+	}
+	got := genGoSetSection(cfg, "m")
+	if got == "" {
+		t.Fatal("genGoSetSection returned nothing for a set declaring match_any")
+	}
+	if strings.Contains(got, `"iter"`) {
+		t.Errorf("a set with no find imported iter:\n%s", got)
+	}
+	if !strings.Contains(got, "func s_which(") {
+		t.Errorf("match_any wrapper missing:\n%s", got)
+	}
+
+	// And nothing at all when there is no set to emit.
+	if got := genGoSetSection(config.BuildConfig{ImportModule: "m"}, "m"); got != "" {
+		t.Errorf("genGoSetSection with no sets = %q, want empty", got)
+	}
+}
+
+// TestGenGoStubFileEmpty covers the early return of the backward-compatible
+// wrapper: entries with no _func fields produce no stub at all, and a file
+// holding only a package clause is worse than no file.
+func TestGenGoStubFileEmpty(t *testing.T) {
+	got, err := genGoStubFile([]config.RegexEntry{{Pattern: "[a-z]+"}}, "m", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("genGoStubFile for a func-less entry = %q, want empty", got)
+	}
+	if _, err := genGoStubFile([]config.RegexEntry{{Pattern: "(", GroupsFunc: "g"}}, "m", "m"); err == nil {
+		t.Error("genGoStubFile on an unparseable pattern succeeded")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Component stub edges.
+
+// TestCComponentStubWriteFailures covers the two write arms. They are separate
+// because the .h and the .c are two files and a build with only one of them is
+// worse than a build with neither: the header alone compiles and links to
+// nothing.
+func TestCComponentStubWriteFailures(t *testing.T) {
+	cfg := cComponentCfg()
+
+	t.Run("header", func(t *testing.T) {
+		dir := t.TempDir()
+		// A FILE where the stub's parent directory must be, so MkdirAll fails.
+		blocker := filepath.Join(dir, "blocked")
+		if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := cComponentStub(cfg, filepath.Join(blocker, "stub.c"))
+		if err == nil {
+			t.Fatal("cComponentStub into an unwritable directory succeeded")
+		}
+	})
+
+	t.Run("body", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "stub.c")
+		// A DIRECTORY where the .c must go: the .h beside it writes fine, so
+		// this is the only way to reach the second arm.
+		if err := os.Mkdir(out, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		err := cComponentStub(cfg, out)
+		if err == nil {
+			t.Fatal("cComponentStub over a directory succeeded")
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "stub.h")); statErr != nil {
+			t.Errorf("the header was not written first, so the .c arm was not what failed: %v", statErr)
+		}
+	})
+}
+
+// TestWriteComponentWitDirRejectsUnrepresentableName covers the error arm of the
+// WIT-directory writer. cComponentStub cannot reach it — genCComponentStubFiles
+// runs witParts first and fails there — so it is driven directly, because an arm
+// that cannot be called is an arm that cannot be shown to still report.
+func TestWriteComponentWitDirRejectsUnrepresentableName(t *testing.T) {
+	cfg := cComponentCfg()
+	cfg.WitPackage = "Not_A_Wit_Name"
+	err := writeComponentWitDir(cfg, filepath.Join(t.TempDir(), "wit"))
+	if err == nil {
+		t.Fatal("writeComponentWitDir accepted an unrepresentable wit_package")
+	}
+	if !strings.Contains(err.Error(), "wit_package") {
+		t.Errorf("error = %v, want it to name the key the user must edit", err)
+	}
+}
+
+// TestCComponentStubVersionedImports pins the version's placement in BOTH the
+// interface import the .c declares and the WIT the consumer builds against —
+// the version goes after the INTERFACE name, and the two must agree or
+// `component new` cannot find the export.
+func TestCComponentStubVersionedImports(t *testing.T) {
+	cfg := cComponentCfg()
+	cfg.WitVersion = "2.3.0"
+	dir := t.TempDir()
+	if err := cComponentStub(cfg, filepath.Join(dir, "stub.c")); err != nil {
+		t.Fatal(err)
+	}
+	cText, err := os.ReadFile(filepath.Join(dir, "stub.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"regexped:urlparts/matcher@2.3.0", "regexped:urlparts/sets@2.3.0"} {
+		if !strings.Contains(string(cText), want) {
+			t.Errorf(".c does not import %q", want)
+		}
+	}
+	consumer, err := os.ReadFile(filepath.Join(dir, "wit", "consumer.wit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"import regexped:urlparts/matcher@2.3.0;",
+		"import regexped:urlparts/sets@2.3.0;",
+	} {
+		if !strings.Contains(string(consumer), want) {
+			t.Errorf("consumer.wit does not carry %q:\n%s", want, consumer)
+		}
+	}
+}
+
+// TestStripExportWorldOneLineWorld covers the single-line world. A `world x {}`
+// opens and closes on one line, so the depth counter must settle on that line
+// rather than swallow the rest of the document.
+func TestStripExportWorldOneLineWorld(t *testing.T) {
+	in := "package regexped:m;\n\ninterface matcher {\n    x: func() -> u32;\n}\n\nworld m { }\n\ninterface after {\n}\n"
+	got := stripExportWorld(in)
+	if strings.Contains(got, "world m") {
+		t.Errorf("the world survived:\n%s", got)
+	}
+	for _, want := range []string{"interface matcher {", "interface after {"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stripExportWorld swallowed %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestComponentStubsRejectUnparseablePattern covers the group-info error arms of
+// both component generators. `groups_func` is the only field whose stub needs
+// the pattern's shape, so it is the only one a bad pattern can fail.
+func TestComponentStubsRejectUnparseablePattern(t *testing.T) {
+	cfg := config.BuildConfig{
+		WasmFormat:   "component",
+		ImportModule: "m",
+		WasmFile:     "m.wasm",
+		Regexps:      []config.RegexEntry{{Pattern: "(?P<a>", GroupsFunc: "g"}},
+	}
+	if _, _, err := genCComponentStubFiles(cfg, "stub.h"); err == nil {
+		t.Error("genCComponentStubFiles accepted an unparseable pattern")
+	}
+	if _, err := genRustComponentStubFile(cfg); err == nil {
+		t.Error("genRustComponentStubFile accepted an unparseable pattern")
+	}
+	if _, err := genRustComponentInner(cfg, map[string]string{"g": "g"}); err == nil {
+		t.Error("genRustComponentInner accepted an unparseable pattern")
+	}
+}
+
+// The stub writers' FAILURE paths.
+//
+// Every one of these functions ends by writing a file, and every one of them
+// can fail there — an unwritable directory, a path that is not a directory, a
+// stub type nothing recognises. Those arms were unreached, which for a CLI is
+// the wrong place to be untested: a swallowed write error means `regexped
+// generate` reports success and produces nothing, and the next build fails
+// somewhere else entirely with a missing import.
+
+func errCfg(stubFile string) config.BuildConfig {
+	return config.BuildConfig{
+		ImportModule: "demo",
+		StubFile:     stubFile,
+		Regexps: []config.RegexEntry{
+			{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
+		}},
+	}
+}
+
+// unwritablePath returns a path whose PARENT is a regular file, so any attempt
+// to create it fails with ENOTDIR. More portable than relying on permissions,
+// which root ignores.
+func unwritablePath(t *testing.T, name string) string {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(blocker, name)
+}
+
+// TestStubWritersReportWriteFailures: each generator must surface the error
+// rather than report success having written nothing.
+func TestStubWritersReportWriteFailures(t *testing.T) {
+	for _, w := range []struct {
+		kind string
+		file string
+		gen  func(config.BuildConfig, string) error
+	}{
+		{"rust", "stubs.rs", rustStub},
+		{"go", "stubs.go", goStub},
+		{"js", "stubs.js", jsStub},
+		{"ts", "stubs.ts", tsStub},
+		{"c", "stubs.h", cStub},
+		{"as", "stubs.ts", asStub},
+	} {
+		t.Run(w.kind, func(t *testing.T) {
+			out := unwritablePath(t, w.file)
+			if err := w.gen(errCfg(out), out); err == nil {
+				t.Error("reported success writing into a path that cannot exist")
+			}
+		})
+	}
+}
+
+// TestCmdGenerateStubRejectsUnknownType covers the dispatch: an extension
+// nothing recognises has to be refused before any generator runs, or the CLI
+// silently does nothing.
+func TestCmdGenerateStubRejectsUnknownType(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"stubs.py", "stubs", "stubs.txt"} {
+		out := filepath.Join(dir, name)
+		err := CmdGenerateStub(errCfg(out), out)
+		if err == nil {
+			t.Errorf("%s: accepted an unrecognised stub type", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "stub") {
+			t.Errorf("%s: error %q does not explain the stub type", name, err)
+		}
+	}
+}
+
+// TestCmdGenerateStubWritesEachType drives the dispatch's SUCCESS arms, one
+// per language, through the same entry point the CLI uses.
+func TestCmdGenerateStubWritesEachType(t *testing.T) {
+	for _, c := range []struct{ file, mustContain string }{
+		{"stubs.rs", "p_match"},
+		{"stubs.go", "p_match"},
+		{"stubs.js", "p_match"},
+		{"stubs.ts", "p_match"},
+		{"stubs.h", "p_match"},
+	} {
+		t.Run(c.file, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "demo")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			out := filepath.Join(dir, c.file)
+			if err := CmdGenerateStub(errCfg(out), out); err != nil {
+				t.Fatalf("CmdGenerateStub: %v", err)
+			}
+			b, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatalf("nothing written: %v", err)
+			}
+			if !strings.Contains(string(b), c.mustContain) {
+				t.Errorf("output does not mention %q", c.mustContain)
+			}
+		})
+	}
+}
+
+// TestCmdGenerateStubExplicitType: `stub_type:` overrides the extension, so a
+// `.txt` path is legal when the type says otherwise. This is the arm that lets
+// a user write the stub anywhere they like.
+func TestCmdGenerateStubExplicitType(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "stubs.txt")
+	cfg := errCfg(out)
+	cfg.StubType = "rust"
+	if err := CmdGenerateStub(cfg, out); err != nil {
+		t.Fatalf("CmdGenerateStub with an explicit type: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "pub mod") {
+		t.Error("explicit stub_type rust did not produce Rust")
+	}
+}
+
+// ── The two arms every stub writer shares ──────────────────────────────────
+//
+// Each of the six generators ends the same way: build the content, return
+// early if there is none, then write it either to a file or to stdout. Both
+// early arms were unreached.
+//
+// "No content" is not a hypothetical. An entry with a pattern but no `_func`
+// fields is explicitly VALID — the compiler skips it silently and emits no
+// WASM for it — so a config made entirely of such entries must produce no stub
+// rather than an empty file. A file with only a header would look to the next
+// build like a stub whose functions had all vanished.
+
+// noFuncCfg is a config whose entries are valid but contribute nothing: a
+// pattern with no capability requested.
+func noFuncCfg(stubFile string) config.BuildConfig {
+	return config.BuildConfig{
+		ImportModule: "demo",
+		StubFile:     stubFile,
+		Regexps: []config.RegexEntry{
+			{Name: "a", Pattern: `[a-z]+`},
+			{Name: "b", Pattern: `[0-9]+`},
+		},
+	}
+}
+
+// FOUR of the six generators guard against this and write no file at all:
+// rust (`allInner == ""`), go (`singleBody == "" && setBody == ""`), c
+// (`hContent == ""`) and as (`content == ""`).
+//
+// JS and TS carry NO such guard and write a zero-byte file instead. That is an
+// inconsistency rather than a decision — an empty .js that a build imports
+// fails later with "module has no exports", which is the diagnosis the other
+// four generators' guards exist to avoid — but changing it changes CLI
+// behaviour, so this test records what each one does today and names the
+// difference rather than papering over it.
+func TestStubWritersProduceNothingWithoutCapabilities(t *testing.T) {
+	cases := []struct {
+		stubType  string
+		wantsFile bool // true = writes a (zero-byte) file rather than skipping
+	}{
+		{"rust", false},
+		{"go", false},
+		{"c", false},
+		{"as", false},
+		{"js", true}, // no empty guard — see the comment above
+		{"ts", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.stubType, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "stub.out")
+			cfg := noFuncCfg(out)
+			cfg.StubType = tc.stubType
+			if err := CmdGenerateStub(cfg, out); err != nil {
+				t.Fatalf("CmdGenerateStub: %v", err)
+			}
+			b, err := os.ReadFile(out)
+			switch {
+			case tc.wantsFile:
+				if os.IsNotExist(err) {
+					t.Skipf("%s now skips the write too — the guard was added; "+
+						"update this table", tc.stubType)
+				}
+				if err != nil {
+					t.Fatalf("stat: %v", err)
+				}
+				if len(b) != 0 {
+					t.Errorf("wrote %d bytes for a config with no capabilities:\n%s",
+						len(b), b)
+				}
+			default:
+				if err == nil {
+					t.Errorf("%s wrote a %d-byte stub where it should have "+
+						"written nothing", tc.stubType, len(b))
+				} else if !os.IsNotExist(err) {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestStubWritersToStdout covers the `-` path, which the CLI uses for
+// `regexped generate -o -` and which writes through a different call than the
+// file path does.
+func TestStubWritersToStdout(t *testing.T) {
+	cfg := func(stubType string) config.BuildConfig {
+		return config.BuildConfig{
+			ImportModule: "demo",
+			StubFile:     "stub." + stubType,
+			StubType:     stubType,
+			Regexps: []config.RegexEntry{
+				{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
+			},
+		}
+	}
+	for _, stubType := range []string{"rust", "js", "ts", "go", "c", "as"} {
+		t.Run(stubType, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				if err := CmdGenerateStub(cfg(stubType), "-"); err != nil {
+					t.Fatalf("CmdGenerateStub(-): %v", err)
+				}
+			})
+			if strings.TrimSpace(out) == "" {
+				t.Fatal("stdout path produced nothing")
+			}
+			// Whatever the language, the generated text must name the export
+			// it was asked for — that is the one thing all six share.
+			if !strings.Contains(out, "p_match") && !strings.Contains(out, "p_find") {
+				t.Errorf("stdout output names neither export:\n%s", out)
+			}
+		})
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of fn. The stub writers
+// print rather than taking a writer, so this is the only way to reach that arm.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				sb.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- sb.String()
+	}()
+	fn()
+	w.Close()
+	os.Stdout = saved
+	return <-done
+}
+
+// TestCmdGenerateStubUnknownType covers the dispatcher's default arm.
+//
+// config.ResolveStubType is what normally rejects an unknown type, so this arm
+// is only reachable if the two ever disagree — which is exactly when a silent
+// fallthrough would be worst, because the CLI would report success and write
+// nothing at all.
+func TestCmdGenerateStubUnknownType(t *testing.T) {
+	cfg := config.BuildConfig{
+		ImportModule: "demo",
+		StubFile:     filepath.Join(t.TempDir(), "stub.xyz"),
+		Regexps: []config.RegexEntry{
+			{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match"},
+		},
+	}
+	err := CmdGenerateStub(cfg, cfg.StubFile)
+	if err == nil {
+		t.Fatal("an unresolvable stub type reported success")
+	}
+	if !strings.Contains(err.Error(), "xyz") && !strings.Contains(err.Error(), "stub type") {
+		t.Errorf("error %q names neither the extension nor the problem", err)
+	}
+}
+
+// ── When a pattern will not parse ──────────────────────────────────────────
+//
+// Every generator reads the pattern back to learn its capture groups, so an
+// unparseable one fails INSIDE generation rather than at config load. The
+// error then has to travel up through three or four frames to the CLI.
+//
+// Each of those frames returns the error rather than logging it, and none of
+// them was covered. That is the wrong arm to leave untested for a code
+// generator: a swallowed error means `regexped generate` reports success and
+// writes a stub with the broken entry silently missing, and the next build
+// fails somewhere else entirely with an unresolved symbol.
+//
+// The config layer does not reject this — patterns are validated by the
+// COMPILER, and a stub can legitimately be generated without compiling — so
+// the path is reachable in ordinary use, not just in tests.
+func badPatternCfg(stubType, out string) config.BuildConfig {
+	return config.BuildConfig{
+		ImportModule: "demo",
+		StubFile:     out,
+		StubType:     stubType,
+		Regexps: []config.RegexEntry{
+			// A valid entry first, so the failure happens PART WAY through
+			// the loop rather than on its first iteration — the shape that
+			// would otherwise let a generator emit a partial file.
+			{Name: "ok", Pattern: `[a-z]+`, GroupsFunc: "ok_groups"},
+			{Name: "bad", Pattern: `([a-z]+`, GroupsFunc: "bad_groups"},
+		},
+	}
+}
+
+func TestStubGeneratorsPropagateParseErrors(t *testing.T) {
+	for _, stubType := range []string{"rust", "js", "ts", "go", "c", "as"} {
+		t.Run(stubType, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "stub.out")
+			err := CmdGenerateStub(badPatternCfg(stubType, out), out)
+			if err == nil {
+				t.Fatal("an unparseable pattern generated a stub and reported success")
+			}
+			// The message must be traceable to the pattern. Without that the
+			// user is told only that generation failed, on a config that may
+			// hold hundreds of entries.
+			if !strings.Contains(err.Error(), "missing closing )") &&
+				!strings.Contains(err.Error(), "error parsing regexp") {
+				t.Errorf("error %q does not explain what failed to parse", err)
+			}
+		})
+	}
+}
+
+// TestStubGeneratorsWriteNothingOnParseError is the half that matters most: a
+// failed generation must not leave a partial file behind for the next build to
+// pick up.
+func TestStubGeneratorsWriteNothingOnParseError(t *testing.T) {
+	for _, stubType := range []string{"rust", "js", "ts", "go", "c", "as"} {
+		t.Run(stubType, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "stub.out")
+			if err := CmdGenerateStub(badPatternCfg(stubType, out), out); err == nil {
+				t.Fatal("expected an error")
+			}
+			entries, err := readDirNames(dir)
+			if err != nil {
+				t.Fatalf("read temp dir: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("a failed generation left %v behind", entries)
+			}
+		})
+	}
+}
+
+func readDirNames(dir string) ([]string, error) {
+	des, err := filepath.Glob(filepath.Join(dir, "*"))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, d := range des {
+		out = append(out, filepath.Base(d))
+	}
+	return out, nil
+}
+
+// Generated symbols keep the config's casing VERBATIM. That
+// was a deliberate choice — a user who writes `url_match` gets `url_match` —
+// and it has one consequence worth telling them about: in Go a lower-case name
+// is unexported, so in a LIBRARY package the generated function is invisible
+// outside it.
+//
+// The decision was to WARN, not to rename and not to reject: if the user wants
+// it private to the package, that is their call. So the contract has three
+// parts and all three matter — the stub still generates, the name is
+// untouched, and the warning is conditional.
+//
+// Which package the stub lands in is not configured directly: `goStub` infers
+// it from the OUTPUT PATH, using `main` unless the parent directory is named
+// after the import module. That inference is the thing being exercised here,
+// so these tests write real files rather than calling the string builder.
+
+func writeGoStub(t *testing.T, dirName, importModule, matchFunc, setFind string) string {
+	t.Helper()
+	src, _ := writeGoStubCapturingLog(t, dirName, importModule, matchFunc, setFind)
+	return src
+}
+
+// writeGoStubCapturingLog is writeGoStub plus the slog output goStub produced
+// while running. The warning is the whole point of this file, and it is not
+// observable in the generated source — only in the log — so the tests that
+// assert it need this rather than the string builder.
+//
+// slog.SetDefault is process-global, so these tests must not run in parallel
+// with anything else in the package that logs.
+func writeGoStubCapturingLog(t *testing.T, dirName, importModule, matchFunc, setFind string) (string, string) {
+	t.Helper()
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+	return writeGoStubInner(t, dirName, importModule, matchFunc, setFind), logBuf.String()
+}
+
+func writeGoStubInner(t *testing.T, dirName, importModule, matchFunc, setFind string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, dirName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "stubs.go")
+	cfg := config.BuildConfig{
+		ImportModule: importModule,
+		StubFile:     out,
+		Regexps: []config.RegexEntry{
+			{Name: "p", Pattern: `[a-z]+`, MatchFunc: matchFunc},
+		},
+	}
+	if setFind != "" {
+		cfg.Sets = []config.SetConfig{{
+			Name: "s", Find: setFind, Patterns: config.PatternSelector{All: true},
+		}}
+	}
+	if err := goStub(cfg, out); err != nil {
+		t.Fatalf("goStub: %v", err)
+	}
+	src, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(src)
+}
+
+// TestGoStubKeepsNamesVerbatim: the name the user wrote is the name emitted,
+// whatever its case, and the removed PascalCase transform has not
+// come back.
+func TestGoStubKeepsNamesVerbatim(t *testing.T) {
+	src := writeGoStub(t, "mylib", "mylib", "url_match", "scan_all_secrets")
+	for _, want := range []string{"func url_match(", "func scan_all_secrets("} {
+		if !strings.Contains(src, want) {
+			t.Errorf("generated stub lacks %q — the name was transformed", want)
+		}
+	}
+	for _, unwanted := range []string{"func UrlMatch(", "func ScanAllSecrets("} {
+		if strings.Contains(src, unwanted) {
+			t.Errorf("generated stub contains %q: names must be verbatim", unwanted)
+		}
+	}
+}
+
+// TestGoStubPackageNameFromOutputPath drives both arms of the package-name
+// inference, which is what decides whether the unexported-name warning is
+// meaningful at all.
+//
+// A stub written into a directory named after the import module is a LIBRARY
+// package, where a lower-case name is invisible to callers. Anywhere else it
+// is `main`, which exports nothing to anyone and where the warning would be
+// pure noise.
+func TestGoStubPackageNameFromOutputPath(t *testing.T) {
+	cases := []struct {
+		name      string
+		dirName   string
+		module    string
+		matchFunc string
+		setFind   string
+		wantPkg   string
+	}{
+		{"library package, unexported names", "mylib", "mylib", "url_match", "scan_secrets", "mylib"},
+		{"library package, exported names", "mylib", "mylib", "URLMatch", "ScanSecrets", "mylib"},
+		{"directory does not match the module: main", "cmd", "mylib", "url_match", "scan_secrets", "main"},
+		{"library package, mixed casing", "mylib", "mylib", "URLMatch", "scan_secrets", "mylib"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src := writeGoStub(t, c.dirName, c.module, c.matchFunc, c.setFind)
+			if !strings.Contains(src, "package "+c.wantPkg+"\n") {
+				t.Errorf("stub is not in package %q", c.wantPkg)
+			}
+			// Generation SUCCEEDS in every case: the warning is advice, never
+			// a rejection.
+			if !strings.Contains(src, "func "+c.matchFunc+"(") {
+				t.Errorf("stub does not declare %q", c.matchFunc)
+			}
+			if c.setFind != "" && !strings.Contains(src, c.setFind) {
+				t.Errorf("stub does not mention the set export %q", c.setFind)
+			}
+		})
+	}
+}
+
+// TestGoStubWarnsOnlyForHiddenLibraryNames asserts the WARNING itself, which no
+// other test in this file can see: it is emitted through slog and leaves no
+// trace in the generated source. Without this, the warning could disappear
+// entirely, fire for package main where it is pure noise, or name the wrong
+// symbols, and every other case here would still pass.
+func TestGoStubWarnsOnlyForHiddenLibraryNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		dirName   string
+		module    string
+		matchFunc string
+		setFind   string
+		wantWarn  bool
+		wantNames []string
+	}{
+		{
+			name:    "library package, both names unexported: warns and names both",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "url_match", setFind: "scan_secrets",
+			wantWarn: true, wantNames: []string{"url_match", "scan_secrets"},
+		},
+		{
+			name:    "library package, both names exported: silent",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "URLMatch", setFind: "ScanSecrets",
+			wantWarn: false,
+		},
+		{
+			// The set export is the only hidden one, so it must be the only
+			// one named — a warning that lists every symbol would be useless.
+			name:    "library package, mixed casing: names only the hidden one",
+			dirName: "mylib", module: "mylib",
+			matchFunc: "URLMatch", setFind: "scan_secrets",
+			wantWarn: true, wantNames: []string{"scan_secrets"},
+		},
+		{
+			// package main exports nothing to anyone, so the advice does not
+			// apply and the warning would be noise.
+			name:    "package main, unexported names: silent",
+			dirName: "cmd", module: "mylib",
+			matchFunc: "url_match", setFind: "scan_secrets",
+			wantWarn: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, logs := writeGoStubCapturingLog(t, c.dirName, c.module, c.matchFunc, c.setFind)
+			got := strings.Contains(logs, "not exported")
+			if got != c.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v; log was:\n%s", got, c.wantWarn, logs)
+			}
+			if !c.wantWarn {
+				return
+			}
+			for _, want := range c.wantNames {
+				if !strings.Contains(logs, want) {
+					t.Errorf("warning does not name %q; log was:\n%s", want, logs)
+				}
+			}
+			if c.matchFunc == "URLMatch" && strings.Contains(logs, "URLMatch") {
+				t.Errorf("warning names the EXPORTED symbol URLMatch; log was:\n%s", logs)
+			}
+		})
+	}
+}
+
+// A matrix over the six stub generators.
+//
+// The existing tests here are mostly assertions about ONE generator's output
+// text for ONE shape. That leaves whole arms unreached: a set with no `find`,
+// a set with only anchored capabilities, the wide `_all` form, a config with
+// no sets at all, a config with several sets, and the batching entry — each of
+// which changes what a generator emits, and several of which change it in ALL
+// SIX languages at once.
+//
+// TestGeneratedStubsCompile hands one config to every real compiler and is the
+// stronger check; it is also slow and needs four toolchains. This is the cheap
+// companion: many shapes, six generators, checking the generator RUNS and
+// produces something with the promised names in it.
+
+type stubShape struct {
+	name    string
+	selects string
+	cfg     config.BuildConfig
+	// wantAll are substrings every language's output must contain.
+	wantAll []string
+}
+
+func entry(name, pattern string, match, find, groups bool) config.RegexEntry {
+	e := config.RegexEntry{Name: name, Pattern: pattern}
+	if match {
+		e.MatchFunc = name + "_match"
+	}
+	if find {
+		e.FindFunc = name + "_find"
+	}
+	if groups {
+		e.GroupsFunc = name + "_groups"
+	}
+	return e
+}
+
+func manyEntries(n int) []config.RegexEntry {
+	out := make([]config.RegexEntry, n)
+	for i := range out {
+		out[i] = config.RegexEntry{
+			Name: fmt.Sprintf("p%02d", i), Pattern: fmt.Sprintf("lit%02d[a-z]+", i),
+		}
+	}
+	return out
+}
+
+func stubShapes() []stubShape {
+	base := []config.RegexEntry{
+		entry("url", `(?P<scheme>https?)://(?P<host>[a-z.]+)/`, true, true, true),
+		entry("num", `[0-9]+`, true, true, false),
+	}
+	return []stubShape{
+		{
+			name: "patterns-only", selects: "a config with NO sets: the single-pattern arms alone",
+			cfg:     config.BuildConfig{ImportModule: "demo", Regexps: base},
+			wantAll: []string{"url_match", "url_find", "url_groups", "num_match"},
+		},
+		{
+			name: "find-only-set", selects: "a set declaring only `find`",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "scan_all", Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"scan_all"},
+		},
+		{
+			name: "anchored-only-set", selects: "a set with only the anchored pair, and hence no find machinery",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", MatchAny: "which", MatchAll: "all_kinds",
+					Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"which", "all_kinds"},
+		},
+		{
+			name: "scan-only-set", selects: "a set with only the scan pair",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", ScanAny: "first_hit", ScanAll: "every_hit",
+					Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"first_hit", "every_hit"},
+		},
+		{
+			name: "overlapping-batch-set", selects: "`overlapping: true` plus `hints: [batch-find]` — the answer-cache shape",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "scan_overlapping",
+					Patterns:    config.PatternSelector{All: true},
+					Overlapping: true, Hints: []string{"batch-find"},
+				}},
+			},
+			wantAll: []string{"scan_overlapping"},
+		},
+		{
+			name: "wide-all-set", selects: "the WIDE `_all` form: past 64 ids the bitmask becomes a memory bitmap",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: manyEntries(70),
+				Sets: []config.SetConfig{{
+					Name: "s", MatchAll: "wide_all", ScanAll: "wide_scan_all",
+					Find: "wide_find", Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"wide_all", "wide_scan_all", "wide_find"},
+		},
+		{
+			name: "named-subset-set", selects: "ID_SPACE > PATTERN_COUNT, which sizes the gate array and the bitmap",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: manyEntries(20),
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "subset_find", MatchAll: "subset_all",
+					Patterns: config.PatternSelector{Names: []string{"p00", "p19"}},
+				}},
+			},
+			wantAll: []string{"subset_find", "subset_all"},
+		},
+		{
+			name: "two-sets", selects: "several sets in one config, whose derived constants must not collide",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{
+					{Name: "alpha", Find: "alpha_find", Patterns: config.PatternSelector{All: true}},
+					{Name: "beta", MatchAny: "beta_any", Patterns: config.PatternSelector{All: true}},
+				},
+			},
+			wantAll: []string{"alpha_find", "beta_any"},
+		},
+		{
+			name: "name-map", selects: "emit_name_map, which adds the pattern-name helper",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "named_find", EmitNameMap: true,
+					Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"named_find"},
+		},
+		{
+			name: "namespace", selects: "the optional namespace, which prefixes symbols with no user name to inherit",
+			cfg: config.BuildConfig{
+				ImportModule: "demo", Namespace: "rx2", Regexps: base,
+				Sets: []config.SetConfig{{
+					Name: "s", Find: "ns_find", Patterns: config.PatternSelector{All: true},
+				}},
+			},
+			wantAll: []string{"ns_find"},
+		},
+	}
+}
+
+// stubWriters maps a stub type to the file extension its generator writes,
+// so each shape can be rendered by all six.
+var stubWriters = []struct {
+	kind string
+	ext  string
+	gen  func(config.BuildConfig, string) error
+}{
+	{"rust", ".rs", rustStub},
+	{"go", ".go", goStub},
+	{"js", ".js", jsStub},
+	{"ts", ".ts", tsStub},
+	{"c", ".h", cStub},
+	{"as", ".ts", asStub},
+}
+
+// TestStubMatrixGenerates renders every shape with every generator.
+//
+// It checks the generator RUNS and that the export names it was given appear
+// in what it wrote. Whether the result COMPILES is TestGeneratedStubsCompile's
+// job, and whether it behaves is the runtime isolation test's — this one is
+// about breadth of shape rather than depth of check.
+func TestStubMatrixGenerates(t *testing.T) {
+	for _, shape := range stubShapes() {
+		for _, w := range stubWriters {
+			t.Run(shape.name+"/"+w.kind, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), shape.cfg.ImportModule)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				out := filepath.Join(dir, "stubs"+w.ext)
+				cfg := shape.cfg
+				cfg.StubFile = out
+				if err := w.gen(cfg, out); err != nil {
+					t.Fatalf("%s (selects %s): %v", w.kind, shape.selects, err)
+				}
+				src := readIfPresent(t, out)
+				if src == "" {
+					t.Fatalf("%s: wrote nothing", w.kind)
+				}
+				for _, want := range shape.wantAll {
+					if !strings.Contains(src, want) {
+						t.Errorf("%s: output does not mention %q", w.kind, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+func readIfPresent(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	return string(b)
 }

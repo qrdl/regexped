@@ -594,7 +594,7 @@ wac plug --plug <regex1.wasm> ... -o output <main.wasm>
 `--main` is the SOCKET (the component with the unsatisfied import); every
 positional is a PLUG, and `--plug` repeats, so several compose in one call. See
 "Output kinds" below for the `wit_package`-uniqueness asymmetry this creates, and
-`merge/multiplug_test.go` for its gate.
+`merge/merge_test.go` for its gate.
 
 ### 5. Utilities (`internal/utils/`)
 
@@ -713,7 +713,7 @@ A pattern the compiler legitimately drops from a set (fallback suffix DFA over
 `state_limit_dropped`) is excluded from the comparison and counted separately,
 so a documented exclusion cannot pass for either a pass or a failure.
 
-### The find-from invariant (`tools/fuzz/find_from_property_test.go`)
+### The find-from invariant (`tools/fuzz/single_pattern_test.go`)
 
 ```bash
 go test ./tools/fuzz -run TestFindFrom
@@ -1001,7 +1001,7 @@ ONE ASYMMETRY, stated because the module path's own comment says the opposite:
 every regexp MODULE may share one `import_module`, since nothing imports it.
 COMPONENTS are matched by their interface name `regexped:<wit_package>/matcher`,
 which the socket genuinely imports, so composing several regexp components
-requires DISTINCT `wit_package` values. `merge/multiplug_test.go` is the gate —
+requires DISTINCT `wit_package` values. `merge/merge_test.go` is the gate —
 two components, one `regexped merge` call, run under wasmtime.
 
 What a component does NOT get from merging is shared memory: `wac plug` leaves

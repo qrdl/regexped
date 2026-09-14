@@ -76,7 +76,7 @@ one frontend would still pass the byte comparison while defending nothing.
 
 **Shufti is deliberately absent.** It is selected only when Aho-Corasick
 declines on budget, which no YAML config can arrange — so it cannot have a
-fixture here. It is covered instead by `tools/fuzz/set_shufti_test.go`, which
+fixture here. It is covered instead by `tools/fuzz/set_caps_test.go`, which
 reaches it through `CompileFileOpts`.
 
 

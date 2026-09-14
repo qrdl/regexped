@@ -19,9 +19,11 @@ import (
 // This package sits above both.
 //
 // The sequence: derive the WIT and the canonical export names from ONE source
-// (generate), compile a core module carrying the matching adapters, write the
-// .wit, and wrap the module beside it. Deriving the names once is what keeps the
-// interface and the module from disagreeing about a single export.
+// (generate), compile a core module carrying the matching adapters, stage the
+// .wit and the wrapped component, and rename both into place. Deriving the names
+// once is what keeps the interface and the module from disagreeing about a
+// single export; staging is what keeps a half-finished build from shipping a
+// .wit the component beside it does not implement.
 func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if !cfg.Component() {
 		return fmt.Errorf("component.CmdCompile called for wasm_format: %q", cfg.WasmFormat)
@@ -47,19 +49,40 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 
 	// The WIT rides alongside the binary: jco, wit-bindgen and wasmtime's
 	// bindgen! all need the interface text, and a component does not hand it
-	// over in a form they take. It is written FIRST: it is pure text from the
-	// config and cannot fail for a reason the component would not, so a .wit
-	// that cannot be written stops the build before a fresh .wasm lands beside
-	// a stale or missing interface file.
+	// over in a form they take.
+	//
+	// BOTH are STAGED next to their destinations and renamed only once wrapping
+	// has succeeded. Whichever of the two were written first, a failure in the
+	// step after it — a missing `wasm-tools` is the everyday one — would leave a
+	// fresh file beside a stale one, and a consumer then builds against a
+	// contract the binary does not implement. Staged in the DESTINATION
+	// directory, never a temp dir, so the rename cannot fail for crossing a
+	// filesystem.
+	//
+	// The .wit is renamed first because that rename is the one that can
+	// realistically fail — something already occupying its path — and failing it
+	// must not leave a fresh .wasm behind. The reverse order is then all that is
+	// left uncovered: two fully written files, and the second rename failing for
+	// a destination `wasm-tools` could not have written to either.
 	witPath := WitPathFor(output)
 	if err := os.MkdirAll(filepath.Dir(witPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(witPath), err)
 	}
-	if err := writeFile(witPath, []byte(witText), 0o644); err != nil {
+	witTmp := witPath + ".tmp"
+	defer os.Remove(witTmp) // a no-op once it has been renamed away
+	if err := writeFile(witTmp, []byte(witText), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", witPath, err)
 	}
-	if err := Wrap(cfg, core, witText, output); err != nil {
+	coreTmp := output + ".tmp"
+	defer os.Remove(coreTmp)
+	if err := Wrap(cfg, core, witText, coreTmp); err != nil {
 		return err
+	}
+	if err := os.Rename(witTmp, witPath); err != nil {
+		return fmt.Errorf("write %s: %w", witPath, err)
+	}
+	if err := os.Rename(coreTmp, output); err != nil {
+		return fmt.Errorf("write %s: %w", output, err)
 	}
 	info, err := statFile(output)
 	if err != nil {

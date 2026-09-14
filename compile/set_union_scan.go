@@ -660,7 +660,7 @@ const unionUnroll = 8
 // fires, and its test is pure per-byte cost — measured +20.9% on the very row
 // it targeted (greedy-3 / 50K a's / scan_all). Do not rebuild it while the
 // copies exist.
-// tools/fuzz/set_union_prevstate_test.go keeps the coverage that episode
+// tools/fuzz/set_union_test.go keeps the coverage that episode
 // added, including the fuel pin on the saturated-run shape.
 
 // emitUnionEntryState selects the walk's start state from `from` and seeds the

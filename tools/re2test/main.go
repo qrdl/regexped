@@ -333,7 +333,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// the DFA exceeds MaxDFAStates/MaxDFAMemory. MaxDFAStates: -1
 				// is the documented, tested way to make that fallback trigger
 				// unconditionally (resolveMaxDFAStates treats negative as 0,
-				// so any real DFA "overflows"; see compile_test.go's
+				// so any real DFA "overflows"; see compile/compile_api_test.go's
 				// match_dfa_overflow/find_dfa_overflow cases for the same
 				// mechanism in production tests).
 				compileOpts.MaxDFAStates = -1
