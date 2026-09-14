@@ -1,9 +1,13 @@
 # regexped must be built first: run `make` in the repo root.
+#
+# This Makefile installs NOTHING: `make dev` and `make deploy` need Wrangler
+# installed and on PATH (see README.md), and stop with a message if it is not.
 REGEXPED    := ../../regexped
+WRANGLER    ?= wrangler
 REGEX_WASMS := regexps.wasm
 JS_STUB     := regexp.js
 
-.PHONY: all build dev deploy clean
+.PHONY: all build run dev deploy clean check-wrangler
 
 all: build
 
@@ -21,13 +25,21 @@ $(JS_STUB): regexped.yaml $(REGEX_WASMS) $(REGEXPED)
 
 build: $(JS_STUB)
 
-# Step 3 – run locally with wrangler (requires: npm install -g wrangler)
-dev: build
-	npx wrangler dev
+# A Worker does not run as a local program, so `make run` — which examples/Makefile
+# calls in every example — only says what to use instead.
+run:
+	@echo "workers: nothing to run locally — use 'make dev' for a local Wrangler server, or 'make deploy'"
+
+check-wrangler:
+	@command -v $(WRANGLER) >/dev/null 2>&1 || { echo "error: '$(WRANGLER)' not found on PATH. Install Wrangler (see README.md): npm install -g wrangler" >&2; exit 1; }
+
+# Step 3 – run locally with Wrangler
+dev: build | check-wrangler
+	$(WRANGLER) dev
 
 # Step 4 – deploy to Cloudflare (requires: wrangler login)
-deploy: build
-	npx wrangler deploy
+deploy: build | check-wrangler
+	$(WRANGLER) deploy
 
 clean:
 	rm -f $(REGEX_WASMS) $(JS_STUB)

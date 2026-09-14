@@ -38,6 +38,11 @@ $(FINAL_WASM): $(MAIN_WASM) $(REGEX_WASM) regexped.yaml $(REGEXPED)
 
 merge: $(FINAL_WASM)
 
+# final.wasm runs on FastEdge, not locally, so `make run` — which examples/Makefile
+# calls in every example — only says so.
+run:
+	@echo "fastedge/validate: nothing to run locally — deploy final.wasm to FastEdge (see docs/fastedge.md)"
+
 clean:
 	cargo clean
 	rm -f stubs.rs $(REGEX_WASM) $(FINAL_WASM)

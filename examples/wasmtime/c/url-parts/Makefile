@@ -45,7 +45,7 @@ WASM_COMPONENT_LD_DIR ?= $(firstword $(wildcard $(HOME)/.rustup/toolchains/*/lib
 
 .PHONY: all generate build compile merge run clean component component-run wasip2 wasip2-run
 
-all: run
+all: merge
 
 # Step 1 – generate C stubs from config (produces both stub.h and stub.c)
 # $(REGEXPED) is a prerequisite of every rule below that runs it: the generated

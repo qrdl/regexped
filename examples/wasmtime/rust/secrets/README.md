@@ -37,22 +37,39 @@ regexped stub.
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- Rust with the wasip2 target: `rustup target add wasm32-wasip2`
-  (no `cargo-component` needed — wasip2 emits a component directly)
-- [wasm-tools](https://github.com/bytecodealliance/wasm-tools) — `regexped
-  compile` shells out to it to wrap the core module into a component
-- [wac](https://github.com/bytecodealliance/wac) — composes this guest with the
-  regexp component, the way `wasm-merge` links a module build
-- [wasmtime](https://wasmtime.dev)
+The Makefile installs nothing. Install these first:
+
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| Rust with the `wasm32-wasip2` target | [rustup](https://rustup.rs), then `rustup target add wasm32-wasip2` (no `cargo-component` needed — wasip2 emits a component directly) |
+| `wasm-tools` | a [release](https://github.com/bytecodealliance/wasm-tools/releases) on `PATH`, or `cargo install --locked wasm-tools` |
+| `wac` | a [release](https://github.com/bytecodealliance/wac/releases) (the `wac-cli-<platform>` binary, renamed to `wac`) on `PATH`, or `cargo install --locked wac-cli` |
+| `wasmtime` | `curl https://wasmtime.dev/install.sh -sSf \| bash` — see [wasmtime.dev](https://wasmtime.dev) |
+
+This example has ONE build route, for a component. What each target needs:
+
+| Target | What it does | Needs |
+|---|---|---|
+| `make` | builds `composed.wasm` — the steps below | `regexped`, `wasm-tools`, Rust, `wac` |
+| `make compile` | compiles the patterns into `secrets.wasm` (a component) and `secrets.wit`; `regexped compile` wraps the core module into a component with `wasm-tools` | `regexped`, `wasm-tools` |
+| `make generate` | generates the Rust stub `stubs.rs` | `regexped` |
+| `make build` | generates the stub if needed, then `cargo build --target wasm32-wasip2` — the consumer, itself a component. Cargo fetches the `wit-bindgen` crate | `regexped`, Rust |
+| `make compose` | composes the consumer with the regexp component into `composed.wasm` — the same as `make`. `regexped merge` does it with `wac`, the way `wasm-merge` links a module build, and checks each component's exports with `wasm-tools` | `regexped`, `wasm-tools`, Rust, `wac` |
+| `make run` | builds if needed, then runs `composed.wasm` under wasmtime on five inputs | all of the above, plus `wasmtime` |
+| `make clean` | removes the build outputs | — |
+
+`wasm-tools` and `wac` are looked up on `PATH` (a config can name them with
+`wasm_tools_path:` and `wac_path:` instead).
 
 ## Run
 
 ```sh
-make
+make       # build composed.wasm
+make run   # run it
 ```
 
-Expected output:
+Expected output of `make run` (abbreviated):
 ```
 === clean text ===
 No secrets found

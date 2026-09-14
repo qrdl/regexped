@@ -4,20 +4,39 @@ Finds all email addresses in strings and parses each into `user` and `domain` na
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- [Node.js](https://nodejs.org) 18+ (for `npx asc`)
-- [wasm-merge](https://github.com/WebAssembly/binaryen)
-- [wasmtime](https://wasmtime.dev)
+The Makefile installs nothing. Install these first:
 
-AssemblyScript (`asc`) and the WASI shim are installed locally via `npm install` on first build — no global install needed.
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| [Node.js](https://nodejs.org) 16+ with npm 7+ | from nodejs.org or your OS package manager — AssemblyScript's minimum |
+| AssemblyScript and its WASI shim | `npm install` in **this directory**. It installs the two dev dependencies in `package.json` into `node_modules`. It has to be this directory, not a global install: `asconfig.json` extends the shim from `node_modules` |
+| `wasm-merge` | from [Binaryen](https://github.com/WebAssembly/binaryen/releases): unpack a release and put its `bin/` on `PATH` |
+| `wasmtime` | `curl https://wasmtime.dev/install.sh -sSf \| bash` — see [wasmtime.dev](https://wasmtime.dev) |
+
+What each target needs:
+
+| Target | What it does | Needs |
+|---|---|---|
+| `make` | builds `final.wasm` — the four steps below | `regexped`, AssemblyScript, `wasm-merge` |
+| `make generate` | generates the stub `stub.ts` | `regexped` |
+| `make build` | compiles `index.ts` to `main.wasm` with `asc`; stops with a message if AssemblyScript or the shim is missing | `regexped`, AssemblyScript |
+| `make compile` | compiles the pattern to `email.wasm` | `regexped` |
+| `make merge` | merges `main.wasm` and `email.wasm` into `final.wasm` — the same as `make` | `regexped`, AssemblyScript, `wasm-merge` |
+| `make run` | builds `final.wasm` if needed, then runs it | all of the above, plus `wasmtime` |
+| `make clean` | removes the build outputs; leaves `node_modules` alone | — |
+
+`wasm-merge` is looked up on `PATH` (a config can name it with `wasm_merge_path:` instead). Set `ASC=/path/to/asc` to use a different AssemblyScript compiler.
 
 ## Run
 
 ```sh
-make
+npm install   # once
+make          # build final.wasm
+make run      # run it
 ```
 
-Expected output:
+Expected output of `make run`:
 ```
 input: Contact alice@example.com or bob@company.org for details.
   email:  alice@example.com
@@ -40,11 +59,11 @@ input: no emails here
 ## Build pipeline
 
 ```
-regexped generate   →  generate AS stub (stub.ts)
-npx asc             →  compile AssemblyScript to WASM (main.wasm)
-regexped compile    →  compile regexp pattern to WASM (email.wasm)
+regexped generate   →  generate the AssemblyScript stub (stub.ts)
+asc                 →  compile index.ts to WASM (main.wasm)
+regexped compile    →  compile the pattern to WASM (email.wasm)
 regexped merge      →  merge main.wasm + email.wasm → final.wasm
-wasmtime run        →  execute
+wasmtime run        →  execute (make run)
 ```
 
 ## AS stub API

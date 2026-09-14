@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
-	"github.com/qrdl/regexped/internal/abi"
 )
 
 // The C stub for `wasm_format: component`.
@@ -349,10 +348,15 @@ extern void %s(const unsigned char *ptr, unsigned int len, unsigned char *ret);
 // end the same way — only their `next` differs.
 //
 // The scan lives behind a RESOURCE here, so `_init` constructs one and `_free`
-// drops it. scratch[0] carries the handle and scratch[1] a magic word marking
-// it live; the struct is the MODULE format's, shared because the header is, and
-// neither format uses both halves of it — a module iterator walks the input
+// drops it. scratch[0] carries the handle, and 0 means none: the canonical ABI
+// never hands out handle 0. scratch[1] is unused. The struct is the MODULE
+// format's, shared because the header is — a module iterator walks the input
 // itself and leaves the scratch zero.
+//
+// `_init` WRITES the struct and never reads it. The contract is C's usual one:
+// `_init` before `_next` or `_free`, and `_free` before initialising the same
+// struct again. Anything that tried to tell a live iterator from a fresh one
+// would have to read storage the caller may never have initialised.
 //
 // The handle is taken IN `_init`, not lazily on the first `next`. Laziness would
 // save the input copy for an iterator that is built and never driven — which is
@@ -370,12 +374,8 @@ int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
     if (!iter || !input) return RX_ERR_NULL_ARG;
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
-    /* Re-initialising a LIVE iterator drops what it held first, as the header
-       promises: overwriting the handle would strand the input copy and the scan
-       state inside the regexp component for good. */
-    if (iter->scratch[1] == %[7]du && iter->scratch[0] != 0) %[6]s((int)iter->scratch[0]);
-    iter->scratch[0] = 0;
-    iter->scratch[1] = 0;
+    /* Writes only: a live iterator must be _free'd before it is initialised
+       again, so nothing here reads what the struct held. */
     iter->input = input;
     iter->len = len;
     iter->offset = offset;
@@ -383,22 +383,20 @@ int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
     iter->done = (offset > len);
     iter->scratch[0] = (unsigned)%[5]s((const unsigned char *)input,
                                        (unsigned int)len, (unsigned int)offset);
-    iter->scratch[1] = %[7]du; /* stamped last: live only once it is */
+    iter->scratch[1] = 0;
     return 0;
 }
 
 void %[1]s_free(%[2]s *iter) {
     if (!iter) return;
-    if (iter->scratch[1] == %[7]du && iter->scratch[0] != 0) %[6]s((int)iter->scratch[0]);
-    /* Idempotent: both words are cleared, so a second call — or a call on an
-       iterator that was never initialised — does nothing rather than drop a
-       handle twice. */
+    if (iter->scratch[0] != 0) %[6]s((int)iter->scratch[0]);
+    /* The handle is cleared, so a second call does nothing rather than drop it
+       twice. Only for a struct that went through _init. */
     iter->scratch[0] = 0;
-    iter->scratch[1] = 0;
     iter->done = 1;
 }
 
-`, funcName, iterType, module, kebab, ctor, drop, abi.FindScratchMagic)
+`, funcName, iterType, module, kebab, ctor, drop)
 }
 
 func genCComponentFind(importModule, funcName, witFunc string) string {

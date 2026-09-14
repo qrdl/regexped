@@ -6,8 +6,20 @@ See [docs/browser.md](../../docs/browser.md) for the full guide.
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- Node.js 18+ (for the local HTTP server)
+The Makefile installs nothing. Install these first:
+
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| `python3` (`make run` only) | your OS package manager, or [python.org](https://www.python.org/downloads/) |
+
+What each target needs:
+
+| Target | What it does | Needs |
+|---|---|---|
+| `make` | compiles the patterns and generates `regexp.js` | `regexped` |
+| `make run` | builds if needed, then serves this directory on port 8080 until you stop it | `regexped`, `python3` |
+| `make clean` | removes the build outputs | — |
 
 ## Run
 

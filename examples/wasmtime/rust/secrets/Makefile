@@ -14,7 +14,7 @@ FINAL     := composed.wasm
 
 .PHONY: all compile generate build compose run clean
 
-all: run
+all: compose
 
 # Step 1 – compile the patterns into a component, plus the sibling .wit.
 # $(REGEXPED) is a prerequisite because the component depends on the COMPILER as

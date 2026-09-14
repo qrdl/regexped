@@ -17,7 +17,7 @@ INPUTS := "nothing sensitive here" \
 
 .PHONY: all compile build run clean component component-build component-run compare
 
-all: run
+all: compile build
 
 # --- the MODULE route ---------------------------------------------------------
 

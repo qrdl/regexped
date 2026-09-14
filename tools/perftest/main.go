@@ -2376,8 +2376,8 @@ func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtim
 		buf[gatePtr+i] = 0
 	}
 	scratchPtr := gatePtr + outCap*4
-	// No answer cache: this harness drives the plain `find`, which never reads
-	// one — only the batching entry's sweep does.
+	// No answer cache: every set this harness drives is non-overlapping, and
+	// only an overlapping `find` reads one.
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 	total := 0
 	from := int32(0)

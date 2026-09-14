@@ -13,7 +13,7 @@ CLI tool, or daemon.
 **It builds BOTH output kinds from the same patterns**, and that contrast is the
 second thing it demonstrates:
 
-| | `make` | `make component-run` |
+| | `make run` | `make component-run` |
 |---|---|---|
 | config | `regexped.yaml` | `regexped-component.yaml` |
 | output kind | `wasm_format: module` | `wasm_format: component` |
@@ -46,23 +46,43 @@ component.
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- Rust (native target, no WASI needed)
-- `wasmtime` crate (declared in `Cargo.toml`)
-- for the component route only: `wasm-tools` on `$PATH`, which `regexped
-  compile` shells out to in order to wrap the core module into a component
+The Makefile install nothing. Install these first:
+
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| Rust (native target — no WASI target needed) | [rustup](https://rustup.rs) |
+| a C toolchain (`cc`) | your OS package manager (e.g. `apt install build-essential`) — Rust links with it, and the `wasmtime` crate's dependencies build with it |
+| `wasm-tools` (component route only) | a [release](https://github.com/bytecodealliance/wasm-tools/releases) on `PATH`, or `cargo install --locked wasm-tools` |
+| `diff` (`make compare` only) | part of any Unix-like system |
+
+The default route is the module route; the component route has its own targets,
+and `make compare` runs both.
+
+| Route | Target | What it does | Needs |
+|---|---|---|---|
+| module | `make` | compiles the set to `secrets.wasm` and builds the native host `secret-scanner` | `regexped`, Rust, `cc` |
+| module | `make compile` | compiles the set to `secrets.wasm`, a standalone module | `regexped` |
+| module | `make build` | builds the native host `secret-scanner`. Cargo fetches the crates | Rust, `cc` |
+| module | `make run` | builds if needed, then runs the host on five inputs | `regexped`, Rust, `cc` |
+| component | `make component` | compiles the set to `component/secrets.wasm`, a component, plus `component/secrets.wit`; `regexped compile` wraps the core module into a component with `wasm-tools` | `regexped`, `wasm-tools` |
+| component | `make component-build` | builds the native host `secret-scanner-component`; its `bindgen!` reads the `.wit` at compile time, so this runs `make component` first | `regexped`, `wasm-tools`, Rust, `cc` |
+| component | `make component-run` | builds if needed, then runs that host on the same five inputs | the above |
+| both | `make compare` | builds both routes, runs both, and diffs the output | everything above, plus `diff` |
+| — | `make clean` | removes the build outputs of both routes | Rust (`cargo clean`) |
+
+Neither route needs `wasm-merge`, `wac` or the `wasmtime` CLI: nothing is linked
+into the host, and the host runs natively with the `wasmtime` crate inside it.
+`wasm-tools` is looked up on `PATH` (a config can name it with
+`wasm_tools_path:` instead).
 
 ## Run
 
 ```sh
-make
-```
-
-Or the component route, and a diff of the two:
-
-```sh
-make component-run
-make compare
+make                # build the module route
+make run            # run it
+make component-run  # build and run the component route
+make compare        # run both and diff the output
 ```
 
 Expected output (abbreviated, identical either way):

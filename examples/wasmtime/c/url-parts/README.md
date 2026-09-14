@@ -10,36 +10,60 @@ print identical output. See [Three build options](#three-build-options).
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- `clang-19` with `wasm-ld` (`apt install clang-19 lld-19`)
-- [wasm-merge](https://github.com/WebAssembly/binaryen) — module build
-- [wasmtime](https://wasmtime.dev)
+The Makefile install nothing. Install these first:
 
-For the component builds additionally:
+| Tool | Routes | How to install |
+|---|---|---|
+| `regexped` | all | run `make` in the repo root |
+| `clang-19` with `wasm-ld` | all | `apt install clang-19 lld-19`, or your distribution's equivalent |
+| `wasmtime` | all (the running targets) | `curl https://wasmtime.dev/install.sh -sSf \| bash` — see [wasmtime.dev](https://wasmtime.dev) |
+| `wasm-merge` | 1 | from [Binaryen](https://github.com/WebAssembly/binaryen/releases): unpack a release and put its `bin/` on `PATH` |
+| `wasm-tools` | 2, 3 | a [release](https://github.com/bytecodealliance/wasm-tools/releases) on `PATH`, or `cargo install --locked wasm-tools` |
+| `wac` | 2, 3 | a [release](https://github.com/bytecodealliance/wac/releases) (the `wac-cli-<platform>` binary, renamed to `wac`) on `PATH`, or `cargo install --locked wac-cli` |
+| the wasip1 adapter | 2 | download `wasi_snapshot_preview1.command.wasm` from a [wasmtime release](https://github.com/bytecodealliance/wasmtime/releases) and pass `ADAPTER=/path/to/it` |
+| `wit-bindgen` CLI | 3 | `cargo install --locked wit-bindgen-cli`, or a [release](https://github.com/bytecodealliance/wit-bindgen/releases) on `PATH` |
+| `wasm-component-ld` | 3 | ships with the Rust toolchain: install Rust with [rustup](https://rustup.rs) |
 
-- [wac](https://github.com/bytecodealliance/wac) — composes the two components
-  (both routes)
-- **`make component`** (wasip1 route) also needs
-  [wasm-tools](https://github.com/bytecodealliance/wasm-tools) and the **wasip1
-  adapter** (`wasi_snapshot_preview1.command.wasm`). `main.c` talks
-  `wasi_snapshot_preview1` directly while a component speaks `wasi:cli`, so the
-  adapter bridges them. The Makefile finds the copy shipped in the
-  `wasi-preview1-component-adapter-provider` crate; point `ADAPTER=` at your own
-  otherwise.
-- **`make wasip2`** route instead needs
-  [`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen) and
-  `wasm-component-ld`. rustup ships the latter inside the toolchain rather than on
-  PATH; override `WASM_COMPONENT_LD_DIR=` if yours lives elsewhere.
+The example builds three ways; see [Three build options](#three-build-options).
+Route 1 is the default:
 
-No libc or WASI sysroot required — the example uses direct WASI imports.
+| Route | Targets | Needs |
+|---|---|---|
+| 1. module (default) | `make` builds `final.wasm`; `make run` also runs it. `make generate`, `make build`, `make compile` and `make merge` are the individual steps | `regexped`, clang, `wasm-merge`; `wasmtime` for `run` |
+| 2. component, wasip1 | `make component` builds `component/composed.wasm`; `make component-run` also runs it | `regexped`, clang, `wasm-tools`, `wac`, the adapter; `wasmtime` for `component-run` |
+| 3. component, wasip2 | `make wasip2` builds `wasip2/composed.wasm`; `make wasip2-run` also runs it | `regexped`, clang, `wasm-tools`, `wac`, `wit-bindgen`, `wasm-component-ld`; `wasmtime` for `wasip2-run` |
+| — | `make clean` removes the outputs of all three | — |
+
+In route 2, `regexped compile` wraps the component with `wasm-tools`, the
+Makefile runs `wasm-tools component embed` and `component new`, and
+`regexped merge` composes with `wac` after checking each component's exports
+with `wasm-tools`. Route 3 uses `wasm-tools` and `wac` the same way through
+`regexped`, and `wit-bindgen c` for one object file.
+
+**The wasip1 adapter** (route 2) bridges `main.c`, which talks
+`wasi_snapshot_preview1` directly, to a component, which speaks `wasi:cli`. If
+`ADAPTER` is not set, the Makefile looks for the copy shipped in the
+`wasi-preview1-component-adapter-provider` crate in your cargo registry.
+
+**`wasm-component-ld`** (route 3) is the linker clang uses for `wasm32-wasip2`.
+rustup ships it inside the toolchain rather than on `PATH`, and the Makefile
+finds it there; override `WASM_COMPONENT_LD_DIR=` if yours lives elsewhere.
+
+`wasm-merge`, `wasm-tools` and `wac` are looked up on `PATH` (a config can name
+them with `wasm_merge_path:`, `wasm_tools_path:` and `wac_path:` instead). No libc
+or WASI sysroot is required — the example uses direct WASI imports.
 
 ## Run
 
 ```sh
-make
+make               # 1. core WASM module (build only)
+make run           # 1. core WASM module
+make component-run # 2. component, wasip1 route
+make wasip2-run    # 3. component, wasip2 route
 ```
 
-Expected output:
+The three running targets print the same output:
+
 ```
 === single URL ===
 URL:
@@ -51,7 +75,7 @@ URL:
   fragment   = section
 ```
 
-## Build pipeline
+## Build pipeline (route 1)
 
 ```
 regexped generate   →  generate C header stub (stub.h)
@@ -64,7 +88,7 @@ wasmtime run        →  execute
 ## Three build options
 
 ```sh
-make               # 1. core WASM module, linked with wasm-merge
+make run           # 1. core WASM module, linked with wasm-merge
 make component-run # 2. component, wasip1 route: clang -> embed -> new -> wac
 make wasip2-run    # 3. component, wasip2 route: clang wraps at link time -> wac
 ```
@@ -85,7 +109,7 @@ need.
 | linker | `wasm-ld` | `wasm-ld` | `wasm-component-ld` |
 | wrapping | — | `wasm-tools component embed` + `new`, after linking | at LINK time, by clang |
 | WASI bridging | native | `--adapt` with the wasip1 adapter | bundled in the linker |
-| extra tool | wasm-merge | wasm-tools + the adapter | **wit-bindgen** |
+| tools beyond clang and wasmtime | wasm-merge | wasm-tools, wac, the adapter | wasm-tools, wac, **wit-bindgen**, wasm-component-ld |
 | link step | `regexped merge` (→ wasm-merge) | `regexped merge` (→ wac) | `regexped merge` (→ wac) |
 
 **Why route 2 exists at all**, given 3 is fewer steps: route 3 needs the

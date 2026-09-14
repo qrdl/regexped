@@ -238,9 +238,11 @@ Four things to know:
   commands](#why-the-wasip1-target-needs-two-extra-commands) below.
 
 - **Call `<func>_free(&iter)` on every exit from a find or groups loop** — each
-  `break`, `return` and `goto`, not only the last. The scan lives inside the
-  regexp component behind a resource handle, so an abandoned iterator strands its
-  input copy and state for the life of the process. The same call is a no-op under
+  `break`, `return` and `goto`, not only the last — and before initialising the
+  same iterator again. The scan lives inside the regexp component behind a
+  resource handle, so an abandoned iterator strands its input copy and state for
+  the life of the process, and `_init` only writes the struct, so it cannot
+  release a handle it was never told about. The same call is a no-op under
   `wasm_format: module`, which is what lets one source build both ways.
 - **Add your own exports** to the generated `wit/consumer.wit`. It arrives with
   the import declared and nothing exported, and a component with no exports can

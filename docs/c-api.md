@@ -215,7 +215,9 @@ find_token_free(&iter);
 
 The iterator owns the advance past a zero-length match and Go's `FindAllIndex` rule — an empty match beginning exactly where the previous reported match ended is not reported. Both used to be your job, copied from this document.
 
-**`_free` is a no-op under `wasm_format: module` and MANDATORY under `component`.** There the scan lives inside the regexp component behind a resource handle, and abandoning an iterator strands the input copy and the scan state for the life of the process. Call it on every exit path — each `break`, `return` and `goto` out of the loop, not only the last one. Re-initialising an iterator frees what it held first, a second `_free` does nothing, and so does one on an iterator that never started. Writing it unconditionally is what lets the same source compile against either format.
+**`_free` is a no-op under `wasm_format: module` and MANDATORY under `component`.** There the scan lives inside the regexp component behind a resource handle, and abandoning an iterator strands the input copy and the scan state for the life of the process. Call it on every exit path — each `break`, `return` and `goto` out of the loop, not only the last one. Writing it unconditionally is what lets the same source compile against either format.
+
+**`_init` only writes the struct, and `_free` needs a struct `_init` has written.** So the contract is the usual one for a C resource: `_init` before `_next` or `_free`, and `_free` before initialising the same iterator again — `_init` does not look at what the struct held, so an iterator initialised again without `_free` leaks under `component`. A second `_free` does nothing; a `_free` on a struct that never went through `_init` is not allowed. The iterator may be an uninitialised local: nothing reads it before `_init` writes it.
 
 ---
 
@@ -246,7 +248,7 @@ The status is the return value rather than something written into `out_groups`, 
 
 `out_groups[0]` is the whole match; subsequent entries are capture groups in source order. A group that did not participate is `{-1, -1}`, so the array length never depends on which groups matched.
 
-The iterator is **caller-owned**, so two scans can be in flight and re-initialising the struct restarts one. It owns the advance and the empty-match rule — the logic this document used to ask you to copy into your own loop, which is the part that got subtly and silently wrong.
+The iterator is **caller-owned**, so two scans can be in flight, and `_free` followed by `_init` restarts one. It owns the advance and the empty-match rule — the logic this document used to ask you to copy into your own loop, which is the part that got subtly and silently wrong.
 
 ```c
 rx_parse_url_iter_t iter;
@@ -266,7 +268,7 @@ if (status == RX_ERR_BT_OVERFLOW) {
 parse_url_free(&iter);
 ```
 
-`_free` carries the same obligation it does for `find`: a no-op for a module, mandatory for a component.
+`_free` carries the same obligations it does for `find`: a no-op for a module, mandatory for a component, and called before initialising the same iterator again.
 
 ---
 
@@ -373,7 +375,9 @@ component` the scan's state lives inside the regexp component behind a handle,
 and dropping that handle is what releases it — so the call is required there.
 It is emitted in both formats, and calling it costs nothing here, so the same
 source compiles and behaves correctly against either. Safe to call twice, and on
-a scanner that already finished.
+a scanner that already finished — but only on one `<find>_init` has written, and
+before initialising the same scanner again: `<find>_init` does not look at what
+the struct held.
 
 **`find` is fill-and-count, not an iterator.** C has no iterator protocol, and
 the raw ABI already fills a buffer and returns a count — which is also the C
@@ -398,8 +402,8 @@ INT32_MAX, since the FFI imports are i32. It does NOT reject `len == 0` (an
 empty input is a legitimate scan — `a*`, `(?:)`, `x?`, `\A\z` all match it) and
 it does NOT reject `offset > len`, which the ABI defines as "nothing found".
 
-Scanner state is **caller-owned**, so two scans can be in flight at once and
-re-initialising the struct restarts one. The `gates` array stays inside the
+Scanner state is **caller-owned**, so two scans can be in flight at once, and
+`<find>_free` followed by `<find>_init` restarts one. The `gates` array stays inside the
 struct: its length is a size the compiler knows, not one you pick.
 
 **The `_all` arrays carry their size in the type.** `int patterns[static
@@ -510,9 +514,9 @@ command line in this document carries it.
 gives identical answers at different speeds. If an overlapping scan is slower
 than you expect, check which of the two you got.
 
-Re-initialising a scanner frees what it held and starts again, so
-"re-initialising restarts a scan" holds whether or not a cache is in play. A
-second `<find>_free` is a no-op.
+`<find>_init` only writes the struct, so a scanner that owns a cache and is
+initialised again without `<find>_free` leaks it: call `<find>_free` first,
+whether or not a cache is in play. A second `<find>_free` is a no-op.
 
 ### The overlapping answer cache's header
 

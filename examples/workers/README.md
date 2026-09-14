@@ -10,8 +10,26 @@ All three patterns are compiled with `hints: [batch-find]` (see [`hints:`](../..
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- Node.js + [Wrangler](https://developers.cloudflare.com/workers/wrangler/) (`npm install -g wrangler`)
+The Makefile installs nothing. Install these first:
+
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| [Node.js](https://nodejs.org) 22+ with `npm` | from nodejs.org or a version manager such as [nvm](https://github.com/nvm-sh/nvm) — Wrangler 4 refuses to start on older Node |
+| [Wrangler](https://developers.cloudflare.com/workers/wrangler/) | `npm install -g wrangler`; for `make deploy`, also `wrangler login` |
+
+What each target needs:
+
+| Target | What it does | Needs |
+|---|---|---|
+| `make` | compiles the patterns and generates `regexp.js` | `regexped` |
+| `make run` | nothing: a Worker does not run as a local program, so it only points at `make dev` and `make deploy` | — |
+| `make dev` | builds if needed, then runs the Worker locally with `wrangler dev` | `regexped`, Wrangler |
+| `make deploy` | builds if needed, then publishes it with `wrangler deploy` | `regexped`, Wrangler, logged in |
+| `make clean` | removes the build outputs | — |
+
+`make dev` and `make deploy` stop with a message if `wrangler` is not on `PATH`;
+set `WRANGLER=/path/to/wrangler` to use another.
 
 ## Run locally
 

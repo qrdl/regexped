@@ -201,9 +201,13 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
 // The scanner struct is the module one, unchanged, because the header is shared —
 // so this body reuses its fields for what it actually needs:
 //
-//	scratch[0]  the resource HANDLE, which is the only state that matters here
-//	scratch[1]  FindScratchMagic while the handle is live
+//	scratch[0]  the resource HANDLE, 0 when there is none — the canonical ABI
+//	            never hands out handle 0
+//	scratch[1]  unused
 //	done        as before
+//
+// `_init` writes the struct and never reads it: `_free` comes before
+// initialising the same scanner again, as with any C resource.
 //
 // `scratch` is the same field the MODULE stub builds its ABI descriptor in, and
 // the struct is shared because the header is. Neither format uses both: a module
@@ -234,18 +238,13 @@ extern int %s(const unsigned char *ptr, unsigned int len, unsigned int start);
     if (!s || !input) return RX_ERR_NULL_ARG;
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
-    /* Re-initialising a LIVE scanner drops the resource it held first, as the
-       header promises: overwriting the handle stranded the input, the gates and
-       the cache inside the regexp component for good. The magic word in
-       scratch[1] is what tells a live scanner from an uninitialised struct. */
-    if (s->scratch[1] == %[7]du && s->scratch[0] != 0) %[6]s((int)s->scratch[0]);
-    s->scratch[0] = 0;
-    s->scratch[1] = 0;
+    /* Writes only: a live scanner must be _free'd before it is initialised
+       again, so nothing here reads what the struct held. */
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
     /* scratch[0] holds the resource handle: the real gate array is inside the
        regexp component, along with the input and the position. */
     s->scratch[0] = (unsigned)%[3]s((const unsigned char *)input, (unsigned int)len, (unsigned int)offset);
-    s->scratch[1] = %[7]du; /* stamped last: the struct reads as live only once it is */
+    s->scratch[1] = 0;
     return 0;
 }
 
@@ -280,9 +279,9 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (count == 0) { s->done = 1; regexped_cabi_release(mark); return 0; }
     /* cap >= %[5]s >= count, so every match of this position fits. */
     for (unsigned int i = 0; i < count; i++) {
-        buf[i].pattern_id = (int)rx_cabi_u32(raw + %[8]d * i);
-        buf[i].start = (ptrdiff_t)rx_cabi_u32(raw + %[8]d * i + 4);
-        buf[i].end = (ptrdiff_t)rx_cabi_u32(raw + %[8]d * i + 8);
+        buf[i].pattern_id = (int)rx_cabi_u32(raw + %[7]d * i);
+        buf[i].start = (ptrdiff_t)rx_cabi_u32(raw + %[7]d * i + 4);
+        buf[i].end = (ptrdiff_t)rx_cabi_u32(raw + %[7]d * i + 8);
     }
     /* Every tuple in one call shares a start. The component already advanced
        its own position; the struct records the MODULE format's meaning, the
@@ -294,16 +293,14 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 }
 
 void %[1]s_free(%[2]s *s) {
-    if (!s || s->scratch[1] != %[7]du || s->scratch[0] == 0) return;
+    if (!s || s->scratch[0] == 0) return;
     %[6]s((int)s->scratch[0]);
-    /* Idempotent: both words are cleared, so a second call, or a call on a
-       struct that was never initialised, does nothing rather than drop a handle
-       twice. */
+    /* The handle is cleared, so a second call does nothing rather than drop it
+       twice. Only for a scanner that went through _init. */
     s->scratch[0] = 0;
-    s->scratch[1] = 0;
     s->done = 1;
 }
 
-`, name, scannerType, ctor, next, konst, drop, abi.FindScratchMagic, abi.SetMatchTupleBytes)
+`, name, scannerType, ctor, next, konst, drop, abi.SetMatchTupleBytes)
 	return b.String()
 }

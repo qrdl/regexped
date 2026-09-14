@@ -364,26 +364,14 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 				// consumer's performance on an overlapping set depends on how
 				// they built, not on what they wrote.
 				cacheField = "    unsigned *cache;\n    size_t cache_words;\n"
-				cacheAlloc = fmt.Sprintf(`#if RX_SET_CACHE
-    /* Re-initialising a LIVE scanner frees what it held, so "re-initialising
-       restarts a scan" stays true here as in every other language.
-       
-       The scanner is CALLER-owned and by value, so a struct that has never
-       been initialised holds stack garbage and cannot otherwise be told from a
-       live one — freeing on the strength of that would be undefined behaviour
-       on the very first call. The MAGIC is what makes it decidable: _init
-       stamps it below, so its presence means this struct has been through
-       _init and its cache fields are real. Garbage equal to the magic is one
-       chance in 2^32, the same guarantee the descriptor already rests on where
-       find traps on a mismatch. */
-    if (s->scratch[0] == %[5]du && s->cache) { free(s->cache); }
-#endif
+				cacheAlloc = fmt.Sprintf(`    /* Writes only: a scanner that owns a cache must be _free'd before it is
+       initialised again, so nothing here reads what the struct held. */
     s->cache = 0; s->cache_words = 0;
 #if RX_SET_CACHE
     {
         unsigned long long m = (unsigned long long)len + 1;
-        unsigned long long row = %[6]dULL;
-        unsigned long long cell = %[7]dULL;
+        unsigned long long row = %[5]dULL;
+        unsigned long long cell = %[6]dULL;
         unsigned long long k = m;
         if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
             k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
@@ -398,14 +386,14 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
                 /* The header only: the engine reads nothing past it before the
                    pass writes it, so zeroing the whole region was a pass over
                    memory the cache is about to fill anyway. */
-                for (size_t w = 0; w < %[8]d; w++) s->cache[w] = 0;
-                s->cache[%[9]d] = (unsigned)k;
+                for (size_t w = 0; w < %[7]d; w++) s->cache[w] = 0;
+                s->cache[%[8]d] = (unsigned)k;
                 s->cache_words = (size_t)((bytes + 3) / 4);
             }
         }
     }
 #endif
-`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max, abi.FindScratchMagic,
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
 					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes/4,
 					config.SetOverlapHdrStrideOff/4)
 				cacheFree = `#if RX_SET_CACHE
@@ -420,7 +408,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			gateArg := "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
 				"u, s->scratch[1] = (unsigned)(size_t)s->gates, " + cacheSet + ", s->scratch), "
 			// D17: the scanner is CALLER-owned, so two scans can be in flight
-			// and re-initialising the struct restarts one. The static
+			// and _free followed by _init restarts one. The static
 			// _next/_reset pair this replaces could do neither.
 			//
 			// The TUPLE BUFFER is the caller's too, for the reason given
@@ -442,20 +430,16 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
     /* The FFI imports are i32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
-%[3]s    /* Stamped LAST, so a struct only reads as initialised once it fully is:
-       an allocation that failed part-way leaves the magic absent and the next
-       _init treats the struct as fresh rather than freeing a partial state. */
-    s->scratch[0] = %[6]du;
-    return 0;
+%[3]s    return 0;
 }
 
 int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     if (!s || !buf) return RX_ERR_NULL_ARG;
     if (cap > 0x7FFFFFFF) return RX_ERR_RANGE;
     /* One match per pattern is the most a position can report, so a buffer that
-       holds %[7]s can never overflow — and the same header serves the component
+       holds %[6]s can never overflow — and the same header serves the component
        format, whose scan cannot re-ask a position. One rule for both. */
-    if (cap < (size_t)%[7]s) return RX_ERR_RANGE;
+    if (cap < (size_t)%[6]s) return RX_ERR_RANGE;
     if (s->done) return 0;
     int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
     /* Negative is RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or
@@ -491,11 +475,8 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 
 void %[1]s_free(%[2]s *s) {
     if (!s) return;
-%[5]s    /* Cleared so a freed scanner no longer reads as live: a second _free is
-       a no-op and a re-init after one allocates rather than double-freeing. */
-    s->scratch[0] = 0;
-}
-`, s.Find, scannerType, gateInit, gateArg, cacheFree, abi.FindScratchMagic, konst)
+%[5]s}
+`, s.Find, scannerType, gateInit, gateArg, cacheFree, konst)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -571,7 +552,7 @@ func genCFindHPart(funcName string) string {
 	iterType := cIterTypeName(funcName)
 	return fmt.Sprintf(
 		"/* Iterator over %[1]s's non-overlapping matches. CALLER-owned, so two\n"+
-			"   scans can be in flight and re-initialising the struct restarts one.\n"+
+			"   scans can be in flight; _free and then _init again restarts one.\n"+
 			"   It owns the advance AND the empty-match rule, which the caller used to\n"+
 			"   copy out of this comment — the place they got subtly wrong. */\n"+
 			"typedef struct {\n"+
@@ -579,11 +560,13 @@ func genCFindHPart(funcName string) string {
 			"    size_t len, offset, prev_end;\n"+
 			"    int done;\n"+
 			"    /* Opaque. Under wasm_format: component this carries the resource\n"+
-			"       handle the scan lives behind and a word marking it live; under\n"+
-			"       wasm_format: module it stays zero. Never read or write it. */\n"+
+			"       handle the scan lives behind; under wasm_format: module it stays\n"+
+			"       zero. Never read or write it. */\n"+
 			"    unsigned scratch[2];\n"+
 			"} %[2]s;\n\n"+
-			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
+			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. It only WRITES the\n"+
+			"   struct, so it may be uninitialised; an iterator already started must be\n"+
+			"   passed to %[1]s_free first. */\n"+
 			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
 			"/* Writes the next match to *out_match.\n"+
 			"     1  a match was written\n"+
@@ -600,9 +583,11 @@ func genCFindHPart(funcName string) string {
 			"   pointer — and is emitted anyway so the SAME source compiles against either\n"+
 			"   format.\n\n"+
 			"   Call it on every exit path, not just the last one: a break or an early\n"+
-			"   return out of the loop leaks under component. Re-initialising frees what\n"+
-			"   the iterator held first, a second call is a no-op, and so is a call on an\n"+
-			"   iterator that finished. */\n"+
+			"   return out of the loop leaks under component. Call it before initialising\n"+
+			"   the same iterator again, too: _init does not look at what the struct\n"+
+			"   held. A second call is a no-op, and so is a call on an iterator that\n"+
+			"   finished; a call on a struct that never went through _init is not\n"+
+			"   allowed. */\n"+
 			"void %[1]s_free(%[2]s *iter);\n\n",
 		funcName, iterType)
 }
@@ -797,7 +782,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	// its set scanner, so this applies a local idiom rather than importing one.
 	fmt.Fprintf(&hb,
 		"/* Iterator over %[1]s's non-overlapping capture matches. CALLER-owned,\n"+
-			"   so two scans can be in flight and re-initialising the struct restarts\n"+
+			"   so two scans can be in flight; _free and then _init again restarts\n"+
 			"   one. */\n"+
 			"typedef struct {\n"+
 			"    const char *input;\n"+
@@ -806,7 +791,8 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"    /* Opaque — see the find iterator. */\n"+
 			"    unsigned scratch[2];\n"+
 			"} %[2]s;\n\n"+
-			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. */\n"+
+			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. Writes only — see\n"+
+			"   the find iterator. */\n"+
 			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
 			"/* Writes this match's groups into the CALLER'S out_groups[], which must\n"+
 			"   hold %[3]s_GROUPS entries. Index 0 is the whole match; a group that\n"+
@@ -817,7 +803,8 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 			"     RX_ERR_BT_OVERFLOW  the engine gave up; what remains is UNKNOWN */\n"+
 			"int %[1]s_next(%[2]s *iter, rx_group_t out_groups[static %[3]s_GROUPS]);\n\n"+
 			"/* Releases whatever the iterator holds — see the find iterator; under\n"+
-			"   wasm_format: component it drops the resource handle and is REQUIRED. */\n"+
+			"   wasm_format: component it drops the resource handle and is REQUIRED,\n"+
+			"   including before initialising the same iterator again. */\n"+
 			"void %[1]s_free(%[2]s *iter);\n\n",
 		funcName, cIterTypeName(funcName), funcUpper)
 
@@ -989,7 +976,7 @@ func cSetScanAllDecl(name, konst string) string {
 // call exists in both.
 func cSetScannerDecls(find, konst, gateField, scannerType string) string {
 	return fmt.Sprintf(`/* Caller-owned scanner for %[1]s. Two scans may be in flight at once, and
-   re-initialising the struct restarts a scan.
+   _free followed by _init restarts a scan.
 
    NOT COPYABLE once initialised. For an overlapping set the scanner OWNS a
    heap region, so a copy plus two _free calls frees it twice; and the
@@ -1026,7 +1013,8 @@ typedef struct {
 
 /* 0 on success, a negative RX_ERR_* otherwise. An EMPTY input is legitimate
    (a*, (?:), x?, \\A\\z all match it) and offset > len is not an error either
-   — the ABI defines it as "nothing found". */
+   — the ABI defines it as "nothing found". It only WRITES the struct, so it may
+   be uninitialised; a scanner already started must be passed to _free first. */
 int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);
 int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
 
@@ -1035,9 +1023,10 @@ int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
    Without the cache it is a no-op — the scanner is caller-owned, by value, and
    holds a borrowed input pointer and the gate array inline.
 
-   Re-initialising a scanner frees what it held and starts again, so
-   "re-initialising restarts a scan" holds whether or not it owns a cache. A
-   second _free is a no-op.
+   Call it before initialising the same scanner again: _init does not look at
+   what the struct held, so a scanner that owns a cache and is initialised
+   again without _free leaks it. A second _free is a no-op; a _free on a struct
+   that never went through _init is not allowed.
 
    It exists so that the same source compiles against either output kind. Under
    wasm_format: component the scan's state lives inside the regexp component

@@ -815,22 +815,49 @@ func TestCScannerRefusesABufferBelowPatternCount(t *testing.T) {
 	}
 }
 
-// Re-initialising a LIVE component scanner drops the resource it held before
-// constructing a new one; the header promises it. A magic word tells a live
-// scanner from an uninitialised struct, as the module scanner's does.
-func TestCComponentReinitDropsTheLiveHandle(t *testing.T) {
+// `_init` only WRITES the struct. A caller may hand it an uninitialised local,
+// so an `_init` that inspected the struct — to drop a handle it guessed was
+// live — would read indeterminate storage and could drop a garbage handle. The
+// contract instead is `_free` before initialising again, and `_free` keys off
+// the handle it zeroes.
+func TestCComponentInitReadsNoPriorState(t *testing.T) {
 	_, c, err := genCComponentStubFiles(cComponentCfg(), "stub.h")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := cFunctionBody(t, c, "int scan_secrets_init(")
-	if !strings.Contains(body, fmt.Sprint(abi.FindScratchMagic)) {
-		t.Errorf("_init does not test the scanner's magic word:\n%s", body)
+	init := cFunctionBody(t, c, "int scan_secrets_init(")
+	for _, banned := range []string{fmt.Sprint(abi.FindScratchMagic), "_drop(", "s->scratch[0] !=", "s->scratch[1] =="} {
+		if strings.Contains(init, banned) {
+			t.Errorf("_init reads prior state (%q):\n%s", banned, init)
+		}
 	}
-	drop, ctor := strings.Index(body, "_drop("), strings.Index(body, "_new(")
-	if drop < 0 || ctor < 0 || drop > ctor {
-		t.Errorf("_init must drop a live handle BEFORE constructing (drop at %d, construct at %d):\n%s",
-			drop, ctor, body)
+	free := cFunctionBody(t, c, "void scan_secrets_free(")
+	for _, want := range []string{"s->scratch[0] == 0) return;", "_drop((int)s->scratch[0]);", "s->scratch[0] = 0;"} {
+		if !strings.Contains(free, want) {
+			t.Errorf("_free is missing %q:\n%s", want, free)
+		}
+	}
+	if strings.Contains(free, fmt.Sprint(abi.FindScratchMagic)) {
+		t.Errorf("_free still tests a liveness magic word:\n%s", free)
+	}
+
+	// The module stub's scanner for an overlapping set owns a cache, and used to
+	// free it in `_init` on the strength of a magic word read from the struct.
+	_, mc, err := genCStubFilesWithSets(ovSizingCfg(), "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	minit := cFunctionBody(t, mc, "int scan_ov_init(")
+	if !strings.Contains(minit, "malloc(") {
+		t.Fatalf("the module scanner reserves no cache, so this checks nothing:\n%s", minit)
+	}
+	for _, banned := range []string{"free(", "s->scratch[0] =="} {
+		if strings.Contains(minit, banned) {
+			t.Errorf("module _init reads prior state (%q):\n%s", banned, minit)
+		}
+	}
+	if mfree := cFunctionBody(t, mc, "void scan_ov_free("); !strings.Contains(mfree, "if (s->cache) { free(s->cache); s->cache = 0;") {
+		t.Errorf("module _free does not free and clear the cache:\n%s", mfree)
 	}
 }
 
@@ -1087,9 +1114,9 @@ func TestCComponentSetParts(t *testing.T) {
 		// builds its ABI descriptor in; neither format uses both.
 		"s->scratch[0] = (unsigned)ffi_scan_it__res_new(",
 		// Dropping is idempotent: a second free must not drop twice, so free
-		// needs a live handle and clears both words.
-		"|| s->scratch[0] == 0) return;",
-		"s->scratch[1] = 0;",
+		// needs a handle and clears it.
+		"if (!s || s->scratch[0] == 0) return;",
+		"s->scratch[0] = 0;",
 		"rx_pattern_names[] = {",
 	} {
 		if !strings.Contains(c, want) {
@@ -1213,8 +1240,7 @@ func TestCComponentWitDirWriteFailure(t *testing.T) {
 // its source. That is how three defects survived: `_all` and the scanner leaked
 // every returned list from the guest's bump heap, the scanner silently discarded
 // what did not fit a small buffer while the shared header promised a
-// transactional overflow, and re-initialising a live scanner orphaned its
-// resource. Each export of the guest below exercises one of them and returns 0
+// transactional overflow, and a scanner started again orphaned its resource. Each export of the guest below exercises one of them and returns 0
 // on success, or the number of the check that failed.
 func TestCComponentSetWrappersEndToEnd(t *testing.T) {
 	if testing.Short() {
@@ -1281,7 +1307,7 @@ func TestCComponentSetWrappersEndToEnd(t *testing.T) {
 		// regexp component, which grows its memory to hold them. Capped at 64 MiB
 		// a leaking build traps well inside 10,000 iterations; a correct one
 		// reuses the same blocks every time.
-		{"re-init drops the live handle", "reinit",
+		{"_free then _init restarts without leaking", "reinit",
 			[]string{"-W", "max-memory-size=67108864", "-W", "trap-on-grow-failure=y"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1401,8 +1427,11 @@ int reinit(void) {
     rx_set_match_t buf[RUNS_PATTERN_COUNT];
     for (int i = 0; i < 10000; i++) {
         if (scan_runs_init(&s, big, BIG, 0) != 0) return 1;
-        if (scan_runs_init(&s, big, BIG, 0) != 0) return 2;
-        if (scan_runs(&s, buf, RUNS_PATTERN_COUNT) <= 0) return 3;
+        if (scan_runs(&s, buf, RUNS_PATTERN_COUNT) <= 0) return 2;
+        scan_runs_free(&s);
+        scan_runs_free(&s); /* a second _free is a no-op */
+        if (scan_runs_init(&s, big, BIG, 0) != 0) return 3;
+        if (scan_runs(&s, buf, RUNS_PATTERN_COUNT) <= 0) return 4;
         scan_runs_free(&s);
     }
     return 0;
