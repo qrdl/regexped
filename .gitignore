@@ -47,6 +47,7 @@ examples/**/*.wasm
 # hidden with them.
 examples/wasmtime/rust/secrets/secrets.wit
 examples/wasmtime/rust/secret-scanner/component/secrets.wit
+examples/wasmtime/rust/secret-scanner/component/.built
 examples/wasmtime/rust/secrets/.component.stamp
 # The C example's component build puts every artefact in its own directory.
 examples/wasmtime/c/url-parts/component/

@@ -123,6 +123,21 @@ func TestCmdCompileRejectsWrongFormat(t *testing.T) {
 	}
 }
 
+// An output named *.wit is its own sibling interface path. It is refused before
+// anything is compiled, so nothing lands on disk, and no wasm-tools is needed.
+func TestCmdCompileRejectsOutputThatIsItsOwnWit(t *testing.T) {
+	for _, name := range []string{"secrets.wit", "secrets.WIT"} {
+		dir := t.TempDir()
+		err := CmdCompile(findCfg("secrets"), filepath.Join(dir, name), nil)
+		if err == nil || !strings.Contains(err.Error(), "same file") {
+			t.Errorf("%s: err = %v, want the collision refused", name, err)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Errorf("%s: the refusal left files behind: %v", name, entries)
+		}
+	}
+}
+
 func TestCmdCompileRejectsConfigWithNoExports(t *testing.T) {
 	cfg := config.BuildConfig{
 		WasmFormat:   "component",

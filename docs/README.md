@@ -18,8 +18,7 @@ Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
 - **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns, BitState memoization for O(n) worst-case on zero-matchable loops
 - **Pattern sets** — compile multiple patterns into a single merged DFA and declare which of five questions you need answered (`match_any`/`match_all` anchored, `scan_any`/`scan_all` non-anchored, `find` for positions and extents); one call scans for all patterns simultaneously, and `find` returns `(pattern_id, start, end)` tuples; a packed-pair SIMD probe (≤16 literals with a usable two-column window), bucketed SIMD Teddy (≤64 literals, given ≥2-byte literals and ≥4 distinct first bytes), Aho-Corasick (the rest, under a 512 KB table budget — it wins where first-byte diversity is low), or a density/hint-selected SIMD Shufti prefilter keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups)
-- **Two output kinds** — a core WASM module (the default) or a **WASM Component Model component** with a generated WIT interface, selected by `wasm_format:` in the config
-- WASM module merging via `wasm-merge` (module format); component wrapping via `wasm-tools` and composition via `wac` (component format), all driven by `regexped merge` and `regexped compile`
+- **Core WASM modules and Component Model components** — `wasm_format:` in the config selects either a core WASM module (the default), merged into a host with `regexped merge`, or a **WASM Component Model component** with a generated WIT interface, composed with its consumer by the same `regexped merge`. Single patterns and pattern sets work in both (a set's `hints: [batch-find]` is module-only); the generated Rust and C stubs have the same API in both, so switching formats changes no calling code
 - Configurable via YAML
 
 ## Installation
@@ -36,7 +35,22 @@ cd regexped
 go build -o regexped .
 ```
 
-**External dependency:** [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen toolkit) — required for the `merge` command.
+Building from source needs Go 1.25 or newer.
+
+**External tools.** `regexped` shells out to three tools, each only where it is
+needed. A core-module `compile` and every `generate` need none of them.
+
+| Tool | Needed for |
+|---|---|
+| [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen) | `regexped merge` of core modules (`wasm_format: module`) |
+| [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) | components only (`wasm_format: component`): `regexped compile` wraps the core module into a component with it, and `regexped merge` checks each component's exports with it |
+| [`wac`](https://github.com/bytecodealliance/wac) | components only: `regexped merge` composes them with it |
+
+Each is found through `wasm_merge_path:`, `wasm_tools_path:` or `wac_path:` in the
+config, else on `PATH`. `get_wasm_merge.sh`, `get_wasm_tools.sh` and `get_wac.sh`
+in the repository download the latest release of each. Building your own host
+code needs its own toolchain (cargo, Go, clang, Node.js…) — see the environment
+guides below.
 
 Or use the official Docker image — no local install needed:
 
@@ -50,7 +64,7 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 ## Usage
 
 - **CLI** — see [cli.md](cli.md) for all commands, flags, and config schema.
-- **Docker** — see [docker.md](docker.md); official image [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped) includes `wasm-merge`.
+- **Docker** — see [docker.md](docker.md); official image [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped) includes `wasm-merge`, `wasm-tools` and `wac`.
 
 ## Documentation
 
@@ -62,14 +76,17 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 - [JavaScript API](js-api.md) — generated JS ES module and generator functions
 - [TypeScript API](ts-api.md) — generated TS ES module with typed generator functions
 - [AssemblyScript API](as-api.md) — generated AS module with typed iterator classes
-- [C API](c-api.md) — generated C header with static iterator functions
+- [C API](c-api.md) — generated C header with caller-owned iterators
 
 **Environments**
 - [Browser embedding](browser.md) — standalone WASM, JS/TS stub, no merge needed
 - [Node.js](node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
-- [wasmtime](wasmtime.md) — embedded WASM merged with a Rust/Go/C/AssemblyScript host, run via the `wasmtime` CLI or any wasmtime embedding
+- [wasmtime](wasmtime.md) — embedded WASM merged with a Rust/Go/C/AssemblyScript host, or a component composed with its guest, run via the `wasmtime` CLI or any wasmtime embedding
 - [Cloudflare Workers](workers.md) — standalone WASM, JS module import, isolate-level init
 - [Gcore FastEdge](fastedge.md) — embedded WASM, Rust stubs, merge workflow
+
+**Component Model**
+- [Components](component.md) — `wasm_format: component`: the WIT interface, naming, versioning, stubs and costs
 
 **Sets**
 - [Pattern sets](sets.md) — multi-pattern composition, YAML schema, output format, frontend selection
@@ -85,7 +102,7 @@ Examples are available for the following environments: wasmtime, native Rust hos
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-Most build a core WASM module. **[`wasmtime/rust/secrets`](../examples/wasmtime/rust/secrets) 🧩** builds a **Component Model component** instead, consumed through a generated Rust stub and composed by `regexped merge` — see [component.md](component.md).
+Most build a core WASM module. Three build **Component Model components** 🧩: [`wasmtime/rust/secrets`](../examples/wasmtime/rust/secrets) instead of a module, consumed through a generated Rust stub and composed by `regexped merge`; [`wasmtime/rust/secret-scanner`](../examples/wasmtime/rust/secret-scanner) and [`wasmtime/c/url-parts`](../examples/wasmtime/c/url-parts) alongside a module, from the same source — see [component.md](component.md).
 
 See [`examples/README.md`](../examples/README.md) for more details, including which format each example builds.
 
@@ -119,9 +136,9 @@ See [`examples/README.md`](../examples/README.md) for more details, including wh
 
 Regexped is almost dependency-free. The only compile-time dependency is [`github.com/goccy/go-yaml`](https://github.com/goccy/go-yaml) for YAML config parsing. All regexp compilation, WASM emission, and stub generation are implemented from scratch with no external libraries.
 
-The `wasmtime-go` binding is used only in the `tools/re2test/`, `tools/perftest/`, `tools/likelytest/`, and `tools/pattest/` testing tools and is not a part of the main tool.
+The `wasmtime-go` binding is used only by the testing and benchmarking tools under `tools/` (`fuzz`, `re2test`, `perftest`, `setperf`, `likelytest`, `pattest`, `settest`) and is not a part of the main tool.
 
-[`wasm-merge`](https://github.com/WebAssembly/binaryen) (from the Binaryen toolkit) is an external binary required only for the `merge` command. It must be installed separately using `get_wasm_merge.sh` shell script.
+The external tools it shells out to — `wasm-merge`, `wasm-tools` and `wac` — and where each is needed are listed under [Installation](#installation).
 
 ## License
 

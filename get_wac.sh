@@ -10,13 +10,19 @@
 # than a tarball, so there is nothing to unpack.
 #
 # Usage: ./get_wac.sh [dest-dir]     (default: alongside this script)
+#
+# With an EXPLICIT dest-dir the PATH short-circuit is skipped, as in
+# get_wasm_tools.sh: the caller wants the release binary in that directory. The
+# Docker build is that caller — the release asset is a static musl binary, while
+# a wac found on the host's PATH (a `cargo install`, say) may be linked against
+# the host's glibc, which the image need not match.
 
 set -euo pipefail
 
 DEST_DIR="${1:-$(cd "$(dirname "$0")" && pwd)}"
 DEST="$DEST_DIR/wac"
 
-if command -v wac >/dev/null 2>&1; then
+if [ -z "${1:-}" ] && command -v wac >/dev/null 2>&1; then
     echo "wac already in PATH ($(command -v wac)), skipping download"
     exit 0
 fi

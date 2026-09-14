@@ -8,6 +8,7 @@ COMP_CFG   := regexped-component.yaml
 COMP_DIR   := component
 COMP_WASM  := $(COMP_DIR)/secrets.wasm
 COMP_WIT   := $(COMP_DIR)/secrets.wit
+COMP_STAMP := $(COMP_DIR)/.built
 
 INPUTS := "nothing sensitive here" \
           "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" \
@@ -45,8 +46,15 @@ run: compile build
 # Step 1 - compile the same set into a component, plus the sibling .wit the host
 # binds against. The .wit is a prerequisite of the host binary, not just an
 # artefact: bindgen! reads it at COMPILE time.
-$(COMP_WASM) $(COMP_WIT): $(COMP_CFG) $(REGEXPED)
+#
+# ONE recipe for both files, through a stamp. `regexped compile` writes the
+# component AND its .wit, but a rule naming both as targets is two independent
+# recipes to make: under `make -j` both could run at once, writing the same files.
+$(COMP_STAMP): $(COMP_CFG) $(REGEXPED)
 	$(REGEXPED) compile --config=$(COMP_CFG)
+	@touch $@
+
+$(COMP_WASM) $(COMP_WIT): $(COMP_STAMP) ;
 
 component: $(COMP_WASM)
 

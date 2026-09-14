@@ -109,14 +109,12 @@ docker: regexped
 	# wasm-tools and wac are needed inside the image for `wasm_format:
 	# component`, the same way wasm-merge is needed for a module `regexped
 	# merge`: wasm-tools wraps the core module into a component, wac composes it
-	# with the consumer. wasm-tools is fetched INTO the build context with an
-	# explicit destination, which skips the script's PATH short-circuit: a
-	# wasm-tools copied from the host's PATH may be linked against a glibc the
-	# image does not have. wac's release asset is a static musl binary, so its
-	# copy fallback stays.
+	# with the consumer. Both are fetched INTO the build context with an
+	# explicit destination, which skips each script's PATH short-circuit: a
+	# copy taken from the host's PATH may be linked against a glibc the image
+	# does not have. Nothing is ever copied from the host.
 	./get_wasm_tools.sh "$(CURDIR)"
-	./get_wac.sh
-	@test -f wac || cp "$$(command -v wac)" ./wac
+	./get_wac.sh "$(CURDIR)"
 	docker build -t regexped .
 
 lint:

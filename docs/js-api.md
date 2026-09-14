@@ -47,27 +47,16 @@ await init(wasm);
 export function <func>(input: string | Uint8Array): number | null
 ```
 
-Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
-
-To test whether the full input matches (anchored at both ends):
+Matches the pattern against the **whole** input. Returns the end position — on a match, the input's length in bytes — or `null` when the input does not match. A pattern compiled to the Backtracking engine **throws** when it exhausts its frame budget, because the answer is then unknown rather than negative; see below.
 
 ```js
-const enc = new TextEncoder();
-const bytes = enc.encode('https://example.com/path');
-const end = url_match(bytes);
-if (end === bytes.length) {
+const end = url_match('https://example.com/path');
+if (end !== null) {
     console.log('valid URL');
 }
 ```
 
-For start-anchored use cases where the end position matters:
-
-```js
-const end = url_match(input);
-if (end !== null) {
-    console.log('matched first', end, 'bytes');
-}
-```
+A pattern that should accept text around the match has to say so itself, e.g. `.*` on either side, or use `find_func`.
 
 ---
 

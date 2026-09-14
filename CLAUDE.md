@@ -557,11 +557,11 @@ Function names are the config values VERBATIM; FFI shims use the `ffi_` prefix.
 
 **JS stubs** (`generate/js_stub.go`):
 
-Generated as a single ES module using top-level `await`. Loads the merged WASM (`output` field) and exports:
+Generated as a single ES module. `init()` takes the WASM bytes (or a compiled `WebAssembly.Module`) and must be awaited first; it exports:
 
 | Field | JS export | Returns |
 |---|---|---|
-| `match_func` | `function <func>(input)` | `boolean` |
+| `match_func` | `function <func>(input)` | `number \| null` — the end position, or null; throws on Backtracking overflow |
 | `find_func` | `function* <func>(input)` | generator of `[start, end]` |
 | `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
 

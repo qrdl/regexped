@@ -53,14 +53,16 @@ await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
 Input can be a `string` or `Uint8Array`.
 
-### `match_func` — boolean validation
+### `match_func` — validation
 
 ```js
-const [end, ok] = email_match('user@example.com');
-const valid = ok && end === input.length;   // true — full input matched
+const valid = email_match('user@example.com') !== null;   // true
 ```
 
-Returns `[endPos, matched]`. `matched` is true if the pattern matched; `endPos` is the byte position where the match ended. For full-string validation, check both `matched` and `end === input.length`.
+Matches the pattern against the **whole** input and returns the end position —
+on a match, the input's length in bytes — or `null`. A pattern compiled to the
+Backtracking engine throws when it exhausts its frame budget: the answer is then
+unknown, not "invalid". See [js-api.md](js-api.md).
 
 ### `find_func` — scan for all matches
 
@@ -120,9 +122,7 @@ for (const match of parse_url(text)) {
     await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
     document.getElementById('email').addEventListener('input', e => {
-      const bytes = new TextEncoder().encode(e.target.value);
-      const [end, ok] = email_match(bytes);
-      const valid = ok && end === bytes.length;
+      const valid = email_match(e.target.value) !== null;
       e.target.style.borderColor = valid ? 'green' : 'red';
     });
   </script>

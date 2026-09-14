@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
@@ -27,6 +28,14 @@ import (
 func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if !cfg.Component() {
 		return fmt.Errorf("component.CmdCompile called for wasm_format: %q", cfg.WasmFormat)
+	}
+	// An output already named *.wit IS its own sibling interface path: the staged
+	// WIT and the staged component would be one file, the component would
+	// overwrite the interface, and the build would end with no .wit at all.
+	// Refused before anything is compiled or written. Compared without case,
+	// because on a case-insensitive filesystem `x.WIT` and `x.wit` are one file too.
+	if output != "-" && strings.EqualFold(WitPathFor(output), output) {
+		return fmt.Errorf("output %q: the component and its sibling .wit would be the same file; give the output another extension, such as .wasm", output)
 	}
 	var rep *compile.Reporter
 	if report != nil {
