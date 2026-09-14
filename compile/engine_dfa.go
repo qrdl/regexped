@@ -71,7 +71,7 @@ type dfa struct {
 	// nfaBoundaryTargetIsAmbiguous's doc comment for the full mechanism.
 	// Compile-time only; consulted by dfaHasAmbiguousBoundaryTarget to route
 	// affected patterns to Backtracking, mirroring dfaHasOutrankedState's
-	// (#15) established precedent.
+	// established precedent.
 	hasAmbiguousBoundaryTarget bool
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
@@ -245,8 +245,8 @@ func isDominantAccept(prog *syntax.Prog, states []uint32, ctx int) bool {
 // whatever context that state's own plain midAccept bit (dfa.midAccepting)
 // is computed under, and it must be included in `boundaryCtx` too (callers
 // already do this — see e.g. state 0's `ecBegin|ecNoWordBoundary`). Passing
-// a bare 0 here regardless of the state's true baseline was a real defect
-// #18's cause (1): for `(?:a*)+^`, walking state 0's closure hits the `^`
+// a bare 0 here regardless of the state's true baseline was a real defect:
+// for `(?:a*)+^`, walking state 0's closure hits the `^`
 // node itself (not any \b/\B) — under boundaryCtx=ecBegin|ecNoWordBoundary
 // it resolves (ecBegin present), under a bare ctx=0 comparison it doesn't
 // (ecBegin absent), so the plain `^` node was wrongly read as a
@@ -901,7 +901,7 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 
 // newDFAWide is newDFA for a merged set bucket holding MORE than 64 patterns,
 // where the u64 accept bitmask every other path uses has run out of bits
-// (G17 sparse accept).
+// (sparse accept).
 //
 // patternIdx is per-PC and is set for EVERY instruction of pattern k, not only
 // its InstMatch — mirroring buildUnionProg's bits exactly. That is load-bearing
@@ -980,7 +980,7 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// inherit). It must be OR'd into every expandWithWB call made against
 		// this item's nfaSet below, mirroring what the mid-accept computations
 		// above already do for these same two bootstrap items
-		// #12) — otherwise a pending \b/\B node resolved by expandWithWB can gate
+		// — otherwise a pending \b/\B node resolved by expandWithWB can gate
 		// a nested ^/(?m:^) node whose begin-context was only ever recorded on
 		// the item's initial closure, not carried into its transition expansion.
 		beginCtx int
@@ -1658,15 +1658,15 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 					nfaSet:      nextSet,
 					prevWasWord: nextPrevWasWord,
 					// Carry the '\n'-reached context into the queued item.
-					// Bug #27's fix folds nlCtx into this
+					// The newline-context fix folds nlCtx into this
 					// state's ACCEPT bitmasks above, but the item drives the
 					// state's TRANSITION build on the next queue iteration,
 					// where expandWithWB runs under item.beginCtx. Without
 					// these two fields that expansion loses ecBeginLine, so a
 					// \b/\B resolved by the incoming byte cannot gate a
 					// nested (?m:^) — the transition-time sibling of the
-					// accept-time defects #12/#27. `\n\b(?m:^x)` on "\nx"
-					// found no match. Sound for the same reason #27 is:
+					// accept-time defects fixed above. `\n\b(?m:^x)` on "\nx"
+					// found no match. Sound for the same reason the accept-time fix is:
 					// '\n'-reached states are distinct DFA states (setToKey's
 					// 'N' suffix) for which ecBeginLine genuinely always
 					// holds; every other item keeps beginCtx 0.
@@ -2039,7 +2039,7 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 // stay in the tens of states; the fuzzer's 1656-character repro produced a
 // 1661-state, 1658-pass chain) forces close to n passes, each re-scanning
 // the not-yet-singleton remainder — O(n^2) total, independent of and
-// additional to newDFA's own (already memoized, see bug 7) subset-
+// additional to newDFA's own (already memoized) subset-
 // construction cost. Past this many passes, minimization is abandoned
 // entirely: the function returns before ever mutating t, so the DFA is
 // emitted unminimized rather than partially refined — merging states from
@@ -2047,8 +2047,8 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 // equivalent could still be distinguished by a later pass), so "stop early
 // and keep what we have" is not a safe option here; "stop early and change
 // nothing" is. This trades a handful of extra (unmerged) states in the
-// output table for bounded worst-case compile time — measured on the bug 11
-// repro (1661 states, 1658 passes to convergence): the fully-linear chain
+// output table for bounded worst-case compile time — measured on a
+// fuzzer repro (1661 states, 1658 passes to convergence): the fully-linear chain
 // only distinguishes states 1-for-1 (1661 states minimize to 1660 — one
 // merge, total), so skipping minimization past the cap costs nothing in
 // table size for this pattern family, only compile time.
@@ -2481,8 +2481,8 @@ type dfaLayout struct {
 	// implementation, per the task's own instruction: dense/long runs
 	// measured -41%..-55% fuel; a run right at the pattern's own minimum
 	// length measured +12% (bounded "LM contract cost" residual, same shape
-	// as LM-3/LM-4's short-run guard cases, covered by the shared task-38
-	// hysteresis).
+	// as the LikelyMatch Shufti channels' short-run guard cases, covered by
+	// the shared hysteresis).
 	lmWideShufti bool
 
 	// lmClassChain enables the chain-start SIMD verify (see
@@ -2538,7 +2538,7 @@ type dfaLayout struct {
 	// state transitions combined with compiled self-loop inner blocks.
 	useHybridDispatch bool
 
-	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phases 1–3).
+	// Dominant self-loop SIMD bulk-skip detection.
 	//
 	// dominantStates lists every DFA state that qualifies for SIMD bulk-skip:
 	//   - ≥ 240/256 byte classes self-loop;
@@ -2564,7 +2564,7 @@ type dfaLayout struct {
 	// needed — the dominantInfo.state value is embedded directly into the
 	// emitted `i32.const + i32.eq + if` chain.
 
-	// lnmAction5 (LNM Action 5 — impossible-byte SIMD skip): set by
+	// lnmAction5 (impossible-byte SIMD skip): set by
 	// compilePattern when buildOpts.LikelyMode == LikelyNoMatch. Threaded
 	// into prefixScanParams.LikelyNoMatch by appendFindCodeEntry so the
 	// 17..64-byte first-byte set Shufti gate ignores the density heuristic.
@@ -3331,7 +3331,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	}
 	l.tableEnd = tableEnd
 
-	// Opt 1 — LikelyNoMatch dominant self-loop detection (Phase 1).
+	// Dominant self-loop detection.
 	// Detection is unconditional and cheap (one pass over the WASM transition
 	// table); emission is gated separately at the call site.
 	detectDominantSelfLoop(l)
@@ -4008,7 +4008,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		// '\n' to be an EXIT byte, so the skip always stops there and the
 		// resumed per-byte loop runs the newline pre-accept check at that
 		// position. This is the channel blind spot in a
-		// different skipper (#41 is the inter-attempt advance; this is the
+		// different skipper (skipSafeOnDead's is the inter-attempt advance; this is the
 		// intra-attempt SIMD skip).
 		//
 		// The word channels get the same treatment defensively. They are
@@ -4116,7 +4116,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // Encoding: midAcceptBytes[state] = 128 + idx, a third sub-range alongside
 // detectDominantSelfLoop's own 2..127 (mid dominants) — 0 = nothing,
 // 1 = plain mid-accept, 2..127 = exit-based dominant idx, 128..253 = Shufti
-// self-loop idx, 254..255 = non-mid dominant (exit-based OR, under LM-3,
+// self-loop idx, 254..255 = non-mid dominant (exit-based OR, under LikelyMatch,
 // Shufti self-loop). Mid channel capped at 126 entries, matching the
 // existing per-kind cap; non-mid channel capped at 2 (shared with
 // detectDominantSelfLoop, the encoding constraint).
@@ -4149,7 +4149,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 // `(\w+)` (min 1, no lower bound at all) measured a +7% dense-match fuel
 // REGRESSION: the fixed SIMD chunk-scan setup this lifts costs more than
 // it saves when the typical match is a handful of bytes, exactly the
-// frequency argument the original (pre-LM-4) gate's doc comment made.
+// frequency argument the original gate's doc comment made, before the bare-prefix relaxation.
 // minLMBareShuftiLen draws the line between those two measured outcomes.
 func detectShuftiSelfLoop(l *dfaLayout) {
 	const minWidth = 9
@@ -4197,7 +4197,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		}
 		isMid := int(state) < len(l.midAcceptBytes) && l.midAcceptBytes[state] != 0
 		if !isMid {
-			// LM-3: non-mid-accept channel, LikelyMatch-gated, shares the
+			// Non-mid-accept channel, LikelyMatch-gated, shares the
 			// 254/255 encoding space with detectDominantSelfLoop's non-mid
 			// entries.
 			if !l.lmNonMidShufti || nonMidIdx >= maxNonMid {
@@ -4267,7 +4267,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 }
 
 // minLMBareShuftiLen is the compile-time-guaranteed minimum match length
-// (regexpMinMaxLen) required before lmBareShuftiEligible allows LM-4's
+// (regexpMinMaxLen) required before lmBareShuftiEligible allows the
 // bare-prefix gate to lift. See detectShuftiSelfLoop's doc comment for the
 // measurements behind this threshold: 8 keeps the confirmed win
 // (`[A-Z]{8,}`, min 8) while excluding the confirmed regression
@@ -4717,10 +4717,10 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// gated the position (a suffix body runs only at a candidate), so the
 	// frequency argument that motivates it does not transfer. What remains is
 	// the per-candidate setup cost on short runs, which is the LM contract's
-	// to accept and the task-38 hysteresis's to bound.
+	// to accept and the non-mid hysteresis's to bound.
 	//
 	// lmBareShufti carries no minimum-match-length check here, unlike the
-	// single-pattern LM-4 gate it mirrors: that gate reads a PATTERN STRING
+	// single-pattern bare-prefix gate it mirrors: that gate reads a PATTERN STRING
 	// (lmBareShuftiEligible re-parses it) and a suffix DFA has no pattern to
 	// re-parse — a bucket may hold several. The equivalent bound is the
 	// hysteresis, plus the short-run likelytest guard case.
@@ -4797,7 +4797,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		nlBitmaskOff = wbWDomBitmaskOff + int32(l.numWASM)*8
 	}
 
-	// G8 liveness table, placed after every other per-state table.
+	// Liveness table, placed after every other per-state table.
 	futureOff := int32(0)
 	if needFuture {
 		futureOff = nlBitmaskOff + int32(l.numWASM)*8
@@ -4864,7 +4864,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		p.wbNWDomBitmaskOff = wbNWDomBitmaskOff
 		p.wbWDomBitmaskOff = wbWDomBitmaskOff
 	}
-	// G17: a bucket whose accept is a per-state LIST takes the sparse body,
+	// Sparse accept: a bucket whose accept is a per-state LIST takes the sparse body,
 	// which walks that list instead of unrolling one compare per pattern —
 	// the only shape that can serve more patterns than the mask has bits.
 	// Its tables and scratch go after everything the layout already placed.
@@ -4892,7 +4892,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			// the index comes from an allocator instead of address arithmetic,
 			// and a body reading a global its assembler never declared fails
 			// WASM validation rather than reading whatever sits at a stale
-			// offset (TODO 75 group A's defect class, applied here).
+			// offset — the reason the window offsets became globals too.
 			//
 			// Allocated ONLY when the skip is emitted, which is the same
 			// condition the per-state flags are sized on — so a neutral build
@@ -5008,7 +5008,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 // probes come from genAnchoredWASM over those buckets. This struct used to
 // carry one built from the find-path DFAs that nothing ever read.
 type suffixArtifacts struct {
-	// sparseScratch is where a G17 sparse body keeps its working arrays;
+	// sparseScratch is where a sparse body keeps its working arrays;
 	// the driver needs the same address to read back probe results.
 	sparseScratch    sparseScratch
 	sparseIDMapOff   int32
@@ -5055,7 +5055,7 @@ type setSuffixParams struct {
 	futureOff int32
 
 	// future is that same table in Go, indexed by WASM state id, populated
-	// exactly when futureOff != 0. G10 needs the value as a
+	// exactly when futureOff != 0. The liveness guard needs the value as a
 	// compile-time constant rather than a load: the bulk-skip's liveness
 	// guard sits on an arm whose state is already known statically.
 	future []uint64
@@ -5146,7 +5146,7 @@ func appendInputLoad8u(b []byte) []byte {
 // disjoint at runtime and the word test can front the newline test.
 //
 // Shared with buildSetProbeBody (compile/set_probe.go): this logic existed
-// there as a second copy, which is how R4 came to be present twice.
+// there as a second copy, which is how one bug came to be present twice.
 func emitSetEntryState(b []byte, p setSuffixParams, paramPtr, paramStart byte) []byte {
 	l := p.l
 	tableMemIdx := p.tableMemIdx
@@ -5593,7 +5593,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 
 	b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01) // pos>=len: br $done
 
-	// G9 liveness exit: stop when no pattern this call
+	// Liveness exit: stop when no pattern this call
 	// still WANTS can accept from here.
 	//
 	// `find` records extents rather than a bitmask, so unlike the probe there
@@ -5657,9 +5657,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// matching the per-byte update the elided iterations would have done.
 	// lBitsScratch is preserved across emitDominantBulkSkip (it only
 	// clobbers lByteClass/lBulkChunk), so we re-read it for the update.
-	// G10: liveness guard on the bulk-skip.
+	// Liveness guard on the bulk-skip.
 	//
-	// The G9 exit at the loop top is DEFEATED by the skip below it: on a
+	// The liveness exit at the loop top is DEFEATED by the skip below it: on a
 	// corpus with no exception byte the skip runs to end of input inside the
 	// very iteration before the exit would have fired, and the loop re-enters
 	// at pos >= len. Since the skip's arm already knows its state D
@@ -5753,7 +5753,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		}
 	}
 
-	// G11: the INVERTED bulk skip, for states whose
+	// The INVERTED bulk skip, for states whose
 	// SELF-LOOP is the small side. Dispatched by state-ID compare, like the
 	// non-mid arm above, because these states are not in midAcceptBytes'
 	// encoded value space at all — they come from memberWalkStates, which is
@@ -6502,7 +6502,7 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 //	    [non-mid dispatch — emitNonMidValDispatch + hysteresis; NO last_accept]
 //
 // When the pattern has no non-mid entries the split is not emitted and the
-// sequence is byte-identical to the pre-task-38 mid-only emission. Under
+// sequence is byte-identical to the mid-only emission that predates the non-mid channel. Under
 // useMandatoryLit the dominant dispatches are suppressed (pre-existing
 // behaviour) but the val < 254 split is still REQUIRED whenever non-mid
 // values are present in the table — without it a plain `!= 0` check would
@@ -7531,7 +7531,7 @@ func dfaHasOutrankedState(t *dfaTable) bool {
 // nfaBoundaryTargetIsAmbiguous's doc comments for the full mechanism.
 // Compile-time only: called from compile.go's dfaTooLarge decision to route
 // affected find-mode patterns to Backtracking, the same precedent
-// dfaHasOutrankedState (#15) established for a sibling blind spot.
+// dfaHasOutrankedState established for a sibling blind spot.
 func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
 	return t.hasAmbiguousBoundaryTarget
 }
@@ -8076,17 +8076,17 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 //
 // Instead of walking backward one byte at a time through a reverse DFA,
 // this verifies all M bytes in one shot with the same SIMD nibble-lookup
-// technique Gap E's emitPrefixClassVerify already uses for
+// technique the mixed-prefix path's emitPrefixClassVerify already uses for
 // `<class>{M}<literal><class>{N}` patterns — reused here unchanged, just
-// reached from the generic lit-anchor path instead of Gap E's bespoke one
-// (see simpleClassPrefix's doc comment for why Gap E's own analyser can't
+// reached from the generic lit-anchor path instead of the mixed-prefix path's bespoke one
+// (see simpleClassPrefix's doc comment for why that path's own analyser can't
 // reach this shape when the suffix is unbounded, e.g. `[^\n]+`).
 //
 // LikelyNoMatch-gated at the call site (compile.go) rather than always-on:
 // this is a strict improvement over the generic walk with no runtime
 // trade-off, but it's new code on a path re2test exercises comparatively
 // rarely, so it ships gated first and can be promoted to default-on later
-// once measured across more of the corpus (same rollout precedent as Opt 1).
+// once measured across more of the corpus (same rollout precedent as the dominant-self-loop bulk-skip).
 func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 	var b []byte
 
@@ -8907,7 +8907,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	// Teddy has false positives, so every candidate is verified byte-for-byte
 	// against every branch's literal(s) before trusting it. Declaration
 	// order is the same-position tie-break (mirrors the existing $try_litN
-	// chain in buildLitAnchorFindBody and Gap E's $next_branch_i chain).
+	// chain in buildLitAnchorFindBody and the mixed-prefix path's $next_branch_i chain).
 	//
 	// Control-flow depths at this point (outside any nested block):
 	//   0 = $outer (loop — br 0 restarts it), 1 = $no_match (block)
@@ -9173,7 +9173,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 
 	// numV128ForScan computes how many v128 locals emitPrefixScan will
 	// actually reference for this pattern's scan strategy, plus whether
-	// Opt 1's dominant-self-loop bulk-skip needs its own `chunk` register
+	// the dominant-self-loop bulk-skip needs its own `chunk` register
 	// independent of the scan. buildFindBody previously reserved up to 12
 	// v128 locals unconditionally (the full Teddy shape) even when the
 	// Shufti/multi-eq or literal-prefix strategies — which reference only
@@ -9218,7 +9218,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		// else: scalar firstByteFlags — no SIMD locals needed
 	}
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
-		numV128ForScan = 1 // Opt 1 bulk-skip needs its own `chunk` register
+		numV128ForScan = 1 // dominant bulk-skip needs its own `chunk` register
 	}
 	// needsDenseSwitch: this pattern got Shufti from a LikelyNoMatch
 	// assertion the static rarity model would not have made on its own —
@@ -10173,14 +10173,14 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
-		// Opt 1: one midAccept[state] load feeds the accept
+		// One midAccept[state] load feeds the accept
 		// update AND both dominant channels via the value ranges written
 		// by applyDominantStateEncoding(l, true):
 		//   val == 0       → nothing
 		//   1 <= val < 254 → mid-accept: last_accept = pos+1 (+ mid dispatch)
 		//   val >= 254     → non-mid dominant dispatch (NO last_accept)
 		// The val < 254 split is emitted only when non-mid values are in
-		// the table, so mid-only patterns keep the exact pre-task-38
+		// the table, so mid-only patterns keep the exact mid-only
 		// instruction sequence.
 		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
 			midAcceptOff, tableMemIdx,
@@ -10258,7 +10258,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
 		b = append(b, 0x0B) // end if
 
-		// Opt 1: one midAccept[state] load feeds the accept
+		// One midAccept[state] load feeds the accept
 		// update and both dominant channels — see the u8+compressed path
 		// above and emitFindMidAcceptDispatch for the value-range scheme.
 		b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
@@ -10405,7 +10405,7 @@ type litChainPattern struct {
 	count    int      // N — minimum chain length (N >= 1, K+N >= 16)
 	countMax int      // M — maximum chain length (M >= N). Equals count for {N,N}.
 	greedy   bool     // false for `{N,M}?`; only matters when count < countMax
-	// Gap E: optional class prefix `<class>{prefixCount}` BEFORE the literal.
+	// Mixed-prefix shape: optional class prefix `<class>{prefixCount}` BEFORE the literal.
 	prefixCount  int      // 0 = no prefix (classic shape)
 	prefixBitmap [32]byte // scalar prefix verify
 	prefixTlo    [16]byte // SIMD prefix verify
@@ -10427,7 +10427,7 @@ func (p *litChainPattern) hasAnchor() bool {
 // gate — callers decide per-context (single-pattern gate vs. per-branch gate
 // inside an alternation).
 //
-// Gap E: optional class prefix `<class>{prefixCount}` BEFORE the literal.
+// Mixed-prefix shape: optional class prefix `<class>{prefixCount}` BEFORE the literal.
 // prefixCount == 0 → original `<literal><class>{N,N}` shape.
 // prefixCount > 0  → mixed-prefix shape `<class>{prefixCount}<literal><class>{N,N}`.
 type litChainBranchInfo struct {
@@ -10438,7 +10438,7 @@ type litChainBranchInfo struct {
 	countMax int      // M (max); equals count for {N,N}
 	greedy   bool     // false for `{N,M}?`
 
-	// Gap E: prefix-class fields. prefixCount == 0 means no prefix.
+	// Mixed-prefix fields. prefixCount == 0 means no prefix.
 	prefixCount  int      // M_prefix (fixed; ranges deferred)
 	prefixBitmap [32]byte // 256-bit byte-class bitmap (scalar prefix verify)
 	prefixTlo    [16]byte // nibble table (SIMD prefix verify)
@@ -10467,7 +10467,7 @@ const (
 //   - class is OpCharClass / OpLiteral / OpAnyCharNotNL / OpAnyChar, ASCII-only
 //   - N >= 1 (counted, not range)
 //   - K + N >= 16 (so the SIMD overlap-load tail covers all class bytes)
-//   - N >= minCount (LM-1: callers pass 24 under neutral/LikelyNoMatch, 1
+//   - N >= minCount (callers pass 24 under neutral/LikelyNoMatch, 1
 //     under LikelyMatch)
 func analyseLitChain(pattern string, minCount int) (*litChainPattern, bool) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
@@ -10493,7 +10493,7 @@ func analyseLitChainRe(re *syntax.Regexp, minCount int) (*litChainPattern, bool)
 	// wall-time regression appears at N=16 despite fuel parity. The win
 	// flips clearly positive by N=36 and grows with N. 24 is the empirical
 	// threshold. (Per-branch gate inside alternations applies separately in
-	// analyseLitChainAlt.) LM-1: under LikelyMatch, the wall-time-only
+	// analyseLitChainAlt.) Under LikelyMatch, the wall-time-only
 	// regression that justified 24 is suspected to be placement noise
 	// rather than a fuel cost, so callers pass a lower
 	// minCount to trade a possible sparse-input wall-time cost for a large
@@ -10522,7 +10522,7 @@ type litChainAltBranch struct {
 	countMax int      // M (max); equals count for {N,N}
 	greedy   bool     // false for `{N,M}?`
 	useSIMD  bool     // N >= 24 → SIMD chunks; else scalar byte-by-byte
-	// Gap E: optional class prefix.
+	// Mixed-prefix shape: optional class prefix.
 	prefixCount  int
 	prefixBitmap [32]byte
 	prefixTlo    [16]byte
@@ -10575,7 +10575,7 @@ func analyseLitChainRange(pattern string, minCount int) (*litChainPattern, bool)
 // endAnchor can be emitted with an end-anchor check performed *only* at the
 // maximal match length — which is all emitLitChainAltLitBranchBodyRange does.
 //
-// FABLE B11. Perl/RE2 greedy semantics try the longest length first and back
+// Perl/RE2 greedy semantics try the longest length first and back
 // off one byte at a time while the trailing assertion fails, so an at-max-only
 // check is correct only when no shorter length in [N, max) could satisfy the
 // anchor that the maximal length fails:
@@ -10651,7 +10651,7 @@ func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 		if info.countMax > info.count {
 			hasRange = true
 			if !info.greedy {
-				// FABLE B10, alternation sibling.
+				// The alternation sibling of the non-greedy collapse problem:
 				// buildLitChainAltRangeFindBody collapses a non-greedy branch
 				// to {N,N} and then emits the fixed-count body, which checks
 				// the end anchor at exactly N. Perl lets `{N,M}?` extend past
@@ -10663,7 +10663,7 @@ func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 					return nil, false
 				}
 			} else if !rangeEndAnchorSafe(info.endAnchor, info.bitmap) {
-				return nil, false // FABLE B11
+				return nil, false // see rangeEndAnchorSafe
 			}
 		}
 		branches = append(branches, litChainAltBranch{
@@ -10685,17 +10685,17 @@ func analyseLitChainAltRange(pattern string) (*litChainAltPattern, bool) {
 }
 
 // analyseLitChainAltPrefixed parses pattern as a strict alternation where
-// every branch matches Gap E mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
+// every branch matches the mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 // All branches must have prefixCount > 0 (otherwise the classic strict-alt
 // path handles it).
 //
 // Two shapes are rejected outright because the shared prefixed branch emitter
 // cannot express them:
 //
-//   - FABLE B6: any branch carrying a start or end anchor.
+//   - any branch carrying a start or end anchor.
 //     emitLitChainAltLitBranchBodyPrefixed never references startAnchor /
 //     endAnchor, so anchors were silently dropped.
-//   - FABLE B9: branches whose prefixCount differs. The candidate scan
+//   - branches whose prefixCount differs. The candidate scan
 //     discovers literals in *literal* position order, but each branch reports
 //     a match start of `attempt_start - prefixCount`. With unequal
 //     prefixCounts the two orders diverge and the emitted body can return a
@@ -10725,7 +10725,7 @@ func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 			return nil, false // ranges not supported with prefix yet
 		}
 		if info.startAnchor != anchorNone || info.endAnchor != anchorNone {
-			return nil, false // B6
+			return nil, false // no mixed-prefix emitter handles anchors
 		}
 		if info.prefixCount == 0 {
 			allPrefixed = false
@@ -10734,7 +10734,7 @@ func analyseLitChainAltPrefixed(pattern string) (*litChainAltPattern, bool) {
 		if prefixCount == -1 {
 			prefixCount = info.prefixCount
 		} else if info.prefixCount != prefixCount {
-			return nil, false // B9
+			return nil, false // unequal prefix lengths break the scan order
 		}
 		branches = append(branches, litChainAltBranch{
 			literal:      info.literal,
@@ -10955,7 +10955,7 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 	}
 	// Accepted shapes (after anchor strip + capture unwrap):
 	//   2 elements: [OpLiteral, OpRepeat(class)]                    — classic lit-chain
-	//   3 elements: [OpRepeat(class), OpLiteral, OpRepeat(class)]   — Gap E mixed-prefix
+	//   3 elements: [OpRepeat(class), OpLiteral, OpRepeat(class)]   — mixed-prefix
 	if len(subs) != 2 && len(subs) != 3 {
 		return nil, false
 	}
@@ -11075,7 +11075,7 @@ func analyseLitChainBranch(re *syntax.Regexp) (*litChainBranchInfo, bool) {
 		endAnchor:   endAnchor,
 	}
 
-	// Gap E: parse the prefix class chain if present.
+	// Mixed-prefix shape: parse the prefix class chain if present.
 	if hasPrefix {
 		// Fixed count `{M,M}` only for now; ranges deferred.
 		if prefixNode.Min != prefixNode.Max || prefixNode.Min < 1 {
@@ -11668,7 +11668,7 @@ func emitLitChainAltLitBranchBodyRange(b []byte, br litChainAltBranch,
 	return b
 }
 
-// emitLitChainAltLitBranchBodyPrefixed is the Gap E counterpart of
+// emitLitChainAltLitBranchBodyPrefixed is the mixed-prefix counterpart of
 // emitLitChainAltLitBranchBody for mixed-prefix branches `<class>{M}<literal><class>{N}`.
 // Caller pre-loads VerifyPow2; this function loads br.prefixTlo for prefix
 // verify, then br.tlo for suffix verify, into locVerifyTlo.
@@ -11980,7 +11980,7 @@ func emitPrefixClassVerify(b []byte, m int,
 	return b
 }
 
-// buildLitChainPrefixedFindBody emits the find body for a Gap E mixed-prefix
+// buildLitChainPrefixedFindBody emits the find body for a mixed-prefix
 // pattern `<class>{M}<literal><class>{N}`. Signature: (ptr,len) → i64.
 //
 // The Teddy frontend scans for the literal; on hit, attempt_start is at the
@@ -12118,7 +12118,7 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 }
 
 // appendLitChainPrefixedFindCodeEntry appends a size-prefixed mixed-prefix
-// find body (Gap E single-pattern, find mode).
+// find body (single pattern, find mode).
 func appendLitChainPrefixedFindCodeEntry(cs []byte, lcp *litChainPattern, tableMemIdx int) ([]byte, findFromMode) {
 	body, mode := buildLitChainPrefixedFindBody(lcp, tableMemIdx)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
@@ -12126,7 +12126,7 @@ func appendLitChainPrefixedFindCodeEntry(cs []byte, lcp *litChainPattern, tableM
 }
 
 // buildLitChainPrefixedMatchBody emits the anchored full-input match body
-// for a Gap E mixed-prefix pattern. Signature: (ptr,len) → i32. Requires
+// for a mixed-prefix pattern. Signature: (ptr,len) → i32. Requires
 // `len == M + K + N` and the entire input to verify against `<class>{M}<lit><class>{N}`.
 func buildLitChainPrefixedMatchBody(lcp *litChainPattern) []byte {
 	var b []byte
@@ -12231,9 +12231,9 @@ func analyseLitChainPrefixed(pattern string) (*litChainPattern, bool) {
 		return nil, false // classic shape → existing path
 	}
 	if info.countMax != info.count {
-		return nil, false // ranges not yet supported on Gap E
+		return nil, false // ranges not yet supported on the mixed-prefix shape
 	}
-	// FABLE B6: none of the three Gap E prefixed emitters
+	// None of the three mixed-prefix emitters
 	// (buildLitChainPrefixedMatchBody / buildLitChainPrefixedFindBody /
 	// emitLitChainAltLitBranchBodyPrefixed) consults startAnchor/endAnchor,
 	// so an anchored mixed-prefix pattern silently matched as if unanchored
@@ -12459,7 +12459,7 @@ type captureGroup struct {
 	// endsAtVariableTail marks a capture whose extent runs to the end of a
 	// variable-length `{N,M}` repeat (N < M), so its end is only known at
 	// runtime and endOffset — a compile-time, Min-based figure — does not
-	// describe it. Recorded structurally by the walk; see FABLE B8.
+	// describe it. Recorded structurally by the walk; see extractLitChainCaptures.
 	// Always false for a fixed-count chain, where every offset really is
 	// compile-time.
 	endsAtVariableTail bool
@@ -12500,7 +12500,7 @@ func hasOpCapture(re *syntax.Regexp) bool {
 // arithmetic instead (`endOffset == K + countMax`) cannot work, because the
 // width is Min-based and Min ≠ Max is exactly what makes the chain a range:
 // the test never fired and every chain-covering capture got a frozen
-// `attemptStart + K + Min` end (FABLE B8, repro `A([0-9]{24,30})` on
+// `attemptStart + K + Min` end (repro `A([0-9]{24,30})` on
 // "A"+30 digits → stdlib `[0 31 1 31]`, WASM `[0 31 1 25]`).
 func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 	var caps []captureGroup
@@ -12640,7 +12640,7 @@ func analyseLitChainGroupsRange(pattern string) (*litChainPattern, *litChainCapt
 	if !info.greedy {
 		return nil, nil, false // collapse to {N,N} via existing path
 	}
-	// FABLE B7: buildLitChainRangeFindGroupsBody never consults
+	// buildLitChainRangeFindGroupsBody never consults
 	// startAnchor/endAnchor (unlike its fixed-count sibling, which has a
 	// full hasAnchors path), so anchored range shapes were matched as if
 	// unanchored. Reject them and let the DFA capture path handle them.
@@ -12882,7 +12882,7 @@ func emitLitChainRangeGroupSlotWrites(b []byte, lcc *litChainCaptures,
 // input length matches and literal + class + anchors verify, returns
 // total = K+N. Otherwise returns -1.
 //
-// Gap B target: replaces the DFA path for `match_func` on lit-chain
+// Replaces the DFA path for `match_func` on lit-chain
 // alternation patterns.
 func buildLitChainAltMatchBody(altp *litChainAltPattern) []byte {
 	var b []byte
@@ -13043,7 +13043,7 @@ func appendLitChainAltMatchCodeEntry(cs []byte, altp *litChainAltPattern) []byte
 // alternation (mixed lit-chain + DFA branches). Signature: (ptr,len) → i32.
 // Each branch is tried at pos 0; lit-chain branches use SIMD/scalar verify
 // with strict len == K+N, DFA branches run an inline anchored DFA and accept
-// iff last_accept == len. Gap B lenient target.
+// iff last_accept == len. The lenient counterpart of the strict alternation match body.
 func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) []byte {
 	var b []byte
 
@@ -13388,7 +13388,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 // `(ptr i32, len i32, out_ptr i32) → i32` returning end position on match
 // or -1 on no match.
 //
-// Native single-function variant of Gap A.3: combines the find body's
+// Native single-function variant of the lit-chain groups path: combines the find body's
 // SIMD scan + verify with inline slot writes. Eliminates the function-call
 // boundary and redundant verify of the wrapper-composition path.
 func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, tableMemIdx int) []byte {
@@ -13686,7 +13686,7 @@ func planRangeChunks(k, countMax int) []rangeChunk {
 // later ones. Avoids per-chunk `block`+`if`+`br` patterns that Cranelift's
 // register allocator handles poorly across the surrounding scan loop.
 //
-// FABLE B12 — over-read guard. Every caller bounds-checks only
+// Over-read guard. Every caller bounds-checks only
 // `base + K + countMin <= len`, but the chunk plan covers `[K, K+countMax)`
 // rounded up to a 16-byte multiple, so a chunk can read up to
 // `countMax - countMin + 15` bytes past `ptr+len`. The values read there
@@ -14518,7 +14518,7 @@ func appendLitChainAltFindGroupsCodeEntry(cs []byte, altp *litChainAltPattern,
 }
 
 // buildLitChainAltPrefixedFindBody emits the find body for a strict
-// alternation where every branch is mixed-prefix shape (Gap E). Signature:
+// alternation where every branch is mixed-prefix shape. Signature:
 // (ptr,len) → i64. Per-branch dispatch uses emitLitChainAltLitBranchBodyPrefixed.
 func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
@@ -14924,7 +14924,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 		}
 		// DFA branch: build its layout starting at cur. forceWordChar:
 		// emitInlineAnchoredDFAVerify now consults midAcceptW/NW
-		// #14) for branches with \b/\B, so those tables must actually be built
+		// for branches with \b/\B, so those tables must actually be built
 		// here — needFind is false for this layout, which would otherwise skip
 		// them (wantWordChar = needFind || forceWordChar[0]).
 		br.dfaLayout = buildDFALayout(dfaLayoutParams{
@@ -15125,7 +15125,7 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 // with a dense first-byte set (e.g. 'e','g','A' in ordinary English/config
 // text — ~1 candidate every 9-10 bytes), that per-candidate restart cost
 // dominated: measured at ~45 fuel/candidate, accounting for most of the
-// task-24 promotion regression on `secrets-combined` even after fixing the
+// lenient-alternation promotion regression on `secrets-combined` even after fixing the
 // separate per-branch DFA-verify cost (see that fix a few lines below).
 func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) ([]byte, findFromMode) {
 	const (
@@ -15345,8 +15345,8 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	// distinct literals rarely share a first byte) and dispatch straight to
 	// the matching group via br_table on the candidate byte value, instead
 	// of trying every branch's first-byte check in sequence. This is the
-	// second half of the task-24 fix: fix #1 (cheap literal pre-check) and
-	// fix #2 (mask persistence) address the cost of a false-positive
+	// second half of that promotion-regression fix: a cheap literal pre-check
+	// and mask persistence address the cost of a false-positive
 	// candidate; this addresses the cost of a TRUE-positive one still
 	// having to walk past every other branch's first-byte compare before
 	// reaching the right one.

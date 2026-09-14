@@ -855,7 +855,7 @@ func TestGenRustSetInner(t *testing.T) {
 	required := []string{
 		"SetMatch",
 		"range(self)",
-		"SCANNER_PATTERN_COUNT",                  // D16: the emitted constant
+		"SCANNER_PATTERN_COUNT",                  // the emitted constant
 		"SCANNER_ID_SPACE",                       // the id-space constant
 		"buf: [[i32; 3]; SCANNER_PATTERN_COUNT]", // tuples: at most one per pattern per position
 		"gates: [u32; SCANNER_ID_SPACE]",         // indexed by pattern id
@@ -875,9 +875,9 @@ func TestGenRustSetInner(t *testing.T) {
 	if strings.Contains(out, "SetAnchorMatch") {
 		t.Error("genRustSetInner: should not contain SetAnchorMatch (removed in 5.4.1)")
 	}
-	// D24/D15: `find` is iterator-only; no stateless probe variant exists.
+	// `find` is iterator-only; no stateless probe variant exists.
 	if strings.Contains(out, "set_findAt") {
-		t.Error("genRustSetInner: emitted a stateless find probe, which D24 removed")
+		t.Error("genRustSetInner: emitted a stateless find probe, which was removed")
 	}
 }
 
@@ -1696,7 +1696,7 @@ func TestDefaultBatchCapBounds(t *testing.T) {
 //
 // The descriptor in set_stub.go decides WHICH parameters a capability takes
 // and in what order; each speller decides only how one is written. That split
-// is the whole point of R12 — the generators stopped deciding the ABI — and it
+// is the whole point of the shared descriptor — the generators stopped deciding the ABI — and it
 // means a speller is a pure lookup, so the honest test is to hand it every
 // value rather than wait for a set shape that happens to produce one.
 //

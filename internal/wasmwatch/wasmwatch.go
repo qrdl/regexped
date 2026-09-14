@@ -6,7 +6,7 @@
 // rather than merely wrong: the iteration rule every stub and bench shim uses
 // is `off += end - off`, so a body that reports a match starting before the
 // position it was asked to search from sends `off` backwards and the loop
-// ping-pongs for ever. That is a real bug (plans/FUZZER_BUGS.md 65), and it
+// ping-pongs for ever. That is a real bug, and it
 // presented as `tools/perftest` sitting at 101% CPU for two and a half hours
 // with no output and no indication of which case it was stuck on.
 //

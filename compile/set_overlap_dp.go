@@ -152,8 +152,8 @@ func (cs *compiledSet) usesOverlapDP() bool { return cs.overlapDPBucket() >= 0 }
 // Every restriction here exists to keep ONE reimplementation of the
 // per-position semantics defensible. The sweep reproduces buildSetSuffixBody's
 // stopping rule exactly; each shape it refuses is one whose rule it would have
-// to reproduce a SECOND time, and a second copy of a semantics is how R4
-// diverged.
+// to reproduce a SECOND time, and a second copy of a semantics is how an
+// earlier copy diverged.
 func (cs *compiledSet) overlapDPBucket() int {
 	// The sweep only ever runs on an OVERLAPPING set: it enumerates every
 	// start position, which is that policy's contract and nobody else's.

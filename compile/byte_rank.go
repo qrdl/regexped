@@ -96,8 +96,8 @@ func (p *packedPairPlan) splatCount() int { return len(p.Bytes1) + len(p.Bytes2)
 //
 // Each byte in a column costs one i8x16.eq plus (beyond the first) one v128.or
 // per 16-byte chunk, so the per-chunk cost grows linearly with the budget while
-// Teddy's nibble tables stay flat. The crossover measured
-// Task G1 put packed-pair ahead through 4 and behind Teddy beyond it, which is
+// Teddy's nibble tables stay flat. The measured crossover
+// put packed-pair ahead through 4 and behind Teddy beyond it, which is
 // also the point at which two columns stop being selective enough to be worth
 // the verification they imply.
 const packedPairByteBudget = 4

@@ -240,8 +240,16 @@ func genCComponentStubFiles(cfg config.BuildConfig, hBasename string) (hContent,
 //     bump pointer at the head of each groups call, which would hand out memory
 //     the adapter was already using. The wrappers instead SAVE the mark before
 //     their call and restore it after, rewinding only their own allocation.
-//   - it is WEAK, so a program that already defines `cabi_realloc` — or links
-//     something that does — wins. wit-bindgen's C output does the same.
+//   - it and the two reclaim hooks, regexped_cabi_mark and regexped_cabi_release,
+//     are ONE UNIT. A cabi_realloc from somewhere else allocates lists the
+//     release hook cannot reclaim, and every call then leaked silently. So a
+//     consumer who brings an allocator says so with
+//     REGEXPED_CABI_EXTERNAL_ALLOCATOR and supplies all three (the stub emits
+//     none, and a missing hook fails the link), and without that define a
+//     foreign cabi_realloc is DETECTED on the first non-empty list — the
+//     stub's heap did not move — and the guest traps instead of leaking. The
+//     check reads the mark through the shared hook, not the stub's own counter,
+//     because with two stubs in one guest only one heap is the live one.
 func cComponentAllocator() string {
 	return `/* Canonical-ABI allocator. A returned list lives in OUR memory, so the
    composition glue calls this to make room for it — and so does the wasip1
@@ -250,9 +258,28 @@ func cComponentAllocator() string {
    wholesale. The generated wrappers save the mark before their call and restore
    it afterwards, which rewinds their own allocation and nothing else.
 
-   WEAK, so your own cabi_realloc wins if you have one. */
+   The allocator and the two reclaim hooks the wrappers call around each returned
+   list, regexped_cabi_mark and regexped_cabi_release, are ONE UNIT: a
+   cabi_realloc from elsewhere allocates lists these hooks cannot reclaim.
+
+   - To bring your own allocator, define REGEXPED_CABI_EXTERNAL_ALLOCATOR and
+     define all three: cabi_realloc (exported as "cabi_realloc"),
+     regexped_cabi_mark(), which returns a token, and
+     regexped_cabi_release(token), which reclaims everything cabi_realloc handed
+     out since that token. This stub then emits none of them, and the link fails
+     if a hook is missing.
+   - Without that define, a cabi_realloc other than this one is detected on the
+     first non-empty returned list, and the guest traps in
+     regexped_cabi_foreign_allocator rather than leaking on every call. */
 #ifndef REGEXPED_CABI_REALLOC_DEFINED
 #define REGEXPED_CABI_REALLOC_DEFINED
+
+#ifdef REGEXPED_CABI_EXTERNAL_ALLOCATOR
+unsigned regexped_cabi_mark(void);
+void regexped_cabi_release(unsigned mark);
+/* Your hooks reclaim through your allocator; nothing here can check them. */
+#define RX_CABI_EXPECT_OURS(mark, n) ((void)0)
+#else
 
 #ifndef REGEXPED_CABI_HEAP_BYTES
 /* 256 KB. Sized by MEASUREMENT, not taste: the wasip1 adapter's allocate_stack
@@ -304,6 +331,20 @@ void *cabi_realloc(void *old_ptr, unsigned old_size, unsigned align, unsigned ne
                      old_size < new_size ? old_size : new_size);
     return &rx_cabi_heap[p];
 }
+
+/* Reached when a returned list was allocated by a cabi_realloc that is not this
+   stub's: regexped_cabi_release can never reclaim it, so carrying on would leak
+   one list per call. Named and never inlined, so the trap's backtrace says why;
+   weak and shared by name like the hooks. */
+__attribute__((__weak__, __noinline__)) void regexped_cabi_foreign_allocator(void) {
+    __builtin_trap();
+}
+
+/* n is the returned list's length. A non-empty list was allocated SOMEWHERE; if
+   the mark did not move, it was not by the allocator the hooks reclaim. */
+#define RX_CABI_EXPECT_OURS(mark, n) \
+    do { if ((n) != 0 && regexped_cabi_mark() == (mark)) regexped_cabi_foreign_allocator(); } while (0)
+#endif /* REGEXPED_CABI_EXTERNAL_ALLOCATOR */
 #endif
 
 `
@@ -482,6 +523,7 @@ func genCComponentGroups(importModule, funcName, witFunc string, numGroups int, 
         if (area[0] != 0) { iter->done = 1; regexped_cabi_release(_mark); return RX_ERR_BT_OVERFLOW; }
         const unsigned char *elems = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
         unsigned int n = rx_cabi_u32(area + 8);
+        RX_CABI_EXPECT_OURS(_mark, n);
         if (!elems || n == 0) { iter->done = 1; regexped_cabi_release(_mark); return 0; }
         /* Group 0 is the whole match and is always set when the engine reported
            one; its extent drives the empty-match rule. */

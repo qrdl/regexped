@@ -612,7 +612,7 @@ func (s SetSpec) needsAnchoredBuckets() bool {
 // indistinguishable from "no match at this position". A bucket that got this
 // far without one would therefore be gated by its literal, dispatched to, and
 // silently report nothing at every candidate — the pattern would never match,
-// with no warning and no --diag-json entry. That is FABLE B24, whose live half
+// with no warning and no --diag-json entry. That bug's live half
 // was binPack's literal-singleton arm keeping a mergeSuffixDFA failure.
 //
 // A BUILD failure rather than a diagnostic, because by this point every packer
@@ -653,14 +653,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		opts.globals = &moduleGlobals{}
 	}
 	diag := &SetDiag{Name: spec.Name}
-	// G17's sparse accept. Probes are served too: a sparse probe cannot return
+	// Sparse accept. Probes are served too: a sparse probe cannot return
 	// a bucket-local bitmask — that is the 32-pattern ceiling it exists to
 	// escape — so it returns a COUNT and leaves the matching GLOBAL ids in the
 	// bucket's scratch, which emitRecordSparseProbe reads back.
 	opts.AllowSparseAccept = true
 	buckets := binPack(spec.Patterns, opts, diag)
 
-	// G12: per-pattern absence literals, used by the preflights in place of
+	// Per-pattern absence literals, used by the preflights in place of
 	// the union walk when available.
 	absLits, absAlive, absOK := buildAbsenceLits(spec)
 
@@ -694,7 +694,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		}
 	}
 	fe := chooseLiteralFrontend(lits)
-	// TEST-ONLY measurement override (task 71). Placed here, before every
+	// TEST-ONLY measurement override. Placed here, before every
 	// structural refusal below, so a forced frontend is still subject to the
 	// rules that exist for correctness rather than for speed — a fallback
 	// bucket still disables a position-skipping prefilter, AC still demotes
@@ -767,7 +767,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// With no `scan_all` declared, nothing needs the mask-complete walk, so
 	// the single probe simply IS the first-hit one and no second body — and
 	// no module bytes — are spent.
-	// G8's liveness table is only worth its per-byte cost where a preflight
+	// The per-bucket liveness table is only worth its per-byte cost where a preflight
 	// will narrow the wanted mask; elsewhere it is the reverted
 	// Candidate A all over again — a check that costs every byte and can
 	// never fire.
@@ -781,9 +781,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// `spec.ScanAny != ""` was the other half of this condition until TODO
 	// A scalar-frontend `scan_any` now compiles to the
 	// union walk itself, so no per-bucket liveness table can ever be consulted
-	// on its behalf. Only G9's gated-`find` preflight still reads one.
+	// on its behalf. Only the gated-`find` preflight still reads one.
 	//
-	// Item 11 extends it to the OVERLAPPING body, which now has a preflight of
+	// It extends to the OVERLAPPING body, which now has a preflight of
 	// its own and therefore something to make the exit fire.
 	//
 	// The structural half is overlapCanPreflight; the other half is whether
@@ -866,7 +866,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// canonical simply fails to dedup; it can never alias onto a different one.
 	//
 	// The "DATA is a function of (table, base) alone" argument holds ONLY for
-	// bitmask buckets. A G17-SPARSE bucket's data additionally carries an
+	// bitmask buckets. A SPARSE bucket's data additionally carries an
 	// idMap of GLOBAL pattern ids plus per-state accept lists sized by its own
 	// pattern count — none of which the table identity sees — so two sparse
 	// buckets with structurally identical suffix DFAs would alias onto one
@@ -1133,15 +1133,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		packedPair, _ = choosePackedPair(lits)
 	}
 
-	// the LikelyMode dispatch design: density-heuristic / Action 5 Shufti for the
+	// density-heuristic / LikelyNoMatch Shufti for the
 	// scalar fallback case. Requires zero fallback buckets (Shufti can't
 	// skip positions that fallback patterns must visit) and a first-byte
 	// union in the 17..64 band. The selection trigger is either the
-	// rarity-based density heuristic or set-level LikelyNoMatch (Action 5).
+	// rarity-based density heuristic or set-level LikelyNoMatch.
 	var shuftiFirstByteSet []byte
 	var shuftiAdaptive bool
 	// maxShuftiUnionLNM is the widened upper bound on the first-byte union,
-	// under set-level LikelyNoMatch only (task 70). The SIMD probe itself is
+	// under set-level LikelyNoMatch only. The SIMD probe itself is
 	// width-agnostic — emitShuftiPrefixCheck just builds one more nibble-table
 	// pair per 8 members — but this body's SCALAR TAIL is not: it tests
 	// membership with an unrolled per-first-byte compare chain, which is
@@ -1192,7 +1192,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 					fe = frontendShufti
 					shuftiFirstByteSet = union
 					shuftiAdaptive = lnm && !rare
-					// TEST-ONLY measurement override (task 74). Inside the
+					// TEST-ONLY measurement override. Inside the
 					// selection branch on purpose: it answers "does the switch
 					// still earn its cost on a set that ships Shufti", not
 					// "emit the switch somewhere it has nothing to guard".
@@ -1493,7 +1493,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// path is for the sets that have nothing to skip with, where the
 	// alternative is visiting every position with every bucket.
 	//
-	// A find-only OVERLAPPING set needs it too, for item 11's preflight: the
+	// A find-only OVERLAPPING set needs it too, for its own preflight: the
 	// alive verdict is what retires a never-dying pattern from validMask, and
 	// without the automaton there is nothing to compute it with.
 	//
@@ -1509,7 +1509,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		unionBase := ra.Reserve("union-scan", 8) // 8-aligned, see anchoredTableBase
 		// needUnionForGated also asks for the per-state accept ROWS, which a
 		// WIDE automaton emits only on request and the wide alive walk reads in
-		// place of the u64 pair it has no room for (item 22 fix 2a-wide). On a
+		// place of the u64 pair it has no room for. On a
 		// narrow build the flag changes nothing: that arm emits the u64 pair and
 		// returns before the rows exist at all.
 		cs.unionScan = buildUnionScanDFA(spec, unionBase, needUnionForGated)
@@ -1570,7 +1570,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the same per-position probe call on exactly the same fallback buckets —
 	// literal-less past 256 ids, or a mixed set whose fallback cannot
 	// determinise into phase2Union — so withholding the table from them left
-	// every position paying a full probe G16 would have skipped. On `find`
+	// every position paying a full probe the first-byte eligibility mask would have skipped. On `find`
 	// that skip was worth 251 -> 94 fuel/byte on greedy-3's no-match row.
 	if fe == frontendScalar && (spec.Find != "" || spec.ScanAny != "" || spec.ScanAll != "") {
 		for bi, bkt := range buckets {
@@ -2131,7 +2131,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotFindNeutral:       setTypeI32I32ToI64, // same shape as the body it twins
 		slotCapture:           setTypeI32x3ToI32,  // (i32,i32,i32)→i32
 		slotGroupsWrapper:     setTypeI32x3ToI32,
-		// The LM-2 batch wrappers share the set match body's
+		// The batch wrappers share the set match body's
 		// (i32×5)→i32 shape rather than needing a type of their own.
 		slotBatchFind:         setMatchTypeMatch,
 		slotBatchGroups:       setMatchTypeMatch,
@@ -2513,7 +2513,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			switch c.kind {
 			case capFind:
 				if cs.findWrapped() {
-					// Decision (11a): the export forwards into the shared
+					// The export forwards into the shared
 					// worker instead of carrying its own copy of the bucket
 					// code. A non-batching set is wrapped for the answer cache
 					// alone, and forwards into the ordinary find body.
@@ -2699,7 +2699,7 @@ func emitSetMatchFnFinal(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMe
 // body is scalar.
 //
 // This exists because `--diag-json` used to report `cs.fe` and was therefore
-// WRONG for exactly those sets (FABLE B23): it named a frontend the module did
+// WRONG for exactly those sets: it named a frontend the module did
 // not contain. Selection and emission now answer through one function, so they
 // cannot drift apart again.
 //
@@ -2716,7 +2716,7 @@ func emittedFrontend(cs *compiledSet) frontendKind {
 			return frontendTeddy
 		}
 	case frontendShufti:
-		// Selection guarantees no fallback buckets — see set_emit.go gap H.3 block.
+		// Selection guarantees no fallback buckets — see the set-level Shufti selection above.
 		if !hasSetFallbackBuckets(cs) {
 			return frontendShufti
 		}
@@ -2982,7 +2982,7 @@ func hasSetFallbackBucketsIn(buckets []*bucket) bool {
 // returning the TOTAL number of matches at the first matching position at or
 // after `from`. See compile/set_find.go for the first-position machinery.
 func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, tableMemIdx int, mode setCapKind, probeFnBase int) []byte {
-	// G8's `scan_any` preflight is GONE. It ran
+	// The old `scan_any` preflight is GONE. It ran
 	// the start-anywhere union automaton once over [from,len) and used the
 	// result to drop never-matching patterns from every bucket's validMask —
 	// a way to make the per-position walk cheaper for a capability that could
@@ -2990,30 +2990,30 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// With the start dropped, `scan_any` IS the union walk (usesUnionScan),
 	// so this body is never reached with mode == capScanAny on a set that
 	// qualified, and the narrowing has nothing left to narrow.
-	// G9: the gated `find` body runs the same union pass once per
+	// The gated `find` body runs the same union pass once per
 	// drive and writes its result back as gate sentinels. Still live —
 	// `find` reports positions and cannot become a union walk.
-	// Item 11: the OVERLAPPING body runs the same pass, keeping its verdict
+	// The OVERLAPPING body runs the same pass, keeping its verdict
 	// in the gate array the caller now supplies for exactly this purpose.
 	// Without it that body walks a never-dying suffix DFA from every start
 	// position and one call is O(n^2).
 	overlapPreflight := mode == capFind && cs.usesOverlappingFindPreflight()
 	findPreflight := mode == capFind && cs.usesGatedFindPreflight() || overlapPreflight
 
-	// G12: the absence prefilter needs one more i32 (its SIMD mask) and a
+	// The absence prefilter needs one more i32 (its SIMD mask) and a
 	// v128 chunk; the union walk needs neither.
 	absence := findPreflight && cs.usesAbsencePrefilter()
 
 	// One further i32 in every arm, LAST in the i32 block: lAllElig, the
-	// per-call "every pattern is eligible from here on" bound (item 22 fix
-	// 2b). Declared only in this body — see setFindCtx.lAllElig for why the
+	// per-call "every pattern is eligible from here on" bound.
+	// Declared only in this body — see setFindCtx.lAllElig for why the
 	// literal-frontend bodies do not get it.
 	// A preflight arm carries ONE more i32 still: lEnd, the union walk's
 	// `pInPtr + len` bound. It exists because that walk's cursor is an
 	// absolute input pointer rather than an offset (see emitUnionTransition),
 	// which is what takes three instructions per byte down to one.
 
-	// The alive mask is one i64 per 64 ids (item 22 fix 2a-wide), so the i64
+	// The alive mask is one i64 per 64 ids, so the i64
 	// group grows with the set's id space. Every other local keeps its index:
 	// the extra words are appended AFTER the mask's first word, which is the
 	// last local of the narrow preflight arm.
@@ -3040,17 +3040,17 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	lPos := c.lPos
 	pInLen := c.pInLen
 
-	// Locals come from the allocator, in declaration order (task 67). This body
+	// Locals come from the allocator, in declaration order. This body
 	// had THREE layouts — plain, find-preflight, absence-prefilter — each with
 	// its own hand-written declaration vector and its own map of indices, and
 	// it additionally passed three raw indices ACROSS a function boundary into
 	// emitFindPreflight. Allocating says each arm once.
-	a := c.locals // the shared five are already allocated (task 67)
+	a := c.locals // the shared five are already allocated
 	c.lMinStart = a.I32()
 	c.lBase = a.I32()
 	c.lStart = a.I32()
 
-	// lFirstByte is E5's hoisted input[lPos]; lPfPos/lPfState/lPfMask are the
+	// lFirstByte is the hoisted input[lPos]; lPfPos/lPfState/lPfMask are the
 	// find preflight's own scratch, named here rather than computed at its call
 	// site.
 	var lFirstByte, lEnd, lChunk, lCand, lPfPos, lPfState, lPfMask byte
@@ -3104,7 +3104,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 		// Before the prologue: emitGateJump reads the gate array, so the
 		// sentinels must already be in place for it to skip ahead correctly.
 		// One emitter serves both bodies — see emitFindPreflight's header for
-		// why the gated and overlapping forms converged (item 22 fix 2a).
+		// why the gated and overlapping forms converged.
 		b = emitFindPreflight(b, cs, lPfPos, lPfState, c.aliveMask,
 			c.pGate, c.pInLen, c.pFrom, lEnd, tableMemIdx, absence, lPfMask, lChunk, lCand)
 	}
@@ -3113,7 +3113,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// per-candidate pre-mask then clears nothing the preflight had retired.
 	// Safe (a gate value is a lower bound, so a stale one only
 	// over-approximates eligibility) but measured at +93% fuel on greedy-3's
-	// no-match `find` — which is exactly what G10's preflight exists to avoid.
+	// no-match `find` — which is exactly what the preflight exists to avoid.
 	b = c.emitGateLocalsPrologue(b)
 	b = c.emitFindPrologue(b, lPos)
 
@@ -3188,14 +3188,14 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	lPos, lTmp := c.lPos, c.lTmp
 	pInPtr, pInLen := c.pInPtr, c.pInLen
 
-	// Locals come from the allocator, in declaration order (task 67). This body
+	// Locals come from the allocator, in declaration order. This body
 	// is the one that most needed it: the adaptive dense switch adds two i32s
 	// in the MIDDLE of the frame, so every index after them moved, and the
 	// previous form spelled that as two index maps and two hand-written
 	// declaration vectors — six or seven groups each — that had to agree with
 	// each other and with the reads below. Allocating conditionally says it
 	// once.
-	a := c.locals // the shared five are already allocated (task 67)
+	a := c.locals // the shared five are already allocated
 
 	lSkipMask := a.I32()
 	lChunk := a.V128()
@@ -3448,14 +3448,14 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, maxLitLen-1, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	// Locals come from the allocator, in declaration order (task 67). The five
+	// Locals come from the allocator, in declaration order. The five
 	// setFindCtx allocates first are reserved, not re-allocated.
 	//
 	// The prefilter's locals are ALLOCATED only when the prefilter is emitted,
 	// which is what the previous form spelled as two index maps and two
 	// hand-written declaration vectors that had to agree with them — the shape
-	// task 67 calls out as most likely to drift.
-	a := c.locals // the shared five are already allocated (task 67)
+	// most likely to drift.
+	a := c.locals // the shared five are already allocated
 
 	lACState := a.I32()
 	lMatchPos := a.I32()
@@ -3859,10 +3859,10 @@ func emitSetMatchFnFinalPackedPair(cs *compiledSet, suffixFnBase, prefixFnBaseId
 	c := newSetFindCtx(cs, suffixFnBase, prefixFnBaseIdx, 0, mode, probeFnBase)
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
-	// Locals come from the allocator, in declaration order (task 67). The five
+	// Locals come from the allocator, in declaration order. The five
 	// setFindCtx allocates first are reserved, not re-allocated: they are
 	// already named by c.lPos and friends.
-	a := c.locals // the shared five are already allocated (task 67)
+	a := c.locals // the shared five are already allocated
 
 	lLaneMask := a.I32()
 	lMatchPos := a.I32()
@@ -4142,10 +4142,10 @@ func emitSetMatchFnFinalTeddy(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, ta
 	lPos := c.lPos
 	pInPtr, pInLen := c.pInPtr, c.pInLen
 	// Locals come from the allocator, in declaration order, so no index in this
-	// body is written twice (task 67). The five setFindCtx allocates first are
+	// body is written twice. The five setFindCtx allocates first are
 	// reserved rather than re-allocated: they are already named by c.lPos and
 	// friends, and reserving keeps this body's numbering identical to theirs.
-	a := c.locals // the shared five are already allocated (task 67)
+	a := c.locals // the shared five are already allocated
 
 	lLaneMask := a.I32()
 	lMatchPos := a.I32()
@@ -4601,7 +4601,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 	}
 	setOpts := CompileSetOptions{
 		// Set-level LikelyMode precedence: set hints > neutral.
-		// Used by H.3 (frontend density gate).
+		// Used by the set frontend density gate.
 		LikelyMode: resolveHints(sc.Hints),
 		// The knob that decides whether a pattern survives into the set at
 		// all: a fallback bucket over this limit is DROPPED, not demoted to

@@ -232,7 +232,7 @@ func raPairing(c capability) string {
 // distort.
 //
 // Scope note, so the label is not over-read: the crossings are not a defect.
-// Batching is built (item 19) and closes the gap on the same rows, and for
+// Batching is built and closes the gap on the same rows, and for
 // C/Go/Rust/AS there are no crossings at all — wasm-merge makes a stub call
 // intra-module, which is why TestSetBatchFindIsJSTSOnly pins batching as
 // JS/TS-only.
@@ -314,7 +314,7 @@ var setHints string
 
 // forcedFrontend pins the literal frontend for every compiled case, so a
 // family can be measured through a frontend its literal count would not have
-// chosen (task 71). Empty means "let chooseLiteralFrontend decide".
+// chosen. Empty means "let chooseLiteralFrontend decide".
 //
 // The crossover constants it exists to interrogate were each calibrated on a
 // NO-MATCH corpus; whether they still hold when nearly every probe is a real
@@ -453,7 +453,7 @@ func buildMatrix() []setCase {
 	// Sets whose patterns all share ONE mandatory literal — the WAF shape, and
 	// the only one here that exercises multi-bucket dispatch behind a single
 	// literal. Every other set has distinct literals, so it gets
-	// one bucket per literal and the bucket-count factor G17 attacks never
+	// one bucket per literal and the bucket-count factor sparse accept attacks never
 	// appears at all.
 	//
 	// TWO sizes on purpose. 32 patterns is ONE bucket and 128 is FOUR (the
@@ -485,7 +485,7 @@ func buildMatrix() []setCase {
 	}
 	// A sparse bucket whose merged suffix DFA carries an ACCEPTING 1-byte
 	// self-loop — the shape the bitmask body's member bulk skip exists for, and
-	// the one the matrix had no row of (TODO 64).
+	// the one the matrix had no row of.
 	//
 	// The two existing sparse families, sharedlit-128 and classchain-128, are
 	// bounded class chains: a bounded repeat produces a CHAIN, not a self-loop,
@@ -540,7 +540,7 @@ func buildMatrix() []setCase {
 	}
 	// Sets with NO mandatory literal that are also large enough to split on the
 	// 32-bit accept mask — the fallback packer's version of the sharedlit pair
-	// above, and the shape G17's promotion was extended to cover.
+	// above, and the shape sparse promotion was extended to cover.
 	//
 	// A fallback bucket has no literal gating it, so each of the ceil(N/32)
 	// suffix walks runs at EVERY input position rather than only where a
@@ -2011,7 +2011,7 @@ func runFuelCross(cases []setCase) {
 			if ourFuel == fuelExhausted || theirFuel == fuelExhausted {
 				note = fmt.Sprintf("one side exceeded the %s budget", fmtFuel(fuelBudget))
 			}
-			// `find` COUNTS here, unlike in the timed matrix where item 22
+			// `find` COUNTS here, unlike in the timed matrix where
 			// the bare-find row withholds its ratio as "api-shape". The distinction is
 			// the whole reason this column exists: a Go->wasmtime call
 			// executes no wasm instructions, so the crossings that make the

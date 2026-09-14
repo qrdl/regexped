@@ -22,7 +22,7 @@ import (
 //
 // # Why byte identity rather than a behaviour test
 //
-// The set redesign shares emitters with the single-pattern path. D6 of
+// The set redesign shares emitters with the single-pattern path.
 // Single-pattern behaviour is out of scope for set work and must not
 // change, and the only evidence strong enough for "must not change" is that
 // the emitted bytes are the same — a behavioural test proves the cases it
@@ -141,7 +141,7 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 // Until these fixtures existed there was NO byte-identity pin on set output at
 // all: all fifteen original fixtures were single-pattern, so every set change
 // was made without the drift check the single-pattern path has had all along.
-// TODO 65 names that gap as a hard prerequisite for splitting CompileSet, whose
+// That gap is a hard prerequisite for ever splitting CompileSet, whose
 // failure mode it also describes — reorder two layout blocks and two table
 // regions overlap, which is "not a compile error and not a WASM validation
 // error, but a module that reads one table through another's bytes".
@@ -184,7 +184,7 @@ func TestByteIdenticalSetShapesAreDistinct(t *testing.T) {
 	// declines on budget, which no YAML config can arrange. See
 	// tools/fuzz/set_caps_test.go, which reaches it through CompileFileOpts.
 	if acceptKinds["sparse"] == 0 {
-		t.Error("no set fixture produces a SPARSE accept bucket — G17's " +
+		t.Error("no set fixture produces a SPARSE accept bucket — its " +
 			"per-state pattern lists are unpinned")
 	}
 	if acceptKinds["bitmask"] == 0 {

@@ -14,7 +14,7 @@ import (
 // compiler emits happily and that answers wrongly — the class no existing test
 // caught, because every one of them compiled green.
 
-// TestAltLitAnchorInSetModule covers E1.
+// TestAltLitAnchorInSetModule pins a set-module assembly regression.
 //
 // compilePattern gives a find-only top-level alternation of equal-length
 // literal-anchored branches an altLitAnchorBranches list. funcCount
@@ -99,10 +99,10 @@ func TestNarrowUnionWithWideAllABI(t *testing.T) {
 	}
 }
 
-// TestTwoSparseBucketsKeepTheirIDs covers C1.
+// TestTwoSparseBucketsKeepTheirIDs pins a suffix-table dedup regression.
 //
 // Suffix-table dedup reuses a table BASE when two buckets' DFAs are
-// structurally identical. For a G17-sparse bucket the emitted data also
+// structurally identical. For a sparse bucket the emitted data also
 // carries an idMap of GLOBAL ids and per-state accept lists sized by that
 // bucket's pattern count — none of which the table identity sees — so two
 // sparse buckets with the same suffix shape aliased onto one idMap and the
@@ -145,7 +145,7 @@ func TestTwoSparseBucketsKeepTheirIDs(t *testing.T) {
 		seen[b.sparseIDMapOff] = append(seen[b.sparseIDMapOff], bi)
 	}
 	if sparse < 2 {
-		t.Skipf("this shape produced %d sparse buckets; C1 needs two", sparse)
+		t.Skipf("this shape produced %d sparse buckets; this regression needs two", sparse)
 	}
 	for off, bis := range seen {
 		if len(bis) > 1 {
@@ -172,7 +172,7 @@ func compileSetForTest(t *testing.T, cfg config.BuildConfig) *compiledSet {
 	return CompileSet(spec, pp, sp, CompileSetOptions{AllowSparseAccept: true})
 }
 
-// TestAbsenceLiteralsPastThirtyTwo covers G2.
+// TestAbsenceLiteralsPastThirtyTwo pins an absence-prefilter regression.
 //
 // The absence prefilter's SEARCH mask is an i32 with one bit per collected
 // literal, while the alive mask is an i64 capped at 64 ids. Entry 32 and
@@ -270,7 +270,7 @@ func exportSectionHas(body []byte, name string) bool {
 	return false
 }
 
-// TestOverlapDPColumnsUseTableMemory covers B1.
+// TestOverlapDPColumnsUseTableMemory pins a table-memory regression.
 //
 // The backward sweep's two working columns live at cs.overlapDPColOff, a
 // TABLE-memory address whose zero-filled segment is rewritten to memory 1 in
@@ -502,7 +502,7 @@ func TestOverlapPreflightPredicatesAgree(t *testing.T) {
 }
 
 // sparseishGroup is n patterns behind one shared literal, the shape that
-// promotes to a G17-sparse bucket.
+// promotes to a sparse bucket.
 func sparseishGroup(n int) []string {
 	out := make([]string, n)
 	for i := range out {

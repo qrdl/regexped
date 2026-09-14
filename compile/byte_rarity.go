@@ -113,8 +113,8 @@ func firstByteSetRaritySum(bytes []byte) int {
 //	[\x00-\x1f]  (32 chars): sum = 0 → Shufti        (rare)
 //	[<>{}\[\]|`] (8 chars):  sum = 8*1 = 8 → Shufti  (uncommon)
 //
-// The 9..16-byte band uses Shufti unconditionally (shipped portion
-// of LNM Action 3); this helper only governs the 17..64 band.
+// The 9..16-byte band uses Shufti unconditionally; this helper only
+// governs the 17..64 band.
 func shuftiBeatsScalar(firstByteSet []byte) bool {
 	const threshold = 40
 	return firstByteSetRaritySum(firstByteSet) < threshold

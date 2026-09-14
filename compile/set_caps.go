@@ -299,7 +299,7 @@ func (a capAccumulator) emitRecordBits(b []byte, bitsLocal byte, ids []int, esca
 	}
 }
 
-// emitRecordSparseCount is emitRecordBits for a G17 SPARSE anchored bucket.
+// emitRecordSparseCount is emitRecordBits for a SPARSE anchored bucket.
 //
 // The probe could not hand back bucket-local bits — 32 of them is the ceiling
 // the sparse form exists to escape — so it returned a COUNT and left the
@@ -382,7 +382,7 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 	if wide {
 		nParams = 3
 	}
-	// The two scratch locals a G17 sparse bucket's recording loop needs are
+	// The two scratch locals a sparse bucket's recording loop needs are
 	// declared ONLY when one is present. Declaring them unconditionally would
 	// change the emitted bytes of every anchored body in the project for no
 	// reason, and module size is an exact gate (tools/setperf `make check`).
@@ -432,7 +432,7 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(probeFnBase+bi))
 		b = append(b, 0x21, lBits)
-		// A G17 sparse bucket returned a COUNT, not bits — the mask passed
+		// A sparse bucket returned a COUNT, not bits — the mask passed
 		// above is ignored by its probe, exactly as on the find path.
 		if cs.anchoredBuckets[bi].sparse {
 			b = acc.emitRecordSparseCount(b, lBits, cs.anchoredBuckets[bi], cs.tableMemIdx, lTmpA, lTmpB, 0)

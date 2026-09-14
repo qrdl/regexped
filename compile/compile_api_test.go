@@ -108,7 +108,7 @@ var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6d}
 // wasmValidator locates a WASM validator once per test binary.
 //
 // This whole file used to accept any byte string starting
-// with the magic header as "a valid WASM module", which is how B15's u16 TDFA
+// with the magic header as "a valid WASM module", which is how a u16 TDFA
 // table addressing — an operand order that never once produced a well-typed
 // function — sat behind a green TestTDFAU16TableAddressing. Compiling a module
 // nothing can instantiate is exactly the failure a compiler test suite exists
@@ -1087,7 +1087,7 @@ func TestNeedsUnicodeSupport(t *testing.T) {
 		t.Error("needsUnicodeSupport([a-z]) = true, want false")
 	}
 	// MIXED ASCII + non-ASCII → rejected. This case asserted `false` until
-	// 2026-09-01, which is precisely the leak FABLE B29 verified: `[a-zé]+`
+	// 2026-09-01, which is precisely the silent divergence it hid: `[a-zé]+`
 	// on "zzé" returned [0,2) where Go returns [0,4), because the engine
 	// truncated é to a byte and the old `hasNonASCII && !hasASCII` gate let
 	// the pattern through. Such a pattern now needs byte_mode.
@@ -1214,7 +1214,7 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 // TestCompileLenientAltFindBody exercises the Phase 2a lenient-alternation
 // find body in compilePattern, reached when analyseLitChainAltLenient
 // succeeds after the strict analysers fail, gated by
-// shouldTryLitChainAlt(pattern) — the test plan T33. The real sql-inject perftest
+// shouldTryLitChainAlt(pattern). The real sql-inject perftest
 // pattern's first branch contains a nested (?:OR|AND) alternation
 // (OpAlternate), which makes shouldTryLitChainAlt bail out early and keep
 // the pattern lit-chain-alt-eligible; confirmed live that
@@ -1231,7 +1231,7 @@ func TestCompileLenientAltFindBody(t *testing.T) {
 
 // TestCompileTDFARegLimitExceededForced exercises the
 // "ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts)" fallback-to-Backtrack
-// re-check in compilePattern — the test plan T34. Only reachable when
+// re-check in compilePattern. Only reachable when
 // forceGroupsEngine bypasses the selector's own register estimate (unlike
 // TestCompileTDFARegLimit, which goes through the normal, unforced
 // selectBestEngine path and so never reaches TDFA construction at all for a
@@ -1377,8 +1377,8 @@ func TestCompileFuzzRepro092700(t *testing.T) {
 }
 
 // TestCompileBTCaptureWithMemoTwoGroups exercises the useMemo=true
-// initialization block in buildBacktrackBody for the capture path —
-// the test plan T35. TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
+// initialization block in buildBacktrackBody for the capture path.
+// TestCompileBTCaptureWithMemo's pattern ((?:a?)+?) has a
 // single capture spanning the whole pattern (MaxCap()==1) and is not
 // itself ^-anchored, so the whole-pattern-single-capture shortcut
 // (compile.go, isWholePatternSingleCapture) now intercepts it before it
@@ -1393,8 +1393,8 @@ func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
 
 // TestCompileEmbeddedLitAnchorTableMemIdx exercises the tableMemIdx = 1
 // branch (!standalone) inside both the single-pattern lit-anchor and the
-// alt-lit-anchor dispatch-body-generation paths in assembleModule —
-// the test plan T36. All existing lit-anchor/alt-lit-anchor tests use
+// alt-lit-anchor dispatch-body-generation paths in assembleModule.
+// All existing lit-anchor/alt-lit-anchor tests use
 // standalone=true; this compiles the same pattern shapes with
 // standalone=false.
 func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
@@ -1411,7 +1411,7 @@ func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
 }
 
 // TestCmdCompile_ErrorPaths exercises the four distinct error/IO branches in
-// CmdCompile — the test plan T37.
+// CmdCompile.
 func TestCmdCompile_ErrorPaths(t *testing.T) {
 	t.Run("compile_file_error_with_sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
@@ -1459,14 +1459,13 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 
 // TestCmdWriteDiagJSON_DroppedPatternError exercises the analyzePattern
 // error path in CmdWriteDiagJSON, propagated as `continue` (silently
-// dropping the pattern from the set's diagnostics) — the test plan T38.
+// dropping the pattern from the set's diagnostics).
 func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 	// This test asserted the DEFECT until 2026-09-09. It required
 	// CmdWriteDiagJSON to skip an unparseable pattern and write a clean
 	// diagnostics file anyway, while CompileFile treats the same pattern as
 	// FATAL — so a config that cannot build produced a diagnostics file
-	// describing a set with the broken pattern quietly missing from it
-	// (FABLE B23, third mechanism).
+	// describing a set with the broken pattern quietly missing from it.
 	//
 	// The property is AGREEMENT: whatever the build does with a pattern, the
 	// file describing that build must do the same. Both now fail, with the
@@ -1528,11 +1527,10 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 // TestCompileAutoSelectEngine exercises the `else { engineType =
 // selectBestEngine(prog, &options) }` branch in compile() — calling the
 // private compile() helper WITHOUT an explicit ForceEngine, unlike every
-// production caller (which always sets ForceEngine: EngineDFA) — the test plan
-// T39.
+// production caller (which always sets ForceEngine: EngineDFA).
 func TestCompileAutoSelectEngine(t *testing.T) {
-	t.Run("backtrack_via_gap_i", func(t *testing.T) {
-		// <([^>]+)> routes to Backtrack via the Gap I inverted-class gate
+	t.Run("backtrack_via_inverted_class_gate", func(t *testing.T) {
+		// <([^>]+)> routes to Backtrack via the inverted-class ambiguity gate
 		// (see CLAUDE.md "Load-bearing engine-selection gates").
 		if _, err := compile(`<([^>]+)>`); err != nil {
 			t.Fatalf("compile: %v", err)
@@ -1580,7 +1578,7 @@ func TestCompileBTCaptureBudgetIncludesMemoTable(t *testing.T) {
 }
 
 // TestUnsupportedRuneRejection pins the contract the byte-mode parameter and
-// its gate were built for (TODO 57 / FABLE B29).
+// its gate were built for.
 //
 // regexped is a byte engine, so a rune it cannot hold in a byte used to be
 // silently truncated — five verified divergences from Go, of which four were
@@ -1598,14 +1596,14 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		why                  string
 	}{
 		// Written non-ASCII: rejected by default, legal as bytes.
-		{`[a-zé]+`, true, false, "B29 row 1 — é truncated to a byte, [0,2) where Go gives [0,4)"},
-		{`\xe9`, true, false, "B29 row 2 — matched a raw Latin-1 byte where Go matched nothing"},
+		{`[a-zé]+`, true, false, "é truncated to a byte, [0,2) where Go gives [0,4)"},
+		{`\xe9`, true, false, "matched a raw Latin-1 byte where Go matched nothing"},
 		{`[a\x80]+`, true, false, "mixed byte escape riding along with ASCII"},
 		{`[\x80-\xff]+`, true, false, "a byte range: the capability byte_mode exists to allow"},
 		{`[\xc0-\xdf]`, true, false, "UTF-8 two-byte lead range"},
 
 		// Above 0xFF: no byte can hold it, so no mode accepts it.
-		{`\p{Greek}+`, true, true, "B29 row 3 — \\p classes compiled and dropped their runes"},
+		{`\p{Greek}+`, true, true, "\\p classes compiled and dropped their runes"},
 		{`[α-ω]+`, true, true, "explicit codepoints past the byte range"},
 		{`\pL+`, true, true, "reaches past 0xFF even though its low members fit"},
 
@@ -1613,7 +1611,7 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`(?i:[a-z]+)`, false, false, "Go expands (?i) classes eagerly: U+017F and U+212A are its artifacts"},
 		{`(?i:([a-z]+)@([a-z]+))`, false, false, "same, with captures"},
 		{`(?i)^\s*SELECT\b`, false, false, "fold orbit escaping 0xFF from an ASCII literal"},
-		{`(?i)k`, false, false, "B29 row 5 — the Kelvin sign, declared byte semantics"},
+		{`(?i)k`, false, false, "the Kelvin sign, declared byte semantics"},
 		{`(?i)abc`, false, false, "plain ASCII folding"},
 		{`[^,]+`, false, false, "a negated class names every rune; rejecting it would reject `.`"},
 		// The same class in both spellings. See TestOpenEndedTailSpellings for
@@ -1622,7 +1620,7 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`[a-\x{10ffff}]+`, false, false, "an explicit range to U+10FFFF IS the complement of everything below"},
 		{"[^\\x00-`]+", false, false, "the same class, spelled as a complement"},
 		{`[a-\x{ffff}]+`, true, true, "a top endpoint below U+10FFFF names members no byte holds"},
-		{`a.c`, false, false, "B29 row 4 — dot is one byte, declared byte semantics"},
+		{`a.c`, false, false, "dot is one byte, declared byte semantics"},
 		{`[a-z]+`, false, false, "plain ASCII"},
 		{`\w+`, false, false, "plain ASCII class"},
 	}
@@ -1963,7 +1961,7 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 	}
 	// An empty hints list doesn't "set" anything (parseHints returns set=false),
 	// so the caller's LikelyNoMatch should still apply here — both bodies
-	// should therefore match (this is the Gap H.1 non-override case, not
+	// should therefore match (this is the non-override case, not
 	// a mismatch check like the block above).
 	if len(p.litAnchorBackScanBody) == 0 || len(pNeutral.litAnchorBackScanBody) == 0 {
 		t.Fatal("expected both compiles to produce a lit-anchor backscan body")

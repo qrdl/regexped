@@ -40,7 +40,7 @@ type compiledAltLitAnchor struct {
 // union of all branches' literals.
 //
 // All-or-nothing: any single branch failing any gate rejects the whole
-// alternation (ok=false), matching Gap E's existing contract. Callers must
+// alternation (ok=false), matching the mixed-prefix path's existing contract. Callers must
 // fall through cleanly to the standard combined-DFA find path on rejection.
 func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, buildOpts CompileOptions) (*compiledAltLitAnchor, bool) {
 	maxStates := resolveMaxDFAStates(&buildOpts)
@@ -136,7 +136,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		// the floor was then reading a stale value.
 		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
 
-		// Opt 1 — default-on for every mode, same as the
+		// Dominant-self-loop SIMD bulk-skip — default-on for every mode, same as the
 		// single-pattern and whole-alternation find/match bodies.
 		// encodeNonMid=false: the forward-verify body dispatches non-mid
 		// via state-ID compares and reads midAccept with plain `!= 0`
@@ -199,8 +199,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		}
 
 		// T1 (2-byte Teddy) is a scan accelerator only — a Teddy hit is
-		// always followed by real scalar literal verification (section 3 of
-		// the plan), so it's safe to skip T1 entirely rather than build a
+		// always followed by real scalar literal verification, so it's safe to skip T1 entirely rather than build a
 		// lossy table: detect any first byte shared by two literals with
 		// DIFFERING second bytes and bail out of T1 (not the whole
 		// alternation) if found.

@@ -169,7 +169,7 @@ func validateWitIdent(s string) error {
 		}
 		for i := 0; i < len(word); i++ {
 			c := word[i]
-			if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
 				return fmt.Errorf("contains %q, which cannot appear in a WIT identifier", string(rune(c)))
 			}
 		}

@@ -23,7 +23,7 @@ custom:
 	# Expectation file vs Go, no WASM involved. Was commented out while its
 	# col0 oracle was wrong (it used a leftmost-first find plus a span check
 	# instead of matching the export's actual contract, and reported 167 false
-	# disagreements). Fixed and clean as of task 54, so it runs again: it is
+	# disagreements). Fixed and clean now, so it runs again: it is
 	# the only thing that keeps the file honest, since every other check
 	# compares WASM against the file rather than against Go.
 	go run . --validate-go --validate-groups $(CUSTOM)
@@ -65,7 +65,7 @@ high-bytes: $(ADJUSTED)
 	go run . --high-bytes --high-bytes-check-corpus --validate-groups $(CUSTOM)
 
 # Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
-# shape (literal + counted class) take the Opt 2 emission path; others fall
+# shape (literal + counted class) take the lit-chain emission path; others fall
 # through to the standard DFA. Confirms LikelyMatch correctness across the
 # full corpus.
 likelymatch: $(ADJUSTED)
@@ -75,7 +75,7 @@ likelymatch: $(ADJUSTED)
 
 # Run every test under LikelyMode=LikelyNoMatch. Patterns with a dominant
 # self-loop (≥240/256 byte classes back to itself, ≤4 exit bytes,
-# mid-accepting) take the Opt 1 SIMD bulk-skip path; others fall through to
+# mid-accepting) take the dominant-self-loop SIMD bulk-skip path; others fall through to
 # the standard DFA. Confirms LikelyNoMatch correctness across the full corpus.
 likelynomatch: $(ADJUSTED)
 	go run . --likelynomatch $(TESTDATA)
@@ -85,7 +85,7 @@ likelynomatch: $(ADJUSTED)
 # Run every test with the DFA forced to overflow (--force-backtrack, so
 # find/match always fall back to Backtracking) AND under
 # LikelyMode=LikelyNoMatch. This is the combination that exercises BT's own
-# Action 5 prefix-scan path (compile/engine_backtrack.go buildBTFindBody)
+# impossible-byte prefix-scan path (compile/engine_backtrack.go buildBTFindBody)
 # across the full corpus: --force-backtrack alone never sets LikelyNoMatch,
 # and --likelynomatch alone rarely forces BT (only for patterns whose DFA
 # already overflows MaxDFAStates), so neither flag on its own reaches this
@@ -109,8 +109,8 @@ matchonly: $(ADJUSTED)
 
 # Run every test with find_func compiled alone (no match_func) for
 # non-capturing patterns. Mirror of matchonly: reaches the
-# `needFind && !needMatch` call sites in compile.go — the Gap E alt-prefixed
-# find body, the Gap C alt-range find body, and the strict/lenient alt find
+# `needFind && !needMatch` call sites in compile.go — the alt-prefixed
+# find body, the alt-range find body, and the strict/lenient alt find
 # bodies — which the default combined match+find dispatch never reaches at
 # all. Regression test for the lit-chain alternation find bodies.
 findonly: $(ADJUSTED)
@@ -171,8 +171,8 @@ sets: $(TESTDATA)
 # The set capabilities under a non-neutral set-level hint.
 #
 # `sets` above runs entirely NEUTRAL, so every hint-gated set emitter had no
-# correctness gate at all: task 68's Shufti self-loop channels in the bucket
-# suffix bodies, LM-6's packer split, and H.3's forced-Shufti frontend are all
+# correctness gate at all: the Shufti self-loop channels in the bucket
+# suffix bodies, the counted-chain packer split, and the forced-Shufti frontend are all
 # invisible to it. --likelymatch / --likelynomatch reach the set path as
 # set-level `hints:` (see main.go's setHints resolution), so these runs compile
 # genuinely different bodies from the ones `sets` checks.

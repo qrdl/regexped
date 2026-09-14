@@ -1,4 +1,4 @@
-# G17 SPARSE ACCEPT — 40 patterns sharing one literal, so they pack into a
+# SPARSE ACCEPT — 40 patterns sharing one literal, so they pack into a
 # SINGLE bucket. A u64 accept mask caps a bucket at 32 patterns; the sparse
 # representation carries per-state LISTS of pattern indices instead, which is
 # what lets one bucket hold more. compile/set_sparse.go.

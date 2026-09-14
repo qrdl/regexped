@@ -38,7 +38,7 @@ setcaps-exhaustive:
 # The sweeps assert that every exported find/groups answer matches Go at every
 # `from`; this target additionally proves WHICH emitters they reach, from the
 # coverage profile of that same run. Two facts, one execution — a second corpus
-# would drift, and the drift is what let plans/FUZZER_BUGS.md 65 ship: the sweep
+# would drift, and the drift is what let a find-from bug ship: the sweep
 # passed for weeks over shapes reaching eight of fourteen find emitters, and two
 # of the six it missed were broken.
 #

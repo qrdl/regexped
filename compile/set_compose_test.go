@@ -1697,7 +1697,7 @@ func TestHasBeginAnchor(t *testing.T) {
 
 // TestTopLevelBeginAnchorKind covers what hasBeginAnchorAtTopLevel used to:
 // whether the anchor is at the pattern's mandatory start. It additionally
-// pins the KIND, which is the part that matters for B43 — collapsing
+// pins the KIND, which is the part that matters here — collapsing
 // (?m:^) onto \A restricts a pattern to position 0 that may legitimately
 // match at every line start.
 func TestTopLevelBeginAnchorKind(t *testing.T) {
@@ -2072,7 +2072,7 @@ func TestACLayoutNoGap(t *testing.T) {
 }
 
 // sparseGroup is 128 distinct patterns sharing ONE mandatory literal — the WAF
-// shape G17 exists for. The distinct part must be NON-LITERAL: mandatory-literal
+// shape sparse accept exists for. The distinct part must be NON-LITERAL: mandatory-literal
 // extraction takes the LONGEST literal, so `unionkw000` would give each pattern
 // its own literal and its own bucket, and nothing would be shared.
 func sparseGroup(t *testing.T, n int, opts CompileSetOptions) []*bucket {
@@ -2091,7 +2091,7 @@ func sparseGroup(t *testing.T, n int, opts CompileSetOptions) []*bucket {
 	return binPack(infos, opts, nil)
 }
 
-// TestSparsePromotionMergesSharedLiteralBuckets is G17's premise and its result
+// TestSparsePromotionMergesSharedLiteralBuckets is sparse promotion's premise and its result
 // in one: without promotion 128 patterns behind one literal split into four
 // buckets — costing four suffix-DFA walks at every candidate position — and
 // with it they are one.
@@ -2103,7 +2103,7 @@ func TestSparsePromotionMergesSharedLiteralBuckets(t *testing.T) {
 	off := sparseGroup(t, 128, CompileSetOptions{})
 	if len(off) != 4 {
 		t.Fatalf("expected 128 patterns to split into 4 bitmask buckets, got %d "+
-			"— the 32-pattern bitmask width is G17's premise", len(off))
+			"— the 32-pattern bitmask width is sparse promotion's premise", len(off))
 	}
 	for _, b := range off {
 		if b.sparse {
@@ -2192,7 +2192,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 	}
 
 	// Under LikelyMatch a counted-class-chain
-	// singleton has the SIMD-verify suffix body, and constraint 0 (LM-6)
+	// singleton has the SIMD-verify suffix body, and constraint 0
 	// kept it out of a shared bucket on purpose; the promotion must not take
 	// it back.
 	{
@@ -2261,7 +2261,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 	}
 }
 
-// G17 foundation: one merged DFA over MORE than 64 patterns, with
+// Sparse-accept foundation: one merged DFA over MORE than 64 patterns, with
 // per-state accept LISTS instead of a u64 bitmask.
 //
 // The bitmask caps a bucket at 64 (32 in practice, since every mask on the
@@ -2292,7 +2292,7 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 	opts := CompileSetOptions{}
 
 	if _, _, err := mergeSuffixDFA(asts, opts); err == nil {
-		t.Fatal("mergeSuffixDFA accepted 128 patterns; the 32-pattern bitmask cap is the premise of G17")
+		t.Fatal("mergeSuffixDFA accepted 128 patterns; the 32-pattern bitmask cap is the premise of sparse accept")
 	}
 
 	tab, d, err := mergeSuffixDFASparseSet(asts, opts)
@@ -2476,7 +2476,7 @@ func TestSparseSetTableAcceptListsAreCorrect(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FABLE B24. binPack's literal-singleton arm built a bucket's suffix DFA and
+// binPack's literal-singleton arm built a bucket's suffix DFA and
 // kept a FAILURE silently:
 //
 //	if ast := patternSuffixAST(p); ast != nil {
@@ -2506,7 +2506,7 @@ func TestSparseSetTableAcceptListsAreCorrect(t *testing.T) {
 //     smaller (e.g. (?:a+|b+|ab+){1,9}Q: 2005 non-LF vs 1156 LF).
 //  3. So if step 1 succeeded, step 2 succeeds.
 //
-// FABLE's own note predicted the opposite ("the merge uses leftmostFirst=true
+// The original bug report predicted the opposite ("the merge uses leftmostFirst=true
 // while analyzePattern's earlier build used false, so state counts can differ
 // and failure is possible"). The direction is real; the SIGN is backwards.
 //
@@ -2611,7 +2611,7 @@ var btRefusedPattern = strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
 // maxFallbackStates is no longer dropped, it is admitted on the Backtracking
 // engine, so the set member behaves like the same pattern compiled alone.
 //
-// Before item 20 this pattern produced 0 buckets and a warning; that older
+// Before Backtracking set members existed, this pattern produced 0 buckets and a warning; that older
 // assertion is now TestCompileFallback_WarnsWhenBTAlsoRefuses's job.
 func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	var prefixPool, suffixPool dfaPool

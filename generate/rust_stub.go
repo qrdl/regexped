@@ -36,9 +36,9 @@ func rustStub(cfg config.BuildConfig, out string) error {
 // Returns unindented content for placement INSIDE
 // pub mod <importModule>.
 //
-// D15: `find` is iterator-only and yields individual SetMatch values; the
+// `find` is iterator-only and yields individual SetMatch values; the
 // iterator owns the reusable tuple buffer and, for a gated set, the gate
-// array, so gates never appear in the public surface. D16: every buffer is
+// array, so gates never appear in the public surface. Every buffer is
 // declared in terms of the emitted <SET>_PATTERN_COUNT constant.
 func genRustSetInner(cfg config.BuildConfig) string {
 	if !hasSetExports(cfg) {
@@ -59,7 +59,7 @@ func genRustSetInner(cfg config.BuildConfig) string {
 
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
-		// the Rust spelling of each is decided here (R12).
+		// the Rust spelling of each is decided here.
 		for _, capability := range setCapabilities(s, cfg, wide) {
 			fmt.Fprintf(&out, "    #[link_name = %q]\n    fn ffi_%s(%s) -> %s;\n",
 				capability.Export, capability.Export,

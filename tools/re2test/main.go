@@ -64,14 +64,14 @@ func main() {
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
 	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
-	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain Opt 2 emission path on the full corpus")
-	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the Opt 1 dominant-self-loop bulk-skip emission path on the full corpus")
+	likelyMatch := flag.Bool("likelymatch", false, "compile every pattern with LikelyMode=LikelyMatch to exercise the lit-chain emission path on the full corpus")
+	likelyNoMatch := flag.Bool("likelynomatch", false, "compile every pattern with LikelyMode=LikelyNoMatch to exercise the dominant-self-loop bulk-skip emission path on the full corpus")
 	groupsOnly := flag.Bool("groups-only", false, "compile patterns with only groups_func set (omit match_func/find_func); surfaces lit-chain capture path bugs that depend on the narrow gate")
-	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's Gap B lenient path) that match+find-together dispatch never exercises")
+	matchOnly := flag.Bool("match-only", false, "compile non-capturing patterns with only match_func set (omit find_func); reaches the needMatch && !needFind call sites (e.g. analyseLitChainAltLenient's lenient path) that match+find-together dispatch never exercises")
 	highByteCheck := flag.Bool("high-bytes-check-corpus", false, "with --high-bytes, also cross-check the corpus's own columns against the twin oracle. Sound ONLY for a corpus whose expectations were written for a BYTE engine (custom-tests.txt); the RE2-derived corpora carry UTF-8 answers that legitimately differ")
 	allMatches := flag.Bool("all-matches", false, "synthesise col4 (EVERY match) from a Go oracle for rows whose corpus line has no such column, so later matches are checked and not just the first. re2-exhaustive.txt has four columns, so without this only one match per row is ever verified")
 	highBytes := flag.Bool("high-bytes", false, "stop skipping corpus inputs that contain bytes above 0x7F: judge them against a Go oracle run on an ASCII twin of the input (see highbytes.go). The corpus columns come from RE2, which decodes UTF-8, and cannot judge a byte engine on such input")
-	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the Gap E alt-prefixed find body, the Gap C alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
+	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the alt-prefixed find body, the alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -558,7 +558,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// FindStringIndex repeatedly over text[off:], advancing by one
 				// after an empty match. That oracle carried the two defects the
 				// expectations were supposed to catch, so WASM and oracle
-				// agreed by being wrong the same way (FABLE T7):
+				// agreed by being wrong the same way:
 				//
 				//   (A) the narrowed slice hides the byte before `off`, so \b,
 				//       \B, (?m:^) and (?m:$) are judged against the slice edge;
@@ -1175,7 +1175,7 @@ func testSetBlock(
 // This is the two-oracle discipline made mechanical. The original --sets run compared
 // the engine against col4; this file computes expectations from Go instead. If
 // the two ever disagree, one of them is wrong and the run must say so — a
-// silent switch of oracle would be exactly the FABLE B42 mistake, where the
+// silent switch of oracle would be exactly the earlier mistake, where the
 // comparison and its oracle were narrowed the same way and agreed while both
 // were wrong.
 func crossCheckCol4(chunk setChunk, strs []string, orc *setOracle) {

@@ -556,7 +556,7 @@ func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	if cfg.Sets[0].Overlapping {
-		t.Error("overlapping must default to false (the gated body is the default, D11)")
+		t.Error("overlapping must default to false (the gated body is the default)")
 	}
 	if !cfg.Sets[0].Gated() {
 		t.Error("a set without overlapping: true is gated")

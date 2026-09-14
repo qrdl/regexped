@@ -873,7 +873,7 @@ func TestShuftiAnchoredAdaptiveIsLarger(t *testing.T) {
 // TestUnionAliveMaskEmits covers emitUnionAliveMask, the preflight's
 // union-automaton pass.
 //
-// The G12 absence prefilter is chosen over it whenever per-pattern absence
+// The absence prefilter is chosen over it whenever per-pattern absence
 // literals exist, which every literal-bearing set in the matrix has — so the
 // union arm is the road not taken there and needs reaching directly.
 func TestUnionAliveMaskEmits(t *testing.T) {
@@ -901,7 +901,7 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 	if len(body) == 0 {
 		t.Fatal("emitted an empty alive-mask sequence")
 	}
-	// fullMask != 0 arms the early exit (item 22 fix 2a prerequisite 2), which
+	// fullMask != 0 arms the early exit, which
 	// is a different emitted shape and the one every real caller gets.
 	withExit := emitUnionAliveMask(nil, u, 8, 9, 10, 2, 11, 0, []uint64{0x7})
 	if len(withExit) <= len(body) {

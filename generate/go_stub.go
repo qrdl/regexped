@@ -103,7 +103,7 @@ func genGoSetBody(cfg config.BuildConfig, shapes *setShapes) (string, bool) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
 		}
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
-		// the Go spelling of each is decided here (R12).
+		// the Go spelling of each is decided here.
 		setCaps := setCapabilities(s, cfg, wide)
 		sig := func(kind string) string {
 			capability := mustCapByKind(setCaps, kind, "Go")

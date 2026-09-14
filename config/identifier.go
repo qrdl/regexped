@@ -367,7 +367,7 @@ func ValidateConfig(cfg *BuildConfig) error {
 		}
 	}
 
-	// Per-stub-type checks (B32, B34). These depend on which generator the
+	// Per-stub-type checks. These depend on which generator the
 	// config targets, so they are skipped entirely when it targets none — a
 	// compile-only config (no stub_type, no stub_file) generates no source and
 	// cannot be broken by any of them.
@@ -567,8 +567,8 @@ var stubPrivateHelpers = map[string][]string{
 	// mark and release are shared by name between every regexped stub in one
 	// guest, so they track the heap of the one cabi_realloc the linker keeps.
 	"c": {
-		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release",
-		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "rx_pattern_names",
+		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release", "regexped_cabi_foreign_allocator",
+		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "rx_pattern_names", "RX_CABI_EXPECT_OURS",
 	},
 	"rust": {"Span", "Error", "Result", "SetMatch"},
 	"as":   {"Span"},

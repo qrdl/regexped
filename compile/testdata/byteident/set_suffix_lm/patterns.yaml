@@ -1,9 +1,9 @@
-# The bucket SUFFIX body's Shufti self-loop channels (task 68).
+# The bucket SUFFIX body's Shufti self-loop channels.
 #
 # Each pattern's mandatory literal (`A="`) is split off by the packer, leaving
 # the suffix `[a-z0-9]+"` — a 36-byte NON-mid-accept self-loop, since the body
-# cannot accept until the closing quote arrives. That is the LM-3 shape, which
-# no set could reach before task 68: a suffix DFA has an empty l.prefix by
+# cannot accept until the closing quote arrives. That is the non-mid Shufti shape, which
+# no set could reach before these channels: a suffix DFA has an empty l.prefix by
 # construction, so detectShuftiSelfLoop's bare-prefix bail refused every bucket
 # body regardless of hint.
 #

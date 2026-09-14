@@ -181,7 +181,7 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 	})
 	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode".
 	// Compiled in BYTE MODE since 2026-09-01: the default mode now rejects a
-	// rune the pattern wrote above 127 (é is 0xE9), which is the FABLE B29
+	// rune the pattern wrote above 127 (é is 0xE9), which is the silent
 	// leak this test used to depend on. Byte mode keeps the pattern legal —
 	// é means the single byte 0xE9 — so analysis.HasUnicode is still set and
 	// the selector path under test is unchanged.
@@ -252,7 +252,7 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 // continuation and exit first-byte sets overlap is now TDFA-eligible (the
 // overlap alone no longer forces Backtracking, since TDFA's LeftmostFirst
 // priority always prefers the loop body over the exit regardless of overlap).
-// This branch had 0 direct test coverage — the pre-task-13 exclusion this
+// This branch had 0 direct test coverage — the earlier exclusion this
 // replaced was itself only ever exercised via re2test, not `go test`.
 func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
 	cases := []struct {
@@ -262,18 +262,18 @@ func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
 	}{
 		// ([a-z]+)(er)([a-z]+): the first loop's continuation ([a-z]) and its
 		// own exit (into "er", which starts with 'e' — itself in [a-z]) overlap.
-		// Pre-task-13 this was forced to Backtracking; the fix's own example.
+		// This used to be forced to Backtracking; the fix's own example.
 		{`([a-z]+)(er)([a-z]+)`, EngineTDFA, "overlapping-terminator loop now TDFA-eligible"},
 		// (cat|car)+: a genuine user alternation NESTED INSIDE a quantifier
 		// loop is still a separate InstAlt, checked in full (non-quantifier
 		// path) — must remain unaffected by the quantifier-loop relaxation.
 		{`(cat|car)+`, EngineTDFA, "nested user alternation inside a loop, no captures inside it"},
-		// Gap I (CLAUDE.md "Load-bearing engine-selection gates"): an inverted
+		// CLAUDE.md "Load-bearing engine-selection gates": an inverted
 		// class wider than 256 codepoints inside a quantifier loop still has an
 		// INDETERMINATE (empty) first-rune-set for getFirstRuneSet, so it must
 		// remain ambiguous → Backtracking, even though it's a quantifier loop.
 		// This must NOT be relaxed — see CLAUDE.md's explicit warning.
-		{`<([^>]+)>`, EngineBacktrack, "Gap I: indeterminate branch inside quantifier loop stays ambiguous"},
+		{`<([^>]+)>`, EngineBacktrack, "inverted-class gate: indeterminate branch inside quantifier loop stays ambiguous"},
 	}
 	for _, c := range cases {
 		got, err := SelectEngine(c.pattern, CompileOptions{})
@@ -474,7 +474,7 @@ func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
 		{`^([^,]*),([^,]*)$`, false, "line anchors excluded from TDFA"},
 		{`\b(\w+)@(\w+)\b`, false, "word boundary excluded from TDFA"},
 		{`<(.+?)>`, false, "non-greedy excluded from TDFA"},
-		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md Gap I)"},
+		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md load-bearing gate)"},
 		{`[a-z]+`, false, "no captures at all — DFA path"},
 	}
 	for _, c := range cases {

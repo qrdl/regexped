@@ -124,7 +124,7 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 //
 // Root cause, live-verified: this is NOT a Cranelift-internal complexity
 // cliff at a specific loop count, and NOT a regexped code-bloat defect.
-// The pattern family (?:$*<9-10 literal bytes>){N} (bug 31's repro shape)
+// The pattern family (?:$*<9-10 literal bytes>){N} (a fuzzer-found repro shape)
 // stays on the cheap primary DFA/CompiledDFA path for N up to 113 (its
 // literal-chain state count stays under the default 1024-state cap), where
 // wasmtime.NewModule takes ~25-30ms regardless of table size. At N=114 the
@@ -143,10 +143,10 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 // BT's per-loop JIT cost is high enough per unit that a completely
 // ordinary-looking pattern can cost several seconds of uninterruptible
 // compile time with zero attribution — e.g. ~1.4s at 228 loop-frame locals,
-// ~6.2s at 400, ~12.1s at 510 (bug 32's own ErrBTStackTooLarge already
+// ~6.2s at 400, ~12.1s at 510 (ErrBTStackTooLarge already
 // rejects this specific family beyond ~510). tools/fuzz's `-fuzz` worker
 // treats any single call over ~10s as a hang and reports it as a crasher
-// (the same mechanism documented on maxNFAInsts and bug 31); a real caller
+// (the same mechanism documented on maxNFAInsts); a real caller
 // compiling such a pattern at build time would just see an unexplained
 // multi-second stall.
 var ErrBTLoopCountTooLarge = errors.New("compile: backtracking loop-frame-local count exceeds JIT-safe limit")
@@ -230,7 +230,7 @@ var ErrBTEmptyBodyLoopChainTooLarge = errors.New("compile: backtracking empty-bo
 // Backtracking code-generation site, before any WASM body is built. 12 is
 // chosen directly from live measurement (see
 // ErrBTEmptyBodyLoopChainTooLarge's doc): call time at N=12 chained `$*` is
-// ~9.5ms (comfortably fast, same bar bug 33 used for its own JIT-time cap),
+// ~9.5ms (comfortably fast, the same bar the JIT-time cap uses),
 // while N=14 already reaches ~101ms and every couple of steps beyond
 // roughly triples again. Ordinary patterns have at most a handful of
 // independent nullable loops; a long straight-line chain of them only
@@ -505,7 +505,7 @@ type compiledPattern struct {
 	// A global is exactly as module-scoped as the table slot it replaces — the
 	// sharing semantics do not change — but the index comes from an allocator
 	// rather than from address arithmetic whose zero value is a real, writable
-	// table offset. That value is what B13's shortcut left unset, and the
+	// table offset. That value is what an earlier shortcut left unset, and the
 	// wrapper then wrote 8 bytes over table offset 0 on every groups() call:
 	// standalone, that offset is the CALLER'S OWN INPUT BUFFER, corrupted in
 	// place. A body reading a global its assembler never declared does not
@@ -821,7 +821,7 @@ func (p *compiledPattern) funcCount() int {
 	return len(p.funcLayout())
 }
 
-// batchOffsets returns the sub-indices of the optional LM-2 batch wrapper
+// batchOffsets returns the sub-indices of the optional batch wrapper
 // functions, which are always laid out last (after everything offsets()
 // accounts for). -1 if the corresponding export was not requested. Kept
 // separate from offsets() so its widely-shared 4-return signature (used by
@@ -1059,7 +1059,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// scan-to-find-extent → fill-captures pipeline and adjusts slot positions
 	// by the match start.
 	if needGroups {
-		// Gap C: single-pattern range with captures (greedy).
+		// Lit-chain range: single pattern with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
@@ -1109,7 +1109,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Pattern); ok {
 			if needMatch {
 				// Anchored alt match for the capture path is not specialised
-				// (Gap B). Fall through to the standard pipeline.
+				// here. Fall through to the standard pipeline.
 			} else {
 				p := &compiledPattern{
 					tableEnd:  tableBase,
@@ -1140,7 +1140,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 		}
 
-		// Gap A.4: lenient alternation with captures. Composes the lit-chain
+		// Lenient alternation with captures. Composes the lit-chain
 		// lenient-alt findBody (fast Teddy + per-branch verify) with the
 		// standard TDFA captureBody via the groups wrapper. Win: replace
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
@@ -1217,7 +1217,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	if !needGroups {
-		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
+		// Mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
@@ -1253,16 +1253,16 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			return p, nil
 		}
-		// Gap C: single-pattern range `{N,M}`.
+		// Lit-chain range `{N,M}`, single pattern.
 		//
 		// Anchored range shapes are excluded from the FIND half of this path
 		// (they fall through to the classic DFA below):
 		//
-		//   - FABLE B7: buildLitChainRangeFindBody never consults
+		//   - buildLitChainRangeFindBody never consults
 		//     startAnchor/endAnchor — unlike its fixed-count sibling, which
 		//     has a full hasAnchors path — so `^A[0-9]{24,30}` matched at any
 		//     position and `A[0-9]{24,30}$` matched without reaching len.
-		//   - FABLE B10: the non-greedy collapse below freezes countMax at
+		//   - the non-greedy collapse below freezes countMax at
 		//     count, but Perl lets `{N,M}?` extend past N when a trailing
 		//     anchor demands it (`A[0-9]{24,30}?$` on "A"+26 digits matches in
 		//     Go, and the collapsed body reports no match).
@@ -1301,7 +1301,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				return p, nil
 			}
 		}
-		// Gap B: anchored match for strict lit-chain alternation.
+		// Anchored match for strict lit-chain alternation.
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				p := &compiledPattern{
@@ -1312,7 +1312,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				p.matchBody = appendLitChainAltMatchCodeEntry(nil, altp)
 				return p, nil
 			}
-			// Gap B lenient: anchored match for mixed lit-chain + DFA branches.
+			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, false); ok {
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
@@ -1328,7 +1328,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 		}
 
-		// Gap E: strict alt of mixed-prefix branches.
+		// Strict alt of mixed-prefix branches.
 		if needFind && !needMatch {
 			if altp, ok := analyseLitChainAltPrefixed(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
@@ -1370,7 +1370,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 				return p, nil
 			}
-			// Gap C: strict alt of lit-chain branches with at least one range.
+			// Strict alt of lit-chain branches with at least one range.
 			if altp, ok := analyseLitChainAltRange(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
@@ -1960,7 +1960,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 			}
 
-			// Opt 1 — dominant-self-loop SIMD bulk-skip. Default-on for all
+			// Dominant-self-loop SIMD bulk-skip. Default-on for all
 			// modes, mid-accept and non-mid-accept alike (2026-07-05).
 			// Non-mid was
 			// previously LM-gated because the original side-table dispatch
@@ -2234,7 +2234,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 
 		// The window offsets are two module globals, so no table region is
-		// reserved for them any more (TODO 75 group A).
+		// reserved for them any more.
 		winGlobal := int32(-1)
 		if needWindow {
 			if buildOpts.globals == nil {
@@ -2327,9 +2327,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 
 	// Type section: 4 fixed types (match, find, capture/groups, and
 	// alt-lit-anchor's forward_verify_i), plus an
-	// optional 5th (the LM-2 batch find/groups wrapper signature) — added
+	// optional 5th (the batch find/groups wrapper signature) — added
 	// only when some pattern actually has a batch export, so modules with
-	// no LM-2 usage (including LikelyMatch modules where every pattern's
+	// no batch export (including LikelyMatch modules where every pattern's
 	// batch shape is out of v1 scope) don't pay its few bytes. Nothing else
 	// ever references type index 4, so omitting it is always safe.
 	// (A different 4th type — for the LNM non-mid bulk-skip helper — was
@@ -2352,7 +2352,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	numTypes := 4
 	if anyBatch {
 		typeSection = append(typeSection,
-			0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // (i32×5)→i32 — LM-2 batch wrapper
+			0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // (i32×5)→i32 — batch wrapper
 		numTypes++
 	}
 	// (i32,i32,i32,i32)→i32 — the groups/named-groups export with a `from`
@@ -2969,7 +2969,7 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// `continue` past an analyzePattern error where CompileFile treats the
 		// same error as FATAL, so a config that cannot build could still
 		// produce a clean-looking diagnostics file describing a set with the
-		// broken pattern quietly missing from it (FABLE B23, third mechanism).
+		// broken pattern quietly missing from it.
 		// Sharing the function is what stops the two answers drifting again.
 		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
 		if err != nil {
@@ -3110,7 +3110,7 @@ const maxUnicodeRune = 0x10ffff
 // regexped is a BYTE engine. A rune above the mode's limit has no byte to be,
 // so the automaton silently truncates it — which is a wrong answer rather than
 // a missing feature, and was for a long time an entirely silent one (five
-// verified divergences from Go, FABLE B29). This is the gate that turns those
+// verified divergences from Go). This is the gate that turns those
 // into compile errors.
 //
 // The limit is 127 by default and 0xFF in byte mode. Three things are
@@ -3120,7 +3120,7 @@ const maxUnicodeRune = 0x10ffff
 //     plus `[\x2d-\U0010ffff]`; the second range names every rune there is,
 //     not a non-ASCII intention. Rejecting it would reject `.` and every
 //     negated class, which is a non-starter. That these consume ONE BYTE is
-//     documented byte semantics (B29 row 4).
+//     documented byte semantics.
 //
 //     The top endpoint is the whole test, and it does not — cannot — ask how
 //     the class was SPELLED. A complement is not merely like an explicit range
@@ -3447,7 +3447,7 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 	return append(b, 0x0B)
 }
 
-// buildBatchFindWrapperBody emits the WASM body for the LM-2 batch find
+// buildBatchFindWrapperBody emits the WASM body for the batch find
 // export. Signature (type 4):
 //
 //	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
@@ -3557,7 +3557,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 	return append(cs, body...)
 }
 
-// buildBatchGroupsWrapperBody emits the WASM body for the LM-2 batch groups
+// buildBatchGroupsWrapperBody emits the WASM body for the batch groups
 // export. Signature (type 4), same as the batch
 // find wrapper:
 //

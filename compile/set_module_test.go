@@ -348,7 +348,7 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 //  4. the union of first bytes across all literals falls in [17, 64] — each
 //     pattern here uses a distinct leading byte, so the union is exactly 33;
 //  5. the set-level "prefer-no-match" hint forces Shufti regardless of the
-//     rarity heuristic (Action 5).
+//     rarity heuristic.
 func TestCompileFile_ShuftiFrontend(t *testing.T) {
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	n := 33
@@ -998,7 +998,7 @@ func TestDiagJSON_Schema(t *testing.T) {
 // TestCompileFile_ShuftiNonAdaptive exercises the non-adaptive locals layout
 // in emitSetMatchFnFinalShufti (shuftiAdaptive = lnm && !rare — false here
 // because rare=true, i.e. shuftiBeatsScalar already selects Shufti
-// statically, so the LikelyNoMatch hint changes nothing) — the test plan T12.
+// statically, so the LikelyNoMatch hint changes nothing).
 // TestCompileFile_ShuftiFrontend's digit/uppercase alphabet always has
 // rare=false, so it can only ever reach adaptive=true; this uses a
 // low-rarity (control-byte/punctuation) first-byte alphabet instead.
@@ -1029,7 +1029,7 @@ func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
 // TestCompileFile_ShuftiVarLenAndAnchor exercises the startAnchorMasks
 // (sam != 0) branch, the prefixFnIdx fixed-prefix loop, and the emitVarLen
 // closure (both varLenEmptySuffix and varLenNonEmptySuffix) inside
-// emitSetMatchFnFinalShufti — the test plan T13. TestCompileFile_ShuftiFrontend's
+// emitSetMatchFnFinalShufti. TestCompileFile_ShuftiFrontend's
 // 33 trivial-prefix patterns never exercise any of these; this reuses the
 // same low-rarity first-byte alphabet (forcing the Shufti frontend
 // unconditionally) but rotates each pattern through 4 prefix shapes:
@@ -1072,8 +1072,8 @@ func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 }
 
 // TestCompileFile_ACStartAnchor exercises the start-anchor branch (sam != 0,
-// prefixFnIdx loop) in the AC frontend (emitSetMatchFnFinalAC) — the test plan
-// T14. Extends TestSetFind_AC_VarLenPrefix's 20-pattern shape (which forces
+// prefixFnIdx loop) in the AC frontend (emitSetMatchFnFinalAC).
+// Extends TestSetFind_AC_VarLenPrefix's 20-pattern shape (which forces
 // the AC frontend, 17-32 unique literals) with one ^-anchored pattern.
 // Confirmed live via CompileSet probing: fe=ac, startAnchorMasks[0]=1.
 func TestCompileFile_ACStartAnchor(t *testing.T) {
@@ -1107,8 +1107,8 @@ func TestCompileFile_ACStartAnchor(t *testing.T) {
 }
 
 // TestCompileFile_TeddyTwoGroupsFourByte exercises the "Group B four-byte
-// lo/hi table load + nibble check" combination in emitSetMatchFnFinalTeddy
-// — the test plan T15. TwoGroups requires > 8 literals; FourByte requires every
+// lo/hi table load + nibble check" combination in emitSetMatchFnFinalTeddy.
+// TwoGroups requires > 8 literals; FourByte requires every
 // literal >= 4 bytes; existing tests only ever hit one condition at a time.
 // 9 patterns, each with a distinct 6-byte mandatory literal, stays under the
 // 16-literal Teddy cap while satisfying both. Confirmed live via CompileSet
@@ -1139,7 +1139,7 @@ func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
 // litAnchorBackScanBody != nil branch and the anchored groupsExport branch
 // inside assembleModuleWithSets (the cfg.Sets-non-empty per-pattern
 // assembler), which are otherwise only exercised via assembleModule's
-// sets-less path — the test plan T16. "secret_[A-Za-z0-9]+" qualifies for
+// sets-less path. "secret_[A-Za-z0-9]+" qualifies for
 // lit-anchor find (confirmed live: findLitAnchorPoint returns non-nil, and
 // the pattern's small forward DFA has useU8=true); "^(a)(b)$" is an anchored
 // groups_func pattern. A trivial, unrelated Sets entry is present so
@@ -1168,7 +1168,7 @@ func TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups(t *testing.T) {
 
 // TestCompileFile_ErrorPropagation exercises the two distinct error paths
 // through CompileFile's full config entry point (previously only unit-
-// tested at the analyzePattern level directly) — the test plan T17.
+// tested at the analyzePattern level directly).
 func TestCompileFile_ErrorPropagation(t *testing.T) {
 	t.Run("compilePattern_failure", func(t *testing.T) {
 		// Broken pattern WITH a func field set, alongside a non-empty Sets
@@ -1215,8 +1215,8 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 // TestSetMatch_ZeroWidthNonNilPrefix exercises the L <= 0 branch in
 // emitSetMatchFnAnchored — a pattern whose prefixAST is non-nil, not a
 // trivial prefix, and not variable-length, but whose fixed length is 0 (a
-// zero-width assertion, here \b, immediately before the mandatory literal)
-// — the test plan T18. Confirmed live via analyzePattern/CompileSet probing:
+// zero-width assertion, here \b, immediately before the mandatory literal).
+// Confirmed live via analyzePattern/CompileSet probing:
 // prefixFnIdx=[0] (a real, non-trivial prefix function), prefixFixedLens=[0]
 // (zero-width), trivialPrefixMasks=[0] (not trivial) — exactly the L<=0,
 // fnIdx>=0 combination the doc flagged as needing verification.
@@ -1239,7 +1239,7 @@ func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The per-export-combination matrix.
 //
-// FABLE wave 3 found bugs visible only under --find-only, and the same is true
+// An earlier review found bugs visible only under --find-only, and the same is true
 // here: each capability emits a different body shape, and a set that declares
 // only one of them exercises a code path no other config reaches. Every row
 // below is one compiled config, checked for its exports and type-validated.
@@ -1520,7 +1520,7 @@ func TestJumpIsProfitable(t *testing.T) {
 		{"single 1-byte class", []string{`[a-z]`}, false},
 		{"single 1-byte literal", []string{`a`}, false},
 		{"single any-char", []string{`.`}, false},
-		// Multi-pattern, scalar frontend (no usable literal): G13 admits these.
+		// Multi-pattern, scalar frontend (no usable literal): admitted.
 		{"two patterns scalar", []string{`a+`, `b+`}, true},
 		{"multi scalar one exceeds", []string{`[a-z]`, `x+`}, true},
 		// Multi-pattern, scalar, but nothing can exceed one byte → dead code.
@@ -1590,7 +1590,7 @@ func TestSetFindBatch_Emission(t *testing.T) {
 	batchHint := []string{"batch-find"}
 
 	t.Run("hint_adds_the_batch_export_alongside_find", func(t *testing.T) {
-		// Decision (11): batching is a property of `find`, not a capability.
+		// Batching is a property of `find`, not a capability.
 		// The hint adds the synthesized export; `find` itself stays exported.
 		w := build(config.SetConfig{Name: "s", Find: "plain_find", Hints: batchHint, Patterns: all})
 		for _, name := range []string{"plain_find", "plain_find_batch"} {
@@ -1619,7 +1619,7 @@ func TestSetFindBatch_Emission(t *testing.T) {
 	})
 
 	t.Run("unhinted_is_unchanged", func(t *testing.T) {
-		// D6's rule one level up: a set that does not ask for batching must
+		// The byte-identity rule one level up: a set that does not ask for batching must
 		// compile to exactly what it compiled to before batching existed.
 		a := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
 		b := build(config.SetConfig{Name: "s", Find: "plain_find", Patterns: all})
@@ -1630,7 +1630,7 @@ func TestSetFindBatch_Emission(t *testing.T) {
 		if len(c) <= len(a) {
 			t.Errorf("the hint did not add code: %d bytes vs %d", len(c), len(a))
 		}
-		// Decision (11a): the batch entry WRAPS the ordinary find rather than
+		// The batch entry WRAPS the ordinary find rather than
 		// re-emitting the bucket code, so the cost is the resume loop and a
 		// wrapper, not a second copy of the body.
 		if grew := len(c) - len(a); grew > len(a) {
@@ -1904,7 +1904,7 @@ func setMatrixCases() []setMatrixCase {
 			subset:   []string{"p00", "p33", "p69"}, caps: capsScan,
 		},
 
-		// ---- one bucket, many patterns: G17's sparse accept ---------------
+		// ---- one bucket, many patterns: sparse accept ---------------
 		//
 		// Sparse needs >32 patterns in ONE bucket, which means they must share
 		// the SAME mandatory literal and differ only after it. Distinct
@@ -1990,7 +1990,7 @@ func setMatrixCases() []setMatrixCase {
 
 // sharedLiteral builds n patterns that all carry the SAME mandatory literal
 // and differ only in the suffix after it, so the packer puts them in one
-// bucket — the precondition for G17's sparse promotion.
+// bucket — the precondition for sparse promotion.
 func sharedLiteral(n int) []string {
 	out := make([]string, n)
 	for i := range out {

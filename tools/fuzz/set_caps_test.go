@@ -729,8 +729,8 @@ func TestSetWideAllBitmap(t *testing.T) {
 // The oracle is deliberately NOT a Go reimplementation of the biased gate
 // encoding: a reference derived from the same
 // spec paragraph as the emitter proves the two agree, not that either is
-// right, and this project has already been bitten by exactly that (FABLE B42,
-// where re2test's comparison AND its oracle narrowed the input the same way).
+// right, and this project has already been bitten by exactly that, when
+// re2test's comparison AND its oracle narrowed the input the same way.
 //
 // Instead Go computes the WHOLE answer: the complete gated output of a set is
 // the union, over every pattern k, of `FindAllIndex(pk, input)` tagged with k.
@@ -1733,8 +1733,7 @@ func TestBatchZeroCapTerminates(t *testing.T) {
 	}
 }
 
-// G17 promotion for the ANCHORED and FALLBACK packers (
-// item 8).
+// Sparse promotion for the ANCHORED and FALLBACK packers.
 //
 // The shared-literal find packer got sparse accept first; these are the two
 // paths that still split at 32 patterns afterwards, and they pay for a split
@@ -1983,7 +1982,7 @@ func TestSparsePromotionWideAll(t *testing.T) {
 // set decides WHICH bodies get emitted, so a sparse bucket can be correct in
 // one configuration and produce a module that does not load in another.
 //
-// Two things here are specific to G17. emitSetAnchoredCapBody declares two
+// Two things here are specific to sparse accept. emitSetAnchoredCapBody declares two
 // extra i32 locals only when an anchored bucket is sparse, which shifts the i64
 // accumulator's local index — a mistake there is an invalid module, not a wrong
 // answer. And an anchored-only set emits no literal frontend at all, so the
@@ -2065,7 +2064,7 @@ func TestSparseSetABIMatrixValidates(t *testing.T) {
 // RE2 corpus (6004 failures at --set-chunk=70, all on empty or empty-matching
 // inputs).
 //
-// The defect predates this change — it shipped with G17's shared-literal path,
+// The defect predates this change — it shipped with sparse accept's shared-literal path,
 // where the corpus never built a >32-pattern group behind one literal — so both
 // arrangements are pinned here: nullable patterns behind a shared literal, and
 // nullable patterns with no literal at all.
@@ -2112,7 +2111,7 @@ func TestSparseZeroLengthMatches(t *testing.T) {
 
 // TestSparseGatedBatchDeliversEveryPattern is the regression for the second
 // defect this work uncovered: every mask-based shortcut on the candidate path
-// is an i32, so none of them can describe a G17 sparse bucket's patterns past
+// is an i32, so none of them can describe a sparse bucket's patterns past
 // the 32nd.
 //
 // emitGateMask clears a bit per pattern for the first 32 only, and
@@ -2671,8 +2670,8 @@ func TestSetMergedModeFromResume(t *testing.T) {
 // same automaton).
 //
 // This test asserts the OUTCOME, not the mechanism: whatever routing is chosen,
-// these answers must match Go. It therefore stays valid if item 13 is ever
-// built properly.
+// these answers must match Go. It therefore stays valid if a better routing is ever
+// built.
 func TestVarLenPrefixMustRouteToFallback(t *testing.T) {
 	cases := []struct {
 		pats   []string
@@ -2833,7 +2832,7 @@ const wideUnionAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 
 // wideUnionPatterns builds n literals whose first bytes are n distinct members
 // of wideUnionAlphabet — so the first-byte union lands ABOVE the 64 that
-// bounded Shufti selection before task 70.
+// bounded Shufti selection before the band was widened.
 func wideUnionPatterns(n int) []string {
 	out := make([]string, 0, n)
 	for i := 0; i < n; i++ {
@@ -2849,7 +2848,7 @@ func wideUnionPatterns(n int) []string {
 // compileCapsWideUnion is compileCapsShufti for the WIDENED band: the same
 // AC-out-of-budget route to the scalar branch, but a first-byte union of 70 —
 // which reaches emitSetMatchFnFinalShufti only under set-level
-// LikelyNoMatch, and only since task 70 raised the selection ceiling.
+// LikelyNoMatch, and only since the selection ceiling was raised.
 func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte {
 	t.Helper()
 	entries := make([]config.RegexEntry, len(pats))
@@ -2890,10 +2889,10 @@ func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte 
 	return w
 }
 
-// The Shufti frontend at a first-byte union WIDER than 64 (task 70).
+// The Shufti frontend at a first-byte union WIDER than 64.
 //
 // emitShuftiPrefixCheck builds one nibble-table pair per 8 set members, so a
-// 70-byte union is 9 pairs where the pre-task-70 ceiling allowed 8. Nothing
+// 70-byte union is 9 pairs where the old 64-byte ceiling allowed 8. Nothing
 // about the emitter is width-specific, but "nothing about it is width-specific"
 // is a claim about code that had never been run past 64 — this runs it, and
 // checks every capability against the Go oracle.
@@ -3175,7 +3174,7 @@ func TestSetBTManyFallbackPatterns(t *testing.T) {
 }
 
 // TestSetBTCaptureBearingPatterns is the regression for the capture-bearing
-// bugs 1 and 2, which turned out to be ONE root cause with two very different
+// pair of bugs, which turned out to be ONE root cause with two very different
 // symptoms.
 //
 // patternSuffixAST's non-splittable branch re-parsed the pattern WITHOUT
@@ -3434,8 +3433,7 @@ func runBTBatch(t *testing.T, w []byte, pats []string, input string, outCap int3
 		t.Fatalf("parse data section: %v", err)
 	}
 	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-	// The overlapping batch entry takes the gate array too, as the
-	// item 11 — not for match gates, which it records none of, but as the
+	// The overlapping batch entry takes the gate array too — not for match gates, which it records none of, but as the
 	// per-drive home of the preflight verdict. Zeroed here: that is what
 	// declares a fresh drive.
 	gatePtr := inBase + pageSize

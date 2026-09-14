@@ -770,7 +770,7 @@ func TestDominantWalkStatesEdges(t *testing.T) {
 // ── The absence-literal prefilter's AST walk ───────────────────────────────
 //
 // findAbsenceLit answers "does every match of this pattern contain this exact
-// byte string?", which the G12 prefilter uses to retire a pattern from the
+// byte string?", which the absence prefilter uses to retire a pattern from the
 // alive mask without walking it. The direction of any error matters
 // asymmetrically: claiming a literal that is NOT mandatory under-approximates
 // alive and silently loses matches, while missing one merely costs a walk.

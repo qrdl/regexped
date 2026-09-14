@@ -33,7 +33,7 @@ import (
 // Before this file, the ONLY coverage of either was re2test's col4 (225
 // hand-picked rows) and col6 (ONE row) — and both were validated against a Go
 // loop carrying the identical defects, so they agreed by being wrong the same
-// way (FABLE T7).
+// way.
 //
 // The oracle here is Go's own FindAllStringIndex / FindAllStringSubmatchIndex
 // over the WHOLE input. Nothing re-implements our loop.
@@ -473,7 +473,7 @@ func TestGroupsIterationMatchesGo(t *testing.T) {
 //
 //   - buildSimplePrefixCheckBody returned `base - count` without a floor, so a
 //     literal inside [from, from+M) reported a start BEFORE from
-//     (TestSimplePrefixCheckHonoursFrom, the G3 regression).
+//     (TestSimplePrefixCheckHonoursFrom).
 //   - buildLitChainAltLenientFindBody seeded locAttemptStart, which in that
 //     body is DERIVED from the window base rather than being the scan cursor.
 //     Every call returned the first match in the buffer regardless of from.
@@ -559,14 +559,14 @@ var findFromShapes = []struct{ name, pat, input string }{
 	{"lit_chain_range", `x[a-f]{24,30}y`,
 		"xabcdefabcdefabcdefabcdefy xffffffffffffffffffffffffffy"},
 
-	// LikelyNoMatch-only emitters. buildSimplePrefixCheckBody is the G3
+	// LikelyNoMatch-only emitters. buildSimplePrefixCheckBody is that
 	// regression's owner: two matches within M bytes put the second call's
 	// candidate inside the first's backward window.
 	// Unbounded self-loop before a mandatory literal: the shape whose DFA
 	// never dies, and the one overlapping find's preflight exists for.
 	{"dominant_selfloop", `[^\n]*ERROR`, "aa ERROR bb\ncc ERROR dd"},
 	// Bounded variable-length prefix — recovery is c - prefixMaxLen, which is
-	// why it cannot use the prefix.literal.suffix split (FAILED_IDEAS item 13).
+	// why it cannot use the prefix.literal.suffix split.
 	{"varlen_prefix", `a{0,2}XYZQ`, "q aXYZQ w aaXYZQ e XYZQ"},
 	// Literal chain with an alternation SUFFIX rather than an alternation of
 	// chains — a different body from both alt paths above.
@@ -1027,7 +1027,7 @@ func TestLitChainGroupsIterate(t *testing.T) {
 	}
 }
 
-// TestSimplePrefixCheckHonoursFrom covers G3.
+// TestSimplePrefixCheckHonoursFrom pins a find-from regression.
 //
 // buildSimplePrefixCheckBody replaces the generic backward scan under
 // LikelyNoMatch when the lit-anchor prefix is a bare [class]{M}. The rework gave
@@ -1361,7 +1361,7 @@ func groupsCaller(t *testing.T, wasmBytes []byte, input string, slots int) (func
 
 // TestGroupsFromIterationMatchesGo is half (B) for the groups export.
 //
-// Task 54's suppression rule — an EMPTY match beginning exactly where the
+// The suppression rule — an EMPTY match beginning exactly where the
 // previous reported match ended is not reported — shipped into the find
 // iterators AND both groups iterators. The find side is checked by
 // TestFindFromIterationTerminates; this is the groups half, which had only
@@ -1435,7 +1435,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 	}
 }
 
-// The batch groups export (LM-2) writes several matches per call into a
+// The batch groups export writes several matches per call into a
 // caller buffer. It is a SEPARATE path from the one-at-a-time groups export
 // and the generated JS/TS stubs prefer it when present, so a defect here is
 // invisible to every groups test that drives `groups`.
@@ -2301,7 +2301,7 @@ func abbrev(s string) string {
 	return fmt.Sprintf("%q...%q (len %d)", s[:32], s[len(s)-16:], len(s))
 }
 
-// B14: register-coloring coalescing (minimizeTDFARegisters/remapOps) can map two
+// Register-coloring coalescing (minimizeTDFARegisters/remapOps) can map two
 // registers in the same parallel-copy batch onto one local, creating a
 // read-after-write dependency that did not exist before coloring. The batch was
 // correctly sequentialized pre-coloring and is never re-sequentialized after, so
@@ -2321,7 +2321,7 @@ func TestTDFARegisterCoalescingOrdering(t *testing.T) {
 	})
 }
 
-// B15: the TDFA body hand-rolls its transition load instead of using the shared
+// The TDFA body hand-rolls its transition load instead of using the shared
 // emitU8Transition / emitCompressedU8Transition / emitU16Transition, so it
 // diverges from whatever encoding buildDFALayout actually picked.
 //
@@ -2356,7 +2356,7 @@ func TestTDFATableAddressingEncodings(t *testing.T) {
 	checkTDFAGroups(t, cases)
 }
 
-// B16: emitTDFABulkSkip advances over a run of same-state bytes without running
+// emitTDFABulkSkip advances over a run of same-state bytes without running
 // the per-byte mid-accept bookkeeping the scalar loop does, so lastAcceptPos and
 // the eagerly-written captures stay frozen at the value they had when the run
 // started. A dead exit byte inside a full 16-byte chunk then reports the stale

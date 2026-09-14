@@ -463,7 +463,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 			}},
 		},
 
-		// ---------- Lit-chain prefixed (Gap E) ----------
+		// ---------- Lit-chain mixed-prefix ----------
 		{
 			"prefixed_digits_ghp",
 			[]config.RegexEntry{{
@@ -1030,8 +1030,8 @@ func TestLitChainAnalysersRejection(t *testing.T) {
 		}
 	})
 
-	t.Run("too_small_count_lm1", func(t *testing.T) {
-		// LM-1: under LikelyMatch, callers pass minCount=1 — N=4 now
+	t.Run("too_small_count_likely_match", func(t *testing.T) {
+		// Under LikelyMatch, callers pass minCount=1 — N=4 now
 		// qualifies (K=4, N=4, K+N=8 < 16 still rejects; use N=12 so
 		// K+N=16 satisfies the overlap-load precondition).
 		if _, ok := analyseLitChain(`AKIA[A-Z0-9]{12}`, 1); !ok {
@@ -1315,7 +1315,7 @@ func TestCompileLikelyNoMatch(t *testing.T) {
 	}
 }
 
-// TestLM2BatchExportGating exercises the LM-2 batch find/groups export gate:
+// The batch find/groups export gate:
 // the "_batch" export must appear exactly when
 // LikelyMode == LikelyMatch and the pattern's own find_func/groups_func was
 // requested, and must NOT appear for anchored (native lit-chain) groups
@@ -1338,9 +1338,9 @@ func TestBatchExportGating(t *testing.T) {
 		GroupsFunc: "groups_ab",
 		Hints:      []string{"batch-find"},
 	}}
-	// (AKIA[A-Z0-9]{24}) is a lit-chain groups shape (Gap C, count>=24 so
+	// (AKIA[A-Z0-9]{24}) is a lit-chain groups shape (lit-chain range, count>=24 so
 	// analyseLitChainGroups accepts it — capture-path analysers are not
-	// LM-1-relaxed, unlike the plain match/find analysers) — anchored:
+	// relaxed under LikelyMatch, unlike the plain match/find analysers) — anchored:
 	// captureBody IS the exported groups function directly ("Path B"), so
 	// batching goes through buildBatchLitChainGroupsWrapperBody, not
 	// buildBatchGroupsWrapperBody.
@@ -1456,7 +1456,7 @@ func TestBatchExportGating(t *testing.T) {
 		}
 	})
 	t.Run("neutral_wasm_size_unaffected_by_hint_plumbing", func(t *testing.T) {
-		// Regression guard for the LM-2 "anyBatch" bug this task's doc calls
+		// Regression guard for the "anyBatch" bug the original change called
 		// out explicitly: a pattern that never requests batch-find must
 		// produce byte-identical output regardless of how "no batch-find" is
 		// spelled (nil Hints vs an empty-but-non-nil slice).
@@ -1614,7 +1614,7 @@ func singleCases() []singleCase {
 			pattern: `\b(\w+)\b`, groups: true,
 		},
 		{
-			name: "groups-backtrack-inverted", selects: "Backtracking via hasAmbiguousCaptures — the Gap I gate",
+			name: "groups-backtrack-inverted", selects: "Backtracking via hasAmbiguousCaptures — the inverted-class gate",
 			pattern: `<([^>]+)>`, groups: true,
 		},
 		{

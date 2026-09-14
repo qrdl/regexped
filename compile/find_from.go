@@ -21,7 +21,7 @@ import "github.com/qrdl/regexped/internal/utils"
 //     correct: byteident cannot distinguish a local index from SLEB128 data
 //     that happens to hold the same byte.
 //
-//   - A table-memory SCRATCH SLOT (the shape B13 used for the groups wrapper's
+//   - A table-memory SCRATCH SLOT (the shape the groups wrapper once used for its
 //     window offsets) has a per-pattern address whose Go zero value — 0 — is a
 //     real, writable table offset. That defect landed twice in one attempt.
 //     Those window offsets are globals themselves now, for this reason: see
@@ -56,7 +56,7 @@ const (
 	// ffUnset is the zero value: no emitter claimed this find function.
 	ffUnset findFromMode = iota
 
-	// ffLegacyNarrow is the pre-task-54 behaviour, moved from the stubs
+	// ffLegacyNarrow is the original behaviour, moved from the stubs
 	// into WASM unchanged: the wrapper hands the body a NARROWED slice and
 	// rebases the result. Left-context assertions still judge the slice
 	// edge. Every emitter starts here; the mode is retired when the last
@@ -160,7 +160,7 @@ func findFromGlobalSection() []byte {
 // has a defect class attached to it — the field's Go zero value, 0, is itself a
 // valid writable address, so an emitter that forgets to set it corrupts memory
 // instead of failing. See this file's header on why the find-from offset is a
-// global at all, and TODO task 75 for the two scratch slots still carrying that
+// global at all. Two scratch slots still carry that
 // hazard.
 //
 // An index from Alloc has no such failure mode. Every index it returns is

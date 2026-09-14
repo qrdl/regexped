@@ -236,7 +236,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 		scratchBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
 		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s + %d", konst, idKonst, scratchDescriptorBytes)
 
-		// Argument ORDER comes from the R12 descriptor, not from the templates
+		// Argument ORDER comes from the shared descriptor, not from the templates
 		// below — the one place the compiler's ABI is written down
 		//. Only the SPELLING of each parameter is decided
 		// here; `args` names the list for one capability.

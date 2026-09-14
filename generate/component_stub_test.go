@@ -861,6 +861,45 @@ func TestCComponentInitReadsNoPriorState(t *testing.T) {
 	}
 }
 
+// The allocator and its reclaim hooks are one unit. Every wrapper that takes a
+// mark around a returned list must also check that the list came from the
+// allocator the hooks reclaim, and REGEXPED_CABI_EXTERNAL_ALLOCATOR must take all
+// three away together, leaving the hooks declared for the consumer to define.
+func TestCComponentAllocatorIsOneUnit(t *testing.T) {
+	cfg := config.BuildConfig{
+		WasmFormat: "component", ImportModule: "unit", WitPackage: "unit",
+		Regexps: []config.RegexEntry{
+			{Name: "g", Pattern: `(a+)(b*)`, GroupsFunc: "g_groups"},
+			{Name: "d", Pattern: `[0-9]+`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", Patterns: config.PatternSelector{All: true},
+			ScanAll: "s_all", Find: "s_find",
+		}},
+	}
+	_, c, err := genCComponentStubFiles(cfg, "stub.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks := strings.Count(c, "= regexped_cabi_mark();")
+	// The macro's two definitions mention it once each; the rest are call sites.
+	checks := strings.Count(c, "RX_CABI_EXPECT_OURS(") - 2
+	if marks < 3 || checks != marks {
+		t.Errorf("%d marked call sites but %d allocator checks: every list a wrapper reclaims must be checked", marks, checks)
+	}
+	ext := c[strings.Index(c, "#ifdef REGEXPED_CABI_EXTERNAL_ALLOCATOR"):strings.Index(c, "#else\n\n#ifndef REGEXPED_CABI_HEAP_BYTES")]
+	for _, want := range []string{"unsigned regexped_cabi_mark(void);", "void regexped_cabi_release(unsigned mark);"} {
+		if !strings.Contains(ext, want) {
+			t.Errorf("external-allocator mode does not declare %q:\n%s", want, ext)
+		}
+	}
+	for _, banned := range []string{"cabi_realloc(", "rx_cabi_heap", "__weak__"} {
+		if strings.Contains(ext, banned) {
+			t.Errorf("external-allocator mode still emits %q:\n%s", banned, ext)
+		}
+	}
+}
+
 // Two component C stubs in ONE guest must link. The allocator's mark and release
 // were strong, non-static definitions, so a second stub was a duplicate symbol;
 // and a per-stub copy of the heap state would let one stub rewind a counter the
@@ -1324,6 +1363,71 @@ func TestCComponentSetWrappersEndToEnd(t *testing.T) {
 			}
 		})
 	}
+
+	// One guest per allocator arrangement, each with its own consumer world: a
+	// world may only export what its core module defines.
+	guest := func(tag, src string, flags ...string) (composed string, linkErr error) {
+		t.Helper()
+		witDir := "wit-" + tag
+		run(t, dir, nil, "cp", "-r", "wit", witDir)
+		write(filepath.Join(witDir, "consumer.wit"), cw[:end]+"    export "+tag+": func() -> s32;\n"+cw[end:])
+		write(tag+".c", src)
+		core := tag + "-core.wasm"
+		args := append([]string{"--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry", "-DRX_SET_CACHE=0"}, flags...)
+		args = append(args, "-o", core, tag+".c", "stub.c")
+		cmd := exec.Command(clang, args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("%w\n%s", err, out)
+		}
+		run(t, dir, nil, "wasm-tools", "component", "embed", witDir, core, "--world", "e2e-consumer", "-o", tag+"-embedded.wasm")
+		run(t, dir, nil, "wasm-tools", "component", "new", tag+"-embedded.wasm", "-o", tag+"-guest.wasm")
+		composed = tag + "-composed.wasm"
+		run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main="+tag+"-guest.wasm", "--output="+composed, "e2e.wasm")
+		return composed, nil
+	}
+	invoke := func(composed, export string) (string, error) {
+		cmd := exec.Command("wasmtime", "run", "--invoke", export+"()", composed)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	t.Run("a foreign cabi_realloc traps instead of leaking", func(t *testing.T) {
+		composed, err := guest("foreign", e2eForeignAllocatorGuest)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		out, err := invoke(composed, "foreign")
+		if err == nil {
+			t.Fatalf("foreign() returned normally (%s): a list from another allocator went unnoticed", strings.TrimSpace(out))
+		}
+		if !strings.Contains(out, "regexped_cabi_foreign_allocator") {
+			t.Errorf("the trap does not name regexped_cabi_foreign_allocator:\n%s", out)
+		}
+	})
+	t.Run("an external allocator with its hooks works", func(t *testing.T) {
+		composed, err := guest("external", e2eExternalAllocatorGuest, "-DREGEXPED_CABI_EXTERNAL_ALLOCATOR")
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		out, err := invoke(composed, "external")
+		if err != nil {
+			t.Fatalf("external(): %v\n%s", err, out)
+		}
+		if got := strings.TrimSpace(out); got != "0" {
+			t.Fatalf("external() returned %s, want 0 (the number is the failing check)", got)
+		}
+	})
+	t.Run("an external allocator without its hooks fails to link", func(t *testing.T) {
+		_, err := guest("nohooks", e2eForeignAllocatorGuest, "-DREGEXPED_CABI_EXTERNAL_ALLOCATOR")
+		if err == nil {
+			t.Fatal("linked without regexped_cabi_mark / regexped_cabi_release defined")
+		}
+		if !strings.Contains(err.Error(), "regexped_cabi_mark") && !strings.Contains(err.Error(), "regexped_cabi_release") {
+			t.Errorf("the link failed for another reason:\n%v", err)
+		}
+	})
 }
 
 // e2eConfig is one pattern plus one set with all five capabilities, overlapping
@@ -1434,6 +1538,75 @@ int reinit(void) {
         if (scan_runs(&s, buf, RUNS_PATTERN_COUNT) <= 0) return 4;
         scan_runs_free(&s);
     }
+    return 0;
+}
+`
+
+// e2eForeignAllocatorGuest defines its OWN cabi_realloc, strong, so it replaces the
+// stub's weak one — but not the stub's reclaim hooks. Big enough for the wasip1
+// adapter's stack, which allocates through it too.
+const e2eForeignAllocatorGuest = `#include "stub.h"
+
+static unsigned char mine[1 << 20];
+static unsigned used;
+
+__attribute__((export_name("cabi_realloc")))
+void *cabi_realloc(void *old_ptr, unsigned old_size, unsigned align, unsigned new_size) {
+    (void)old_ptr; (void)old_size;
+    unsigned p = (used + align - 1) & ~(align - 1);
+    if (p + new_size > sizeof mine) __builtin_trap();
+    used = p + new_size;
+    return &mine[p];
+}
+
+__attribute__((export_name("foreign")))
+int foreign(void) {
+    int ids[RUNS_PATTERN_COUNT];
+    return runs_scan_all("ab12CD", 6, 0, ids);
+}
+
+__attribute__((export_name("nohooks")))
+int nohooks(void) { return foreign(); }
+`
+
+// e2eExternalAllocatorGuest brings the whole unit: cabi_realloc and both hooks,
+// built with REGEXPED_CABI_EXTERNAL_ALLOCATOR. Its hooks must be the ones called,
+// and they must reclaim every list.
+const e2eExternalAllocatorGuest = `#include "stub.h"
+
+static unsigned char mine[1 << 20];
+static unsigned used;
+static unsigned releases;
+
+__attribute__((export_name("cabi_realloc")))
+void *cabi_realloc(void *old_ptr, unsigned old_size, unsigned align, unsigned new_size) {
+    (void)old_ptr; (void)old_size;
+    unsigned p = (used + align - 1) & ~(align - 1);
+    if (p + new_size > sizeof mine) __builtin_trap();
+    used = p + new_size;
+    return &mine[p];
+}
+
+unsigned regexped_cabi_mark(void) { return used; }
+void regexped_cabi_release(unsigned mark) { used = mark; releases++; }
+
+__attribute__((export_name("external")))
+int external(void) {
+    int ids[RUNS_PATTERN_COUNT];
+    if (runs_scan_all("ab12CD", 6, 0, ids) != 3) return 1;
+    unsigned before = used;
+    for (int i = 0; i < 5000; i++)
+        if (runs_scan_all("ab12CD", 6, 0, ids) != 3) return 2;
+    if (used != before) return 3; /* a list was not reclaimed */
+    /* static: zeroed without a memset call, which a -nostdlib guest cannot link. */
+    static rx_runs_scanner_t s;
+    rx_set_match_t buf[RUNS_PATTERN_COUNT];
+    if (scan_runs_init(&s, "ab12CD ab12CD", 13, 0) != 0) return 4;
+    int n, total = 0;
+    while ((n = scan_runs(&s, buf, RUNS_PATTERN_COUNT)) > 0) total += n;
+    scan_runs_free(&s);
+    if (n < 0 || total == 0) return 5;
+    if (releases == 0) return 6; /* the stub did not call these hooks */
     return 0;
 }
 `

@@ -223,7 +223,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			fmt.Fprintf(&hb, "__attribute__((import_module(%q), import_name(%q)))\n%s\n", cfg.ImportModule, name, sig)
 		}
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
-		// the C spelling of each is decided here (R12). C puts the return type
+		// the C spelling of each is decided here. C puts the return type
 		// FIRST, which is why this builds the whole declaration rather than
 		// just a parameter list.
 		setCaps := setCapabilities(s, cfg, wide)
@@ -244,7 +244,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			} else {
 				imp(s.MatchAll, decl("match_all"))
 			}
-			// Decision (12): C99's `static N` in an array parameter declarator
+			// C99's `static N` in an array parameter declarator
 			// means "the caller must pass at least N elements" — GCC and Clang
 			// diagnose a smaller array at the CALL SITE, it rules out NULL,
 			// and it self-documents. A plain int patterns[N] would decay to
@@ -407,7 +407,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			gateInit += cacheAlloc
 			gateArg := "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
 				"u, s->scratch[1] = (unsigned)(size_t)s->gates, " + cacheSet + ", s->scratch), "
-			// D17: the scanner is CALLER-owned, so two scans can be in flight
+			// The scanner is CALLER-owned, so two scans can be in flight
 			// and _free followed by _init restarts one. The static
 			// _next/_reset pair this replaces could do neither.
 			//
@@ -817,7 +817,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	fmt.Fprintf(&cb, "__attribute__((import_module(\"%s\"), import_name(\"%s\")))\n", importModule, exportName)
 	fmt.Fprintf(&cb, "extern int %s(const unsigned char *ptr, unsigned int len, int *out, unsigned int from);\n\n", ffi)
 
-	// .c: the iterator. Decision (8)'s caller-owned array, now driven by a
+	// .c: the iterator. The caller-owned array, now driven by a
 	// caller-owned iterator too, so nothing here is static and a second scan
 	// cannot invalidate the first.
 	//

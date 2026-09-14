@@ -1,7 +1,7 @@
 package compile
 
 // --------------------------------------------------------------------------
-// Gap F: TDFA capture-body bulk-skip for dominant self-loop states.
+// TDFA capture-body bulk-skip for dominant self-loop states.
 //
 // Capture patterns with a simple repeated-class body ((\w+), <([a-z]+)>,
 // X([a-zA-Z]+)Y) spend most of their runtime byte-stepping through a single
@@ -14,9 +14,9 @@ package compile
 // This is a different optimization from the plain-DFA dominant
 // self-loop bulk-skip (detectDominantSelfLoop/emitDominantBulkSkip): that
 // machinery is tuned for large self-loop / tiny exit-set states (e.g. `.`
-// inside a comment body) and is the wrong polarity for Gap F's population,
+// inside a comment body) and is the wrong polarity for this skip's population,
 // which has small self-loop classes (\w=63 bytes, [a-z]=26, [a-zA-Z]=52)
-// and large exit sets. Gap F reuses emitShuftiPrefixCheck's technique
+// and large exit sets. This skip reuses emitShuftiPrefixCheck's technique
 // instead (a generalized ≤64-member positive-membership SIMD test).
 
 // tdfaBulkSkipInfo describes one dominant self-loop state in a tdfaTable
@@ -42,7 +42,7 @@ const (
 //   - self-loops on between tdfaBulkSkipMinBytes and tdfaBulkSkipMaxBytes distinct bytes
 //   - fires the exact same tag-op batch on every one of those self-loop bytes
 //   - every op in that batch is a set-to-pos op (src == -1); copy ops are out of
-//     v1 scope (see plan Gap F, "Scope decisions")
+//     scope
 //
 // Returns the state with the largest self-loop class among qualifying states,
 // or nil if none qualify. Only one dominant state is supported per pattern.
@@ -149,7 +149,7 @@ func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, lo
 	// backwards from the end and mask off the lanes below pos.
 	//
 	// Without this the last `len mod 16` bytes of every run are walked one at a
-	// time, which is the sawtooth the plan measured on the capture body: the
+	// time, which is the sawtooth measured on the capture body: the
 	// same pattern costs 1,013 fuel at a 15-byte run and 227 at 16, and 1,072 at
 	// 31 against 263 at 32. The step is entirely the missing tail.
 	//

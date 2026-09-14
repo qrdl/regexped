@@ -101,7 +101,7 @@ func TestLitChainBranchRejects(t *testing.T) {
 		{
 			name:    "prefix_is_a_range",
 			pattern: `[a-z]{2,3}abc[a-z]{20}`,
-			why:     "the Gap E prefix is verified at a fixed offset from the literal, which a {M,N} prefix does not have",
+			why:     "the mixed-prefix shape's prefix is verified at a fixed offset from the literal, which a {M,N} prefix does not have",
 		},
 		{
 			name:    "prefix_non_ascii_class_range",
@@ -178,7 +178,7 @@ func TestLitChainBranchAccepts(t *testing.T) {
 			wantLiteral: "abc",
 			wantCount:   20,
 			wantPrefix:  3,
-			why:         "same capture transparency as the suffix, on the Gap E prefix",
+			why:         "same capture transparency as the suffix, on the mixed-prefix shape's prefix",
 		},
 		{
 			name:        "prefix_of_a_single_literal",
@@ -254,7 +254,7 @@ func TestLitChainBranchRejectsMalformedTrees(t *testing.T) {
 				litChainLiteralNode("abc"),
 				validSuffix,
 			),
-			why: "same Sub[0]-only read on the Gap E prefix",
+			why: "same Sub[0]-only read on the mixed-prefix shape's prefix",
 		},
 		{
 			name: "prefix_class_matches_nothing",
@@ -367,7 +367,7 @@ func TestLitChainRangeMatchBodyStartAnchors(t *testing.T) {
 // TestLitChainRangeMatchBodyEndAnchors covers the end-anchor emission. The
 // match consumes the whole input, so the end position is always len: `\z`
 // always holds, `\A` never does, and `\b`/`\B` reduce to a single is_word probe
-// of the last byte. FABLE B7 is exactly this half going missing — an emitter
+// of the last byte. The defect pinned here is this half going missing — an emitter
 // that ignores endAnchor reports matches that Go's regexp does not.
 func TestLitChainRangeMatchBodyEndAnchors(t *testing.T) {
 	control := litChainRangeBody(t, `abc[A-Z]{24,30}`)
@@ -426,7 +426,7 @@ func TestLitChainRangeMatchBodyCompiles(t *testing.T) {
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
 			// Match-only: the find half of this path deliberately rejects
-			// anchored ranges (FABLE B7/B10) and falls back to the DFA.
+			// anchored ranges and falls back to the DFA.
 			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
 		})
 	}
@@ -539,11 +539,11 @@ func TestLitChainExtractCapturesZeroWidthFallthrough(t *testing.T) {
 	}
 }
 
-// TestLitChainExtractCapturesVariableTail pins the endsAtVariableTail flag that
-// FABLE B8 added. `A([0-9]{24,30})` closes its group on the range chain, so its
+// TestLitChainExtractCapturesVariableTail pins the endsAtVariableTail flag.
+// `A([0-9]{24,30})` closes its group on the range chain, so its
 // end is a runtime value; `(A)[0-9]{24,30}` closes before the chain and its end
 // really is compile-time. Confusing the two freezes the capture end at
-// attemptStart+K+Min, which is the exact B8 symptom.
+// attemptStart+K+Min, which is the exact frozen-end symptom.
 func TestLitChainExtractCapturesVariableTail(t *testing.T) {
 	cases := []struct {
 		pattern      string
@@ -585,7 +585,7 @@ func TestLitChainRangeGroupSlotWrites(t *testing.T) {
 	)
 
 	// A group whose end is compile-time must be written as attemptStart+offset,
-	// NOT as attemptStart+K+match_len. Mixing the two up is FABLE B8 in reverse:
+	// NOT as attemptStart+K+match_len. Mixing the two up is the frozen-end bug in reverse:
 	// a fixed-width capture would stretch to the end of the range chain.
 	t.Run("compile_time_end_offset", func(t *testing.T) {
 		lcc := &litChainCaptures{
@@ -628,7 +628,7 @@ func TestLitChainRangeGroupSlotWrites(t *testing.T) {
 		}
 		// The Min-based compile-time end must not be baked in anywhere.
 		if bytes.Contains(body, litChainAttemptPlusStore(outPtrLocal, attemptStartLocal, 28, 12)) {
-			t.Errorf("group 1 end slot froze at the compile-time offset 28 (FABLE B8)")
+			t.Errorf("group 1 end slot froze at the compile-time offset 28")
 		}
 	})
 
@@ -817,7 +817,7 @@ func TestLenAltMatchBodySkipsImpossibleBranches(t *testing.T) {
 
 // TestLenAltMatchBodyEndAnchors covers the end-anchor arm of a lit-chain branch
 // inside a lenient alternation — the sibling of the single-pattern case above,
-// and the same FABLE B7 failure mode if it goes missing.
+// and the same failure mode if it goes missing.
 func TestLenAltMatchBodyEndAnchors(t *testing.T) {
 	control := litChainLenAltBody(t, `abc[A-Z]{24}|qq[0-9]z`)
 
@@ -928,10 +928,10 @@ func TestLenAltMatchBodyCompiles(t *testing.T) {
 // rejected and the neighbouring shapes that must keep taking the fast path,
 // since an over-broad gate silently costs the fast path on patterns that were
 // always correct. End-to-end behaviour is covered by
-// tools/re2test/custom-tests.txt category 36 (blocks Fable B6/B7/B9/B10/B11),
+// tools/re2test/custom-tests.txt category 36,
 // which needs `make findonly` for the alternation halves.
 
-// B6 — the three Gap E mixed-prefix emitters never referenced
+// The three mixed-prefix emitters never referenced
 // startAnchor/endAnchor, so anchored `<class>{M}<literal><class>{N}` patterns
 // matched as if unanchored.
 func TestAnalyseLitChainPrefixed_RejectsAnchors(t *testing.T) {
@@ -972,7 +972,7 @@ func TestAnalyseLitChainAltPrefixed_RejectsAnchors(t *testing.T) {
 	}
 }
 
-// B9 — branches whose prefix lengths differ make the candidate-scan order
+// Branches whose prefix lengths differ make the candidate-scan order
 // (literal position) diverge from the match-start order (attempt_start minus
 // prefixCount), so a later-starting match can be reported over an earlier one.
 func TestAnalyseLitChainAltPrefixed_RequiresEqualPrefixCount(t *testing.T) {
@@ -986,7 +986,7 @@ func TestAnalyseLitChainAltPrefixed_RequiresEqualPrefixCount(t *testing.T) {
 	}
 }
 
-// B7 (capture half) — buildLitChainRangeFindGroupsBody has no anchor handling,
+// Capture half: buildLitChainRangeFindGroupsBody has no anchor handling,
 // unlike its fixed-count sibling.
 func TestAnalyseLitChainGroupsRange_RejectsAnchors(t *testing.T) {
 	rejected := []string{
@@ -1005,7 +1005,7 @@ func TestAnalyseLitChainGroupsRange_RejectsAnchors(t *testing.T) {
 	}
 }
 
-// B11 — emitLitChainAltLitBranchBodyRange checks the end anchor only at the
+// emitLitChainAltLitBranchBodyRange checks the end anchor only at the
 // maximal match length, with no backoff.
 func TestAnalyseLitChainAltRange_EndAnchorBackoff(t *testing.T) {
 	rejected := []string{
@@ -1022,7 +1022,7 @@ func TestAnalyseLitChainAltRange_EndAnchorBackoff(t *testing.T) {
 			t.Errorf("analyseLitChainAltRange(%q) accepted an at-max-only end anchor", pat)
 		}
 	}
-	// B10, alternation sibling: buildLitChainAltRangeFindBody collapses a
+	// Alternation sibling of the non-greedy collapse: buildLitChainAltRangeFindBody collapses a
 	// non-greedy branch to {N,N}, freezing the length the end anchor is
 	// checked at. Start anchors are position-based and stay allowed.
 	nonGreedyRejected := []string{
@@ -1114,7 +1114,7 @@ func TestRangeEndAnchorSafe(t *testing.T) {
 	}
 }
 
-// B12 — planRangeChunks covers [K, K+countMax) rounded up to 16, while callers
+// planRangeChunks covers [K, K+countMax) rounded up to 16, while callers
 // only bounds-check K+countMin, so chunks past that window need the load
 // clamp. This pins which chunks emitRangeClassVerify must guard; the trap it
 // prevents is exercised end-to-end by tools/fuzz's
@@ -1145,7 +1145,7 @@ func TestPlanRangeChunks_ClampWindow(t *testing.T) {
 	}
 }
 
-// B8 — extractLitChainCaptures gave every OpRepeat a Min-based width, and the
+// extractLitChainCaptures gave every OpRepeat a Min-based width, and the
 // range slot-write emitter re-derived "this capture ends at the chain" by
 // testing `endOffset == K + countMax`. For a true range Min ≠ Max, so that
 // equality can never hold and every chain-covering capture got a frozen
@@ -1514,7 +1514,7 @@ func TestBuildSimplePrefixCheckBody(t *testing.T) {
 // (compile.go) that gates buildSimplePrefixCheckBody on
 // LikelyMode == LikelyNoMatch: a bare `[class]{M}` prefix ahead of an
 // UNBOUNDED literal-anchored suffix. A bounded suffix (e.g. `{36}`) is
-// instead caught earlier by Gap E's analyseLitChainPrefixed and never
+// instead caught earlier by analyseLitChainPrefixed and never
 // reaches this path — see the alt-lit-anchor dispatch test for the analogous
 // alternation case.
 func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
@@ -1632,7 +1632,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 // compiledPattern.altLitAnchorBranchFuncIdx (all 0% covered without this) —
 // by compiling a find-only alternation whose branches have an UNBOUNDED
 // suffix (`[^\s]+`). Bounded-suffix branches like the ones
-// TestFindAltLitAnchorPoints uses are caught earlier by Gap E's
+// TestFindAltLitAnchorPoints uses are caught earlier by
 // analyseLitChainAltPrefixed (compile.go), which returns before the
 // alt-lit-anchor block is ever reached; an unbounded suffix isn't a lit-chain
 // shape, so it falls through to this path instead.

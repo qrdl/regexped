@@ -17,7 +17,7 @@ import (
 // at a flat 154. This builds the one automaton.
 //
 // WHY IT IS NOT THE BUCKET PACKER WITH A BIGGER BUDGET. The obvious cheaper
-// route is to let the existing G17 sparse anchored merge take the whole set:
+// route is to let the existing sparse anchored merge take the whole set:
 // it already produces one automaton with O(1) recording, which is why
 // classchain-128 costs 139 fuel where keywords-128 costs 700. It is refused on
 // table size, and the refusal is REAL, not an artefact of a pessimistic
@@ -65,7 +65,7 @@ type anchoredUnion struct{ unionScanDFA }
 // with one union automaton can pay.
 //
 // It cannot when the packing is ALREADY one automaton with constant-time
-// recording — a single G17-sparse bucket, which reads its answer out of a
+// recording — a single sparse bucket, which reads its answer out of a
 // per-state list (`emitRecordSparseCount`) rather than unrolling a test per
 // pattern. There the union changes the table format and nothing else, and for
 // `match_all` it changes it for the worse: the wide `_all` ABI makes it OR a
@@ -180,7 +180,7 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	// trade in a different disguise.
 	//
 	// Deliberately NOT folded into hasNeverDyingState: that predicate gates
-	// G8/G9 elsewhere, and widening it would re-gate those on an argument they
+	// the liveness table and preflights elsewhere, and widening it would re-gate those on an argument they
 	// were not measured under.
 	if len(memberWalkStates(tbl)) > 0 {
 		return nil

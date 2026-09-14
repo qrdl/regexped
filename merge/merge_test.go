@@ -390,7 +390,7 @@ func TestCmdMergeComponentReportsUnreadablePlug(t *testing.T) {
 // `regexped:<wit_package>/matcher`, which is what a generated stub emits too.
 // A `match` import lowers to `(ptr, len, retptr)` with a 12-byte result area:
 // [0] outer result discriminant, [4] option discriminant, [8] the end position
-// (§5.4 of the plan, and compile/component.go).
+// (see compile/component.go).
 const socketWAT = `(module
   (import "regexped:pkg-a/matcher" "match-a" (func $match_a (param i32 i32 i32)))
   (import "regexped:pkg-b/matcher" "match-b" (func $match_b (param i32 i32 i32)))

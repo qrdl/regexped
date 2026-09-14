@@ -178,7 +178,7 @@ func TestComputePrefix(t *testing.T) {
 }
 
 // TestDFAU16RowDedup exercises the u16 transition-table row-dedup path
-// (buildDFALayout's rowMap, emitU16Transition, dfaDataSegments) — the test plan T1.
+// (buildDFALayout's rowMap, emitU16Transition, dfaDataSegments).
 // [a-z]{300} produces 301 states (> 256 -> u16 table); the uniform class-run
 // body means nearly all rows are identical, so numUniqueRows <= 255 and
 // useRowDedup triggers.
@@ -194,8 +194,8 @@ func TestDFAU16RowDedup(t *testing.T) {
 }
 
 // TestDFAMandLitFindWordNewlineBoundary exercises the mandatory-lit find
-// prologue combined with word/newline boundary handling in buildFindBody —
-// the test plan T2. This area has a documented historical bug (simdMaskLocal
+// prologue combined with word/newline boundary handling in buildFindBody.
+// This area has a documented historical bug (simdMaskLocal
 // clobbering ptr, found via (?m:^(foo.*)$)).
 func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 	t.Run("newline_boundary_u8_compressed", func(t *testing.T) {
@@ -213,8 +213,8 @@ func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 
 // TestDFANonMidDominantU16Sentinel exercises the reserved-value (254+)
 // sentinel check in the u16 find dispatcher for a non-accepting dominant
-// self-loop (emitFindMidAcceptDispatch's hasNonMidVals/"val < 254" branch) —
-// the test plan T3. [^,]{300,}XYZ forces > 256 states (u16) via the bounded-then-
+// self-loop (emitFindMidAcceptDispatch's hasNonMidVals/"val < 254" branch).
+// [^,]{300,}XYZ forces > 256 states (u16) via the bounded-then-
 // unbounded repetition, and the unbounded [^,] tail state is a genuine
 // non-mid dominant (self-loops on 254 of 256 bytes, exits on ',' and 'X',
 // not itself accepting since "XYZ" must still follow). Confirmed live via
@@ -229,7 +229,7 @@ func TestDFANonMidDominantU16Sentinel(t *testing.T) {
 }
 
 // TestDFATeddyThreeFourBytePrefix exercises the Teddy T2/T3 (3-byte/4-byte
-// literal prefix) SIMD table construction and emission — the test plan T4. An
+// literal prefix) SIMD table construction and emission. An
 // alternation with >= 3 branches, each with a distinct >= 4-byte fixed
 // literal prefix, reaches the general DFA find path (not the lit-chain-alt
 // frontend) and has few enough distinct first bytes for Teddy.
@@ -239,7 +239,7 @@ func TestDFATeddyThreeFourBytePrefix(t *testing.T) {
 
 // TestDFACaseFoldUnicodeOrbit exercises the full-Unicode SimpleFold orbit
 // expansion for a case-insensitive single rune in nfaBuildInputMap
-// (InstRune1) — the test plan T5. (?i)k folds across a 3-way orbit: Kelvin sign
+// (InstRune1). (?i)k folds across a 3-way orbit: Kelvin sign
 // U+212A <-> 'K' <-> 'k' — not just ASCII upper/lower.
 func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?i)k`, MatchFunc: "m"}})
@@ -248,7 +248,7 @@ func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
 // TestDFAImmAcceptMidStartSinglePattern exercises the bits==0 -> bits=1
 // sentinel fallback on midStart/midStartWord/midStartNewline for a nullable,
 // immediate-accepting pattern in single-pattern (non-set) mode, where
-// nfaAcceptBits is always 0 — the test plan T6.
+// nfaAcceptBits is always 0.
 func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 	t.Run("word_boundary", func(t *testing.T) {
 		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:x)?\b`, FindFunc: "f"}})
@@ -260,7 +260,7 @@ func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 
 // TestDFALitAnchorNonMidDominant exercises the dominant bulk-skip dispatch
 // for lit-anchor find (buildLitAnchorFindBody) when the dominant self-loop
-// state is not an accept state — the test plan T7..*bar has a wide non-accepting
+// state is not an accept state. `.*bar` has a wide non-accepting
 // self-loop ('.' excludes only '\n', minus the 'b' exit byte that starts the
 // literal) confirmed live via buildDFALayout probing (isMidAccept=false),
 // and findLitAnchorPoint/l.useU8 both qualify (numWASM=5) so the pattern
@@ -271,8 +271,8 @@ func TestDFALitAnchorNonMidDominant(t *testing.T) {
 
 // TestDFAAltLitAnchorNoSIMDFallback exercises the default (scalar-scan, no
 // Teddy/multi-eq SIMD) case in buildAltLitAnchorFindBody, reached when the
-// alt-lit-anchor union of candidate first bytes is empty or exceeds 64 —
-// the test plan T8. Each branch below has an equal-length fixed literal prefix (a
+// alt-lit-anchor union of candidate first bytes is empty or exceeds 64.
+// Each branch below has an equal-length fixed literal prefix (a
 // distinct upper-case letter, required for the alt-lit-anchor equal-prefix
 // restriction) followed by a wide character class, giving > 64 distinct
 // candidate first bytes across all branches combined.
@@ -289,8 +289,8 @@ func TestDFAAltLitAnchorNoSIMDFallback(t *testing.T) {
 }
 
 // TestDFAMixedMidNonMidDominant exercises the mixed mid-accept +
-// non-mid-accept dominant dispatch in emitPhase4Dispatch (buildMatchBody) —
-// the test plan T9. [^,]*bar[^\n]* produces (confirmed live via buildDFALayout
+// non-mid-accept dominant dispatch in emitPhase4Dispatch (buildMatchBody).
+// [^,]*bar[^\n]* produces (confirmed live via buildDFALayout
 // probing with the LL/leftmostFirst=false DFA that match mode actually
 // uses) two mid-accept dominants and one non-mid-accept dominant: the
 // trailing [^\n]* run can end the match at any point (mid-accept, wide
@@ -303,7 +303,7 @@ func TestDFAMixedMidNonMidDominant(t *testing.T) {
 // TestDFALenAltAnchorSkipPartialLane exercises the lenAlt (length-
 // discriminated alternation) frontend's compile-time branch elision for
 // anchor incompatibilities plus partial (<16-byte) SIMD lane masking in
-// buildLenAltMatchBody — the test plan T10. Branches have mixed \b anchors and
+// buildLenAltMatchBody. Branches have mixed \b anchors and
 // non-16-multiple literal lengths.
 func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
 	mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo[0-9]{3}|bar[0-9]{5}`, MatchFunc: "m"}})
@@ -312,7 +312,7 @@ func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
 // TestDFASetsEmptyFallbackStrictPrefix exercises the constant "no match"
 // body returned by genSuffixWASM when a set bucket's literal has no
 // required suffix chars (i.e. one literal is a strict prefix of another in
-// the same bucket) — the test plan T11.
+// the same bucket).
 func TestDFASetsEmptyFallbackStrictPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{
@@ -699,7 +699,7 @@ func TestDFALayoutDominantSelfLoopNewlineExit(t *testing.T) {
 }
 
 // TestDFALayoutShuftiSelfLoop covers detectShuftiSelfLoop's LikelyMatch-gated
-// channels: the non-mid-accept branch (LM-3), the same '\n' carve-out as the
+// channels: the non-mid-accept branch, the same '\n' carve-out as the
 // dominant detector, and the byte-class-compressed table reader.
 func TestDFALayoutShuftiSelfLoop(t *testing.T) {
 	cases := []struct {
@@ -723,8 +723,8 @@ func TestDFALayoutShuftiSelfLoop(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.why, func(t *testing.T) {
 			params := dfaLayoutCovFindParams()
-			// LM-4 lifts the "needs a literal anchor" bail and LM-3 enables the
-			// non-mid channel; both are LikelyMatch-only in production.
+			// lmBareShufti lifts the "needs a literal anchor" bail and lmNonMidShufti
+			// enables the non-mid channel; both are LikelyMatch-only in production.
 			params.lmBareShufti = true
 			params.lmNonMidShufti = true
 			_, layout := dfaLayoutCovBuild(t, tc.pattern, params)
@@ -1073,7 +1073,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	// required), which is what makes it a NON-mid dominant.
 	const pattern = `x{300}[0-9a-zA-Z ]+"`
 	params := dfaLayoutCovFindParams()
-	params.lmNonMidShufti = true // LM-3: the non-mid channel is LikelyMatch-gated
+	params.lmNonMidShufti = true // the non-mid channel is LikelyMatch-gated
 	table, layout := dfaLayoutCovBuild(t, pattern, params)
 	if layout.useU8 {
 		t.Fatalf("%q: expected a u16 table (numWASM=%d)", pattern, layout.numWASM)

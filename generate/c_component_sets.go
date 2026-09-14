@@ -181,6 +181,7 @@ func cComponentSetAllBody(module, kebab, name, ffi, konst string, hasOffset bool
     if (area[0] != 0) { regexped_cabi_release(mark); return RX_ERR_BT_OVERFLOW; } /* result unknown, not empty */
     const unsigned char *ids = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
     unsigned int count = rx_cabi_u32(area + 8);
+    RX_CABI_EXPECT_OURS(mark, count);
     /* The interface cannot report more ids than the set has patterns, and the
        declaration promises the caller's array is at least that long. The clamp
        is here anyway: it costs nothing and it bounds the write by something
@@ -276,6 +277,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
     }
     const unsigned char *raw = (const unsigned char *)(size_t)rx_cabi_u32(area + 4);
     unsigned int count = rx_cabi_u32(area + 8);
+    RX_CABI_EXPECT_OURS(mark, count);
     if (count == 0) { s->done = 1; regexped_cabi_release(mark); return 0; }
     /* cap >= %[5]s >= count, so every match of this position fits. */
     for (unsigned int i = 0; i < count; i++) {

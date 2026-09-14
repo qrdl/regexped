@@ -254,8 +254,11 @@ If a pattern exports groups, or a set returns a list, the stub also defines
 `cabi_realloc`, because the canonical ABI allocates a returned list in *your*
 memory. It is a bump allocator that the generated wrappers mark and restore
 around their own calls, sized by `REGEXPED_CABI_HEAP_BYTES` (256 KB default) —
-raise that if a pattern has a very large number of groups. See
-[c-api.md](c-api.md).
+raise that if a pattern has a very large number of groups. The allocator and its
+mark/restore hooks are one unit: to bring your own, define
+`REGEXPED_CABI_EXTERNAL_ALLOCATOR` and supply all three; a foreign `cabi_realloc`
+without it traps on the first returned list rather than leaking. See
+[c-api.md](c-api.md#cabi_realloc-and-its-heap).
 
 ### Composing — `regexped merge`
 

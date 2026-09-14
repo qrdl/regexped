@@ -345,7 +345,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 			// so it must never be STRICTER than the pattern. hasBeginAnchor is
 			// the anywhere-in-the-tree scan — it fires for anchors nested in
 			// *, ?, or an alternation (which restrict nothing) and collapses
-			// (?m:^) to "position 0 only", which is B43. This site was missed
+			// (?m:^) to "position 0 only", which is a known defect class. This site was missed
 			// when the others were converted.
 			info.setTopLevelAnchor(parsed)
 			// suffixDFA is built later by compileFallback via mergeSuffixDFA.
@@ -467,7 +467,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	//
 	// The forward suffix walk is unaffected and needs no guard: it threads
 	// exactly that context through midAcceptNW/midAcceptW, which is what
-	// FABLE B40 built. Only the backward prefix scan is blind, so only a
+	// they were built for. Only the backward prefix scan is blind, so only a
 	// prefix boundary disqualifies the split.
 	if info.prefixAST != nil && regexpHasWordBoundary(info.prefixAST) {
 		info.splittable = false
@@ -583,17 +583,17 @@ type CompileSetOptions struct {
 	ACBudgetBytes         int   // max Aho-Corasick table bytes for the whole set; default 524288
 	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
 	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
-	// AllowSparseAccept permits G17's >32-pattern buckets. Off by default so a
+	// AllowSparseAccept permits sparse >32-pattern buckets. Off by default so a
 	// caller that has not thought about probes cannot get one: see CompileSet.
 	AllowSparseAccept bool
 
 	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
-	// set-frontend density gate (H.3, shipped — forces Shufti for a 17..64-byte
+	// set-frontend density gate (forces Shufti for a 17..64-byte
 	// first-byte union under LikelyNoMatch).
 	LikelyMode LikelyMode
 
 	// ForceFrontend overrides chooseLiteralFrontend's verdict. TEST-ONLY, and
-	// specifically a MEASUREMENT knob (task 71): the crossover constants in
+	// specifically a MEASUREMENT knob: the crossover constants in
 	// chooseLiteralFrontend were each calibrated on a no-match corpus, and the
 	// only way to ask whether they still hold on a match-dense one is to run a
 	// set through the frontend it would not have chosen.
@@ -609,7 +609,7 @@ type CompileSetOptions struct {
 	// ForceShuftiAdaptive overrides the `shuftiAdaptive = lnm && !rare`
 	// verdict that decides whether a forced-Shufti set carries the runtime
 	// density switch. TEST-ONLY, and a MEASUREMENT knob in exactly the sense
-	// ForceFrontend is (task 74).
+	// ForceFrontend is.
 	//
 	// The switch was built on evidence (a guard case measuring +23%/+21% fuel
 	// without it) that no longer reproduces, and the only way to ask whether
@@ -626,7 +626,7 @@ type CompileSetOptions struct {
 	// globals is the MODULE's global allocator, shared with every pattern and
 	// every other set in the same compile. A set reaches for it when a bucket
 	// wants module-scoped state — today only the sparse member skip's
-	// per-bucket verdict (TODO 75 group C). nil in the out-of-package entry
+	// per-bucket verdict. nil in the out-of-package entry
 	// points, which is why every consumer must allocate ONLY on the condition
 	// that produced it.
 	globals *moduleGlobals
@@ -669,7 +669,7 @@ func (o CompileSetOptions) WithShuftiAdaptive(on bool) CompileSetOptions {
 // its unrolled per-pattern chain at 32 (set_find.go, set_caps.go,
 // set_probe.go, startable.go, set_emit.go's group masks). A bucket wider than
 // this loses patterns 32.. from every mask, prefix check and probe SILENTLY —
-// the exact class G17 was built to end.
+// the exact class sparse accept was built to end.
 const bucketMaskBits = 32
 
 // bitmaskWidth is the number of patterns one BITMASK bucket may hold.
@@ -834,7 +834,7 @@ func compileSetASTs(asts []*syntax.Regexp, what string) ([]*syntax.Prog, error) 
 // from prog k (skipping its own inst 0) start at offsets[k].
 // mergeSuffixDFASparseSet is mergeSuffixDFA for a bucket that exceeds the
 // bitmask width: one merged DFA over ALL the patterns, with per-state accept
-// LISTS rather than a u64 mask (G17 sparse accept).
+// LISTS rather than a u64 mask (sparse accept).
 //
 // The point is call count, not table size. A candidate position today runs one
 // suffix-DFA call per bucket; merging 128 patterns behind their shared literal
@@ -1055,7 +1055,7 @@ const (
 	//   - the set would otherwise have used the scalar path,
 	//   - 17 ≤ |unionFirstBytes| ≤ 64,
 	//   - AND either `shuftiBeatsScalar(unionFirstBytes)` (density wins)
-	//     or set-level LikelyMode is LikelyNoMatch (Gap H.3 Action 5).
+	//     or set-level LikelyMode is LikelyNoMatch.
 	// Requires zero fallback buckets — fallback runs at every position
 	// so a first-byte SIMD skip can't safely advance past it.
 	frontendShufti
@@ -1365,7 +1365,7 @@ func teddyGroupABytes(t *teddyTables) int32 {
 // litUnionFirstBytes returns the sorted distinct first bytes across `lits`.
 // Empty literals are skipped (their first byte is undefined; the standard
 // frontend selection already rejects sets with empty literals before this
-// helper is called for the Shufti decision in H.3).
+// helper is called for the set-level Shufti decision).
 func litUnionFirstBytes(lits [][]byte) []byte {
 	var seen [256]bool
 	for _, lit := range lits {
@@ -1532,7 +1532,7 @@ func bucketByLiteral(patterns []*PatternInfo) (map[string][]*PatternInfo, []*Pat
 //
 // Each rejection is recorded in diag. Non-literal and non-splittable patterns
 // are routed to compileFallback instead.
-// promoteSharedLiteralBuckets is G17 promotion for ONE shared-literal group:
+// promoteSharedLiteralBuckets is sparse promotion for ONE shared-literal group:
 // buckets that split at 32 patterns behind the same literal become one sparse
 // bucket, so a position where that literal hits costs one suffix-DFA walk
 // instead of ceil(N/32). Measured at 3.33x for 128 patterns against 32
@@ -1551,7 +1551,7 @@ func promoteSharedLiteralBuckets(litBuckets []*bucket, opts CompileSetOptions) [
 	})
 }
 
-// sparsePromotion is the part of G17 promotion that differs between the three
+// sparsePromotion is the part of sparse promotion that differs between the three
 // packers. Everything else — the budgets, the refusals, the bucket that comes
 // out — is shared, which is the point: the promotion POLICY existing once is
 // what keeps the three packers from drifting apart the way they once
@@ -1606,7 +1606,7 @@ type sparsePromotion struct {
 // Buckets it cannot take are KEPT rather than made to block the promotion, and
 // the merged bucket inherits the first candidate's slot so relative order is
 // unchanged. That matters most for the fallback packer, where a single
-// Backtracking bucket (item 20) or one isolated non-greedy pattern would
+// Backtracking bucket or one isolated non-greedy pattern would
 // otherwise cost the whole group its promotion.
 func promoteSparseBuckets(in []*bucket, opts CompileSetOptions, pr sparsePromotion) []*bucket {
 	if !opts.AllowSparseAccept || len(in) < 2 {
@@ -1674,7 +1674,7 @@ func promoteSparseBuckets(in []*bucket, opts CompileSetOptions, pr sparsePromoti
 	// The promotion exists because the accept BITMASK ran out of bits. A group
 	// that fits one bitmask bucket never split for that reason, so promoting it
 	// buys nothing and costs the slowest body shape there is: under LikelyMatch
-	// it re-merges two counted-chain singletons that constraint 0 (LM-6)
+	// it re-merges two counted-chain singletons that constraint 0
 	// deliberately kept apart, losing the SIMD-verify suffix body for
 	// both.
 	if total <= opts.bitmaskWidth() {
@@ -1780,7 +1780,7 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			placed := false
 
 			for bi, b := range litBuckets {
-				// Constraint 0 (LM-6, LikelyMatch only): don't merge two
+				// Constraint 0 (LikelyMatch only): don't merge two
 				// counted-chain-eligible patterns. isCountedClassChain requires
 				// a single-pattern suffix DFA (see its doc comment), so merging
 				// them loses the single-pattern SIMD-verify suffix body for
@@ -1938,7 +1938,7 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 				})
 			}
 		}
-		// G17: buckets that split ONLY because the accept mask ran out of bits
+		// Sparse promotion: buckets that split ONLY because the accept mask ran out of bits
 		// are re-merged into one sparse bucket, so a candidate position costs
 		// one suffix-DFA walk instead of ceil(N/32). Only for a shared literal:
 		// distinct literals already get a bucket each and gain nothing.
@@ -1949,7 +1949,7 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 	// Fallback: compile non-literal / non-splittable patterns.
 	if len(fallbackPatterns) > 0 {
 		fb := compileFallback(fallbackPatterns, opts, diag)
-		// G17 again, and this is the group that pays most for a split: a
+		// Sparse promotion again, and this is the group that pays most for a split: a
 		// fallback bucket has no literal gating it, so every one of the
 		// ceil(N/32) walks runs at EVERY input position rather than only where
 		// a literal hit.
@@ -1973,7 +1973,7 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			}
 			// A Backtracking bucket reports as its own type. Without this the
 			// diag for a BT-backed set is byte-identical to the DFA one — which
-			// is exactly why item 20's under-report took a day to localise: the
+			// is exactly why a Backtracking-member under-report once took a day to localise: the
 			// one artefact that should have shown the difference showed none.
 			// Its suffix_states / table_bytes are honestly 0: it has no table.
 			if b.btFallback != nil {
@@ -1986,7 +1986,7 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 			for j, p := range b.patterns {
 				refs[j] = patternRefFor(p)
 			}
-			// "sparse" for a G17 bucket. Hardcoding "bitmask" made the diag
+			// "sparse" for a sparse-accept bucket. Hardcoding "bitmask" made the diag
 			// say the opposite of what the bucket is, and the accept form is
 			// the one thing that distinguishes them.
 			acceptKind := "bitmask"
@@ -2328,7 +2328,7 @@ func mergeAnchoredDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable,
 
 // mergeAnchoredDFASparseSet is mergeAnchoredDFA's wide twin: per-state accept
 // LISTS instead of a u64 mask, so an anchored bucket can hold more than 32
-// patterns (G17 sparse accept).
+// patterns (sparse accept).
 //
 // The anchored trio pays for a split differently from `find`. There is no
 // literal frontend and no candidate enumeration — emitSetAnchoredCapBody simply
@@ -2430,7 +2430,7 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 		})
 		members = append(members, []*PatternInfo{p})
 	}
-	// G17: re-merge buckets that split only on the 32-bit accept mask. Done
+	// Sparse promotion: re-merge buckets that split only on the 32-bit accept mask. Done
 	// here rather than by packing differently above so declaration order — and
 	// with it the bucket-bit-to-global-id mapping the non-promoted path relies
 	// on — is untouched when the promotion is refused.

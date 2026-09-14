@@ -72,7 +72,7 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 // patternsInSet returns the number of patterns in s — a safe upper bound on
 // how many matches `find` can report at a single start position (each pattern
 // emits at most once per start), and therefore the size of the tuple buffer.
-// Emitted as the public <SET>_PATTERN_COUNT constant under D16.
+// Emitted as the public <SET>_PATTERN_COUNT constant.
 //
 // It is NOT a bound on pattern id VALUES: ids are global indices into
 // `regexps:`, so a set holding two patterns can report id 69. Anything indexed
@@ -230,7 +230,7 @@ func boxSetBuffers(tupleSlots, gateSlots int) bool {
 // A set capability's WASM signature is ONE fact. Before this it was six: each
 // generator in this package hand-rolled the same chain over the five
 // capabilities and restated the parameter list from memory. That duplication is
-// what let R1 diverge — a stub sized an array by PATTERN_COUNT where the module
+// what let an array size diverge — a stub sized an array by PATTERN_COUNT where the module
 // indexed it by ID_SPACE, which is a memory-safety hazard rather than a wrong
 // answer — so the ORDER and MEANING of the parameters live here and nowhere
 // else.
@@ -261,7 +261,7 @@ const (
 	// It replaced a bare gate pointer in the same position. The gate array is
 	// still the caller's and still zeroed to start a drive, and is still sized
 	// by ID_SPACE and never by PATTERN_COUNT — a set of two patterns can report
-	// id 69, which is the R1 hazard. What changed is only that its address
+	// id 69, which is the memory-safety hazard. What changed is only that its address
 	// travels inside a descriptor, so the answer cache has somewhere to travel
 	// with it: the cache is what makes an overlapping drive linear instead of
 	// quadratic, and it needs caller-owned memory for the same reason the gates
@@ -548,7 +548,7 @@ type jsArgSpelling struct {
 // spellJSArgs renders one capability's argument list in ABI order.
 //
 // The JS and TS set templates are ~260 pairwise-duplicated lines that each
-// hand-rolled these lists, while rust/go/c/as had already adopted the R12
+// hand-rolled these lists, while rust/go/c/as had already adopted the shared
 // descriptor. They were in sync; the risk is FORWARD drift, which is exactly
 // how the cross-batch empty-match suppression came to exist in the find path
 // and not the groups path. Deriving the order from

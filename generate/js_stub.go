@@ -64,7 +64,7 @@ func genJSSetSection(cfg config.BuildConfig) string {
 		scratchBase := fmt.Sprintf("_outBase + 12*%s + 4*%s", konst, idKonst)
 		bitmapBase := fmt.Sprintf("_outBase + 12*%s + 4*%s + %d", konst, idKonst, scratchDescriptorBytes)
 
-		// Argument ORDER comes from the R12 descriptor, not from the templates
+		// Argument ORDER comes from the shared descriptor, not from the templates
 		// below — the one place the compiler's ABI is written down
 		//. Only the SPELLING of each parameter is decided
 		// here; `args` names the list for one capability.
@@ -629,7 +629,7 @@ export function* %[1]s(input, offset = 0) {
 // Yields an array per match; each element is [start, end] or null for
 // unmatched groups. Index 0 is the full match.
 //
-// Prefers the LM-2 batch export (funcName+"_batch") the same way
+// Prefers the batch export (funcName+"_batch") the same way
 // genJSFindFunc does — see its doc comment. The batch record layout is
 // [start, end, group0_start, group0_end, ...] (recSize ints; group 0
 // duplicates start/end — see buildBatchGroupsWrapperBody's doc comment in

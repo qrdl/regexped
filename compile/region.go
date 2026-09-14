@@ -20,7 +20,7 @@ import "fmt"
 //
 // Overlap is not a compile error and not a WASM validation error. It is a
 // module that reads one table through another's bytes, and it has shipped
-// before (FABLE_REVIEW B1). This type makes the frontier the only source of a
+// before. This type makes the frontier the only source of a
 // base address, so a block cannot lay a table at an address computed from a
 // stale cursor, and it refuses a commit that moves backwards.
 //

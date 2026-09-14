@@ -46,11 +46,13 @@ func resolveWasmTools(cfg config.BuildConfig) (string, error) {
 }
 
 // Wrap turns core (a module compiled with CompileOptions.Component) plus witText
-// into a component, written to out.
+// into a component, written to out ("-" streams it to stdout).
 //
-// The WIT is written beside the component as well, because jco, wit-bindgen and
-// wasmtime's bindgen! all need the interface text and a component alone does not
-// hand it over in a form those tools take.
+// It writes ONLY the component. witText goes to `wasm-tools component embed` in a
+// temporary directory and nowhere else: a caller that wants the interface text
+// beside the component — which jco, wit-bindgen and wasmtime's bindgen! all need,
+// and a component alone does not hand over in a form they take — writes it
+// itself. CmdCompile does, staging both files so neither ships without the other.
 func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 	tool, err := resolveWasmTools(cfg)
 	if err != nil {

@@ -27,7 +27,7 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 // the built automaton, not of the pattern text. That table used to be thrown
 // away (`_ = tt`, "table will be built again in compilePattern"), so every TDFA
 // pattern paid for two identical constructions. newTDFA is the expensive step:
-// 88 ms for a 16-state automaton before the Wave 1 strconv fix, ~46 ms after.
+// 88 ms for a 16-state automaton before a strconv fix, ~46 ms after.
 //
 // The second return value is non-nil ONLY when the returned engine is
 // EngineTDFA, i.e. only when the table passed both the state limit and the
@@ -333,7 +333,7 @@ func hasLineAnchors(prog *syntax.Prog) bool {
 // forward exit — the same test hasNonLoopAlternations/hasNestedQuantifiers
 // use) get a narrower version of the check: isAlternationDeterministic still
 // rejects an INDETERMINATE branch (empty first-rune set, e.g. an inverted
-// class wider than 256 codepoints — this is Gap I's protection, see
+// class wider than 256 codepoints — this is the inverted-class protection, see
 // CLAUDE.md "Load-bearing engine-selection gates", and must not be relaxed
 // here). It only skips the disjoint-ness requirement once both branches are
 // computable, since TDFA's LeftmostFirst priority always prefers the loop
@@ -572,7 +572,7 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 //
 // quantifierLoop is true when altPC is a quantifier-loop Alt (see
 // hasAmbiguousCaptures' doc comment). For those, an INDETERMINATE branch
-// (empty first-rune set — Gap I's inverted-class signal, CLAUDE.md
+// (empty first-rune set — the inverted-class signal, CLAUDE.md
 // "Load-bearing engine-selection gates") is still treated as ambiguous; only
 // the disjoint-ness requirement between two otherwise-computable branches is
 // skipped, since TDFA's LeftmostFirst priority resolves that case
@@ -603,7 +603,7 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop boo
 	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
 
 	if len(leftRunes) == 0 || len(rightRunes) == 0 {
-		return false // can't determine first chars for at least one branch — ambiguous even for quantifier loops (Gap I)
+		return false // can't determine first chars for at least one branch — ambiguous even for quantifier loops
 	}
 
 	if quantifierLoop {

@@ -167,7 +167,7 @@ type setFindCtx struct {
 	// the five every frontend shares and hands the allocator on, so a body
 	// continues the same allocation rather than opening a second one and
 	// reserving five slots to skip past these — which is what all five bodies
-	// did while the ctx still numbered its own locals by hand (task 67).
+	// did while the ctx still numbered its own locals by hand.
 	locals *localAlloc
 
 	// gated selects the default, per-pattern non-overlapping body: the
@@ -193,7 +193,7 @@ type setFindCtx struct {
 	//   - gated: gates are written for every tuple actually DELIVERED, not
 	//     only for a position that fitted whole. That is what lets the batch
 	//     loop resume a split position — the gate pre-mask then excludes
-	//     exactly the patterns already handed to the caller. `find` keeps D2's
+	//     exactly the patterns already handed to the caller. `find` keeps the
 	//     transactional rule, which is why this is a separate body.
 	//   - ungated: pSkip names a trailing parameter holding how many of this
 	//     position's tuples to count but not write. There is no gate array to
@@ -238,10 +238,10 @@ type setFindCtx struct {
 	lAllElig byte
 	lAcc     byte // i64 bitmask accumulator, scan_all only
 	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
-	// [from,len). G9's gated-`find` preflight fills it and writes it back as
+	// [from,len). The gated-`find` preflight fills it and writes it back as
 	// gate sentinels.
 	//
-	// G8's `scan_any` preflight also used it, to intersect every bucket's
+	// The old `scan_any` preflight also used it, to intersect every bucket's
 	// validMask and make the liveness exit fire. That is gone with
 	// `scan_any` reporting no start: it is the union walk now, so there is no
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
@@ -461,7 +461,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 	if !c.readsGate() || c.sparseBucket(bi) {
 		return b
 	}
-	// Skip the whole chain where it provably clears nothing (item 22 fix 2b).
+	// Skip the whole chain where it provably clears nothing.
 	// Wrapping is safe because the chain below contains no branch out of this
 	// block — only one `if` per pattern — so nothing inside it depends on the
 	// nesting depth.
@@ -583,7 +583,7 @@ func appendGateLocalGroup(b []byte, n int) []byte {
 	return append(b, 0x7F)
 }
 
-// sparseBucket reports whether bucket bi carries G17's per-state accept LISTS
+// sparseBucket reports whether bucket bi carries sparse per-state accept LISTS
 // rather than a 32-bit accept mask. Every mask-based shortcut on the candidate
 // path has to consult this: the masks are i32s and cannot describe such a
 // bucket's patterns, so a shortcut that reads one as authoritative silently
@@ -709,7 +709,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // individual group has been exhausted long enough to matter. Group retirement
 // would only pay on a skewed corpus where some groups saturate early while
 // others never hit — a workload no benchmark here has, and inventing one to
-// justify the code would be backwards. CLAUDE.md's Gap I is this lesson.
+// justify the code would be backwards. CLAUDE.md's load-bearing gates section is this lesson.
 //
 // Recorded rather than silently dropped, so anyone revisiting that
 // retirement idea knows it has been tried at this level and what it measured.
@@ -842,7 +842,7 @@ func setPatternIDs(cs *compiledSet) []int {
 //
 // Multi-pattern sets were NOT undecidable-so-assume-yes here; they were
 // measured-negative — but only on a LITERAL-frontend set. That
-// measurement is what task G13 narrows: log-levels-dense costs ~1K
+// measurement is what the scalar-frontend exception narrows: log-levels-dense costs ~1K
 // fuel per call because Teddy skips the whole line, so an O(patterns)
 // prologue is +6.8% of a small number. A SCALAR-frontend set has no such
 // skip: its calls cost Θ(n) at ~55 fuel per stepped position, against which
@@ -857,7 +857,7 @@ func setPatternIDs(cs *compiledSet) []int {
 // fire, so the prologue would be dead code. regexpMinMaxLen answers that
 // (maxLen == -1 means unbounded).
 // The frontend test comes FIRST because patternFullAST re-parses the pattern:
-// a literal-frontend set must reach the same verdict as before G13 without
+// a literal-frontend set must reach the same verdict as before the scalar-frontend exception without
 // paying for a walk it will discard.
 func (cs *compiledSet) jumpIsProfitable() bool {
 	n := 0
@@ -904,7 +904,7 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 func (c *setFindCtx) emitAllEligibleFrom(b []byte) []byte {
 	if !c.anyGroupCanShortcut() {
 		// Nothing will read it. Emitting it anyway is not free: the loop is
-		// O(patterns) on EVERY call, and a set whose buckets are all G17-sparse
+		// O(patterns) on EVERY call, and a set whose buckets are all sparse
 		// suppresses the chain entirely, so the prologue would be pure cost
 		// against no saving at all. Measured before this test existed:
 		// classchain-128 (four sparse buckets) paid +19.4% on its dense `find`
@@ -935,7 +935,7 @@ func (c *setFindCtx) emitAllEligibleFrom(b []byte) []byte {
 // prologue's O(patterns) on every call. Both ends were measured on the setperf
 // corpus with no threshold at all: 32 patterns in one bucket won 4.5% on
 // classchain-32's dense `find`, while THREE patterns lost 5.5% on every
-// greedy-3 gated row — the same shape item 11's refutations warn about, a
+// greedy-3 gated row — the same shape the refuted overlapping designs warn about, a
 // per-position test that does not fire often enough to repay itself. 8 sits
 // between the measured points, on the winning side of both.
 const gateShortcutMinPatterns = 8
@@ -1148,7 +1148,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLocal byte) []byte {
 	// Mode-INDEPENDENT. The table says which patterns can BEGIN at a byte,
 	// which is as true for a scan as for a find; the gate was a leftover from
-	// G16 shipping on the find path first. The remaining
+	// the eligibility mask shipping on the find path first. The remaining
 	// conditions are the real ones: L must be 0, and the emission side decides
 	// which buckets have a table at all.
 	if g.L != 0 {

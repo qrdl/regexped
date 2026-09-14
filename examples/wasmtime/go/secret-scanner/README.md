@@ -65,7 +65,7 @@ regexped merge      →  merge app + patterns into final.wasm
 
 `stub.go` is auto-generated. The scan function keeps the config's name
 VERBATIM — `find: scan_secrets` in `regexped.yaml` yields `func scan_secrets`,
-not `ScanSecrets`; the PascalCase transform was retired (TODO task 62). Symbols
+not `ScanSecrets`; the PascalCase transform was retired. Symbols
 with no user-supplied name, like `PatternName`, keep Go's convention.
 
 `main.go` is ~20 lines:

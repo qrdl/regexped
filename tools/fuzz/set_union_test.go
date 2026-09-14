@@ -796,7 +796,7 @@ func TestWideUnionScanSingleCapability(t *testing.T) {
 // The gated `find` preflight runs the union automaton once per drive and writes
 // its verdict into the caller's gate array as gate sentinels. Its emitters
 // read acceptOff/eofOff as [numStates] u64 — tables a WIDE automaton does not
-// emit at all. Before item 21 the predicate needed no id-space test, because
+// emit at all. Before wide union scans the predicate needed no id-space test, because
 // `cs.unionScan != nil` implied 64 ids or fewer; afterwards it does, and
 // without it a set like this one would run the preflight against the transition
 // table, read garbage as accept masks, and RETIRE patterns that are alive.
@@ -909,7 +909,7 @@ func newCapRunnerFromModule(t *testing.T, w []byte, input string, npat int) *cap
 //
 //   - a scalar frontend and a NEVER-DYING suffix DFA, or no preflight is
 //     emitted at all (a preflight that retires nothing is Candidate A);
-//   - every pattern LITERAL-LESS, so G12's absence prefilter declines
+//   - every pattern LITERAL-LESS, so the absence prefilter declines
 //     (buildAbsenceLits needs one pattern with a mandatory literal) and the
 //     union walk is what computes the verdict. greedy-3 — the fixture the
 //     preflight work was built against — fails exactly here: `ERROR` is an
@@ -1053,7 +1053,7 @@ func runUnionPreflightFind(t *testing.T, w []byte, pats []string, input string, 
 }
 
 func TestUnionAliveMaskPreflightMatchesGo(t *testing.T) {
-	// Every pattern literal-less (so G12 declines) with a never-dying leading
+	// Every pattern literal-less (so the absence prefilter declines) with a never-dying leading
 	// `[^\n]*` (so the preflight is emitted at all).
 	sets := [][]string{
 		{`[^\n]*[0-2]`, `[^\n]*[3-5]`},
@@ -1195,7 +1195,7 @@ func TestUnionAliveMaskPreflightResumes(t *testing.T) {
 // and on it.
 
 // digitRunWideSet is N patterns whose aliveness a single digit run decides,
-// plus a nullable member at a wide id. Literal-less throughout, so G12's
+// plus a nullable member at a wide id. Literal-less throughout, so the
 // absence prefilter declines and the union walk is what computes the verdict —
 // which it must, since that prefilter is capped at 64 ids and could not serve
 // this set anyway.

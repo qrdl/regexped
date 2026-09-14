@@ -1801,7 +1801,7 @@ func TestOverlappingPreflightSurvivesResume(t *testing.T) {
 }
 
 // TestOverlappingPreflightRunsOncePerDrive pins the amortisation itself, which
-// is the half of item 11 that the reverted attempt got wrong.
+// is the half of the overlapping preflight that the reverted attempt got wrong.
 //
 // A preflight that re-runs on every call is CORRECT and useless: it was
 // measured at 3,724 union passes on one drive, worse than the quadratic it

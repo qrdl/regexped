@@ -687,7 +687,7 @@ func TestCabiReallocTrapsWhenTheCarveWrapsTheAddressSpace(t *testing.T) {
 //   - the post-return reset, since --invoke gives every call a fresh instance
 //     and so can never show a leak.
 //
-// Result-area layouts are §3.3 of the component plan and are asserted here by
+// Result-area layouts follow the canonical ABI and are asserted here by
 // reading the bytes back.
 
 // componentWasm compiles entries as a component core module and returns the

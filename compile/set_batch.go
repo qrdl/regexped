@@ -66,7 +66,7 @@ func setCursorMaxCount(patternCount int) int32 { return config.SetCursorMaxCount
 // emitSetWorkerBody emits the SHARED per-position worker of a batching set:
 // the ordinary `find` body, built with compiledSet.batchPos set.
 //
-// Decision (11a) is what makes it shared. Previously this was the batch
+// It was not always shared. Previously this was the batch
 // export's private copy, and the module carried the bucket code twice — the
 // exported `find` body plus this one — which is where the measured 10-59%
 // module-size cost of declaring `find_batch` came from. Now the exported
@@ -943,7 +943,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, dpIdx, blkIdx int) []byte 
 	pGate, pOutPtr, pOutCap = 3, 4, 5
 	// pGate is the DESCRIPTOR on entry and the gate pointer after the prologue
 	// below overwrites it, which is what lets every reference to it stand.
-	// Locals come from the allocator, in declaration order (task 67): the index
+	// Locals come from the allocator, in declaration order: the index
 	// and the declaration are one statement rather than two that must agree.
 	a := newLocalAlloc(6)
 	// ONE name each. They were allocated as pScratch/pScratchLen and then

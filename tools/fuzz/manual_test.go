@@ -1,6 +1,6 @@
 package fuzz
 
-// Multi-global merge check (TODO 75's entry toll), run by hand:
+// Multi-global merge check, run by hand:
 //
 //	go test ./tools/fuzz -run TestMergedTwoGlobals \
 //	    -args -mergeglobals-std=<std.wasm> -mergeglobals-merged=<merged.wasm>

@@ -199,7 +199,7 @@ func buildCountedChainSuffixBody(class []byte, n int, patternID int, prefixMaxLe
 		// parameter is still declared so the function matches the gated suffix
 		// type every find body calls.
 	)
-	// Locals come from the allocator (task 67), so the group order below is
+	// Locals come from the allocator, so the group order below is
 	// the allocation order rather than a comment asking the two to agree —
 	// and the gated signature's extra parameter shifts every index by
 	// construction.

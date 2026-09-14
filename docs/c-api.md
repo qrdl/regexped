@@ -113,9 +113,27 @@ Three things to know about the one you get:
 - its size is `REGEXPED_CABI_HEAP_BYTES`, **256 KB** by default, chosen by
   measurement because the adapter's stack takes the bulk of it. Define it smaller
   for a component that pulls in no adapter;
-- it is **weak**, so your own `cabi_realloc` wins if you have one.
+- it and the two hooks the wrappers call to reclaim each returned list,
+  `regexped_cabi_mark()` and `regexped_cabi_release(mark)`, are **one unit**.
 
 It traps rather than overruns, so too small a heap fails loudly.
+
+**Bringing your own allocator.** A `cabi_realloc` from elsewhere allocates lists
+the stub's hooks cannot reclaim, so replacing only the allocator would leak one
+list per call. Define `REGEXPED_CABI_EXTERNAL_ALLOCATOR` when compiling the stub
+and define all three yourself:
+
+```c
+/* exported as "cabi_realloc", the canonical-ABI signature */
+void *cabi_realloc(void *old_ptr, unsigned old_size, unsigned align, unsigned new_size);
+unsigned regexped_cabi_mark(void);           /* a token, taken before a call  */
+void regexped_cabi_release(unsigned mark);   /* reclaim everything since then */
+```
+
+The stub then emits none of the three, and the link fails if either hook is
+missing. **Without the define**, a `cabi_realloc` other than the stub's is
+detected on the first non-empty returned list — the stub's heap did not move —
+and the guest traps in `regexped_cabi_foreign_allocator` instead of leaking.
 
 ### The consumer world needs your exports
 

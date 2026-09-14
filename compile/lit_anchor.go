@@ -31,7 +31,7 @@ type litAnchorPoint struct {
 //
 // Deliberately narrower than analyseLitChainBranch's prefix handling: that
 // function requires the pattern's *suffix* to also be a bounded class-chain
-// (Gap E), which excludes any prefix ahead of an unbounded suffix like
+// (the mixed-prefix shape), which excludes any prefix ahead of an unbounded suffix like
 // `[^\n]+` (parsed as OpPlus, not OpRepeat) — exactly the shape lit-anchor
 // patterns commonly have. simpleClassPrefix only looks at the prefix, so it
 // applies regardless of what the suffix looks like.
@@ -482,7 +482,7 @@ type altLitAnchorBranch struct {
 
 // maxAltLitAnchorBranches bounds the branch count to the same 8-alternative
 // cap extractLitSet already applies to literal-alternation anchor points and
-// Gap E's layout planner applies to its own branch count — keeps 2-byte
+// the mixed-prefix layout planner applies to its own branch count — keeps 2-byte
 // Teddy available for the common case and bounds compile-time work.
 const maxAltLitAnchorBranches = 8
 

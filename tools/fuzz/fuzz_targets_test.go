@@ -65,7 +65,7 @@ const inputCap = int(tableBase)
 //	2500   4450ms                2.2x
 //	3000   5863ms                1.7x
 //	4000   8323ms                1.2x
-//	5000   9246ms                1.1x   <- previous value, bug #42
+//	5000   9246ms                1.1x   <- previous value
 //	none   11927ms               0.8x
 //
 // Real fuzz-worker conditions cost roughly 3.5x the solo compile time:
@@ -852,8 +852,7 @@ func slotsEqual(a, b []int) bool {
 // A behavioural sweep is worth exactly what its reach can be shown to be. The
 // find sweep passed for weeks over shapes that reached eight of fourteen
 // emitters; the six it never touched included two that answered with a match
-// starting before the position they were asked to search from
-// (plans/FUZZER_BUGS.md 65).
+// starting before the position they were asked to search from.
 //
 // The obvious accounting — a second corpus, in package `compile`, driving the
 // emitters and recording which fired — proves the wrong thing. It shows that

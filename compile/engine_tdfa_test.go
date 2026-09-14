@@ -436,7 +436,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 
 // TestTDFAAllZeroTagOpsSkip exercises the "if !anyHasOps { return b }" early
 // skip in emitTDFATagOps, reached when the whole TDFA transition table has
-// zero register-set/copy ops — the test plan T28. a has one zero-width capture
+// zero register-set/copy ops. a has one zero-width capture
 // group, resolved entirely via entry ops before the first byte-consuming
 // transition (anyHasOps=false).
 func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
@@ -446,7 +446,7 @@ func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
 // TestTDFAMinimizeRegistersApplyColoring exercises the block in
 // minimizeTDFARegisters that rewrites tagOps/acceptOps/acceptRegMap after
 // graph coloring finds a real register-count reduction (guarded by
-// newNumRegs < numRegs) — the test plan T29. Two alternated, order-swapped
+// newNumRegs < numRegs). Two alternated, order-swapped
 // capture groups inside a `+` loop give the construction-time canonical
 // register numbering more registers than liveness analysis actually needs.
 // Confirmed live: numRegs is minimised to 19 (well below the raw tag count),
@@ -463,7 +463,7 @@ func TestTDFAMinimizeRegistersApplyColoring(t *testing.T) {
 }
 
 // TestTDFAU16TableAddressing exercises the useU8=false (2-byte state ID)
-// branch of buildTDFAMatchBody/emitTDFATagOps — the test plan T30. Bounded
+// branch of buildTDFAMatchBody/emitTDFATagOps. Bounded
 // repetition unrolls into many states without necessarily blowing up
 // register count: confirmed live via newTDFA, this pattern has 511 states
 // (> 256, forcing u16) and 24 registers (within the default 32-register
@@ -481,8 +481,8 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 }
 
 // TestTDFAEpsWalkAltFallthrough exercises the "try inst.Arg after inst.Out
-// fails" fallback in tdfaEpsCapOps/tdfaEpsCapOpsTo's InstAlt handling —
-// the test plan T31. (?:(a)|(b)): the nested alternation's Out branch doesn't
+// fails" fallback in tdfaEpsCapOps/tdfaEpsCapOpsTo's InstAlt handling.
+// (?:(a)|(b)): the nested alternation's Out branch doesn't
 // reach the target/capture being searched for, so the epsilon walk must
 // fall through to Arg. Top-level Op is OpAlternate (not OpCapture/OpConcat),
 // so the whole-pattern-single-capture shortcut never applies
@@ -493,7 +493,7 @@ func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 
 // TestTDFAStartThreadOffMainEntry exercises startThreads[i]'s capture-op
 // discovery via tdfaEpsCapOpsTo for a start PC that isn't the main entry
-// target (newTDFA's comment: "e.g. (a*) reaching InstMatch") — the test plan T32.
+// target (newTDFA's comment: "e.g. (a*) reaching InstMatch").
 // (a*) alone reaches InstMatch via a pure-epsilon path from Start, exactly
 // the mechanism this targets — but it also trips the whole-pattern-
 // single-capture shortcut (MaxCap()==1, confirmed live), which would bypass
@@ -673,8 +673,7 @@ func TestDetectTDFABulkSkipReject(t *testing.T) {
 // instructions are decoded just far enough to skip their operands. This
 // independently verifies the block/loop/if nesting and branch depths
 // without needing a live WASM runtime — the only way to catch a
-// depth-arithmetic bug that isn't also a validator error (see Gap F plan,
-// risk #1: an off-by-one branch depth is still a *valid* WASM program, just
+// depth-arithmetic bug that isn't also a validator error (an off-by-one branch depth is still a *valid* WASM program, just
 // one that jumps to the wrong place).
 func decodeControlFlow(t *testing.T, b []byte) []string {
 	t.Helper()

@@ -112,7 +112,7 @@ func genASSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
 		}
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
-		// the AssemblyScript spelling of each is decided here (R12).
+		// the AssemblyScript spelling of each is decided here.
 		setCaps := setCapabilities(s, cfg, wide)
 		sig := func(kind string) string {
 			capability := mustCapByKind(setCaps, kind, "AS")

@@ -4,7 +4,7 @@ import (
 	"github.com/qrdl/regexped/internal/utils"
 )
 
-// ── Sparse-set accept: the >32-pattern suffix body (task G17) ───────────────
+// ── Sparse-set accept: the >32-pattern suffix body ──────────────────────────
 //
 // A set whose patterns share ONE mandatory literal packs into ceil(N/32)
 // buckets, because the accept bitmask every other path uses is an i32 on the
@@ -108,7 +108,7 @@ func planSparseScratch(base int32, numPatterns, numStates int) sparseScratch {
 	s.fired = s.seen + int32(numPatterns)
 	s.memberStale = s.fired + int32(numPatterns)*2
 	// The per-BUCKET verdict used to take one more byte here. It is a module
-	// GLOBAL now (TODO 75 group C): an allocator index instead of an address,
+	// GLOBAL now: an allocator index instead of an address,
 	// so there is no per-bucket offset to compute, forget, or leave at a zero
 	// value that is itself a writable table location.
 	s.end = s.memberStale + int32(numStates)

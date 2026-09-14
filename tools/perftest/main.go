@@ -153,7 +153,7 @@ var tests = []testCase{
 		// JWT branch is replaced with a Stripe-style key using an explicit
 		// {N,M} range on a SINGLE <literal><class> segment. This is the
 		// shape analyseLitChainAltRange actually accepts (branches must be
-		// exactly [literal, repeat(class)] or the Gap E 3-element mixed-
+		// exactly [literal, repeat(class)] or the 3-element mixed-
 		// prefix shape) — secrets-combined's JWT branch is a multi-segment
 		// chain (literal, class+, literal ".", class+, literal ".", class+)
 		// that analyseLitChainAltRange rejects outright (only 2- or
@@ -485,7 +485,7 @@ var tests = []testCase{
 		},
 	},
 
-	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
+	// ── LikelyNoMatch / dominant bulk-skip coverage on 100 KB workloads ─────────────────────────────
 	// These three patterns surface the wins (or absence thereof) of recent
 	// shipping work on a realistic-scale perftest.
 	{
@@ -511,8 +511,8 @@ var tests = []testCase{
 		},
 	},
 	{
-		// Shufti 9..16 first-byte-set amplifier (shipped portion of LNM
-		// Action 3). Pattern's first-byte set is `[0-9a-f]` (exactly 16
+		// Shufti 9..16 first-byte-set amplifier.
+		// Pattern's first-byte set is `[0-9a-f]` (exactly 16
 		// chars) — before Shufti, the prefix scan emitted 4*16=64 multi-
 		// eq SIMD ops per chunk; Shufti reduces to ~17 ops/chunk. On 100KB
 		// log-like input with sparse hex strings, this exercises both the
@@ -554,8 +554,8 @@ var tests = []testCase{
 		},
 	},
 	{
-		// Density-heuristic-POSITIVE case (deferred portion of LNM Action 3,
-		// shipped 2026-06-17): `[\x00-\x1f]` is 32 chars, all control
+		// Density-heuristic-POSITIVE case (shipped
+		// 2026-06-17): `[\x00-\x1f]` is 32 chars, all control
 		// bytes, every byte rarity class 0 → sum = 0 < threshold 40 →
 		// Shufti emitted. Scalar would scan every byte (no early exit
 		// since prose has zero control bytes); Shufti's 4-half nibble

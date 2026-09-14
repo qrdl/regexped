@@ -782,7 +782,7 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	b = e.emitCopyColumnToCkpt(b, e.lNumBlocks, cellBytes)
 
 	// Position len. It belongs to block 0 exactly when nb == 1, and is WRITTEN
-	// only then — the bug the earlier draft of the plan had was excluding it
+	// only then — the bug an earlier draft had was excluding it
 	// from the block sweep entirely, which silently dropped every
 	// end-of-input match.
 	// Per-block counting runs from the TOP block down; cum[] is prefix-summed

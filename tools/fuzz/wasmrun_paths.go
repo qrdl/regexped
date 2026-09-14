@@ -139,7 +139,7 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 // Scope of the claim: this is a resource-management defect, established by
 // reading the API (wasmtime-go v42 does expose Store.Close and Module.Close;
 // we simply never called them). It is NOT known to cause any particular
-// observed failure — in particular it does not explain bug 49's worker aborts,
+// observed failure — in particular it does not explain the fuzz worker aborts,
 // which survived this fix, and measurement afterwards showed 200 iterations of
 // a bug-49 repro sitting flat at 102 MB.
 //

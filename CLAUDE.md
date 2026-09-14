@@ -714,7 +714,7 @@ its six runs / 0 failures.
 `custom-sets.txt` adds hand-picked blocks whose expectations are REGENERATED
 from Go (`go run ./make_sets custom-sets.txt`) rather than hand-maintained,
 which keeps them an independent oracle rather than a transcript of engine
-output. Its `SetG15*` blocks are permanent regressions, alongside other hand-picked shapes.
+output. Its blocks include permanent regressions alongside other hand-picked shapes.
 
 **`make -C tools/re2test set-batch`** is the older single-set-per-block shape, kept because it is the only
 configuration that compiles sets of several thousand patterns: ONE set per

@@ -1,6 +1,6 @@
 package main
 
-// Task G15: drive EVERY set capability over the corpus.
+// Drive EVERY set capability over the corpus.
 //
 // Before this file, --sets declared one set with `find` OR `find_batch`,
 // `patterns: all` and no `overlapping`, so six of the eight capabilities plus a
@@ -1310,7 +1310,7 @@ func runSetProfile(
 		if c.find, e = get(s.find, s.setName+"_find"); e != nil {
 			return e
 		}
-		// Decision (11): the batch entry is synthesized from `find`'s name
+		// The batch entry is synthesized from `find`'s name
 		// under the hint, not declared, so its export name is derived the
 		// same way the compiler and the six generators derive it.
 		if c.findBatch, e = get(s.batchFind, config.SetBatchExportName(s.setName+"_find")); e != nil {
@@ -1909,7 +1909,7 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 // delivering anything: the union-scan prologue runs once, and permanently
 // gates out every pattern that matches nowhere at or after `from`. That is
 // sound (a pattern it eliminates cannot match, so no answer changes) and it is
-// where G10's −99.74% comes from — but it does mean docs/sets.md's literal
+// where the liveness guard's −99.74% comes from — but it does mean docs/sets.md's literal
 // "the gate array is left exactly as it was found" is not true byte-for-byte.
 // Asserting the bytes would therefore fail on a correct compiler; asserting the
 // answer is both what a caller can observe and what the rule exists to protect.

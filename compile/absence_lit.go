@@ -8,7 +8,7 @@ import (
 
 // Literal-existence absence prefilter.
 //
-// The G8/G9 preflights only need to know which patterns are PROVEN matchless
+// The union preflights only need to know which patterns are PROVEN matchless
 // in [from, len); over-approximating "alive" is documented-safe. A
 // pattern whose mandatory literal does not OCCUR in that range cannot match
 // there, and that is an exact absence proof — independent of prefixes, word
@@ -51,7 +51,7 @@ type absenceLit struct {
 // gives up once the offset becomes unbounded — which is exactly why
 // `[^\n]*ERROR` yields nothing there: `[^\n]*` drives curMax to -1 and the
 // next recursion hits the `maxOff < 0` guard. For an ABSENCE proof the offset
-// is irrelevant; only occurrence matters. Q5 established that none of B41's
+// is irrelevant; only occurrence matters. An earlier analysis established that none of the
 // start-recovery concerns apply to this use.
 //
 // Returns the LONGEST literal it can find, since selectivity is the whole

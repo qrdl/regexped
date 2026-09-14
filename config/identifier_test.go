@@ -270,7 +270,7 @@ func TestValidateImportModule_PerStubType(t *testing.T) {
 		module    string
 		wantError bool
 	}{
-		// B32: hyphens are fine for JS/TS, which never emit the module name,
+		// Hyphens are fine for JS/TS, which never emit the module name,
 		// and invalid for the four languages that do.
 		{"hyphen js", "js", "my-mod", false},
 		{"hyphen ts", "ts", "my-mod", false},
@@ -315,7 +315,7 @@ func TestValidateImportModule_PerStubType(t *testing.T) {
 }
 
 func TestValidateExports_HelperCollisions(t *testing.T) {
-	// B34 class 1: a user export named after something the generator declares
+	// Class 1: a user export named after something the generator declares
 	// for itself. Only the generators that declare it are affected.
 	cases := []struct {
 		stubType  string
@@ -434,7 +434,7 @@ func TestValidateExports_SetDerivedConstantCollisions(t *testing.T) {
 }
 
 func TestValidateExports_FFIPrefix(t *testing.T) {
-	// B34 class 3: `ffi_x` collides with the private binding generated for an
+	// Class 3: `ffi_x` collides with the private binding generated for an
 	// export named `x`.
 	for _, st := range []string{"rust", "go"} {
 		cfg := &BuildConfig{
@@ -459,7 +459,7 @@ func TestValidateExports_FFIPrefix(t *testing.T) {
 }
 
 func TestValidateExports_CaseFoldCollision(t *testing.T) {
-	// B34 class 2: distinct WASM exports (so ValidateSets' verbatim dedup is
+	// Class 2: distinct WASM exports (so ValidateSets' verbatim dedup is
 	// happy) that collapse to one generated Rust iterator type.
 	//
 	// RUST ONLY. Go dropped out of this — its names are

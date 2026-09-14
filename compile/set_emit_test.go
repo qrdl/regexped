@@ -141,7 +141,7 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		},
 		// Captures the selector routes to BACKTRACKING, not TDFA: an inverted
 		// class wider than 256 codepoints makes getFirstRuneSet report
-		// ambiguity (CLAUDE.md "Gap I"). That is what makes p.isTDFA false, so
+		// ambiguity (CLAUDE.md, "Load-bearing engine-selection gates"). That is what makes p.isTDFA false, so
 		// the composed wrapper has to pass the BT window scratch offset rather
 		// than -1. Non-anchored, so the wrapper composes find + capture.
 		{
@@ -198,7 +198,7 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 // their UNION-AUTOMATON arm.
 //
 // Both preflights have two ways to compute "this pattern matches nowhere at or
-// after `from`": G12's literal-absence scan, and a pass over the start-anywhere
+// after `from`": the literal-absence scan, and a pass over the start-anywhere
 // union automaton. The absence scan wins whenever any member carries a
 // mandatory literal, which is nearly every set anyone writes — so the union arm
 // (and with it the wider local frame emitSetMatchFnFinalScalar declares for it)
@@ -379,7 +379,7 @@ func TestSetEmitACFrontendSingleByteLiteral(t *testing.T) {
 // stopping rule, and every refusal here is a shape whose rule it would have to
 // reproduce a second time. A refusal that stopped firing does not fail to
 // compile — it produces a module that answers a different question, which is
-// how R4 diverged — so the predicate is asserted directly rather than through
+// how an earlier copy diverged — so the predicate is asserted directly rather than through
 // the emitted bytes.
 func TestSetEmitOverlapDPRefusals(t *testing.T) {
 	// The sweep needs all of: find, overlapping, batching, and exactly one
@@ -789,7 +789,7 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 		// counter and its skip flag are absent.
 		//
 		// The count is of i32s, not of GROUPS, and that is a consequence of
-		// task 67's conversion: the allocator coalesces adjacent same-type
+		// allocating locals: the allocator coalesces adjacent same-type
 		// runs, so both frames now declare five groups and the group count no
 		// longer tells them apart. The i32 total does — it is exactly the two
 		// locals the dense switch adds.
@@ -951,7 +951,7 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 	// Everything above the stack must be laid out in order and inside `end`,
 	// or two regions share an address and one silently overwrites the other.
 	// The window pair is no longer among them: it is two module globals, so it
-	// has no address to collide with (TODO 75 group A).
+	// has no address to collide with.
 	if regions.slotScratch < regions.stackLimit || regions.end <= regions.slotScratch {
 		t.Errorf("regions overlap or run backwards: %+v", *regions)
 	}
@@ -1138,7 +1138,7 @@ func TestSetEmitUnionScanTableLayouts(t *testing.T) {
 			// bytes wide; five byte classes, so the row length is 10 and the
 			// index needs a multiply.
 			//
-			// The repeat is {7}, not {6}: task 72 made buildUnionScanDFA
+			// The repeat is {7}, not {6}: minimization made buildUnionScanDFA
 			// MINIMIZE its automaton, and {6} drops from >256 states to 200 —
 			// u8, which is not the layout this case exists to cover. {7}
 			// minimizes to 496 and still exercises it. Any future change that
@@ -1191,7 +1191,7 @@ func TestSetEmitUnionScanTableLayouts(t *testing.T) {
 // Both are about what the verdict is APPLIED through. It is written into the
 // caller's gate array and read back as an i32 validMask, so:
 //
-//   - a SPARSE bucket is refused outright, because G17's rule is that nothing
+//   - a SPARSE bucket is refused outright, because the sparse rule is that nothing
 //     on the candidate path may read an i32 mask as authoritative for one;
 //   - an id space past 64 is refused because the alive verdict itself is an
 //     i64 mask, and an id with no bit in it could never be retired.
@@ -1424,7 +1424,7 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 // predicates refuse it earlier), so the emitter is called on an empty
 // compiledSet directly.
 //
-// One emitter, not two: item 22 fix 2a gave the gated body the overlapping
+// One emitter, not two: the gated body was given the overlapping
 // body's alive-marking write-back, at which point the two were the same code.
 func TestSetEmitPreflightWithNoPatterns(t *testing.T) {
 	empty := &compiledSet{}
@@ -2076,14 +2076,14 @@ func TestSetCoreCompileFallbackMergeRefusalStartsNewBucket(t *testing.T) {
 // binPack
 
 func TestSetCoreBinPackCountedChainConflictUnderLikelyMatch(t *testing.T) {
-	// LM-6: under LikelyMatch two counted-class-chain patterns must NOT share
+	// Under LikelyMatch two counted-class-chain patterns must NOT share
 	// a bucket, because isCountedClassChain needs a single-pattern suffix DFA
 	// and merging them costs both the SIMD-verify suffix body. The conflict is
 	// recorded in --diag-json so the split is explainable.
 	infos := setCoreCovAnalyzeAll(t, `KEY[0-9]{4}`, `KEY[A-Z0-9]{16}`)
 	for _, info := range infos {
 		if _, _, ok := isCountedClassChain(info.suffixDFA); !ok {
-			t.Fatalf("%q: suffix is not a counted class chain; this case no longer selects LM-6",
+			t.Fatalf("%q: suffix is not a counted class chain; this case no longer selects the counted-chain split",
 				info.fullPattern)
 		}
 	}
@@ -2140,7 +2140,7 @@ func TestSetCoreBinPackMergeRefusalStartsNewBucket(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// G17 promotion policy
+// Sparse promotion policy
 
 func TestSetCorePromoteSharedLiteralBucketsDeclines(t *testing.T) {
 	// Two shapes gain nothing and must be returned untouched: no buckets at
@@ -3223,7 +3223,7 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FABLE B23, mechanism (a). `--diag-json` reported the frontend SELECTION
+// `--diag-json` reported the frontend SELECTION
 // chose, while the emitted body could still be the scalar one.
 //
 // A fallback bucket has no literal gating it, so it must be tried at EVERY
