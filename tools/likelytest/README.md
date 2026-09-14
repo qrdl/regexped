@@ -30,7 +30,7 @@ exactly this corpus's blind spot: fuel/time numbers look "good" whether the
 compiled WASM took a legitimately cheap path or is silently returning the
 wrong answer cheaper than the correct one would cost. The case that motivated
 adding this check was exactly that: a false negative in a groups-mode capture
-composition, sitting undetected in this benchmark's own `gap-e-groups` case
+composition, sitting undetected in this benchmark's own `mixed-prefix-groups` case
 because nothing here validated output, only cost.
 
 ## Running it
@@ -79,7 +79,7 @@ meaningless 0%. If *both* the LM and LNM rows print this for a case, that
 case is compile-time-inert: no `LikelyMode` gate in `compile/` currently
 affects its output at all. Such cases test nothing and should be removed
 (this happened once already — `dense-set-chains`, a negative control for
-LM-6's binPack-merge-refusal gate, removed 2026-08-01 once the case it was
+the counted-chain split's binPack-merge-refusal gate, removed 2026-08-01 once the case it was
 guarding against was confirmed unreachable by construction: AKIA/ghp_ share
 no literal, so binPack never considers merging them, independent of
 `LikelyMode`).
@@ -90,10 +90,10 @@ Cases fall into a few families (see the comment above each entry in
 `main.go` for the specific optimisation it targets):
 
 - **Shufti prefix-scan targets** (`alpha-run`, `word-run`) — patterns with no
-  literal anchor, first-byte set of varying width, testing Action 3/5's
-  scalar-vs-SIMD prefix scan routing.
+  literal anchor, first-byte set of varying width, testing the density
+  heuristic's scalar-vs-SIMD prefix scan routing.
 - **Lit-anchor targets** (`lit-anchor-*`) — literal-anchored find with a
-  bounded-repeat prefix, testing the backward verify scan (task 22).
+  bounded-repeat prefix, testing the SIMD backward verify scan.
 - **Dense-workload cases** (`dense-*`) — `exhaustive: true` cases that drain
   every match in a 50 KB buffer instead of stopping at the first one, so
   per-match/per-attempt cost (not just scan-to-first-match cost) shows up in
@@ -106,15 +106,15 @@ Cases fall into a few families (see the comment above each entry in
   exactly ONE capability, because the compiler emits only the machinery the
   declared capabilities need — a case declaring two would compile a literal
   frontend it is not driving and report the union of both in the size column.
-  The five added 2026-08-31 for TODO tasks 68-70:
+  The five added 2026-08-31:
 
   | Case | Capability | Targets |
   |---|---|---|
-  | `set-dense-quoted` | `find` | task 68 — the Shufti self-loop skip inside a bucket's SUFFIX body, 20-50-byte quoted bodies (the win case) |
-  | `set-dense-quoted-short` | `find` | task 68 — same set, 3-6-byte bodies: the hysteresis guard that decided no minimum-length gate was needed |
-  | `set-scan-classchain-sparse` | `scan_any` | task 69 — the union automaton's SIMD stride. Literal-less patterns, since `find` never enters the union scan except through a preflight |
-  | `set-scan-all-classchain-sparse` | `scan_all` | task 69 — the twin; both scan capabilities do identical per-byte work, so a union-scan change must move both or neither |
-  | `set-wide-union-shufti` | `find` | task 70 — the Shufti frontend at a first-byte union WIDER than 64. Reaching it needs ~80 long literals so Aho-Corasick exceeds its 512 KB budget, which is the only route from a literal set to the scalar branch |
+  | `set-dense-quoted` | `find` | the Shufti self-loop skip inside a bucket's SUFFIX body, 20-50-byte quoted bodies (the win case) |
+  | `set-dense-quoted-short` | `find` | same set, 3-6-byte bodies: the hysteresis guard that decided no minimum-length gate was needed |
+  | `set-scan-classchain-sparse` | `scan_any` | the union automaton's SIMD stride. Literal-less patterns, since `find` never enters the union scan except through a preflight |
+  | `set-scan-all-classchain-sparse` | `scan_all` | the twin; both scan capabilities do identical per-byte work, so a union-scan change must move both or neither |
+  | `set-wide-union-shufti` | `find` | the Shufti frontend at a first-byte union WIDER than 64. Reaching it needs ~80 long literals so Aho-Corasick exceeds its 512 KB budget, which is the only route from a literal set to the scalar branch |
 
   The scan pair is reachable at all only because the set mode gained a
   capability selector in the same change; before that it drove `find`
@@ -143,37 +143,37 @@ finding, not a defect.
 
 | Case | Mode | Fuel Δ | What it's guarding |
 |---|---|---|---|
-| `dense-quoted-short` | LM (match) | +3% | LM-3 non-mid Shufti self-loop, short-run hysteresis guard |
-| `dense-printable-short` | LM (match) | +26% | LM-5 wide-class-band self-loop, at-minimum-length guard |
+| `dense-quoted-short` | LM (match) | +3% | Non-mid Shufti self-loop, short-run hysteresis guard |
+| `dense-printable-short` | LM (match) | +26% | Wide-class-band self-loop, at-minimum-length guard |
 | ~~`set-shufti-dense-harm`~~ | LNM (match & no-match) | ~~+5% / +5%~~ → **-67% / -62%** | **NO LONGER A GUARD CASE — re-measured 2026-08-31.** See below. |
 
 **`set-shufti-dense-harm` stopped demonstrating harm.** The case had drifted
-onto the Teddy frontend and was measuring nothing; task 73 restored it by
-pinning selection to scalar, and it now shows `prefer-no-match` **winning**
+onto the Teddy frontend and was measuring nothing; forcing the scalar
+frontend restored it, and it now shows `prefer-no-match` **winning**
 by 62-67% on the very input built to make it lose. The documented +5%/+5%
 is not reproducible on this tree.
 
 Two things follow, and neither is settled here:
 
-- The suite currently has **no case demonstrating H.3's dense-data cost**,
-  so task 28's adaptive switch has no standing guard. Whether that is
+- The suite currently has **no case demonstrating the set-level Shufti's dense-data cost**,
+  so the adaptive density switch has no standing guard. Whether that is
   because the switch now works well enough that the cost is gone, or because
   this input no longer adversarially violates the assumption, is unmeasured.
 - Its neutral arm is a **forced** scalar frontend. 21 short literals would
   never be scalar in production — they would be Teddy — so the -62% is the
-  honest size of the *H.3 scalar-vs-Shufti decision* for this byte set, and
-  says nothing about how these 21 patterns would actually perform. H.3 only
+  honest size of the *set-level scalar-vs-Shufti decision* for this byte set, and
+  says nothing about how these 21 patterns would actually perform. That decision only
   ever fires for sets that are already on scalar, so measuring it this way is
   legitimate; reading the number as a property of the pattern set is not.
 
-### Family 2 — the task-25 "dense-switch" residual
+### Family 2 — the "dense-switch" residual
 
 `LikelyNoMatch` forces the SIMD (Shufti) prefix scan for 17–64-byte
 first-byte sets that a static density heuristic would otherwise route to
-scalar (Action 5) — because scalar's per-chunk early-exit beats Shufti's
+scalar — because scalar's per-chunk early-exit beats Shufti's
 fixed per-chunk cost when the class is common in the real data (e.g. plain
-`[a-zA-Z]` over prose). Task 25 added a runtime `DenseCounter`/
-`DenseSkipFlag` pair (`compile/prefix_scan.go`) that falls back to scalar
+`[a-zA-Z]` over prose). A runtime `DenseCounter`/
+`DenseSkipFlag` pair (`compile/prefix_scan.go`) falls back to scalar
 after ~8 unproductive attempts, collapsing what was originally a +69-78%
 fuel regression down to a small residual.
 
@@ -187,7 +187,7 @@ repeatedly for the next match), not just of the byte class:
 |---|---|---|---|
 | `alpha-run` | LNM (match) | +15% | One single-call scan across most of 51 KB — counter trips almost immediately, then stays scalar for the rest. |
 | `word-run` | LNM (match) | +17% | Same shape as `alpha-run`. |
-| `alpha-run` | LNM (no-match) | +3% | The number task 25's fix collapsed this to (was +69% pre-fix). |
+| `alpha-run` | LNM (no-match) | +3% | The number the dense switch collapsed this to (was +69% pre-fix). |
 | `word-run` | LNM (no-match) | +3% | Same, was +78% pre-fix. |
 | `dense-bare-upper` | LNM (match) | +8% | `exhaustive: true`, 10-30-byte runs — enough room between matches for the counter to trip mid-scan some of the time, but not as cleanly as `alpha-run`'s single long scan. |
 | `dense-words-grouped` | LNM (match) | +37% | `exhaustive: true`, `(\w+)` matching almost every ~6 bytes — each `find_all` call returns before the counter can accumulate anywhere near the ~8-attempt threshold, so the switch essentially never trips and the whole scan pays the Shufti tax. |
@@ -197,11 +197,11 @@ previously written up in `docs/prefer-hints.md`) — same
 mechanism as
 the `alpha-run`/`word-run` residual, just a larger instance of it because
 of how frequently their matches restart the per-call counter. This is a
-real, understood limitation of the task-25 mechanism (short/frequent
+real, understood limitation of the dense-switch mechanism (short/frequent
 matches defeat the adaptive switch), not a new class of bug — but the
 mechanism has only ever been tuned/measured against `alpha-run`, `word-run`,
 `alpha-run-impossible-bytes`, and `deadskip-near-miss`, which is the whole of
-task 25's original measurement plan. A future fix would need to
+its original measurement set. A future fix would need to
 either persist the counter across calls (state stored outside the function,
 e.g. a global or memory cell) or accept that exhaustive/frequent-match
 workloads are the worst case for this mechanism.
@@ -215,21 +215,21 @@ no-match-input columns at once:
 
 | Mode | Case | Match fuel Δ | No-match fuel Δ | Mechanism |
 |---|---|---|---|---|
-| LNM | `alpha-run-impossible-bytes` | -58% | -58% | Action 5 forced Shufti skips impossible-byte runs on both inputs at ~16 B/cycle. |
-| LNM | `bt-action5-target` | -58% | -58% | Same Action-5 mechanism, BT-routed (Gap G). |
-| LM | `minlen-quantifier-skip` | -82% | -82% | LM-4 bare self-loop bulk-skip — `[a-z]{50,}[0-9]` has no literal prefix, so *both* inputs spend nearly their whole scan inside the bulk-skip-eligible self-loop. |
-| LNM | `lit-anchor-false-positive-literal` | -1% | -64% | Task 22 SIMD backward-verify; the match-side gain is real but negligible in magnitude. |
-| LNM | `set-shufti-lnm` | -97%* | -98%* | H.3 forced Shufti on the whole 21-pattern set frontend. |
+| LNM | `alpha-run-impossible-bytes` | -58% | -58% | LNM-forced Shufti skips impossible-byte runs on both inputs at ~16 B/cycle. |
+| LNM | `bt-impossible-bytes` | -58% | -58% | Same impossible-byte skip mechanism, BT-routed. |
+| LM | `minlen-quantifier-skip` | -82% | -82% | Bare self-loop bulk-skip — `[a-z]{50,}[0-9]` has no literal prefix, so *both* inputs spend nearly their whole scan inside the bulk-skip-eligible self-loop. |
+| LNM | `lit-anchor-false-positive-literal` | -1% | -64% | SIMD backward-verify; the match-side gain is real but negligible in magnitude. |
+| LNM | `set-shufti-lnm` | -97%* | -98%* | Set-level forced Shufti on the whole 21-pattern set frontend. |
 
-> **RE-MEASURED 2026-08-31 after task 73; the starred figures above are the
+> **RE-MEASURED 2026-08-31 after forcing the scalar frontend; the starred figures above are the
 > OLD ones.** Current: `set-shufti-lnm` -97% match / -70% no-match. The two
 > cases had drifted off the Shufti frontend entirely and were measuring
 > Teddy: 21
 > literals of length 3 with 21 distinct first bytes now satisfy
 > `chooseLiteralFrontend`'s Teddy branch, and both cases print "identical
-> WASM — same as neutral" in all three modes. Task 73 pinned selection to
+> WASM — same as neutral" in all three modes. Selection is now pinned to
 > scalar, which is the only way a 21-literal set can reach Shufti, so both
-> cases measure the H.3 decision again — but their Δ% is an upper bound
+> cases measure the set-level Shufti decision again — but their Δ% is an upper bound
 > against an artificial baseline. See the `set-shufti-dense-harm` note under
 > *Known regression cases*.
 
@@ -249,21 +249,21 @@ which is precisely what a default-on promotion cannot safely assume.
 - ~~`set-shufti-lnm` vs. `set-shufti-dense-harm` — the *same 21 patterns*,
   opposite result, driven entirely by data density.~~ **This argument no
   longer holds (2026-08-31).** It was the suite's cleanest same-pattern
-  win-versus-loss pair, and after task 73 restored both cases to the Shufti
+  win-versus-loss pair, and after forcing scalar restored both cases to the Shufti
   frontend they BOTH win: -97%/-70% on sparse data, -67%/-62% on dense. The
   data-density reversal this bullet rested on is not currently reproducible
   for this pattern set. `alpha-run-impossible-bytes` vs `alpha-run` above is
   now the only same-pattern reversal in the suite, so the conclusion below
   rests on one pair rather than two.
-- `minlen-quantifier-skip` (-82%/-82%) qualifies for the same LM-4 gate
+- `minlen-quantifier-skip` (-82%/-82%) qualifies for the same bare-prefix gate
   (min length ≥ 8) as `alpha-run`/`word-run`, which show a persistent "LM
   contract cost" residual (+22%/+24% match fuel, Family 2 above) under the
   same mechanism. The gate is shape-based (compile-time min length), but
   "min length ≥ 8" doesn't distinguish "long dominant self-loop run" (wins)
   from "one short match buried in a large buffer" (loses) — that
   distinction is workload, not shape.
-- `bt-action5-target` inherits the same data-dependence as
-  `alpha-run-impossible-bytes` — it's the same Action-5 mechanism, just
+- `bt-impossible-bytes` inherits the same data-dependence as
+  `alpha-run-impossible-bytes` — it's the same impossible-byte skip mechanism, just
   BT-routed.
 
 Promoting any of these to unconditional-default would mean every pattern of
@@ -272,17 +272,17 @@ adversarial-sparse/long-run assumption baked into the win case — and for
 common classes like letters/word-chars, dense/common-byte data is
 arguably the *more* likely real-world case, not the exception.
 
-`lit-anchor-false-positive-literal` (task 22's SIMD backward-verify) is the
+`lit-anchor-false-positive-literal` (the SIMD backward-verify) is the
 one case here **without** a demonstrated sibling regression in the current
 suite — it's a plausible future promotion candidate. But "no counter-case
 has surfaced yet" isn't "proven safe": every optimisation that *has* been
-promoted to unconditional-default in this codebase (Opt 1, Opt 2, Gap F, the
-sets bulk-skip) only shipped that way after a dedicated adversarial
+promoted to unconditional-default in this codebase (the dominant self-loop bulk-skip, the lit-chain
+emission, the TDFA capture-body bulk-skip, the sets bulk-skip) only shipped that way after a dedicated adversarial
 counter-case was built and run through the full likelytest matrix plus the
-complete 8-stage re2test sweep — and Opt 1 specifically failed that process
+complete 8-stage re2test sweep — and the dominant self-loop bulk-skip specifically failed that process
 on its first design (a 48-57% no-match regression from the original
 side-table dispatch) and had to be redesigned before it could go default.
-Task 22 hasn't been through that drill yet; see `CLAUDE.md`'s "Load-bearing
+The backward-verify hasn't been through that drill yet; see `CLAUDE.md`'s "Load-bearing
 engine-selection gates" note for the standing project policy this falls
 under — don't relax a gate (or remove one entirely by defaulting it on)
 without measuring the specific counter-shape first.

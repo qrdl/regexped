@@ -5,16 +5,35 @@
 Regexped is driven by a YAML config file (default: `regexped.yaml` in the current directory).
 
 ```yaml
-wasm_merge: "wasm-merge"   # path to wasm-merge binary; defaults to $WASM_MERGE env var, then wasm-merge in $PATH
-output:   "merged.wasm"    # output path for the merge command; overridable with --output
+wasm_format: "module"      # optional; "module" (default) or "component" — see "Output kinds" below
+wasm_merge_path: "tools"   # optional; where wasm-merge is (merge, wasm_format: module). A FILE is the
+                           #   tool itself, so it may be named anything; a DIRECTORY gets `wasm-merge`
+                           #   appended. Relative to this config file; `~` and `~/dir` expand to $HOME.
+                           #   Omitted → `wasm-merge` in $PATH. No environment variable is read.
+wasm_tools_path: "tools"   # optional; the same rule for wasm-tools (wasm_format: component — compile,
+                           #   and merge, which reads each plug's exports with it)
+wac_path: "tools"          # optional; the same rule for wac (merge, wasm_format: component)
+output:   "merged.wasm"    # output path for the merge command; overridable with --output. The merge
+                           #   target in both formats; under wasm_format: component it does not select
+                           #   the memory mode (a component owns its own memory)
 wasm_file: "regexps.wasm"  # output path for the compile command; overridable with --output
-import_module: "mymod"     # WASM module name used by wasm-merge and Rust/Go FFI
-stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h
-stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as
-namespace:      "acme"     # optional; prefixes the symbols a stub declares that YOU did not name
-                           #   (Span, SetMatch, the error type, the pattern-name helper, C's rx_*_t)
-                           #   so two stubs can share one package. No-op for Rust, whose
-                           #   `pub mod <import_module>` already isolates each stub.
+import_module: "mymod"     # the WASM import-module name — a WIRE string, and the default for the
+                           #   three source-identifier keys below
+rust_module: "mymod"       # optional; the Rust `pub mod` name.   Defaults to import_module
+go_package:  "mymod"       # optional; the Go `package` name.     Defaults to import_module
+wit_package: "my-mod"      # optional; the WIT package name.      Defaults to kebab(import_module)
+wit_world:   "my-mod"      # optional; the WIT world name.        Defaults to wit_package
+wit_version: "1.2.0"       # optional; component only. UNSET MEANS NO VERSION — see "Versioning" below
+stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h, .wit
+stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as, wit
+namespace:      "acme"     # optional; prefixes the fixed symbols a stub declares — Span, SetMatch,
+                           #   the error type, the pattern-name helper, C's rx_match_t, rx_group_t and
+                           #   rx_set_match_t — so two stubs can share one package. It does NOT prefix
+                           #   names you choose: func and capability names, or what a set's NAME
+                           #   derives (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, rx_<set>_scanner_t,
+                           #   <Set>PatternCount). Two stubs in one package or C translation unit need
+                           #   distinct set names, and choosing them is yours. No-op for Rust, whose
+                           #   `pub mod <rust_module>` already isolates each stub.
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
@@ -67,10 +86,26 @@ sets:
 > set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
 > `batch_size` — see [sets.md](sets.md#the-five-capabilities).
 
+> **Three tool keys were retired and are now load errors:** `wasm_merge:`,
+> `wasm_tools:` and `wac:`. Use `wasm_merge_path:`, `wasm_tools_path:` and
+> `wac_path:`. The `$WASM_MERGE`, `$WASM_TOOLS` and `$WAC` environment variables
+> are no longer read either: a tool is found through its key or in `$PATH`, and
+> nothing else.
+
 All paths in the config file are resolved relative to the config file's directory.
-A leading `~/` in `output`, `wasm_file`, `stub_file` or `wasm_merge` is expanded to
-the user's home directory (a bare `~` and the `~user` form are not expanded — only
-a shell can resolve another user's home).
+A leading `~/` in `output`, `wasm_file` or `stub_file` is expanded to the user's
+home directory (a bare `~` and the `~user` form are not expanded — only a shell
+can resolve another user's home).
+
+The three tool keys follow one rule of their own. Omitted, the tool is looked up
+by its fixed name in `$PATH`. Given, the value is a path: relative to the config
+file's directory, with `~` alone and `~/dir` expanded to the home directory
+(`~user` is taken literally, as a relative path, which is what Bash does for an
+unknown user). What it points at decides how it is used: a file, or a symlink to
+one, IS the tool, so a tool installed under another name (`wasm-merge-118`)
+works; a directory, or a symlink to one, gets the tool name appended. A tool that
+cannot be found is reported with the key, the value as written, and the exact
+path tried.
 
 ### Export-name rules
 
@@ -84,11 +119,13 @@ runs. A violation is a hard error: nothing is written and the exit status is non
 - **Shape** — must match `^[A-Za-z_][A-Za-z0-9_]*$`. ASCII only, no leading digit. This is
   stricter than Rust, Go, JS and TS individually allow (all four accept some non-ASCII
   identifiers), so that one config is portable across every `stub_type`.
-- **Reserved words** — the name must not be a reserved word in *any* of the six stub
-  languages (Rust, Go, C, JavaScript, TypeScript, AssemblyScript), regardless of which
-  `stub_type` is configured. The union is used so that changing `stub_type` cannot turn a
-  working config into a compile error in the caller's project. Notably this rejects
-  `match` (a Rust keyword), `find` and `groups` are fine.
+- **Reserved words** — the name must not be a reserved word in the language `stub_type`
+  generates: Rust, Go, C, JavaScript, TypeScript or AssemblyScript. A `wasm_format:
+  component` config, or `stub_type: wit`, is also checked against WIT's keywords, and for
+  a Rust component stub the snake_case name wit-bindgen binds must not be a Rust keyword
+  either. A compile-only config — no `stub_type` and no `stub_file` — generates no source,
+  so only the shape rule applies to it. Notably `match` is refused for a Rust stub; `find`
+  and `groups` are fine everywhere.
 - Contextual keywords that are legal identifiers in their own language — TypeScript's
   `type`, `from`, `of`, `get`, `set`, `string`, `number`, or Go's predeclared `len`/`cap` —
   are **not** rejected.
@@ -112,13 +149,15 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 
 | Check | Applies to | Rationale |
 |---|---|---|
-| `import_module` must be a valid identifier and not a keyword of that language | `rust`, `go` | Emitted as `pub mod <name>` / `package <name>`. A hyphenated `import_module: "my-mod"` stays legal for `js`/`ts`, which never emit it. |
-| `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. |
+| The **effective Rust module name** must be a valid identifier and not a Rust keyword | `rust` | Emitted as `pub mod <name>`. The name is `rust_module`, falling back to `import_module` — so a config setting neither gets exactly the check it always got, and setting `rust_module` is the escape hatch for a wire name like `match` that is a keyword, or `url_ipv6` that you would rather not see as a module name. |
+| The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
+| `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
+| `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
 | Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_patternNames`, `patternName`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
-| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
-| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`) | `c` | Same reason. |
-| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
-| Export names must not start with `ffi_` | `rust`, `go` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
+| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `rx_pattern_names`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
+| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not start with `ffi_` | `rust`, `go`, `c` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
 | An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
 | An export must not collide with a symbol DERIVED from another export (`<func>_index`, `<func>_names`, `<func>_count`, `<func>_indices`, `<func>_iter`, in the base name's own casing style) | all | `groups_func: parse` emits `parse_index` and friends; a second export literally named `parse_index` duplicates the symbol. |
@@ -292,7 +331,7 @@ diagnostic chatter below warning level.
 |---|---|---|
 | `0` | Success. Also returned by `-h` on any subcommand. | |
 | `1` | Usage error — the command line is wrong. | No subcommand, unknown subcommand, unrecognised flag, missing `--main`/`--output`, `--output=-` and `--diag-json=-` both writing to stdout |
-| `2` | Config or build error — the command line was fine, the work was not. | Malformed YAML, invalid export name, duplicate capture-group name, missing `import_module`, compile/generate/merge failure |
+| `2` | Config or build error — the command line was fine, the work was not. | Malformed YAML, invalid export name, duplicate capture-group name, missing `import_module`, an unknown `wasm_format`, a set with `hints: [batch-find]` under `wasm_format: component`, compile/generate/merge failure |
 | `3` | I/O error — a file could not be read or written. | Config file does not exist, config file not readable, output path not writable |
 
 Codes `2` and `3` are distinguished by inspecting the error: anything carrying a
@@ -311,11 +350,22 @@ All commands validate their required options and config fields before doing any 
 regexped [--debug] generate [--config=<file>] [--output=<file>|-]
 ```
 
-Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub type is determined by:
+Generates a stub file (Rust, JS, TypeScript, Go, C, AssemblyScript, or WIT) from the config. The stub type is determined by:
 
-1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`, `as`)
-2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c)
+1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`, `as`, `wit`)
+2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c, `.wit` → wit)
 3. Error if neither resolves to a known type
+
+**Which types are available depends on `wasm_format`**, which is why the output kind is a config key rather than a flag — `generate` has to make the same choice `compile` did:
+
+| `wasm_format` | Accepted | Refused |
+|---|---|---|
+| `module` (default) | `rust`, `js`, `ts`, `go`, `c`, `as` | `wit` — "stub_type \"wit\" requires wasm_format: component" |
+| `component` | `wit`, `rust`, `c` | `go`, `as`, `js`, `ts` — "… is not supported for wasm_format: component", with no "yet": none is a component target. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component, so a JS/TS consumer needs `jco transpile`, which lands on the core module the `module` format already produces. |
+
+Under `component`, `stub_type: rust` and `stub_type: c` generate stubs whose public API is identical to the module-format ones; `wit` emits the interface alone, for a consumer that binds against it directly (a host using `wasmtime::component::bindgen!`, for instance).
+
+The C stub additionally writes a `wit/` directory beside itself — `wasm-tools component embed` resolves `deps/` only when given that directory.
 
 > **Note:** AssemblyScript source files use the `.ts` extension (same as TypeScript). Set `stub_type: "as"` explicitly — extension-based inference always resolves `.ts` to the TypeScript ES module stub.
 
@@ -332,11 +382,11 @@ Generates a stub file (Rust, JS, TypeScript, Go, or C) from the config. The stub
 |---|---|
 | `stub_file` | Required unless `--output` is given |
 | `stub_type` or `stub_file` extension | Determines output language |
-| `import_module` | Required for Rust, Go, C, and AS stubs; validated upfront |
+| `import_module` | Required for Rust, Go, C, and AS stubs; validated upfront. Also required (or `wit_package`) under `wasm_format: component`, where it names the WIT package, the world, and every export |
 
 #### Rust stubs
 
-Wraps every entry in one `pub mod <import_module> { … }` block.
+Wraps every entry in one `pub mod <rust_module> { … }` block (`rust_module` defaults to `import_module`).
 
 | Config field | Generated function | Return type |
 |---|---|---|
@@ -421,10 +471,42 @@ also gives C and AssemblyScript named access, which they never had.
 regexped [--debug] compile [--config=<file>] [--output=<file>|-]
 ```
 
-Compiles each regexp pattern to a single WASM module. The output mode is selected automatically based on the config:
+Compiles each regexp pattern to a single WASM module, or to a Component Model component.
+
+### Output kinds
+
+`wasm_format` selects the kind. It is a **config key, not a CLI flag** — there is deliberately no `--wasm-format` and no `--component` — because `generate` must make the same choice, and a flag lets the two commands diverge.
+
+**`wasm_format: module`** (the default) is today's core WASM module, with two memory modes selected automatically:
 
 - **Standalone** (no `output` field in config) — the module owns its memory, DFA/TDFA tables start at address 0. Load directly in JS/TS without merging.
 - **Embedded** (`output` field present) — the module imports memory from a `"main"` host module. Use `regexped merge` to combine with a Rust/Go/C host binary.
+
+**`wasm_format: component`** produces a Component Model component plus a sibling `.wit` (the same path as `wasm_file` with the extension replaced), by wrapping the core module through `wasm-tools`. Standalone memory is **forced** — a component owns and exports its own memory — so the standalone-vs-embedded choice above is not made here, and `output:` does not drive it. `output:` still means what it means for a module: the `regexped merge` target. Requires `wasm-tools` (`wasm_tools_path:`, else `$PATH`) to build and to merge, and `wac` (`wac_path:`, else `$PATH`) to merge.
+
+The `.wit` is written BEFORE the component, so a `.wit` that cannot be written leaves no fresh `.wasm` behind. `--output -` streams the component to stdout and writes no `.wit`, since there is no path beside it; a line on stderr says so. Get the interface text with `regexped generate` and `stub_type: wit`.
+
+Refused at load under `component`, rather than half-emitted:
+
+| Config | Error |
+|---|---|
+| a set with `hints: [batch-find]` | "…is not supported for wasm_format: component — the component interface exposes one position per call through the find resource" |
+| no `import_module` and no `wit_package` | "…is required for wasm_format: component: it names the WIT package, the world, and every export" |
+
+`sets:` IS supported. Their raw ABI does not cross the boundary: `match_all` and
+`scan_all` return a list of pattern ids instead of a bitmask or a caller-owned
+bitmap, and `find` becomes a `resource` that owns the drive — the gate array the
+module ABI makes the caller own has nowhere to live in a component consumer. The
+generated Rust and C stubs present the same API either way; see
+[component.md](component.md#sets) and [sets.md](sets.md).
+
+See [component.md](component.md) for the generated interface and how to consume it.
+
+### Versioning the component interface
+
+`wit_version` is optional and **unset means no version at all**: the package is `package regexped:<name>;` and exports are named `regexped:<name>/matcher#<func>`. Set it and `@x.y.z` is appended to the package — and therefore to every export name.
+
+That makes adding, removing or changing it a **breaking change** for anyone who built against the component: every export is renamed, and their build fails with a missing import. It is opt-in and loud, by design. Under `wasm_format: module` the key is inert and warns.
 
 **Flags:**
 
@@ -433,6 +515,7 @@ Compiles each regexp pattern to a single WASM module. The output mode is selecte
 | `--config` | `regexped.yaml` | YAML config file |
 | `--output`, `-o` | config `wasm_file` | Output WASM file; `-` writes to stdout |
 | `--diag-json` | (none) | Write set-composition diagnostics as JSON to this path; `-` for stdout |
+| `--verbose` | off | Report what the compiler decided per pattern and per set, to stderr |
 
 **Required config fields:**
 
@@ -491,21 +574,38 @@ See [sets.md](sets.md) for full pipeline details and output tuple formats.
 
 ---
 
-### `merge` — Merge WASM modules
+### `merge` — Link your binary with regexped's
 
 ```
-regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>] <regex1.wasm> ...
 ```
 
-Merges the host main WASM with one or more regexp WASM modules into a single binary using `wasm-merge`. Each regexp module's memory is kept separate (multi-memory) and renumbered by wasm-merge.
+Links the host main WASM with one or more regexp WASM artifacts into a single binary. **The command does not depend on the output kind** — it dispatches on `wasm_format` and runs the right tool:
 
-This command is a thin wrapper around `wasm-merge`. You may invoke wasm-merge directly with:
+| `wasm_format` | Tool | What it does |
+|---|---|---|
+| `module` (default) | `wasm-merge` | merges the core modules into one. Each regexp module keeps its own memory (multi-memory), renumbered by wasm-merge |
+| `component` | `wac plug` | composes the components. `--main` is the **socket** (the component with the unsatisfied import); each positional is a **plug** |
+
+A component config that ran `merge` before this dispatch existed invoked `wasm-merge` on a component binary, which Binaryen cannot parse.
+
+You may invoke either tool directly. For modules:
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
   <main.wasm> main <regexp.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
+
+For components:
+
+```
+wac plug --plug <regexp1.wasm> --plug <regexp2.wasm> -o output.wasm <main.wasm>
+```
+
+**Composition is not merging.** `wasm-merge` produces ONE module whose regexp code reads the host's memory directly; `wac plug` produces a component holding two instances with two memories, where each call crosses the canonical ABI and copies its `list<u8>` input. Same command, different cost model — see [component.md](component.md).
+
+**Several regexp artifacts in one call** works for both kinds, with one asymmetry. Regexp *modules* may all share an `import_module` name, because nothing imports it. Regexp *components* are matched by their WIT interface name, `regexped:<wit_package>/matcher`, which the socket genuinely imports — so composing several requires **distinct `wit_package` values**, or `wac` cannot tell which component should satisfy which import. `wac` reports that case with the same text a genuine name mismatch gives, so `merge` checks first: it runs `wasm-tools component wit` on every plug and refuses a repeated interface by name ("plugs a.wasm and b.wasm both export regexped:pkg/matcher"). A component merge therefore needs `wasm-tools` as well as `wac`, which every component pipeline already has, since a component cannot be compiled without it.
 
 **Flags:**
 
@@ -518,16 +618,20 @@ wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk
 **Positional arguments:** one or more regexp WASM files (at least one required).
 
 Unlike `generate` and `compile`, `merge` does not accept `-` for stdout: the
-value is handed straight to `wasm-merge`, which would create a file literally
-named `-`.
+value is handed straight to the external tool, which would create a file
+literally named `-`.
 
-**Required config fields:**
+**Config fields:**
 
 | Field | Notes |
 |---|---|
-| `output` | Required unless `--output` is given |
-| `wasm_merge` | Optional; path to wasm-merge binary; defaults to `$WASM_MERGE` env var, then `wasm-merge` in $PATH |
-| `import_module` | Optional; module name passed to wasm-merge; defaults to basename of the regexp WASM |
+| `output` | Required unless `--output` is given. The merge target in both formats |
+| `wasm_format` | Selects the tool: `module` → wasm-merge, `component` → wac |
+| `wasm_merge_path` | Optional, `module` only. A file is the tool; a directory gets `wasm-merge` appended; relative to the config file. Omitted → `wasm-merge` in $PATH |
+| `wac_path` | Optional, `component` only; the same rule for `wac` |
+| `wasm_tools_path` | Optional, `component` only; the same rule for `wasm-tools`, which `merge` runs on each plug before composing (see above) |
+| `import_module` | Optional, `module` only; module name passed to wasm-merge; defaults to basename of the regexp WASM |
+| `wit_package` | `component` only; must be DISTINCT per regexp component when composing several (see above) |
 
 ---
 

@@ -9,7 +9,11 @@ Regexped generates Go stubs that call into compiled WASM regexp modules via `//g
 
 ## Including stubs in your project
 
-A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package name is inferred from the output path: if the stub lives inside a directory named after `import_module`, the package is set to that name; otherwise it defaults to `main`.
+A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package name is inferred from the output path: if the stub lives inside a directory named after the Go package name, the package is set to that name; otherwise it defaults to `main`.
+
+That name is `go_package`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name — while `package` needs a Go identifier: `url_ipv6` is a fine wire name and a package name every linter flags, and a wire name that happens to be a Go keyword cannot be a package at all. The `//go:wasmimport` lines keep using `import_module` either way.
+
+> **Component format:** Go is **not** a component target. `stub_type: go` under `wasm_format: component` is refused permanently, not "yet": stock Go has no wasip2 target (`go tool dist list` offers `wasip1/wasm` only), so a component stub would have to be TinyGo. See [component.md](component.md).
 
 ```
 myapp/
@@ -247,6 +251,7 @@ The generated wrapper **returns it**. It used to panic; a panic unwinding out of
 
 ```go
 var ErrBacktrackOverflow = errors.New("regexped: backtracking stack overflow — ...")
+var ErrMalformedCache = errors.New("regexped: the overlapping answer cache's header is malformed — ...")
 ```
 
 Test for it with `errors.Is`. Where it appears depends on when the failure can occur:
@@ -262,3 +267,27 @@ Test for it with `errors.Is`. Where it appears depends on when the failure can o
 The iterators also stop for good once they record an error. That is required rather than tidy: the overflow is deterministic and the failing call does not advance the offset, so an iterator that kept going would re-run the identical call forever.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated iterator cannot produce it: it sizes the region and writes the stride
+from one formula when it is created, so seeing it means something outside the
+stub wrote into the region.
+
+The `find` iterator records **`ErrMalformedCache`** and stops; read it with
+`Err()` after the loop, exactly as for the backtracking sentinel.
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The generated iterators only
+move forward, so they never do; the rule matters to a caller driving the raw ABI,
+on every set. A backwards offset is unsupported and may lose matches. Detection
+is best effort, with no guarantee: the engine notices only once an overlapping
+set's answer cache has engaged and a position falls below where it was built,
+and then the `find` iterator records **`ErrOutOfOrder`** and stops. Anywhere else it goes undetected.

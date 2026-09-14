@@ -7,7 +7,7 @@
 // Usage:
 //
 //	settest -config <yaml> [-set <name>] [-cap <capability>] -inputs <file>
-//	        [-detailed] [-force-frontend <fe>] [-iters <n>]
+//	        [-detailed] [-force-frontend <fe>] [-cache on|off] [-iters <n>]
 //
 // The question it answers is "can THIS set benefit from a hint", in three
 // layers, cheapest first:
@@ -47,6 +47,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -61,6 +62,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/benchshim"
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -149,7 +151,19 @@ type build struct {
 type cell struct {
 	fuel uint64
 	t    time.Duration
+	// ready is the answer cache's verdict for this drive, straight out of the
+	// region's header: 1 swept, -1 offered and refused, 0 offered and never
+	// engaged. cacheNone when no region was offered at all. Reported because a
+	// drive that silently walked and one that swept differ by orders of
+	// magnitude in fuel, and nothing else in the output distinguishes them.
+	ready int32
 }
+
+// cacheNone marks a cell whose drive was handed no answer cache — a
+// non-overlapping set, a shape the sweep declines, or `-cache off`. Distinct
+// from 0, which means a region WAS offered and the drive stayed cheap enough
+// not to want it.
+const cacheNone = int32(-99)
 
 func main() {
 	wcallCase = "settest"
@@ -165,11 +179,16 @@ func main() {
 	detailed := flag.Bool("detailed", false, "show per-input results instead of bucket averages")
 	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend (teddy, ac, scalar, packed-pair, shufti); empty lets the chooser decide")
 	adaptive := flag.String("adaptive", "", "TEST-ONLY: pin the Shufti density switch on or off; empty uses the compiler's verdict")
+	cacheFlag := flag.String("cache", "on", "offer an overlapping find the answer cache every generated stub reserves (on|off); off measures the bare walk")
 	iters := flag.Int("iters", 1000, "timed passes per input per mode; the reported time is their p50")
 	flag.Parse()
 
 	if *configFlag == "" || *inputsFlag == "" {
-		fmt.Fprintln(os.Stderr, "usage: settest -config <yaml> [-set <name>] [-cap <capability>] -inputs <file> [-detailed] [-force-frontend <fe>] [-adaptive on|off] [-iters <n>]")
+		fmt.Fprintln(os.Stderr, "usage: settest -config <yaml> [-set <name>] [-cap <capability>] -inputs <file> [-detailed] [-force-frontend <fe>] [-adaptive on|off] [-cache on|off] [-iters <n>]")
+		os.Exit(2)
+	}
+	if *cacheFlag != "on" && *cacheFlag != "off" {
+		fmt.Fprintf(os.Stderr, "error: -cache must be \"on\" or \"off\", got %q\n", *cacheFlag)
 		os.Exit(2)
 	}
 	if *iters < 1 {
@@ -206,6 +225,26 @@ func main() {
 	// answer: the gate array is indexed by global pattern id.
 	patternCount := cfg.Sets[setIdx].PatternCount(cfg)
 	idSpace := cfg.Sets[setIdx].IDSpaceSize(cfg)
+
+	// The answer cache, which the generated stubs reserve for an overlapping
+	// `find` whether or not the set carries the batching hint. Offering it here
+	// is what makes settest measure the drive a caller would actually get: the
+	// plain `find` reads the descriptor's cache exactly as the batch entry does,
+	// so a harness that passed 0, 0 measured a walk nothing ships.
+	//
+	// The SHAPE is fetched once. It is a compile of the set, and only the
+	// column width comes out of it; the region and the stride are then
+	// arithmetic on the input length, which changes per bucket.
+	cache := cacheSpec{on: *cacheFlag == "on" && kind == capFind}
+	if cache.on {
+		sh, err := compile.SetOverlapCacheShapeOpts(cfg.Sets[setIdx], cfg, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: sizing the answer cache: %v\n", err)
+			os.Exit(1)
+		}
+		cache.shape = sh
+		cache.on = sh.Eligible
+	}
 
 	inputs, err := readInputs(*inputsFlag)
 	if err != nil {
@@ -258,7 +297,7 @@ func main() {
 	// is — but a mis-driven ABI measures the wrong work entirely, and every
 	// number below it would be meaningless rather than merely wrong.
 	if exact {
-		if err := sanityCheck(builds, kind, export, patternCount, idSpace, inputs, oracle, engine); err != nil {
+		if err := sanityCheck(builds, kind, export, patternCount, idSpace, inputs, oracle, engine, cache); err != nil {
 			fmt.Fprintf(os.Stderr, "\nSANITY FAIL: %v\n", err)
 			os.Exit(1)
 		}
@@ -271,8 +310,8 @@ func main() {
 	if *detailed {
 		report = printDetailed
 	}
-	report("Matching inputs", matching, builds, kind, export, patternCount, idSpace, *iters, engine, fuelEngine)
-	report("Non-matching inputs", nonMatching, builds, kind, export, patternCount, idSpace, *iters, engine, fuelEngine)
+	report("Matching inputs", matching, builds, kind, export, patternCount, idSpace, *iters, engine, fuelEngine, cache)
+	report("Non-matching inputs", nonMatching, builds, kind, export, patternCount, idSpace, *iters, engine, fuelEngine, cache)
 }
 
 // --------------------------------------------------------------------------
@@ -517,30 +556,79 @@ func readInputs(path string) ([]string, error) {
 // single-pattern convention) would silently overwrite the frontend tables and
 // the set would answer garbage.
 
+// cacheSpec is the overlapping answer cache this run offers, if any.
+//
+// `on` is false for every capability but `find`, for a set the sweep declines,
+// and under `-cache off`. The shape's column width comes from ONE compile of
+// the set; everything else is arithmetic on the input length, so a bucket sizes
+// its own region from the longest input it holds.
+type cacheSpec struct {
+	on    bool
+	shape compile.OverlapCacheShape
+}
+
+// sizeFor is the region and stride for a bucket whose longest input is n bytes.
+//
+// It calls the SAME config functions every stub generator does, which is what
+// makes the header the sweep validates the one a shipped stub would have
+// written. A region sized for the longest input serves the shorter ones too:
+// the pass clamps a stride wider than the span it is given and derives its
+// block count from the clamp, so both stay within what this reserved.
+func (c cacheSpec) sizeFor(n int) (bytes, stride int) {
+	if !c.on {
+		return 0, 0
+	}
+	return config.SetOverlapCheckpointBytes(n, c.shape.Cells, c.shape.Patterns),
+		config.SetOverlapCheckpointStride(n, c.shape.Cells, c.shape.Patterns)
+}
+
 type memPlan struct {
 	inputBase int32
 	outBase   int32 // find tuples, 12 bytes each
 	gatePtr   int32 // id_space u32s
-	bitmapPtr int32 // ceil(id_space/8) bytes, for the wide _all ABI
-	needTop   int64
+	// scratchPtr is the DESCRIPTOR the find exports take in place of a bare
+	// gate pointer (internal/abi).
+	scratchPtr int32
+	bitmapPtr  int32 // ceil(id_space/8) bytes, for the wide _all ABI
+	// cachePtr is the overlapping answer cache, 0 when none is offered, and
+	// cacheStride the k its header must carry — the one field the CALLER owns,
+	// because the caller is what sized the allocation from it.
+	cachePtr    int32
+	cacheLen    int32
+	cacheStride int32
+	needTop     int64
 }
 
-func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int) (memPlan, error) {
+func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int, cache cacheSpec) (memPlan, error) {
 	top, err := utils.ParseDataSectionBytes(wasmBytes)
 	if err != nil {
 		return memPlan{}, fmt.Errorf("locate table top: %w", err)
 	}
 	inBase := (top + pageSize - 1) / pageSize * pageSize
 	outBase := inBase + int64(maxInputLen) + 4096
-	gate := outBase + int64(patternCount)*12 + 64
-	bitmap := gate + int64(idSpace)*4 + 64
+	gate := outBase + int64(patternCount)*abi.SetMatchTupleBytes + 64
+	scratch := gate + int64(idSpace)*4 + 64
+	bitmap := scratch + abi.FindScratchBytes + 64
 	need := bitmap + int64((idSpace+7)/8) + 64
+	// The answer cache sits at the top, sized for the longest input this bucket
+	// holds. 4-aligned, like everything else the set ABI is handed: the header
+	// is read as i32 slots.
+	cachePtr, cacheLen, cacheStride := int64(0), 0, 0
+	if bytes, stride := cache.sizeFor(maxInputLen); bytes > 0 {
+		cachePtr = (need + 7) &^ 7
+		cacheLen, cacheStride = bytes, stride
+		need = cachePtr + int64(bytes) + 64
+	}
 	return memPlan{
-		inputBase: int32(inBase),
-		outBase:   int32(outBase),
-		gatePtr:   int32(gate),
-		bitmapPtr: int32(bitmap),
-		needTop:   need,
+		inputBase:   int32(inBase),
+		outBase:     int32(outBase),
+		gatePtr:     int32(gate),
+		scratchPtr:  int32(scratch),
+		bitmapPtr:   int32(bitmap),
+		cachePtr:    int32(cachePtr),
+		cacheLen:    int32(cacheLen),
+		cacheStride: int32(cacheStride),
+		needTop:     need,
 	}, nil
 }
 
@@ -684,9 +772,25 @@ func (r *runner) drive(inputLen int32) (bool, error) {
 func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 	p := r.plan
 	r.zero(p.gatePtr, int32(r.idSpace)*4)
+	// The ANSWER CACHE, offered exactly as a generated stub offers it: the
+	// plain `find` reads the descriptor's cache the same way the batch entry
+	// does, so a harness that passed 0, 0 measured a walk nothing ships.
+	//
+	// Zeroed and re-stamped per DRIVE, for the same reason the gate array is:
+	// this is one scan from the start, and a header left holding the previous
+	// drive's `ready` would serve the next input out of the last one's blocks.
+	// Only the 48-byte header — the region below it is written before it is
+	// read, and zeroing megabytes would land in every timed pass.
+	if p.cachePtr != 0 {
+		r.zero(p.cachePtr, config.SetOverlapCheckpointHeaderBytes)
+		buf := r.mem.UnsafeData(r.store)
+		binary.LittleEndian.PutUint32(buf[p.cachePtr+config.SetOverlapHdrStrideOff:], uint32(p.cacheStride))
+		runtime.KeepAlive(r.store)
+	}
+	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, p.cacheLen)
 	found := false
 	for from := int32(0); ; {
-		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.gatePtr, p.outBase, r.outCap)
+		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.scratchPtr, p.outBase, r.outCap)
 		if err != nil {
 			return found, err
 		}
@@ -700,6 +804,24 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		runtime.KeepAlive(r.store)
 		from = start + 1
 	}
+}
+
+// cacheReady is what the sweep did with the region this drive offered: 1 swept,
+// -1 asked and refused, 0 offered and never wanted. cacheNone when none was
+// offered at all.
+//
+// Read after a drive rather than inferred from the fuel, because those are the
+// two numbers a reader is trying to connect: a drive that silently walked and
+// one that swept differ by orders of magnitude, and nothing else in the output
+// tells them apart.
+func (r *runner) cacheReady() int32 {
+	if r.plan.cachePtr == 0 {
+		return cacheNone
+	}
+	v := int32(binary.LittleEndian.Uint32(
+		r.mem.UnsafeData(r.store)[r.plan.cachePtr+config.SetOverlapHdrReadyOff:]))
+	runtime.KeepAlive(r.store)
+	return v
 }
 
 func (r *runner) zero(ptr, n int32) {
@@ -716,14 +838,14 @@ func (r *runner) zero(ptr, n int32) {
 // measureMode measures every input against one mode's module, reusing a single
 // instance across them: instantiation is not part of what a hint changes, and
 // paying it per input would dominate short inputs.
-func measureMode(b build, kind capKind, export string, inputs []string, iters int, engine, fuelEngine *wasmtime.Engine, patternCount, idSpace int) ([]cell, error) {
+func measureMode(b build, kind capKind, export string, inputs []string, iters int, engine, fuelEngine *wasmtime.Engine, patternCount, idSpace int, cache cacheSpec) ([]cell, error) {
 	maxLen := 0
 	for _, in := range inputs {
 		if len(in) > maxLen {
 			maxLen = len(in)
 		}
 	}
-	plan, err := planMem(b.wasm, maxLen, patternCount, idSpace)
+	plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -780,14 +902,16 @@ func measureMode(b build, kind capKind, export string, inputs []string, iters in
 		if err != nil {
 			return nil, fmt.Errorf("timed pass over %q: %w", truncate(in, 60), err)
 		}
-		out[i] = cell{fuel: before - after, t: benchshim.ComputeStat(samples, 50)}
+		// `ready` from the FUEL runner: both runners drive identical work, and
+		// the fuel pass is the deterministic one.
+		out[i] = cell{fuel: before - after, t: benchshim.ComputeStat(samples, 50), ready: fuelRun.cacheReady()}
 	}
 	return out, nil
 }
 
 // sanityCheck confirms the driven export agrees with the oracle about whether
 // each input matches at all, for every mode that compiled distinct code.
-func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idSpace int, inputs []string, oracle []oracleEntry, engine *wasmtime.Engine) error {
+func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idSpace int, inputs []string, oracle []oracleEntry, engine *wasmtime.Engine, cache cacheSpec) error {
 	maxLen := 0
 	for _, in := range inputs {
 		if len(in) > maxLen {
@@ -798,7 +922,7 @@ func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idS
 		if b.identical {
 			continue
 		}
-		plan, err := planMem(b.wasm, maxLen, patternCount, idSpace)
+		plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
 		if err != nil {
 			return err
 		}
@@ -911,7 +1035,7 @@ func anchoredCol(d compile.SetDiag) string {
 	return "union/narrow"
 }
 
-func printSummary(title string, inputs []string, builds [3]build, kind capKind, export string, patternCount, idSpace, iters int, engine, fuelEngine *wasmtime.Engine) {
+func printSummary(title string, inputs []string, builds [3]build, kind capKind, export string, patternCount, idSpace, iters int, engine, fuelEngine *wasmtime.Engine, cache cacheSpec) {
 	fmt.Printf("=== %s (%d) ===\n", title, len(inputs))
 	if len(inputs) == 0 {
 		fmt.Println("  (none)")
@@ -925,26 +1049,33 @@ func printSummary(title string, inputs []string, builds [3]build, kind capKind, 
 			continue
 		}
 		cells, err := measureMode(b, kind, export, inputs, iters, engine, fuelEngine,
-			patternCount, idSpace)
+			patternCount, idSpace, cache)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  measure %s: %v\n", modeNames[i], err)
 			continue
 		}
 		var totalFuel uint64
 		var totalTime time.Duration
+		ready := cacheNone
 		for _, c := range cells {
 			totalFuel += c.fuel
 			totalTime += c.t
+			// The bucket's verdict is the STRONGEST any input produced: a
+			// region is sized for the longest input here, so a short one may
+			// legitimately stay under the trigger while a long one sweeps, and
+			// reporting "walked" for the bucket would then hide the sweep the
+			// reader is looking for.
+			ready = strongerReady(ready, c.ready)
 		}
 		n := uint64(len(cells))
-		rows[i] = cell{fuel: totalFuel / n, t: totalTime / time.Duration(n)}
+		rows[i] = cell{fuel: totalFuel / n, t: totalTime / time.Duration(n), ready: ready}
 		haveRow[i] = true
 	}
 	printTable(builds, rows, haveRow)
 	fmt.Println()
 }
 
-func printDetailed(title string, inputs []string, builds [3]build, kind capKind, export string, patternCount, idSpace, iters int, engine, fuelEngine *wasmtime.Engine) {
+func printDetailed(title string, inputs []string, builds [3]build, kind capKind, export string, patternCount, idSpace, iters int, engine, fuelEngine *wasmtime.Engine, cache cacheSpec) {
 	fmt.Printf("=== %s (%d) ===\n", title, len(inputs))
 	if len(inputs) == 0 {
 		fmt.Println("  (none)")
@@ -958,7 +1089,7 @@ func printDetailed(title string, inputs []string, builds [3]build, kind capKind,
 			continue
 		}
 		cells, err := measureMode(b, kind, export, inputs, iters, engine, fuelEngine,
-			patternCount, idSpace)
+			patternCount, idSpace, cache)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  measure %s: %v\n", modeNames[i], err)
 			continue
@@ -984,7 +1115,20 @@ func printDetailed(title string, inputs []string, builds [3]build, kind capKind,
 func printTable(builds [3]build, rows [3]cell, have [3]bool) {
 	baseFuel := float64(rows[0].fuel)
 	baseTime := float64(rows[0].t)
-	fmt.Printf("  %-16s %14s %7s %14s %7s\n", "mode", "fuel", "Δ%", "p50 time", "Δ%")
+	// The cache column appears only when a region was actually offered, i.e.
+	// for an overlapping `find` on a sweep-eligible set under `-cache on`. Every
+	// other run would carry a column of dashes.
+	showCache := false
+	for i := range rows {
+		if have[i] && rows[i].ready != cacheNone {
+			showCache = true
+		}
+	}
+	if showCache {
+		fmt.Printf("  %-16s %14s %7s %14s %7s  %s\n", "mode", "fuel", "Δ%", "p50 time", "Δ%", "cache")
+	} else {
+		fmt.Printf("  %-16s %14s %7s %14s %7s\n", "mode", "fuel", "Δ%", "p50 time", "Δ%")
+	}
 	for i := range rows {
 		if builds[i].identical {
 			fmt.Printf("  %-16s %s\n", modeNames[i],
@@ -1000,9 +1144,47 @@ func printTable(builds [3]build, rows [3]cell, have [3]bool) {
 			gFuel = gain(float64(rows[i].fuel), baseFuel)
 			gTime = gain(float64(rows[i].t), baseTime)
 		}
+		if showCache {
+			fmt.Printf("  %-16s %14s %7s %14s %7s  %s\n", modeNames[i],
+				fmtFuel(rows[i].fuel), gFuel, fmtDur(rows[i].t), gTime, readyLabel(rows[i].ready))
+			continue
+		}
 		fmt.Printf("  %-16s %14s %7s %14s %7s\n", modeNames[i],
 			fmtFuel(rows[i].fuel), gFuel, fmtDur(rows[i].t), gTime)
 	}
+}
+
+// strongerReady keeps the more informative of two cache verdicts, ordered
+// swept > refused > offered-and-unused > none.
+func strongerReady(a, b int32) int32 {
+	rank := func(v int32) int {
+		switch v {
+		case 1:
+			return 3
+		case -1:
+			return 2
+		case cacheNone:
+			return 0
+		}
+		return 1
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
+}
+
+// readyLabel renders the answer cache's header verdict.
+func readyLabel(v int32) string {
+	switch v {
+	case 1:
+		return "swept"
+	case -1:
+		return "refused"
+	case cacheNone:
+		return "—"
+	}
+	return "walked"
 }
 
 // gain returns a signed percentage like "-23%"/"+8%" for cur against base (the

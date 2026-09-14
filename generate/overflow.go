@@ -66,3 +66,55 @@ func btOverflowMsg(funcName string) string {
 // source. Named so generated code reads as a deliberate sentinel comparison
 // rather than a magic -2.
 const btOverflow = abi.BTStackOverflow
+
+// ---------------------------------------------------------------------------
+// abi.OverlapCacheMalformed handling in generated stubs.
+//
+// The second unknowable answer, and it travels the same channels for the same
+// reason: a `find` on an `overlapping: true` set returns -4 when the answer
+// cache's header contradicts itself — a stride below 1, or a layout that does
+// not describe what a sweep would have written. The drive has NOT finished; it
+// cannot tell whether more matches exist.
+//
+// Every stub folded it into "n <= 0 means the scan is over", which is the same
+// silent-wrong-answer the backtracking sentinel exists to prevent, on a code
+// path a hand-written caller can reach by building its own descriptor.
+//
+// A generated `init` cannot produce it: it writes the stride from the same
+// formula that sized the region. That is worth saying in each message, because
+// a user who sees this has either built the descriptor themselves or reused one
+// region for two scanners.
+
+// malformedCacheMsg is the diagnostic text embedded in generated stubs, naming
+// the public function the caller invoked.
+func malformedCacheMsg(funcName string) string {
+	return fmt.Sprintf("regexped: %s: the overlapping answer cache's header is "+
+		"malformed; the scan result is unknown, not finished — a generated init "+
+		"cannot produce this, so the descriptor was built by hand or shared "+
+		"between two scanners (see docs/sets.md)", funcName)
+}
+
+// malformedCache is abi.OverlapCacheMalformed, for embedding as a literal.
+const malformedCache = abi.OverlapCacheMalformed
+
+// ---------------------------------------------------------------------------
+// abi.OverlapCacheOutOfOrder handling in generated stubs.
+//
+// The third unknowable answer: an overlapping `find` asked for an offset BELOW
+// the floor its engaged answer cache was swept from. Within one scan the offset
+// must never go backwards, and a generated iterator never moves it backwards,
+// so a user who sees this drove the raw ABI or reused a scanner's state.
+// Detection is best effort — only an engaged cache can see it — which each
+// message says, so nobody reads the absence of the error as a guarantee.
+
+// outOfOrderMsg is the diagnostic text embedded in generated stubs, naming the
+// public function the caller invoked.
+func outOfOrderMsg(funcName string) string {
+	return fmt.Sprintf("regexped: %s: the scan offset went backwards within one scan, "+
+		"below where the overlapping answer cache was built; the scan result is unknown. "+
+		"Offsets must never go backwards within a scan, and this is detected only on a "+
+		"best-effort basis (see docs/sets.md)", funcName)
+}
+
+// outOfOrder is abi.OverlapCacheOutOfOrder, for embedding as a literal.
+const outOfOrder = abi.OverlapCacheOutOfOrder

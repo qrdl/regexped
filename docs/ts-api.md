@@ -2,6 +2,8 @@
 
 Regexped generates a TypeScript ES module stub that loads a compiled WASM regexp module and exports typed wrapper functions. The TypeScript stub matches the JavaScript stub's external API and behaviour, with one internal exception noted in [Notes](#notes) below (JS's `find_func`/`groups_func` generators have an internal fast path the TS stub doesn't yet have).
 
+> **Component format:** this stub is for `wasm_format: module`, and there is no component equivalent — `stub_type: ts` is refused permanently under `wasm_format: component`. No JavaScript runtime loads a component (`WebAssembly.instantiate` accepts core modules only), so consuming one from JS needs `jco transpile`, whose output is a core module plus glue — which is what this stub already gives you directly, without the extra tool. See [component.md](component.md).
+
 ## Including stubs in your project
 
 The stub is a single `.ts` ES module file. Import it directly:
@@ -45,27 +47,16 @@ await init(wasm);
 export function <func>(input: string | Uint8Array): number | null
 ```
 
-Returns `[endPos, true]` if the pattern matches starting at position 0, or `[0, false]` if no match. `endPos` is the exclusive end position of the match in bytes.
-
-To test whether the full input matches (anchored at both ends):
+Matches the pattern against the **whole** input. Returns the end position — on a match, the input's length in bytes — or `null` when the input does not match. A pattern compiled to the Backtracking engine **throws** when it exhausts its frame budget, because the answer is then unknown rather than negative; see below.
 
 ```ts
-const enc = new TextEncoder();
-const bytes = enc.encode('https://example.com/path');
-const end = url_match(bytes);
-if (end === bytes.length) {
+const end: number | null = url_match('https://example.com/path');
+if (end !== null) {
     console.log('valid URL');
 }
 ```
 
-For start-anchored use cases where the end position matters:
-
-```ts
-const end: number | null = url_match(input);
-if (end !== null) {
-    console.log('matched first', end, 'bytes');
-}
-```
+A pattern that should accept text around the match has to say so itself, e.g. `.*` on either side, or use `find_func`.
 
 ---
 
@@ -234,7 +225,7 @@ with no boundary to amortise. The hint is a no-op there.
 
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers, Deno).
-- `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. The stub is not re-entrant: do not call two generators concurrently on the same stub module instance.
+- `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. Calling other stub functions while an iterator is suspended is safe: each live iterator owns its own region of the module's memory. An overlapping set's iterator reserves its answer cache in that region too — up to 64 MiB for one live iterator over a large input — and WebAssembly memory only grows, so the high-water mark stays allocated.
 - The TypeScript and JavaScript stubs are independent generators (`generate/ts_stub.go` / `generate/js_stub.go`) that produce the same external API, typed vs. untyped, including the same batch behaviour: `find_func` and `groups_func` generators auto-detect and drain an internal `<func>_batch` WASM export when present, reducing host↔WASM call overhead. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it has no effect on the output shape, only on call overhead.
 
   The rule about `groups_func` and `named_groups_func` *sharing* a batch export is gone with the key: one capability, one export, one name.
@@ -258,3 +249,26 @@ member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
 `-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### The overlapping answer cache's header
+
+An `overlapping: true` set's `find` reads a caller-owned region — the answer
+cache — and returns a distinct **`-4`** when its header contradicts itself: a
+stride below 1, or a layout that is not one a sweep would have written. Like the
+backtracking sentinel it means UNKNOWN, not finished: the drive stopped without
+knowing what remained.
+
+The generated generator cannot produce it: it sizes the region and writes the stride
+from one formula when it is created, so seeing it means something outside the
+stub wrote into the region.
+
+The generator **throws**, before the loop can read it as a finished scan.
+
+### A scan that goes backwards
+
+Within one scan the offset must never go backwards. The generated iterators only
+move forward, so they never do; the rule matters to a caller driving the raw ABI,
+on every set. A backwards offset is unsupported and may lose matches. Detection
+is best effort, with no guarantee: the engine notices only once an overlapping
+set's answer cache has engaged and a position falls below where it was built,
+and then the generator **throws** an error saying the offset went backwards. Anywhere else it goes undetected.

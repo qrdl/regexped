@@ -1,4 +1,4 @@
-# Strict alternation whose branches all carry a fixed-length prefix (Gap E):
+# Strict alternation whose branches all carry a fixed-length prefix (the mixed-prefix shape):
 # buildLitChainAltPrefixedFindBody, via the shared
 # emitLitChainAltLitBranchBodyPrefixed. Same missing find-from floor as
 # lit_chain_prefixed, and it was found the same way — by asking which emitters

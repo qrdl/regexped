@@ -38,7 +38,7 @@ setcaps-exhaustive:
 # The sweeps assert that every exported find/groups answer matches Go at every
 # `from`; this target additionally proves WHICH emitters they reach, from the
 # coverage profile of that same run. Two facts, one execution — a second corpus
-# would drift, and the drift is what let plans/FUZZER_BUGS.md 65 ship: the sweep
+# would drift, and the drift is what let a find-from bug ship: the sweep
 # passed for weeks over shapes reaching eight of fourteen find emitters, and two
 # of the six it missed were broken.
 #
@@ -56,7 +56,7 @@ from-coverage:
 
 # Set-emitter reach. Same question as from-coverage, for compile/set_*.go:
 # which emitters do the tests that CHECK ANSWERS actually drive? The smoke
-# matrix in compile/set_matrix_coverage_test.go proves a shape still COMPILES,
+# matrix in compile/set_module_test.go proves a shape still COMPILES,
 # which is a different claim — see that file's opening comment for the gap it
 # describes, and this target for the other side of it.
 #
@@ -100,12 +100,21 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/...
+	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 
 docker: regexped
 	./get_wasm_merge.sh
+	# wasm-tools and wac are needed inside the image for `wasm_format:
+	# component`, the same way wasm-merge is needed for a module `regexped
+	# merge`: wasm-tools wraps the core module into a component, wac composes it
+	# with the consumer. Both are fetched INTO the build context with an
+	# explicit destination, which skips each script's PATH short-circuit: a
+	# copy taken from the host's PATH may be linked against a glibc the image
+	# does not have. Nothing is ever copied from the host.
+	./get_wasm_tools.sh "$(CURDIR)"
+	./get_wac.sh "$(CURDIR)"
 	docker build -t regexped .
 
 lint:

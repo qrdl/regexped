@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // asStub generates an AssemblyScript stub file for all regexp entries in cfg.
@@ -60,15 +61,28 @@ func genASStubFile(cfg config.BuildConfig) (string, error) {
 // `abort`, a one-way trap the AS caller cannot handle. So a throw here would be
 // strictly worse than a sentinel: uncatchable rather than merely awkward.
 func asSentinelPreamble() string {
-	return `/** The Backtracking engine exhausted its frame budget: the result is UNKNOWN,
+	return fmt.Sprintf(`/** The Backtracking engine exhausted its frame budget: the result is UNKNOWN,
  *  NOT "no match". Returned by the scalar and i64-returning exports. */
-export const RX_ERR_BT_OVERFLOW: i32 = -2;
+export const RX_ERR_BT_OVERFLOW: i32 = %d;
+
+/** The overlapping answer cache's header is malformed — a stride below 1, or
+ *  a layout that does not describe what the sweep would have written. The scan
+ *  is UNKNOWN, not finished. A generated scanner cannot produce this: it sizes
+ *  the region and writes the stride from one formula. */
+export const RX_ERR_MALFORMED_CACHE: i32 = %d;
+
+/** An overlapping set's find was asked for an offset BELOW where its answer
+ *  cache was built: the scan went backwards, and its result is UNKNOWN.
+ *  Offsets must never go backwards within one scan. Detection is best effort,
+ *  so its absence is not a guarantee. -6, not -5: every error code means the
+ *  same thing in every language, and C owns -5. */
+export const RX_ERR_OUT_OF_ORDER: i32 = %d;
 
 /** The same condition from an export whose return is a POINTER, where 0
  *  already means "finished" and there is no negative value to spend. */
 export const RX_ITER_ERROR: u32 = 0xFFFFFFFF;
 
-`
+`, btOverflow, malformedCache, outOfOrder)
 }
 
 // genASSetSection generates AssemblyScript set wrappers.
@@ -83,12 +97,13 @@ func genASSetSection(cfg config.BuildConfig) string {
 	//. It is also in the namespace-rewritten shared-symbol
 	// list, which only makes sense for a symbol the caller can see.
 	out.WriteString("export class SetMatch { constructor(public patternId: i32, public start: u32, public end: u32) {} }\n")
-	for _, s := range cfg.Sets {
+	shapes := newSetShapes(cfg)
+	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := screamingCase(s.Name) + "_PATTERN_COUNT"
 		idN := idSpaceSize(s, cfg)
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
-		wide := wideAllForm(s, cfg)
+		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
 		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
@@ -97,13 +112,10 @@ func genASSetSection(cfg config.BuildConfig) string {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
 		}
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
-		// the AssemblyScript spelling of each is decided here (R12).
-		setCaps := setCapabilities(s, cfg)
+		// the AssemblyScript spelling of each is decided here.
+		setCaps := setCapabilities(s, cfg, wide)
 		sig := func(kind string) string {
-			capability := capByKind(setCaps, kind)
-			if capability == nil {
-				panic("generate: AS stub asked for the signature of an undeclared capability " + kind)
-			}
+			capability := mustCapByKind(setCaps, kind, "AS")
 			return "(" + capability.render(asABIParam, ", ") + "): " + asABIRet(capability.Ret)
 		}
 		if s.MatchAny != "" {
@@ -211,9 +223,59 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			// — the branch that omitted it was unreachable
 			// and is gone.
 			decl(s.Find, sig("find"))
-			gateField := "    gates: StaticArray<u32>;\n"
-			gateInit := "        this.gates = new StaticArray<u32>(" + idKonst + ");\n"
-			gateArg := "changetype<usize>(this.gates), "
+			gateField := "    gates: StaticArray<u32>;\n    scratch: StaticArray<u32>;\n"
+			gateInit := "        this.gates = new StaticArray<u32>(" + idKonst + ");\n" +
+				"        this.scratch = new StaticArray<u32>(4);\n"
+			// The SCRATCH DESCRIPTOR the export takes in place of a bare gate
+			// pointer: magic, gate pointer, and the answer cache — the region
+			// reserved below for a cache-eligible overlapping set, zero
+			// otherwise.
+			//
+			// Written before EACH call: field 1 is the address of a managed
+			// array, and a descriptor written once could outlive a compaction.
+			cacheSet := "this.scratch[2] = 0, this.scratch[3] = 0"
+			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+				consts := overlapCacheConstsFor(sh)
+				// The CHECKPOINTED answer cache, allocated once with the
+				// iterator and collected with it — `init`/`free` in a language
+				// that has a runtime. Without one an overlapping drive is
+				// quadratic, and `find` reads a cache exactly as the batching
+				// entry does.
+				//
+				// The stride is the one field the caller owns, because the
+				// caller is what sized the allocation from it. This arithmetic
+				// MUST match config.SetOverlapCheckpoint*: the sweep validates
+				// what it is handed and reports a header it cannot parse.
+				// A zero-length array is "no cache", and it is the field's
+				// INITIALISER rather than an else-branch assignment: asc's
+				// definite-assignment analysis does not see through the
+				// conditional below and rejects the class outright (TS2564).
+				gateField += "    cache: StaticArray<u32> = new StaticArray<u32>(0);\n"
+				gateInit += fmt.Sprintf(`        {
+            const m: u64 = <u64>input.byteLength + 1;
+            const row: u64 = %[5]d;
+            const cell: u64 = %[6]d;
+            let k: u64 = m;
+            if (%[3]d + cell + 4 + m * row > %[4]d) {
+                k = <u64>Math.sqrt(<f64>m * %[1]d * 4 / <f64>row);
+                if (k < 16) k = 16;
+                if (k > m) k = m;
+            }
+            const nb: u64 = (m + k - 1) / k;
+            const bytes: u64 = %[3]d + nb * cell + 4 + k * row;
+            if (bytes <= %[4]d) {
+                this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
+                this.cache[%[7]d] = <u32>k;
+            }
+        }
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
+				cacheSet = "this.scratch[2] = (this.cache.length == 0 ? 0 : changetype<usize>(this.cache) as u32), " +
+					"this.scratch[3] = <u32>(this.cache.length * 4)"
+			}
+			gateArg := "(this.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
+				", this.scratch[1] = changetype<usize>(this.gates) as u32, " + cacheSet +
+				", changetype<usize>(this.scratch)), "
 			// AssemblyScript has no generators, so `find` is an explicit
 			// iterator object — caller-owned, so two scans can be in flight
 			// and re-creating it restarts the scan.
@@ -224,7 +286,7 @@ export class %[1]s {
     private input: ArrayBuffer;
     private from: i32;
     private done: bool = false;
-    private overflowed: bool = false;
+    private overflowed: i32 = 0;
     private n: i32 = 0;
     private i: i32 = 0;
     private buf: StaticArray<i32>;
@@ -248,7 +310,12 @@ export class %[1]s {
             // scan when the rest of the input was never answered. It is
             // RECORDED rather than thrown — asc cannot catch — and read back
             // with err() after the loop.
-            if (got == %[7]d) { this.done = true; this.overflowed = true; return null; }
+            if (got == %[7]d) { this.done = true; this.overflowed = RX_ERR_BT_OVERFLOW; return null; }
+            // And -4: the answer cache's header is malformed, so the drive is
+            // not finished and cannot say what is left.
+            if (got == %[8]d) { this.done = true; this.overflowed = RX_ERR_MALFORMED_CACHE; return null; }
+            // And -6: the offset went below where the answer cache was built.
+            if (got == %[9]d) { this.done = true; this.overflowed = RX_ERR_OUT_OF_ORDER; return null; }
             if (got <= 0) { this.done = true; return null; }
             this.n = got;
             this.i = 0;
@@ -256,11 +323,12 @@ export class %[1]s {
             this.from = this.buf[1] + 1;
         }
     }
-    /** RX_ERR_BT_OVERFLOW if the scan stopped because the engine gave up and
-     *  what remained was UNKNOWN, 0 if it ran to completion. Check it after
-     *  the loop: an unchecked err() means a silently truncated match list. */
+    /** RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or RX_ERR_OUT_OF_ORDER if the scan stopped
+     *  because the engine could not answer and what remained was UNKNOWN, 0 if
+     *  it ran to completion. Check it after the loop: an unchecked err() means
+     *  a silently truncated match list. */
     err(): i32 {
-        return this.overflowed ? RX_ERR_BT_OVERFLOW : 0;
+        return this.overflowed;
     }
 }
 
@@ -268,7 +336,7 @@ export class %[1]s {
 export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
     return new %[1]s(input, offset);
 }
-`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, btOverflowMsg(s.Find))
+`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, malformedCache, outOfOrder)
 		}
 		out.WriteString("\n")
 	}
@@ -474,7 +542,7 @@ export function %[1]s(input: ArrayBuffer, offset: u32): %[2]s {
 	//
 	// _capture takes `input` again ON PURPOSE: the slots are offsets, so
 	// decoding needs the buffer. A stub that remembered the last input would
-	// be exactly the mutable-static pattern C decision (8) removes, and would
+	// be exactly the mutable-static pattern the C stub's caller-owned scanner removed, and would
 	// break the moment two scans interleave. The raw offsets stay reachable,
 	// so this is additive.
 	fmt.Fprintf(&sb, "export const %s_GROUPS: i32 = %d;\n\n", toUpperIdent(funcName), numGroups)
@@ -505,8 +573,8 @@ func asABIParam(p abiParam) string {
 		return "len: i32"
 	case abiFrom:
 		return "from: i32"
-	case abiGatePtr:
-		return "gates: usize"
+	case abiScratchPtr:
+		return "scratch: usize"
 	case abiBitmapPtr, abiTuplePtr:
 		return "out: usize"
 	case abiOutCap:

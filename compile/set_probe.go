@@ -82,7 +82,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 
 	// Dominant-state bulk skip, anchored only.
 	//
-	// Restricted to the uncompressed u8 layout for the same reason G5's unroll
+	// Restricted to the uncompressed u8 layout for the same reason the per-byte unroll
 	// is: the compressed and u16 paths route the input byte through a class
 	// map or a scaled index. Also skipped for compiled-DFA-style layouts that
 	// are not plain direct-index.
@@ -139,7 +139,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	//
 	// The per-byte loop below is already minimal — 24 WASM instructions, with
 	// no accept-table load at all, because every orTableBits call in this
-	// function is guarded by !anchored. G5's original hypothesis (a per-byte
+	// function is guarded by !anchored. The original hypothesis (a per-byte
 	// accept load that only EOF needs) was therefore REFUTED by disassembly;
 	// the cost is simply that 24 instructions run per byte, of which 9 are
 	// loop scaffolding rather than the transition itself.
@@ -283,7 +283,7 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 		// answer is not monotone (a mid-accept says nothing about reaching
 		// `len`). Which test applies is the caller's choice; see probeExit.
 		if p.futureOff != 0 {
-			// G8 liveness exit: stop once no WANTED pattern can still accept
+			// Liveness exit: stop once no WANTED pattern can still accept
 			// from here. Strictly stronger than the tests below — it subsumes
 			// "all wanted seen" and also fires when the remainder is
 			// unreachable. Over-approximating futureAccepts only delays this;
@@ -479,7 +479,7 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		leftmostFirst: false,
 	})
 
-	// G17: an anchored bucket whose accept is a per-state LIST takes the sparse
+	// Sparse accept: an anchored bucket whose accept is a per-state LIST takes the sparse
 	// probe. Same trigger as genSuffixWASM's, and the same reason: it is the
 	// only shape that can answer for more patterns than a mask has bits.
 	if t.acceptWide != nil {
@@ -543,7 +543,7 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		// the returned mask, so an empty slice would mask every bit off.
 		patternIDs:  make([]int, numPatterns),
 		tableMemIdx: tableMemIdx,
-		// G7 + G11: states this anchored walk may bulk-skip through — the
+		// States this anchored walk may bulk-skip through — the
 		// wide-self-loop flavour followed by the small-self-loop one.
 		// Exception mode goes first so it keeps the cheaper compare
 		// chain's position when both fire.

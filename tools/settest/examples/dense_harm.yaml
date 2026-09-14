@@ -1,4 +1,4 @@
-# The `set-shufti-dense-harm` guard case, as a settest fixture (TODO task 74).
+# The `set-shufti-dense-harm` guard case, as a settest fixture.
 #
 # The same 21 [A-U]-prefixed patterns as shufti.yaml, pointed at input built to
 # make Shufti LOSE: solid A-U with no gaps, so every SIMD chunk's bitmask is

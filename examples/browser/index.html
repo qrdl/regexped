@@ -63,15 +63,22 @@
     document.getElementById('loading').style.display = 'none';
     document.getElementById('app').style.display = 'block';
 
-    const _enc = new TextEncoder();
+    // A match function matches the WHOLE input and returns its end position, or
+    // null. It throws only when a Backtracking-compiled pattern exhausts its frame
+    // budget — the answer is then unknown, which is not the same as invalid.
     function bind(inputId, statusId, matchFn) {
       const input  = document.getElementById(inputId);
       const status = document.getElementById(statusId);
       input.addEventListener('input', () => {
         if (!input.value) { status.textContent = ''; status.className = 'status'; return; }
-        const bytes = _enc.encode(input.value);
-        const [end, ok] = matchFn(bytes);
-        const valid = ok && end === bytes.length;
+        let valid;
+        try {
+          valid = matchFn(input.value) !== null;
+        } catch (e) {
+          status.textContent = '? cannot decide';
+          status.className   = 'status';
+          return;
+        }
         status.textContent = valid ? '✓ valid' : '✗ invalid';
         status.className   = valid ? 'status valid' : 'status invalid';
       });

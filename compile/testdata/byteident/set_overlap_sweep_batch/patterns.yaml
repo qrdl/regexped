@@ -1,0 +1,17 @@
+# The same sweep with `hints: [batch-find]`. Both find entries serve the cache
+# and only SERVING is per-entry — `find` returns a position's total where the
+# batch entry returns what it wrote — so the two serving paths are different
+# code and need pinning separately.
+regexps:
+  - name: p0
+    pattern: '[a-z]+'
+  - name: p1
+    pattern: '[0-9]+'
+  - name: p2
+    pattern: '[A-Z]+'
+sets:
+  - name: s
+    find: s_find
+    overlapping: true
+    hints: [batch-find]
+    patterns: all

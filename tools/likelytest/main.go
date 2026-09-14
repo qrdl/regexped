@@ -38,6 +38,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -117,7 +118,7 @@ type testCase struct {
 	// naturally has hundreds), which inflates the prefilter's share of total
 	// cost. That cancels for a 3-mode comparison, since every arm carries the
 	// same buckets — but it makes the Δ% an UPPER BOUND, not a production
-	// figure. See TODO task 73.
+	// figure.
 	forceScalarFrontend bool
 }
 
@@ -131,7 +132,7 @@ const (
 )
 
 var tests = []testCase{
-	// ── Shufti prefix-scan targets (LNM Action 3) ───────────────────────
+	// ── Shufti prefix-scan targets ───────────────────────
 	// Patterns with no usable literal anchor (no mandatoryLit) and a
 	// first-byte set of varying size. Today these fall to multi-eq SIMD
 	// (set size 5..16) or the scalar firstByteFlags loop (set > 16).
@@ -186,29 +187,29 @@ var tests = []testCase{
 		nomatchInput: printableRunInput(false, true),
 	},
 	{
-		// Gap E groups: captures wrap class-prefix and class-suffix pieces.
+		// Mixed-prefix groups: captures wrap class-prefix and class-suffix pieces.
 		// Group offsets must account for the prefix (group d at 0..8, group
 		// k at 12..48 after the K=4 ghp_ literal).
-		name:    "gap-e-groups",
+		name:    "mixed-prefix-groups",
 		pattern: `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
 		mode:    modeGroups,
-		notes:   "mixed-prefix shape with captures — Gap E groups target",
+		notes:   "mixed-prefix shape with captures",
 		matchInput: configInput([]string{
 			"12345678ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab",
 		}),
 		nomatchInput: configInput(nil),
 	},
 	{
-		// LNM Action 5 amplifier: pattern accepts only [a-zA-Z] (52-byte
-		// set, routed to scalar by Action 3 density heuristic). Input is
+		// Impossible-byte skip amplifier: pattern accepts only [a-zA-Z] (52-byte
+		// set, routed to scalar by the density heuristic). Input is
 		// dominated by digits/punctuation/whitespace — bytes that no
 		// state can consume ("impossible bytes"). Scalar firstByteFlags
-		// pays 1 byte/cycle through long impossible runs; Action 5's
+		// pays 1 byte/cycle through long impossible runs; the LikelyNoMatch
 		// SIMD impossible-byte skip should cut that to ~16 bytes/cycle.
 		name:         "alpha-run-impossible-bytes",
 		pattern:      `[a-zA-Z]{8,}`,
 		mode:         modeFind,
-		notes:        "52-byte first-set in mostly-impossible-byte input — LNM Action 5 target",
+		notes:        "52-byte first-set in mostly-impossible-byte input — LNM impossible-byte skip target",
 		matchInput:   impossibleRunInput(true),
 		nomatchInput: impossibleRunInput(false),
 	},
@@ -254,14 +255,14 @@ var tests = []testCase{
 		nomatchInput: litAnchorFalsePositiveInput(),
 	},
 	{
-		// Gap G target: BT find body with a 17..64-byte first-byte set on
+		// BT find body with a 17..64-byte first-byte set on
 		// impossible-byte-heavy input. Pattern requirements to exercise
 		// the right BT path:
 		//   - non-greedy capture → ambiguous, TDFA-ineligible → BT
 		//   - no mandatory literal substring → BT uses the
-		//     nfaFirstBytes/Teddy/Shufti fallback (where Action 5 lives),
+		//     nfaFirstBytes/Teddy/Shufti fallback (where the impossible-byte skip lives),
 		//     not the mlScan literal-prefix path
-		//   - 17..64-byte first-byte set → Action 5 has something to act on
+		//   - 17..64-byte first-byte set → the skip has something to act on
 		// `([a-zA-Z]+?)\d` satisfies all three: `\d` exit is a class
 		// (no literal), capture is non-greedy, first-byte set is 52.
 		//
@@ -269,12 +270,12 @@ var tests = []testCase{
 		// each followed by a digit (so the BT body completes a match).
 		// No-match input: pure impossible bytes (no letters at all) —
 		// prefix scan loop runs the whole input, never enters BT body.
-		name:         "bt-action5-target",
+		name:         "bt-impossible-bytes",
 		pattern:      `([a-zA-Z]+?)\d`,
 		mode:         modeGroups,
-		notes:        "BT find + 17..64-byte first-byte set — Gap G (LNM Action 5 for BT) target",
-		matchInput:   btAction5Input(true),
-		nomatchInput: btAction5Input(false),
+		notes:        "BT find + 17..64-byte first-byte set — LNM impossible-byte skip for BT",
+		matchInput:   btImpossibleBytesInput(true),
+		nomatchInput: btImpossibleBytesInput(false),
 	},
 	{
 		// pattern with greedy class quantifier followed by a
@@ -304,7 +305,7 @@ var tests = []testCase{
 		//
 		// No-match input is 2000 lowercase letters with no digit anywhere:
 		// the DFA never dies (stays in-class the whole way) and never runs
-		// short of input (the dead-state skip and follow-up #1's
+		// short of input (the dead-state skip and the
 		// EOF-without-match check both stay silent), so every attempt from
 		// position k scans forward to EOF before failing — the pattern is
 		// entirely captured by neither prior fix. Confirmed via direct fuel
@@ -327,9 +328,9 @@ var tests = []testCase{
 		nomatchInput: minLenQuantifierSkipInput(false),
 	},
 	{
-		// H.3 target: 21 literal-prefixed patterns with distinct lowercase
+		// Set-level Shufti target: 21 literal-prefixed patterns with distinct lowercase
 		// first bytes [a..u]. AC builds ~63 nodes which exceeds the 32-node
-		// cap → frontend falls back to scalar. With H.3, set-level
+		// cap → frontend falls back to scalar. Set-level
 		// LikelyNoMatch forces Shufti: the rarity sum is 21*3 = 63 against
 		// the 40 threshold, so `rare` is false and the density heuristic
 		// alone keeps scalar — LNM is the only trigger. Under neutral/LM the
@@ -353,7 +354,7 @@ var tests = []testCase{
 		// lowercase, i.e. maximally DENSE against [a..u]. Both corpora are
 		// therefore uppercase now; see setShuftiLNMInput.
 		//
-		// SELECTION IS FORCED (forceScalarFrontend, task 73). Between this
+		// SELECTION IS FORCED (forceScalarFrontend). Between this
 		// case being written and 2026-08-31 it drifted onto **Teddy** and
 		// printed "identical WASM" in all three modes, measuring nothing
 		// hint-related: 21 literals of length 3 with 21 distinct first bytes
@@ -386,7 +387,7 @@ var tests = []testCase{
 			`u1:[^\n]+`,
 		},
 		mode:         modeSet,
-		notes:        "set with 21 [a-u]-prefixed literals — H.3 (LNM forces Shufti over scalar)",
+		notes:        "set with 21 [a-u]-prefixed literals — LNM forces Shufti over scalar",
 		matchInput:   setShuftiLNMInput(true),
 		nomatchInput: setShuftiLNMInput(false),
 	},
@@ -400,14 +401,13 @@ var tests = []testCase{
 		// attempt, forcing the scalar membership-check tail on literally
 		// EVERY position, on top of the SIMD overhead itself. None of the
 		// letters is ever followed by "1:" so nothing matches. That tail is
-		// the per-first-byte compare chain whose cost is the reason task 70's
+		// the per-first-byte compare chain whose cost is the reason the widened
 		// Shufti band is capped at 128 rather than 239 — so this is the
-		// instrument task 70's step B measures with.
+		// instrument that cap was measured with.
 		//
-		// Selection forced to scalar for the same reason as its sibling above
-		// (task 73).
+		// Selection forced to scalar for the same reason as its sibling above.
 		//
-		// WHAT IT DOES NOT MEASURE (task 74, settled 2026-09-01). This case
+		// WHAT IT DOES NOT MEASURE (settled 2026-09-01). This case
 		// used to be cited as the guard for `shuftiAdaptive`, the runtime
 		// density switch emitSetMatchFnFinalShufti carries — the set port of
 		// EmitPrefixScan's DenseCounter/DenseSkipFlag, which alpha-run and
@@ -440,16 +440,16 @@ var tests = []testCase{
 		nomatchInput: setShuftiDenseHarmInput(false),
 	},
 	{
-		// NOT a Gap F target, despite its name and its original comment.
+		// NOT a TDFA capture-body bulk-skip target, despite its name and its original comment.
 		// `(\w+)` is a whole-pattern single capture, so it takes the
 		// capture-stripping shortcut and compiles to a **Compiled DFA** —
 		// `compile --verbose` reports "no captures; promoted to direct-index
 		// dispatch". It never reaches the TDFA capture body, and the DFA it
 		// does reach already has the self-loop bulk skip, so any movement
-		// here is the shortcut's, not Gap F's. Verified 2026-09-01, also by
+		// here is the shortcut's, not the bulk skip's. Verified 2026-09-01, also by
 		// CompileForced producing byte-identical TDFA and BT modules for it.
 		//
-		// Kept because it still guards the shortcut. The real Gap F targets
+		// Kept because it still guards the shortcut. The real bulk-skip targets
 		// are the two cases below.
 		name:         "tdfa-bulk-skip-word-class",
 		pattern:      `(\w+)`,
@@ -490,7 +490,7 @@ var tests = []testCase{
 		nomatchInput: memberSkipInput(false, false),
 	},
 	{
-		// Gap F target, WIN half. `<([a-z]+)>` is a partial capture, so the
+		// TDFA capture-body bulk-skip target, WIN half. `<([a-z]+)>` is a partial capture, so the
 		// shortcut does not apply and it genuinely compiles to TDFA
 		// (verified with `compile --verbose`). Its body state self-loops on
 		// [a-z] with a uniform set-to-pos tag op, which is the shape a
@@ -504,12 +504,12 @@ var tests = []testCase{
 		name:         "tdfa-capture-body-long",
 		pattern:      `<([a-z]+)>`,
 		mode:         modeGroups,
-		notes:        "TDFA capture body, 10 KB uniform [a-z] run — Gap F win case",
+		notes:        "TDFA capture body, 10 KB uniform [a-z] run — bulk-skip win case",
 		matchInput:   "<" + strings.Repeat("a", 10240) + ">",
 		nomatchInput: "!" + strings.Repeat("a", 10240),
 	},
 	{
-		// Gap F target, HARM half. Same pattern and engine, but the captured
+		// TDFA capture-body bulk-skip target, HARM half. Same pattern and engine, but the captured
 		// bodies are 3 bytes, far below the 16-byte SIMD chunk — so the skip
 		// can never amortise its setup and this is where it costs rather
 		// than pays. A win case alone would measure only the flattering
@@ -518,7 +518,7 @@ var tests = []testCase{
 		name:         "tdfa-capture-body-short",
 		pattern:      `<([a-z]+)>`,
 		mode:         modeGroups,
-		notes:        "TDFA capture body, 3-byte run — Gap F harm case (below the SIMD chunk)",
+		notes:        "TDFA capture body, 3-byte run — bulk-skip harm case (below the SIMD chunk)",
 		matchInput:   "<abc>",
 		nomatchInput: "!abc>",
 	},
@@ -538,34 +538,34 @@ var tests = []testCase{
 		nomatchInput: "," + strings.Repeat("aB3_", 2560),
 	},
 
-	// ── LM-0: match-dense cases ──────────────────────
+	// ── match-dense cases ──────────────────────
 	// All prior cases above bury a single match in 10-50 KB — scan-to-first-
 	// match dominates total fuel, so any per-hit/per-run optimisation is
 	// diluted to ~0% in the matrix. These cases exhaust the whole buffer
 	// (exhaustive: true) so per-match cost actually shows up in the total.
 	{
-		// LM-1 companion / regression guard: N=36 already clears the
-		// existing N>=24 lit-chain SIMD-verify gate, so this is NOT an LM-1
+		// Lit-chain gate companion / regression guard: N=36 already clears the
+		// existing N>=24 lit-chain SIMD-verify gate, so this is NOT a gate-relaxation
 		// win case — it's a dense-workload guard for whatever already
-		// applies to this shape today, and a target for LM-2 (host-call
-		// amortisation via batched find).
+		// applies to this shape today, and a target for host-call
+		// amortisation via batched find.
 		name:         "dense-secrets",
 		pattern:      `ghp_[A-Za-z0-9]{36}`,
 		mode:         modeFind,
-		notes:        "dense ghp_ tokens (N=36, already >=24 lit-chain gate) — dense-workload guard / LM-2 target",
+		notes:        "dense ghp_ tokens (N=36, already >=24 lit-chain gate) — dense-workload guard / batched find target",
 		matchInput:   denseSecretsInput(true),
 		nomatchInput: denseSecretsInput(false),
 		exhaustive:   true,
 	},
 	{
-		// LM-1 primary target: N=16 < 24, currently rejected by
+		// Lit-chain gate relaxation primary target: N=16 < 24, currently rejected by
 		// analyseLitChain's single-pattern gate (compile/engine_dfa.go),
-		// falls back to plain DFA. This is the case LM-1's measurement plan
-		// names as primary.
+		// falls back to plain DFA. This is the relaxation's primary
+		// measurement case.
 		name:         "dense-akia",
 		pattern:      `AKIA[A-Z0-9]{16}`,
 		mode:         modeFind,
-		notes:        "dense AKIA tokens (N=16 < 24) — LM-1 primary target (lit-chain SIMD-verify gate relaxation)",
+		notes:        "dense AKIA tokens (N=16 < 24) — primary target of the lit-chain SIMD-verify gate relaxation",
 		matchInput:   denseAkiaInput(true),
 		nomatchInput: denseAkiaInput(false),
 		exhaustive:   true,
@@ -574,74 +574,74 @@ var tests = []testCase{
 		// Many short \w+ runs per pass (a word every ~6 bytes) instead of
 		// tdfa-bulk-skip-word-class's one long homogeneous run — stresses
 		// TDFA bulk-skip entry/exit frequency and, once batched find lands,
-		// is a natural LM-2 host-call-amortisation target.
+		// is a natural host-call-amortisation target.
 		name:         "dense-words-grouped",
 		pattern:      `(\w+)`,
 		mode:         modeGroups,
-		notes:        "dense short \\w+ runs (word every ~6 bytes) — TDFA bulk-skip entry/exit frequency, LM-2 target",
+		notes:        "dense short \\w+ runs (word every ~6 bytes) — TDFA bulk-skip entry/exit frequency, batched find target",
 		matchInput:   denseWordsInput(true),
 		nomatchInput: denseWordsInput(false),
 		exhaustive:   true,
 	},
 	{
-		// LM-3 target: non-mid-accept 9-64-byte self-loop body
+		// Non-mid Shufti channel target: non-mid-accept 9-64-byte self-loop body
 		// (`[^>]+` after a 1-byte literal `<`), dense tags every ~20 bytes.
 		// Today's Shufti self-loop bulk-skip is mid-accept only;
 		// this shape's accept state sits at `>`, one byte AFTER the
-		// self-loop, i.e. non-mid — uncovered until LM-3.
+		// self-loop, i.e. non-mid — uncovered until the non-mid channel.
 		name:         "dense-tags",
 		pattern:      `<[^>]+>`,
 		mode:         modeFind,
-		notes:        "dense HTML-ish tags every ~20 bytes, non-mid-accept self-loop — LM-3 target",
+		notes:        "dense HTML-ish tags every ~20 bytes, non-mid-accept self-loop — non-mid channel target",
 		matchInput:   denseTagsInput(true),
 		nomatchInput: denseTagsInput(false),
 		exhaustive:   true,
 	},
 	{
-		// LM-3 primary target: non-mid-accept self-loop with LONG runs
+		// Non-mid channel primary target: non-mid-accept self-loop with LONG runs
 		// (20-50 bytes per token, well over the 16-byte SIMD chunk width),
 		// unlike dense-tags above whose ~14-byte tag bodies are short enough
-		// to trip the task-38 hysteresis (advance < 16 -> unproductive) on
+		// to trip the non-mid hysteresis (advance < 16 -> unproductive) on
 		// nearly every attempt. This is the case expected to show the actual
 		// win from lifting the non-mid gate on a 9-64-byte class.
 		name:         "dense-quoted",
 		pattern:      `"[a-z0-9]+"`,
 		mode:         modeFind,
-		notes:        "dense quoted alnum tokens, 20-50 bytes each — LM-3 primary target (long non-mid self-loop runs)",
+		notes:        "dense quoted alnum tokens, 20-50 bytes each — non-mid channel primary target (long non-mid self-loop runs)",
 		matchInput:   denseQuotedInput(true, false),
 		nomatchInput: denseQuotedInput(false, false),
 		exhaustive:   true,
 	},
 	{
-		// LM-3 harm/guard case: same pattern, but tokens are 3-6 bytes —
-		// every attempt advances < 16 bytes, so the task-38 hysteresis
+		// Non-mid channel harm/guard case: same pattern, but tokens are 3-6 bytes —
+		// every attempt advances < 16 bytes, so the non-mid hysteresis
 		// should self-disable the channel after nonMidHystStreak wasted
 		// attempts and hold fuel roughly flat vs neutral for the rest of
 		// the buffer.
 		name:         "dense-quoted-short",
 		pattern:      `"[a-z0-9]+"`,
 		mode:         modeFind,
-		notes:        "dense quoted alnum tokens, 3-6 bytes each — LM-3 harm/hysteresis guard (short non-mid self-loop runs)",
+		notes:        "dense quoted alnum tokens, 3-6 bytes each — non-mid channel harm/hysteresis guard (short non-mid self-loop runs)",
 		matchInput:   denseQuotedInput(true, true),
 		nomatchInput: denseQuotedInput(false, true),
 		exhaustive:   true,
 	},
 	{
-		// LM-4 target: bare (no literal prefix) 9-64-byte-class self-loop —
+		// Bare-prefix gate target: bare (no literal prefix) 9-64-byte-class self-loop —
 		// detectShuftiSelfLoop bails on len(l.prefix)==0 today (the
 		// gate). Runs vary 10-30 bytes so the self-loop is exercised
 		// repeatedly rather than as one giant run.
 		name:         "dense-bare-upper",
 		pattern:      `[A-Z]{8,}`,
 		mode:         modeFind,
-		notes:        "dense bare uppercase runs, 10-30 bytes, no literal prefix — LM-4 target",
+		notes:        "dense bare uppercase runs, 10-30 bytes, no literal prefix — bare-prefix gate target",
 		matchInput:   denseBareUpperInput(true),
 		nomatchInput: denseBareUpperInput(false),
 		exhaustive:   true,
 	},
 	{
-		// LM-5 target: 65-239-byte-class self-loop, above Shufti's
-		// pre-LM-5 64-byte cap. `:[ -~]{10,}` after a literal `:` — a
+		// Widened Shufti band target: 65-239-byte-class self-loop, above
+		// Shufti's former 64-byte cap. `:[ -~]{10,}` after a literal `:` — a
 		// 95-byte printable class. Sized with pattest before
 		// implementation (`:[ -~]{10,}` over 20-60 and 100-200-byte runs
 		// measured -41%/-55% fuel); this case uses long runs (65-150
@@ -649,26 +649,26 @@ var tests = []testCase{
 		name:         "dense-printable",
 		pattern:      `:[ -~]{10,}`,
 		mode:         modeFind,
-		notes:        "dense printable runs, 65-150 bytes, 95-byte class width — LM-5 target (widened Shufti band)",
+		notes:        "dense printable runs, 65-150 bytes, 95-byte class width — widened Shufti band target",
 		matchInput:   densePrintableInput(true, false),
 		nomatchInput: densePrintableInput(false, false),
 		exhaustive:   true,
 	},
 	{
-		// LM-5 harm/guard case: same pattern, runs 10-15 bytes (right at
+		// Widened-band harm/guard case: same pattern, runs 10-15 bytes (right at
 		// the pattern's own `{10,}` minimum) — pattest measured +12% here,
-		// the bounded "LM contract cost" residual task-38's hysteresis is
+		// the bounded "LM contract cost" residual the non-mid hysteresis is
 		// meant to contain, same shape as dense-quoted-short/alpha-run.
 		name:         "dense-printable-short",
 		pattern:      `:[ -~]{10,}`,
 		mode:         modeFind,
-		notes:        "dense printable runs, 10-15 bytes (at pattern minimum) — LM-5 harm/hysteresis guard",
+		notes:        "dense printable runs, 10-15 bytes (at pattern minimum) — widened-band harm/hysteresis guard",
 		matchInput:   densePrintableInput(true, true),
 		nomatchInput: densePrintableInput(false, true),
 		exhaustive:   true,
 	},
 	{
-		// LM-6 primary target: two counted-chain-eligible patterns that
+		// Counted-chain split primary target: two counted-chain-eligible patterns that
 		// DO share a mandatory literal ("eyJ", a base64 JSON-header
 		// prefix — two JWT-segment-length variants). An AKIA/ghp_ variant
 		// of this case (patterns sharing no literal) was tried and removed:
@@ -678,7 +678,7 @@ var tests = []testCase{
 		// WASM across all three modes and exercises nothing. This pair, by
 		// contrast, lands in the same bucketByLiteral group and binPack's
 		// constraint checks merge them under neutral, losing the
-		// single-pattern SIMD suffix body for both. LM-6 gates a refusal on
+		// single-pattern SIMD suffix body for both. The split gates a refusal on
 		// this exact shape.
 		name: "dense-set-shared-prefix",
 		setPatterns: []string{
@@ -686,17 +686,17 @@ var tests = []testCase{
 			`eyJ[A-Za-z0-9_-]{40}`,
 		},
 		mode:         modeSet,
-		notes:        "eyJ-prefixed set, two counted-chain lengths sharing a literal — LM-6 primary target (binPack merge refusal)",
+		notes:        "eyJ-prefixed set, two counted-chain lengths sharing a literal — counted-chain split primary target (binPack merge refusal)",
 		matchInput:   denseSetSharedPrefixInput(true),
 		nomatchInput: denseSetSharedPrefixInput(false),
 	},
 	{
-		// Task 68 primary target: the LM-3 shape inside a SET. Each pattern's
+		// Suffix-body Shufti primary target: the non-mid channel shape inside a SET. Each pattern's
 		// mandatory literal (`A="`) is split off by the packer, leaving the
 		// suffix `[a-z0-9]+"` — a 36-byte NON-mid-accept self-loop, since the
 		// body cannot accept until the closing quote arrives.
 		//
-		// Before task 68 no set could reach that channel at all: a suffix DFA
+		// Before suffix bodies got the channel no set could reach that channel at all: a suffix DFA
 		// has an empty l.prefix by construction, so detectShuftiSelfLoop's
 		// bare-prefix bail refused every bucket body regardless of hint.
 		// Long runs (20-50 bytes) so a 16-byte chunk skip is productive.
@@ -706,16 +706,16 @@ var tests = []testCase{
 			`E="[a-z0-9]+"`, `F="[a-z0-9]+"`, `G="[a-z0-9]+"`, `H="[a-z0-9]+"`,
 		},
 		mode:         modeSet,
-		notes:        "8-pattern set, quoted alnum bodies 20-50 bytes — task 68 primary target (non-mid Shufti self-loop in a bucket suffix body)",
+		notes:        "8-pattern set, quoted alnum bodies 20-50 bytes — non-mid Shufti self-loop in a bucket suffix body, primary target",
 		matchInput:   setQuotedInput(true, false),
 		nomatchInput: setQuotedInput(false, false),
 	},
 	{
-		// Task 68 harm/hysteresis guard: same set, 3-6-byte bodies. Every
-		// bulk-skip attempt advances < 16 bytes, so the task-38 hysteresis
+		// Suffix-body Shufti harm/hysteresis guard: same set, 3-6-byte bodies. Every
+		// bulk-skip attempt advances < 16 bytes, so the non-mid hysteresis
 		// should self-disable the channel and hold fuel near neutral. This is
-		// the case that decides whether task 68 needs a minimum-length gate
-		// of its own (the single-pattern LM-4 precedent) or whether the
+		// the case that decides whether the suffix-body channel needs a minimum-length gate
+		// of its own (the single-pattern bare-prefix gate precedent) or whether the
 		// hysteresis is enough — a suffix DFA has no pattern string to
 		// re-parse for a min-length check, so "enough" is the better answer.
 		name: "set-dense-quoted-short",
@@ -724,12 +724,12 @@ var tests = []testCase{
 			`E="[a-z0-9]+"`, `F="[a-z0-9]+"`, `G="[a-z0-9]+"`, `H="[a-z0-9]+"`,
 		},
 		mode:         modeSet,
-		notes:        "same 8-pattern set, bodies 3-6 bytes — task 68 harm/hysteresis guard",
+		notes:        "same 8-pattern set, bodies 3-6 bytes — suffix-body Shufti harm/hysteresis guard",
 		matchInput:   setQuotedInput(true, true),
 		nomatchInput: setQuotedInput(false, true),
 	},
 	{
-		// Task 69 target: a LITERAL-LESS set driving scan_any, which is the
+		// Union-scan stride target: a LITERAL-LESS set driving scan_any, which is the
 		// only way into the union automaton (compile/set_union_scan.go) —
 		// `find` never enters it except through a preflight, so a find-only
 		// harness cannot see a union-scan change at all.
@@ -746,7 +746,7 @@ var tests = []testCase{
 		},
 		mode:         modeSet,
 		setCap:       setCapScanAny,
-		notes:        "literal-less 8-pattern set, scan_any over the union automaton — task 69 target (entry-state self-loop skip)",
+		notes:        "literal-less 8-pattern set, scan_any over the union automaton — union-scan stride target (entry-state self-loop skip)",
 		matchInput:   setClassChainInput(true),
 		nomatchInput: setClassChainInput(false),
 	},
@@ -764,12 +764,12 @@ var tests = []testCase{
 		},
 		mode:         modeSet,
 		setCap:       setCapScanAll,
-		notes:        "same literal-less set driving scan_all — task 69 twin (no early exit until every id is seen)",
+		notes:        "same literal-less set driving scan_all — union-scan stride twin (no early exit until every id is seen)",
 		matchInput:   setClassChainInput(true),
 		nomatchInput: setClassChainInput(false),
 	},
 	{
-		// Task 70 target: a set whose first-byte union is WIDER than the
+		// Widened set Shufti band target: a set whose first-byte union is WIDER than the
 		// 17..64 Shufti band, which neutral mode therefore leaves on the
 		// scalar per-position walk.
 		//
@@ -779,19 +779,19 @@ var tests = []testCase{
 		// fallback bucket. 80 patterns over a 79-byte alphabet does it.
 		//
 		// The no-match input is built from bytes OUTSIDE the union — the
-		// "impossible bytes" workload LNM.md's Action 5 was written for, and
+		// "impossible bytes" workload the impossible-byte skip was written for, and
 		// the only shape where a 79-byte prefilter can skip anything. The
 		// match input is dense in the union, where it cannot.
 		name:         "set-wide-union-shufti",
 		setPatterns:  wideUnionSetPatterns(80),
 		mode:         modeSet,
-		notes:        "80 long literals, 79 distinct first bytes — task 70 target (Shufti band widened past 64 under LNM)",
+		notes:        "80 long literals, 79 distinct first bytes — Shufti band widened past 64 under LNM",
 		matchInput:   wideUnionInput(true),
 		nomatchInput: wideUnionInput(false),
 	},
 }
 
-// wideUnionAlphabet is the 79 bytes the task-70 case's literals start with:
+// wideUnionAlphabet is the 79 bytes the wide-union case's literals start with:
 // every alphanumeric plus the punctuation that needs no regexp escaping. Its
 // COMPLEMENT is what the no-match input is built from, so the two must be
 // derived from one place.
@@ -812,7 +812,7 @@ func wideUnionSetPatterns(n int) []string {
 	return out
 }
 
-// wideUnionInput builds ~50 KB for the task-70 case.
+// wideUnionInput builds ~50 KB for the wide-union case.
 //
 // The no-match half uses ONLY bytes outside wideUnionAlphabet, which is what
 // makes it the case a wide prefilter can serve at all; anything else and a
@@ -1010,11 +1010,11 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 	return string(b[:targetSize])
 }
 
-// btAction5Input builds a ~50 KB input for `([a-zA-Z]+?)\d`. The
+// btImpossibleBytesInput builds a ~50 KB input for `([a-zA-Z]+?)\d`. The
 // pattern compiles to Backtracking (non-greedy quantifier inside a
 // capture = TDFA-ineligible). The first-byte set is `[a-zA-Z]` (52
-// bytes), placing it in the 17..64-byte band where Action 5
-// (force-Shufti) helps.
+// bytes), placing it in the 17..64-byte band where LNM's
+// force-Shufti helps.
 //
 // When withMatches is true: 5 letter runs immediately followed by a
 // digit, embedded in punct/space filler (digits stripped from filler
@@ -1023,7 +1023,7 @@ func classRunInput(withMatches bool, class string, runLen, runs int) string {
 // When false: pure non-letter filler (digits/punct/space), no letters
 // → prefix scan loop runs the entire input without entering the BT
 // body.
-func btAction5Input(withMatches bool) string {
+func btImpossibleBytesInput(withMatches bool) string {
 	const targetSize = 50 * 1024
 	// Filler contains no letters. Includes digits, punctuation, whitespace.
 	filler := []byte("0123456789.,;:!?@#$%^&*()-+=[]{}|\\/<> \t01234567")
@@ -1184,7 +1184,7 @@ func minLenQuantifierSkipInput(withMatches bool) string {
 	return string(b)
 }
 
-// setShuftiLNMInput builds ~50 KB for the H.3 set-shufti-lnm case.
+// setShuftiLNMInput builds ~50 KB for the set-shufti-lnm case.
 //
 // When withMatches is true: lowercase prose with occasional uppercase
 // "<Letter>1:<body>\n" log lines mixed in. Shufti finds a candidate in
@@ -1285,11 +1285,11 @@ func setShuftiDenseHarmInput(withMatches bool) string {
 
 // impossibleRunInput builds ~50 KB of input dominated by bytes outside
 // the [a-zA-Z] class — digits, punctuation, whitespace. For the LNM
-// Action 5 (impossible-byte SIMD skip) demonstration.
+// impossible-byte SIMD skip demonstration.
 //
 // When withMatches is true: 5 letter runs (≥8 chars) embedded between
 // long blocks of impossible bytes. The scalar prefix scan crawls
-// through the impossible runs byte-by-byte; Action 5 should
+// through the impossible runs byte-by-byte; LNM should
 // SIMD-skip them.
 // When withMatches is false: pure impossible bytes, no letter runs.
 func impossibleRunInput(withMatches bool) string {
@@ -1319,7 +1319,7 @@ func impossibleRunInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// denseSecretsInput builds ~50 KB for LM-0's dense-secrets case
+// denseSecretsInput builds ~50 KB for the dense-secrets case
 // (`ghp_[A-Za-z0-9]{36}`). When withMatches, packs back-to-back valid
 // tokens separated by ", " so an exhaustion-driven find() pass visits
 // hundreds of matches instead of scanning past just one. When false, the
@@ -1346,8 +1346,8 @@ func denseSecretsInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// denseAkiaInput builds ~50 KB for LM-0's dense-akia case
-// (`AKIA[A-Z0-9]{16}`) — LM-1's primary measurement target (N=16 < 24).
+// denseAkiaInput builds ~50 KB for the dense-akia case
+// (`AKIA[A-Z0-9]{16}`) — the lit-chain gate relaxation's primary target (N=16 < 24).
 // Same shape as denseSecretsInput, sized for this token's length.
 func denseAkiaInput(withMatches bool) string {
 	const targetSize = 50 * 1024
@@ -1371,7 +1371,7 @@ func denseAkiaInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// denseWordsInput builds ~50 KB for LM-0's dense-words-grouped case
+// denseWordsInput builds ~50 KB for the dense-words-grouped case
 // (`(\w+)` groups mode). When withMatches, English-like prose (a word
 // every ~6 bytes on average); when false, 50 KB of punctuation with no
 // \w byte at all, so the internal find() never has anything to report.
@@ -1393,8 +1393,8 @@ func denseWordsInput(withMatches bool) string {
 	return string(b[:targetSize])
 }
 
-// denseTagsInput builds ~50 KB for LM-0's dense-tags case (`<[^>]+>`) —
-// LM-3's target (non-mid-accept self-loop: the accept state sits at `>`,
+// denseTagsInput builds ~50 KB for the dense-tags case (`<[^>]+>`) —
+// the non-mid channel's target (non-mid-accept self-loop: the accept state sits at `>`,
 // one byte after the self-loop body). Tags every ~20 bytes when
 // withMatches; no-match input has no `<` byte anywhere.
 func denseTagsInput(withMatches bool) string {
@@ -1418,10 +1418,10 @@ func denseTagsInput(withMatches bool) string {
 }
 
 // denseQuotedInput builds ~50 KB for the dense-quoted / dense-quoted-short
-// cases (`"[a-z0-9]+"`) — LM-3's target and harm/hysteresis guard. When
+// cases (`"[a-z0-9]+"`) — the non-mid channel's target and harm/hysteresis guard. When
 // short is false, tokens cycle 20..50 bytes (multiple 16-byte SIMD chunks
 // per run); when short is true, tokens cycle 3..6 bytes (every bulk-skip
-// attempt advances < 16 bytes, exercising the task-38 hysteresis). No-match
+// attempt advances < 16 bytes, exercising the non-mid hysteresis). No-match
 // input contains no `"` at all.
 func denseQuotedInput(withMatches, short bool) string {
 	const targetSize = 50 * 1024
@@ -1455,7 +1455,7 @@ func denseQuotedInput(withMatches, short bool) string {
 }
 
 // densePrintableInput builds ~50 KB for the dense-printable /
-// dense-printable-short cases (`:[ -~]{10,}`) — LM-5's target (65-239-byte
+// dense-printable-short cases (`:[ -~]{10,}`) — the widened band's target (65-239-byte
 // Shufti band). Tokens are a literal ':' followed by a run cycling over
 // the full printable range 0x20..0x7e; run length cycles 65..150 bytes
 // (long, short=false) or 10..15 bytes (at the pattern's own minimum,
@@ -1494,8 +1494,8 @@ func densePrintableInput(withMatches, short bool) string {
 	return string(b[:targetSize])
 }
 
-// denseBareUpperInput builds ~50 KB for LM-0's dense-bare-upper case
-// (`[A-Z]{8,}`) — LM-4's target (bare self-loop, no literal prefix; today
+// denseBareUpperInput builds ~50 KB for the dense-bare-upper case
+// (`[A-Z]{8,}`) — the bare-prefix gate's target (bare self-loop, no literal prefix; today
 // detectShuftiSelfLoop bails on len(l.prefix)==0). Run lengths cycle
 // 10..30 bytes, separated by single spaces, when withMatches; no-match
 // input is plain lowercase prose.
@@ -1526,8 +1526,8 @@ func denseBareUpperInput(withMatches bool) string {
 }
 
 // denseSetSharedPrefixInput builds ~50 KB for the dense-set-shared-prefix
-// case (two eyJ-prefixed counted-chain patterns, N=20 and N=40) — LM-6's
-// primary measurement target. Alternates the two token lengths when
+// case (two eyJ-prefixed counted-chain patterns, N=20 and N=40) — the counted-chain
+// split's primary measurement target. Alternates the two token lengths when
 // withMatches; token-free filler of the same size otherwise.
 func denseSetSharedPrefixInput(withMatches bool) string {
 	const targetSize = 50 * 1024
@@ -1601,7 +1601,7 @@ func setQuotedInput(withMatches, short bool) string {
 
 // setClassChainInput builds ~50 KB for the literal-less scan cases.
 //
-// The two inputs differ in the axis task 69 turns on, not just in whether
+// The two inputs differ in the axis the union-scan stride turns on, not just in whether
 // they match: the no-match input is SPARSE in [a-z] (the byte class every
 // pattern starts with), so the union automaton's entry state sits in a long
 // self-loop run that a SIMD skip can stride over. The match input is dense
@@ -1703,7 +1703,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 // compileSetMode compiles tc.setPatterns as a regexped set under the given
 // LikelyMode and returns standalone WASM exporting the set `find`. The mode is
 // applied via the set's own `hints:` field — the set's resolveHints(sc.Hints)
-// call is what actually consumes it (H.3 frontend density gate); none of
+// call is what actually consumes it (the set frontend density gate); none of
 // these entries carry their own _func fields, so there is no per-pattern
 // fallback to plumb.
 func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
@@ -2129,7 +2129,7 @@ func measureWasm(tc testCase, wasm []byte, mode compile.LikelyMode, input string
 // correctness bug can hide in exactly this corpus's blind spot: a "good"
 // fuel/time number looks identical whether the compiled WASM took a
 // legitimately cheaper path or is silently returning the wrong answer
-// (a past defect’s gap-e-groups case is exactly this — a false
+// (the mixed-prefix-groups case is exactly this — a false
 // negative that went unnoticed here because nothing checked the return
 // value, only its cost). So every (pattern, mode, input) combination that
 // gets a fuel/time number here also gets checked against Go's regexp
@@ -2365,7 +2365,7 @@ func checkFindExhaust(engine *wasmtime.Engine, wasmBytes []byte, input string, r
 // composition documented at compile.go's "Capture path" comment performs an
 // internal find (not a strict anchored-at-ptr check) for any shape that
 // doesn't hit the native lit-chain fast path — confirmed empirically for
-// a past defect’s gap-e-groups repro, where a ptr=0 call over a 10KB
+// the mixed-prefix-groups repro, where a ptr=0 call over a 10KB
 // buffer found a match starting mid-buffer. Mirrors tools/re2test's col5
 // check: plain FindStringSubmatchIndex, no anchoring requirement.
 func expectedGroups(re *regexp.Regexp, input string) []int {
@@ -2416,7 +2416,7 @@ func checkGroups(engine *wasmtime.Engine, wasmBytes []byte, input string, re *re
 // the ABSOLUTE positions the export reports: advance to the match end,
 // or one past the start when the match is empty.
 //
-// It used to model the pre-task-54 relative rule (advance by slots[1], off++
+// It used to model the old relative rule (advance by slots[1], off++
 // when that is zero) and shift the oracle's own spans by `off` — both of which
 // are now wrong twice over, since the export is handed the whole buffer and
 // returns positions in it.
@@ -2725,20 +2725,25 @@ func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan,
 // runSetExhaust drives the set `find` export to exhaustion, the way a
 // generated iterator does: zero the gate array, then call
 //
-//	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
+//	find(ptr, len, from, scratch_ptr, out_ptr, out_cap) -> total at that position
+//
+// where scratch_ptr is the descriptor holding the gate pointer and (declined
+// here) the overlapping answer cache — see internal/abi.
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
 func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.Memory, plan setMemPlan, inputLen int32) error {
-	gatePtr := plan.outputBase + setOutCap*12
+	gatePtr := plan.outputBase + setOutCap*abi.SetMatchTupleBytes
+	scratchPtr := gatePtr + setOutCap*4
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < setOutCap*4; i++ {
 		buf[gatePtr+i] = 0
 	}
+	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
-		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, gatePtr, plan.outputBase, setOutCap)
+		n, err := wcall(findFn, store, plan.inputBase, inputLen, from, scratchPtr, plan.outputBase, setOutCap)
 		if err != nil {
 			return err
 		}

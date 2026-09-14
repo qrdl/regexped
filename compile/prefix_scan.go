@@ -11,7 +11,7 @@ import (
 // bitmask on the stack: bit `k` set ⇔ lane k of the chunk is a byte in
 // `firstByteSet`.
 //
-// Used by `EmitPrefixScan` (LNM Action 3) as the SIMD strategy for
+// Used by `EmitPrefixScan` as the SIMD strategy for
 // first-byte sets of 9..64 bytes, replacing the older multi-eq emission
 // that did 4×N ops/chunk.
 //
@@ -523,7 +523,7 @@ type prefixScanParams struct {
 	// 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables).
 	TableMemIdx int
 
-	// LikelyNoMatch (LNM Action 5 — impossible-byte SIMD skip):
+	// LikelyNoMatch (impossible-byte SIMD skip):
 	// when true, the 17..64-byte first-byte set gate ignores the density
 	// heuristic and forces Shufti. Set from buildOpts.LikelyMode ==
 	// LikelyNoMatch.
@@ -832,9 +832,9 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 		// ── firstByteFlags / SIMD fast-skip ──────────────────────────────────
 		// Strategy based on len(p.FirstByteSet):
 		//   <= 8:    2-byte Teddy (when TeddyTwoByte) or 1-byte Teddy
-		// 9..16: Shufti — 2-half nibble lookup (LNM Action 3, shipped)
+		// 9..16: Shufti — 2-half nibble lookup
 		//   17..64:  Shufti when `shuftiBeatsScalar(set)`, else scalar
-		// (LNM Action 3 deferred portion — density heuristic)
+		// (density heuristic)
 		//   > 64:    scalar 256-byte flag table
 		//
 		// Shufti for 9..16 strictly beats the prior multi-eq emission

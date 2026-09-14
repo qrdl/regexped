@@ -1,11 +1,13 @@
 package abi
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 )
 
-// This package is two constants, so these tests pin the INVARIANTS the doc
+// This package is a handful of constants plus the descriptor writer, so these
+// tests pin the INVARIANTS the doc
 // comment states rather than the literal values — the values are arbitrary,
 // but every property below is load-bearing for a host trying to tell "the
 // input does not match" from "the engine gave up".
@@ -58,5 +60,63 @@ func TestPackedFindResultNeverCollides(t *testing.T) {
 				t.Errorf("packed(start=%d, end=%d) = %d collides with a sentinel", s, e, packed)
 			}
 		}
+	}
+}
+
+// TestWriteFindScratchLaysTheDocumentedLayout is the only executable check that
+// the descriptor's four fields land where every consumer expects them.
+//
+// The layout is agreed by five Go harnesses, six stub generators emitting
+// source text in other languages, and the WASM prologue compile/ splices into
+// every `find` — and a field written at the wrong offset is a wrong POINTER, not
+// a compile error. The magic word turns a stale caller into a trap; it cannot
+// help a writer that puts the gate pointer where the cache goes.
+//
+// The write is placed at a non-zero offset, because a `put` that forgot to add
+// `off` is correct at 0 and wrong everywhere else — which is exactly how the
+// harnesses call it.
+func TestWriteFindScratchLaysTheDocumentedLayout(t *testing.T) {
+	const off = 64
+	buf := make([]byte, off+FindScratchBytes+8)
+	// A canary past the descriptor: writing more than FindScratchBytes would
+	// corrupt whatever the caller put next to it, which in every harness is
+	// live memory.
+	for i := off + FindScratchBytes; i < len(buf); i++ {
+		buf[i] = 0xAB
+	}
+	WriteFindScratch(buf, off, 0x1111, 0x2222, 0x3333)
+
+	read := func(at int) uint32 { return binary.LittleEndian.Uint32(buf[off+at:]) }
+	for _, c := range []struct {
+		name string
+		at   int
+		want uint32
+	}{
+		{"magic", FindScratchMagicOff, FindScratchMagic},
+		{"gate_ptr", FindScratchGateOff, 0x1111},
+		{"cache_ptr", FindScratchCacheOff, 0x2222},
+		{"cache_len", FindScratchCacheLenOff, 0x3333},
+	} {
+		if got := read(c.at); got != c.want {
+			t.Errorf("%s at +%d = %#x, want %#x", c.name, c.at, got, c.want)
+		}
+	}
+	for i := off + FindScratchBytes; i < len(buf); i++ {
+		if buf[i] != 0xAB {
+			t.Fatalf("byte %d past the descriptor was overwritten: the write is wider than FindScratchBytes", i-off)
+		}
+	}
+
+	// Declining the cache is `0, 0` and must leave two honest zeros rather than
+	// a stale value: the same buffer is reused across drives in every harness.
+	WriteFindScratch(buf, off, 0x4444, 0, 0)
+	if got := read(FindScratchCacheOff); got != 0 {
+		t.Errorf("declined cache_ptr = %#x, want 0", got)
+	}
+	if got := read(FindScratchCacheLenOff); got != 0 {
+		t.Errorf("declined cache_len = %#x, want 0", got)
+	}
+	if got := read(FindScratchGateOff); got != 0x4444 {
+		t.Errorf("rewritten gate_ptr = %#x, want 0x4444", got)
 	}
 }

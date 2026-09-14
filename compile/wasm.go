@@ -67,8 +67,7 @@ type dataSegment struct {
 //
 // Like stripSegCount, rawData is always appendDataSegment's own output, so a
 // LEB128 decode failure here is an internal invariant violation, not malformed
-// user input — see the note on stripSegCount in compile.go
-// B39.
+// user input — see the note on stripSegCount in compile.go.
 func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
 	off := 0

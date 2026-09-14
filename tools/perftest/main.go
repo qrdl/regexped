@@ -22,6 +22,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -152,7 +153,7 @@ var tests = []testCase{
 		// JWT branch is replaced with a Stripe-style key using an explicit
 		// {N,M} range on a SINGLE <literal><class> segment. This is the
 		// shape analyseLitChainAltRange actually accepts (branches must be
-		// exactly [literal, repeat(class)] or the Gap E 3-element mixed-
+		// exactly [literal, repeat(class)] or the 3-element mixed-
 		// prefix shape) — secrets-combined's JWT branch is a multi-segment
 		// chain (literal, class+, literal ".", class+, literal ".", class+)
 		// that analyseLitChainAltRange rejects outright (only 2- or
@@ -484,7 +485,7 @@ var tests = []testCase{
 		},
 	},
 
-	// ── LNM / Opt 1 coverage on 100 KB workloads ─────────────────────────────
+	// ── LikelyNoMatch / dominant bulk-skip coverage on 100 KB workloads ─────────────────────────────
 	// These three patterns surface the wins (or absence thereof) of recent
 	// shipping work on a realistic-scale perftest.
 	{
@@ -510,8 +511,8 @@ var tests = []testCase{
 		},
 	},
 	{
-		// Shufti 9..16 first-byte-set amplifier (shipped portion of LNM
-		// Action 3). Pattern's first-byte set is `[0-9a-f]` (exactly 16
+		// Shufti 9..16 first-byte-set amplifier.
+		// Pattern's first-byte set is `[0-9a-f]` (exactly 16
 		// chars) — before Shufti, the prefix scan emitted 4*16=64 multi-
 		// eq SIMD ops per chunk; Shufti reduces to ~17 ops/chunk. On 100KB
 		// log-like input with sparse hex strings, this exercises both the
@@ -553,8 +554,8 @@ var tests = []testCase{
 		},
 	},
 	{
-		// Density-heuristic-POSITIVE case (deferred portion of LNM Action 3,
-		// shipped 2026-06-17): `[\x00-\x1f]` is 32 chars, all control
+		// Density-heuristic-POSITIVE case (shipped
+		// 2026-06-17): `[\x00-\x1f]` is 32 chars, all control
 		// bytes, every byte rarity class 0 → sum = 0 < threshold 40 →
 		// Shufti emitted. Scalar would scan every byte (no early exit
 		// since prose has zero control bytes); Shufti's 4-half nibble
@@ -2330,7 +2331,7 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	// out_cap is patterns_in_set: the exact worst case for a single position,
 	// so the exhaustion loop never overflows.
 	outCap := int32(len(sc.patterns))
-	gatePtr := outBase + outCap*12
+	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
 
 	// Warmup: exhaust all matches a few times.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
@@ -2365,16 +2366,23 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
 // start, so reading the first tuple is enough to resume.
+// gatePtr points at the gate array; the SCRATCH DESCRIPTOR the export actually
+// takes is built immediately above it (internal/abi), so one argument still
+// describes all of the caller's scratch.
 func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
 	inBase, inLen, gatePtr, outBase, outCap int32) int {
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < outCap*4; i++ {
 		buf[gatePtr+i] = 0
 	}
+	scratchPtr := gatePtr + outCap*4
+	// No answer cache: every set this harness drives is non-overlapping, and
+	// only an overlapping `find` reads one.
+	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 	total := 0
 	from := int32(0)
 	for {
-		res, err := wcall(findFn, store, inBase, inLen, from, gatePtr, outBase, outCap)
+		res, err := wcall(findFn, store, inBase, inLen, from, scratchPtr, outBase, outCap)
 		if err != nil {
 			return total
 		}
@@ -2443,7 +2451,7 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	copy(buf[inBase:], []byte(input))
 
 	outCap := int32(len(sc.patterns))
-	gatePtr := outBase + outCap*12
+	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
 
 	// Warmup call (uncounted).
 	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)

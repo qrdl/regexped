@@ -170,8 +170,8 @@ type BucketDiag struct {
 	// "bt-fallback" is a pattern admitted on the Backtracking engine after its
 	// suffix DFA exceeded max_fallback_states; it holds
 	// exactly one pattern and has NO table, so SuffixStates and TableBytes are
-	// 0 for it rather than unknown. "sparse-set" is G17's >32-pattern bucket
-	//: its accept is a per-state LIST rather than a bitmask, which
+	// 0 for it rather than unknown. "sparse-set" is the >32-pattern sparse-accept
+	// bucket: its accept is a per-state LIST rather than a bitmask, which
 	// is what lets it hold a whole shared-literal group in one bucket instead
 	// of ceil(N/32) of them.
 	Type         string       `json:"type"`

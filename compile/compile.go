@@ -124,7 +124,7 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 //
 // Root cause, live-verified: this is NOT a Cranelift-internal complexity
 // cliff at a specific loop count, and NOT a regexped code-bloat defect.
-// The pattern family (?:$*<9-10 literal bytes>){N} (bug 31's repro shape)
+// The pattern family (?:$*<9-10 literal bytes>){N} (a fuzzer-found repro shape)
 // stays on the cheap primary DFA/CompiledDFA path for N up to 113 (its
 // literal-chain state count stays under the default 1024-state cap), where
 // wasmtime.NewModule takes ~25-30ms regardless of table size. At N=114 the
@@ -143,10 +143,10 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 // BT's per-loop JIT cost is high enough per unit that a completely
 // ordinary-looking pattern can cost several seconds of uninterruptible
 // compile time with zero attribution — e.g. ~1.4s at 228 loop-frame locals,
-// ~6.2s at 400, ~12.1s at 510 (bug 32's own ErrBTStackTooLarge already
+// ~6.2s at 400, ~12.1s at 510 (ErrBTStackTooLarge already
 // rejects this specific family beyond ~510). tools/fuzz's `-fuzz` worker
 // treats any single call over ~10s as a hang and reports it as a crasher
-// (the same mechanism documented on maxNFAInsts and bug 31); a real caller
+// (the same mechanism documented on maxNFAInsts); a real caller
 // compiling such a pattern at build time would just see an unexplained
 // multi-second stall.
 var ErrBTLoopCountTooLarge = errors.New("compile: backtracking loop-frame-local count exceeds JIT-safe limit")
@@ -230,7 +230,7 @@ var ErrBTEmptyBodyLoopChainTooLarge = errors.New("compile: backtracking empty-bo
 // Backtracking code-generation site, before any WASM body is built. 12 is
 // chosen directly from live measurement (see
 // ErrBTEmptyBodyLoopChainTooLarge's doc): call time at N=12 chained `$*` is
-// ~9.5ms (comfortably fast, same bar bug 33 used for its own JIT-time cap),
+// ~9.5ms (comfortably fast, the same bar the JIT-time cap uses),
 // while N=14 already reaches ~101ms and every couple of steps beyond
 // roughly triples again. Ordinary patterns have at most a handful of
 // independent nullable loops; a long straight-line chain of them only
@@ -355,6 +355,28 @@ func hasBatchHint(hints []string) bool {
 
 // CompileOptions contains optional parameters for engine selection.
 type CompileOptions struct {
+	// Component emits the canonical-ABI adapters (cabi_realloc, the
+	// post-return, one lifted adapter per export) so the module can be wrapped
+	// into a Component Model component by `wasm-tools component new`. It FORCES
+	// standalone memory: the allocator grows memory 0, which is the module's
+	// own only when standalone. Off means today's bytes, unchanged.
+	//
+	// Filled from the config's `wasm_format` by CmdCompile, the way
+	// MaxDFAStates is filled from max_dfa_states.
+	Component bool
+	// ComponentPackage is the WIT interface prefix every canonical export name
+	// is built from, e.g. "regexped:regexps/matcher".
+	ComponentPackage string
+	// ComponentExportNames maps a pattern's configured func name to the
+	// canonical export name for its adapter. Supplied by the caller (generate
+	// derives it from the same WIT it writes) so the .wit and the core module
+	// cannot disagree.
+	ComponentExportNames map[string]string
+	// ComponentPatternResources is the name table for the ITERATING exports.
+	// `find` and `groups` are WIT resources — the input crosses into the
+	// component once, in the constructor, instead of on every step — so they
+	// carry a constructor/next/dtor trio rather than one function name.
+	ComponentPatternResources map[string]ComponentPatternResource
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
 	// (match/find) or TDFA (capture groups). If the DFA/TDFA exceeds this limit
 	// the engine falls back to Backtracking. 0 means use the default (1024).
@@ -483,7 +505,7 @@ type compiledPattern struct {
 	// A global is exactly as module-scoped as the table slot it replaces — the
 	// sharing semantics do not change — but the index comes from an allocator
 	// rather than from address arithmetic whose zero value is a real, writable
-	// table offset. That value is what B13's shortcut left unset, and the
+	// table offset. That value is what an earlier shortcut left unset, and the
 	// wrapper then wrote 8 bytes over table offset 0 on every groups() call:
 	// standalone, that offset is the CALLER'S OWN INPUT BUFFER, corrupted in
 	// place. A body reading a global its assembler never declared does not
@@ -799,7 +821,7 @@ func (p *compiledPattern) funcCount() int {
 	return len(p.funcLayout())
 }
 
-// batchOffsets returns the sub-indices of the optional LM-2 batch wrapper
+// batchOffsets returns the sub-indices of the optional batch wrapper
 // functions, which are always laid out last (after everything offsets()
 // accounts for). -1 if the corresponding export was not requested. Kept
 // separate from offsets() so its widely-shared 4-return signature (used by
@@ -1037,7 +1059,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// scan-to-find-extent → fill-captures pipeline and adjusts slot positions
 	// by the match start.
 	if needGroups {
-		// Gap C: single-pattern range with captures (greedy).
+		// Lit-chain range: single pattern with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
@@ -1087,7 +1109,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Pattern); ok {
 			if needMatch {
 				// Anchored alt match for the capture path is not specialised
-				// (Gap B). Fall through to the standard pipeline.
+				// here. Fall through to the standard pipeline.
 			} else {
 				p := &compiledPattern{
 					tableEnd:  tableBase,
@@ -1118,7 +1140,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 		}
 
-		// Gap A.4: lenient alternation with captures. Composes the lit-chain
+		// Lenient alternation with captures. Composes the lit-chain
 		// lenient-alt findBody (fast Teddy + per-branch verify) with the
 		// standard TDFA captureBody via the groups wrapper. Win: replace
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
@@ -1195,7 +1217,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	if !needGroups {
-		// Gap E: mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
+		// Mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
@@ -1231,16 +1253,16 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			return p, nil
 		}
-		// Gap C: single-pattern range `{N,M}`.
+		// Lit-chain range `{N,M}`, single pattern.
 		//
 		// Anchored range shapes are excluded from the FIND half of this path
 		// (they fall through to the classic DFA below):
 		//
-		//   - FABLE B7: buildLitChainRangeFindBody never consults
+		//   - buildLitChainRangeFindBody never consults
 		//     startAnchor/endAnchor — unlike its fixed-count sibling, which
 		//     has a full hasAnchors path — so `^A[0-9]{24,30}` matched at any
 		//     position and `A[0-9]{24,30}$` matched without reaching len.
-		//   - FABLE B10: the non-greedy collapse below freezes countMax at
+		//   - the non-greedy collapse below freezes countMax at
 		//     count, but Perl lets `{N,M}?` extend past N when a trailing
 		//     anchor demands it (`A[0-9]{24,30}?$` on "A"+26 digits matches in
 		//     Go, and the collapsed body reports no match).
@@ -1279,7 +1301,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				return p, nil
 			}
 		}
-		// Gap B: anchored match for strict lit-chain alternation.
+		// Anchored match for strict lit-chain alternation.
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
 				p := &compiledPattern{
@@ -1290,7 +1312,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				p.matchBody = appendLitChainAltMatchCodeEntry(nil, altp)
 				return p, nil
 			}
-			// Gap B lenient: anchored match for mixed lit-chain + DFA branches.
+			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, false); ok {
 				layout := planLenAltLayout(lenAltp, tableBase)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
@@ -1306,7 +1328,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 		}
 
-		// Gap E: strict alt of mixed-prefix branches.
+		// Strict alt of mixed-prefix branches.
 		if needFind && !needMatch {
 			if altp, ok := analyseLitChainAltPrefixed(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
@@ -1348,7 +1370,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 				return p, nil
 			}
-			// Gap C: strict alt of lit-chain branches with at least one range.
+			// Strict alt of lit-chain branches with at least one range.
 			if altp, ok := analyseLitChainAltRange(re.Pattern); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
@@ -1760,7 +1782,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// a leading `^`/`(?m:^)` followed by nothing that can consume a
 			// '\n' makes the backward scan's stop-at-'\n' exact rather than
 			// premature, and the forward continuation is already newline-aware
-			// (phase 3 picks wasmMidStartNewline; the forward loop emits
+			// (its third step picks wasmMidStartNewline; the forward loop emits
 			// emitNLPreAcceptCheck). See lineAnchoredPrefixSafe.
 			lineAnchorOK := false
 			if lap != nil {
@@ -1938,7 +1960,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 			}
 
-			// Opt 1 — dominant-self-loop SIMD bulk-skip. Default-on for all
+			// Dominant-self-loop SIMD bulk-skip. Default-on for all
 			// modes, mid-accept and non-mid-accept alike (2026-07-05).
 			// Non-mid was
 			// previously LM-gated because the original side-table dispatch
@@ -2212,7 +2234,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 
 		// The window offsets are two module globals, so no table region is
-		// reserved for them any more (TODO 75 group A).
+		// reserved for them any more.
 		winGlobal := int32(-1)
 		if needWindow {
 			if buildOpts.globals == nil {
@@ -2252,7 +2274,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 // standalone=false: module imports memory from "main" (for wasm-merge).
 // Both modes emit active data segments; in non-standalone mode the host stub's
 // reservation variable ensures the host runtime declares enough initial memory.
-func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool, globals *moduleGlobals) []byte {
+// assembleModule emits the core WASM module.
+//
+// opts carries the component configuration; its ZERO VALUE MEANS MODULE, so
+// every call site that predates components passes asmOpts{} and gets today's
+// bytes exactly — which `make byteident` is the proof of.
+func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool, globals *moduleGlobals, opts asmOpts) []byte {
 	// Pre-collect data segments.
 	totalSegs := 0
 	var rawData []byte
@@ -2261,12 +2288,37 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		rawData = append(rawData, p.dataBytes...)
 	}
 
-	// Pass 1: assign base function indices.
-	baseIdx := make([]int, len(patterns))
-	total := 0
-	for i, p := range patterns {
-		baseIdx[i] = total
-		total += p.funcCount()
+	// A component with an ITERATING export imports the `[resource-new]` canon
+	// builtin once per resource, and a function import occupies a function
+	// index — so every DEFINED function starts past them, pattern bodies
+	// included. Their internal `call` targets all derive from baseIdx, so the
+	// offset reaches them without any emitter knowing about it.
+	numFuncImports := 0
+	var resources []patternResource
+	if opts.Component {
+		resources = orderedPatternResources(patterns, opts.PatternResources, 0)
+		numFuncImports = len(resources)
+	}
+
+	// Pass 1: assign base function indices, past the imports.
+	baseIdx, definedTotal := patternBaseIndices(patterns)
+	for i := range baseIdx {
+		baseIdx[i] += numFuncImports
+	}
+	total := numFuncImports + definedTotal
+
+	// Component adapters are APPENDED after every pattern function, so no
+	// baseIdx and no per-pattern offset moves. Their own indices start at
+	// `total`: cabi_realloc, then cm_free, then cm_post, then one adapter each.
+	var adapters []componentAdapter
+	reallocIdx, freeIdx, postIdx, firstAdapterIdx := -1, -1, -1, -1
+	if opts.Component {
+		adapters = componentAdapters(patterns, opts.ExportNames, opts.PatternResources, numFuncImports)
+		reallocIdx = total
+		freeIdx = total + 1
+		postIdx = total + 2
+		firstAdapterIdx = total + 3
+		total += 3 + len(adapters)
 	}
 
 	var out []byte
@@ -2275,9 +2327,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 
 	// Type section: 4 fixed types (match, find, capture/groups, and
 	// alt-lit-anchor's forward_verify_i), plus an
-	// optional 5th (the LM-2 batch find/groups wrapper signature) — added
+	// optional 5th (the batch find/groups wrapper signature) — added
 	// only when some pattern actually has a batch export, so modules with
-	// no LM-2 usage (including LikelyMatch modules where every pattern's
+	// no batch export (including LikelyMatch modules where every pattern's
 	// batch shape is out of v1 scope) don't pay its few bytes. Nothing else
 	// ever references type index 4, so omitting it is always safe.
 	// (A different 4th type — for the LNM non-mid bulk-skip helper — was
@@ -2300,7 +2352,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	numTypes := 4
 	if anyBatch {
 		typeSection = append(typeSection,
-			0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // (i32×5)→i32 — LM-2 batch wrapper
+			0x60, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // (i32×5)→i32 — batch wrapper
 		numTypes++
 	}
 	// (i32,i32,i32,i32)→i32 — the groups/named-groups export with a `from`
@@ -2313,20 +2365,66 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
 		numTypes++
 	}
+	// cabi_realloc has the same (i32,i32,i32,i32)→i32 shape as the groups-from
+	// wrapper, so it reuses that type when one is already declared and adds it
+	// otherwise. cm_post's (i32)→() has no existing equivalent.
+	reallocTypeIdx, postTypeIdx := -1, -1
+	if opts.Component {
+		reallocTypeIdx = groupsFromTypeIdx
+		if reallocTypeIdx < 0 {
+			reallocTypeIdx = numTypes
+			typeSection = append(typeSection,
+				0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+			numTypes++
+		}
+		postTypeIdx = numTypes
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x00)
+		numTypes++
+	}
+	// (i32)→i32 — a resource's `next`, and the `[resource-new]` builtin it is
+	// imported with. Declared only when the config has an iterating export, so
+	// a component with nothing but `match` is unchanged.
+	nextTypeIdx := -1
+	if opts.Component && numFuncImports > 0 {
+		nextTypeIdx = numTypes
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x01, 0x7F)
+		numTypes++
+	}
 	typeSection[0] = byte(numTypes)
 	out = appendSection(out, 1, typeSection)
 
 	// Import section (embedded only): import "main" memory as memory[0].
 	// In the merged binary, main keeps memory[0] and our own memory becomes memory[1].
 	// Input data loads use implicit memory[0]; DFA table loads use explicit memory[1].
-	if !standalone {
+	//
+	// A COMPONENT never imports memory — it owns its own — but it does import
+	// one `[resource-new]` canon builtin per iterating export, which is what a
+	// constructor calls to turn its representation into a handle. Returning the
+	// representation instead type-checks, builds, and traps at the first use
+	// with "unknown handle index".
+	if !standalone || numFuncImports > 0 {
 		var importSec []byte
-		importSec = utils.AppendULEB128(importSec, 1) // 1 import
-		importSec = appendString(importSec, "main")   // module name
-		importSec = appendString(importSec, "memory") // field name
-		importSec = append(importSec, 0x02)           // kind: memory
-		importSec = append(importSec, 0x00)           // limits flags: no max
-		importSec = append(importSec, 0x00)           // min = 0 pages
+		n := 0
+		if !standalone {
+			n++
+		}
+		n += numFuncImports
+		importSec = utils.AppendULEB128(importSec, uint32(n))
+		if !standalone {
+			importSec = appendString(importSec, "main")   // module name
+			importSec = appendString(importSec, "memory") // field name
+			importSec = append(importSec, 0x02)           // kind: memory
+			importSec = append(importSec, 0x00)           // limits flags: no max
+			importSec = append(importSec, 0x00)           // min = 0 pages
+		}
+		// Same order as orderedPatternResources, which is what makes each
+		// constructor's import index the one the adapter list assigned it.
+		for _, r := range resources {
+			importSec = appendString(importSec, r.res.ResourceImport)
+			importSec = appendString(importSec, r.res.ResourceNew)
+			importSec = append(importSec, 0x00) // kind: function
+			importSec = utils.AppendULEB128(importSec, uint32(nextTypeIdx))
+		}
 		out = appendSection(out, 2, importSec)
 	}
 
@@ -2352,7 +2450,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotGroupsFromWrapper: byte(groupsFromTypeIdx), // (i32×4)→i32
 	}
 	var fs []byte
-	fs = utils.AppendULEB128(fs, uint32(total))
+	// `total` counts every function index INCLUDING the imported builtins; the
+	// function section declares only the defined ones.
+	fs = utils.AppendULEB128(fs, uint32(total-numFuncImports))
 	for _, p := range patterns {
 		for _, slot := range p.funcLayout() {
 			t, ok := singlePatternSlotType[slot.kind]
@@ -2362,6 +2462,24 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			fs = append(fs, t)
 		}
 	}
+	if opts.Component {
+		// cm_free and cm_post share the (i32)→() shape.
+		fs = append(fs, byte(reallocTypeIdx), byte(postTypeIdx), byte(postTypeIdx))
+		for _, a := range adapters {
+			switch a.kind {
+			case adapterMatch:
+				fs = append(fs, 0x00) // (i32,i32)→i32
+			case adapterPatCtor:
+				fs = append(fs, 0x02) // (ptr, len, start) → handle
+			case adapterPatFindNext, adapterPatGroupsNext:
+				fs = append(fs, byte(nextTypeIdx)) // (rep) → retptr
+			case adapterPatDtor:
+				fs = append(fs, byte(postTypeIdx)) // (rep) → ()
+			default:
+				fs = append(fs, 0x02) // (i32,i32,i32)→i32 — find and groups alike
+			}
+		}
+	}
 	out = appendSection(out, 3, fs)
 
 	// Memory section: own memory for both standalone and embedded.
@@ -2369,7 +2487,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	{
 		var mem []byte
 		mem = append(mem, 0x01, 0x00)
-		mem = utils.AppendULEB128(mem, uint32(memPages))
+		declPages := memPages
+		if opts.Component {
+			// One page for the allocator's free-list heads, which sit at the
+			// static top and are written without a bounds check.
+			declPages++
+		}
+		mem = utils.AppendULEB128(mem, uint32(declPages))
 		out = appendSection(out, 5, mem)
 	}
 
@@ -2380,6 +2504,21 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// harness, rather than a silent read of the wrong thing.
 	if globals == nil {
 		globals = &moduleGlobals{}
+	}
+	// The component allocator's two globals, allocated here so they land in the
+	// section emitted immediately below. See component.go for the layout.
+	//
+	// classHeadsBase is the static top — everything BELOW it is DFA tables
+	// written by data segments — and the heap proper starts past the free-list
+	// head array. The memory section above declares one extra page for
+	// components precisely so that array is in bounds before the first
+	// allocation grows anything.
+	heapGlobal, callListGlobal := uint32(0), uint32(0)
+	staticTop := memPages * 65536
+	classHeadsBase := staticTop
+	if opts.Component {
+		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		callListGlobal = globals.AllocInit(0)
 	}
 	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
 		out = appendSection(out, 6, globals.Section())
@@ -2406,6 +2545,19 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		}
 		if p.batchGroupsExport != "" {
 			numExports++
+		}
+	}
+	if opts.Component {
+		// cabi_realloc, plus one canonical name and one cabi_post_ name per
+		// adapter. Every post name points at the SAME function: a WASM function
+		// may be exported under any number of names, so one shared reset body
+		// serves them all.
+		numExports++
+		for _, a := range adapters {
+			numExports++
+			if a.kind.needsPost() {
+				numExports++
+			}
 		}
 	}
 	var es []byte
@@ -2448,11 +2600,32 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			es = utils.AppendULEB128(es, uint32(base+batchGroupsOff))
 		}
 	}
+	if opts.Component {
+		// The raw exports above are KEPT. They are unreachable from a component
+		// host — `component new` exposes only what the WIT declares — but they
+		// cost a few bytes and they keep the core module drivable by the
+		// module-path harnesses after `wasm-tools component unbundle`.
+		es = appendString(es, "cabi_realloc")
+		es = append(es, 0x00)
+		es = utils.AppendULEB128(es, uint32(reallocIdx))
+		for i, a := range adapters {
+			es = appendString(es, a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(firstAdapterIdx+i))
+			if !a.kind.needsPost() {
+				continue
+			}
+			es = appendString(es, "cabi_post_"+a.export)
+			es = append(es, 0x00)
+			es = utils.AppendULEB128(es, uint32(postIdx))
+		}
+	}
 	out = appendSection(out, 7, es)
 
-	// Code section.
+	// Code section. Defined functions only — `total` counts the imported canon
+	// builtins too.
 	var cs []byte
-	cs = utils.AppendULEB128(cs, uint32(total))
+	cs = utils.AppendULEB128(cs, uint32(total-numFuncImports))
 	for i, p := range patterns {
 		base := baseIdx[i]
 		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
@@ -2551,6 +2724,23 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly)
 		}
 	}
+	if opts.Component {
+		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentFreeBody(classHeadsBase))
+		cs = appendCodeEntry(cs, buildComponentPostBody(callListGlobal, freeIdx))
+		for _, a := range adapters {
+			switch a.kind {
+			case adapterMatch:
+				cs = appendCodeEntry(cs, buildMatchAdapterBody(reallocIdx, a.funcIdx))
+			case adapterFind:
+				cs = appendCodeEntry(cs, buildFindAdapterBody(reallocIdx, a.funcIdx))
+			case adapterGroups:
+				cs = appendCodeEntry(cs, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
+			default:
+				cs = appendCodeEntry(cs, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
+			}
+		}
+	}
 	out = appendSection(out, 10, cs)
 
 	// Data section: active segments targeting the correct memory index.
@@ -2616,6 +2806,17 @@ func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone boo
 func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
 	if !standalone {
 		opts.tableMemIdx = 1
+		// A component's allocator grows memory 0 and its exported "memory" is
+		// what the canonical ABI lowers into; embedded modules IMPORT memory 0
+		// from the host and keep their own as memory 1, so neither holds. This
+		// is a caller error, not a config one: CmdCompile forces standalone
+		// under `wasm_format: component`.
+		if opts.Component {
+			return nil, 0, errComponentNeedsStandalone
+		}
+	}
+	if err := opts.asmOpts(nil).validate(); err != nil {
+		return nil, 0, err
 	}
 	// One allocator per module, created before the loop so every pattern draws
 	// from the same counter and the assembler below declares exactly what they
@@ -2655,7 +2856,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone, globals), lastTableEnd, nil
+	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts(nil)), lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a
@@ -2768,38 +2969,21 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// `continue` past an analyzePattern error where CompileFile treats the
 		// same error as FATAL, so a config that cannot build could still
 		// produce a clean-looking diagnostics file describing a set with the
-		// broken pattern quietly missing from it (FABLE B23, third mechanism).
+		// broken pattern quietly missing from it.
 		// Sharing the function is what stops the two answers drifting again.
 		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
 		if err != nil {
 			return err
 		}
-		spec := SetSpec{
-			Name:        sc.Name,
-			MatchAny:    sc.MatchAny,
-			MatchAll:    sc.MatchAll,
-			ScanAny:     sc.ScanAny,
-			ScanAll:     sc.ScanAll,
-			Find:        sc.Find,
-			BatchFind:   sc.BatchFind(),
-			Overlapping: sc.Overlapping,
-			Patterns:    infos,
-			PatternIDs:  globalIDs,
-
-			DeclaredPatternCount: sc.PatternCount(cfg),
-		}
-		// Same budget the real compile uses (set_emit.go's setOpts). Without
-		// it --diag-json reports drops under the default 1024 while the build
-		// it is describing kept those patterns.
-		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{
-			MaxFallbackStates: cfg.MaxFallbackStates,
-			// The set's own hint. Omitting it made this re-run NEUTRAL
-			// whatever the config said, so --diag-json reported the frontend,
-			// union-scan body and member-skip counts of a compilation the user
-			// was not asking about — and those are hint-dependent selections
-			// for which this file is the only window.
-			LikelyMode: resolveHints(sc.Hints),
-		})
+		// THE SAME spec and options the real compile builds, through the same
+		// helper. This function RE-RUNS CompileSet rather than threading the
+		// build's own diagnostics out, so every field it gets wrong describes a
+		// compilation the user is not asking about — and it has: the set's
+		// LikelyMode was omitted, so the frontend, the union-scan body and the
+		// member-skip counts were all reported NEUTRAL whatever `hints:` said,
+		// and this file is the only window onto those.
+		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
+		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		if cs.diag != nil {
 			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)
@@ -2926,7 +3110,7 @@ const maxUnicodeRune = 0x10ffff
 // regexped is a BYTE engine. A rune above the mode's limit has no byte to be,
 // so the automaton silently truncates it — which is a wrong answer rather than
 // a missing feature, and was for a long time an entirely silent one (five
-// verified divergences from Go, FABLE B29). This is the gate that turns those
+// verified divergences from Go). This is the gate that turns those
 // into compile errors.
 //
 // The limit is 127 by default and 0xFF in byte mode. Three things are
@@ -2936,7 +3120,7 @@ const maxUnicodeRune = 0x10ffff
 //     plus `[\x2d-\U0010ffff]`; the second range names every rune there is,
 //     not a non-ASCII intention. Rejecting it would reject `.` and every
 //     negated class, which is a non-starter. That these consume ONE BYTE is
-//     documented byte semantics (B29 row 4).
+//     documented byte semantics.
 //
 //     The top endpoint is the whole test, and it does not — cannot — ask how
 //     the class was SPELLED. A complement is not merely like an explicit range
@@ -3263,7 +3447,7 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 	return append(b, 0x0B)
 }
 
-// buildBatchFindWrapperBody emits the WASM body for the LM-2 batch find
+// buildBatchFindWrapperBody emits the WASM body for the batch find
 // export. Signature (type 4):
 //
 //	(ptr i32, len i32, out_ptr i32, out_cap i32, start_pos i32) → i32 (count)
@@ -3373,7 +3557,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 	return append(cs, body...)
 }
 
-// buildBatchGroupsWrapperBody emits the WASM body for the LM-2 batch groups
+// buildBatchGroupsWrapperBody emits the WASM body for the batch groups
 // export. Signature (type 4), same as the batch
 // find wrapper:
 //

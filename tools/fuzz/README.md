@@ -89,7 +89,7 @@ would have been reported as an engine bug, or matched the oracle by luck.
 
 ## Regression tests (not fuzz targets)
 
-`bt_overflow_test.go` is a plain test, not a fuzz target: it pins the
+`backtrack_test.go`'s overflow cases are plain tests, not a fuzz target: it pins the
 BT-stack-overflow sentinel at exactly `numAlts * 4096 ± 1` frames across all five BT-hosting
 export shapes (`match`, `find`, `groups`, `find_batch`, `groups_batch`), and
 pins the ceiling itself so a change to `btAllocSizes` fails loudly instead of

@@ -210,7 +210,7 @@ type btSharedRegions struct {
 	// winGlobal is the first of TWO consecutive module globals holding
 	// (startOff, endOff) for window mode — the same pair the single-pattern
 	// path carries, and globals for the same reason: an allocator index has no
-	// zero value that is also a writable table address (TODO 75 group A).
+	// zero value that is also a writable table address.
 	winGlobal   int32
 	slotScratch int32 // 8-byte group-0 (start, end) buffer the BT body writes
 	end         int32 // one past everything above

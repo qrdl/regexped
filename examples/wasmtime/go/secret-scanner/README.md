@@ -21,16 +21,35 @@ and returns all matches with their pattern name and position.
 
 ## Prerequisites
 
-- `regexped` binary (run `make` in the repo root)
-- Go 1.23+ with `GOOS=wasip1 GOARCH=wasm` support
-- `wasm-merge` from [Binaryen](https://github.com/WebAssembly/binaryen)
-- `wasmtime` CLI
+The Makefile installs nothing. Install these first:
+
+| Tool | How to install |
+|---|---|
+| `regexped` | run `make` in the repo root |
+| Go 1.23+ | [go.dev/dl](https://go.dev/dl/) |
+| `wasm-merge` | from [Binaryen](https://github.com/WebAssembly/binaryen/releases): unpack a release and put its `bin/` on `PATH` |
+| `wasmtime` | `curl https://wasmtime.dev/install.sh -sSf \| bash` — see [wasmtime.dev](https://wasmtime.dev) |
+
+What each target needs:
+
+| Target | What it does | Needs |
+|---|---|---|
+| `make` | builds `final.wasm` — the steps below | `regexped`, Go, `wasm-merge` |
+| `make generate` | generates the Go stub `stub.go` | `regexped` |
+| `make build` | generates the stub if needed, then `GOOS=wasip1 GOARCH=wasm go build` into `app.wasm` | `regexped`, Go |
+| `make compile` | compiles the patterns to `secrets.wasm` | `regexped` |
+| `make merge` | merges the two into `final.wasm` — the same as `make` | `regexped`, Go, `wasm-merge` |
+| `make run` | builds if needed, then runs `final.wasm` under wasmtime on a sample token | all of the above, plus `wasmtime` |
+| `make clean` | removes the build outputs | — |
+
+`wasm-merge` is looked up on `PATH` (a config can name it with `wasm_merge_path:` instead).
 
 ## Build and run
 
 ```sh
-make
-echo "token: ghp_abcdef123456789012345678901234567890" | wasmtime final.wasm
+make       # build final.wasm
+make run   # run it on a sample token
+echo "token: ghp_abcdef123456789012345678901234567890" | wasmtime final.wasm   # or on your own input
 ```
 
 ## Build pipeline
@@ -46,7 +65,7 @@ regexped merge      →  merge app + patterns into final.wasm
 
 `stub.go` is auto-generated. The scan function keeps the config's name
 VERBATIM — `find: scan_secrets` in `regexped.yaml` yields `func scan_secrets`,
-not `ScanSecrets`; the PascalCase transform was retired (TODO task 62). Symbols
+not `ScanSecrets`; the PascalCase transform was retired. Symbols
 with no user-supplied name, like `PatternName`, keep Go's convention.
 
 `main.go` is ~20 lines:

@@ -6,7 +6,7 @@ MAIN_WASM   := target/$(WASM_TARGET)/release/url_guard.wasm
 PATTERN_WASM := patterns.wasm
 FINAL_WASM  := final.wasm
 
-.PHONY: all generate build compile merge clean
+.PHONY: all generate build compile merge run clean
 
 all: merge
 
@@ -37,6 +37,11 @@ $(FINAL_WASM): $(MAIN_WASM) $(PATTERN_WASM) regexped.yaml $(REGEXPED)
 	$(REGEXPED) merge --config=regexped.yaml --main=$(MAIN_WASM) $(PATTERN_WASM)
 
 merge: $(FINAL_WASM)
+
+# final.wasm runs on FastEdge, not locally, so `make run` — which examples/Makefile
+# calls in every example — only says so.
+run:
+	@echo "fastedge/url-guard: nothing to run locally — deploy final.wasm to FastEdge (see docs/fastedge.md)"
 
 clean:
 	cargo clean

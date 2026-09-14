@@ -31,7 +31,7 @@ type litAnchorPoint struct {
 //
 // Deliberately narrower than analyseLitChainBranch's prefix handling: that
 // function requires the pattern's *suffix* to also be a bounded class-chain
-// (Gap E), which excludes any prefix ahead of an unbounded suffix like
+// (the mixed-prefix shape), which excludes any prefix ahead of an unbounded suffix like
 // `[^\n]+` (parsed as OpPlus, not OpRepeat) — exactly the shape lit-anchor
 // patterns commonly have. simpleClassPrefix only looks at the prefix, so it
 // applies regardless of what the suffix looks like.
@@ -328,7 +328,7 @@ func prefixContainsWordBoundary(re *syntax.Regexp) bool {
 // pattern's DFA, not a freshly-compiled `suffixRe` DFA
 // (`p.litAnchorFindTable`/`p.litAnchorFindLayout` are the whole-pattern
 // table/layout), and it does establish the preceding byte's newline context:
-// buildLitAnchorFindBody's phase 3 loads `ptr[rev_result-1]` and picks
+// buildLitAnchorFindBody's third step loads `ptr[rev_result-1]` and picks
 // wasmStart / wasmMidStartNewline / wasmMidStart accordingly, and its forward
 // loop calls emitNLPreAcceptCheck for a trailing `(?m:$)`. That has been true
 // since lit-anchor's original landing.
@@ -460,7 +460,7 @@ func canConsumeNewline(re *syntax.Regexp) bool {
 //     would then depend on context the scan does not track.
 //
 // The forward continuation is already newline-aware independently of this:
-// buildLitAnchorFindBody phase 3 selects wasmMidStartNewline from the byte
+// buildLitAnchorFindBody's third step selects wasmMidStartNewline from the byte
 // preceding the recovered match start, and its forward loop calls
 // emitNLPreAcceptCheck for any trailing `(?m:$)`.
 func lineAnchoredPrefixSafe(re *syntax.Regexp) bool {
@@ -482,7 +482,7 @@ type altLitAnchorBranch struct {
 
 // maxAltLitAnchorBranches bounds the branch count to the same 8-alternative
 // cap extractLitSet already applies to literal-alternation anchor points and
-// Gap E's layout planner applies to its own branch count — keeps 2-byte
+// the mixed-prefix layout planner applies to its own branch count — keeps 2-byte
 // Teddy available for the common case and bounds compile-time work.
 const maxAltLitAnchorBranches = 8
 

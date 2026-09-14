@@ -6,8 +6,8 @@ package compile
 // self-loop covers almost every byte, waiting for a handful of bytes that may
 // never arrive. Measured on the greedy-3 anchored automaton over
 // corpusNoMatch(): occupancy 4096/4096 sampled bytes in a single state whose
-// self-loop covers 254 of 256 bytes, the exceptions being '\n' and 'E'. G5
-// showed the per-byte loop is already minimal at 24 instructions; what it
+// self-loop covers 254 of 256 bytes, the exceptions being '\n' and 'E'. An
+// earlier measurement showed the per-byte loop is already minimal at 24 instructions; what it
 // could not show is that on such a walk the per-byte work is unnecessary
 // altogether. That is a SIMD bulk-skip shape.
 //
@@ -106,8 +106,8 @@ func dominantWalkStates(t *dfaTable) []dominantWalkState {
 // Deliberately asks dominantWalkStates ONLY, never memberWalkStates. A 1-byte
 // self-loop can hold a walk to end of input too, so widening this would be
 // defensible in the abstract — but it would flip futureOff from 0 to non-zero
-// on sets that have no wide-self-loop state at all, changing G8/G9 emission
-// far outside G11's remit. G11 is a skip, not a re-gate.
+// on sets that have no wide-self-loop state at all, changing the liveness and preflight emission
+// far outside the inverted skip's remit, which is a skip, not a re-gate.
 func hasNeverDyingState(t *dfaTable) bool {
 	return len(dominantWalkStates(t)) > 0
 }

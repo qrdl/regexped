@@ -769,7 +769,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	//
 	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
 	// reverted: it broke non-greedy loops (e.g. `^(?:(?:(?:a*?){0,}))$`)
-	// and other loop shapes outside bug 28's specific repro class — see
+	// and other loop shapes outside the specific repro class it targeted — see
 	// a past defect’s "Confidence"/investigation notes. All bt.loops
 	// heads need this, not just the empty-body-greedy subset.
 	extraFrameLocals := make([]uint32, 0, len(loopPCsSorted)+len(entryPCsSorted)+snapTotal)
@@ -1367,11 +1367,11 @@ func emitBTInstHandler(
 				// answer here depends on whether THIS SPECIFIC LOOP has made
 				// any real forward progress since it was entered — not since
 				// the whole match attempt began (a mandatory prefix before
-				// the loop makes those two positions differ — #20), and not
+				// the loop makes those two positions differ), and not
 				// "never, unconditionally" (a body with no nested loop can
 				// still have made real progress in an earlier iteration
 				// before a later one resolves via a zero-width leaf
-				// assertion — #19). loopEntryLocalIdx[p] holds the position
+				// assertion). loopEntryLocalIdx[p] holds the position
 				// at which this loop's first-entry twin instruction last ran
 				// (see loopEntryOutOf's doc) — the correct, per-loop-instance
 				// reference point, in place of both the old unconditional
@@ -2294,7 +2294,7 @@ func buildBTInnerDisp(
 	//
 	// Narrowing this to only bt.emptyBodyGreedyLoop heads was tried and
 	// reverted: it broke non-greedy loops and other loop shapes outside
-	// bug 28's specific repro class — see buildBacktrackBody's matching note.
+	// the specific repro class it targeted — see buildBacktrackBody's matching note.
 	loopPCsSorted := make([]int, 0, len(bt.loops))
 	for pc := range bt.loops {
 		loopPCsSorted = append(loopPCsSorted, pc)
@@ -2534,8 +2534,8 @@ func entryLoopPCsSorted(bt *backtrack) []int {
 // a backtrack pop if not saved/restored the same way.
 //
 // Narrowing this to only count bt.emptyBodyGreedyLoop heads was tried and
-// reverted (breaks non-greedy loops and other loop shapes outside bug 28's
-// specific repro class) — must count every bt.loops head.
+// reverted (breaks non-greedy loops and other loop shapes outside the
+// specific repro class it targeted) — must count every bt.loops head.
 func btNumLoopFrameLocals(bt *backtrack, withCaptureSnapshots bool) int {
 	n := len(bt.loops) + len(bt.emptyBodyGreedyLoop)
 	if withCaptureSnapshots {
@@ -2782,7 +2782,7 @@ func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams
 // them the place that decides them. They agreed only by coincidence, and a
 // wrong index is not a validation error: WASM locals are zero-initialised, so
 // naming the wrong one yields a module that runs and scans from somewhere
-// unintended. Same defect class as TODO 67's, which this is the first site of.
+// unintended.
 //
 // The v128 group is fixed at six here because that is the widest shape the
 // scan can ask for (two-byte Teddy); a body with fewer simply never names the

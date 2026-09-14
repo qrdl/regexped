@@ -8,7 +8,7 @@ FINAL_WASM := final.wasm
 
 .PHONY: all generate compile build merge run clean
 
-all: run
+all: merge
 
 # Step 1 – generate Rust stub from config
 # $(REGEXPED) is a prerequisite of every rule below that runs it: the generated

@@ -5,7 +5,7 @@
 run:
 	go run . $(ARGS)
 
-# Clear LikelyMatch win on the matching-inputs table (LM-1: relaxes the
+# Clear LikelyMatch win on the matching-inputs table (relaxes the
 # lit-chain SIMD-verify gate from N>=24 to N>=1; see tools/likelytest's
 # "dense-akia" case). AKIA[A-Z0-9]{16} has
 # count N=16, below the neutral/LikelyNoMatch gate of 24 but above
@@ -14,7 +14,7 @@ run:
 # counted-chain verify path instead. The old example here
 # (https://cdn\.io/[0-9a-f]{64}, N=64) was already >=24 under neutral,
 # so LikelyMatch never changed its codegen and the win was always 0% —
-# it predates LM-1 lowering the gate and was never revisited.
+# it predates LikelyMatch lowering the gate and was never revisited.
 example-lm:
 	go run . -pattern 'AKIA[A-Z0-9]{16}' -mode find -inputs examples/lm_akia_inputs.txt $(ARGS)
 
@@ -33,10 +33,10 @@ example-lnm:
 #     lmBareShuftiEligible) — SIMD self-loop bulk-skip through a long run of
 #     matching bytes, big win on dense matching input, no effect on
 #     non-matching input (self-loop is never entered).
-#   - LikelyNoMatch's dominant-state SIMD bulk-skip (Opt 1) speeds up
+#   - LikelyNoMatch's dominant-state SIMD bulk-skip speeds up
 #     scanning through bytes outside the first-byte class, big win on
 #     non-matching input, no effect once inside a real match run.
-# The old example here (`[0-9]{8}ghp_[A-Za-z0-9]{200}`) relied on Gap E
+# The old example here (`[0-9]{8}ghp_[A-Za-z0-9]{200}`) relied on the mixed-prefix path
 # (analyseLitChainPrefixed), which is not LikelyMode-gated at all — it always
 # emits identical code regardless of mode, so the win was always 0%/0%.
 example-combined:

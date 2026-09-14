@@ -5,7 +5,7 @@ It answers a single question: **can this set benefit from a `hints:` value?**
 
 ```
 settest -config <yaml> [-set <name>] [-cap <capability>] -inputs <file>
-        [-detailed] [-force-frontend <fe>] [-adaptive on|off] [-iters <n>]
+        [-detailed] [-force-frontend <fe>] [-adaptive on|off] [-cache on|off] [-iters <n>]
 ```
 
 `-config` takes the same YAML `regexped compile` reads, so the set under test is
@@ -92,6 +92,28 @@ The module is compiled with every capability the config declares, not just the
 driven one: that is the module you would ship, so it is the one whose size is
 worth reporting. It also makes the identical-WASM verdict conservative in the
 right direction — "identical" is a definitive no for every capability at once.
+
+## The answer cache, and the `cache` column
+
+For an `overlapping: true` set, `find` is driven **with** the answer cache every
+generated stub reserves — sized and strided by the same `config` functions the
+stubs use, zeroed and re-stamped per drive exactly as the gate array is. That
+matters because the plain `find` reads the cache the same way the batch entry
+does: measuring without one would report a walk that nothing ships.
+
+A `cache` column then appears, carrying the region header's own verdict:
+
+| value | meaning |
+|---|---|
+| `swept` | the drive crossed the trigger and the sweep answered the rest |
+| `walked` | a region was offered and the drive never needed it |
+| `refused` | the sweep declined the region; the drive walked |
+| `—` | no region offered: not `find`, not overlapping, or a shape the sweep declines |
+
+`-cache off` measures the bare walk, which is what this tool did before the
+column existed. The difference is worth seeing at least once — on `a*` over
+5,000 `a`s the same module reports 33,306,262 fuel walking and 1,895,494 with
+the cache, a 17.6x gap that no other column in the output would have explained.
 
 ## `-adaptive`
 

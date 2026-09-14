@@ -41,7 +41,7 @@ seed-set:                       ## set find_all
 
 # Each fuzz-* goal pairs -fuzz with a matching -run. Without the -run filter,
 # `go test -fuzz=X` still replays EVERY other target's seed corpus first, so one
-# open bug anywhere (e.g. bug 40 in FuzzGroups) aborts the run before the
+# open bug anywhere (e.g. one in FuzzGroups) aborts the run before the
 # requested target ever starts fuzzing.
 fuzz-match:
 	go test -run=FuzzMatch -fuzz=FuzzMatch -fuzztime=10m .

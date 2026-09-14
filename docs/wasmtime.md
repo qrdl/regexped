@@ -15,16 +15,23 @@ For pure-WASM in-browser or Node.js usage, see [browser.md](browser.md) and
 [node.md](node.md) — those flows use the standalone WASM output and do not
 involve `wasm-merge`.
 
+wasmtime also runs a **component** build (`wasm_format: component`): the guest is
+itself a component, targeting `wasm32-wasip2`, and `regexped merge` composes it
+with the regexp component using `wac` rather than merging with `wasm-merge`. The
+pipeline below is the same shape; [component.md](component.md) covers the
+differences.
+
 ## Prerequisites
 
 - `regexped` binary (`go install github.com/qrdl/regexped@latest` or build from source)
-- [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen toolkit) — combines the host module with the regexp module
+- [`wasm-merge`](https://github.com/WebAssembly/binaryen) (Binaryen toolkit) — combines the host module with the regexp module (module format)
+- for a component build instead: [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools), which `regexped compile` and `regexped merge` use, and [`wac`](https://github.com/bytecodealliance/wac), which `regexped merge` composes with
 - [`wasmtime`](https://wasmtime.dev) CLI
 - Toolchain for the host language:
-  - **Rust** — `rustup target add wasm32-wasip1`
+  - **Rust** — `rustup target add wasm32-wasip1` (`wasm32-wasip2` for a component guest)
   - **Go** — Go 1.23+ (compile with `GOOS=wasip1`)
   - **C** — `clang` with `wasm-ld` (`clang-19` works without a WASI sysroot)
-  - **AssemblyScript** — Node.js 18+ (`npx asc`)
+  - **AssemblyScript** — Node.js 16+ with npm 7+; `npm install` in your project fetches `assemblyscript` and `@assemblyscript/wasi-shim`
 
 ## Configuration
 
@@ -106,22 +113,27 @@ Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/was
 | Language | Example | Engine | Demonstrates |
 |---|---|---|---|
 | Rust | [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) | DFA | Anchored match — validate IPv6 URLs |
-| Rust | [`rust/secrets/`](../examples/wasmtime/rust/secrets/) | DFA find | Three-pattern credential scan (GitHub PAT, JWT, AWS) |
-| Rust | [`rust/secret-scanner/`](../examples/wasmtime/rust/secret-scanner/) | Set `find` | Multi-pattern secret detection, calling the WASM export directly (gate array and all) |
+| Rust | [`rust/secrets/`](../examples/wasmtime/rust/secrets/) 🧩 | DFA find | Three-pattern credential scan (GitHub PAT, JWT, AWS) as a **component**: a wasip2 guest composed with `wac` |
+| Rust | [`rust/secret-scanner/`](../examples/wasmtime/rust/secret-scanner/) 🧩 | Set `find` | Multi-pattern secret detection from a native host, loading the set as a module (the WASM export called directly, gate array and all) and as a component |
 | Go | [`go/csv/`](../examples/wasmtime/go/csv/) | TDFA named groups | CSV parse + email validation |
 | Go | [`go/sql-injection/`](../examples/wasmtime/go/sql-injection/) | Backtracking | SQL injection capture groups |
 | Go | [`go/secret-scanner/`](../examples/wasmtime/go/secret-scanner/) | Set `find` | Set composition from Go (wasip1), via the generated `iter.Seq` |
-| C | [`c/url-parts/`](../examples/wasmtime/c/url-parts/) | TDFA named groups | Parse URLs into `scheme`/`host`/`port`/… |
+| C | [`c/url-parts/`](../examples/wasmtime/c/url-parts/) 🧩 | TDFA named groups | Parse URLs into `scheme`/`host`/`port`/…, as a module and as a component by two routes |
 | AssemblyScript | [`as/find-email/`](../examples/wasmtime/as/find-email/) | TDFA | Email extraction with `user`/`domain` groups |
 | AssemblyScript | [`as/inject-scanner/`](../examples/wasmtime/as/inject-scanner/) | Set | Injection pattern scanner |
 
-Most examples have a `Makefile` that runs the full `generate → host build →
-compile → merge → wasmtime run` pipeline shown above. `rust/secret-scanner/`
-is the exception: it's a standalone (no `output` field, no merge step)
-example that embeds wasmtime as a library instead — a native `cargo build`
-host binary loads `secrets.wasm` directly via the `wasmtime` crate and runs
-with `cargo run --release`, the same pattern described in
-[Embedding wasmtime as a library](#embedding-wasmtime-as-a-library) above.
+Every example has a `Makefile`: `make` builds it and `make run` runs it. The
+module-format examples follow the `generate → host build → compile → merge →
+wasmtime run` pipeline shown above. `rust/secrets/` builds a component — its
+guest targets `wasm32-wasip2` and `regexped merge` composes with `wac` — and
+`c/url-parts/` builds a module by default plus a component by two more routes
+(`make component-run`, `make wasip2-run`).
+
+`rust/secret-scanner/` is the exception to merging: a native `cargo build` host
+embeds wasmtime as a library and loads the regexp output directly — the module
+with `make run`, the component with `make component-run` — the pattern described
+in [Embedding wasmtime as a library](#embedding-wasmtime-as-a-library) above.
+Each example's README lists the tools it needs.
 
 ## Related
 

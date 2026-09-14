@@ -5,7 +5,7 @@ exact bytes its `patterns.yaml` compiles to. `compile/byteident_test.go`
 recompiles them and compares byte for byte — no tolerance.
 
 They exist because the set redesign shares emitters with the
-single-pattern path, and D6 of that plan says single-pattern behaviour must not
+single-pattern path, and single-pattern behaviour must not
 change. Byte identity is the only evidence strong enough for "must not change":
 a behavioural test proves the cases it tries, and a shared-emitter regression
 is exactly the kind that hides in the cases nobody tried.
@@ -38,7 +38,7 @@ add a fixture for it.
 | `strict_alt` | `AKIA[A-Z0-9]{16}\|ghp_[A-Za-z0-9]{20}` | strict alternation of lit-chain branches — `buildLitChainAltFindBody` | Compiled DFA |
 | `lenient_alt` | `ERROR[0-9]{3}\|WARNING[0-9]{3}` | lenient alternation find — `buildLitChainAltLenientFindBody`, the one find body whose scan cursor is NOT `locAttemptStart` | Compiled DFA |
 | `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
-| `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | Gap E: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
+| `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | mixed-prefix: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 | `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
 | `lm_sole_dominant` | `[a-zA-Z]{20,}` + `prefer-match` | the LikelyMatch mid-accept dominant dispatch and its Shufti self-loop bulk skip. `prefer-match` reached NO single-pattern fixture before this one — only the two set fixtures — so every LM-gated emitter in a find body was unpinned | Compiled DFA |
 
@@ -46,8 +46,8 @@ add a fixture for it.
 
 Everything above is SINGLE-PATTERN. Until these existed, set output had no
 byte-identity pin at all — every set change was made without the drift check the
-single-pattern path has had since the beginning, which is the gap TODO 65 names
-as a hard prerequisite for splitting `CompileSet`.
+single-pattern path has had since the beginning, a gap that must stay closed
+before `CompileSet` can ever be split.
 
 The failure mode is the expensive one. `CompileSet` is a memory allocator whose
 ordering invariant is enforced by prose: reorder two layout blocks and two table
@@ -60,12 +60,14 @@ that reads one table through another's bytes.
 | `set_teddy` | 17..64 literals with DIVERSE first bytes, nibble tables | teddy |
 | `set_ac` | >16 literals, LOW first-byte diversity (`aho_corasick.go`) | ac |
 | `set_scalar` | no literal to anchor on — no prefilter emitted | scalar |
-| `set_sparse` | G17 sparse accept: 40 patterns in ONE bucket, past the 32 a u64 mask allows | packed-pair |
+| `set_sparse` | sparse accept: 40 patterns in ONE bucket, past the 32 a u64 mask allows | packed-pair |
 | `set_member_skip` | the SAME sparse shape under `prefer-match`, which adds the member self-loop skip. Paired with `set_sparse` on purpose: that one pins the body without the skip, so a diff that moves both is the body and a diff that moves only this one is the skip | packed-pair |
 | `set_anchored` | the anchored pair alone — an anchored-only set emits NO literal frontend | packed-pair |
 | `set_scan` | the scan pair: non-anchored, offset-taking, no positions | packed-pair |
 | `set_overlap` | `overlapping: true` — every-start enumeration, same signature as gated find | packed-pair |
 | `set_batch` | `hints: [batch-find]` — a second entry point over ONE shared worker | packed-pair |
+| `set_overlap_sweep` | `overlapping: true` over LITERAL-LESS patterns, which is what puts a SWEEP in the module: the checkpoint pass, the block materialiser, the projection table and the successor scratch. `set_overlap` above is eight literals and contains none of them | scalar |
+| `set_overlap_sweep_batch` | the same sweep with `hints: [batch-find]`. Only SERVING is per-entry — `find` returns a position's total where the batch entry returns what it wrote — so the two serving paths are separate code and are pinned separately | scalar |
 
 `TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
 capability list from the diagnostics on every run, for the same reason the
@@ -74,7 +76,7 @@ one frontend would still pass the byte comparison while defending nothing.
 
 **Shufti is deliberately absent.** It is selected only when Aho-Corasick
 declines on budget, which no YAML config can arrange — so it cannot have a
-fixture here. It is covered instead by `tools/fuzz/set_shufti_test.go`, which
+fixture here. It is covered instead by `tools/fuzz/set_caps_test.go`, which
 reaches it through `CompileFileOpts`.
 
 

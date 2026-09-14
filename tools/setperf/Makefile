@@ -24,7 +24,7 @@ fuel-lnm:
 
 # Every literal frontend forced over every family, which is how the crossover
 # constants in chooseLiteralFrontend get interrogated rather than assumed
-# (TODO task 71 closed that question for the keywords families on a dense
+# (a past measurement closed that question for the keywords families on a dense
 # corpus; this is the command that re-asks it for a new shape).
 fuel-frontends:
 	@for fe in packed-pair teddy ac scalar; do \

@@ -1,0 +1,54 @@
+# The COMPONENT build of the same ten patterns and the same set.
+#
+# A separate config so both builds coexist in one directory: `make` builds the
+# module and drives the raw ABI by hand, `make component` builds this and drives
+# the WIT interface. Everything this one emits goes under component/.
+#
+# What differs from regexped.yaml: `wasm_format: component`, a `wit_package`
+# naming the interface, and no `stub_file:` — a NATIVE host cannot use a
+# generated stub (stubs are for guests compiled to WASM), so the host binds
+# against the sibling .wit with `wasmtime::component::bindgen!` instead.
+#
+# `emit_name_map: true` stays for symmetry with regexped.yaml, and is inert
+# here for the same reason: it generates a stub helper, and there is no stub.
+wasm_format:   component
+wit_package:   "secrets"
+wasm_file:     "component/secrets.wasm"
+import_module: "secrets"
+
+regexps:
+  - name: aws_key
+    pattern: 'AKIA[0-9A-Z]{16}'
+
+  - name: aws_secret
+    pattern: 'aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}'
+
+  - name: github_pat
+    pattern: 'ghp_[0-9a-zA-Z]{36}'
+
+  - name: github_oauth
+    pattern: 'gho_[0-9a-zA-Z]{36}'
+
+  - name: github_app
+    pattern: 'ghu_[0-9a-zA-Z]{36}'
+
+  - name: jwt
+    pattern: 'eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.'
+
+  - name: slack_token
+    pattern: 'xox[baprs]-[0-9a-zA-Z\-]{10,}'
+
+  - name: stripe_live
+    pattern: 'sk_live_[0-9a-zA-Z]{24,}'
+
+  - name: stripe_test
+    pattern: 'sk_test_[0-9a-zA-Z]{24,}'
+
+  - name: google_api
+    pattern: 'AIza[0-9A-Za-z\-_]{35}'
+
+sets:
+  - name: scanner
+    find: scan_secrets
+    emit_name_map: true
+    patterns: "all"

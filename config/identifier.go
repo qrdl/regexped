@@ -26,10 +26,13 @@ import (
 //     configured stub_type would itself accept. Rust, Go, JS and TS all permit
 //     non-ASCII identifiers; C and AssemblyScript are narrower. One common
 //     denominator is simpler to reason about than six.
-//   - Reserved words: the union across all six stub languages, applied
-//     regardless of stub_type. A name that is legal today would otherwise
-//     become a compile error in the caller's project the moment stub_type
-//     changes.
+//   - Reserved words: PER LANGUAGE. A name is checked against the keywords of
+//     the language whose stub the config generates, and against WIT's when a
+//     WIT document is produced (wasm_format: component, or stub_type: wit).
+//     The consequence is deliberate: `match_func: defer` loads for a Rust stub
+//     and fails once stub_type switches to Go — switching the language is
+//     expected to change what is legal. A config that generates no stub gets no
+//     keyword check at all.
 //   - Violations are a hard error before any compile or generate work.
 //
 // Deliberately NOT validated: `regexps[].name` and `sets[].name`. Those are
@@ -44,30 +47,16 @@ import (
 // symptom — duplicate map keys in the named-groups stub — and shares no code
 // with this check.
 
-// reservedWords is the union of reserved words across the six stub languages
-// regexped can emit: Rust, Go, C, JavaScript, TypeScript and AssemblyScript.
-//
-// The union is intentional: an export name is written into whichever language
-// stub_type selects, and a config that compiles today should not start failing
-// because stub_type changed. `match` is in here for exactly that reason — it is
-// a Rust keyword, and the Rust generator emits `pub fn <func>` for the public
-// wrapper, so a func named "match" produces invalid Rust today with no
-// diagnostic (only the FFI declaration is protected, by its ffi_ prefix and
-// #[link_name]).
+// The keyword lists below are applied PER LANGUAGE through keywordSets: a name
+// is written into the language stub_type selects, and only that language's
+// keywords can break it. `match` is in the Rust list because the Rust generator
+// emits `pub fn <func>` for the public wrapper, so a func named "match" is
+// invalid Rust.
 //
 // Contextual/soft keywords that are legal identifiers in their language (TS's
 // `type`, `from`, `of`, `get`, `set`, `string`, `number`; Go's predeclared
 // `len`, `cap`, `new`) are NOT included: they compile fine as function names,
 // and rejecting them would be over-reach rather than safety.
-var reservedWords = map[string]bool{}
-
-func init() {
-	for _, list := range [][]string{rustKeywords, goKeywords, cKeywords, jsKeywords, tsKeywords} {
-		for _, w := range list {
-			reservedWords[w] = true
-		}
-	}
-}
 
 // rustKeywords covers the 2015/2018/2021/2024 editions' strict keywords plus
 // the reserved-for-future-use set (rejecting those keeps a name from breaking
@@ -139,8 +128,10 @@ var tsKeywords = []string{
 	"abstract", "declare", "is", "namespace", "readonly", "require",
 }
 
-// ValidateIdentifier reports whether name is usable as a generated function
-// name in every stub language. See the package comment above for the rules.
+// ValidateIdentifier reports whether name has the SHAPE of a generated function
+// name in every stub language. Reserved words are not checked here: they depend
+// on which language the config generates, which ValidateConfig knows and this
+// does not.
 func ValidateIdentifier(name string) error {
 	if name == "" {
 		return fmt.Errorf("must not be empty")
@@ -164,10 +155,111 @@ func ValidateIdentifier(name string) error {
 		// (shadowable) global.
 		return fmt.Errorf("is the blank identifier, which is not a usable function name in Rust or Go")
 	}
-	if reservedWords[name] {
-		return fmt.Errorf("is a reserved word in at least one stub language (Rust/Go/C/JS/TS/AS) and cannot be used as a generated function name")
-	}
 	return nil
+}
+
+// witKeywords is WIT's keyword set. Every one is refused by wasm-tools as a
+// function, resource or package name.
+var witKeywords = map[string]bool{}
+
+func init() {
+	for _, w := range []string{
+		"as", "bool", "borrow", "char", "constructor", "enum", "export", "f32", "f64",
+		"flags", "from", "func", "future", "import", "include", "interface", "list",
+		"option", "own", "package", "record", "resource", "result", "s8", "s16", "s32",
+		"s64", "static", "stream", "string", "tuple", "type", "u8", "u16", "u32", "u64",
+		"use", "variant", "with", "world",
+	} {
+		witKeywords[w] = true
+	}
+}
+
+// exportNameRefs lists every user-supplied export name with where it came from,
+// in config order: the three _func fields, then every set capability.
+func exportNameRefs(cfg *BuildConfig) []exportRef {
+	var refs []exportRef
+	for _, re := range cfg.Regexps {
+		owner := "regexp"
+		if re.Name != "" {
+			owner = fmt.Sprintf("regexp %q", re.Name)
+		} else if re.Pattern != "" {
+			owner = fmt.Sprintf("regexp %q", re.Pattern)
+		}
+		for _, f := range []struct{ field, name string }{
+			{"match_func", re.MatchFunc},
+			{"find_func", re.FindFunc},
+			{"groups_func", re.GroupsFunc},
+		} {
+			if f.name != "" {
+				refs = append(refs, exportRef{owner: owner, field: f.field, name: f.name})
+			}
+		}
+	}
+	for _, s := range cfg.Sets {
+		for _, c := range s.Capabilities() {
+			refs = append(refs, exportRef{owner: fmt.Sprintf("set %q", s.Name), field: c.Field, name: c.Name})
+		}
+	}
+	return refs
+}
+
+// validateWITNames checks the names that become WIT identifiers when a WIT
+// document is produced, at LOAD rather than inside `wasm-tools component embed`.
+//
+// Every func and capability name is converted to kebab case, and that form must
+// be representable, must not be a WIT keyword, and must not collide with a type
+// the interface itself defines — `error-code` in both interfaces, `set-match` in
+// `sets`, where escaping cannot help because the problem is a duplicate. The
+// package and world names get the keyword check too.
+//
+// rustBindings adds the check a Rust COMPONENT stub needs: it reaches every
+// export through wit-bindgen, whose identifier is the snake_case of the WIT
+// name, so `Match` — not a Rust keyword as written — binds as `match`, which
+// is. The package name becomes a module path segment the same way.
+func validateWITNames(cfg *BuildConfig, rustBindings bool) []string {
+	var problems []string
+	for _, r := range exportNameRefs(cfg) {
+		if ValidateIdentifier(r.name) != nil {
+			continue // already reported by its shape
+		}
+		kebab, err := KebabIdent(r.name)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("%s: %s %q cannot be a WIT identifier (%v)", r.owner, r.field, r.name, err))
+			continue
+		case witKeywords[kebab]:
+			problems = append(problems, fmt.Sprintf("%s: %s %q is the WIT keyword %q once converted to a WIT name; pick another name",
+				r.owner, r.field, r.name, kebab))
+		case kebab == "error-code":
+			problems = append(problems, fmt.Sprintf("%s: %s %q becomes the WIT name error-code, which the interface already defines as its error type; pick another name",
+				r.owner, r.field, r.name))
+		case kebab == "set-match" && len(cfg.Sets) > 0:
+			problems = append(problems, fmt.Sprintf("%s: %s %q becomes the WIT name set-match, which the sets interface already defines as its match record; pick another name",
+				r.owner, r.field, r.name))
+		}
+		if snake := strings.ReplaceAll(kebab, "-", "_"); rustBindings && keywordSets["rust"][snake] {
+			problems = append(problems, fmt.Sprintf("%s: %s %q binds as %q in the Rust component stub (the snake_case of its WIT name %q), which is a Rust keyword; pick another name",
+				r.owner, r.field, r.name, snake, kebab))
+		}
+	}
+
+	pkgKey := "import_module"
+	if cfg.WitPackage != "" {
+		pkgKey = "wit_package"
+	}
+	if pkg, err := cfg.WitPackageName(); err == nil {
+		if witKeywords[pkg] {
+			problems = append(problems, fmt.Sprintf("%s %q gives the WIT package name %q, which is a WIT keyword", pkgKey, cfg.WitPackageRaw(), pkg))
+		}
+		if snake := strings.ReplaceAll(pkg, "-", "_"); rustBindings && keywordSets["rust"][snake] {
+			problems = append(problems, fmt.Sprintf("%s %q gives the WIT package %q, which the Rust component stub reaches as the module path segment %q — a Rust keyword; set wit_package",
+				pkgKey, cfg.WitPackageRaw(), pkg, snake))
+		}
+		if cfg.WitWorld != "" && witKeywords[cfg.WitWorld] {
+			problems = append(problems, fmt.Sprintf("wit_world %q is a WIT keyword", cfg.WitWorld))
+		}
+	}
+	return problems
 }
 
 // ValidateConfig checks every user-supplied export name in cfg, and the
@@ -219,6 +311,22 @@ func ValidateConfig(cfg *BuildConfig) error {
 		}
 	}
 
+	// Reserved words, PER LANGUAGE: the keywords of the one language whose stub
+	// this config generates, and WIT's when a WIT document is produced. A config
+	// that generates no source is not keyword-checked at all.
+	stubType, stubErr := ResolveStubType(*cfg)
+	if stubErr == nil && keywordSets[stubType] != nil {
+		for _, r := range exportNameRefs(cfg) {
+			if ValidateIdentifier(r.name) == nil && keywordSets[stubType][r.name] {
+				problems = append(problems, fmt.Sprintf("%s: %s %q is a reserved word in %s, the language this config generates (stub_type %q); pick another name",
+					r.owner, r.field, r.name, stubType, stubType))
+			}
+		}
+	}
+	if cfg.Component() || (stubErr == nil && stubType == "wit") {
+		problems = append(problems, validateWITNames(cfg, cfg.Component() && stubErr == nil && stubType == "rust")...)
+	}
+
 	// `name:` reaches generated source as a STRING LITERAL when
 	// `emit_name_map` is on, quoted with Go's %q — whose escapes (\x00,
 	// \u00e9) are not valid in every one of the six languages, and whose
@@ -254,10 +362,12 @@ func ValidateConfig(cfg *BuildConfig) error {
 	if cfg.Namespace != "" {
 		if err := ValidateIdentifier(cfg.Namespace); err != nil {
 			problems = append(problems, fmt.Sprintf("namespace %q %v", cfg.Namespace, err))
+		} else if stubErr == nil && keywordSets[stubType][cfg.Namespace] {
+			problems = append(problems, fmt.Sprintf("namespace %q is a reserved word in %s, the language this config generates", cfg.Namespace, stubType))
 		}
 	}
 
-	// Per-stub-type checks (B32, B34). These depend on which generator the
+	// Per-stub-type checks. These depend on which generator the
 	// config targets, so they are skipped entirely when it targets none — a
 	// compile-only config (no stub_type, no stub_file) generates no source and
 	// cannot be broken by any of them.
@@ -417,13 +527,13 @@ func quoteAll(names []string) []string {
 // (TestSharedSymbolsMirrorIsInStep), which is the only thing that keeps a copy
 // honest.
 var stubSharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ITER_ERROR"},
+	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
-		"RX_ERR_BT_OVERFLOW", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
+		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED",
 	},
 	// Rust is deliberately absent from the SHARED list for the same reason it
@@ -452,7 +562,14 @@ var stubPrivateHelpers = map[string][]string{
 	// Go declares no private helpers of its own, but `init` is reserved by the
 	// LANGUAGE: `func init(input []byte) (uint, bool, error)` is a compile
 	// error, since Go's init takes no arguments and returns nothing.
-	"go":   {"init"},
+	"go": {"init"},
+	// The C COMPONENT stub's file-scope helpers. NOT namespaced on purpose: the
+	// mark and release are shared by name between every regexped stub in one
+	// guest, so they track the heap of the one cabi_realloc the linker keeps.
+	"c": {
+		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release", "regexped_cabi_foreign_allocator",
+		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "rx_pattern_names", "RX_CABI_EXPECT_OURS",
+	},
 	"rust": {"Span", "Error", "Result", "SetMatch"},
 	"as":   {"Span"},
 }
@@ -485,10 +602,10 @@ var rustTransformedReserved = []string{"SetMatch"}
 func ResolveStubType(cfg BuildConfig) (string, error) {
 	if cfg.StubType != "" {
 		switch cfg.StubType {
-		case "rust", "js", "ts", "go", "c", "as":
+		case "rust", "js", "ts", "go", "c", "as", "wit":
 			return cfg.StubType, nil
 		default:
-			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, c, or as)", cfg.StubType)
+			return "", fmt.Errorf("unknown stub_type %q (expected rust, js, ts, go, c, as, or wit)", cfg.StubType)
 		}
 	}
 	switch strings.ToLower(filepath.Ext(cfg.StubFile)) {
@@ -502,8 +619,10 @@ func ResolveStubType(cfg BuildConfig) (string, error) {
 		return "go", nil
 	case ".h":
 		return "c", nil
+	case ".wit":
+		return "wit", nil
 	default:
-		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, c, or as)", cfg.StubFile)
+		return "", fmt.Errorf("cannot infer stub type from %q: set stub_type in config (rust, js, ts, go, c, as, or wit)", cfg.StubFile)
 	}
 }
 
@@ -589,33 +708,56 @@ func init() {
 	add("as", jsKeywords, tsKeywords)
 }
 
-// validateImportModule checks cfg.ImportModule against the requirements of the
-// one generator stubType selects.
+// validateImportModule checks the name a generator will emit against the
+// requirements of the one generator stubType selects.
 //
-//   - rust: emitted as `pub mod <name>` — needs a real Rust identifier.
-//   - go:   emitted as `package <name>` when the stub lands in a directory of
-//     that name (generate/go_stub.go:17-20) — needs a real Go identifier.
-//   - c/as: emitted only inside a quoted attribute string
-//     (`import_module("<name>")`, `@external("<name>", …)`) — anything that
-//     cannot survive a C/TS string literal breaks the file, and a bare `"` is
-//     an injection vector.
-//   - js/ts: never emitted. No constraint at all.
+//   - rust: `pub mod <name>` — needs a real Rust identifier. The name is
+//     `rust_module`, falling back to `import_module`.
+//   - go:   `package <name>` when the stub lands in a directory of that name
+//     (generate/go_stub.go:17-20) — needs a real Go identifier. The name is
+//     `go_package`, falling back to `import_module`.
+//   - c/as: `import_module` itself, emitted only inside a quoted attribute
+//     string (`import_module("<name>")`, `@external("<name>", …)`) — anything
+//     that cannot survive a C/TS string literal breaks the file, and a bare
+//     `"` is an injection vector.
+//   - js/ts: nothing emitted. No constraint at all.
+//
+// The identifier rules apply to the EFFECTIVE value, not to `import_module`:
+// a config that sets neither role key still gets exactly the errors it always
+// got, because the effective value IS `import_module` — while setting
+// `rust_module`/`go_package` is now the escape hatch for a wire name that is
+// a keyword or carries an underscore.
 func validateImportModule(cfg *BuildConfig, stubType string) []string {
-	name := cfg.ImportModule
-	if name == "" {
-		return nil // required-ness is main.go's check, not this one
-	}
 	switch stubType {
 	case "rust", "go":
+		field, name := "rust_module", cfg.RustModuleName()
+		emitted := "`pub mod`"
+		if stubType == "go" {
+			field, emitted = "go_package", "`package`"
+			name = cfg.GoPackageName()
+		}
+		if name == "" {
+			return nil // required-ness is main.go's check, not this one
+		}
+		// Name whichever key actually carries the value, so the message points
+		// at the line the user has to edit.
+		src := field
+		if (stubType == "rust" && cfg.RustModule == "") || (stubType == "go" && cfg.GoPackage == "") {
+			src = "import_module"
+		}
 		if err := validateIdentShape(name); err != nil {
-			return []string{fmt.Sprintf("import_module %q %v (it is emitted as a %s identifier for stub_type %q)",
-				name, err, map[string]string{"rust": "`pub mod`", "go": "`package`"}[stubType], stubType)}
+			return []string{fmt.Sprintf("%s %q %v (it is emitted as a %s identifier for stub_type %q; set %s to override)",
+				src, name, err, emitted, stubType, field)}
 		}
 		if keywordSets[stubType][name] {
-			return []string{fmt.Sprintf("import_module %q is a reserved word in %s, and is emitted as a %s identifier",
-				name, stubType, map[string]string{"rust": "`pub mod`", "go": "`package`"}[stubType])}
+			return []string{fmt.Sprintf("%s %q is a reserved word in %s, and is emitted as a %s identifier (set %s to override)",
+				src, name, stubType, emitted, field)}
 		}
 	case "c", "as":
+		name := cfg.ImportModule
+		if name == "" {
+			return nil
+		}
 		for i := 0; i < len(name); i++ {
 			if c := name[i]; c == '"' || c == '\\' || c < 0x20 || c == 0x7F {
 				return []string{fmt.Sprintf("import_module %q contains %q at offset %d, which cannot appear in the quoted import attribute the %s generator emits",
@@ -650,10 +792,12 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	}
 
 	// (2) Collisions with the generated private FFI binding. Rust emits
-	// `ffi_<export>` alongside `pub fn <export>`, and Go emits `ffi_<export>`
-	// for the //go:wasmimport shim, so an export literally named `ffi_x`
-	// duplicates the shim generated for an export named `x`.
-	if stubType == "rust" || stubType == "go" {
+	// `ffi_<export>` alongside `pub fn <export>`, Go emits `ffi_<export>` for the
+	// //go:wasmimport shim, and C emits `ffi_<export>` for its import — plus, in
+	// the component format, `ffi_<find>__res_new` / `__res_next` / `__res_drop`
+	// for a set scanner's resource. An export literally named `ffi_x` duplicates
+	// one of them.
+	if stubType == "rust" || stubType == "go" || stubType == "c" {
 		for _, r := range refs {
 			if strings.HasPrefix(r.name, "ffi_") {
 				problems = append(problems, fmt.Sprintf("%s: %s %q must not start with \"ffi_\": the %s generator emits ffi_<export> for its private FFI binding, so this name can collide with the shim for export %q",

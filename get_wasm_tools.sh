@@ -14,13 +14,19 @@
 # /releases/latest" trick, so neither script pins a version that goes stale.
 #
 # Usage: ./get_wasm_tools.sh [dest-dir]     (default: alongside this script)
+#
+# With an EXPLICIT dest-dir the PATH short-circuit is skipped: the caller wants
+# the release binary in that directory. The Docker build is that caller — a
+# wasm-tools found on the host's PATH may be linked against the host's glibc,
+# which the image does not carry, so copying it in builds an image whose
+# wasm-tools does not start.
 
 set -euo pipefail
 
 DEST_DIR="${1:-$(cd "$(dirname "$0")" && pwd)}"
 DEST="$DEST_DIR/wasm-tools"
 
-if command -v wasm-tools >/dev/null 2>&1; then
+if [ -z "${1:-}" ] && command -v wasm-tools >/dev/null 2>&1; then
     echo "wasm-tools already in PATH ($(command -v wasm-tools)), skipping download"
     exit 0
 fi

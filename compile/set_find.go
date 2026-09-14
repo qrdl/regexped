@@ -167,7 +167,7 @@ type setFindCtx struct {
 	// the five every frontend shares and hands the allocator on, so a body
 	// continues the same allocation rather than opening a second one and
 	// reserving five slots to skip past these — which is what all five bodies
-	// did while the ctx still numbered its own locals by hand (task 67).
+	// did while the ctx still numbered its own locals by hand.
 	locals *localAlloc
 
 	// gated selects the default, per-pattern non-overlapping body: the
@@ -193,7 +193,7 @@ type setFindCtx struct {
 	//   - gated: gates are written for every tuple actually DELIVERED, not
 	//     only for a position that fitted whole. That is what lets the batch
 	//     loop resume a split position — the gate pre-mask then excludes
-	//     exactly the patterns already handed to the caller. `find` keeps D2's
+	//     exactly the patterns already handed to the caller. `find` keeps the
 	//     transactional rule, which is why this is a separate body.
 	//   - ungated: pSkip names a trailing parameter holding how many of this
 	//     position's tuples to count but not write. There is no gate array to
@@ -203,7 +203,7 @@ type setFindCtx struct {
 	pSkip   byte
 	// pBatchMode names the gated worker's trailing parameter: 0 selects
 	// `find`'s transactional gate rule, non-zero the batch loop's
-	// deliver-and-gate rule (decision (11a)). Valid only when batch && gated.
+	// deliver-and-gate rule. Valid only when batch && gated.
 	pBatchMode byte
 
 	// Locals.
@@ -238,12 +238,12 @@ type setFindCtx struct {
 	lAllElig byte
 	lAcc     byte // i64 bitmask accumulator, scan_all only
 	// aliveMask is an i64 local holding the ids that match SOMEWHERE in
-	// [from,len). G9's gated-`find` preflight fills it and writes it back as
+	// [from,len). The gated-`find` preflight fills it and writes it back as
 	// gate sentinels.
 	//
-	// G8's `scan_any` preflight also used it, to intersect every bucket's
+	// The old `scan_any` preflight also used it, to intersect every bucket's
 	// validMask and make the liveness exit fire. That is gone with
-	// decision (10): `scan_any` is the union walk now, so there is no
+	// `scan_any` reporting no start: it is the union walk now, so there is no
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
 	// went with it.
 	aliveMask byte
@@ -461,7 +461,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 	if !c.readsGate() || c.sparseBucket(bi) {
 		return b
 	}
-	// Skip the whole chain where it provably clears nothing (item 22 fix 2b).
+	// Skip the whole chain where it provably clears nothing.
 	// Wrapping is safe because the chain below contains no branch out of this
 	// block — only one `if` per pattern — so nothing inside it depends on the
 	// nesting depth.
@@ -583,7 +583,7 @@ func appendGateLocalGroup(b []byte, n int) []byte {
 	return append(b, 0x7F)
 }
 
-// sparseBucket reports whether bucket bi carries G17's per-state accept LISTS
+// sparseBucket reports whether bucket bi carries sparse per-state accept LISTS
 // rather than a 32-bit accept mask. Every mask-based shortcut on the candidate
 // path has to consult this: the masks are i32s and cannot describe such a
 // bucket's patterns, so a shortcut that reads one as authoritative silently
@@ -607,7 +607,7 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 	//
 	// The second half is `find`'s transactional rule and the batch loop's
 	// absence of one, selected at RUNTIME because both callers share this
-	// body (decision (11a)). A non-batching set has no batch_mode parameter
+	// body. A non-batching set has no batch_mode parameter
 	// and keeps the compile-time form, so its `find` is unchanged.
 	b = append(b, 0x20, c.lTotal, 0x41, 0x00, 0x4A) // total > 0 (signed)
 	if c.batch && c.gated {
@@ -635,7 +635,9 @@ func (c *setFindCtx) emitGateWriteback(b []byte, lPos byte) []byte {
 		// batch_mode.
 		b = append(b, 0x20, lPos, 0x20, c.pOutCap, 0x4E, 0x0D, 0x01) // idx >= cap → done
 	}
-	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41, 12, 0x6C, 0x6A, 0x21, c.lOutBase)
+	b = append(b, 0x20, c.pOutPtr, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
+	b = append(b, 0x6C, 0x6A, 0x21, c.lOutBase)
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x00, 0x21, c.lTmp)   // id
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x04, 0x21, c.lStart) // start
 	b = append(b, 0x20, c.lOutBase, 0x28, 0x02, 0x08, 0x21, c.lBase)  // end
@@ -707,7 +709,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // individual group has been exhausted long enough to matter. Group retirement
 // would only pay on a skewed corpus where some groups saturate early while
 // others never hit — a workload no benchmark here has, and inventing one to
-// justify the code would be backwards. CLAUDE.md's Gap I is this lesson.
+// justify the code would be backwards. CLAUDE.md's load-bearing gates section is this lesson.
 //
 // Recorded rather than silently dropped, so anyone revisiting that
 // retirement idea knows it has been tried at this level and what it measured.
@@ -840,7 +842,7 @@ func setPatternIDs(cs *compiledSet) []int {
 //
 // Multi-pattern sets were NOT undecidable-so-assume-yes here; they were
 // measured-negative — but only on a LITERAL-frontend set. That
-// measurement is what task G13 narrows: log-levels-dense costs ~1K
+// measurement is what the scalar-frontend exception narrows: log-levels-dense costs ~1K
 // fuel per call because Teddy skips the whole line, so an O(patterns)
 // prologue is +6.8% of a small number. A SCALAR-frontend set has no such
 // skip: its calls cost Θ(n) at ~55 fuel per stepped position, against which
@@ -855,7 +857,7 @@ func setPatternIDs(cs *compiledSet) []int {
 // fire, so the prologue would be dead code. regexpMinMaxLen answers that
 // (maxLen == -1 means unbounded).
 // The frontend test comes FIRST because patternFullAST re-parses the pattern:
-// a literal-frontend set must reach the same verdict as before G13 without
+// a literal-frontend set must reach the same verdict as before the scalar-frontend exception without
 // paying for a walk it will discard.
 func (cs *compiledSet) jumpIsProfitable() bool {
 	n := 0
@@ -902,7 +904,7 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 func (c *setFindCtx) emitAllEligibleFrom(b []byte) []byte {
 	if !c.anyGroupCanShortcut() {
 		// Nothing will read it. Emitting it anyway is not free: the loop is
-		// O(patterns) on EVERY call, and a set whose buckets are all G17-sparse
+		// O(patterns) on EVERY call, and a set whose buckets are all sparse
 		// suppresses the chain entirely, so the prologue would be pure cost
 		// against no saving at all. Measured before this test existed:
 		// classchain-128 (four sparse buckets) paid +19.4% on its dense `find`
@@ -933,7 +935,7 @@ func (c *setFindCtx) emitAllEligibleFrom(b []byte) []byte {
 // prologue's O(patterns) on every call. Both ends were measured on the setperf
 // corpus with no threshold at all: 32 patterns in one bucket won 4.5% on
 // classchain-32's dense `find`, while THREE patterns lost 5.5% on every
-// greedy-3 gated row — the same shape item 11's refutations warn about, a
+// greedy-3 gated row — the same shape the refuted overlapping designs warn about, a
 // per-position test that does not fire often enough to repay itself. 8 sits
 // between the measured points, on the winning side of both.
 const gateShortcutMinPatterns = 8
@@ -1028,7 +1030,9 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	}
 	b = append(b, 0x20, c.pInLen)
 	b = append(b, 0x20, posLocal)
-	b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41, 12, 0x6C, 0x6A)
+	b = append(b, 0x20, c.pOutPtr, 0x20, c.lBase, 0x41)
+	b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
+	b = append(b, 0x6C, 0x6A)
 	b = append(b, 0x20, c.pOutCap, 0x20, c.lBase, 0x6B)
 	b = append(b, 0x20, c.lValidMask, 0x41)
 	b = utils.AppendSLEB128(b, int32(mask))
@@ -1144,7 +1148,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLocal byte) []byte {
 	// Mode-INDEPENDENT. The table says which patterns can BEGIN at a byte,
 	// which is as true for a scan as for a find; the gate was a leftover from
-	// G16 shipping on the find path first. The remaining
+	// the eligibility mask shipping on the find path first. The remaining
 	// conditions are the real ones: L must be 0, and the emission side decides
 	// which buckets have a table at all.
 	if g.L != 0 {
@@ -1588,4 +1592,80 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 	// that used to live here served only the last of those and were silently
 	// overwritten by the other four.
 	return c
+}
+
+// --- the scratch descriptor prologue ---------------------------------------
+
+// injectScratchPrologue rewrites an already-emitted `find` body so that its
+// fourth parameter is a SCRATCH DESCRIPTOR pointer rather than a bare gate
+// pointer (internal/abi).
+//
+// It splices rather than threading the change through the four frontend
+// emitters, and that is the point: every one of them reads the gate through
+// `c.pGate`, so replacing the PARAMETER'S VALUE at entry leaves all of them
+// correct without a single edit. WASM parameters are mutable locals, which is
+// what makes that possible.
+//
+//	if load(p+0) != MAGIC { unreachable }
+//	p = load(p+4)
+//
+// The trap is the whole reason for the magic word: the descriptor replaces a
+// parameter of the same type, so a caller still passing a bare gate array would
+// otherwise have gate[0] — zero on a clean scan — read as a pointer, and
+// corrupt memory quietly. Here it fails on the first call instead.
+//
+// The input is a complete CODE ENTRY — a ULEB128 byte count, then
+// [locals vector][code] — so both the size prefix and the locals vector are
+// parsed, and the prefix is re-emitted at the new length. Splicing without
+// rewriting the count produces a module whose code section is off by the
+// prologue's length from the first spliced function onward.
+func injectScratchPrologue(entry []byte, pScratch byte) []byte {
+	size, n, err := utils.DecodeULEB128(entry)
+	if err != nil || int(size)+n != len(entry) {
+		panic("compile: injectScratchPrologue given something that is not one code entry")
+	}
+	body := entry[n:]
+	off := localsVectorEnd(body)
+	var p []byte
+	p = append(p, 0x20, pScratch)
+	p = append(p, 0x28, 0x02, abi.FindScratchMagicOff) // i32.load align=4
+	p = append(p, 0x41)
+	p = utils.AppendSLEB128(p, abi.FindScratchMagic)
+	p = append(p, 0x47)       // i32.ne
+	p = append(p, 0x04, 0x40) // if
+	p = append(p, 0x00)       // unreachable
+	p = append(p, 0x0B)       // end
+	p = append(p, 0x20, pScratch)
+	p = append(p, 0x28, 0x02, abi.FindScratchGateOff)
+	p = append(p, 0x21, pScratch)
+
+	out := make([]byte, 0, len(body)+len(p))
+	out = append(out, body[:off]...)
+	out = append(out, p...)
+	out = append(out, body[off:]...)
+	return append(utils.AppendULEB128(nil, uint32(len(out))), out...)
+}
+
+// localsVectorEnd returns the offset just past a function body's locals
+// declaration vector: a ULEB128 group count, then that many (ULEB128 count,
+// valtype) pairs.
+//
+// Parsed rather than assumed. Bodies here declare anywhere from zero groups to
+// several, and a hardcoded offset would splice the prologue into the middle of
+// a declaration — which produces a module that still validates when the bytes
+// happen to read as something, and misbehaves.
+func localsVectorEnd(body []byte) int {
+	groups, n, err := utils.DecodeULEB128(body)
+	if err != nil {
+		panic("compile: malformed locals vector in an emitted find body")
+	}
+	off := n
+	for i := uint64(0); i < groups; i++ {
+		_, n, err := utils.DecodeULEB128(body[off:])
+		if err != nil {
+			panic("compile: malformed local group in an emitted find body")
+		}
+		off += n + 1 // the count, then its valtype byte
+	}
+	return off
 }

@@ -1,0 +1,18 @@
+# One fixture per adapter kind, so all three retptr layouts are pinned:
+#   match  -> result<option<u32>, error-code>                      area 12
+#   find   -> result<option<tuple<u32,u32>>, error-code>            area 16
+#   groups -> result<option<list<option<tuple<u32,u32>>>>, …>       area 16 + list
+# The groups pattern carries an OPTIONAL group so the `none` element arm is
+# emitted too, and a second find pins the shared cabi_realloc / post-return.
+wasm_format: component
+import_module: "byteident"
+
+regexps:
+  - pattern: '[a-z]+'
+    match_func: "lower_match"
+  - pattern: 'ghp_[A-Za-z0-9]{4}'
+    find_func: "token_find"
+  - pattern: 'AKIA[A-Z0-9]{4}'
+    find_func: "aws_find"
+  - pattern: '(?P<opt>x)?(?P<tail>y+)'
+    groups_func: "opt_groups"

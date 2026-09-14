@@ -8,6 +8,7 @@
  *   parse_url_init(&iter, text, len, 0);
  *   rx_group_t groups[PARSE_URL_GROUPS];
  *   while (parse_url_next(&iter, groups) == 1) { ... }
+ *   parse_url_free(&iter);   // no-op for a module, REQUIRED for a component
  *
  * The iterator also owns the advance and the empty-match rule, which this file
  * used to hand-roll. Named groups are index CONSTANTS now — parse_url_scheme,
@@ -97,6 +98,11 @@ void _start(void) {
             my_write("\n", 1);
         }
     }
+    /* Before EITHER exit below. Under wasm_format: component the scan lives in
+       the regexp component behind a resource handle, and this drops it; under
+       wasm_format: module it does nothing. Writing it unconditionally is what
+       lets this one file build both ways. */
+    parse_url_free(&iter);
     if (status == RX_ERR_BT_OVERFLOW) {
         /* The engine gave up: what remains is UNKNOWN, not "no more URLs". */
         my_puts("cannot decide: backtracking budget exhausted");

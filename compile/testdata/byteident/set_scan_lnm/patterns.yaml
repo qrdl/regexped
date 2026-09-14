@@ -1,4 +1,4 @@
-# The union automaton's LikelyNoMatch SIMD stride (task 69).
+# The union automaton's LikelyNoMatch SIMD stride.
 #
 # Literal-less patterns, so the set has no literal frontend and the scan pair
 # compiles to the one-pass union automaton rather than a per-position bucket

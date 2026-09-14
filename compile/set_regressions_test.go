@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
@@ -13,7 +14,7 @@ import (
 // compiler emits happily and that answers wrongly — the class no existing test
 // caught, because every one of them compiled green.
 
-// TestAltLitAnchorInSetModule covers E1.
+// TestAltLitAnchorInSetModule pins a set-module assembly regression.
 //
 // compilePattern gives a find-only top-level alternation of equal-length
 // literal-anchored branches an altLitAnchorBranches list. funcCount
@@ -98,10 +99,10 @@ func TestNarrowUnionWithWideAllABI(t *testing.T) {
 	}
 }
 
-// TestTwoSparseBucketsKeepTheirIDs covers C1.
+// TestTwoSparseBucketsKeepTheirIDs pins a suffix-table dedup regression.
 //
 // Suffix-table dedup reuses a table BASE when two buckets' DFAs are
-// structurally identical. For a G17-sparse bucket the emitted data also
+// structurally identical. For a sparse bucket the emitted data also
 // carries an idMap of GLOBAL ids and per-state accept lists sized by that
 // bucket's pattern count — none of which the table identity sees — so two
 // sparse buckets with the same suffix shape aliased onto one idMap and the
@@ -144,7 +145,7 @@ func TestTwoSparseBucketsKeepTheirIDs(t *testing.T) {
 		seen[b.sparseIDMapOff] = append(seen[b.sparseIDMapOff], bi)
 	}
 	if sparse < 2 {
-		t.Skipf("this shape produced %d sparse buckets; C1 needs two", sparse)
+		t.Skipf("this shape produced %d sparse buckets; this regression needs two", sparse)
 	}
 	for off, bis := range seen {
 		if len(bis) > 1 {
@@ -171,7 +172,7 @@ func compileSetForTest(t *testing.T, cfg config.BuildConfig) *compiledSet {
 	return CompileSet(spec, pp, sp, CompileSetOptions{AllowSparseAccept: true})
 }
 
-// TestAbsenceLiteralsPastThirtyTwo covers G2.
+// TestAbsenceLiteralsPastThirtyTwo pins an absence-prefilter regression.
 //
 // The absence prefilter's SEARCH mask is an i32 with one bit per collected
 // literal, while the alive mask is an i64 capped at 64 ids. Entry 32 and
@@ -269,7 +270,7 @@ func exportSectionHas(body []byte, name string) bool {
 	return false
 }
 
-// TestOverlapDPColumnsUseTableMemory covers B1.
+// TestOverlapDPColumnsUseTableMemory pins a table-memory regression.
 //
 // The backward sweep's two working columns live at cs.overlapDPColOff, a
 // TABLE-memory address whose zero-filled segment is rewritten to memory 1 in
@@ -312,16 +313,49 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	if cs.overlapDPFnOffset() < 0 {
 		t.Skip("this shape no longer engages the backward sweep")
 	}
-	body := emitOverlapDPBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
+	// The CHECKPOINT PASS, which is what the whole-drive sweep became: it holds
+	// the same hazard, since its working columns live in TABLE memory while the
+	// cache it writes is the CALLER's.
+	body := emitCkptPassBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
 
-	// Count memory-0 i32 loads/stores. The tuple writer and the header writer
+	// Count memory-0 i32 loads/stores. The row writer and the header writer
 	// legitimately use them — they address the CALLER's scratch — so the test
 	// is a bound, pinned against the standalone body which uses memory 0 for
 	// everything.
-	standalone := emitOverlapDPBody(cs, 0, cs.overlapDPColOff)
+	standalone := emitCkptPassBody(cs, 0, cs.overlapDPColOff)
 	if got, want := countMem0Access(body), countMem0Access(standalone); got >= want {
 		t.Errorf("the embedded sweep body makes %d memory-0 i32 accesses and the standalone one %d: "+
 			"the column loads/stores are still going to memory 0, i.e. to the host's heap", got, want)
+	}
+
+	// A COUNT is not enough on its own, and the bulk copies are where it is
+	// weakest: a checkpoint save and a checkpoint load are both `memory.copy`,
+	// they differ only in which of the two memory indices comes first, and a
+	// swapped pair would copy the caller's bytes over the working column and
+	// the column back over the caller — passing any count-based test exactly.
+	//
+	// memory.copy is `FC 0A dst src`. The save writes the column (table memory)
+	// into the caller's region, so dst is 0 and src the table; the load is the
+	// reverse. BOTH bodies are checked, because the pass writes checkpoints and
+	// the block materialiser reads them.
+	block := emitCkptBlockBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
+	for _, tc := range []struct {
+		name string
+		body []byte
+		save int // FC 0A 00 01 -> caller <- table
+		load int // FC 0A 01 00 -> table  <- caller
+	}{
+		{"checkpoint pass", body, 1, 0},
+		{"block materialiser", block, 0, 1},
+	} {
+		gotSave := countSeq(tc.body, []byte{0xFC, 0x0A, 0x00, 0x01})
+		gotLoad := countSeq(tc.body, []byte{0xFC, 0x0A, 0x01, 0x00})
+		if (gotSave > 0) != (tc.save > 0) || (gotLoad > 0) != (tc.load > 0) {
+			t.Errorf("%s: %d checkpoint saves (caller <- table) and %d loads (table <- caller); "+
+				"want %s. A swapped pair copies each region over the other and counts the same",
+				tc.name, gotSave, gotLoad,
+				map[bool]string{true: "at least one save and no load", false: "no save and at least one load"}[tc.save > 0])
+		}
 	}
 	// And the module as a whole must still assemble.
 	w, _, err := CompileFile(cfg, "merged.wasm")
@@ -329,6 +363,18 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 		t.Fatalf("CompileFile: %v", err)
 	}
 	assertWasm(t, w, "embedded overlapping batch module")
+}
+
+// countSeq counts non-overlapping occurrences of an exact byte sequence.
+func countSeq(body, seq []byte) int {
+	n := 0
+	for i := 0; i+len(seq) <= len(body); i++ {
+		if bytes.Equal(body[i:i+len(seq)], seq) {
+			n++
+			i += len(seq) - 1
+		}
+	}
+	return n
 }
 
 // countMem0Access counts i32.load/i32.store opcodes whose alignment byte has
@@ -456,7 +502,7 @@ func TestOverlapPreflightPredicatesAgree(t *testing.T) {
 }
 
 // sparseishGroup is n patterns behind one shared literal, the shape that
-// promotes to a G17-sparse bucket.
+// promotes to a sparse bucket.
 func sparseishGroup(n int) []string {
 	out := make([]string, n)
 	for i := range out {

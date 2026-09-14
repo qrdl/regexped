@@ -1,9 +1,12 @@
 package compile
 
 import (
+	"fmt"
 	"regexp/syntax"
 	"strings"
 	"testing"
+
+	"github.com/qrdl/regexped/config"
 )
 
 func TestResolveMaxDFAStates(t *testing.T) {
@@ -178,7 +181,7 @@ func TestSelectEngineNonCapturePaths(t *testing.T) {
 	})
 	// Mixed ASCII+non-ASCII char class → HasUnicode=true in analysePattern → complexity="Unicode".
 	// Compiled in BYTE MODE since 2026-09-01: the default mode now rejects a
-	// rune the pattern wrote above 127 (é is 0xE9), which is the FABLE B29
+	// rune the pattern wrote above 127 (é is 0xE9), which is the silent
 	// leak this test used to depend on. Byte mode keeps the pattern legal —
 	// é means the single byte 0xE9 — so analysis.HasUnicode is still set and
 	// the selector path under test is unchanged.
@@ -249,7 +252,7 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 // continuation and exit first-byte sets overlap is now TDFA-eligible (the
 // overlap alone no longer forces Backtracking, since TDFA's LeftmostFirst
 // priority always prefers the loop body over the exit regardless of overlap).
-// This branch had 0 direct test coverage — the pre-task-13 exclusion this
+// This branch had 0 direct test coverage — the earlier exclusion this
 // replaced was itself only ever exercised via re2test, not `go test`.
 func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
 	cases := []struct {
@@ -259,18 +262,18 @@ func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
 	}{
 		// ([a-z]+)(er)([a-z]+): the first loop's continuation ([a-z]) and its
 		// own exit (into "er", which starts with 'e' — itself in [a-z]) overlap.
-		// Pre-task-13 this was forced to Backtracking; the fix's own example.
+		// This used to be forced to Backtracking; the fix's own example.
 		{`([a-z]+)(er)([a-z]+)`, EngineTDFA, "overlapping-terminator loop now TDFA-eligible"},
 		// (cat|car)+: a genuine user alternation NESTED INSIDE a quantifier
 		// loop is still a separate InstAlt, checked in full (non-quantifier
 		// path) — must remain unaffected by the quantifier-loop relaxation.
 		{`(cat|car)+`, EngineTDFA, "nested user alternation inside a loop, no captures inside it"},
-		// Gap I (CLAUDE.md "Load-bearing engine-selection gates"): an inverted
+		// CLAUDE.md "Load-bearing engine-selection gates": an inverted
 		// class wider than 256 codepoints inside a quantifier loop still has an
 		// INDETERMINATE (empty) first-rune-set for getFirstRuneSet, so it must
 		// remain ambiguous → Backtracking, even though it's a quantifier loop.
 		// This must NOT be relaxed — see CLAUDE.md's explicit warning.
-		{`<([^>]+)>`, EngineBacktrack, "Gap I: indeterminate branch inside quantifier loop stays ambiguous"},
+		{`<([^>]+)>`, EngineBacktrack, "inverted-class gate: indeterminate branch inside quantifier loop stays ambiguous"},
 	}
 	for _, c := range cases {
 		got, err := SelectEngine(c.pattern, CompileOptions{})
@@ -471,7 +474,7 @@ func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
 		{`^([^,]*),([^,]*)$`, false, "line anchors excluded from TDFA"},
 		{`\b(\w+)@(\w+)\b`, false, "word boundary excluded from TDFA"},
 		{`<(.+?)>`, false, "non-greedy excluded from TDFA"},
-		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md Gap I)"},
+		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md load-bearing gate)"},
 		{`[a-z]+`, false, "no captures at all — DFA path"},
 	}
 	for _, c := range cases {
@@ -597,5 +600,332 @@ func TestSelectorTDFALimitReasons(t *testing.T) {
 		if c.unwantLimit != "" && strings.Contains(limits, c.unwantLimit) {
 			t.Errorf("%s: limits = %q, must not quote %q", c.label, limits, c.unwantLimit)
 		}
+	}
+}
+
+// TestDFAStateLimitBailsOutFast guards against a real compile-time DoS found
+// 2026-08-06: newDFA's subset-construction BFS had no internal state cap.
+// [^,]{250,}X[^;]{250,} — two independent bounded-repetition inverted
+// classes straddling an ambiguous split point (any 'X' byte is valid inside
+// both classes too) — makes the number of distinct reachable NFA-state
+// subsets explode with no plateau in sight (confirmed live: 40,000+ DFA
+// states generated in 12s with no sign of leveling off, driven entirely by
+// map/string-key allocation in the subset-construction worklist).
+// CompileOptions.MaxDFAStates was completely ineffective against this,
+// because it was only ever checked on newDFA's *output*, after the
+// unbounded construction already ran (or hung trying to). This test must
+// complete quickly and either succeed with a small compiled pattern or
+// cleanly fall back to Backtracking — never hang.
+func TestDFAStateLimitBailsOutFast(t *testing.T) {
+	const pattern = `[^,]{250,}X[^;]{250,}`
+	t.Run("newDFA_bails_out_internally", func(t *testing.T) {
+		re, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		if _, ok := newDFA(prog, false, true, 1024); ok {
+			t.Fatalf("newDFA(%q, maxStates=1024): expected state-limit bail-out (ok=false), got ok=true", pattern)
+		}
+	})
+	t.Run("compile_falls_back_to_backtracking", func(t *testing.T) {
+		// End-to-end: MaxDFAStates left at its default (1024) — the pattern
+		// must compile successfully (falling back to Backtracking), not
+		// hang and not hard-error.
+		mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}})
+	})
+}
+
+func TestRegexpMinMaxLen(t *testing.T) {
+	parse := func(pattern string) *syntax.Regexp {
+		re, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", pattern, err)
+		}
+		return re // NOT simplified — preserves OpRepeat
+	}
+
+	cases := []struct {
+		pattern string
+		wantMin int
+		wantMax int
+	}{
+		// OpLiteral
+		{"abc", 3, 3},
+		{"a", 1, 1},
+		// OpAnyCharNotNL
+		{".", 1, 1},
+		// OpCharClass
+		{"[a-z]", 1, 1},
+		// OpStar
+		{"a*", 0, -1},
+		// OpPlus
+		{"a+", 1, -1},
+		// OpQuest
+		{"a?", 0, 1},
+		// OpRepeat finite
+		{"a{2,5}", 2, 5},
+		// OpRepeat infinite upper
+		{"a{3,}", 3, -1},
+		// OpConcat
+		{"ab", 2, 2},
+		{"abc", 3, 3},
+		// OpConcat with unbounded part
+		{"ab*", 1, -1},
+		// OpAlternate
+		{"a|bb", 1, 2},
+		// OpCapture
+		{"(abc)", 3, 3},
+		// Anchors/boundaries → (0,0)
+		{"^", 0, 0},
+		{`\b`, 0, 0},
+		// 2-byte UTF-8 literal (é = U+00E9): OpPlus recurses into Literal → n += 2
+		{"é+", 2, -1},
+		// 3-byte UTF-8 literal (中 = U+4E2D): n += 3
+		{"中+", 3, -1},
+		// 4-byte UTF-8 literal (𐀀 = U+10000): n += 4
+		{"𐀀+", 4, -1},
+		// OpRepeat with unbounded child max → hi = -1
+		{"(?:[a-z]+){2,3}", 2, -1},
+		// OpAlternate with unbounded branch → totMax = -1
+		{"a+|b", 1, -1},
+	}
+	for _, c := range cases {
+		re := parse(c.pattern)
+		gotMin, gotMax := regexpMinMaxLen(re, false)
+		if gotMin != c.wantMin || gotMax != c.wantMax {
+			t.Errorf("regexpMinMaxLen(%q, false) = (%d,%d), want (%d,%d)",
+				c.pattern, gotMin, gotMax, c.wantMin, c.wantMax)
+		}
+	}
+}
+
+// TestFindMandatoryLitRecDegenerate covers defensive branches in findMandatoryLitRec
+// that the parser never triggers (empty literal rune slice, captures/plus with wrong
+// sub count). Called directly to reach these guards.
+func TestFindMandatoryLitRecDegenerate(t *testing.T) {
+	cases := []struct {
+		name string
+		re   *syntax.Regexp
+	}{
+		// OpLiteral with empty Rune slice → len(bs)==0 → nil.
+		{"literal_empty_rune", &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune{}}},
+		// OpCapture with 0 subs → len(re.Sub)!=1 → nil.
+		{"capture_no_sub", &syntax.Regexp{Op: syntax.OpCapture}},
+		// OpPlus with 0 subs → len(re.Sub)!=1 → nil.
+		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
+	}
+	for _, c := range cases {
+		got, _ := findMandatoryLitRec(c.re, 0, 0, false)
+		if got != nil {
+			t.Errorf("findMandatoryLitRec(%s, false): got %v, want nil", c.name, got)
+		}
+	}
+}
+
+// TestRegexpMinMaxLenDegenerate covers edge cases that the parser never produces
+// (empty Sub slices, OpNoMatch/OpEmptyMatch, unknown Op) by constructing Regexp
+// nodes directly.
+func TestRegexpMinMaxLenDegenerate(t *testing.T) {
+	cases := []struct {
+		name    string
+		re      *syntax.Regexp
+		wantMin int
+		wantMax int
+	}{
+		{"OpRepeat_no_sub", &syntax.Regexp{Op: syntax.OpRepeat, Min: 1, Max: 3}, 0, 0},
+		{"OpPlus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}, 0, -1},
+		{"OpQuest_no_sub", &syntax.Regexp{Op: syntax.OpQuest}, 0, 0},
+		{"OpAlternate_no_sub", &syntax.Regexp{Op: syntax.OpAlternate}, 0, 0},
+		{"OpCapture_no_sub", &syntax.Regexp{Op: syntax.OpCapture}, 0, 0},
+		{"OpNoMatch", &syntax.Regexp{Op: syntax.OpNoMatch}, 0, 0},
+		{"OpEmptyMatch", &syntax.Regexp{Op: syntax.OpEmptyMatch}, 0, 0},
+		{"unknown_op", &syntax.Regexp{Op: syntax.Op(99)}, 0, -1},
+	}
+	for _, c := range cases {
+		min, max := regexpMinMaxLen(c.re, false)
+		if min != c.wantMin || max != c.wantMax {
+			t.Errorf("regexpMinMaxLen(%s, false) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
+		}
+	}
+}
+
+func TestFindMandatoryLit(t *testing.T) {
+	cases := []struct {
+		pattern string
+		wantNil bool
+		wantLit string
+		wantMin int32
+	}{
+		// Simple literal: the whole thing is mandatory.
+		{"foo", false, "foo", 0},
+		// Literal inside a non-capturing group.
+		{"(?:foo)", false, "foo", 0},
+		// Literal after a mandatory prefix — minOff reflects prefix length.
+		{"bar://", false, "bar://", 0},
+		// Alternation: no guaranteed literal.
+		{"a|b", true, "", 0},
+		// Kleene star: body not mandatory.
+		{"a*", true, "", 0},
+		// Plus: body mandatory at least once.
+		{"a+b", false, "a", 0},
+		// Sequence: first literal is mandatory at offset 0.
+		{"foo.*bar", false, "foo", 0},
+		// Invalid pattern: returns nil.
+		{"[invalid", true, "", 0},
+		// Empty pattern: returns nil.
+		{"", true, "", 0},
+		// URL-like: mandatory literal ://, minOff=2 (minimum 2 chars before it).
+		{`[a-zA-Z]{2,8}://[^\s]+`, false, "://", 2},
+		// Non-ASCII literal: r > 127 → returns nil.
+		{"é", true, "", 0},
+		// OpRepeat with Min=0: not mandatory → skipped; foo found after.
+		{"[a-z]{0,3}foo", false, "foo", 0},
+	}
+	for _, c := range cases {
+		got := findMandatoryLit(c.pattern, false)
+		if c.wantNil {
+			if got != nil {
+				t.Errorf("findMandatoryLit(%q, false): got %v, want nil", c.pattern, got)
+			}
+			continue
+		}
+		if got == nil {
+			t.Errorf("findMandatoryLit(%q, false): got nil, want lit=%q", c.pattern, c.wantLit)
+			continue
+		}
+		if string(got.bytes) != c.wantLit {
+			t.Errorf("findMandatoryLit(%q, false): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
+		}
+		if got.minOff != c.wantMin {
+			t.Errorf("findMandatoryLit(%q, false): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
+		}
+		if got.maxOff < got.minOff {
+			t.Errorf("findMandatoryLit(%q, false): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
+		}
+	}
+}
+
+func TestHasMandatoryLit(t *testing.T) {
+	cases := []struct {
+		pattern string
+		want    bool
+	}{
+		{"foo", true},
+		{"foo.*bar", true},
+		{`[a-z]{0,3}foo`, true}, // bounded prefix; literal still mandatory
+		{`\d+foo`, false},       // unbounded prefix → maxOff -1 rejects literal
+		{"a|b", false},
+		{"a*", false},
+		{"(?i)foo", false}, // FoldCase strips the literal
+		{"[a-z]+", false},
+		{"[invalid", false}, // parse error
+	}
+	for _, c := range cases {
+		if got := HasMandatoryLit(c.pattern, false); got != c.want {
+			t.Errorf("HasMandatoryLit(%q, false) = %v, want %v", c.pattern, got, c.want)
+		}
+	}
+}
+
+func chainTable(t *testing.T, pat string) *dfaTable {
+	t.Helper()
+	re, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		t.Fatalf("pattern=%q parse: %v", pat, err)
+	}
+	table, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("pattern=%q mergeSuffixDFA: %v", pat, err)
+	}
+	return table
+}
+
+func TestIsCountedClassChain_Accepts(t *testing.T) {
+	cases := []struct {
+		pat     string
+		wantN   int
+		classSz int
+	}{
+		{`[A-Z0-9]{16}`, 16, 36},
+		{`[A-Za-z0-9]{36}`, 36, 62},
+		{`[0-9]{4}`, 4, 10},
+		{`[a-f]{24}`, 24, 6},
+	}
+	for _, c := range cases {
+		table := chainTable(t, c.pat)
+		class, n, ok := isCountedClassChain(table)
+		if !ok {
+			t.Errorf("pattern=%q: expected chain detected, got ok=false", c.pat)
+			continue
+		}
+		if n != c.wantN {
+			t.Errorf("pattern=%q: n=%d, want %d", c.pat, n, c.wantN)
+		}
+		if len(class) != c.classSz {
+			t.Errorf("pattern=%q: classSz=%d, want %d", c.pat, len(class), c.classSz)
+		}
+	}
+}
+
+func TestIsCountedClassChain_Rejects(t *testing.T) {
+	cases := []string{
+		`[A-Z0-9]{16,20}`,    // range, not exact — intermediate states also accept
+		`[A-Z0-9]{16,}`,      // open-ended
+		`[A-Z0-9]+`,          // unbounded self-loop (cycle)
+		`[A-Z]{8}[0-9]{8}`,   // class changes partway — not uniform C
+		`(?:AB|CD)[A-Z]{16}`, // branching before the chain
+		`[A-Z0-9]{16}\b`,     // word boundary
+	}
+	for _, pat := range cases {
+		table := chainTable(t, pat)
+		_, _, ok := isCountedClassChain(table)
+		if ok {
+			t.Errorf("pattern=%q: expected rejection, got ok=true", pat)
+		}
+	}
+}
+
+func TestIsCountedClassChain_RealPatterns(t *testing.T) {
+	for _, pat := range []string{`AKIA[A-Z0-9]{16}`, `ghp_[A-Za-z0-9]{36}`} {
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Mirror analyzePattern's literal/suffix split for a rough check:
+		// simplest way is to just check the FULL DFA fails (has the literal
+		// prefix baked in) but the SUFFIX (class only) succeeds — already
+		// covered by TestIsCountedClassChain_Accepts. Here just sanity check
+		// the full pattern's own DFA does NOT spuriously look like a chain
+		// (it has more states due to the literal prefix).
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, dOk := newDFA(prog, false, true, maxHelperDFAStates)
+		if !dOk {
+			t.Fatalf("newDFA: state limit exceeded")
+		}
+		full := dfaTableFrom(d)
+		_, n, ok := isCountedClassChain(full)
+		if ok {
+			t.Errorf("pattern=%q: full DFA (with literal prefix) unexpectedly detected as a chain, n=%d", pat, n)
+		}
+	}
+}
+
+func TestCountedChainEmission(t *testing.T) {
+	// End-to-end: does genSuffixWASM actually take the fast path (small,
+	// table-free body) for the target patterns vs. a plain repeated class
+	// with no literal (used as a suffix, single pattern)?
+	table := chainTable(t, `[A-Z0-9]{16}`)
+	art, dataBytes, dataSegCount, _ := genSuffixWASM(table, 0, 0, []int{5}, []int{0}, LikelyNeutral, false, false, nil)
+	body := art.fnBody
+	fmt.Printf("counted-chain suffix: bodyLen=%d dataBytesLen=%d dataSegCount=%d\n", len(body), len(dataBytes), dataSegCount)
+	if dataSegCount != 0 {
+		t.Errorf("expected 0 data segments (pure SIMD, no table), got %d", dataSegCount)
 	}
 }

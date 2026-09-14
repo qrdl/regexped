@@ -56,6 +56,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -138,9 +139,11 @@ const (
 	// boundary once per position. find_batch crosses once per BUFFERFUL, so
 	// the two sides finally differ by engine work rather than by call count.
 	capFindBatch capability = "find_batch"
-	// capFindOverlapping is the ungated `find`. regex-automata has no
-	// equivalent — per-start-position enumeration is not a search it can
-	// express — so it is measured but never compared.
+	// capFindOverlapping is the ungated `find`. It IS compared as of
+	// 2026-09-11, against per-start anchored leftmost-first searches rather
+	// than against regex-automata's own overlapping search — which answers a
+	// different question (half matches keyed by END, MatchKind::All, no
+	// starts). See raPairing and regex_bench/src/automata.rs.
 	capFindOverlapping capability = "find(overlapping)"
 	// capFindBatchOverlapping is the batching entry of an overlapping set.
 	// Added while investigating a batching sweep and KEPT after that
@@ -202,6 +205,17 @@ func raPairing(c capability) string {
 		// O(matches / buffer) host crossings instead of one side making O(1)
 		// and the other O(matches).
 		return "ra_bench_find_gated"
+	case capFindOverlapping, capFindBatchOverlapping:
+		// Per START POSITION, an anchored leftmost-first search — the
+		// construction that reproduces OUR answer set, and what a
+		// regex-automata user would write to get it.
+		//
+		// NOT their own overlapping search, which answers a different question:
+		// it yields half matches (pattern + END offset, no start) and requires
+		// MatchKind::All, so `a|aa` over "aa" gets it an extent we never
+		// produce and `ab|b` over "ab" gets it one report where we have two.
+		// See regex_bench/src/automata.rs for the worked examples.
+		return "ra_bench_find_overlapping"
 	}
 	return ""
 }
@@ -218,7 +232,7 @@ func raPairing(c capability) string {
 // distort.
 //
 // Scope note, so the label is not over-read: the crossings are not a defect.
-// Batching is built (item 19) and closes the gap on the same rows, and for
+// Batching is built and closes the gap on the same rows, and for
 // C/Go/Rust/AS there are no crossings at all — wasm-merge makes a stub call
 // intra-module, which is why TestSetBatchFindIsJSTSOnly pins batching as
 // JS/TS-only.
@@ -258,6 +272,8 @@ func raFuelPairing(c capability) string {
 		// One call walks the whole input for every pattern, which is what one
 		// exhausted drive is on our side.
 		return "ra_find_gated"
+	case capFindOverlapping, capFindBatchOverlapping:
+		return "ra_find_overlapping"
 	}
 	return ""
 }
@@ -298,7 +314,7 @@ var setHints string
 
 // forcedFrontend pins the literal frontend for every compiled case, so a
 // family can be measured through a frontend its literal count would not have
-// chosen (task 71). Empty means "let chooseLiteralFrontend decide".
+// chosen. Empty means "let chooseLiteralFrontend decide".
 //
 // The crossover constants it exists to interrogate were each calibrated on a
 // NO-MATCH corpus; whether they still hold when nearly every probe is a real
@@ -437,7 +453,7 @@ func buildMatrix() []setCase {
 	// Sets whose patterns all share ONE mandatory literal — the WAF shape, and
 	// the only one here that exercises multi-bucket dispatch behind a single
 	// literal. Every other set has distinct literals, so it gets
-	// one bucket per literal and the bucket-count factor G17 attacks never
+	// one bucket per literal and the bucket-count factor sparse accept attacks never
 	// appears at all.
 	//
 	// TWO sizes on purpose. 32 patterns is ONE bucket and 128 is FOUR (the
@@ -469,7 +485,7 @@ func buildMatrix() []setCase {
 	}
 	// A sparse bucket whose merged suffix DFA carries an ACCEPTING 1-byte
 	// self-loop — the shape the bitmask body's member bulk skip exists for, and
-	// the one the matrix had no row of (TODO 64).
+	// the one the matrix had no row of.
 	//
 	// The two existing sparse families, sharedlit-128 and classchain-128, are
 	// bounded class chains: a bounded repeat produces a CHAIN, not a self-loop,
@@ -524,7 +540,7 @@ func buildMatrix() []setCase {
 	}
 	// Sets with NO mandatory literal that are also large enough to split on the
 	// 32-bit accept mask — the fallback packer's version of the sharedlit pair
-	// above, and the shape G17's promotion was extended to cover.
+	// above, and the shape sparse promotion was extended to cover.
 	//
 	// A fallback bucket has no literal gating it, so each of the ceil(N/32)
 	// suffix walks runs at EVERY input position rather than only where a
@@ -595,6 +611,33 @@ func buildMatrix() []setCase {
 		// for the letter it lacks rather than for matching nothing.
 		setCase{"greedy-3", greedy, corpusNoMatch(), "no-ERROR 100KB"},
 	)
+	// The overlapping SHAPE family: ONE set, several INPUT LENGTHS.
+	//
+	// Every other family here holds the input at 100 KB and varies the
+	// patterns. This one does the opposite, and it has to. The question it
+	// exists to answer is whether the overlapping drive is QUADRATIC, and a
+	// single input size can only ever show a ratio — "faster" and "no longer
+	// quadratic" look identical in one number. Four sizes make the SHAPE
+	// readable off the fuel column: x4 of input costing x16 of fuel is
+	// quadratic, x4 costing x4 is linear.
+	//
+	// LITERAL-LESS on purpose, and only three patterns. The backward sweep runs
+	// over ONE FALLBACK bucket, and a pattern with a literal prefix gets a
+	// literal bucket instead — a single literal in the set and no sweep is
+	// emitted at all, leaving both configurations measuring the same walk. A
+	// proof of concept made exactly that mistake, read 1.00x at every size, and
+	// nearly concluded the mechanism does nothing.
+	//
+	// The sizes stop at 8 KB because the pre-sweep drive is quadratic and the
+	// fuel budget is not: measured 622M fuel at 4 KB, so 16 KB is ~9.9e9
+	// against a 4e9 budget and would report exhausted rather than a number.
+	// After the sweep lands the same row is ~26M and the ceiling stops binding,
+	// but the baseline has to be comparable, so the sizes stay put.
+	overlapShape := []string{`[a-z]+`, `[0-9]+`, `[A-Z]+`}
+	for _, n := range []int{256, 1024, 4096, 8192} {
+		out = append(out, setCase{"overlap-shape-3", overlapShape,
+			strings.Repeat("abcdefgh", n/8), fmt.Sprintf("dense %dB", n)})
+	}
 	return out
 }
 
@@ -837,29 +880,47 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		w, _, err := compile.CompileFile(cfg, "")
 		return w, err
 	}
-	opts := compile.CompileSetOptions{}.WithForcedFrontend(validFrontends[forcedFrontend])
-	w, _, _, err := compile.CompileFileOpts(cfg, "", opts)
+	w, _, _, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
 	return w, err
+}
+
+// compileSetOptions is the ONE place the set-compile overrides are built. The
+// module compileCase emits and the shape overlapSetConfigFor's callers inspect
+// must come from the same options: the bucket a set packs into depends on the
+// frontend, so a shape inspected without the pin can name an automaton the
+// module does not contain, and the cache is then sized for the wrong sweep.
+func compileSetOptions() compile.CompileSetOptions {
+	if forcedFrontend == "" {
+		return compile.CompileSetOptions{}
+	}
+	return compile.CompileSetOptions{}.WithForcedFrontend(validFrontends[forcedFrontend])
 }
 
 // rxInstance is an instantiated regexped module with its memory layout.
 type rxInstance struct {
-	store    *wasmtime.Store
-	inst     *wasmtime.Instance
-	mem      *wasmtime.Memory
-	inBase   int32
-	outPtr   int32
-	gatePtr  int32
-	bitmapPt int32
-	batchPtr int32
+	store   *wasmtime.Store
+	inst    *wasmtime.Instance
+	mem     *wasmtime.Memory
+	inBase  int32
+	outPtr  int32
+	gatePtr int32
+	// scratchPtr is the descriptor the find exports take; gatePtr is what it
+	// points at.
+	scratchPtr int32
+	bitmapPt   int32
+	batchPtr   int32
 	// cachePtr/cacheLen are the OVERLAPPING answer cache (see the
-	// stage C). Offered only to the overlapping batch entry, which is what a
-	// generated JS/TS iterator does: every other capability is handed 0, 0
-	// and takes the ordinary per-position walk.
+	// stage C). Offered to BOTH overlapping find entries, which is what a
+	// caller who wants a linear drive passes: every other capability is
+	// handed 0, 0 and takes the ordinary per-position walk.
 	cachePtr int32
 	cacheLen int32
-	npat     int32
-	inLen    int32
+	// The checkpointed cache's stride, which the CALLER picks and the sweep
+	// validates. A generated `init` computes it from
+	// the same config helper; this harness is that init's stand-in.
+	cacheStride int32
+	npat        int32
+	inLen       int32
 	// fnCache holds resolved exports. Resolving inside the timed loop meant
 	// every measured operation paid a string-keyed export lookup that is
 	// neither engine work nor the wasmtime crossing — pure harness cost, and
@@ -914,11 +975,27 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	}
 	outPtr := inBase + span
 	gatePtr := outPtr + npat*12
-	bitmapPt := gatePtr + npat*4
+	// The SCRATCH DESCRIPTOR `find` and `find_batch` take in place of a bare
+	// gate pointer (internal/abi). It carries the gate array and the answer
+	// cache, so the harness builds one per instance and hands out its address.
+	scratchPtr := gatePtr + npat*4
+	bitmapPt := scratchPtr + abi.FindScratchBytes
 	// The batch buffer sits above the bitmap, 4 KB clear of it.
 	batchPtr := bitmapPt + int32(npat)/8 + 4096
 	cachePtr := (batchPtr + int32(batchCap)*12 + 4096 + 7) &^ 7
-	cacheLen := int32(config.SetOverlapCacheBytes(len(c.input), int(npat)))
+	// The checkpointed region, sized from the sweep column the compiler
+	// actually built. Falls back to a nominal region when the set gets no
+	// sweep: the descriptor still carries a pointer, and the drive declines it.
+	// The region and the stride from ONE helper: the region is sized from the
+	// stride, and the sweep validates the stride against the region, so a
+	// harness computing them apart would be handed -4. It also sizes off the
+	// BUCKET's pattern count rather than the set's declared one — a set whose
+	// members were dropped or packed elsewhere has fewer.
+	cacheStride := int32(0)
+	cacheLen := int32(config.SetOverlapCheckpointHeaderBytes)
+	if bytes, k, err := overlapSizingFor(c); err == nil {
+		cacheLen, cacheStride = int32(bytes), int32(k)
+	}
 	top := int64(cachePtr) + int64(cacheLen) + 4096
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
@@ -930,12 +1007,73 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	runtime.KeepAlive(store)
 	return &rxInstance{
 		store: store, inst: inst, mem: mem,
-		inBase: inBase, outPtr: outPtr, gatePtr: gatePtr, bitmapPt: bitmapPt,
+		inBase: inBase, outPtr: outPtr, gatePtr: gatePtr, scratchPtr: scratchPtr,
+		bitmapPt: bitmapPt,
 		batchPtr: batchPtr,
-		cachePtr: cachePtr, cacheLen: cacheLen,
+		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: npat, inLen: int32(len(c.input)),
 	}, nil
 }
+
+// writeScratch fills the descriptor: the magic, the gate array, and either the
+// answer cache or a declined one.
+//
+// The cache goes to the OVERLAPPING drives only, which is what a generated JS/TS
+// iterator does: it is the one policy whose drive the backward sweep can
+// answer. A gated drive is handed 0, 0 and walks, so those rows keep measuring
+// what they measured before the cache existed.
+func (r *rxInstance) writeScratch(cache bool) {
+	buf := r.mem.UnsafeData(r.store)
+	for i := int32(0); i < r.npat*4; i++ {
+		buf[r.gatePtr+i] = 0
+	}
+	cachePtr, cacheLen := int32(0), int32(0)
+	if cache {
+		cachePtr, cacheLen = r.cachePtr, r.cacheLen
+		for i := int32(0); i < config.SetOverlapCheckpointHeaderBytes; i++ {
+			buf[cachePtr+i] = 0
+		}
+		// The stride is the one header field the CALLER fills. Everything else
+		// is zero, which is what "this drive has not swept yet" means.
+		binary.LittleEndian.PutUint32(buf[cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
+	}
+	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
+	runtime.KeepAlive(r.store)
+}
+
+// cacheReady is what the sweep did with the region the last drive offered:
+// 1 swept, -1 asked and refused, 0 never asked. Reading it is what stops a
+// cached leg passing for verified when it silently walked.
+func (r *rxInstance) cacheReady() int32 {
+	if r.cachePtr == 0 {
+		return 0
+	}
+	v := int32(binary.LittleEndian.Uint32(r.mem.UnsafeData(r.store)[r.cachePtr+config.SetOverlapHdrReadyOff:]))
+	runtime.KeepAlive(r.store)
+	return v
+}
+
+// cacheWork is the header's `work` word after the last drive: the matched bytes
+// the walk accumulated, which the engine compares against the sweep's cost.
+func (r *rxInstance) cacheWork() uint32 {
+	if r.cachePtr == 0 {
+		return 0
+	}
+	v := binary.LittleEndian.Uint32(r.mem.UnsafeData(r.store)[r.cachePtr+config.SetOverlapHdrWorkOff:])
+	runtime.KeepAlive(r.store)
+	return v
+}
+
+// sweptRow is one sweep-eligible row's cache leg, printed as a table after
+// --verify so a reader sees why each row did or did not engage.
+type sweptRow struct {
+	row       string
+	ready     int32
+	work      uint32
+	threshold uint64
+}
+
+var sweptRows []sweptRow
 
 // zeroBitmap clears the >64-pattern bitmap before a wide `_all` call.
 //
@@ -1021,18 +1159,22 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 	// its preflight verdict, and zeroing it is what declares a fresh drive.
 	// Doing it once here rather than per call is the point of the change —
 	// the per-call form is what the attempt log measured and rejected.
-	buf := r.mem.UnsafeData(r.store)
-	for i := int32(0); i < r.npat*4; i++ {
-		buf[r.gatePtr+i] = 0
-	}
-	runtime.KeepAlive(r.store)
+	// The cache is offered to the OVERLAPPING flavour and declined for the
+	// gated one, exactly as exhaustFindBatch does: since the cache logic
+	// became common code BOTH find entries read it, and a gated drive has no
+	// sweep to engage.
+	//
+	// This is what the `find(overlapping)` rows of the input-length family
+	// measure, so it changes what those rows mean: before it they were the
+	// quadratic walk with a cache the body could not read.
+	r.writeScratch(!gated)
 	from := int32(0)
 	calls := 0
 	for {
 		var res interface{}
 		var err error
 		calls++
-		res, err = wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, from, r.scratchPtr, r.outPtr, r.npat)
 		if err != nil {
 			return calls, err
 		}
@@ -1054,29 +1196,14 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 // stop, and reading the tuples would add harness work to a timed loop that is
 // meant to measure the engine.
 func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error) {
-	buf := r.mem.UnsafeData(r.store)
-	for i := int32(0); i < r.npat*4; i++ {
-		buf[r.gatePtr+i] = 0
-	}
-	// The answer cache goes to the OVERLAPPING drive only, which is what a
-	// generated JS/TS iterator does: it is the one policy whose drive the
-	// backward sweep can answer. A gated drive is handed 0, 0 and walks, so
-	// this row keeps measuring what it measured before the cache existed.
-	cachePtr, cacheLen := int32(0), int32(0)
-	if !gated {
-		cachePtr, cacheLen = r.cachePtr, r.cacheLen
-		for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
-			buf[cachePtr+i] = 0
-		}
-	}
-	runtime.KeepAlive(r.store)
+	r.writeScratch(!gated)
 	cursor := int64(0)
 	calls := 0
 	for {
 		var res interface{}
 		var err error
 		calls++
-		res, err = wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err = wcall(fn, r.store, r.inBase, r.inLen, cursor, r.scratchPtr, r.batchPtr, int32(batchCap))
 		if err != nil {
 			return calls, err
 		}
@@ -1884,7 +2011,7 @@ func runFuelCross(cases []setCase) {
 			if ourFuel == fuelExhausted || theirFuel == fuelExhausted {
 				note = fmt.Sprintf("one side exceeded the %s budget", fmtFuel(fuelBudget))
 			}
-			// `find` COUNTS here, unlike in the timed matrix where item 22
+			// `find` COUNTS here, unlike in the timed matrix where
 			// the bare-find row withholds its ratio as "api-shape". The distinction is
 			// the whole reason this column exists: a Go->wasmtime call
 			// executes no wasm instructions, so the crossings that make the
@@ -2140,7 +2267,7 @@ func runVerify(cases []setCase) int {
 		// uses, and the one raPairing already trusts for the fuel rows. This
 		// is the only capability here whose EXTENTS are checked, not just its
 		// ids, which is why leaving it out mattered.
-		ourFind := rxCollectFind(r)
+		ourFind := rxCollectFind(r, false)
 		if theirFind, complete := raFindGated(ra, int32(len(c.input))); !complete {
 			// The harness buffer is fixed, and ra_find_gated truncates rather
 			// than growing it. A truncated list is not a smaller answer, so
@@ -2170,7 +2297,7 @@ func runVerify(cases []setCase) int {
 		// is the only one whose find_batch reads the answer cache, so the
 		// backward sweep had no correctness check at all — the engine-
 		// independent find-vs-find_batch cross-check is applied to it here.
-		if n := verifyOverlapping(engine, c); n > 0 {
+		if n := verifyOverlapping(engine, ra, c); n > 0 {
 			bad += n
 		}
 
@@ -2179,6 +2306,12 @@ func runVerify(cases []setCase) int {
 		// worth seeing rather than hiding behind "ok".
 		fmt.Printf("ok   %s/%s (anchored: %d/%d prefixes match, find: %d matches)\n",
 			c.name, c.inputLbl, anchoredMatches, len(anchoredLens(len(c.input))), len(ourFind))
+	}
+	if len(sweptRows) > 0 {
+		fmt.Println("\nanswer-cache legs on sweep-eligible rows (ready 1 = swept):")
+		for _, sr := range sweptRows {
+			fmt.Printf("  %-48s ready %2d  work %12d  threshold %12d\n", sr.row, sr.ready, sr.work, sr.threshold)
+		}
 	}
 	if bad > 0 {
 		fmt.Printf("\n%d mismatch(es)\n", bad)
@@ -2189,14 +2322,21 @@ func runVerify(cases []setCase) int {
 }
 
 // verifyOverlapping compiles the OVERLAPPING module for one case and holds its
-// `find` against its own `find_batch`.
+// `find` against its own `find_batch` AND against regex-automata.
 //
-// regex-automata has no every-start-position enumeration to compare against,
-// so this is an internal cross-check rather than a cross-engine one — but the
-// two bodies are independent implementations of the same answer, and the batch
-// one is the only consumer of the backward sweep. Without it nothing in
-// --verify ever built an overlapping module.
-func verifyOverlapping(engine *wasmtime.Engine, c setCase) int {
+// The internal cross-check came first and still matters: the two bodies are
+// independent implementations of the same answer, and the batch one is the only
+// consumer of the backward sweep, so without this nothing in --verify ever built
+// an overlapping module at all.
+//
+// The cross-ENGINE half was added 2026-09-11, and it is what makes the
+// performance row beside it legitimate. regex-automata has no every-start
+// enumeration of its own — its overlapping search yields half matches keyed by
+// END under MatchKind::All — but the construction a user would write to get our
+// semantics, one anchored leftmost-first search per start, produces our answer
+// set exactly. Checking that it DOES, tuple for tuple, is the difference between
+// a fair comparison and two engines being timed on different questions.
+func verifyOverlapping(engine *wasmtime.Engine, ra *raHarness, c setCase) int {
 	wasm, err := compileCase(c, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: compiling the overlapping module for %s/%s: %v\n", c.name, c.inputLbl, err)
@@ -2207,14 +2347,94 @@ func verifyOverlapping(engine *wasmtime.Engine, c setCase) int {
 		fmt.Fprintf(os.Stderr, "HARNESS ERROR: instantiating the overlapping module for %s/%s: %v\n", c.name, c.inputLbl, err)
 		os.Exit(1)
 	}
-	ourFind := rxCollectFind(r)
+	ourFind := rxCollectFind(r, false)
 	ourBatch := rxCollectFindBatch(r)
+	bad := 0
 	if !sameMatches(ourFind, ourBatch) {
 		fmt.Printf("MISMATCH %s/%s overlapping find vs find_batch: find=%d matches, batch=%d\n",
 			c.name, c.inputLbl, len(ourFind), len(ourBatch))
-		return 1
+		bad++
 	}
-	return 0
+	// The same `find`, offered the cache. It is a different body below the
+	// export — a binary search into the swept tuples and a memory.copy, where
+	// the drive above walks — and it is also the path the timed
+	// find(overlapping) rows take, so measuring it without checking it would
+	// be timing an answer nothing had verified.
+	if cached := rxCollectFind(r, true); !sameMatches(ourFind, cached) {
+		fmt.Printf("MISMATCH %s/%s overlapping find with vs without the answer cache: %d matches vs %d\n",
+			c.name, c.inputLbl, len(ourFind), len(cached))
+		bad++
+	}
+	// Did the cache leg SWEEP, or did it quietly fall back to the walk? A
+	// declined region answers identically — the walk is correct too — so the
+	// comparison above passes either way and the cache goes unverified. The
+	// header's `ready` is the one field a caller may read, and it is the only
+	// thing that tells the two apart.
+	//
+	// Whether it SHOULD have swept is measurable rather than a label. The engine
+	// engages once the walk's work passes len × cost-per-byte (strictly), or
+	// once the counter saturates; exactly at the threshold is not a failure. A
+	// shape with no sweep at all has nothing to engage and is not checked.
+	sc, cfg := overlapSetConfigFor(c)
+	if shape, err := compile.SetOverlapCacheShapeOpts(sc, cfg, compileSetOptions()); err == nil && shape.Eligible {
+		ready, work := r.cacheReady(), r.cacheWork()
+		threshold := uint64(len(c.input)) * uint64(shape.CostPerByte)
+		over := work == 0x7FFFFFFF || uint64(work) > threshold
+		sweptRows = append(sweptRows, sweptRow{c.name + "/" + c.inputLbl, ready, work, threshold})
+		switch {
+		case ready == 1:
+		case ready != 0:
+			fmt.Printf("MISMATCH %s/%s overlapping find: the cache leg REFUSED the region "+
+				"(ready=%d) — it was sized by config and must fit\n", c.name, c.inputLbl, ready)
+			bad++
+		case over:
+			fmt.Printf("MISMATCH %s/%s overlapping find: work %d passed the sweep threshold %d "+
+				"and the cache never engaged\n", c.name, c.inputLbl, work, threshold)
+			bad++
+		default:
+			fmt.Printf("UNSWEPT %s/%s overlapping find: work %d stayed at or below the sweep threshold %d, "+
+				"so the cached row is the walk\n", c.name, c.inputLbl, work, threshold)
+		}
+	}
+	if theirs := raFindOverlapping(ra, int32(len(c.input))); !sameMatches(theirs, ourFind) {
+		fmt.Printf("MISMATCH %s/%s overlapping find: ours=%d matches, theirs=%d\n",
+			c.name, c.inputLbl, len(ourFind), len(theirs))
+		bad++
+	}
+	return bad
+}
+
+// raFindOverlapping reads the per-start anchored enumeration a page at a time.
+// The export fills RA_OUT_BUF with WHOLE positions only and reports where to
+// resume, so no position is split between pages and nothing is lost at a page
+// edge — which is what used to leave the two 100 KB rows where the sweep
+// engages uncompared, as "buffer full".
+func raFindOverlapping(h *raHarness, inputLen int32) []setTuple {
+	var out []setTuple
+	from := int32(0)
+	for {
+		n := raCallI32(h, "ra_find_overlapping", inputLen, from)
+		buf := h.mem.UnsafeData(h.store)
+		for i := int32(0); i < n; i++ {
+			base := int(h.outPtr) + int(i)*12
+			out = append(out, setTuple{
+				int32(binary.LittleEndian.Uint32(buf[base:])),
+				int32(binary.LittleEndian.Uint32(buf[base+4:])),
+				int32(binary.LittleEndian.Uint32(buf[base+8:])),
+			})
+		}
+		runtime.KeepAlive(h.store)
+		resume := raCallI32(h, "ra_overlap_resume")
+		if resume < 0 {
+			return out
+		}
+		if n == 0 {
+			fmt.Fprintf(os.Stderr, "HARNESS ERROR: position %d alone has more tuples than RA_OUT_BUF holds (%d)\n",
+				resume, raOutTuples)
+			os.Exit(1)
+		}
+		from = resume
+	}
 }
 
 // scanFromValues picks the `from` positions the scan pair is verified at: the
@@ -2234,8 +2454,14 @@ func scanFromValues(n int) []int {
 // find_batch buffer.
 type setTuple struct{ id, start, end int32 }
 
-// rxCollectFind drives the gated `find` to exhaustion and returns every tuple.
-func rxCollectFind(r *rxInstance) []setTuple {
+// rxCollectFind drives `find` to exhaustion and returns every tuple.
+//
+// `cache` decides whether the descriptor OFFERS the overlapping answer cache.
+// Both answers are checked on an overlapping module, because the cached path
+// and the walk are two different bodies producing one answer: the cache serves
+// a whole position out of the swept tuples, the walk enumerates it. Declining
+// is the only legal value for a gated module, which has no sweep.
+func rxCollectFind(r *rxInstance, cache bool) []setTuple {
 	fn := r.inst.GetFunc(r.store, "cap_find")
 	if fn == nil {
 		// Not `return nil`: two nils compare equal, so a missing export used
@@ -2243,15 +2469,11 @@ func rxCollectFind(r *rxInstance) []setTuple {
 		fmt.Fprintln(os.Stderr, "HARNESS ERROR: our module has no export \"cap_find\"")
 		os.Exit(1)
 	}
-	buf := r.mem.UnsafeData(r.store)
-	for i := int32(0); i < r.npat*4; i++ {
-		buf[r.gatePtr+i] = 0
-	}
-	runtime.KeepAlive(r.store)
+	r.writeScratch(cache)
 	var out []setTuple
 	from := int32(0)
 	for {
-		res, err := wcall(fn, r.store, r.inBase, r.inLen, from, r.gatePtr, r.outPtr, r.npat)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, from, r.scratchPtr, r.outPtr, r.npat)
 		if err != nil {
 			return out
 		}
@@ -2281,11 +2503,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 		fmt.Fprintln(os.Stderr, "HARNESS ERROR: our module has no export \"cap_find_batch\"")
 		os.Exit(1)
 	}
-	buf := r.mem.UnsafeData(r.store)
-	for i := int32(0); i < r.npat*4; i++ {
-		buf[r.gatePtr+i] = 0
-	}
-	// Offered unconditionally here, unlike the fuel drive.
+	// The cache is offered unconditionally here, unlike the fuel drive.
 	//
 	// NOTE what this does and does not cover. Offering the cache to a GATED
 	// module puts nothing under check: the backward sweep is read only by the
@@ -2293,16 +2511,12 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 	// (compile/set_batch.go). The sweep is exercised by the overlapping
 	// module verifyOverlapping builds below, which is what this comment used
 	// to claim for itself.
-	cachePtr, cacheLen := r.cachePtr, r.cacheLen
-	for i := int32(0); i < config.SetOverlapCacheHeaderBytes; i++ {
-		buf[cachePtr+i] = 0
-	}
-	runtime.KeepAlive(r.store)
+	r.writeScratch(true)
 	countMask := int64(1)<<uint(config.SetCursorCountBits(int(r.npat))) - 1
 	var out []setTuple
 	cursor := int64(0)
 	for {
-		res, err := wcall(fn, r.store, r.inBase, r.inLen, cursor, r.gatePtr, r.batchPtr, int32(batchCap), cachePtr, cacheLen)
+		res, err := wcall(fn, r.store, r.inBase, r.inLen, cursor, r.scratchPtr, r.batchPtr, int32(batchCap))
 		if err != nil {
 			return out
 		}
@@ -2561,4 +2775,53 @@ func fmtFuel(v uint64) string {
 		s = s[:len(s)-3]
 	}
 	return strings.Join(append([]string{s}, parts...), ",")
+}
+
+// overlapSizingFor is the region and stride a case's answer cache needs.
+func overlapSizingFor(c setCase) (bytes, stride int, err error) {
+	sc, cfg := overlapSetConfigFor(c)
+	return compile.SetOverlapCacheSizingOpts(sc, cfg, len(c.input), compileSetOptions())
+}
+
+// overlapSetConfigFor reports the sweep column a case's set compiles to, which
+// is what sizes its answer cache.
+//
+// It recompiles the set — the same route a stub generator takes — because the
+// column width falls out of the DFA construction and nothing in the case's
+// pattern list implies it.
+func overlapSetConfigFor(c setCase) (config.SetConfig, config.BuildConfig) {
+	entries := make([]config.RegexEntry, len(c.patterns))
+	pnames := make([]string, len(c.patterns))
+	for i, p := range c.patterns {
+		pnames[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: pnames[i], Pattern: p}
+	}
+	// The set MUST be declared exactly as compileCase declares it — every
+	// capability and the batch hint — and inspected under compileSetOptions,
+	// which carries the forced frontend. The bucket a set packs
+	// into depends on what it has to serve, so a shape looked up from a
+	// reduced config can name a different automaton than the module actually
+	// contains, and the region would be sized and strided for the wrong sweep.
+	// That is not hypothetical: looking it up from a find-only config made the
+	// 256-byte overlap-shape row disagree with the walk while every other row
+	// passed.
+	hints := []string{"batch-find"}
+	if setHints != "" {
+		hints = append(hints, setHints)
+	}
+	cfg := config.BuildConfig{
+		Regexps: entries,
+		Sets: []config.SetConfig{{
+			Name:        "s",
+			MatchAny:    "cap_match_any",
+			MatchAll:    "cap_match_all",
+			ScanAny:     "cap_scan_any",
+			ScanAll:     "cap_scan_all",
+			Find:        "cap_find",
+			Hints:       hints,
+			Overlapping: true,
+			Patterns:    config.PatternSelector{Names: pnames},
+		}},
+	}
+	return cfg.Sets[0], cfg
 }

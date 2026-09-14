@@ -33,7 +33,7 @@ var errBTOverflow = errors.New("backtracking stack overflow (abi.BTStackOverflow
 const (
 	// tableBase is the WASM memory offset where DFA tables start. Test
 	// input is written at offset 0, so any input at or past tableBase would
-	// spill into table data — see inputCap in fuzz_test.go.
+	// spill into table data — see inputCap in fuzz_targets_test.go.
 	tableBase = int64(65536)
 
 	wasmCallTimeout = 2 * time.Second

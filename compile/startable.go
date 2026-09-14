@@ -24,7 +24,7 @@ import (
 // greedy-3 (`a+`, `[^\n]*ERROR`, `x?y`) packs into ONE fallback bucket, and
 // `[^\n]*ERROR` starts with almost any byte — so the bucket's UNION is
 // all-ones and a bucket-granular test could never fire. Per-PATTERN bits are
-// what make it work: G9's preflight has already gated `[^\n]*ERROR` out of
+// what make it work: the gated-`find` preflight has already gated `[^\n]*ERROR` out of
 // the drive (it matches nowhere), so at a byte that is neither `a` nor `x`/`y`
 // the surviving mask is empty even though the table entry is not.
 //
@@ -83,7 +83,7 @@ func buildStartableTable(bkt *bucket) []uint32 {
 		return nil
 	}
 	if bkt.sparse {
-		// A G17-sparse bucket reads its answer out of per-state LISTS and
+		// A sparse bucket reads its answer out of per-state LISTS and
 		// ignores every i32 mask on the candidate path (validMask included),
 		// so a table indexed into one is dead weight there — and, worse, a
 		// reader who wired it up would be applying a bucket-local mask to a

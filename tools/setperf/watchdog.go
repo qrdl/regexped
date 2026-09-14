@@ -15,8 +15,8 @@ import (
 // host-side loop to notice either. When a generated find body reported a match
 // starting before the position it was asked to search from, the shim's
 // `off += end - off` advance went negative and this process sat at 101%% CPU
-// for two and a half hours with no output and no clue which case it was on
-// (plans/FUZZER_BUGS.md 65). re2test and tools/fuzz already had a watchdog and
+// for two and a half hours with no output and no clue which case it was on.
+// re2test and tools/fuzz already had a watchdog and
 // would have named the pattern in seconds.
 //
 // The timeout is a liveness check, not a latency budget — see wasmwatch.

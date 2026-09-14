@@ -174,11 +174,11 @@ together with bucket dispatch and the isolated-fallback path for non-greedy
 patterns. Per-shape *scaling* is measured separately by `tools/setperf` and the
 fuel ladder.
 
-`make sets` samples the corpus — measured at **2m58s for 6,525,501 checks** —
-which is why it is part of `make test`; `make sets-exhaustive` is the same
-coverage over every chunk and takes hours. Both run clean with **0 failures**,
-and the whole-block gated-`find` leg still reports its historical
-**4,935,736**.
+`make sets` samples the corpus, at **22,244,845 checks** over its ten runs, and
+is part of `make test`; `make sets-exhaustive` is the same coverage over every
+chunk. Both run clean with **0 failures**,
+and the whole-block gated-`find` leg (`make set-batch`, which
+`sets-exhaustive` runs last) reports **5,205,664**.
 
 ### Sets under a hint (`make sets-likely`)
 
@@ -188,7 +188,7 @@ body, the union scan's stride, the widened Shufti band, the counted-chain
 packer split, and the forced-Shufti frontend. `make sets-likely` runs the same
 capability sweep with `--likelymatch` and `--likelynomatch`, which reach the
 set path as set-level `hints:` — so it compiles genuinely different bodies
-against the same oracle, at **9,410,470 checks, 0 failures**. It is part of
+against the same oracle, at **10,435,992 checks, 0 failures**. It is part of
 `make test`.
 
 Fewer configurations than `make sets` on purpose: a hint changes the emitted

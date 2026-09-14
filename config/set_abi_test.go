@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // The ABI helpers in this package are the SHARED DEFINITION of numbers the
 // compiler and all six stub generators must agree on: how many tuples a `find`
@@ -134,31 +139,6 @@ func TestSetCursorMaxCountIsMonotonic(t *testing.T) {
 	}
 }
 
-// TestSetOverlapCacheBytes pins the sizing rule the compiler and the JS/TS
-// stubs both compute: a 16-byte header plus twelve bytes per tuple, worst case
-// one tuple per pattern per START POSITION — of which there are len+1, not len,
-// because a match can begin at end of input.
-func TestSetOverlapCacheBytes(t *testing.T) {
-	if got, want := SetOverlapCacheBytes(0, 1), SetOverlapCacheHeaderBytes+12; got != want {
-		t.Errorf("empty input, 1 pattern: %d, want %d (position 0 is still a start)", got, want)
-	}
-	if got, want := SetOverlapCacheBytes(100, 3), SetOverlapCacheHeaderBytes+101*3*12; got != want {
-		t.Errorf("100 bytes, 3 patterns: %d, want %d", got, want)
-	}
-	// Strictly increasing in both arguments — a cache that did not grow with
-	// the input would be handed to a sweep that overruns it.
-	if SetOverlapCacheBytes(10, 1) <= SetOverlapCacheBytes(9, 1) {
-		t.Error("not increasing in input length")
-	}
-	if SetOverlapCacheBytes(10, 2) <= SetOverlapCacheBytes(10, 1) {
-		t.Error("not increasing in pattern count")
-	}
-	if SetOverlapCacheHeaderBytes%4 != 0 {
-		t.Errorf("header %d is not 4-byte aligned; its slots are i32",
-			SetOverlapCacheHeaderBytes)
-	}
-}
-
 // TestBatchFindHint: batching is requested through `hints:`, not declared as a
 // capability, and only alongside `find`.
 func TestBatchFindHint(t *testing.T) {
@@ -202,5 +182,233 @@ func TestSanitizeSetName(t *testing.T) {
 	// one: it is interpolated into an identifier position in six languages.
 	if got := SanitizeSetName("9lives"); got != "" && got[0] >= '0' && got[0] <= '9' {
 		t.Errorf("SanitizeSetName(%q) = %q, which is not a legal identifier start", "9lives", got)
+	}
+}
+
+// The CHECKPOINTED region's arithmetic, which every stub in six languages
+// reproduces and the sweep then validates.
+//
+// The stride is the whole knob. Below the budget it is the WHOLE SPAN, which is
+// one block: one sweep, nothing re-swept, and the behaviour the whole-drive
+// cache had. Above it the stride drops to the square-root optimum and the
+// region becomes sqrt-sized, at the cost of sweeping each position twice. The
+// crossover is therefore a memory policy and not a performance one, and this
+// pins where it is.
+func TestSetOverlapCheckpointStride(t *testing.T) {
+	const cells, pats = 6, 3
+	row := SetOverlapBlockRowBytes(pats)
+
+	// SINGLE BLOCK below the budget: the stride IS the span.
+	if got, want := SetOverlapCheckpointStride(1000, cells, pats), 1001; got != want {
+		t.Errorf("a 1000-byte input strides %d, want %d (m, i.e. one block)", got, want)
+	}
+	// Find the crossover by construction rather than by a constant: it is
+	// where the single-block region passes the budget.
+	cross := 0
+	for m := 1; ; m++ {
+		if SetOverlapCheckpointHeaderBytes+(cells*4+4)+4+m*row > SetOverlapCacheMaxBytes {
+			cross = m - 1 // the last m that still fits
+			break
+		}
+	}
+	if got := SetOverlapCheckpointStride(cross-1, cells, pats); got != cross {
+		t.Errorf("just below the crossover the stride is %d, want %d (still one block)", got, cross)
+	}
+	if got := SetOverlapCheckpointStride(cross, cells, pats); got >= cross+1 {
+		t.Errorf("just above the crossover the stride is still the whole span (%d): "+
+			"the region would be over budget", got)
+	}
+	// The 16 floor: a tiny stride is all cost and no saving, since every block
+	// re-sweeps from a checkpoint.
+	if got := SetOverlapCheckpointStride(1<<30, 1, 64); got < 16 {
+		t.Errorf("stride %d is below the floor of 16", got)
+	}
+	// And it never exceeds the span, whatever the square root says.
+	for _, n := range []int{0, 1, 2, 5} {
+		if got := SetOverlapCheckpointStride(n, cells, pats); got > n+1 {
+			t.Errorf("input %d strides %d, which is wider than the span of %d", n, got, n+1)
+		}
+	}
+}
+
+// The region and the stride are computed by two functions that must describe
+// the SAME layout: the caller sizes the allocation from one and writes the
+// other into the header, and the sweep refuses a header that does not fit the
+// region it was given.
+func TestSetOverlapCheckpointBytesAgreesWithStride(t *testing.T) {
+	for _, tc := range []struct{ n, cells, pats int }{
+		{0, 6, 3}, {1, 6, 3}, {100, 6, 3}, {4096, 353, 32}, {1 << 20, 353, 32},
+	} {
+		k := SetOverlapCheckpointStride(tc.n, tc.cells, tc.pats)
+		got := SetOverlapCheckpointBytes(tc.n, tc.cells, tc.pats)
+		want := SetOverlapCheckpointBytesForStride(tc.n, tc.cells, tc.pats, k)
+		if got != want {
+			t.Errorf("len=%d: Bytes says %d, BytesForStride at the chosen k=%d says %d",
+				tc.n, got, k, want)
+		}
+		// The layout the sweep computes: header, one column per block, the
+		// cumulative counts, and one block buffer.
+		m := tc.n + 1
+		nb := (m + k - 1) / k
+		exact := SetOverlapCheckpointHeaderBytes + nb*tc.cells*4 + (nb+1)*4 +
+			k*SetOverlapBlockRowBytes(tc.pats)
+		if got != exact {
+			t.Errorf("len=%d: %d bytes reserved, %d needed by the layout", tc.n, got, exact)
+		}
+	}
+}
+
+// A stride the caller chose is clamped into range before it sizes anything,
+// because a caller may pass one the sweep would refuse.
+func TestSetOverlapCheckpointBytesForStrideClamps(t *testing.T) {
+	const cells, pats = 6, 3
+	base := SetOverlapCheckpointBytesForStride(100, cells, pats, 1)
+	if got := SetOverlapCheckpointBytesForStride(100, cells, pats, 0); got != base {
+		t.Errorf("k=0 sized %d, want the k=1 size %d", got, base)
+	}
+	if got := SetOverlapCheckpointBytesForStride(100, cells, pats, -7); got != base {
+		t.Errorf("k=-7 sized %d, want the k=1 size %d", got, base)
+	}
+	whole := SetOverlapCheckpointBytesForStride(100, cells, pats, 101)
+	if got := SetOverlapCheckpointBytesForStride(100, cells, pats, 1<<20); got != whole {
+		t.Errorf("a stride wider than the span sized %d, want the one-block size %d", got, whole)
+	}
+}
+
+// The single-block size OVERFLOWS on a large enough input, and overflowing is
+// itself a reason to checkpoint rather than a reason to fail.
+func TestSingleBlockBytesOverflowDeclinesTheWholeSpan(t *testing.T) {
+	if got := singleBlockBytes(1<<62, 6, 3); got != 0 {
+		t.Errorf("an m that overflows returned %d, want 0 (the signal to checkpoint)", got)
+	}
+	// And the stride function survives it: it must pick the sqrt arm rather
+	// than compare against a wrapped number.
+	if got := SetOverlapCheckpointStride(1<<40, 353, 32); got <= 0 || got > 1<<40 {
+		t.Errorf("stride %d for a huge input is not in range", got)
+	}
+}
+
+// TestSetOverlapRowEndOff pins the row shape against the arithmetic the
+// writer and both readers used to spell separately.
+func TestSetOverlapRowEndOff(t *testing.T) {
+	if SetOverlapRowMaskOff != 0 {
+		t.Fatalf("mask offset = %d, want 0", SetOverlapRowMaskOff)
+	}
+	for k := 0; k < 8; k++ {
+		if got, want := SetOverlapRowEndOff(k), 4+4*k; got != want {
+			t.Errorf("SetOverlapRowEndOff(%d) = %d, want %d", k, got, want)
+		}
+	}
+	// The last end must sit inside the row, and the row must hold nothing
+	// beyond it: a row is exactly a mask plus one end per pattern.
+	for _, pats := range []int{1, 3, 64} {
+		row := SetOverlapBlockRowBytes(pats)
+		if got := SetOverlapRowEndOff(pats-1) + 4; got != row {
+			t.Errorf("pats=%d: last end ends at %d, row is %d bytes", pats, got, row)
+		}
+	}
+}
+
+// TestSetOverlapSizingClampsNonPositiveLen covers the m<1 guards in all three
+// sizing helpers. A caller that asks about an empty-or-negative input must get
+// the one-position answer, not a negative region — the stubs reproduce this
+// arithmetic and would allocate nothing.
+func TestSetOverlapSizingClampsNonPositiveLen(t *testing.T) {
+	const cells, pats = 6, 3
+	for _, n := range []int{-1, -7, -1 << 20} {
+		if got, want := SetOverlapCheckpointStride(n, cells, pats), 1; got != want {
+			t.Errorf("Stride(%d) = %d, want %d", n, got, want)
+		}
+		want := SetOverlapCheckpointBytes(0, cells, pats)
+		if got := SetOverlapCheckpointBytes(n, cells, pats); got != want {
+			t.Errorf("Bytes(%d) = %d, want Bytes(0) = %d", n, got, want)
+		}
+		wantK := SetOverlapCheckpointBytesForStride(0, cells, pats, 1)
+		if got := SetOverlapCheckpointBytesForStride(n, cells, pats, 1); got != wantK {
+			t.Errorf("BytesForStride(%d,k=1) = %d, want %d", n, got, wantK)
+		}
+	}
+}
+
+// TestSetOverlapStrideClampsSqrt covers the two clamps on the square-root
+// optimum. Both need a region ABOVE the budget, since below it the stride is
+// the whole span and neither clamp is reached.
+func TestSetOverlapStrideClampsSqrt(t *testing.T) {
+	// Low floor: many patterns make a row wide, so sqrt(m*cells*4/row) lands
+	// under 16 while m*row still blows the budget. A stride below 16 would
+	// make the checkpoint column cost more than the block it saves.
+	const pats = 1000
+	const m = 20000
+	if n := singleBlockBytes(m, 1, pats); n > 0 && n <= SetOverlapCacheMaxBytes {
+		t.Fatalf("single-block region %d is within the budget; the clamp is unreachable", n)
+	}
+	if got := SetOverlapCheckpointStride(m-1, 1, pats); got != 16 {
+		t.Errorf("Stride(%d,1,%d) = %d, want the floor 16", m-1, pats, got)
+	}
+
+	// High ceiling: a very wide column over a two-position span. The optimum
+	// exceeds the span, and a stride past the span would size a block for
+	// positions that do not exist.
+	const cells = 17_000_000
+	if n := singleBlockBytes(2, cells, 0); n > 0 && n <= SetOverlapCacheMaxBytes {
+		t.Fatalf("single-block region %d is within the budget; the clamp is unreachable", n)
+	}
+	if got := SetOverlapCheckpointStride(1, cells, 0); got != 2 {
+		t.Errorf("Stride(1,%d,0) = %d, want the span 2", cells, got)
+	}
+}
+
+// TestSingleBlockBytesReportsOverflow covers both of singleBlockBytes' refusals.
+// It answers 0 rather than a wrapped size, because a wrapped size is a region
+// the sweep's validation would reject only by luck.
+func TestSingleBlockBytesReportsOverflow(t *testing.T) {
+	// m*b overflows: the guard fires before the multiply.
+	if got := singleBlockBytes(1<<62, 6, 3); got != 0 {
+		t.Errorf("singleBlockBytes(1<<62,6,3) = %d, want 0", got)
+	}
+	// The COLUMN alone overflows, which the m*b guard cannot see: the sum
+	// itself goes negative.
+	if got := singleBlockBytes(1, 1<<61, 0); got != 0 {
+		t.Errorf("singleBlockBytes(1,1<<61,0) = %d, want 0", got)
+	}
+	// And the stride helper above it must not return a nonsense stride when
+	// that happens — 0 is treated as "does not fit", so it sweeps to sqrt.
+	if got := SetOverlapCheckpointStride(1, 1<<61, 0); got < 1 {
+		t.Errorf("Stride over an overflowing column = %d, want >= 1", got)
+	}
+}
+
+// TestSetOverlapBytesForStrideClampsAboveSpan pins the k>m clamp, which is the
+// one-block mode a caller reaches by asking for a stride larger than the input.
+func TestSetOverlapBytesForStrideClampsAboveSpan(t *testing.T) {
+	const cells, pats = 6, 3
+	whole := SetOverlapCheckpointBytesForStride(100, cells, pats, 101)
+	if got := SetOverlapCheckpointBytesForStride(100, cells, pats, 1<<30); got != whole {
+		t.Errorf("k past the span = %d, want the whole-span %d", got, whole)
+	}
+}
+
+// TestLoadConfigUnresolvablePath covers the filepath.Abs failure. It is
+// reachable only with no working directory, which is why the error is reported
+// by the path rather than assumed impossible.
+func TestLoadConfigUnresolvablePath(t *testing.T) {
+	gone := t.TempDir()
+	sub := filepath.Join(gone, "cwd")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+	if err := os.Remove(sub); err != nil {
+		t.Skipf("cannot remove the working directory on this platform: %v", err)
+	}
+	if _, err := os.Getwd(); err == nil {
+		t.Skip("this platform still resolves a removed working directory")
+	}
+	_, err := LoadConfig("regexped.yaml")
+	if err == nil {
+		t.Fatal("LoadConfig with no working directory succeeded")
+	}
+	if !strings.Contains(err.Error(), "resolve config path") {
+		t.Errorf("error = %v, want it to name the path resolution", err)
 	}
 }

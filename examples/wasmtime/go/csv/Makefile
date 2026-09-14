@@ -9,7 +9,7 @@ STUB       := stub.go
 
 .PHONY: all generate build compile merge run clean
 
-all: run
+all: merge
 
 # Step 1 – generate Go stub from config
 # $(REGEXPED) is a prerequisite of every rule below that runs it: the generated

@@ -27,7 +27,7 @@ example-lnm:
 example-shufti:
 	go run . -config examples/shufti.yaml -inputs examples/shufti_inputs.txt -force-frontend scalar -iters 200 $(ARGS)
 
-# The `shuftiAdaptive` A/B (task 74). Not a hint comparison — both arms use
+# The `shuftiAdaptive` A/B. Not a hint comparison — both arms use
 # prefer-no-match, and what differs is the runtime density switch that the
 # forced-Shufti frontend carries. Nothing reachable from YAML compiles both
 # arms (the verdict `prefer-no-match && !rare` is deterministic per set), which

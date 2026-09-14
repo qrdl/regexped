@@ -69,9 +69,16 @@ Workers import WASM as a module object (not bytes), so `init(wasm)` receives the
 
 ## Deploy
 
+Install [Wrangler](https://developers.cloudflare.com/workers/wrangler/) first —
+`npm install -g wrangler`; Wrangler 4 needs Node.js 22 or newer — then:
+
 ```bash
-npx wrangler dev     # local dev server
-npx wrangler deploy  # deploy to Cloudflare
+wrangler dev     # local dev server
+wrangler deploy  # deploy to Cloudflare (after `wrangler login`)
 ```
+
+In [`examples/workers/`](../examples/workers/), `make dev` and `make deploy` build
+first and then run these. The Makefile installs nothing: it stops with a message
+if `wrangler` is not on `PATH`.
 
 See [`examples/workers/`](../examples/workers/) for the complete example including `wrangler.toml`.

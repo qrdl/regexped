@@ -11,7 +11,7 @@ package compile
 // and reverted it. The mechanism was right and the gate was missing: on
 // greedy-3 the wanted set contains `[^\n]*ERROR`, which on a corpus with no
 // newline is simultaneously never-recorded and never-dead, so the check cost
-// ~12 instructions per byte and could never fire. G8 only emits it for sets
+// ~12 instructions per byte and could never fire. It is only emitted for sets
 // where a union preflight has first removed such patterns from the wanted
 // mask, which is what lets the exit actually fire.
 //
@@ -33,7 +33,7 @@ func futureAccepts(t *dfaTable) []uint64 {
 	// Seed with every accept channel a probe or suffix body can observe.
 	// Missing one here would under-approximate, which is the unsafe
 	// direction — so this deliberately includes the word-boundary and
-	// newline channels even though G8's emission gate excludes such sets.
+	// newline channels even though the emission gate excludes such sets.
 	for s := 0; s < n; s++ {
 		out[s] = t.acceptStates[s] | t.midAcceptStates[s] | t.immediateAcceptStates[s] |
 			t.midAcceptNWStates[s] | t.midAcceptWStates[s] | t.midAcceptNLStates[s]

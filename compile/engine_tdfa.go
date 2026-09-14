@@ -55,7 +55,7 @@ type tdfaTable struct {
 	entryOps     []tdfaTagOp // ops emitted at function entry (before first byte is consumed)
 
 	// bulkSkip describes a single dominant self-loop state eligible for SIMD
-	// bulk-skip in the match body (Gap F); nil when no qualifying state exists.
+	// bulk-skip in the match body; nil when no qualifying state exists.
 	bulkSkip *tdfaBulkSkipInfo
 }
 
@@ -1115,13 +1115,13 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	b = append(b, 0x0D, 0x01) // br_if $done
 
 	if hasBulkSkip {
-		// if state == bulkSkip.wasmState: SIMD-skip the self-loop run (Gap F)
+		// if state == bulkSkip.wasmState: SIMD-skip the self-loop run
 		b = append(b, 0x20, byte(localState))
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, tt.bulkSkip.wasmState)
 		b = append(b, 0x46)       // i32.eq
 		b = append(b, 0x04, 0x40) // if (void)
-		// B16: hand the skip the mid-accept bookkeeping it would otherwise
+		// Hand the skip the mid-accept bookkeeping it would otherwise
 		// jump over. The state is known here at compile time (it is the very
 		// constant the `if` above compares against), so the runtime
 		// `if midAccept[state]` guard midAcceptCheck emits is decided now

@@ -21,7 +21,7 @@ import "github.com/qrdl/regexped/internal/utils"
 //     correct: byteident cannot distinguish a local index from SLEB128 data
 //     that happens to hold the same byte.
 //
-//   - A table-memory SCRATCH SLOT (the shape B13 used for the groups wrapper's
+//   - A table-memory SCRATCH SLOT (the shape the groups wrapper once used for its
 //     window offsets) has a per-pattern address whose Go zero value — 0 — is a
 //     real, writable table offset. That defect landed twice in one attempt.
 //     Those window offsets are globals themselves now, for this reason: see
@@ -56,7 +56,7 @@ const (
 	// ffUnset is the zero value: no emitter claimed this find function.
 	ffUnset findFromMode = iota
 
-	// ffLegacyNarrow is the pre-task-54 behaviour, moved from the stubs
+	// ffLegacyNarrow is the original behaviour, moved from the stubs
 	// into WASM unchanged: the wrapper hands the body a NARROWED slice and
 	// rebases the result. Left-context assertions still judge the slice
 	// edge. Every emitter starts here; the mode is retired when the last
@@ -160,7 +160,7 @@ func findFromGlobalSection() []byte {
 // has a defect class attached to it — the field's Go zero value, 0, is itself a
 // valid writable address, so an emitter that forgets to set it corrupts memory
 // instead of failing. See this file's header on why the find-from offset is a
-// global at all, and TODO task 75 for the two scratch slots still carrying that
+// global at all. Two scratch slots still carry that
 // hazard.
 //
 // An index from Alloc has no such failure mode. Every index it returns is
@@ -179,6 +179,10 @@ type moduleGlobals struct {
 	// extra counts globals allocated BEYOND the find-from channel, so the
 	// zero value means "just find-from" and needs no constructor.
 	extra uint32
+	// inits holds a non-zero initialiser for an allocated global, keyed by its
+	// index. Absent means zero, which is what every global was before the
+	// component allocator needed a heap pointer starting at the static top.
+	inits map[uint32]int32
 }
 
 // Alloc reserves one more mutable i32 global, initialised to 0, and returns its
@@ -187,6 +191,18 @@ type moduleGlobals struct {
 func (g *moduleGlobals) Alloc() uint32 {
 	g.extra++
 	return findFromGlobalIdx + g.extra
+}
+
+// AllocInit is Alloc with a non-zero initial value.
+func (g *moduleGlobals) AllocInit(init int32) uint32 {
+	idx := g.Alloc()
+	if init != 0 {
+		if g.inits == nil {
+			g.inits = map[uint32]int32{}
+		}
+		g.inits[idx] = init
+	}
+	return idx
 }
 
 // Count is the number of globals Section will declare.
@@ -204,11 +220,10 @@ func (g *moduleGlobals) Section() []byte {
 	n := g.Count()
 	out := utils.AppendULEB128(nil, n)
 	for i := uint32(0); i < n; i++ {
-		out = append(out,
-			0x7F, 0x01, // mut i32
-			0x41, 0x00, // i32.const 0
-			0x0B, // end of init expr
-		)
+		out = append(out, 0x7F, 0x01) // mut i32
+		out = append(out, 0x41)       // i32.const
+		out = utils.AppendSLEB128(out, g.inits[i])
+		out = append(out, 0x0B) // end of init expr
 	}
 	return out
 }
