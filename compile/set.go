@@ -14,7 +14,11 @@ import (
 // PatternInfo holds the analysis result for a single pattern in a set.
 // Populated by analyzePattern; consumed by set composition (Phase 2+).
 type PatternInfo struct {
-	fullPattern string
+	// fullPattern is what every consumer parses: the member's pattern after
+	// collapseZeroWidthRepeats. displayPattern is the pattern as written, for
+	// naming a nameless member in warnings and diagnostics.
+	fullPattern    string
+	displayPattern string
 	// byteMode is the member's config.RegexEntry.ByteMode, kept because the
 	// length analysers need it and PatternInfo is all a set-level consumer
 	// gets: regexpMinMaxLen counts a literal rune 0x80..0xFF as one byte under
@@ -318,14 +322,20 @@ func (info *PatternInfo) setTopLevelAnchor(parsed *syntax.Regexp) {
 // the path (quantifier in path), have trivialPrefix=true and splittable=false;
 // they will route to the fallback bucket in Phase 3.
 func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*PatternInfo, error) {
-	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+	// The set path's copy of compilePatternBody's rewrite: members are parsed
+	// here, never through that function, and every later consumer re-parses
+	// fullPattern, so the rewritten string is stored there once. Errors and
+	// displayPattern keep the pattern as the user wrote it.
+	pattern := collapseZeroWidthRepeats(re.Pattern)
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Pattern, err)
 	}
 	stripCaptures(parsed)
 
 	info := &PatternInfo{
-		fullPattern: re.Pattern,
+		fullPattern:    pattern,
+		displayPattern: re.Pattern,
 		byteMode:    re.ByteMode,
 		prefixID:    -1,
 		suffixID:    -1,
@@ -2274,7 +2284,7 @@ func warnPatternDroppedReason(p *PatternInfo, where, reason, hint string, states
 func patternRefFor(p *PatternInfo) PatternRef {
 	name := p.name
 	if name == "" {
-		name = p.fullPattern
+		name = p.displayPattern
 	}
 	return PatternRef{ID: p.globalID, Name: name}
 }

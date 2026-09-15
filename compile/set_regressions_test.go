@@ -543,3 +543,34 @@ func TestZCaretIsNotExcluded(t *testing.T) {
 		})
 	}
 }
+
+// TestSetMemberZeroWidthRepeatsCollapsed is the set path's copy of the
+// rewrite: analyzePattern parses each member itself rather than going through
+// compilePatternBody, so without it a set member kept the chain that makes
+// Backtracking exponential. The rewritten spelling is internal — warnings and
+// diagnostics still name a nameless member by the pattern as written.
+func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
+	const pattern = `(?m:$*$*$*$*$*$*$*$*$*$*$*)*0$`
+	var prefixPool, suffixPool dfaPool
+	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+	if err != nil {
+		t.Fatalf("analyzePattern: %v", err)
+	}
+	if want := collapseZeroWidthRepeats(pattern); info.fullPattern != want {
+		t.Errorf("fullPattern = %q, want the collapsed %q", info.fullPattern, want)
+	}
+	if ref := patternRefFor(info); ref.Name != pattern {
+		t.Errorf("patternRefFor name = %q, want the pattern as written %q", ref.Name, pattern)
+	}
+
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "chain", Pattern: pattern}, {Name: "lit", Pattern: `abc`}},
+		Sets: []config.SetConfig{{
+			Name: "s", MatchAny: "ma", ScanAll: "sall", Find: "f",
+			Patterns: config.PatternSelector{Names: []string{"chain", "lit"}},
+		}},
+	}
+	if _, _, err := CompileFile(cfg, ""); err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+}

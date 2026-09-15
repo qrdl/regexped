@@ -280,6 +280,14 @@ func FuzzFindIteration(f *testing.F) {
 		if len(input) > inputCap || len(pat) > 120 {
 			t.Skip()
 		}
+		// The engine is byte-oriented: `.` consumes one byte, and iteration
+		// steps past an empty match by one byte where Go steps by one rune
+		// (docs/sets.md, "The empty-match rule"). Over non-ASCII input the two
+		// disagree by design, so the oracle cannot judge it — the same skip
+		// FuzzCorrectness makes.
+		if hasUnsupportedUnicode(input) {
+			t.Skip()
+		}
 		re, err := regexp.Compile(pat)
 		if err != nil {
 			t.Skip()

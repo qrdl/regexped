@@ -376,17 +376,27 @@ func isResourceCeiling(err error) bool {
 		errors.Is(err, compile.ErrDFAStateLimit)
 }
 
-// hasCaptures reports whether pat contains at least one capture group.
+// hasCaptures reports whether pat's compiled program records at least one
+// capture group.
 //
-// A groups export is only emitted for patterns with MaxCap() > 0: setting
-// groups_func on a capture-less pattern yields a module with no groups export at
-// all. tools/re2test gates on exactly this (`parsed.MaxCap() > 0`) before
-// setting GroupsFunc, so the Layer-2 groups targets must too — otherwise every
-// capture-less seed fails with "module missing groups export", which is a
-// harness gap wearing an engine bug's clothes.
+// A groups export is only emitted for a pattern with a group that can
+// participate: setting groups_func on a capture-less pattern yields a module
+// with no groups export at all, and so does a pattern whose only groups
+// simplification removes — `(a){0}` (see hasGroupsFromWrapper in
+// compile/compile.go). Without this gate every such seed fails with "module
+// missing groups export", which is a harness gap wearing an engine bug's
+// clothes.
+//
+// The count is taken from the program, not the parse tree: MaxCap() still
+// counts the group in `(a){0}`, which Simplify drops, so a MaxCap() gate let
+// exactly those patterns through.
 func hasCaptures(pat string) bool {
 	parsed, err := syntax.Parse(pat, syntax.Perl)
-	return err == nil && parsed.MaxCap() > 0
+	if err != nil {
+		return false
+	}
+	prog, err := syntax.Compile(parsed.Simplify())
+	return err == nil && prog.NumCap > 2 // slots 0 and 1 are the whole match
 }
 
 // ---------------------------------------------------------------------------

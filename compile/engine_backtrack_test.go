@@ -1274,7 +1274,7 @@ func TestEnginesCovMatchPathBTLimits(t *testing.T) {
 	t.Run("loop_count", func(t *testing.T) {
 		// Same shape as TestCompileBTLoopCountTooLarge, reached through
 		// match_func instead of find_func.
-		pattern := strings.Repeat(`(?:$*llllllll0)`, 114)
+		pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 114)
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}}, 0, true)
 		if !errors.Is(err, ErrBTLoopCountTooLarge) {
 			t.Fatalf("Compile(match): err = %v, want ErrBTLoopCountTooLarge", err)
@@ -1285,7 +1285,7 @@ func TestEnginesCovMatchPathBTLimits(t *testing.T) {
 		// The anchored DFA for this shape fits comfortably under the default
 		// state cap, so unlike the find path it has to be pushed onto the
 		// Backtracking fallback explicitly before the chain guard is reached.
-		pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)`
+		pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)`
 		_, _, err := Compile(
 			[]config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}}, 65536, true,
 			CompileOptions{MaxDFAStates: 1},
@@ -1769,14 +1769,14 @@ func TestEnginesCovGroupsPathBTLimits(t *testing.T) {
 	// The trailing literal keeps each pattern off the whole-pattern
 	// single-capture shortcut, which would bypass the guards entirely.
 	t.Run("loop_count", func(t *testing.T) {
-		pattern := strings.Repeat(`(?:$*llllllll0)`, 114) + `(x)y`
+		pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 114) + `(x)y`
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
 		if !errors.Is(err, ErrBTLoopCountTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTLoopCountTooLarge", err)
 		}
 	})
 	t.Run("empty_body_loop_chain", func(t *testing.T) {
-		pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)(x)y`
+		pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)(x)y`
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 65536, true)
 		if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
@@ -1950,9 +1950,11 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 	// their Backtracking construction blows a limit. That is the only
 	// configuration in which the capture path's copies decide the outcome.
 	t.Run("program_too_large", func(t *testing.T) {
-		// 21000 zero-width assertions: a huge NFA whose DFA is a couple of
-		// states, and `\b` also keeps the capture path off TDFA.
-		pattern := strings.Repeat(`(?:\b){1000}`, 21) + `(x)`
+		// 7000 captured zero-width assertions: a huge NFA whose DFA is a couple
+		// of states, and `\b` also keeps the capture path off TDFA. The group
+		// is what keeps collapseZeroWidthRepeats from reducing the repeat to a
+		// single `\b`, as it now does for the uncaptured `(?:\b){1000}`.
+		pattern := strings.Repeat(`(\b){1000}`, 7) + `(x)`
 		if got := len(enginesCovProg(t, pattern).Inst); got <= maxBTFallbackInstructions {
 			t.Skipf("witness pattern produces %d instructions, need > %d", got, maxBTFallbackInstructions)
 		}
@@ -1963,10 +1965,11 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 	})
 
 	t.Run("loop_count", func(t *testing.T) {
-		// 40 `$*` loops separated by single literals: 80 loop-frame locals,
-		// but the DFA is just `a{40}`. The trailing literal keeps it off the
-		// whole-pattern single-capture shortcut.
-		pattern := strings.Repeat(`(?:$*a)`, 40) + `(x)y`
+		// 40 nullable loops separated by single literals: 80 loop-frame
+		// locals. `(?:$|a)*` rather than `$*`, which collapseZeroWidthRepeats
+		// now removes before the engine sees it. The trailing literal keeps it
+		// off the whole-pattern single-capture shortcut.
+		pattern := strings.Repeat(`(?:(?:$|a)*a)`, 40) + `(x)y`
 		backtracker := newBacktrack(enginesCovProg(t, pattern))
 		if got := btNumLoopFrameLocals(backtracker, true); got <= maxBTLoopFrameLocals {
 			t.Skipf("witness pattern has %d loop-frame locals, need > %d", got, maxBTLoopFrameLocals)

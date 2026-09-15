@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"regexp/syntax"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1247,7 +1249,7 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 }
 
 // TestCompileBTStackTooLarge — a past defect. A no-capture find
-// pattern shaped like N sequential `(?:$*<literal>)` groups drives the
+// pattern shaped like N sequential `(?:(?:$|l)*<literal>)` groups drives the
 // Backtracking find-fallback's DFA past MaxDFAStates (the DFA-too-large
 // gate that routes it to Backtracking), and btAllocSizes' stackSize formula
 // (65536·N·(N+1) for this exact shape) past WASM32's 4GiB linear-memory
@@ -1264,7 +1266,7 @@ func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 // unchanged and still guards other pattern shapes that reach a large
 // stackSize without a large loop count.
 func TestCompileBTStackTooLarge(t *testing.T) {
-	pattern := strings.Repeat(`(?:$*llllllll0)`, 256)
+	pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 256)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
 	if !errors.Is(err, ErrBTLoopCountTooLarge) {
 		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
@@ -1280,7 +1282,7 @@ func TestCompileBTStackTooLarge(t *testing.T) {
 // checkBTLoopCount now correctly rejects it for that independent reason
 // before checkBTMemoryBudget's arithmetic is reached.
 func TestCompileBTStackWithinBudget(t *testing.T) {
-	pattern := strings.Repeat(`(?:$*llllllll0)`, 255)
+	pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 255)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
 	if !errors.Is(err, ErrBTLoopCountTooLarge) {
 		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
@@ -1290,14 +1292,18 @@ func TestCompileBTStackWithinBudget(t *testing.T) {
 // TestCompileBTLoopCountTooLarge — a past defect
 // (tools/fuzz/testdata/fuzz/FuzzCorrectness/092700-8c386fe83b176a61, itself
 // a bug-31 regression-corpus entry that still crashed real `-fuzz` fuzzing
-// via an unbounded wasmtime JIT-time cost). N=114 sequential
-// `(?:$*llllllll0)` repeats is the exact natural boundary — at the default
-// MaxDFAStates=1024, N=113 stays on the cheap primary DFA/CompiledDFA path
-// (its ~9-byte-per-repeat literal chain needs ~1019 states) while N=114
-// crosses 1024 states and falls to Backtracking, whose 228 loop-frame
-// locals now trip checkBTLoopCount before wasmtime ever sees the module.
+// via an unbounded wasmtime JIT-time cost). N=114 sequential repeats is the
+// natural boundary — N=113 still compiles, N=114 falls to Backtracking, whose
+// loop-frame locals trip checkBTLoopCount before wasmtime ever sees the
+// module.
+//
+// The loop is `(?:$|l)*`, not the fuzz repro's `$*`: a repeat whose body only
+// asserts is removed before any engine sees the pattern
+// (collapseZeroWidthRepeats), so `$*` no longer reaches Backtracking at all.
+// `(?:$|l)*` keeps the nullable loop and the boundary, measured live at
+// 113/114.
 func TestCompileBTLoopCountTooLarge(t *testing.T) {
-	pattern := strings.Repeat(`(?:$*llllllll0)`, 114)
+	pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 114)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
 	if !errors.Is(err, ErrBTLoopCountTooLarge) {
 		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
@@ -1310,7 +1316,7 @@ func TestCompileBTLoopCountTooLarge(t *testing.T) {
 // (which only runs once a pattern actually reaches Backtracking
 // construction).
 func TestCompileBTLoopCountWithinBudget(t *testing.T) {
-	pattern := strings.Repeat(`(?:$*llllllll0)`, 113)
+	pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 113)
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -1323,18 +1329,22 @@ func TestCompileBTLoopCountWithinBudget(t *testing.T) {
 // under checkBTLoopCount's JIT-time cap) but takes over a second of
 // wasmtime *runtime* find-call time on a single-byte non-matching input —
 // checkBTEmptyBodyLoopChain now rejects it at Compile() time instead.
+//
+// The witness loop is `(?:$|a)*`: that repro's `$*` is now removed by
+// collapseZeroWidthRepeats (see TestCompileFuzzRepro143548), and a body that
+// can also consume a byte keeps the chain in front of the guard.
 func TestCompileBTEmptyBodyLoopChainTooLarge(t *testing.T) {
-	pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)`
+	pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)`
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
 	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
 		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
 	}
 }
 
-// TestCompileBTEmptyBodyLoopChainWithinBudget confirms a chain of `$*`
-// exactly at maxBTEmptyBodyGreedyLoops still compiles successfully.
+// TestCompileBTEmptyBodyLoopChainWithinBudget confirms a chain of the same
+// loops exactly at maxBTEmptyBodyGreedyLoops still compiles successfully.
 func TestCompileBTEmptyBodyLoopChainWithinBudget(t *testing.T) {
-	pattern := `(?m:` + strings.Repeat(`$*`, maxBTEmptyBodyGreedyLoops) + `0$)`
+	pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, maxBTEmptyBodyGreedyLoops) + `0$)`
 	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 65536, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -1349,14 +1359,16 @@ func TestCompileBTEmptyBodyLoopChainWithinBudget(t *testing.T) {
 // single-byte input, because compiling it succeeded but each `find` call
 // took over a second — with no bound, since this project's "runtime over
 // compile time" design principle means find-mode calls have no watchdog in
-// production. checkBTEmptyBodyLoopChain now rejects it at Compile() time
-// instead, which tools/fuzz's existing error skip (fuzz_targets_test.go) is
-// extended to also skip on.
+// production. checkBTEmptyBodyLoopChain first rejected it at Compile() time.
+//
+// It now COMPILES: every `$*` repeats a body that only asserts, so
+// collapseZeroWidthRepeats removes the whole chain and the pattern is `0$`,
+// which never reaches Backtracking. The refusal was the mitigation; this is
+// the fix, and the find call it produces costs 48 fuel on the repro's input.
 func TestCompileFuzzRepro143548(t *testing.T) {
 	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)`
-	_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "find"}}, 65536, true)
-	if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
-		t.Fatalf("Compile: err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
+	if _, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "find"}}, 65536, true); err != nil {
+		t.Fatalf("Compile: %v", err)
 	}
 }
 
@@ -1368,11 +1380,87 @@ func TestCompileFuzzRepro143548(t *testing.T) {
 // coverage-instrumentation and multi-worker CPU contention. checkBTLoopCount
 // now rejects it at Compile() time instead, which tools/fuzz's existing
 // ErrBTProgramTooLarge/ErrBTStackTooLarge skip (fuzz_targets_test.go) is extended to
-// also skip on.
+// also skip on. The loop is `(?:$|l)*` for TestCompileBTLoopCountTooLarge's
+// reason: the repro's own `$*` is now collapsed before any engine sees it.
 func TestCompileFuzzRepro092700(t *testing.T) {
-	_, _, err := Compile([]config.RegexEntry{{Pattern: `(?:$*llllllll0){200}`, FindFunc: "find"}}, 65536, true)
+	_, _, err := Compile([]config.RegexEntry{{Pattern: `(?:(?:$|l)*llllllll0){200}`, FindFunc: "find"}}, 65536, true)
 	if !errors.Is(err, ErrBTLoopCountTooLarge) {
 		t.Fatalf("Compile: err = %v, want ErrBTLoopCountTooLarge", err)
+	}
+}
+
+// TestCollapseZeroWidthRepeats pins the rewrite that keeps a chain of repeated
+// assertions off Backtracking's exponential empty-body-loop path. It asserts
+// meaning rather than the printed form: Regexp.String owns the spelling, and a
+// rewrite that prints differently but finds the same matches is still right.
+func TestCollapseZeroWidthRepeats(t *testing.T) {
+	collapsible := []string{
+		`(?m:$*$*$*$*$*$*$*$*$*$*)*0$`,
+		"(?m:$*$*$*$*$*$*$*$*$*$*<*)*\t$*$",
+		"(?m:$*$*$*$*$*$*$*$*)*$*$*$*\x01*\x01$",
+		`(?m:$*$*$*$*$*$*$*$*$*$*)*$dd*`,
+		`(?m:$*0*$*\x01*$*$*$*$$*0*$*$*)*$*$* $*$`,
+		`(?m:$*$*$*$*$*$*$+$+$*$*)*$*0$`,
+		`a\b*b`,
+		`a\b+b`,
+		`x(?:^|$)+y`,
+		`(?:\b\B)?z`,
+		`(?:(?:)*)+q`,
+		`a$*?b`,
+		`a\b{2,5}\w`,
+		`a\b{0,3}\w`,
+	}
+	kept := []string{
+		`(\b)*a`,     // a capture group records where it matched
+		`(?:$|a)*b`,  // the body can consume a byte
+		`a*`,         // nothing zero-width at all
+		`\b\w+\b`,    // assertions, but none repeated
+		`(?:\b|x?)+`, // x? consumes
+	}
+	inputs := []string{"", "0", "D", "0\n", "\n0\n", "ab", "a b", "xy", "x\ny", "q", "z", "a\x01\n", "\t$", "dd", "a0b\n0"}
+
+	for _, pat := range collapsible {
+		out := collapseZeroWidthRepeats(pat)
+		if out == pat {
+			t.Errorf("%q: not rewritten", pat)
+			continue
+		}
+		re, err := syntax.Parse(out, syntax.Perl)
+		if err != nil {
+			t.Errorf("%q -> %q: does not parse: %v", pat, out, err)
+			continue
+		}
+		if collapseZeroWidthRepeatsRe(re) {
+			t.Errorf("%q -> %q: still holds a repeat of a zero-width body", pat, out)
+		}
+		want, got := regexp.MustCompile(pat), regexp.MustCompile(out)
+		for _, in := range inputs {
+			if w, g := want.FindAllStringIndex(in, -1), got.FindAllStringIndex(in, -1); !slices.EqualFunc(w, g, slices.Equal) {
+				t.Errorf("%q -> %q over %q: matches %v, want %v", pat, out, in, g, w)
+			}
+		}
+	}
+	for _, pat := range kept {
+		if out := collapseZeroWidthRepeats(pat); out != pat {
+			t.Errorf("%q: rewritten to %q, want it untouched", pat, out)
+		}
+	}
+}
+
+// TestCompileNestedEmptyBodyLoopChain is the fuzz-found shape: a chain of `$*`
+// under an outer `*`. Bug 34's cap counts the loops but was calibrated on a
+// flat chain, and nesting made the same count exponential again; with the
+// repeats collapsed the pattern is `0$` and must compile without reaching
+// Backtracking's loop guards at all.
+func TestCompileNestedEmptyBodyLoopChain(t *testing.T) {
+	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*)*0$`
+	for _, entry := range []config.RegexEntry{
+		{Pattern: pattern, FindFunc: "f"},
+		{Pattern: pattern, MatchFunc: "m"},
+	} {
+		if _, _, err := Compile([]config.RegexEntry{entry}, 65536, true); err != nil {
+			t.Errorf("Compile(%+v): %v", entry, err)
+		}
 	}
 }
 

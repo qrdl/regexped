@@ -772,7 +772,7 @@ func litChainLenAltBody(t *testing.T, pattern string) []byte {
 	if !ok {
 		t.Fatalf("analyseLitChainAltLenient(%q) rejected the shape", pattern)
 	}
-	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0), 0)
+	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
 }
 
 // TestLenAltMatchBodySkipsImpossibleBranches covers the compile-time start
@@ -861,7 +861,7 @@ func TestLenAltMatchBodyScalarBranch(t *testing.T) {
 	if altp.branches[0].useSIMD {
 		t.Fatalf("branch 0 (N=6) chose the SIMD verify; the scalar path is what this test covers")
 	}
-	layout := planLenAltLayout(altp, 0)
+	layout := planLenAltLayout(altp, 0, false)
 	if layout.branchBitmapOff[0] < 0 {
 		t.Fatalf("no bitmap allocated for the scalar branch: the verify has nothing to read")
 	}
@@ -890,7 +890,7 @@ func TestLenAltMatchBodyMasksPartialSimdChunk(t *testing.T) {
 		t.Fatalf("chunk plan = %+v, want a single partial-lane chunk", chunks)
 	}
 
-	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0), 0)
+	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
 	// `i32.const <laneMask>; i32.and` — the lanes holding literal bytes are
 	// cleared out of the bad-byte mask before it is branched on.
 	wantMask := utils.AppendSLEB128([]byte{0x41}, int32(chunks[0].laneMask))

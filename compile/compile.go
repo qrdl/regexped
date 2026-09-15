@@ -1026,6 +1026,10 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 		buildOpts.report().End()
 	}()
+	// Every body below parses re.Pattern for itself, so the rewrite is applied
+	// to the string, once, before any of them sees it. The verbose scope above
+	// keeps the pattern as the user wrote it.
+	re.Pattern = collapseZeroWidthRepeats(re.Pattern)
 	needMatch := re.MatchFunc != ""
 	needFind := re.FindFunc != ""
 	needGroups := re.CaptureStubsRequested()
@@ -1176,7 +1180,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 							p.groupNames = extractGroupNames(parsed)
 
 							// Lenient-alt data + find body.
-							lenLayout := planLenAltLayout(lenAltp, tableBase)
+							lenLayout := planLenAltLayout(lenAltp, tableBase, true)
 							lenData, lenSeg := buildLenAltDataSegments(lenAltp, lenLayout)
 							if needFind {
 								p.findExport = re.FindFunc
@@ -1314,7 +1318,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, false); ok {
-				layout := planLenAltLayout(lenAltp, tableBase)
+				layout := planLenAltLayout(lenAltp, tableBase, false)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
 					matchExport:  re.MatchFunc,
@@ -1389,7 +1393,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// but starts with a literal. DFA branches are inlined as anchored DFA
 			// verifies from the candidate position.
 			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
-				layout := planLenAltLayout(lenAltp, tableBase)
+				layout := planLenAltLayout(lenAltp, tableBase, true)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
 				var findBody []byte
@@ -1654,6 +1658,14 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		matchExport: re.MatchFunc,
 		findExport:  re.FindFunc,
 		anchored:    anchored,
+		// The address past everything laid out so far — tableBase, or past the
+		// match table. Every site below either replaces it or allocates from
+		// it, so it must never be left at 0: an anchored groups pattern whose
+		// DFA is dfaTooLarge builds no layout and no find fallback, reaches the
+		// capture branch with nothing else having set it, and used to place
+		// its Backtracking stack (or TDFA table) at address 0 — over the
+		// caller's input and the module's own tables.
+		tableEnd: cur,
 	}
 	if anchored {
 		// On this path `anchored` really does mean "can only match at 0" —
@@ -3012,6 +3024,111 @@ func stripCaptures(re *syntax.Regexp) {
 	if re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		*re = *re.Sub[0]
 	}
+}
+
+// collapseZeroWidthRepeats returns pattern with every repetition of a body
+// that can only match the empty string removed, or pattern itself when there
+// is nothing to remove.
+//
+// An assertion's outcome depends only on the position it is tested at, so
+// repeating one never moves the position and succeeds every time it succeeds
+// once. For a capture-free body x built only from assertions and empty
+// matches, x*, x? and x{0,n} (greedy or not) are the empty match — zero
+// iterations always succeed, and every path ends where it began with the same
+// capture state, so leftmost-first priority cannot select a different match —
+// and x+ and x{n,m} with n >= 1 are x.
+//
+// It exists because Backtracking treats each such repeat as an empty-body
+// greedy loop, and a chain of them costs exponential time per call:
+// `(?m:$*$*$*$*$*$*$*$*$*$*)*0$` spent over 2e10 fuel on a one-byte input to
+// answer "no match", correctly. Rewritten it is `0$`.
+//
+// The rewritten tree is printed with Regexp.String and kept only when the
+// printed pattern compiles to the same NFA program as the tree it came from,
+// so nothing the printer fails to round-trip can change what a pattern means.
+func collapseZeroWidthRepeats(pattern string) string {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil || !collapseZeroWidthRepeatsRe(re) {
+		return pattern
+	}
+	out := re.String()
+	back, err := syntax.Parse(out, syntax.Perl)
+	if err != nil {
+		return pattern
+	}
+	want, err1 := syntax.Compile(re.Simplify())
+	got, err2 := syntax.Compile(back.Simplify())
+	if err1 != nil || err2 != nil || want.String() != got.String() {
+		return pattern
+	}
+	return out
+}
+
+// collapseZeroWidthRepeatsRe applies collapseZeroWidthRepeats' rewrite to re
+// in place, bottom-up so a repeat sees its body already collapsed, and reports
+// whether anything changed.
+func collapseZeroWidthRepeatsRe(re *syntax.Regexp) bool {
+	changed := false
+	for _, sub := range re.Sub {
+		if collapseZeroWidthRepeatsRe(sub) {
+			changed = true
+		}
+	}
+	switch re.Op {
+	case syntax.OpStar, syntax.OpQuest, syntax.OpPlus, syntax.OpRepeat:
+		if !matchesOnlyEmpty(re.Sub[0]) {
+			return changed
+		}
+		if re.Op == syntax.OpPlus || (re.Op == syntax.OpRepeat && re.Min >= 1) {
+			*re = *re.Sub[0]
+		} else {
+			*re = syntax.Regexp{Op: syntax.OpEmptyMatch, Flags: re.Flags}
+		}
+		return true
+	case syntax.OpConcat:
+		if !changed {
+			return false
+		}
+		// A collapsed repeat leaves an empty match behind, which inside a
+		// concatenation contributes nothing but a node — and a node is enough
+		// to keep a shape-matching emitter from recognising what remains:
+		// `a\b*b` has to arrive as `ab`, not `a(?:)b`.
+		kept := re.Sub[:0]
+		for _, sub := range re.Sub {
+			if sub.Op != syntax.OpEmptyMatch {
+				kept = append(kept, sub)
+			}
+		}
+		switch len(kept) {
+		case 0:
+			*re = syntax.Regexp{Op: syntax.OpEmptyMatch, Flags: re.Flags}
+		case 1:
+			*re = *kept[0]
+		default:
+			re.Sub = kept
+		}
+		return true
+	}
+	return changed
+}
+
+// matchesOnlyEmpty reports whether re can match nothing but the empty string
+// and holds no capture group: assertions and empty matches, and
+// concatenations, alternations and repeats built only from them.
+func matchesOnlyEmpty(re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpEmptyMatch, syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText,
+		syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return true
+	case syntax.OpConcat, syntax.OpAlternate, syntax.OpStar, syntax.OpPlus, syntax.OpQuest, syntax.OpRepeat:
+		for _, sub := range re.Sub {
+			if !matchesOnlyEmpty(sub) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // NeedsUnicodeSupport reports whether pattern requires CompileOptions.Unicode

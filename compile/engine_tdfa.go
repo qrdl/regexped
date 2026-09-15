@@ -688,30 +688,37 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			expandedNonWord = expandWithWB(pcSet, ecNoWordBoundary)
 		}
 
-		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			return nfaBuildInputMap(prog, expanded, leftmostFirst, nil, nil)
+		buildInputMap := func(expanded []uint32) (map[rune][]uint32, map[rune][]uint32) {
+			return nfaBuildInputMapSrc(prog, expanded, leftmostFirst, nil, nil, true)
 		}
 
-		inputMapWord := buildInputMap(expandedWord)
-		inputMapNonWord := buildInputMap(expandedNonWord)
+		inputMapWord, srcMapWord := buildInputMap(expandedWord)
+		inputMapNonWord, srcMapNonWord := buildInputMap(expandedNonWord)
 
 		// For each byte, compute the set of (nextPC, tagOps) pairs.
 		// We process all 256 bytes; word/non-word uses appropriate inputMap.
-		processTransition := func(b byte, inputMap map[rune][]uint32) {
+		processTransition := func(b byte, inputMap, srcMap map[rune][]uint32) {
 			nextNFAPCs, ok := inputMap[rune(b)]
 			if !ok || len(nextNFAPCs) == 0 {
 				return
 			}
 
-			// Build the set of Out-pointers that actually fired for byte b.
-			// A source thread srcThread.pc is only a valid source if its byte consumer
-			// matched b, i.e. prog.Inst[srcThread.pc].Out ∈ firedOutSet.
-			// This prevents a thread that cannot match b from claiming as source via an
-			// epsilon exit path (e.g. letter-loop thread misidentified as source for
-			// a space transition when [a-z] and \s are disjoint but share an Alt exit).
-			firedOutSet := make(map[int]bool, len(nextNFAPCs))
-			for _, outPC := range nextNFAPCs {
-				firedOutSet[int(outPC)] = true
+			// The instructions that actually consumed byte b. A source thread is
+			// only a valid source if ITS OWN instruction is among them — which
+			// also keeps a thread that cannot match b from claiming as source via
+			// an epsilon exit path (e.g. a letter-loop thread for a space
+			// transition when [a-z] and \s are disjoint but share an Alt exit).
+			//
+			// Testing the thread's Out against the fired Outs, the old rule, is
+			// not enough: Go's compiler points every alternative's final consumer
+			// at one shared continuation, so a higher-priority alternative that
+			// did NOT match b still passed and donated its capture registers —
+			// `()a|b` over "b" reported group 1 as [0,0]. srcMap comes from the
+			// same input-map build as nextNFAPCs, so case folding, the byte clamp
+			// and leftmost-first suppression are applied to both identically.
+			firedSrcSet := make(map[int]bool, len(nextNFAPCs))
+			for _, srcPC := range srcMap[rune(b)] {
+				firedSrcSet[int(srcPC)] = true
 			}
 
 			// Epsilon-close the successor NFA states.
@@ -739,8 +746,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 				// a lower-priority thread earlier in pc order, which would otherwise
 				// make this loop copy captures from the wrong source thread.
 				for _, srcThread := range sd.priorityThreads {
-					// Only consider source threads whose byte consumer actually fired for b.
-					if !firedOutSet[int(prog.Inst[srcThread.pc].Out)] {
+					// Only consider source threads that themselves consumed b.
+					if !firedSrcSet[srcThread.pc] {
 						continue
 					}
 					// srcThread.pc is a byte-consuming NFA state (from epsilonClosure).
@@ -804,9 +811,9 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		for bi := 0; bi < 256; bi++ {
 			b := byte(bi)
 			if isWordChar(b) {
-				processTransition(b, inputMapWord)
+				processTransition(b, inputMapWord, srcMapWord)
 			} else {
-				processTransition(b, inputMapNonWord)
+				processTransition(b, inputMapNonWord, srcMapNonWord)
 			}
 		}
 	}
@@ -1662,7 +1669,9 @@ func tdfaTagOpsEqual(a, b []tdfaTagOp) bool {
 // are.  It does not alter observable capture semantics.
 //
 // Algorithm:
-//  1. Compute per-state liveness via a backwards dataflow fixpoint.
+//  1. Compute per-state liveness via a backwards dataflow fixpoint, removing
+//     dead writes (to a register not live after the transition and not read
+//     later in the same batch) and recomputing until none remain.
 //  2. Build an interference graph: edge (r1,r2) if both live at the same state
 //     OR if both appear as dst in the same op batch (prevents ordering hazards
 //     after renaming where two ops would write the same local in sequence).
@@ -1676,64 +1685,133 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	}
 	transitions := tt.transitions
 
-	// ---- Step 1: backwards liveness ----
+	// ---- Step 1: backwards liveness, with dead writes removed ----
 	// live[s][r] = register r may be needed on a future path from state s.
-	live := make([][]bool, n)
-	for i := range live {
-		live[i] = make([]bool, numRegs)
-	}
-
-	// Seed: registers referenced in acceptRegMap are live at their accepting state.
-	for s := 0; s < n; s++ {
-		if s >= len(tt.acceptRegMap) || tt.acceptRegMap[s] == nil {
-			continue
+	var live [][]bool
+	computeLive := func() {
+		live = make([][]bool, n)
+		for i := range live {
+			live[i] = make([]bool, numRegs)
 		}
-		for _, r := range tt.acceptRegMap[s] {
-			if r >= 0 && r < numRegs {
-				live[s][r] = true
+
+		// Seed: registers referenced in acceptRegMap are live at their accepting state.
+		for s := 0; s < n; s++ {
+			if s >= len(tt.acceptRegMap) || tt.acceptRegMap[s] == nil {
+				continue
+			}
+			for _, r := range tt.acceptRegMap[s] {
+				if r >= 0 && r < numRegs {
+					live[s][r] = true
+				}
+			}
+		}
+
+		// Propagate backwards until stable.
+		for changed := true; changed; {
+			changed = false
+			for s := 0; s < n; s++ {
+				for b := 0; b < 256; b++ {
+					idx := s*256 + b
+					if idx >= len(transitions) {
+						continue
+					}
+					next := transitions[idx]
+					if next < 0 || next >= n {
+						continue
+					}
+					var ops []tdfaTagOp
+					if idx < len(tt.tagOps) {
+						ops = tt.tagOps[idx]
+					}
+					// Registers killed (written) by ops on this transition.
+					killed := make([]bool, numRegs)
+					for _, op := range ops {
+						if op.dst >= 0 && op.dst < numRegs {
+							killed[op.dst] = true
+						}
+					}
+					// Propagate: r alive at next and not killed → alive at s.
+					for r := 0; r < numRegs; r++ {
+						if live[next][r] && !killed[r] && !live[s][r] {
+							live[s][r] = true
+							changed = true
+						}
+					}
+					// Registers read (as src) by ops are live at s.
+					for _, op := range ops {
+						if op.src >= 0 && op.src < numRegs && !live[s][op.src] {
+							live[s][op.src] = true
+							changed = true
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// Propagate backwards until stable.
-	for changed := true; changed; {
-		changed = false
+	// A write whose register is not live after the transition, and that no
+	// later op in the same batch reads, is dead. Left in, it is invisible to
+	// the liveness edges below, so colouring may give it the same local as a
+	// register whose value must survive the transition — and every execution
+	// of the dead write then destroys that value. `(0+)(0)*` over "0" reported
+	// group 1 as [1,1]: the `(0)` thread's never-read "group 2 open" register
+	// shared a local with group 1's start. Removing a write can make its own
+	// source dead, hence the fixpoint. The in-batch read check keeps the
+	// scratch register's cycle-break write (see sequentializeCopies), which the
+	// next op in its batch reads.
+	dropDead := func(ops []tdfaTagOp, liveAfter []bool) ([]tdfaTagOp, bool) {
+		if len(ops) == 0 {
+			return ops, false
+		}
+		var kept []tdfaTagOp
+		dropped := false
+		for i, op := range ops {
+			dead := op.dst >= 0 && op.dst < numRegs && !liveAfter[op.dst]
+			if dead {
+				for _, later := range ops[i+1:] {
+					if later.src == op.dst {
+						dead = false
+						break
+					}
+				}
+			}
+			if dead {
+				dropped = true
+				continue
+			}
+			kept = append(kept, op)
+		}
+		if !dropped {
+			return ops, false
+		}
+		return kept, true
+	}
+	for {
+		computeLive()
+		removed := false
 		for s := 0; s < n; s++ {
 			for b := 0; b < 256; b++ {
 				idx := s*256 + b
-				if idx >= len(transitions) {
+				if idx >= len(transitions) || idx >= len(tt.tagOps) {
 					continue
 				}
 				next := transitions[idx]
 				if next < 0 || next >= n {
 					continue
 				}
-				var ops []tdfaTagOp
-				if idx < len(tt.tagOps) {
-					ops = tt.tagOps[idx]
-				}
-				// Registers killed (written) by ops on this transition.
-				killed := make([]bool, numRegs)
-				for _, op := range ops {
-					if op.dst >= 0 && op.dst < numRegs {
-						killed[op.dst] = true
-					}
-				}
-				// Propagate: r alive at next and not killed → alive at s.
-				for r := 0; r < numRegs; r++ {
-					if live[next][r] && !killed[r] && !live[s][r] {
-						live[s][r] = true
-						changed = true
-					}
-				}
-				// Registers read (as src) by ops are live at s.
-				for _, op := range ops {
-					if op.src >= 0 && op.src < numRegs && !live[s][op.src] {
-						live[s][op.src] = true
-						changed = true
-					}
+				if kept, d := dropDead(tt.tagOps[idx], live[next]); d {
+					tt.tagOps[idx] = kept
+					removed = true
 				}
 			}
+		}
+		// entryOps fire before the first byte, in the start state (0).
+		if kept, d := dropDead(tt.entryOps, live[0]); d {
+			tt.entryOps = kept
+			removed = true
+		}
+		if !removed {
+			break
 		}
 	}
 
