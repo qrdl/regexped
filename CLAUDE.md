@@ -282,6 +282,28 @@ regexped/
 │   ├── abi/
 │   │   └── abi.go             # The numeric return-value contract shared by compile/ and generate/
 │   ├── benchshim/             # WASM shims the benchmark harnesses time exports from inside
+│   ├── ownership/             # Hands a ROOT process's outputs to the owner of the directory
+│   │                          #   they land in. For the Docker image: a bind-mounted project
+│   │                          #   dir belongs to the host user and the kernel enforces that
+│   │                          #   inside the container, so a non-root container cannot write
+│   │                          #   into it AT ALL — which is why every docs/docker.md example
+│   │                          #   used to carry `--user $(id -u):$(id -g)`. The image runs as
+│   │                          #   root and this corrects what root produced. NO-OP unless
+│   │                          #   uid 0, so an ordinary run and a `--user` run are unchanged.
+│   │                          #   MkdirAll collects the missing levels BEFORE creating them:
+│   │                          #   afterwards nothing distinguishes a level this call made from
+│   │                          #   one already there, and a directory the USER made is not ours
+│   │                          #   to re-own. They inherit the nearest PRE-EXISTING ancestor's
+│   │                          #   owner, which is also the answer to the circularity in "the
+│   │                          #   owner of the output directory" when that directory is one
+│   │                          #   being created right now — it is root, which is the very
+│   │                          #   answer the package exists to avoid. Fix() goes on the FINAL
+│   │                          #   path, after any rename (a rename replaces the inode, so a
+│   │                          #   staged file renamed over a user-owned one is root-owned
+│   │                          #   again) and after the subprocess that wrote it: wasm-merge,
+│   │                          #   wac and `wasm-tools component new` write their own output.
+│   │                          #   Failure is a WARNING, never an error — Docker Desktop's
+│   │                          #   macOS/Windows mounts synthesise ownership and refuse chown
 │   ├── tools/                 # Resolves and runs wasm-merge, wasm-tools and wac from their config keys
 │   ├── wasmwatch/             # Bounds how long a single WASM call may run
 │   ├── utils/
@@ -318,6 +340,16 @@ regexped/
 │       │                      #   takes the set from a YAML config, drives any of the five
 │       │                      #   capabilities, varies only the set-level `hints:`
 │       └── Makefile           # Runs against a config/capability/input file; example targets
+├── docker/
+│   ├── Dockerfile             # The image. Runs as ROOT deliberately — see internal/ownership.
+│   │                          #   The build context is THIS directory, not the repo root, so
+│   │                          #   `make docker` assembles the four binaries it copies here
+│   ├── .dockerignore          # …and excludes everything that is not one of those four
+│   ├── get_wasm_merge.sh      # Fetch the latest release of each tool INTO the build context.
+│   ├── get_wasm_tools.sh      #   The two that take a dest-dir skip their PATH short-circuit
+│   └── get_wac.sh             #   when given one: a host binary may want a glibc the image
+│                              #   does not carry. get_wasm_merge.sh takes none — it writes
+│                              #   alongside itself, which since the move is already docker/
 ├── docs/
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
@@ -1185,15 +1217,16 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 - **wasm-tools** (external, Bytecode Alliance) — REQUIRED by `wasm_format: component` (`component/` wraps the core module with it, and a component `merge` reads each plug's exports with it); also used by several tests to validate emitted modules, where it is optional and the tests skip without it
 - **wac** (external, Bytecode Alliance) — `merge` under `wasm_format: component`
 
-All three ship in the Docker image (`make docker`, fetched by `get_wasm_merge.sh`
-/ `get_wasm_tools.sh` / `get_wac.sh`). Each is found through its config key —
+All three ship in the Docker image (`make docker`, fetched by
+`docker/get_wasm_merge.sh` / `docker/get_wasm_tools.sh` / `docker/get_wac.sh`
+into `docker/`, which is the build context). Each is found through its config key —
 `wasm_merge_path:`, `wasm_tools_path:`, `wac_path:` — else in `$PATH`; no
 environment variable is read. A `module` build needs NONE of them to
 compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-09-14
+**Last Updated:** 2026-09-15
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/ownership"
 	"github.com/qrdl/regexped/internal/tools"
 )
 
@@ -85,6 +86,9 @@ func composeComponents(cfg config.BuildConfig, mainWasm, output string, plugs []
 	if err := tools.Run(wacCmd, args, "", nil); err != nil {
 		return fmt.Errorf("wac plug: %w", err)
 	}
+	// wac writes the output itself, as a child of this process: under the
+	// Docker image that makes it root-owned on the host.
+	ownership.Fix(output)
 
 	info, err := os.Stat(output)
 	if err != nil {
@@ -183,6 +187,8 @@ func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []
 	if err := tools.Run(wasmMergeCmd, mergeArgs, "", nil); err != nil {
 		return fmt.Errorf("wasm-merge: %w", err)
 	}
+	// As in composeComponents: wasm-merge, not this process, created the file.
+	ownership.Fix(output)
 
 	info, err := os.Stat(output)
 	if err != nil {

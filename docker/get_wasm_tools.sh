@@ -13,7 +13,8 @@
 # Modelled on get_wasm_merge.sh, including its "follow the redirect from
 # /releases/latest" trick, so neither script pins a version that goes stale.
 #
-# Usage: ./get_wasm_tools.sh [dest-dir]     (default: alongside this script)
+# Usage: ./docker/get_wasm_tools.sh [dest-dir]   (default: alongside this script,
+#                                                i.e. docker/, the build context)
 #
 # With an EXPLICIT dest-dir the PATH short-circuit is skipped: the caller wants
 # the release binary in that directory. The Docker build is that caller — a

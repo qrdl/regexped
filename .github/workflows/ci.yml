@@ -14,26 +14,33 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
     steps:
+
       - uses: actions/checkout@v6
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
       - name: Build regexped
         run: go build -o regexped .
+
       # Several tests validate the emitted module by shelling out to
       # `wasm-tools validate`. They SKIP when it is absent, so without this
       # step the suite still passes — while quietly checking nothing. The
       # modules it rejects are ones that only fail at load, which no Go
       # assertion catches.
       - name: Install wasm-tools
-        run: ./get_wasm_tools.sh /usr/local/bin
+        run: ./docker/get_wasm_tools.sh /usr/local/bin
+
       - name: Run unit tests
         run: go test -coverprofile=coverage.out ./compile/... ./config/... ./generate/... ./merge/... ./internal/... ./component/...
+
       - name: Upload coverage reports to Codecov
         if: ${{ github.ref == 'refs/heads/main' }}
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
       - name: Upload binary
         if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/upload-artifact@v7
@@ -47,10 +54,13 @@ jobs:
     needs: build
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
+
       - uses: actions/checkout@v6
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
       - name: Run RE2 test suite
         working-directory: tools/re2test
         run: make test
@@ -63,31 +73,52 @@ jobs:
     permissions:
       contents: read
     steps:
+
       - uses: actions/checkout@v6
+
+      # Into docker/, which IS the build context — `make docker` assembles the
+      # same four binaries there.
       - name: Download binary
         uses: actions/download-artifact@v8
         with:
           name: regexped
+          path: docker
+
       - name: Make binary executable
-        run: chmod +x regexped
+        run: chmod +x docker/regexped
+
+      # Writes alongside itself, i.e. into docker/; it takes no destination.
       - name: Download wasm-merge
-        run: ./get_wasm_merge.sh
+        run: ./docker/get_wasm_merge.sh
+
       # The Dockerfile copies wasm-tools and wac as well — both needed for
       # wasm_format: component — and neither is in a fresh checkout. An explicit
       # destination makes each script fetch the release binary into the build
       # context rather than trust whatever is on the runner's PATH.
       - name: Download wasm-tools
-        run: ./get_wasm_tools.sh "$PWD"
+        run: ./docker/get_wasm_tools.sh "$PWD/docker"
+
       - name: Download wac
-        run: ./get_wac.sh "$PWD"
+        run: ./docker/get_wac.sh "$PWD/docker"
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
           username: qrdl
           password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: qrdl/regexped
+          flavor: latest=true
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: docker
           push: true
-          tags: qrdl/regexped:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -9,7 +9,8 @@
 # Unlike the other two, wac ships the binary itself as the release asset rather
 # than a tarball, so there is nothing to unpack.
 #
-# Usage: ./get_wac.sh [dest-dir]     (default: alongside this script)
+# Usage: ./docker/get_wac.sh [dest-dir]   (default: alongside this script, i.e.
+#                                          docker/, which is the build context)
 #
 # With an EXPLICIT dest-dir the PATH short-circuit is skipped, as in
 # get_wasm_tools.sh: the caller wants the release binary in that directory. The

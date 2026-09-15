@@ -58,6 +58,12 @@ Cargo.lock
 wasm-merge
 /wasm-tools
 /wac
+# `make docker` assembles the build context in docker/: the regexped binary is
+# copied there and the three tools are fetched there. `regexped` and
+# `wasm-merge` above are unanchored and already cover their copies; these two
+# are anchored to the repo root, so their docker/ counterparts need naming.
+/docker/wasm-tools
+/docker/wac
 examples/workers/.wrangler
 node_modules
 package-lock.json

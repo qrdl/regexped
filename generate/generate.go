@@ -8,6 +8,7 @@ import (
 	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/ownership"
 )
 
 // ResolveStubType determines the stub type from cfg.StubType or the extension
@@ -68,13 +69,18 @@ func generateStub(cfg config.BuildConfig, stubType, out string) error {
 }
 
 // writeStub creates the parent directory and writes data to path.
+//
+// Every generator funnels through here — each stub type, both of C's files, and
+// the C component stub's wit/consumer.wit and wit/deps/<pkg>.wit — so it is the
+// one place stub ownership has to be settled. See internal/ownership.
 func writeStub(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := ownership.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
+	ownership.Fix(path)
 	slog.Info("Written stub", "file", path)
 	return nil
 }

@@ -1,0 +1,8 @@
+# The build context is this directory, and the image wants only the four
+# binaries `make docker` assembles here. Everything else is context the daemon
+# would copy and the build would ignore.
+*
+!regexped
+!wasm-merge
+!wasm-tools
+!wac

@@ -47,8 +47,8 @@ needed. A core-module `compile` and every `generate` need none of them.
 | [`wac`](https://github.com/bytecodealliance/wac) | components only: `regexped merge` composes them with it |
 
 Each is found through `wasm_merge_path:`, `wasm_tools_path:` or `wac_path:` in the
-config, else on `PATH`. `get_wasm_merge.sh`, `get_wasm_tools.sh` and `get_wac.sh`
-in the repository download the latest release of each. Building your own host
+config, else on `PATH`. `docker/get_wasm_merge.sh`, `docker/get_wasm_tools.sh`
+and `docker/get_wac.sh` in the repository download the latest release of each. Building your own host
 code needs its own toolchain (cargo, Go, clang, Node.js…) — see the environment
 guides below.
 
@@ -58,6 +58,9 @@ Or use the official Docker image — no local install needed:
 docker pull qrdl/regexped
 docker run --rm -v $(pwd):/work -w /work qrdl/regexped <command> [flags]
 ```
+
+No `--user` flag is needed: everything the image writes is handed to the owner
+of the directory it lands in.
 
 See [docker.md](docker.md) for full Docker usage and workflow examples.
 
