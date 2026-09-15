@@ -11,6 +11,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/generate"
+	"github.com/qrdl/regexped/internal/ownership"
 )
 
 // CmdCompile is `regexped compile` for `wasm_format: component`.
@@ -74,7 +75,7 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	// left uncovered: two fully written files, and the second rename failing for
 	// a destination `wasm-tools` could not have written to either.
 	witPath := WitPathFor(output)
-	if err := os.MkdirAll(filepath.Dir(witPath), 0o755); err != nil {
+	if err := ownership.MkdirAll(filepath.Dir(witPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(witPath), err)
 	}
 	witTmp := witPath + ".tmp"
@@ -93,6 +94,10 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if err := os.Rename(coreTmp, output); err != nil {
 		return fmt.Errorf("write %s: %w", output, err)
 	}
+	// After the renames, not before: a rename replaces the inode, so a staged
+	// file renamed over one the user already owned is root-owned again.
+	ownership.Fix(witPath)
+	ownership.Fix(output)
 	info, err := statFile(output)
 	if err != nil {
 		return fmt.Errorf("stat output: %w", err)

@@ -9,7 +9,10 @@ SHELL := /bin/bash
 
 GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go generate/*.go internal/*/*.go merge/*.go))
 
-.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt
+# `docker` MUST stay in this list: it is now a directory as well as a target, so
+# without it make compares docker/'s mtime against regexped's and reports the
+# image "up to date" rather than building it.
+.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt docker
 
 build: regexped
 
@@ -104,8 +107,13 @@ unittest:
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 
+# The build context is docker/, not the repo root: the image needs exactly four
+# binaries, and a root context ships the whole tree — .git, testdata, examples —
+# to the daemon to copy none of it. Everything the context needs is therefore
+# ASSEMBLED in docker/ first, and every one of those four is gitignored.
 docker: regexped
-	./get_wasm_merge.sh
+	cp regexped docker/regexped
+	./docker/get_wasm_merge.sh
 	# wasm-tools and wac are needed inside the image for `wasm_format:
 	# component`, the same way wasm-merge is needed for a module `regexped
 	# merge`: wasm-tools wraps the core module into a component, wac composes it
@@ -113,9 +121,12 @@ docker: regexped
 	# explicit destination, which skips each script's PATH short-circuit: a
 	# copy taken from the host's PATH may be linked against a glibc the image
 	# does not have. Nothing is ever copied from the host.
-	./get_wasm_tools.sh "$(CURDIR)"
-	./get_wac.sh "$(CURDIR)"
-	docker build -t regexped .
+	#
+	# get_wasm_merge.sh takes no destination argument at all: it writes the
+	# binary alongside itself, and since the move that is already docker/.
+	./docker/get_wasm_tools.sh "$(CURDIR)/docker"
+	./docker/get_wac.sh "$(CURDIR)/docker"
+	docker build -t regexped docker
 
 lint:
 	golangci-lint run -D errcheck
