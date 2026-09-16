@@ -971,9 +971,10 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // eager write sidesteps that entirely: whichever write happened last is
 // necessarily the most recent valid accept, exactly the invariant we want.
 //
-// Word-boundary/line-anchor context never applies here — TDFA is never
-// selected for patterns with \b/\B or (?m) anchors
-// (compile/selector.go's hasWordBoundary/hasLineAnchors gates route those to
+// Word-boundary/anchor context never applies here — TDFA is never
+// selected for patterns with \b/\B, (?m) anchors, or a \A/^ anywhere but a
+// start-anchored pattern's own start (compile/selector.go's
+// hasWordBoundary/hasLineAnchors/hasUnsafeBeginText gates route those to
 // Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
 // variants, is sufficient.
 func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
