@@ -12,6 +12,7 @@ import (
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/ownership"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -2932,6 +2933,7 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 	if err := os.WriteFile(outPath, wasmBytes, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
+	ownership.Fix(outPath)
 	slog.Info("Done", "bytes", len(wasmBytes))
 	return nil
 }
@@ -3011,7 +3013,11 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		_, err := os.Stdout.Write(data)
 		return err
 	}
-	return os.WriteFile(diagPath, data, 0o644)
+	if err := os.WriteFile(diagPath, data, 0o644); err != nil {
+		return err
+	}
+	ownership.Fix(diagPath)
+	return nil
 }
 
 // stripCaptures converts all capture groups in the regexp tree to non-capturing

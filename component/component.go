@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/ownership"
 	"github.com/qrdl/regexped/internal/tools"
 )
 
@@ -96,12 +97,15 @@ func Wrap(cfg config.BuildConfig, core []byte, witText, out string) error {
 		_, err = os.Stdout.Write(data)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+	if err := ownership.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(out), err)
 	}
+	// `component new` writes the file itself, as a child of this process, so
+	// under the Docker image the component lands owned by root.
 	if err := tools.Run(tool, []string{"component", "new", embedPath, "-o", out}, "", nil); err != nil {
 		return fmt.Errorf("wasm-tools component new: %w", err)
 	}
+	ownership.Fix(out)
 	return nil
 }
 
