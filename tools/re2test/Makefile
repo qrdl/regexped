@@ -6,6 +6,13 @@ CUSTOM       := custom-tests.txt
 CUSTOM_SETS  := custom-sets.txt
 ADJUSTED     := re2-adjusted.txt
 
+# RE2TEST_FLAGS is appended to every re2test invocation below, so one flag can
+# be applied to the whole suite — e.g. `make test RE2TEST_FLAGS=--bt-fallback-always`
+# runs every target with every Backtracking program answered by its memoised
+# fallback body alone. From the repository root, `make re2test RE2TEST_FLAGS=...`
+# reaches here through MAKEFLAGS. Empty by default: no invocation changes.
+RE2TEST_FLAGS ?=
+
 $(TESTDATA): $(TESTDATA_BZ2)
 	bzip2 -dk -c $< > $@
 
@@ -17,7 +24,7 @@ $(TESTDATA): $(TESTDATA_BZ2)
 # The flag synthesises col4 from a Go oracle for rows that lack one: 4.9M rows,
 # and it costs about 40% more wall time than the bare run.
 exhaustive: $(TESTDATA)
-	go run . --all-matches $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --all-matches $(TESTDATA)
 
 custom:
 	# Expectation file vs Go, no WASM involved. Was commented out while its
@@ -26,19 +33,19 @@ custom:
 	# disagreements). Fixed and clean now, so it runs again: it is
 	# the only thing that keeps the file honest, since every other check
 	# compares WASM against the file rather than against Go.
-	go run . --validate-go --validate-groups $(CUSTOM)
-	go run . --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --validate-go --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --validate-groups $(CUSTOM)
 
 $(ADJUSTED): $(TESTDATA)
 	go run ./make_adjusted $(TESTDATA) $(ADJUSTED)
 
 adjusted: $(ADJUSTED)
-	go run . --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --validate-groups $(ADJUSTED)
 
 force-backtrack: $(ADJUSTED)
-	go run . --force-backtrack $(TESTDATA)
-	go run . --force-backtrack --validate-groups $(ADJUSTED)
-	go run . --force-backtrack --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --force-backtrack $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --force-backtrack --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --force-backtrack --validate-groups $(CUSTOM)
 
 # Corpus inputs carrying a byte above 0x7F, which every other target SKIPS.
 #
@@ -57,30 +64,30 @@ force-backtrack: $(ADJUSTED)
 # bytes, which is how a Backtracking engine that dropped every byte >= 0x80
 # from a rune range stayed green across ~9.5M cases.
 high-bytes: $(ADJUSTED)
-	go run . --high-bytes $(TESTDATA)
-	go run . --high-bytes --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --high-bytes $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --high-bytes --validate-groups $(ADJUSTED)
 	# --high-bytes-check-corpus only here: custom-tests.txt's columns are
 	# written for a BYTE engine, so they can be compared with the twin. The
 	# RE2-derived corpora above carry UTF-8 answers that legitimately differ.
-	go run . --high-bytes --high-bytes-check-corpus --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --high-bytes --high-bytes-check-corpus --validate-groups $(CUSTOM)
 
 # Run every test under LikelyMode=LikelyMatch. Patterns matching the lit-chain
 # shape (literal + counted class) take the lit-chain emission path; others fall
 # through to the standard DFA. Confirms LikelyMatch correctness across the
 # full corpus.
 likelymatch: $(ADJUSTED)
-	go run . --likelymatch $(TESTDATA)
-	go run . --likelymatch --validate-groups $(ADJUSTED)
-	go run . --likelymatch --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --likelymatch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --likelymatch --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --likelymatch --validate-groups $(CUSTOM)
 
 # Run every test under LikelyMode=LikelyNoMatch. Patterns with a dominant
 # self-loop (≥240/256 byte classes back to itself, ≤4 exit bytes,
 # mid-accepting) take the dominant-self-loop SIMD bulk-skip path; others fall through to
 # the standard DFA. Confirms LikelyNoMatch correctness across the full corpus.
 likelynomatch: $(ADJUSTED)
-	go run . --likelynomatch $(TESTDATA)
-	go run . --likelynomatch --validate-groups $(ADJUSTED)
-	go run . --likelynomatch --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --likelynomatch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --likelynomatch --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --likelynomatch --validate-groups $(CUSTOM)
 
 # Run every test with the DFA forced to overflow (--force-backtrack, so
 # find/match always fall back to Backtracking) AND under
@@ -93,9 +100,9 @@ likelynomatch: $(ADJUSTED)
 # buildBTFindBody's v128-local allocation silently emitted invalid WASM for
 # first-byte sets of 17..64 bytes routed through the Shufti path).
 force-backtrack-likelynomatch: $(ADJUSTED)
-	go run . --force-backtrack --likelynomatch $(TESTDATA)
-	go run . --force-backtrack --likelynomatch --validate-groups $(ADJUSTED)
-	go run . --force-backtrack --likelynomatch --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --force-backtrack --likelynomatch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --force-backtrack --likelynomatch --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --force-backtrack --likelynomatch --validate-groups $(CUSTOM)
 
 # Run every test with match_func compiled alone (no find_func) for
 # non-capturing patterns. Reaches the needMatch && !needFind call site
@@ -103,9 +110,9 @@ force-backtrack-likelynomatch: $(ADJUSTED)
 # match+find dispatch never exercises. Regression test for
 # the lit-chain-alt anchored-match bugs.
 matchonly: $(ADJUSTED)
-	go run . --match-only $(TESTDATA)
-	go run . --match-only --validate-groups $(ADJUSTED)
-	go run . --match-only --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --match-only $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --match-only --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --match-only --validate-groups $(CUSTOM)
 
 # Run every test with find_func compiled alone (no match_func) for
 # non-capturing patterns. Mirror of matchonly: reaches the
@@ -114,18 +121,18 @@ matchonly: $(ADJUSTED)
 # bodies — which the default combined match+find dispatch never reaches at
 # all. Regression test for the lit-chain alternation find bodies.
 findonly: $(ADJUSTED)
-	go run . --find-only $(TESTDATA)
-	go run . --find-only --validate-groups $(ADJUSTED)
-	go run . --find-only --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --find-only $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --find-only --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --find-only --validate-groups $(CUSTOM)
 
 # Run every test with only groups_func compiled (no match_func/find_func)
 # for capturing patterns. Surfaces lit-chain capture path bugs that depend
 # on the narrow needGroups-only gate (compile.go), which the default
 # combined match+find+groups dispatch never exercises in isolation.
 groupsonly: $(ADJUSTED)
-	go run . --groups-only $(TESTDATA)
-	go run . --groups-only --validate-groups $(ADJUSTED)
-	go run . --groups-only --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --groups-only $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(CUSTOM)
 
 test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
 
@@ -154,19 +161,19 @@ test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelyno
 SET_PROFILES := all-profiles
 
 sets: $(TESTDATA)
-	go run . --sets --set-chunk=8  --sample=200 --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=70 --sample=60  --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=70 --sample=60  --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --sample=200 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=70 --sample=60  --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=16 --sample=150 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=70 --sample=60  --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	# --set-bt forces set members onto the Backtracking fallback engine
 	# which is the only way to reach a BT-backed bucket at corpus scale. It was
 	# wired into no target at all, so that path had no standing gate.
-	go run . --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=0 --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0 --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 # The set capabilities under a non-neutral set-level hint.
 #
@@ -182,25 +189,25 @@ sets: $(TESTDATA)
 # already covered above. What is new here is the emission, and one chunk size
 # per hint reaches it across the whole corpus.
 sets-likely: $(TESTDATA)
-	go run . --sets --set-chunk=8  --sample=200 --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=8  --sample=200 --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=16 --sample=150 --set-shuffle --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=0  --likelymatch   --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=0  --likelynomatch --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --sample=200 --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=16 --sample=150 --set-shuffle --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --sample=200 --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=16 --sample=150 --set-shuffle --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --likelymatch   --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --likelynomatch --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 sets-exhaustive: $(TESTDATA)
-	go run . --sets --set-chunk=8  --set-profiles=all $(TESTDATA)
-	go run . --sets --set-chunk=32 --set-shuffle --set-profiles=all $(TESTDATA)
-	go run . --sets --set-chunk=70 --set-shuffle --set-profiles=all $(TESTDATA)
-	go run . --sets --set-chunk=32 --set-shuffle --set-subset --set-profiles=all $(TESTDATA)
-	go run . --sets --set-chunk=8  --sample=10 --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=16 --sample=10 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
-	go run . --sets --set-chunk=8  --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
-	go run . --sets --set-chunk=0  --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --set-profiles=all $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=32 --set-shuffle --set-profiles=all $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=70 --set-shuffle --set-profiles=all $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=32 --set-shuffle --set-subset --set-profiles=all $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --sample=10 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=16 --sample=10 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=4  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8  --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0  --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 	$(MAKE) set-batch
 
 # The original shape: ONE set per corpus block, `find` and `find_batch` only,
@@ -209,8 +216,8 @@ sets-exhaustive: $(TESTDATA)
 # several thousand patterns. --set-batch drives find_batch at a buffer capacity
 # of ONE so every multi-match position splits.
 set-batch: $(TESTDATA)
-	go run . --sets --set-chunk=0 --set-profiles=find $(TESTDATA)
-	go run . --sets --set-chunk=0 --set-batch --set-profiles=batch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0 --set-profiles=find $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0 --set-batch --set-profiles=batch $(TESTDATA)
 
 clean:
 	rm -f $(TESTDATA) $(ADJUSTED)

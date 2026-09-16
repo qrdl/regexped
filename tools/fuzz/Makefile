@@ -1,5 +1,5 @@
 .PHONY: seed seed-all fuzz fuzz-long clean \
-        seed-match seed-groups seed-engines seed-set \
+        seed-match seed-groups seed-engines seed-bodies seed-set \
         seed-caps seed-batch seed-iteration \
         fuzz-match fuzz-groups fuzz-engines fuzz-set
 
@@ -27,7 +27,7 @@ fuzz-long:
 # The seed-* goals have no such restriction and are what CI should run.
 
 # Replay every Layer-2 target's seed corpus.
-seed-all: seed seed-match seed-groups seed-engines seed-set seed-caps seed-batch seed-iteration
+seed-all: seed seed-match seed-groups seed-engines seed-bodies seed-set seed-caps seed-batch seed-iteration
 
 seed-match:                     ## anchored match (full-consumption oracle)
 	go test -run=FuzzMatch .
@@ -35,6 +35,8 @@ seed-groups:                    ## captures, selector's engine choice
 	go test -run='FuzzGroups$$' .
 seed-engines:                   ## captures, TDFA vs Backtracking cross-check
 	go test -run=FuzzGroupsBothEngines .
+seed-bodies:                    ## captures, Backtracking fast body vs its fallback
+	go test -run=FuzzGroupsBothBodies .
 seed-set:                       ## set find (overlapping)
 	go test -run='FuzzSet$$' .
 seed-caps:                      ## every set capability, at every `from`

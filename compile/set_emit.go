@@ -112,7 +112,9 @@ type compiledSet struct {
 	// single-pattern capture body has. Laid out LAST among a set's functions so
 	// adding them moves no existing offset. btRegions is the one shared
 	// stack/memo/scratch allocation they all use.
-	// numBTFns is the count of Backtracking drivers this set will emit. It is
+	// numBTFns is the count of Backtracking functions this set will emit — one
+	// driver per BT bucket, plus one fallback per budgeted bucket (planBT),
+	// laid out after every driver. It is
 	// known in CompileSet, whereas btFnBodies is only FILLED at assembleModule
 	// time (a driver's suffix body needs function indices). Every layout
 	// question — funcCount, the function section, btFnBaseOffset — must use
@@ -124,6 +126,9 @@ type compiledSet struct {
 	tableMemIdx int
 	btFnBodies  [][]byte
 	btRegions   *btSharedRegions
+	// btWorkBudget is CompileSetOptions.BTWorkBudget, kept for buildBTBodies,
+	// which builds the drivers at assembly time when the options are gone.
+	btWorkBudget int
 
 	// prefixFnBodies[i] is the body for the i-th unique prefix DFA (backward scan).
 	// Signature: (ptr i32, scan_end i32) → i32  (type 0)
@@ -1267,8 +1272,23 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// the per-candidate driver calls one suffix function at a time and the
 	// memo re-zeroes itself at the head of every call.
 	btBase := ra.Reserve("bt-fallback", 1)
+	// A budgeted bucket — every BT bucket unless the budget is off — also gets a
+	// fallback driver, which memoises every Alt,
+	// so its share of the memo region is the full reservation even when its
+	// fast driver never touches the memo. Recorded before the regions are
+	// planned, since they are sized to the largest bucket's needs.
+	numBTFallbacks := 0
+	for _, bkt := range buckets {
+		if bkt.btFallback == nil || !planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
+			continue
+		}
+		numBTFallbacks++
+		if bkt.btFallback.memoSize == 0 {
+			_, bkt.btFallback.memoSize = btAllocSizes(bkt.btFallback.bt, true, 0, resolveMemoBudget(nil))
+		}
+	}
 	btRegions := planBTRegions(buckets, int64(btBase), opts.globals)
-	numBTFns := 0
+	numBTFns := numBTFallbacks
 	for bi, bkt := range buckets {
 		if bkt.btFallback == nil {
 			continue
@@ -1333,6 +1353,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		numBTFns:            numBTFns,
 		tableMemIdx:         opts.TableMemIdx,
 		btRegions:           btRegions,
+		btWorkBudget:        opts.BTWorkBudget,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
 		prefixFnBodies:      prefixFnBodies,
@@ -1779,6 +1800,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			MaxDFAStates:              cfg.MaxDFAStates,
 			MaxTDFARegs:               cfg.MaxTDFARegs,
 			Report:                    rep,
+			BTWorkBudget:              over.BTWorkBudget, // test-only override, as below
 			Component:                 comp.Component,
 			ComponentPackage:          comp.ComponentPackage,
 			ComponentExportNames:      comp.ExportNames,
@@ -1796,6 +1818,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
 		Report:       rep,
+		// Test-only override (CompileFileOpts); zero everywhere else.
+		BTWorkBudget: over.BTWorkBudget,
 	}
 	if !standalone {
 		opts.tableMemIdx = 1
@@ -2131,6 +2155,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotFindNeutral:       setTypeI32I32ToI64, // same shape as the body it twins
 		slotCapture:           setTypeI32x3ToI32,  // (i32,i32,i32)→i32
 		slotGroupsWrapper:     setTypeI32x3ToI32,
+		// A fallback has its fast body's signature.
+		slotMatchFallback:   setTypeI32I32ToI32,
+		slotFindFallback:    setTypeI32I32ToI64,
+		slotCaptureFallback: setTypeI32x3ToI32,
 		// The batch wrappers share the set match body's
 		// (i32×5)→i32 shape rather than needing a type of their own.
 		slotBatchFind:         setMatchTypeMatch,
@@ -2406,9 +2434,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total-numFuncImports))
 	for i, p := range patterns {
 		base := baseIdx[i]
-		_, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
+		matchOff, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
-			cs_bytes = append(cs_bytes, p.matchBody...)
+			cs_bytes = p.appendMatchBodies(cs_bytes, base+matchOff)
 		}
 		if p.altLitAnchorBranches != nil {
 			for _, br := range p.altLitAnchorBranches {
@@ -2443,7 +2471,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = p.appendFindBodyWithTwin(cs_bytes, base+findOff)
 		}
 		if p.captureBody != nil {
-			cs_bytes = append(cs_bytes, p.captureBody...)
+			cs_bytes = p.appendCaptureBodies(cs_bytes, base+captureOff)
 			if !p.anchored {
 				wrapperTableMemIdx := 0
 				if !standalone {
@@ -4612,6 +4640,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		MaxFallbackStates: cfg.MaxFallbackStates,
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
+		BTWorkBudget:  over.BTWorkBudget,
 		// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
 		ForceFrontend: over.ForceFrontend,
 		forceFrontend: over.forceFrontend,

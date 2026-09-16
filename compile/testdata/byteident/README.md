@@ -31,7 +31,8 @@ add a fixture for it.
 | `match_only` | `(?:https?)://(?:[^/]+)/(?:.*)` | `match_func` alone: anchored body, no find sibling | Compiled DFA |
 | `find_only` | `\d{4}-\d{2}-\d{2}` | `find_func` alone | Compiled DFA |
 | `tdfa_groups` | `(?P<scheme>…)://(?P<host>…)/(?P<path>…)` | TDFA capture path with named groups | TDFA |
-| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible) | Backtracking |
+| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible), with the work budget and fallback body every Backtracking program carries | Backtracking |
+| `bt_empty_loop` | `^(\w*\|)*c` | Backtracking capture path over an empty-body greedy loop, the shape that motivated the WORK BUDGET — an i64 counter set once per call and charged on every frame pop, whose exhaustion tail-calls a second function — and that function: the FALLBACK body, memoised at every Alt, with the memo reservation it needs. `bt_groups` above carries the same machinery; this one pins it over a program that has loop trackers and the empty-body-loop handling in its fast body | Backtracking |
 | `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction | Compiled DFA |
 | `line_anchored` | `(?m:^)ERROR:.*(?m:$)` | newline-boundary machinery: `midStartNewline`, the `midAcceptNL` side table | Compiled DFA |
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |

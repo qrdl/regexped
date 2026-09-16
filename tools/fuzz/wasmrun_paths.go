@@ -70,6 +70,16 @@ func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 	return w, err
 }
 
+// compileGroupsBudget compiles pat with a groups export forced onto
+// Backtracking under a given compile.CompileOptions.BTWorkBudget, so the fast
+// body and its fallback can each be run alone.
+func compileGroupsBudget(pat string, budget int) ([]byte, error) {
+	entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
+	w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true,
+		compile.EngineBacktrack, compile.CompileOptions{BTWorkBudget: budget})
+	return w, err
+}
+
 // compileSet compiles pats as one set exporting find_all. Patterns are named
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.

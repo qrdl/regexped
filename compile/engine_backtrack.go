@@ -685,10 +685,16 @@ func loopCaptureLocals(prog *syntax.Prog, idom []int, loopPC int) []uint32 {
 	return locals
 }
 
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32) []byte {
-	body := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winGlobal, memoMaxLen, capStartGlobal)
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+// appendBacktrackCodeEntry appends a size-prefixed capture body. callOff is
+// the byte offset, within the returned slice, of the fallback call's
+// placeholder immediate (-1 when the body makes no such call).
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32, workK int, tripCalls, fallback bool) (out []byte, callOff int) {
+	body, off := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, nativeAnchored, tableMemIdx, winGlobal, memoMaxLen, capStartGlobal, workK, tripCalls, fallback)
+	sized, off := btSizePrefix(body, off)
+	if off >= 0 {
+		off += len(cs)
+	}
+	return append(cs, sized...), off
 }
 
 // buildBacktrackBody emits the WASM function body for the backtracking NFA.
@@ -712,7 +718,24 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // fix-up, and the wrapper needs no per-slot rebasing pass afterwards.
 // Byte consumption is still bounded by endOff (limitLocal), so window mode
 // explores exactly the same positions the narrowed slice used to.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32) []byte {
+//
+// workK > 0 adds the work budget (btWorkK): an i64 local, set once per call
+// from the span the search ranges over, charged on every frame pop. tripCalls
+// makes an exhausted budget tail-call the fallback body (emitBTFallbackCall)
+// instead of answering -2; callOff reports where that call's index goes.
+//
+// fallback builds the FALLBACK body instead: the same emitter over
+// btFallbackView(bt), memoised at every Alt, with no budget of its own. The
+// caller must hand it a memo region and ceiling, and a frame size computed from
+// the view — its frames carry no loop trackers.
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, nativeAnchored bool, tableMemIdx int, winGlobal int32, memoMaxLen int32, capStartGlobal int32, workK int, tripCalls, fallback bool) (_ []byte, callOff int) {
+	callOff = -1
+	if fallback {
+		bt = btFallbackView(bt)
+		useMemo = true
+		workK = 0
+		tripCalls = false
+	}
 
 	prog := bt.prog
 	N := len(prog.Inst)
@@ -829,9 +852,21 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	var body []byte
 
 	// ── Local declarations ────────────────────────────────────────────────────
-	body = append(body, 0x01)
+	// The work counter is the one i64, in a group of its own after every i32,
+	// so no existing index moves and a body without it declares exactly what
+	// it always did.
+	useWork := workK > 0
+	workLocal := uint32(3 + totalLocals) // after the three params and every i32
+	if useWork {
+		body = append(body, 0x02)
+	} else {
+		body = append(body, 0x01)
+	}
 	body = utils.AppendULEB128(body, uint32(totalLocals))
 	body = append(body, 0x7F)
+	if useWork {
+		body = append(body, 0x01, 0x7E) // one i64
+	}
 
 	// ── Window offsets (window mode only) ───────────────────────────────────
 	// Loaded once; winStart also seeds pos, and winEnd is the consumption
@@ -925,6 +960,21 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 		body = utils.AppendULEB128(body, loopEntryLocalIdx[pc])
 	}
 
+	// ── Work budget ─────────────────────────────────────────────────────────
+	// Over the WINDOW in window mode, not the input: a composed groups call
+	// runs this body once per match, and a budget sized from the whole input
+	// would let one pathological window burn k·N·len pops before tripping.
+	if useWork {
+		body = emitBTWorkInit(body, workLocal, workK, N, func(b []byte) []byte {
+			if useWindow {
+				b = btLocalGet(b, winEndLocal)
+				b = btLocalGet(b, winStartLocal)
+				return append(b, 0x6B) // i32.sub
+			}
+			return append(b, 0x20, localLen)
+		})
+	}
+
 	// ── Part 3: Memo table lazy clear ──────────────────────────────────────
 	if useMemo {
 		// The memo reservation is sized from memoMaxLen and the bit indices are
@@ -966,6 +1016,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	body = append(body, 0x41, 0x7F) // i32.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end if (empty)
+
+	if useWork {
+		body = emitBTWorkCharge(body, workLocal, func(b []byte) []byte {
+			if tripCalls {
+				return emitBTFallbackCall(b, 3, &callOff) // ptr, len, out_ptr
+			}
+			return btWorkTripI32(b)
+		})
+	}
 
 	// Pop frame: sp -= frameSize
 	body = append(body, 0x20, localSP) // local.get sp
@@ -1050,7 +1109,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTab
 	body = append(body, 0x0B)       // end loop $run
 	body = append(body, 0x41, 0x7F) // i32.const -1 (unreachable fallthrough)
 	body = append(body, 0x0B)       // end function
-	return body
+	return body, callOff
 }
 
 // emitBitStateGuard emits the shared BitState "already visited (p, pos)?
@@ -1816,6 +1875,266 @@ func btOverflowFindReturn(bb []byte, _ uint32) []byte {
 	return append(bb, 0x0F) // return
 }
 
+// BTWorkBudgetOff is the CompileOptions.BTWorkBudget value that emits no work
+// counter at all, so an empty-body-loop program compiles to exactly the bytes
+// it had before the budget existed. For attribution: a difference that
+// survives it is not the counter's.
+const BTWorkBudgetOff = -1
+
+// BTWorkBudgetForceFallback is the CompileOptions.BTWorkBudget value that makes
+// a Backtracking program's fast body a bare tail call into its fallback body, so
+// the fallback alone answers every call. A TEST knob: the fallback otherwise
+// runs only after a trip, which the corpus reaches a handful of times, and it is
+// a general bitstate body that has to be right for everything a program can
+// contain.
+const BTWorkBudgetForceFallback = -2
+
+// defaultBTWorkK is the budget multiplier when CompileOptions.BTWorkBudget is 0.
+const defaultBTWorkK = 8
+
+// btWorkK returns the work-budget multiplier a body for bt must carry, or 0 for
+// no counter.
+//
+// # Why a budget, and why every program
+//
+// A backtracker without memoisation is exponential whenever a loop can split
+// the same input more than one way, and nothing in this engine's ordinary body
+// cuts that off. `^(\w*|)*c` — a loop whose body can match empty through an
+// alternation branch — took 3 ms at 12 bytes, 783 ms at 22, and never returned
+// at 40; `^(aa|a)*b` — overlapping branches in a loop whose body always
+// consumes — took 238 ms at 32 bytes and never returned at 40. The zero-progress
+// guard does not fire on either, because iterations DO consume bytes; the frame
+// budget is not exhausted, because the stack is popped as the search goes.
+// BitState memoisation cannot be added alongside the guard: the guard needs a
+// second arrival at a (pc, pos) and the memo forbids one, so the two disagree by
+// construction and `(?:a*|b*)*` over "b" answers end=1 instead of end=0.
+//
+// So the body counts instead. Every such blowup is made of backtracking, and
+// every backtrack is a frame POP, so the counter is decremented on the pop path
+// and costs nothing on a call that never backtracks.
+//
+// EVERY Backtracking program carries it. The first version was scoped to
+// programs with an empty-body greedy loop, on the premise that every other
+// program was bounded by the zero-progress guard — and `^(aa|a)*b` refutes the
+// premise. No syntactic rule for "can blow up" is known to be complete, so there
+// is no rule here.
+//
+// # Why (span+1)·k·N pops, and why that bounds TIME
+//
+// A search that never revisits a (pc, pos) pushes at most N·(span+1) frames,
+// hence pops at most that many. A run past k times that bound is no longer in
+// the polynomial regime, so the body gives up. k is a knob, not a proof
+// obligation: a trip answers "unknown", never a wrong answer.
+//
+// Counting pops bounds time as well, not just backtracks. Every cycle in a
+// syntax.Prog passes through an Alt, and an Alt either pushes a frame or takes a
+// loop's guard exit; a guard exit cannot repeat at the same head without a pop
+// in between. So between two consecutive push or pop events the path takes at
+// most L guard exits (L = loop heads), and each stretch between two of those is
+// acyclic, at most N instructions. One stretch is therefore at most N·(L+1)
+// instructions, and a call at most N·(L+1)·(2·pops + stack depth + 1) — linear
+// in the input, since pops are bounded by the budget and depth by the static
+// stack.
+func btWorkK(_ *backtrack, budget int) int {
+	if budget < 0 {
+		return 0
+	}
+	if budget == 0 {
+		return defaultBTWorkK
+	}
+	return budget
+}
+
+// btPlan is how one Backtracking program is emitted under a work budget.
+type btPlan struct {
+	// k is the fast body's pop-budget multiplier; 0 means no counter.
+	k int
+	// fallback: the program also gets a fallback body, laid out right after
+	// its fast body, and a trip TAIL-CALLS it instead of answering -2.
+	fallback bool
+	// force: the fast body is nothing but that tail call
+	// (BTWorkBudgetForceFallback).
+	force bool
+}
+
+// planBT resolves CompileOptions.BTWorkBudget for one program.
+//
+// Every budgeted program gets a fallback, and a fallback exists only behind a
+// counter or the force knob: a trip that answered -2 where a fallback could
+// have answered would lose an answer the engine is able to give. The one
+// exception is BTWorkBudgetOff, which emits neither — the bytes from before
+// the budget existed, for attribution.
+func planBT(bt *backtrack, budget int) btPlan {
+	if budget == BTWorkBudgetForceFallback {
+		return btPlan{fallback: true, force: true}
+	}
+	k := btWorkK(bt, budget)
+	return btPlan{k: k, fallback: k > 0}
+}
+
+// btFallbackView returns bt as the FALLBACK body sees it, which is the whole
+// definition of that body: the same emitter, handed a program with
+//
+//   - no loop heads, so every Alt is an ordinary "push the retry, continue";
+//   - no loop trackers or capture snapshots, so a frame is pos + captures +
+//     retryPC and nothing else;
+//   - every Alt memoised on (pc, pos).
+//
+// Why that is sound. With the trackers gone, (pc, pos) IS the complete machine
+// state: the program is a graph with no return addresses, so the continuation
+// from a (pc, pos) depends on nothing else. The first visit to one explores
+// every path out of it in priority order; if any succeeds the call returns, so a
+// second arrival can only follow a first that failed, and cutting it loses
+// nothing. That is Go regexp's bitstate discipline. The trackers are exactly
+// what made it unsound on the fast body: the zero-progress guard needs a second
+// arrival at a (pc, pos) and the memo forbids one, so `(?:a*|b*)*` over "b"
+// answered end=1 there.
+//
+// Go checks its visited set at EVERY instruction; this checks only at Alts, and
+// the two are equivalent. From a non-Alt instruction the path is deterministic
+// up to the next Alt, Match or Fail, so a revisit of a non-Alt (pc, pos) is cut
+// at that next Alt — and it can never reach Match, because the first visit
+// would already have returned. Checks at every instruction would only add cost.
+//
+// Why it terminates without the zero-progress guard: every cycle in a
+// syntax.Prog passes through an Alt, and an Alt can be entered at a given pos
+// at most once per call.
+func btFallbackView(bt *backtrack) *backtrack {
+	v := *bt
+	v.loops = map[int]bool{}
+	v.nonGreedyLoop = map[int]bool{}
+	v.emptyBodyGreedyLoop = map[int]bool{}
+	v.loopEntryOutOf = map[int]int{}
+	v.loopEntryArgOf = map[int]int{}
+	v.loopEntryAtStart = map[int]bool{}
+	v.memoInnerLoop = map[int]bool{}
+	for pc, inst := range bt.prog.Inst {
+		if inst.Op == syntax.InstAlt || inst.Op == syntax.InstAltMatch {
+			v.memoInnerLoop[pc] = true
+		}
+	}
+	return &v
+}
+
+// btFallbackCallPlaceholder is the immediate a fast body's call to its fallback
+// carries until the assembler knows the fallback's function index: five
+// zero-padded LEB128 bytes, so the real index overwrites it in place and
+// nothing moves. Same width and mechanism as the neutral find twin's handoff.
+var btFallbackCallPlaceholder = utils.AppendPaddedULEB128(nil, 0, twinCallImmWidth)
+
+// emitBTFallbackCall emits the tail call a tripped fast body makes:
+// `local.get 0 … local.get nParams-1; call <placeholder>; return`, forwarding
+// the fast body's own arguments. The fallback reads every global the fast body
+// read — the find-from position, the window offsets, the capture start — and
+// the fast body writes none of them, so it restarts the call from scratch on
+// exactly the inputs the caller gave. *callOff receives the placeholder's byte
+// offset within b.
+func emitBTFallbackCall(b []byte, nParams int, callOff *int) []byte {
+	if *callOff >= 0 {
+		panic("compile: a Backtracking body emitted its fallback call twice")
+	}
+	for i := 0; i < nParams; i++ {
+		b = append(b, 0x20, byte(i)) // local.get param
+	}
+	b = append(b, 0x10) // call
+	*callOff = len(b)
+	b = append(b, btFallbackCallPlaceholder...)
+	return append(b, 0x0F) // return
+}
+
+// btTailCallBody is the whole fast body under BTWorkBudgetForceFallback: no
+// locals, one forwarding call. Returned size-prefixed, with callOff counted
+// from the start of the size prefix.
+func btTailCallBody(nParams int) (body []byte, callOff int) {
+	callOff = -1
+	b := []byte{0x00} // no locals
+	b = emitBTFallbackCall(b, nParams, &callOff)
+	b = append(b, 0x0B) // end (the return above makes this unreachable)
+	return btSizePrefix(b, callOff)
+}
+
+// btSizePrefix size-prefixes a body and moves a recorded offset (-1 = none)
+// past the prefix.
+func btSizePrefix(body []byte, off int) ([]byte, int) {
+	prefix := utils.AppendULEB128(nil, uint32(len(body)))
+	if off >= 0 {
+		off += len(prefix)
+	}
+	return append(prefix, body...), off
+}
+
+// patchBTFallbackCall returns a copy of a size-prefixed fast body with its
+// fallback call pointing at fallbackIdx. It checks the placeholder is still
+// where the emitter recorded it, so an offset that went stale fails the compile
+// instead of calling some other function.
+func patchBTFallbackCall(body []byte, off, fallbackIdx int) []byte {
+	if off < 1 || off+twinCallImmWidth > len(body) || body[off-1] != 0x10 ||
+		string(body[off:off+twinCallImmWidth]) != string(btFallbackCallPlaceholder) {
+		panic("compile: Backtracking fallback call patch offset does not name the placeholder")
+	}
+	out := append([]byte(nil), body...)
+	copy(out[off:off+twinCallImmWidth], utils.AppendPaddedULEB128(nil, uint32(fallbackIdx), twinCallImmWidth))
+	return out
+}
+
+// emitBTWorkInit emits `work = (span + 1) * (k * N)` in i64, where span pushes
+// the i32 length the search ranges over: the window in window mode, the input
+// otherwise. i64 because N·(span+1)·k overflows i32 at 1 MB for N ≥ 256.
+//
+// Set once per CALL. A find body's attempts share it, and it is never saved
+// into a frame: it is a bound on the whole call's work, not per-path state.
+func emitBTWorkInit(b []byte, workLocal uint32, k, n int, span func([]byte) []byte) []byte {
+	b = span(b)
+	b = append(b, 0xAD)       // i64.extend_i32_u
+	b = append(b, 0x42, 0x01) // i64.const 1
+	b = append(b, 0x7C)       // i64.add
+	b = append(b, 0x42)       // i64.const k*N
+	b = utils.AppendSLEB128_64(b, int64(k)*int64(n))
+	b = append(b, 0x7E) // i64.mul
+	b = append(b, 0x21) // local.set work
+	return utils.AppendULEB128(b, workLocal)
+}
+
+// emitBTWorkCharge emits the pop-path decrement: `if (--work == 0) trip`. It
+// belongs AFTER the empty-stack test, so only a real pop is charged. trip must
+// leave the function — a return needs no branch depth, which is why this helper
+// takes none.
+func emitBTWorkCharge(b []byte, workLocal uint32, trip func([]byte) []byte) []byte {
+	b = btLocalGet(b, workLocal)
+	b = append(b, 0x42, 0x01) // i64.const 1
+	b = append(b, 0x7D)       // i64.sub
+	b = append(b, 0x22)       // local.tee work
+	b = utils.AppendULEB128(b, workLocal)
+	b = append(b, 0x50)       // i64.eqz
+	b = append(b, 0x04, 0x40) // if void
+	b = trip(b)
+	return append(b, 0x0B) // end if
+}
+
+// btWorkTrip returns what an exhausted budget runs in a body with nParams
+// parameters: the fallback tail call when tripCalls, else unknown — the -2 the
+// body's frame-stack overflow already answers. nil when the body carries no
+// counter.
+func btWorkTrip(useWork, tripCalls bool, nParams int, callOff *int, unknown func([]byte) []byte) func([]byte) []byte {
+	if !useWork {
+		return nil
+	}
+	return func(b []byte) []byte {
+		if tripCalls {
+			return emitBTFallbackCall(b, nParams, callOff)
+		}
+		return unknown(b)
+	}
+}
+
+// btWorkTripI32 is the trip for the i32-returning bodies (capture and match):
+// the same abi.BTStackOverflow a frame-stack overflow answers.
+func btWorkTripI32(b []byte) []byte {
+	b = append(b, 0x41) // i32.const abi.BTStackOverflow
+	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+	return append(b, 0x0F) // return
+}
+
 // btPushFrame pushes a backtrack frame onto the stack:
 // mem[sp+0]                  = pos
 // mem[sp+4..4+capLocals*4]   = captures
@@ -2281,6 +2600,12 @@ func buildBTInnerDisp(
 	// rebases nothing.
 	memoOriginLocal uint32,
 	hasMemoOrigin bool,
+	// The work budget (btWorkK): when workTrip is non-nil, every frame pop
+	// charges workLocal and an exhausted budget runs workTrip, which must leave
+	// the function — a fallback tail call, or the -2 a frame-stack overflow
+	// answers.
+	workLocal uint32,
+	workTrip func([]byte) []byte,
 ) []byte {
 	numCapLocals := 0
 	prog := bt.prog
@@ -2316,6 +2641,9 @@ func buildBTInnerDisp(
 	body = append(body, 0x4D, 0x04, 0x40) // i32.le_u; if void (empty stack)
 	body = failEmptyStack(body)
 	body = append(body, 0x0B) // end of (empty stack) if
+	if workTrip != nil {
+		body = emitBTWorkCharge(body, workLocal, workTrip)
+	}
 	// Pop frame: sp -= frameSize
 	body = append(body, 0x20, localSP, 0x41)
 	body = utils.AppendSLEB128(body, frameSize)
@@ -2386,10 +2714,13 @@ func buildBTInnerDisp(
 // appendBTMatchCodeEntry appends a size-prefixed no-capture BT match body.
 // Signature: (ptr i32, len i32) → i32
 // Returns match end position (≥ 0) on success, -1 on failure.
-func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32) []byte {
-	body := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx, memoMaxLen)
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...)
+func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32, workK int, tripCalls, fallback bool) (out []byte, callOff int) {
+	body, off := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx, memoMaxLen, workK, tripCalls, fallback)
+	sized, off := btSizePrefix(body, off)
+	if off >= 0 {
+		off += len(cs)
+	}
+	return append(cs, sized...), off
 }
 
 // buildBTMatchBody emits the full WASM function body for a no-capture BT match.
@@ -2403,7 +2734,16 @@ func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, fra
 // The fake_out_ptr at index 2 aligns the remaining locals with the package-level
 // constants (localPos=3, localSP=4, localState=5, localScratch=6) so all
 // existing helper functions (btFail, btSetStateAndBr, etc.) can be reused.
-func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32) []byte {
+//
+// workK, tripCalls and fallback are buildBacktrackBody's, for this body.
+func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32, workK int, tripCalls, fallback bool) (_ []byte, callOff int) {
+	callOff = -1
+	if fallback {
+		bt = btFallbackView(bt)
+		useMemo = true
+		workK = 0
+		tripCalls = false
+	}
 	prog := bt.prog
 
 	loopPCsSorted := make([]int, 0, len(bt.loops))
@@ -2438,10 +2778,22 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 	// +1 for fake out_ptr at index 2
 	totalLocals := 4 + len(loopPCsSorted) + len(entryPCsSorted) + memoLocalsCount + 1
 
+	// The work counter (btWorkK) is the one i64, in its own group after every
+	// i32, so no existing index moves.
+	useWork := workK > 0
+	workLocal := uint32(2 + totalLocals) // after the two params and every i32
+
 	var body []byte
-	body = append(body, 0x01)
+	if useWork {
+		body = append(body, 0x02)
+	} else {
+		body = append(body, 0x01)
+	}
 	body = utils.AppendULEB128(body, uint32(totalLocals))
 	body = append(body, 0x7F)
+	if useWork {
+		body = append(body, 0x01, 0x7E) // one i64
+	}
 
 	// pos=0, sp=stackBase, state=prog.Start
 	body = append(body, 0x41, 0x00, 0x21, localPos)
@@ -2473,6 +2825,12 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 		body = emitBTMemoZeroInit(body, memoTableBase, memoDirtyHi, memoZeroLen, memoMaxLen, false, tableMemIdx)
 	}
 
+	if useWork {
+		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+			return append(b, 0x20, localLen)
+		})
+	}
+
 	// loop $run
 	body = append(body, 0x03, 0x40)
 
@@ -2496,13 +2854,14 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize, memoTable
 		memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
 		useMemo, failEmpty, matchFn, nil, tableMemIdx,
 		// The anchored match body starts at 0 and has no origin to rebase onto.
-		0, false)
+		0, false,
+		workLocal, btWorkTrip(useWork, tripCalls, 2, &callOff, btWorkTripI32))
 
 	body = append(body, 0x00)       // unreachable
 	body = append(body, 0x0B)       // end loop $run
 	body = append(body, 0x41, 0x7F) // i32.const -1
 	body = append(body, 0x0B)       // end function
-	return body
+	return body, callOff
 }
 
 // entryLoopPCsSorted returns bt.emptyBodyGreedyLoop's keys in sorted order,
@@ -2755,10 +3114,13 @@ func emitBTMemoZeroInit(body []byte, memoTableBase int32,
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
 func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int, memoMaxLen int32) ([]byte, findFromMode) {
-	body, mode := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx, memoMaxLen)
-	cs = utils.AppendULEB128(cs, uint32(len(body)))
-	return append(cs, body...), mode
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, mandLit *mandatoryLit, tableMemIdx int, memoMaxLen int32, workK int, tripCalls, fallback bool) (out []byte, mode findFromMode, callOff int) {
+	body, mode, off := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, memoTableBase, useMemo, tableMemIdx, memoMaxLen, workK, tripCalls, fallback)
+	sized, off := btSizePrefix(body, off)
+	if off >= 0 {
+		off += len(cs)
+	}
+	return append(cs, sized...), mode, off
 }
 
 // buildBTFindBody emits the full WASM function body for a no-capture BT find.
@@ -2808,7 +3170,14 @@ func btScanLocalsOnly() prefixScanLocals {
 }
 
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
-	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32) ([]byte, findFromMode) {
+	stackBase, stackLimit, frameSize, memoTableBase int32, useMemo bool, tableMemIdx int, memoMaxLen int32, workK int, tripCalls, fallback bool) (_ []byte, _ findFromMode, callOff int) {
+	callOff = -1
+	if fallback {
+		bt = btFallbackView(bt)
+		useMemo = true
+		workK = 0
+		tripCalls = false
+	}
 	var findFrom findFromMode
 	prog := bt.prog
 
@@ -2918,6 +3287,13 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	}
 	a.Reserve(valV128, numV128Locals)
 	a.Reserve(valI32, numLoopAndMemoLocals)
+	// The work counter (btWorkK) is allocated LAST, so it is the only local a
+	// budgeted body adds and no index above moves.
+	useWork := workK > 0
+	var workLocal uint32
+	if useWork {
+		workLocal = uint32(a.I64())
+	}
 	body = a.EmitDecls(body)
 
 	locAttemptStart := attemptCursor.Local()
@@ -2928,6 +3304,15 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
 	// was simply never told where to start.
 	body, findFrom = emitFindFromSeed(body, attemptCursor)
+
+	// The work budget, once per CALL: every attempt this call makes shares
+	// it. Sized from the whole input rather than len - from — a larger budget
+	// only delays a trip, and the bound stays linear in the input.
+	if useWork {
+		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+			return append(b, 0x20, localLen)
+		})
+	}
 
 	// ── BitState memo: zeroed ONCE per call, not once per attempt ────────────
 	//
@@ -3157,7 +3542,8 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx,
-			memoOrigin, useMemo)
+			memoOrigin, useMemo,
+			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOff, func(bb []byte) []byte { return btOverflowFindReturn(bb, 0) }))
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
 		body = append(body, 0x0B) // end block $run_exit
@@ -3172,7 +3558,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x42, 0x7F) // i64.const -1
 		body = append(body, 0x0F)       // return
 		body = append(body, 0x0B)       // end function
-		return body, findFrom
+		return body, findFrom, callOff
 	}
 
 	// ── Standard first-byte / prefix scan path ────────────────────────────────
@@ -3235,7 +3621,8 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			stackBase, stackLimit, frameSize,
 			memoTableBase, memoDirtyHi, memoBitIdx, memoByteAddr, memoMemoByte,
 			useMemo, failEmpty, matchFn, overflowFind, tableMemIdx,
-			memoOrigin, useMemo)
+			memoOrigin, useMemo,
+			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOff, func(bb []byte) []byte { return btOverflowFindReturn(bb, 0) }))
 
 		b = append(b, 0x00) // unreachable
 		b = append(b, 0x0B) // end loop $run
@@ -3253,5 +3640,5 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	body = append(body, 0x42, 0x7F) // i64.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end function
-	return body, findFrom
+	return body, findFrom, callOff
 }

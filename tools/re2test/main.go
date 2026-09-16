@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 const (
@@ -35,6 +37,13 @@ const (
 	skipParseError  = "parse/compile error"
 	skipOther       = "other reasons"
 	skipTimeout     = "timeout (exponential backtracking)"
+	// skipBTOverflow is a Backtracking body answering abi.BTStackOverflow:
+	// "the answer is unknown". It is a SKIP rather than a comparison because
+	// -2 is not an answer, and it is counted on its own because the groups
+	// helpers used to fold every negative result into -1 — a -2 on a
+	// no-match row then compared equal to the expectation and PASSED, so
+	// nothing that gave up could ever be seen.
+	skipBTOverflow = "Backtracking overflow (-2, answer unknown)"
 )
 
 // skipOrder controls the display order of skip reasons in the summary.
@@ -46,6 +55,7 @@ var skipOrder = []string{
 	skipBadSyntax,
 	skipParseError,
 	skipTimeout,
+	skipBTOverflow,
 	"requires " + compile.EngineBacktrack.String(),
 	skipOther,
 }
@@ -61,6 +71,7 @@ func main() {
 	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did originally). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
 	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
 	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). Patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
+	btFallbackAlwaysF := flag.Bool("bt-fallback-always", false, "compile every Backtracking program with a FALLBACK body and make its fast body a bare tail call into it (compile.BTWorkBudgetForceFallback), so the memoised fallback alone answers every Backtracking call — pattern and set member alike. Under it an abi.BTStackOverflow (-2) answer is a FAILURE: corpus inputs sit far below the fallback's memo ceiling, so nothing it cannot answer is expected")
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
 	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
@@ -90,6 +101,7 @@ func main() {
 	setSample = *setSampleN
 	setMaxPrint = *maxErrors
 	setBTFallback = *setBT
+	btFallbackAlways = *btFallbackAlwaysF
 	if *setSampleN < 1 {
 		fmt.Fprintln(os.Stderr, "--sample must be >= 1")
 		os.Exit(1)
@@ -343,6 +355,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			}
 			if likelyNoMatch {
 				compileOpts.LikelyMode = compile.LikelyNoMatch
+			}
+			if btFallbackAlways {
+				compileOpts.BTWorkBudget = compile.BTWorkBudgetForceFallback
 			}
 			wasmBytes, _, compErr := compile.CompileForced([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
 			if compErr != nil {
@@ -613,6 +628,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				} else {
 					got, callErr := callFind(wd, store, findFn, findMemory, text, 0)
 					if callErr != nil {
+						if errors.Is(callErr, errBTOverflow) {
+							noteBTOverflow(skipCount, verbose, "find", pattern, text)
+							continue
+						}
 						if isTimeout(callErr) {
 							if forceBacktrack {
 								store, matchFn, memory = nil, nil, nil
@@ -655,6 +674,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					// groups is now non-anchored; treat as no match if result doesn't start at 0.
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
+						if errors.Is(callErr, errBTOverflow) {
+							noteBTOverflow(skipCount, verbose, "groups", pattern, text)
+							continue
+						}
 						if isTimeout(callErr) {
 							if forceBacktrack {
 								groupsStore, groupsFn, groupsMemory = nil, nil, nil
@@ -712,6 +735,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					// contract, not matchFn's full-consumption one.
 					got, callErr := callMatch(wd, store, matchFn, memory, text)
 					if callErr != nil {
+						if errors.Is(callErr, errBTOverflow) {
+							noteBTOverflow(skipCount, verbose, "match", pattern, text)
+							continue
+						}
 						if isTimeout(callErr) {
 							if forceBacktrack {
 								store, matchFn, memory = nil, nil, nil
@@ -758,6 +785,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					for offset <= len(text) {
 						r, callErr := callFind(wd, store, findFn, findMemory, text, offset)
 						if callErr != nil {
+							if errors.Is(callErr, errBTOverflow) {
+								noteBTOverflow(skipCount, verbose, "find-iter", pattern, text)
+								goto nextResultLine
+							}
 							if isTimeout(callErr) {
 								if forceBacktrack {
 									store, matchFn, memory = nil, nil, nil
@@ -817,6 +848,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if col5 != "" && col5 != "-" && groupsFn != nil {
 					endPos, slots, callErr := callGroups(wd, groupsStore, groupsFn, groupsMemory, text, numGroups)
 					if callErr != nil {
+						if errors.Is(callErr, errBTOverflow) {
+							noteBTOverflow(skipCount, verbose, "groups-find", pattern, text)
+							goto nextResultLine
+						}
 						if isTimeout(callErr) {
 							if forceBacktrack {
 								groupsStore, groupsFn, groupsMemory = nil, nil, nil
@@ -891,6 +926,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					for offset <= textLen {
 						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase, textLen, offset, numGroups)
 						if callErr != nil {
+							if errors.Is(callErr, errBTOverflow) {
+								noteBTOverflow(skipCount, verbose, "groups-exhaust", pattern, text)
+								goto nextResultLine
+							}
 							if isTimeout(callErr) {
 								if forceBacktrack {
 									groupsStore, groupsFn, groupsMemory = nil, nil, nil
@@ -1035,6 +1074,18 @@ done:
 	}
 	if nfail > 0 {
 		return fmt.Errorf("%d test(s) failed", nfail)
+	}
+	// Under --bt-fallback-always a -2 is a failure, not a skip: the fallback's
+	// only ceilings are its memo reservation and its frame stack, and corpus
+	// inputs are far below both, so an unknown answer means the fallback gave
+	// up on something it should have answered.
+	if btFallbackAlways {
+		if n := skipCount[skipBTOverflow]; n > 0 {
+			return fmt.Errorf("%d Backtracking call(s) answered -2 under --bt-fallback-always", n)
+		}
+		if setStats.btUnknown > 0 {
+			return fmt.Errorf("%d set Backtracking call(s) answered -2 under --bt-fallback-always", setStats.btUnknown)
+		}
 	}
 	if nfailSet > 0 {
 		return fmt.Errorf("%d set test(s) failed", nfailSet)
@@ -1313,6 +1364,28 @@ func (w *watchdog) Arm(store *wasmtime.Store) {
 func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 
 // isTimeout reports whether a wasmtime error is an epoch interruption.
+// btFallbackAlways is --bt-fallback-always: see its flag.
+var btFallbackAlways bool
+
+// errBTOverflow is what the call helpers return, in place of a result, when a
+// Backtracking body answers abi.BTStackOverflow. Returning it as an error puts
+// it on the path every call site already inspects before comparing, so no
+// comparison can mistake -2 for "no match". See skipBTOverflow.
+var errBTOverflow = errors.New("backtracking body returned abi.BTStackOverflow")
+
+// noteBTOverflow counts one skipBTOverflow and names the call, so a count that
+// moves can be traced to the rows that moved it. Printed like a FAIL line, but
+// only the first btOverflowPrintCap per run unless -v: a count is the gate, the
+// rows are for attribution.
+func noteBTOverflow(skipCount map[string]int, verbose bool, what, pattern, text string) {
+	skipCount[skipBTOverflow]++
+	if verbose || skipCount[skipBTOverflow] <= btOverflowPrintCap {
+		fmt.Printf("BTOVERFLOW (%s) pattern=%q input=%q\n", what, pattern, text)
+	}
+}
+
+const btOverflowPrintCap = 50
+
 func isTimeout(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "interrupt")
 }
@@ -1328,6 +1401,9 @@ func callMatch(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasm
 	result, err := fn.Call(store, inputBase, int32(len(text)))
 	if err != nil {
 		return 0, err
+	}
+	if result.(int32) == abi.BTStackOverflow {
+		return 0, errBTOverflow
 	}
 	return result.(int32), nil
 }
@@ -1348,6 +1424,9 @@ func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmt
 	result, err := fn.Call(store, inputBase, int32(len(text)), int32(from))
 	if err != nil {
 		return 0, err
+	}
+	if result.(int64) == abi.BTStackOverflow {
+		return 0, errBTOverflow
 	}
 	return result.(int64), nil
 }
@@ -1377,6 +1456,9 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 		return 0, nil, err
 	}
 	endPos := result.(int32)
+	if endPos == abi.BTStackOverflow {
+		return 0, nil, errBTOverflow
+	}
 	if endPos < 0 {
 		return -1, nil, nil
 	}
@@ -1419,6 +1501,9 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 		return 0, nil, err
 	}
 	endPos := result.(int32)
+	if endPos == abi.BTStackOverflow {
+		return 0, nil, errBTOverflow
+	}
 	if endPos < 0 {
 		return -1, nil, nil
 	}

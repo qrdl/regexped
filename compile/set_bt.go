@@ -493,6 +493,15 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 	}
 	out := make(map[int][]byte)
 	btIdx := map[int]int{}
+	// Drivers sit at btFnBase+k, the index each suffix body calls; every
+	// fallback follows the last driver, so adding them moved no driver.
+	numDrivers := 0
+	for _, bkt := range cs.buckets {
+		if bkt.btFallback != nil {
+			numDrivers++
+		}
+	}
+	var fallbacks [][]byte
 	k := 0
 	for bi, bkt := range cs.buckets {
 		if bkt.btFallback == nil {
@@ -502,18 +511,39 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		// The driver: window mode gives it the candidate position and the true
 		// input edges; nativeAnchored lets it accept at the first match end
 		// rather than only on full consumption. See the file header.
-		driver := appendBacktrackCodeEntry(nil, info.bt,
-			cs.btRegions.stackBase, cs.btRegions.stackLimit,
-			int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
-			true, // nativeAnchored
-			tableMemIdx, cs.btRegions.winGlobal,
-			// Per-bucket, not per-set: the shared memo region is sized to the
-			// LARGEST bucket's reservation, but each body's fill is sized from
-			// its OWN N, so each must be bounded by its own ceiling.
-			btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil)),
-			// Set BT buckets are driven directly, not through the groups
-			// wrapper, and use window mode — their slots are already absolute.
-			-1)
+		plan := planBT(info.bt, cs.btWorkBudget)
+		// Per-bucket, not per-set: the shared memo region is sized to the
+		// LARGEST bucket's reservation, but each body's fill is sized from its
+		// OWN N, so each must be bounded by its own ceiling.
+		memoMaxLen := btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil))
+		var driver []byte
+		callOff := -1
+		if plan.force {
+			driver, callOff = btTailCallBody(3)
+		} else {
+			driver, callOff = appendBacktrackCodeEntry(nil, info.bt,
+				cs.btRegions.stackBase, cs.btRegions.stackLimit,
+				int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
+				true, // nativeAnchored
+				tableMemIdx, cs.btRegions.winGlobal, memoMaxLen,
+				// Set BT buckets are driven directly, not through the groups
+				// wrapper, and use window mode — their slots are already absolute.
+				-1,
+				plan.k, plan.fallback, false)
+		}
+		if plan.fallback {
+			// Built here like the driver, so its real index is known and the
+			// driver is patched at once. Whatever the fallback cannot answer
+			// (its memo ceiling, its frame stack) comes back as
+			// abi.BTStackOverflow, which the suffix body already forwards.
+			fb, _ := appendBacktrackCodeEntry(nil, info.bt,
+				cs.btRegions.stackBase, cs.btRegions.stackLimit,
+				int32(btFrameSize(btFallbackView(info.bt))), cs.btRegions.memoBase, true,
+				true, tableMemIdx, cs.btRegions.winGlobal, memoMaxLen, -1,
+				0, false, true)
+			driver = patchBTFallbackCall(driver, callOff, btFnBase+numDrivers+len(fallbacks))
+			fallbacks = append(fallbacks, fb)
+		}
 		cs.btFnBodies = append(cs.btFnBodies, driver)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
@@ -526,6 +556,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		btIdx[bi] = btFnBase + k
 		k++
 	}
+	cs.btFnBodies = append(cs.btFnBodies, fallbacks...)
 	// Probes, for the scan and anchored capabilities. A bucket that filled
 	// only its suffix slot left these EMPTY — a declared function with no
 	// body, which is a module that will not parse.

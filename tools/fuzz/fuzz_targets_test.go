@@ -521,6 +521,78 @@ func FuzzGroups(f *testing.F) {
 	})
 }
 
+// FuzzGroupsBothBodies runs one Backtracking capture program three ways and
+// checks each against the oracle:
+//
+//   - the FAST body alone (compile.BTWorkBudgetOff) — the body every call runs
+//     first, with no counter;
+//   - the FALLBACK body alone (compile.BTWorkBudgetForceFallback) — the
+//     memoised body a tripped fast body tail-calls;
+//   - the two together, as shipped (the default budget).
+//
+// The fallback runs only after a trip in production, which the corpus reaches a
+// handful of times, so without this target it would be seen almost never. The
+// fast body alone may still blow up exponentially on an empty-body-loop program
+// — that is the defect the budget exists for — so a hang there skips the case
+// once the other two legs have answered; a hang in either of them is a bug.
+func FuzzGroupsBothBodies(f *testing.F) {
+	for _, c := range seedCorpus(seedFile) {
+		f.Add(c.pattern, c.input)
+	}
+	f.Fuzz(func(t *testing.T, pat, input string) {
+		if len(input) >= pathsInputCap {
+			t.Skip()
+		}
+		if reason := skipPattern(pat, input); reason != "" {
+			t.Skip(reason)
+		}
+		if !hasCaptures(pat) {
+			t.Skip("no capture groups: no groups export is emitted for such patterns")
+		}
+		ref := regexp.MustCompile(pat)
+		numGroups := ref.NumSubexp() + 1
+		if numGroups > maxFuzzGroups {
+			t.Skip("too many capture groups for the harness slot buffer")
+		}
+		want := ref.FindStringSubmatchIndex(input)
+
+		legs := []struct {
+			name      string
+			budget    int
+			hangIsBug bool
+		}{
+			{"fallback", compile.BTWorkBudgetForceFallback, true},
+			{"shipped", 0, true},
+			{"fast", compile.BTWorkBudgetOff, false},
+		}
+		for _, leg := range legs {
+			wasmBytes, compErr := compileGroupsBudget(pat, leg.budget)
+			if compErr != nil {
+				// Backtracking can legitimately refuse a program (its resource
+				// ceilings) — and refuses it for every leg alike.
+				t.Skip("backtracking refused the program")
+			}
+			got, ok, hang, runErr := runWasmGroupsPath(wasmBytes, input, numGroups)
+			if errors.Is(runErr, errBTOverflow) {
+				t.Skip("backtracking reached a ceiling (memo or frame stack)")
+			}
+			if runErr != nil {
+				t.Fatalf("wasm error (%s body): pat=%q input=%q: %v", leg.name, pat, input, runErr)
+			}
+			if hang {
+				if leg.hangIsBug {
+					t.Fatalf("hang (%s body, watchdog %s): pat=%q input=%q", leg.name, wasmCallTimeout, pat, input)
+				}
+				t.Skip("the fast body alone blew up exponentially; the other two legs answered")
+			}
+			if msg := compareSlots(want, got, ok); msg != "" {
+				t.Fatalf("groups mismatch (%s) on the %s body: pat=%q input=%q\n  expected %v\n  got      %v (ok=%v)",
+					msg, leg.name, pat, input, want, got, ok)
+			}
+		}
+	})
+}
+
 // FuzzGroupsBothEngines runs the same pattern through TDFA and Backtracking and
 // checks both against the oracle.
 //

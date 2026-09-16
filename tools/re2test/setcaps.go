@@ -1068,7 +1068,13 @@ func newSetRunner(
 	var diags []compile.SetDiag
 	var err error
 	droppedFind, droppedAnchored := captureDrops(func() {
-		wasmBytes, _, diags, err = compile.CompileFileDiag(cfg, "")
+		// CompileFileOpts with a zero override IS CompileFileDiag; the override
+		// is only ever --bt-fallback-always's.
+		var over compile.CompileSetOptions
+		if btFallbackAlways {
+			over.BTWorkBudget = compile.BTWorkBudgetForceFallback
+		}
+		wasmBytes, _, diags, err = compile.CompileFileOpts(cfg, "", over)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)

@@ -633,6 +633,10 @@ type CompileSetOptions struct {
 	ForceShuftiAdaptive bool
 	forceShuftiAdaptive bool
 
+	// BTWorkBudget is CompileOptions.BTWorkBudget for the set's Backtracking
+	// fallback buckets. Same values, same meaning; zero is the default budget.
+	BTWorkBudget int
+
 	// globals is the MODULE's global allocator, shared with every pattern and
 	// every other set in the same compile. A set reaches for it when a bucket
 	// wants module-scoped state — today only the sparse member skip's

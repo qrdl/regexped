@@ -1648,7 +1648,12 @@ func TestCompileAutoSelectEngine(t *testing.T) {
 // checkBTLoopCount and maxBTFallbackInstructions.
 func TestCompileBTCaptureBudgetIncludesMemoTable(t *testing.T) {
 	const stackOnly = 245 // repeats; ~4.02GB of BT capture stack
-	opts := CompileOptions{MemoBudget: 512 << 20}
+	// BTWorkBudgetOff: with the work budget on, EVERY Backtracking program
+	// reserves the memo for its fallback body, so the control below would
+	// carry a memo table too and there would be nothing to contrast. Off, the
+	// memo is reserved only where the fast body needs it (needsBitState), which
+	// is the distinction this test is about.
+	opts := CompileOptions{MemoBudget: 512 << 20, BTWorkBudget: BTWorkBudgetOff}
 
 	// Control: identical stack, but no zero-width loop → no memo table →
 	// the reservation fits and compilation succeeds.

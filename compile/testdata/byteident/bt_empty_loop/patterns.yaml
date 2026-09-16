@@ -1,0 +1,8 @@
+# Backtracking capture path over an EMPTY-BODY GREEDY LOOP: the outer `*`'s
+# body can match empty through the `|` branch — the shape that motivated the
+# work budget (btWorkK) and the fallback body its trip tail-calls. Every
+# Backtracking program carries both; this one pins them over a fast body with
+# loop trackers and empty-body-loop handling.
+regexps:
+  - pattern: '^(\w*|)*c'
+    groups_func: bt_empty_loop
