@@ -49,3 +49,54 @@ jobs:
             args+=(--notes-start-tag "${PREV}")
           fi
           gh release create "${args[@]}" regexped
+
+      # The image ships the SAME binary the release attaches — the -trimpath
+      # -ldflags "-s -w" build above — rather than a second one built
+      # differently. docker/ IS the build context, which is why the binary is
+      # copied there; `make docker` assembles the same four binaries in the same
+      # place. No chmod is needed: unlike a downloaded artifact, a copied file
+      # keeps its executable bit.
+      - name: Copy binary into the Docker build context
+        run: cp regexped docker/regexped
+
+      # Writes alongside itself, i.e. into docker/; it takes no destination.
+      - name: Download wasm-merge
+        run: ./docker/get_wasm_merge.sh
+
+      # The Dockerfile copies wasm-tools and wac as well — both needed for
+      # wasm_format: component — and neither is in a fresh checkout. An explicit
+      # destination makes each script fetch the release binary into the build
+      # context rather than trust whatever is on the runner's PATH.
+      - name: Download wasm-tools
+        run: ./docker/get_wasm_tools.sh "$PWD/docker"
+
+      - name: Download wac
+        run: ./docker/get_wac.sh "$PWD/docker"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: qrdl
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: qrdl/regexped
+          # {{version}} strips the leading v, so tag v0.4.0 publishes
+          # qrdl/regexped:0.4.0; `latest=true` aliases it. On the branch-push
+          # job this moved from there was no semver tag for that flavor to
+          # alias, which is why it was spelled as a raw tag there and is not
+          # here.
+          tags: type=semver,pattern={{version}}
+          flavor: latest=true
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          labels: ${{ steps.meta.outputs.labels }}
