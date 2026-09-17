@@ -37,13 +37,36 @@ regexped/
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission.
 │   │                          #   EVERY program is emitted as TWO functions: the ordinary body plus
 │   │                          #   a pop-counted WORK BUDGET, and a FALLBACK body it tail-calls when
-│   │                          #   the budget runs out — same emitter over btFallbackView, a
+│   │                          #   the budget runs out, its frame stack overflows or its input
+│   │                          #   passes its static memo — same emitter over btFallbackView, a
 │   │                          #   (pc, pos) memo at EVERY Alt and no loop guards. The memo cannot
 │   │                          #   simply be added to the ordinary body: its zero-progress guard
 │   │                          #   needs a second arrival at a (pc, pos) and a memo forbids one, so
 │   │                          #   `(?:a*|b*)*` over "b" answered end=1. Scoping the budget to
 │   │                          #   empty-body loops (`^(\w*|)*c`) was tried and REFUTED by
-│   │                          #   `^(aa|a)*b`, which hung with no empty-body loop at all
+│   │                          #   `^(aa|a)*b`, which hung with no empty-body loop at all.
+│   │                          #   A stack overflow needs no call site of its own: it ARMS the
+│   │                          #   budget to trip on the next pop, so a body makes at most two calls.
+│   │                          #   EXCEPTION: a program with a ZERO-WIDTH CYCLE (progHasZeroWidthCycle)
+│   │                          #   gets no ordinary body — its first function is the bare tail call.
+│   │                          #   The loop trackers only approximate Go's "drop a second arrival at
+│   │                          #   (pc, pos)" and were wrong on a whole class (`(a*?)*?b` group 1 =
+│   │                          #   1-2 over "aab"; 465 of 15,072 differential patterns, all with such
+│   │                          #   a cycle). Memoising the untracked Alts instead broke 2 that had
+│   │                          #   been right, because the trackers make a (pc, pos) path-dependent
+│   │                          #   In a SET, a member's budget, fallback region and visited set last
+│   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate
+│   ├── bt_scratch.go          # The FALLBACK body's run-time memory: memo and frame stack sized from
+│   │                          #   the input at call time, memory.grow when they do not fit, -2 only
+│   │                          #   when memory cannot grow. Found through two globals whose meaning
+│   │                          #   is settled per output kind by placeBTScratch: embedded = above the
+│   │                          #   tables, component = cabi_realloc's heap top (the SAME global), and
+│   │                          #   standalone = the exported `regexped:scratch_base` the HOST keeps
+│   │                          #   current, 0 meaning fresh pages per call. Standalone needs a
+│   │                          #   protocol because every byte above the tables is the JS/TS stubs';
+│   │                          #   a second memory would have avoided it and was rejected because
+│   │                          #   Safari has no multi-memory. Memo rows are whole bytes (bit = pc%8,
+│   │                          #   a constant) and cleared LAZILY as the search reaches them
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
 │   ├── find_from.go           # The find-from channel: a module-level mutable i32 GLOBAL
 │   │                          #   carrying an exported find's `from` position to the body,
@@ -777,8 +800,16 @@ path, where every negative result was folded into "no match", so a `-2` on a
 no-match row PASSED. `--bt-fallback-always` compiles every Backtracking program
 with its memoised FALLBACK body answering every call alone
 (`compile.BTWorkBudgetForceFallback`) and makes any `-2` a failure, sets
-included. That body otherwise runs only after a work budget trips, which the
-corpus reaches a handful of times. `RE2TEST_FLAGS` is appended to every re2test
+included. That body otherwise answers every call only for a program with a
+zero-width cycle, which gets no ordinary body; for any other program it runs
+only after a work budget trips or a fast body's static stack or memo runs out,
+which the corpus reaches a handful of times. Its memory is sized at call time, so the corpus and benchmark harnesses
+(re2test, perftest, likelytest, pattest, settest, setperf) and `tools/fuzz`'s run
+helpers set a standalone module's exported `regexped:scratch_base` global to the
+first byte above what they write; left at 0, as the fuzz package's
+single-purpose tests leave it, every call that reaches the fallback takes fresh
+pages — still the right answer, but a run under the flag would grow memory on
+every Backtracking call. `RE2TEST_FLAGS` is appended to every re2test
 invocation in the Makefile, so the whole suite runs that way with
 `make re2test RE2TEST_FLAGS=--bt-fallback-always` — 0 failures and 0 `-2`s,
 the same as the default run. `tools/fuzz`'s `FuzzGroupsBothBodies`
@@ -1251,7 +1282,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-09-15
+**Last Updated:** 2026-09-17
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
@@ -1262,4 +1293,4 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 **Member self-loop skip** (`compile/set_sparse.go`, sparse bucket bodies, `prefer-match` only). While the walk sits in a state its accept list cannot change, so a run of bytes that all self-loop moves nothing but the position — and `record` may fire ONCE at the end of the run instead of once per byte. Worth **−80%** of the bucket's fuel on a shared-literal family with long self-loop tails, and **+1.6%** on the same family with no runs to stride over, which is why it is hinted rather than default. That +1.6% was +26%, then +9%, and the two reductions attack DIFFERENT costs. The first is a per-state stale flag in the body's scratch, set when an attempt advances nothing and cleared when one advances; it bounds the WASTED ATTEMPT. It has to be per STATE and it has to live in SCRATCH — the body is called once per CANDIDATE, so a local resets before any streak accumulates (a local counter measured +33%, worse than none), and one flag shared across a bucket's dozens of eligible states lets one failing state silence the rest (win collapsed −80% → +5%). The second is that the walk is emitted TWICE, with the member dispatch and without, and chosen between at entry on a per-BUCKET verdict byte: what the stale flags cannot bound is the DISPATCH — a `memberTab[state]` load, a tee and a branch at every byte of every candidate — which on one-byte tails is the entire remaining cost, ~54 fuel per call with not one attempt executing. The no-dispatch copy is byte-for-byte the walk a neutral bucket emits, so a bucket whose skip is not paying costs exactly what not having the feature costs. BOTH escapes RE-PROBE rather than latch, because scratch survives calls and drives: a latch would let one run-free input disable the skip for every later run-heavy one. The per-state flag re-probes on `lPos & 63 == 0`; the per-bucket verdict re-probes on `lPos & 31 == 0`, the CANDIDATE POSITION rather than a call counter, because a counter must be loaded, incremented and stored on the very path the verdict exists to make cheap and measured as two thirds of what was left. The verdict counts states DISPATCHED to, not attempts made — attempts are already suppressed by the stale flags, so counting them reads as "nothing to judge" and clears the verdict every call. Per state, `memberTab[state]` gives a set id and `memberSets[id]` two nibble-table pairs, EXACT — one bit per distinct nibble ROW (see `buildShuftiPairs`), so two pairs cover a set of ANY width and the former 16-byte ceiling is gone; a `[^\n]+` tail is now served, and served exactly. The pair count is fixed because the set is chosen at RUNTIME and the emitted code shape cannot vary per state. The correctness argument rests on `record` stamping the position (last write wins) and its first-timer bookkeeping being idempotent behind `seen`; both are pinned by tests, because breaking either makes every skipped run report the wrong extent silently. A bucket with no eligible state emits no dispatch at all, so it pays nothing. `--diag-json` reports `member_skip_states` / `member_skip_sets` — the skip is otherwise invisible, and an invisible mechanism is one that stops working quietly.
 
-**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, a pop-counted work budget with a memoised fallback body on every program, all logic inside WASM)
+**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, a pop-counted work budget with a memoised fallback body on every program whose frame stack and memo grow with the input, the fallback alone for a program with a zero-width cycle, all logic inside WASM)

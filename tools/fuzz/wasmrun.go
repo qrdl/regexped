@@ -89,6 +89,10 @@ func runWasmFind(wasmBytes []byte, input string) (span [2]int, ok bool, hang boo
 	if findFn == nil || memExp == nil || memExp.Memory() == nil {
 		return span, false, false, fmt.Errorf("module missing find export or memory")
 	}
+	// The input lives in page 0, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+		return span, false, false, err
+	}
 	mem := memExp.Memory()
 
 	if len(input) > 0 {
@@ -117,6 +121,24 @@ func runWasmFind(wasmBytes []byte, input string) (span [2]int, ok bool, hang boo
 	span[0] = int(uint32(r >> 32))
 	span[1] = int(uint32(r))
 	return span, true, false, nil
+}
+
+// setScratchBase tells a standalone module's Backtracking fallback the lowest
+// address it may use as run-time scratch (abi.ScratchBaseExport): the first
+// byte above everything the harness writes. Each runner sets it for its own
+// layout — the single-pattern ones write below the tables, the set ones above
+// them — because a value below live data is a wrong answer, where leaving it
+// at 0 only costs fresh pages on every call that reaches the fallback. A module
+// with no Backtracking program has no such global.
+func setScratchBase(store *wasmtime.Store, inst *wasmtime.Instance, top int32) error {
+	exp := inst.GetExport(store, abi.ScratchBaseExport)
+	if exp == nil || exp.Global() == nil {
+		return nil
+	}
+	if err := exp.Global().Set(store, wasmtime.ValI32(top)); err != nil {
+		return fmt.Errorf("set %s: %w", abi.ScratchBaseExport, err)
+	}
+	return nil
 }
 
 // watchdog manages a single reusable timeout goroutine, mirroring

@@ -28,6 +28,24 @@ const (
 	maxDFAStates = 100000
 )
 
+// setScratchBase tells a standalone module's Backtracking fallback the lowest
+// address it may use as run-time scratch (abi.ScratchBaseExport): the first
+// byte above everything this harness writes. Left at 0, the fallback takes
+// fresh pages on every call that reaches it — still correct, but a
+// --bt-fallback-always run, where every Backtracking call does, would grow
+// memory by at least a page per call. A module with no Backtracking program has
+// no such global.
+func setScratchBase(store *wasmtime.Store, inst *wasmtime.Instance, top int32) error {
+	exp := inst.GetExport(store, abi.ScratchBaseExport)
+	if exp == nil || exp.Global() == nil {
+		return nil
+	}
+	if err := exp.Global().Set(store, wasmtime.ValI32(top)); err != nil {
+		return fmt.Errorf("set %s: %w", abi.ScratchBaseExport, err)
+	}
+	return nil
+}
+
 const (
 	skipNonAnchored = "requires Backtracking (non-greedy find mode)"
 	skipCaptures    = "requires Backtracking (capture groups)"
@@ -71,7 +89,7 @@ func main() {
 	setChunk := flag.Int("set-chunk", 32, "with --sets, patterns per compiled set (0 = one set per corpus block, which is what --sets did originally). The RE2 corpus has 27 blocks of 132..7020 patterns, so without chunking the frontend and id-space thresholds (packed-pair <=16, Teddy <=64, AC >16, wide `_all` >64) are never crossed from below")
 	setShuffle := flag.Bool("set-shuffle", false, "with --sets, deterministically permute a block's patterns before chunking, so a set holds unrelated patterns instead of variations of one generator family")
 	setBT := flag.Int("set-bt", 0, "with --sets, force set members onto the Backtracking fallback engine by capping max_fallback_states at this many DFA states (0 = off, 1 = force everything BT can take). Patterns over the limit used to be DROPPED from the set entirely, so this is the only way to exercise BT-backed buckets at corpus scale")
-	btFallbackAlwaysF := flag.Bool("bt-fallback-always", false, "compile every Backtracking program with a FALLBACK body and make its fast body a bare tail call into it (compile.BTWorkBudgetForceFallback), so the memoised fallback alone answers every Backtracking call — pattern and set member alike. Under it an abi.BTStackOverflow (-2) answer is a FAILURE: corpus inputs sit far below the fallback's memo ceiling, so nothing it cannot answer is expected")
+	btFallbackAlwaysF := flag.Bool("bt-fallback-always", false, "compile every Backtracking program with a FALLBACK body and make its fast body a bare tail call into it (compile.BTWorkBudgetForceFallback), so the memoised fallback alone answers every Backtracking call — pattern and set member alike. Under it an abi.BTStackOverflow (-2) answer is a FAILURE: the fallback sizes its frame stack and memo from the input at call time and answers -2 only when memory cannot grow, which no corpus input comes near")
 	setSampleN := flag.Int("sample", 1, "with --sets, test only every Nth chunk (1 = all). This is what separates the sampled gate from the exhaustive run")
 	setSubsetF := flag.Bool("set-subset", false, "with --sets, make each set select a NAMED SUBSET of the chunk's patterns (every second one, from index 1) instead of `patterns: all`; this is the only configuration in which PATTERN_COUNT and ID_SPACE differ, which is what sizes the gate array and the `_all` bitmap")
 	setProfiles := flag.String("set-profiles", "all", "with --sets, comma-separated capability profiles to compile per chunk: all, anchored, scan, scan-any, find, find-ov, batch, batch-ov — or all-profiles")
@@ -381,6 +399,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			inst, instErr := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 			if instErr != nil {
 				return fmt.Errorf("%s:%d: NewInstance for %q: %w", testFile, lineno, pattern, instErr)
+			}
+			// Inputs and capture slots all live in page 0, below the tables.
+			if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+				return fmt.Errorf("%s:%d: %q: %w", testFile, lineno, pattern, err)
 			}
 			matchFn = inst.GetFunc(store, "match")
 			findFn = inst.GetFunc(store, "find")
@@ -1075,10 +1097,11 @@ done:
 	if nfail > 0 {
 		return fmt.Errorf("%d test(s) failed", nfail)
 	}
-	// Under --bt-fallback-always a -2 is a failure, not a skip: the fallback's
-	// only ceilings are its memo reservation and its frame stack, and corpus
-	// inputs are far below both, so an unknown answer means the fallback gave
-	// up on something it should have answered.
+	// Under --bt-fallback-always a -2 is a failure, not a skip: the fallback
+	// sizes its frame stack and memo from the input at call time, so it answers
+	// -2 only when linear memory cannot grow, which no corpus input comes near.
+	// An unknown answer means the fallback gave up on something it should have
+	// answered.
 	if btFallbackAlways {
 		if n := skipCount[skipBTOverflow]; n > 0 {
 			return fmt.Errorf("%d Backtracking call(s) answered -2 under --bt-fallback-always", n)

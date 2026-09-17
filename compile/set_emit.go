@@ -1273,21 +1273,31 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// memo re-zeroes itself at the head of every call.
 	btBase := ra.Reserve("bt-fallback", 1)
 	// A budgeted bucket — every BT bucket unless the budget is off — also gets a
-	// fallback driver, which memoises every Alt,
-	// so its share of the memo region is the full reservation even when its
-	// fast driver never touches the memo. Recorded before the regions are
-	// planned, since they are sized to the largest bucket's needs.
+	// fallback driver. It reserves no region: its frame stack and memo are
+	// sized from the input at call time and found through the module's
+	// scratch globals (bt_scratch.go), allocated here while the allocator is
+	// still open.
 	numBTFallbacks := 0
 	for _, bkt := range buckets {
 		if bkt.btFallback == nil || !planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
 			continue
 		}
 		numBTFallbacks++
-		if bkt.btFallback.memoSize == 0 {
-			_, bkt.btFallback.memoSize = btAllocSizes(bkt.btFallback.bt, true, 0, resolveMemoBudget(nil))
+	}
+	btRegions := planBTRegions(buckets, int64(btBase), opts.globals, opts.BTWorkBudget)
+	if btRegions != nil && numBTFallbacks > 0 {
+		btRegions.scratch = opts.globals.BTScratch()
+		// The call-scoped state that lets one host call's candidates share a
+		// member's budget, region and visited set (btDriveMember).
+		btRegions.drive = allocBTDrive(opts.globals)
+		btRegions.hasDrive = true
+		btRegions.members = map[int]*btDriveMember{}
+		for bi, bkt := range buckets {
+			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
+				btRegions.members[bi] = allocBTDriveMember(opts.globals, btRegions.drive)
+			}
 		}
 	}
-	btRegions := planBTRegions(buckets, int64(btBase), opts.globals)
 	numBTFns := numBTFallbacks
 	for bi, bkt := range buckets {
 		if bkt.btFallback == nil {
@@ -1784,6 +1794,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		return nil, 0, nil, err
 	}
 	if err := comp.validate(); err != nil {
+		return nil, 0, nil, err
+	}
+	if err := validateBTWorkBudget(over.BTWorkBudget); err != nil {
 		return nil, 0, nil, err
 	}
 
@@ -2288,9 +2301,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	staticTop := memPages * 65536
 	classHeadsBase := staticTop
 	if opts.Component {
-		heapGlobal = globals.AllocInit(staticTop + classHeadsBytes)
+		heapGlobal = componentHeapGlobal(globals, staticTop)
 		callListGlobal = globals.AllocInit(0)
 	}
+	scratch, exportScratch := placeBTScratch(globals, staticTop, standalone, opts.Component)
 
 	// Global section: the find-from channel (see find_from.go), on the same
 	// terms as the single-pattern assembler. Set capabilities take their own
@@ -2302,6 +2316,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// Export section.
 	numExports := 0
 	if standalone {
+		numExports++
+	}
+	if exportScratch {
 		numExports++
 	}
 	for _, p := range patterns {
@@ -2354,6 +2371,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	if standalone {
 		es = appendString(es, "memory")
 		es = append(es, 0x02, 0x00)
+	}
+	if exportScratch {
+		es = appendBTScratchExport(es, scratch)
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
@@ -2538,6 +2558,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			blkIdx = base + cs.overlapBlockFnOffset()
 		}
 		for _, c := range cs.capFns() {
+			capStart := len(cs_bytes)
 			switch c.kind {
 			case capFind:
 				if cs.findWrapped() {
@@ -2589,6 +2610,13 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					body = emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
 				}
 				cs_bytes = append(cs_bytes, body...)
+			}
+			// Every exported capability that can reach a Backtracking member
+			// starts a new host call for it. The anchored pair cannot: no BT
+			// bucket is admitted there.
+			if cs.btRegions != nil && cs.btRegions.hasDrive && c.kind != capMatchAny && c.kind != capMatchAll {
+				entry := injectBTDrivePrologue(cs_bytes[capStart:], cs.btRegions.drive)
+				cs_bytes = append(cs_bytes[:capStart], entry...)
 			}
 		}
 		if cs.findWrapped() {

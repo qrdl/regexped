@@ -193,6 +193,9 @@ func runWasmMatch(wasmBytes []byte, input string) (end int, ok bool, hang bool, 
 	if fn == nil {
 		return 0, false, false, fmt.Errorf("module missing match export")
 	}
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		return 0, false, false, err
+	}
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[pathsInputBase:], input)
 	}
@@ -229,6 +232,10 @@ func runWasmGroupsPath(wasmBytes []byte, input string, numGroups int) (slots []i
 	fn := inst.GetFunc(store, "groups")
 	if fn == nil {
 		return nil, false, false, fmt.Errorf("module missing groups export")
+	}
+	// Input and slots both lie below the tables.
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		return nil, false, false, err
 	}
 	buf := mem.UnsafeData(store)
 	if len(input) > 0 {
@@ -324,6 +331,11 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
 			return nil, false, fmt.Errorf("memory.Grow to %d pages: %w", neededPages, growErr)
 		}
+	}
+	// Input, gates and tuples all lie ABOVE the tables here, so the scratch
+	// has to start past the tuple buffer.
+	if err := setScratchBase(store, inst, int32(int64(outBase)+outBytes)); err != nil {
+		return nil, false, err
 	}
 	for i := int32(0); i < pageSize; i++ {
 		mem.UnsafeData(store)[gateBase+i] = 0

@@ -87,7 +87,7 @@ DIRECTLY, with `bindgen!` or `jco`, calls the constructor and `next` itself.
 
 ```
 ok(none)                  — there is definitely no match at or after `start`
-err(backtrack-overflow)   — the Backtracking engine ran out of frames and
+err(backtrack-overflow)   — the Backtracking engine ran out of memory and
                             ABANDONED part of the search space
 err(malformed-cache)      — an overlapping set's answer cache had a header the
                             engine could not parse, so the scan is UNFINISHED

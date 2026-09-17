@@ -479,7 +479,7 @@ surface.
 
 ## Backtracking stack overflow
 
-Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
 C has no unwinding, so the sentinel is returned to the caller instead. The header defines it:
 

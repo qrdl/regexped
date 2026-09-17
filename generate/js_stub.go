@@ -103,13 +103,13 @@ export function %s(input) {
 export function %s(input) {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
-    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3).fill(0);
     const n = _exp['%s'](%s);
     // -2 is UNKNOWN, not "nothing matched". The anchored path never probes a
     // Backtracking member today, so this cannot fire; it is here so that a
     // future one cannot fail silently.
     if (n === %d) throw new Error("%s");
-    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const bits = new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
@@ -152,13 +152,13 @@ export function %s(input, from = 0) {
 export function %s(input, from = 0) {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
-    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3).fill(0);
     const n = _exp['%s'](%s);
     // -2 is UNKNOWN, not an empty result: a Backtracking member gave up. The
     // narrow form has no room to say this — its i64 return IS the bitmask — so
     // a BT member is exactly what forces this wide form.
     if (n === %d) throw new Error("%s");
-    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const bits = new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
@@ -201,10 +201,10 @@ export function %s(input, from = 0) {
 			// the end of what _open handed out.
 			findReserve := 12*n + plainGateRegion
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
-    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+    new Uint32Array(_exp.memory.buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst) + plainCachePost + fmt.Sprintf(`    // The scratch descriptor: magic, the gate pointer, and the cache.
     const scratchBase = %s;
-    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+    new Uint32Array(_exp.memory.buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, scratchBase, abi.FindScratchMagic, plainCacheArgs)
 			gateArg := "scratchBase, "
 			gateDoc := "// The generator owns the gate array for its lifetime: dropping it and\n" +
@@ -224,7 +224,7 @@ export function %s(input, from = 0) {
     // Hoisted rather than rebuilt per position, which allocated one typed
     // array per matching position. _att re-attaches it if an interleaved
     // call grew memory while this generator was suspended.
-    let buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
+    let buf = new Int32Array(_exp.memory.buffer, _outBase, 3*%s);
     while (true) {
         // The buffer is sized at the set's pattern count, the exact worst case
         // for a single position, so n can never exceed it.
@@ -275,7 +275,7 @@ export function %s(input, from = 0) {
 				// signature is pinned instead by
 				// compile/set_emit.go's setTypeBatchGated and the goldens.
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
-    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+    new Uint32Array(_exp.memory.buffer, gateBase, %s).fill(0);
 `, idKonst)
 				// The scratch descriptor sits above the gate array and below
 				// the bitmap, and is written AFTER the cache is sized: the
@@ -296,7 +296,7 @@ export function %s(input, from = 0) {
 				// The descriptor, written last: it carries the cache pointer,
 				// which the block above may have declined.
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
-    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+    new Uint32Array(_exp.memory.buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, batchScratchBase, abi.FindScratchMagic, cacheArgs)
 				cacheArgs = ""
 				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
@@ -312,7 +312,7 @@ export function %s(input, from = 0) {
 %s%s    let cursor = BigInt(offset) << 32n;
     // Hoisted for the same reason the per-position shape hoists its view, and
     // re-attached by _att when an interleaved call grows memory.
-    let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
+    let buf = new Int32Array(_exp.memory.buffer, _outBase, 3*batchSize);
     while (true) {
         const packed = _exp['%s'](_inBase, len, cursor, %s_outBase, batchSize);%s
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
@@ -431,12 +431,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	// iterator finishes the whole arena resets, which for ordinary code is
 	// between every loop.
 	sb.WriteString("function _align(x) { return (x + 7) & ~7; }\n\n")
-	sb.WriteString("function _grow(top) {\n")
-	sb.WriteString("    if (top > _mem.buffer.byteLength) {\n")
-	sb.WriteString("        _exp.memory.grow(Math.ceil((top - _mem.buffer.byteLength) / 65536));\n")
-	sb.WriteString("        _mem = new Uint8Array(_exp.memory.buffer); // grow DETACHES the old one\n")
-	sb.WriteString("    }\n")
-	sb.WriteString("}\n\n")
+	sb.WriteString(jsGrowFunc(false))
 	sb.WriteString("function _inCap(input) {\n")
 	sb.WriteString("    // Worst-case UTF-8 expansion of a JS string is 3 bytes per UTF-16 code\n")
 	sb.WriteString("    // unit (an astral char is 2 units and encodes to 4, so 3x still bounds\n")
@@ -508,7 +503,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("    // hold native pointers rather than views. A detached view reports\n")
 		sb.WriteString("    // length 0 and reads as undefined SILENTLY, so re-attach on that. The\n")
 		sb.WriteString("    // offset is still ours, so rebuilding at the same place is correct.\n")
-		sb.WriteString("    return view.length === 0 ? new Ctor(_mem.buffer, at, len) : view;\n")
+		sb.WriteString("    return view.length === 0 ? new Ctor(_exp.memory.buffer, at, len) : view;\n")
 		sb.WriteString("}\n\n")
 
 	}
@@ -531,6 +526,37 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 
 	sb.WriteString(genJSSetSection(cfg))
 	return sb.String(), nil
+}
+
+// jsGrowFunc emits `_grow`, shared by the JS and TS stubs (ts adds the casts).
+//
+// It does three things, and the last two exist because a call INTO the module
+// can grow memory as well: a Backtracking fallback sizes its frame stack and
+// memo from the input at call time.
+//
+//   - grows memory until `top` fits;
+//   - re-acquires `_mem` whenever the buffer changed, whoever grew it — a grow
+//     detaches every view of the old buffer, and _write reads through `_mem`;
+//   - keeps the module's scratch-base global (abi.ScratchBaseExport) at the
+//     highest byte this stub has ever handed out, so that scratch lands above
+//     every live region. Raised only, never lowered: a suspended iterator's
+//     region stays live after `_bump` resets. Read unsigned, because an i32
+//     global reads back negative past 2 GiB. Absent when the module has no
+//     Backtracking program.
+func jsGrowFunc(ts bool) string {
+	sig, mem, global := "function _grow(top) {", "_exp.memory", "_exp['"+abi.ScratchBaseExport+"']"
+	if ts {
+		sig = "function _grow(top: number): void {"
+		mem = "(_exp.memory as WebAssembly.Memory)"
+		global = "(_exp['" + abi.ScratchBaseExport + "'] as WebAssembly.Global | undefined)"
+	}
+	return sig + "\n" +
+		"    const m = " + mem + ";\n" +
+		"    if (top > m.buffer.byteLength) m.grow(Math.ceil((top - m.buffer.byteLength) / 65536));\n" +
+		"    if (_mem.buffer !== m.buffer) _mem = new Uint8Array(m.buffer); // a grow DETACHES the old view\n" +
+		"    const sb = " + global + ";\n" +
+		"    if (sb !== undefined && top > (sb.value >>> 0)) sb.value = top;\n" +
+		"}\n\n"
 }
 
 // genJSMatchFunc generates a JS export for an anchored match.
@@ -575,7 +601,7 @@ export function* %[1]s(input, offset = 0) {
     const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * 8 : 0);
     try {
     if (_batched) {
-        let outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
+        let outBuf = new Uint32Array(_exp.memory.buffer, _outBase, %[2]d * 2);
         let startPos = offset;
         let prevEnd = -1;
         while (true) {
@@ -648,7 +674,7 @@ export function* %[1]s(input, offset = 0) {
     const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
     try {
     if (_batched) {
-        let outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
+        let outBuf = new Int32Array(_exp.memory.buffer, _outBase, %[2]d * %[3]d);
         let startPos = offset;
         // Kept ACROSS calls, exactly as the find batch loop does. The in-WASM
         // wrapper suppresses empty-adjacent matches only within one call, so a
@@ -684,7 +710,7 @@ export function* %[1]s(input, offset = 0) {
     }
     // Hoisted out of the loop rather than rebuilt per match, and re-attached
     // by _att when an interleaved call grew memory while suspended.
-    let slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
+    let slots = new Int32Array(_exp.memory.buffer, _outBase, %[6]d);
     let off = offset;
     let prevEnd = -1;
     while (off <= len) {
@@ -692,6 +718,9 @@ export function* %[1]s(input, offset = 0) {
         slots.fill(-1);
         const r = _exp['%[1]s'](_inBase, len, _outBase, off);
         if (r === %[7]d) throw new Error("%[8]s");
+        // The call itself may have grown memory — a Backtracking fallback
+        // sizes its scratch from the input — which detaches this view.
+        slots = _att(slots, Int32Array, _outBase, %[6]d);
         if (r < 0) {
             // Terminal, not "try the next position": the groups
             // export has SCAN-FROM semantics in both wrapper arms, so a
@@ -832,7 +861,7 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
 	// from it.
 	post = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
     if (cacheBase !== 0) {
-        const _hdr = new Uint32Array(_mem.buffer, cacheBase, %d);
+        const _hdr = new Uint32Array(_exp.memory.buffer, cacheBase, %d);
         _hdr.fill(0);
         _hdr[%d] = _k;
     }

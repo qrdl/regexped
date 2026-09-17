@@ -1241,7 +1241,9 @@ func TestCompileLenientAltFindBody(t *testing.T) {
 func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 	_, err := compilePattern(
 		config.RegexEntry{Pattern: "(a)(b)(c)(d)(e)(f)", GroupsFunc: "g"},
-		0, EngineTDFA, CompileOptions{MaxTDFARegs: 1},
+		// The allocator: the pattern falls back to Backtracking, whose fallback
+		// body reads the module's scratch globals.
+		0, EngineTDFA, CompileOptions{MaxTDFARegs: 1, globals: &moduleGlobals{}},
 	)
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
@@ -1667,6 +1669,25 @@ func TestCompileBTCaptureBudgetIncludesMemoTable(t *testing.T) {
 	entry := config.RegexEntry{Pattern: ctrl.Pattern + `(a*)*`, GroupsFunc: "g"}
 	if _, err := compilePattern(entry, 0, EngineBacktrack, opts); !errors.Is(err, ErrBTStackTooLarge) {
 		t.Fatalf("compilePattern: err = %v, want ErrBTStackTooLarge", err)
+	}
+}
+
+// TestBTWorkBudgetRejectsUnnamedNegative pins that a negative BTWorkBudget
+// other than the two named knobs is an error at both entry points. btWorkK
+// reads every negative value as "no counter", so without the check a stale
+// constant compiles a module with no work budget and no fallback, silently.
+func TestBTWorkBudgetRejectsUnnamedNegative(t *testing.T) {
+	entries := []config.RegexEntry{{Pattern: `^(aa|a)*b`, GroupsFunc: "groups"}}
+	for _, budget := range []int{0, 8, BTWorkBudgetOff, BTWorkBudgetForceFallback, -3} {
+		wantErr := budget == -3
+		_, _, err := Compile(entries, 0, true, CompileOptions{BTWorkBudget: budget})
+		if got := errors.Is(err, errBTWorkBudget); got != wantErr || (!wantErr && err != nil) {
+			t.Errorf("Compile, BTWorkBudget %d: err = %v, want error %v", budget, err, wantErr)
+		}
+		_, _, _, err = CompileFileOpts(config.BuildConfig{Regexps: entries}, "", CompileSetOptions{BTWorkBudget: budget})
+		if got := errors.Is(err, errBTWorkBudget); got != wantErr || (!wantErr && err != nil) {
+			t.Errorf("CompileFileOpts, BTWorkBudget %d: err = %v, want error %v", budget, err, wantErr)
+		}
 	}
 }
 
@@ -2398,7 +2419,7 @@ func TestVerboseDFAConstructionLimit(t *testing.T) {
 	// 15-byte window, far past newDFA's internal ceiling.
 	re := config.RegexEntry{Name: "blowup", Pattern: `(?s).*a.{14}b`, FindFunc: "find"}
 	rep := &Reporter{}
-	if _, err := compilePattern(re, 0, 0, CompileOptions{Report: rep, MaxDFAStates: 64}); err != nil {
+	if _, err := compilePattern(re, 0, 0, CompileOptions{Report: rep, MaxDFAStates: 64, globals: &moduleGlobals{}}); err != nil {
 		t.Fatalf("compilePattern: %v", err)
 	}
 	if len(rep.Patterns) != 1 {

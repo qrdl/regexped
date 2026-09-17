@@ -1213,6 +1213,14 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		fmt.Fprintf(os.Stderr, "  regexped NewInstance(%s): %v\n", tc.name, err)
 		return benchResult{}
 	}
+	// Inputs live in pages 0-1, below the tables. Left at 0 a Backtracking
+	// fallback would take fresh pages on every call that reaches it.
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32(tableBase))); err != nil {
+			fmt.Fprintf(os.Stderr, "  regexped set %s(%s): %v\n", abi.ScratchBaseExport, tc.name, err)
+			return benchResult{}
+		}
+	}
 	instantiation := time.Since(t0)
 
 	// Get memory and the exported function.
@@ -1525,6 +1533,12 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
 		return 0, false
+	}
+	// Inputs live in pages 0-1, below the tables.
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32(tableBase))); err != nil {
+			return 0, false
+		}
 	}
 	var mem *wasmtime.Memory
 	if exp := inst.GetExport(store, "memory"); exp != nil {
@@ -2323,6 +2337,14 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	if neededPages > curPages {
 		mem.Grow(store, neededPages-curPages) //nolint:errcheck
 	}
+	// Input, tuples and gate array all lie ABOVE the tables, below
+	// neededPages. Left at 0 a Backtracking member's fallback would take fresh
+	// pages on every call that reaches it, inside the timed loop.
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32(neededPages*pageSize))); err != nil {
+			return benchResult{}
+		}
+	}
 
 	// Write input into WASM memory.
 	buf := mem.UnsafeData(store)
@@ -2446,6 +2468,12 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	neededPages := uint64((int64(outBase) + 4096*4 + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
 		mem.Grow(store, neededPages-cur) //nolint:errcheck
+	}
+	// Everything this host writes lies below neededPages; see benchRegexpedSet.
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32(neededPages*pageSize))); err != nil {
+			return 0
+		}
 	}
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))

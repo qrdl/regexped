@@ -183,6 +183,56 @@ type moduleGlobals struct {
 	// index. Absent means zero, which is what every global was before the
 	// component allocator needed a heap pointer starting at the static top.
 	inits map[uint32]int32
+	// btScratchP1 is btScratch.host + 1, or 0 while no Backtracking fallback
+	// body has asked for its scratch globals.
+	btScratchP1 uint32
+	// i64 marks the globals AllocI64 made, with their initial values. Every
+	// other global is an i32.
+	i64 map[uint32]int64
+}
+
+// btScratch names the two globals a Backtracking FALLBACK body finds its
+// run-time memory through — its frame stack and its memo, both sized from the
+// input at call time. See emitBTScratchInit for how a body uses them.
+type btScratch struct {
+	// host is the lowest address the host lets the fallback use, or 0 when the
+	// host has said nothing. Its meaning and initial value are settled by the
+	// assembler, per output kind: exported as abi.ScratchBaseExport and 0 in a
+	// standalone module; the end of the tables in an embedded one, whose memory
+	// nothing else touches; the allocator's heap top in a component.
+	host uint32
+	// floor is the end of the module's own tables, which no host value may
+	// place the scratch below.
+	floor uint32
+}
+
+// BTScratch returns the module's fallback-scratch globals, allocating them on
+// the first call. One pair per module: every fallback body shares it, and at
+// most one body runs at a time.
+func (g *moduleGlobals) BTScratch() btScratch {
+	if g.btScratchP1 == 0 {
+		host := g.Alloc()
+		g.Alloc() // floor, at host+1
+		g.btScratchP1 = host + 1
+	}
+	return btScratch{host: g.btScratchP1 - 1, floor: g.btScratchP1}
+}
+
+// btScratchGlobals reports the fallback-scratch pair, if some body allocated it.
+func (g *moduleGlobals) btScratchGlobals() (btScratch, bool) {
+	if g == nil || g.btScratchP1 == 0 {
+		return btScratch{}, false
+	}
+	return btScratch{host: g.btScratchP1 - 1, floor: g.btScratchP1}, true
+}
+
+// setInit gives an already allocated global a non-zero initialiser. For the
+// values only the assembler knows, such as the static top.
+func (g *moduleGlobals) setInit(idx uint32, init int32) {
+	if g.inits == nil {
+		g.inits = map[uint32]int32{}
+	}
+	g.inits[idx] = init
 }
 
 // Alloc reserves one more mutable i32 global, initialised to 0, and returns its
@@ -205,11 +255,22 @@ func (g *moduleGlobals) AllocInit(init int32) uint32 {
 	return idx
 }
 
+// AllocI64 reserves one more mutable i64 global with the given initial value
+// and returns its index, from the same index space as Alloc.
+func (g *moduleGlobals) AllocI64(init int64) uint32 {
+	idx := g.Alloc()
+	if g.i64 == nil {
+		g.i64 = map[uint32]int64{}
+	}
+	g.i64[idx] = init
+	return idx
+}
+
 // Count is the number of globals Section will declare.
 func (g *moduleGlobals) Count() uint32 { return 1 + g.extra }
 
-// Section returns the WASM global section payload: Count() mutable i32 globals,
-// each initialised to 0.
+// Section returns the WASM global section payload: Count() mutable globals, i32
+// unless AllocI64 made them, each with its initial value (0 unless set).
 //
 // The assemblers gate this on the module needing globals at all
 // (moduleUsesFindFrom, plus any allocation). A module that declares the section
@@ -220,6 +281,13 @@ func (g *moduleGlobals) Section() []byte {
 	n := g.Count()
 	out := utils.AppendULEB128(nil, n)
 	for i := uint32(0); i < n; i++ {
+		if init, ok := g.i64[i]; ok {
+			out = append(out, 0x7E, 0x01) // mut i64
+			out = append(out, 0x42)       // i64.const
+			out = utils.AppendSLEB128_64(out, init)
+			out = append(out, 0x0B) // end of init expr
+			continue
+		}
 		out = append(out, 0x7F, 0x01) // mut i32
 		out = append(out, 0x41)       // i32.const
 		out = utils.AppendSLEB128(out, g.inits[i])

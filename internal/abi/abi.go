@@ -8,8 +8,8 @@
 // engine gave up", which is the whole point of this package existing:
 //
 //	-1  NoMatch          the input does not match — an ordinary, expected answer
-//	-2  BTStackOverflow  the Backtracking engine's frame stack was exhausted;
-//	                     the answer is UNKNOWN, not "no"
+//	-2  BTStackOverflow  the Backtracking engine ran out of memory for the
+//	                     search; the answer is UNKNOWN, not "no"
 //
 // For the i64-returning find exports the same values apply, sign-extended
 // (i64.const -1 / -2); a genuine packed (start << 32 | end) result always has
@@ -29,32 +29,33 @@ const (
 	NoMatch = -1
 
 	// BTStackOverflow is returned when the Backtracking engine cannot complete a
-	// search because one of its compile-time sized regions is too small for the
-	// input. Two independent regions can hit that, and both report this value:
+	// search for lack of memory. Where it can arise:
 	//
-	//   - the backtrack FRAME STACK (btPushFrame's guard in
-	//     compile/engine_backtrack.go), sized from the pattern's alternation
-	//     count by btAllocSizes;
-	//   - the BitState MEMO bitset (emitBTMemoLenGuard, same file), sized from
-	//     the pattern's instruction count by btMemoMaxLen.
+	//   - a program compiled with the work budget off
+	//     (compile.BTWorkBudgetOff): the backtrack FRAME STACK (btPushFrame's
+	//     guard in compile/engine_backtrack.go), sized from the pattern's
+	//     alternation count by btAllocSizes, or the BitState MEMO bitset
+	//     (emitBTMemoLenGuard, same file), sized from the instruction count by
+	//     btMemoMaxLen — both compile-time sized while the requirement scales
+	//     with the input;
+	//   - every other program only when its FALLBACK body, which sizes both
+	//     regions from the input at call time, cannot grow linear memory any
+	//     further (WASM32's 4 GiB, or a lower host limit). The ordinary body's
+	//     own static regions no longer produce it: running out of either hands
+	//     the call to the fallback.
 	//
-	// Both budgets are compile-time constants while the true requirement scales
-	// with input length, so a long enough input can exhaust either. The two
-	// ceilings move independently — one with numAlts, the other with N — so
-	// neither guard may be left to the other to catch.
-	//
-	// When either fires the engine has abandoned part of the search space and
+	// Whichever fires, the engine has abandoned part of the search space and
 	// cannot say whether a match exists: reporting NoMatch here would be a
 	// false negative that scales in with input size and carries no diagnostic,
 	// which is exactly the failure this sentinel exists to prevent.
 	//
-	// They share one value because a host acts identically on both — surface an
-	// error, do not treat it as "no match" — and because a new value would have
-	// to be threaded through all six stub generators to convey a distinction no
-	// caller can act on.
+	// They share one value because a host acts identically on all of them —
+	// surface an error, do not treat it as "no match" — and because a new value
+	// would have to be threaded through all six stub generators to convey a
+	// distinction no caller can act on.
 	//
 	// Hosts must surface it as an error, never as "no match". See
-	// docs/engines.md ("Backtracking frame budget").
+	// docs/engines.md ("Frame budget and the -2 sentinel").
 	BTStackOverflow = -2
 
 	// OverlapCacheMalformed is returned when an overlapping `find` is handed an
@@ -139,6 +140,33 @@ const (
 	FindScratchCacheOff    = 8
 	FindScratchCacheLenOff = 12
 )
+
+// ScratchBaseExport is the export name of the mutable i32 global a STANDALONE
+// module carries when it contains a Backtracking program: the lowest address
+// the host lets the module use as run-time scratch during a call.
+//
+// A Backtracking call that exhausts its work budget or its frame stack, or whose
+// input passes its static memo, falls over to a memoised fallback body whose frame stack and memo are sized from
+// the input at call time. In a standalone module every byte above the tables
+// belongs to the host (the JS/TS stubs carve their input regions there), so the
+// module cannot see what is live. The contract:
+//
+//   - The host sets the global to the first byte at and above which it keeps
+//     nothing it needs during a call. It may raise it at any time and must not
+//     write at or above it while a call runs.
+//   - The module places its scratch at the HIGHER of the global and the end of
+//     its own tables, and grows memory when the scratch does not fit.
+//   - 0, the initial value, means the host has said nothing: the scratch then
+//     takes fresh pages at the end of memory on every call that needs it.
+//     Always correct, but memory grows on each such call.
+//
+// The name carries a colon so no export a config can name collides with it:
+// config.ValidateConfig accepts only identifiers. Embedded modules own their
+// memory and components own their allocator, so neither exports it.
+//
+// A module that grows memory during a call detaches every JavaScript view of
+// the old buffer; a JS host must read the buffer afresh after each call.
+const ScratchBaseExport = "regexped:scratch_base"
 
 // SetMatchTupleBytes is one set match as the find exports write it: {pattern
 // id, start, end}, three i32. Every writer of a tuple buffer and every reader

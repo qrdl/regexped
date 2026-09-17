@@ -532,9 +532,11 @@ func FuzzGroups(f *testing.F) {
 //
 // The fallback runs only after a trip in production, which the corpus reaches a
 // handful of times, so without this target it would be seen almost never. The
-// fast body alone may still blow up exponentially on an empty-body-loop program
-// — that is the defect the budget exists for — so a hang there skips the case
-// once the other two legs have answered; a hang in either of them is a bug.
+// fast body alone may still blow up exponentially — that is the defect the
+// budget exists for — so a hang there skips the case once the other two legs
+// have answered; a hang in either of them is a bug. The fast leg is skipped
+// outright for a program with a zero-width cycle: every budgeted build answers
+// that one with the fallback alone, and its ordinary body is not exact.
 func FuzzGroupsBothBodies(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
@@ -556,16 +558,30 @@ func FuzzGroupsBothBodies(f *testing.F) {
 		}
 		want := ref.FindStringSubmatchIndex(input)
 
+		// overflowIsBug: the fallback sizes its frame stack and memo from the
+		// input at call time, so on the fallback and shipped legs a -2 means
+		// memory.grow failed or hit the 4 GiB cap — impossible at pathsInputCap,
+		// so it is a bug. Only the fast body alone still has compile-time
+		// regions to run out of.
 		legs := []struct {
-			name      string
-			budget    int
-			hangIsBug bool
+			name          string
+			budget        int
+			hangIsBug     bool
+			overflowIsBug bool
 		}{
-			{"fallback", compile.BTWorkBudgetForceFallback, true},
-			{"shipped", 0, true},
-			{"fast", compile.BTWorkBudgetOff, false},
+			{"fallback", compile.BTWorkBudgetForceFallback, true, true},
+			{"shipped", 0, true, true},
+			{"fast", compile.BTWorkBudgetOff, false, false},
 		}
 		for _, leg := range legs {
+			if leg.budget == compile.BTWorkBudgetOff {
+				// A program with a zero-width cycle ships only its fallback
+				// body; the ordinary body is not exact there and no budgeted
+				// build runs it.
+				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err == nil && cyc {
+					t.Skip("zero-width cycle: the ordinary body is never shipped for this program")
+				}
+			}
 			wasmBytes, compErr := compileGroupsBudget(pat, leg.budget)
 			if compErr != nil {
 				// Backtracking can legitimately refuse a program (its resource
@@ -574,7 +590,10 @@ func FuzzGroupsBothBodies(f *testing.F) {
 			}
 			got, ok, hang, runErr := runWasmGroupsPath(wasmBytes, input, numGroups)
 			if errors.Is(runErr, errBTOverflow) {
-				t.Skip("backtracking reached a ceiling (memo or frame stack)")
+				if leg.overflowIsBug {
+					t.Fatalf("-2 on the %s body, whose memory grows with the input: pat=%q input=%q", leg.name, pat, input)
+				}
+				t.Skip("the fast body alone reached a ceiling (memo or frame stack)")
 			}
 			if runErr != nil {
 				t.Fatalf("wasm error (%s body): pat=%q input=%q: %v", leg.name, pat, input, runErr)

@@ -106,6 +106,58 @@ These are good references for callers that need to load a merged WASM module
 into a wasmtime `Store`, write the input bytes into the WASM's linear memory,
 and invoke an exported regexp function.
 
+### Loading a standalone module directly: set `regexped:scratch_base`
+
+Both harnesses load STANDALONE modules, and a host doing that — with no
+generated stub in between — has one more duty when the module contains a
+Backtracking program. The host passes its input by writing it into the module's
+own memory, and a Backtracking call may need working memory in that same
+memory. The module exports a mutable global, `regexped:scratch_base`, and the
+host sets it to the first address past its own buffers, so the module works
+above them. It is a variable inside the module, not a call argument: set it
+once, and raise it only if your buffers ever need more room.
+
+**Leaving it at 0 is not safe for a long-running host.** Answers stay correct,
+but every call that needs the working memory takes new pages, and WebAssembly
+memory never shrinks: perftest's html-tags pattern looping over the tags of 10 KB
+HTML pages reached 300 MB after 10 pages and 3.0 GB after 100 on one instance,
+against a flat 1.2 MB with the global set. At 4 GB such calls start answering
+`-2`.
+
+In Rust (`wasmtime` 36):
+
+```rust
+let instance = Instance::new(&mut store, &module, &[])?;
+let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+// 1. Before the first call, the memory's size is the end of the module's own
+//    data; everything from there up is yours.
+let in_base = memory.data_size(&store) as u32;
+let out_base = in_base + MAX_INPUT;
+let host_end = out_base + OUT_BYTES;
+
+// 2. Make room for your buffers.
+let have = memory.data_size(&store) as u32;
+if host_end > have {
+    memory.grow(&mut store, ((host_end - have + 65535) / 65536) as u64)?;
+}
+
+// 3. Tell a Backtracking module where its working memory may start. The value
+//    stays set between calls. A module with no Backtracking program has no
+//    such export.
+if let Some(g) = instance.get_global(&mut store, "regexped:scratch_base") {
+    g.set(&mut store, Val::I32(host_end as i32))?;
+}
+
+// 4. For each input: write it at in_base, call, then read the answer from a
+//    FRESH `memory.data(&store)` — the call may have grown memory.
+```
+
+If a later input is larger than `MAX_INPUT`, grow memory for the bigger buffers
+and set the global to their new end before the call. The full contract is in
+[wasm.md](wasm.md) "The Backtracking scratch base". A merged module needs
+nothing of the kind.
+
 ## Examples
 
 Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/wasmtime/):

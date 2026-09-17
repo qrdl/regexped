@@ -49,8 +49,8 @@ See [`examples/fastedge/validate/Makefile`](../examples/fastedge/validate/Makefi
 Include the generated stubs and call the regexp functions through the module namespace:
 
 Every call has THREE outcomes, not two. Besides "matched" and "did not match"
-there is **`Err`** — a pattern compiled to the Backtracking engine exhausted its
-frame budget, so the engine cannot say whether the input matches. Collapsing it
+there is **`Err`** — a pattern compiled to the Backtracking engine ran out of
+memory for its search, so the engine cannot say whether the input matches. Collapsing it
 into "did not match" is an input-length-dependent false negative, which for a
 validator means failing OPEN. Match all three arms.
 
@@ -105,7 +105,7 @@ sets:
 // automaton — no position, no extent, which is all a block decision needs.
 // The third arm is not optional: Err means the engine could not ANSWER, so
 // treating it as clean would fail OPEN on an input crafted to exhaust the
-// Backtracking frame budget.
+// Backtracking engine's memory.
 match patterns::scan_url(&url, 0) {
     Ok(Some(pattern_id)) => {
         let attack = patterns::pattern_name(pattern_id);

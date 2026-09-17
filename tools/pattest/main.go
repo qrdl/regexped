@@ -29,6 +29,7 @@ import (
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -204,6 +205,22 @@ func measureOne(wasm []byte, mode, input string, engine, fuelEngine *wasmtime.En
 	return cell{fuel: fuel, avgTime: t}, nil
 }
 
+// setScratchBase tells a standalone module's Backtracking fallback the lowest
+// address it may use as run-time scratch (abi.ScratchBaseExport): the first
+// byte above everything this harness writes. Left at 0 the fallback would take
+// fresh pages on every call that reaches it, and a benchmark repeats its calls.
+// A module with no Backtracking program has no such global.
+func setScratchBase(store *wasmtime.Store, inst *wasmtime.Instance, top int32) error {
+	exp := inst.GetExport(store, abi.ScratchBaseExport)
+	if exp == nil || exp.Global() == nil {
+		return nil
+	}
+	if err := exp.Global().Set(store, wasmtime.ValI32(top)); err != nil {
+		return fmt.Errorf("set %s: %w", abi.ScratchBaseExport, err)
+	}
+	return nil
+}
+
 // benchFuel measures fuel consumed by a single call.
 func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine) (uint64, error) {
 	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
@@ -216,6 +233,10 @@ func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine
 	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
+		return 0, err
+	}
+	// The input lives below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
 		return 0, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
@@ -251,6 +272,10 @@ func benchTime(wasmBytes []byte, mode, input string, engine *wasmtime.Engine) (t
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
 		return 0, fmt.Errorf("instance: %w", err)
+	}
+	// The input lives below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+		return 0, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
 	rpdFn := inst.GetFunc(store, mode)

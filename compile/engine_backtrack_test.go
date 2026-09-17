@@ -1472,6 +1472,51 @@ func TestEnginesCovAltLoopBodyStartAltArgBackEdge(t *testing.T) {
 	}
 }
 
+// TestProgHasZeroWidthCycleRoutesToFallback pins the predicate that decides
+// whether a Backtracking program gets an ordinary body, and planBT's use of it:
+// with a work budget, a program with a zero-width cycle is planned exactly as
+// BTWorkBudgetForceFallback plans every program; BTWorkBudgetOff still emits
+// the ordinary body alone.
+func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		cycle   bool
+	}{
+		{`(a*?)*?b`, true},  // the reported shape
+		{`^(\w*|)*c`, true}, // loop body matches empty through `|`
+		{`(?:(a*?|b))*(b*)b`, true},
+		{`((\b)*)*`, true}, // an assertion on the cycle still counts
+		{`(a|)+`, true},
+		{`^(aa|a)*b`, false}, // every iteration consumes a byte
+		{`(a.*?b)(c+)`, false},
+		{`([a-zA-Z]+?)\d`, false},
+		{`x{3}(y|z)`, false},
+	} {
+		re, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := progHasZeroWidthCycle(prog); got != c.cycle {
+			t.Errorf("%s: progHasZeroWidthCycle = %v, want %v", c.pattern, got, c.cycle)
+			continue
+		}
+		bt := newBacktrack(prog)
+		for _, budget := range []int{0, 8} {
+			plan := planBT(bt, budget)
+			if plan.force != c.cycle || !plan.fallback {
+				t.Errorf("%s budget %d: plan = %+v, want force=%v with a fallback", c.pattern, budget, plan, c.cycle)
+			}
+		}
+		if plan := planBT(bt, BTWorkBudgetOff); plan.force || plan.fallback {
+			t.Errorf("%s under BTWorkBudgetOff: plan = %+v, want neither", c.pattern, plan)
+		}
+	}
+}
+
 func TestEnginesCovNestedLoopPCRejectsImmediateHead(t *testing.T) {
 	// `(?:^)*`'s loop body is the head itself: the walk must stop instead of
 	// reporting the head as its own nested inner loop, which would memoise a
@@ -2014,7 +2059,7 @@ func TestEnginesCovBTFallbackPrefixTruncation(t *testing.T) {
 	pattern := strings.Repeat("ab", 40) + `[0-9]`
 	compiled, err := compilePattern(
 		config.RegexEntry{Pattern: pattern, FindFunc: "f"}, 0, 0,
-		CompileOptions{MaxDFAStates: 1})
+		CompileOptions{MaxDFAStates: 1, globals: &moduleGlobals{}})
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
 	}

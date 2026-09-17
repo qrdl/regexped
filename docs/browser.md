@@ -61,8 +61,8 @@ const valid = email_match('user@example.com') !== null;   // true
 
 Matches the pattern against the **whole** input and returns the end position —
 on a match, the input's length in bytes — or `null`. A pattern compiled to the
-Backtracking engine throws when it exhausts its frame budget: the answer is then
-unknown, not "invalid". See [js-api.md](js-api.md).
+Backtracking engine throws when it runs out of memory for its search: the answer
+is then unknown, not "invalid". See [js-api.md](js-api.md).
 
 ### `find_func` — scan for all matches
 

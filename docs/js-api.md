@@ -47,7 +47,7 @@ await init(wasm);
 export function <func>(input: string | Uint8Array): number | null
 ```
 
-Matches the pattern against the **whole** input. Returns the end position — on a match, the input's length in bytes — or `null` when the input does not match. A pattern compiled to the Backtracking engine **throws** when it exhausts its frame budget, because the answer is then unknown rather than negative; see below.
+Matches the pattern against the **whole** input. Returns the end position — on a match, the input's length in bytes — or `null` when the input does not match. A pattern compiled to the Backtracking engine **throws** when it runs out of memory for its search, because the answer is then unknown rather than negative; see below.
 
 ```js
 const end = url_match('https://example.com/path');
@@ -252,6 +252,7 @@ with no boundary to amortise. The hint is a no-op there.
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. Calling other stub functions while an iterator is suspended is safe: each live iterator owns its own region of the module's memory. An overlapping set's iterator reserves its answer cache in that region too — up to 64 MiB for one live iterator over a large input — and WebAssembly memory only grows, so the high-water mark stays allocated.
+- A pattern compiled to the Backtracking engine may also grow memory *inside* a call: a search that outgrows the engine's compile-time regions continues in a fallback whose frame stack and memo are sized from the input — on the order of the input length times the capture frame size, placed above everything the stub has handed out, and reused by later calls. The stub tells the module where its own data ends through the module's `regexped:scratch_base` global and re-reads the memory buffer after every call, so this needs nothing from you; see [wasm.md](wasm.md) "The Backtracking scratch base".
 - `find_func` and `groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array output. Covers every `groups_func` shape, including the native lit-chain ("Path B") groups bodies.
 
   The rule about `groups_func` and `named_groups_func` *sharing* a batch export is gone with the key: one capability, one export, one name.
@@ -260,7 +261,7 @@ with no boundary to amortise. The hint is a no-op there.
 
 ## Backtracking stack overflow
 
-Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
 The generated function **throws** an `Error` whose message names the function. Since the find/groups functions are generators, the throw surfaces from the `next()` call (i.e. from the `for...of` loop), not from the call that creates the generator.
 

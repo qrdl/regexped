@@ -935,7 +935,11 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 	const pattern = `Z(?:a?)+?xyz`
 	const length = 60000
 	entries := []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}
-	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096})
+	// BTWorkBudgetOff: with the budget on, a body past its static regions hands
+	// the call to its fallback, which sizes its memory from the input and
+	// answers — so -2 would need memory that cannot grow. Off, the body keeps
+	// answering -2 at its static ceiling, which is the arm under test.
+	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096, BTWorkBudget: compile.BTWorkBudgetOff})
 
 	store, inst, mem := instantiateCore(t, w)
 	f := res["f"]

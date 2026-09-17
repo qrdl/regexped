@@ -1,7 +1,7 @@
 .PHONY: seed seed-all fuzz fuzz-long clean \
         seed-match seed-groups seed-engines seed-bodies seed-set \
         seed-caps seed-batch seed-iteration \
-        fuzz-match fuzz-groups fuzz-engines fuzz-set
+        fuzz-match fuzz-groups fuzz-engines fuzz-bodies fuzz-set
 
 # ---------------------------------------------------------------------------
 # Layer 1: the original no-capture DFA/CompiledDFA find body.
@@ -56,6 +56,8 @@ fuzz-groups:
 	go test -run='FuzzGroups$$' -fuzz='FuzzGroups$$' -fuzztime=10m .
 fuzz-engines:
 	go test -run=FuzzGroupsBothEngines -fuzz=FuzzGroupsBothEngines -fuzztime=10m .
+fuzz-bodies:
+	go test -run=FuzzGroupsBothBodies -fuzz=FuzzGroupsBothBodies -fuzztime=10m .
 fuzz-set:
 	go test -run='FuzzSet$$' -fuzz='FuzzSet$$' -fuzztime=10m .
 

@@ -829,8 +829,8 @@ table.
 
 **One consequence reaches the ABI.** Every other set engine is table-driven and
 always finishes with a definite answer: pattern *k* matched, or it did not.
-Backtracking has a third outcome — an exhausted frame budget means it abandoned
-part of the search space and does **not know**. Reporting that as "no match"
+Backtracking has a third outcome — running out of memory for its search means it
+abandoned part of the search space and does **not know**. Reporting that as "no match"
 would turn giving up into a confident wrong answer, so it gets its own channel:
 
 | capability | how "unknown" arrives |
@@ -846,24 +846,43 @@ call — Rust returns `Err(Error::BacktrackOverflow)`, Go returns
 `RX_ITER_ERROR`, and C returns `RX_ERR_BT_OVERFLOW`. What none of them do is
 quietly report "nothing matched".
 
-**Two budgets can produce it, and one of them scales with input length.** The
-frame budget above is sized from the member's alternation count. A member that
-also needs BitState memoisation — a non-greedy loop whose body can match zero
-bytes — carries a second, independent ceiling sized from its instruction count;
-see *BitState memoization* in [engines.md](engines.md). The two move
-independently, so either can be the one a given input hits first.
+**When it can happen.** A member's ordinary Backtracking body works within
+compile-time regions: a frame stack sized from its alternation count and, for a
+member that needs BitState memoisation, a memo sized from its instruction count.
+A call that outgrows either, or backtracks past its work budget, is handed to
+the member's fallback body, which sizes both from the input at call time — see
+*Work budget and the fallback body* in [engines.md](engines.md). "Unknown" is
+left for the case where that memory cannot be had: linear memory cannot grow any
+further.
 
-The memo ceiling matters more for a set than for a lone pattern. A set's
-Backtracking bucket is a suffix function called once per candidate position, and
-each call searches from that candidate to the end of the input — so the length
-measured against the ceiling is bounded by the INPUT, not by the match, and a
-long enough input can report "unknown" at every candidate. A lone pattern's
-`find` does not behave this way: its memo is rebased onto the call's `from`, so
-a host walking a buffer keeps getting answers as it advances.
+A set's Backtracking bucket is a suffix function called once per candidate
+position, each call searching from that candidate to the end of the input. What
+bounds a whole call to a set capability — a `find`, `scan_any` or `scan_all` call
+from the host — is that its candidates share three things per member rather than
+paying for each separately:
 
-If you are scanning inputs of unbounded size with a set, the reliable fix is to
-keep such a member out of the set — its ceiling is a property of the pattern,
-not of the set — or to feed the set in bounded chunks.
+- **one work budget**, sized from the span at the member's first candidate and
+  drawn down across all of them. Once it runs out, every later candidate of that
+  member goes straight to the fallback body without running the ordinary body
+  first.
+- **one scratch region**, placed at the member's first fallback call and sized
+  for the rest of the input, which every later candidate reuses.
+- **the visited set in it**: a position the fallback has already explored and
+  failed from is not explored again for a later candidate. It is reset whenever
+  that member matches, because an attempt that matched leaves marks that are not
+  failures.
+
+So a call over an input with no match is linear in the input, not quadratic in
+it. In a standalone module the host decides where the scratch goes through the
+exported `regexped:scratch_base` global ([wasm.md](wasm.md)); the generated JS
+and TS stubs keep it current. A host that leaves it at 0 gets fresh pages on
+each call that reaches a fallback — once per call to the capability, not once
+per candidate.
+
+One cost is NOT bounded that way. `scan_all` keeps probing a pattern at every
+later position even after that pattern has matched, stopping only once every
+pattern has matched. A Backtracking member that matches at many positions
+therefore still costs its ordinary body's walk from each of them.
 
 A set with no Backtracking member is completely unaffected: it keeps the `i64`
 bitmask form and none of these checks are emitted.

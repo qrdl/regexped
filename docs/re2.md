@@ -235,6 +235,27 @@ not supported by Go's `regexp/syntax` package and is rejected at parse time.
 
 Skip reason: `unsupported RE2 syntax (invalid escape sequence)`
 
+### Backtracking gave up (currently 0)
+
+A Backtracking call that answers `-2` has abandoned part of the search, so its
+answer is unknown and the row is skipped rather than compared. Each such row is
+printed (the first 50 per run, all of them under `-v`). With
+`--bt-fallback-always`, which makes the memoised fallback body answer every
+Backtracking call, any `-2` fails the run instead.
+
+Skip reason: `Backtracking overflow (-2, answer unknown)`
+
+### Timeouts (currently 0)
+
+Every WASM call runs under a 2-second watchdog. For a single pattern a timeout
+fails the run (`TIMEOUT:`), except under `--force-backtrack`, where it is counted
+here instead. In set mode a timed-out call is skipped rather than scored, and
+the run fails if timed-out calls exceed 0.1% of the calls checked; that gate is
+lifted under `--force-backtrack` and `--set-bt`, which push engines past their
+limits on purpose.
+
+Skip reason: `timeout (exponential backtracking)`
+
 ---
 
 ## What remains unimplemented

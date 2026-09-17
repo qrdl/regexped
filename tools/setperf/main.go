@@ -1003,6 +1003,14 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 			return nil, err
 		}
 	}
+	// Everything above lies below `top`. Left at 0 a Backtracking fallback
+	// would take fresh pages on every call that reaches it, and each benchmark
+	// row repeats its calls.
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32(top))); err != nil {
+			return nil, err
+		}
+	}
 	copy(mem.UnsafeData(store)[inBase:], c.input)
 	runtime.KeepAlive(store)
 	return &rxInstance{
