@@ -40,6 +40,10 @@ type PatternInfo struct {
 	lineAnchor       bool // (?m:^): eligible at position 0 and after any newline
 	prefixMaxLen     int  // byte length of the (fixed-length) prefix; 0 = trivial
 	isolatedFallback bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
+	// boundaryAmbiguous: the pattern's leftmost-first DFA loses the priority of
+	// a \b / \B / (?m:$) branch (dfaHasAmbiguousBoundaryTarget), so the find
+	// packers give it a Backtracking bucket instead of a DFA one.
+	boundaryAmbiguous bool
 
 	suffixDFA      *dfaTable // built from suffixAST
 	suffixClasses  int       // numClasses after computeByteClasses (Phase 2)
@@ -341,6 +345,24 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		suffixID:    -1,
 	}
 
+	// A pattern whose leftmost-first DFA cannot keep an assertion branch's
+	// priority goes to Backtracking, exactly as it does outside a set (compile.go
+	// routes a find on dfaHasAmbiguousBoundaryTarget). The table loses the
+	// priority when a \b / \B / (?m:$) resolves onto a step some lower-priority
+	// branch already reached: `(?:\B|a|)a` over "aaa" from position 1 has `\B`
+	// hold and match [1,2), but the table keeps the empty branch's copy of the
+	// final `a`, below branch `a`, so it answered [1,3). No set body can recover
+	// a priority the table does not hold.
+	//
+	// Checked before every other routing decision: a fixed prefix or a
+	// non-greedy quantifier would otherwise send it to a DFA bucket first.
+	if patternBoundaryAmbiguous(parsed) {
+		info.splittable = false
+		info.boundaryAmbiguous = true
+		info.setTopLevelAnchor(parsed)
+		return info, nil
+	}
+
 	// Patterns with non-greedy quantifiers contaminate merged suffix DFAs when mixed
 	// with greedy patterns (via immediateAcceptStates). Isolate them in their own
 	// fallback bucket; mergeSuffixDFA (leftmostFirst=true) gives correct non-greedy
@@ -560,6 +582,18 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	info.suffixID = suffixPool.Add(suffixTable)
 
 	return info, nil
+}
+
+// patternBoundaryAmbiguous reports whether re's leftmost-first DFA — the one a
+// fallback bucket would run — loses an assertion branch's priority. Only \b,
+// \B and (?m:$) are resolved late enough to lose it (nfaExpandWithWB), so a
+// pattern without them is not built twice.
+func patternBoundaryAmbiguous(re *syntax.Regexp) bool {
+	if !regexpHasWordBoundary(re) && !containsOp(re, syntax.OpEndLine) {
+		return false
+	}
+	t, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+	return err == nil && dfaHasAmbiguousBoundaryTarget(t)
 }
 
 // --------------------------------------------------------------------------
@@ -2087,6 +2121,22 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 	var buckets []*bucket
 
 	for _, p := range patterns {
+		// A DFA bucket would answer with the wrong extent (analyzePattern), so
+		// there is no DFA to fall back to: a pattern Backtracking cannot take
+		// either is dropped, as a pattern whose DFA cannot be built is.
+		if p.boundaryAmbiguous {
+			if nb := newBTBucket(p); nb != nil {
+				buckets = append(buckets, nb)
+				continue
+			}
+			warnPatternDroppedReason(p, "Backtracking fallback bucket",
+				"its DFA loses a word-boundary branch's priority and Backtracking cannot take it",
+				"simplify the pattern or move it out of the set", 0, opts.maxFallbackStates())
+			if diag != nil {
+				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+			}
+			continue
+		}
 		// Isolated patterns (e.g. non-greedy) get their own bucket to prevent
 		// their pre-built leftmostFirst=false DFA from being replaced by a merged one.
 		if p.isolatedFallback {

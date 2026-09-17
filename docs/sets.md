@@ -820,10 +820,21 @@ behaves like the same pattern compiled on its own. Backtracking is the only
 engine here not bound by a compiled table size — it walks the NFA with an
 explicit stack — which is what lets it take a pattern no table budget will fit.
 
+A member also goes to Backtracking, whatever its size, when a DFA cannot keep
+the priority of one of its `\b`, `\B` or `(?m:$)` branches — the same rule that
+puts the pattern on Backtracking when it is compiled on its own. The shape is a
+boundary branch followed by one that consumes the same byte and a
+lower-priority branch reaching the same next step: over `aaa`, `(?:\B|a|)a`
+must match `[1,2)` from position 1, and a DFA answers `[1,3)`. Like the other
+route, this switches the set's `match_all` and `scan_all` to the `out_ptr` form.
+Unlike it, the member stays in `match_any` and `match_all`, whose whole-input
+answer does not depend on which branch wins.
+
 It narrows the drop set rather than emptying it. A pattern whose NFA is larger
 than the engine's own instruction cap, or that trips its loop checks, is still
 excluded, still warned about, and still recorded in `--diag-json`'s
-`state_limit_dropped`. Buckets that were admitted appear there as
+`state_limit_dropped` — for either reason above, since a DFA bucket would give
+the second kind wrong extents. Buckets that were admitted appear there as
 `"bt-fallback"`, with `suffix_states` and `table_bytes` of 0 — they have no
 table.
 
@@ -878,11 +889,6 @@ exported `regexped:scratch_base` global ([wasm.md](wasm.md)); the generated JS
 and TS stubs keep it current. A host that leaves it at 0 gets fresh pages on
 each call that reaches a fallback — once per call to the capability, not once
 per candidate.
-
-One cost is NOT bounded that way. `scan_all` keeps probing a pattern at every
-later position even after that pattern has matched, stopping only once every
-pattern has matched. A Backtracking member that matches at many positions
-therefore still costs its ordinary body's walk from each of them.
 
 A set with no Backtracking member is completely unaffected: it keeps the `i64`
 bitmask form and none of these checks are emitted.

@@ -2998,6 +2998,17 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// comes out right, which is why `\b,` and `\bfoo` were always correct.
 		wbAcceptNWMidWord := t.hasWordBoundary && t.midAcceptNWStates[t.midStartWordState] != 0
 		wbAcceptWMidWord := t.hasWordBoundary && t.midAcceptWStates[t.midStartWordState] != 0
+		// The newline channel has the same gap: an empty-width accept that holds
+		// only when the NEXT byte is '\n'. For `\b(?m:$)` it lives in
+		// midStartWordState alone (prev=word, next='\n' is the boundary), no
+		// start context consumes a byte, and nothing above flags '\n' — so the
+		// fast-skip passed over every such position and only the end-of-input
+		// accept was ever found: "a\n" matched nothing where Go answers [1,1).
+		// `\B(?m:$)` escaped only because its start state accepts the empty
+		// input, which flags every byte.
+		nlAcceptCtx := t.hasNewlineBoundary && (t.midAcceptNLStates[t.midStartState] != 0 ||
+			t.midAcceptNLStates[t.startState] != 0 || t.midAcceptNLStates[t.midStartWordState] != 0 ||
+			t.midAcceptNLStates[t.midStartNewlineState] != 0)
 		if t.midAcceptStates[t.midStartState] != 0 || t.midAcceptStates[t.startState] != 0 || t.acceptStates[t.startState] != 0 ||
 			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) ||
 			(wbAcceptNWMidWord && wbAcceptWMidWord) {
@@ -3035,6 +3046,9 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 					l.firstByteFlags[b] = 1
 				}
 				if wbAcceptNWMidWord && !isWordCharByte(byte(b)) {
+					l.firstByteFlags[b] = 1
+				}
+				if nlAcceptCtx && b == '\n' {
 					l.firstByteFlags[b] = 1
 				}
 			}

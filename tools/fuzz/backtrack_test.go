@@ -683,6 +683,103 @@ func TestSetBTHostCallIsLinear(t *testing.T) {
 	}
 }
 
+// TestSetScanAllStopsProbingMatchedPatterns pins that one `scan_all` call stops
+// probing a pattern once that pattern has matched. The call's only other exit
+// is "every pattern has matched", so before, each later position probed the
+// matched member again: over a×n+b, `(aa|a)*b` matches from EVERY position and
+// its Backtracking body walked to the `b` from each of them — measured ×3.98 per
+// doubling, 1,831,049,699 fuel at a×8000+b where this build measures 5,345,550.
+//
+// Same members as TestSetBTHostCallIsLinear; only the input differs.
+func TestSetScanAllStopsProbingMatchedPatterns(t *testing.T) {
+	names := []string{"p0", "p1", "p2"}
+	cfg := config.BuildConfig{
+		MaxFallbackStates: 1,
+		Regexps: []config.RegexEntry{
+			{Name: "p0", Pattern: `(\w*|)*c`},
+			{Name: "p1", Pattern: `bar[0-9]+`},
+			{Name: "p2", Pattern: `(aa|a)*b`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", ScanAll: "set_scan_all",
+			Patterns: config.PatternSelector{Names: names},
+		}},
+	}
+	w, _, diags, err := compile.CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if d := droppedFromSet(diags); len(d) > 0 {
+		t.Fatalf("patterns were dropped from the set: %v", d)
+	}
+
+	wcfg := wasmtime.NewConfig()
+	wcfg.SetConsumeFuel(true)
+	wcfg.SetWasmSIMD(true)
+	eng := wasmtime.NewEngineWithConfig(wcfg)
+	mod, err := wasmtime.NewModule(eng, w)
+	if err != nil {
+		t.Fatalf("module: %v", err)
+	}
+	defer mod.Close()
+	const pageSize = 65536
+	dataTop, err := utils.ParseDataSectionBytes(w)
+	if err != nil {
+		t.Fatalf("parse data section: %v", err)
+	}
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+
+	fuelAt := func(n int) uint64 {
+		store := wasmtime.NewStore(eng)
+		defer store.Close()
+		if err := store.SetFuel(1 << 62); err != nil {
+			t.Fatal(err)
+		}
+		inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mem := inst.GetExport(store, "memory").Memory()
+		out := inBase + int32((n+1+pageSize)/pageSize*pageSize)
+		top := int64(out) + pageSize
+		if need, cur := uint64(top/pageSize), mem.Size(store); need > cur {
+			if _, err := mem.Grow(store, need-cur); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := inst.GetExport(store, abi.ScratchBaseExport).Global().Set(store, wasmtime.ValI32(int32(top))); err != nil {
+			t.Fatal(err)
+		}
+		copy(mem.UnsafeData(store)[inBase:], strings.Repeat("a", n)+"b")
+
+		f0, _ := store.GetFuel()
+		res, err := inst.GetFunc(store, "set_scan_all").Call(store, inBase, int32(n+1), int32(0), out)
+		if err != nil {
+			t.Fatalf("a×%d+b: scan_all: %v", n, err)
+		}
+		f1, _ := store.GetFuel()
+		if got, bitmap := res.(int32), mem.UnsafeData(store)[out]; got != 1 || bitmap != 1<<2 {
+			t.Fatalf("a×%d+b: scan_all answered %d with bitmap %08b, want 1 with only p2's bit", n, got, bitmap)
+		}
+		return f0 - f1
+	}
+
+	const maxRatio = 2.2
+	var prev uint64
+	var report strings.Builder
+	for _, n := range []int{1000, 2000, 4000, 8000} {
+		f := fuelAt(n)
+		fmt.Fprintf(&report, "  %-9s scan_all=%d\n", fmt.Sprintf("a×%d+b", n), f)
+		if prev > 0 {
+			if r := float64(f) / float64(prev); r > maxRatio {
+				t.Errorf("scan_all fuel grew x%.2f from a×%d+b to a×%d+b, want <= x%.1f", r, n/2, n, maxRatio)
+			}
+		}
+		prev = f
+	}
+	t.Logf("fuel per host call:\n%s", report.String())
+}
+
 // ---------------------------------------------------------------------------
 // Regression: the Backtracking engine's BitState memo is a bitset of
 // N*(len+1) bits zeroed by one memory.fill at the head of every attempt, but
