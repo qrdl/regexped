@@ -30,6 +30,36 @@
 # tools/re2test/custom-tests.txt (custom-sets.txt for a set target) as a
 # permanent regression test — don't rely on the testdata/fuzz entry alone for
 # that.
+#
+# TRIAGE: not every crasher is a defect. Go's fuzzer kills any single call
+# that runs longer than 10 seconds and files the input exactly as it files a
+# wrong answer, so a slow COMPILE arrives looking like an engine bug.
+#
+# Sort them by TIMING before looking for a wrong answer:
+#
+#   cp found/<TARGET>/.../HHMMSS-<hash> testdata/fuzz/<TARGET>/<hash>
+#   /usr/bin/time go test -run='^<TARGET>$/<hash>$' .
+#
+# A file that PASSES on that solo replay and reports no mismatch is a TIMING
+# ARTEFACT, not a defect. Two kinds turn up, and neither is an engine fault:
+#
+#   * A slow compile. The harness's maxNFAInsts cap does not bound this —
+#     cost is not predicted by instruction count (17 instructions have taken
+#     1.7s, 802 have taken 42s). The build the fuzzer uses is instrumented for
+#     coverage, which costs at least another 2x on top of a solo run, so a
+#     case needs to be near 2-3 seconds solo to stay under the limit, not
+#     merely under 10.
+#
+#   * A file Go's MINIMISER wrote. When the worker shrinking a crasher dies,
+#     Go writes out whatever candidate that worker was holding, with the
+#     message "hung or terminated unexpectedly while minimizing". These
+#     replay in milliseconds and need not even be the shape they look like
+#     (`.{7000` parses as `.` followed by the literal text `{7000`).
+#
+# This is accepted behaviour, not an open bug: making the compiler faster was
+# tried, measured, and does not close it, because the mutator simply scales the
+# pattern until it crosses whatever bar exists. plans/FUZZER_BUGS.md bug 83
+# carries the measurements and the one approach that would actually end it.
 
 set -euo pipefail
 cd "$(dirname "$0")"

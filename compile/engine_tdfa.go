@@ -104,6 +104,117 @@ func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
 		return append([]tdfaTagOp(nil), copyOps...)
 	}
 
+	n := len(copyOps)
+	dsts := make([]int, 0, n)
+	for _, op := range copyOps {
+		dsts = append(dsts, op.dst)
+	}
+	sort.Ints(dsts)
+
+	idxOf := make(map[int]int, n)
+	for i, d := range dsts {
+		idxOf[d] = i
+	}
+	if len(idxOf) != n {
+		// Destinations are distinct by construction (the rename is bijective,
+		// see this function's doc comment). Deferring to the reference
+		// implementation here would not help: it keys `srcOf` by destination
+		// too, so a duplicate silently drops the earlier op there as well.
+		// Both paths would be wrong, so say so instead of picking one.
+		panic("sequentializeCopies: duplicate destination registers; the rename is not bijective")
+	}
+
+	srcv := make([]int, n)
+	for _, op := range copyOps {
+		srcv[idxOf[op.dst]] = op.src
+	}
+
+	// pending[i] counts the still-remaining ops that read dsts[i], which is
+	// exactly the "needed" set sequentializeCopiesRoundwise rebuilds from
+	// scratch on every round. Maintaining it incrementally is the whole of
+	// this function's advantage: a fresh map plus n hashed inserts per round,
+	// over up to n rounds, was measured at 60% of one 22-second compile.
+	pending := make([]int, n)
+	for j := 0; j < n; j++ {
+		if k, ok := idxOf[srcv[j]]; ok {
+			pending[k]++
+		}
+	}
+
+	remaining := make([]bool, n)
+	for i := range remaining {
+		remaining[i] = true
+	}
+	left := n
+
+	result := make([]tdfaTagOp, 0, n+2)
+	emitted := make([]int, 0, n)
+	for left > 0 {
+		// The ROUND STRUCTURE is load-bearing, not incidental. Safety is
+		// judged against the state at the START of a round and every safe
+		// destination is emitted in sorted order within it, so decrements are
+		// deferred to the round's end. Decrementing as you go would free a
+		// later destination inside the same round and emit it early, which is
+		// a different sequence — and a different sequence here reads a
+		// clobbered register, silently.
+		emitted = emitted[:0]
+		for i := 0; i < n; i++ {
+			if !remaining[i] || pending[i] != 0 {
+				continue
+			}
+			result = append(result, tdfaTagOp{dst: dsts[i], src: srcv[i]})
+			remaining[i] = false
+			left--
+			emitted = append(emitted, i)
+		}
+		if len(emitted) > 0 {
+			for _, i := range emitted {
+				if k, ok := idxOf[srcv[i]]; ok {
+					pending[k]--
+				}
+			}
+			continue
+		}
+
+		breakIdx := -1
+		for i := 0; i < n; i++ {
+			if remaining[i] {
+				breakIdx = i
+				break
+			}
+		}
+		result = append(result, tdfaTagOp{dst: scratchRegSentinel, src: dsts[breakIdx]})
+		result = append(result, tdfaTagOp{dst: dsts[breakIdx], src: srcv[breakIdx]})
+		remaining[breakIdx] = false
+		left--
+		if k, ok := idxOf[srcv[breakIdx]]; ok {
+			pending[k]--
+		}
+		// No decrement of pending[breakIdx] here: breakIdx has already left
+		// `remaining`, so nothing reads its counter again.
+		for j := 0; j < n; j++ {
+			if remaining[j] && srcv[j] == dsts[breakIdx] {
+				srcv[j] = scratchRegSentinel
+			}
+		}
+	}
+	return result
+}
+
+// sequentializeCopiesRoundwise is the REFERENCE implementation of
+// sequentializeCopies: the same algorithm written the obvious way, rebuilding
+// the "who still needs reading" set from scratch on every round.
+//
+// It is reachable only if the bijective-rename invariant is violated, and it
+// is kept for two reasons: it is what the fast path must reproduce exactly,
+// op for op, and TestSequentializeCopiesMatchesReference holds the two to
+// that. A divergence here does not fail loudly — it emits a copy that reads a
+// register another copy in the same batch has already overwritten.
+func sequentializeCopiesRoundwise(copyOps []tdfaTagOp) []tdfaTagOp {
+	if len(copyOps) <= 1 {
+		return append([]tdfaTagOp(nil), copyOps...)
+	}
+
 	srcOf := make(map[int]int, len(copyOps))
 	dsts := make([]int, 0, len(copyOps))
 	for _, op := range copyOps {
@@ -231,22 +342,64 @@ func tdfaEpsCapOps(prog *syntax.Prog, fromPC int, visited map[int]bool) (targetP
 	return -1, nil
 }
 
-// tdfaEpsCapOpsTo follows epsilon transitions from fromPC looking for targetPC,
-// collecting InstCapture ops along the way. Tries Alt.Out then Alt.Arg.
-// Returns (true, ops) if targetPC is found, (false, nil) otherwise.
-// Used in processTransition to correctly find capture ops through Alt loops.
-func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bool) (bool, []captureOp) {
-	if fromPC < 0 || fromPC >= len(prog.Inst) || visited[fromPC] {
+// epsWalker follows epsilon transitions from one PC looking for another,
+// collecting InstCapture ops along the way: Alt.Out before Alt.Arg, so the ops
+// come back in leftmost-first order. newTDFA's transition construction uses it
+// to find capture ops through Alt loops.
+//
+// It exists as a WORKSPACE rather than a function because its two allocations
+// sat in the innermost loop of the construction — a fresh map[int]bool per
+// call, at one call per source thread per byte per state, and a new slice per
+// capture. One generation-stamped visited array and one reusable buffer per
+// construction replace both.
+type epsWalker struct {
+	prog *syntax.Prog
+	seen []uint32
+	gen  uint32
+	buf  []captureOp
+}
+
+func newEpsWalker(prog *syntax.Prog) *epsWalker {
+	return &epsWalker{prog: prog, seen: make([]uint32, len(prog.Inst))}
+}
+
+// find reports whether targetPC is reachable from fromPC through epsilons, and
+// returns the capture ops on the path that reached it.
+//
+// The returned slice is the walker's OWN buffer and is only VALID UNTIL THE
+// NEXT CALL to find. Both callers in newTDFA consume it immediately — one
+// inside the `if` that tested `found`, the other before the `break` that ends
+// its loop — so nothing copies it. Copying here instead would put an
+// allocation per successful thread back into the innermost loop, which is the
+// cost this type exists to remove. A caller that needs to keep the ops past
+// its next find must copy them itself; tdfaEpsCapOpsTo does.
+func (w *epsWalker) find(fromPC, targetPC int) (bool, []captureOp) {
+	w.gen++
+	if w.gen == 0 {
+		for i := range w.seen {
+			w.seen[i] = 0
+		}
+		w.gen = 1
+	}
+	w.buf = w.buf[:0]
+	if !w.walk(fromPC, targetPC) {
 		return false, nil
 	}
-	if fromPC == targetPC {
-		return true, nil
+	return true, w.buf
+}
+
+func (w *epsWalker) walk(fromPC, targetPC int) bool {
+	if fromPC < 0 || fromPC >= len(w.prog.Inst) || w.seen[fromPC] == w.gen {
+		return false
 	}
-	visited[fromPC] = true
-	inst := prog.Inst[fromPC]
+	if fromPC == targetPC {
+		return true
+	}
+	w.seen[fromPC] = w.gen
+	inst := w.prog.Inst[fromPC]
 	switch inst.Op {
 	case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-		return false, nil // byte consumer or terminal — not the target
+		return false
 	case syntax.InstCapture:
 		var op captureOp
 		if inst.Arg&1 == 0 {
@@ -254,22 +407,51 @@ func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bo
 		} else {
 			op = captureOp{open: false, group: int(inst.Arg >> 1)}
 		}
-		ok, rest := tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
-		if !ok {
-			return false, nil
+		mark := len(w.buf)
+		w.buf = append(w.buf, op)
+		if w.walk(int(inst.Out), targetPC) {
+			return true
 		}
-		return true, append([]captureOp{op}, rest...)
+		w.buf = w.buf[:mark]
+		return false
 	case syntax.InstNop:
-		return tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
+		return w.walk(int(inst.Out), targetPC)
 	case syntax.InstAlt, syntax.InstAltMatch:
-		if ok, ops := tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited); ok {
-			return true, ops
+		mark := len(w.buf)
+		if w.walk(int(inst.Out), targetPC) {
+			return true
 		}
-		return tdfaEpsCapOpsTo(prog, int(inst.Arg), targetPC, visited)
+		w.buf = w.buf[:mark]
+		return w.walk(int(inst.Arg), targetPC)
 	case syntax.InstEmptyWidth:
-		return tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
+		return w.walk(int(inst.Out), targetPC)
 	}
-	return false, nil
+	return false
+}
+
+// tdfaEpsCapOpsTo is a thin adapter over epsWalker, kept so the unit tests that
+// address this signature exercise the LIVE walker rather than a second copy of
+// the algorithm. Production calls epsWalker.find directly; this has no callers
+// outside tests.
+//
+// `visited` is honoured: its PCs are pre-marked in the walker's generation
+// array, which is what the "already visited" test depends on. The ops are
+// COPIED out, because find's buffer is only valid until its next call.
+func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bool) (bool, []captureOp) {
+	w := newEpsWalker(prog)
+	w.gen = 1
+	for pc, seen := range visited {
+		if seen && pc >= 0 && pc < len(w.seen) {
+			w.seen[pc] = w.gen
+		}
+	}
+	if !w.walk(fromPC, targetPC) {
+		return false, nil
+	}
+	if len(w.buf) == 0 {
+		return true, nil
+	}
+	return true, append([]captureOp(nil), w.buf...)
 }
 
 // --------------------------------------------------------------------------
@@ -624,6 +806,11 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	// ops on the path to the first byte consumer.
 	entryVisited := make(map[int]bool)
 	entryTargetPC, entryCapOps := tdfaEpsCapOps(prog, prog.Start, entryVisited)
+	epsW := newEpsWalker(prog)
+	// firedGen replaces a map[int]bool allocated per (state, byte) and probed
+	// once per priority thread: generation-stamped, so a reset is one increment.
+	firedGen := make([]uint32, len(prog.Inst))
+	firedTick := uint32(0)
 	entryRegMap := append([]int(nil), startRegMap...)
 	if entryTargetPC >= 0 {
 		for _, cop := range entryCapOps {
@@ -640,7 +827,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	// on the epsilon path from prog.Start to that PC. For the first byte consumer
 	// (entryTargetPC), these are the entry ops (fired before the loop). For other
 	// terminal PCs (e.g. InstMatch reachable without consuming bytes, as in (a*)),
-	// we also discover captures via tdfaEpsCapOpsTo.
+	// we also discover captures via the epsilon walker.
 	startThreads := make([]tdfaThread, len(startPCSet))
 	for i, pc := range startPCSet {
 		var rm []int
@@ -650,8 +837,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			rm = append([]int(nil), startRegMap...)
 			// Find captures on the epsilon path from Start to this PC (e.g. close caps
 			// for patterns that can match empty string, like (a*) reaching InstMatch).
-			epsV := make(map[int]bool)
-			if found, epsCops := tdfaEpsCapOpsTo(prog, prog.Start, int(pc), epsV); found && len(epsCops) > 0 {
+			if found, epsCops := epsW.find(prog.Start, int(pc)); found && len(epsCops) > 0 {
 				for _, cop := range epsCops {
 					tagIdx := cop.group * 2
 					if !cop.open {
@@ -716,9 +902,18 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			// `()a|b` over "b" reported group 1 as [0,0]. srcMap comes from the
 			// same input-map build as nextNFAPCs, so case folding, the byte clamp
 			// and leftmost-first suppression are applied to both identically.
-			firedSrcSet := make(map[int]bool, len(nextNFAPCs))
+			firedTick++
+			if firedTick == 0 {
+				for i := range firedGen {
+					firedGen[i] = 0
+				}
+				firedTick = 1
+			}
+			// Indexed unguarded: every pc here is a prog index by
+			// construction, so an out-of-range one is a compiler bug and a
+			// panic says so. A bounds check would hide it.
 			for _, srcPC := range srcMap[rune(b)] {
-				firedSrcSet[int(srcPC)] = true
+				firedGen[int(srcPC)] = firedTick
 			}
 
 			// Epsilon-close the successor NFA states.
@@ -747,15 +942,14 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 				// make this loop copy captures from the wrong source thread.
 				for _, srcThread := range sd.priorityThreads {
 					// Only consider source threads that themselves consumed b.
-					if !firedSrcSet[srcThread.pc] {
+					if firedGen[srcThread.pc] != firedTick {
 						continue
 					}
 					// srcThread.pc is a byte-consuming NFA state (from epsilonClosure).
 					// Check if consuming byte b from srcThread.pc leads to nextPC via epsilon.
-					// Use tdfaEpsCapOpsTo to correctly traverse Alt branches (e.g. loop exits).
+					// Walk epsilons to traverse Alt branches correctly (e.g. loop exits).
 					outPC := int(prog.Inst[srcThread.pc].Out)
-					visited := make(map[int]bool)
-					found, cops := tdfaEpsCapOpsTo(prog, outPC, int(nextPC), visited)
+					found, cops := epsW.find(outPC, int(nextPC))
 					if !found {
 						continue
 					}

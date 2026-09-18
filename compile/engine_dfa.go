@@ -1142,6 +1142,20 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// call with the SAME (states, ctx) pair, whether that mid-accept hit is
 	// safe to stop the scan on (see isDominantMidAccept above).
 	markDominant := func(m map[int]uint64, state int, states []uint32, ctx int) {
+		// "Dominant" means this mid-accept outranks every other live thread
+		// under LEFTMOST-FIRST priority, which is the only order in which
+		// outranking means anything. A table built leftmost-LONGEST has no
+		// priority to speak of, so a dominance mark on one is a verdict the
+		// automaton cannot support, and a reader acting on it stops the walk
+		// early on a thread that was never beaten. That is bug 81: the lenient
+		// alternation's anchored-match body builds its per-branch helper DFAs
+		// leftmost-longest on purpose (see analyseLitChainAltLenient's
+		// leftmostFirst parameter and bug 35), and `0$0|-(\b|0)` over "-0"
+		// answered "no match" because the `\b` branch's accept was marked
+		// dominant and cut off the thread that would have consumed the rest.
+		if !leftmostFirst {
+			return
+		}
 		if isDominantMidAccept(states, ctx) {
 			m[state] = 1
 		}
@@ -13262,7 +13276,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 			b = append(b, 0x21, locPos)
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locState, locPos, locClass, locOutEnd,
-				tableMemIdx, 0)
+				tableMemIdx, 0, true)
 
 			// Anchored match: require last_accept == len for full input consumption.
 			b = append(b, 0x20, locOutEnd)
@@ -15058,9 +15072,12 @@ func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) 
 //	locOutEnd           — i32 (output: position one past last accepted byte)
 //
 // Constraint: dfaLayout.useU8 must be true (we capped DFA at 256 states).
+// fullConsumption is set by a caller whose contract is "the match must end at
+// len", which makes every mid-input accept unusable to it (see the
+// pre-accept block below).
 func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	locPtr, locLen, locState, locPos, locClass, locOutEnd byte,
-	tableMemIdx int, nextBranchDepth byte) []byte {
+	tableMemIdx int, nextBranchDepth byte, fullConsumption bool) []byte {
 
 	// Initialize: state = wasmStart; last_accept (locOutEnd) = -1.
 	b = append(b, 0x41)
@@ -15111,17 +15128,53 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// buildDFALayout call in planLenAltLayout) — a no-op otherwise. This
 	// loop is directly [loop $dfa, block $dfa_done], the same shape
 	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes.
-	b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
-		dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	// A full-consumption caller emits NO word-boundary pre-accept check, and
+	// this is not only an optimisation — leaving it in is bug 81.
+	//
+	// Three steps say the check cannot help such a caller. The loop tests
+	// `pos >= len` FIRST and leaves through the end-of-input arm above, so
+	// this check only ever runs while pos < len. It writes last_accept = pos,
+	// so every value it can write is below len. And last_accept's only
+	// consumers are the caller's `last_accept == len` test and its return, so
+	// a value below len always fails that test — identically to never having
+	// recorded anything.
+	//
+	// Leaving it in also breaks the answer, because emitWBPreAcceptCheck does
+	// not merely record: on a dominant hit it leaves the loop, killing the
+	// lower-priority thread that would have consumed the rest of the input.
+	// Measured over 2,688 lenient alternations that emit this check and every
+	// input of length 0-3 over "0-xy": emitting it and omitting it agree on
+	// all 228,480 answers, and today's shipped code (which also leaves the
+	// loop) is wrong against Go on 990 of them.
+	//
+	// THE ORDER OF THE LOOP IS LOAD-BEARING. If the `pos >= len` test above
+	// ever moves below this point, step one stops holding and this becomes a
+	// silent wrong answer.
+	if !fullConsumption {
+		b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
+			dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	}
 
 	// Newline pre-transition accept: `(?m:$)` before a '\n' is not a
 	// transition but this channel, tested against the byte about to be
 	// consumed. Without it a branch ending in `(?m:$)` matched only at end of
-	// input. The table exists only when planLenAltLayout built this branch
-	// for the find body (forceNewline); the match body has none and emits
-	// nothing here.
-	b = emitNLPreAcceptCheckLocals(b, dl.midAcceptNLOff, dl.midAcceptNLBytes != nil,
-		locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	// input.
+	//
+	// Gated on !fullConsumption for the SAME reason as the word-boundary check
+	// above, and gated here rather than relied upon: it happens that
+	// planLenAltLayout never builds the newline table for the match layout
+	// (its forceNewline is `find && ...`), so this was already emitting
+	// nothing — but that is a fact about a function three call levels away,
+	// exactly the kind of indirect correctness this body's other gate exists
+	// to avoid. State the contract locally instead.
+	if !fullConsumption {
+		b = emitNLPreAcceptCheckLocals(b, dl.midAcceptNLOff, dl.midAcceptNLBytes != nil,
+			locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	} else if dl.midAcceptNLBytes != nil {
+		// If the layout ever does build one for a full-consumption caller,
+		// the assumption above has changed and the emitted body would differ.
+		panic("emitInlineAnchoredDFAVerify: newline pre-accept table built for a full-consumption caller")
+	}
 
 	// Transition: state = table[state * numClasses + class(input[pos])].
 	if dl.useCompression {
@@ -15383,7 +15436,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 			b = append(b, 0x21, locDFAPos)
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locDFAState, locDFAPos, locDFAClass, locDFAOutEnd,
-				tableMemIdx, 0)
+				tableMemIdx, 0, false)
 			// Success — return packed (attempt_start, locDFAOutEnd).
 			b = emitReturnPackedI64FromLocal(b, locAttemptStart, locDFAOutEnd)
 		}

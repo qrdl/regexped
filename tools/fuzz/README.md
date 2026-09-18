@@ -21,6 +21,7 @@ make seed-all     # every layer's seed corpus (what CI should run)
 make seed-match   make fuzz-match     # anchored match
 make seed-groups  make fuzz-groups    # captures, selector's engine
 make seed-engines make fuzz-engines   # captures, TDFA vs Backtracking
+make seed-bodies  make fuzz-bodies    # captures, Backtracking fast body vs its fallback
 make seed-set     make fuzz-set       # set find (overlapping)
 make seed-caps                        # every set capability
 make seed-batch                       # set find through the batch entry
@@ -70,6 +71,7 @@ Single patterns:
 ./fuzz-budget.sh 30m 5 FuzzMatch               # anchored match
 ./fuzz-budget.sh 30m 5 FuzzGroups              # captures, selector's engine
 ./fuzz-budget.sh 30m 5 FuzzGroupsBothEngines   # captures, TDFA vs Backtracking
+./fuzz-budget.sh 30m 5 FuzzGroupsBothBodies    # captures, Backtracking fast body vs its fallback
 ./fuzz-budget.sh 30m 5 FuzzFindIteration       # find iterated from successive offsets
 ```
 
@@ -79,6 +81,14 @@ Sets:
 ./fuzz-budget.sh 30m 5 FuzzSet                 # overlapping set find
 ./fuzz-budget.sh 30m 5 FuzzSetCaps             # every set capability, at every `from`
 ./fuzz-budget.sh 30m 5 FuzzFindBatch           # set find through the batch entry, capacity 1
+```
+
+That is all NINE targets, five single-pattern and three set below, plus
+`FuzzCorrectness` itself. The list is easy to let drift, so check it against
+the package rather than against this file:
+
+```bash
+go test -list '^Fuzz' . | grep '^Fuzz'
 ```
 
 An unknown target is refused with the list of the package's fuzz functions. The

@@ -43,9 +43,11 @@ const (
 // non-anchored find function, with no captures — the DFA/Compiled DFA find
 // body (Layer 1's target).
 func compileFind(pat string) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-	wasmBytes, _, err := compile.Compile([]config.RegexEntry{entry}, tableBase, true)
-	return wasmBytes, err
+	return cachedCompile("find\x00"+pat, func() ([]byte, error) {
+		entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
+		wasmBytes, _, err := compile.Compile([]config.RegexEntry{entry}, tableBase, true)
+		return wasmBytes, err
+	})
 }
 
 // One wasmtime engine + watchdog per test process, shared across all fuzz
