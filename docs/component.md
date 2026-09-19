@@ -87,7 +87,7 @@ DIRECTLY, with `bindgen!` or `jco`, calls the constructor and `next` itself.
 
 ```
 ok(none)                  — there is definitely no match at or after `start`
-err(backtrack-overflow)   — the Backtracking engine ran out of frames and
+err(backtrack-overflow)   — the Backtracking engine ran out of memory and
                             ABANDONED part of the search space
 err(malformed-cache)      — an overlapping set's answer cache had a header the
                             engine could not parse, so the scan is UNFINISHED
@@ -492,11 +492,13 @@ owns one, and here it drops the handle, which is mandatory. See
   is what makes repeated calls flat.
 - The component is roughly 2 KB larger than the core module it wraps.
 
-## Not yet supported
+## Deliberately not offered
+
+Neither of these is a gap waiting to be filled.
 
 | | Status |
 |---|---|
-| Batch exports on a set (`hints: [batch-find]`) | Refused at load. Batching amortises host crossings for a caller that intends to consume everything, and the interface deliberately exposes one position per call through the find resource. It is refused rather than ignored because the user asked for a second entry point. |
+| Batch exports (`hints: [batch-find]`, on a set or a `regexps:` entry) | Refused at load, by design. Batching exists for one reason — to save host↔WASM crossings — and only the JS and TS stubs ever generate it, because every other stub is itself compiled to WASM and calls the body directly, with no crossing to save. JS and TS are not component targets, so under `component` there is no host batching could help. It is refused rather than ignored because the user asked for a second entry point. |
 | `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
 
 ## How it is built

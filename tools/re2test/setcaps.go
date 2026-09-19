@@ -44,7 +44,7 @@ import (
 )
 
 // errBTUnknown is returned by a drive whose engine answered
-// abi.BTStackOverflow: the Backtracking member exhausted its frame budget, so
+// abi.BTStackOverflow: a Backtracking member gave up for lack of memory, so
 // the result is UNKNOWN. The caller skips the comparison for that input rather
 // than scoring it — see setStats.btUnknown.
 var errBTUnknown = errors.New("backtracking member gave up (abi.BTStackOverflow)")
@@ -1068,7 +1068,13 @@ func newSetRunner(
 	var diags []compile.SetDiag
 	var err error
 	droppedFind, droppedAnchored := captureDrops(func() {
-		wasmBytes, _, diags, err = compile.CompileFileDiag(cfg, "")
+		// CompileFileOpts with a zero override IS CompileFileDiag; the override
+		// is only ever --bt-fallback-always's.
+		var over compile.CompileSetOptions
+		if btFallbackAlways {
+			over.BTWorkBudget = compile.BTWorkBudgetForceFallback
+		}
+		wasmBytes, _, diags, err = compile.CompileFileOpts(cfg, "", over)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
@@ -1218,6 +1224,11 @@ func newSetRunner(
 			release()
 			return nil, fmt.Errorf("memory.Grow to %d pages: %w", needed, err)
 		}
+	}
+	// Everything above lies below `top`.
+	if err := setScratchBase(store, inst, int32(top)); err != nil {
+		release()
+		return nil, err
 	}
 	return &setRunner{
 		store: store, inst: inst, mem: mem, wd: wd, release: release, profile: prof.name,

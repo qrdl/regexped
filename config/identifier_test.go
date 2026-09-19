@@ -1383,3 +1383,32 @@ func TestKebabEdgesPerKey(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateConfigRejectsMalformedSetCapabilityName covers the set half of
+// ValidateConfig's shape check. The existing tests give a set a RESERVED word,
+// which fails later on, in the per-language pass; this one gives it a name that
+// is not an identifier at all, which is the earlier check.
+func TestValidateConfigRejectsMalformedSetCapabilityName(t *testing.T) {
+	for _, c := range []struct {
+		field string
+		set   SetConfig
+	}{
+		{"match_any", SetConfig{Name: "s", MatchAny: "bad name"}},
+		{"match_all", SetConfig{Name: "s", MatchAll: "9lives"}},
+		{"scan_any", SetConfig{Name: "s", ScanAny: "has-dash"}},
+		{"scan_all", SetConfig{Name: "s", ScanAll: "with.dot"}},
+		{"find", SetConfig{Name: "s", Find: "sp ace"}},
+	} {
+		cfg := BuildConfig{
+			Regexps: []RegexEntry{{Name: "p", Pattern: "a"}},
+			Sets:    []SetConfig{c.set},
+		}
+		err := ValidateConfig(&cfg)
+		if err == nil {
+			t.Fatalf("ValidateConfig accepted set capability %s with a malformed name", c.field)
+		}
+		if !strings.Contains(err.Error(), c.field) {
+			t.Errorf("error does not name the offending capability %s: %v", c.field, err)
+		}
+	}
+}

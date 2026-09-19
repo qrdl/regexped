@@ -45,8 +45,10 @@ Sets work too, with the same public API: `match_any`/`scan_any` return
 `Result<Option<i32>>`, the `_all` pair returns `Result<impl Iterator<Item = i32>>`,
 and `find` returns the same `<Func>Iter` of `Result<SetMatch>`. Underneath, the
 iterator holds a scan in progress inside the regexp component and drops it with
-itself, so the gate array never appears — in either format. One set feature has no
-component form: `hints: [batch-find]` is refused at load. See
+itself, so the gate array never appears — in either format. `hints: [batch-find]`
+is refused at load, by design rather than as a gap: batching only saves
+host↔WASM crossings, only the JS and TS stubs generate it, and neither is a
+component target. A Rust caller never had it in either format. See
 [component.md](component.md#sets).
 
 `Cargo.toml` needs one dependency:
@@ -308,7 +310,7 @@ surface. See [sets.md](sets.md) for the measurements behind that.
 
 ## Backtracking stack overflow
 
-Patterns compiled to the Backtracking engine have a backtrack-frame budget fixed at compile time, while the number of frames actually needed can grow with input length. When an input exhausts the budget, the engine has abandoned part of the search space and cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
+A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".
 
 The generated wrapper returns **`Err(Error::BacktrackOverflow)`**. It used to panic; a panic unwinding out of an FFI wrapper is a poor fit for the contexts this library targets — under `panic = "abort"` it is a hard process abort, and a server taking user input cannot have a data-dependent abort in its matcher.
 

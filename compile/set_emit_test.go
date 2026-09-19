@@ -929,7 +929,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 // sizes is what distinguishes "took the max" from "took the first".
 func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 	// Nothing to lay out: no BT bucket, no regions.
-	if got := planBTRegions([]*bucket{{isFallback: true}}, 0, &moduleGlobals{}); got != nil {
+	if got := planBTRegions([]*bucket{{isFallback: true}}, 0, &moduleGlobals{}, 0); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
 
@@ -941,7 +941,7 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 		}
 		withMemo = append(withMemo, &bucket{isFallback: true, btFallback: info})
 	}
-	regions := planBTRegions(withMemo, 0, &moduleGlobals{})
+	regions := planBTRegions(withMemo, 0, &moduleGlobals{}, 0)
 	if regions == nil {
 		t.Fatal("no regions planned for two Backtracking buckets")
 	}
@@ -983,7 +983,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{})
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{}, 0)
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
@@ -995,7 +995,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 			t.Errorf("panic message %q does not say what was wrong", message)
 		}
 	}()
-	buildSetBTSuffixBody(regions, 0, 0, 0, true, true, 0)
+	buildSetBTSuffixBody(regions, btBucketCall{fallbackIdx: -1}, 0, 0, true, true, 0)
 }
 
 // TestSetEmitBTProbeBody emits a Backtracking bucket's probe.
@@ -1011,8 +1011,8 @@ func TestSetEmitBTProbeBody(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{})
-	body := buildSetBTProbeBody(regions, 7, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{}, 0)
+	body := buildSetBTProbeBody(regions, btBucketCall{driverIdx: 7, fallbackIdx: -1}, 0)
 	if len(body) == 0 {
 		t.Fatal("the Backtracking probe emitted nothing")
 	}
@@ -1391,7 +1391,15 @@ func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
 		}
 		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
 	}
-	regions := planBTRegions(buckets, 0, &moduleGlobals{})
+	// Such a program has a zero-width cycle, so with a work budget its
+	// ordinary body is the bare tail call and reads no region at all: only a
+	// build with the budget off still runs the body that uses the memo.
+	if routed := planBTRegions(buckets, 0, &moduleGlobals{}, 0); routed == nil {
+		t.Fatal("no regions planned for two Backtracking buckets")
+	} else if routed.memoBase != 0 || routed.stackLimit != routed.stackBase {
+		t.Errorf("buckets whose ordinary body never runs reserved a stack or memo: %+v", *routed)
+	}
+	regions := planBTRegions(buckets, 0, &moduleGlobals{}, BTWorkBudgetOff)
 	if regions == nil {
 		t.Fatal("no regions planned for two Backtracking buckets")
 	}

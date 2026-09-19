@@ -196,7 +196,8 @@ func hasBTBucketIn(buckets []*bucket) bool {
 //
 //  1. The memo re-zeroes itself at the head of every BT call
 //     (emitBTMemoZeroInitTrimmed), so one pattern cannot inherit another's
-//     bits.
+//     bits. (A FALLBACK body's memo is not in these regions: it is per member
+//     and lasts a host call — see btDriveMember.)
 //  2. The per-candidate driver calls one suffix function at a time via a plain
 //     `call` (set_find.go's emitBucketCall) — no nesting, no reentrancy, no
 //     threads — so exactly one BT call is ever live.
@@ -214,11 +215,65 @@ type btSharedRegions struct {
 	winGlobal   int32
 	slotScratch int32 // 8-byte group-0 (start, end) buffer the BT body writes
 	end         int32 // one past everything above
+	// scratch is the module's fallback-scratch globals, allocated when some
+	// bucket has a fallback driver. Its memory lies outside every region above.
+	scratch btScratch
+	// drive and members are the call-scoped globals (btDriveMember), keyed by
+	// bucket index, for every bucket with a fallback driver; hasDrive is false
+	// when there is none.
+	drive    btDrive
+	hasDrive bool
+	members  map[int]*btDriveMember
+}
+
+// btBucketCall is how a BT bucket's suffix or probe body reaches its bodies:
+// the ordinary driver, and — when the bucket has one — the fallback, which a
+// member whose budget tripped in this host call is sent to directly.
+type btBucketCall struct {
+	driverIdx   int
+	fallbackIdx int            // -1: no fallback
+	member      *btDriveMember // nil: no fallback
+	// route: the driver is an ordinary body, so a tripped member skips it.
+	// False when the driver is already the bare tail call.
+	route bool
+}
+
+// emitCall calls the member's body for (ptr, len, slotScratch) and stores the
+// i32 answer in end, then resets the member's visited set after a match.
+func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, end byte) []byte {
+	args := func(b []byte) []byte {
+		b = append(b, 0x20, ptr)
+		b = append(b, 0x20, length)
+		b = append(b, 0x41)
+		return utils.AppendSLEB128(b, regions.slotScratch)
+	}
+	call := func(b []byte, idx int) []byte {
+		b = args(b)
+		b = append(b, 0x10)
+		return utils.AppendULEB128(b, uint32(idx))
+	}
+	if c.route {
+		b = emitBTMemberTripped(b, c.member)
+		b = append(b, 0x04, 0x7F) // if (result i32)
+		b = call(b, c.fallbackIdx)
+		b = append(b, 0x05) // else
+		b = call(b, c.driverIdx)
+		b = append(b, 0x0B) // end if
+	} else {
+		b = call(b, c.driverIdx)
+	}
+	b = append(b, 0x21, end)
+	if c.member != nil {
+		b = emitBTMemberMatched(b, c.member, end)
+	}
+	return b
 }
 
 // planBTRegions lays the shared regions out above `base` and returns them,
-// or nil when the set has no BT bucket. Sizes are the max over BT buckets.
-func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals) *btSharedRegions {
+// or nil when the set has no BT bucket. Sizes are the max over BT buckets whose
+// ordinary body runs: a bucket planned as the bare tail call (planBT's force
+// plan) reads neither region.
+func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget int) *btSharedRegions {
 	maxStack, maxMemo := 0, 0
 	any := false
 	for _, b := range buckets {
@@ -226,6 +281,9 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals) *btSha
 			continue
 		}
 		any = true
+		if planBT(b.btFallback.bt, budget).force {
+			continue
+		}
 		if b.btFallback.stackSize > maxStack {
 			maxStack = b.btFallback.stackSize
 		}
@@ -327,7 +385,7 @@ func btSufEndLocal(hasTrailingParam bool) byte {
 }
 
 func buildSetBTSuffixBody(regions *btSharedRegions,
-	btFuncIdx int, patternID int, patternBit int, gated, hasSkip bool, tableMemIdx int) []byte {
+	call btBucketCall, patternID int, patternBit int, gated, hasSkip bool, tableMemIdx int) []byte {
 
 	if gated && hasSkip {
 		// Mutually exclusive by construction; both would want parameter 7.
@@ -364,13 +422,7 @@ func buildSetBTSuffixBody(regions *btSharedRegions,
 	b = utils.AppendULEB128(b, uint32(regions.winGlobal+1))
 
 	// end = bt(ptr, len, slotScratch)
-	b = append(b, 0x20, btSufPtr)
-	b = append(b, 0x20, btSufLen)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.slotScratch)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(btFuncIdx))
-	b = append(b, 0x21, btSufEnd)
+	b = call.emitCall(b, regions, btSufPtr, btSufLen, btSufEnd)
 
 	// Frame budget exhausted: the engine abandoned part of the search space and
 	// does NOT know whether this pattern matched. Propagate it as a negative
@@ -492,7 +544,16 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		return nil
 	}
 	out := make(map[int][]byte)
-	btIdx := map[int]int{}
+	// Drivers sit at btFnBase+k, the index each suffix body calls; every
+	// fallback follows the last driver, so adding them moved no driver.
+	numDrivers := 0
+	for _, bkt := range cs.buckets {
+		if bkt.btFallback != nil {
+			numDrivers++
+		}
+	}
+	var fallbacks [][]byte
+	calls := map[int]btBucketCall{}
 	k := 0
 	for bi, bkt := range cs.buckets {
 		if bkt.btFallback == nil {
@@ -502,42 +563,68 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		// The driver: window mode gives it the candidate position and the true
 		// input edges; nativeAnchored lets it accept at the first match end
 		// rather than only on full consumption. See the file header.
-		driver := appendBacktrackCodeEntry(nil, info.bt,
-			cs.btRegions.stackBase, cs.btRegions.stackLimit,
-			int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
-			true, // nativeAnchored
-			tableMemIdx, cs.btRegions.winGlobal,
-			// Per-bucket, not per-set: the shared memo region is sized to the
-			// LARGEST bucket's reservation, but each body's fill is sized from
-			// its OWN N, so each must be bounded by its own ceiling.
-			btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil)),
-			// Set BT buckets are driven directly, not through the groups
-			// wrapper, and use window mode — their slots are already absolute.
-			-1)
+		plan := planBT(info.bt, cs.btWorkBudget)
+		// Per-bucket, not per-set: the shared memo region is sized to the
+		// LARGEST bucket's reservation, but each body's fill is sized from its
+		// OWN N, so each must be bounded by its own ceiling.
+		memoMaxLen := btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil))
+		member := cs.btRegions.members[bi]
+		call := btBucketCall{driverIdx: btFnBase + k, fallbackIdx: -1}
+		var driver []byte
+		var callOffs []int
+		if plan.force {
+			driver, callOffs = btTailCallBody(3)
+		} else {
+			driver, callOffs = appendBacktrackCodeEntry(nil, info.bt,
+				cs.btRegions.stackBase, cs.btRegions.stackLimit,
+				int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
+				true, // nativeAnchored
+				tableMemIdx, cs.btRegions.winGlobal, memoMaxLen,
+				// Set BT buckets are driven directly, not through the groups
+				// wrapper, and use window mode — their slots are already absolute.
+				-1,
+				plan.k, plan.fallback, nil, member)
+		}
+		if plan.fallback {
+			// Built here like the driver, so its real index is known and the
+			// driver is patched at once. What the fallback cannot answer — memory
+			// that will not grow — comes back as abi.BTStackOverflow, which the
+			// suffix body already forwards.
+			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
+				int32(btFrameSize(btFallbackView(info.bt))), 0, true,
+				true, tableMemIdx, cs.btRegions.winGlobal, 0, -1,
+				0, false, &cs.btRegions.scratch, member)
+			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
+			call.member = member
+			call.route = !plan.force && member != nil
+			driver = patchBTFallbackCall(driver, callOffs, call.fallbackIdx)
+			fallbacks = append(fallbacks, fb)
+		}
 		cs.btFnBodies = append(cs.btFnBodies, driver)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
 		// things for parameter 7; passing them as one flag made the body read
 		// the batch skip count as a gate pointer.
-		body := buildSetBTSuffixBody(cs.btRegions, btFnBase+k,
+		body := buildSetBTSuffixBody(cs.btRegions, call,
 			cs.patternIDs[bi][0], 0, cs.gatedFind(), cs.suffixHasSkip,
 			tableMemIdx)
 		out[bi] = sizePrefixed(body)
-		btIdx[bi] = btFnBase + k
+		calls[bi] = call
 		k++
 	}
+	cs.btFnBodies = append(cs.btFnBodies, fallbacks...)
 	// Probes, for the scan and anchored capabilities. A bucket that filled
 	// only its suffix slot left these EMPTY — a declared function with no
 	// body, which is a module that will not parse.
-	for bi, idx := range btIdx {
+	for bi, call := range calls {
 		if cs.scanProbeBodies != nil {
 			cs.scanProbeBodies[bi] = sizePrefixed(
-				buildSetBTProbeBody(cs.btRegions, idx, tableMemIdx))
+				buildSetBTProbeBody(cs.btRegions, call, tableMemIdx))
 		}
 		if cs.scanProbeAnyBodies != nil && cs.anyProbeIdx != nil &&
 			bi < len(cs.anyProbeIdx) && cs.anyProbeIdx[bi] >= 0 {
 			cs.scanProbeAnyBodies[cs.anyProbeIdx[bi]] = sizePrefixed(
-				buildSetBTProbeBody(cs.btRegions, idx, tableMemIdx))
+				buildSetBTProbeBody(cs.btRegions, call, tableMemIdx))
 		}
 	}
 	return out
@@ -582,7 +669,7 @@ func sizePrefixed(body []byte) []byte {
 // members and the anchored pair". The parameter and its full-consumption arm
 // were once dead code that made the exclusion look like an oversight rather
 // than the contract it is.
-func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, tableMemIdx int) []byte {
+func buildSetBTProbeBody(regions *btSharedRegions, call btBucketCall, tableMemIdx int) []byte {
 	const (
 		pPtr       = 0
 		pStart     = 1
@@ -612,13 +699,7 @@ func buildSetBTProbeBody(regions *btSharedRegions, btFuncIdx int, tableMemIdx in
 	b = append(b, 0x24)
 	b = utils.AppendULEB128(b, uint32(regions.winGlobal+1))
 
-	b = append(b, 0x20, pPtr)
-	b = append(b, 0x20, pLen)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, regions.slotScratch)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(btFuncIdx))
-	b = append(b, 0x21, lEnd)
+	b = call.emitCall(b, regions, pPtr, pLen, lEnd)
 
 	// Budget exhausted: the engine abandoned part of the search space and does
 	// NOT know whether this pattern matched. Report it DISTINCTLY rather than

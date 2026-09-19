@@ -31,7 +31,8 @@ add a fixture for it.
 | `match_only` | `(?:https?)://(?:[^/]+)/(?:.*)` | `match_func` alone: anchored body, no find sibling | Compiled DFA |
 | `find_only` | `\d{4}-\d{2}-\d{2}` | `find_func` alone | Compiled DFA |
 | `tdfa_groups` | `(?P<scheme>…)://(?P<host>…)/(?P<path>…)` | TDFA capture path with named groups | TDFA |
-| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible) | Backtracking |
+| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible), with the work budget and fallback body every Backtracking program without a zero-width cycle carries | Backtracking |
+| `bt_empty_loop` | `^(\w*\|)*c` | Backtracking capture path over a program with a ZERO-WIDTH CYCLE (the outer `*`'s body can match empty through the `\|` branch). Such a program gets no ordinary body: its fast body is the bare tail call into the FALLBACK body, memoised at every Alt, whose frame stack and memo are sized from the input at call time and found through the module's scratch globals (exported, standalone, as `regexped:scratch_base`). `bt_groups` above pins the other shape — an ordinary body with the WORK BUDGET, an i64 counter charged on every frame pop whose exhaustion tail-calls the same fallback | Backtracking |
 | `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction | Compiled DFA |
 | `line_anchored` | `(?m:^)ERROR:.*(?m:$)` | newline-boundary machinery: `midStartNewline`, the `midAcceptNL` side table | Compiled DFA |
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |

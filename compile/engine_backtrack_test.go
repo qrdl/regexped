@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"regexp/syntax"
@@ -1274,7 +1275,7 @@ func TestEnginesCovMatchPathBTLimits(t *testing.T) {
 	t.Run("loop_count", func(t *testing.T) {
 		// Same shape as TestCompileBTLoopCountTooLarge, reached through
 		// match_func instead of find_func.
-		pattern := strings.Repeat(`(?:$*llllllll0)`, 114)
+		pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 114)
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}}, 0, true)
 		if !errors.Is(err, ErrBTLoopCountTooLarge) {
 			t.Fatalf("Compile(match): err = %v, want ErrBTLoopCountTooLarge", err)
@@ -1285,7 +1286,7 @@ func TestEnginesCovMatchPathBTLimits(t *testing.T) {
 		// The anchored DFA for this shape fits comfortably under the default
 		// state cap, so unlike the find path it has to be pushed onto the
 		// Backtracking fallback explicitly before the chain guard is reached.
-		pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)`
+		pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)`
 		_, _, err := Compile(
 			[]config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}}, 65536, true,
 			CompileOptions{MaxDFAStates: 1},
@@ -1469,6 +1470,51 @@ func TestEnginesCovAltLoopBodyStartAltArgBackEdge(t *testing.T) {
 	}
 	if bodyPC != int(inst.Arg) {
 		t.Errorf("altLoopBody(prog.Start) body = %d, want Arg = %d (non-greedy loop)", bodyPC, inst.Arg)
+	}
+}
+
+// TestProgHasZeroWidthCycleRoutesToFallback pins the predicate that decides
+// whether a Backtracking program gets an ordinary body, and planBT's use of it:
+// with a work budget, a program with a zero-width cycle is planned exactly as
+// BTWorkBudgetForceFallback plans every program; BTWorkBudgetOff still emits
+// the ordinary body alone.
+func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		cycle   bool
+	}{
+		{`(a*?)*?b`, true},  // the reported shape
+		{`^(\w*|)*c`, true}, // loop body matches empty through `|`
+		{`(?:(a*?|b))*(b*)b`, true},
+		{`((\b)*)*`, true}, // an assertion on the cycle still counts
+		{`(a|)+`, true},
+		{`^(aa|a)*b`, false}, // every iteration consumes a byte
+		{`(a.*?b)(c+)`, false},
+		{`([a-zA-Z]+?)\d`, false},
+		{`x{3}(y|z)`, false},
+	} {
+		re, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := progHasZeroWidthCycle(prog); got != c.cycle {
+			t.Errorf("%s: progHasZeroWidthCycle = %v, want %v", c.pattern, got, c.cycle)
+			continue
+		}
+		bt := newBacktrack(prog)
+		for _, budget := range []int{0, 8} {
+			plan := planBT(bt, budget)
+			if plan.force != c.cycle || !plan.fallback {
+				t.Errorf("%s budget %d: plan = %+v, want force=%v with a fallback", c.pattern, budget, plan, c.cycle)
+			}
+		}
+		if plan := planBT(bt, BTWorkBudgetOff); plan.force || plan.fallback {
+			t.Errorf("%s under BTWorkBudgetOff: plan = %+v, want neither", c.pattern, plan)
+		}
 	}
 }
 
@@ -1769,14 +1815,14 @@ func TestEnginesCovGroupsPathBTLimits(t *testing.T) {
 	// The trailing literal keeps each pattern off the whole-pattern
 	// single-capture shortcut, which would bypass the guards entirely.
 	t.Run("loop_count", func(t *testing.T) {
-		pattern := strings.Repeat(`(?:$*llllllll0)`, 114) + `(x)y`
+		pattern := strings.Repeat(`(?:(?:$|l)*llllllll0)`, 114) + `(x)y`
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
 		if !errors.Is(err, ErrBTLoopCountTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTLoopCountTooLarge", err)
 		}
 	})
 	t.Run("empty_body_loop_chain", func(t *testing.T) {
-		pattern := `(?m:` + strings.Repeat(`$*`, 16) + `0$)(x)y`
+		pattern := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)(x)y`
 		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 65536, true)
 		if !errors.Is(err, ErrBTEmptyBodyLoopChainTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTEmptyBodyLoopChainTooLarge", err)
@@ -1950,9 +1996,11 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 	// their Backtracking construction blows a limit. That is the only
 	// configuration in which the capture path's copies decide the outcome.
 	t.Run("program_too_large", func(t *testing.T) {
-		// 21000 zero-width assertions: a huge NFA whose DFA is a couple of
-		// states, and `\b` also keeps the capture path off TDFA.
-		pattern := strings.Repeat(`(?:\b){1000}`, 21) + `(x)`
+		// 7000 captured zero-width assertions: a huge NFA whose DFA is a couple
+		// of states, and `\b` also keeps the capture path off TDFA. The group
+		// is what keeps collapseZeroWidthRepeats from reducing the repeat to a
+		// single `\b`, as it now does for the uncaptured `(?:\b){1000}`.
+		pattern := strings.Repeat(`(\b){1000}`, 7) + `(x)`
 		if got := len(enginesCovProg(t, pattern).Inst); got <= maxBTFallbackInstructions {
 			t.Skipf("witness pattern produces %d instructions, need > %d", got, maxBTFallbackInstructions)
 		}
@@ -1963,10 +2011,11 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 	})
 
 	t.Run("loop_count", func(t *testing.T) {
-		// 40 `$*` loops separated by single literals: 80 loop-frame locals,
-		// but the DFA is just `a{40}`. The trailing literal keeps it off the
-		// whole-pattern single-capture shortcut.
-		pattern := strings.Repeat(`(?:$*a)`, 40) + `(x)y`
+		// 40 nullable loops separated by single literals: 80 loop-frame
+		// locals. `(?:$|a)*` rather than `$*`, which collapseZeroWidthRepeats
+		// now removes before the engine sees it. The trailing literal keeps it
+		// off the whole-pattern single-capture shortcut.
+		pattern := strings.Repeat(`(?:(?:$|a)*a)`, 40) + `(x)y`
 		backtracker := newBacktrack(enginesCovProg(t, pattern))
 		if got := btNumLoopFrameLocals(backtracker, true); got <= maxBTLoopFrameLocals {
 			t.Skipf("witness pattern has %d loop-frame locals, need > %d", got, maxBTLoopFrameLocals)
@@ -2011,7 +2060,7 @@ func TestEnginesCovBTFallbackPrefixTruncation(t *testing.T) {
 	pattern := strings.Repeat("ab", 40) + `[0-9]`
 	compiled, err := compilePattern(
 		config.RegexEntry{Pattern: pattern, FindFunc: "f"}, 0, 0,
-		CompileOptions{MaxDFAStates: 1})
+		CompileOptions{MaxDFAStates: 1, globals: &moduleGlobals{}})
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
 	}
@@ -2210,5 +2259,153 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	suffixMin, suffixMax := regexpMinMaxLen(suffixAST, false)
 	if suffixMin != 3 || suffixMax != 3 {
 		t.Errorf("suffix length = [%d, %d], want [3, 3] (digit, 'b', trailing digit)", suffixMin, suffixMax)
+	}
+}
+
+// TestBTStaticMemoBodiesCompile covers the Backtracking engine's STATIC
+// BitState memo — `emitBitStateGuard` and the `emitBTMemo*` helpers that set
+// the bitset up at the head of a call.
+//
+// Reaching that code needs two things at once, and nothing else in this
+// package's tests had both:
+//
+//   - a program that needs the memo, which means a loop whose body can match
+//     EMPTY (`needsBitState`), and
+//   - BTWorkBudgetOff.
+//
+// The second is the part that is easy to miss. Since the work budget landed,
+// `planBT` sends any program with a zero-width cycle straight to the FALLBACK
+// body and emits no ordinary body at all — and every program that needs the
+// memo has such a cycle, because `needsBitState` requires
+// `loopBodyCanMatchEmpty`, which is exactly an epsilon-only path from a loop
+// head back to itself. The fallback body uses the `Dyn` variants instead, so
+// under any ordinary budget the static ones are never emitted.
+//
+// BTWorkBudgetOff is the "bytes from before the budget existed" mode: no
+// fallback, so the ordinary body is emitted for these programs after all, and
+// the static memo goes with it. `tools/fuzz`'s FuzzGroupsBothBodies drives it
+// for real; this test exists so the compile package covers the emission.
+//
+// MaxDFAStates: 1 is what pushes `match` and `find` onto Backtracking too —
+// their bodies set the bitset up differently from the groups body
+// (`emitBTMemoZeroInit` and `emitBTMemoFirstAttempt` against
+// `emitBTMemoLazyClear`), so all three exports are compiled here.
+func TestBTStaticMemoBodiesCompile(t *testing.T) {
+	// Each of these has a non-greedy loop whose body matches empty, which is
+	// what makes needsBitState true.
+	pats := []string{`(a??)*?b`, `(x?)*?y`, `(\w*?)*?c`, `(a*)*?b`}
+	exports := []struct {
+		name  string
+		entry func(string) config.RegexEntry
+	}{
+		{"groups", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, GroupsFunc: "g"} }},
+		{"match", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, MatchFunc: "m"} }},
+		{"find", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, FindFunc: "f"} }},
+	}
+	for _, p := range pats {
+		for _, e := range exports {
+			t.Run(p+"/"+e.name, func(t *testing.T) {
+				mustCompileEntries(t, []config.RegexEntry{e.entry(p)},
+					CompileOptions{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1})
+			})
+		}
+	}
+}
+
+// TestBTEmptyBodyGreedyLoopBodiesCompile covers the ORDINARY Backtracking
+// body's handling of a GREEDY loop whose body can match empty —
+// `bt.emptyBodyGreedyLoop`, and with it the loop-entry bookkeeping
+// (`loopEntryOutOf` / `loopEntryArgOf`) that only such a loop needs.
+//
+// It needs BTWorkBudgetOff for the same reason the static memo does (see
+// TestBTStaticMemoBodiesCompile): a loop whose body can match empty is a
+// zero-width cycle, `planBT` sends those to the fallback body and emits no
+// ordinary body, and the fallback flattens every loop away. Only the
+// budget-off build, which emits no fallback, still compiles this code.
+func TestBTEmptyBodyGreedyLoopBodiesCompile(t *testing.T) {
+	pats := []string{`(a*)*b`, `(a|)*b`, `(a?)*b`, `((a)*)*b`, `(a*b*)*c`}
+	exports := []struct {
+		name  string
+		entry func(string) config.RegexEntry
+	}{
+		{"groups", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, GroupsFunc: "g"} }},
+		{"match", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, MatchFunc: "m"} }},
+		{"find", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, FindFunc: "f"} }},
+	}
+	for _, p := range pats {
+		for _, e := range exports {
+			t.Run(p+"/"+e.name, func(t *testing.T) {
+				mustCompileEntries(t, []config.RegexEntry{e.entry(p)},
+					CompileOptions{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1})
+			})
+		}
+	}
+}
+
+// TestBacktrackHasZeroWidthCycle covers the exported predicate tools/fuzz uses
+// to decide whether a program ships an ordinary body at all.
+func TestBacktrackHasZeroWidthCycle(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want bool
+	}{
+		{`(a|)*b`, true},
+		{`(a*)*b`, true},
+		{`(a??)*?b`, true},
+		{`abc`, false},
+		{`(a+)(b)`, false},
+		{`[a-z]+x`, false},
+	} {
+		got, err := BacktrackHasZeroWidthCycle(c.pat)
+		if err != nil {
+			t.Fatalf("%q: %v", c.pat, err)
+		}
+		if got != c.want {
+			t.Errorf("BacktrackHasZeroWidthCycle(%q) = %v, want %v", c.pat, got, c.want)
+		}
+	}
+	if _, err := BacktrackHasZeroWidthCycle(`(`); err == nil {
+		t.Error("BacktrackHasZeroWidthCycle on an unparsable pattern returned no error")
+	}
+}
+
+// TestLoopEntryAtStartBodies covers the `loopEntryAtStart` arms in the
+// Backtracking bodies: a greedy loop whose body IS the very first thing in the
+// program has no predecessor instruction to write its entry position, so the
+// body seeds that local itself. Needs BTWorkBudgetOff for the same reason the
+// other empty-body loop tests do — see TestBTStaticMemoBodiesCompile.
+func TestLoopEntryAtStartBodies(t *testing.T) {
+	// Verified to produce a non-empty bt.loopEntryAtStart.
+	pats := []string{`(?:a??){1,}`, `(?:a*)+`, `(a*)+`}
+	for _, p := range pats {
+		for _, e := range []config.RegexEntry{
+			{Pattern: p, GroupsFunc: "g"}, {Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"},
+			{Pattern: p, FindFunc: "f", GroupsFunc: "g"},
+		} {
+			for _, o := range []CompileOptions{
+				{BTWorkBudget: BTWorkBudgetOff},
+				{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1},
+			} {
+				if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, o); err != nil {
+					t.Fatalf("Compile(%q): %v", p, err)
+				}
+			}
+		}
+	}
+	// A BT member inside a set runs in WINDOW mode, which seeds that same
+	// local from the window start instead of from zero.
+	for _, f := range [][]string{{`(a*)*b`, `x`}, {`(a??)*?b`, `y`}} {
+		entries := make([]config.RegexEntry, len(f))
+		names := make([]string, len(f))
+		for i, p := range f {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		sc := config.SetConfig{Name: "s", MatchAny: "ma", ScanAny: "sa", Find: "fi",
+			Patterns: config.PatternSelector{Names: names}}
+		if _, _, err := CompileFile(
+			config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
+			t.Fatalf("CompileFile(%v): %v", f, err)
+		}
 	}
 }

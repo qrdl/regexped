@@ -30,13 +30,13 @@ Every export signals failure with a negative value, and the values are disjoint 
 | value | name | meaning |
 |---|---|---|
 | `-1` | `NoMatch` | the input does not match — an ordinary, reliable answer |
-| `-2` | `BTStackOverflow` | the Backtracking engine exhausted its compile-time frame budget; whether the input matches is **unknown** |
+| `-2` | `BTStackOverflow` | the Backtracking engine could not get the memory the search needed; whether the input matches is **unknown** |
 
 The same two values apply to the `i64` find exports, sign-extended (`i64.const -1` / `-2`). No legitimate packed `(start << 32 | end)` result can be confused with either, because `start` is a non-negative `i32` so bit 63 is always clear.
 
 For the `_batch` exports, which return a match **count**, `-2` appears as a negative count; a successful call always returns a count ≥ 0. Returning the count collected so far would be a silent truncation the host could not distinguish from a completed scan.
 
-`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling) and only for a subset of pattern shapes — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
+`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling). A Backtracking call that outgrows its compile-time regions hands itself to a fallback body that sizes its memory from the input, so `-2` means linear memory could not grow far enough — WASM32's 4 GiB, or a lower limit the host set — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
 
 `$from` on the capture exports means what it means on `$find`: where the
 SEARCH starts, with `$ptr`/`$len` still describing the whole input. Slot
@@ -60,6 +60,70 @@ it.
 Hosts never touch this global — it is not exported, and `wasm-merge` renumbers
 it (and every reference to it) when merging into a host that has globals of its
 own. Several regexp modules merged into one host each keep their own.
+
+### The Backtracking scratch base (standalone modules)
+
+**Who needs this.** Only a host that loads a **standalone** module directly — a
+wasmtime/wasmer program in Rust, Go or Python, or JavaScript that does not use
+the generated stub — and only when the module contains a Backtracking program
+(a pattern or set member compiled to Backtracking). The generated JS and TS
+stubs already do everything below. Merged (embedded) modules and components do
+not have the global and need nothing.
+
+**Why it exists.** A standalone module has one memory, and the host has no
+other way to pass data: it writes its input, and the buffers it reads answers
+from, into the module's exported `memory`. A Backtracking call that needs more
+room than its compile-time regions — see [engines.md](engines.md) "Work budget
+and the fallback body" — also works in that same memory, and it cannot tell
+which parts of it the host is using. The exported mutable `i32` global
+**`regexped:scratch_base`** is how the host tells it: "everything from this
+address up is free while a call runs".
+
+**What a host does:**
+
+1. **Find where free memory starts.** Right after instantiating, before the
+   first call, the memory's size is the end of the module's own data. Everything
+   from there up is the host's.
+2. **Place your buffers there** (input, output, anything else you write), growing
+   memory first if they do not fit. Addresses are offsets into the module's
+   memory, 0 being its first byte.
+3. **Set `regexped:scratch_base` to the first byte past your last buffer.** It is
+   a variable inside the module, not a call argument: it keeps its value between
+   calls, so setting it once is enough.
+4. **Raise it if your buffers ever need more room** — a bigger input than before —
+   before the next call. Do not write at or above it while a call runs.
+5. **After every call, fetch the memory's data again** (a new slice in wasmtime,
+   `memory.buffer` in JS): the call may have grown memory, which can move it.
+
+The module then puts its working memory at that address and reuses the same
+spot on every call, growing memory only when a larger input needs more than the
+last one did.
+
+**If you leave it at 0** (its initial value), answers stay correct, but every
+call that needs this working memory takes new pages at the end of memory, and
+WebAssembly memory never shrinks. Measured with perftest's html-tags pattern
+(`groups_func`) looping over the tags of a 10 KB HTML page, one call per tag:
+
+| documents processed | memory, global at 0 | memory, global set |
+|---|---|---|
+| 1 (457 calls) | 31 MB | 1.2 MB |
+| 10 (4,570 calls) | 300 MB | 1.2 MB |
+| 100 (45,700 calls) | 3.0 GB | 1.2 MB |
+
+At 4 GB memory cannot grow any further, and from then on such calls answer
+`-2` until the instance is recreated.
+
+A module without a Backtracking program does not export the global; check for
+the export and skip this when it is absent. The module never uses memory below
+the end of its own tables, whatever the global says, and the name carries a
+colon so that no configured export can collide with it. The generated JS and TS
+stubs keep the global at the highest byte they have ever handed out.
+
+**Growing memory detaches JavaScript views.** A module that grows memory inside
+a call replaces the `ArrayBuffer` behind `memory.buffer`, and every typed array
+over the old one reads as length 0 without throwing. A JS host must read
+`memory.buffer` afresh after every call rather than keep a view across one; the
+generated stubs do.
 
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
@@ -231,7 +295,7 @@ Single memory (index 0, exported as "memory"):
 0              tableBase         tableEnd
 ```
 
-The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test).
+The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test). A module with a Backtracking program may also use memory above the host's data as run-time scratch — see "The Backtracking scratch base" above.
 
 ---
 

@@ -45,8 +45,10 @@ func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) 
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-	return w, droppedFromSet(diags), err
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, map[int]bool, error) {
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		return w, droppedFromSet(diags), err
+	})
 }
 
 // capRunner holds an instantiated capability module plus its memory layout.
@@ -319,16 +321,34 @@ var capCases = []struct {
 }
 
 // allIDs calls a `_all` capability and returns the matching ids, hiding the
-// ABI split: at most 64 ids the answer is an i64 mask returned directly; past
-// that the callee fills a caller-owned BITMAP and returns a count. Both forms
-// exist in the emitters, and a test that knew only the narrow one could not
-// drive any set wide enough to select the Shufti frontend — which needs more
-// literals than Teddy accepts, so its id space is always past 64.
+// ABI split: the answer is either an i64 mask returned directly, or a count
+// with the ids written into a caller-owned BITMAP. Both forms exist in the
+// emitters, and a test that knew only the narrow one could not drive any set
+// wide enough to select the Shufti frontend — which needs more literals than
+// Teddy accepts, so its id space is always past 64.
+//
+// The form is read off the function's TYPE, never predicted from the pattern
+// count, because the count does not decide it. A set holding a member on the
+// BACKTRACKING engine takes the bitmap form at ANY width: Backtracking can
+// answer "unknown" (abi.BTStackOverflow) and the narrow form's i64 return IS
+// the mask, so there is nowhere to put that. Two routes put a member there —
+// one over max_fallback_states, and, since bug 77's fix, any member whose
+// `\b`/`\B`/`(?m:$)` branch a DFA cannot keep in priority order. The second
+// needs two instructions (`\B|`), so a TWO-pattern set can be wide. Keying on
+// `npat <= 64` therefore passed two arguments to a three-argument export and
+// died before comparing anything (FUZZER_BUGS bug 82). tools/settest reads the
+// form this way for the same reason.
 func (r *capRunner) allIDs(t *testing.T, fn string, args ...interface{}) []int {
 	t.Helper()
-	if r.npat <= 64 {
+	f := r.inst.GetFunc(r.store, fn)
+	if f == nil {
+		t.Fatalf("missing export %q", fn)
+	}
+	if len(f.Type(r.store).Params()) == len(args) {
 		return idsFromMask(uint64(r.call(t, fn, args...).(int64)), r.npat)
 	}
+	// The module only ORs bits in and counts 0 -> 1 transitions, so the bitmap
+	// must start all-zero or it reports stale patterns (docs/sets.md).
 	buf := r.mem.UnsafeData(r.store)
 	nbytes := (r.npat + 7) / 8
 	for i := 0; i < nbytes; i++ {
@@ -601,7 +621,7 @@ func FuzzSetCaps(f *testing.F) {
 		} else if !containsInt(wantAnchored, gotAny) {
 			t.Fatalf("match_any = %d, not among %v: pats=%q,%q input=%q", gotAny, wantAnchored, pat1, pat2, input)
 		}
-		gotAll := idsFromMask(uint64(r.call(t, "cap_match_all", inBase, n).(int64)), len(pats))
+		gotAll := r.allIDs(t, "cap_match_all", inBase, n)
 		if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
 			t.Fatalf("match_all = %v, want %v: pats=%q,%q input=%q", gotAll, wantAnchored, pat1, pat2, input)
 		}
@@ -621,7 +641,7 @@ func FuzzSetCaps(f *testing.F) {
 			} else if !containsInt(wantScanAll, int(gotScanAny)) {
 				t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
 			}
-			gotScanAll := idsFromMask(uint64(r.call(t, "cap_scan_all", inBase, n, f32).(int64)), len(pats))
+			gotScanAll := r.allIDs(t, "cap_scan_all", inBase, n, f32)
 			if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
 				t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)
 			}
@@ -753,8 +773,10 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Find:     "gated_find",
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-	return w, err
+	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
+		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		return w, err
+	})
 }
 
 // gatedRun drives the gated find to exhaustion with a zeroed gate array, the
@@ -1217,8 +1239,10 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-	return w, err
+	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
+		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		return w, err
+	})
 }
 
 // runBatchFind drives find_batch to exhaustion with the given buffer capacity,

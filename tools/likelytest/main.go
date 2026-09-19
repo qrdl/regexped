@@ -1770,6 +1770,10 @@ func benchTime(wasmBytes []byte, tc testCase, input string, engine *wasmtime.Eng
 	if err != nil {
 		return 0, fmt.Errorf("instance: %w", err)
 	}
+	// Input and slots live in pages 0-1, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+		return 0, err
+	}
 	var fnExport string
 	switch tc.mode {
 	case modeAnchored:
@@ -1871,6 +1875,10 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
+		return 0, err
+	}
+	// Input and slots live in pages 0-1, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
 		return 0, err
 	}
 	var fnExport string
@@ -1992,6 +2000,10 @@ func benchTimeExhaust(wasmBytes []byte, tc testCase, input string, engine *wasmt
 	if err != nil {
 		return 0, fmt.Errorf("instance: %w", err)
 	}
+	// Input and slots live in pages 0-1, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+		return 0, err
+	}
 	var fnExport string
 	switch tc.mode {
 	case modeFind:
@@ -2052,6 +2064,10 @@ func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *w
 	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
+		return 0, err
+	}
+	// Input and slots live in pages 0-1, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
 		return 0, err
 	}
 	var fnExport string
@@ -2154,6 +2170,10 @@ func newPlainInstance(engine *wasmtime.Engine, wasmBytes []byte) (*wasmtime.Stor
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("instance: %w", err)
+	}
+	// Input and slots live in pages 0-1, below the tables.
+	if err := setScratchBase(store, inst, int32(tableBase)); err != nil {
+		return nil, nil, nil, err
 	}
 	mem := inst.GetExport(store, "memory").Memory()
 	if mem == nil {
@@ -2625,6 +2645,10 @@ func benchTimeSet(tc testCase, wasmBytes []byte, input string, engine *wasmtime.
 	if err := writeSetInput(store, mem, plan, input); err != nil {
 		return 0, err
 	}
+	// Input, tuples and gates all lie above the tables here.
+	if err := setScratchBase(store, inst, setMemTop(plan)); err != nil {
+		return 0, err
+	}
 	drive, err := setDriver(tc, store, inst, mem, plan, int32(len(input)))
 	if err != nil {
 		return 0, err
@@ -2690,6 +2714,10 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 	if err := writeSetInput(store, mem, plan, input); err != nil {
 		return 0, err
 	}
+	// Input, tuples and gates all lie above the tables here.
+	if err := setScratchBase(store, inst, setMemTop(plan)); err != nil {
+		return 0, err
+	}
 	drive, err := setDriver(tc, store, inst, mem, plan, int32(len(input)))
 	if err != nil {
 		return 0, err
@@ -2702,10 +2730,31 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 	return before - after, nil
 }
 
+// setMemTop is one past everything a set bench writes: tuples, then the gate
+// array, both above outputBase.
+func setMemTop(plan setMemPlan) int32 {
+	return plan.outputBase + setOutCap*16 + 4096
+}
+
+// setScratchBase tells a standalone module's Backtracking fallback the lowest
+// address it may use as run-time scratch (abi.ScratchBaseExport): the first
+// byte above everything this harness writes. Left at 0 the fallback would take
+// fresh pages on every call that reaches it, and a benchmark repeats its calls.
+// A module with no Backtracking program has no such global.
+func setScratchBase(store *wasmtime.Store, inst *wasmtime.Instance, top int32) error {
+	exp := inst.GetExport(store, abi.ScratchBaseExport)
+	if exp == nil || exp.Global() == nil {
+		return nil
+	}
+	if err := exp.Global().Set(store, wasmtime.ValI32(top)); err != nil {
+		return fmt.Errorf("set %s: %w", abi.ScratchBaseExport, err)
+	}
+	return nil
+}
+
 func writeSetInput(store *wasmtime.Store, mem *wasmtime.Memory, plan setMemPlan, input string) error {
 	const pageSize = 65536
-	// Tuples, then the gate array, both above outputBase.
-	needTop := uint64(plan.outputBase) + uint64(setOutCap)*16 + 4096
+	needTop := uint64(setMemTop(plan))
 	neededPages := (needTop + pageSize - 1) / pageSize
 	curPages := mem.Size(store)
 	if neededPages > curPages {

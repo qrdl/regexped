@@ -2850,3 +2850,92 @@ func TestCompileFallback_NilSuffixDFANoPanic(t *testing.T) {
 	// Panics fail the test by default; no assertion needed beyond returning.
 	compileFallback([]*PatternInfo{info}, CompileSetOptions{MaxFallbackStates: 8}, nil)
 }
+
+// TestWideSetShapesCompile covers the set paths that only a set with more
+// patterns than the narrow 64-id accept mask can hold ever reaches: the wide
+// union-scan body and its alive mask, the wide anchored union, and the
+// id-space arithmetic that goes with them.
+func TestWideSetShapesCompile(t *testing.T) {
+	mk := func(n int, f func(int) string) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = f(i)
+		}
+		return out
+	}
+	families := []struct {
+		name string
+		pats []string
+	}{
+		{"literals70", mk(70, func(i int) string { return fmt.Sprintf("k%03d", i) })},
+		{"classes70", mk(70, func(i int) string { return fmt.Sprintf("[a-z]%02dx", i%100) })},
+		{"literals130", mk(130, func(i int) string { return fmt.Sprintf("w%03dz", i) })},
+		{"literals300", mk(300, func(i int) string { return fmt.Sprintf("q%04d", i) })},
+		{"counted70", mk(70, func(i int) string { return fmt.Sprintf("[a-c]{%d,}d", i%5+1) })},
+		{"alts90", mk(90, func(i int) string { return fmt.Sprintf("(?:a|b)%02d", i%50) })},
+	}
+	for _, f := range families {
+		for _, ov := range []bool{false, true} {
+			for _, all := range []bool{false, true} {
+				for _, hints := range [][]string{nil, {"prefer-no-match"}, {"prefer-match"}} {
+					name := fmt.Sprintf("%s/ov=%v/all=%v/%v", f.name, ov, all, hints)
+					t.Run(name, func(t *testing.T) {
+						entries := make([]config.RegexEntry, len(f.pats))
+						names := make([]string, len(f.pats))
+						for i, p := range f.pats {
+							names[i] = fmt.Sprintf("p%d", i)
+							entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+						}
+						sc := config.SetConfig{
+							Name: "s", Overlapping: ov, Hints: hints,
+							MatchAny: "ma", ScanAny: "sa", Find: "fi",
+							Patterns: config.PatternSelector{Names: names},
+						}
+						if all {
+							sc.MatchAll, sc.ScanAll = "mall", "sall"
+						}
+						if _, _, err := CompileFile(
+							config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
+							t.Fatalf("CompileFile: %v", err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestSetWithPatternDroppedAtStateLimit covers the set emitter's handling of a
+// member the packer DROPPED: its bit is still carried by the union automaton
+// but named by no bucket, so the emitted mask arithmetic has to restrict the
+// answer to the patterns that can actually be reported.
+//
+// A low MaxFallbackStates is what forces the drop; nothing else in the suite
+// compiles a set that loses a member this way.
+func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
+	fams := [][]string{
+		{`[a-z]{0,60}x`, `abc`, `def`},
+		{`(?s).{0,80}q`, `k1`, `k2`, `k3`},
+		{`[a-z]{0,40}Z`, `[0-9]{0,40}Y`, `p`},
+		{`\w{0,50}!`, `foo`, `bar`, `baz`},
+	}
+	for _, f := range fams {
+		entries := make([]config.RegexEntry, len(f))
+		names := make([]string, len(f))
+		for i, p := range f {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		for _, lim := range []int{2, 4, 8, 16, 32} {
+			for _, ov := range []bool{false, true} {
+				sc := config.SetConfig{Name: "s", Overlapping: ov,
+					MatchAny: "ma", MatchAll: "mall", ScanAny: "sa", ScanAll: "sall", Find: "fi",
+					Patterns: config.PatternSelector{Names: names}}
+				if _, _, err := CompileFile(config.BuildConfig{
+					Regexps: entries, Sets: []config.SetConfig{sc}, MaxFallbackStates: lim}, ""); err != nil {
+					t.Fatalf("CompileFile(%v, limit=%d): %v", f, lim, err)
+				}
+			}
+		}
+	}
+}

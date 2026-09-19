@@ -648,6 +648,18 @@ func boundaryTargetReachesLaterState(prog *syntax.Prog, pc uint32, assertionIdx 
 // pattern's early match from suppressing transitions for other patterns.
 func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 	pBits []uint64, pIdx []int32) map[rune][]uint32 {
+	m, _ := nfaBuildInputMapSrc(prog, expanded, leftmostFirst, pBits, pIdx, false)
+	return m
+}
+
+// nfaBuildInputMapSrc is nfaBuildInputMap that can also report where each entry
+// came from: with wantSrc, src[r][i] is the pc of the instruction whose Out is
+// m[r][i]. TDFA needs that to choose a transition's capture source — Out alone
+// cannot say which thread consumed the byte, because Go's compiler points every
+// alternative's final consumer at one shared continuation. m is identical with
+// and without wantSrc; src is nil without it.
+func nfaBuildInputMapSrc(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
+	pBits []uint64, pIdx []int32, wantSrc bool) (m map[rune][]uint32, src map[rune][]uint32) {
 	// Pass 1: find which bytes need a private (non-shared) transition list —
 	// any byte named by a live InstRune/InstRune1 instruction (plus its
 	// case-folded siblings), and '\n' whenever an InstRuneAnyNotNL instruction
@@ -719,13 +731,24 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 		special['\n'] = true
 	}
 
-	m := make(map[rune][]uint32, len(special))
+	m = make(map[rune][]uint32, len(special))
+	if wantSrc {
+		src = make(map[rune][]uint32, len(special))
+	}
+	// record appends one entry for byte r: the continuation out and, with
+	// wantSrc, the pc of the instruction it came from.
+	record := func(r rune, pc, out uint32) {
+		m[r] = append(m[r], out)
+		if wantSrc {
+			src[r] = append(src[r], pc)
+		}
+	}
 
 	// Pass 2: the original single walk over `expanded`, unchanged in logic —
 	// only the InstRuneAny/InstRuneAnyNotNL cases now fan out over the (small)
 	// special set plus one shared defaultOut accumulator instead of looping
 	// over all 256 bytes individually.
-	var defaultOut []uint32
+	var defaultOut, defaultSrc []uint32
 	seenMatch := false       // single-pattern mode
 	var seenMatchBits uint64 // multi-pattern mode
 	// wideSeen is the >64-pattern form of seenMatchBits: suppression keyed on
@@ -781,7 +804,7 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 		case syntax.InstRune1:
 			r := inst.Rune[0]
 			if special[r] {
-				m[r] = append(m[r], inst.Out)
+				record(r, pc, inst.Out)
 			}
 			if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
 				seen := make(map[rune]bool)
@@ -790,7 +813,7 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 					if !seen[folded] {
 						seen[folded] = true
 						if special[folded] {
-							m[folded] = append(m[folded], inst.Out)
+							record(folded, pc, inst.Out)
 						}
 					}
 				}
@@ -813,7 +836,7 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 				}
 				for r := lo; r <= hi; r++ {
 					if special[r] {
-						m[r] = append(m[r], inst.Out)
+						record(r, pc, inst.Out)
 					}
 					if isFoldCase {
 						seen := make(map[rune]bool)
@@ -822,7 +845,7 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 							if !seen[folded] && (folded < minRune || folded > maxRune) {
 								seen[folded] = true
 								if special[folded] {
-									m[folded] = append(m[folded], inst.Out)
+									record(folded, pc, inst.Out)
 								}
 							}
 						}
@@ -831,14 +854,20 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 			}
 		case syntax.InstRuneAny:
 			defaultOut = append(defaultOut, inst.Out)
+			if wantSrc {
+				defaultSrc = append(defaultSrc, pc)
+			}
 			for r := range special {
-				m[r] = append(m[r], inst.Out)
+				record(r, pc, inst.Out)
 			}
 		case syntax.InstRuneAnyNotNL:
 			defaultOut = append(defaultOut, inst.Out)
+			if wantSrc {
+				defaultSrc = append(defaultSrc, pc)
+			}
 			for r := range special {
 				if r != '\n' {
-					m[r] = append(m[r], inst.Out)
+					record(r, pc, inst.Out)
 				}
 			}
 		}
@@ -857,10 +886,13 @@ func nfaBuildInputMap(prog *syntax.Prog, expanded []uint32, leftmostFirst bool,
 				continue
 			}
 			m[r] = defaultOut
+			if wantSrc {
+				src[r] = defaultSrc
+			}
 		}
 	}
 
-	return m
+	return m, src
 }
 
 // nfaStatesKey returns a byte-exact encoding of an NFA state-PC slice, used
@@ -1110,6 +1142,20 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// call with the SAME (states, ctx) pair, whether that mid-accept hit is
 	// safe to stop the scan on (see isDominantMidAccept above).
 	markDominant := func(m map[int]uint64, state int, states []uint32, ctx int) {
+		// "Dominant" means this mid-accept outranks every other live thread
+		// under LEFTMOST-FIRST priority, which is the only order in which
+		// outranking means anything. A table built leftmost-LONGEST has no
+		// priority to speak of, so a dominance mark on one is a verdict the
+		// automaton cannot support, and a reader acting on it stops the walk
+		// early on a thread that was never beaten. That is bug 81: the lenient
+		// alternation's anchored-match body builds its per-branch helper DFAs
+		// leftmost-longest on purpose (see analyseLitChainAltLenient's
+		// leftmostFirst parameter and bug 35), and `0$0|-(\b|0)` over "-0"
+		// answered "no match" because the `\b` branch's accept was marked
+		// dominant and cut off the thread that would have consumed the rest.
+		if !leftmostFirst {
+			return
+		}
 		if isDominantMidAccept(states, ctx) {
 			m[state] = 1
 		}
@@ -2127,7 +2173,15 @@ func minimizeDFA(t *dfaTable) {
 	// Two states stay in the same class only if, for every input byte, their
 	// transitions land in the same class.  Repeat until stable.
 	// Dead state (-1 in transitions) is treated as its own implicit class (-1).
-	buf := make([]byte, 256*4) // reusable key buffer: 4 bytes per byte position
+	// Refinement only ever compares transition COLUMNS, and two bytes whose
+	// columns are identical from every state can never separate two states.
+	// So refine over one representative byte per equivalence class instead of
+	// all 256: the partition, and therefore the class numbering and the
+	// minimised table, are identical, but the inner loop shrinks by the
+	// compression ratio — which is 256/3 on the counted-repeat shapes where
+	// this function dominates a set compile.
+	_, mcRep, _ := computeByteClasses(t)
+	buf := make([]byte, len(mcRep)*4) // reusable key buffer: 4 bytes per byte class
 	passes := 0
 	for {
 		passes++
@@ -2154,23 +2208,25 @@ func minimizeDFA(t *dfaTable) {
 			// Encode: 4 bytes per byte position; dead→0, class c→c+1 (uint32 LE).
 			keyToNew := make(map[string]int, 4)
 			for _, s := range members {
-				for b := 0; b < 256; b++ {
-					next := t.transitions[s*256+b]
+				for c, rep := range mcRep {
+					next := t.transitions[s*256+rep]
 					var cv uint32
 					if next >= 0 {
 						cv = uint32(classOf[next]) + 1
 					}
-					buf[b*4] = byte(cv)
-					buf[b*4+1] = byte(cv >> 8)
-					buf[b*4+2] = byte(cv >> 16)
-					buf[b*4+3] = byte(cv >> 24)
+					buf[c*4] = byte(cv)
+					buf[c*4+1] = byte(cv >> 8)
+					buf[c*4+2] = byte(cv >> 16)
+					buf[c*4+3] = byte(cv >> 24)
 				}
-				key := string(buf)
-				nc, ok := keyToNew[key]
+				// A map lookup keyed by string(someBytes) does not allocate;
+				// only the insert does, and that happens once per NEW class
+				// rather than once per state per pass.
+				nc, ok := keyToNew[string(buf)]
 				if !ok {
 					nc = newNumClasses
 					newNumClasses++
-					keyToNew[key] = nc
+					keyToNew[string(buf)] = nc
 				}
 				newClassOf[s] = nc
 			}
@@ -2664,7 +2720,11 @@ type dfaLayoutParams struct {
 	lmWideShufti         bool
 	lmClassChain         bool
 	forceWordChar        bool
-	report               *Reporter
+	// forceNewline builds the newline pre-accept table outside find mode, for
+	// the lenient alternation's inline DFA verify, which is a find body over a
+	// non-find layout. Like forceWordChar, but for (?m:$) before a '\n'.
+	forceNewline bool
+	report       *Reporter
 }
 
 func buildDFALayout(p dfaLayoutParams) *dfaLayout {
@@ -2919,8 +2979,9 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		wbAcceptSize = int32(l.numWASM) * 2
 	}
 
-	// Newline-boundary pre-transition accept flag (find mode only).
-	if needFind && t.hasNewlineBoundary {
+	// Newline-boundary pre-transition accept flag (find mode, or forced).
+	wantNewline := needFind || p.forceNewline
+	if wantNewline && t.hasNewlineBoundary {
 		l.midAcceptNLOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize + wbAcceptSize
 		l.midAcceptNLBytes = make([]byte, l.numWASM)
 		// See the midAcceptNWBytes/midAcceptWBytes comment above: 1 =
@@ -2936,7 +2997,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		}
 	}
 	nlAcceptSize := int32(0)
-	if needFind && t.hasNewlineBoundary {
+	if wantNewline && t.hasNewlineBoundary {
 		nlAcceptSize = int32(l.numWASM)
 	}
 
@@ -2961,6 +3022,17 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// comes out right, which is why `\b,` and `\bfoo` were always correct.
 		wbAcceptNWMidWord := t.hasWordBoundary && t.midAcceptNWStates[t.midStartWordState] != 0
 		wbAcceptWMidWord := t.hasWordBoundary && t.midAcceptWStates[t.midStartWordState] != 0
+		// The newline channel has the same gap: an empty-width accept that holds
+		// only when the NEXT byte is '\n'. For `\b(?m:$)` it lives in
+		// midStartWordState alone (prev=word, next='\n' is the boundary), no
+		// start context consumes a byte, and nothing above flags '\n' — so the
+		// fast-skip passed over every such position and only the end-of-input
+		// accept was ever found: "a\n" matched nothing where Go answers [1,1).
+		// `\B(?m:$)` escaped only because its start state accepts the empty
+		// input, which flags every byte.
+		nlAcceptCtx := t.hasNewlineBoundary && (t.midAcceptNLStates[t.midStartState] != 0 ||
+			t.midAcceptNLStates[t.startState] != 0 || t.midAcceptNLStates[t.midStartWordState] != 0 ||
+			t.midAcceptNLStates[t.midStartNewlineState] != 0)
 		if t.midAcceptStates[t.midStartState] != 0 || t.midAcceptStates[t.startState] != 0 || t.acceptStates[t.startState] != 0 ||
 			(wbAcceptNWMid && wbAcceptWMid) || (wbAcceptNWStart0 && wbAcceptWStart0) ||
 			(wbAcceptNWMidWord && wbAcceptWMidWord) {
@@ -3000,6 +3072,9 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 				if wbAcceptNWMidWord && !isWordCharByte(byte(b)) {
 					l.firstByteFlags[b] = 1
 				}
+				if nlAcceptCtx && b == '\n' {
+					l.firstByteFlags[b] = 1
+				}
 			}
 		}
 
@@ -3025,48 +3100,98 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 				l.teddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
 				l.teddyHiBytes[fb>>4] |= byte(1 << uint(i))
 			}
+			// The tiers below ask, per first byte, which following bytes keep
+			// the automaton alive. That has to be asked of EVERY state a find
+			// attempt can begin in, not just midStartState, because a context
+			// can leave a different — or an already-satisfied — continuation
+			// after the same first byte, and one filter bit cannot say "any
+			// next byte in one context, only '0' in the other". The union of
+			// their continuations goes into the filter, and an accept reachable
+			// from any of them makes a further byte requirement unsound.
+			//
+			//   - midStartWordState: "a0|\Ba" — from midStartState 'a' needs
+			//     a following '0'; from the word context \Ba completes at once.
+			//   - startState: "^0|10|00" — at position 0 '0' completes `^0`,
+			//     but from midStartState it only opens `00`. Walking the mid
+			//     context alone recorded '0' as the only byte after '0', so
+			//     position 0 of "0x..." was skipped once the input reached the
+			//     SIMD path. firstByteFlags always unioned this state; the
+			//     tiers did not.
+			//   - midStartNewlineState: the same gap for `(?m:^0)|10|00`, whose
+			//     attempts right after a '\n' begin in a state of their own.
+			//
+			// ctxStarts.s[0] is midStartState, whose death after a first byte
+			// still disables the tiers outright.
+			type liveSet struct {
+				s [4]int
+				n int
+			}
+			var ctxStarts liveSet
+			addCtx := func(s int) {
+				ctxStarts.s[ctxStarts.n] = s
+				ctxStarts.n++
+			}
+			addCtx(t.midStartState)
+			if t.hasWordBoundary {
+				addCtx(t.midStartWordState)
+			}
+			if t.startState != t.midStartState {
+				addCtx(t.startState)
+			}
+			if t.hasNewlineBoundary && t.midStartNewlineState != t.midStartState {
+				addCtx(t.midStartNewlineState)
+			}
+			// liveAfter returns the live successors of from on byte bv, with
+			// ok=false as soon as one of them can already accept.
+			liveAfter := func(from liveSet, bv int) (next liveSet, ok bool) {
+				for _, s := range from.s[:from.n] {
+					n := t.transitions[s*256+bv]
+					if n < 0 {
+						continue
+					}
+					if stateCanAcceptHere(n) {
+						return liveSet{}, false
+					}
+					next.s[next.n] = n
+					next.n++
+				}
+				return next, true
+			}
+			// markLive sets lane i's bit for every byte on which some state of
+			// from stays alive, and returns how many bytes that was.
+			markLive := func(lo, hi []byte, i int, from liveSet) int {
+				count := 0
+				for bv := 0; bv < 256; bv++ {
+					for _, s := range from.s[:from.n] {
+						if t.transitions[s*256+bv] >= 0 {
+							count++
+							lo[bv&0x0F] |= byte(1 << uint(i))
+							hi[bv>>4] |= byte(1 << uint(i))
+							break
+						}
+					}
+				}
+				return count
+			}
+
 			t1Lo := make([]byte, 16)
 			t1Hi := make([]byte, 16)
 			useTwoByte := true
+			// afterFB[i]: the states the start contexts reach on
+			// l.firstBytes[i]. T2 and T3 thread it further.
+			afterFB := make([]liveSet, len(l.firstBytes))
 			for i, fb := range l.firstBytes {
-				stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
-				if stateAfterFB < 0 || stateCanAcceptHere(stateAfterFB) {
+				if t.transitions[t.midStartState*256+int(fb)] < 0 {
 					useTwoByte = false
 					break
 				}
-				// midStartWordState (prev=word context) can resolve a leading
-				// \b/\B differently than midStartState, landing on a state
-				// with a divergent — or already-satisfied — continuation
-				// requirement after the same first byte fb. E.g. "a0|\Ba":
-				// from midStartState 'a' leaves only the "a0" thread alive
-				// (needs a following '0'); from midStartWordState \Ba
-				// completes the match right there, so no second byte is
-				// required at all. A single T1 filter bit can't express "any
-				// second byte OK in one context, only '0' in the other", so
-				// both possibilities must be unioned into the filter, and an
-				// immediate accept from either context makes any second-byte
-				// requirement unsound.
-				stateAfterFBWord := -1
-				if t.hasWordBoundary {
-					stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
-					if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
-						useTwoByte = false
-						break
-					}
+				after, ok := liveAfter(ctxStarts, int(fb))
+				if !ok {
+					useTwoByte = false
+					break
 				}
-				validCount := 0
-				for b2 := 0; b2 < 256; b2++ {
-					valid := t.transitions[stateAfterFB*256+b2] >= 0
-					if stateAfterFBWord >= 0 && t.transitions[stateAfterFBWord*256+b2] >= 0 {
-						valid = true
-					}
-					if valid {
-						validCount++
-						t1Lo[b2&0x0F] |= byte(1 << uint(i))
-						t1Hi[b2>>4] |= byte(1 << uint(i))
-					}
-				}
-				if validCount == 0 || validCount > 64 {
+				afterFB[i] = after
+				if n := markLive(t1Lo, t1Hi, i, after); n == 0 || n > 64 {
 					useTwoByte = false
 					break
 				}
@@ -3077,57 +3202,23 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 				l.teddyT1LoOff = l.teddyHiOff + 16
 				l.teddyT1HiOff = l.teddyT1LoOff + 16
 
-				// Try T2 tables (third byte). Same midStartState/
-				// midStartWordState union as T1 above, threaded one byte
-				// further.
+				// Try T2 tables (third byte): the same start-context union as
+				// T1, threaded one byte further.
 				t2Lo := make([]byte, 16)
 				t2Hi := make([]byte, 16)
 				useThreeByte := true
 			outerThreeByte:
-				for i, fb := range l.firstBytes {
-					stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
-					if stateAfterFB < 0 {
-						useThreeByte = false
-						break
-					}
-					stateAfterFBWord := -1
-					if t.hasWordBoundary {
-						stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
-						if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
+				for i := range l.firstBytes {
+					for b2 := 0; b2 < 256; b2++ {
+						after2, ok := liveAfter(afterFB[i], b2)
+						if !ok {
 							useThreeByte = false
 							break outerThreeByte
 						}
-					}
-					for b2 := 0; b2 < 256; b2++ {
-						stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
-						stateAfterFB2Word := -1
-						if stateAfterFBWord >= 0 {
-							stateAfterFB2Word = t.transitions[stateAfterFBWord*256+b2]
-						}
-						if stateAfterFB2 < 0 && stateAfterFB2Word < 0 {
+						if after2.n == 0 {
 							continue
 						}
-						if stateAfterFB2 >= 0 && stateCanAcceptHere(stateAfterFB2) {
-							useThreeByte = false
-							break outerThreeByte
-						}
-						if stateAfterFB2Word >= 0 && stateCanAcceptHere(stateAfterFB2Word) {
-							useThreeByte = false
-							break outerThreeByte
-						}
-						validCount3 := 0
-						for b3 := 0; b3 < 256; b3++ {
-							valid := stateAfterFB2 >= 0 && t.transitions[stateAfterFB2*256+b3] >= 0
-							if stateAfterFB2Word >= 0 && t.transitions[stateAfterFB2Word*256+b3] >= 0 {
-								valid = true
-							}
-							if valid {
-								validCount3++
-								t2Lo[b3&0x0F] |= byte(1 << uint(i))
-								t2Hi[b3>>4] |= byte(1 << uint(i))
-							}
-						}
-						if validCount3 == 0 || validCount3 > 64 {
+						if n := markLive(t2Lo, t2Hi, i, after2); n == 0 || n > 64 {
 							useThreeByte = false
 							break outerThreeByte
 						}
@@ -3139,76 +3230,29 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 					l.teddyT2LoOff = l.teddyT1HiOff + 16
 					l.teddyT2HiOff = l.teddyT2LoOff + 16
 
-					// Try T3 tables (fourth byte). Same union, threaded two
+					// Try T3 tables (fourth byte): the same union, threaded two
 					// bytes further.
 					t3Lo := make([]byte, 16)
 					t3Hi := make([]byte, 16)
 					useFourByte := true
 				outerFourByte:
-					for i, fb := range l.firstBytes {
-						stateAfterFB := t.transitions[t.midStartState*256+int(fb)]
-						if stateAfterFB < 0 {
-							useFourByte = false
-							break
-						}
-						stateAfterFBWord := -1
-						if t.hasWordBoundary {
-							stateAfterFBWord = t.transitions[t.midStartWordState*256+int(fb)]
-							if stateAfterFBWord >= 0 && stateCanAcceptHere(stateAfterFBWord) {
-								useFourByte = false
-								break outerFourByte
-							}
-						}
+					for i := range l.firstBytes {
 						for b2 := 0; b2 < 256; b2++ {
-							stateAfterFB2 := t.transitions[stateAfterFB*256+b2]
-							stateAfterFB2Word := -1
-							if stateAfterFBWord >= 0 {
-								stateAfterFB2Word = t.transitions[stateAfterFBWord*256+b2]
-							}
-							if stateAfterFB2 < 0 && stateAfterFB2Word < 0 {
-								continue
-							}
-							if stateAfterFB2 >= 0 && stateCanAcceptHere(stateAfterFB2) {
+							after2, ok := liveAfter(afterFB[i], b2)
+							if !ok {
 								useFourByte = false
 								break outerFourByte
 							}
-							if stateAfterFB2Word >= 0 && stateCanAcceptHere(stateAfterFB2Word) {
-								useFourByte = false
-								break outerFourByte
-							}
-							for b3 := 0; b3 < 256; b3++ {
-								stateAfterFB3 := -1
-								if stateAfterFB2 >= 0 {
-									stateAfterFB3 = t.transitions[stateAfterFB2*256+b3]
+							for b3 := 0; b3 < 256 && after2.n > 0; b3++ {
+								after3, ok := liveAfter(after2, b3)
+								if !ok {
+									useFourByte = false
+									break outerFourByte
 								}
-								stateAfterFB3Word := -1
-								if stateAfterFB2Word >= 0 {
-									stateAfterFB3Word = t.transitions[stateAfterFB2Word*256+b3]
-								}
-								if stateAfterFB3 < 0 && stateAfterFB3Word < 0 {
+								if after3.n == 0 {
 									continue
 								}
-								if stateAfterFB3 >= 0 && stateCanAcceptHere(stateAfterFB3) {
-									useFourByte = false
-									break outerFourByte
-								}
-								if stateAfterFB3Word >= 0 && stateCanAcceptHere(stateAfterFB3Word) {
-									useFourByte = false
-									break outerFourByte
-								}
-								validCount4 := 0
-								for b4 := 0; b4 < 256; b4++ {
-									valid := stateAfterFB3 >= 0 && t.transitions[stateAfterFB3*256+b4] >= 0
-									if stateAfterFB3Word >= 0 && t.transitions[stateAfterFB3Word*256+b4] >= 0 {
-										valid = true
-									}
-									if valid {
-										validCount4++
-										t3Lo[b4&0x0F] |= byte(1 << uint(i))
-										t3Hi[b4>>4] |= byte(1 << uint(i))
-									}
-								}
-								if validCount4 == 0 || validCount4 > 64 {
+								if n := markLive(t3Lo, t3Hi, i, after3); n == 0 || n > 64 {
 									useFourByte = false
 									break outerFourByte
 								}
@@ -3308,11 +3352,12 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		maxEnd(l.midAcceptNWOff, int64(l.numWASM))
 		maxEnd(l.midAcceptWOff, int64(l.numWASM))
 	}
+	// Non-nil in find mode, or outside it only when forceNewline built it.
+	if l.midAcceptNLBytes != nil {
+		maxEnd(l.midAcceptNLOff, int64(l.numWASM))
+	}
 	if needFind {
 		maxEnd(l.midAcceptOff, int64(l.numWASM))
-		if l.midAcceptNLBytes != nil {
-			maxEnd(l.midAcceptNLOff, int64(l.numWASM))
-		}
 		if len(l.prefix) == 0 {
 			maxEnd(l.firstByteOff, 256)
 			if len(l.teddyLoBytes) > 0 {
@@ -4501,6 +4546,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if l.needWordCharTable {
 				count += 3 // wordCharTable + midAcceptNW + midAcceptW
 			}
+			if l.midAcceptNLBytes != nil {
+				count++ // forceNewline only
+			}
 			ds = append(ds, count)
 			if l.needWordCharTable {
 				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
@@ -4522,6 +4570,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if l.needWordCharTable {
 				ds = appendDataSegment(ds, l.midAcceptNWOff, l.midAcceptNWBytes)
 				ds = appendDataSegment(ds, l.midAcceptWOff, l.midAcceptWBytes)
+			}
+			if l.midAcceptNLBytes != nil {
+				ds = appendDataSegment(ds, l.midAcceptNLOff, l.midAcceptNLBytes)
 			}
 		}
 	} else {
@@ -4580,6 +4631,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if l.needWordCharTable {
 				count += 3 // wordCharTable + midAcceptNW + midAcceptW
 			}
+			if l.midAcceptNLBytes != nil {
+				count++ // forceNewline only
+			}
 			ds = append(ds, count)
 			if l.needWordCharTable {
 				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
@@ -4600,6 +4654,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if l.needWordCharTable {
 				ds = appendDataSegment(ds, l.midAcceptNWOff, l.midAcceptNWBytes)
 				ds = appendDataSegment(ds, l.midAcceptWOff, l.midAcceptWBytes)
+			}
+			if l.midAcceptNLBytes != nil {
+				ds = appendDataSegment(ds, l.midAcceptNLOff, l.midAcceptNLBytes)
 			}
 		}
 	}
@@ -6105,6 +6162,8 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			midAcceptNLOff:     l.midAcceptNLOff,
 			hasNewlineBoundary: t.hasNewlineBoundary,
 			tableMemIdx:        tableMemIdx,
+			useRowDedup:        l.useRowDedup,
+			rowMapOff:          l.rowMapOff,
 		})
 	} else {
 		fp := findBodyParams{
@@ -7108,11 +7167,22 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 	hasNewlineBoundary bool,
 	posLocal, stateLocal byte,
 	tableMemIdx int) []byte {
+	return emitNLPreAcceptCheckLocals(b, midAcceptNLOff, hasNewlineBoundary,
+		0x00, posLocal, stateLocal, 0x05, tableMemIdx)
+}
+
+// emitNLPreAcceptCheckLocals is emitNLPreAcceptCheck for a body whose input
+// pointer and last-accept position are not locals 0 and 5 — the lenient
+// alternation's inline DFA verify, whose shape ([loop $dfa] directly inside
+// [block $dfa_done]) is the one foundBrDepth assumes, as for
+// emitWBPreAcceptCheck.
+func emitNLPreAcceptCheckLocals(b []byte, midAcceptNLOff int32,
+	hasNewlineBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	tableMemIdx int) []byte {
 	if !hasNewlineBoundary {
 		return b
 	}
-	const ptrLocal = 0x00
-	const lastAcceptLocal = 0x05
 	const foundBrDepth = 4
 	b = append(b, 0x20, ptrLocal)
 	b = append(b, 0x20, posLocal)
@@ -7643,6 +7713,15 @@ type anchoredFindBodyParams struct {
 	midAcceptNLOff     int32
 	hasNewlineBoundary bool
 	tableMemIdx        int
+	// The u16 row-dedup indirection, exactly as findBodyParams carries it.
+	// These are NOT optional: a layout that deduped its rows stores
+	// numUniqueRows rows, not numWASM, so indexing by state id reads another
+	// state's row and, once the id passes the row count, memory past the
+	// table. This body defaulted them to false/0 for as long as row dedup and
+	// the anchored find body have both existed, which is why `^.{0,150}0`
+	// answered "no match" and `\A.*.0.......` trapped.
+	useRowDedup bool
+	rowMapOff   int32
 }
 
 func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
@@ -7666,6 +7745,8 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 	midAcceptNLOff := p.midAcceptNLOff
 	hasNewlineBoundary := p.hasNewlineBoundary
 	tableMemIdx := p.tableMemIdx
+	useRowDedup := p.useRowDedup
+	rowMapOff := p.rowMapOff
 	var b []byte
 
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
@@ -7846,7 +7927,7 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	b = emitU16Transition(b, tableOff, false, 0, 0x02, 0x06, tableMemIdx)
+	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x06, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
@@ -13218,7 +13299,7 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 			b = append(b, 0x21, locPos)
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locState, locPos, locClass, locOutEnd,
-				tableMemIdx, 0)
+				tableMemIdx, 0, true)
 
 			// Anchored match: require last_accept == len for full input consumption.
 			b = append(b, 0x20, locOutEnd)
@@ -14902,7 +14983,10 @@ type lenAltLayout struct {
 	tableEnd        int64
 }
 
-func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
+// find is true for the find body, whose inline DFA verify tests the newline
+// pre-accept channel, so each DFA branch's layout must carry that table; the
+// anchored match body needs a match ending at len and never reads it.
+func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool) lenAltLayout {
 	l := lenAltLayout{
 		branchBitmapOff: make([]int32, len(altp.branches)),
 	}
@@ -14938,6 +15022,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64) lenAltLayout {
 			lmNonMidShufti:       false,
 			lmWideShufti:         false,
 			forceWordChar:        br.dfaTable.hasWordBoundary,
+			forceNewline:         find && br.dfaTable.hasNewlineBoundary,
 		})
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
@@ -15010,9 +15095,12 @@ func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) 
 //	locOutEnd           — i32 (output: position one past last accepted byte)
 //
 // Constraint: dfaLayout.useU8 must be true (we capped DFA at 256 states).
+// fullConsumption is set by a caller whose contract is "the match must end at
+// len", which makes every mid-input accept unusable to it (see the
+// pre-accept block below).
 func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	locPtr, locLen, locState, locPos, locClass, locOutEnd byte,
-	tableMemIdx int, nextBranchDepth byte) []byte {
+	tableMemIdx int, nextBranchDepth byte, fullConsumption bool) []byte {
 
 	// Initialize: state = wasmStart; last_accept (locOutEnd) = -1.
 	b = append(b, 0x41)
@@ -15063,8 +15151,53 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// buildDFALayout call in planLenAltLayout) — a no-op otherwise. This
 	// loop is directly [loop $dfa, block $dfa_done], the same shape
 	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes.
-	b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
-		dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	// A full-consumption caller emits NO word-boundary pre-accept check, and
+	// this is not only an optimisation — leaving it in is bug 81.
+	//
+	// Three steps say the check cannot help such a caller. The loop tests
+	// `pos >= len` FIRST and leaves through the end-of-input arm above, so
+	// this check only ever runs while pos < len. It writes last_accept = pos,
+	// so every value it can write is below len. And last_accept's only
+	// consumers are the caller's `last_accept == len` test and its return, so
+	// a value below len always fails that test — identically to never having
+	// recorded anything.
+	//
+	// Leaving it in also breaks the answer, because emitWBPreAcceptCheck does
+	// not merely record: on a dominant hit it leaves the loop, killing the
+	// lower-priority thread that would have consumed the rest of the input.
+	// Measured over 2,688 lenient alternations that emit this check and every
+	// input of length 0-3 over "0-xy": emitting it and omitting it agree on
+	// all 228,480 answers, and today's shipped code (which also leaves the
+	// loop) is wrong against Go on 990 of them.
+	//
+	// THE ORDER OF THE LOOP IS LOAD-BEARING. If the `pos >= len` test above
+	// ever moves below this point, step one stops holding and this becomes a
+	// silent wrong answer.
+	if !fullConsumption {
+		b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
+			dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	}
+
+	// Newline pre-transition accept: `(?m:$)` before a '\n' is not a
+	// transition but this channel, tested against the byte about to be
+	// consumed. Without it a branch ending in `(?m:$)` matched only at end of
+	// input.
+	//
+	// Gated on !fullConsumption for the SAME reason as the word-boundary check
+	// above, and gated here rather than relied upon: it happens that
+	// planLenAltLayout never builds the newline table for the match layout
+	// (its forceNewline is `find && ...`), so this was already emitting
+	// nothing — but that is a fact about a function three call levels away,
+	// exactly the kind of indirect correctness this body's other gate exists
+	// to avoid. State the contract locally instead.
+	if !fullConsumption {
+		b = emitNLPreAcceptCheckLocals(b, dl.midAcceptNLOff, dl.midAcceptNLBytes != nil,
+			locPtr, locPos, locState, locOutEnd, tableMemIdx)
+	} else if dl.midAcceptNLBytes != nil {
+		// If the layout ever does build one for a full-consumption caller,
+		// the assumption above has changed and the emitted body would differ.
+		panic("emitInlineAnchoredDFAVerify: newline pre-accept table built for a full-consumption caller")
+	}
 
 	// Transition: state = table[state * numClasses + class(input[pos])].
 	if dl.useCompression {
@@ -15326,7 +15459,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 			b = append(b, 0x21, locDFAPos)
 			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
 				locPtr, locLen, locDFAState, locDFAPos, locDFAClass, locDFAOutEnd,
-				tableMemIdx, 0)
+				tableMemIdx, 0, false)
 			// Success — return packed (attempt_start, locDFAOutEnd).
 			b = emitReturnPackedI64FromLocal(b, locAttemptStart, locDFAOutEnd)
 		}

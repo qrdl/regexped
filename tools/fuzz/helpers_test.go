@@ -223,3 +223,54 @@ func cacheDriveAddrs(w []byte, inputLen int, canaryBelow bool) (inBase, gatePtr,
 	}
 	return inBase, gatePtr, outPtr, regionPtr, nil
 }
+
+// TestSetKeyDistinguishesPatternOrderAndSeparators pins the set module cache's
+// key against FUZZER_BUGS bug 87.
+//
+// The cache is keyed by the caller, and the four set callers used to build the
+// key with fmt.Sprintf("%v", pats). %v joins a []string with a SPACE, so
+// {" ", ""} and {"", " "} both render as "[  ]" — one set then silently got
+// the other set's compiled module. A pattern's INDEX is its id, so swapping
+// two patterns swaps every id the set reports, and the harness checked one
+// module's answers against the other's oracle. Five crasher files came out of
+// that, all of which passed when replayed alone.
+//
+// Joining on a separator does not fix it either, whatever the separator: the
+// fuzzer mutates arbitrary bytes and Go's regexp compiles a NUL as an ordinary
+// literal, so a NUL join makes {"a\x00b"} and {"a", "b"} collide exactly as %v
+// did. Only a length prefix is injective.
+//
+// The pairs below are the ones that actually collided under each rejected
+// scheme, so this test fails if anyone reverts to either.
+func TestSetKeyDistinguishesPatternOrderAndSeparators(t *testing.T) {
+	pairs := [][2][]string{
+		{{" ", ""}, {"", " "}},     // the raw crashers: %v renders both "[  ]"
+		{{"a\x00b"}, {"a", "b"}},   // a NUL join would collide here
+		{{"a b"}, {"a", "b"}},      // a space join would collide here
+		{{""}, {"", ""}},           // arity must matter
+		{{"ab", "c"}, {"a", "bc"}}, // the split point must matter
+		{{"1:x"}, {"", "x"}},       // the length prefix must not be forgeable
+	}
+	for _, p := range pairs {
+		if a, b := setKey(p[0]), setKey(p[1]); a == b {
+			t.Errorf("setKey(%q) == setKey(%q) == %q: two different sets share one cache entry", p[0], p[1], a)
+		}
+	}
+}
+
+// TestSetCacheReturnsThePatternsOwnModule is the end-to-end half: the two
+// orderings must not hand back the same bytes, which is what the crashers saw.
+func TestSetCacheReturnsThePatternsOwnModule(t *testing.T) {
+	first, _, err := compileCaps([]string{" ", ""}, false)
+	if err != nil {
+		t.Fatalf("compile {\" \", \"\"}: %v", err)
+	}
+	second, _, err := compileCaps([]string{"", " "}, false)
+	if err != nil {
+		t.Fatalf("compile {\"\", \" \"}: %v", err)
+	}
+	if string(first) == string(second) {
+		t.Fatal(`compileCaps([" ", ""]) and compileCaps(["", " "]) returned the same module: ` +
+			`the cache key does not separate them, so one set is answering with the other's pattern ids`)
+	}
+}

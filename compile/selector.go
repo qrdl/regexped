@@ -117,11 +117,13 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 
 	// Capture groups: try TDFA first (O(n)), fall back to Backtrack for patterns TDFA
 	// cannot correctly handle: non-greedy quantifiers, multiline line anchors,
-	// word boundaries (broken \ b start-state construction), or overlapping greedy
-	// Alt branches where a quantifier's char class includes the following separator.
+	// a begin-of-text assertion anywhere but a start-anchored pattern's own
+	// start, word boundaries (broken \ b start-state construction), or
+	// overlapping greedy Alt branches where a quantifier's char class includes
+	// the following separator.
 	if hasCaptureGroups {
 		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
-			!hasWordBoundary && !hasAmbiguousCaptures(prog) {
+			!hasUnsafeBeginText(prog) && !hasWordBoundary && !hasAmbiguousCaptures(prog) {
 			tt, ok := newTDFA(prog, resolveMaxDFAStates(opts))
 			if ok && tt.numRegs > resolveMaxTDFARegs(opts) {
 				ok = false
@@ -318,6 +320,85 @@ func hasLineAnchors(prog *syntax.Prog) bool {
 			if flag&(syntax.EmptyBeginLine|syntax.EmptyEndLine|syntax.EmptyEndText) != 0 {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// hasUnsafeBeginText reports whether the NFA carries a begin-of-text assertion
+// (\A, or ^ outside multiline) in a position TDFA cannot honour.
+//
+// EmptyBeginText is the one empty-width op the other three gates let through:
+// hasLineAnchors covers EmptyBeginLine/EmptyEndLine/EmptyEndText and
+// hasWordBoundary covers \b/\B. TDFA does not honour it either. Its subset
+// construction is careful — the start closure uses ecBegin and every
+// mid-string closure ctx=0 (engine_tdfa.go) — but the capture-op walks that
+// decide which tag ops fire on a transition, tdfaEpsCapOps and
+// tdfaEpsCapOpsTo, traverse InstEmptyWidth unconditionally. So a `^` reached
+// after bytes have been consumed hands out capture positions for a branch
+// that cannot run: `0*(0|^)` over "0" reported group 1 as [1,1] (the `^`
+// branch, matching empty at 1) where RE2 says [0,1).
+//
+// Two shapes are unsafe, and one is not:
+//
+//   - Not start-anchored (StartCond lacks EmptyBeginText). The TDFA body is
+//     anchored and runs over the window the find pass picked, whose start need
+//     not be 0 — so even a leading `^` would be judged against the wrong
+//     position. `(^|x)(a)` over "yxa" is the shape.
+//   - Start-anchored but with an assertion reachable after a byte consumer:
+//     the window is position 0, but that assertion is false where it sits and
+//     the walks follow it anyway. `^(a)^(b)` is the shape.
+//   - Start-anchored with every assertion reachable only through epsilons from
+//     the start: true exactly where it is tested, which is the ordinary
+//     `^(\d{4})-(\d{2})` pattern. Left on TDFA.
+func hasUnsafeBeginText(prog *syntax.Prog) bool {
+	isBeginText := func(pc int) bool {
+		inst := &prog.Inst[pc]
+		return inst.Op == syntax.InstEmptyWidth &&
+			syntax.EmptyOp(inst.Arg)&syntax.EmptyBeginText != 0
+	}
+	any := false
+	for i := range prog.Inst {
+		if isBeginText(i) {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return false
+	}
+	if prog.StartCond()&syntax.EmptyBeginText == 0 {
+		return true
+	}
+	// Forward walk from the start, carrying "a byte has been consumed on this
+	// path". Two visit states per PC, so the walk terminates through loops.
+	const (
+		fresh = 1 << iota
+		consumed
+	)
+	seen := make([]int, len(prog.Inst))
+	queue := []struct{ pc, state int }{{prog.Start, fresh}}
+	for len(queue) > 0 {
+		it := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if it.pc < 0 || it.pc >= len(prog.Inst) || seen[it.pc]&it.state != 0 {
+			continue
+		}
+		seen[it.pc] |= it.state
+		if it.state == consumed && isBeginText(it.pc) {
+			return true
+		}
+		inst := &prog.Inst[it.pc]
+		next := it.state
+		switch inst.Op {
+		case syntax.InstFail, syntax.InstMatch:
+			continue
+		case syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			next = consumed
+		}
+		queue = append(queue, struct{ pc, state int }{int(inst.Out), next})
+		if inst.Op == syntax.InstAlt || inst.Op == syntax.InstAltMatch {
+			queue = append(queue, struct{ pc, state int }{int(inst.Arg), next})
 		}
 	}
 	return false

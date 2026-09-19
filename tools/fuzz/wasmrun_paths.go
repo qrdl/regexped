@@ -47,17 +47,21 @@ const (
 // anchored match function. No captures, so this exercises the DFA /
 // CompiledDFA / lit-chain match bodies.
 func compileMatch(pat string) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, MatchFunc: "match"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
-	return w, err
+	return cachedCompile("match\x00"+pat, func() ([]byte, error) {
+		entry := config.RegexEntry{Pattern: pat, MatchFunc: "match"}
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		return w, err
+	})
 }
 
 // compileGroups compiles pat with a groups export, letting the selector pick
 // the engine (TDFA when eligible, Backtracking otherwise).
 func compileGroups(pat string) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
-	return w, err
+	return cachedCompile("groups\x00"+pat, func() ([]byte, error) {
+		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		return w, err
+	})
 }
 
 // compileGroupsForced compiles pat with a groups export on a specific engine,
@@ -65,37 +69,53 @@ func compileGroups(pat string) ([]byte, error) {
 // this, whichever engine the selector prefers is the only one the fuzzer ever
 // sees for a given pattern shape, and the other backend stays dark.
 func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-	w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng)
-	return w, err
+	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), func() ([]byte, error) {
+		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng)
+		return w, err
+	})
+}
+
+// compileGroupsBudget compiles pat with a groups export forced onto
+// Backtracking under a given compile.CompileOptions.BTWorkBudget, so the fast
+// body and its fallback can each be run alone.
+func compileGroupsBudget(pat string, budget int) ([]byte, error) {
+	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), func() ([]byte, error) {
+		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true,
+			compile.EngineBacktrack, compile.CompileOptions{BTWorkBudget: budget})
+		return w, err
+	})
 }
 
 // compileSet compiles pats as one set exporting find_all. Patterns are named
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
-	entries := make([]config.RegexEntry, len(pats))
-	names := make([]string, len(pats))
-	for i, p := range pats {
-		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
-	}
-	sets := []config.SetConfig{{
-		Name: "s",
-		Find: "set_find",
-		// Ungated body: every start position is enumerated, which is what
-		// allStartPositionMatches models.
-		Overlapping: true,
-		Patterns:    config.PatternSelector{Names: names},
-	}}
-	// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
-	// tables always start at address 0 and the input CANNOT live at offset 0
-	// the way it does for the single-pattern paths. cfg.Output == "" selects
-	// standalone. runWasmSetFindAll therefore derives its layout from the
-	// emitted data section rather than using pathsInputBase.
-	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	w, _, diags, err := compile.CompileFileDiag(cfg, "")
-	return w, droppedFromSet(diags), err
+	return cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, map[int]bool, error) {
+		entries := make([]config.RegexEntry, len(pats))
+		names := make([]string, len(pats))
+		for i, p := range pats {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		sets := []config.SetConfig{{
+			Name: "s",
+			Find: "set_find",
+			// Ungated body: every start position is enumerated, which is what
+			// allStartPositionMatches models.
+			Overlapping: true,
+			Patterns:    config.PatternSelector{Names: names},
+		}}
+		// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
+		// tables always start at address 0 and the input CANNOT live at offset 0
+		// the way it does for the single-pattern paths. cfg.Output == "" selects
+		// standalone. runWasmSetFindAll therefore derives its layout from the
+		// emitted data section rather than using pathsInputBase.
+		cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+		w, _, diags, err := compile.CompileFileDiag(cfg, "")
+		return w, droppedFromSet(diags), err
+	})
 }
 
 // droppedFromSet returns the indices of the patterns the compiler EXCLUDED
@@ -183,6 +203,9 @@ func runWasmMatch(wasmBytes []byte, input string) (end int, ok bool, hang bool, 
 	if fn == nil {
 		return 0, false, false, fmt.Errorf("module missing match export")
 	}
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		return 0, false, false, err
+	}
 	if len(input) > 0 {
 		copy(mem.UnsafeData(store)[pathsInputBase:], input)
 	}
@@ -219,6 +242,10 @@ func runWasmGroupsPath(wasmBytes []byte, input string, numGroups int) (slots []i
 	fn := inst.GetFunc(store, "groups")
 	if fn == nil {
 		return nil, false, false, fmt.Errorf("module missing groups export")
+	}
+	// Input and slots both lie below the tables.
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		return nil, false, false, err
 	}
 	buf := mem.UnsafeData(store)
 	if len(input) > 0 {
@@ -314,6 +341,11 @@ func runWasmSetFind(wasmBytes []byte, input string, numPatterns int) (matches []
 		if _, growErr := mem.Grow(store, neededPages-cur); growErr != nil {
 			return nil, false, fmt.Errorf("memory.Grow to %d pages: %w", neededPages, growErr)
 		}
+	}
+	// Input, gates and tuples all lie ABOVE the tables here, so the scratch
+	// has to start past the tuple buffer.
+	if err := setScratchBase(store, inst, int32(int64(outBase)+outBytes)); err != nil {
+		return nil, false, err
 	}
 	for i := int32(0); i < pageSize; i++ {
 		mem.UnsafeData(store)[gateBase+i] = 0

@@ -912,7 +912,9 @@ func TestGenJSSetSection(t *testing.T) {
 		"patternName",
 		"patternId",
 		"_exp",
-		"_mem",
+		// The live buffer, not the cached `_mem` view: a call into the module
+		// may grow memory and detach it.
+		"_exp.memory.buffer",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {
@@ -935,7 +937,7 @@ func TestGenTSSetSection(t *testing.T) {
 		"scannerPatternCount",
 		"patternName",
 		"_exp",
-		"_mem",
+		"(_exp.memory as WebAssembly.Memory).buffer",
 	}
 	for _, s := range required {
 		if !strings.Contains(out, s) {

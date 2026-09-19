@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"math/bits"
 	"regexp/syntax"
 	"sort"
 	"strconv"
@@ -100,6 +101,117 @@ const scratchRegSentinel = -2
 // its destination first. When only cycles remain (A needs B's slot, B needs
 // A's), one is broken by spilling to a scratch register.
 func sequentializeCopies(copyOps []tdfaTagOp) []tdfaTagOp {
+	if len(copyOps) <= 1 {
+		return append([]tdfaTagOp(nil), copyOps...)
+	}
+
+	n := len(copyOps)
+	dsts := make([]int, 0, n)
+	for _, op := range copyOps {
+		dsts = append(dsts, op.dst)
+	}
+	sort.Ints(dsts)
+
+	idxOf := make(map[int]int, n)
+	for i, d := range dsts {
+		idxOf[d] = i
+	}
+	if len(idxOf) != n {
+		// Destinations are distinct by construction (the rename is bijective,
+		// see this function's doc comment). Deferring to the reference
+		// implementation here would not help: it keys `srcOf` by destination
+		// too, so a duplicate silently drops the earlier op there as well.
+		// Both paths would be wrong, so say so instead of picking one.
+		panic("sequentializeCopies: duplicate destination registers; the rename is not bijective")
+	}
+
+	srcv := make([]int, n)
+	for _, op := range copyOps {
+		srcv[idxOf[op.dst]] = op.src
+	}
+
+	// pending[i] counts the still-remaining ops that read dsts[i], which is
+	// exactly the "needed" set sequentializeCopiesRoundwise rebuilds from
+	// scratch on every round. Maintaining it incrementally is the whole of
+	// this function's advantage: a fresh map plus n hashed inserts per round,
+	// over up to n rounds, was measured at 60% of one 22-second compile.
+	pending := make([]int, n)
+	for j := 0; j < n; j++ {
+		if k, ok := idxOf[srcv[j]]; ok {
+			pending[k]++
+		}
+	}
+
+	remaining := make([]bool, n)
+	for i := range remaining {
+		remaining[i] = true
+	}
+	left := n
+
+	result := make([]tdfaTagOp, 0, n+2)
+	emitted := make([]int, 0, n)
+	for left > 0 {
+		// The ROUND STRUCTURE is load-bearing, not incidental. Safety is
+		// judged against the state at the START of a round and every safe
+		// destination is emitted in sorted order within it, so decrements are
+		// deferred to the round's end. Decrementing as you go would free a
+		// later destination inside the same round and emit it early, which is
+		// a different sequence — and a different sequence here reads a
+		// clobbered register, silently.
+		emitted = emitted[:0]
+		for i := 0; i < n; i++ {
+			if !remaining[i] || pending[i] != 0 {
+				continue
+			}
+			result = append(result, tdfaTagOp{dst: dsts[i], src: srcv[i]})
+			remaining[i] = false
+			left--
+			emitted = append(emitted, i)
+		}
+		if len(emitted) > 0 {
+			for _, i := range emitted {
+				if k, ok := idxOf[srcv[i]]; ok {
+					pending[k]--
+				}
+			}
+			continue
+		}
+
+		breakIdx := -1
+		for i := 0; i < n; i++ {
+			if remaining[i] {
+				breakIdx = i
+				break
+			}
+		}
+		result = append(result, tdfaTagOp{dst: scratchRegSentinel, src: dsts[breakIdx]})
+		result = append(result, tdfaTagOp{dst: dsts[breakIdx], src: srcv[breakIdx]})
+		remaining[breakIdx] = false
+		left--
+		if k, ok := idxOf[srcv[breakIdx]]; ok {
+			pending[k]--
+		}
+		// No decrement of pending[breakIdx] here: breakIdx has already left
+		// `remaining`, so nothing reads its counter again.
+		for j := 0; j < n; j++ {
+			if remaining[j] && srcv[j] == dsts[breakIdx] {
+				srcv[j] = scratchRegSentinel
+			}
+		}
+	}
+	return result
+}
+
+// sequentializeCopiesRoundwise is the REFERENCE implementation of
+// sequentializeCopies: the same algorithm written the obvious way, rebuilding
+// the "who still needs reading" set from scratch on every round.
+//
+// It is reachable only if the bijective-rename invariant is violated, and it
+// is kept for two reasons: it is what the fast path must reproduce exactly,
+// op for op, and TestSequentializeCopiesMatchesReference holds the two to
+// that. A divergence here does not fail loudly — it emits a copy that reads a
+// register another copy in the same batch has already overwritten.
+func sequentializeCopiesRoundwise(copyOps []tdfaTagOp) []tdfaTagOp {
 	if len(copyOps) <= 1 {
 		return append([]tdfaTagOp(nil), copyOps...)
 	}
@@ -231,45 +343,126 @@ func tdfaEpsCapOps(prog *syntax.Prog, fromPC int, visited map[int]bool) (targetP
 	return -1, nil
 }
 
-// tdfaEpsCapOpsTo follows epsilon transitions from fromPC looking for targetPC,
-// collecting InstCapture ops along the way. Tries Alt.Out then Alt.Arg.
-// Returns (true, ops) if targetPC is found, (false, nil) otherwise.
-// Used in processTransition to correctly find capture ops through Alt loops.
-func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bool) (bool, []captureOp) {
-	if fromPC < 0 || fromPC >= len(prog.Inst) || visited[fromPC] {
+// epsWalker follows epsilon transitions from one PC looking for another,
+// collecting InstCapture ops along the way: Alt.Out before Alt.Arg, so the ops
+// come back in leftmost-first order. newTDFA's transition construction uses it
+// to find capture ops through Alt loops.
+//
+// It exists as a WORKSPACE rather than a function because its two allocations
+// sat in the innermost loop of the construction — a fresh map[int]bool per
+// call, at one call per source thread per byte per state, and a new slice per
+// capture. One generation-stamped visited array and one reusable buffer per
+// construction replace both.
+type epsWalker struct {
+	prog *syntax.Prog
+	seen []uint32
+	gen  uint32
+	buf  []captureOp
+}
+
+func newEpsWalker(prog *syntax.Prog) *epsWalker {
+	return &epsWalker{prog: prog, seen: make([]uint32, len(prog.Inst))}
+}
+
+// find reports whether targetPC is reachable from fromPC through epsilons, and
+// returns the capture ops on the path that reached it.
+//
+// The returned slice is the walker's OWN buffer and is only VALID UNTIL THE
+// NEXT CALL to find. Both callers in newTDFA consume it immediately — one
+// inside the `if` that tested `found`, the other before the `break` that ends
+// its loop — so nothing copies it. Copying here instead would put an
+// allocation per successful thread back into the innermost loop, which is the
+// cost this type exists to remove. A caller that needs to keep the ops past
+// its next find must copy them itself; tdfaEpsCapOpsTo does.
+func (w *epsWalker) find(fromPC, targetPC int) (bool, []captureOp) {
+	w.gen++
+	if w.gen == 0 {
+		for i := range w.seen {
+			w.seen[i] = 0
+		}
+		w.gen = 1
+	}
+	w.buf = w.buf[:0]
+	if !w.walk(fromPC, targetPC) {
 		return false, nil
 	}
-	if fromPC == targetPC {
+	return true, w.buf
+}
+
+func (w *epsWalker) walk(fromPC, targetPC int) bool {
+	// Iterative in the TAIL positions, and reading each instruction through a
+	// POINTER.
+	//
+	// Every arm but one recurses in tail position — Nop and EmptyWidth on Out,
+	// Capture on Out, Alt on Arg after its Out branch failed — so those become
+	// `fromPC = …; continue` and only Alt's FIRST branch is still a call. The
+	// buffer rollback survives the change: a recursive frame truncated to its
+	// own mark on failure, and since each frame's mark is at least the one
+	// below it, the net effect after the whole chain fails is a truncation to
+	// the OUTERMOST mark — which is what entryMark is.
+	//
+	// `inst := w.prog.Inst[fromPC]` copied a whole syntax.Inst (Op, Out, Arg
+	// and a Rune slice header) at every node, and was the single most
+	// expensive line in this function.
+	insts := w.prog.Inst
+	entryMark := len(w.buf)
+	for {
+		if fromPC < 0 || fromPC >= len(insts) || w.seen[fromPC] == w.gen {
+			w.buf = w.buf[:entryMark]
+			return false
+		}
+		if fromPC == targetPC {
+			return true
+		}
+		w.seen[fromPC] = w.gen
+		inst := &insts[fromPC]
+		switch inst.Op {
+		case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			w.buf = w.buf[:entryMark]
+			return false
+		case syntax.InstCapture:
+			op := captureOp{open: inst.Arg&1 == 0, group: int(inst.Arg >> 1)}
+			w.buf = append(w.buf, op)
+			fromPC = int(inst.Out)
+		case syntax.InstNop, syntax.InstEmptyWidth:
+			fromPC = int(inst.Out)
+		case syntax.InstAlt, syntax.InstAltMatch:
+			mark := len(w.buf)
+			if w.walk(int(inst.Out), targetPC) {
+				return true
+			}
+			w.buf = w.buf[:mark]
+			fromPC = int(inst.Arg)
+		default:
+			w.buf = w.buf[:entryMark]
+			return false
+		}
+	}
+}
+
+// tdfaEpsCapOpsTo is a thin adapter over epsWalker, kept so the unit tests that
+// address this signature exercise the LIVE walker rather than a second copy of
+// the algorithm. Production calls epsWalker.find directly; this has no callers
+// outside tests.
+//
+// `visited` is honoured: its PCs are pre-marked in the walker's generation
+// array, which is what the "already visited" test depends on. The ops are
+// COPIED out, because find's buffer is only valid until its next call.
+func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bool) (bool, []captureOp) {
+	w := newEpsWalker(prog)
+	w.gen = 1
+	for pc, seen := range visited {
+		if seen && pc >= 0 && pc < len(w.seen) {
+			w.seen[pc] = w.gen
+		}
+	}
+	if !w.walk(fromPC, targetPC) {
+		return false, nil
+	}
+	if len(w.buf) == 0 {
 		return true, nil
 	}
-	visited[fromPC] = true
-	inst := prog.Inst[fromPC]
-	switch inst.Op {
-	case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-		return false, nil // byte consumer or terminal — not the target
-	case syntax.InstCapture:
-		var op captureOp
-		if inst.Arg&1 == 0 {
-			op = captureOp{open: true, group: int(inst.Arg >> 1)}
-		} else {
-			op = captureOp{open: false, group: int(inst.Arg >> 1)}
-		}
-		ok, rest := tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
-		if !ok {
-			return false, nil
-		}
-		return true, append([]captureOp{op}, rest...)
-	case syntax.InstNop:
-		return tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
-	case syntax.InstAlt, syntax.InstAltMatch:
-		if ok, ops := tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited); ok {
-			return true, ops
-		}
-		return tdfaEpsCapOpsTo(prog, int(inst.Arg), targetPC, visited)
-	case syntax.InstEmptyWidth:
-		return tdfaEpsCapOpsTo(prog, int(inst.Out), targetPC, visited)
-	}
-	return false, nil
+	return true, append([]captureOp(nil), w.buf...)
 }
 
 // --------------------------------------------------------------------------
@@ -624,6 +817,11 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	// ops on the path to the first byte consumer.
 	entryVisited := make(map[int]bool)
 	entryTargetPC, entryCapOps := tdfaEpsCapOps(prog, prog.Start, entryVisited)
+	epsW := newEpsWalker(prog)
+	// firedGen replaces a map[int]bool allocated per (state, byte) and probed
+	// once per priority thread: generation-stamped, so a reset is one increment.
+	firedGen := make([]uint32, len(prog.Inst))
+	firedTick := uint32(0)
 	entryRegMap := append([]int(nil), startRegMap...)
 	if entryTargetPC >= 0 {
 		for _, cop := range entryCapOps {
@@ -640,7 +838,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	// on the epsilon path from prog.Start to that PC. For the first byte consumer
 	// (entryTargetPC), these are the entry ops (fired before the loop). For other
 	// terminal PCs (e.g. InstMatch reachable without consuming bytes, as in (a*)),
-	// we also discover captures via tdfaEpsCapOpsTo.
+	// we also discover captures via the epsilon walker.
 	startThreads := make([]tdfaThread, len(startPCSet))
 	for i, pc := range startPCSet {
 		var rm []int
@@ -650,8 +848,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			rm = append([]int(nil), startRegMap...)
 			// Find captures on the epsilon path from Start to this PC (e.g. close caps
 			// for patterns that can match empty string, like (a*) reaching InstMatch).
-			epsV := make(map[int]bool)
-			if found, epsCops := tdfaEpsCapOpsTo(prog, prog.Start, int(pc), epsV); found && len(epsCops) > 0 {
+			if found, epsCops := epsW.find(prog.Start, int(pc)); found && len(epsCops) > 0 {
 				for _, cop := range epsCops {
 					tagIdx := cop.group * 2
 					if !cop.open {
@@ -688,30 +885,46 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			expandedNonWord = expandWithWB(pcSet, ecNoWordBoundary)
 		}
 
-		buildInputMap := func(expanded []uint32) map[rune][]uint32 {
-			return nfaBuildInputMap(prog, expanded, leftmostFirst, nil, nil)
+		buildInputMap := func(expanded []uint32) (map[rune][]uint32, map[rune][]uint32) {
+			return nfaBuildInputMapSrc(prog, expanded, leftmostFirst, nil, nil, true)
 		}
 
-		inputMapWord := buildInputMap(expandedWord)
-		inputMapNonWord := buildInputMap(expandedNonWord)
+		inputMapWord, srcMapWord := buildInputMap(expandedWord)
+		inputMapNonWord, srcMapNonWord := buildInputMap(expandedNonWord)
 
 		// For each byte, compute the set of (nextPC, tagOps) pairs.
 		// We process all 256 bytes; word/non-word uses appropriate inputMap.
-		processTransition := func(b byte, inputMap map[rune][]uint32) {
+		processTransition := func(b byte, inputMap, srcMap map[rune][]uint32) {
 			nextNFAPCs, ok := inputMap[rune(b)]
 			if !ok || len(nextNFAPCs) == 0 {
 				return
 			}
 
-			// Build the set of Out-pointers that actually fired for byte b.
-			// A source thread srcThread.pc is only a valid source if its byte consumer
-			// matched b, i.e. prog.Inst[srcThread.pc].Out ∈ firedOutSet.
-			// This prevents a thread that cannot match b from claiming as source via an
-			// epsilon exit path (e.g. letter-loop thread misidentified as source for
-			// a space transition when [a-z] and \s are disjoint but share an Alt exit).
-			firedOutSet := make(map[int]bool, len(nextNFAPCs))
-			for _, outPC := range nextNFAPCs {
-				firedOutSet[int(outPC)] = true
+			// The instructions that actually consumed byte b. A source thread is
+			// only a valid source if ITS OWN instruction is among them — which
+			// also keeps a thread that cannot match b from claiming as source via
+			// an epsilon exit path (e.g. a letter-loop thread for a space
+			// transition when [a-z] and \s are disjoint but share an Alt exit).
+			//
+			// Testing the thread's Out against the fired Outs, the old rule, is
+			// not enough: Go's compiler points every alternative's final consumer
+			// at one shared continuation, so a higher-priority alternative that
+			// did NOT match b still passed and donated its capture registers —
+			// `()a|b` over "b" reported group 1 as [0,0]. srcMap comes from the
+			// same input-map build as nextNFAPCs, so case folding, the byte clamp
+			// and leftmost-first suppression are applied to both identically.
+			firedTick++
+			if firedTick == 0 {
+				for i := range firedGen {
+					firedGen[i] = 0
+				}
+				firedTick = 1
+			}
+			// Indexed unguarded: every pc here is a prog index by
+			// construction, so an out-of-range one is a compiler bug and a
+			// panic says so. A bounds check would hide it.
+			for _, srcPC := range srcMap[rune(b)] {
+				firedGen[int(srcPC)] = firedTick
 			}
 
 			// Epsilon-close the successor NFA states.
@@ -739,16 +952,15 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 				// a lower-priority thread earlier in pc order, which would otherwise
 				// make this loop copy captures from the wrong source thread.
 				for _, srcThread := range sd.priorityThreads {
-					// Only consider source threads whose byte consumer actually fired for b.
-					if !firedOutSet[int(prog.Inst[srcThread.pc].Out)] {
+					// Only consider source threads that themselves consumed b.
+					if firedGen[srcThread.pc] != firedTick {
 						continue
 					}
 					// srcThread.pc is a byte-consuming NFA state (from epsilonClosure).
 					// Check if consuming byte b from srcThread.pc leads to nextPC via epsilon.
-					// Use tdfaEpsCapOpsTo to correctly traverse Alt branches (e.g. loop exits).
+					// Walk epsilons to traverse Alt branches correctly (e.g. loop exits).
 					outPC := int(prog.Inst[srcThread.pc].Out)
-					visited := make(map[int]bool)
-					found, cops := tdfaEpsCapOpsTo(prog, outPC, int(nextPC), visited)
+					found, cops := epsW.find(outPC, int(nextPC))
 					if !found {
 						continue
 					}
@@ -804,9 +1016,9 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		for bi := 0; bi < 256; bi++ {
 			b := byte(bi)
 			if isWordChar(b) {
-				processTransition(b, inputMapWord)
+				processTransition(b, inputMapWord, srcMapWord)
 			} else {
-				processTransition(b, inputMapNonWord)
+				processTransition(b, inputMapNonWord, srcMapNonWord)
 			}
 		}
 	}
@@ -964,9 +1176,10 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // eager write sidesteps that entirely: whichever write happened last is
 // necessarily the most recent valid accept, exactly the invariant we want.
 //
-// Word-boundary/line-anchor context never applies here — TDFA is never
-// selected for patterns with \b/\B or (?m) anchors
-// (compile/selector.go's hasWordBoundary/hasLineAnchors gates route those to
+// Word-boundary/anchor context never applies here — TDFA is never
+// selected for patterns with \b/\B, (?m) anchors, or a \A/^ anywhere but a
+// start-anchored pattern's own start (compile/selector.go's
+// hasWordBoundary/hasLineAnchors/hasUnsafeBeginText gates route those to
 // Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
 // variants, is sufficient.
 func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
@@ -1662,7 +1875,9 @@ func tdfaTagOpsEqual(a, b []tdfaTagOp) bool {
 // are.  It does not alter observable capture semantics.
 //
 // Algorithm:
-//  1. Compute per-state liveness via a backwards dataflow fixpoint.
+//  1. Compute per-state liveness via a backwards dataflow fixpoint, removing
+//     dead writes (to a register not live after the transition and not read
+//     later in the same batch) and recomputing until none remain.
 //  2. Build an interference graph: edge (r1,r2) if both live at the same state
 //     OR if both appear as dst in the same op batch (prevents ordering hazards
 //     after renaming where two ops would write the same local in sequence).
@@ -1675,93 +1890,191 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		return tt
 	}
 	transitions := tt.transitions
+	words := (numRegs + 63) / 64
 
-	// ---- Step 1: backwards liveness ----
-	// live[s][r] = register r may be needed on a future path from state s.
-	live := make([][]bool, n)
-	for i := range live {
-		live[i] = make([]bool, numRegs)
-	}
+	// ---- Step 1: backwards liveness, with dead writes removed ----
+	// live[s*words : (s+1)*words] is a bitset of the registers that may be
+	// needed on a future path from state s.
+	var live []uint64
+	testLive := func(s, r int) bool { return live[s*words+r/64]&(1<<uint(r%64)) != 0 }
+	killed := make([]uint64, words)
+	computeLive := func() {
+		live = make([]uint64, n*words)
 
-	// Seed: registers referenced in acceptRegMap are live at their accepting state.
-	for s := 0; s < n; s++ {
-		if s >= len(tt.acceptRegMap) || tt.acceptRegMap[s] == nil {
-			continue
+		// Seed: registers referenced in acceptRegMap are live at their accepting state.
+		for s := 0; s < n; s++ {
+			if s >= len(tt.acceptRegMap) || tt.acceptRegMap[s] == nil {
+				continue
+			}
+			for _, r := range tt.acceptRegMap[s] {
+				if r >= 0 && r < numRegs {
+					live[s*words+r/64] |= 1 << uint(r%64)
+				}
+			}
 		}
-		for _, r := range tt.acceptRegMap[s] {
-			if r >= 0 && r < numRegs {
-				live[s][r] = true
+
+		// Propagate backwards until stable. States are visited HIGH TO LOW:
+		// this is a backward dataflow, so descending order carries a whole
+		// chain of states in one round where ascending order carries one
+		// state per round.
+		for changed := true; changed; {
+			changed = false
+			for s := n - 1; s >= 0; s-- {
+				base := s * words
+				for b := 0; b < 256; b++ {
+					idx := s*256 + b
+					if idx >= len(transitions) {
+						continue
+					}
+					next := transitions[idx]
+					if next < 0 || next >= n {
+						continue
+					}
+					var ops []tdfaTagOp
+					if idx < len(tt.tagOps) {
+						ops = tt.tagOps[idx]
+					}
+					nbase := next * words
+					if len(ops) == 0 {
+						for w := 0; w < words; w++ {
+							v := live[base+w] | live[nbase+w]
+							if v != live[base+w] {
+								live[base+w] = v
+								changed = true
+							}
+						}
+						continue
+					}
+					// Registers killed (written) by ops on this transition.
+					for w := range killed {
+						killed[w] = 0
+					}
+					for _, op := range ops {
+						if op.dst >= 0 && op.dst < numRegs {
+							killed[op.dst/64] |= 1 << uint(op.dst%64)
+						}
+					}
+					// Propagate: r alive at next and not killed → alive at s.
+					for w := 0; w < words; w++ {
+						v := live[base+w] | (live[nbase+w] &^ killed[w])
+						if v != live[base+w] {
+							live[base+w] = v
+							changed = true
+						}
+					}
+					// Registers read (as src) by ops are live at s.
+					for _, op := range ops {
+						if op.src >= 0 && op.src < numRegs {
+							m := uint64(1) << uint(op.src%64)
+							if live[base+op.src/64]&m == 0 {
+								live[base+op.src/64] |= m
+								changed = true
+							}
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// Propagate backwards until stable.
-	for changed := true; changed; {
-		changed = false
+	// A write whose register is not live after the transition, and that no
+	// later op in the same batch reads, is dead. Left in, it is invisible to
+	// the liveness edges below, so colouring may give it the same local as a
+	// register whose value must survive the transition — and every execution
+	// of the dead write then destroys that value. `(0+)(0)*` over "0" reported
+	// group 1 as [1,1]: the `(0)` thread's never-read "group 2 open" register
+	// shared a local with group 1's start. Removing a write can make its own
+	// source dead, hence the fixpoint. The in-batch read check keeps the
+	// scratch register's cycle-break write (see sequentializeCopies), which the
+	// next op in its batch reads.
+	//
+	// liveState is the state whose live set applies AFTER this batch — the
+	// transition's destination, or state 0 for entryOps. It used to be that
+	// state's `[]bool` row; live is a bitset now, so the caller passes the
+	// state and the row is read through testLive.
+	dropDead := func(ops []tdfaTagOp, liveState int) ([]tdfaTagOp, bool) {
+		if len(ops) == 0 {
+			return ops, false
+		}
+		var kept []tdfaTagOp
+		dropped := false
+		for i, op := range ops {
+			dead := op.dst >= 0 && op.dst < numRegs && !testLive(liveState, op.dst)
+			if dead {
+				for _, later := range ops[i+1:] {
+					if later.src == op.dst {
+						dead = false
+						break
+					}
+				}
+			}
+			if dead {
+				dropped = true
+				continue
+			}
+			kept = append(kept, op)
+		}
+		if !dropped {
+			return ops, false
+		}
+		return kept, true
+	}
+	for {
+		computeLive()
+		removed := false
 		for s := 0; s < n; s++ {
 			for b := 0; b < 256; b++ {
 				idx := s*256 + b
-				if idx >= len(transitions) {
+				if idx >= len(transitions) || idx >= len(tt.tagOps) {
 					continue
 				}
 				next := transitions[idx]
 				if next < 0 || next >= n {
 					continue
 				}
-				var ops []tdfaTagOp
-				if idx < len(tt.tagOps) {
-					ops = tt.tagOps[idx]
-				}
-				// Registers killed (written) by ops on this transition.
-				killed := make([]bool, numRegs)
-				for _, op := range ops {
-					if op.dst >= 0 && op.dst < numRegs {
-						killed[op.dst] = true
-					}
-				}
-				// Propagate: r alive at next and not killed → alive at s.
-				for r := 0; r < numRegs; r++ {
-					if live[next][r] && !killed[r] && !live[s][r] {
-						live[s][r] = true
-						changed = true
-					}
-				}
-				// Registers read (as src) by ops are live at s.
-				for _, op := range ops {
-					if op.src >= 0 && op.src < numRegs && !live[s][op.src] {
-						live[s][op.src] = true
-						changed = true
-					}
+				if kept, d := dropDead(tt.tagOps[idx], next); d {
+					tt.tagOps[idx] = kept
+					removed = true
 				}
 			}
+		}
+		// entryOps fire before the first byte, in the start state (0).
+		if kept, d := dropDead(tt.entryOps, 0); d {
+			tt.entryOps = kept
+			removed = true
+		}
+		if !removed {
+			break
 		}
 	}
 
 	// ---- Step 2: interference graph ----
-	interfere := make([][]bool, numRegs)
-	for i := range interfere {
-		interfere[i] = make([]bool, numRegs)
+	// interfere[r*words : (r+1)*words] is r's neighbour bitset. Edges are
+	// added a ROW at a time rather than a pair at a time: every edge set
+	// below is "this register interferes with every member of that set", so
+	// one OR of `words` machine words replaces |set| individual stores.
+	interfere := make([]uint64, numRegs*words)
+	orInto := func(r int, mask []uint64) {
+		base := r * words
+		for w := 0; w < words; w++ {
+			interfere[base+w] |= mask[w]
+		}
+		interfere[base+r/64] &^= 1 << uint(r%64) // addEdge never made self-edges
 	}
-	addEdge := func(r1, r2 int) {
-		if r1 != r2 && r1 >= 0 && r1 < numRegs && r2 >= 0 && r2 < numRegs {
-			interfere[r1][r2] = true
-			interfere[r2][r1] = true
+
+	// Simultaneous-liveness edges: the registers live at a state form a clique.
+	for s := 0; s < n; s++ {
+		row := live[s*words : (s+1)*words]
+		for w := 0; w < words; w++ {
+			m := row[w]
+			for m != 0 {
+				r := w*64 + bits.TrailingZeros64(m)
+				m &= m - 1
+				orInto(r, row)
+			}
 		}
 	}
 
-	// Simultaneous-liveness edges.
-	for s := 0; s < n; s++ {
-		for r1 := 0; r1 < numRegs; r1++ {
-			if !live[s][r1] {
-				continue
-			}
-			for r2 := r1 + 1; r2 < numRegs; r2++ {
-				if live[s][r2] {
-					addEdge(r1, r2)
-				}
-			}
-		}
-	}
 	// Per-batch edges. Two kinds, both about what a batch means:
 	//
 	//   dst–dst: two registers written in the same op batch cannot share a
@@ -1780,19 +2093,70 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	//   instead of [2 3]. Forbidding the coalesce is the cheap half of the fix
 	//   (the alternative being a re-sequentialization pass over every remapped
 	//   batch); an op whose own dst equals another's src is already the same
-	//   register, and addEdge ignores self-edges, so this only ever constrains
+	//   register, and self-edges are ignored, so this only ever constrains
 	//   pairs that were genuinely distinct.
+	//
+	// The i != j exclusion is what the counts below are for: (dst_i, src_i)
+	// belongs in the graph only when some OTHER op names the same register,
+	// so a register named exactly once is removed from the mask again.
+	dstMask := make([]uint64, words)
+	srcMask := make([]uint64, words)
+	dstCount := make([]int32, numRegs)
+	srcCount := make([]int32, numRegs)
 	addBatchEdges := func(ops []tdfaTagOp) {
-		for i := 0; i < len(ops); i++ {
-			for j := i + 1; j < len(ops); j++ {
-				addEdge(ops[i].dst, ops[j].dst)
+		if len(ops) < 2 {
+			return // a one-op batch has no i != j pair and no dst pair
+		}
+		for w := range dstMask {
+			dstMask[w] = 0
+			srcMask[w] = 0
+		}
+		for _, op := range ops {
+			if op.dst >= 0 && op.dst < numRegs {
+				dstMask[op.dst/64] |= 1 << uint(op.dst%64)
+				dstCount[op.dst]++
+			}
+			if op.src >= 0 && op.src < numRegs {
+				srcMask[op.src/64] |= 1 << uint(op.src%64)
+				srcCount[op.src]++
 			}
 		}
-		for i := 0; i < len(ops); i++ {
-			for j := 0; j < len(ops); j++ {
-				if i != j && ops[j].src >= 0 {
-					addEdge(ops[i].dst, ops[j].src)
-				}
+		for _, op := range ops {
+			if op.dst < 0 || op.dst >= numRegs {
+				continue
+			}
+			// dst–dst clique, plus dst–src for every op but this one.
+			orInto(op.dst, dstMask)
+			if op.src >= 0 && op.src < numRegs && srcCount[op.src] == 1 {
+				m := uint64(1) << uint(op.src%64)
+				srcMask[op.src/64] &^= m
+				orInto(op.dst, srcMask)
+				srcMask[op.src/64] |= m
+			} else {
+				orInto(op.dst, srcMask)
+			}
+		}
+		for _, op := range ops {
+			if op.src < 0 || op.src >= numRegs {
+				continue
+			}
+			// The symmetric half: src interferes with every op's dst but its
+			// own, unless another op names the same src as well.
+			if srcCount[op.src] == 1 && op.dst >= 0 && op.dst < numRegs && dstCount[op.dst] == 1 {
+				m := uint64(1) << uint(op.dst%64)
+				dstMask[op.dst/64] &^= m
+				orInto(op.src, dstMask)
+				dstMask[op.dst/64] |= m
+			} else {
+				orInto(op.src, dstMask)
+			}
+		}
+		for _, op := range ops {
+			if op.dst >= 0 && op.dst < numRegs {
+				dstCount[op.dst] = 0
+			}
+			if op.src >= 0 && op.src < numRegs {
+				srcCount[op.src] = 0
 			}
 		}
 	}
@@ -1813,11 +2177,11 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	// also deterministic, unlike the raw allocation order.
 	degree := make([]int, numRegs)
 	for r := 0; r < numRegs; r++ {
-		for r2 := 0; r2 < numRegs; r2++ {
-			if interfere[r][r2] {
-				degree[r]++
-			}
+		d := 0
+		for _, w := range interfere[r*words : (r+1)*words] {
+			d += bits.OnesCount64(w)
 		}
+		degree[r] = d
 	}
 	order := make([]int, numRegs)
 	for i := range order {
@@ -1839,11 +2203,16 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		for i := range forbidden {
 			forbidden[i] = false
 		}
-		for r2 := 0; r2 < numRegs; r2++ {
-			if interfere[r][r2] && color[r2] >= 0 {
-				c2 := color[r2]
-				if c2 < numRegs {
-					forbidden[c2] = true
+		row := interfere[r*words : (r+1)*words]
+		for w := 0; w < words; w++ {
+			m := row[w]
+			for m != 0 {
+				r2 := w*64 + bits.TrailingZeros64(m)
+				m &= m - 1
+				if r2 < numRegs && color[r2] >= 0 {
+					if c2 := color[r2]; c2 < numRegs {
+						forbidden[c2] = true
+					}
 				}
 			}
 		}
@@ -1853,7 +2222,6 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		}
 		color[r] = c
 	}
-
 	newNumRegs := 0
 	for _, c := range color {
 		if c+1 > newNumRegs {

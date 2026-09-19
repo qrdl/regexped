@@ -1321,3 +1321,61 @@ sets:
 		t.Fatal("a patterns: value the YAML decoder cannot build: want an error")
 	}
 }
+
+// TestToolPathAsWrittenUnknownKey covers ToolPathAsWritten's fallthrough: a key
+// that is not one of the three tool-path keys has no path to report.
+func TestToolPathAsWrittenUnknownKey(t *testing.T) {
+	cfg := BuildConfig{WasmMergePath: "a", WasmToolsPath: "b", WacPath: "c"}
+	for _, key := range []string{"wasm_merge_path", "wasm_tools_path", "wac_path"} {
+		if cfg.ToolPathAsWritten(key) == "" {
+			t.Errorf("ToolPathAsWritten(%q) = \"\", want the configured path", key)
+		}
+	}
+	for _, key := range []string{"", "stub_file", "wasm_merge", "WAC_PATH"} {
+		if got := cfg.ToolPathAsWritten(key); got != "" {
+			t.Errorf("ToolPathAsWritten(%q) = %q, want \"\"", key, got)
+		}
+	}
+}
+
+// TestResolveToolPathTildeWithoutHome covers resolveToolPath's fallback for a
+// bare `~` when the home directory cannot be determined: the value is left
+// exactly as written rather than resolved to something wrong.
+//
+// os.UserHomeDir reports an error on Unix when $HOME is empty, which is what
+// t.Setenv arranges here (and undoes when the test ends).
+func TestResolveToolPathTildeWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	if got := resolveToolPath("/base", "~"); got != "~" {
+		t.Errorf("resolveToolPath(\"~\") with no home = %q, want %q", got, "~")
+	}
+}
+
+// TestWitWorldNameDefaultFailures covers the two arms WitWorldName takes when
+// wit_world is UNSET and so defaults to the package name: the package name
+// being invalid, and the package name colliding with an interface the package
+// itself defines.
+func TestWitWorldNameDefaultFailures(t *testing.T) {
+	t.Run("invalid_package", func(t *testing.T) {
+		cfg := BuildConfig{WitPackage: "Not A Package"}
+		_, err := cfg.WitWorldName()
+		if err == nil {
+			t.Fatal("WitWorldName = nil error, want the package name's error")
+		}
+		if !strings.Contains(err.Error(), "wit_package") {
+			t.Errorf("error does not come from the package name: %v", err)
+		}
+	})
+	for _, name := range []string{"matcher", "sets"} {
+		t.Run("defaults_to_"+name, func(t *testing.T) {
+			cfg := BuildConfig{WitPackage: name}
+			_, err := cfg.WitWorldName()
+			if err == nil {
+				t.Fatalf("WitWorldName with wit_package %q = nil error, want a collision error", name)
+			}
+			if !strings.Contains(err.Error(), "set wit_world") {
+				t.Errorf("error does not tell the user to set wit_world: %v", err)
+			}
+		})
+	}
+}

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"regexp/syntax"
@@ -2229,4 +2230,92 @@ func TestSuffixWalkExtentGlobal(t *testing.T) {
 	}()
 	genSuffixWASM(nil, 0, 0, []int{1}, []int{0}, LikelyNeutral, false, false,
 		nil, false, false, false, false, true)
+}
+
+// TestAnchoredFindBodyReadsTheRowMap pins FUZZER_BUGS bug 86.
+//
+// A find that can only match at position 0 gets its own body,
+// buildAnchoredFindBody. When the layout has more than 256 states its table is
+// u16, and when 255 or fewer of those rows are DISTINCT the layout stores one
+// row per distinct row plus a rowMap[state] lookup. Every reader of the table
+// must go through that lookup. This body did not: it indexed by state id, so
+// state 200 read row 200 of a 129-row table — a wrong answer when the borrowed
+// row disagreed, and a read past the end of memory once the id passed the row
+// count. It was wrong for as long as row dedup and this body have both existed.
+//
+// Why a unit test and not just the answer-level ones: the custom-tests.txt
+// block and the FuzzFindIteration seed only fail while these patterns keep
+// landing in the narrow window where the table is u16 AND the rows still
+// collapse under 256. Any change to minimisation or to the state count moves
+// them out of it, and the coverage would disappear without a single test going
+// red. This asserts the emitted body itself.
+func TestAnchoredFindBodyReadsTheRowMap(t *testing.T) {
+	// An anchored run of a wide class closed by a one-byte-wide tail: past 256
+	// states, and the rows still collapse. `^.{0,170}0` is one of bug 86's
+	// three raw crashers.
+	const pat = `^.{0,170}0`
+
+	matcher, err := compile(pat, CompileOptions{MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true})
+	if err != nil {
+		t.Fatalf("compile %q: %v", pat, err)
+	}
+	table := dfaTableFrom(matcher.(*dfa))
+	opts := CompileOptions{}
+	l := buildDFALayout(dfaLayoutParams{
+		t: table, tableBase: 65536, needFind: true, leftmostFirst: true,
+		compiledDFAThreshold: resolveCompiledDFAThreshold(&opts),
+	})
+
+	// The premise. If any of these stops holding, this test is no longer
+	// covering the bug and should be pointed at a pattern that restores them
+	// rather than deleted.
+	if l.useU8 {
+		t.Fatalf("%q no longer builds a u16 table (%d states) — pick a bigger pattern", pat, table.numStates)
+	}
+	if !l.useRowDedup {
+		t.Fatalf("%q no longer deduplicates its rows (%d states) — pick a pattern whose rows still collapse", pat, table.numStates)
+	}
+	if !isAnchoredFind(table) {
+		t.Fatalf("%q is no longer an anchored find — pick an anchored pattern", pat)
+	}
+
+	body := buildAnchoredFindBody(anchoredFindBodyParams{
+		startState: l.wasmStart, tableOff: l.tableOff, midAcceptOff: l.midAcceptOff,
+		classMapOff: l.classMapOff, numClasses: l.numClasses,
+		useU8: l.useU8, useCompression: l.useCompression,
+		acceptLimit: l.acceptLimit, startBeginAccept: l.startBeginAccept,
+		immAcceptLimit: l.immAcceptLimit, hasImmAccept: l.hasImmAccept,
+		wordCharTableOff: l.wordCharTableOff, hasWordBoundary: l.needWordCharTable,
+		midAcceptNWOff: l.midAcceptNWOff, midAcceptWOff: l.midAcceptWOff,
+		midAcceptNLOff: l.midAcceptNLOff, hasNewlineBoundary: table.hasNewlineBoundary,
+		tableMemIdx: 0,
+		useRowDedup: l.useRowDedup, rowMapOff: l.rowMapOff,
+	})
+
+	// emitU16Transition's dedup arm is `i32.const rowMapOff; local.get state;
+	// i32.add; i32.load8_u` — so the body must carry rowMapOff as an i32.const.
+	// Nothing else in this layout sits at that address.
+	want := append([]byte{0x41}, utils.AppendSLEB128(nil, l.rowMapOff)...)
+	if !bytes.Contains(body, want) {
+		t.Fatalf("the anchored find body for %q never loads rowMap (address %d, %d states, %d unique rows): "+
+			"it is indexing a deduplicated table by state id", pat, l.rowMapOff, table.numStates, l.numUniqueRows)
+	}
+}
+
+// TestCountedClassChainShortTail covers buildFindBody's `k < 16` arm in the
+// counted class-chain SIMD verify: with fewer than 16 chain bytes only the
+// first k lanes decide, so a non-member past them must not stop a match.
+// It needs a chain short enough to leave lanes over, under LikelyMatch, which
+// is what turns the chain verify on.
+func TestCountedClassChainShortTail(t *testing.T) {
+	for _, p := range []string{`[a-z]{5,}`, `[a-f]{8,}`, `\w{12,}x`, `[0-9]{3,}-[0-9]{4,}`} {
+		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			t.Run(fmt.Sprintf("%s/%v", p, lm), func(t *testing.T) {
+				if _, _, err := Compile([]config.RegexEntry{{Pattern: p, FindFunc: "f"}},
+					65536, true, CompileOptions{LikelyMode: lm}); err != nil {
+					t.Fatalf("Compile(%q): %v", p, err)
+				}
+			})
+		}
+	}
 }

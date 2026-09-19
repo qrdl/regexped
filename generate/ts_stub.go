@@ -95,12 +95,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	// iterator finishes the whole arena resets, which for ordinary code is
 	// between every loop.
 	sb.WriteString("function _align(x: number): number { return (x + 7) & ~7; }\n\n")
-	sb.WriteString("function _grow(top: number): void {\n")
-	sb.WriteString("    if (top > _mem.buffer.byteLength) {\n")
-	sb.WriteString("        (_exp.memory as WebAssembly.Memory).grow(Math.ceil((top - _mem.buffer.byteLength) / 65536));\n")
-	sb.WriteString("        _mem = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer); // grow DETACHES the old one\n")
-	sb.WriteString("    }\n")
-	sb.WriteString("}\n\n")
+	sb.WriteString(jsGrowFunc(true))
 	sb.WriteString("function _inCap(input: string | Uint8Array): number {\n")
 	sb.WriteString("    // Worst-case UTF-8 expansion of a JS string is 3 bytes per UTF-16 code\n")
 	sb.WriteString("    // unit (an astral char is 2 units and encodes to 4, so 3x still bounds\n")
@@ -181,7 +176,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("    // hold native pointers rather than views. A detached view reports\n")
 		sb.WriteString("    // length 0 and reads as undefined SILENTLY, so re-attach on that. The\n")
 		sb.WriteString("    // offset is still ours, so rebuilding at the same place is correct.\n")
-		sb.WriteString("    return view.length === 0 ? new Ctor(_mem.buffer, at, len) : view;\n")
+		sb.WriteString("    return view.length === 0 ? new Ctor((_exp.memory as WebAssembly.Memory).buffer, at, len) : view;\n")
 		sb.WriteString("}\n\n")
 
 	}
@@ -273,12 +268,12 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array): number[] {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
-    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3).fill(0);
     // The wide form returns a count; the bitmap carries the answer. The count
     // is read only for the sentinel, which means unknown, not "matched none".
     const n = (_exp['%s'] as Function)(%s) as number;
     if (n === %d) throw new Error("%s");
-    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
@@ -322,12 +317,12 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				fmt.Fprintf(&out, `export function %s(input: string | Uint8Array, from: number = 0): number[] {
     const [_inBase, _outBase, len] = _stage(input, %d);
     const bitmapBase = %s;
-    new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3).fill(0);
+    new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3).fill(0);
     // The wide form returns a count; the bitmap carries the answer. The count
     // is read only for the sentinel, which means unknown, not "matched none".
     const n = (_exp['%s'] as Function)(%s) as number;
     if (n === %d) throw new Error("%s");
-    const bits = new Uint8Array(_mem.buffer, bitmapBase, (%s+7)>>3);
+    const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
     for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
     return out;
@@ -364,10 +359,10 @@ func genTSSetSection(cfg config.BuildConfig) string {
 			// alignment padding included.
 			findReserve := 12*n + plainGateRegion
 			gateSetup := fmt.Sprintf(`    const gateBase = %s;
-    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+    new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, gateBase, %s).fill(0);
 `, gateBase, idKonst) + plainCachePost + fmt.Sprintf(`    // The scratch descriptor: magic, the gate pointer, and the cache.
     const scratchBase = %s;
-    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+    new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, scratchBase, abi.FindScratchMagic, plainCacheArgs)
 			gateArg := "scratchBase, "
 			if !s.BatchFind() {
@@ -383,7 +378,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
     // Hoisted rather than rebuilt per position, which allocated one typed
     // array per matching position. _att re-attaches it if an interleaved
     // call grew memory while this generator was suspended.
-    let buf = new Int32Array(_mem.buffer, _outBase, 3*%s);
+    let buf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, 3*%s);
     while (true) {
         const n = (_exp['%s'] as Function)(%s) as number;
         // Before the "scan finished" test: -2 is the engine abandoning the
@@ -425,7 +420,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// compile/set_emit.go's setTypeBatchGated and the goldens.
 				batchScratchBase := fmt.Sprintf("gateBase + 4*%s", idKonst)
 				batchGateSetup := fmt.Sprintf(`    const gateBase = _outBase + 12*batchSize;
-    new Uint32Array(_mem.buffer, gateBase, %s).fill(0);
+    new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, gateBase, %s).fill(0);
 `, idKonst)
 				// The overlapping answer cache. An OVERLAPPING drive reports
 				// every start position, so a pattern whose automaton never
@@ -449,7 +444,7 @@ func genTSSetSection(cfg config.BuildConfig) string {
 				// Written last: the descriptor carries the cache pointer, which
 				// the block above may have declined.
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
-    new Uint32Array(_mem.buffer, scratchBase, 4).set([%d, gateBase, %s]);
+    new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, batchScratchBase, abi.FindScratchMagic, cacheArgs)
 				cacheArgs = ""
 				fmt.Fprintf(&out, `// batchSize is how many tuples one WASM call may fill: 1 is a call per
@@ -465,7 +460,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 %s%s    let cursor = BigInt(offset) << 32n;
     // Hoisted for the same reason the per-position shape hoists its view, and
     // re-attached by _att when an interleaved call grows memory.
-    let buf = new Int32Array(_mem.buffer, _outBase, 3*batchSize);
+    let buf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, 3*batchSize);
     while (true) {
         const packed = (_exp['%s'] as Function)(_inBase, len, cursor, %s_outBase, batchSize) as bigint;%s
         // The cursor is opaque: hand it back unchanged. Only its top 32 bits
@@ -554,7 +549,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * 8 : 0);
     try {
     if (_batched) {
-        let outBuf = new Uint32Array(_mem.buffer, _outBase, %[2]d * 2);
+        let outBuf = new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, %[2]d * 2);
         let startPos = offset;
         let prevEnd = -1;
         while (true) {
@@ -626,7 +621,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
     try {
     if (_batched) {
-        let outBuf = new Int32Array(_mem.buffer, _outBase, %[2]d * %[3]d);
+        let outBuf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, %[2]d * %[3]d);
         let startPos = offset;
         // Kept ACROSS calls, exactly as the find batch loop does. The in-WASM
         // wrapper suppresses empty-adjacent matches only within one call, so a
@@ -662,7 +657,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     }
     // Hoisted out of the loop rather than rebuilt per match, and re-attached
     // by _att when an interleaved call grew memory while suspended.
-    let slots = new Int32Array(_mem.buffer, _outBase, %[6]d);
+    let slots = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, %[6]d);
     let off = offset;
     let prevEnd = -1;
     while (off <= len) {
@@ -670,6 +665,9 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         slots.fill(-1);
         const r = (_exp['%[1]s'] as CallableFunction)(_inBase, len, _outBase, off) as number;
         if (r === %[7]d) throw new Error("%[8]s");
+        // The call itself may have grown memory — a Backtracking fallback
+        // sizes its scratch from the input — which detaches this view.
+        slots = _att(slots, Int32Array, _outBase, %[6]d);
         if (r < 0) {
             // Terminal, not "try the next position": the groups
             // export has SCAN-FROM semantics in both wrapper arms, so a
@@ -733,13 +731,14 @@ export const %s = {
 
 // tsOverlapCacheBlock is jsOverlapCacheBlock with TypeScript's one annotation.
 //
-// The two generators are near-copies by design, and this is the one line that
-// differs: `let _k: number`, which TypeScript needs because the variable is
-// assigned in both arms of a branch rather than initialised, and the sizing
-// function's parameter and result types.
+// The two generators are near-copies by design, and these are the lines that
+// differ: `let _k: number`, which TypeScript needs because the variable is
+// assigned in both arms of a branch rather than initialised, the sizing
+// function's parameter and result types, and the memory export's cast.
 func tsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre, dest, reserve, post, args string) {
 	pre, dest, reserve, post, args = jsOverlapCacheBlock(s, sh, gateRegion)
 	pre = strings.Replace(pre, "        let _k;\n", "        let _k: number;\n", 1)
 	pre = strings.Replace(pre, "const _cacheFor = (_len) => {", "const _cacheFor = (_len: number): [number, number] => {", 1)
+	post = strings.Replace(post, "_exp.memory.buffer", "(_exp.memory as WebAssembly.Memory).buffer", 1)
 	return pre, dest, reserve, post, args
 }

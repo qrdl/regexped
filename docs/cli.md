@@ -486,11 +486,15 @@ Compiles each regexp pattern to a single WASM module, or to a Component Model co
 
 The `.wit` is written BEFORE the component, so a `.wit` that cannot be written leaves no fresh `.wasm` behind. `--output -` streams the component to stdout and writes no `.wit`, since there is no path beside it; a line on stderr says so. Get the interface text with `regexped generate` and `stub_type: wit`.
 
-Refused at load under `component`, rather than half-emitted:
+Refused at load under `component`, rather than half-emitted. `batch-find` is a
+design decision, not a missing feature: batching only ever saves host↔WASM
+crossings, only the JS and TS stubs generate it, and neither is a component
+target — so there is no host under `component` it could help.
 
 | Config | Error |
 |---|---|
 | a set with `hints: [batch-find]` | "…is not supported for wasm_format: component — the component interface exposes one position per call through the find resource" |
+| a `regexps:` entry with `hints: [batch-find]` | "…is not supported for wasm_format: component — the batch groups export it adds has no WIT form" |
 | no `import_module` and no `wit_package` | "…is required for wasm_format: component: it names the WIT package, the world, and every export" |
 
 `sets:` IS supported. Their raw ABI does not cross the boundary: `match_all` and

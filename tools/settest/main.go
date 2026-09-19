@@ -689,6 +689,14 @@ func newRunner(engine *wasmtime.Engine, wasmBytes []byte, kind capKind, export s
 			return nil, fmt.Errorf("mem grow: %w", err)
 		}
 	}
+	// Everything the plan writes lies below needTop, above the tables. Left at
+	// 0 a Backtracking fallback would take fresh pages on every call that
+	// reaches it — a grow between timed passes, which would be measured.
+	if exp := inst.GetExport(store, abi.ScratchBaseExport); exp != nil && exp.Global() != nil {
+		if err := exp.Global().Set(store, wasmtime.ValI32(int32(plan.needTop))); err != nil {
+			return nil, fmt.Errorf("set %s: %w", abi.ScratchBaseExport, err)
+		}
+	}
 	return &runner{
 		store: store, mem: mem, fn: fn, plan: plan, kind: kind,
 		wide: wide, idSpace: idSpace, outCap: int32(patternCount),

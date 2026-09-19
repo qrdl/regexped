@@ -692,7 +692,8 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 	return b
 }
 
-// scan_all group retirement: MEASURED AND REJECTED.
+// scan_all group retirement: MEASURED AND REJECTED, except for Backtracking
+// members (emitRecordedSkip).
 //
 // The original design wanted "retire each pattern once it hits", and an
 // earlier note recorded the
@@ -710,6 +711,19 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // would only pay on a skewed corpus where some groups saturate early while
 // others never hit — a workload no benchmark here has, and inventing one to
 // justify the code would be backwards. CLAUDE.md's load-bearing gates section is this lesson.
+//
+// A second, finer form was built and measured on 2026-09-17: clear each
+// recorded pattern's bit from lValidMask (one shift of the accumulator or one
+// bitmap read per bucket), and skip a sparse bucket once all its ids are
+// recorded, in both the narrow and wide forms. Same verdict — 17 scan_all rows
+// up, none down: the same +48 / +192 / +384 on keywords, and sharedlit-32 dense
+// 25,576 -> 31,309 (+22%), because a partly recorded bucket's probe still walks
+// for the patterns that are not.
+//
+// The exception is a Backtracking member. Its probe is not a bounded DFA walk
+// but a search to the end of the input, so re-probing a member that matches
+// from every position makes one call quadratic, and the skip costs one bitmap
+// read against a whole search.
 //
 // Recorded rather than silently dropped, so anyone revisiting that
 // retirement idea knows it has been tried at this level and what it measured.
@@ -1082,6 +1096,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		b = append(b, 0x21, c.lStart)
 		b = c.emitStartGuards(b, g.L != 0)
 		b = c.emitGroupMask(b, bi, g, posLocal)
+		b = c.emitRecordedSkip(b, bi)
 		// First-byte eligibility comes FIRST. Both
 		// it and the gate chain only refine lValidMask, so their order is
 		// semantics-free — but the costs are not remotely equal. The gate
@@ -1172,6 +1187,38 @@ func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLo
 
 	// Nothing left to look for at this position.
 	b = append(b, 0x20, c.lValidMask, 0x45, 0x0D, 0x00) // eqz; br_if $skip_group
+	return b
+}
+
+// emitRecordedSkip leaves $skip_group, in a `scan_all` body, when bucket bi is
+// a Backtracking member this call has already recorded.
+//
+// `scan_all` asks which patterns match ANYWHERE, so once a pattern's bit is set
+// no later position can change its answer — yet the call's only exit is "every
+// pattern has matched" (emitDrainCheck), and until then each candidate probed
+// the recorded member again. For a member that matches from every position that
+// is QUADRATIC: `(aa|a)*b` over a×n+b walked to the `b` from each of the n
+// starts, ×3.98 fuel per doubling. Skipping its probe also removes a chance of
+// -2 for a pattern whose answer is already known.
+//
+// Backtracking buckets only. The same retirement for every bucket was measured
+// twice and costs fuel with nothing to save — see the note above
+// maskCanBeEmpty. A Backtracking bucket holds one pattern and forces the wide
+// form (wideAll), so the test is one bit of the caller's bitmap.
+func (c *setFindCtx) emitRecordedSkip(b []byte, bi int) []byte {
+	if c.mode != capScanAll || bi >= len(c.cs.buckets) || c.cs.buckets[bi].btFallback == nil {
+		return b
+	}
+	if !c.wideBitmap {
+		panic("compile: a scan_all body with a Backtracking bucket must use the wide bitmap form")
+	}
+	gid := c.cs.patternIDs[bi][0]
+	b = append(b, 0x20, c.pOutPtr, 0x2D, 0x00) // i32.load8_u
+	b = utils.AppendULEB128(b, uint32(gid/8))
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(1)<<uint(gid%8))
+	b = append(b, 0x71)       // i32.and
+	b = append(b, 0x0D, 0x00) // br_if $skip_group
 	return b
 }
 
