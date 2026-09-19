@@ -1,7 +1,14 @@
-# Prerequisites: run `make docker`, which copies the regexped binary and fetches
+# Prerequisites: run `make docker`, which builds the regexped binary and fetches
 # wasm-merge, wasm-tools and wac into THIS directory — the build context is
 # docker/, not the repo root, so the context is these four binaries and nothing
 # else.
+#
+# MULTI-PLATFORM. Every binary carries its architecture in its name, because a
+# `docker buildx --platform linux/amd64,linux/arm64` build shares ONE context
+# between the two per-architecture builds: both sets have to be in docker/ at
+# the same time, and TARGETARCH (set by BuildKit, amd64 or arm64) is what picks
+# a set. The names are what `make docker` and release.yml ask the get_*.sh
+# scripts for.
 #
 # All three tools are shelled out to by the compiler, so an image without them
 # can only do part of the job:
@@ -26,10 +33,11 @@
 FROM gcr.io/distroless/cc-debian13 AS base
 
 FROM scratch
+ARG TARGETARCH
 LABEL org.opencontainers.image.base.name="gcr.io/distroless/cc-debian13"
 COPY --from=base / /
-COPY regexped   /usr/local/bin/regexped
-COPY wasm-merge /usr/local/bin/wasm-merge
-COPY wasm-tools /usr/local/bin/wasm-tools
-COPY wac        /usr/local/bin/wac
+COPY regexped-${TARGETARCH}   /usr/local/bin/regexped
+COPY wasm-merge-${TARGETARCH} /usr/local/bin/wasm-merge
+COPY wasm-tools-${TARGETARCH} /usr/local/bin/wasm-tools
+COPY wac-${TARGETARCH}        /usr/local/bin/wac
 ENTRYPOINT ["/usr/local/bin/regexped"]

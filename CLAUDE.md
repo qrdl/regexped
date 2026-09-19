@@ -377,11 +377,16 @@ regexped/
 │   │                          #   The build context is THIS directory, not the repo root, so
 │   │                          #   `make docker` assembles the four binaries it copies here
 │   ├── .dockerignore          # …and excludes everything that is not one of those four
-│   ├── get_wasm_merge.sh      # Fetch the latest release of each tool INTO the build context.
-│   ├── get_wasm_tools.sh      #   The two that take a dest-dir skip their PATH short-circuit
-│   └── get_wac.sh             #   when given one: a host binary may want a glibc the image
-│                              #   does not carry. get_wasm_merge.sh takes none — it writes
-│                              #   alongside itself, which since the move is already docker/
+│   ├── arch.sh                # `[arch] [dest]`, shared by the three fetchers below:
+│   ├── get_wasm_merge.sh      #   arch is amd64/arm64 (empty = this machine, or amd64
+│   ├── get_wasm_tools.sh      #   when it is neither); dest is a DIRECTORY, which gets
+│   └── get_wac.sh             #   the tool name appended, or the FILE to write. An
+│                              #   explicit dest also skips the PATH short-circuit: a host
+│                              #   binary may want a glibc the image does not carry.
+│                              #   release.yml asks for `wasm-tools-arm64` and friends BY
+│                              #   NAME because a multi-platform build shares ONE context
+│                              #   between its per-architecture builds; ci.yml passes a
+│                              #   directory, since it only wants one copy on PATH
 ├── docs/
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
@@ -1275,7 +1280,13 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 All three ship in the Docker image (`make docker`, fetched by
 `docker/get_wasm_merge.sh` / `docker/get_wasm_tools.sh` / `docker/get_wac.sh`
-into `docker/`, which is the build context). Each is found through its config key —
+into `docker/`, which is the build context). The image is MULTI-PLATFORM
+(`linux/amd64` and `linux/arm64`), so every binary in that context carries its
+architecture in its name and the Dockerfile picks a set with `TARGETARCH`: one
+`docker buildx` build shares a single context between its two per-architecture
+builds. `make docker` assembles only this machine's set (override with
+`DOCKER_ARCH=`); the release workflow assembles both. Each is found through its
+config key —
 `wasm_merge_path:`, `wasm_tools_path:`, `wac_path:` — else in `$PATH`; no
 environment variable is read. A `module` build needs NONE of them to
 compile — only to merge; a `component` build cannot finish without wasm-tools.

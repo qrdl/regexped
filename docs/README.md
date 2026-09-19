@@ -48,7 +48,9 @@ needed. A core-module `compile` and every `generate` need none of them.
 
 Each is found through `wasm_merge_path:`, `wasm_tools_path:` or `wac_path:` in the
 config, else on `PATH`. `docker/get_wasm_merge.sh`, `docker/get_wasm_tools.sh`
-and `docker/get_wac.sh` in the repository download the latest release of each. Building your own host
+and `docker/get_wac.sh` in the repository download the latest release of each —
+each takes an optional architecture (`amd64` or `arm64`, default this machine's)
+and an optional destination. Building your own host
 code needs its own toolchain (cargo, Go, clang, Node.js…) — see the environment
 guides below.
 
