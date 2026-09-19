@@ -6,12 +6,14 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     name: Build and publish draft release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -26,12 +28,40 @@ jobs:
       - name: Build regexped
         run: go build -trimpath -ldflags "-s -w" -o regexped .
 
+      # The image is multi-platform, so the arm64 binary is cross-built here
+      # rather than on an arm runner: regexped is pure Go with no cgo, so
+      # GOARCH alone is enough and both come from one toolchain.
+      - name: Build regexped for the image
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "regexped-$arch" .
+          done
+
       - name: Determine previous tag
         id: prev
         run: |
           current="${GITHUB_REF_NAME}"
           prev=$(git tag --sort=-creatordate | grep -v "^${current}$" | head -n1 || true)
           echo "previous=${prev}" >> "$GITHUB_OUTPUT"
+
+      # BEFORE the draft release, deliberately. Everything after `gh release
+      # create` has to be re-runnable on its own, because a second run of this
+      # job would fail on the tag's existing draft — which is why the image
+      # work is a separate job. A fallible upload placed after the create would
+      # put the release job back in exactly that position.
+      #
+      # These are handed to the docker job so the image ships binaries built
+      # the SAME way as the one the release attaches — -trimpath -ldflags
+      # "-s -w", one toolchain — rather than a second build done differently
+      # in another job.
+      - name: Upload the release binaries for the image job
+        uses: actions/upload-artifact@v4
+        with:
+          name: regexped-binaries
+          path: regexped-*
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Create draft release
         env:
@@ -50,28 +80,57 @@ jobs:
           fi
           gh release create "${args[@]}" regexped
 
-      # The image ships the SAME binary the release attaches — the -trimpath
-      # -ldflags "-s -w" build above — rather than a second one built
-      # differently. docker/ IS the build context, which is why the binary is
-      # copied there; `make docker` assembles the same four binaries in the same
-      # place. No chmod is needed: unlike a downloaded artifact, a copied file
-      # keeps its executable bit.
-      - name: Copy binary into the Docker build context
-        run: cp regexped docker/regexped
 
-      # Writes alongside itself, i.e. into docker/; it takes no destination.
-      - name: Download wasm-merge
-        run: ./docker/get_wasm_merge.sh
+  docker:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    # A SEPARATE job, not more steps on the release one: everything below is
+    # fallible (three downloads, a registry login, a build and a push) and the
+    # draft release already exists by the time it runs. As steps, a failure
+    # here left a published draft behind and re-running the workflow tried to
+    # create that release a second time. As a job it can be re-run on its own.
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      # The Dockerfile copies wasm-tools and wac as well — both needed for
-      # wasm_format: component — and neither is in a fresh checkout. An explicit
-      # destination makes each script fetch the release binary into the build
-      # context rather than trust whatever is on the runner's PATH.
-      - name: Download wasm-tools
-        run: ./docker/get_wasm_tools.sh "$PWD/docker"
+      # docker/ IS the build context, which is why the binaries land there;
+      # `make docker` assembles the same names in the same place, for one
+      # architecture rather than both.
+      - name: Download the release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: regexped-binaries
+          path: docker
 
-      - name: Download wac
-        run: ./docker/get_wac.sh "$PWD/docker"
+      # An artifact does not carry the executable bit, where the plain `cp`
+      # this replaced did. Without this the image builds and every container
+      # fails at exec time.
+      - name: Restore the binaries' executable bit
+        run: chmod +x docker/regexped-amd64 docker/regexped-arm64
+
+      # The Dockerfile copies wasm-merge, wasm-tools and wac as well — the
+      # first for a module `regexped merge`, the other two for
+      # wasm_format: component — and none is in a fresh checkout. Each is
+      # fetched at an explicit PATH rather than into a directory: a
+      # multi-platform build shares ONE context between its per-architecture
+      # builds, so both copies live here at once and the Dockerfile picks with
+      # TARGETARCH. The explicit path also skips each script's PATH
+      # short-circuit, so nothing is ever taken from the runner.
+      - name: Download the tools for both architectures
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            ./docker/get_wasm_merge.sh "$arch" "$PWD/docker/wasm-merge-$arch"
+            ./docker/get_wasm_tools.sh "$arch" "$PWD/docker/wasm-tools-$arch"
+            ./docker/get_wac.sh        "$arch" "$PWD/docker/wac-$arch"
+          done
+
+      # Required for BOTH things below: the default `docker` driver can build
+      # only for the runner's own architecture and cannot attach attestations
+      # at all. The `docker-container` driver this installs does both.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
@@ -97,6 +156,13 @@ jobs:
         with:
           context: docker
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           annotations: ${{ steps.meta.outputs.annotations }}
           labels: ${{ steps.meta.outputs.labels }}
+          # mode=max, not the default mode=min: min records only the digests of
+          # what went in, which is why Docker Hub's "Source & Build Information"
+          # panel stayed empty. max records the Dockerfile, the commit it was
+          # built from and the build steps, which is what fills that panel.
+          provenance: mode=max
+          sbom: true
