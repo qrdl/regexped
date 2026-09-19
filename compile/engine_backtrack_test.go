@@ -2344,7 +2344,6 @@ func TestBTEmptyBodyGreedyLoopBodiesCompile(t *testing.T) {
 
 // TestBacktrackHasZeroWidthCycle covers the exported predicate tools/fuzz uses
 // to decide whether a program ships an ordinary body at all.
-
 func TestBacktrackHasZeroWidthCycle(t *testing.T) {
 	for _, c := range []struct {
 		pat  string
@@ -2370,6 +2369,11 @@ func TestBacktrackHasZeroWidthCycle(t *testing.T) {
 	}
 }
 
+// TestLoopEntryAtStartBodies covers the `loopEntryAtStart` arms in the
+// Backtracking bodies: a greedy loop whose body IS the very first thing in the
+// program has no predecessor instruction to write its entry position, so the
+// body seeds that local itself. Needs BTWorkBudgetOff for the same reason the
+// other empty-body loop tests do — see TestBTStaticMemoBodiesCompile.
 func TestLoopEntryAtStartBodies(t *testing.T) {
 	// Verified to produce a non-empty bt.loopEntryAtStart.
 	pats := []string{`(?:a??){1,}`, `(?:a*)+`, `(a*)+`}
@@ -2405,11 +2409,3 @@ func TestLoopEntryAtStartBodies(t *testing.T) {
 		}
 	}
 }
-
-// TestSetWithPatternDroppedAtStateLimit covers the set emitter's handling of a
-// member the packer DROPPED: its bit is still carried by the union automaton
-// but named by no bucket, so the emitted mask arithmetic has to restrict the
-// answer to the patterns that can actually be reported.
-//
-// A low MaxFallbackStates is what forces the drop; nothing else in the suite
-// compiles a set that loses a member this way.

@@ -972,7 +972,6 @@ func TestBatchEdgeSetsMatchThePairLoops(t *testing.T) {
 // referenceBatchEdges is the ORIGINAL construction, kept verbatim so the test
 // compares against the algorithm that shipped for months rather than against a
 // restatement of the new one.
-
 func referenceBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
 	out := map[[2]int]bool{}
 	addEdge := func(r1, r2 int) {
@@ -1000,7 +999,6 @@ func referenceBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
 // rather than a call because the real one closes over the function's bitset
 // and its per-batch scratch; keeping the copy honest is this file's job, and
 // any divergence shows up as a failure here first.
-
 func shippedBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
 	words := (numRegs + 63) / 64
 	interfere := make([]uint64, numRegs*words)

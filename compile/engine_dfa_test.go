@@ -2302,6 +2302,11 @@ func TestAnchoredFindBodyReadsTheRowMap(t *testing.T) {
 	}
 }
 
+// TestCountedClassChainShortTail covers buildFindBody's `k < 16` arm in the
+// counted class-chain SIMD verify: with fewer than 16 chain bytes only the
+// first k lanes decide, so a non-member past them must not stop a match.
+// It needs a chain short enough to leave lanes over, under LikelyMatch, which
+// is what turns the chain verify on.
 func TestCountedClassChainShortTail(t *testing.T) {
 	for _, p := range []string{`[a-z]{5,}`, `[a-f]{8,}`, `\w{12,}x`, `[0-9]{3,}-[0-9]{4,}`} {
 		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
@@ -2314,7 +2319,3 @@ func TestCountedClassChainShortTail(t *testing.T) {
 		}
 	}
 }
-
-// TestMemoBudgetTooSmall covers the btMemoPlan error path in the capture
-// branch: a MemoBudget below what the program's instruction count needs is
-// reported as a compile error rather than silently sized down.

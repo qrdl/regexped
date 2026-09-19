@@ -2654,11 +2654,9 @@ func TestVerboseReporterNotes(t *testing.T) {
 	}
 }
 
-// TestWideSetShapesCompile covers the set paths that only a set with more
-// patterns than the narrow 64-id accept mask can hold ever reaches: the wide
-// union-scan body and its alive mask, the wide anchored union, and the
-// id-space arithmetic that goes with them.
-
+// TestMemoBudgetTooSmall covers the btMemoPlan error path in the capture
+// branch: a MemoBudget below what the program's instruction count needs is
+// reported as a compile error rather than silently sized down.
 func TestMemoBudgetTooSmall(t *testing.T) {
 	saw := false
 	for _, p := range []string{`(a??)*?b`, `(a*)*b`, `(a|)*b`, `(a+?)(b)`} {
@@ -2674,9 +2672,3 @@ func TestMemoBudgetTooSmall(t *testing.T) {
 		t.Error("no MemoBudget was small enough to be refused — the budgets here need raising")
 	}
 }
-
-// TestLoopEntryAtStartBodies covers the `loopEntryAtStart` arms in the
-// Backtracking bodies: a greedy loop whose body IS the very first thing in the
-// program has no predecessor instruction to write its entry position, so the
-// body seeds that local itself. Needs BTWorkBudgetOff for the same reason the
-// other empty-body loop tests do — see TestBTStaticMemoBodiesCompile.

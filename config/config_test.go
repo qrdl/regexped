@@ -1344,24 +1344,12 @@ func TestToolPathAsWrittenUnknownKey(t *testing.T) {
 //
 // os.UserHomeDir reports an error on Unix when $HOME is empty, which is what
 // t.Setenv arranges here (and undoes when the test ends).
-
-// TestResolveToolPathTildeWithoutHome covers resolveToolPath's fallback for a
-// bare `~` when the home directory cannot be determined: the value is left
-// exactly as written rather than resolved to something wrong.
-//
-// os.UserHomeDir reports an error on Unix when $HOME is empty, which is what
-// t.Setenv arranges here (and undoes when the test ends).
 func TestResolveToolPathTildeWithoutHome(t *testing.T) {
 	t.Setenv("HOME", "")
 	if got := resolveToolPath("/base", "~"); got != "~" {
 		t.Errorf("resolveToolPath(\"~\") with no home = %q, want %q", got, "~")
 	}
 }
-
-// TestValidateConfigRejectsMalformedSetCapabilityName covers the set half of
-// ValidateConfig's shape check. The existing tests give a set a RESERVED word,
-// which fails later on, in the per-language pass; this one gives it a name that
-// is not an identifier at all, which is the earlier check.
 
 // TestWitWorldNameDefaultFailures covers the two arms WitWorldName takes when
 // wit_world is UNSET and so defaults to the package name: the package name

@@ -2851,6 +2851,10 @@ func TestCompileFallback_NilSuffixDFANoPanic(t *testing.T) {
 	compileFallback([]*PatternInfo{info}, CompileSetOptions{MaxFallbackStates: 8}, nil)
 }
 
+// TestWideSetShapesCompile covers the set paths that only a set with more
+// patterns than the narrow 64-id accept mask can hold ever reaches: the wide
+// union-scan body and its alive mask, the wide anchored union, and the
+// id-space arithmetic that goes with them.
 func TestWideSetShapesCompile(t *testing.T) {
 	mk := func(n int, f func(int) string) []string {
 		out := make([]string, n)
@@ -2901,12 +2905,13 @@ func TestWideSetShapesCompile(t *testing.T) {
 	}
 }
 
-// TestCountedClassChainShortTail covers buildFindBody's `k < 16` arm in the
-// counted class-chain SIMD verify: with fewer than 16 chain bytes only the
-// first k lanes decide, so a non-member past them must not stop a match.
-// It needs a chain short enough to leave lanes over, under LikelyMatch, which
-// is what turns the chain verify on.
-
+// TestSetWithPatternDroppedAtStateLimit covers the set emitter's handling of a
+// member the packer DROPPED: its bit is still carried by the union automaton
+// but named by no bucket, so the emitted mask arithmetic has to restrict the
+// answer to the patterns that can actually be reported.
+//
+// A low MaxFallbackStates is what forces the drop; nothing else in the suite
+// compiles a set that loses a member this way.
 func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 	fams := [][]string{
 		{`[a-z]{0,60}x`, `abc`, `def`},

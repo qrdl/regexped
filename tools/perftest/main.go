@@ -1213,6 +1213,12 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		fmt.Fprintf(os.Stderr, "  regexped NewInstance(%s): %v\n", tc.name, err)
 		return benchResult{}
 	}
+	// Stopped HERE, before the scratch global below. Only a module carrying a
+	// Backtracking program exports that global, so timing its setup would add
+	// two host calls to the Backtracking rows and none to the others —
+	// a difference between engines that is not instantiation.
+	instantiation := time.Since(t0)
+
 	// Inputs live in pages 0-1, below the tables. Left at 0 a Backtracking
 	// fallback would take fresh pages on every call that reaches it.
 	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
@@ -1221,7 +1227,6 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 			return benchResult{}
 		}
 	}
-	instantiation := time.Since(t0)
 
 	// Get memory and the exported function.
 	var mem *wasmtime.Memory

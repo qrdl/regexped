@@ -1412,8 +1412,3 @@ func TestValidateConfigRejectsMalformedSetCapabilityName(t *testing.T) {
 		}
 	}
 }
-
-// TestWitWorldNameDefaultFailures covers the two arms WitWorldName takes when
-// wit_world is UNSET and so defaults to the package name: the package name
-// being invalid, and the package name colliding with an interface the package
-// itself defines.
