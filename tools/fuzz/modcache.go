@@ -2,6 +2,8 @@ package fuzz
 
 import (
 	"container/list"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -143,3 +145,27 @@ func cachedCompileSet(key string, build func() ([]byte, map[int]bool, error)) ([
 // entry. The single-pattern cache stores the key inside its entry instead;
 // this one keeps it beside, because the entry type is shared with callers.
 var setKeyOf = map[*list.Element]string{}
+
+// setKey turns a set's pattern list into a cache key.
+//
+// NOT fmt.Sprintf("%v", pats): that joins with a SPACE, so []string{" ", ""}
+// and []string{"", " "} both render as "[  ]" and the second set silently gets
+// the first one's module. A pattern's INDEX is its id, so swapping two
+// patterns swaps every id the set reports, and the harness then checks one
+// module's answers against the other's oracle. That produced five crasher
+// files that pass on solo replay (FUZZER_BUGS bug 87).
+//
+// NOT a joined string either, whatever the separator. The fuzzer mutates
+// arbitrary bytes and Go's regexp compiles every one of them — a NUL is an
+// ordinary literal, verified — so joining on NUL makes {"a\x00b"} and
+// {"a", "b"} collide exactly as %v did. Only a LENGTH PREFIX is injective:
+// the reader of the key can always tell where one pattern stops.
+func setKey(pats []string) string {
+	var b strings.Builder
+	for _, p := range pats {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteByte(':')
+		b.WriteString(p)
+	}
+	return b.String()
+}

@@ -2625,3 +2625,58 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 		})
 	}
 }
+
+// TestVerboseReporterNotes covers the --verbose reporting arms in
+// compilePatternBody: they only run when a Reporter is attached, and the rest
+// of the suite compiles without one.
+func TestVerboseReporterNotes(t *testing.T) {
+	cases := []struct {
+		name string
+		pat  string
+		opts CompileOptions
+	}{
+		// u16 state ids AND the u16 row-dedup note.
+		{"u16_rowdedup", `^.{0,170}0`, CompileOptions{}},
+		// Small enough to be promoted to direct-index dispatch.
+		{"compiled_dfa", `abc`, CompileOptions{}},
+		// Over the DFA memory bound, so the reporter names that limit.
+		{"memory_bound", `[a-z]{0,80}x`, CompileOptions{MaxDFAMemory: 64}},
+		{"memory_bound_big", `[a-z]{0,300}x`, CompileOptions{MaxDFAMemory: 1024}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			o := c.opts
+			o.Report = &Reporter{}
+			if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 65536, true, o); err != nil {
+				t.Fatalf("Compile(%q): %v", c.pat, err)
+			}
+		})
+	}
+}
+
+// TestWideSetShapesCompile covers the set paths that only a set with more
+// patterns than the narrow 64-id accept mask can hold ever reaches: the wide
+// union-scan body and its alive mask, the wide anchored union, and the
+// id-space arithmetic that goes with them.
+
+func TestMemoBudgetTooSmall(t *testing.T) {
+	saw := false
+	for _, p := range []string{`(a??)*?b`, `(a*)*b`, `(a|)*b`, `(a+?)(b)`} {
+		for _, budget := range []int{1, 8, 16} {
+			_, _, err := Compile([]config.RegexEntry{{Pattern: p, GroupsFunc: "g"}}, 65536, true,
+				CompileOptions{MemoBudget: budget, MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
+			if err != nil {
+				saw = true
+			}
+		}
+	}
+	if !saw {
+		t.Error("no MemoBudget was small enough to be refused — the budgets here need raising")
+	}
+}
+
+// TestLoopEntryAtStartBodies covers the `loopEntryAtStart` arms in the
+// Backtracking bodies: a greedy loop whose body IS the very first thing in the
+// program has no predecessor instruction to write its entry position, so the
+// body seeds that local itself. Needs BTWorkBudgetOff for the same reason the
+// other empty-body loop tests do — see TestBTStaticMemoBodiesCompile.

@@ -92,7 +92,7 @@ func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
-	return cachedCompileSet(fmt.Sprintf("set\x00%v", pats), func() ([]byte, map[int]bool, error) {
+	return cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, map[int]bool, error) {
 		entries := make([]config.RegexEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {

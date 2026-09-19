@@ -35,7 +35,7 @@ const (
 	//     (compile.BTWorkBudgetOff): the backtrack FRAME STACK (btPushFrame's
 	//     guard in compile/engine_backtrack.go), sized from the pattern's
 	//     alternation count by btAllocSizes, or the BitState MEMO bitset
-	//     (emitBTMemoLenGuard, same file), sized from the instruction count by
+	//     (emitBTMemoLenGuardThen, same file), sized from the instruction count by
 	//     btMemoMaxLen — both compile-time sized while the requirement scales
 	//     with the input;
 	//   - every other program only when its FALLBACK body, which sizes both

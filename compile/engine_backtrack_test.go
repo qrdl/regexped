@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"regexp/syntax"
@@ -2260,3 +2261,155 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 		t.Errorf("suffix length = [%d, %d], want [3, 3] (digit, 'b', trailing digit)", suffixMin, suffixMax)
 	}
 }
+
+// TestBTStaticMemoBodiesCompile covers the Backtracking engine's STATIC
+// BitState memo — `emitBitStateGuard` and the `emitBTMemo*` helpers that set
+// the bitset up at the head of a call.
+//
+// Reaching that code needs two things at once, and nothing else in this
+// package's tests had both:
+//
+//   - a program that needs the memo, which means a loop whose body can match
+//     EMPTY (`needsBitState`), and
+//   - BTWorkBudgetOff.
+//
+// The second is the part that is easy to miss. Since the work budget landed,
+// `planBT` sends any program with a zero-width cycle straight to the FALLBACK
+// body and emits no ordinary body at all — and every program that needs the
+// memo has such a cycle, because `needsBitState` requires
+// `loopBodyCanMatchEmpty`, which is exactly an epsilon-only path from a loop
+// head back to itself. The fallback body uses the `Dyn` variants instead, so
+// under any ordinary budget the static ones are never emitted.
+//
+// BTWorkBudgetOff is the "bytes from before the budget existed" mode: no
+// fallback, so the ordinary body is emitted for these programs after all, and
+// the static memo goes with it. `tools/fuzz`'s FuzzGroupsBothBodies drives it
+// for real; this test exists so the compile package covers the emission.
+//
+// MaxDFAStates: 1 is what pushes `match` and `find` onto Backtracking too —
+// their bodies set the bitset up differently from the groups body
+// (`emitBTMemoZeroInit` and `emitBTMemoFirstAttempt` against
+// `emitBTMemoLazyClear`), so all three exports are compiled here.
+func TestBTStaticMemoBodiesCompile(t *testing.T) {
+	// Each of these has a non-greedy loop whose body matches empty, which is
+	// what makes needsBitState true.
+	pats := []string{`(a??)*?b`, `(x?)*?y`, `(\w*?)*?c`, `(a*)*?b`}
+	exports := []struct {
+		name  string
+		entry func(string) config.RegexEntry
+	}{
+		{"groups", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, GroupsFunc: "g"} }},
+		{"match", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, MatchFunc: "m"} }},
+		{"find", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, FindFunc: "f"} }},
+	}
+	for _, p := range pats {
+		for _, e := range exports {
+			t.Run(p+"/"+e.name, func(t *testing.T) {
+				mustCompileEntries(t, []config.RegexEntry{e.entry(p)},
+					CompileOptions{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1})
+			})
+		}
+	}
+}
+
+// TestBTEmptyBodyGreedyLoopBodiesCompile covers the ORDINARY Backtracking
+// body's handling of a GREEDY loop whose body can match empty —
+// `bt.emptyBodyGreedyLoop`, and with it the loop-entry bookkeeping
+// (`loopEntryOutOf` / `loopEntryArgOf`) that only such a loop needs.
+//
+// It needs BTWorkBudgetOff for the same reason the static memo does (see
+// TestBTStaticMemoBodiesCompile): a loop whose body can match empty is a
+// zero-width cycle, `planBT` sends those to the fallback body and emits no
+// ordinary body, and the fallback flattens every loop away. Only the
+// budget-off build, which emits no fallback, still compiles this code.
+func TestBTEmptyBodyGreedyLoopBodiesCompile(t *testing.T) {
+	pats := []string{`(a*)*b`, `(a|)*b`, `(a?)*b`, `((a)*)*b`, `(a*b*)*c`}
+	exports := []struct {
+		name  string
+		entry func(string) config.RegexEntry
+	}{
+		{"groups", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, GroupsFunc: "g"} }},
+		{"match", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, MatchFunc: "m"} }},
+		{"find", func(p string) config.RegexEntry { return config.RegexEntry{Pattern: p, FindFunc: "f"} }},
+	}
+	for _, p := range pats {
+		for _, e := range exports {
+			t.Run(p+"/"+e.name, func(t *testing.T) {
+				mustCompileEntries(t, []config.RegexEntry{e.entry(p)},
+					CompileOptions{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1})
+			})
+		}
+	}
+}
+
+// TestBacktrackHasZeroWidthCycle covers the exported predicate tools/fuzz uses
+// to decide whether a program ships an ordinary body at all.
+
+func TestBacktrackHasZeroWidthCycle(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want bool
+	}{
+		{`(a|)*b`, true},
+		{`(a*)*b`, true},
+		{`(a??)*?b`, true},
+		{`abc`, false},
+		{`(a+)(b)`, false},
+		{`[a-z]+x`, false},
+	} {
+		got, err := BacktrackHasZeroWidthCycle(c.pat)
+		if err != nil {
+			t.Fatalf("%q: %v", c.pat, err)
+		}
+		if got != c.want {
+			t.Errorf("BacktrackHasZeroWidthCycle(%q) = %v, want %v", c.pat, got, c.want)
+		}
+	}
+	if _, err := BacktrackHasZeroWidthCycle(`(`); err == nil {
+		t.Error("BacktrackHasZeroWidthCycle on an unparsable pattern returned no error")
+	}
+}
+
+func TestLoopEntryAtStartBodies(t *testing.T) {
+	// Verified to produce a non-empty bt.loopEntryAtStart.
+	pats := []string{`(?:a??){1,}`, `(?:a*)+`, `(a*)+`}
+	for _, p := range pats {
+		for _, e := range []config.RegexEntry{
+			{Pattern: p, GroupsFunc: "g"}, {Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"},
+			{Pattern: p, FindFunc: "f", GroupsFunc: "g"},
+		} {
+			for _, o := range []CompileOptions{
+				{BTWorkBudget: BTWorkBudgetOff},
+				{BTWorkBudget: BTWorkBudgetOff, MaxDFAStates: 1},
+			} {
+				if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, o); err != nil {
+					t.Fatalf("Compile(%q): %v", p, err)
+				}
+			}
+		}
+	}
+	// A BT member inside a set runs in WINDOW mode, which seeds that same
+	// local from the window start instead of from zero.
+	for _, f := range [][]string{{`(a*)*b`, `x`}, {`(a??)*?b`, `y`}} {
+		entries := make([]config.RegexEntry, len(f))
+		names := make([]string, len(f))
+		for i, p := range f {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		sc := config.SetConfig{Name: "s", MatchAny: "ma", ScanAny: "sa", Find: "fi",
+			Patterns: config.PatternSelector{Names: names}}
+		if _, _, err := CompileFile(
+			config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
+			t.Fatalf("CompileFile(%v): %v", f, err)
+		}
+	}
+}
+
+// TestSetWithPatternDroppedAtStateLimit covers the set emitter's handling of a
+// member the packer DROPPED: its bit is still carried by the union automaton
+// but named by no bucket, so the emitted mask arithmetic has to restrict the
+// answer to the patterns that can actually be reported.
+//
+// A low MaxFallbackStates is what forces the drop; nothing else in the suite
+// compiles a set that loses a member this way.

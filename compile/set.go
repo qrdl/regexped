@@ -340,9 +340,9 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	info := &PatternInfo{
 		fullPattern:    pattern,
 		displayPattern: re.Pattern,
-		byteMode:    re.ByteMode,
-		prefixID:    -1,
-		suffixID:    -1,
+		byteMode:       re.ByteMode,
+		prefixID:       -1,
+		suffixID:       -1,
 	}
 
 	// A pattern whose leftmost-first DFA cannot keep an assertion branch's

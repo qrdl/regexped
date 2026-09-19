@@ -45,7 +45,7 @@ func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) 
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%v", overlapping, pats), func() ([]byte, map[int]bool, error) {
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, map[int]bool, error) {
 		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
 		return w, droppedFromSet(diags), err
 	})
@@ -773,7 +773,7 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Find:     "gated_find",
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	return cachedCompile(fmt.Sprintf("gatedset\x00%v", pats), func() ([]byte, error) {
+	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
 		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
 		return w, err
 	})
@@ -1239,7 +1239,7 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%v", overlapping, pats), func() ([]byte, error) {
+	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
 		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
 		return w, err
 	})

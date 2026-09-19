@@ -3,6 +3,8 @@ package compile
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
+	"math/rand"
 	"reflect"
 	"regexp/syntax"
 	"testing"
@@ -858,4 +860,211 @@ func TestTDFABulkSkipMidAcceptModuleValid(t *testing.T) {
 			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
 		})
 	}
+}
+
+// TestSequentializeCopiesMatchesReference pins the fast parallel-copy
+// sequencer to the reference implementation it replaced.
+//
+// The two must agree op for op, not merely produce a valid order: the emitted
+// sequence ends up as WASM register moves, and a sequence that orders them
+// differently can read a register an earlier move in the same batch already
+// overwrote. That failure is silent — the module validates and answers wrongly
+// — which is why this is a differential rather than a property test.
+//
+// Random bijections over a small register pool are exactly the interesting
+// input, because a bijection is what the rename produces and cycles (A needs
+// B's slot, B needs A's) are what force the scratch-register break.
+func TestSequentializeCopiesMatchesReference(t *testing.T) {
+	rnd := rand.New(rand.NewSource(20260918))
+	var cyclic int
+	const iters = 200000
+	for iter := 0; iter < iters; iter++ {
+		n := 1 + rnd.Intn(10)
+		extra := rnd.Intn(3) // some sources outside the destination set
+		pool := make([]int, n+extra)
+		for i := range pool {
+			pool[i] = i
+		}
+		rnd.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+		ops := make([]tdfaTagOp, 0, n)
+		ok := true
+		for i := 0; i < n; i++ {
+			if pool[i] == i { // a self-copy: the rename never emits one
+				ok = false
+				break
+			}
+			ops = append(ops, tdfaTagOp{dst: i, src: pool[i]})
+		}
+		if !ok {
+			continue
+		}
+		want := sequentializeCopiesRoundwise(append([]tdfaTagOp(nil), ops...))
+		got := sequentializeCopies(append([]tdfaTagOp(nil), ops...))
+		if len(want) != len(got) {
+			t.Fatalf("length differs for %v:\n reference %v\n fast      %v", ops, want, got)
+		}
+		for i := range want {
+			if want[i] != got[i] {
+				t.Fatalf("op %d differs for %v:\n reference %v\n fast      %v", i, ops, want, got)
+			}
+		}
+		if len(want) > len(ops) {
+			cyclic++
+		}
+	}
+	// A run that never needed the scratch register would not have tested the
+	// cycle-breaking arm at all, which is the half most likely to diverge.
+	if cyclic < iters/10 {
+		t.Fatalf("only %d of %d cases needed cycle-breaking; the generator is not producing cycles", cyclic, iters)
+	}
+	t.Logf("%d cases, %d required cycle-breaking through the scratch register", iters, cyclic)
+}
+
+// TestBatchEdgeSetsMatchThePairLoops pins minimizeTDFARegisters' per-batch
+// interference edges against the pair-at-a-time construction they replaced.
+//
+// The original added one edge per pair: every (dst_i, dst_j) with i < j, and
+// every (dst_i, src_j) with i != j. That is O(len(ops)^2) stores into a dense
+// matrix, and on a 900-register batch it was 47% of SelectEngine's whole
+// runtime. The shipped version instead ORs a whole mask into one register's
+// row at a time, which is `words` machine words instead of |set| stores.
+//
+// The masks are the easy part. The "i != j" exclusion is not: (dst_i, src_i)
+// belongs in the graph only when some OTHER op names the same register, so a
+// register named exactly once has to be taken back out of the mask again, on
+// BOTH halves of the symmetry. That reasoning is what this test checks — byte
+// identity over a corpus cannot, because a corpus may never produce a batch
+// with a duplicated dst or a duplicated src.
+//
+// Coloring reads the matrix only as a set of edges, so equal edge sets give
+// equal register assignments and therefore equal emitted bytes.
+func TestBatchEdgeSetsMatchThePairLoops(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for iter := 0; iter < 200000; iter++ {
+		numRegs := 1 + rng.Intn(12)
+		ops := make([]tdfaTagOp, rng.Intn(6))
+		for i := range ops {
+			// -1 stands for "no register", which both halves must ignore.
+			ops[i].dst = rng.Intn(numRegs + 1)
+			if ops[i].dst == numRegs {
+				ops[i].dst = -1
+			}
+			ops[i].src = -1
+			if rng.Intn(3) != 0 {
+				ops[i].src = rng.Intn(numRegs)
+			}
+		}
+		want := referenceBatchEdges(ops, numRegs)
+		got := shippedBatchEdges(ops, numRegs)
+		if len(want) != len(got) {
+			t.Fatalf("iter %d ops=%+v numRegs=%d: %d edges, want %d\n got  %v\n want %v",
+				iter, ops, numRegs, len(got), len(want), got, want)
+		}
+		for e := range want {
+			if !got[e] {
+				t.Fatalf("iter %d ops=%+v numRegs=%d: missing edge %v\n got  %v\n want %v",
+					iter, ops, numRegs, e, got, want)
+			}
+		}
+	}
+}
+
+// referenceBatchEdges is the ORIGINAL construction, kept verbatim so the test
+// compares against the algorithm that shipped for months rather than against a
+// restatement of the new one.
+
+func referenceBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
+	out := map[[2]int]bool{}
+	addEdge := func(r1, r2 int) {
+		if r1 != r2 && r1 >= 0 && r1 < numRegs && r2 >= 0 && r2 < numRegs {
+			out[[2]int{r1, r2}] = true
+			out[[2]int{r2, r1}] = true
+		}
+	}
+	for i := 0; i < len(ops); i++ {
+		for j := i + 1; j < len(ops); j++ {
+			addEdge(ops[i].dst, ops[j].dst)
+		}
+	}
+	for i := 0; i < len(ops); i++ {
+		for j := 0; j < len(ops); j++ {
+			if i != j && ops[j].src >= 0 {
+				addEdge(ops[i].dst, ops[j].src)
+			}
+		}
+	}
+	return out
+}
+
+// shippedBatchEdges mirrors minimizeTDFARegisters' addBatchEdges. It is a copy
+// rather than a call because the real one closes over the function's bitset
+// and its per-batch scratch; keeping the copy honest is this file's job, and
+// any divergence shows up as a failure here first.
+
+func shippedBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
+	words := (numRegs + 63) / 64
+	interfere := make([]uint64, numRegs*words)
+	orInto := func(r int, mask []uint64) {
+		base := r * words
+		for w := 0; w < words; w++ {
+			interfere[base+w] |= mask[w]
+		}
+		interfere[base+r/64] &^= 1 << uint(r%64)
+	}
+	out := map[[2]int]bool{}
+	if len(ops) < 2 {
+		return out
+	}
+	dstMask := make([]uint64, words)
+	srcMask := make([]uint64, words)
+	dstCount := make([]int32, numRegs)
+	srcCount := make([]int32, numRegs)
+	for _, op := range ops {
+		if op.dst >= 0 && op.dst < numRegs {
+			dstMask[op.dst/64] |= 1 << uint(op.dst%64)
+			dstCount[op.dst]++
+		}
+		if op.src >= 0 && op.src < numRegs {
+			srcMask[op.src/64] |= 1 << uint(op.src%64)
+			srcCount[op.src]++
+		}
+	}
+	for _, op := range ops {
+		if op.dst < 0 || op.dst >= numRegs {
+			continue
+		}
+		orInto(op.dst, dstMask)
+		if op.src >= 0 && op.src < numRegs && srcCount[op.src] == 1 {
+			m := uint64(1) << uint(op.src%64)
+			srcMask[op.src/64] &^= m
+			orInto(op.dst, srcMask)
+			srcMask[op.src/64] |= m
+		} else {
+			orInto(op.dst, srcMask)
+		}
+	}
+	for _, op := range ops {
+		if op.src < 0 || op.src >= numRegs {
+			continue
+		}
+		if srcCount[op.src] == 1 && op.dst >= 0 && op.dst < numRegs && dstCount[op.dst] == 1 {
+			m := uint64(1) << uint(op.dst%64)
+			dstMask[op.dst/64] &^= m
+			orInto(op.src, dstMask)
+			dstMask[op.dst/64] |= m
+		} else {
+			orInto(op.src, dstMask)
+		}
+	}
+	for r := 0; r < numRegs; r++ {
+		for w := 0; w < words; w++ {
+			m := interfere[r*words+w]
+			for m != 0 {
+				b := bits.TrailingZeros64(m)
+				m &= m - 1
+				out[[2]int{r, w*64 + b}] = true
+			}
+		}
+	}
+	return out
 }

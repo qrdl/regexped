@@ -3198,12 +3198,14 @@ func btMemoPlan(numInsts, memoBudget int) (memoMaxLen int32, bitsetBytes int64, 
 	return memoMaxLen, bitsetBytes, nil
 }
 
-// emitBTMemoLenGuard emits `if <len> > memoMaxLen { return abi.BTStackOverflow }`
-// with the length expression ALREADY on the stack.
+// emitBTMemoLenGuardThen emits `if <len> > memoMaxLen { <over> }` with the
+// length expression ALREADY on the stack. `over` must leave the function.
 //
-// abi.BTStackOverflow rather than a new sentinel: both mean "a compile-time
-// sized resource was exceeded, so the engine abandoned the search and the
-// answer is UNKNOWN" — which is exactly what a host must not read as
+// A fast body with a fallback CALLS the fallback there, since the fallback
+// sizes its memo from the input and has no such ceiling. A body without one
+// returns abi.BTStackOverflow — not a new sentinel, because both mean "a
+// compile-time sized resource was exceeded, so the engine abandoned the search
+// and the answer is UNKNOWN", which is exactly what a host must not read as
 // NoMatch. A distinct value would have to be threaded through all six stub
 // generators (see internal/abi's doc comment) to gain nothing a host acts on
 // differently.
@@ -3212,22 +3214,6 @@ func btMemoPlan(numInsts, memoBudget int) (memoMaxLen int32, bitsetBytes int64, 
 // one with N — so neither guard may be left to the other. On the html-tags
 // pattern the frame budget happens to fire first for extents up to memoMaxLen
 // and the memo overruns at the very next byte.
-func emitBTMemoLenGuard(body []byte, memoMaxLen int32, i64Return bool) []byte {
-	return emitBTMemoLenGuardThen(body, memoMaxLen, func(b []byte) []byte {
-		if i64Return {
-			b = append(b, 0x42) // i64.const
-		} else {
-			b = append(b, 0x41) // i32.const
-		}
-		b = utils.AppendSLEB128(b, abi.BTStackOverflow)
-		return append(b, 0x0F) // return
-	})
-}
-
-// emitBTMemoLenGuardThen is emitBTMemoLenGuard with the action taken past the
-// ceiling supplied: a fast body with a fallback CALLS it there, since the
-// fallback sizes its memo from the input and has no such ceiling. over must
-// leave the function.
 func emitBTMemoLenGuardThen(body []byte, memoMaxLen int32, over func([]byte) []byte) []byte {
 	body = append(body, 0x41)
 	body = utils.AppendSLEB128(body, memoMaxLen)

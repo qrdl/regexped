@@ -132,8 +132,7 @@ See [`examples/README.md`](../examples/README.md) for more details, including wh
 ## Limitations
 
 - **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
-- **Component Model support is partial** — `wasm_format: component` produces a component with a WIT interface for single patterns (`match_func`, `find_func`, `groups_func`) and for pattern **sets** (a second `sets` interface, where `match_all`/`scan_all` return a `list<u32>` of ids and `find` becomes a WIT resource), with generated **Rust and C** stubs whose API is identical to the module-format ones. Not covered: `hints: [batch-find]` on a set, since the find resource exposes one position per call; and Go, AssemblyScript, JavaScript and TypeScript are not component targets — for JS/TS because no runtime loads a component natively, so the module format already serves them better. See [component.md](component.md).
-- **Not thread-safe** — the C, JS, TS, and AS stubs are not safe for concurrent use. Only the Rust and Go stubs are thread-safe.
+- **Re-entrant, not thread-safe** — every stub keeps its per-scan state with the caller (a caller-owned scanner in C, inside the iterator in Rust, Go and AssemblyScript, a per-call region in JS and TS), so two scans can be in flight at once on one thread. The module itself is not thread-safe in any language: the Backtracking engine keeps its frame stack and BitState memo at fixed addresses in the module's memory, and the find-from position travels to the body through a module-level global. Use one module instance per thread.
 
 ## Dependencies
 

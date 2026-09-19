@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"math/bits"
 	"regexp/syntax"
 	"sort"
 	"strconv"
@@ -389,44 +390,54 @@ func (w *epsWalker) find(fromPC, targetPC int) (bool, []captureOp) {
 }
 
 func (w *epsWalker) walk(fromPC, targetPC int) bool {
-	if fromPC < 0 || fromPC >= len(w.prog.Inst) || w.seen[fromPC] == w.gen {
-		return false
-	}
-	if fromPC == targetPC {
-		return true
-	}
-	w.seen[fromPC] = w.gen
-	inst := w.prog.Inst[fromPC]
-	switch inst.Op {
-	case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-		return false
-	case syntax.InstCapture:
-		var op captureOp
-		if inst.Arg&1 == 0 {
-			op = captureOp{open: true, group: int(inst.Arg >> 1)}
-		} else {
-			op = captureOp{open: false, group: int(inst.Arg >> 1)}
+	// Iterative in the TAIL positions, and reading each instruction through a
+	// POINTER.
+	//
+	// Every arm but one recurses in tail position — Nop and EmptyWidth on Out,
+	// Capture on Out, Alt on Arg after its Out branch failed — so those become
+	// `fromPC = …; continue` and only Alt's FIRST branch is still a call. The
+	// buffer rollback survives the change: a recursive frame truncated to its
+	// own mark on failure, and since each frame's mark is at least the one
+	// below it, the net effect after the whole chain fails is a truncation to
+	// the OUTERMOST mark — which is what entryMark is.
+	//
+	// `inst := w.prog.Inst[fromPC]` copied a whole syntax.Inst (Op, Out, Arg
+	// and a Rune slice header) at every node, and was the single most
+	// expensive line in this function.
+	insts := w.prog.Inst
+	entryMark := len(w.buf)
+	for {
+		if fromPC < 0 || fromPC >= len(insts) || w.seen[fromPC] == w.gen {
+			w.buf = w.buf[:entryMark]
+			return false
 		}
-		mark := len(w.buf)
-		w.buf = append(w.buf, op)
-		if w.walk(int(inst.Out), targetPC) {
+		if fromPC == targetPC {
 			return true
 		}
-		w.buf = w.buf[:mark]
-		return false
-	case syntax.InstNop:
-		return w.walk(int(inst.Out), targetPC)
-	case syntax.InstAlt, syntax.InstAltMatch:
-		mark := len(w.buf)
-		if w.walk(int(inst.Out), targetPC) {
-			return true
+		w.seen[fromPC] = w.gen
+		inst := &insts[fromPC]
+		switch inst.Op {
+		case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			w.buf = w.buf[:entryMark]
+			return false
+		case syntax.InstCapture:
+			op := captureOp{open: inst.Arg&1 == 0, group: int(inst.Arg >> 1)}
+			w.buf = append(w.buf, op)
+			fromPC = int(inst.Out)
+		case syntax.InstNop, syntax.InstEmptyWidth:
+			fromPC = int(inst.Out)
+		case syntax.InstAlt, syntax.InstAltMatch:
+			mark := len(w.buf)
+			if w.walk(int(inst.Out), targetPC) {
+				return true
+			}
+			w.buf = w.buf[:mark]
+			fromPC = int(inst.Arg)
+		default:
+			w.buf = w.buf[:entryMark]
+			return false
 		}
-		w.buf = w.buf[:mark]
-		return w.walk(int(inst.Arg), targetPC)
-	case syntax.InstEmptyWidth:
-		return w.walk(int(inst.Out), targetPC)
 	}
-	return false
 }
 
 // tdfaEpsCapOpsTo is a thin adapter over epsWalker, kept so the unit tests that
@@ -1879,15 +1890,16 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		return tt
 	}
 	transitions := tt.transitions
+	words := (numRegs + 63) / 64
 
 	// ---- Step 1: backwards liveness, with dead writes removed ----
-	// live[s][r] = register r may be needed on a future path from state s.
-	var live [][]bool
+	// live[s*words : (s+1)*words] is a bitset of the registers that may be
+	// needed on a future path from state s.
+	var live []uint64
+	testLive := func(s, r int) bool { return live[s*words+r/64]&(1<<uint(r%64)) != 0 }
+	killed := make([]uint64, words)
 	computeLive := func() {
-		live = make([][]bool, n)
-		for i := range live {
-			live[i] = make([]bool, numRegs)
-		}
+		live = make([]uint64, n*words)
 
 		// Seed: registers referenced in acceptRegMap are live at their accepting state.
 		for s := 0; s < n; s++ {
@@ -1896,15 +1908,19 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 			}
 			for _, r := range tt.acceptRegMap[s] {
 				if r >= 0 && r < numRegs {
-					live[s][r] = true
+					live[s*words+r/64] |= 1 << uint(r%64)
 				}
 			}
 		}
 
-		// Propagate backwards until stable.
+		// Propagate backwards until stable. States are visited HIGH TO LOW:
+		// this is a backward dataflow, so descending order carries a whole
+		// chain of states in one round where ascending order carries one
+		// state per round.
 		for changed := true; changed; {
 			changed = false
-			for s := 0; s < n; s++ {
+			for s := n - 1; s >= 0; s-- {
+				base := s * words
 				for b := 0; b < 256; b++ {
 					idx := s*256 + b
 					if idx >= len(transitions) {
@@ -1918,25 +1934,42 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 					if idx < len(tt.tagOps) {
 						ops = tt.tagOps[idx]
 					}
+					nbase := next * words
+					if len(ops) == 0 {
+						for w := 0; w < words; w++ {
+							v := live[base+w] | live[nbase+w]
+							if v != live[base+w] {
+								live[base+w] = v
+								changed = true
+							}
+						}
+						continue
+					}
 					// Registers killed (written) by ops on this transition.
-					killed := make([]bool, numRegs)
+					for w := range killed {
+						killed[w] = 0
+					}
 					for _, op := range ops {
 						if op.dst >= 0 && op.dst < numRegs {
-							killed[op.dst] = true
+							killed[op.dst/64] |= 1 << uint(op.dst%64)
 						}
 					}
 					// Propagate: r alive at next and not killed → alive at s.
-					for r := 0; r < numRegs; r++ {
-						if live[next][r] && !killed[r] && !live[s][r] {
-							live[s][r] = true
+					for w := 0; w < words; w++ {
+						v := live[base+w] | (live[nbase+w] &^ killed[w])
+						if v != live[base+w] {
+							live[base+w] = v
 							changed = true
 						}
 					}
 					// Registers read (as src) by ops are live at s.
 					for _, op := range ops {
-						if op.src >= 0 && op.src < numRegs && !live[s][op.src] {
-							live[s][op.src] = true
-							changed = true
+						if op.src >= 0 && op.src < numRegs {
+							m := uint64(1) << uint(op.src%64)
+							if live[base+op.src/64]&m == 0 {
+								live[base+op.src/64] |= m
+								changed = true
+							}
 						}
 					}
 				}
@@ -1954,14 +1987,19 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	// source dead, hence the fixpoint. The in-batch read check keeps the
 	// scratch register's cycle-break write (see sequentializeCopies), which the
 	// next op in its batch reads.
-	dropDead := func(ops []tdfaTagOp, liveAfter []bool) ([]tdfaTagOp, bool) {
+	//
+	// liveState is the state whose live set applies AFTER this batch — the
+	// transition's destination, or state 0 for entryOps. It used to be that
+	// state's `[]bool` row; live is a bitset now, so the caller passes the
+	// state and the row is read through testLive.
+	dropDead := func(ops []tdfaTagOp, liveState int) ([]tdfaTagOp, bool) {
 		if len(ops) == 0 {
 			return ops, false
 		}
 		var kept []tdfaTagOp
 		dropped := false
 		for i, op := range ops {
-			dead := op.dst >= 0 && op.dst < numRegs && !liveAfter[op.dst]
+			dead := op.dst >= 0 && op.dst < numRegs && !testLive(liveState, op.dst)
 			if dead {
 				for _, later := range ops[i+1:] {
 					if later.src == op.dst {
@@ -1994,14 +2032,14 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 				if next < 0 || next >= n {
 					continue
 				}
-				if kept, d := dropDead(tt.tagOps[idx], live[next]); d {
+				if kept, d := dropDead(tt.tagOps[idx], next); d {
 					tt.tagOps[idx] = kept
 					removed = true
 				}
 			}
 		}
 		// entryOps fire before the first byte, in the start state (0).
-		if kept, d := dropDead(tt.entryOps, live[0]); d {
+		if kept, d := dropDead(tt.entryOps, 0); d {
 			tt.entryOps = kept
 			removed = true
 		}
@@ -2011,30 +2049,32 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	}
 
 	// ---- Step 2: interference graph ----
-	interfere := make([][]bool, numRegs)
-	for i := range interfere {
-		interfere[i] = make([]bool, numRegs)
+	// interfere[r*words : (r+1)*words] is r's neighbour bitset. Edges are
+	// added a ROW at a time rather than a pair at a time: every edge set
+	// below is "this register interferes with every member of that set", so
+	// one OR of `words` machine words replaces |set| individual stores.
+	interfere := make([]uint64, numRegs*words)
+	orInto := func(r int, mask []uint64) {
+		base := r * words
+		for w := 0; w < words; w++ {
+			interfere[base+w] |= mask[w]
+		}
+		interfere[base+r/64] &^= 1 << uint(r%64) // addEdge never made self-edges
 	}
-	addEdge := func(r1, r2 int) {
-		if r1 != r2 && r1 >= 0 && r1 < numRegs && r2 >= 0 && r2 < numRegs {
-			interfere[r1][r2] = true
-			interfere[r2][r1] = true
+
+	// Simultaneous-liveness edges: the registers live at a state form a clique.
+	for s := 0; s < n; s++ {
+		row := live[s*words : (s+1)*words]
+		for w := 0; w < words; w++ {
+			m := row[w]
+			for m != 0 {
+				r := w*64 + bits.TrailingZeros64(m)
+				m &= m - 1
+				orInto(r, row)
+			}
 		}
 	}
 
-	// Simultaneous-liveness edges.
-	for s := 0; s < n; s++ {
-		for r1 := 0; r1 < numRegs; r1++ {
-			if !live[s][r1] {
-				continue
-			}
-			for r2 := r1 + 1; r2 < numRegs; r2++ {
-				if live[s][r2] {
-					addEdge(r1, r2)
-				}
-			}
-		}
-	}
 	// Per-batch edges. Two kinds, both about what a batch means:
 	//
 	//   dst–dst: two registers written in the same op batch cannot share a
@@ -2053,19 +2093,70 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	//   instead of [2 3]. Forbidding the coalesce is the cheap half of the fix
 	//   (the alternative being a re-sequentialization pass over every remapped
 	//   batch); an op whose own dst equals another's src is already the same
-	//   register, and addEdge ignores self-edges, so this only ever constrains
+	//   register, and self-edges are ignored, so this only ever constrains
 	//   pairs that were genuinely distinct.
+	//
+	// The i != j exclusion is what the counts below are for: (dst_i, src_i)
+	// belongs in the graph only when some OTHER op names the same register,
+	// so a register named exactly once is removed from the mask again.
+	dstMask := make([]uint64, words)
+	srcMask := make([]uint64, words)
+	dstCount := make([]int32, numRegs)
+	srcCount := make([]int32, numRegs)
 	addBatchEdges := func(ops []tdfaTagOp) {
-		for i := 0; i < len(ops); i++ {
-			for j := i + 1; j < len(ops); j++ {
-				addEdge(ops[i].dst, ops[j].dst)
+		if len(ops) < 2 {
+			return // a one-op batch has no i != j pair and no dst pair
+		}
+		for w := range dstMask {
+			dstMask[w] = 0
+			srcMask[w] = 0
+		}
+		for _, op := range ops {
+			if op.dst >= 0 && op.dst < numRegs {
+				dstMask[op.dst/64] |= 1 << uint(op.dst%64)
+				dstCount[op.dst]++
+			}
+			if op.src >= 0 && op.src < numRegs {
+				srcMask[op.src/64] |= 1 << uint(op.src%64)
+				srcCount[op.src]++
 			}
 		}
-		for i := 0; i < len(ops); i++ {
-			for j := 0; j < len(ops); j++ {
-				if i != j && ops[j].src >= 0 {
-					addEdge(ops[i].dst, ops[j].src)
-				}
+		for _, op := range ops {
+			if op.dst < 0 || op.dst >= numRegs {
+				continue
+			}
+			// dst–dst clique, plus dst–src for every op but this one.
+			orInto(op.dst, dstMask)
+			if op.src >= 0 && op.src < numRegs && srcCount[op.src] == 1 {
+				m := uint64(1) << uint(op.src%64)
+				srcMask[op.src/64] &^= m
+				orInto(op.dst, srcMask)
+				srcMask[op.src/64] |= m
+			} else {
+				orInto(op.dst, srcMask)
+			}
+		}
+		for _, op := range ops {
+			if op.src < 0 || op.src >= numRegs {
+				continue
+			}
+			// The symmetric half: src interferes with every op's dst but its
+			// own, unless another op names the same src as well.
+			if srcCount[op.src] == 1 && op.dst >= 0 && op.dst < numRegs && dstCount[op.dst] == 1 {
+				m := uint64(1) << uint(op.dst%64)
+				dstMask[op.dst/64] &^= m
+				orInto(op.src, dstMask)
+				dstMask[op.dst/64] |= m
+			} else {
+				orInto(op.src, dstMask)
+			}
+		}
+		for _, op := range ops {
+			if op.dst >= 0 && op.dst < numRegs {
+				dstCount[op.dst] = 0
+			}
+			if op.src >= 0 && op.src < numRegs {
+				srcCount[op.src] = 0
 			}
 		}
 	}
@@ -2086,11 +2177,11 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 	// also deterministic, unlike the raw allocation order.
 	degree := make([]int, numRegs)
 	for r := 0; r < numRegs; r++ {
-		for r2 := 0; r2 < numRegs; r2++ {
-			if interfere[r][r2] {
-				degree[r]++
-			}
+		d := 0
+		for _, w := range interfere[r*words : (r+1)*words] {
+			d += bits.OnesCount64(w)
 		}
+		degree[r] = d
 	}
 	order := make([]int, numRegs)
 	for i := range order {
@@ -2112,11 +2203,16 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		for i := range forbidden {
 			forbidden[i] = false
 		}
-		for r2 := 0; r2 < numRegs; r2++ {
-			if interfere[r][r2] && color[r2] >= 0 {
-				c2 := color[r2]
-				if c2 < numRegs {
-					forbidden[c2] = true
+		row := interfere[r*words : (r+1)*words]
+		for w := 0; w < words; w++ {
+			m := row[w]
+			for m != 0 {
+				r2 := w*64 + bits.TrailingZeros64(m)
+				m &= m - 1
+				if r2 < numRegs && color[r2] >= 0 {
+					if c2 := color[r2]; c2 < numRegs {
+						forbidden[c2] = true
+					}
 				}
 			}
 		}
@@ -2126,7 +2222,6 @@ func minimizeTDFARegisters(tt *tdfaTable) *tdfaTable {
 		}
 		color[r] = c
 	}
-
 	newNumRegs := 0
 	for _, c := range color {
 		if c+1 > newNumRegs {

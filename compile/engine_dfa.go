@@ -2173,7 +2173,15 @@ func minimizeDFA(t *dfaTable) {
 	// Two states stay in the same class only if, for every input byte, their
 	// transitions land in the same class.  Repeat until stable.
 	// Dead state (-1 in transitions) is treated as its own implicit class (-1).
-	buf := make([]byte, 256*4) // reusable key buffer: 4 bytes per byte position
+	// Refinement only ever compares transition COLUMNS, and two bytes whose
+	// columns are identical from every state can never separate two states.
+	// So refine over one representative byte per equivalence class instead of
+	// all 256: the partition, and therefore the class numbering and the
+	// minimised table, are identical, but the inner loop shrinks by the
+	// compression ratio — which is 256/3 on the counted-repeat shapes where
+	// this function dominates a set compile.
+	_, mcRep, _ := computeByteClasses(t)
+	buf := make([]byte, len(mcRep)*4) // reusable key buffer: 4 bytes per byte class
 	passes := 0
 	for {
 		passes++
@@ -2200,23 +2208,25 @@ func minimizeDFA(t *dfaTable) {
 			// Encode: 4 bytes per byte position; dead→0, class c→c+1 (uint32 LE).
 			keyToNew := make(map[string]int, 4)
 			for _, s := range members {
-				for b := 0; b < 256; b++ {
-					next := t.transitions[s*256+b]
+				for c, rep := range mcRep {
+					next := t.transitions[s*256+rep]
 					var cv uint32
 					if next >= 0 {
 						cv = uint32(classOf[next]) + 1
 					}
-					buf[b*4] = byte(cv)
-					buf[b*4+1] = byte(cv >> 8)
-					buf[b*4+2] = byte(cv >> 16)
-					buf[b*4+3] = byte(cv >> 24)
+					buf[c*4] = byte(cv)
+					buf[c*4+1] = byte(cv >> 8)
+					buf[c*4+2] = byte(cv >> 16)
+					buf[c*4+3] = byte(cv >> 24)
 				}
-				key := string(buf)
-				nc, ok := keyToNew[key]
+				// A map lookup keyed by string(someBytes) does not allocate;
+				// only the insert does, and that happens once per NEW class
+				// rather than once per state per pass.
+				nc, ok := keyToNew[string(buf)]
 				if !ok {
 					nc = newNumClasses
 					newNumClasses++
-					keyToNew[key] = nc
+					keyToNew[string(buf)] = nc
 				}
 				newClassOf[s] = nc
 			}
@@ -6152,6 +6162,8 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			midAcceptNLOff:     l.midAcceptNLOff,
 			hasNewlineBoundary: t.hasNewlineBoundary,
 			tableMemIdx:        tableMemIdx,
+			useRowDedup:        l.useRowDedup,
+			rowMapOff:          l.rowMapOff,
 		})
 	} else {
 		fp := findBodyParams{
@@ -7701,6 +7713,15 @@ type anchoredFindBodyParams struct {
 	midAcceptNLOff     int32
 	hasNewlineBoundary bool
 	tableMemIdx        int
+	// The u16 row-dedup indirection, exactly as findBodyParams carries it.
+	// These are NOT optional: a layout that deduped its rows stores
+	// numUniqueRows rows, not numWASM, so indexing by state id reads another
+	// state's row and, once the id passes the row count, memory past the
+	// table. This body defaulted them to false/0 for as long as row dedup and
+	// the anchored find body have both existed, which is why `^.{0,150}0`
+	// answered "no match" and `\A.*.0.......` trapped.
+	useRowDedup bool
+	rowMapOff   int32
 }
 
 func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
@@ -7724,6 +7745,8 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 	midAcceptNLOff := p.midAcceptNLOff
 	hasNewlineBoundary := p.hasNewlineBoundary
 	tableMemIdx := p.tableMemIdx
+	useRowDedup := p.useRowDedup
+	rowMapOff := p.rowMapOff
 	var b []byte
 
 	// emitPrologue: state=startState, pos=0 (default), last_accept=-1, midAccept check.
@@ -7904,7 +7927,7 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u (input byte)
 	b = append(b, 0x21, 0x06)       // local.set byte
 
-	b = emitU16Transition(b, tableOff, false, 0, 0x02, 0x06, tableMemIdx)
+	b = emitU16Transition(b, tableOff, useRowDedup, rowMapOff, 0x02, 0x06, tableMemIdx)
 
 	b = append(b, 0x20, 0x02)
 	b = append(b, 0x45)
