@@ -31,11 +31,14 @@ between its two per-architecture builds, so both sets have to be present under
 distinct names.
 
 `make docker` assembles only your own machine's set, which is all a local image
-needs. To build for the other one instead:
+needs. `DOCKER_ARCH` names a different one — `amd64` or `arm64`:
 
 ```bash
 make docker DOCKER_ARCH=arm64
 ```
+
+The image is then built for that architecture, binaries and platform label
+alike, so it runs under emulation unless it happens to match your machine.
 
 Everything the image needs lives in [`docker/`](../docker): the `Dockerfile`, the three `get_*.sh` fetch scripts, the `arch.sh` helper they share, and the binaries they assemble.
 

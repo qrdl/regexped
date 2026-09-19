@@ -45,6 +45,24 @@ jobs:
           prev=$(git tag --sort=-creatordate | grep -v "^${current}$" | head -n1 || true)
           echo "previous=${prev}" >> "$GITHUB_OUTPUT"
 
+      # BEFORE the draft release, deliberately. Everything after `gh release
+      # create` has to be re-runnable on its own, because a second run of this
+      # job would fail on the tag's existing draft — which is why the image
+      # work is a separate job. A fallible upload placed after the create would
+      # put the release job back in exactly that position.
+      #
+      # These are handed to the docker job so the image ships binaries built
+      # the SAME way as the one the release attaches — -trimpath -ldflags
+      # "-s -w", one toolchain — rather than a second build done differently
+      # in another job.
+      - name: Upload the release binaries for the image job
+        uses: actions/upload-artifact@v4
+        with:
+          name: regexped-binaries
+          path: regexped-*
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,16 +80,6 @@ jobs:
           fi
           gh release create "${args[@]}" regexped
 
-      # Handed to the docker job so the image ships binaries built the SAME way
-      # as the one the release attaches — -trimpath -ldflags "-s -w", one
-      # toolchain — rather than a second build done differently in another job.
-      - name: Upload the release binaries for the image job
-        uses: actions/upload-artifact@v4
-        with:
-          name: regexped-binaries
-          path: regexped-*
-          retention-days: 1
-          if-no-files-found: error
 
   docker:
     name: Build and push Docker image

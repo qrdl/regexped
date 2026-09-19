@@ -118,7 +118,10 @@ unittest:
 DOCKER_ARCH ?= $(shell ./docker/arch.sh)
 
 docker: regexped
-	GOARCH=$(DOCKER_ARCH) go build -trimpath -ldflags "-s -w" -o docker/regexped-$(DOCKER_ARCH) .
+	# GOOS=linux as well as GOARCH: the image is Linux whatever this machine
+	# is, and a macOS build would otherwise put a Mach-O binary in it that no
+	# container can start.
+	GOOS=linux GOARCH=$(DOCKER_ARCH) go build -trimpath -ldflags "-s -w" -o docker/regexped-$(DOCKER_ARCH) .
 	./docker/get_wasm_merge.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wasm-merge-$(DOCKER_ARCH)"
 	# wasm-tools and wac are needed inside the image for `wasm_format:
 	# component`, the same way wasm-merge is needed for a module `regexped
@@ -129,7 +132,12 @@ docker: regexped
 	# have. Nothing is ever copied from the host.
 	./docker/get_wasm_tools.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wasm-tools-$(DOCKER_ARCH)"
 	./docker/get_wac.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wac-$(DOCKER_ARCH)"
-	docker build --build-arg TARGETARCH=$(DOCKER_ARCH) -t regexped docker
+	# --platform as well as the build arg. The arg alone picks which binaries
+	# are copied in, but the image would still be labelled with this machine's
+	# architecture — so `make docker DOCKER_ARCH=arm64` on an amd64 box would
+	# produce an amd64 image full of arm64 executables, which fails at run time
+	# with no useful message.
+	docker build --platform linux/$(DOCKER_ARCH) --build-arg TARGETARCH=$(DOCKER_ARCH) -t regexped docker
 
 lint:
 	golangci-lint run -D errcheck

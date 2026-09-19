@@ -64,8 +64,10 @@ curl -fsSL "$URL" -o "$DEST"
 chmod +x "$DEST"
 
 echo "wac installed to $DEST"
-# Only runnable when it was built for THIS machine; a cross-fetched binary is
-# for the image, not for here.
-if [ "$ARCH" = "$(normalise_arch "")" ]; then
+# Only runnable when it was built for THIS machine — which means the OS as well
+# as the CPU. Every asset above is a LINUX binary, so on macOS the architectures
+# can match while the binary still cannot execute, and `set -e` would abort the
+# fetch (and `make docker`) right after a successful download.
+if [ "$(uname -s)" = "Linux" ] && [ "$ARCH" = "$(normalise_arch "")" ]; then
     "$DEST" --version
 fi
