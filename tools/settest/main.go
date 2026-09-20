@@ -468,11 +468,18 @@ func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDi
 			dropped[r.ID] = true
 		}
 	}
-	// UnparseableDropped excludes a pattern from the ANCHORED capabilities
-	// only; `find` and the scan pair keep it.
+	// These two exclude a pattern from the ANCHORED capabilities only; `find`
+	// and the scan pair keep it. AnchoredStateLimitDropped is the anchored
+	// packer's own state-limit drop — separate from StateLimitDropped above,
+	// which the `find` packers write and which means the pattern left the set
+	// entirely.
 	if kind.anchored() {
-		for _, r := range diag.UnparseableDropped {
-			dropped[r.ID] = true
+		for _, refs := range [][]compile.PatternRef{
+			diag.UnparseableDropped, diag.AnchoredStateLimitDropped,
+		} {
+			for _, r := range refs {
+				dropped[r.ID] = true
+			}
 		}
 	}
 

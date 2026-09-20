@@ -2330,7 +2330,12 @@ func TestReporterRenderSets(t *testing.T) {
 			},
 			StateLimitDropped:     []PatternRef{{ID: 7, Name: "huge"}},
 			CaptureBearingDropped: []PatternRef{{ID: 8}}, // unnamed → "#8"
-			UnparseableDropped:    []PatternRef{{ID: 9, Name: "bad"}},
+			// The two anchored-only scopes. Both are here so the render is
+			// checked to keep them APART from the two global ones above: a
+			// reader who cannot tell the four lines apart cannot tell "gone
+			// from the set" from "gone from two of the five exports".
+			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
+			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}},
 			FrontendDemotion:      &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
 		}},
 	}
@@ -2348,7 +2353,8 @@ func TestReporterRenderSets(t *testing.T) {
 		"(fallback — no lite…", // truncated to the 24-col bucket-literal width
 		"dropped (fallback DFA over max_fallback_states): huge",
 		"dropped (capture-bearing): #8", // the unnamed spelling
-		"dropped (unparseable): bad",
+		"dropped from match_any/match_all (anchored DFA over the packer's limits): anch",
+		"dropped from match_any/match_all (unparseable): bad",
 		"id space:   9",
 		"DOWNGRADED frontend:",
 	} {

@@ -2325,6 +2325,88 @@ func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
 	}
 }
 
+// setCoreCovAnchoredUnbuildable is the FuzzSetCaps crasher's own member
+// (found/FuzzSetCaps/20260920-053458/061640-d3e4ec1fb889fdc0, bugs 91 and 92).
+// Its solo anchored DFA hits maxHelperDFAStates INSIDE mergeAnchoredDFA, so
+// that call returns an error rather than an oversized table — the arm where
+// there is no state count to report and max_fallback_states is not the limit
+// that bound anything.
+var setCoreCovAnchoredUnbuildable = "|0..+0.........\".\x00\x10$"
+
+func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T) {
+	info := setCoreCovAnalyze(t, setCoreCovAnchoredUnbuildable)
+
+	buf, restore := captureWarnings(t)
+	defer restore()
+
+	diag := &SetDiag{Name: "anchored-unbuildable"}
+	buckets, members := compileAnchoredBuckets([]*PatternInfo{info}, CompileSetOptions{}, diag)
+
+	if len(buckets) != 0 || len(members) != 0 {
+		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+	}
+	// Bug 91: the ANCHORED capabilities lose it and scan_any/scan_all/find keep
+	// it, so it must NOT land in StateLimitDropped, which the find packers use
+	// to mean "gone from the set entirely". A consumer reading one field for
+	// both excluded a pattern scan_any correctly reported.
+	if len(diag.AnchoredStateLimitDropped) != 1 {
+		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
+			diag.AnchoredStateLimitDropped)
+	}
+	if len(diag.StateLimitDropped) != 0 {
+		t.Errorf("anchored-only drop recorded as a whole-set drop: StateLimitDropped = %v",
+			diag.StateLimitDropped)
+	}
+	// Bug 92: the message used to be "suffix DFA exceeds state limit ...
+	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
+	// pattern never reached and a knob that cannot change the outcome, since
+	// what bound the build is the hard-coded maxHelperDFAStates.
+	out := buf.String()
+	if !strings.Contains(out, "Pattern dropped from set") {
+		t.Fatalf("silent drop: slog output was %q", out)
+	}
+	if strings.Contains(out, "max_fallback_states") {
+		t.Errorf("warning still points at max_fallback_states, which cannot change this outcome: %q", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("limit=%d", maxHelperDFAStates)) {
+		t.Errorf("warning should name the limit that actually bound the build (%d): %q",
+			maxHelperDFAStates, out)
+	}
+}
+
+func TestSetCoreCompileAnchoredBucketsOverFallbackLimitKeepsItsMessage(t *testing.T) {
+	// The other arm of the same switch, and the reason bug 92 is a split rather
+	// than a rewrite: here the DFA BUILDS and is genuinely over
+	// max_fallback_states, so the size and the knob in the message are both
+	// true and the wording must not change.
+	info := setCoreCovAnalyze(t, `[a-z]{40}`)
+
+	buf, restore := captureWarnings(t)
+	defer restore()
+
+	diag := &SetDiag{Name: "anchored-over-limit"}
+	buckets, _ := compileAnchoredBuckets([]*PatternInfo{info},
+		CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, diag)
+
+	if len(buckets) != 0 {
+		t.Fatalf("expected the pattern dropped; got %d buckets", len(buckets))
+	}
+	if len(diag.AnchoredStateLimitDropped) != 1 {
+		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
+			diag.AnchoredStateLimitDropped)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "exceeds state limit") {
+		t.Errorf("the over-limit arm should still say so: %q", out)
+	}
+	if !strings.Contains(out, "limit=4") {
+		t.Errorf("warning should name max_fallback_states as given: %q", out)
+	}
+	if strings.Contains(out, "states=0") {
+		t.Errorf("this arm has a real state count and must report it: %q", out)
+	}
+}
+
 func TestSetCoreCompileAnchoredBucketsMergeRefusalStartsNewBucket(t *testing.T) {
 	// The anchored packer's own merge refusal. It packs in DECLARATION order
 	// because a bucket's bit k must map to a stable global id, so a refused

@@ -28,7 +28,11 @@ import (
 
 // compileCaps compiles pats into a standalone module exporting all seven
 // capabilities under their canonical names.
-func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) {
+//
+// It returns BOTH drop scopes (setDrops): a pattern the anchored packer alone
+// refused still answers on scan_any, scan_all and `find`, so one map cannot
+// serve every oracle — that conflation is FUZZER_BUGS bug 91.
+func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 	entries := make([]config.RegexEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
@@ -45,9 +49,9 @@ func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) 
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, map[int]bool, error) {
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
 		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-		return w, droppedFromSet(diags), err
+		return w, dropsFromSet(diags), err
 	})
 }
 
@@ -612,7 +616,10 @@ func FuzzSetCaps(f *testing.F) {
 		r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
 		n := int32(len(input))
 
-		wantAnchored := oracleAnchored(pats, input, dropped)
+		// The anchored oracle gets the ANCHORED scope and the two below get the
+		// global one: a pattern the anchored packer alone refused is gone from
+		// match_any/match_all and still live for scan and find (bug 91).
+		wantAnchored := oracleAnchored(pats, input, dropped.anchored)
 		gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
 		if len(wantAnchored) == 0 {
 			if gotAny != -1 {
@@ -628,9 +635,9 @@ func FuzzSetCaps(f *testing.F) {
 
 		for from := 0; from <= len(input); from++ {
 			f32 := int32(from)
-			wantPos, _ := oracleFirstPosition(pats, input, from, dropped)
+			wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
 
-			wantScanAll := oracleScanAll(pats, input, from, dropped)
+			wantScanAll := oracleScanAll(pats, input, from, dropped.all)
 
 			// See site 1: a bare id, checked against the anywhere-set.
 			gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
@@ -2970,8 +2977,11 @@ func TestTwoPhaseMixedSets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			if len(dropped) != 0 {
-				t.Fatalf("patterns dropped: %v", dropped)
+			// anchored is the WIDER scope (it contains all), so this rejects a
+			// drop of either kind — which is what this test wants: its
+			// expectations assume every pattern is in the set.
+			if len(dropped.anchored) != 0 {
+				t.Fatalf("patterns dropped: %v", dropped.anchored)
 			}
 			res := make([]*regexp.Regexp, len(tc.pats))
 			for i, p := range tc.pats {

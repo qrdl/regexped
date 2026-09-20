@@ -1,0 +1,4 @@
+go test fuzz v1
+string("|0..+0.........\".\x00\x10$")
+string("\\B0000")
+string("@")

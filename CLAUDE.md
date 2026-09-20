@@ -792,10 +792,14 @@ so every multi-match position splits and the corpus becomes a check of the
 resume path (delivered-tuple gating when gated, the `skip` parameter when
 overlapping).
 
-A pattern the compiler legitimately drops from a set (fallback suffix DFA over
-`max_fallback_states`, warned and recorded in `--diag-json`'s
-`state_limit_dropped`) is excluded from the comparison and counted separately,
-so a documented exclusion cannot pass for either a pass or a failure.
+A pattern the compiler legitimately drops from a set (a fallback suffix DFA
+over `max_fallback_states`, or one the anchored packer alone refused) is
+excluded from the comparison and counted separately, so a documented exclusion
+cannot pass for either a pass or a failure. The exclusion comes from the drop
+WARNING, not from `--diag-json`, and is SCOPED by its `where`: an "anchored
+bucket" drop costs the pattern `match_any`/`match_all` only, and every other
+drop costs it the non-anchored capabilities. `--diag-json` keeps the same two
+scopes apart as `anchored_state_limit_dropped` and `state_limit_dropped`.
 
 **Backtracking `-2` and the fallback body.** A Backtracking call answering
 `-2` ("the engine gave up, answer unknown") is its own skip category,

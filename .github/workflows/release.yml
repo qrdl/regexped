@@ -25,13 +25,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build regexped
-        run: go build -trimpath -ldflags "-s -w" -o regexped .
-
-      # The image is multi-platform, so the arm64 binary is cross-built here
-      # rather than on an arm runner: regexped is pure Go with no cgo, so
-      # GOARCH alone is enough and both come from one toolchain.
-      - name: Build regexped for the image
+      # ONE build step for both consumers: these same two files are attached
+      # to the release AND handed to the image job. A separate host build for
+      # the release used to sit above this, which meant the release asset and
+      # the image's amd64 binary were two different files that only happened to
+      # be built the same way.
+      #
+      # The image is multi-platform and the release carries both
+      # architectures, so arm64 is cross-built here rather than on an arm
+      # runner: regexped is pure Go with no cgo, so GOARCH alone is enough and
+      # both come from one toolchain.
+      - name: Build regexped for both architectures
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
@@ -51,12 +55,11 @@ jobs:
       # work is a separate job. A fallible upload placed after the create would
       # put the release job back in exactly that position.
       #
-      # These are handed to the docker job so the image ships binaries built
-      # the SAME way as the one the release attaches — -trimpath -ldflags
-      # "-s -w", one toolchain — rather than a second build done differently
-      # in another job.
+      # These are handed to the docker job so the image ships the SAME FILES
+      # the release attaches, rather than a second build done differently in
+      # another job.
       - name: Upload the release binaries for the image job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: regexped-binaries
           path: regexped-*
@@ -78,7 +81,7 @@ jobs:
           if [ -n "${PREV}" ]; then
             args+=(--notes-start-tag "${PREV}")
           fi
-          gh release create "${args[@]}" regexped
+          gh release create "${args[@]}" regexped-amd64 regexped-arm64
 
 
   docker:
@@ -98,7 +101,7 @@ jobs:
       # `make docker` assembles the same names in the same place, for one
       # architecture rather than both.
       - name: Download the release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: regexped-binaries
           path: docker

@@ -92,7 +92,7 @@ func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
-	return cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, map[int]bool, error) {
+	w, drops, err := cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, setDrops, error) {
 		entries := make([]config.RegexEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
@@ -114,8 +114,11 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 		// emitted data section rather than using pathsInputBase.
 		cfg := config.BuildConfig{Regexps: entries, Sets: sets}
 		w, _, diags, err := compile.CompileFileDiag(cfg, "")
-		return w, droppedFromSet(diags), err
+		return w, dropsFromSet(diags), err
 	})
+	// compileSet's callers drive `find` only, so the anchored-only scope has
+	// nothing to say to them.
+	return w, drops.all, err
 }
 
 // droppedFromSet returns the indices of the patterns the compiler EXCLUDED
@@ -132,16 +135,50 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 // The ids here are the set's global pattern ids, which compileSet assigns as
 // the index into pats — so they index the caller's slice directly.
 func droppedFromSet(diags []compile.SetDiag) map[int]bool {
-	dropped := map[int]bool{}
-	for _, d := range diags {
-		for _, ref := range d.StateLimitDropped {
-			dropped[ref.ID] = true
+	return dropsFromSet(diags).all
+}
+
+// setDrops separates the two KINDS of drop, because they are not
+// interchangeable and treating them as one is FUZZER_BUGS bug 91: a set's
+// `scan_any` correctly reported a pattern this harness had already written off,
+// and the disagreement was read as a wrong answer.
+//
+//   - all: the pattern left the set ENTIRELY. No capability answers for it.
+//   - anchored: `all`, PLUS the patterns the anchored packer alone refused.
+//     Those keep scan_any, scan_all and `find`, and lose only
+//     match_any/match_all.
+//
+// So an anchored oracle uses `anchored` and every other oracle uses `all`.
+type setDrops struct {
+	all      map[int]bool
+	anchored map[int]bool
+}
+
+// dropsFromSet reads both scopes out of the compiler's own diagnostics.
+//
+// The scope is the compiler's to state, not this harness's to guess: see
+// compile.SetDiag's AnchoredStateLimitDropped, which exists because one field
+// used to carry both meanings.
+func dropsFromSet(diags []compile.SetDiag) setDrops {
+	d := setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
+	for _, sd := range diags {
+		for _, ref := range sd.StateLimitDropped {
+			d.all[ref.ID] = true
 		}
-		for _, ref := range d.CaptureBearingDropped {
-			dropped[ref.ID] = true
+		for _, ref := range sd.CaptureBearingDropped {
+			d.all[ref.ID] = true
+		}
+		for _, ref := range sd.AnchoredStateLimitDropped {
+			d.anchored[ref.ID] = true
+		}
+		for _, ref := range sd.UnparseableDropped {
+			d.anchored[ref.ID] = true
 		}
 	}
-	return dropped
+	for id := range d.all {
+		d.anchored[id] = true
+	}
+	return d
 }
 
 // instantiate builds and instantiates a module, returning the store, instance,

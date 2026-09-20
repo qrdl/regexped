@@ -615,7 +615,10 @@ exceeds `max_fallback_states` can be rescued onto the Backtracking engine for
 `find` and the scan pair. The ANCHORED packing admits no Backtracking member —
 it has no BT bucket path at all — so such a pattern is silently absent from
 `match_any` and `match_all`. `--diag-json` shows it in both places: in a
-`bt-fallback` bucket, and in `state_limit_dropped` for the anchored packing.
+`bt-fallback` bucket, and in `anchored_state_limit_dropped` for the anchored
+packing. That is a SEPARATE array from `state_limit_dropped`, which means the
+pattern left the set entirely — here it is still answered by `find` and the
+scan pair.
 If your set needs the anchored pair to answer for every member, raise
 `max_fallback_states` until nothing is BT-rescued.
 
@@ -632,9 +635,17 @@ The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 `in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
 and per-set `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
-`conflicts`, `capture_bearing_dropped`, and `state_limit_dropped` (patterns
+`conflicts`, `capture_bearing_dropped`, `state_limit_dropped` (patterns
 dropped for exceeding a fallback bucket's state budget — see
-[Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
+[Bin-packing](#bin-packing-and-merge-constraints) above) and
+`anchored_state_limit_dropped` arrays.
+
+The last two are not the same thing and a consumer must not merge them.
+`state_limit_dropped` means the pattern left the set ENTIRELY: no capability
+answers for it. `anchored_state_limit_dropped` means only the ANCHORED packing
+refused it, so `match_any` and `match_all` no longer see it while `scan_any`,
+`scan_all` and `find` still do. `unparseable_dropped` has the anchored-only
+scope too.
 
 If a set's frontend was **downgraded** from the one its literals selected, the
 per-set `frontend_demotion` object says so, with `from`, `to`, a machine-

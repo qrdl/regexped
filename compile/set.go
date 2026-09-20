@@ -2,6 +2,7 @@ package compile
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -2334,6 +2335,22 @@ func warnPatternDroppedReason(p *PatternInfo, where, reason, hint string, states
 		"hint", hint)
 }
 
+// recordAnchoredStateLimitDrop records a drop that cost the pattern the
+// ANCHORED capabilities only.
+//
+// It is a separate field from StateLimitDropped, which the `find` packers
+// write and which means the pattern left the set entirely. Collapsing the two
+// made a scope-blind consumer exclude a pattern the scan pair and `find` still
+// answer for — bug 91, where a set's scan_any correctly reported a pattern its
+// caller's oracle had already written off. UnparseableDropped is the same
+// anchored-only kind and was already separate; this follows it.
+func recordAnchoredStateLimitDrop(diag *SetDiag, p *PatternInfo) {
+	if diag == nil {
+		return
+	}
+	diag.AnchoredStateLimitDropped = append(diag.AnchoredStateLimitDropped, patternRefFor(p))
+}
+
 // patternRefFor builds a PatternRef from a PatternInfo.
 func patternRefFor(p *PatternInfo) PatternRef {
 	name := p.name
@@ -2475,15 +2492,30 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			continue
 		}
 		solo, err := mergeAnchoredDFA([]*syntax.Regexp{ast}, opts)
-		if err != nil || solo.numStates > opts.maxFallbackStates() {
-			states := 0
-			if solo != nil {
-				states = solo.numStates
-			}
-			warnPatternDropped(p, "anchored bucket", states, opts.maxFallbackStates())
-			if diag != nil {
-				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
-			}
+		// Three different things end the pattern's life here and they used to
+		// share one message: "suffix DFA exceeds state limit", with a size and
+		// a max_fallback_states limit. On the err arm solo is nil, so the size
+		// printed was 0 — a number the pattern never reached — and the limit
+		// that actually bound the build is maxHelperDFAStates INSIDE
+		// mergeAnchoredDFA, not max_fallback_states, so the hint sent the
+		// reader after a knob that cannot change the outcome. Bug 92.
+		switch {
+		case errors.Is(err, ErrDFAStateLimit):
+			warnPatternDroppedReason(p, "anchored bucket",
+				"the anchored DFA hit the internal state limit while being built",
+				"simplify the pattern or move it out of the set — this limit is not configurable",
+				0, maxHelperDFAStates)
+			recordAnchoredStateLimitDrop(diag, p)
+			continue
+		case err != nil:
+			warnPatternDroppedReason(p, "anchored bucket",
+				"the anchored DFA could not be built: "+err.Error(),
+				"simplify the pattern or move it out of the set", 0, 0)
+			recordAnchoredStateLimitDrop(diag, p)
+			continue
+		case solo.numStates > opts.maxFallbackStates():
+			warnPatternDropped(p, "anchored bucket", solo.numStates, opts.maxFallbackStates())
+			recordAnchoredStateLimitDrop(diag, p)
 			continue
 		}
 		buckets = append(buckets, &bucket{

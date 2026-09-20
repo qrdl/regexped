@@ -198,10 +198,15 @@ What is new here is the emission, and one chunk size per hint reaches it
 across the whole corpus.
 
 A pattern the compiler legitimately drops from a set — a fallback bucket's
-suffix DFA over the `max_fallback_states` budget, reported as a warning and in
-`--diag-json`'s `state_limit_dropped` — is excluded from the comparison and
-counted separately in the summary, so a documented exclusion cannot masquerade
-as either a pass or a failure.
+suffix DFA over the `max_fallback_states` budget, or one the anchored packer
+alone refused — is excluded from the comparison and counted separately in the
+summary, so a documented exclusion cannot masquerade as either a pass or a
+failure. The exclusion is taken from the compiler's own drop WARNING rather
+than from `--diag-json`, and it is SCOPED by that warning's `where`: an
+"anchored bucket" drop excludes the pattern from `match_any`/`match_all` only,
+while a fallback-bucket drop excludes it from everything non-anchored. Merging
+the two scopes would make the oracle expect matches from a pattern the module
+no longer holds, or drop ones it still reports.
 
 ### Batched sets (`make set-batch`)
 

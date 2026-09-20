@@ -14956,6 +14956,29 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 		if dt.numStates+1 > 256 {
 			return nil, false // keep inline DFA small (u8 table)
 		}
+		// A FIND branch must be able to express its own leftmost-first answer
+		// in a plain transition table, because emitInlineAnchoredDFAVerify
+		// walks it keeping the LAST mid-accept it sees — the longest match for
+		// that start. That agrees with leftmost-first only where building the
+		// table with leftmostFirst=true already pruned the lower-priority
+		// continuations, and the two predicates below name exactly the states
+		// where it cannot: a boundary-gated accept that outranks the state's
+		// own unconditional one (dfaHasOutrankedState) and one that needs a
+		// further mandatory byte also reachable by a lower-priority path
+		// (dfaHasAmbiguousBoundaryTarget). Refusing sends the whole pattern
+		// down the generic find path, which applies these same two predicates
+		// to the whole-pattern table (compile.go's dfaTooLarge) and routes it
+		// to Backtracking. Without this, `0$|-(?:\b|0*)0` over "-00" answered
+		// 0-3 from the `0*` alternative where RE2 answers 0-2 from the `\b`
+		// one — bug 90.
+		//
+		// leftmostFirst only: the anchored-match caller builds its branch
+		// tables leftmost-LONGEST on purpose (see this function's own doc
+		// comment), and its verify wants a match ending at len, so longest is
+		// the answer it needs and no priority is being lost.
+		if leftmostFirst && (dfaHasOutrankedState(dt) || dfaHasAmbiguousBoundaryTarget(dt)) {
+			return nil, false
+		}
 		branches = append(branches, lenAltBranch{
 			literal:    literal,
 			isLitChain: false,

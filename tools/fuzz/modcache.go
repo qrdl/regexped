@@ -87,11 +87,12 @@ func cachedCompile(key string, build func() ([]byte, error)) ([]byte, error) {
 }
 
 // setCacheEntry is a compiled SET plus the per-set fact its callers need
-// alongside the bytes (which patterns the compiler dropped).
+// alongside the bytes (which patterns the compiler dropped, in both scopes —
+// see setDrops).
 type setCacheEntry struct {
-	wasm    []byte
-	dropped map[int]bool
-	err     error
+	wasm  []byte
+	drops setDrops
+	err   error
 }
 
 var (
@@ -100,15 +101,15 @@ var (
 	setCacheIdx map[string]*list.Element
 )
 
-// cachedCompileSet is cachedCompile for set compiles, which return a dropped
-// map as well as bytes.
+// cachedCompileSet is cachedCompile for set compiles, which return the dropped
+// patterns as well as bytes.
 //
 // Sets need this more than single patterns do, not less: FUZZER_BUGS bug 83
 // names set compilation as one of the two families its speed work does not
 // touch, and FuzzSetCaps compiles TWO patterns into every capability body on
-// each call. The returned map is shared, so callers must not write to it —
-// none does; droppedFromSet builds it fresh and it is only ever read.
-func cachedCompileSet(key string, build func() ([]byte, map[int]bool, error)) ([]byte, map[int]bool, error) {
+// each call. The returned maps are shared, so callers must not write to them —
+// none does; dropsFromSet builds them fresh and they are only ever read.
+func cachedCompileSet(key string, build func() ([]byte, setDrops, error)) ([]byte, setDrops, error) {
 	setCacheMu.Lock()
 	if setCacheIdx == nil {
 		setCacheLRU, setCacheIdx = list.New(), map[string]*list.Element{}
@@ -117,20 +118,20 @@ func cachedCompileSet(key string, build func() ([]byte, map[int]bool, error)) ([
 		setCacheLRU.MoveToFront(el)
 		e := el.Value.(*setCacheEntry)
 		setCacheMu.Unlock()
-		return e.wasm, e.dropped, e.err
+		return e.wasm, e.drops, e.err
 	}
 	setCacheMu.Unlock()
 
-	wasm, dropped, err := build()
+	wasm, drops, err := build()
 
 	setCacheMu.Lock()
 	defer setCacheMu.Unlock()
 	if el, ok := setCacheIdx[key]; ok {
 		setCacheLRU.MoveToFront(el)
 		e := el.Value.(*setCacheEntry)
-		return e.wasm, e.dropped, e.err
+		return e.wasm, e.drops, e.err
 	}
-	setCacheIdx[key] = setCacheLRU.PushFront(&setCacheEntry{wasm: wasm, dropped: dropped, err: err})
+	setCacheIdx[key] = setCacheLRU.PushFront(&setCacheEntry{wasm: wasm, drops: drops, err: err})
 	setKeyOf[setCacheLRU.Front()] = key
 	for setCacheLRU.Len() > modCacheSize {
 		oldest := setCacheLRU.Back()
@@ -138,7 +139,7 @@ func cachedCompileSet(key string, build func() ([]byte, map[int]bool, error)) ([
 		delete(setCacheIdx, setKeyOf[oldest])
 		delete(setKeyOf, oldest)
 	}
-	return wasm, dropped, err
+	return wasm, drops, err
 }
 
 // setKeyOf maps a list element back to its key, so eviction can drop the index
