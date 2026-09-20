@@ -1147,10 +1147,11 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// outranking means anything. A table built leftmost-LONGEST has no
 		// priority to speak of, so a dominance mark on one is a verdict the
 		// automaton cannot support, and a reader acting on it stops the walk
-		// early on a thread that was never beaten. That is bug 81: the lenient
-		// alternation's anchored-match body builds its per-branch helper DFAs
-		// leftmost-longest on purpose (see analyseLitChainAltLenient's
-		// leftmostFirst parameter and bug 35), and `0$0|-(\b|0)` over "-0"
+		// early on a thread that was never beaten. That is the defect this guard
+		// exists for: the lenient alternation's anchored-match body builds its
+		// per-branch helper DFAs leftmost-longest on purpose (see
+		// analyseLitChainAltLenient's leftmostFirst parameter), and
+		// `0$0|-(\b|0)` over "-0"
 		// answered "no match" because the `\b` branch's accept was marked
 		// dominant and cut off the thread that would have consumed the rest.
 		if !leftmostFirst {
@@ -14970,7 +14971,8 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 		// to the whole-pattern table (compile.go's dfaTooLarge) and routes it
 		// to Backtracking. Without this, `0$|-(?:\b|0*)0` over "-00" answered
 		// 0-3 from the `0*` alternative where RE2 answers 0-2 from the `\b`
-		// one — bug 90.
+		// one: a leftmost-LONGEST walk of a branch whose leftmost-first accept
+		// is boundary-gated.
 		//
 		// leftmostFirst only: the anchored-match caller builds its branch
 		// tables leftmost-LONGEST on purpose (see this function's own doc
@@ -15175,7 +15177,9 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// loop is directly [loop $dfa, block $dfa_done], the same shape
 	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes.
 	// A full-consumption caller emits NO word-boundary pre-accept check, and
-	// this is not only an optimisation — leaving it in is bug 81.
+	// this is not only an optimisation — leaving it in is the dominance defect
+	// described at emitWBPreAcceptCheck's own call site above: a mid-accept
+	// marked dominant on a leftmost-longest table cuts off a live thread.
 	//
 	// Three steps say the check cannot help such a caller. The loop tests
 	// `pos >= len` FIRST and leaves through the end-of-input arm above, so

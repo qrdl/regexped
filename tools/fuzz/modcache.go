@@ -26,7 +26,7 @@ import (
 //
 // This is a THROUGHPUT measure and nothing more. It cannot stop a slow compile
 // being filed as a crasher, because the first sight of any pattern is a miss
-// and the miss is what costs — see FUZZER_BUGS bug 83.
+// and the miss is what costs.
 const modCacheSize = 16
 
 // modCache is a per-process LRU of compiled modules, keyed by the caller's own
@@ -104,10 +104,10 @@ var (
 // cachedCompileSet is cachedCompile for set compiles, which return the dropped
 // patterns as well as bytes.
 //
-// Sets need this more than single patterns do, not less: FUZZER_BUGS bug 83
-// names set compilation as one of the two families its speed work does not
-// touch, and FuzzSetCaps compiles TWO patterns into every capability body on
-// each call. The returned maps are shared, so callers must not write to them —
+// Sets need this more than single patterns do, not less: set compilation is one
+// of the two families the compiler's own speed work does not touch (the other
+// is TDFA construction inside engine selection), and FuzzSetCaps compiles TWO
+// patterns into every capability body on each call. The returned maps are shared, so callers must not write to them —
 // none does; dropsFromSet builds them fresh and they are only ever read.
 func cachedCompileSet(key string, build func() ([]byte, setDrops, error)) ([]byte, setDrops, error) {
 	setCacheMu.Lock()
@@ -154,7 +154,7 @@ var setKeyOf = map[*list.Element]string{}
 // the first one's module. A pattern's INDEX is its id, so swapping two
 // patterns swaps every id the set reports, and the harness then checks one
 // module's answers against the other's oracle. That produced five crasher
-// files that pass on solo replay (FUZZER_BUGS bug 87).
+// files that pass on solo replay.
 //
 // NOT a joined string either, whatever the separator. The fuzzer mutates
 // arbitrary bytes and Go's regexp compiles every one of them — a NUL is an

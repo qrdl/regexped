@@ -2232,7 +2232,7 @@ func TestSuffixWalkExtentGlobal(t *testing.T) {
 		nil, false, false, false, false, true)
 }
 
-// TestAnchoredFindBodyReadsTheRowMap pins FUZZER_BUGS bug 86.
+// TestAnchoredFindBodyReadsTheRowMap pins the anchored find body's rowMap read.
 //
 // A find that can only match at position 0 gets its own body,
 // buildAnchoredFindBody. When the layout has more than 256 states its table is
@@ -2251,8 +2251,8 @@ func TestSuffixWalkExtentGlobal(t *testing.T) {
 // red. This asserts the emitted body itself.
 func TestAnchoredFindBodyReadsTheRowMap(t *testing.T) {
 	// An anchored run of a wide class closed by a one-byte-wide tail: past 256
-	// states, and the rows still collapse. `^.{0,170}0` is one of bug 86's
-	// three raw crashers.
+	// states, and the rows still collapse. `^.{0,170}0` is one of the three
+	// fuzz crashers that reported this.
 	const pat = `^.{0,170}0`
 
 	matcher, err := compile(pat, CompileOptions{MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true})

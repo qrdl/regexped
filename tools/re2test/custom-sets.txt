@@ -1729,3 +1729,32 @@ regexps
 -;1-3;-;-;1-3
 -;3-4;-;-;3-4,4-5
 -;3-4;-;-;3-4,4-5,5-6
+# ============================================================
+# Category S-fold: a set member whose branches collapse into a fold-cased
+# literal.
+#
+# The live set oracle re-serialised each pattern before embedding it in its
+# `\A(?:pat)\z` probe, and `B$|b|B` does not survive that round-trip: it
+# re-parses as `B(?:$|)` and stops matching "b", so the oracle expected no
+# anchored match where the module correctly reported one.
+# ============================================================
+SetFoldAltBranch
+strings
+""
+"b"
+"B"
+"bB"
+"0b"
+regexps
+"0"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-1;-;-;0-1
+"B$|b|B"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2

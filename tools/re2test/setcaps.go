@@ -512,7 +512,7 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 	// expectation would be quietly wrong. A twin is pure ASCII, so runes and
 	// bytes coincide and the probe means what it says; the module is still
 	// driven over the ORIGINAL bytes, which the engine cannot distinguish from
-	// the twin (see asciiTwinForPatterns). Rows with no twin keep EMPTY
+	// the twin (see setOracleTwins). Rows with no twin keep EMPTY
 	// expectations and are routed to driveUnicodePinned — computing a wrong
 	// answer and relying on nobody reading it is how a harness bug becomes an
 	// engine bug report.
@@ -602,18 +602,44 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 	return o, nil
 }
 
-// normalizeSetOraclePattern re-serialises a pattern through regexp/syntax
-// before it is embedded in a wrapper like `\A(?:pat)\z`.
+// normalizeSetOraclePattern returns the text to embed for pat in a wrapper like
+// `\A(?:pat)\z`.
 //
-// The raw source may contain `\Q`, which quotes everything after it —
-// including the wrapper's own closing paren — and would silently build a
-// DIFFERENT regexp, then blame the engine for the difference.
+// The pattern AS WRITTEN is preferred. Re-serialising it through
+// regexp/syntax is NOT language-preserving — Go's factor() decides that two
+// alternation branches share a leading character class using
+// (*Regexp).Equal, which compares OpLiteral nodes on Rune alone and ignores
+// Flags&FoldCase — so the printed form of `B$|b|B` is `B$|[Bb]`, which
+// re-parses as `B(?:$|)` and never matches "b". Re-serialising
+// unconditionally made this oracle expect no anchored match for that member
+// while the module correctly reported one: 52 failures over custom-sets.txt.
+//
+// Re-serialising is kept as the FALLBACK, because it is the only way to defuse
+// an unterminated `\Q`, which quotes everything after it including the
+// wrapper's own closing paren. That case announces itself: the `(?:` is left
+// unclosed, so embedding the raw pattern is a parse ERROR rather than a
+// silently different regexp, and the error is what selects the fallback. A
+// `\Q` closed by `\E` is self-contained and takes the raw path.
+//
+// An error is returned when neither route is safe, which the caller turns into
+// "no oracle for this set" rather than a comparison against a wrong answer.
 func normalizeSetOraclePattern(pat string) (string, error) {
+	if _, err := regexp.Compile(`\A(?:` + pat + `)\z`); err == nil {
+		return pat, nil
+	}
 	parsed, err := syntax.Parse(pat, syntax.Perl)
 	if err != nil {
 		return "", err
 	}
-	return parsed.String(), nil
+	rt := parsed.String()
+	again, aerr := syntax.Parse(rt, syntax.Perl)
+	if aerr != nil {
+		return "", aerr
+	}
+	if !again.Equal(parsed) {
+		return "", fmt.Errorf("cannot be embedded in an oracle wrapper: it needs re-serialising (unterminated \\Q) and the re-serialised form re-parses to a different language")
+	}
+	return rt, nil
 }
 
 // setDotPrefix builds a regexp matching exactly p runes of anything.
@@ -1479,7 +1505,6 @@ func runSetProfile(
 					if errors.Is(e, errBTUnknown) {
 						// The engine said "unknown"; there is nothing to
 						// compare against. Counted, not scored.
-						e = nil
 						hang = true
 					} else if e != nil {
 						return e
@@ -1500,7 +1525,7 @@ func runSetProfile(
 				// position.
 				ovM, hang, viol, e := r.driveFindOverflow(c.find, text, c.spec.overlapping)
 				if errors.Is(e, errBTUnknown) {
-					e, hang = nil, true
+					hang = true
 				} else if e != nil {
 					return e
 				}
@@ -1523,7 +1548,7 @@ func runSetProfile(
 					}
 					fm, hang, e := r.driveFindFrom(c.find, text, int32(from))
 					if errors.Is(e, errBTUnknown) {
-						e, hang = nil, true
+						hang = true
 					} else if e != nil {
 						return e
 					}
@@ -1566,7 +1591,7 @@ func runSetProfile(
 							r.recordCacheLeg()
 						}
 						if errors.Is(e, errBTUnknown) {
-							e, hang = nil, true
+							hang = true
 						} else if e != nil {
 							return e
 						}

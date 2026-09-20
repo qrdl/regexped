@@ -2409,3 +2409,107 @@ func TestLoopEntryAtStartBodies(t *testing.T) {
 		}
 	}
 }
+
+// forcedBTPatterns are capture patterns the selector routes to Backtracking of
+// its own accord. That is what makes them usable below: forcing the engine the
+// selector would have picked anyway must not change one byte of the output.
+var forcedBTPatterns = []string{
+	// The three filed as fuzz crashers for compile TIME alone: the first is 41
+	// NFA instructions and took 5.36 s to replay, of
+	// which 5.0 s was three tagged DFAs that no leg of the target used.
+	`[0]+0()00.{31}`,
+	`((.(1)*)11){11}`,
+	// Ordinary shapes, so the invariant is not pinned by pathological patterns
+	// alone. Each is documented as Backtracking's territory: an inverted class
+	// reads as an ambiguous capture, `(?m:$)` is a line anchor, `\b` is a word
+	// boundary, and `*?` is a non-greedy quantifier.
+	`<([^>]+)>`,
+	`([^,]+),`,
+	`(?m:(foo)$)`,
+	`(\b\w+\b)`,
+	`(a*?)*?b`,
+}
+
+// TestForcedBacktrackMatchesSelectedBacktrack pins that forcing the groups
+// engine onto Backtracking produces exactly the module the selector's own
+// choice produces.
+//
+// It is the gate for the skip in compilePatternBody that stops a forced
+// Backtracking compile building a tagged DFA it then discards. The saving is
+// real — 94% to 98% of such a compile — but it is only sound if the discarded
+// table had no other effect, and byte identity is the only evidence strong
+// enough for that.
+func TestForcedBacktrackMatchesSelectedBacktrack(t *testing.T) {
+	for _, pat := range forcedBTPatterns {
+		entry := []config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}
+
+		eng, err := SelectEngine(pat, CompileOptions{})
+		if err != nil {
+			t.Fatalf("SelectEngine(%q): %v", pat, err)
+		}
+		if eng != EngineBacktrack {
+			// Not a failure of the invariant, but of this test's premise: the
+			// pattern no longer reaches Backtracking on its own, so it can no
+			// longer tell the two paths apart. Say so rather than passing
+			// silently, which is how a gate quietly stops gating.
+			t.Errorf("premise broken: SelectEngine(%q) = %v, want Backtracking — "+
+				"pick a different pattern or drop this one", pat, eng)
+			continue
+		}
+
+		selected, _, err := Compile(entry, 0, true)
+		if err != nil {
+			t.Fatalf("Compile(%q): %v", pat, err)
+		}
+		forced, _, err := CompileForced(entry, 0, true, EngineBacktrack)
+		if err != nil {
+			t.Fatalf("CompileForced(%q, Backtracking): %v", pat, err)
+		}
+		if !bytes.Equal(selected, forced) {
+			t.Errorf("%q: forced Backtracking module differs from the selected one (%d vs %d bytes)",
+				pat, len(selected), len(forced))
+		}
+	}
+}
+
+// TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath is a TRIPWIRE, not a
+// gate, and the difference matters.
+//
+// compilePatternBody skips engine selection when the groups engine is forced
+// onto Backtracking, but only for a pattern WITH capture groups. The reason for
+// that restriction is that the selector's DFA arm sets opts.LeftmostFirst for an
+// alternation, and `groups_func` on a capture-LESS pattern reaches the selector
+// too.
+//
+// Today that assignment has no consumer downstream: the capture engines take
+// the prog alone, and the find/match bodies were emitted earlier from their own
+// explicit options. So this test passes whether or not the restriction is in
+// place — verified by removing it and re-running — and it is recorded here as
+// such rather than dressed up as a gate that bites.
+//
+// What it is for: the moment anything downstream of that call starts reading
+// LeftmostFirst, the explicit build below keeps the flag where the plain one
+// loses it, these bytes part company, and this test names the guard to restore.
+func TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath(t *testing.T) {
+	// Branches where one is a prefix of the other, so leftmost-first and
+	// leftmost-longest genuinely differ in extent.
+	for _, pat := range []string{`a|ab`, `(?:a|ab)c`, `foo|foobar`} {
+		entry := []config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}
+
+		plain, _, err := CompileForced(entry, 0, true, EngineBacktrack)
+		if err != nil {
+			t.Fatalf("CompileForced(%q): %v", pat, err)
+		}
+		explicit, _, err := CompileForced(entry, 0, true, EngineBacktrack,
+			CompileOptions{LeftmostFirst: true})
+		if err != nil {
+			t.Fatalf("CompileForced(%q, LeftmostFirst): %v", pat, err)
+		}
+		if !bytes.Equal(plain, explicit) {
+			t.Errorf("%q: LeftmostFirst is no longer inert on the forced groups path "+
+				"(%d bytes without it, %d with it explicitly) — the prog.NumCap > 2 "+
+				"guard in compilePatternBody is now load-bearing, keep it",
+				pat, len(plain), len(explicit))
+		}
+	}
+}

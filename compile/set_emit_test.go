@@ -2325,8 +2325,7 @@ func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
 	}
 }
 
-// setCoreCovAnchoredUnbuildable is the FuzzSetCaps crasher's own member
-// (found/FuzzSetCaps/20260920-053458/061640-d3e4ec1fb889fdc0, bugs 91 and 92).
+// setCoreCovAnchoredUnbuildable is a FuzzSetCaps crasher's own member.
 // Its solo anchored DFA hits maxHelperDFAStates INSIDE mergeAnchoredDFA, so
 // that call returns an error rather than an oversized table — the arm where
 // there is no state count to report and max_fallback_states is not the limit
@@ -2345,7 +2344,7 @@ func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T)
 	if len(buckets) != 0 || len(members) != 0 {
 		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
 	}
-	// Bug 91: the ANCHORED capabilities lose it and scan_any/scan_all/find keep
+	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep
 	// it, so it must NOT land in StateLimitDropped, which the find packers use
 	// to mean "gone from the set entirely". A consumer reading one field for
 	// both excluded a pattern scan_any correctly reported.
@@ -2357,7 +2356,7 @@ func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T)
 		t.Errorf("anchored-only drop recorded as a whole-set drop: StateLimitDropped = %v",
 			diag.StateLimitDropped)
 	}
-	// Bug 92: the message used to be "suffix DFA exceeds state limit ...
+	// The message used to be "suffix DFA exceeds state limit ...
 	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
 	// pattern never reached and a knob that cannot change the outcome, since
 	// what bound the build is the hard-coded maxHelperDFAStates.
@@ -2375,8 +2374,8 @@ func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T)
 }
 
 func TestSetCoreCompileAnchoredBucketsOverFallbackLimitKeepsItsMessage(t *testing.T) {
-	// The other arm of the same switch, and the reason bug 92 is a split rather
-	// than a rewrite: here the DFA BUILDS and is genuinely over
+	// The other arm of the same switch, and the reason the message is a split
+	// rather than a rewrite: here the DFA BUILDS and is genuinely over
 	// max_fallback_states, so the size and the knob in the message are both
 	// true and the wording must not change.
 	info := setCoreCovAnalyze(t, `[a-z]{40}`)

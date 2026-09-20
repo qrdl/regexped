@@ -1450,7 +1450,8 @@ func TestCollapseZeroWidthRepeats(t *testing.T) {
 }
 
 // TestCompileNestedEmptyBodyLoopChain is the fuzz-found shape: a chain of `$*`
-// under an outer `*`. Bug 34's cap counts the loops but was calibrated on a
+// under an outer `*`. The empty-body-loop-chain cap counts the loops but was
+// calibrated on a
 // flat chain, and nesting made the same count exponential again; with the
 // repeats collapsed the pattern is `0$` and must compile without reaching
 // Backtracking's loop guards at all.
@@ -2336,7 +2337,7 @@ func TestReporterRenderSets(t *testing.T) {
 			// from the set" from "gone from two of the five exports".
 			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
 			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}},
-			FrontendDemotion:      &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
+			FrontendDemotion:          &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
 		}},
 	}
 	var b bytes.Buffer

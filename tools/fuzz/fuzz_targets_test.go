@@ -356,6 +356,14 @@ func skipPattern(pat, input string) string {
 	if _, err := regexp.Compile(pat); err != nil {
 		return "Go stdlib rejects it too — no oracle"
 	}
+	// The whole-input oracles embed the pattern in a wrapper. Almost every
+	// pattern goes in as written; the residue is an unterminated `\Q`, which
+	// swallows the wrapper's closing paren, and for those the re-serialised
+	// form is used instead — unless IT re-parses to a different tree, in which
+	// case no oracle can be built for the pattern at all.
+	if _, ok := oracleBody(pat); !ok {
+		return "no safe oracle embedding: neither the pattern nor its re-serialised form can be wrapped"
+	}
 	return ""
 }
 
@@ -854,16 +862,12 @@ func sortSpans(v [][2]int) {
 //
 // `.{p}` counts runes, so callers must restrict the corpus to ASCII.
 //
-// The pattern is re-serialised through regexp/syntax before being embedded:
-// the raw source may contain `\Q`, which quotes everything after it and would
-// swallow the closing paren of the `(?:...)` wrapper, silently building a
-// DIFFERENT regexp and blaming the engine for the difference.
+// The pattern is embedded AS WRITTEN wherever it can be, and re-serialised
+// only when it cannot — see oracleBody (set_caps_test.go) for why that order
+// matters: re-serialising is not language-preserving, and doing it
+// unconditionally has already reported a correct module as wrong.
 func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
-	parsed, err := syntax.Parse(re.String(), syntax.Perl)
-	if err != nil {
-		panic("oracle: pattern Go already accepted failed to re-parse: " + err.Error())
-	}
-	body := parsed.String()
+	body := mustOracleBody(re.String())
 	var out [][2]int
 	for p := 0; p <= len(input); p++ {
 		anchored, err := regexp.Compile(`\A` + dotPrefix(p) + `(?:` + body + `)`)

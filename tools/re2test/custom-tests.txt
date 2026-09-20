@@ -7021,7 +7021,7 @@ regexps
 -;-;-;-;-;-
 -;-;-;-;-;-
 -;-;-;-;-;-
-# Bug 81: the lenient literal-chain alternation's ANCHORED-MATCH body ran
+# The lenient literal-chain alternation's ANCHORED-MATCH body used to run
 # each non-lit-chain branch through an inline DFA whose word-boundary
 # pre-accept check could LEAVE the verify loop on a "dominant" hit. That
 # body only accepts a match ending at len, so leaving early killed the
@@ -7132,7 +7132,7 @@ regexps
 # ============================================================
 # Category: anchored find over a ROW-DEDUPED u16 transition table
 # ============================================================
-# FUZZER_BUGS bug 86. A find that can only match at position 0 uses its own
+# A find that can only match at position 0 uses its own
 # body (buildAnchoredFindBody), and that body read the transition table by
 # state id while the layout had replaced the table with one row per DISTINCT
 # row plus a rowMap[state] lookup. So state 200 read row 200 of a 129-row
@@ -7202,7 +7202,7 @@ regexps
 -;0-3;-;-;0-3;0-3
 -;0-2;-;-;0-2;0-2
 0-3;0-3;-;-;0-3;0-3
-# Bug 90: the lenient literal-chain alternation's FIND body ran each
+# The lenient literal-chain alternation's FIND body used to run each
 # non-lit-chain branch through an inline DFA verify that keeps the LAST
 # mid-accept it sees, i.e. the longest match for that start. That is only
 # leftmost-first when construction pruned the lower-priority continuations,
@@ -7273,3 +7273,98 @@ regexps
 -;1-3;-;-;1-3,3-4;1-3;1-3|3-4
 -;1-3;-;-;1-3,3-4;1-3;1-3|3-4
 -;0-2;-;-;0-2;0-2;0-2
+# ============================================================
+# Category 34: an alternation whose branches collapse into a fold-cased
+# literal.
+#
+# `b|B` is folded by the parser into one case-insensitive literal, which puts
+# it next to the unfolded `B` of `B$` and makes the pattern a round-trip
+# HAZARD: printing the parse tree and re-parsing it yields `B(?:$|)`, a
+# different language that never matches "b". regexped compiles the pattern as
+# written and is correct; it was a fuzz ORACLE that re-serialised the pattern
+# and then blamed the engine.
+#
+# Every branch here is spelled out, so the parse of the SOURCE is not
+# mis-factored and these expectations are Perl-correct as well as Go-correct
+# (patterns that reach the defect directly, such as `B$|[Bb]`, are deliberately
+# NOT in this corpus — Go answers those wrongly and the row would enshrine it).
+# ============================================================
+Cat34FoldAltBranch
+strings
+""
+"b"
+"B"
+"bB"
+"Bb"
+"xb"
+"b "
+regexps
+"B$|b|B"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"b|B$|B"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"B$|b"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"B|b|B$"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+# ============================================================
+# Category 35: capture patterns whose groups engine is FORCED.
+#
+# Under --force-backtrack these compile with forceGroupsEngine=EngineBacktrack,
+# which no longer builds the TDFA table it would discard. The gate is that the
+# answers are unchanged; the byte-for-byte gate is
+# compile.TestForcedBacktrackMatchesSelectedBacktrack.
+#
+# All three were filed as fuzz crashers purely for compile TIME: the first is
+# 41 NFA instructions and took 5.36s to replay, of which 5.0s was three
+# discarded TDFA tables.
+# ============================================================
+Cat35ForcedBTSelectorSkip
+strings
+"\""
+"0000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+"a11a11a11a11a11a11a11a11a11a11a11"
+""
+regexps
+"[0]+0()00.{31}"
+-;-;-;-;-;-;-
+0-35 2-2;0-35;-;-;0-35;0-35 2-2;0-35 2-2
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+"((.(1)*)11){11}"
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+0-33 30-33 30-31 -;0-33;-;-;0-33;0-33 30-33 30-31 -;0-33 30-33 30-31 -
+-;-;-;-;-;-;-
+Cat35ForcedBTSelectorSkipEmptyLoop
+strings
+""
+"0"
+regexps
+"((00*){317}\x00\x000*)*"
+0-0 - -;0-0;-;-;0-0;0-0 - -;0-0 - -
+0-0 - -;0-0;-;-;0-0,1-1;0-0 - -;0-0 - -|1-1 - -

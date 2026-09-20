@@ -346,65 +346,6 @@ func goAllMatchesCol(pattern, text string) (string, bool) {
 // the byte-vs-rune advance on empty matches: Go's rune advance over an ASCII
 // twin IS a byte advance, so the oracle now states the engine's contract
 // instead of contradicting it.
-//
-// A set is driven once per input for ALL its patterns, so the substitute has to
-// be interchangeable with respect to every pattern in the chunk at once — not
-// one, as in the single-pattern path. Where no such byte exists the row falls
-// back to the pinned path, which is why that path stays.
-
-// asciiTwinForPatterns is asciiTwin over a whole set: the substitute must be
-// interchangeable under EVERY pattern's ranges simultaneously.
-func asciiTwinForPatterns(text string, patterns []string) (string, bool) {
-	if !hasHighByte(text) {
-		return text, true
-	}
-	var classes [][]byteRange
-	dotNotNL := false
-	for _, pat := range patterns {
-		for i := 0; i < len(pat); i++ {
-			if pat[i] >= 0x80 {
-				return "", false
-			}
-		}
-		rs, dnl, ok := patternByteRanges(pat)
-		if !ok {
-			return "", false
-		}
-		classes = append(classes, rs...)
-		dotNotNL = dotNotNL || dnl
-	}
-	var used [256]bool
-	for i := 0; i < len(text); i++ {
-		used[text[i]] = true
-	}
-	mapping := make(map[byte]byte)
-	out := make([]byte, len(text))
-	for i := 0; i < len(text); i++ {
-		b := text[i]
-		if b < 0x80 {
-			out[i] = b
-			continue
-		}
-		sub, seen := mapping[b]
-		if !seen {
-			found := false
-			for _, cand := range twinCandidates {
-				if used[cand] || !interchangeable(cand, b, classes, dotNotNL) {
-					continue
-				}
-				sub, found = cand, true
-				break
-			}
-			if !found {
-				return "", false
-			}
-			used[sub] = true
-			mapping[b] = sub
-		}
-		out[i] = sub
-	}
-	return string(out), true
-}
 
 // setOracleTwins returns twins[pi][si] — the string PATTERN pi's expectation
 // should be computed over — plus whether the live oracle can serve input si.

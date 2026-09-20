@@ -139,7 +139,7 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 }
 
 // setDrops separates the two KINDS of drop, because they are not
-// interchangeable and treating them as one is FUZZER_BUGS bug 91: a set's
+// interchangeable and treating them as one has already cost a false failure: a set's
 // `scan_any` correctly reported a pattern this harness had already written off,
 // and the disagreement was read as a wrong answer.
 //

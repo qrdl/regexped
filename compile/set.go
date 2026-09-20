@@ -2341,8 +2341,8 @@ func warnPatternDroppedReason(p *PatternInfo, where, reason, hint string, states
 // It is a separate field from StateLimitDropped, which the `find` packers
 // write and which means the pattern left the set entirely. Collapsing the two
 // made a scope-blind consumer exclude a pattern the scan pair and `find` still
-// answer for — bug 91, where a set's scan_any correctly reported a pattern its
-// caller's oracle had already written off. UnparseableDropped is the same
+// answer for: a set's scan_any correctly reported a pattern its caller's
+// oracle had already written off. UnparseableDropped is the same
 // anchored-only kind and was already separate; this follows it.
 func recordAnchoredStateLimitDrop(diag *SetDiag, p *PatternInfo) {
 	if diag == nil {
@@ -2498,7 +2498,7 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 		// printed was 0 — a number the pattern never reached — and the limit
 		// that actually bound the build is maxHelperDFAStates INSIDE
 		// mergeAnchoredDFA, not max_fallback_states, so the hint sent the
-		// reader after a knob that cannot change the outcome. Bug 92.
+		// reader after a knob that cannot change the outcome.
 		switch {
 		case errors.Is(err, ErrDFAStateLimit):
 			warnPatternDroppedReason(p, "anchored bucket",

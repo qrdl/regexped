@@ -2256,9 +2256,37 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// forceGroupsEngine override onto TDFA still falls through to a fresh build
 	// below (CompileForced deliberately bypasses the eligibility gate, so the
 	// selector may never have attempted a table for this pattern).
-	groupsEngine, selTDFA := selectBestEngineWithTDFA(prog, &buildOpts)
-	if forceGroupsEngine != 0 {
-		groupsEngine = forceGroupsEngine
+	//
+	// A force onto BACKTRACKING reads NEITHER return value: groupsEngine is
+	// overwritten and selTDFA is only consulted on the TDFA arm. Calling the
+	// selector anyway means building a tagged DFA and throwing it away, which is
+	// 94% to 98% of such a compile — 1.68 s of 1.78 s for a 41-instruction
+	// pattern — and the harnesses that force Backtracking pay it per compile
+	// (FuzzGroupsBothBodies three times per case, for its three budgets).
+	//
+	// The prog.NumCap > 2 guard keeps the skip off the one path with a side
+	// effect to lose. The selector is also where a pattern with NO capture
+	// groups picks up opts.LeftmostFirst (selector.go's DFA arm), and
+	// groups_func on a capture-less pattern does reach here — needGroups is
+	// re.CaptureStubsRequested(), which never looks at the pattern.
+	//
+	// Stated exactly, because it would be easy to overclaim: nothing
+	// downstream of this point reads buildOpts.LeftmostFirst today. The
+	// capture engines take the prog alone (newBacktrack(prog), newTDFA(prog,
+	// maxStates)), and the find/match bodies were emitted far above with their
+	// own explicit llOpts/lfOpts. So the guard is insurance against a future
+	// reader of the flag, not a fix for an observable difference — and
+	// TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath is the tripwire
+	// that fires when that stops being true.
+	var groupsEngine EngineType
+	var selTDFA *tdfaTable
+	if forceGroupsEngine == EngineBacktrack && prog.NumCap > 2 {
+		groupsEngine = EngineBacktrack
+	} else {
+		groupsEngine, selTDFA = selectBestEngineWithTDFA(prog, &buildOpts)
+		if forceGroupsEngine != 0 {
+			groupsEngine = forceGroupsEngine
+		}
 	}
 
 	if groupsEngine == EngineTDFA {

@@ -724,8 +724,6 @@ type adapterResult struct {
 	err      bool // result discriminant: true = err(backtrack-overflow)
 	some     bool // option discriminant
 	a, b     uint32
-	listPtr  uint32
-	listLen  uint32
 	retptr   uint32
 	memPages uint32
 }

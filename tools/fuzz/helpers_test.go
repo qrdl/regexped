@@ -225,7 +225,7 @@ func cacheDriveAddrs(w []byte, inputLen int, canaryBelow bool) (inBase, gatePtr,
 }
 
 // TestSetKeyDistinguishesPatternOrderAndSeparators pins the set module cache's
-// key against FUZZER_BUGS bug 87.
+// key against the collision below.
 //
 // The cache is keyed by the caller, and the four set callers used to build the
 // key with fmt.Sprintf("%v", pats). %v joins a []string with a SPACE, so
