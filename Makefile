@@ -111,22 +111,33 @@ unittest:
 # binaries, and a root context ships the whole tree — .git, testdata, examples —
 # to the daemon to copy none of it. Everything the context needs is therefore
 # ASSEMBLED in docker/ first, and every one of those four is gitignored.
+# DOCKER_ARCH is the one architecture `make docker` builds for: this machine's,
+# so the image it produces runs here. release.yml assembles BOTH and builds for
+# both; the Dockerfile picks a set with TARGETARCH either way, which is why
+# every binary carries its architecture in its name.
+DOCKER_ARCH ?= $(shell ./docker/arch.sh)
+
 docker: regexped
-	cp regexped docker/regexped
-	./docker/get_wasm_merge.sh
+	# GOOS=linux as well as GOARCH: the image is Linux whatever this machine
+	# is, and a macOS build would otherwise put a Mach-O binary in it that no
+	# container can start.
+	GOOS=linux GOARCH=$(DOCKER_ARCH) go build -trimpath -ldflags "-s -w" -o docker/regexped-$(DOCKER_ARCH) .
+	./docker/get_wasm_merge.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wasm-merge-$(DOCKER_ARCH)"
 	# wasm-tools and wac are needed inside the image for `wasm_format:
 	# component`, the same way wasm-merge is needed for a module `regexped
 	# merge`: wasm-tools wraps the core module into a component, wac composes it
-	# with the consumer. Both are fetched INTO the build context with an
-	# explicit destination, which skips each script's PATH short-circuit: a
-	# copy taken from the host's PATH may be linked against a glibc the image
-	# does not have. Nothing is ever copied from the host.
-	#
-	# get_wasm_merge.sh takes no destination argument at all: it writes the
-	# binary alongside itself, and since the move that is already docker/.
-	./docker/get_wasm_tools.sh "$(CURDIR)/docker"
-	./docker/get_wac.sh "$(CURDIR)/docker"
-	docker build -t regexped docker
+	# with the consumer. All three are fetched INTO the build context at an
+	# explicit path, which skips each script's PATH short-circuit: a copy taken
+	# from the host's PATH may be linked against a glibc the image does not
+	# have. Nothing is ever copied from the host.
+	./docker/get_wasm_tools.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wasm-tools-$(DOCKER_ARCH)"
+	./docker/get_wac.sh $(DOCKER_ARCH) "$(CURDIR)/docker/wac-$(DOCKER_ARCH)"
+	# --platform as well as the build arg. The arg alone picks which binaries
+	# are copied in, but the image would still be labelled with this machine's
+	# architecture — so `make docker DOCKER_ARCH=arm64` on an amd64 box would
+	# produce an amd64 image full of arm64 executables, which fails at run time
+	# with no useful message.
+	docker build --platform linux/$(DOCKER_ARCH) --build-arg TARGETARCH=$(DOCKER_ARCH) -t regexped docker
 
 lint:
 	golangci-lint run -D errcheck

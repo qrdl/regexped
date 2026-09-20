@@ -1,8 +1,11 @@
-# The build context is this directory, and the image wants only the four
-# binaries `make docker` assembles here. Everything else is context the daemon
-# would copy and the build would ignore.
+# The build context is this directory, and the image wants only the binaries
+# `make docker` (or release.yml) assembles here. Everything else is context the
+# daemon would copy and the build would ignore.
+#
+# Every name carries an architecture, because a multi-platform build shares one
+# context between its per-architecture builds — see the Dockerfile's header.
 *
-!regexped
-!wasm-merge
-!wasm-tools
-!wac
+!regexped-*
+!wasm-merge-*
+!wasm-tools-*
+!wac-*

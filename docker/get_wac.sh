@@ -9,21 +9,28 @@
 # Unlike the other two, wac ships the binary itself as the release asset rather
 # than a tarball, so there is nothing to unpack.
 #
-# Usage: ./docker/get_wac.sh [dest-dir]   (default: alongside this script, i.e.
-#                                          docker/, which is the build context)
+# Usage: ./docker/get_wac.sh [arch] [dest]
 #
-# With an EXPLICIT dest-dir the PATH short-circuit is skipped, as in
-# get_wasm_tools.sh: the caller wants the release binary in that directory. The
+#   arch   amd64 or arm64. Default: this machine's, or amd64 when this machine
+#          is neither.
+#   dest   where to put it. An existing DIRECTORY gets `wac` appended; anything
+#          else is taken as the file to write. Default: alongside this script,
+#          i.e. docker/, the build context.
+#
+# With an EXPLICIT dest the PATH short-circuit is skipped, as in
+# get_wasm_tools.sh: the caller wants the release binary at that path. The
 # Docker build is that caller — the release asset is a static musl binary, while
 # a wac found on the host's PATH (a `cargo install`, say) may be linked against
 # the host's glibc, which the image need not match.
 
 set -euo pipefail
 
-DEST_DIR="${1:-$(cd "$(dirname "$0")" && pwd)}"
-DEST="$DEST_DIR/wac"
+. "$(cd "$(dirname "$0")" && pwd)/arch.sh"
 
-if [ -z "${1:-}" ] && command -v wac >/dev/null 2>&1; then
+ARCH=$(normalise_arch "${1:-}")
+DEST=$(resolve_dest "${2:-}" wac "$(dirname "$0")")
+
+if [ -z "${2:-}" ] && command -v wac >/dev/null 2>&1; then
     echo "wac already in PATH ($(command -v wac)), skipping download"
     exit 0
 fi
@@ -44,9 +51,12 @@ if [ -z "$LOCATION" ]; then
 fi
 
 VERSION=$(basename "$LOCATION")   # e.g. v0.11.0
-echo "Latest wac release: $VERSION"
+echo "Latest wac release: $VERSION ($ARCH)"
 
-ASSET="wac-cli-x86_64-unknown-linux-musl"
+case "$ARCH" in
+    amd64) ASSET="wac-cli-x86_64-unknown-linux-musl" ;;
+    arm64) ASSET="wac-cli-aarch64-unknown-linux-musl" ;;
+esac
 URL="https://github.com/bytecodealliance/wac/releases/download/${VERSION}/${ASSET}"
 
 echo "Downloading $URL ..."
@@ -54,4 +64,10 @@ curl -fsSL "$URL" -o "$DEST"
 chmod +x "$DEST"
 
 echo "wac installed to $DEST"
-"$DEST" --version
+# Only runnable when it was built for THIS machine — which means the OS as well
+# as the CPU. Every asset above is a LINUX binary, so on macOS the architectures
+# can match while the binary still cannot execute, and `set -e` would abort the
+# fetch (and `make docker`) right after a successful download.
+if [ "$(uname -s)" = "Linux" ] && [ "$ARCH" = "$(normalise_arch "")" ]; then
+    "$DEST" --version
+fi

@@ -29,8 +29,12 @@ jobs:
       # step the suite still passes — while quietly checking nothing. The
       # modules it rejects are ones that only fail at load, which no Go
       # assertion catches.
+      # An empty first argument is "this runner's architecture"; the second is
+      # where to put it, and an existing DIRECTORY gets `wasm-tools` appended,
+      # which is what puts it on PATH. release.yml passes both explicitly
+      # instead, because the image needs each architecture under its own name.
       - name: Install wasm-tools
-        run: ./docker/get_wasm_tools.sh /usr/local/bin
+        run: ./docker/get_wasm_tools.sh "" /usr/local/bin
 
       - name: Run unit tests
         run: go test -coverprofile=coverage.out ./compile/... ./config/... ./generate/... ./merge/... ./internal/... ./component/...

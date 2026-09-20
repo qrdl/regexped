@@ -10,15 +10,37 @@ The official image is published on Docker Hub as [`qrdl/regexped`](https://hub.d
 docker pull qrdl/regexped
 ```
 
+It is built for **`linux/amd64` and `linux/arm64`**, so it runs natively on
+Intel and AMD machines, on Apple Silicon under Docker Desktop, and on arm64
+servers. `docker pull` picks the right one; nothing needs to be said on the
+command line.
+
 ## Building the image locally
 
 ```bash
 make docker
 ```
 
-This builds the `regexped` binary locally and assembles the build context in `docker/` — the binary is copied there and `wasm-merge`, `wasm-tools` and `wac` are downloaded there (each one's latest release, if it is not already present — never copied from your `PATH`, which may be linked against a different glibc than the image carries). It then builds the Docker image tagged `regexped` from that directory.
+This builds the `regexped` binary locally and assembles the build context in `docker/` — the binary is built there and `wasm-merge`, `wasm-tools` and `wac` are downloaded there (each one's latest release, if it is not already present — never copied from your `PATH`, which may be linked against a different glibc than the image carries). It then builds the Docker image tagged `regexped` from that directory.
 
-Everything the image needs lives in [`docker/`](../docker): the `Dockerfile`, the three `get_*.sh` fetch scripts, and the four binaries they assemble.
+Every binary in that directory carries its architecture in its name —
+`regexped-arm64`, `wasm-merge-arm64` and so on — and the `Dockerfile` picks a
+set with `TARGETARCH`. That is what lets the published image be built for both
+architectures at once: one `docker buildx` build shares a single context
+between its two per-architecture builds, so both sets have to be present under
+distinct names.
+
+`make docker` assembles only your own machine's set, which is all a local image
+needs. `DOCKER_ARCH` names a different one — `amd64` or `arm64`:
+
+```bash
+make docker DOCKER_ARCH=arm64
+```
+
+The image is then built for that architecture, binaries and platform label
+alike, so it runs under emulation unless it happens to match your machine.
+
+Everything the image needs lives in [`docker/`](../docker): the `Dockerfile`, the three `get_*.sh` fetch scripts, the `arch.sh` helper they share, and the binaries they assemble.
 
 ## General usage
 
