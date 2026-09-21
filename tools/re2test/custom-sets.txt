@@ -1758,3 +1758,43 @@ regexps
 0-1;0-1;-;-;0-1
 -;0-1;-;-;0-1,1-2
 -;1-2;-;-;1-2
+# ============================================================
+# Category S-boundary-priority: a pending \b/\B/(?m:$) ahead of Match must
+# block a set member's immediate accept.
+#
+# A set bucket's DFA marks a state immediately-accepting for pattern k once
+# k's Match comes before any of k's live threads in priority order, and the
+# body then stops that member's scan. A pending boundary assertion IS a live
+# thread: it resolves on the next byte and may go on consuming. In
+# `a?\B\w|.|\w*\B` over "ab", branch 1 (`a`, `\B` between the letters, `\w`
+# takes `b`) outranks the `.` branch's Match after "a", so the answer at 0 is
+# 0-2; stopping at the first Match gave 0-1. The single-pattern DFA already
+# treated these assertions as blockers; the set path did not. Expectations
+# generated from Go.
+# ============================================================
+SetBoundaryPendingBlocksImmediateAccept
+strings
+""
+"ab"
+"ab\ncd"
+"aa0"
+"a0 b1\n"
+"b"
+"a b"
+regexps
+"a?\\B\\w|.|\\w*\\B"
+0-0;0-0;-;-;0-0
+0-2;0-2;-;-;0-2
+-;0-2;-;-;0-2,3-4,4-5
+-;0-2;-;-;0-2,2-3
+-;0-2;-;-;0-2,2-3,3-4,4-5,6-6
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2,2-3
+"(?:a\\B\\s?|0*)+\\w"
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;0-2;-;-;0-2,3-4,4-5
+0-3;0-3;-;-;0-3
+-;0-2;-;-;0-2,3-4,4-5
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,2-3

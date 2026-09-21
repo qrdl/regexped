@@ -1674,6 +1674,14 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 						// appears before any of k's byte-consumers in the priority
 						// ordered NFA set.  Patterns with ongoing byte-consumers
 						// (a+, a*) are NOT marked immediately accepting here.
+						//
+						// A pending \b/\B/(?m:$) counts as one of k's live
+						// threads, for the reason isImmediateAccepting gives:
+						// the closure cannot resolve it, the next byte can, and
+						// the thread behind it may go on consuming. Without it
+						// a set member stopped at a lower-priority Match —
+						// `a?\B\w|.|\w*\B` over "ab" answered 0-1 where the
+						// `\B` branch's 0-2 outranks it.
 						var seenByteConsumers uint64
 						var immBits uint64
 						for _, pc := range nextSet {
@@ -1687,6 +1695,10 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 							case syntax.InstRune, syntax.InstRune1,
 								syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 								seenByteConsumers |= pkBits
+							case syntax.InstEmptyWidth:
+								if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary|syntax.EmptyEndLine) != 0 {
+									seenByteConsumers |= pkBits // pending \b/\B/(?m:$): a live thread of k
+								}
 							}
 						}
 						dfa.immediateAccepting[nextDFAState] |= immBits
