@@ -1798,3 +1798,59 @@ regexps
 -;0-2;-;-;0-2,3-4,4-5
 0-1;0-1;-;-;0-1
 -;0-1;-;-;0-1,2-3
+# ============================================================
+# Category S-begin-line: a set member's (?m:^) next to a '\n'.
+#
+# Each pattern needs (?m:^) to hold beside a '\n' in or just before the match:
+# after a '\n' the match consumed, at start of text ahead of a '\n' the match
+# then consumes, or after the '\n' preceding the match. Every one was
+# answered correctly as a single pattern and not at all as a set member.
+# Expectations generated from Go.
+# ============================================================
+SetBeginLineAcrossNewline
+strings
+""
+"0\n0"
+"\n0"
+"\n "
+"0a1 x\n00 a"
+"a\n0"
+"x\n\n0 "
+"\n\n0a a"
+regexps
+"\\w\\W(?m:^)0\\b"
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;-;-;-;-
+"(?m:^)(?:\\W|1)0(?:\\d| |\\b)"
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;2-5;-;-;2-5
+-;-;-;-;-
+"(?:\\b)*(?m:^)[^0] (?:(?m:^)){0,2}"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?m:^)[a0]\\w a(?m:$)"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;6-10;-;-;6-10
+-;-;-;-;-
+-;-;-;-;-
+-;2-6;-;-;2-6

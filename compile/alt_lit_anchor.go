@@ -134,7 +134,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		// report matches starting before the caller's position. It must stay in
 		// step with the dispatcher's mode — the two were briefly out of step and
 		// the floor was then reading a stale value.
-		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
+		bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true, false)
 
 		// Dominant-self-loop SIMD bulk-skip — default-on for every mode, same as the
 		// single-pattern and whole-alternation find/match bodies.

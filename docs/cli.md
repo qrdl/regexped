@@ -36,6 +36,8 @@ namespace:      "acme"     # optional; prefixes the fixed symbols a stub declare
                            #   `pub mod <rust_module>` already isolates each stub.
 max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
+                           #   `compile --verbose` prints, per pattern, the engine chosen, why, and
+                           #   the DFA/TDFA state and TDFA register counts against these limits
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
 
 regexps:

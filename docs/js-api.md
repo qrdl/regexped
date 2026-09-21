@@ -63,7 +63,7 @@ A pattern that should accept text around the match has to say so itself, e.g. `.
 ### `find_func` — non-anchored find generator
 
 ```js
-export function* <func>(input: string | Uint8Array): Generator<[number, number]>
+export function* <func>(input: string | Uint8Array, offset = 0): Generator<[number, number]>
 ```
 
 Generator that yields `[start, end]` absolute byte positions for each non-overlapping match. After a zero-length match the iterator advances by one byte to avoid infinite loops, and — following Go's `FindAllIndex` — an empty match beginning exactly where the previous reported match ended is not reported.
@@ -71,6 +71,8 @@ Generator that yields `[start, end]` absolute byte positions for each non-overla
 The whole input is passed on every call and `offset` only bounds where the search STARTS, so a leading `\b`, `\B`, `^` or `(?m:^)` is judged against the real preceding byte rather than a slice edge.
 
 ```js
+// `text` is ASCII here: positions are UTF-8 byte offsets, so for non-ASCII
+// input slice the encoded bytes instead (see Notes).
 // All matches:
 for (const [start, end] of find_token(text)) {
     console.log('match:', text.slice(start, end));
@@ -89,12 +91,15 @@ if (first) {
 ### `groups_func` — capture groups generator
 
 ```js
-export function* <func>(input: string | Uint8Array): Generator<Array<[number, number] | null>>
+export function* <func>(input: string | Uint8Array, offset = 0): Generator<Array<[number, number] | null>>
 ```
 
 Generator that yields one array per non-overlapping match. Each element is `[start, end]` (absolute byte positions) or `null` for a group that did not participate. Index 0 is the full match; subsequent indices are capture groups in order.
 
+As with `find_func`, the whole input is passed on every call and `offset` only bounds where the search STARTS; the search is not anchored at it.
+
 ```js
+// `text` is ASCII here (see the byte-offset note in Notes).
 // All matches:
 for (const groups of parse_groups(text)) {
     if (groups[1] !== null) {
@@ -127,6 +132,7 @@ export const <groups_func>_indices = Object.freeze({
 ```
 
 ```js
+// `text` is ASCII here (see the byte-offset note in Notes).
 for (const match of parse_url(text)) {
     const host = match[parse_url_indices.host];
     if (host) console.log('host:', text.slice(host[0], host[1]));
@@ -156,16 +162,16 @@ export const <set>PatternCount = 12;
 export function <match_any>(input)            // -> number | null   (a pattern id)
 export function <match_all>(input)            // -> number[]        NOT a boolean
 
-// non-anchored: each takes an offset bounding the search
-export function <scan_any>(input, offset = 0) // -> number | null   (an id; NO position)
-export function <scan_all>(input, offset = 0) // -> number[]        NOT a boolean
+// non-anchored: each takes a start position bounding the search
+export function <scan_any>(input, from = 0)   // -> number | null   (an id; NO position)
+export function <scan_all>(input, from = 0)   // -> number[]        NOT a boolean
 
 export function* <find>(input, offset = 0)    // yields {patternId, start, end}
 
 // with hints: [batch-find] the find generator gains a third parameter, and the
 // set exports its ceiling. Without the hint the parameter does not exist.
 export const <set>BatchMaxSize
-export function* <find>(input, offset = 0, batchSize = 256)
+export function* <find>(input, offset = 0, batchSize = 256) // default: max(256, <set>PatternCount), capped at <set>BatchMaxSize
 
 export function patternName(id)             // only if any set sets emit_name_map: true
 ```
@@ -249,6 +255,7 @@ with no boundary to amortise. The hint is a no-op there.
 
 ## Notes
 
+- All positions are byte offsets into the UTF-8 encoding of the input, not indices into a JavaScript (UTF-16) string. A `string` input is UTF-8 encoded before matching, so for non-ASCII input `input.slice(start, end)` does NOT return the match; slice the encoded bytes instead, e.g. `new TextEncoder().encode(input).subarray(start, end)`. For ASCII input the two coincide.
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
 - `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. Calling other stub functions while an iterator is suspended is safe: each live iterator owns its own region of the module's memory. An overlapping set's iterator reserves its answer cache in that region too — up to 64 MiB for one live iterator over a large input — and WebAssembly memory only grows, so the high-water mark stays allocated.

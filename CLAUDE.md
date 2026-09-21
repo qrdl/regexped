@@ -479,7 +479,7 @@ regexps:
     # Each func name becomes the WASM export name AND the generated function name.
     match_func:        "url_match"         # anchored match → Result<Option<usize>> / number|null (JS)
     find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
-    groups_func:       "url_groups"        # anchored + captures → GroupsIter / generator (JS)
+    groups_func:       "url_groups"        # captures, searched from an offset (not anchored) → GroupsIter / generator (JS)
     byte_mode:         false               # optional; runes 0x80-0xFF mean those BYTES
  # `named_groups_func:` is RETIRED and is a load error. It was
     # never a separate capability — both stubs called the SAME WASM export — so
@@ -516,7 +516,7 @@ An entry with no `_func` fields is valid — no WASM file is compiled and no stu
 Two-phase decision in `selectBestEngine`:
 
 **Phase 1 — capture groups present:**
-- Try **TDFA** if: no non-greedy quantifiers + no line anchors + no word boundaries + no ambiguous alternations + TDFA state count ≤ MaxDFAStates (default 1024) + register count ≤ MaxTDFARegs (default 32)
+- Try **TDFA** if: no non-greedy quantifiers + no `(?m:^)`/`(?m:$)` and no end-of-text `$`/`\z` (`hasLineAnchors`) + no word boundaries + no ambiguous alternations + TDFA state count ≤ MaxDFAStates (default 1024) + register count ≤ MaxTDFARegs (default 32)
 - Fall back to **Backtracking** otherwise
 
 **Phase 2 — no capture groups:**

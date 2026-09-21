@@ -7989,7 +7989,19 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 // shares this builder but has its own `from` parameter and never writes the
 // find-from global — reading it there would let a single-pattern find's
 // leftover position bound an unrelated set scan.
-func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal bool) []byte {
+//
+// nlContinue changes what a '\n' does. Without it the scan checks the
+// newline pre-accept and then STOPS, which is right for the single-pattern
+// lit-anchor prefix: there `(?m:^)` can only sit at the prefix's start, so a
+// '\n' ends every candidate. A set member's prefix is any fixed-length
+// fragment before its literal, so the '\n' may be one the prefix itself
+// consumes (`(?m:^)\W0` over "\n0") or may sit in front of a `(?m:^)` in the
+// middle of it (`\w\W(?m:^)0`). With nlContinue the scan records the
+// pre-accept and then takes the '\n' transition like any other byte; the DFA
+// built it under ecEndLine, so the reversed `(?m:^)` resolves there. The set
+// path passes true, and must also build revL with forceNewline — without the
+// table this reads bytes that belong to other tables.
+func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal, nlContinue bool) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
@@ -8102,10 +8114,12 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 		b = append(b, 0x6A)       // pos + 1
 		b = append(b, 0x21, 0x04) // local.set last_accept
 		b = append(b, 0x0B)       // end if midAcceptNL
-		// Always stop at '\n' for anchored patterns.
-		// Depths: 0=nl_if, 1=$rev, 2=$done → br 2 exits $done
-		b = append(b, 0x0C, 0x02) // br 2 → $done
-		b = append(b, 0x0B)       // end if byte=='\n'
+		if !nlContinue {
+			// Always stop at '\n' for anchored patterns.
+			// Depths: 0=nl_if, 1=$rev, 2=$done → br 2 exits $done
+			b = append(b, 0x0C, 0x02) // br 2 → $done
+		}
+		b = append(b, 0x0B) // end if byte=='\n'
 		// Stack now has: nothing (the local.tee result was consumed by i32.eq)
 	} else {
 		b = append(b, 0x1A) // drop the stacked byte value (local.tee leftover)

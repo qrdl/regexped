@@ -1964,7 +1964,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 							lmNonMidShufti:       false,
 							lmWideShufti:         false,
 						})
-						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true)
+						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true, false)
 						// When the prefix is a bare `[class]{M}` (M<=16),
 						// a single SIMD chunk verify replaces the scalar reverse
 						// walk above with no runtime trade-off. LikelyNoMatch-gated
