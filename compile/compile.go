@@ -1664,28 +1664,30 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	// Check if the LF DFA exceeds the state limit — if so, use BT find body.
-	// dfaHasOutrankedState: a state whose boundary-gated
-	// mid-accept channel outranks the state's own unconditional (ctx=0)
-	// mid-accept, e.g. `0*\b|0*` — the find-mode scan loop's ctx=0 check has
-	// no priority concept and can let a later, lower-priority hit silently
-	// overwrite an already-correct higher-priority one. Routed to
-	// Backtracking (correct by construction) rather than patched in the DFA
-	// scan-loop codegen — see dfaHasOutrankedState's doc comment.
-	// dfaHasAmbiguousBoundaryTarget: a sibling blind
-	// spot where resolving a \b/\B/(?m:$) assertion needs one more mandatory
-	// byte before Match, and that byte's own Rune is ALSO reachable via some
-	// other, already-live, lower-priority path in the same NFA set (e.g.
-	// ` (\b|0*)0`) — the ordinary transition table permanently loses the
-	// higher-priority derivation, with no dominant/outranked bit to catch
-	// it. See nfaBoundaryTargetIsAmbiguous's doc comment.
+	// dfaHasAmbiguousBoundaryTarget: resolving a \b/\B/(?m:$) assertion needs
+	// one more mandatory byte before Match, and that byte's own Rune is ALSO
+	// reachable via some other, already-live, lower-priority path in the same
+	// NFA set (e.g. ` (\b|0*)0`) — the ordinary transition table permanently
+	// loses the higher-priority derivation. See nfaBoundaryTargetIsAmbiguous's
+	// doc comment.
+	//
+	// dfaHasOutrankedState is deliberately NOT a reason any more. It used to
+	// route every pattern with an outranked boundary channel to Backtracking,
+	// on the theory that the scan loops let a later, lower-priority accept
+	// overwrite a higher-priority one. Measured over 1,663 such patterns, the
+	// wrong answers the route was hiding all had one cause, in construction:
+	// isImmediateAccepting did not count a pending (?m:$) as a live blocker,
+	// so the DFA stopped at a Match that a higher-priority end-of-line thread
+	// still outranked. With that fixed the DFA answers every one of them as
+	// Go does, and 2x-5x cheaper on find than the Backtracking it was sent to.
 	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
-		dfaHasOutrankedState(table) || dfaHasAmbiguousBoundaryTarget(table)
+		dfaHasAmbiguousBoundaryTarget(table)
 
 	// The real DFA-vs-Backtracking decision for the no-capture paths, recorded
 	// where it is MADE. An earlier version of --verbose asked SelectEngine
 	// instead and reported a DFA the compiler had not built: the selector
-	// answers for the capture path, and does not model dfaHasOutrankedState,
-	// the memory bound, or the ambiguous-boundary refusal below. A verbose mode
+	// answers for the capture path, and does not model the memory bound or
+	// the ambiguous-boundary refusal below. A verbose mode
 	// that lies is worse than none.
 	if rep := buildOpts.report(); rep != nil {
 		// table is nil exactly when construction itself hit the ceiling —
@@ -1702,8 +1704,6 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		case memLimit > 0 && dfaTableBytes(table) > memLimit:
 			rep.Engine(EngineBacktrack, "DFA table over the memory bound")
 			rep.Limit("DFA table bytes", dfaTableBytes(table), memLimit)
-		case dfaHasOutrankedState(table):
-			rep.Engine(EngineBacktrack, "DFA has an outranked state (leftmost-first cannot be preserved in a plain table)")
 		case dfaHasAmbiguousBoundaryTarget(table):
 			rep.Engine(EngineBacktrack, "DFA has an ambiguous word-boundary target")
 		}

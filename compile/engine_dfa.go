@@ -43,23 +43,15 @@ type dfa struct {
 	// midAcceptingNW/W/NL where the boundary assertion resolves to a Match at
 	// STRICTLY HIGHER priority than whatever the state's own ctx=0 midAccept
 	// would resolve to (see boundaryOutranksCtx0), while NOT being dominant.
-	// Every find-mode DFA/CompiledDFA scan-loop body's ctx=0 midAccept check
-	// is unconditional — it has no priority concept at all, so on a
-	// self-looping state it will happily let a LATER, lower-priority ctx=0
-	// hit overwrite an earlier, correctly-recorded higher-priority boundary
-	// hit (repro: `0*\b|0*` on "01", expected [0,0), got [0,1)). Patching
-	// that unconditional-overwrite defect would require touching every
-	// find-mode scan-loop shape in this file (five distinct WASM emission
-	// functions, each with independent local layouts) — evaluated and
-	// rejected as disproportionately invasive for how narrow this pattern
-	// family is. Instead, this flag is consulted only by
-	// dfaHasOutrankedState, a compile-time-only gate (see compile.go's
-	// dfaTooLarge) that routes affected patterns to the Backtracking engine,
-	// which resolves priority via genuine backtracking and has no equivalent
-	// defect. It is still tracked as a minimizeDFA/set.go-signature-relevant
-	// per-state flag (mirroring Dominant) purely so minimization doesn't
-	// merge two states whose only difference is this flag — that would
-	// silently make the gate's answer depend on minimization order.
+	// Read only through dfaHasOutrankedState, whose one remaining caller is
+	// the lenient alternation's per-branch refusal: its inline verify walks a
+	// branch keeping the LAST mid-accept it sees, which cannot express this
+	// priority. The generic find path no longer routes on it — see the
+	// comment above compile.go's dfaTooLarge for why. It is still tracked as
+	// a minimizeDFA/set.go-signature-relevant per-state flag (mirroring
+	// Dominant) purely so minimization doesn't merge two states whose only
+	// difference is this flag — that would silently make the refusal's
+	// answer depend on minimization order.
 	midAcceptingNWOutranked map[int]uint64
 	midAcceptingWOutranked  map[int]uint64
 	midAcceptingNLOutranked map[int]uint64
@@ -70,8 +62,7 @@ type dfa struct {
 	// work item's NFA set to a higher-priority position — see
 	// nfaBoundaryTargetIsAmbiguous's doc comment for the full mechanism.
 	// Compile-time only; consulted by dfaHasAmbiguousBoundaryTarget to route
-	// affected patterns to Backtracking, mirroring dfaHasOutrankedState's
-	// established precedent.
+	// affected patterns to Backtracking.
 	hasAmbiguousBoundaryTarget bool
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
@@ -127,6 +118,14 @@ func (d *dfa) Type() EngineType {
 // `\b0|` vs "0": \b0 is still alive, but the pruned closure only shows the
 // empty branch's Match). So an unresolved \b/\B assertion found ahead of
 // Match must block immediate-accept, the same as a live byte-consumer would.
+//
+// (?m:$) is in the same position: the closure never resolves it either
+// (ecEndLine is only known once the next byte is '\n'), and the thread behind
+// it may go on consuming. Leaving it out made `(?:(?m:$)\s)+` over "\n\n"
+// stop at the first Match and answer 0-1,1-2 instead of 0-2. The other
+// pending assertions cannot outlive this position: `^`/`\A`/(?m:^) are
+// decided by what precedes it, already known here, and `$`/`\z` only resolve
+// at end of text, where no thread consumes anything further.
 func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	for _, pc := range states {
 		switch prog.Inst[pc].Op {
@@ -136,8 +135,8 @@ func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 			syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 			return false // byte consumer before match -> not immediate
 		case syntax.InstEmptyWidth:
-			if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
-				return false // pending \b/\B: not yet resolvable here, treat as a live blocker
+			if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary|syntax.EmptyEndLine) != 0 {
+				return false // pending \b/\B/(?m:$): not yet resolvable here, treat as a live blocker
 			}
 		}
 	}
@@ -541,8 +540,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // detector instead identifies the narrow set of patterns where the defect is
 // live, so dfaHasAmbiguousBoundaryTarget can route them to Backtracking,
 // which resolves priority via genuine backtracking and has no equivalent
-// defect — the same precedent dfaHasOutrankedState
-// already established for a sibling blind spot.
+// defect.
 func nfaBoundaryTargetIsAmbiguous(prog *syntax.Prog, closedSet []uint32, baseCtx, wbCtx int, leftmostFirst bool) bool {
 	origIndex := make(map[uint32]int, len(closedSet))
 	for i, s := range closedSet {
@@ -7577,10 +7575,9 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 // (state, channel) — but the check costs nothing and documents the reasoning
 // inline rather than relying on a cross-function invariant holding silently.
 //
-// Compile-time only: called from compile.go's dfaTooLarge decision to route
-// affected find-mode patterns to Backtracking instead of patching the
-// unconditional ctx=0 overwrite in every DFA/CompiledDFA scan-loop shape —
-// see dfa.midAcceptingNWOutranked's comment for the full reasoning.
+// Compile-time only. Its one caller is the lenient alternation's per-branch
+// refusal (emitInlineAnchoredDFAVerify keeps the LAST mid-accept it sees);
+// the generic find path no longer consults it — see dfa.midAcceptingNWOutranked.
 func dfaHasOutrankedState(t *dfaTable) bool {
 	for s := 0; s < t.numStates; s++ {
 		if t.midAcceptNWStatesOutranked[s] != 0 && t.midAcceptNWStatesDominant[s] == 0 {
@@ -7601,8 +7598,7 @@ func dfaHasOutrankedState(t *dfaTable) bool {
 // construction — see dfa.hasAmbiguousBoundaryTarget and
 // nfaBoundaryTargetIsAmbiguous's doc comments for the full mechanism.
 // Compile-time only: called from compile.go's dfaTooLarge decision to route
-// affected find-mode patterns to Backtracking, the same precedent
-// dfaHasOutrankedState established for a sibling blind spot.
+// affected find-mode patterns to Backtracking.
 func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
 	return t.hasAmbiguousBoundaryTarget
 }
@@ -14967,9 +14963,9 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 		// own unconditional one (dfaHasOutrankedState) and one that needs a
 		// further mandatory byte also reachable by a lower-priority path
 		// (dfaHasAmbiguousBoundaryTarget). Refusing sends the whole pattern
-		// down the generic find path, which applies these same two predicates
-		// to the whole-pattern table (compile.go's dfaTooLarge) and routes it
-		// to Backtracking. Without this, `0$|-(?:\b|0*)0` over "-00" answered
+		// down the generic find path, whose scan loop keeps leftmost-first
+		// priority (and whose dfaTooLarge still routes the ambiguous-target
+		// case to Backtracking). Without this, `0$|-(?:\b|0*)0` over "-00" answered
 		// 0-3 from the `0*` alternative where RE2 answers 0-2 from the `\b`
 		// one: a leftmost-LONGEST walk of a branch whose leftmost-first accept
 		// is boundary-gated.
