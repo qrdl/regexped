@@ -982,15 +982,18 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				cnt++
 				prefixDataBytes = append(prefixDataBytes, rawPfx...)
 				prefixDataSegCount += cnt
+				// Reserve whichever is larger: the encoded segments' length,
+				// which is what this advanced by alone and which over-covers
+				// tables laid out back to back, or the layout's own end,
+				// which is the one that holds when a table sits past a gap
+				// (the newline table follows the space immAcceptSize and
+				// wbAcceptSize leave). tableEnd is a plain maximum over table
+				// ends, so the second wins only where a table really ends
+				// past the encoded length — anywhere else the advance, and
+				// every later prefix table's address, is unchanged.
 				adv := int32(len(rawPfx))
-				// The encoded segments' length has always over-covered the
-				// span they fill, but the newline table sits past the gap
-				// immAcceptSize/wbAcceptSize leave in the layout, so reserve
-				// up to the layout's own end whenever it is present.
-				if revL.midAcceptNLBytes != nil {
-					if span := int32(revL.tableEnd) - prefixTableOffset; span > adv {
-						adv = span
-					}
+				if span := int32(revL.tableEnd) - prefixTableOffset; span > adv {
+					adv = span
 				}
 				prefixTableOffset += adv
 			}

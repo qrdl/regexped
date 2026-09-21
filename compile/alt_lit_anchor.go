@@ -55,11 +55,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		if err != nil {
 			return nil, false
 		}
-		fwdMatcher, ok := matcher.(*dfa)
-		if !ok {
-			return nil, false
-		}
-		table := dfaTableFrom(fwdMatcher)
+		table := dfaTableFrom(matcher.(*dfa)) // compile() builds only DFAs
 		// Same gates as the single-pattern lit-anchor path in compile.go:
 		// `\b`/`\B` and, per a past defect, `(?m:^)`/`(?m:$)`
 		// in the prefix.

@@ -528,10 +528,15 @@ func TestEngineTypeMethod(t *testing.T) {
 		t.Errorf("dfa.Type() = %v, want DFA", dfaEngine.Type())
 	}
 
-	btEngine, err := compile("(a+?)", CompileOptions{ForceEngine: EngineBacktrack})
+	re, err := syntax.Parse("(a+?)", syntax.Perl)
 	if err != nil {
-		t.Fatalf("compile BT: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		t.Fatalf("compile prog: %v", err)
+	}
+	btEngine := newBacktrack(prog)
 	if btEngine.Type() != EngineBacktrack {
 		t.Errorf("backtrack.Type() = %v, want Backtracking", btEngine.Type())
 	}
@@ -1053,16 +1058,18 @@ func TestCompile_UnicodeWithoutOpt(t *testing.T) {
 	}
 }
 
-func TestCompile_EngineNotSupported(t *testing.T) {
-	// Force TDFA / CompiledDFA via ForceEngine → compile() switch falls through
-	// to the "not yet supported" error path.
-	_, err := compile("abc", CompileOptions{ForceEngine: EngineTDFA})
-	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
-		t.Errorf("compile(force TDFA): want 'not yet supported' error, got %v", err)
-	}
-	_, err = compile("abc", CompileOptions{ForceEngine: EngineCompiledDFA})
-	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
-		t.Errorf("compile(force CompiledDFA): want 'not yet supported' error, got %v", err)
+// TestCompile_RejectsNonDFAEngine pins compile() as a DFA builder: asking it
+// for another engine is a programming error, not a request it can serve.
+func TestCompile_RejectsNonDFAEngine(t *testing.T) {
+	for _, eng := range []EngineType{EngineTDFA, EngineCompiledDFA, EngineBacktrack} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("compile(ForceEngine=%v): want a panic", eng)
+				}
+			}()
+			_, _ = compile("abc", CompileOptions{ForceEngine: eng})
+		}()
 	}
 }
 
@@ -1187,6 +1194,13 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 		}
 		if !bytes.Contains(data, []byte(`"capture_bearing"`)) {
 			t.Errorf("diag JSON missing capture_bearing key: %s", data)
+		}
+	})
+
+	t.Run("unwritable_path", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "no-such-dir", "diag.json")
+		if err := CmdWriteDiagJSON(cfg, "", path); err == nil {
+			t.Fatalf("CmdWriteDiagJSON(%s): want a write error, got nil", path)
 		}
 	})
 
@@ -1611,25 +1625,6 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 		}
 		if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
 			t.Errorf("diag JSON missing expected patterns_total: %s", data)
-		}
-	})
-}
-
-// TestCompileAutoSelectEngine exercises the `else { engineType =
-// selectBestEngine(prog, &options) }` branch in compile() — calling the
-// private compile() helper WITHOUT an explicit ForceEngine, unlike every
-// production caller (which always sets ForceEngine: EngineDFA).
-func TestCompileAutoSelectEngine(t *testing.T) {
-	t.Run("backtrack_via_inverted_class_gate", func(t *testing.T) {
-		// <([^>]+)> routes to Backtrack via the inverted-class ambiguity gate
-		// (see CLAUDE.md "Load-bearing engine-selection gates").
-		if _, err := compile(`<([^>]+)>`); err != nil {
-			t.Fatalf("compile: %v", err)
-		}
-	})
-	t.Run("plain_dfa", func(t *testing.T) {
-		if _, err := compile(`a{500}`); err != nil {
-			t.Fatalf("compile: %v", err)
 		}
 	})
 }
@@ -2636,6 +2631,28 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 // TestVerboseReporterNotes covers the --verbose reporting arms in
 // compilePatternBody: they only run when a Reporter is attached, and the rest
 // of the suite compiles without one.
+// TestCmdCompileVerboseSets drives CmdCompileVerbose down its set branch with
+// a report writer: the per-set diagnostics must reach the rendered report.
+func TestCmdCompileVerboseSets(t *testing.T) {
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `foo\w+`}, {Name: "p2", Pattern: `bar\d+`}},
+		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
+	}
+	var report bytes.Buffer
+	out := filepath.Join(t.TempDir(), "out.wasm")
+	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
+		t.Fatalf("CmdCompileVerbose: %v", err)
+	}
+	if !strings.Contains(report.String(), "s1") {
+		t.Errorf("verbose report does not mention set s1:\n%s", report.String())
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	validateWASM(t, data)
+}
+
 func TestVerboseReporterNotes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2677,5 +2694,28 @@ func TestMemoBudgetTooSmall(t *testing.T) {
 	}
 	if !saw {
 		t.Error("no MemoBudget was small enough to be refused — the budgets here need raising")
+	}
+}
+
+// TestMemoBudgetTooSmallMatchFind is TestMemoBudgetTooSmall for the match and
+// find Backtracking fallbacks (MaxDFAStates: 1 sends both there), which size
+// their memo through the same btMemoPlan and must refuse the same way. The
+// pattern needs the memo (a non-greedy loop whose body can match empty) and
+// enough instructions that one byte cannot hold a row; BTWorkBudgetOff keeps
+// the fast body, whose memo is what gets planned.
+func TestMemoBudgetTooSmallMatchFind(t *testing.T) {
+	const pat = `(?:a??)*?bcdefghijklmnopqrstuvwxyz0123456789`
+	for _, fn := range []string{"match", "find"} {
+		e := config.RegexEntry{Pattern: pat}
+		if fn == "match" {
+			e.MatchFunc = "m"
+		} else {
+			e.FindFunc = "f"
+		}
+		_, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+			CompileOptions{MemoBudget: 1, MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
+		if err == nil || !strings.Contains(err.Error(), "bytes of memo") {
+			t.Errorf("%s: want a memo-budget refusal at MemoBudget 1, got %v", fn, err)
+		}
 	}
 }

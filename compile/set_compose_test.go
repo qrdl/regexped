@@ -2683,6 +2683,40 @@ func TestCompileFallback_WarnsWhenBTAlsoRefuses(t *testing.T) {
 	}
 }
 
+// TestCompileFallback_DropsBoundaryAmbiguousWhenBTRefuses is the same drop for
+// a pattern whose DFA loses a `\B` branch's priority: it has no DFA bucket to
+// fall back to, so a Backtracking refusal must drop it, loudly and into the
+// diagnostics. `(?:\B|a|)a` carries the ambiguity; the 13 chained nullable
+// loops after it are btRefusedPattern's refusal. No MaxFallbackStates is
+// needed: the ambiguity alone routes it here, at the default limits.
+func TestCompileFallback_DropsBoundaryAmbiguousWhenBTRefuses(t *testing.T) {
+	pattern := `(?:\B|a|)a` + strings.Repeat(`(?:a|)*`, 13)
+	var prefixPool, suffixPool dfaPool
+	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+	if err != nil {
+		t.Fatalf("analyzePattern: %v", err)
+	}
+	if !info.boundaryAmbiguous {
+		t.Fatal("pattern is not boundary-ambiguous; this test no longer reaches the branch it names")
+	}
+
+	buf, restore := captureWarnings(t)
+	defer restore()
+
+	diag := &SetDiag{Name: "boundary-ambiguous"}
+	buckets := compileFallback([]*PatternInfo{info}, CompileSetOptions{}, diag)
+
+	if len(buckets) != 0 {
+		t.Fatalf("expected the pattern dropped (0 buckets), got %d", len(buckets))
+	}
+	if out := buf.String(); !strings.Contains(out, "loses a word-boundary branch's priority") {
+		t.Errorf("drop produced no word-boundary warning; slog output was %q", out)
+	}
+	if len(diag.StateLimitDropped) != 1 {
+		t.Errorf("diag.StateLimitDropped = %v, want the one dropped pattern", diag.StateLimitDropped)
+	}
+}
+
 // TestAdmitBTFallback_RefusesUnsupported pins WHY btRefusedPattern is refused,
 // so the two tests above cannot silently start passing for a different reason
 // (e.g. a pattern that stops reaching the drop branch at all).
@@ -2938,4 +2972,76 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestCompileSetDirectAPIShapes covers CompileSet as a caller that does not go
+// through CompileFile sees it: a spec with no IDSpaceSize (the anchored packer
+// derives it from PatternIDs), the forced-frontend knob overriding the
+// crossover verdict, and a nil *SetDiag handed to the drop recorder.
+func TestCompileSetDirectAPIShapes(t *testing.T) {
+	build := func(t *testing.T, pats []string) (SetSpec, *dfaPool, *dfaPool) {
+		t.Helper()
+		var prefixPool, suffixPool dfaPool
+		var infos []*PatternInfo
+		var ids []int
+		for i, pat := range pats {
+			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			if err != nil {
+				t.Fatalf("analyzePattern(%q): %v", pat, err)
+			}
+			infos = append(infos, info)
+			ids = append(ids, i)
+		}
+		return SetSpec{Name: "s", Patterns: infos, PatternIDs: ids}, &prefixPool, &suffixPool
+	}
+
+	t.Run("id_space_from_pattern_ids", func(t *testing.T) {
+		spec, pp, sp := build(t, []string{`foo\d+`, `bar[a-z]+`, `baz`})
+		spec.MatchAll = "ml"
+		if spec.IDSpaceSize != 0 {
+			t.Fatal("the test needs a spec without IDSpaceSize")
+		}
+		if cs := CompileSet(spec, pp, sp, CompileSetOptions{}); cs == nil {
+			t.Fatal("CompileSet returned nil")
+		}
+	})
+
+	t.Run("forced_frontend", func(t *testing.T) {
+		pats := make([]string, 20)
+		for i := range pats {
+			pats[i] = fmt.Sprintf("kw%03d[0-9]{2}", i)
+		}
+		spec, pp, sp := build(t, pats)
+		spec.ScanAny = "sa"
+		cs := CompileSet(spec, pp, sp, CompileSetOptions{}.WithForcedFrontend(frontendTeddy))
+		if cs.fe != frontendTeddy {
+			t.Errorf("fe = %v, want the forced frontendTeddy", cs.fe)
+		}
+	})
+
+	t.Run("nil_diag_drop_record", func(t *testing.T) {
+		spec, _, _ := build(t, []string{`abc`})
+		recordAnchoredStateLimitDrop(nil, spec.Patterns[0]) // must not panic
+	})
+}
+
+// TestCompileFileEmbeddedSet compiles a set for the embedded (merged) output
+// kind, whose tables live in the module's own second memory, beside a plain
+// find pattern that takes the alternation literal-anchor path — its dispatcher
+// is emitted by the set assembler and must address that second memory too.
+func TestCompileFileEmbeddedSet(t *testing.T) {
+	cfg := config.BuildConfig{
+		Output: "merged.wasm",
+		Regexps: []config.RegexEntry{
+			{Name: "p1", Pattern: `foo\d+`}, {Name: "p2", Pattern: `(?:bar|baz)[a-z]+`},
+			{Name: "alt", Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+`, FindFunc: "alt_find"},
+		},
+		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", MatchAll: "ml",
+			Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}}},
+	}
+	wasm, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	validateWASM(t, wasm)
 }

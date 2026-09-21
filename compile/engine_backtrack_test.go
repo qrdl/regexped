@@ -1799,15 +1799,6 @@ func TestEnginesCovBTProgramTooLarge(t *testing.T) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTProgramTooLarge", err)
 		}
 	})
-	t.Run("compile_forced_engine", func(t *testing.T) {
-		// The internal compile() entry point applies the same bound when a
-		// caller asks for Backtracking directly.
-		pattern := enginesCovHugeBTPattern(t, `x`)
-		_, err := compile(pattern, CompileOptions{ForceEngine: EngineBacktrack})
-		if !errors.Is(err, ErrBTProgramTooLarge) {
-			t.Fatalf("compile(ForceEngine=Backtrack): err = %v, want ErrBTProgramTooLarge", err)
-		}
-	})
 }
 
 func TestEnginesCovGroupsPathBTLimits(t *testing.T) {
@@ -2510,6 +2501,28 @@ func TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath(t *testing.T) {
 				"(%d bytes without it, %d with it explicitly) — the prog.NumCap > 2 "+
 				"guard in compilePatternBody is now load-bearing, keep it",
 				pat, len(plain), len(explicit))
+		}
+	}
+}
+
+// TestBTZeroProgressLoopEntriesBudgetOff compiles greedy loops whose body can
+// match empty, forced onto Backtracking (MaxDFAStates: 1) with the work budget
+// OFF. Only that knob keeps such a program's ordinary body — otherwise its
+// zero-width cycle sends it to the memoised fallback alone — so the loop-entry
+// bookkeeping for a body at the very start of the program (loopEntryAtStart)
+// is emitted only here, for match, find and groups.
+func TestBTZeroProgressLoopEntriesBudgetOff(t *testing.T) {
+	for _, p := range []string{`(?:a?)+b`, `(?:a??){1,}b`, `(?:a|)+b`, `(a?)+b`, `x(?:a|b?)+y`, `(?:(a?)|b)+c`, `(?:ab|a?)+c`} {
+		for _, e := range []config.RegexEntry{
+			{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"},
+			{Pattern: p, GroupsFunc: "g"}, {Pattern: p, FindFunc: "f", GroupsFunc: "g"},
+		} {
+			wasm, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+				CompileOptions{MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
+			if err != nil {
+				t.Fatalf("Compile(%q): %v", p, err)
+			}
+			validateWASM(t, wasm)
 		}
 	}
 }

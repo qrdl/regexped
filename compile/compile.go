@@ -36,10 +36,11 @@ import (
 // target that reports it as a defect is reporting the ceiling, not a bug.
 var ErrDFAStateLimit = errors.New("compile: DFA state limit exceeded during construction")
 
-// ErrBTProgramTooLarge is returned whenever compile() would route a pattern
-// to the Backtracking engine — whether because the primary DFA was rejected
-// as too large, TDFA was ineligible for a capture pattern, or ForceEngine
-// requested it directly — but the underlying NFA program is itself too
+// ErrBTProgramTooLarge is returned whenever a pattern is routed to the
+// Backtracking engine — whether because the primary DFA was rejected as too
+// large, TDFA was ineligible for a capture pattern, CompileForced requested
+// it directly, or a set member took the Backtracking route — but the
+// underlying NFA program is itself too
 // large for the Backtracking engine's br_table-per-instruction WASM
 // emission to produce a module the WASM runtime can load. Without this
 // check, such patterns silently compile to a WASM module that fails to
@@ -1674,12 +1675,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// dfaHasOutrankedState is deliberately NOT a reason any more. It used to
 	// route every pattern with an outranked boundary channel to Backtracking,
 	// on the theory that the scan loops let a later, lower-priority accept
-	// overwrite a higher-priority one. Measured over 1,663 such patterns, the
-	// wrong answers the route was hiding all had one cause, in construction:
-	// isImmediateAccepting did not count a pending (?m:$) as a live blocker,
-	// so the DFA stopped at a Match that a higher-priority end-of-line thread
-	// still outranked. With that fixed the DFA answers every one of them as
-	// Go does, and 2x-5x cheaper on find than the Backtracking it was sent to.
+	// overwrite a higher-priority one. The wrong answers that route was hiding
+	// had one cause, in construction: isImmediateAccepting did not count a
+	// pending (?m:$) as a live blocker, so the DFA stopped at a Match that a
+	// higher-priority end-of-line thread still outranked. With that fixed the
+	// DFA answers these patterns itself; custom-tests.txt Category 39 guards it.
 	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
 		dfaHasAmbiguousBoundaryTarget(table)
 
@@ -3388,7 +3388,16 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 	return selectBestEngine(prog, &opts), nil
 }
 
-// compile parses the pattern, selects the optimal engine, and returns a compiled matcher.
+// compile parses pattern and builds its DFA, the table the match and find
+// construction reads for its layout and literal analysis.
+//
+// It does NOT choose an engine. compilePatternBody decides that with
+// selectBestEngineWithTDFA and only then asks here for a DFA. This function
+// used to carry an auto-select branch, a Backtracking arm and a "not yet
+// supported" arm left over from the first version, when it was the entry
+// point; no production caller reached any of them. ForceEngine is accepted
+// for the callers that still spell out EngineDFA, and any other value is a
+// programming error.
 func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -3407,38 +3416,25 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 		return nil, unsupportedRuneError(bad)
 	}
 
-	var engineType EngineType
-	if options.ForceEngine != 0 {
-		engineType = options.ForceEngine
-	} else {
-		engineType = selectBestEngine(prog, &options)
+	if options.ForceEngine != 0 && options.ForceEngine != EngineDFA {
+		panic(fmt.Sprintf("compile: builds a DFA only, asked for engine %v", options.ForceEngine))
 	}
 
-	switch engineType {
-	case EngineDFA:
-		// max(maxHelperDFAStates, resolveMaxDFAStates(&options)): callers
-		// (compile.go's match/find construction) deliberately set
-		// MaxDFAStates arbitrarily low to force a BT fallback while still
-		// expecting a real (if oversized) table back for prefix-extraction
-		// optimisations — see maxHelperDFAStates' doc comment. But a caller
-		// that configures a MaxDFAStates ABOVE maxHelperDFAStates (e.g.
-		// re2test's 100000) must have construction actually reach that
-		// budget, or the 2048 ceiling silently downgrades DFA-eligible
-		// patterns to Backtracking regardless of the configured threshold.
-		ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options))
-		d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, ceiling)
-		if !ok {
-			return nil, ErrDFAStateLimit
-		}
-		return d, nil
-	case EngineBacktrack:
-		if len(prog.Inst) > maxBTFallbackInstructions {
-			return nil, ErrBTProgramTooLarge
-		}
-		return newBacktrack(prog), nil
-	default:
-		return nil, fmt.Errorf("engine %v not yet supported by wasm compiler", engineType)
+	// max(maxHelperDFAStates, resolveMaxDFAStates(&options)): callers
+	// (compile.go's match/find construction) deliberately set
+	// MaxDFAStates arbitrarily low to force a BT fallback while still
+	// expecting a real (if oversized) table back for prefix-extraction
+	// optimisations — see maxHelperDFAStates' doc comment. But a caller
+	// that configures a MaxDFAStates ABOVE maxHelperDFAStates (e.g.
+	// re2test's 100000) must have construction actually reach that
+	// budget, or the 2048 ceiling silently downgrades DFA-eligible
+	// patterns to Backtracking regardless of the configured threshold.
+	ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options))
+	d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, ceiling)
+	if !ok {
+		return nil, ErrDFAStateLimit
 	}
+	return d, nil
 }
 
 // maxUnicodeRune is the upper bound syntax.Compile writes for an open-ended

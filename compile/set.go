@@ -1966,10 +1966,13 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 					// litBuckets[0].literal and treats an empty one as "this is
 					// the fallback group". Injecting one here would corrupt that
 					// classification for the whole group.
+					// No state count (no DFA was finished), and the limit is
+					// the internal one mergeSuffixDFA builds under, not
+					// max_fallback_states — raising that cannot help.
 					warnPatternDroppedReason(p, "binPack",
 						"its own suffix DFA could not be built",
-						"simplify the pattern or move it out of the set",
-						0, opts.maxFallbackStates())
+						"simplify the pattern or move it out of the set — this limit is not configurable",
+						-1, maxHelperDFAStates)
 					if diag != nil {
 						diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
 					}
@@ -2075,8 +2078,11 @@ func admitOrDropFallback(p *PatternInfo, dfa *dfaTable, where string, opts Compi
 		if nb := newBTBucket(p); nb != nil {
 			return nb
 		}
+		// As in binPack: no DFA to count, and the bound is mergeSuffixDFA's
+		// internal maxHelperDFAStates, not max_fallback_states.
 		warnPatternDroppedReason(p, where, "its own suffix DFA could not be built",
-			"simplify the pattern or move it out of the set", 0, opts.maxFallbackStates())
+			"simplify the pattern or move it out of the set — this limit is not configurable",
+			-1, maxHelperDFAStates)
 		if diag != nil {
 			diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
 		}
@@ -2132,7 +2138,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			}
 			warnPatternDroppedReason(p, "Backtracking fallback bucket",
 				"its DFA loses a word-boundary branch's priority and Backtracking cannot take it",
-				"simplify the pattern or move it out of the set", 0, opts.maxFallbackStates())
+				"simplify the pattern or move it out of the set", -1, -1)
 			if diag != nil {
 				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
 			}
@@ -2324,15 +2330,20 @@ func warnPatternDropped(p *PatternInfo, where string, states, limit int) {
 // The one-message form said "suffix DFA exceeds state limit" — with a
 // max_fallback_states hint — for the unparseable-anchored drop too, where
 // neither half is true and the hint sends the reader after the wrong knob.
+// states or limit below 0 is left out of the message: a drop that happened
+// before a DFA was finished has no state count, and one with no size limit
+// behind it has no limit — printing 0 names a number the pattern never reached.
 func warnPatternDroppedReason(p *PatternInfo, where, reason, hint string, states, limit int) {
 	ref := patternRefFor(p)
-	slog.Warn("Pattern dropped from set: "+reason,
-		"pattern", ref.Name,
-		"id", ref.ID,
-		"where", where,
-		"states", states,
-		"limit", limit,
-		"hint", hint)
+	args := []any{"pattern", ref.Name, "id", ref.ID, "where", where}
+	if states >= 0 {
+		args = append(args, "states", states)
+	}
+	if limit >= 0 {
+		args = append(args, "limit", limit)
+	}
+	args = append(args, "hint", hint)
+	slog.Warn("Pattern dropped from set: "+reason, args...)
 }
 
 // recordAnchoredStateLimitDrop records a drop that cost the pattern the
@@ -2458,7 +2469,7 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			// `find` kept it, with nothing in --diag-json to explain the
 			// disagreement.
 			warnPatternDroppedReason(p, "anchored bucket", "the pattern could not be parsed for the anchored packing",
-				"simplify the pattern or move it out of the set", 0, 0)
+				"simplify the pattern or move it out of the set", -1, -1)
 			if diag != nil {
 				diag.UnparseableDropped = append(diag.UnparseableDropped, patternRefFor(p))
 			}
@@ -2501,16 +2512,18 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 		// reader after a knob that cannot change the outcome.
 		switch {
 		case errors.Is(err, ErrDFAStateLimit):
+			// No state count: construction stopped at the limit, so there is
+			// no finished DFA to count. -1 leaves the attribute out.
 			warnPatternDroppedReason(p, "anchored bucket",
 				"the anchored DFA hit the internal state limit while being built",
 				"simplify the pattern or move it out of the set — this limit is not configurable",
-				0, maxHelperDFAStates)
+				-1, maxHelperDFAStates)
 			recordAnchoredStateLimitDrop(diag, p)
 			continue
 		case err != nil:
 			warnPatternDroppedReason(p, "anchored bucket",
 				"the anchored DFA could not be built: "+err.Error(),
-				"simplify the pattern or move it out of the set", 0, 0)
+				"simplify the pattern or move it out of the set", -1, -1)
 			recordAnchoredStateLimitDrop(diag, p)
 			continue
 		case solo.numStates > opts.maxFallbackStates():

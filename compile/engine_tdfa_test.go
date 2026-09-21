@@ -1066,3 +1066,35 @@ func shippedBatchEdges(ops []tdfaTagOp, numRegs int) map[[2]int]bool {
 	}
 	return out
 }
+
+// TestTDFARegisterEdgeShapes compiles capture patterns that reach rarely-hit
+// corners of TDFA construction and register minimisation, each found by
+// searching generated patterns: a transition whose register copies form a
+// cycle (the scratch register breaks it), a copy whose destination a later
+// op in the same batch still reads, entry ops that minimisation drops as
+// dead, and a register live out of several states. Each must stay on TDFA —
+// otherwise the test no longer reaches what it is for — and emit a valid
+// module.
+func TestTDFARegisterEdgeShapes(t *testing.T) {
+	for _, pat := range []string{
+		`((?:bx(.)?|(xc)))+`,               // copy cycle: scratch register
+		`((c){1,2}([ab]))`,                 // a later op reads an earlier op's dst
+		`(?:(((x))*)|((?:cc|(?:a|[ab]))))`, // dead entry ops
+		`((?:(x)(ab)+|(a)(x){1,2}))+`,      // register live out of several states
+	} {
+		t.Run(pat, func(t *testing.T) {
+			eng, err := SelectEngine(pat, CompileOptions{})
+			if err != nil {
+				t.Fatalf("SelectEngine: %v", err)
+			}
+			if eng != EngineTDFA {
+				t.Fatalf("engine = %v, want TDFA — the shape no longer reaches TDFA construction", eng)
+			}
+			wasm, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "g"}}, 65536, true)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			validateWASM(t, wasm)
+		})
+	}
+}
