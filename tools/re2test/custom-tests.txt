@@ -7274,22 +7274,25 @@ regexps
 -;1-3;-;-;1-3,3-4;1-3;1-3|3-4
 -;0-2;-;-;0-2;0-2;0-2
 # ============================================================
-# Category 34: an alternation whose branches collapse into a fold-cased
+# Category 38: an alternation whose branches collapse into a fold-cased
 # literal.
 #
-# `b|B` is folded by the parser into one case-insensitive literal, which puts
-# it next to the unfolded `B` of `B$` and makes the pattern a round-trip
-# HAZARD: printing the parse tree and re-parsing it yields `B(?:$|)`, a
-# different language that never matches "b". regexped compiles the pattern as
-# written and is correct; it was a fuzz ORACLE that re-serialised the pattern
-# and then blamed the engine.
+# `b|B` is folded by the parser into one case-insensitive literal, `[Bb]`,
+# which then sits next to the unfolded `B` of `B$`. go1.25.9's regexp/syntax
+# factored the two as a common leading `B` and kept only the first branch's
+# fold flag, so `B$|[Bb]` compiled as `B(?:$|)` and never matched "b" — and
+# since every engine here takes its parse tree from that parser, regexped gave
+# the same wrong answer as Go, where no Go-based oracle could see it. Go 1.26
+# (checked on 1.26.0 and 1.26.8) compares the fold flag in `(*Regexp).Equal`,
+# which fixes it.
 #
-# Every branch here is spelled out, so the parse of the SOURCE is not
-# mis-factored and these expectations are Perl-correct as well as Go-correct
-# (patterns that reach the defect directly, such as `B$|[Bb]`, are deliberately
-# NOT in this corpus — Go answers those wrongly and the row would enshrine it).
+# The first four patterns spell every branch out, so their SOURCE never reached
+# the defect: they guard the round-trip hazard, where printing the parse tree
+# and re-parsing it turned `B$|b|B` into `B$|[Bb]`. The last four reach the
+# defect directly. Every expectation is Perl-correct; under go1.25.9 both
+# `--validate-go` and the WASM check fail on the last four.
 # ============================================================
-Cat34FoldAltBranch
+Cat38FoldAltBranch
 strings
 ""
 "b"
@@ -7331,6 +7334,38 @@ regexps
 -;0-1;-;-;0-1,1-2
 -;1-2;-;-;1-2
 -;0-1;-;-;0-1
+"B$|[Bb]"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"B$|(?i:B)"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"B\\b|[Bb]"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+-;0-1;-;-;0-1
+"[Bb]$|B\\b"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2
+-;1-2;-;-;1-2
+-;-;-;-;-
 # ============================================================
 # Category 35: capture patterns whose groups engine is FORCED.
 #

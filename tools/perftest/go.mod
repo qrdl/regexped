@@ -1,6 +1,6 @@
 module github.com/qrdl/regexped/tools/perftest
 
-go 1.25
+go 1.26
 
 replace github.com/qrdl/regexped => ../../
 

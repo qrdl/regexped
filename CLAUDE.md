@@ -1270,7 +1270,14 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 
 ## Dependencies
 
-- **Go 1.25.9+**
+- **Go 1.26+** — a CORRECTNESS floor, not a convenience one. Every engine takes its
+  parse tree from `regexp/syntax`, and before 1.26 its `factor()` merged a folded
+  and an unfolded leading literal as one prefix, so `B$|[Bb]` compiled as
+  `B(?:$|)` and missed `"b"`. Go's own `regexp` gave the same wrong answer, so no
+  Go-based oracle here could see it. `custom-tests.txt` Category 38 fails under
+  go1.25.9. Every `tools/*` module declares `go 1.26` too, and must stay in
+  step with the root: `go` refuses to build a module that declares an older version
+  than a dependency requires
 - **github.com/goccy/go-yaml** — YAML parsing, in STRICT mode (`yaml.Strict()`):
   an unknown key anywhere in the file is a line-numbered load error. That is what
   catches retired set keys and typos — and it also means ADDING a config key is

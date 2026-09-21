@@ -35,7 +35,7 @@ cd regexped
 go build -o regexped .
 ```
 
-Building from source needs Go 1.25 or newer.
+Building from source needs Go 1.26 or newer.
 
 **External tools.** `regexped` shells out to three tools, each only where it is
 needed. A core-module `compile` and every `generate` need none of them.
