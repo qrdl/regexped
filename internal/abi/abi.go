@@ -32,16 +32,14 @@ const (
 	// search for lack of memory. Where it can arise:
 	//
 	//   - a program compiled with the work budget off
-	//     (compile.BTWorkBudgetOff): the backtrack FRAME STACK (btPushFrame's
-	//     guard in compile/engine_backtrack.go), sized from the pattern's
-	//     alternation count by btAllocSizes, or the BitState MEMO bitset
-	//     (emitBTMemoLenGuardThen, same file), sized from the instruction count by
-	//     btMemoMaxLen — both compile-time sized while the requirement scales
-	//     with the input;
-	//   - every other program only when its FALLBACK body, which sizes both
-	//     regions from the input at call time, cannot grow linear memory any
-	//     further (WASM32's 4 GiB, or a lower host limit). The ordinary body's
-	//     own static regions no longer produce it: running out of either hands
+	//     (compile.BTWorkBudgetOff, a test knob): the backtrack FRAME STACK
+	//     (btPushFrame's guard in compile/engine_backtrack.go), sized from the
+	//     pattern's alternation count by btAllocSizes — compile-time sized while
+	//     the requirement scales with the input;
+	//   - every other program only when its FALLBACK body, which sizes its
+	//     frame stack and memo from the input at call time, cannot grow linear
+	//     memory any further (WASM32's 4 GiB, or a lower host limit). The
+	//     ordinary body's static stack no longer produces it: running out hands
 	//     the call to the fallback.
 	//
 	// Whichever fires, the engine has abandoned part of the search space and
@@ -145,9 +143,10 @@ const (
 // module carries when it contains a Backtracking program: the lowest address
 // the host lets the module use as run-time scratch during a call.
 //
-// A Backtracking call that exhausts its work budget or its frame stack, or whose
-// input passes its static memo, falls over to a memoised fallback body whose frame stack and memo are sized from
-// the input at call time. In a standalone module every byte above the tables
+// A Backtracking call that exhausts its work budget or its frame stack falls
+// over to a memoised fallback body whose frame stack and memo are sized from the
+// input at call time — as does every call to a program with a zero-width cycle,
+// which has no other body. In a standalone module every byte above the tables
 // belongs to the host (the JS/TS stubs carve their input regions there), so the
 // module cannot see what is live. The contract:
 //

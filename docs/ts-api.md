@@ -178,8 +178,8 @@ export function* <find>(input: string | Uint8Array, offset: number = 0): Generat
 
 // with hints: [batch-find]
 export const <set>BatchMaxSize: number;
-// batchSize defaults to max(256, <set>PatternCount), capped at <set>BatchMaxSize
-export function* <find>(input: string | Uint8Array, offset: number = 0, batchSize: number = 256): Generator<SetMatch>
+// <default> = max(256, <set>PatternCount), capped at <set>BatchMaxSize
+export function* <find>(input: string | Uint8Array, offset: number = 0, batchSize: number = <default>): Generator<SetMatch>
 ```
 
 `<match_all>` and `<scan_all>` stay **arrays, not generators**. That is

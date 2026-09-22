@@ -37,23 +37,23 @@ regexped/
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission.
 │   │                          #   EVERY program is emitted as TWO functions: the ordinary body plus
 │   │                          #   a pop-counted WORK BUDGET, and a FALLBACK body it tail-calls when
-│   │                          #   the budget runs out, its frame stack overflows or its input
-│   │                          #   passes its static memo — same emitter over btFallbackView, a
-│   │                          #   (pc, pos) memo at EVERY Alt and no loop guards. The memo cannot
-│   │                          #   simply be added to the ordinary body: its zero-progress guard
-│   │                          #   needs a second arrival at a (pc, pos) and a memo forbids one, so
-│   │                          #   `(?:a*|b*)*` over "b" answered end=1. Scoping the budget to
-│   │                          #   empty-body loops (`^(\w*|)*c`) was tried and REFUTED by
-│   │                          #   `^(aa|a)*b`, which hung with no empty-body loop at all.
-│   │                          #   A stack overflow needs no call site of its own: it ARMS the
-│   │                          #   budget to trip on the next pop, so a body makes at most two calls.
+│   │                          #   the budget runs out or its frame stack overflows — same emitter,
+│   │                          #   a (pc, pos) memo at EVERY Alt. Scoping the budget to empty-body
+│   │                          #   loops (`^(\w*|)*c`) was tried and REFUTED by `^(aa|a)*b`, which
+│   │                          #   hung with no empty-body loop at all. A stack overflow needs no
+│   │                          #   call site of its own: it ARMS the budget to trip on the next pop.
 │   │                          #   EXCEPTION: a program with a ZERO-WIDTH CYCLE (progHasZeroWidthCycle)
-│   │                          #   gets no ordinary body — its first function is the bare tail call.
-│   │                          #   The loop trackers only approximate Go's "drop a second arrival at
+│   │                          #   gets no ordinary body under ANY budget, BTWorkBudgetOff included —
+│   │                          #   its first function is the bare tail call. The ordinary body has NO
+│   │                          #   loop guard and NO memo: without such a cycle every cycle consumes a
+│   │                          #   byte, so no guard can fire. It used to carry per-loop zero-progress
+│   │                          #   trackers, which only approximated Go's "drop a second arrival at
 │   │                          #   (pc, pos)" and were wrong on a whole class (`(a*?)*?b` group 1 =
 │   │                          #   1-2 over "aab"; 465 of 15,072 differential patterns, all with such
-│   │                          #   a cycle). Memoising the untracked Alts instead broke 2 that had
-│   │                          #   been right, because the trackers make a (pc, pos) path-dependent
+│   │                          #   a cycle); on every other program they were bookkeeping that could
+│   │                          #   never change an answer, and were deleted (2026-09-22), with the
+│   │                          #   two compile-time limits that only counted them (so a set member
+│   │                          #   they made Backtracking refuse is now ADMITTED, not dropped).
 │   │                          #   In a SET, a member's budget, fallback region and visited set last
 │   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate
 │   ├── bt_scratch.go          # The FALLBACK body's run-time memory: memo and frame stack sized from

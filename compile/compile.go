@@ -90,9 +90,9 @@ const maxBTFallbackPrefixLen = 64
 // reservation (btAllocSizes' stackSize, or the capture-tracking path's
 // equivalent inline computation) would push the module's own linear memory
 // requirement past what WASM32 can declare (65536 pages × 64KiB = 4GiB).
-// stackSize scales with bt.numAlts and per-loop frame-local count, both of
-// which grow with ordinary pattern structure (repeated groups, nested
-// loops) rather than anything pathological — an unremarkable-looking
+// stackSize scales with bt.numAlts and the capture count, both of which grow
+// with ordinary pattern structure (repeated groups, alternations) rather than
+// anything pathological — an unremarkable-looking
 // bounded-repeat pattern can cross this ceiling well within this project's
 // normal pattern-size range. Without this check, Compile silently returns a
 // WASM module whose memory section is already invalid: it fails at
@@ -112,141 +112,6 @@ const maxWasmMemoryBytes = 1 << 32
 func checkBTMemoryBudget(base int64, extra int64) error {
 	if base+extra > maxWasmMemoryBytes {
 		return ErrBTStackTooLarge
-	}
-	return nil
-}
-
-// ErrBTLoopCountTooLarge is returned when a Backtracking construction's
-// loop-frame-local count (btNumLoopFrameLocals) is large enough that
-// wasmtime's JIT compilation of the resulting module becomes too slow for
-// tools/fuzz's `-fuzz` worker to tolerate (a past defect — discovered
-// via FuzzCorrectness/092700-8c386fe83b176a61, a bug-31 regression-corpus
-// entry that still crashed under real `-fuzz` fuzzing, though not under
-// plain seed replay).
-//
-// Root cause, live-verified: this is NOT a Cranelift-internal complexity
-// cliff at a specific loop count, and NOT a regexped code-bloat defect.
-// The pattern family (?:$*<9-10 literal bytes>){N} (a fuzzer-found repro shape)
-// stays on the cheap primary DFA/CompiledDFA path for N up to 113 (its
-// literal-chain state count stays under the default 1024-state cap), where
-// wasmtime.NewModule takes ~25-30ms regardless of table size. At N=114 the
-// chain crosses 1024 states and the pattern falls to the Backtracking
-// engine instead — a structurally different, much more expensive-to-JIT
-// body — producing the apparent "~50x jump" that first looked like a
-// loop-count-triggered cliff but is really an engine-selection regime
-// change coincident with this pattern family's specific literal length.
-//
-// Isolating pure Backtracking-path JIT cost (forcing early BT fallback via
-// a tiny MaxDFAStates, independent of the 1024-state crossover) shows
-// smooth, non-cliff growth: 78ms at 64 loop-frame locals, 294ms at 128,
-// mildly superlinear but not runaway. The real risk this check closes is
-// that once a pattern's *natural* structure (large bounded repeats,
-// independent loop constructs) pushes it into the Backtracking fallback,
-// BT's per-loop JIT cost is high enough per unit that a completely
-// ordinary-looking pattern can cost several seconds of uninterruptible
-// compile time with zero attribution — e.g. ~1.4s at 228 loop-frame locals,
-// ~6.2s at 400, ~12.1s at 510 (ErrBTStackTooLarge already
-// rejects this specific family beyond ~510). tools/fuzz's `-fuzz` worker
-// treats any single call over ~10s as a hang and reports it as a crasher
-// (the same mechanism documented on maxNFAInsts); a real caller
-// compiling such a pattern at build time would just see an unexplained
-// multi-second stall.
-var ErrBTLoopCountTooLarge = errors.New("compile: backtracking loop-frame-local count exceeds JIT-safe limit")
-
-// maxBTLoopFrameLocals caps btNumLoopFrameLocals(bt, ...) at every
-// Backtracking code-generation site, before any WASM body is built. 64 is
-// chosen directly from live measurement (see ErrBTLoopCountTooLarge): at
-// exactly this loop-frame-local count, isolated Backtracking-path JIT time
-// is ~78ms — comfortably fast — while every measured case that actually
-// triggered the fuzz-worker crash (228 loop-frame locals and up) sits
-// 3.5x-8x above this cap. Ordinary patterns have at most a handful of
-// independent loop constructs; dozens-to-hundreds only arises from
-// pathological/adversarial or unrolled-large-{N}-repeat shapes like bug
-// 31's repro family, so this cap is not expected to reject realistic
-// patterns.
-const maxBTLoopFrameLocals = 64
-
-// checkBTLoopCount returns ErrBTLoopCountTooLarge if bt's loop-frame-local
-// count is large enough that wasmtime's JIT compilation of the resulting
-// Backtracking body risks costing multiple seconds with zero attribution
-// (see ErrBTLoopCountTooLarge). withCaptureSnapshots must match the value
-// the call site's own btNumLoopFrameLocals call uses (true only for the
-// capture-tracking body).
-func checkBTLoopCount(bt *backtrack, withCaptureSnapshots bool) error {
-	if btNumLoopFrameLocals(bt, withCaptureSnapshots) > maxBTLoopFrameLocals {
-		return ErrBTLoopCountTooLarge
-	}
-	return nil
-}
-
-// ErrBTEmptyBodyLoopChainTooLarge is returned when a Backtracking
-// construction's count of bt.emptyBodyGreedyLoop heads is large enough that
-// a single find/match/groups call risks costing multiple seconds at
-// *runtime* — a distinct failure mode from ErrBTLoopCountTooLarge, which
-// only bounds one-time JIT compile cost (a past defect, discovered via
-// tools/fuzz/found repros of `(?m:$*$*...$*0$)`-shaped patterns, e.g. 16
-// chained `$*`).
-//
-// Root cause, live-verified: every pushed backtrack frame snapshots *all*
-// loop_pos/loop_entry trackers (btNumLoopFrameLocals), not just the pushing
-// loop's own. Restoring an EARLIER loop's frame (e.g. during downstream
-// unwinding after a later, unrelated match failure) resets every LATER
-// loop's tracker back to its pre-visit ("unprimed") value, forcing each
-// later loop in the chain to redo its own push-and-resolve cycle from
-// scratch — including re-pushing its own first-entry twin frame, which is
-// itself indistinguishable from a genuine fresh entry once the trackers are
-// unprimed (an emptyBodyGreedyLoop's twin frame cannot be skipped
-// unconditionally: its body's "matches empty" branch can be a *conditional*
-// zero-width assertion — e.g. `\b` in `.(?:\b|0)*` — that legitimately fails
-// at a given position, in which case the twin's pushed frame is the only
-// path back to "zero iterations of this star", so removing it breaks
-// correctness; confirmed live by a reverted attempt at exactly this skip,
-// which produced a wrong "no match" for `.(?:\b|0)*` against `" "`, expected
-// `[0,1)`). For N loops chained in straight-line sequence with an
-// always-failing tail, the unprimed-replay cost compounds multiplicatively:
-// confirmed live via wasmtime call timing on `(?m:` + `$*`×N + `0$)` against
-// a non-matching single-byte input — call time crosses 33ms at N=13, 101ms
-// at N=14, 342ms at N=15, 1.03s at N=16, 9.9s at N=18 — all while compiled
-// WASM size and Compile() time itself stay small and linear, confirming the
-// blowup is execution-time-only, invisible to ErrBTLoopCountTooLarge's
-// JIT-time-based cap (which permits far more than 14 such loops for this
-// pattern shape, well past where runtime cost already becomes
-// unacceptable). Per CLAUDE.md's "runtime over compile time" principle, an
-// unbounded runtime cost is worse than an unbounded compile-time cost, so
-// this is rejected at compile time rather than left for a caller to
-// discover as an unexplained multi-second `find`/`match` call.
-//
-// Eliminating the underlying exponential (e.g. by memoising each
-// emptyBodyGreedyLoop head's resolved outcome per-position via the existing
-// BitState mechanism, or by snapshotting only the loop trackers actually
-// live past a given push instead of all of them) was not attempted here:
-// this exact loop-head logic has a documented history of subtle correctness
-// regressions from well-intentioned changes (see bt.memoInnerLoop's doc,
-// a past defect’s two reverted fix attempts, and this bug's own
-// reverted twin-skip attempt above) and deserves its own carefully-measured
-// change, not a fix folded into an unrelated bug report. A compile-time cap
-// is the safe, narrowly-scoped mitigation for now.
-var ErrBTEmptyBodyLoopChainTooLarge = errors.New("compile: backtracking empty-body-loop chain length exceeds runtime-safe limit")
-
-// maxBTEmptyBodyGreedyLoops caps len(bt.emptyBodyGreedyLoop) at every
-// Backtracking code-generation site, before any WASM body is built. 12 is
-// chosen directly from live measurement (see
-// ErrBTEmptyBodyLoopChainTooLarge's doc): call time at N=12 chained `$*` is
-// ~9.5ms (comfortably fast, the same bar the JIT-time cap uses),
-// while N=14 already reaches ~101ms and every couple of steps beyond
-// roughly triples again. Ordinary patterns have at most a handful of
-// independent nullable loops; a long straight-line chain of them only
-// arises from pathological/adversarial or mechanically-unrolled shapes, so
-// this cap is not expected to reject realistic patterns.
-const maxBTEmptyBodyGreedyLoops = 12
-
-// checkBTEmptyBodyLoopChain returns ErrBTEmptyBodyLoopChainTooLarge if bt
-// has more than maxBTEmptyBodyGreedyLoops emptyBodyGreedyLoop heads — see
-// ErrBTEmptyBodyLoopChainTooLarge's doc for the runtime-cost mechanism this
-// guards against.
-func checkBTEmptyBodyLoopChain(bt *backtrack) error {
-	if len(bt.emptyBodyGreedyLoop) > maxBTEmptyBodyGreedyLoops {
-		return ErrBTEmptyBodyLoopChainTooLarge
 	}
 	return nil
 }
@@ -417,16 +282,12 @@ type CompileOptions struct {
 	// constraint). Negative value disables the compiled path entirely.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	CompiledDFAThreshold int
-	// MemoBudget is the maximum bytes allocated for the BitState memoization
-	// buffer. Only used when the pattern requires BitState (needsBitState == true).
-	// Defaults to 128*1024 (128 KB) when zero.
-	MemoBudget int
 	// BTWorkBudget is the multiplier k of the Backtracking WORK BUDGET: every
 	// Backtracking body may pop at most (span+1)·k·len(prog.Inst) backtrack
 	// frames per call, and when that runs out it tail-calls its memoised
 	// FALLBACK body, which answers the call from scratch. A backtracker is
 	// exponential whenever a loop can split its input more than one way, and
-	// nothing else bounds the search — see btWorkK and btFallbackView.
+	// nothing else bounds the search — see btWorkK and planBT.
 	//
 	// 0 → the default (8); a positive value → that k; BTWorkBudgetOff → no
 	// counter and no fallback, the bytes every body had before the budget
@@ -633,8 +494,7 @@ type compiledPattern struct {
 
 	// Backtracking FALLBACK bodies, one per budgeted fast body (matchBody,
 	// findBody, captureBody): the memoised body a fast body tail-calls when
-	// its work budget trips, its frame stack overflows or its input passes
-	// its static memo (see planBT and btFallbackView). Each is laid out
+	// its work budget trips or its frame stack overflows (see planBT). Each is laid out
 	// directly after its fast body — after findNeutralBody, for find — and
 	// has the fast body's own signature. Nil when that body has no budget.
 	//
@@ -1547,55 +1407,30 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
-			if err := checkBTLoopCount(bt, false); err != nil {
-				return nil, err
-			}
-			if err := checkBTEmptyBodyLoopChain(bt); err != nil {
-				return nil, err
-			}
-			useMemo := needsBitState(btProg)
 			// The fallback's memo and stack are sized at call time
-			// (bt_scratch.go), so only the fast body's own memo is reserved —
+			// (bt_scratch.go), so only the fast body's stack is reserved —
 			// and nothing at all when the fast body is the bare tail call.
 			plan := planBT(bt, buildOpts.BTWorkBudget)
-			reserveMemo := useMemo && !plan.force
 			btBase := utils.PageAlign(cur)
-			matchMemoBudget := resolveMemoBudget(&buildOpts)
-			// Refuses a budget too small to hold even the shortest admissible
-			// input's bitset — see btMemoPlan. This path reserves the whole
-			// budget rather than the bitset's own size, so without the check it
-			// would accept what the capture path rejects.
-			matchMemoMaxLen := int32(0)
-			if reserveMemo {
-				var err error
-				matchMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), matchMemoBudget)
-				if err != nil {
-					return nil, err
-				}
-			}
-			btStackSize, btMemoSize := btAllocSizes(bt, reserveMemo, 0, matchMemoBudget)
+			btStackSize := btAllocSizes(bt)
 			if plan.force {
 				btStackSize = 0
 			}
-			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
+			if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
 				return nil, err
 			}
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
-			var btMemoBase int32
-			if reserveMemo {
-				btMemoBase = btStackLimit + btMemoHeaderBytes
-			}
 			if plan.force {
 				matchBody, matchFallbackCallOffs = btTailCallBody(2)
 			} else {
-				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, int32(8+btNumLoopFrameLocals(bt, false)*4), btMemoBase, useMemo, buildOpts.tableMemIdx, matchMemoMaxLen, plan.k, plan.fallback, nil)
+				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, btNoCaptureFrameSize, buildOpts.tableMemIdx, plan.k, plan.fallback, nil)
 			}
 			if plan.fallback {
 				scratch := buildOpts.btScratch()
-				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, 0, 0, int32(8+btNumLoopFrameLocals(btFallbackView(bt), false)*4), 0, true, buildOpts.tableMemIdx, 0, 0, false, &scratch)
+				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, 0, false, &scratch)
 			}
-			matchEnd = btBase + int64(btStackSize) + int64(btMemoSize)
+			matchEnd = btBase + int64(btStackSize)
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
 				t:                    llTable,
@@ -1807,13 +1642,6 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
-			if err := checkBTLoopCount(bt, false); err != nil {
-				return nil, err
-			}
-			if err := checkBTEmptyBodyLoopChain(bt); err != nil {
-				return nil, err
-			}
-			useMemo := needsBitState(btProg)
 			// Choose scan strategy (in priority order):
 			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
 			//   2. Mandatory interior literal via two-level outer loop.
@@ -1859,38 +1687,22 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			p.dataSegCount += btScanSegCnt
 			// Allocate BT stack after SIMD tables.
 			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
-			memoBudget := resolveMemoBudget(&buildOpts)
 			// See the match path above: the fallback reserves nothing, and nor
 			// does a fast body that is the bare tail call.
 			plan := planBT(bt, buildOpts.BTWorkBudget)
-			reserveMemo := useMemo && !plan.force
-			// Same refusal as the match path above, for the same reason.
-			findMemoMaxLen := int32(0)
-			if reserveMemo {
-				var err error
-				findMemoMaxLen, _, err = btMemoPlan(len(bt.prog.Inst), memoBudget)
-				if err != nil {
-					return nil, err
-				}
-			}
-			btStackSize, btMemoSize := btAllocSizes(bt, reserveMemo, 0, memoBudget)
+			btStackSize := btAllocSizes(bt)
 			if plan.force {
 				btStackSize = 0
 			}
-			if err := checkBTMemoryBudget(btBase, int64(btStackSize)+int64(btMemoSize)); err != nil {
+			if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
 				return nil, err
 			}
 			btStackBase := int32(btBase)
 			btStackLimit := btStackBase + int32(btStackSize)
-			var btMemoBase int32
-			if reserveMemo {
-				btMemoBase = btStackLimit + btMemoHeaderBytes
-			}
-			frameSize := int32(8 + btNumLoopFrameLocals(bt, false)*4) // pos + loop trackers + retryPC (no cap slots)
 			var fallbackMode findFromMode
 			if plan.fallback {
 				scratch := buildOpts.btScratch()
-				p.findFallbackBody, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, int32(8+btNumLoopFrameLocals(btFallbackView(bt), false)*4), 0, true, btMandLit, buildOpts.tableMemIdx, 0, 0, false, &scratch)
+				p.findFallbackBody, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, 0, false, &scratch)
 			}
 			if plan.force {
 				// The stub forwards (ptr, len) and never reads `from`; the
@@ -1899,14 +1711,14 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				stub, p.findFallbackCallOffs = btTailCallBody(2)
 				p.setFind(stub, fallbackMode)
 			} else {
-				fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, frameSize, btMemoBase, useMemo, btMandLit, buildOpts.tableMemIdx, findMemoMaxLen, plan.k, plan.fallback, nil)
+				fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, plan.k, plan.fallback, nil)
 				if plan.fallback && mode != fallbackMode {
 					panic("compile: a Backtracking find body and its fallback read `from` differently")
 				}
 				p.setFind(fast, mode)
 				p.findFallbackCallOffs = offs
 			}
-			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize) + int64(btMemoSize))
+			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize))
 		} else {
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Pattern)
@@ -2345,46 +2157,25 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			return nil, ErrBTProgramTooLarge
 		}
 		bt := newBacktrack(prog)
-		if err := checkBTLoopCount(bt, true); err != nil {
-			return nil, err
-		}
-		if err := checkBTEmptyBodyLoopChain(bt); err != nil {
-			return nil, err
-		}
 
 		// Stack placed directly after all find-mode DFA and lit-anchor tables.
 		// p.tableEnd includes lit-anchor reversed-DFA and SIMD tables when active;
 		// using l.tableEnd would overlap those tables and corrupt them at runtime.
 		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
-		frameSize := 4 + numCapLocs*4 + btNumLoopFrameLocals(bt, true)*4 + 4
+		frameSize := 4 + numCapLocs*4 + 4 // pos, captures, retryPC
 		maxFrames := bt.numAlts * 4096
 		if maxFrames < 4096 {
 			maxFrames = 4096
 		}
 		stackSize := maxFrames * frameSize
 
-		// Memo table (BitState memoization) — only when the pattern has loops
-		// whose body can match zero bytes, which can cause infinite revisiting.
-		// Sized before the budget check below: the check has to cover
-		// everything this path reserves, not just the stack.
-		useMemo := needsBitState(prog)
 		// The fallback's memo and stack are sized at call time
-		// (bt_scratch.go), so only the fast body's own stack and memo are
-		// reserved — and neither when the fast body is the bare tail call.
+		// (bt_scratch.go), so only the fast body's stack is reserved — and
+		// nothing when the fast body is the bare tail call.
 		plan := planBT(bt, buildOpts.BTWorkBudget)
-		reserveMemo := useMemo && !plan.force
 		if plan.force {
 			stackSize = 0
-		}
-		var memoMaxLen int32
-		var memoMaxSize int64
-		if reserveMemo {
-			var err error
-			memoMaxLen, memoMaxSize, err = btMemoPlan(len(prog.Inst), resolveMemoBudget(&buildOpts))
-			if err != nil {
-				return nil, err
-			}
 		}
 
 		// Window mode: patterns whose assertions are defined against the
@@ -2402,20 +2193,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// eight bytes never decided a verdict.
 		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
 
-		// memoMaxSize is the BITSET; the reservation also carries its header.
-		memoReserve := memoMaxSize
-		if reserveMemo {
-			memoReserve += btMemoHeaderBytes
-		}
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)+memoReserve); err != nil {
+		if err := checkBTMemoryBudget(btBase, int64(stackSize)); err != nil {
 			return nil, err
 		}
 		stackBase := int32(btBase)
 		stackLimit := stackBase + int32(stackSize)
-		var memoTableBase int32
-		if reserveMemo {
-			memoTableBase = stackBase + int32(stackSize) + btMemoHeaderBytes
-		}
 
 		// The window offsets are two module globals, so no table region is
 		// reserved for them any more.
@@ -2427,14 +2209,10 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			winGlobal = int32(buildOpts.globals.Alloc())
 			buildOpts.globals.Alloc() // endOff, at winGlobal+1
 		}
-		// Kept in int64 throughout: memoTableBase is an int32 whose bit
-		// pattern is the right WASM address even past 2GiB, but
-		// sign-extending it back here would make the reservation's own end
-		// address negative and hide an over-ceiling reservation from the
-		// tableEnd bookkeeping. Identical below 2GiB.
-		afterBT := btBase + int64(stackSize)
-		afterBT += memoReserve
-		p.tableEnd = utils.PageAlign(afterBT)
+		// Kept in int64: the reservation's end can pass 2GiB, where an int32
+		// would go negative and hide an over-ceiling reservation from the
+		// tableEnd bookkeeping.
+		p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
 
 		p.numGroups = bt.numGroups
 		p.winGlobalP1 = winGlobal + 1
@@ -2450,14 +2228,13 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if plan.force {
 			p.captureBody, p.captureFallbackCallOffs = btTailCallBody(3)
 		} else {
-			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), memoTableBase, useMemo, anchored, buildOpts.tableMemIdx, winGlobal, memoMaxLen, p.capStartGlobal(), plan.k, plan.fallback, nil, nil)
+			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil)
 		}
 		if plan.fallback {
-			// The same globals as the fast body; its own run-time memory; its
-			// frames carry no loop trackers.
+			// The same globals and frame layout as the fast body; its own
+			// run-time memory.
 			scratch := buildOpts.btScratch()
-			fallbackFrame := 4 + numCapLocs*4 + btNumLoopFrameLocals(btFallbackView(bt), true)*4 + 4
-			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(fallbackFrame), 0, true, anchored, buildOpts.tableMemIdx, winGlobal, 0, p.capStartGlobal(), 0, false, &scratch, nil)
+			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil)
 		}
 	}
 
@@ -3352,10 +3129,11 @@ func NeedsUnicodeSupport(pattern string) (bool, error) {
 
 // BacktrackHasZeroWidthCycle reports whether pattern's GROUPS program — the
 // capture-bearing one — can go round a cycle without consuming a byte. Every
-// build with a work budget answers such a program with its fallback body alone;
-// its ordinary body runs only under BTWorkBudgetOff, and is not exact there.
-// Exported for harnesses that drive that ordinary body on purpose (tools/fuzz's
-// FuzzGroupsBothBodies), so they do not score a body no module ships.
+// build answers such a program with its fallback body alone, BTWorkBudgetOff
+// included: it has no ordinary body. Exported for harnesses that drive the
+// ordinary body on purpose (tools/fuzz's FuzzGroupsBothBodies), so they know a
+// build of such a program under BTWorkBudgetOff is the fallback, not the
+// ordinary body.
 //
 // It does not answer for the match or find program. Those are compiled with
 // the captures stripped, and Go's simplifier can then collapse the cycle:

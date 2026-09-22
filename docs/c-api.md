@@ -433,9 +433,10 @@ patterns IN the set have bits — `ID_SPACE` remains correct for everything
 indexed BY an id, and this is a list of ids rather than an id-indexed array.
 
 **Re-entrancy is not thread-safety.** Removing the last mutable static makes
-these calls re-entrant, but the Backtracking engine keeps its stack and its
-BitState memo at fixed addresses inside the module, so BT-compiled patterns
-stay non-reentrant at the WASM level.
+these calls re-entrant, but the Backtracking engine keeps its stack at a fixed
+address inside the module, and its fallback body's memo and stack in scratch
+found through module globals, so BT-compiled patterns stay non-reentrant at the
+WASM level.
 
 The two constants differ for a named subset: `<SET>_PATTERN_COUNT` counts the
 set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past
@@ -461,9 +462,10 @@ surface.
 
 - Every iterator and every output array is **caller-owned**, so two scans can be
   in flight and nothing is overwritten behind your back. That is re-entrancy,
-  not thread-safety: the Backtracking engine keeps its stack and BitState memo
-  at fixed addresses in the module's memory, so a BT-compiled pattern is not
-  safe to drive from two threads sharing one instance.
+  not thread-safety: the Backtracking engine keeps its stack at a fixed address
+  in the module's memory, and its fallback body's memo in scratch found through
+  module globals, so a BT-compiled pattern is not safe to drive from two threads
+  sharing one instance.
 - Groups are addressed by **index**, with a constant per named group. The
   `name` pointer `rx_group_t` used to carry is gone — the index carries identity
   now, and the pointer duplicated the name table at a pointer per group.

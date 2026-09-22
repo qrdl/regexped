@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"regexp"
@@ -50,10 +51,10 @@ func TestBTFindMemoIsLinearInInputLength(t *testing.T) {
 	cfg.SetWasmSIMD(true)
 	engine := wasmtime.NewEngineWithConfig(cfg)
 
-	// Needs all three: a non-greedy loop with an empty-matchable body (so
-	// needsBitState fires), a DFA squeezed past its limit (so the pattern
-	// reaches Backtracking for find at all), and a no-match input (so every
-	// start position is attempted).
+	// Needs all three: a non-greedy loop with an empty-matchable body (a
+	// zero-width cycle, so the memoised fallback answers), a DFA squeezed past
+	// its limit (so the pattern reaches Backtracking for find at all), and a
+	// no-match input (so every start position is attempted).
 	entry := config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"}
 	opts := compile.CompileOptions{MaxDFAStates: 1}
 	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
@@ -126,16 +127,15 @@ func TestBTFindMemoIsLinearInInputLength(t *testing.T) {
 // with length. Neutralising the fill entirely measured 12,238,053, so what
 // remains of the clear is 2.0% rather than 95% of the call.
 //
-// The fix is not the find body's hoist: this memo is the ORDINARY body's
-// compile-time region, shared by every member, and its marks are not carried
-// across candidate calls. Instead the memo is indexed POSITION-major, which
-// makes the bytes one attempt dirties a contiguous run from the base, and each
-// call clears exactly the run the previous call recorded in the memo header
-// word. (A member's FALLBACK body does carry its marks across candidates, per
-// host call — TestSetBTHostCallIsLinear.)
+// That memo was the ORDINARY body's compile-time region; the fix then indexed
+// it POSITION-major and cleared only the run the previous call dirtied. The
+// ordinary body has since lost its memo altogether: a member whose program
+// needs one has a zero-width cycle, so it answers through its FALLBACK body,
+// whose visited set lasts one host call (TestSetBTHostCallIsLinear). The
+// linear growth this test pins is now that body's.
 func TestSetBTMemoIsLinearInInputLength(t *testing.T) {
 	// Needs all of: a member forced onto BT (max_fallback_states = 1), a
-	// non-greedy loop with an empty-matchable body (needsBitState), a rare
+	// non-greedy loop with an empty-matchable body (a zero-width cycle), a rare
 	// leading byte so most positions are candidates that FAIL fast, and a
 	// match at the very end so the drive scans the whole input.
 	cfg := config.BuildConfig{
@@ -240,11 +240,12 @@ func TestSetBTMemoIsLinearInInputLength(t *testing.T) {
 // first, which Go's visited set drops. A differential found the ordinary body
 // wrong on 306 of 3,072 systematic nestings and 159 of 12,000 random nested
 // patterns, every one with such a cycle. Such programs now run the memoised
-// fallback body alone (compile's planBT); these shapes, drawn from both
+// fallback body alone (compile's planBT) under every budget, and the ordinary
+// body carries no loop guard at all; these shapes, drawn from both
 // differentials, must agree with Go in every slot.
 //
-// The control proves the shapes still reach the class: the ordinary body alone
-// (BTWorkBudgetOff) must be wrong on at least one of them.
+// The control proves the shapes still reach the class: each must have the
+// zero-width cycle, which is what gives it the fallback alone.
 func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 	shapes := []string{
 		`(a*?)*?b`,
@@ -268,7 +269,6 @@ func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 		}
 	}
 
-	ordinaryWrong := 0
 	for _, pat := range shapes {
 		if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err != nil || !cyc {
 			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — the shape no longer has the cycle this test is about", pat, cyc, err)
@@ -278,10 +278,6 @@ func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 		shipped, err := compileGroupsBudget(pat, 0)
 		if err != nil {
 			t.Fatalf("%s: compile: %v", pat, err)
-		}
-		ordinary, err := compileGroupsBudget(pat, compile.BTWorkBudgetOff)
-		if err != nil {
-			t.Fatalf("%s: compile with the budget off: %v", pat, err)
 		}
 		cases := inputs
 		if pat == `(a*?)*?b` {
@@ -296,15 +292,8 @@ func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 			if msg := compareSlots(want, got, ok); msg != "" {
 				t.Errorf("%s over %q (%s): got %v, want %v", pat, in, msg, got, want)
 			}
-			if got, ok, hang, err := runWasmGroupsPath(ordinary, in, numGroups); err == nil && !hang && compareSlots(want, got, ok) != "" {
-				ordinaryWrong++
-			}
 		}
 	}
-	if ordinaryWrong == 0 {
-		t.Errorf("the ordinary body alone answered every case correctly — these shapes no longer exercise the class the routing exists for")
-	}
-	t.Logf("the ordinary body alone was wrong on %d cases the shipped build answers correctly", ordinaryWrong)
 }
 
 // exportBTDriveMember returns a copy of a set module with the first
@@ -851,20 +840,18 @@ func btMemoCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs 
 	}
 }
 
-// btMemoPatterns covers every body that fills a memo. All four need
-// needsBitState (a non-greedy loop whose body can match empty); the no-capture
-// ones additionally need the DFA squeezed past its limit or they never reach
-// Backtracking at all.
+// btMemoPatterns covers every body that fills a memo. All of them have a
+// zero-width cycle (a non-greedy loop whose body can match empty), so the
+// memoised fallback answers every call; the no-capture ones additionally need
+// the DFA squeezed past its limit or they never reach Backtracking at all.
 //
-// MemoBudget is deliberately SMALL on three of them: it moves the ceiling down
-// to a few thousand bytes so the sweep crosses it in milliseconds. htmlTags
-// keeps the default budget and reproduces the original report exactly — its
-// ceiling sits at a 41,942-byte extent.
+// The memo used to be a compile-time region with a length ceiling — for
+// htmlTags a 41,942-byte extent, which the lengths below straddle. The
+// fallback sizes its memo from the input, so every length must now be answered.
 const htmlTagsPattern = `<(?P<tag>\w+)(?:\s*(?P<attr>\w+)?(?:="(?P<val>[^"]*)")?)*?>`
 
 func TestBTMemoOverflowIsGuarded(t *testing.T) {
-	small := compile.CompileOptions{MemoBudget: 4096}
-	squeezedSmall := compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096}
+	squeezed := compile.CompileOptions{MaxDFAStates: 1}
 
 	cases := []struct {
 		name   string
@@ -880,16 +867,8 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 	}{
 		{
 			// buildBacktrackBody — the capture body, shared with set BT buckets.
-			name:   "groups/html-tags/default-budget",
+			name:   "groups/html-tags",
 			entry:  config.RegexEntry{Pattern: htmlTagsPattern, GroupsFunc: "groups"},
-			export: "groups", extra: []int32{pathsOutBase, 0},
-			wrap:   func(a string) string { return "<" + a + ">" },
-			answer: func(_ string, loc []int) int64 { return int64(loc[1]) },
-		},
-		{
-			name:   "groups/small-budget",
-			entry:  config.RegexEntry{Pattern: htmlTagsPattern, GroupsFunc: "groups"},
-			opts:   []compile.CompileOptions{small},
 			export: "groups", extra: []int32{pathsOutBase, 0},
 			wrap:   func(a string) string { return "<" + a + ">" },
 			answer: func(_ string, loc []int) int64 { return int64(loc[1]) },
@@ -898,7 +877,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 			// buildBTMatchBody.
 			name:   "match",
 			entry:  config.RegexEntry{Pattern: `(?:a?)+?b`, MatchFunc: "match"},
-			opts:   []compile.CompileOptions{squeezedSmall},
+			opts:   []compile.CompileOptions{squeezed},
 			export: "match",
 			wrap:   func(a string) string { return a + "b" },
 			answer: func(in string, _ []int) int64 { return int64(len(in)) },
@@ -907,7 +886,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 			// buildBTFindBody, general-scan branch.
 			name:   "find/general-scan",
 			entry:  config.RegexEntry{Pattern: `(?:a?)+?`, FindFunc: "find"},
-			opts:   []compile.CompileOptions{squeezedSmall},
+			opts:   []compile.CompileOptions{squeezed},
 			export: "find", extra: []int32{0},
 			wrap:   func(a string) string { return a },
 			answer: func(_ string, loc []int) int64 { return int64(loc[0])<<32 | int64(loc[1]) },
@@ -917,15 +896,14 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 			// site with its own copy of the fill.
 			name:   "find/mandatory-literal",
 			entry:  config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"},
-			opts:   []compile.CompileOptions{squeezedSmall},
+			opts:   []compile.CompileOptions{squeezed},
 			export: "find", extra: []int32{0},
 			wrap:   func(a string) string { return a + "xyz" },
 			answer: func(_ string, loc []int) int64 { return int64(loc[0])<<32 | int64(loc[1]) },
 		},
 	}
 
-	// Spans every ceiling above: 4096-byte budgets put it in the low
-	// thousands, the default budget puts it at 41,942.
+	// Straddles the old compile-time ceiling (41,942 for htmlTags).
 	lengths := []int{0, 1, 100, 4095, 4096, 4097, 20000, 41940, 41941, 41942, 41943, 60000, 120000}
 
 	for _, tc := range cases {
@@ -936,7 +914,6 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 			}
 			re := regexp.MustCompile(tc.entry.Pattern)
 
-			answered := 0
 			for _, n := range lengths {
 				in := tc.wrap(strings.Repeat("a", n))
 				if len(in) > int(pathsOutBase-pathsInputBase) {
@@ -944,11 +921,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 				}
 				got, err := btMemoCall(t, w, tc.export, in, tc.extra...)
 				if err != nil {
-					t.Fatalf("len=%d: %v\nthe memo fill ran past its reservation — "+
-						"the guard is missing from this body", len(in), err)
-				}
-				if got == abi.BTStackOverflow {
-					continue // a resource ceiling; the answer is unknown, which is allowed
+					t.Fatalf("len=%d: %v", len(in), err)
 				}
 				loc := re.FindStringIndex(in)
 				var want int64 = abi.NoMatch
@@ -956,165 +929,56 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 					want = tc.answer(in, loc)
 				}
 				if got != want {
-					t.Fatalf("len=%d: got %d, want %d (or BTStackOverflow)", len(in), got, want)
+					t.Fatalf("len=%d: got %d, want %d", len(in), got, want)
 				}
-				answered++
-			}
-			// Guards that reject everything would satisfy the loop above
-			// vacuously; at least the short inputs must still get real answers.
-			if answered == 0 {
-				t.Fatalf("every length returned BTStackOverflow — the guard has "+
-					"replaced all results rather than bounding them (%d lengths tried)", len(lengths))
 			}
 		})
 	}
 }
 
-// The memo's length guard REFUSES: past the ceiling the body returns
-// abi.BTStackOverflow, which means "the answer is unknown". Emitted at the head
-// of a call, that verdict was reached before the find body had looked at the
-// input at all — so a long input whose prefilter finds no candidate anywhere
-// was told "unknown" when the engine could have answered "no match" for free,
-// without ever touching the memo.
+// TestBTFallbackFindAnswersLongInputs drives a no-capture find whose program
+// has a zero-width cycle — so it has no ordinary body under any budget, and the
+// memoised fallback answers every call — over inputs long enough that a
+// compile-time memo would once have refused them.
 //
-// The guard and the clear now sit at the head of the first ATTEMPT instead, so
-// a call that never attempts never pays and never refuses.
+//	quiet — no byte can begin a match, so no attempt runs and the fallback's
+//	        run-time memory is never placed
+//	busy  — every position is a candidate, attempts run and the memo is filled
 //
-// The test drives ONE pattern at ONE length over two inputs that differ only in
-// which byte they repeat, and requires the two arms to differ:
-//
-//	quiet — no byte can begin a match, so no attempt runs → NoMatch
-//	busy  — every position is a candidate, attempts run, the memo is filled
-//	        past its ceiling → BTStackOverflow
-//
-// Both arms matter. Without the busy one the test would pass just as well
-// against a build with no memo at all, or one whose ceiling was never reached,
-// and would stop being evidence for anything.
-//
-// The static memo ceiling answers -2 only in a body compiled with
-// compile.BTWorkBudgetOff, so that is what the two arms are measured on. A body
-// with the budget hands a call past the ceiling to its fallback, which sizes
-// its memo from the input — the SHIPPED build is checked for that answer last.
-func TestBTMemoGuardDoesNotRefuseWhatThePrefilterAnswers(t *testing.T) {
-	// MaxDFAStates squeezes the pattern onto Backtracking; the small budget
-	// puts the memo ceiling in the low thousands so a 60 KB input is well past
-	// it either way.
-	opts := compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096, BTWorkBudget: compile.BTWorkBudgetOff}
-
-	// Leading `Z` gives the prefilter something to reject on; `(?:a?)+?` is
-	// what makes needsBitState fire.
+// both from 0 and from a late `from`, where the memo is rebased onto the
+// remainder. Every call must answer NoMatch. BTWorkBudgetOff must build the
+// very same module: it cannot give such a program an ordinary body either.
+func TestBTFallbackFindAnswersLongInputs(t *testing.T) {
 	const pattern = `Z(?:a?)+?xyz`
 	const length = 60000
-
 	entry := config.RegexEntry{Pattern: pattern, FindFunc: "find"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
+	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+		compile.CompileOptions{MaxDFAStates: 1})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
+	}
+	off, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+		compile.CompileOptions{MaxDFAStates: 1, BTWorkBudget: compile.BTWorkBudgetOff})
+	if err != nil {
+		t.Fatalf("compile (budget off): %v", err)
+	}
+	if !bytes.Equal(w, off) {
+		t.Error("BTWorkBudgetOff built a different module for a program with a zero-width cycle")
 	}
 
 	quiet := strings.Repeat("m", length) // no `Z`: nothing can begin a match
 	busy := strings.Repeat("Z", length)  // every position is a candidate
-
-	if regexp.MustCompile(pattern).MatchString(quiet) ||
-		regexp.MustCompile(pattern).MatchString(busy) {
-		t.Fatal("an input matches after all — the case is not testing what it claims")
-	}
-
-	got, err := btMemoCall(t, w, "find", quiet, 0)
-	if err != nil {
-		t.Fatalf("quiet: %v", err)
-	}
-	if got != abi.NoMatch {
-		t.Errorf("quiet input of %d bytes: got %d, want NoMatch(%d) — the memo guard is "+
-			"refusing a call the prefilter answers without ever touching the memo",
-			length, got, abi.NoMatch)
-	}
-
-	got, err = btMemoCall(t, w, "find", busy, 0)
-	if err != nil {
-		t.Fatalf("busy: %v", err)
-	}
-	if got != abi.BTStackOverflow {
-		t.Errorf("busy input of %d bytes: got %d, want BTStackOverflow(%d) — this arm is "+
-			"what proves the memo path is reached at all, so the quiet arm above is "+
-			"evidence of a moved guard rather than of an absent one",
-			length, got, abi.BTStackOverflow)
-	}
-
-	// Shipped: past the ceiling, the fallback answers.
-	opts.BTWorkBudget = 0
-	w, _, err = compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
-	if err != nil {
-		t.Fatalf("compile (budget on): %v", err)
-	}
-	if got, err = btMemoCall(t, w, "find", busy, 0); err != nil || got != abi.NoMatch {
-		t.Errorf("budget on, busy input of %d bytes: got %d (%v), want NoMatch(%d) from the fallback",
-			length, got, err, abi.NoMatch)
-	}
-}
-
-// The memo is REBASED onto the call's `from`: bit index 0 stands for that
-// position, not for position 0. No attempt in a call ever starts before `from`
-// — attempt_start is seeded from it and only advances — so the bitset a call
-// needs covers the REMAINDER it is searching, and the ceiling is checked
-// against that rather than against the whole buffer.
-//
-// Without the rebase a host walking a long buffer got BTStackOverflow from
-// every call in the walk, including the ones with only a handful of bytes left
-// to search, because each was measured against the buffer's full length.
-//
-// Both arms again: `from` at 0 must still refuse (the remainder really is past
-// the ceiling), and a late `from` must answer. A build that simply lost its
-// ceiling would pass the second arm and fail the first.
-//
-// Measured with compile.BTWorkBudgetOff, where the ceiling still refuses; with
-// the budget on, the refusal hands the call to the fallback, checked last.
-func TestBTMemoCeilingAppliesToTheRemainder(t *testing.T) {
-	opts := compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096, BTWorkBudget: compile.BTWorkBudgetOff}
-	const pattern = `Z(?:a?)+?xyz`
-	const length = 60000
-
-	entry := config.RegexEntry{Pattern: pattern, FindFunc: "find"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
-	if err != nil {
-		t.Fatalf("compile: %v", err)
-	}
-	// Every position is a candidate, so every call reaches an attempt and the
-	// memo is genuinely used.
-	input := strings.Repeat("Z", length)
-	if regexp.MustCompile(pattern).MatchString(input) {
-		t.Fatal("the input matches after all — the case is not testing what it claims")
-	}
-
-	got, err := btMemoCall(t, w, "find", input, 0)
-	if err != nil {
-		t.Fatalf("from=0: %v", err)
-	}
-	if got != abi.BTStackOverflow {
-		t.Errorf("from=0: got %d, want BTStackOverflow(%d) — the whole %d-byte remainder "+
-			"is past the memo ceiling, so this call must still refuse",
-			got, abi.BTStackOverflow, length)
-	}
-
-	// Only 100 bytes remain to search, which fits the memo comfortably.
-	const late = length - 100
-	got, err = btMemoCall(t, w, "find", input, int32(late))
-	if err != nil {
-		t.Fatalf("from=%d: %v", late, err)
-	}
-	if got != abi.NoMatch {
-		t.Errorf("from=%d: got %d, want NoMatch(%d) — only %d bytes remain, so the memo "+
-			"ceiling must be measured against those and not against the whole buffer",
-			late, got, abi.NoMatch, length-late)
-	}
-
-	opts.BTWorkBudget = 0
-	w, _, err = compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
-	if err != nil {
-		t.Fatalf("compile (budget on): %v", err)
-	}
-	if got, err = btMemoCall(t, w, "find", input, 0); err != nil || got != abi.NoMatch {
-		t.Errorf("budget on, from=0: got %d (%v), want NoMatch(%d) from the fallback", got, err, abi.NoMatch)
+	for _, in := range []string{quiet, busy} {
+		if regexp.MustCompile(pattern).MatchString(in) {
+			t.Fatal("an input matches after all — the case is not testing what it claims")
+		}
+		for _, from := range []int32{0, length - 100} {
+			got, err := btMemoCall(t, w, "find", in, from)
+			if err != nil || got != abi.NoMatch {
+				t.Errorf("%q x%d from=%d: got %d (%v), want NoMatch(%d)",
+					in[:1], length, from, got, err, abi.NoMatch)
+			}
+		}
 	}
 }
 

@@ -2590,21 +2590,12 @@ func captureWarnings(t *testing.T) (*bytes.Buffer, func()) {
 	return &buf, func() { slog.SetDefault(prev) }
 }
 
-// btRefusedPattern is a pattern the Backtracking fallback engine REFUSES, so
-// a set member over maxFallbackStates is still dropped rather than admitted.
-//
-// The refusal is checkBTEmptyBodyLoopChain's: 13 chained nullable loops against
-// maxBTEmptyBodyGreedyLoops == 12 (measured live — the chain is only 87 NFA
-// instructions, so this is a cheap pattern, not a pathological one). The
-// `[a-z]{20}` tail is what puts the suffix DFA over the small limits used
-// below; without it the pattern fits in a DFA bucket and never reaches a drop
-// branch at all.
-//
-// Using the instruction cap (maxBTFallbackInstructions, 20000) instead is NOT
-// a workable alternative: every pattern big enough to exceed it fails earlier,
-// inside analyzePattern, with "DFA state limit exceeded during construction",
-// so it never reaches compileFallback.
-var btRefusedPattern = strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
+// btNullableChainPattern is 13 chained nullable loops ahead of a `[a-z]{20}`
+// tail, which puts the suffix DFA over the small limits used below. A limit on
+// such chains once made the Backtracking fallback REFUSE it, so a set dropped
+// it; with that limit gone it is admitted like any other member. (The chain is
+// only 87 NFA instructions — a cheap pattern, not a pathological one.)
+var btNullableChainPattern = strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
 
 // TestCompileFallback_AdmitsToBTOverStateLimit is the positive half of the
 // Backtracking-member contract: a pattern whose suffix DFA exceeds
@@ -2647,96 +2638,19 @@ func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	}
 }
 
-// TestCompileFallback_WarnsWhenBTAlsoRefuses covers the drop warning, which
-// still exists: BT NARROWS the drop set, it does not empty it. A pattern that
-// exceeds maxFallbackStates AND that BT refuses must be reported at warning
-// level, not dropped silently.
-//
-// The branch is driven via CompileSetOptions.MaxFallbackStates rather than by
-// finding a pathological pattern: the reachable window for the default limit is
-// only (1024, maxHelperDFAStates] == (1024, 2048], and DFA state counts for the
-// exponential-blowup pattern families that get anywhere near it jump in powers
-// of the class size, so they skip straight over the window. Lowering the limit
-// exercises exactly the same branch with an ordinary pattern.
-func TestCompileFallback_WarnsWhenBTAlsoRefuses(t *testing.T) {
+// TestAdmitBTFallback_AdmitsNullableChain pins that the Backtracking fallback
+// takes a member a limit on chained nullable loops used to refuse, alongside an
+// ordinary one.
+func TestAdmitBTFallback_AdmitsNullableChain(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: btRefusedPattern}, &prefixPool, &suffixPool)
-	if err != nil {
-		t.Fatalf("analyzePattern: %v", err)
-	}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	opts := CompileSetOptions{MaxFallbackStates: 8}
-	buckets := compileFallback([]*PatternInfo{info}, opts, nil)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern to be dropped (0 buckets), got %d", len(buckets))
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("dropped pattern produced no warning; slog output was %q", out)
-	}
-	if !strings.Contains(out, "limit=8") {
-		t.Errorf("warning should report the limit that was exceeded; got %q", out)
-	}
-}
-
-// TestCompileFallback_DropsBoundaryAmbiguousWhenBTRefuses is the same drop for
-// a pattern whose DFA loses a `\B` branch's priority: it has no DFA bucket to
-// fall back to, so a Backtracking refusal must drop it, loudly and into the
-// diagnostics. `(?:\B|a|)a` carries the ambiguity; the 13 chained nullable
-// loops after it are btRefusedPattern's refusal. No MaxFallbackStates is
-// needed: the ambiguity alone routes it here, at the default limits.
-func TestCompileFallback_DropsBoundaryAmbiguousWhenBTRefuses(t *testing.T) {
-	pattern := `(?:\B|a|)a` + strings.Repeat(`(?:a|)*`, 13)
-	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
-	if err != nil {
-		t.Fatalf("analyzePattern: %v", err)
-	}
-	if !info.boundaryAmbiguous {
-		t.Fatal("pattern is not boundary-ambiguous; this test no longer reaches the branch it names")
-	}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "boundary-ambiguous"}
-	buckets := compileFallback([]*PatternInfo{info}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped (0 buckets), got %d", len(buckets))
-	}
-	if out := buf.String(); !strings.Contains(out, "loses a word-boundary branch's priority") {
-		t.Errorf("drop produced no word-boundary warning; slog output was %q", out)
-	}
-	if len(diag.StateLimitDropped) != 1 {
-		t.Errorf("diag.StateLimitDropped = %v, want the one dropped pattern", diag.StateLimitDropped)
-	}
-}
-
-// TestAdmitBTFallback_RefusesUnsupported pins WHY btRefusedPattern is refused,
-// so the two tests above cannot silently start passing for a different reason
-// (e.g. a pattern that stops reaching the drop branch at all).
-func TestAdmitBTFallback_RefusesUnsupported(t *testing.T) {
-	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: btRefusedPattern}, &prefixPool, &suffixPool)
-	if err != nil {
-		t.Fatalf("analyzePattern: %v", err)
-	}
-	if got := admitBTFallback(patternSuffixAST(info), resolveMemoBudget(nil)); got != nil {
-		t.Fatalf("admitBTFallback accepted %q; the drop-path tests depend on it refusing", btRefusedPattern)
-	}
-	// And the admitted control, so this test fails if admitBTFallback starts
-	// refusing everything.
-	okInfo, err := analyzePattern(config.RegexEntry{Pattern: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
-	if err != nil {
-		t.Fatalf("analyzePattern: %v", err)
-	}
-	if got := admitBTFallback(patternSuffixAST(okInfo), resolveMemoBudget(nil)); got == nil {
-		t.Fatal("admitBTFallback refused [a-z0-9]{200}; the admit-path test depends on it accepting")
+	for _, pattern := range []string{btNullableChainPattern, `[a-z0-9]{200}`} {
+		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("analyzePattern(%q): %v", pattern, err)
+		}
+		if got := admitBTFallback(patternSuffixAST(info)); got == nil {
+			t.Errorf("admitBTFallback refused %q", pattern)
+		}
 	}
 }
 
@@ -2763,51 +2677,19 @@ func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	}
 }
 
-// TestCompileFallback_WarnsWithNilDiag is the specific regression for the
-// nil-diag warning mechanism. The warning must not be nested inside the
-// `if diag != nil` bookkeeping guards: CompileSet always allocates a SetDiag so
-// those guards always pass, but the struct is discarded unless --diag-json was
-// requested. Passing an explicitly nil diag here asserts the warning is
-// independent of diagnostics being collected.
-func TestCompileFallback_WarnsWithNilDiag(t *testing.T) {
-	var prefixPool, suffixPool dfaPool
-	// Must be a pattern BT also refuses, or there is no drop left to warn
-	// about.
-	info, err := analyzePattern(config.RegexEntry{Pattern: btRefusedPattern}, &prefixPool, &suffixPool)
-	if err != nil {
-		t.Fatalf("analyzePattern: %v", err)
-	}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	compileFallback([]*PatternInfo{info}, CompileSetOptions{MaxFallbackStates: 8}, nil /* diag */)
-
-	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("warning must fire with a nil diag; got %q", out)
-	}
-}
-
 // TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch.
 //
-// The tests above drive the drop through CompileSetOptions directly, which
-// proves the branch works but says nothing about whether a user can reach it.
-// They could not: CompileSetOptions was constructed in two places and NEITHER
-// set MaxFallbackStates, so the hardcoded default of 1024 always won — and the
+// Driving compileFallback through CompileSetOptions proves the branch works but
+// says nothing about whether a user can reach it. They could not:
+// CompileSetOptions was constructed in two places and NEITHER set
+// MaxFallbackStates, so the hardcoded default of 1024 always won — and the
 // drop warning's own hint said "raise max_dfa_states", a field that feeds a
-// different budget entirely. A pattern dropped from a set was therefore
-// unfixable through the remedy it was told to use.
+// different budget entirely.
 //
-// This drives the real entry point, CompileFile, so a future refactor that
+// This drives the real entry point, CompileFileDiag, so a future refactor that
 // rebuilds CompileSetOptions without the field fails here rather than silently
-// restoring the unreachable knob.
-//
-// Since sets gained Backtracking members the observable effect of the budget
-// being reached is
-// only a DROP for a pattern BT also refuses — an ordinary over-limit pattern is
-// now admitted to BT instead, and warns about nothing. So the pattern here is
-// btRefusedPattern: the budget is still what decides its fate, and the warning
-// is still how that decision is observed.
+// restoring the unreachable knob. The budget's observable effect is the bucket
+// the member lands in: over it, a Backtracking bucket; under it, a DFA one.
 func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	cfg := func(limit int) config.BuildConfig {
 		return config.BuildConfig{
@@ -2815,7 +2697,7 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 			Regexps: []config.RegexEntry{
 				// No usable literal, so it lands in a fallback bucket, and
 				// enough states to clear a small limit and not a large one.
-				{Name: "big", Pattern: btRefusedPattern},
+				{Name: "big", Pattern: btNullableChainPattern},
 			},
 			Sets: []config.SetConfig{{
 				Name:     "s",
@@ -2826,31 +2708,26 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		limit       int
-		wantDropped bool
+		limit  int
+		wantBT bool
 	}{
-		{8, true},        // below the pattern's state count: dropped
-		{1 << 20, false}, // far above it: admitted
+		{8, true},        // below the pattern's state count: Backtracking
+		{1 << 20, false}, // far above it: a DFA bucket
 	} {
-		buf, restore := captureWarnings(t)
-		if _, _, err := CompileFile(cfg(tc.limit), ""); err != nil {
-			restore()
-			t.Fatalf("max_fallback_states=%d: CompileFile: %v", tc.limit, err)
+		_, _, diags, err := CompileFileDiag(cfg(tc.limit), "")
+		if err != nil {
+			t.Fatalf("max_fallback_states=%d: CompileFileDiag: %v", tc.limit, err)
 		}
-		out := buf.String()
-		restore()
-
-		got := strings.Contains(out, "Pattern dropped from set")
-		if got != tc.wantDropped {
-			t.Errorf("max_fallback_states=%d: dropped=%v, want %v (slog output %q)",
-				tc.limit, got, tc.wantDropped, out)
+		gotBT := false
+		for _, d := range diags {
+			for _, b := range d.Buckets {
+				if b.Type == "bt-fallback" {
+					gotBT = true
+				}
+			}
 		}
-		if tc.wantDropped && !strings.Contains(out, "limit=8") {
-			t.Errorf("max_fallback_states=8: warning reported a different limit: %q", out)
-		}
-		// The hint must name a key that actually feeds this budget.
-		if tc.wantDropped && !strings.Contains(out, "raise max_fallback_states") {
-			t.Errorf("drop hint should name max_fallback_states; got %q", out)
+		if gotBT != tc.wantBT {
+			t.Errorf("max_fallback_states=%d: Backtracking bucket=%v, want %v", tc.limit, gotBT, tc.wantBT)
 		}
 	}
 }

@@ -1543,15 +1543,12 @@ type bucket struct {
 // fallback bucket. Built by admitBTFallback at the point the pattern would
 // otherwise have been dropped.
 type btBucketInfo struct {
-	bt      *backtrack // the compiled NFA program driver
-	useMemo bool       // BitState memoisation required (needsBitState)
-	// stackSize and memoSize are this pattern's own requirements. The set
-	// allocates ONE shared region sized to the max over its BT buckets:
-	// only one BT call is ever live, because the
-	// per-candidate driver calls one suffix function at a time, and the memo
-	// re-zeroes itself at the head of every call.
+	bt *backtrack // the compiled NFA program driver
+	// stackSize is this pattern's own frame-stack requirement. The set
+	// allocates ONE shared stack sized to the max over its BT buckets: only
+	// one BT call is ever live, because the per-candidate driver calls one
+	// suffix function at a time.
 	stackSize int
-	memoSize  int
 }
 
 // bucketKey is used in the literal grouping map. "~fallback~" is the sentinel

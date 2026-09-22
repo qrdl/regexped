@@ -254,7 +254,7 @@ func FuzzCorrectness(f *testing.F) {
 
 		wasmBytes, compErr := compileFind(pat)
 		if compErr != nil {
-			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) || errors.Is(compErr, compile.ErrBTLoopCountTooLarge) || errors.Is(compErr, compile.ErrBTEmptyBodyLoopChainTooLarge) {
+			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) {
 				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
 			}
 			t.Fatalf("compile error on a pattern Go stdlib accepts: pat=%q: %v", pat, compErr)
@@ -374,10 +374,8 @@ func skipPattern(pat, input string) string {
 func isResourceCeiling(err error) bool {
 	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||
-		errors.Is(err, compile.ErrBTLoopCountTooLarge) ||
-		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge) ||
 		// The SET path's helper-DFA ceiling (maxHelperDFAStates, 2048). Unlike
-		// the four above it has no fallback — the set compile fails — but it is
+		// the two above it has no fallback — the set compile fails — but it is
 		// the same KIND of event: a construction refused as effectively
 		// unbounded, not an answer that disagrees with Go. Omitting it is what
 		// made FuzzSet/40f883ef54d47f63 look like a defect.
@@ -543,8 +541,9 @@ func FuzzGroups(f *testing.F) {
 // fast body alone may still blow up exponentially — that is the defect the
 // budget exists for — so a hang there skips the case once the other two legs
 // have answered; a hang in either of them is a bug. The fast leg is skipped
-// outright for a program with a zero-width cycle: every budgeted build answers
-// that one with the fallback alone, and its ordinary body is not exact.
+// outright for a program with a zero-width cycle: every build answers that one
+// with the fallback alone, BTWorkBudgetOff included, so the leg would only
+// repeat the fallback leg.
 func FuzzGroupsBothBodies(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
@@ -583,9 +582,8 @@ func FuzzGroupsBothBodies(f *testing.F) {
 		}
 		for _, leg := range legs {
 			if leg.budget == compile.BTWorkBudgetOff {
-				// A program with a zero-width cycle ships only its fallback
-				// body; the ordinary body is not exact there and no budgeted
-				// build runs it.
+				// A program with a zero-width cycle has no ordinary body in
+				// any build — under Off it is the fallback leg again.
 				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err == nil && cyc {
 					t.Skip("zero-width cycle: the ordinary body is never shipped for this program")
 				}

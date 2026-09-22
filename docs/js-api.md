@@ -171,7 +171,7 @@ export function* <find>(input, offset = 0)    // yields {patternId, start, end}
 // with hints: [batch-find] the find generator gains a third parameter, and the
 // set exports its ceiling. Without the hint the parameter does not exist.
 export const <set>BatchMaxSize
-export function* <find>(input, offset = 0, batchSize = 256) // default: max(256, <set>PatternCount), capped at <set>BatchMaxSize
+export function* <find>(input, offset = 0, batchSize = <default>) // <default> = max(256, <set>PatternCount), capped at <set>BatchMaxSize
 
 export function patternName(id)             // only if any set sets emit_name_map: true
 ```
