@@ -507,7 +507,7 @@ and they are not interchangeable:
 | constant | value | sizes |
 |---|---|---|
 | `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the batch cursor's `k` field |
-| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
+| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array and the `_all` bitmask/bitmap. Which `_all` ABI is exported depends on it AND on whether the set has a Backtracking member — see above |
 
 For `patterns: all` — the common case — the two are equal. They diverge only
 for a named subset, and using the wrong one there is a memory-safety bug: the
@@ -846,7 +846,20 @@ reason above, since a DFA bucket would give the second kind wrong extents. No
 pattern is known to reach that any more: the main refusal left is the engine's
 instruction cap, and a member that large fails the whole set compile earlier.
 Buckets that were admitted appear in `--diag-json` as `"bt-fallback"`, with
-`suffix_states` and `table_bytes` of 0 — they have no table.
+`suffix_states` and `table_bytes` of 0 — they have no table — and `compile
+--verbose` prints their engine as `Backtracking`. Every compile also WARNS,
+once per such member and for every route onto Backtracking: "Set member runs
+on Backtracking: <reason>", with a hint for keeping it on a DFA. It is a
+warning, not a drop — the member still matches.
+
+**What one costs.** Measured on a set of 15 ordinary patterns (credentials,
+log fields) plus ONE member routed here for word-boundary ambiguity,
+`(?:\B|a|)a`, against the same set with its twin `(?:\B|a)a`, which stays on a
+DFA, over 80-byte to 10 KB inputs. The routed member made `scan_any` and `find`
+cost 1.7x-2.2x the fuel on matching and non-matching text alike, and `scan_all`
+2.2x on non-matching text but only 1.0x-1.3x on matching text. `match_any` and
+`match_all` were unaffected — the member stays in their anchored DFA. On its
+own, as a one-pattern set, the same member cost about what its twin does.
 
 **One consequence reaches the ABI.** Every other set engine is table-driven and
 always finishes with a definite answer: pattern *k* matched, or it did not.

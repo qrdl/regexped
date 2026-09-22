@@ -110,8 +110,10 @@ const (
 	localScratch = byte(0x06)
 )
 
-func capStartLocal(i int) uint32 { return uint32(7 + i*2) }
-func capEndLocal(i int) uint32   { return uint32(8 + i*2) }
+// capStartLocal and capEndLocal are group i's two capture locals. The pairs
+// start right after localScratch, the last of the fixed locals above.
+func capStartLocal(i int) uint32 { return uint32(localScratch) + 1 + uint32(i*2) }
+func capEndLocal(i int) uint32   { return capStartLocal(i) + 1 }
 
 // btHasWordBoundary reports whether prog contains a \b/\B assertion —
 // used to decide whether a non-anchored captureBody needs the edge-scratch

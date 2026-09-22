@@ -2073,6 +2073,8 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 func admitOrDropFallback(p *PatternInfo, dfa *dfaTable, where string, opts CompileSetOptions, diag *SetDiag) *bucket {
 	if dfa == nil {
 		if nb := newBTBucket(p); nb != nil {
+			warnPatternOnBacktracking(p, "its own suffix DFA could not be built",
+				"simplify the pattern to keep it on a DFA", -1, maxHelperDFAStates)
 			return nb
 		}
 		// As in binPack: no DFA to count, and the bound is mergeSuffixDFA's
@@ -2087,6 +2089,8 @@ func admitOrDropFallback(p *PatternInfo, dfa *dfaTable, where string, opts Compi
 	}
 	if dfa.numStates > opts.maxFallbackStates() {
 		if nb := newBTBucket(p); nb != nil {
+			warnPatternOnBacktracking(p, "suffix DFA exceeds max_fallback_states",
+				"raise max_fallback_states to keep it on a DFA", dfa.numStates, opts.maxFallbackStates())
 			return nb
 		}
 		warnPatternDropped(p, where, dfa.numStates, opts.maxFallbackStates())
@@ -2130,6 +2134,8 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 		// either is dropped, as a pattern whose DFA cannot be built is.
 		if p.boundaryAmbiguous {
 			if nb := newBTBucket(p); nb != nil {
+				warnPatternOnBacktracking(p, "its DFA would lose a word-boundary branch's priority",
+					"rewrite the \\b, \\B or (?m:$) alternative, or move the pattern out of the set", -1, -1)
 				buckets = append(buckets, nb)
 				continue
 			}
@@ -2341,6 +2347,32 @@ func warnPatternDroppedReason(p *PatternInfo, where, reason, hint string, states
 	}
 	args = append(args, "hint", hint)
 	slog.Warn("Pattern dropped from set: "+reason, args...)
+}
+
+// warnPatternOnBacktracking reports a set member admitted on the Backtracking
+// engine instead of a DFA bucket. The member still matches — this is not a
+// drop — but the switch is not free and used to be silent: one such member
+// measured up to 2.2x the fuel of a 16-pattern set's scan_any, scan_all and
+// find, and it moves the set's match_all / scan_all to the out_ptr form. Every
+// route onto Backtracking warns, not only the word-boundary one.
+//
+// The message must NOT begin "Pattern dropped from set": tools/re2test counts
+// drops by that prefix, and a member that is kept must not be excluded from
+// its comparison. states or limit below 0 is left out, as in
+// warnPatternDroppedReason.
+func warnPatternOnBacktracking(p *PatternInfo, reason, hint string, states, limit int) {
+	ref := patternRefFor(p)
+	args := []any{"pattern", ref.Name, "id", ref.ID}
+	if states >= 0 {
+		args = append(args, "states", states)
+	}
+	if limit >= 0 {
+		args = append(args, "limit", limit)
+	}
+	args = append(args,
+		"effect", "scan_any, scan_all and find cost more (up to ~2x measured); match_all and scan_all switch to the out_ptr form",
+		"hint", hint)
+	slog.Warn("Set member runs on Backtracking: "+reason, args...)
 }
 
 // recordAnchoredStateLimitDrop records a drop that cost the pattern the

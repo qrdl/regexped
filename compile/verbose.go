@@ -161,8 +161,17 @@ func (r *Reporter) Render(w io.Writer) {
 			if lit == "" {
 				lit = "(fallback — no literal)"
 			}
-			fmt.Fprintf(w, "    #%-3d %-24s %-8s %2d pattern(s)  %d states  %d bytes\n",
-				b.ID, truncate(lit, 24), b.AcceptKind, len(b.Patterns), b.SuffixStates, b.TableBytes)
+			// The engine is printed because a Backtracking bucket otherwise
+			// reads exactly like a DFA fallback bucket here, and the switch is
+			// not free: one such member measured up to 2.2x the fuel of a
+			// 16-pattern set's scan_any, scan_all and find (docs/sets.md). It
+			// also moves the set's _all pair to the out_ptr form.
+			engine := "DFA"
+			if b.Type == "bt-fallback" {
+				engine = "Backtracking"
+			}
+			fmt.Fprintf(w, "    #%-3d %-24s %-8s %-12s %2d pattern(s)  %d states  %d bytes\n",
+				b.ID, truncate(lit, 24), b.AcceptKind, engine, len(b.Patterns), b.SuffixStates, b.TableBytes)
 		}
 		// The drops are the whole reason a user needs this: a set that does not
 		// contain a pattern does not report its matches, and today that is

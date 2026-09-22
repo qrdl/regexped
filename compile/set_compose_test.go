@@ -2638,6 +2638,54 @@ func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	}
 }
 
+// TestCompileFallback_WarnsWhenMovedToBT pins the warning every route onto
+// Backtracking prints: the member is kept, so it must not read as a drop, but
+// the switch costs the set (up to ~2x measured on scan_any, scan_all and find)
+// and changes its _all ABI, and it used to be silent.
+func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
+	for _, tc := range []struct {
+		name, pattern, reason string
+		opts                  CompileSetOptions
+	}{
+		{"word-boundary", `(?:\B|a|)a`, "lose a word-boundary branch's priority", CompileSetOptions{}},
+		{"over-max-fallback-states", btNullableChainPattern, "exceeds max_fallback_states", CompileSetOptions{MaxFallbackStates: 8}},
+		{"own-dfa-unbuildable", setCoreCovNullableUnbuildable, "could not be built", CompileSetOptions{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var prefixPool, suffixPool dfaPool
+			info, err := analyzePattern(config.RegexEntry{Pattern: tc.pattern}, &prefixPool, &suffixPool)
+			if err != nil {
+				t.Fatalf("analyzePattern: %v", err)
+			}
+			buf, restore := captureWarnings(t)
+			defer restore()
+			buckets := compileFallback([]*PatternInfo{info}, tc.opts, nil)
+			if len(buckets) != 1 || buckets[0].btFallback == nil {
+				t.Fatalf("expected one Backtracking bucket, got %d buckets", len(buckets))
+			}
+			out := buf.String()
+			if !strings.Contains(out, "Set member runs on Backtracking") || !strings.Contains(out, tc.reason) {
+				t.Errorf("no Backtracking warning naming %q; slog output was %q", tc.reason, out)
+			}
+			if strings.Contains(out, "Pattern dropped from set") {
+				t.Errorf("a kept member must not warn about a drop; got %q", out)
+			}
+		})
+	}
+	// And the control: a member that stays on a DFA warns about nothing.
+	var prefixPool, suffixPool dfaPool
+	info, err := analyzePattern(config.RegexEntry{Pattern: `(?:\B|a)a`}, &prefixPool, &suffixPool)
+	if err != nil {
+		t.Fatalf("analyzePattern: %v", err)
+	}
+	buf, restore := captureWarnings(t)
+	defer restore()
+	compileFallback([]*PatternInfo{info}, CompileSetOptions{}, nil)
+	if out := buf.String(); out != "" {
+		t.Errorf("a DFA member warned: %q", out)
+	}
+}
+
 // TestAdmitBTFallback_AdmitsNullableChain pins that the Backtracking fallback
 // takes a member a limit on chained nullable loops used to refuse, alongside an
 // ordinary one.

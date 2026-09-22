@@ -2179,6 +2179,10 @@ func TestReporterRenderSets(t *testing.T) {
 					ID: 1, Type: "fallback", AcceptKind: "bitmask", Literal: "",
 					Patterns: []PatternRef{{ID: 1}}, SuffixStates: 4, TableBytes: 80,
 				},
+				{
+					ID: 2, Type: "bt-fallback", AcceptKind: "bitmask", Literal: "",
+					Patterns: []PatternRef{{ID: 2, Name: "ambig"}},
+				},
 			},
 			StateLimitDropped:     []PatternRef{{ID: 7, Name: "huge"}},
 			CaptureBearingDropped: []PatternRef{{ID: 8}}, // unnamed → "#8"
@@ -2200,9 +2204,14 @@ func TestReporterRenderSets(t *testing.T) {
 		"frontend:   teddy",
 		"capabilities: find, scan_any",
 		"overlapping: true",
-		"buckets:    2",
+		"buckets:    3",
 		"AKIA",
 		"(fallback — no lite…", // truncated to the 24-col bucket-literal width
+		// Each bucket names its engine: a Backtracking one used to read
+		// exactly like the DFA fallback bucket above it.
+		"#0   AKIA                     bitmask  DFA",
+		"#1   (fallback — no lite…     bitmask  DFA",
+		"#2   (fallback — no lite…     bitmask  Backtracking",
 		"dropped (fallback DFA over max_fallback_states): huge",
 		"dropped (capture-bearing): #8", // the unnamed spelling
 		"dropped from match_any/match_all (anchored DFA over the packer's limits): anch",

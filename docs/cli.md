@@ -39,6 +39,8 @@ max_tdfa_regs:  32         # optional; max TDFA registers before falling back to
                            #   `compile --verbose` prints, per pattern, the engine chosen, why, and
                            #   the DFA/TDFA state and TDFA register counts against these limits
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
+                           #   A member over it moves to the Backtracking engine, with a warning;
+                           #   `compile --verbose` prints each bucket's engine
 
 regexps:
   - pattern: 'https?://...' # RE2 regexp pattern
