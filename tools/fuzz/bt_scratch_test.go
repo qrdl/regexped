@@ -3,6 +3,7 @@ package fuzz
 import (
 	"encoding/binary"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 	"testing"
 
@@ -29,10 +30,10 @@ import (
 //     them — still the right answer;
 //   - embedded: the module's own memory, above its tables.
 //
-// Each test first builds the same case with compile.BTWorkBudgetOff and
-// requires -2 (requireFastBodyGivesUp). Without that control a later raise of
-// the fast body's static stack or memo would let every test here pass without
-// executing a byte of bt_scratch.go.
+// Each test first proves its answer can only come from the fallback
+// (requireFallbackAnswers). Without that control a later raise of the fast
+// body's static stack would let every test here pass without executing a byte
+// of bt_scratch.go.
 
 // btScratchInCap is the input window below the tables; the slots buffer sits
 // right above it.
@@ -59,8 +60,8 @@ func btScratchCases() []btScratchCase {
 		{"groups/window", config.RegexEntry{Pattern: `x(\w*|)*c\b`, GroupsFunc: "groups"}, compile.CompileOptions{}, "--x" + w(70000) + "c--"},
 		{"match/empty-body-loop", config.RegexEntry{Pattern: `(\w*|)*c`, MatchFunc: "match"}, squeezed, w(100000) + "c"},
 		{"find/empty-body-loop", config.RegexEntry{Pattern: `(\w*|)*c`, FindFunc: "find"}, squeezed, "--" + w(90000) + "c"},
-		// A fast body with its OWN static memo, past that memo's ceiling: the
-		// length guard hands the call over instead of answering -2.
+		// A non-greedy loop whose body can match empty: a zero-width cycle, so
+		// the fallback alone, over an input far past any compile-time memo.
 		{"find/static-memo-ceiling", config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"}, squeezed, a(200000) + "xyz"},
 		{"groups/static-memo-ceiling", config.RegexEntry{Pattern: `((?:a?)+?)xyz`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(200000) + "xyz"},
 	}
@@ -151,12 +152,23 @@ func (c btScratchCase) check(t *testing.T, got int64, slots []int) {
 	}
 }
 
-// requireFastBodyGivesUp is the control every test here runs first: the same
-// case built with compile.BTWorkBudgetOff — the fast body alone, no fallback —
-// must answer -2, so the answer the test then requires can only have come from
-// the fallback's run-time memory.
-func (c btScratchCase) requireFastBodyGivesUp(t *testing.T) {
+// requireFallbackAnswers is the control every test here runs first: it proves
+// the answer the test then requires can only have come from the fallback's
+// run-time memory. A program with a zero-width cycle gets no ordinary body in
+// any build, so for one the proof is the cycle itself. Any other program is
+// built with compile.BTWorkBudgetOff — the fast body alone, no fallback — and
+// must answer -2.
+func (c btScratchCase) requireFallbackAnswers(t *testing.T) {
 	t.Helper()
+	pat := c.entry.Pattern
+	if c.entry.GroupsFunc == "" {
+		pat = withoutCaptures(t, pat) // the program match and find compile
+	}
+	if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err != nil {
+		t.Fatalf("control: %v", err)
+	} else if cyc {
+		return
+	}
 	opts := c.opts
 	opts.BTWorkBudget = compile.BTWorkBudgetOff
 	w, _, err := compile.Compile([]config.RegexEntry{c.entry}, btScratchTableBase, true, opts)
@@ -181,6 +193,27 @@ func (c btScratchCase) requireFastBodyGivesUp(t *testing.T) {
 	}
 }
 
+// withoutCaptures is pattern with every capture group made non-capturing —
+// the program a match or find export compiles.
+func withoutCaptures(t *testing.T, pattern string) string {
+	t.Helper()
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		t.Fatalf("parse %q: %v", pattern, err)
+	}
+	var strip func(*syntax.Regexp) *syntax.Regexp
+	strip = func(r *syntax.Regexp) *syntax.Regexp {
+		for i, sub := range r.Sub {
+			r.Sub[i] = strip(sub)
+		}
+		if r.Op == syntax.OpCapture {
+			return r.Sub[0]
+		}
+		return r
+	}
+	return strip(re).String()
+}
+
 func (c btScratchCase) numSlots() int {
 	if c.entry.GroupsFunc == "" {
 		return 0
@@ -194,7 +227,7 @@ const btScratchTableBase = int64(btScratchInCap + 65536)
 
 func TestBTFallbackScratchStandalone(t *testing.T) {
 	for _, c := range btScratchCases() {
-		t.Run(c.name+"/control", c.requireFastBodyGivesUp)
+		t.Run(c.name+"/control", c.requireFallbackAnswers)
 		for _, setGlobal := range []bool{true, false} {
 			name := c.name + "/global-0"
 			if setGlobal {
@@ -252,7 +285,7 @@ func TestBTFallbackScratchHostWritesAboveTables(t *testing.T) {
 	entry := config.RegexEntry{Pattern: `^(\w*|)*c`, GroupsFunc: "groups"}
 	input := strings.Repeat("w", 100000) + "c"
 	loc := regexp.MustCompile(entry.Pattern).FindStringSubmatchIndex(input)
-	btScratchCase{entry: entry, input: input}.requireFastBodyGivesUp(t)
+	btScratchCase{entry: entry, input: input}.requireFallbackAnswers(t)
 
 	w, _, err := compile.Compile([]config.RegexEntry{entry}, 0, true, compile.CompileOptions{})
 	if err != nil {
@@ -322,7 +355,7 @@ func TestBTFallbackScratchHostWritesAboveTables(t *testing.T) {
 func TestBTFallbackScratchEmbedded(t *testing.T) {
 	for _, c := range btScratchCases() {
 		t.Run(c.name, func(t *testing.T) {
-			c.requireFastBodyGivesUp(t)
+			c.requireFallbackAnswers(t)
 			w, _, err := compile.Compile([]config.RegexEntry{c.entry}, 0, false, c.opts)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
@@ -374,7 +407,7 @@ func TestBTFallbackScratchComponent(t *testing.T) {
 	inA := strings.Repeat("w", 100000) + "c"
 	inB := strings.Repeat("w", 90000) + "c"
 	for _, in := range []string{inA, inB} {
-		btScratchCase{entry: config.RegexEntry{Pattern: pattern, GroupsFunc: "g"}, input: in}.requireFastBodyGivesUp(t)
+		btScratchCase{entry: config.RegexEntry{Pattern: pattern, GroupsFunc: "g"}, input: in}.requireFallbackAnswers(t)
 	}
 	pa, la := h.writeInput(inA)
 	a := h.call(n.Constructor, pa, la, int32(0))

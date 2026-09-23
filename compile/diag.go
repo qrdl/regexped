@@ -59,6 +59,17 @@ type SetDiag struct {
 	Conflicts             []ConflictDiag    `json:"conflicts"`
 	CaptureBearingDropped []PatternRef      `json:"capture_bearing_dropped"`
 	StateLimitDropped     []PatternRef      `json:"state_limit_dropped,omitempty"`
+	// AnchoredStateLimitDropped lists patterns whose own anchored DFA could not
+	// be built inside the packer's limits, so they left match_any/match_all
+	// while scan_any, scan_all and `find` kept them.
+	//
+	// Separate from StateLimitDropped on purpose. That field is written by the
+	// `find` packers and means the pattern left the set ENTIRELY; this one is
+	// scoped to the anchored capabilities. One field carried both meanings
+	// until 2026-09-20, so nothing downstream could tell a pattern that still
+	// answers from one that does not — a consumer excluded a pattern the scan
+	// pair correctly reported, and read the disagreement as a wrong answer.
+	AnchoredStateLimitDropped []PatternRef `json:"anchored_state_limit_dropped,omitempty"`
 	// UnparseableDropped lists patterns the anchored packer could not re-parse
 	// and therefore excluded from match/match_any/match_all while `find` kept
 	// them. Defensive — analyzePattern already parsed these once — but a

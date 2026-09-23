@@ -341,12 +341,12 @@ var tests = []testCase{
 		},
 	},
 	{
-		// HTML tag extraction — benchmarks BitState memo zero-init overhead.
-		// The outer *? loop body (\s*(attr)?(="val")?) can match zero bytes, so
-		// needsBitState fires: a memo table of N×(len+1) bits is zeroed at the
-		// start of every BT capture call.  Each '<' in the input triggers one
-		// such call, including closing tags that fail immediately (the '/' is
-		// not \w).
+		// HTML tag extraction — benchmarks the Backtracking fallback body's
+		// memo overhead. The outer *? loop body (\s*(attr)?(="val")?) can match
+		// zero bytes — a zero-width cycle — so every BT capture call is answered
+		// by the memoised fallback, which places its run-time memo per call.
+		// Each '<' in the input triggers one such call, including closing tags
+		// that fail immediately (the '/' is not \w).
 		// "bare-tags": 18 '<' positions, 0 lazy iterations per matching tag.
 		// "attr-tags": same '<' count; each opening tag requires multiple lazy
 		// iterations to step past attributes, adding BT work atop zeroing overhead.
@@ -1036,10 +1036,10 @@ func largeLogInput(events []string) string {
 }
 
 // htmlTagInput returns a small HTML document (~165 / ~355 bytes). The pattern
-// <(\w+)(?:\s*(\w+)?(="([^"]*)")?)*?> triggers needsBitState because the outer
-// *? loop body is entirely optional (can match zero bytes); a BitState memo
-// table (25 NFA states × (len+1) bits) is therefore zeroed on every BT capture
-// call — one per '<' character, closing tags included (they fail after one byte).
+// <(\w+)(?:\s*(\w+)?(="([^"]*)")?)*?> has a zero-width cycle because the outer
+// *? loop body is entirely optional (can match zero bytes); every BT capture
+// call — one per '<' character, closing tags included (they fail after one
+// byte) — is therefore answered by the memoised fallback body.
 // withAttrs=false: bare tags, 0 lazy iterations per matching tag.
 // withAttrs=true:  attribute-bearing tags, multiple lazy iterations per match.
 func htmlTagInput(withAttrs bool) string {

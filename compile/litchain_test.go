@@ -698,6 +698,39 @@ func TestLitChainRangeGroupsCompiles(t *testing.T) {
 // analyseLitChainAltLenient
 // ---------------------------------------------------------------------------
 
+// TestLitChainAltLayoutOneByteLiteral: 2-byte Teddy reads each branch's
+// SECOND literal byte as fixed, so one branch whose literal is a single byte
+// must switch it off for the whole alternation — that branch's second byte is
+// its class, not a constant. The two-byte control keeps it on, so the
+// assertion cannot pass because the tables were never built at all.
+func TestLitChainAltLayoutOneByteLiteral(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		twoByte bool
+	}{
+		{`x[0-9]{20}|yz[0-9]{20}`, false},
+		{`xy[0-9]{20}|yz[0-9]{20}`, true},
+	} {
+		altp, ok := analyseLitChainAlt(tc.pattern)
+		if !ok {
+			t.Fatalf("%q is not a lit-chain alternation; this test no longer reaches the layout", tc.pattern)
+		}
+		l := planLitChainAltLayout(altp, 0)
+		if l.useTwoByteTeddy != tc.twoByte {
+			t.Errorf("%q: useTwoByteTeddy = %v, want %v", tc.pattern, l.useTwoByteTeddy, tc.twoByte)
+		}
+		if !tc.twoByte && (l.teddyT1LoOff != 0 || l.teddyT1HiOff != 0) {
+			t.Errorf("%q: second-byte tables placed at %d/%d without 2-byte Teddy",
+				tc.pattern, l.teddyT1LoOff, l.teddyT1HiOff)
+		}
+		wasm, _, err := Compile([]config.RegexEntry{{Pattern: tc.pattern, MatchFunc: "m", FindFunc: "f"}}, 0, true)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.pattern, err)
+		}
+		validateWASM(t, wasm)
+	}
+}
+
 // TestLitChainAltLenientRejects pins the reasons a lenient alternation is
 // refused. Each branch that is not lit-chain shaped is compiled to an inline
 // anchored DFA whose table is emitted with u8 state ids and read without any

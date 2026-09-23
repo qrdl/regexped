@@ -964,8 +964,14 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 					lmBareShufti:         false,
 					lmNonMidShufti:       false,
 					lmWideShufti:         false,
+					// The backward scan reads the newline pre-accept table at
+					// every '\n' of a prefix with a line anchor. Without this
+					// it was never built, and the scan read whatever bytes sat
+					// at offset 0 + state: `(?m:^)\d\d:\d\d ERROR` missed every
+					// line after the first.
+					forceNewline: p.prefixDFA.hasNewlineBoundary,
 				})
-				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx, false)
+				body := buildLitAnchorBackScanBody(revL, p.prefixDFA, opts.TableMemIdx, false, true)
 				fnIdx = len(prefixFnBodies)
 				prefixFnBodies = append(prefixFnBodies, body)
 				prefixPoolToFnIdx[prefixID] = fnIdx
@@ -976,7 +982,20 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				cnt++
 				prefixDataBytes = append(prefixDataBytes, rawPfx...)
 				prefixDataSegCount += cnt
-				prefixTableOffset += int32(len(rawPfx))
+				// Reserve whichever is larger: the encoded segments' length,
+				// which is what this advanced by alone and which over-covers
+				// tables laid out back to back, or the layout's own end,
+				// which is the one that holds when a table sits past a gap
+				// (the newline table follows the space immAcceptSize and
+				// wbAcceptSize leave). tableEnd is a plain maximum over table
+				// ends, so the second wins only where a table really ends
+				// past the encoded length — anywhere else the advance, and
+				// every later prefix table's address, is unchanged.
+				adv := int32(len(rawPfx))
+				if span := int32(revL.tableEnd) - prefixTableOffset; span > adv {
+					adv = span
+				}
+				prefixTableOffset += adv
 			}
 			prefixFnIdx[bi][j] = fnIdx
 		}

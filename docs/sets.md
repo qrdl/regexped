@@ -507,7 +507,7 @@ and they are not interchangeable:
 | constant | value | sizes |
 |---|---|---|
 | `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the batch cursor's `k` field |
-| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array, the `_all` bitmask/bitmap, and which `_all` ABI is exported |
+| `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array and the `_all` bitmask/bitmap. Which `_all` ABI is exported depends on it AND on whether the set has a Backtracking member — see above |
 
 For `patterns: all` — the common case — the two are equal. They diverge only
 for a named subset, and using the wrong one there is a memory-safety bug: the
@@ -590,20 +590,19 @@ optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged
 into the same bucket, even if they'd otherwise fit — recorded as conflict
 reason `lm_counted_chain_split` in diagnostics.
 
-**Fallback buckets can drop patterns, not just deprioritize them.** A
-fallback bucket's own merged DFA is still subject to the `max_fallback_states`
-budget above; a pattern that would push it over that limit is skipped
-entirely rather than merged — it does not appear in the set's compiled
-output at all. Check `state_limit_dropped` in diagnostics (see below) to
-find any patterns this happened to, and raise `max_fallback_states` in the
-config to admit them.
+**Over `max_fallback_states`, a pattern changes engine.** A fallback bucket's
+own merged DFA is still subject to the `max_fallback_states` budget above; a
+pattern that would push it over that limit is not merged but moved onto the
+Backtracking engine, in a bucket of its own — see [When a set member falls back
+to Backtracking](#when-a-set-member-falls-back-to-backtracking). It still
+matches, at Backtracking's cost, and it switches the set's `match_all` and
+`scan_all` to the `out_ptr` form. Check `--diag-json` for `"bt-fallback"`
+buckets, and raise `max_fallback_states` to keep such a pattern on a DFA.
 
-This is the one budget in the table whose effect is not a slower path but a
-MISSING pattern: a single pattern over `max_dfa_states` falls back to another
-engine and still matches, while a set member over `max_fallback_states` is
-absent from the set and can never match. The build still succeeds, so a
-pipeline that only checks the exit code will ship a set that under-reports —
-read the warning, or `state_limit_dropped`.
+A member the FIND-path packers could not place at all would be absent from
+those capabilities and recorded in `state_limit_dropped`; the build still
+succeeds, so a pipeline that only checks the exit code would ship a set that
+under-reports — read the warning, or `state_limit_dropped`.
 
 **Which capabilities a drop removes it from.** A pattern the FIND-path packers
 drop is gone from `find` and the scan pair; the anchored pair is packed
@@ -615,7 +614,10 @@ exceeds `max_fallback_states` can be rescued onto the Backtracking engine for
 `find` and the scan pair. The ANCHORED packing admits no Backtracking member —
 it has no BT bucket path at all — so such a pattern is silently absent from
 `match_any` and `match_all`. `--diag-json` shows it in both places: in a
-`bt-fallback` bucket, and in `state_limit_dropped` for the anchored packing.
+`bt-fallback` bucket, and in `anchored_state_limit_dropped` for the anchored
+packing. That is a SEPARATE array from `state_limit_dropped`, which means the
+pattern left the set entirely — here it is still answered by `find` and the
+scan pair.
 If your set needs the anchored pair to answer for every member, raise
 `max_fallback_states` until nothing is BT-rescued.
 
@@ -632,9 +634,17 @@ The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
 `in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
 and per-set `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
-`conflicts`, `capture_bearing_dropped`, and `state_limit_dropped` (patterns
+`conflicts`, `capture_bearing_dropped`, `state_limit_dropped` (patterns
 dropped for exceeding a fallback bucket's state budget — see
-[Bin-packing](#bin-packing-and-merge-constraints) above) arrays.
+[Bin-packing](#bin-packing-and-merge-constraints) above) and
+`anchored_state_limit_dropped` arrays.
+
+The last two are not the same thing and a consumer must not merge them.
+`state_limit_dropped` means the pattern left the set ENTIRELY: no capability
+answers for it. `anchored_state_limit_dropped` means only the ANCHORED packing
+refused it, so `match_any` and `match_all` no longer see it while `scan_any`,
+`scan_all` and `find` still do. `unparseable_dropped` has the anchored-only
+scope too.
 
 If a set's frontend was **downgraded** from the one its literals selected, the
 per-set `frontend_demotion` object says so, with `from`, `to`, a machine-
@@ -830,13 +840,26 @@ route, this switches the set's `match_all` and `scan_all` to the `out_ptr` form.
 Unlike it, the member stays in `match_any` and `match_all`, whose whole-input
 answer does not depend on which branch wins.
 
-It narrows the drop set rather than emptying it. A pattern whose NFA is larger
-than the engine's own instruction cap, or that trips its loop checks, is still
-excluded, still warned about, and still recorded in `--diag-json`'s
-`state_limit_dropped` — for either reason above, since a DFA bucket would give
-the second kind wrong extents. Buckets that were admitted appear there as
-`"bt-fallback"`, with `suffix_states` and `table_bytes` of 0 — they have no
-table.
+A member Backtracking cannot take either is still excluded, still warned
+about, and still recorded in `--diag-json`'s `state_limit_dropped` — for either
+reason above, since a DFA bucket would give the second kind wrong extents. No
+pattern is known to reach that any more: the main refusal left is the engine's
+instruction cap, and a member that large fails the whole set compile earlier.
+Buckets that were admitted appear in `--diag-json` as `"bt-fallback"`, with
+`suffix_states` and `table_bytes` of 0 — they have no table — and `compile
+--verbose` prints their engine as `Backtracking`. Every compile also WARNS,
+once per such member and for every route onto Backtracking: "Set member runs
+on Backtracking: <reason>", with a hint for keeping it on a DFA. It is a
+warning, not a drop — the member still matches.
+
+**What one costs.** Measured on a set of 15 ordinary patterns (credentials,
+log fields) plus ONE member routed here for word-boundary ambiguity,
+`(?:\B|a|)a`, against the same set with its twin `(?:\B|a)a`, which stays on a
+DFA, over 80-byte to 10 KB inputs. The routed member made `scan_any` and `find`
+cost 1.7x-2.2x the fuel on matching and non-matching text alike, and `scan_all`
+2.2x on non-matching text but only 1.0x-1.3x on matching text. `match_any` and
+`match_all` were unaffected — the member stays in their anchored DFA. On its
+own, as a one-pattern set, the same member cost about what its twin does.
 
 **One consequence reaches the ABI.** Every other set engine is table-driven and
 always finishes with a definite answer: pattern *k* matched, or it did not.
@@ -857,11 +880,12 @@ call — Rust returns `Err(Error::BacktrackOverflow)`, Go returns
 `RX_ITER_ERROR`, and C returns `RX_ERR_BT_OVERFLOW`. What none of them do is
 quietly report "nothing matched".
 
-**When it can happen.** A member's ordinary Backtracking body works within
-compile-time regions: a frame stack sized from its alternation count and, for a
-member that needs BitState memoisation, a memo sized from its instruction count.
-A call that outgrows either, or backtracks past its work budget, is handed to
-the member's fallback body, which sizes both from the input at call time — see
+**When it can happen.** A member's ordinary Backtracking body works within a
+compile-time frame stack sized from its alternation count, and memoises
+nothing. A call that outgrows the stack, or backtracks past its work budget, is
+handed to the member's fallback body, which sizes its stack and its memo from
+the input at call time — as is every call to a member whose program has a
+zero-width cycle, which has no ordinary body — see
 *Work budget and the fallback body* in [engines.md](engines.md). "Unknown" is
 left for the case where that memory cannot be had: linear memory cannot grow any
 further.

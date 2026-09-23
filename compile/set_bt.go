@@ -41,25 +41,20 @@ import (
 // That combination has no other caller today, so it carries its own tests
 // rather than inheriting confidence from the single-pattern paths.
 //
-// BT NARROWS THE DROP SET RATHER THAN EMPTYING IT. A pattern whose NFA exceeds
-// maxBTFallbackInstructions, or that fails BT's own loop checks, is still
-// dropped and still reported — admitBTFallback returns nil and the caller
-// keeps its existing warn-and-continue.
+// A pattern Backtracking cannot take either — its NFA exceeds
+// maxBTFallbackInstructions, or its suffix AST does not compile — is still
+// dropped and still reported: admitBTFallback returns nil and the caller keeps
+// its existing warn-and-continue. No pattern known to reach that branch
+// remains: a member over the instruction cap fails the whole set compile
+// earlier, in analyzePattern.
 
 // admitBTFallback tries to build a Backtracking driver for a pattern that is
 // about to be dropped from a set. Returns nil when BT cannot take it either,
 // in which case the caller drops the pattern exactly as before.
 //
-// memoBudget is the BitState budget. There is no SET-level knob for it —
-// CompileSetOptions has no MemoBudget field — so every caller passes
-// resolveMemoBudget(nil), i.e. the single-pattern default of 128 KB. The doc
-// here used to name a configured set budget that does not exist
-// ; the parameter stays so adding one later is a change at
-// the three call sites rather than in this function.
-//
 // ast is the pattern's full AST (patternSuffixAST), captures already
 // irrelevant because sets never report them.
-func admitBTFallback(ast *syntax.Regexp, memoBudget int) *btBucketInfo {
+func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
 	if ast == nil {
 		return nil
 	}
@@ -74,19 +69,9 @@ func admitBTFallback(ast *syntax.Regexp, memoBudget int) *btBucketInfo {
 	// Sets never report captures, so group 0 is all this body will ever
 	// record. This mirrors the single-pattern find fallback in compile.go.
 	bt.numGroups = 0
-	if err := checkBTLoopCount(bt, false); err != nil {
-		return nil
-	}
-	if err := checkBTEmptyBodyLoopChain(bt); err != nil {
-		return nil
-	}
-	useMemo := needsBitState(prog)
-	stackSize, memoSize := btAllocSizes(bt, useMemo, 0, memoBudget)
 	return &btBucketInfo{
 		bt:        bt,
-		useMemo:   useMemo,
-		stackSize: stackSize,
-		memoSize:  memoSize,
+		stackSize: btAllocSizes(bt),
 	}
 }
 
@@ -192,22 +177,15 @@ func hasBTBucketIn(buckets []*bucket) bool {
 // btSharedRegions is the one stack / memo / scratch allocation a set makes for
 // ALL of its BT buckets, sized to the largest of them.
 //
-// Sharing is safe for two reasons, both verified rather than assumed:
-//
-//  1. The memo re-zeroes itself at the head of every BT call
-//     (emitBTMemoZeroInitTrimmed), so one pattern cannot inherit another's
-//     bits. (A FALLBACK body's memo is not in these regions: it is per member
-//     and lasts a host call — see btDriveMember.)
-//  2. The per-candidate driver calls one suffix function at a time via a plain
-//     `call` (set_find.go's emitBucketCall) — no nesting, no reentrancy, no
-//     threads — so exactly one BT call is ever live.
-//
-// The stack needs no clearing for a third reason: BT pushes from stackBase and
-// unwinds within the call, so it starts empty each time.
+// Sharing is safe because the per-candidate driver calls one suffix function
+// at a time via a plain `call` (set_find.go's emitBucketCall) — no nesting, no
+// reentrancy, no threads — so exactly one BT call is ever live, and the stack
+// needs no clearing: BT pushes from stackBase and unwinds within the call, so
+// it starts empty each time. (A FALLBACK body's memo and stack are not in these
+// regions: they are per member and last a host call — see btDriveMember.)
 type btSharedRegions struct {
 	stackBase  int32 // start of the shared BT frame stack
 	stackLimit int32 // one past its end; BT reports overflow on reaching this
-	memoBase   int32 // start of the shared BitState bitset, past its header (0 when unused)
 	// winGlobal is the first of TWO consecutive module globals holding
 	// (startOff, endOff) for window mode — the same pair the single-pattern
 	// path carries, and globals for the same reason: an allocator index has no
@@ -272,9 +250,9 @@ func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, 
 // planBTRegions lays the shared regions out above `base` and returns them,
 // or nil when the set has no BT bucket. Sizes are the max over BT buckets whose
 // ordinary body runs: a bucket planned as the bare tail call (planBT's force
-// plan) reads neither region.
+// plan) reads no stack.
 func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget int) *btSharedRegions {
-	maxStack, maxMemo := 0, 0
+	maxStack := 0
 	any := false
 	for _, b := range buckets {
 		if b.btFallback == nil {
@@ -287,9 +265,6 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget
 		if b.btFallback.stackSize > maxStack {
 			maxStack = b.btFallback.stackSize
 		}
-		if b.btFallback.memoSize > maxMemo {
-			maxMemo = b.btFallback.memoSize
-		}
 	}
 	if !any {
 		return nil
@@ -298,12 +273,6 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget
 	r := &btSharedRegions{stackBase: cur}
 	r.stackLimit = r.stackBase + int32(maxStack)
 	cur = r.stackLimit
-	if maxMemo > 0 {
-		// maxMemo (from btAllocSizes) already covers the header word that sits
-		// immediately below the bitset, so memoBase points PAST it.
-		r.memoBase = cur + btMemoHeaderBytes
-		cur += int32(maxMemo)
-	}
 	// The window pair is allocated, not reserved: no table bytes here.
 	//
 	// The allocator is guaranteed non-nil by CompileSet, which is the single
@@ -329,7 +298,7 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget
 // exactly one pattern: BT has no merged form, so there is nothing to share
 // with.
 func newBTBucket(p *PatternInfo) *bucket {
-	info := admitBTFallback(patternSuffixAST(p), resolveMemoBudget(nil))
+	info := admitBTFallback(patternSuffixAST(p))
 	if info == nil {
 		return nil
 	}
@@ -564,10 +533,6 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		// input edges; nativeAnchored lets it accept at the first match end
 		// rather than only on full consumption. See the file header.
 		plan := planBT(info.bt, cs.btWorkBudget)
-		// Per-bucket, not per-set: the shared memo region is sized to the
-		// LARGEST bucket's reservation, but each body's fill is sized from its
-		// OWN N, so each must be bounded by its own ceiling.
-		memoMaxLen := btMemoMaxLen(len(info.bt.prog.Inst), resolveMemoBudget(nil))
 		member := cs.btRegions.members[bi]
 		call := btBucketCall{driverIdx: btFnBase + k, fallbackIdx: -1}
 		var driver []byte
@@ -577,9 +542,9 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		} else {
 			driver, callOffs = appendBacktrackCodeEntry(nil, info.bt,
 				cs.btRegions.stackBase, cs.btRegions.stackLimit,
-				int32(btFrameSize(info.bt)), cs.btRegions.memoBase, info.useMemo,
+				btNoCaptureFrameSize,
 				true, // nativeAnchored
-				tableMemIdx, cs.btRegions.winGlobal, memoMaxLen,
+				tableMemIdx, cs.btRegions.winGlobal,
 				// Set BT buckets are driven directly, not through the groups
 				// wrapper, and use window mode — their slots are already absolute.
 				-1,
@@ -591,8 +556,8 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			// that will not grow — comes back as abi.BTStackOverflow, which the
 			// suffix body already forwards.
 			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
-				int32(btFrameSize(btFallbackView(info.bt))), 0, true,
-				true, tableMemIdx, cs.btRegions.winGlobal, 0, -1,
+				btNoCaptureFrameSize,
+				true, tableMemIdx, cs.btRegions.winGlobal, -1,
 				0, false, &cs.btRegions.scratch, member)
 			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
 			call.member = member
@@ -628,12 +593,6 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		}
 	}
 	return out
-}
-
-// btFrameSize is the per-frame byte size the driver pushes: pos + loop
-// trackers + retryPC, with no capture slots (sets never report captures).
-func btFrameSize(bt *backtrack) int {
-	return 8 + btNumLoopFrameLocals(bt, false)*4
 }
 
 // sizePrefixed wraps a raw body in the LEB128 length the code section wants.

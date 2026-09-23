@@ -478,7 +478,7 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
 	opt.region = scratchPtr
-	buf := d.buf()
+	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	var out [][3]int
 	from := offset
@@ -1291,7 +1291,7 @@ func driveCacheFindCorrupt(t *testing.T, pats []string, input string,
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
-	buf := d.buf()
+	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	from, corrupted := int32(0), false
 	for calls := 0; calls < 4*(len(input)+2)*len(pats)+16; calls++ {
@@ -1462,7 +1462,7 @@ func driveCacheFindSequence(t *testing.T, pats []string, input string,
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
-	buf := d.buf()
+	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	call := func(from int32) int32 {
 		res, err := fn.Call(store, inBase, int32(len(input)), from, desc, outPtr, int32(len(pats)))
@@ -1586,7 +1586,7 @@ func driveBatchSequence(t *testing.T, pats []string, input string,
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
-	buf := d.buf()
+	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	outCap := int32(len(pats))
 	span := int(outCap) * 12
@@ -1632,7 +1632,7 @@ func driveCacheFindHooked(t *testing.T, pats []string, input string,
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, desc := d.inBase, d.outPtr, d.scratchPtr, d.desc
-	buf := d.buf()
+	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	var out [][3]int32
 	from, hooked := int32(0), false

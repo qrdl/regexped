@@ -125,22 +125,6 @@ func TestResolveMaxDFAMemory(t *testing.T) {
 	}
 }
 
-func TestResolveMemoBudget(t *testing.T) {
-	cases := []struct {
-		opts *CompileOptions
-		want int
-	}{
-		{nil, 128 * 1024},
-		{&CompileOptions{}, 128 * 1024},
-		{&CompileOptions{MemoBudget: 65536}, 65536},
-	}
-	for _, c := range cases {
-		if got := resolveMemoBudget(c.opts); got != c.want {
-			t.Errorf("resolveMemoBudget(%v) = %d, want %d", c.opts, got, c.want)
-		}
-	}
-}
-
 func TestPrintAnalysis(t *testing.T) {
 	a := &patternAnalysis{
 		NumInstructions:         42,

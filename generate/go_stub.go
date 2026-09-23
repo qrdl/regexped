@@ -472,11 +472,7 @@ func %s(ptr unsafe.Pointer, length uint32) int32
 // engine and the input exhausted its frame budget: the engine cannot tell
 // whether the input matches, so ok=false — a definite "no" — would be a lie.
 func %s(input []byte) (end uint, ok bool, err error) {
-	var ptr unsafe.Pointer
-	if len(input) > 0 {
-		ptr = unsafe.Pointer(&input[0])
-	}
-	result := %s(ptr, uint32(len(input)))
+	result := %s(unsafe.Pointer(unsafe.SliceData(input)), uint32(len(input)))
 	if result == %d {
 		return 0, false, ErrBacktrackOverflow
 	}

@@ -254,7 +254,7 @@ func FuzzCorrectness(f *testing.F) {
 
 		wasmBytes, compErr := compileFind(pat)
 		if compErr != nil {
-			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) || errors.Is(compErr, compile.ErrBTLoopCountTooLarge) || errors.Is(compErr, compile.ErrBTEmptyBodyLoopChainTooLarge) {
+			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) {
 				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
 			}
 			t.Fatalf("compile error on a pattern Go stdlib accepts: pat=%q: %v", pat, compErr)
@@ -356,6 +356,14 @@ func skipPattern(pat, input string) string {
 	if _, err := regexp.Compile(pat); err != nil {
 		return "Go stdlib rejects it too — no oracle"
 	}
+	// The whole-input oracles embed the pattern in a wrapper. Almost every
+	// pattern goes in as written; the residue is an unterminated `\Q`, which
+	// swallows the wrapper's closing paren, and for those the re-serialised
+	// form is used instead — unless IT re-parses to a different tree, in which
+	// case no oracle can be built for the pattern at all.
+	if _, ok := oracleBody(pat); !ok {
+		return "no safe oracle embedding: neither the pattern nor its re-serialised form can be wrapped"
+	}
 	return ""
 }
 
@@ -366,10 +374,8 @@ func skipPattern(pat, input string) string {
 func isResourceCeiling(err error) bool {
 	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||
-		errors.Is(err, compile.ErrBTLoopCountTooLarge) ||
-		errors.Is(err, compile.ErrBTEmptyBodyLoopChainTooLarge) ||
 		// The SET path's helper-DFA ceiling (maxHelperDFAStates, 2048). Unlike
-		// the four above it has no fallback — the set compile fails — but it is
+		// the two above it has no fallback — the set compile fails — but it is
 		// the same KIND of event: a construction refused as effectively
 		// unbounded, not an answer that disagrees with Go. Omitting it is what
 		// made FuzzSet/40f883ef54d47f63 look like a defect.
@@ -535,8 +541,9 @@ func FuzzGroups(f *testing.F) {
 // fast body alone may still blow up exponentially — that is the defect the
 // budget exists for — so a hang there skips the case once the other two legs
 // have answered; a hang in either of them is a bug. The fast leg is skipped
-// outright for a program with a zero-width cycle: every budgeted build answers
-// that one with the fallback alone, and its ordinary body is not exact.
+// outright for a program with a zero-width cycle: every build answers that one
+// with the fallback alone, BTWorkBudgetOff included, so the leg would only
+// repeat the fallback leg.
 func FuzzGroupsBothBodies(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
@@ -575,9 +582,8 @@ func FuzzGroupsBothBodies(f *testing.F) {
 		}
 		for _, leg := range legs {
 			if leg.budget == compile.BTWorkBudgetOff {
-				// A program with a zero-width cycle ships only its fallback
-				// body; the ordinary body is not exact there and no budgeted
-				// build runs it.
+				// A program with a zero-width cycle has no ordinary body in
+				// any build — under Off it is the fallback leg again.
 				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err == nil && cyc {
 					t.Skip("zero-width cycle: the ordinary body is never shipped for this program")
 				}
@@ -854,16 +860,12 @@ func sortSpans(v [][2]int) {
 //
 // `.{p}` counts runes, so callers must restrict the corpus to ASCII.
 //
-// The pattern is re-serialised through regexp/syntax before being embedded:
-// the raw source may contain `\Q`, which quotes everything after it and would
-// swallow the closing paren of the `(?:...)` wrapper, silently building a
-// DIFFERENT regexp and blaming the engine for the difference.
+// The pattern is embedded AS WRITTEN wherever it can be, and re-serialised
+// only when it cannot — see oracleBody (set_caps_test.go) for why that order
+// matters: re-serialising is not language-preserving, and doing it
+// unconditionally has already reported a correct module as wrong.
 func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
-	parsed, err := syntax.Parse(re.String(), syntax.Perl)
-	if err != nil {
-		panic("oracle: pattern Go already accepted failed to re-parse: " + err.Error())
-	}
-	body := parsed.String()
+	body := mustOracleBody(re.String())
 	var out [][2]int
 	for p := 0; p <= len(input); p++ {
 		anchored, err := regexp.Compile(`\A` + dotPrefix(p) + `(?:` + body + `)`)

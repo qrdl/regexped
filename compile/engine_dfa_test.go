@@ -2232,7 +2232,7 @@ func TestSuffixWalkExtentGlobal(t *testing.T) {
 		nil, false, false, false, false, true)
 }
 
-// TestAnchoredFindBodyReadsTheRowMap pins FUZZER_BUGS bug 86.
+// TestAnchoredFindBodyReadsTheRowMap pins the anchored find body's rowMap read.
 //
 // A find that can only match at position 0 gets its own body,
 // buildAnchoredFindBody. When the layout has more than 256 states its table is
@@ -2251,8 +2251,8 @@ func TestSuffixWalkExtentGlobal(t *testing.T) {
 // red. This asserts the emitted body itself.
 func TestAnchoredFindBodyReadsTheRowMap(t *testing.T) {
 	// An anchored run of a wide class closed by a one-byte-wide tail: past 256
-	// states, and the rows still collapse. `^.{0,170}0` is one of bug 86's
-	// three raw crashers.
+	// states, and the rows still collapse. `^.{0,170}0` is one of the three
+	// fuzz crashers that reported this.
 	const pat = `^.{0,170}0`
 
 	matcher, err := compile(pat, CompileOptions{MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true})
@@ -2318,4 +2318,199 @@ func TestCountedClassChainShortTail(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestLitAnchorNumV128Locals pins the lit-anchor find body's v128 local
+// count, including the 17..64 first-byte band no pattern reaches today:
+// emitPrefixScan takes the Shufti route there and needs the chunk local.
+func TestLitAnchorNumV128Locals(t *testing.T) {
+	cases := []struct {
+		t1, t0, scan bool
+		n, want      int
+	}{
+		{t1: true, want: 6},
+		{t0: true, want: 3},
+		{scan: true, want: 1},
+		{n: 1, want: 1},
+		{n: 16, want: 1},
+		{n: 17, want: 1},
+		{n: 64, want: 1},
+		{n: 65, want: 0},
+		{n: 0, want: 0},
+	}
+	for _, c := range cases {
+		if got := litAnchorNumV128Locals(c.t1, c.t0, c.scan, c.n); got != c.want {
+			t.Errorf("litAnchorNumV128Locals(t1=%v, t0=%v, scan=%v, n=%d) = %d, want %d",
+				c.t1, c.t0, c.scan, c.n, got, c.want)
+		}
+	}
+}
+
+// TestStartIsNonMidDominant pins when the mandatory-literal prologue needs its
+// dominant-marker guard: only when a start state it can load is a NON-mid
+// dominant. No real pattern reaches it, so the input is synthetic.
+func TestStartIsNonMidDominant(t *testing.T) {
+	doms := []dominantInfo{{state: 3, isMidAccept: true}, {state: 5}}
+	for _, c := range []struct {
+		starts []uint32
+		want   bool
+	}{
+		{[]uint32{3}, false},    // a MID dominant stores a real accept
+		{[]uint32{1, 5}, true},  // a non-mid dominant among the starts
+		{[]uint32{1, 2}, false}, // no start is dominant
+	} {
+		if got := startIsNonMidDominant(doms, c.starts...); got != c.want {
+			t.Errorf("startIsNonMidDominant(%v) = %v, want %v", c.starts, got, c.want)
+		}
+	}
+	if startIsNonMidDominant(nil, 5) {
+		t.Error("startIsNonMidDominant(nil) = true, want false")
+	}
+}
+
+// TestMidAcceptTestGuard pins the guarded midAccept test byte for byte, and —
+// since exact bytes cannot show the stack shape is right where the fragment
+// is spliced in — wraps each form the way emitDFAPrologue uses it (the test,
+// then `if last_accept = pos end`) in a minimal function and validates the
+// module. No real pattern emits the guarded form today.
+func TestMidAcceptTestGuard(t *testing.T) {
+	const midAcceptOff = 100
+	plain := emitMidAcceptTest(nil, midAcceptOff, 0x02, 0, false)
+	guarded := emitMidAcceptTest(nil, midAcceptOff, 0x02, 0, true)
+
+	wantPlain := []byte{
+		0x41, 0xE4, 0x00, // i32.const 100
+		0x20, 0x02, // local.get state
+		0x6A,             // i32.add
+		0x2D, 0x00, 0x00, // i32.load8_u
+	}
+	wantGuarded := append(append([]byte{}, wantPlain...),
+		0x41, 0x01, // i32.const 1
+		0x6B,             // i32.sub
+		0x41, 0xFD, 0x01, // i32.const 253
+		0x49, // i32.lt_u
+	)
+	if !bytes.Equal(plain, wantPlain) {
+		t.Errorf("plain test = % x, want % x", plain, wantPlain)
+	}
+	if !bytes.Equal(guarded, wantGuarded) {
+		t.Errorf("guarded test = % x, want % x", guarded, wantGuarded)
+	}
+
+	for name, frag := range map[string][]byte{"plain": plain, "guarded": guarded} {
+		var code []byte
+		code = append(code, 0x01, 0x06, 0x7F) // six i32 locals: state(2), pos(3), last_accept(5)
+		code = append(code, frag...)
+		code = append(code, 0x04, 0x40, 0x20, 0x03, 0x21, 0x05, 0x0B) // if (void) last_accept = pos end
+		code = append(code, 0x0B)                                     // end function
+		body := append(utils.AppendULEB128(nil, uint32(len(code))), code...)
+
+		m := []byte{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}
+		m = appendSection(m, 1, []byte{0x01, 0x60, 0x00, 0x00}) // type 0: () -> ()
+		m = appendSection(m, 3, []byte{0x01, 0x00})             // one function of type 0
+		m = appendSection(m, 5, []byte{0x01, 0x00, 0x01})       // one memory, min 1 page
+		m = appendSection(m, 10, append([]byte{0x01}, body...)) // code
+		t.Run(name, func(t *testing.T) { validateWASM(t, m) })
+	}
+}
+
+// TestDFAHasOutrankedStateChannels checks every boundary channel on a
+// synthetic table: an outranked, non-dominant NW, W or NL accept reports true,
+// and the same accept marked dominant does not. Its one remaining caller, the
+// lenient alternation's branch refusal, is reached by no generated pattern.
+func TestDFAHasOutrankedStateChannels(t *testing.T) {
+	mk := func() *dfaTable {
+		return &dfaTable{
+			numStates:                  1,
+			midAcceptNWStatesOutranked: map[int]uint64{}, midAcceptNWStatesDominant: map[int]uint64{},
+			midAcceptWStatesOutranked: map[int]uint64{}, midAcceptWStatesDominant: map[int]uint64{},
+			midAcceptNLStatesOutranked: map[int]uint64{}, midAcceptNLStatesDominant: map[int]uint64{},
+		}
+	}
+	for _, ch := range []string{"NW", "W", "NL"} {
+		out, dom := mk(), mk()
+		for _, tab := range []*dfaTable{out, dom} {
+			switch ch {
+			case "NW":
+				tab.midAcceptNWStatesOutranked[0] = 1
+			case "W":
+				tab.midAcceptWStatesOutranked[0] = 1
+			case "NL":
+				tab.midAcceptNLStatesOutranked[0] = 1
+			}
+		}
+		switch ch {
+		case "NW":
+			dom.midAcceptNWStatesDominant[0] = 1
+		case "W":
+			dom.midAcceptWStatesDominant[0] = 1
+		case "NL":
+			dom.midAcceptNLStatesDominant[0] = 1
+		}
+		if !dfaHasOutrankedState(out) {
+			t.Errorf("%s: outranked non-dominant accept not reported", ch)
+		}
+		if dfaHasOutrankedState(dom) {
+			t.Errorf("%s: an outranked accept that is also dominant was reported", ch)
+		}
+	}
+	if dfaHasOutrankedState(mk()) {
+		t.Error("empty table reported an outranked state")
+	}
+}
+
+// TestEmitterCornerPatterns compiles single patterns, with match, find and
+// groups all declared, that reach corners of DFA construction and engine
+// selection — each found by running generated and corpus patterns through
+// Compile: a boundary target that reaches a later state of the same closure
+// (`(?:(?:(?:.|\b|\d))+?)?`), a literal prefix walk that meets an accepting
+// state before its end (`(?:\B|a)(?:^|a)`), and a pattern whose program does
+// not start with \A although one branch is anchored (`\A(a)|a`).
+func TestEmitterCornerPatterns(t *testing.T) {
+	for _, pat := range []string{`(?:(?:(?:.|\b|\d))+?)?`, `(?:\B|a)(?:^|a)`, `\A(a)|a`} {
+		t.Run(pat, func(t *testing.T) {
+			wasm, _, err := Compile([]config.RegexEntry{{Pattern: pat, MatchFunc: "m", FindFunc: "f", GroupsFunc: "g"}}, 65536, true)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			validateWASM(t, wasm)
+		})
+	}
+}
+
+// TestNfaBuildInputMapHandBuiltPrograms drives two branches no compiled
+// pattern reaches, on hand-built programs:
+//   - an InstRune1 carrying FoldCase. Go's compiler clears the flag before it
+//     chooses Rune1, so this is defensive; if that ever changed, the fold
+//     partners that are bytes must still get transitions;
+//   - wide (>64-pattern, pIdx) leftmost-first suppression: once pattern k's
+//     Match is seen, k's later byte-consumers are dropped, while another
+//     pattern's are kept.
+func TestNfaBuildInputMapHandBuiltPrograms(t *testing.T) {
+	t.Run("rune1_fold_case", func(t *testing.T) {
+		prog := &syntax.Prog{Inst: []syntax.Inst{
+			{Op: syntax.InstRune1, Out: 1, Arg: uint32(syntax.FoldCase), Rune: []rune{'k'}},
+			{Op: syntax.InstMatch},
+		}}
+		m := nfaBuildInputMap(prog, []uint32{0}, false, nil, nil)
+		for _, r := range []rune{'k', 'K'} {
+			if len(m[r]) == 0 {
+				t.Errorf("no transition on %q for a fold-case Rune1 'k'", r)
+			}
+		}
+	})
+	t.Run("wide_suppression", func(t *testing.T) {
+		prog := &syntax.Prog{Inst: []syntax.Inst{
+			{Op: syntax.InstMatch},                            // pattern 0 matches first
+			{Op: syntax.InstRune1, Out: 0, Rune: []rune{'a'}}, // pattern 0: suppressed
+			{Op: syntax.InstRune1, Out: 0, Rune: []rune{'b'}}, // pattern 1: kept
+		}}
+		m := nfaBuildInputMap(prog, []uint32{0, 1, 2}, true, nil, []int32{0, 0, 1})
+		if len(m['a']) != 0 {
+			t.Errorf("pattern 0's consumer after its Match was kept: %v", m['a'])
+		}
+		if len(m['b']) == 0 {
+			t.Error("pattern 1's consumer was dropped by pattern 0's Match")
+		}
+	})
 }

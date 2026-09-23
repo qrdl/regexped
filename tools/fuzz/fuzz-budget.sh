@@ -58,8 +58,8 @@
 #
 # This is accepted behaviour, not an open bug: making the compiler faster was
 # tried, measured, and does not close it, because the mutator simply scales the
-# pattern until it crosses whatever bar exists. plans/FUZZER_BUGS.md bug 83
-# carries the measurements and the one approach that would actually end it.
+# pattern until it crosses whatever bar exists. The residual families are TDFA
+# construction inside engine selection, and set compilation.
 
 set -euo pipefail
 cd "$(dirname "$0")"

@@ -7,11 +7,11 @@ import (
 
 // A Backtracking FALLBACK body's run-time memory.
 //
-// The fallback (btFallbackView) is the body a call lands in when the ordinary
-// body gives up: its work budget ran out, or its frame stack, or its memo. Its
-// own frame stack and memo are therefore sized from the INPUT, at call time,
-// rather than reserved at compile time — a compile-time region is exactly the
-// ceiling the fallback exists to remove.
+// The fallback is the body a call lands in when the ordinary body gives up —
+// its work budget ran out, or its frame stack — and the only body a program
+// with a zero-width cycle has. Its own frame stack and memo are therefore sized
+// from the INPUT, at call time, rather than reserved at compile time — a
+// compile-time region is exactly the ceiling the fallback exists to remove.
 //
 // # Layout
 //
@@ -305,9 +305,9 @@ func emitBTDynPushCheck(b []byte, d *btDyn, unknown func([]byte) []byte) []byte 
 	return append(b, 0x0B) // end if (sp > stackTop)
 }
 
-// emitBitStateGuardDyn is emitBitStateGuard for a fallback body: "already
-// visited (p, pos)? fail : mark visited", over the run-time memo, clearing it
-// as the search reaches it. byteAddr and memoByte are scratch locals.
+// emitBitStateGuardDyn is a fallback body's BitState guard: "already visited
+// (p, pos)? fail : mark visited", over the run-time memo, clearing it as the
+// search reaches it. byteAddr and memoByte are scratch locals.
 func emitBitStateGuardDyn(b []byte, d *btDyn, p int, byteAddr, memoByte uint32,
 	brDepth uint32, memoOriginLocal uint32, hasMemoOrigin bool) []byte {
 

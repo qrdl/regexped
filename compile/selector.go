@@ -265,15 +265,6 @@ func resolveMaxDFAMemory(opts *CompileOptions) int {
 	return opts.MaxDFAMemory
 }
 
-// resolveMemoBudget returns the effective BitState memo budget in bytes.
-// Zero → default (128 KB).
-func resolveMemoBudget(opts *CompileOptions) int {
-	if opts == nil || opts.MemoBudget == 0 {
-		return 128 * 1024
-	}
-	return opts.MemoBudget
-}
-
 // resolveCompiledDFAThreshold returns the effective compiled-DFA state threshold
 // from opts. Zero → default (256). Negative → disabled (0). Capped at 256.
 func resolveCompiledDFAThreshold(opts *CompileOptions) int {

@@ -724,8 +724,6 @@ type adapterResult struct {
 	err      bool // result discriminant: true = err(backtrack-overflow)
 	some     bool // option discriminant
 	a, b     uint32
-	listPtr  uint32
-	listLen  uint32
 	retptr   uint32
 	memPages uint32
 }
@@ -929,17 +927,16 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 // The -2 sentinel means the answer is UNKNOWN, and must lift to
 // err(backtrack-overflow) rather than to a definite ok(none). Reaching it needs
 // the same squeeze tools/fuzz uses elsewhere: Backtracking forced by a tiny
-// MaxDFAStates, a small memo budget, and an input long enough to exhaust the
-// frame budget.
+// MaxDFAStates, and an input long enough to exhaust the frame stack. The
+// pattern must have no zero-width cycle — such a program has no ordinary body
+// in any build, and only the ordinary body has a static ceiling to hit.
 func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
-	const pattern = `Z(?:a?)+?xyz`
-	const length = 60000
-	entries := []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}
-	// BTWorkBudgetOff: with the budget on, a body past its static regions hands
+	entries := []config.RegexEntry{{Pattern: btNoCapturePattern, FindFunc: "f"}}
+	// BTWorkBudgetOff: with the budget on, a body past its static stack hands
 	// the call to its fallback, which sizes its memory from the input and
 	// answers — so -2 would need memory that cannot grow. Off, the body keeps
 	// answering -2 at its static ceiling, which is the arm under test.
-	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 1, MemoBudget: 4096, BTWorkBudget: compile.BTWorkBudgetOff})
+	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 2, BTWorkBudget: compile.BTWorkBudgetOff})
 
 	store, inst, mem := instantiateCore(t, w)
 	f := res["f"]
@@ -953,7 +950,8 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 		t.Fatalf("the raw export is kept under component, and this test needs it")
 	}
 
-	busy := strings.Repeat("Z", length) // every position is a candidate
+	busy := strings.Repeat("ab", 8192) + "xyzuvw" // past numAlts*4096 frames
+	length := len(busy)
 	buf := mem.UnsafeData(store)
 	if length > int(pathsOutBase-pathsInputBase) {
 		t.Fatalf("input runs into the output window")

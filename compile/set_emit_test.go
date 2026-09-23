@@ -837,7 +837,7 @@ func setEmitCovLocalsOfType(t *testing.T, body []byte, ty byte) int {
 // cannot be built — so they are asserted at the predicate rather than through
 // a compile that would merely lose the pattern either way.
 func TestSetEmitBTAdmissionRefusals(t *testing.T) {
-	if got := admitBTFallback(nil, 0); got != nil {
+	if got := admitBTFallback(nil); got != nil {
 		t.Error("a nil AST was admitted to the Backtracking fallback")
 	}
 
@@ -845,7 +845,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// instructions, which is the cheapest way to build a program of a known
 	// size without tripping the parser's repeat limits.
 	long := parseForBTFallback(t, strings.Repeat("a", maxBTFallbackInstructions+500))
-	if got := admitBTFallback(long, 0); got != nil {
+	if got := admitBTFallback(long); got != nil {
 		t.Errorf("a %d-instruction program was admitted; the NFA size cap no longer refuses it",
 			maxBTFallbackInstructions+500)
 	}
@@ -853,7 +853,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// A pattern the cap does admit, so the refusals above are not passing for
 	// the wrong reason.
 	ok := parseForBTFallback(t, `[0-9]+x`)
-	if got := admitBTFallback(ok, 0); got == nil {
+	if got := admitBTFallback(ok); got == nil {
 		t.Error("an ordinary pattern was refused; the cases above prove nothing")
 	}
 }
@@ -922,31 +922,36 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 
 // TestSetEmitPlanBTRegionsMemo covers the BitState memo region.
 //
-// The shared regions are laid out as the MAX over every Backtracking bucket,
-// and the memo is the one that may be absent: a program the engine can run
-// without memoization gets no region at all, and one that needs it gets a
-// region sized for the largest such program. Two buckets with different memo
-// sizes is what distinguishes "took the max" from "took the first".
-func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
+// The shared stack is laid out as the MAX over every Backtracking bucket whose
+// ordinary body runs. Two buckets with different stack needs is what
+// distinguishes "took the max" from "took the first".
+func TestSetEmitPlanBTRegions(t *testing.T) {
 	// Nothing to lay out: no BT bucket, no regions.
 	if got := planBTRegions([]*bucket{{isFallback: true}}, 0, &moduleGlobals{}, 0); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
 
-	var withMemo []*bucket
-	for _, pattern := range []string{`(?:a|ab)+c`, `(?:[0-9]|[0-9][0-9])+x`} {
-		info := admitBTFallback(parseForBTFallback(t, pattern), 0)
+	var buckets []*bucket
+	largest := 0
+	for _, pattern := range []string{`(?:a|ab)+c`, `(?:[0-9]|[0-9][0-9]|x|y)+x`} {
+		info := admitBTFallback(parseForBTFallback(t, pattern))
 		if info == nil {
 			t.Fatalf("%q was refused by the Backtracking fallback", pattern)
 		}
-		withMemo = append(withMemo, &bucket{isFallback: true, btFallback: info})
+		if info.stackSize > largest {
+			largest = info.stackSize
+		}
+		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
 	}
-	regions := planBTRegions(withMemo, 0, &moduleGlobals{}, 0)
+	if buckets[0].btFallback.stackSize == buckets[1].btFallback.stackSize {
+		t.Fatal("both witnesses need the same stack — they cannot tell max from first")
+	}
+	regions := planBTRegions(buckets, 0, &moduleGlobals{}, 0)
 	if regions == nil {
 		t.Fatal("no regions planned for two Backtracking buckets")
 	}
-	if regions.stackLimit <= regions.stackBase {
-		t.Errorf("empty stack region: base %d, limit %d", regions.stackBase, regions.stackLimit)
+	if got := int(regions.stackLimit - regions.stackBase); got != largest {
+		t.Errorf("stack region is %d bytes, want the largest bucket's %d", got, largest)
 	}
 	// Everything above the stack must be laid out in order and inside `end`,
 	// or two regions share an address and one silently overwrites the other.
@@ -957,15 +962,6 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 	}
 	if regions.winGlobal < 0 {
 		t.Errorf("no window globals allocated for a BT bucket: %+v", *regions)
-	}
-	memoUsed := false
-	for _, bkt := range withMemo {
-		if bkt.btFallback.memoSize > 0 {
-			memoUsed = true
-		}
-	}
-	if memoUsed && regions.memoBase == 0 {
-		t.Error("a bucket asked for a BitState memo but no memo region was placed")
 	}
 }
 
@@ -979,7 +975,7 @@ func TestSetEmitPlanBTRegionsMemo(t *testing.T) {
 // nobody has checked, and the failure it prevents is a "local index out of
 // bounds" at module validation, which is how it was originally caught.
 func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`), 0)
+	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -1007,7 +1003,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 // parameter and its arm are gone, because dead machinery made a documented
 // exclusion look like an oversight.
 func TestSetEmitBTProbeBody(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`), 0)
+	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -1350,75 +1346,27 @@ func TestSetEmitPrefixCheckPerPatternGuard(t *testing.T) {
 	setEmitCovMustCompile(t, cfg)
 }
 
-// TestSetEmitBTLoopFrameRefusal covers the loop-frame-local cap.
-//
-// Backtracking narrows the set of patterns a set must drop; it does not empty
-// it, and this is one of the two checks that keeps a pattern on the drop list.
-// Every pushed backtrack frame snapshots ALL loop trackers, so the count is a
-// per-frame cost the JIT pays — sixty-five chained non-greedy loops is well
-// past what that can carry.
-func TestSetEmitBTLoopFrameRefusal(t *testing.T) {
-	// Non-greedy PLUS loops: each needs its own tracker. Greedy stars collapse
-	// to a single tracker and would not reach the cap at any length.
-	pattern := strings.Repeat(`(?:[a-z]+?)`, maxBTLoopFrameLocals+6) + `0`
-	if got := admitBTFallback(parseForBTFallback(t, pattern), 0); got != nil {
-		t.Errorf("a pattern with more than %d loop frame locals was admitted to Backtracking",
-			maxBTLoopFrameLocals)
-	}
-}
-
-// TestSetEmitPlanBTRegionsWithMemo places the BitState memo region.
-//
-// The memo is the one shared region that may be absent: a program the engine
-// can run without memoization gets none. Two buckets that both want one is
-// what distinguishes "took the max over the buckets" from "took the first" —
-// and an under-sized memo is a silent out-of-bounds write into whatever
-// follows it, not a validation error.
-func TestSetEmitPlanBTRegionsWithMemo(t *testing.T) {
-	// A non-greedy loop whose body can match empty is what needsBitState looks
-	// for; the budget has to be non-zero or btAllocSizes has nothing to
-	// allocate from.
-	const memoBudget = 1 << 16
+// TestSetEmitPlanBTRegionsZeroWidthCycle: a bucket whose program has a
+// zero-width cycle has no ordinary body under any budget — BTWorkBudgetOff
+// included — so it reads no shared stack and none is reserved for it.
+func TestSetEmitPlanBTRegionsZeroWidthCycle(t *testing.T) {
 	var buckets []*bucket
 	for _, pattern := range []string{`(?:a*?)+b`, `(?:.*?)+xyz`} {
-		info := admitBTFallback(parseForBTFallback(t, pattern), memoBudget)
+		info := admitBTFallback(parseForBTFallback(t, pattern))
 		if info == nil {
 			t.Fatalf("%q was refused by the Backtracking fallback", pattern)
 		}
-		if !info.useMemo || info.memoSize == 0 {
-			t.Fatalf("%q needs no BitState memo (useMemo=%v size=%d); the memo region is not reached",
-				pattern, info.useMemo, info.memoSize)
+		if !info.bt.zeroWidthCycle {
+			t.Fatalf("%q has no zero-width cycle — witness no longer has the shape", pattern)
 		}
 		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
 	}
-	// Such a program has a zero-width cycle, so with a work budget its
-	// ordinary body is the bare tail call and reads no region at all: only a
-	// build with the budget off still runs the body that uses the memo.
-	if routed := planBTRegions(buckets, 0, &moduleGlobals{}, 0); routed == nil {
-		t.Fatal("no regions planned for two Backtracking buckets")
-	} else if routed.memoBase != 0 || routed.stackLimit != routed.stackBase {
-		t.Errorf("buckets whose ordinary body never runs reserved a stack or memo: %+v", *routed)
-	}
-	regions := planBTRegions(buckets, 0, &moduleGlobals{}, BTWorkBudgetOff)
-	if regions == nil {
-		t.Fatal("no regions planned for two Backtracking buckets")
-	}
-	if regions.memoBase == 0 {
-		t.Fatal("both buckets asked for a BitState memo but no memo region was placed")
-	}
-	largest := 0
-	for _, bkt := range buckets {
-		if bkt.btFallback.memoSize > largest {
-			largest = bkt.btFallback.memoSize
+	for _, budget := range []int{0, BTWorkBudgetOff} {
+		if routed := planBTRegions(buckets, 0, &moduleGlobals{}, budget); routed == nil {
+			t.Fatalf("budget %d: no regions planned for two Backtracking buckets", budget)
+		} else if routed.stackLimit != routed.stackBase {
+			t.Errorf("budget %d: buckets whose ordinary body never runs reserved a stack: %+v", budget, *routed)
 		}
-	}
-	// memoBase points past the header word, so the region starts one header
-	// below it — that is what has to hold the largest bucket's reservation.
-	// slotScratch is what follows the memo now that the window pair is two
-	// globals rather than eight table bytes.
-	if int(regions.slotScratch-(regions.memoBase-btMemoHeaderBytes)) < largest {
-		t.Errorf("memo region is %d bytes, smaller than the largest bucket's %d",
-			regions.slotScratch-(regions.memoBase-btMemoHeaderBytes), largest)
 	}
 }
 
@@ -1903,73 +1851,16 @@ func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
 // setCoreCovIsolatedUnbuildable is non-greedy — so analyzePattern isolates it
 // and returns EARLY, leaving suffixDFA nil for compileFallback to build — and
 // its own merge then fails too. Dereferencing the nil that results was a crash.
-// The 13 chained nullable loops are what make the Backtracking fallback refuse
-// it as well (maxBTEmptyBodyGreedyLoops == 12), so it reaches the warn-and-drop
-// rather than being admitted on BT.
+// Its 13 chained nullable loops once made Backtracking refuse it, through a
+// limit on such chains, so it was dropped; with that limit gone it is admitted.
 var setCoreCovIsolatedUnbuildable = `a*?` + strings.Repeat(`(?:a|)*`, 13) +
 	`[a-z]{1000}[0-9]{1000}[a-z]{1000}`
 
-// setCoreCovIsolatedBTRefused is non-greedy and BT-refused like the above, but
+// setCoreCovIsolatedChain is non-greedy with the same chain as the above, but
 // its DFA is small enough to BUILD — it is only over an artificially low
-// max_fallback_states. That separates the two isolated-bucket drop branches:
-// "no DFA at all" and "a DFA that is too big".
-var setCoreCovIsolatedBTRefused = `a*?` + strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
-
-func TestSetCoreCompileFallbackIsolatedDropsWhenDFAUnbuildable(t *testing.T) {
-	info := setCoreCovAnalyze(t, setCoreCovIsolatedUnbuildable)
-	if !info.isolatedFallback {
-		t.Fatalf("pattern is not isolated; the non-greedy detection this case depends on has moved")
-	}
-	if info.suffixDFA != nil {
-		t.Fatal("an isolated pattern should reach compileFallback with suffixDFA nil")
-	}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "isolated-unbuildable"}
-	buckets := compileFallback([]*PatternInfo{info}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped (0 buckets), got %d", len(buckets))
-	}
-	if len(diag.StateLimitDropped) != 1 {
-		t.Errorf("drop not recorded in --diag-json: StateLimitDropped = %v", diag.StateLimitDropped)
-	}
-	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("silent drop: slog output was %q", out)
-	}
-}
-
-func TestSetCoreCompileFallbackIsolatedOverStateLimit(t *testing.T) {
-	// Same isolated branch, one step further along: the DFA builds but exceeds
-	// max_fallback_states. BT is offered the pattern first and refuses, so the
-	// warn-and-drop arm runs.
-	info := setCoreCovAnalyze(t, setCoreCovIsolatedBTRefused)
-	if !info.isolatedFallback {
-		t.Fatalf("pattern is not isolated; the non-greedy detection this case depends on has moved")
-	}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "isolated-over-limit"}
-	buckets := compileFallback([]*PatternInfo{info}, CompileSetOptions{MaxFallbackStates: 8}, diag)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped (0 buckets), got %d", len(buckets))
-	}
-	if len(diag.StateLimitDropped) != 1 {
-		t.Errorf("drop not recorded in --diag-json: StateLimitDropped = %v", diag.StateLimitDropped)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("silent drop: slog output was %q", out)
-	}
-	if !strings.Contains(out, "limit=8") {
-		t.Errorf("warning should name the limit that was exceeded; got %q", out)
-	}
-}
+// max_fallback_states. That separates the two isolated branches that offer a
+// member to Backtracking: "no DFA at all" and "a DFA that is too big".
+var setCoreCovIsolatedChain = `a*?` + strings.Repeat(`(?:a|)*`, 13) + `[a-z]{20}`
 
 func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 	// The positive half of both isolated drop branches: a non-greedy member
@@ -1995,6 +1886,18 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 			pattern: `a*?bcdefghijkl`,
 			opts:    CompileSetOptions{MaxFallbackStates: 8},
 			why:     "the isolated DFA builds but is larger than max_fallback_states",
+		},
+		{
+			name:    "own-dfa-unbuildable/nullable-chain",
+			pattern: setCoreCovIsolatedUnbuildable,
+			opts:    CompileSetOptions{},
+			why:     "no table to size, and a chain of nullable loops Backtracking once refused",
+		},
+		{
+			name:    "over-max-fallback-states/nullable-chain",
+			pattern: setCoreCovIsolatedChain,
+			opts:    CompileSetOptions{MaxFallbackStates: 8},
+			why:     "over max_fallback_states, and a chain of nullable loops Backtracking once refused",
 		},
 	}
 	for _, tc := range cases {
@@ -2028,8 +1931,9 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 
 // setCoreCovNullableUnbuildable has minLen 0, so analyzePattern returns early
 // with suffixDFA nil — the NON-isolated twin of the case above. Its own merge
-// then fails and BT refuses it, which is the sibling guard that was missing for
-// years while the isolated branch carried it.
+// then fails, which reached a nil dereference until the sibling guard the
+// isolated branch carried was added here too. Its chain of nullable loops once
+// made Backtracking refuse it, so that guard dropped it; it is admitted now.
 var setCoreCovNullableUnbuildable = strings.Repeat(`(?:a|)*`, 13) +
 	`(?:[a-z]{1000}[0-9]{1000}[a-z]{1000})?`
 
@@ -2048,14 +1952,14 @@ func TestSetCoreCompileFallbackNewBucketDFAUnbuildable(t *testing.T) {
 	diag := &SetDiag{Name: "nullable-unbuildable"}
 	buckets := compileFallback([]*PatternInfo{info}, CompileSetOptions{}, diag)
 
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped (0 buckets), got %d", len(buckets))
+	if len(buckets) != 1 || buckets[0].btFallback == nil {
+		t.Fatalf("expected one Backtracking bucket, got %d buckets", len(buckets))
 	}
-	if len(diag.StateLimitDropped) != 1 {
-		t.Errorf("drop not recorded in --diag-json: StateLimitDropped = %v", diag.StateLimitDropped)
+	if len(diag.StateLimitDropped) != 0 {
+		t.Errorf("an admitted pattern was recorded as dropped: StateLimitDropped = %v", diag.StateLimitDropped)
 	}
-	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("silent drop: slog output was %q", out)
+	if out := buf.String(); strings.Contains(out, "Pattern dropped from set") {
+		t.Errorf("a BT-admitted pattern must not warn about being dropped; got %q", out)
 	}
 }
 
@@ -2322,6 +2226,87 @@ func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
 		t.Errorf("silent drop: slog output was %q", out)
+	}
+}
+
+// setCoreCovAnchoredUnbuildable is a FuzzSetCaps crasher's own member.
+// Its solo anchored DFA hits maxHelperDFAStates INSIDE mergeAnchoredDFA, so
+// that call returns an error rather than an oversized table — the arm where
+// there is no state count to report and max_fallback_states is not the limit
+// that bound anything.
+var setCoreCovAnchoredUnbuildable = "|0..+0.........\".\x00\x10$"
+
+func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T) {
+	info := setCoreCovAnalyze(t, setCoreCovAnchoredUnbuildable)
+
+	buf, restore := captureWarnings(t)
+	defer restore()
+
+	diag := &SetDiag{Name: "anchored-unbuildable"}
+	buckets, members := compileAnchoredBuckets([]*PatternInfo{info}, CompileSetOptions{}, diag)
+
+	if len(buckets) != 0 || len(members) != 0 {
+		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+	}
+	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep
+	// it, so it must NOT land in StateLimitDropped, which the find packers use
+	// to mean "gone from the set entirely". A consumer reading one field for
+	// both excluded a pattern scan_any correctly reported.
+	if len(diag.AnchoredStateLimitDropped) != 1 {
+		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
+			diag.AnchoredStateLimitDropped)
+	}
+	if len(diag.StateLimitDropped) != 0 {
+		t.Errorf("anchored-only drop recorded as a whole-set drop: StateLimitDropped = %v",
+			diag.StateLimitDropped)
+	}
+	// The message used to be "suffix DFA exceeds state limit ...
+	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
+	// pattern never reached and a knob that cannot change the outcome, since
+	// what bound the build is the hard-coded maxHelperDFAStates.
+	out := buf.String()
+	if !strings.Contains(out, "Pattern dropped from set") {
+		t.Fatalf("silent drop: slog output was %q", out)
+	}
+	if strings.Contains(out, "max_fallback_states") {
+		t.Errorf("warning still points at max_fallback_states, which cannot change this outcome: %q", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("limit=%d", maxHelperDFAStates)) {
+		t.Errorf("warning should name the limit that actually bound the build (%d): %q",
+			maxHelperDFAStates, out)
+	}
+}
+
+func TestSetCoreCompileAnchoredBucketsOverFallbackLimitKeepsItsMessage(t *testing.T) {
+	// The other arm of the same switch, and the reason the message is a split
+	// rather than a rewrite: here the DFA BUILDS and is genuinely over
+	// max_fallback_states, so the size and the knob in the message are both
+	// true and the wording must not change.
+	info := setCoreCovAnalyze(t, `[a-z]{40}`)
+
+	buf, restore := captureWarnings(t)
+	defer restore()
+
+	diag := &SetDiag{Name: "anchored-over-limit"}
+	buckets, _ := compileAnchoredBuckets([]*PatternInfo{info},
+		CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, diag)
+
+	if len(buckets) != 0 {
+		t.Fatalf("expected the pattern dropped; got %d buckets", len(buckets))
+	}
+	if len(diag.AnchoredStateLimitDropped) != 1 {
+		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
+			diag.AnchoredStateLimitDropped)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "exceeds state limit") {
+		t.Errorf("the over-limit arm should still say so: %q", out)
+	}
+	if !strings.Contains(out, "limit=4") {
+		t.Errorf("warning should name max_fallback_states as given: %q", out)
+	}
+	if strings.Contains(out, "states=0") {
+		t.Errorf("this arm has a real state count and must report it: %q", out)
 	}
 }
 

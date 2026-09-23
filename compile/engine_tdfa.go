@@ -760,6 +760,10 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		if isAccepting(pcs, wCtx) {
 			dfaMidAcceptW[id] = 1
 		}
+		// Shared with the DFA: a pending (?m:$) counts as a live blocker here
+		// too. Selection keeps (?m:$) patterns off TDFA (hasLineAnchors), so
+		// only a CompileForced TDFA build sees it, and there it costs the early
+		// stop, not correctness.
 		if isImmediateAccepting(pcs, prog) {
 			dfaImmediateAccepting[id] = 1
 		}

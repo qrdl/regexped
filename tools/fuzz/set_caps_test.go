@@ -28,7 +28,12 @@ import (
 
 // compileCaps compiles pats into a standalone module exporting all seven
 // capabilities under their canonical names.
-func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) {
+//
+// It returns BOTH drop scopes (setDrops): a pattern the anchored packer alone
+// refused still answers on scan_any, scan_all and `find`, so one map cannot
+// serve every oracle: conflating them made this harness exclude a pattern the
+// scan pair still answers for, and read the disagreement as a wrong answer.
+func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 	entries := make([]config.RegexEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
@@ -45,9 +50,9 @@ func compileCaps(pats []string, overlapping bool) ([]byte, map[int]bool, error) 
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, map[int]bool, error) {
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
 		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
-		return w, droppedFromSet(diags), err
+		return w, dropsFromSet(diags), err
 	})
 }
 
@@ -173,7 +178,7 @@ func oracleAnchored(pats []string, input string, dropped map[int]bool) []int {
 		if dropped[k] {
 			continue
 		}
-		if regexp.MustCompile(`\A(?:` + normalizeForOracle(p) + `)\z`).MatchString(input) {
+		if regexp.MustCompile(`\A(?:` + mustOracleBody(p) + `)\z`).MatchString(input) {
 			out = append(out, k)
 		}
 	}
@@ -214,19 +219,54 @@ func oracleFirstPosition(pats []string, input string, from int, dropped map[int]
 	return -1, nil
 }
 
-// normalizeForOracle re-serialises a pattern through regexp/syntax before it
-// is embedded in a wrapper like `\A(?:pat)\z`.
+// oracleBody returns the text to embed for pat inside an oracle wrapper like
+// `\A(?:pat)\z`.
 //
-// Regexp.String() returns the ORIGINAL source, so a pattern containing `\Q`
-// quotes everything after it — including the wrapper's own closing paren —
-// and silently builds a different regexp (or fails to compile at all). Parsing
-// and re-printing produces a form with no `\Q` in it.
-func normalizeForOracle(pat string) string {
+// The pattern AS WRITTEN is preferred, and that preference is the fix for
+// a fuzz crasher. This used to re-serialise unconditionally
+// (`syntax.Parse(pat).String()`), which is NOT language-preserving: Go's
+// factor() decides two alternation branches share a leading character class
+// with (*Regexp).Equal, which compares OpLiteral nodes on Rune alone and
+// ignores Flags&FoldCase. So the printed form of `B$|b|B` — `B$|[Bb]`, where
+// the parser has folded `b|B` into one case-insensitive literal — re-parses as
+// `B(?:$|)`, which never matches "b". The oracle then expected no match where
+// the compiled module correctly reported one.
+//
+// Re-serialising stays as the FALLBACK, because it is the only way to defuse an
+// unterminated `\Q`: that quotes everything after it, including the wrapper's
+// own closing paren. Such a pattern cannot silently mean something else — the
+// `(?:` is left unclosed, so it is a parse ERROR, and that error is exactly
+// what selects the fallback here. A `\Q` closed by `\E` is self-contained and
+// takes the raw path like anything else.
+//
+// The second return value is false when neither route is safe: the raw pattern
+// does not embed AND its re-serialised form does not re-parse to the same tree.
+// skipPattern rejects such a pattern before any target reaches an oracle, so a
+// caller seeing false has skipped that check and should say so loudly.
+func oracleBody(pat string) (string, bool) {
+	if _, err := regexp.Compile(`\A(?:` + pat + `)\z`); err == nil {
+		return pat, true
+	}
 	parsed, err := syntax.Parse(pat, syntax.Perl)
 	if err != nil {
-		panic("oracle: pattern Go already accepted failed to re-parse: " + err.Error())
+		return "", false
 	}
-	return parsed.String()
+	rt := parsed.String()
+	again, err := syntax.Parse(rt, syntax.Perl)
+	if err != nil || !again.Equal(parsed) {
+		return "", false
+	}
+	return rt, true
+}
+
+// mustOracleBody is oracleBody for the call sites that have no way to skip.
+func mustOracleBody(pat string) string {
+	body, ok := oracleBody(pat)
+	if !ok {
+		panic("oracle: no safe embedding for " + strconv.Quote(pat) +
+			" — skipPattern is supposed to have rejected it")
+	}
+	return body
 }
 
 // probeCache memoises the `\A.{p}(?:pat)` probes matchesAt builds.
@@ -258,7 +298,7 @@ func probeFor(pat string, p int) *regexp.Regexp {
 	if len(probeCache) >= probeCacheMax {
 		probeCache = make(map[string]*regexp.Regexp, probeCacheMax)
 	}
-	re := regexp.MustCompile(`\A` + dotPrefix(p) + `(?:` + normalizeForOracle(pat) + `)`)
+	re := regexp.MustCompile(`\A` + dotPrefix(p) + `(?:` + mustOracleBody(pat) + `)`)
 	probeCache[key] = re
 	return re
 }
@@ -332,11 +372,12 @@ var capCases = []struct {
 // BACKTRACKING engine takes the bitmap form at ANY width: Backtracking can
 // answer "unknown" (abi.BTStackOverflow) and the narrow form's i64 return IS
 // the mask, so there is nowhere to put that. Two routes put a member there —
-// one over max_fallback_states, and, since bug 77's fix, any member whose
+// one over max_fallback_states, and, since boundary-ambiguity routing was
+// added, any member whose
 // `\b`/`\B`/`(?m:$)` branch a DFA cannot keep in priority order. The second
 // needs two instructions (`\B|`), so a TWO-pattern set can be wide. Keying on
 // `npat <= 64` therefore passed two arguments to a three-argument export and
-// died before comparing anything (FUZZER_BUGS bug 82). tools/settest reads the
+// died before comparing anything. tools/settest reads the
 // form this way for the same reason.
 func (r *capRunner) allIDs(t *testing.T, fn string, args ...interface{}) []int {
 	t.Helper()
@@ -612,7 +653,10 @@ func FuzzSetCaps(f *testing.F) {
 		r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
 		n := int32(len(input))
 
-		wantAnchored := oracleAnchored(pats, input, dropped)
+		// The anchored oracle gets the ANCHORED scope and the two below get the
+		// global one: a pattern the anchored packer alone refused is gone from
+		// match_any/match_all and still live for scan and find.
+		wantAnchored := oracleAnchored(pats, input, dropped.anchored)
 		gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
 		if len(wantAnchored) == 0 {
 			if gotAny != -1 {
@@ -628,9 +672,9 @@ func FuzzSetCaps(f *testing.F) {
 
 		for from := 0; from <= len(input); from++ {
 			f32 := int32(from)
-			wantPos, _ := oracleFirstPosition(pats, input, from, dropped)
+			wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
 
-			wantScanAll := oracleScanAll(pats, input, from, dropped)
+			wantScanAll := oracleScanAll(pats, input, from, dropped.all)
 
 			// See site 1: a bare id, checked against the anywhere-set.
 			gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
@@ -2970,8 +3014,11 @@ func TestTwoPhaseMixedSets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			if len(dropped) != 0 {
-				t.Fatalf("patterns dropped: %v", dropped)
+			// anchored is the WIDER scope (it contains all), so this rejects a
+			// drop of either kind — which is what this test wants: its
+			// expectations assume every pattern is in the set.
+			if len(dropped.anchored) != 0 {
+				t.Fatalf("patterns dropped: %v", dropped.anchored)
 			}
 			res := make([]*regexp.Regexp, len(tc.pats))
 			for i, p := range tc.pats {
@@ -3633,5 +3680,105 @@ func TestAnchoredBatchDoesNotRepeat(t *testing.T) {
 			t.Errorf("%q on %q via find_batch: got %s want %s (n=%d)",
 				c.pat, c.input, fmtSpans(got), fmtSpans(want), n)
 		}
+	}
+}
+
+// TestOracleBodyPreservesLanguage pins that the oracle embeds the language the
+// caller asked about.
+//
+// Every whole-input oracle in this package embeds the pattern in a wrapper, and
+// it used to re-serialise it first (syntax.Parse(pat).String()) to defuse `\Q`.
+// That re-serialisation is not language-preserving: Go's factor() decides two
+// alternation branches share a leading character class with (*Regexp).Equal,
+// which compares OpLiteral nodes on Rune alone and ignores Flags&FoldCase. The
+// printed form of `B$|b|B` is `B$|[Bb]` — the parser folds `b|B` into one
+// case-insensitive literal — and THAT re-parses as `B(?:$|)`, which never
+// matches "b". FuzzSetCaps then reported `match_any = 1, want -1` against a
+// module that was right.
+func TestOracleBodyPreservesLanguage(t *testing.T) {
+	// Inputs chosen to separate the languages: "b" is what the fold-losing
+	// form stops matching, and "B" is what it keeps, so a test that checked
+	// only "B" would pass against the bug.
+	inputs := []string{"", "b", "B", "bB", "Bb", "xb", "b "}
+
+	for _, pat := range []string{
+		`B$|b|B`, // the crasher's own pattern
+		`b|B$|B`,
+		`B$|b`,
+		`B|b|B$`,
+		// Shapes with nothing to do with folding, so the raw-preferred path is
+		// exercised beyond the one family.
+		`a|ab`, `foo|foobar`, `(?:a|ab)c`, `\bcat\b`, `(?m:^)a`, `a*`, `[^,]+,`,
+	} {
+		body, ok := oracleBody(pat)
+		if !ok {
+			t.Errorf("oracleBody(%q): not embeddable, want embeddable", pat)
+			continue
+		}
+		got := regexp.MustCompile(`\A(?:` + body + `)\z`)
+		// The wrapper is full-consumption, so the comparison is against a
+		// full-consumption reading of the pattern itself, not against any match.
+		wantAnchored := regexp.MustCompile(`\A(?:` + pat + `)\z`)
+		for _, in := range inputs {
+			if wantAnchored.MatchString(in) != got.MatchString(in) {
+				t.Errorf("oracleBody(%q) = %q: anchored match of %q is %v, want %v",
+					pat, body, in, got.MatchString(in), wantAnchored.MatchString(in))
+			}
+		}
+	}
+}
+
+// TestOracleBodyDefusesUnterminatedQuote pins the reason the re-serialising
+// fallback is still there: an unterminated `\Q` quotes everything after it,
+// including the wrapper's own closing paren.
+func TestOracleBodyDefusesUnterminatedQuote(t *testing.T) {
+	cases := []struct {
+		pat   string
+		input string
+	}{
+		{`x\Qy`, "xy"},
+		{`a\Q`, "a"},
+		{`\Q`, ""},
+		{`x\Qy)\z|zzz`, `xy)\z|zzz`},
+		// A `\Q` CLOSED by `\E` is self-contained, so it takes the raw path;
+		// included here to show both routes answer alike.
+		{`a\Qb\Ec`, "abc"},
+	}
+	for _, c := range cases {
+		body, ok := oracleBody(c.pat)
+		if !ok {
+			t.Errorf("oracleBody(%q): not embeddable, want embeddable", c.pat)
+			continue
+		}
+		re, err := regexp.Compile(`\A(?:` + body + `)\z`)
+		if err != nil {
+			t.Errorf("oracleBody(%q) = %q: wrapper does not compile: %v", c.pat, body, err)
+			continue
+		}
+		if !re.MatchString(c.input) {
+			t.Errorf("oracleBody(%q) = %q: does not match %q, want a match", c.pat, body, c.input)
+		}
+	}
+}
+
+// TestOracleBodyPrefersTheRawPattern states the ORDER explicitly, because the
+// fix is the order and nothing else: a pattern that embeds as written must be
+// handed back untouched, never re-serialised.
+func TestOracleBodyPrefersTheRawPattern(t *testing.T) {
+	for _, pat := range []string{`B$|b|B`, `a|ab`, `(a)(b)`, `\bx\b`, `a{2,3}`} {
+		body, ok := oracleBody(pat)
+		if !ok || body != pat {
+			t.Errorf("oracleBody(%q) = %q, %v; want the pattern unchanged", pat, body, ok)
+		}
+	}
+	// And the round-trip it replaced really does change this one's language,
+	// so the test above is not passing by accident.
+	parsed, err := syntax.Parse(`B$|b|B`, syntax.Perl)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if regexp.MustCompile(`\A(?:` + parsed.String() + `)\z`).MatchString("b") {
+		t.Skip("Go no longer mis-factors the re-serialised form — the upstream cause is fixed, " +
+			"and the raw-preferred order is now belt and braces")
 	}
 }

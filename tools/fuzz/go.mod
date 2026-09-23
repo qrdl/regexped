@@ -1,6 +1,6 @@
 module github.com/qrdl/regexped/tools/fuzz
 
-go 1.25.9
+go 1.26
 
 replace github.com/qrdl/regexped => ../../
 
@@ -9,4 +9,4 @@ require (
 	github.com/qrdl/regexped v0.0.0-00010101000000-000000000000
 )
 
-require github.com/goccy/go-yaml v1.19.2 // indirect
+require github.com/goccy/go-yaml v1.19.2

@@ -252,7 +252,7 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Used for:** `groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
 
-**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's compile-time stack (plus its bitset, where it needs one); a call that outgrows either is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
+**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's compile-time stack; a call that outgrows it is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
 
 ### How it works
 
@@ -268,15 +268,15 @@ The fast body's backtrack stack is sized **at compile time**:
 
 ```
 maxFrames = max(numAlts × 4096, 4096)      # numAlts = InstAlt count in the NFA
-frameSize = 4 + numGroups × 2 × 4 + 4      # + 4 per loop_pos/loop_entry tracker
+frameSize = 4 + numGroups × 2 × 4 + 4      # pos, capture slots, retry PC
 stackSize = maxFrames × frameSize
 ```
 
 The real requirement, however, scales with **input length**: a pattern that leaves one live backtrack frame per input byte exhausts a `numAlts × 4096` budget once the input passes that many bytes. So the ceiling is a function of the input, not just the pattern, and no compile-time check can predict it.
 
-When that stack runs out, the fast body does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body, whose stack grows with the input (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff` still stops at this ceiling.
+When that stack runs out, the fast body does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body, whose stack grows with the input (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff`, a test knob, still stops at this ceiling.
 
-The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, or a lower limit the host set), or, with the budget off, a compile-time region ran out. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
+The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, or a lower limit the host set), or, with the budget off, the compile-time stack ran out. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
 
 | value | meaning |
 |---|---|
@@ -326,66 +326,19 @@ Every construction site that can route to Backtracking — the no-capture find/m
 
 ### BitState memoization
 
-Memoization is only enabled when the pattern contains a **non-greedy loop whose body can match zero bytes** — the condition checked by `needsBitState`. Patterns like `(a+)*` or `(?:b*)*` do not need it; patterns like `(?:(?:(a){0,})*?)` do, because the inner loop body can succeed without consuming input, causing the engine to revisit the same `(state, position)` pair infinitely.
+Only the [fallback body](#work-budget-and-the-fallback-body) memoises. At every alternation it checks a `(pc, pos)` visited bitset: if the bit is already set, the current thread is discarded — it cannot produce a new result; otherwise the bit is set and execution continues. Each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen). The bitset is sized from the input at call time — see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from) — so it has no compile-time ceiling.
 
-When enabled, before executing a non-greedy loop head (`InstAlt` with a backward edge), the engine checks a `(pc, pos)` visited bitset stored in WASM linear memory immediately after the backtrack stack:
+A find body shares its marks across the attempts of one call: it tracks no captures, so a `(pc, pos)` that failed from one start position fails from every start position. Its memo is rebased onto `from`, so a host iterating a long buffer pays for the remainder being searched, not for the whole buffer. A capture body cannot share them — its state includes the capture registers.
 
-```
-bitIndex  = pos * numInstructions + pc
-byteAddr  = memoTableBase + bitIndex / 8
-bit       = 1 << (bitIndex & 7)
-```
-
-If the bit is already set, the current thread is discarded — it cannot produce a new result. Otherwise the bit is set and execution continues. This guarantees each `(pc, pos)` pair is visited at most once, bounding runtime to O(numInstructions × inputLen).
-
-The index is **position-major**: all `numInstructions` bits belonging to one input position are adjacent. That is what keeps the clear cheap. The bytes a single search dirties are then one contiguous run from the base of the bitset, and each call zeroes exactly the run the previous call recorded in a 4-byte header word stored immediately below the bitset — rather than a region sized from the input. For a body called once per candidate position (a set's Backtracking bucket) an input-sized clear made the whole scan quadratic; this makes it linear.
-
-In the fast body the bitset's addressable size is `ceil(numInstructions × (inputLen + 1) / 8)` bytes, bounded by the actual input length, while the region reserved for it is a compile-time 128 KB. The two therefore meet at a ceiling:
-
-```
-maxInputLen = 128 KB × 8 / numInstructions − 1
-```
-
-An input longer than that cannot be memoised in the space reserved, so the fast body hands the call to its [fallback body](#work-budget-and-the-fallback-body), which sizes its own bitset from the input, instead of running the fill past its region. With `compile.BTWorkBudgetOff` it reports `-2` (the same "resource exhausted, answer unknown" sentinel as a backtrack-stack overflow) instead. The ceiling scales inversely with the pattern's instruction count: a 25-instruction pattern memoises inputs up to about 42 KB in the fast body, a 250-instruction one about 4 KB.
-
-The two ceilings — this one and the frame stack — move independently, with `numInstructions` and with `numAlts` respectively, so either can be the one a given pattern and input hits first.
-
-#### What the ceiling is measured against
-
-Past the ceiling the fast body hands over (or, with the budget off, answers `-2`,
-which means *the engine did not finish*, never *no match*). Which **length** is
-compared against the ceiling differs per body, because each searches a different
-span:
-
-| Body | Length compared against the ceiling |
-|---|---|
-| Anchored `match` | The whole input. |
-| Non-anchored `find` | The **remainder**, `len − from`. The memo is rebased onto `from`, so a host iterating a long buffer keeps getting answers as `from` advances. |
-| `groups` capture body | The narrowed match extent, or in window mode the window's own length — not the whole input. |
-| A set's Backtracking bucket | The span from the candidate position to the end of the input. This is the one case where a long input can pass the ceiling at every candidate; it is bounded by the input, not by the match. |
-
-Two further properties are worth relying on:
-
-* The check happens at the head of the **first attempt**, not at the head of the
-  call. A call whose prefilter finds no candidate — no mandatory literal
-  anywhere, or no byte that can begin a match — answers `-1` without ever
-  consulting the memo, however long the input is.
-* Only patterns that need memoisation in the fast body are affected.
-  `needsBitState` is narrow: a non-greedy loop whose body can match zero bytes.
-  The [fallback body](#work-budget-and-the-fallback-body) memoises every
-  program, but reserves nothing at compile time and has no such ceiling.
-
-The levers on how often a call crosses the ceiling are the pattern's instruction
-count (the ceiling scales inversely with it) and `CompileOptions.MemoBudget`,
-which is not reachable from YAML.
+The ordinary (fast) body memoises nothing and carries **no loop guard**. It runs only programs without a zero-width cycle: in such a program every cycle consumes a byte, so a search terminates without one, and a `(pc, pos)` is reached again only after its first visit has failed. A program that can go round a cycle without consuming a byte — a loop whose body can match zero bytes, such as `(?:(?:(a){0,})*?)` — has no ordinary body at all (see below).
 
 **Memory layout:**
 ```
-[DFA find tables] → [backtrack stack] → [4-byte dirty header] → [BitState memo bitset]
+[DFA find tables] → [backtrack stack]
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region. The fallback body's run-time memory lies outside all of them; see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from).
 
-**Thread safety:** the memo bitset is allocated at a fixed compile-time address, and the fallback's scratch is found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
+**Thread safety:** the backtrack stack is allocated at a fixed compile-time address, and the fallback's scratch is found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
 
 ### Work budget and the fallback body
 
@@ -395,18 +348,8 @@ split before it fails. Two measured shapes: `^(\w*|)*c` — a loop whose body ca
 match empty through an alternation branch — over word characters with no `c`
 took 3 ms at 12 bytes, 783 ms at 22, and never returned at 40; `^(aa|a)*b` —
 overlapping branches in a loop whose body always consumes — took 238 ms over
-`a`×32 and never returned at 40. Neither existing bound stops them:
-
-* the zero-progress guard does not fire, because every iteration DOES consume
-  bytes;
-* the frame budget is not exhausted, because the stack is popped as the search
-  goes;
-* BitState memoization cannot simply be switched on for the loop. The
-  zero-progress guard works by noticing a SECOND arrival at the same
-  `(pc, pos)`; a visited bitset forbids that arrival. With both in place,
-  `(?:a*|b*)*` over `"b"` answers `end=1` instead of `end=0`: the memo cuts the
-  revisit the guard was waiting for, and control falls through to the
-  lower-priority `b*` branch.
+`a`×32 and never returned at 40. The frame stack does not stop them: it is
+popped as the search goes, so it is never exhausted.
 
 **How it is bounded.** Every Backtracking program is emitted as TWO functions
 (with one exception, below):
@@ -417,15 +360,13 @@ overlapping branches in a loop whose body always consumes — took 238 ms over
    runs in window mode. A call that never backtracks pays nothing for it.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
-   compile-time frame stack or memo runs out, which arms the counter to trip on
-   the next pop or calls the fallback directly. It is the same emitter over the
-   same program with no loop heads, no loop trackers and a `(pc, pos)` visited
+   compile-time frame stack runs out, which arms the counter to trip on the next
+   pop. It is the same emitter over the same program with a `(pc, pos)` visited
    bitset at EVERY alternation — Go `regexp`'s bitstate discipline. It restarts
    the call from scratch on the caller's own arguments and globals, and sizes
    its own frame stack and bitset from the input at call time.
 
-Why the fallback is correct: without the loop trackers, `(pc, pos)` is the
-program's complete state — the NFA has no return addresses — so the first
+Why the fallback is correct: `(pc, pos)` is the program's complete state — the NFA has no return addresses — so the first
 arrival at a `(pc, pos)` explores every path out of it in priority order. If one
 succeeds the call returns; so a second arrival can only follow a first that
 failed, and cutting it loses nothing. Checking only at alternations is enough:
@@ -436,32 +377,38 @@ given position at most once per call.
 **A program with a zero-width cycle gets no ordinary body.** If the program can
 go round a cycle without consuming a byte — `^(\w*|)*c`, `(a*?)*?b`, anything
 whose loop body can match empty — its fast body is nothing but the tail call,
-so the fallback answers every call. The loop trackers that let the ordinary body
-cope with such a cycle only approximate Go's rule that a second arrival at an
-occupied `(pc, pos)` is dropped, and the approximation is wrong on a whole
-class: `(a*?)*?b` over `aab` reported group 1 as `1-2` where Go says `0-2`,
+so the fallback answers every call, under every budget setting,
+`compile.BTWorkBudgetOff` included: the ordinary body has no loop guard, so it
+could go round such a cycle forever. It used to carry per-loop zero-progress
+trackers for these programs instead. They only approximated Go's rule that a
+second arrival at an occupied `(pc, pos)` is dropped, and the approximation was
+wrong on a whole class: `(a*?)*?b` over `aab` reported group 1 as `1-2` where Go says `0-2`,
 because the outer loop's empty iteration re-entered the inner star
 at position 1 and queued a second attempt ahead of the first. A differential
 against Go found the ordinary body wrong on 306 of 3,072 systematic nestings and
 159 of 12,000 random nested patterns, every one with such a cycle; the fallback
-was right on all of them. Without such a cycle a `(pc, pos)` is reached again
-only after its first visit has failed, so the ordinary body is exact.
+was right on all of them. On every other program the trackers could never
+change an answer — without such a cycle a `(pc, pos)` is reached again only
+after its first visit has failed — and they were deleted. On `tools/perftest`'s
+Backtracking rows that took 0.7–5.3% off the fuel of the four measurements that
+moved and 38–213 bytes off four modules; the other rows did not change.
 
-Why counting pops bounds time: every loop iteration passes through an
-alternation, which either pushes a frame or takes a guard exit, and a guard exit
-cannot repeat without a pop in between. At most `numInstructions × (loops + 1)`
-instructions separate two push or pop events, so a fast call does linear work
-before it either finishes or trips.
+Why counting pops bounds time: every cycle in the program passes through an
+alternation, and in the fast body every alternation pushes a frame, so at most
+`numInstructions` instructions separate two push or pop events and a fast call
+does linear work before it either finishes or trips.
 
 **Why every program, not just the empty-body loop.** The budget was first given
 only to programs with an empty-body loop, on the premise that the zero-progress
-guard bounds every other one. `^(aa|a)*b` refuted that: it selects Backtracking
+guard the ordinary body then carried bounded every other one. `^(aa|a)*b` refuted that: it selects Backtracking
 (the branches overlap, so TDFA is ineligible), its loop body always consumes a
 byte, and it hung. No syntactic rule for "can blow up" is known to be complete,
 so there is none. With the budget it answers in about 60 µs over `a`×40.
 
-**What it costs** (`groups_func`, standalone; "off" is the same program compiled
-with `compile.BTWorkBudgetOff`, the bytes from before the budget existed).
+**What it costs** (`groups_func`, standalone; measured when the budget was
+introduced, while the ordinary body still carried its loop trackers — "off" is
+the same program compiled with the budget off, which then gave every program,
+`^(\w*|)*c` included, the ordinary body alone).
 
 `^(aa|a)*b` has no zero-width cycle, so it keeps its ordinary body and the
 budget:
@@ -476,7 +423,8 @@ budget:
 | same call, fallback body alone | — | 318 fuel/byte |
 | matching call, `a`×16,378 + `b` (fast stack full) | `-2` | 132 fuel/byte, answered, +576 KB memory |
 
-`^(\w*|)*c` has one, so every budgeted build answers it with the fallback alone:
+`^(\w*|)*c` has one, so every build now answers it with the fallback alone —
+the "off" column below is the ordinary body it no longer has:
 
 | | off | on |
 |---|---|---|
@@ -551,7 +499,8 @@ the host has set a lower limit.
 **Knobs.** `CompileOptions.BTWorkBudget` and `CompileSetOptions.BTWorkBudget`,
 neither reachable from YAML: `0` is the default multiplier of 8, a positive
 value replaces it, `compile.BTWorkBudgetOff` emits neither counter nor fallback
-(the bytes from before the budget existed), and
+— the ordinary body alone, which is how tests drive it by itself; a program
+with a zero-width cycle still gets the fallback alone — and
 `compile.BTWorkBudgetForceFallback` reduces every fast body to the bare tail
 call, so the fallback alone answers — sizing its memory at call time on every
 call.

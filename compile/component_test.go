@@ -657,9 +657,12 @@ func TestSetComponentMixedWithPatterns(t *testing.T) {
 	cfg := setComponentCfg(3)
 	cfg.Regexps[0].MatchFunc = "token_match"
 	cfg.Regexps[1].FindFunc = "token_find"
+	// Not a set member: a groups_func entry is dropped from every set.
+	cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Pattern: `(\w+)=(\d+)`, GroupsFunc: "token_groups"})
 	names := map[string]string{
-		"token_match": "regexped:t/matcher#token-match",
-		"token_find":  "regexped:t/matcher#token-find",
+		"token_match":  "regexped:t/matcher#token-match",
+		"token_find":   "regexped:t/matcher#token-find",
+		"token_groups": "regexped:t/matcher#token-groups",
 	}
 	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, setComponentNames("s"), nil)
 	if err != nil {
@@ -673,6 +676,7 @@ func TestSetComponentMixedWithPatterns(t *testing.T) {
 		"regexped:t/matcher#token-match",
 		"cabi_post_regexped:t/matcher#token-match",
 		"regexped:t/matcher#token-find",
+		"regexped:t/matcher#token-groups",
 		"regexped:t/sets#any-hit",
 		"regexped:t/sets#[constructor]scan-it",
 	} {

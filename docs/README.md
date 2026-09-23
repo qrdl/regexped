@@ -35,7 +35,7 @@ cd regexped
 go build -o regexped .
 ```
 
-Building from source needs Go 1.25 or newer.
+Building from source needs Go 1.26 or newer.
 
 **External tools.** `regexped` shells out to three tools, each only where it is
 needed. A core-module `compile` and every `generate` need none of them.
@@ -134,7 +134,7 @@ See [`examples/README.md`](../examples/README.md) for more details, including wh
 ## Limitations
 
 - **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
-- **Re-entrant, not thread-safe** — every stub keeps its per-scan state with the caller (a caller-owned scanner in C, inside the iterator in Rust, Go and AssemblyScript, a per-call region in JS and TS), so two scans can be in flight at once on one thread. The module itself is not thread-safe in any language: the Backtracking engine keeps its frame stack and BitState memo at fixed addresses in the module's memory, and the find-from position travels to the body through a module-level global. Use one module instance per thread.
+- **Re-entrant, not thread-safe** — every stub keeps its per-scan state with the caller (a caller-owned scanner in C, inside the iterator in Rust, Go and AssemblyScript, a per-call region in JS and TS), so two scans can be in flight at once on one thread. The module itself is not thread-safe in any language: the Backtracking engine keeps its frame stack at a fixed address in the module's memory and its fallback body's memo in scratch found through module globals, and the find-from position travels to the body through a module-level global. Use one module instance per thread.
 
 ## Dependencies
 

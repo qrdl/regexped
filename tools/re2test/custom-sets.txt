@@ -1729,3 +1729,128 @@ regexps
 -;1-3;-;-;1-3
 -;3-4;-;-;3-4,4-5
 -;3-4;-;-;3-4,4-5,5-6
+# ============================================================
+# Category S-fold: a set member whose branches collapse into a fold-cased
+# literal.
+#
+# The live set oracle re-serialised each pattern before embedding it in its
+# `\A(?:pat)\z` probe, and `B$|b|B` does not survive that round-trip: it
+# re-parses as `B(?:$|)` and stops matching "b", so the oracle expected no
+# anchored match where the module correctly reported one.
+# ============================================================
+SetFoldAltBranch
+strings
+""
+"b"
+"B"
+"bB"
+"0b"
+regexps
+"0"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-1;-;-;0-1
+"B$|b|B"
+-;-;-;-;-
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2
+-;1-2;-;-;1-2
+# ============================================================
+# Category S-boundary-priority: a pending \b/\B/(?m:$) ahead of Match must
+# block a set member's immediate accept.
+#
+# A set bucket's DFA marks a state immediately-accepting for pattern k once
+# k's Match comes before any of k's live threads in priority order, and the
+# body then stops that member's scan. A pending boundary assertion IS a live
+# thread: it resolves on the next byte and may go on consuming. In
+# `a?\B\w|.|\w*\B` over "ab", branch 1 (`a`, `\B` between the letters, `\w`
+# takes `b`) outranks the `.` branch's Match after "a", so the answer at 0 is
+# 0-2; stopping at the first Match gave 0-1. The single-pattern DFA already
+# treated these assertions as blockers; the set path did not. Expectations
+# generated from Go.
+# ============================================================
+SetBoundaryPendingBlocksImmediateAccept
+strings
+""
+"ab"
+"ab\ncd"
+"aa0"
+"a0 b1\n"
+"b"
+"a b"
+regexps
+"a?\\B\\w|.|\\w*\\B"
+0-0;0-0;-;-;0-0
+0-2;0-2;-;-;0-2
+-;0-2;-;-;0-2,3-4,4-5
+-;0-2;-;-;0-2,2-3
+-;0-2;-;-;0-2,2-3,3-4,4-5,6-6
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,1-2,2-3
+"(?:a\\B\\s?|0*)+\\w"
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;0-2;-;-;0-2,3-4,4-5
+0-3;0-3;-;-;0-3
+-;0-2;-;-;0-2,3-4,4-5
+0-1;0-1;-;-;0-1
+-;0-1;-;-;0-1,2-3
+# ============================================================
+# Category S-begin-line: a set member's (?m:^) next to a '\n'.
+#
+# Each pattern needs (?m:^) to hold beside a '\n' in or just before the match:
+# after a '\n' the match consumed, at start of text ahead of a '\n' the match
+# then consumes, or after the '\n' preceding the match. Every one was
+# answered correctly as a single pattern and not at all as a set member.
+# Expectations generated from Go.
+# ============================================================
+SetBeginLineAcrossNewline
+strings
+""
+"0\n0"
+"\n0"
+"\n "
+"0a1 x\n00 a"
+"a\n0"
+"x\n\n0 "
+"\n\n0a a"
+regexps
+"\\w\\W(?m:^)0\\b"
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-3;0-3;-;-;0-3
+-;-;-;-;-
+-;-;-;-;-
+"(?m:^)(?:\\W|1)0(?:\\d| |\\b)"
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;2-5;-;-;2-5
+-;-;-;-;-
+"(?:\\b)*(?m:^)[^0] (?:(?m:^)){0,2}"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?m:^)[a0]\\w a(?m:$)"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;6-10;-;-;6-10
+-;-;-;-;-
+-;-;-;-;-
+-;2-6;-;-;2-6

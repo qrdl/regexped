@@ -43,23 +43,15 @@ type dfa struct {
 	// midAcceptingNW/W/NL where the boundary assertion resolves to a Match at
 	// STRICTLY HIGHER priority than whatever the state's own ctx=0 midAccept
 	// would resolve to (see boundaryOutranksCtx0), while NOT being dominant.
-	// Every find-mode DFA/CompiledDFA scan-loop body's ctx=0 midAccept check
-	// is unconditional — it has no priority concept at all, so on a
-	// self-looping state it will happily let a LATER, lower-priority ctx=0
-	// hit overwrite an earlier, correctly-recorded higher-priority boundary
-	// hit (repro: `0*\b|0*` on "01", expected [0,0), got [0,1)). Patching
-	// that unconditional-overwrite defect would require touching every
-	// find-mode scan-loop shape in this file (five distinct WASM emission
-	// functions, each with independent local layouts) — evaluated and
-	// rejected as disproportionately invasive for how narrow this pattern
-	// family is. Instead, this flag is consulted only by
-	// dfaHasOutrankedState, a compile-time-only gate (see compile.go's
-	// dfaTooLarge) that routes affected patterns to the Backtracking engine,
-	// which resolves priority via genuine backtracking and has no equivalent
-	// defect. It is still tracked as a minimizeDFA/set.go-signature-relevant
-	// per-state flag (mirroring Dominant) purely so minimization doesn't
-	// merge two states whose only difference is this flag — that would
-	// silently make the gate's answer depend on minimization order.
+	// Read only through dfaHasOutrankedState, whose one remaining caller is
+	// the lenient alternation's per-branch refusal: its inline verify walks a
+	// branch keeping the LAST mid-accept it sees, which cannot express this
+	// priority. The generic find path no longer routes on it — see the
+	// comment above compile.go's dfaTooLarge for why. It is still tracked as
+	// a minimizeDFA/set.go-signature-relevant per-state flag (mirroring
+	// Dominant) purely so minimization doesn't merge two states whose only
+	// difference is this flag — that would silently make the refusal's
+	// answer depend on minimization order.
 	midAcceptingNWOutranked map[int]uint64
 	midAcceptingWOutranked  map[int]uint64
 	midAcceptingNLOutranked map[int]uint64
@@ -70,8 +62,7 @@ type dfa struct {
 	// work item's NFA set to a higher-priority position — see
 	// nfaBoundaryTargetIsAmbiguous's doc comment for the full mechanism.
 	// Compile-time only; consulted by dfaHasAmbiguousBoundaryTarget to route
-	// affected patterns to Backtracking, mirroring dfaHasOutrankedState's
-	// established precedent.
+	// affected patterns to Backtracking.
 	hasAmbiguousBoundaryTarget bool
 
 	// transitions[state*256 + byte] = nextState (-1 = no transition)
@@ -127,6 +118,14 @@ func (d *dfa) Type() EngineType {
 // `\b0|` vs "0": \b0 is still alive, but the pruned closure only shows the
 // empty branch's Match). So an unresolved \b/\B assertion found ahead of
 // Match must block immediate-accept, the same as a live byte-consumer would.
+//
+// (?m:$) is in the same position: the closure never resolves it either
+// (ecEndLine is only known once the next byte is '\n'), and the thread behind
+// it may go on consuming. Leaving it out made `(?:(?m:$)\s)+` over "\n\n"
+// stop at the first Match and answer 0-1,1-2 instead of 0-2. The other
+// pending assertions cannot outlive this position: `^`/`\A`/(?m:^) are
+// decided by what precedes it, already known here, and `$`/`\z` only resolve
+// at end of text, where no thread consumes anything further.
 func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 	for _, pc := range states {
 		switch prog.Inst[pc].Op {
@@ -136,8 +135,8 @@ func isImmediateAccepting(states []uint32, prog *syntax.Prog) bool {
 			syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 			return false // byte consumer before match -> not immediate
 		case syntax.InstEmptyWidth:
-			if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary) != 0 {
-				return false // pending \b/\B: not yet resolvable here, treat as a live blocker
+			if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary|syntax.EmptyEndLine) != 0 {
+				return false // pending \b/\B/(?m:$): not yet resolvable here, treat as a live blocker
 			}
 		}
 	}
@@ -541,8 +540,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // detector instead identifies the narrow set of patterns where the defect is
 // live, so dfaHasAmbiguousBoundaryTarget can route them to Backtracking,
 // which resolves priority via genuine backtracking and has no equivalent
-// defect — the same precedent dfaHasOutrankedState
-// already established for a sibling blind spot.
+// defect.
 func nfaBoundaryTargetIsAmbiguous(prog *syntax.Prog, closedSet []uint32, baseCtx, wbCtx int, leftmostFirst bool) bool {
 	origIndex := make(map[uint32]int, len(closedSet))
 	for i, s := range closedSet {
@@ -1147,10 +1145,11 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// outranking means anything. A table built leftmost-LONGEST has no
 		// priority to speak of, so a dominance mark on one is a verdict the
 		// automaton cannot support, and a reader acting on it stops the walk
-		// early on a thread that was never beaten. That is bug 81: the lenient
-		// alternation's anchored-match body builds its per-branch helper DFAs
-		// leftmost-longest on purpose (see analyseLitChainAltLenient's
-		// leftmostFirst parameter and bug 35), and `0$0|-(\b|0)` over "-0"
+		// early on a thread that was never beaten. That is the defect this guard
+		// exists for: the lenient alternation's anchored-match body builds its
+		// per-branch helper DFAs leftmost-longest on purpose (see
+		// analyseLitChainAltLenient's leftmostFirst parameter), and
+		// `0$0|-(\b|0)` over "-0"
 		// answered "no match" because the `\b` branch's accept was marked
 		// dominant and cut off the thread that would have consumed the rest.
 		if !leftmostFirst {
@@ -1396,102 +1395,82 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// Mid-string start state (prev=word): used when attempt_start > 0 and prev byte was a word char.
 	// Same NFA set as midStart but different prevWasWord context → different DFA state.
 	midStartWordKey := setToKey(midStartSet, true, nfaAcceptBits(midStartSet))
-	// Same collision guard as midStart above: don't
-	// trust a raw key match unless the found id's recorded accept value
-	// already agrees with what midStartWord is rightfully entitled to.
+	// Always a new state: its key carries the 'W' suffix, and the only states
+	// that exist yet — start and midStart — were keyed without it, so there
+	// is nothing to reuse (a reuse arm here was unreachable).
 	midStartWordRightfulAccept := acceptBitsFor(midStartSet, ecEnd|ecWordBoundary)
-	if id, exists := stateMap[midStartWordKey]; exists && dfa.accepting[id] == midStartWordRightfulAccept {
-		dfa.midStartWord = id
-		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
-			bits := nfaAcceptBits(midStartSet)
-			if bits == 0 {
-				bits = 1
-			}
-			dfa.immediateAccepting[dfa.midStartWord] |= bits
-		}
-	} else {
-		dfa.midStartWord = nextStateID
-		stateMap[midStartWordKey] = nextStateID
-		nextStateID++
-		// midStartWord is prevWasWord=true: end-of-input → \b fires
-		orAccept(dfa.accepting, dfa.midStartWord, midStartWordRightfulAccept)
-		orAccept(dfa.midAccepting, dfa.midStartWord, acceptBitsFor(midStartSet, 0))
-		recordWideSet(dfa.midStartWord, midStartSet, 0, ecEnd|ecWordBoundary)
-		// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
-		orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
-		markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
-		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary)
-		// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
-		orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
-		markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
-		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, 0, ecNoWordBoundary)
-		// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
-		if dfa.hasNewlineBoundary {
-			orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
-			markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
-			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary|ecEndLine)
-		}
-		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
-			bits := nfaAcceptBits(midStartSet)
-			if bits == 0 {
-				bits = 1
-			}
-			dfa.immediateAccepting[dfa.midStartWord] |= bits
-		}
-		queue = append(queue, workItem{dfaState: dfa.midStartWord, nfaSet: midStartSet, prevWasWord: true})
+	dfa.midStartWord = nextStateID
+	stateMap[midStartWordKey] = nextStateID
+	nextStateID++
+	// midStartWord is prevWasWord=true: end-of-input → \b fires
+	orAccept(dfa.accepting, dfa.midStartWord, midStartWordRightfulAccept)
+	orAccept(dfa.midAccepting, dfa.midStartWord, acceptBitsFor(midStartSet, 0))
+	recordWideSet(dfa.midStartWord, midStartSet, 0, ecEnd|ecWordBoundary)
+	// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
+	orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
+	markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
+	markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary)
+	// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
+	orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
+	markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
+	markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, 0, ecNoWordBoundary)
+	// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
+	if dfa.hasNewlineBoundary {
+		orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
+		markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
+		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary|ecEndLine)
 	}
+	if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
+		bits := nfaAcceptBits(midStartSet)
+		if bits == 0 {
+			bits = 1
+		}
+		dfa.immediateAccepting[dfa.midStartWord] |= bits
+	}
+	queue = append(queue, workItem{dfaState: dfa.midStartWord, nfaSet: midStartSet, prevWasWord: true})
 
 	// Mid-string start state (prev=newline): used when attempt_start > 0 and prev byte was '\n'.
 	// NFA set uses ecBeginLine context so (?m:^) assertions fire.
 	if dfa.hasNewlineBoundary {
 		midStartNewlineSet := epsilonClosure([]uint32{uint32(prog.Start)}, ecBeginLine)
 		midStartNewlineKey := setToKey(midStartNewlineSet, false, nfaAcceptBits(midStartNewlineSet), true) // prevWasWord=false, prevWasNewline=true
-		// Same collision guard as midStart above.
+		// Always a new state: its key carries the 'N' suffix, which no state
+		// built so far (start, midStart, midStartWord) has, so there is nothing
+		// to reuse (a reuse arm here was unreachable).
 		// ecBeginLine is unconditionally true for this bootstrap state (it's the
 		// "restart after a \n" context), so it must be OR'd into every context
 		// below — a pending ^-flavored node from the initial closure (line 963)
 		// can gate a nested $ check that would otherwise never resolve.
 		midStartNewlineRightfulAccept := acceptBitsFor(midStartNewlineSet, ecBeginLine|ecEnd|ecNoWordBoundary)
-		if id, exists := stateMap[midStartNewlineKey]; exists && dfa.accepting[id] == midStartNewlineRightfulAccept {
-			dfa.midStartNewline = id
-			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
-				bits := nfaAcceptBits(midStartNewlineSet)
-				if bits == 0 {
-					bits = 1
-				}
-				dfa.immediateAccepting[dfa.midStartNewline] |= bits
+		dfa.midStartNewline = nextStateID
+		stateMap[midStartNewlineKey] = nextStateID
+		nextStateID++
+		// midStartNewline is prevWasNewline=true: ecBeginLine fires, ecNoWordBoundary fires (newline is non-word).
+		orAccept(dfa.accepting, dfa.midStartNewline, midStartNewlineRightfulAccept)
+		orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
+		// Unreachable on today's sparse path — promoteSparseBuckets refuses
+		// (?m) patterns — but a bootstrap state without its wide lists is
+		// precisely the defect above, so it is not left for the next person
+		// who relaxes that refusal.
+		recordWideSet(dfa.midStartNewline, midStartNewlineSet, 0, ecBeginLine|ecEnd|ecNoWordBoundary)
+		orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
+		markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
+		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
+		orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecWordBoundary))
+		markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
+		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecWordBoundary)
+		// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
+		orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine))
+		markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
+		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
+		if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
+			bits := nfaAcceptBits(midStartNewlineSet)
+			if bits == 0 {
+				bits = 1
 			}
-		} else {
-			dfa.midStartNewline = nextStateID
-			stateMap[midStartNewlineKey] = nextStateID
-			nextStateID++
-			// midStartNewline is prevWasNewline=true: ecBeginLine fires, ecNoWordBoundary fires (newline is non-word).
-			orAccept(dfa.accepting, dfa.midStartNewline, midStartNewlineRightfulAccept)
-			orAccept(dfa.midAccepting, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, 0))
-			// Unreachable on today's sparse path — promoteSparseBuckets refuses
-			// (?m) patterns — but a bootstrap state without its wide lists is
-			// precisely the defect above, so it is not left for the next person
-			// who relaxes that refusal.
-			recordWideSet(dfa.midStartNewline, midStartNewlineSet, 0, ecBeginLine|ecEnd|ecNoWordBoundary)
-			orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
-			markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
-			markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
-			orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecWordBoundary))
-			markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
-			markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecWordBoundary)
-			// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
-			orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine))
-			markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
-			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
-			if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
-				bits := nfaAcceptBits(midStartNewlineSet)
-				if bits == 0 {
-					bits = 1
-				}
-				dfa.immediateAccepting[dfa.midStartNewline] |= bits
-			}
-			queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true, beginCtx: ecBeginLine})
+			dfa.immediateAccepting[dfa.midStartNewline] |= bits
 		}
+		queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true, beginCtx: ecBeginLine})
 	} else {
 		// No (?m:^)/(?m:$) in the pattern, so a restart after a '\n' behaves
 		// identically to a restart after any other non-word byte — alias
@@ -1675,6 +1654,14 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 						// appears before any of k's byte-consumers in the priority
 						// ordered NFA set.  Patterns with ongoing byte-consumers
 						// (a+, a*) are NOT marked immediately accepting here.
+						//
+						// A pending \b/\B/(?m:$) counts as one of k's live
+						// threads, for the reason isImmediateAccepting gives:
+						// the closure cannot resolve it, the next byte can, and
+						// the thread behind it may go on consuming. Without it
+						// a set member stopped at a lower-priority Match —
+						// `a?\B\w|.|\w*\B` over "ab" answered 0-1 where the
+						// `\B` branch's 0-2 outranks it.
 						var seenByteConsumers uint64
 						var immBits uint64
 						for _, pc := range nextSet {
@@ -1688,6 +1675,10 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 							case syntax.InstRune, syntax.InstRune1,
 								syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
 								seenByteConsumers |= pkBits
+							case syntax.InstEmptyWidth:
+								if syntax.EmptyOp(prog.Inst[pc].Arg)&(syntax.EmptyWordBoundary|syntax.EmptyNoWordBoundary|syntax.EmptyEndLine) != 0 {
+									seenByteConsumers |= pkBits // pending \b/\B/(?m:$): a live thread of k
+								}
 							}
 						}
 						dfa.immediateAccepting[nextDFAState] |= immBits
@@ -7576,10 +7567,9 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 // (state, channel) — but the check costs nothing and documents the reasoning
 // inline rather than relying on a cross-function invariant holding silently.
 //
-// Compile-time only: called from compile.go's dfaTooLarge decision to route
-// affected find-mode patterns to Backtracking instead of patching the
-// unconditional ctx=0 overwrite in every DFA/CompiledDFA scan-loop shape —
-// see dfa.midAcceptingNWOutranked's comment for the full reasoning.
+// Compile-time only. Its one caller is the lenient alternation's per-branch
+// refusal (emitInlineAnchoredDFAVerify keeps the LAST mid-accept it sees);
+// the generic find path no longer consults it — see dfa.midAcceptingNWOutranked.
 func dfaHasOutrankedState(t *dfaTable) bool {
 	for s := 0; s < t.numStates; s++ {
 		if t.midAcceptNWStatesOutranked[s] != 0 && t.midAcceptNWStatesDominant[s] == 0 {
@@ -7600,8 +7590,7 @@ func dfaHasOutrankedState(t *dfaTable) bool {
 // construction — see dfa.hasAmbiguousBoundaryTarget and
 // nfaBoundaryTargetIsAmbiguous's doc comments for the full mechanism.
 // Compile-time only: called from compile.go's dfaTooLarge decision to route
-// affected find-mode patterns to Backtracking, the same precedent
-// dfaHasOutrankedState established for a sibling blind spot.
+// affected find-mode patterns to Backtracking.
 func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
 	return t.hasAmbiguousBoundaryTarget
 }
@@ -7960,6 +7949,71 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 	return b
 }
 
+// startIsNonMidDominant reports whether any of starts is a NON-mid dominant
+// state, whose midAccept byte is the reserved 254/255 marker rather than an
+// accept. The mandatory-literal prologue needs the `(val-1) u< 253` guard its
+// two siblings have exactly then. No pattern reaches that today — that path
+// needs a literal within 256 bytes of every match, and a start state
+// self-looping on the 9+ bytes a dominant needs admits arbitrarily long runs
+// ahead of it — so the guard is emitted for no current pattern and the output
+// is byte-identical. It is there so that relaxing either limit cannot turn the
+// marker into a silent empty match.
+func startIsNonMidDominant(dominantStates []dominantInfo, starts ...uint32) bool {
+	for _, info := range dominantStates {
+		if info.isMidAccept || info.state < 0 {
+			continue
+		}
+		for _, s := range starts {
+			if uint32(info.state) == s {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// emitMidAcceptTest pushes the condition "midAccept[state] is an accept" onto
+// the stack: the raw table byte, or, with guardDominant, `(val-1) u< 253`,
+// which reads the reserved non-mid-dominant markers 254/255 (and 0) as "no".
+func emitMidAcceptTest(b []byte, midAcceptOff int32, stateLocal byte, tableMemIdx int, guardDominant bool) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, midAcceptOff)
+	b = append(b, 0x20, stateLocal)
+	b = append(b, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+	if guardDominant {
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6B) // val - 1
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(253))
+		b = append(b, 0x49) // (val-1) u< 253: a real accept, not a dominant marker
+	}
+	return b
+}
+
+// litAnchorNumV128Locals is buildLitAnchorFindBody's v128 local count: the
+// Teddy tiers need their chunk and nibble tables, and the single-literal
+// prefix scan and a first-byte scan need one chunk.
+//
+// The first-byte bound is 64, not 16: emitPrefixScan takes the Shufti route
+// for a 17..64 first-byte set, which needs this same one chunk local — the
+// alternation path's buildAltLitAnchorFindBody already sizes it so. No
+// pattern reaches 17 here today (findLitAnchorPointInRegexp caps the literal
+// set at 8, one first byte each), so the output is byte-identical; the wider
+// bound is what keeps raising that cap from emitting a module that refers to
+// a local it never declared.
+func litAnchorNumV128Locals(hasT1, hasT0, usePrefixScan bool, nFirstBytes int) int {
+	switch {
+	case hasT1:
+		return 6 // chunk(8), tLo(9), tHi(10), chunk1(11), t1Lo(12), t1Hi(13)
+	case hasT0:
+		return 3 // chunk(8), tLo(9), tHi(10)
+	case usePrefixScan || (nFirstBytes > 0 && nFirstBytes <= 64):
+		return 1 // chunk(8)
+	}
+	return 0
+}
+
 // buildLitAnchorBackScanBody returns the size-prefixed WASM function body for the
 // backward scan helper used by the literal-anchored find optimisation.
 //
@@ -7980,7 +8034,19 @@ func buildAnchoredFindBody(p anchoredFindBodyParams) []byte {
 // shares this builder but has its own `from` parameter and never writes the
 // find-from global — reading it there would let a single-pattern find's
 // leftover position bound an unrelated set scan.
-func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal bool) []byte {
+//
+// nlContinue changes what a '\n' does. Without it the scan checks the
+// newline pre-accept and then STOPS, which is right for the single-pattern
+// lit-anchor prefix: there `(?m:^)` can only sit at the prefix's start, so a
+// '\n' ends every candidate. A set member's prefix is any fixed-length
+// fragment before its literal, so the '\n' may be one the prefix itself
+// consumes (`(?m:^)\W0` over "\n0") or may sit in front of a `(?m:^)` in the
+// middle of it (`\w\W(?m:^)0`). With nlContinue the scan records the
+// pre-accept and then takes the '\n' transition like any other byte; the DFA
+// built it under ecEndLine, so the reversed `(?m:^)` resolves there. The set
+// path passes true, and must also build revL with forceNewline — without the
+// table this reads bytes that belong to other tables.
+func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal, nlContinue bool) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
@@ -8093,10 +8159,12 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 		b = append(b, 0x6A)       // pos + 1
 		b = append(b, 0x21, 0x04) // local.set last_accept
 		b = append(b, 0x0B)       // end if midAcceptNL
-		// Always stop at '\n' for anchored patterns.
-		// Depths: 0=nl_if, 1=$rev, 2=$done → br 2 exits $done
-		b = append(b, 0x0C, 0x02) // br 2 → $done
-		b = append(b, 0x0B)       // end if byte=='\n'
+		if !nlContinue {
+			// Always stop at '\n' for anchored patterns.
+			// Depths: 0=nl_if, 1=$rev, 2=$done → br 2 exits $done
+			b = append(b, 0x0C, 0x02) // br 2 → $done
+		}
+		b = append(b, 0x0B) // end if byte=='\n'
 		// Stack now has: nothing (the local.tee result was consumed by i32.eq)
 	} else {
 		b = append(b, 0x1A) // drop the stacked byte value (local.tee leftover)
@@ -8269,16 +8337,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	hasT0 := !usePrefixScan && len(p.litAnchorTeddyLoBytes) > 0
 	hasT1 := !usePrefixScan && len(p.litAnchorTeddyT1LoBytes) > 0
 	numI32Locals := 6 // state(2), pos(3), attempt_start(4), last_accept(5), rev_result(6), simdMask_or_class(7)
-	var numV128Locals int
-	if hasT1 {
-		numV128Locals = 6 // chunk(8), tLo(9), tHi(10), chunk1(11), t1Lo(12), t1Hi(13)
-	} else if hasT0 {
-		numV128Locals = 3 // chunk(8), tLo(9), tHi(10)
-	} else if usePrefixScan || (len(p.litAnchorFirstBytes) > 0 && len(p.litAnchorFirstBytes) <= 16) {
-		numV128Locals = 1 // chunk(8)
-	} else {
-		numV128Locals = 0
-	}
+	numV128Locals := litAnchorNumV128Locals(hasT1, hasT0, usePrefixScan, len(p.litAnchorFirstBytes))
 
 	// Local indices for the DFA locals (also used by emitPrefixScan). The
 	// v128 group is variable-width, so the allocator reserves the tail rather
@@ -9992,6 +10051,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		return b
 	}
 
+	// See startIsNonMidDominant: the prologue's midAccept check needs the
+	// dominant-marker guard exactly when one of these can be loaded.
+	prologueStartIsNonMidDominant := startIsNonMidDominant(dominantStates,
+		startState, midStartState, midStartWordState, midStartNewlineState)
+
 	// emitDFAPrologue emits: state=..., pos=attempt_start, last_accept=-1, midAccept check.
 	// Used only for the mandatory-lit code path (which has no prefix scan).
 	emitDFAPrologue := func(b []byte) []byte {
@@ -10079,11 +10143,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x21, 0x03) // local.set pos
 		b = append(b, 0x41, 0x7F) // i32.const -1
 		b = append(b, 0x21, 0x05) // local.set last_accept
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, midAcceptOff)
-		b = append(b, 0x20, 0x02)
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		b = emitMidAcceptTest(b, midAcceptOff, 0x02, tableMemIdx, prologueStartIsNonMidDominant)
 		b = append(b, 0x04, 0x40)
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x21, 0x05)
@@ -14956,6 +15016,30 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 		if dt.numStates+1 > 256 {
 			return nil, false // keep inline DFA small (u8 table)
 		}
+		// A FIND branch must be able to express its own leftmost-first answer
+		// in a plain transition table, because emitInlineAnchoredDFAVerify
+		// walks it keeping the LAST mid-accept it sees — the longest match for
+		// that start. That agrees with leftmost-first only where building the
+		// table with leftmostFirst=true already pruned the lower-priority
+		// continuations, and the two predicates below name exactly the states
+		// where it cannot: a boundary-gated accept that outranks the state's
+		// own unconditional one (dfaHasOutrankedState) and one that needs a
+		// further mandatory byte also reachable by a lower-priority path
+		// (dfaHasAmbiguousBoundaryTarget). Refusing sends the whole pattern
+		// down the generic find path, whose scan loop keeps leftmost-first
+		// priority (and whose dfaTooLarge still routes the ambiguous-target
+		// case to Backtracking). Without this, `0$|-(?:\b|0*)0` over "-00" answered
+		// 0-3 from the `0*` alternative where RE2 answers 0-2 from the `\b`
+		// one: a leftmost-LONGEST walk of a branch whose leftmost-first accept
+		// is boundary-gated.
+		//
+		// leftmostFirst only: the anchored-match caller builds its branch
+		// tables leftmost-LONGEST on purpose (see this function's own doc
+		// comment), and its verify wants a match ending at len, so longest is
+		// the answer it needs and no priority is being lost.
+		if leftmostFirst && (dfaHasOutrankedState(dt) || dfaHasAmbiguousBoundaryTarget(dt)) {
+			return nil, false
+		}
 		branches = append(branches, lenAltBranch{
 			literal:    literal,
 			isLitChain: false,
@@ -15152,7 +15236,9 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// loop is directly [loop $dfa, block $dfa_done], the same shape
 	// emitWBPreAcceptCheck's hardcoded br depth 4 assumes.
 	// A full-consumption caller emits NO word-boundary pre-accept check, and
-	// this is not only an optimisation — leaving it in is bug 81.
+	// this is not only an optimisation — leaving it in is the dominance defect
+	// described at emitWBPreAcceptCheck's own call site above: a mid-accept
+	// marked dominant on a leftmost-longest table cuts off a live thread.
 	//
 	// Three steps say the check cannot help such a caller. The loop tests
 	// `pos >= len` FIRST and leaves through the end-of-input arm above, so

@@ -45,13 +45,6 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Upload binary
-        if: ${{ github.ref == 'refs/heads/main' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: regexped
-          path: regexped
-
   re2-tests:
     name: RE2 test suite
     runs-on: ubuntu-latest

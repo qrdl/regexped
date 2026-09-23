@@ -574,3 +574,106 @@ func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
 		t.Fatalf("CompileFile: %v", err)
 	}
 }
+
+// TestUnionScanShapes compiles literal-less sets that reach the union scan's
+// less common layouts, and validates each module. `\d{k}` patterns give one
+// union state per digit count, so the state count stays small while the id
+// count grows:
+//   - 150 ids make three 64-bit words per accept row — a row size that is not
+//     a power of two, so the row address is a multiply, not a shift;
+//   - a set selecting only ids from 64 up leaves the alive mask's first word
+//     empty;
+//   - `$`-anchored members accept only at end of text, so no state accepts
+//     mid-string;
+//   - a member whose id is past 256 is outside what the gated preflight's
+//     alive mask can name;
+//   - a member that matches empty (`\d?`) makes every state accept
+//     mid-string, so the wide body needs no accept-range compare.
+func TestUnionScanShapes(t *testing.T) {
+	digits := func(n int, suffix string) []config.RegexEntry {
+		var out []config.RegexEntry
+		for k := 1; k <= n; k++ {
+			out = append(out, config.RegexEntry{Name: fmt.Sprintf("d%03d", k), Pattern: fmt.Sprintf(`\d{%d}%s`, k, suffix)})
+		}
+		return out
+	}
+	dummies := func(n int) []config.RegexEntry {
+		var out []config.RegexEntry
+		for k := 0; k < n; k++ {
+			out = append(out, config.RegexEntry{Name: fmt.Sprintf("z%03d", k), Pattern: fmt.Sprintf("lit%03d", k)})
+		}
+		return out
+	}
+	names := func(es []config.RegexEntry) []string {
+		var out []string
+		for _, e := range es {
+			out = append(out, e.Name)
+		}
+		return out
+	}
+	set := func(sel []string) config.SetConfig {
+		return config.SetConfig{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl",
+			Patterns: config.PatternSelector{Names: sel}}
+	}
+	cases := []struct {
+		name string
+		cfg  config.BuildConfig
+	}{
+		{"three_word_rows", func() config.BuildConfig {
+			d := digits(150, "")
+			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+		}()},
+		{"empty_first_mask_word", func() config.BuildConfig {
+			z, d := dummies(64), digits(100, "")
+			return config.BuildConfig{Regexps: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
+		}()},
+		{"no_mid_string_accept", func() config.BuildConfig {
+			d := digits(150, "$")
+			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+		}()},
+		{"ids_past_256", func() config.BuildConfig {
+			z, d := dummies(300), digits(2, "")
+			return config.BuildConfig{Regexps: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
+		}()},
+		{"every_state_accepts_mid_string", func() config.BuildConfig {
+			d := append(digits(150, ""), config.RegexEntry{Name: "empty", Pattern: `\d?`})
+			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+		}()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			wasm, _, err := CompileFile(c.cfg, "")
+			if err != nil {
+				t.Fatalf("CompileFile: %v", err)
+			}
+			validateWASM(t, wasm)
+		})
+	}
+}
+
+// TestSetMemberCornerShapes compiles one-member sets, with every capability
+// declared, whose member reaches a corner of set compilation — each found by
+// running the generated and corpus patterns through CompileFile:
+//   - `$^\W`: a union automaton in which no state can accept mid-string;
+//   - `[^0](?m:^)0[^0]\s`: a prefix whose reversed DFA carries a newline
+//     boundary, so its layout is built with the newline pre-accept table;
+//   - `(?:(?:\w|\B|\d))*`: a Backtracking member whose program has a
+//     zero-width cycle, so its body is the bare tail call into the fallback;
+//   - `(?m:^) (?:(?:[01])+){0,2}`: a member self-loop set with more than one
+//     member byte class.
+func TestSetMemberCornerShapes(t *testing.T) {
+	for _, pat := range []string{`$^\W`, `[^0](?m:^)0[^0]\s`, `(?:(?:\w|\B|\d))*`, `(?m:^) (?:(?:[01])+){0,2}`} {
+		t.Run(pat, func(t *testing.T) {
+			cfg := config.BuildConfig{
+				Regexps: []config.RegexEntry{{Name: "p", Pattern: pat}},
+				Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl",
+					MatchAny: "ma", MatchAll: "ml", Patterns: config.PatternSelector{All: true}}},
+			}
+			wasm, _, err := CompileFile(cfg, "")
+			if err != nil {
+				t.Fatalf("CompileFile: %v", err)
+			}
+			validateWASM(t, wasm)
+		})
+	}
+}
