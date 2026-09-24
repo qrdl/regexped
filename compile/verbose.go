@@ -192,6 +192,26 @@ func (r *Reporter) Render(w io.Writer) {
 		if d.FrontendDemotion != nil {
 			fmt.Fprintf(w, "  DOWNGRADED frontend: %+v\n", *d.FrontendDemotion)
 		}
+		// Members served outside the buckets, and the work counters: each
+		// changes the set's cost by large factors and shows nowhere else.
+		if len(d.SplitMembers) > 0 {
+			ids := make([]string, len(d.SplitMembers))
+			for i, id := range d.SplitMembers {
+				ids[i] = fmt.Sprintf("#%d", id)
+			}
+			fmt.Fprintf(w, "  split out (not provably linear; own start-anywhere find): %s\n", strings.Join(ids, ", "))
+		}
+		if u := d.ScanUnion; u != nil {
+			switch {
+			case u.Direct:
+				fmt.Fprintf(w, "  scan pair: one union automaton over every member (%d states)\n", u.States)
+			case u.Counter:
+				fmt.Fprintf(w, "  scan pair: work counter switching to a union automaton (%d states)\n", u.States)
+			}
+		}
+		if d.InCallCounter {
+			fmt.Fprintf(w, "  overlapping find: in-call counter sweeps the answer cache\n")
+		}
 	}
 }
 

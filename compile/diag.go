@@ -106,6 +106,26 @@ type SetDiag struct {
 	// each" — which is the whole cost difference between 154 fuel and 700 —
 	// was invisible to everything but a disassembler.
 	AnchoredUnion *AnchoredUnionDiag `json:"anchored_union,omitempty"`
+	// SplitMembers lists the ids of the members served by their own
+	// start-anywhere find instead of by the buckets: `find`, `scan_any` and
+	// `scan_all` merge their answers with the buckets'. Empty for a set whose
+	// members are all provably linear in its bodies.
+	SplitMembers []int `json:"split_members,omitempty"`
+	// ScanUnion reports the scan pair's own union automaton: its whole body
+	// (Direct, when members are split out) or the target a literal
+	// frontend's work counter switches to (Counter).
+	ScanUnion *ScanUnionDiag `json:"scan_union,omitempty"`
+	// InCallCounter is set when the overlapping `find` carries the work
+	// counter that sweeps the answer cache INSIDE a call.
+	InCallCounter bool `json:"in_call_counter,omitempty"`
+}
+
+// ScanUnionDiag reports the scan pair's own union automaton.
+type ScanUnionDiag struct {
+	Direct  bool `json:"direct,omitempty"`
+	Counter bool `json:"counter,omitempty"`
+	States  int  `json:"states"`
+	Wide    bool `json:"wide,omitempty"`
 }
 
 // AnchoredUnionDiag reports the anchored trio's body selection.

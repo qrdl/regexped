@@ -15,7 +15,34 @@ import (
 // The match function body is not stored here — it is built at assemble time
 // (when function-table indices are known) by emitSetMatchFnFinal.
 type compiledSet struct {
-	name string
+	// midSweepWork / midSweepBudget are the module globals of the
+	// overlapping `find`'s in-call counter, emitted wherever the answer cache
+	// is: once the walk has cost what the sweep would, the body bails out and
+	// the wrapper sweeps and answers from the cache. -1 = none.
+	midSweepWork, midSweepBudget int32
+	// scanSwWork is the scan pair's work counter, emitted where scanUnion is
+	// its switch target (see scanSwitch); -1 = none.
+	scanSwWork int32
+	// scanUnion is a start-anywhere union automaton over the set's members
+	// for the scan pair, beside the one unionScan holds: either the switch
+	// target of a literal frontend's work counter, or — scanUnionDirect — the
+	// scan pair's whole body, over EVERY member, when members are split out.
+	scanUnion       *unionScanDFA
+	scanUnionDirect bool
+	scanUnionMask   uint64 // the ids below 64 it can report: its early exit
+	// split holds the members served by their own start-anywhere find instead
+	// of by the buckets (set_split.go); splitData / splitSegs their tables.
+	split     []splitMember
+	splitData []byte
+	splitSegs int
+	// keptEmpty: every member the non-anchored capabilities serve is split,
+	// so the merge wrappers have no bucket body to call.
+	keptEmpty bool
+	// keptPosGlobal is the module global the bucket `find` stamps with the
+	// position it answered for, which a split set's merge wrapper reads
+	// back even when out_cap = 0 wrote nothing. -1 = none.
+	keptPosGlobal int32
+	name          string
 
 	// Capability export names; "" = not declared. `match` and `scan` were
 	// retired — `match_any(...) >= 0` and
@@ -337,12 +364,23 @@ func (cs *compiledSet) capFns() []setCapFn {
 	return out
 }
 
+// capFnOffset is the index of capability kind's export within the set's
+// functions, or -1 when it is not declared.
+func (cs *compiledSet) capFnOffset(kind setCapKind) int {
+	for i, c := range cs.capFns() {
+		if c.kind == kind {
+			return i
+		}
+	}
+	return -1
+}
+
 // funcCount returns the number of WASM functions contributed by this compiled set:
 // one per declared capability, plus the per-bucket suffix, prefix and probe helpers.
 func (cs *compiledSet) funcCount() int {
 	return len(cs.capFns()) + cs.hiddenFnCount() + cs.numSuffixFns + len(cs.prefixFnBodies) +
 		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies) +
-		cs.numBTFns
+		cs.numBTFns + cs.extraFnCount()
 }
 
 // btFnBaseOffset returns the index of the first Backtracking driver, which sit
@@ -635,6 +673,18 @@ func assertBucketEmittable(bi int, bkt *bucket) {
 }
 
 func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions) *compiledSet {
+	if opts.globals == nil {
+		opts.globals = &moduleGlobals{}
+	}
+	return compileSetSplit(spec, prefixPool, suffixPool, opts)
+}
+
+// compileSetWith is CompileSet with the members at the spec.Patterns indices
+// in split served by their own start-anywhere find (set_split.go) rather than
+// by the buckets. They stay in the anchored packing: only the non-anchored
+// capabilities are split. nonLinear says a member is not provably linear in
+// the set's bodies, which is what the work counters exist for.
+func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, split []int, nonLinear bool) *compiledSet {
 	// THE nil-allocator fallback for the whole set path. A nil allocator means
 	// this set is being compiled outside a module assembly — CompileSet is
 	// reachable that way from tests that inspect the result rather than run
@@ -658,6 +708,12 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		opts.globals = &moduleGlobals{}
 	}
 	diag := &SetDiag{Name: spec.Name}
+	// full is the whole set; spec, from here on, is what the buckets serve.
+	full := spec
+	spec = keptSpec(full, split)
+	for _, i := range split {
+		diag.SplitMembers = append(diag.SplitMembers, full.PatternIDs[i])
+	}
 	// Sparse accept. Probes are served too: a sparse probe cannot return
 	// a bucket-local bitmask — that is the 32-pattern ceiling it exists to
 	// escape — so it returns a COUNT and leaves the matching GLOBAL ids in the
@@ -674,9 +730,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// Through a map built once, not a linear search through spec.Patterns per
 	// bucket member — that was O(P^2) in the pattern count, twice over (the
 	// anchored packing below repeated it).
-	globalIDOf := make(map[*PatternInfo]int, len(spec.Patterns))
-	for k, sp := range spec.Patterns {
-		globalIDOf[sp] = spec.PatternIDs[k]
+	globalIDOf := make(map[*PatternInfo]int, len(full.Patterns))
+	for k, sp := range full.Patterns {
+		globalIDOf[sp] = full.PatternIDs[k]
 	}
 	patternIDs := make([][]int, len(buckets))
 	for bi, b := range buckets {
@@ -707,6 +763,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	// crossover VERDICT is overridden.
 	if opts.forceFrontend && len(lits) > 0 {
 		fe = opts.ForceFrontend
+	}
+
+	// The scan pair's own union automaton (see planScanUnion). Planned here,
+	// before anything reads the scan capabilities: a counter's probes must be
+	// built to stamp their walks, and a set whose scan pair the union serves
+	// directly builds no scan machinery in its buckets at all.
+	scanPlan := planScanUnion(full, spec, split, buckets, nonLinear)
+	if scanPlan.direct {
+		spec.ScanAny, spec.ScanAll = "", ""
 	}
 
 	// First pass: compute per-bucket prefix metadata (before building suffix DFAs).
@@ -908,8 +973,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), wantsWalkExtent(spec, buckets, bi))
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), wantsWalkExtent(spec, buckets, bi), scanPlan.counter)
 		bkt.dp = art.dp
+		if art.probeWalkEndGlobal >= 0 {
+			bkt.probeWalkEndP1 = art.probeWalkEndGlobal + 1
+		}
 		if art.walkEndGlobal >= 0 {
 			walkEndGlobal = art.walkEndGlobal
 		}
@@ -1365,13 +1433,17 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		name:                spec.Name,
 		matchAny:            spec.MatchAny,
 		matchAll:            spec.MatchAll,
-		scanAny:             spec.ScanAny,
-		scanAll:             spec.ScanAll,
+		scanAny:             full.ScanAny,
+		scanAll:             full.ScanAll,
 		find:                spec.Find,
 		batchFind:           spec.BatchFind,
-		patternCount:        spec.patternCount(),
+		patternCount:        full.patternCount(),
 		suffixHasSkip:       spec.suffixNeedsSkip(),
 		overlapping:         spec.Overlapping,
+		midSweepWork:        -1,
+		midSweepBudget:      -1,
+		scanSwWork:          -1,
+		keptPosGlobal:       -1,
 		walkEndGlobal:       walkEndGlobal,
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
@@ -1413,6 +1485,15 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		litLens:             litLens,
 		diag:                diag,
 	}
+	// The overlapping `find`'s in-call counter, wherever the answer cache is
+	// and a member is not provably linear: the between-calls trigger cannot
+	// fire inside the ONE call a no-match input makes, and that call is
+	// quadratic only through such a member's failed walks.
+	if nonLinear && cs.usesOverlapDP() && walkEndGlobal >= 0 {
+		cs.midSweepWork = int32(opts.globals.Alloc())   //nolint:gosec // a global index
+		cs.midSweepBudget = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+		diag.InCallCounter = true
+	}
 	// Anchored-capability automata: a separate packing over the full
 	// patterns with leftmost-first pruning disabled.
 	//
@@ -1437,7 +1518,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
 		// Its result is discarded when the union wins, which costs compile time
 		// only (CLAUDE.md: runtime over compile time).
-		abuckets, amembers := compileAnchoredBuckets(spec.Patterns, opts, diag)
+		abuckets, amembers := compileAnchoredBuckets(full.Patterns, opts, diag)
 		// The union must answer for exactly the patterns the PACKER kept.
 		//
 		// It is built from a spec, and the packer drops a pattern whose solo
@@ -1447,20 +1528,20 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		// halves of one capability disagree: with the union, match_any and
 		// match_all reported patterns that with buckets they do not, and the
 		// --set-bt corpus leg found exactly that.
-		anchoredSpec := spec
-		kept := make(map[*PatternInfo]bool, len(spec.Patterns))
+		anchoredSpec := full
+		kept := make(map[*PatternInfo]bool, len(full.Patterns))
 		for _, members := range amembers {
 			for _, p := range members {
 				kept[p] = true
 			}
 		}
-		if len(kept) != len(spec.Patterns) {
+		if len(kept) != len(full.Patterns) {
 			anchoredSpec.Patterns = nil
 			anchoredSpec.PatternIDs = nil
-			for i, p := range spec.Patterns {
+			for i, p := range full.Patterns {
 				if kept[p] {
 					anchoredSpec.Patterns = append(anchoredSpec.Patterns, p)
-					anchoredSpec.PatternIDs = append(anchoredSpec.PatternIDs, spec.PatternIDs[i])
+					anchoredSpec.PatternIDs = append(anchoredSpec.PatternIDs, full.PatternIDs[i])
 				}
 			}
 		}
@@ -1475,7 +1556,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 			idSpace := spec.IDSpaceSize
 			if idSpace <= 0 {
 				maxID := -1
-				for _, id := range spec.PatternIDs {
+				for _, id := range full.PatternIDs {
 					if id > maxID {
 						maxID = id
 					}
@@ -1605,6 +1686,11 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 		diag.UnionScan = unionScanDiagOf(cs.phase2Union, sub, true)
 	}
 
+	// The scan pair's own union automaton, and the split members' two passes.
+	// Both after every region above, for the reason the union DFA is.
+	cs.buildScanUnion(scanPlan, ra, opts)
+	cs.buildSplitMembers(full, split, ra, opts)
+
 	// First-byte eligibility tables, laid out after every other
 	// region for the same reason the union DFA is: whatever is built last must
 	// start above what is already placed, or two tables share an address.
@@ -1696,9 +1782,9 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	diag.IDSpaceSize = cs.idSpaceSize()
 	diag.Overlapping = spec.Overlapping
 	for _, c := range []struct{ field, name string }{
-		{"match_any", spec.MatchAny}, {"match_all", spec.MatchAll},
-		{"scan_any", spec.ScanAny}, {"scan_all", spec.ScanAll},
-		{"find", spec.Find},
+		{"match_any", full.MatchAny}, {"match_all", full.MatchAll},
+		{"scan_any", full.ScanAny}, {"scan_all", full.ScanAll},
+		{"find", full.Find},
 	} {
 		if c.name != "" {
 			diag.Capabilities = append(diag.Capabilities, c.field)
@@ -2191,6 +2277,12 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotMatchFallback:   setTypeI32I32ToI32,
 		slotFindFallback:    setTypeI32I32ToI64,
 		slotCaptureFallback: setTypeI32x3ToI32,
+		// The start-anywhere find: two (i32,i32)→i32 passes, and the glue and
+		// a switch's dispatcher in the find body's own shape.
+		slotSAFwd:      setTypeI32I32ToI32,
+		slotSARev:      setTypeI32I32ToI32,
+		slotSAGlue:     setTypeI32I32ToI64,
+		slotSADispatch: setTypeI32I32ToI64,
 		// The batch wrappers share the set match body's
 		// (i32×5)→i32 shape rather than needing a type of their own.
 		slotBatchFind:         setMatchTypeMatch,
@@ -2270,6 +2362,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			// (ptr, len, out_ptr) -> i32, the capture-body shape.
 			fs = append(fs, byte(setTypeI32x3ToI32))
 		}
+		// A split set's kept bodies, switch targets and member passes.
+		fs = append(fs, cs.extraFnTypes()...)
 	}
 	if opts.Component {
 		// cabi_realloc reuses the (i32×4)→i32 probe type; cm_free and cm_post
@@ -2327,8 +2421,13 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 
 	// Global section: the find-from channel (see find_from.go), on the same
 	// terms as the single-pattern assembler. Set capabilities take their own
-	// `from` as a real parameter and do not use it.
-	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
+	// `from` as a real parameter; only a split member's backward pass reads
+	// the channel, as its floor.
+	setsSplit := false
+	for _, cs := range sets {
+		setsSplit = setsSplit || len(cs.split) > 0
+	}
+	if moduleUsesFindFrom(patterns) || globals.Count() > 1 || setsSplit {
 		out = appendSection(out, 6, globals.Section())
 	}
 
@@ -2507,8 +2606,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = utils.AppendULEB128(cs_bytes, uint32(len(litAnchorFindBody)))
 			cs_bytes = append(cs_bytes, litAnchorFindBody...)
 		} else if p.findBody != nil {
-			cs_bytes = p.appendFindBodyWithTwin(cs_bytes, base+findOff)
+			cs_bytes = p.appendFindBodyWithTwin(cs_bytes, base+p.todayFindOff())
 		}
+		cs_bytes = p.appendStartAnywhereBodies(cs_bytes, base)
 		if p.captureBody != nil {
 			cs_bytes = p.appendCaptureBodies(cs_bytes, base+captureOff)
 			if !p.anchored {
@@ -2576,8 +2676,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			dpIdx = base + off
 			blkIdx = base + cs.overlapBlockFnOffset()
 		}
-		for _, c := range cs.capFns() {
-			capStart := len(cs_bytes)
+		// capBody is the code entry a capability's export gets on an unsplit
+		// set. A split set's merged capabilities get a merge wrapper there
+		// instead, and this body moves behind it (keptFnOffset).
+		capBody := func(c setCapFn) []byte {
+			var out []byte
 			switch c.kind {
 			case capFind:
 				if cs.findWrapped() {
@@ -2585,7 +2688,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// worker instead of carrying its own copy of the bucket
 					// code. A non-batching set is wrapped for the answer cache
 					// alone, and forwards into the ordinary find body.
-					cs_bytes = append(cs_bytes, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
+					out = append(out, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
 				} else {
 					// The EXPORTED find takes a scratch descriptor where the
 					// body reads a gate pointer, so the prologue converts one
@@ -2593,18 +2696,18 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// set's export is the wrapper above, which does the same
 					// thing by hand; the shared worker keeps taking a gate,
 					// because both of its callers have already dereferenced.
-					cs_bytes = append(cs_bytes, injectScratchPrologue(
+					out = append(out, injectScratchPrologue(
 						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3)...)
 				}
 			case capFindBatch:
-				cs_bytes = append(cs_bytes, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
+				out = append(out, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), base+cs.capFnOffset(capFindBatch), dpIdx, blkIdx)...)
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
-					cs_bytes = append(cs_bytes,
+					out = append(out,
 						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx)...)
 					break
 				}
-				cs_bytes = append(cs_bytes, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
+				out = append(out, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
 			default:
 				var body []byte
 				if cs.usesTwoPhaseScan(c.kind) {
@@ -2628,14 +2731,39 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// position and keeps the mask-complete ones.
 					body = emitSetMatchFnFinal(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx, c.kind, scanProbeBase)
 				}
-				cs_bytes = append(cs_bytes, body...)
+				out = append(out, body...)
 			}
 			// Every exported capability that can reach a Backtracking member
 			// starts a new host call for it. The anchored pair cannot: no BT
 			// bucket is admitted there.
 			if cs.btRegions != nil && cs.btRegions.hasDrive && c.kind != capMatchAny && c.kind != capMatchAll {
-				entry := injectBTDrivePrologue(cs_bytes[capStart:], cs.btRegions.drive)
-				cs_bytes = append(cs_bytes[:capStart], entry...)
+				out = injectBTDrivePrologue(out, cs.btRegions.drive)
+			}
+			return out
+		}
+		splitFwd := make([]int, len(cs.split))
+		splitRev := make([]int, len(cs.split))
+		for i := range cs.split {
+			splitFwd[i], splitRev[i] = base+cs.splitFwdOffset(i), base+cs.splitRevOffset(i)
+		}
+		keptIdx := func(kind setCapKind) int {
+			if off := cs.keptFnOffset(kind); off >= 0 {
+				return base + off
+			}
+			return -1
+		}
+		for _, c := range cs.capFns() {
+			switch {
+			case c.kind == capFind && cs.mergedCap(c.kind):
+				cs_bytes = append(cs_bytes, emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev)...)
+			case cs.mergedCap(c.kind):
+				cs_bytes = append(cs_bytes, emitSplitScanBody(cs, c.kind, keptIdx(c.kind), splitFwd)...)
+			case cs.scanUnionDirect && (c.kind == capScanAny || c.kind == capScanAll):
+				// Members are split out and one union over all of them
+				// answers the scan pair: no bucket body, no merge.
+				cs_bytes = append(cs_bytes, cs.scanUnionBody(c.kind, tableMemIdx)...)
+			default:
+				cs_bytes = append(cs_bytes, capBody(c)...)
 			}
 		}
 		if cs.findWrapped() {
@@ -2695,6 +2823,17 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// Backtracking drivers last, matching btFnBaseOffset.
 		for _, bb := range cs.btFnBodies {
 			cs_bytes = append(cs_bytes, bb...)
+		}
+		// Then a split set's functions, in extraFnTypes' order.
+		for _, c := range cs.keptCaps() {
+			cs_bytes = append(cs_bytes, capBody(c)...)
+		}
+		for _, c := range cs.switchCaps() {
+			cs_bytes = append(cs_bytes, cs.scanUnionBody(c.kind, tableMemIdx)...)
+		}
+		for _, sm := range cs.split {
+			cs_bytes = append(cs_bytes, sm.fwdBody...)
+			cs_bytes = append(cs_bytes, sm.revBody...)
 		}
 	}
 	if opts.Component {
@@ -4695,6 +4834,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// CompileSetOptions.ForceShuftiAdaptive.
 		ForceShuftiAdaptive: over.ForceShuftiAdaptive,
 		forceShuftiAdaptive: over.forceShuftiAdaptive,
+		NoSplit:             over.NoSplit,
 		// The module's allocator, shared with the per-pattern entries above.
 		globals: globals,
 	}

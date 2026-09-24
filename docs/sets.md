@@ -465,6 +465,69 @@ these cheap, not the absence of extent tracking.)
 Do not use `scan_any` as a locate step for `find` — calling both at the same
 position duplicates one position's work. Pick one.
 
+## Members that are not provably linear
+
+A set's non-anchored bodies try candidate positions one at a time, and some
+member shapes make that **quadratic** on a long run of bytes that keeps an
+attempt alive without matching — `[a-z]+@example\.com` over one long word,
+`a+b` over `a`×N, `foo[a-z]+bar` over `foo`×N. At 64 KB that is tens of
+billions of instructions for one drive. The single-pattern find solves the
+same problem with a second, linear find (see
+[engines.md](engines.md#which-find-a-pattern-gets-linear-on-every-input)); a
+set applies the same machinery per member.
+
+A member is **provably linear** in a set when a failed attempt walks a bounded
+number of bytes (no reachable cycle of non-accepting states — `ERROR`,
+`AKIA[A-Z0-9]{16}`, `[a-z]{4}[0-9]{3}`), or when it sits in a literal bucket
+and the part after its literal cannot read that literal without accepting
+(`KEY="[a-z0-9]+"`, `union[ \t]+k00\w+`): a walk then never runs past the next
+occurrence without having matched. A set whose members are all provably linear
+compiles exactly as before. Otherwise:
+
+| Capability | What the set does |
+|---|---|
+| `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own start-anywhere find, and `find` merges their answers with the buckets' |
+| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes |
+| `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find` |
+| `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks (`4 × bytes advanced + 64`, the single-pattern rule) that hands the call to a start-anywhere union automaton over the set |
+| `scan_any`, `scan_all`, where no union automaton can be built | split out |
+
+When members are split out, every non-anchored capability serves them the
+same way: `find` merges, and the scan pair uses one union automaton over EVERY
+member when one can be built (one pass, however many members were split),
+otherwise the buckets' answer plus one forward pass per split member.
+`match_any` and `match_all` are anchored and never change.
+
+The merge keeps `find`'s contract exactly — the matches at the smallest start
+at or after `from`, all of them, with the transactional overflow rule — and it
+stays linear over a drive: it keeps, in the caller's gate array, a lower bound
+on each split member's next start and on the buckets' next answer, so neither
+is searched again before the drive reaches it. The gate array's size and its
+"zero it to start a drive" rule are unchanged. As before, a drive's `from`
+must never go backwards.
+
+Costs, measured at 64 KB on single-shape and mixed sets: a split member costs
+its start-anywhere find, about 29 instructions per byte, where the bucket body
+often cost 2-3 on text it could skip — so a split member's gated `find` is up to
+14× slower on ordinary text, and 21,000-77,000× faster on the worst case; mixed
+sets that were quadratic are 170-21,000× faster. Each split member adds its two
+automata's tables (uncompressed) to the module. One case stays slow:
+`overlapping: true` on a set the answer cache cannot serve, over members whose
+matches are long and overlap — every start's match is walked in full, split or
+not.
+
+**Not split:** a set with `hints: [batch-find]` — its batch entry resumes inside
+a position through its own gate rule, which the merge does not reproduce — so a
+batching gated set with such members stays as it was. The overlapping in-call
+counter does apply to it. A member with an empty-width assertion, one the
+compiler dropped or put on Backtracking, and one whose start-anywhere automaton
+exceeds `max_fallback_states` also stay in the buckets. At most 24 members are
+split out of one set; a set with more keeps all of them in its buckets.
+
+`--diag-json` reports all of it: `split_members` (the ids served outside the
+buckets), `scan_union` (`direct` when it is the scan pair's whole body,
+`counter` when it is the counter's switch target) and `in_call_counter`.
+
 ## Output formats
 
 `find` writes 12-byte tuples, 4-byte aligned:
@@ -540,8 +603,11 @@ pattern id back to its `name:` string.
 
 Several of a set's decisions are invisible in the output and change its cost by
 large factors: which literal frontend shipped, whether the scan pair got the
-one-pass union automaton or the per-position walk, and whether a sparse
-bucket's states carry the member self-loop skip (`member_skip_states`). If a
+one-pass union automaton or the per-position walk, whether a sparse
+bucket's states carry the member self-loop skip (`member_skip_states`), and
+which members are served outside the buckets and which work counters the set
+carries (`split_members`, `scan_union`, `in_call_counter` — see
+[Members that are not provably linear](#members-that-are-not-provably-linear)). If a
 set is slower than you expect, that file is where to look first — there is no
 other window onto any of it.
 

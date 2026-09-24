@@ -2391,3 +2391,173 @@ func TestTDFABulkSkipMidAccept(t *testing.T) {
 	)
 	checkTDFAGroups(t, cases)
 }
+
+// findStrategyShapes is one example of every find shape the compile-time
+// find classifier distinguishes (compile/start_anywhere.go), with the byte it
+// repeats to build that shape's worst-case run and one string it matches.
+var findStrategyShapes = []struct {
+	pat, fill, needle string
+	extra             []string // inputs aimed at one path
+}{
+	{`a*b`, "a", "aab", nil},
+	{`[^,]*,`, "a", "field,", nil},
+	{`\w+@\w+`, "a", "joe@example", nil},
+	{`[a-z]+[0-9]{3}`, "a", "abc123", nil},
+	{`[a-z]+[0-9]+z`, "a", "ab12z", nil},
+	{`(?:ab)+c`, "ab", "ababc", nil},
+	{`\w+abc\d`, "abc", "xabc1", nil},
+	{`\w+_x\d`, "_x", "a_x1", nil},
+	{`.*foo\d`, "foo", "foo1", nil},
+	{`(?i)select\s+.*\s+from`, "select ", "SELECT a FROM", nil},
+	{`ERROR\w*y|WARN\w*z`, "ERROR", "ERRORxy", nil},
+	{`foo[a-z]+bar`, "foo", "fooxbar", nil},
+	{`a+b`, "a", "aab", nil},
+	{`[a-z]+@example\.com`, "a", "joe@example.com", nil},
+	{`\w+@\w+\.com`, "a", "joe@x.com", nil},
+	{`foo[a-z]+`, "FOO", "foox", nil},
+	{`[0-9]{3}-[0-9]{4}`, "1", "555-1234", nil},
+	// The literal-anchored find whose backward walks FAIL at the floor.
+	{`[0-9]\w+abc\d`, "abc", "1xabc2", nil},
+	// The alternation literal-anchored find.
+	{`x{3}abc\w*z|y{3}ghi\w*z`, "xxxabc", "xxxabcz", nil},
+	// The attempt at 0 walks the whole input and fails, and a match starts at
+	// 1: a counter that trips on that walk must resume the search AT 1.
+	{`a\w*X|b\w*Y`, "b", "Y", []string{"a" + strings.Repeat("b", 300) + "Y", "aa" + strings.Repeat("b", 300) + "Y"}},
+}
+
+// TestFindStrategiesMatchGo drives every find strategy — today's find, the
+// start-anywhere find alone, today's find with a work counter that trips
+// almost at once (N = 1), and whatever the classifier picks — at EVERY start
+// position, against the whole-input Go oracle. The long inputs are worst-case
+// runs, which is what trips the counter, so the handover to the start-anywhere
+// find is exercised mid-call and not only on its first attempt.
+func TestFindStrategiesMatchGo(t *testing.T) {
+	strategies := []struct {
+		name string
+		opts compile.CompileOptions
+		note string // the verbose note proving the strategy was served
+	}{
+		{"today", compile.CompileOptions{TodayFind: true}, "find: today"},
+		{"start-anywhere", compile.CompileOptions{StartAnywhereFind: true}, "find: start-anywhere"},
+		{"switch-n1", compile.CompileOptions{StartAnywhereSwitchN: 1}, "find: switch"},
+		{"classifier", compile.CompileOptions{}, "find: "},
+	}
+	rng := rand.New(rand.NewSource(105))
+	for _, c := range findStrategyShapes {
+		alpha := c.fill + c.needle + " ,@"
+		inputs := []string{
+			strings.Repeat(c.fill, 300/len(c.fill)) + c.needle,
+			strings.Repeat(c.fill, 150/len(c.fill)) + c.needle + strings.Repeat(c.fill, 150/len(c.fill)),
+		}
+		inputs = append(inputs, c.extra...)
+		for i := 0; i < 20; i++ {
+			b := make([]byte, rng.Intn(40))
+			for j := range b {
+				b[j] = alpha[rng.Intn(len(alpha))]
+			}
+			inputs = append(inputs, string(b))
+		}
+		for _, st := range strategies {
+			t.Run(c.pat+"/"+st.name, func(t *testing.T) {
+				r := &compile.Reporter{}
+				o := st.opts
+				o.Report = r
+				w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true, o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.End()
+				served := false
+				for _, n := range r.Patterns[0].Notes {
+					served = served || strings.HasPrefix(n, st.note)
+				}
+				if !served {
+					t.Fatalf("not served by %q: notes %v", st.note, r.Patterns[0].Notes)
+				}
+				for _, in := range inputs {
+					call, done, ok := findCaller(t, w, in)
+					if !ok {
+						t.Fatal("module would not instantiate")
+					}
+					ends := endsAt(t, c.pat, in)
+					for from := 0; from <= len(in); from++ {
+						got, state := call(from)
+						want, wantOK := goFirstFrom(ends, from)
+						switch {
+						case state == findHang:
+							t.Fatalf("%q from=%d: watchdog fired", in, from)
+						case state == findNone && wantOK:
+							t.Fatalf("%q from=%d: got -1, want %v", in, from, want)
+						case state == findMatch && (!wantOK || got != want):
+							t.Fatalf("%q from=%d: got %v, want %v (%v)", in, from, got, want, wantOK)
+						}
+					}
+					done()
+				}
+			})
+		}
+	}
+}
+
+// TestFindStrategiesLinear pins what the find classifier exists for: every
+// shape's find, as compiled by default, is LINEAR on that shape's worst-case
+// run. It is measured in fuel over the whole iteration at two lengths 4×
+// apart — linear grows ~4×, quadratic ~16× — so a counter that stopped
+// charging some walk (the literal-anchored find's failed backward walks, say)
+// fails here even though every answer it gives is still right.
+func TestFindStrategiesLinear(t *testing.T) {
+	cfg := wasmtime.NewConfig()
+	cfg.SetConsumeFuel(true)
+	cfg.SetWasmSIMD(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+	fuelFor := func(mod *wasmtime.Module, in string) uint64 {
+		st := wasmtime.NewStore(engine)
+		defer st.Close()
+		st.SetFuel(1 << 62)
+		inst, err := wasmtime.NewInstance(st, mod, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(inst.GetExport(st, "memory").Memory().UnsafeData(st)[pathsInputBase:], in)
+		fn := inst.GetFunc(st, "find")
+		for from := 0; from <= len(in); {
+			v, err := fn.Call(st, pathsInputBase, int32(len(in)), int32(from))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := v.(int64)
+			if r < 0 {
+				break
+			}
+			s, e := int(uint32(r>>32)), int(uint32(r))
+			if e > s {
+				from = e
+			} else {
+				from = e + 1
+			}
+		}
+		left, _ := st.GetFuel()
+		return uint64(1<<62) - left
+	}
+	for _, c := range findStrategyShapes {
+		t.Run(c.pat, func(t *testing.T) {
+			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mod.Close()
+			runs := []string{strings.Repeat(c.fill, 4096/len(c.fill)), strings.Repeat(c.fill, 16384/len(c.fill))}
+			if len(c.extra) > 0 {
+				runs = []string{"a" + strings.Repeat("b", 4096), "a" + strings.Repeat("b", 16384)}
+			}
+			small, large := fuelFor(mod, runs[0]), fuelFor(mod, runs[1])
+			if ratio := float64(large) / float64(small); ratio > 8 {
+				t.Errorf("fuel grew %.1f× for a 4× longer worst-case run (%d → %d): quadratic", ratio, small, large)
+			}
+		})
+	}
+}

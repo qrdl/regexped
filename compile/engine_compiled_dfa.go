@@ -396,5 +396,6 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		hasTwin:               hasTwin,
 		skipSafeOnDead:        l.skipSafeOnDead,
 		eofSkipSafe:           l.eofSkipSafe,
+		switchN:               l.switchN,
 	})
 }

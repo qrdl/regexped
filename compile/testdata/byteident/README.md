@@ -31,9 +31,9 @@ add a fixture for it.
 | `match_only` | `(?:https?)://(?:[^/]+)/(?:.*)` | `match_func` alone: anchored body, no find sibling | Compiled DFA |
 | `find_only` | `\d{4}-\d{2}-\d{2}` | `find_func` alone | Compiled DFA |
 | `tdfa_groups` | `(?P<scheme>…)://(?P<host>…)/(?P<path>…)` | TDFA capture path with named groups | TDFA |
-| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible), with the work budget and fallback body every Backtracking program without a zero-width cycle carries | Backtracking |
+| `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible), with the work budget and fallback body every Backtracking program without a zero-width cycle carries. Its find step — the find `groups` locates a match with — carries the find work counter, so it also pins the dispatcher that `groups` reaches the find through | Backtracking |
 | `bt_empty_loop` | `^(\w*\|)*c` | Backtracking capture path over a program with a ZERO-WIDTH CYCLE (the outer `*`'s body can match empty through the `\|` branch). Such a program gets no ordinary body: its fast body is the bare tail call into the FALLBACK body, memoised at every Alt, whose frame stack and memo are sized from the input at call time and found through the module's scratch globals (exported, standalone, as `regexped:scratch_base`). `bt_groups` above pins the other shape — an ordinary body with the WORK BUDGET, an i64 counter charged on every frame pop whose exhaustion tail-calls the same fallback | Backtracking |
-| `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction | Compiled DFA |
+| `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction. Not provably linear, so its find carries the work counter | Compiled DFA |
 | `line_anchored` | `(?m:^)ERROR:.*(?m:$)` | newline-boundary machinery: `midStartNewline`, the `midAcceptNL` side table | Compiled DFA |
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |
 | `strict_alt` | `AKIA[A-Z0-9]{16}\|ghp_[A-Za-z0-9]{20}` | strict alternation of lit-chain branches — `buildLitChainAltFindBody` | Compiled DFA |
@@ -42,6 +42,10 @@ add a fixture for it.
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | mixed-prefix: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 | `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
 | `lm_sole_dominant` | `[a-zA-Z]{20,}` + `prefer-match` | the LikelyMatch mid-accept dominant dispatch and its Shufti self-loop bulk skip. `prefer-match` reached NO single-pattern fixture before this one — only the two set fixtures — so every LM-gated emitter in a find body was unpinned | Compiled DFA |
+| `find_start_anywhere` | `\w+@\w+` | the START-ANYWHERE find alone: a forward pass over the leftmost-first DFA of `(?s:.)*?(?:pat)` and a backward pass over the reversed pattern, joined by a glue body — what the find classifier picks for a leading repeat of a word class with no literal to scan for | Compiled DFA |
+| `find_switch` | `a*b` | today's general find WITH the work counter at its failed-attempt exits, the start-anywhere find beside it, and the dispatcher every caller of the find reaches | Compiled DFA |
+| `lit_anchor_switch` | `\w+abc\d` | the literal-anchored find with the counter; its backward walker stamps where it stopped, so a FAILED backward walk is charged too | Compiled DFA |
+| `alt_lit_switch` | `x{3}abc\w*z\|y{3}ghi\w*z` | the alternation literal-anchored find with the counter; each branch's backward walker and forward verifier stamp where they stopped | Compiled DFA |
 
 ## Set fixtures
 
@@ -60,7 +64,7 @@ that reads one table through another's bytes.
 | `set_packed_pair` | <=16 literals, narrow two-column probe (`byte_rank.go`) | packed-pair |
 | `set_teddy` | 17..64 literals with DIVERSE first bytes, nibble tables | teddy |
 | `set_ac` | >16 literals, LOW first-byte diversity (`aho_corasick.go`) | ac |
-| `set_scalar` | no literal to anchor on — no prefilter emitted | scalar |
+| `set_scalar` | no literal to anchor on — no prefilter emitted. Its letter runs are bounded, so every member is provably linear and stays in the buckets | scalar |
 | `set_sparse` | sparse accept: 40 patterns in ONE bucket, past the 32 a u64 mask allows | packed-pair |
 | `set_member_skip` | the SAME sparse shape under `prefer-match`, which adds the member self-loop skip. Paired with `set_sparse` on purpose: that one pins the body without the skip, so a diff that moves both is the body and a diff that moves only this one is the skip | packed-pair |
 | `set_anchored` | the anchored pair alone — an anchored-only set emits NO literal frontend | packed-pair |
@@ -69,6 +73,10 @@ that reads one table through another's bytes.
 | `set_batch` | `hints: [batch-find]` — a second entry point over ONE shared worker | packed-pair |
 | `set_overlap_sweep` | `overlapping: true` over LITERAL-LESS patterns, which is what puts a SWEEP in the module: the checkpoint pass, the block materialiser, the projection table and the successor scratch. `set_overlap` above is eight literals and contains none of them | scalar |
 | `set_overlap_sweep_batch` | the same sweep with `hints: [batch-find]`. Only SERVING is per-entry — `find` returns a position's total where the batch entry returns what it wrote — so the two serving paths are separate code and are pinned separately | scalar |
+| `set_split` | members that are not provably linear in a set's bodies SPLIT OUT to their own start-anywhere find: the merge wrapper `find` becomes, the member passes, the position global the bucket body stamps, and — the `\b` member refusing a union automaton — the merged scan wrappers | scalar |
+| `set_split_scan_union` | the same split with a union automaton over every member serving the scan pair on its own, so only `find` is merged | packed-pair |
+| `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks and the scan bodies carry the work counter that hands the call to a union automaton | packed-pair |
+| `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would | scalar |
 
 `TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
 capability list from the diagnostics on every run, for the same reason the

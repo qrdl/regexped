@@ -88,6 +88,23 @@ set a hint or not.
   structured, or non-ASCII-heavy data, and self-disabling on input that is
   dense in them.
 
+**Both hints also choose a `find_func` pattern's find** when the pattern is not
+provably linear — see
+[engines.md](engines.md#which-find-a-pattern-gets-linear-on-every-input):
+
+- `prefer-match` on a pattern that starts with an unbounded run of a word-like
+  class and has no literal to scan for (`\w+@\w+`) keeps the ordinary find,
+  which is faster on match-dense text; without it the pattern gets the
+  start-anywhere find, which is linear on every input and much faster when
+  matches are rare.
+- `prefer-no-match` on a pattern that starts with an unbounded run including
+  the space byte (`[^,]*,`) gets the start-anywhere find alone; without it the
+  pattern gets the ordinary find with a work counter.
+- On any other pattern that is not provably linear, a hint keeps the ordinary
+  find exactly as it was — without the work counter an unhinted pattern gets —
+  so a long run that keeps an attempt alive without matching stays quadratic
+  for it. If your input can contain such runs, leave the hint off.
+
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.
 

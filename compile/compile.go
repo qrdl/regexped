@@ -294,6 +294,15 @@ type CompileOptions struct {
 	// existed; BTWorkBudgetForceFallback → the fallback answers every call.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTWorkBudget int
+	// The three FIND-STRATEGY overrides, for tests and measurement only — no
+	// YAML key sets them. Unset, classifyFind (start_anywhere.go) decides.
+	// TodayFind keeps today's find with nothing added (the baseline);
+	// StartAnywhereFind serves the find with the start-anywhere find alone,
+	// wherever it can be built; StartAnywhereSwitchN > 0 gives today's find
+	// the work counter with that N. The first one set wins.
+	TodayFind            bool
+	StartAnywhereFind    bool
+	StartAnywhereSwitchN int
 
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
@@ -437,6 +446,27 @@ type compiledPattern struct {
 	litAnchorTeddyT1LoBytes []byte
 	litAnchorTeddyT1HiBytes []byte
 	litAnchorLitSet         [][]byte // raw literals for post-Teddy scalar verification
+	// litAnchorRevL / litAnchorRevTable: the reversed-prefix DFA the backward
+	// walker was built from, kept so a start-anywhere switch can rebuild the
+	// walker stamping where it stopped.
+	litAnchorRevL     *dfaLayout
+	litAnchorRevTable *dfaTable
+	// The start-anywhere find (start_anywhere.go): saFwdBody and saRevBody
+	// are its two passes, laid out in slotSAFwd/slotSARev with the glue that
+	// joins them (slotSAGlue) built at assembly time. startAnywhere: the glue
+	// IS the pattern's find. saSwitch: today's find stays and carries the work
+	// counter, and a dispatcher (slotSADispatch) fronts both — every caller of
+	// the find reaches it. switchN is the counter's N for a body built at
+	// assembly time (the literal-anchored ones); the general body reads its
+	// layout's. backStampP1 is one PAST the global the counting
+	// literal-anchored bodies' backward walkers stamp with where they
+	// stopped (0 = none) — plus one because the zero value is a real index.
+	startAnywhere bool
+	saSwitch      bool
+	saFwdBody     []byte
+	saRevBody     []byte
+	switchN       int32
+	backStampP1   int32
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were removed with the rest of that infrastructure.
 
@@ -549,6 +579,12 @@ type altLitAnchorCompiledBranch struct {
 	litSet            [][]byte // this branch's own literal(s), for the scalar verify chain
 	backScanBody      []byte   // size-prefixed; built by buildLitAnchorBackScanBody, reused unchanged
 	forwardVerifyBody []byte   // size-prefixed; built by buildAltLitAnchorForwardVerifyBody
+	// The tables both bodies were built from, kept so a start-anywhere switch
+	// can rebuild them stamping where they stopped (stampAltLitAnchorBranches).
+	revL     *dfaLayout
+	revTable *dfaTable
+	fwdL     *dfaLayout
+	fwdTable *dfaTable
 }
 
 // setFind records this pattern's find body together with the way its
@@ -601,6 +637,10 @@ const (
 	slotMatchFallback     // a Backtracking matchBody's fallback, right after it
 	slotFindFallback      // a Backtracking findBody's fallback, after it and its twin
 	slotCaptureFallback   // a Backtracking captureBody's fallback, right after it
+	slotSAFwd             // the start-anywhere find's forward pass
+	slotSARev             // …its backward pass
+	slotSAGlue            // …and the find body joining them
+	slotSADispatch        // today's find or the start-anywhere find, for a switch
 )
 
 // funcSlot is one entry of a pattern's function layout. branch is the
@@ -650,6 +690,14 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 			add(slotFindFallback)
 		}
 	}
+	if p.saFwdBody != nil {
+		add(slotSAFwd)
+		add(slotSARev)
+		add(slotSAGlue)
+		if p.saSwitch {
+			add(slotSADispatch)
+		}
+	}
 	if p.captureBody != nil {
 		add(slotCapture)
 		if p.captureFallbackBody != nil {
@@ -688,7 +736,8 @@ func (p *compiledPattern) slotIndex(k funcSlotKind) int {
 // of its three shapes: a plain body, the lit-anchor pair (whose find half is
 // generated at assembleModule time), or the alt-lit-anchor branch dispatcher.
 func (p *compiledPattern) hasFindFunc() bool {
-	return p.findBody != nil || p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil
+	return p.findBody != nil || p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil ||
+		p.saFwdBody != nil
 }
 
 // findWrapperOffset returns the sub-index of the exported find wrapper — the
@@ -759,16 +808,28 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 	backwardScanOff = p.slotIndex(slotLitAnchorBackScan)
 	captureOff = p.slotIndex(slotCapture)
 	wrapperOff = p.slotIndex(slotGroupsWrapper)
-	// findOff names whichever function fronts the find: the alt dispatcher,
-	// the lit-anchor forward half, or a plain body.
+	// findOff names whichever function fronts the find: the start-anywhere
+	// dispatcher of a switch, the alt dispatcher, the lit-anchor forward half,
+	// a plain body, or — for the start-anywhere find alone — its glue.
 	findOff = -1
-	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
+	for _, k := range []funcSlotKind{slotSADispatch, slotAltDispatch, slotLitAnchorFind, slotFind, slotSAGlue} {
 		if i := p.slotIndex(k); i >= 0 {
 			findOff = i
 			break
 		}
 	}
 	return
+}
+
+// todayFindOff is the sub-index of TODAY'S find function — findOff minus the
+// start-anywhere dispatcher a switch puts in front of it — or -1.
+func (p *compiledPattern) todayFindOff() int {
+	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
+		if i := p.slotIndex(k); i >= 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 // appendFindBodyWithTwin appends the plain-find body, patching its handoff call
@@ -1720,6 +1781,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize))
 		} else {
+			// Where today's literal-anchored tables start: a pattern the
+			// classifier sends to the start-anywhere find drops them again.
+			dataMark, segMark := len(p.dataBytes), p.dataSegCount
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Pattern)
 			// Reject prefixes containing `\b`/`\B` explicitly. The
@@ -1847,6 +1911,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 						buildOpts.report().Note("literal-anchored find (SIMD literal scan + backward DFA)")
 						p.litAnchorBackScanBody = bsBody
+						p.litAnchorRevL, p.litAnchorRevTable = revL, revTable
 						// findFromMode is deliberately NOT set here. This
 						// pair's find half is built at assembleModule time and
 						// records its own mode there. Leaving the field at its
@@ -1920,84 +1985,151 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 			}
 
-			// Dominant-self-loop SIMD bulk-skip. Default-on for all
-			// modes, mid-accept and non-mid-accept alike (2026-07-05).
-			// Non-mid was
-			// previously LM-gated because the original side-table dispatch
-			// caused a 48-57% no-match regression; replaced with a
-			// state-ID-compare emission (commit dbb4dfa9) that shrinks the
-			// no-match cost to ~18-21% wall time (0% fuel) on the patterns
-			// that show it at all — a real, measured trade-off against a
-			// much larger match-path win, not a fully regression-free win.
-			// Anchored find uses a separate builder (buildAnchoredFindBody)
-			// whose midAccept consumers don't decode the encoding, so we
-			// skip it there.
-			//
-			// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
-			// decodes the encoding; both channels (mid + non-mid) are kept
-			// unconditionally there. History: commit 36f91ab (2026-07-12)
-			// dropped the MID channel at this site to fix a fuel-flat
-			// wall-time regression on url-find-100kb — that delta was later
-			// proven to be instruction-placement noise on the Kaby Lake dev
-			// machine (2026-07-18 padding-scan experiment), and the drop
-			// cost a real 20x fuel / ~40x time
-			// regression on lit-anchor patterns whose post-literal body IS
-			// the mid-accept dominant state (likelytest
-			// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
-			// 40,600 -> 813,127, bisect-confirmed to that commit). Reverted
-			// 2026-07-18. The non-mid channel here carries bt-find-mand-lit's
-			// genuine -58% fuel win (the `.*` before its alternation), so it
-			// stays too.
-			//
-			// Since 2026-07-18: buildFindBody's own call site (the
-			// litAnchorBackScanBody == nil branch below) emits the
-			// non-mid channel for every LikelyMode again, replacing task
-			// 36's LikelyMatch-only gate. The short-run fuel harm that
-			// gate protected against (dense short runs in the dominant
-			// state — an input property no compile-time gate can see) is
-			// now handled at runtime by the hysteresis wrapped around the
-			// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
-			// the −90% long-run win and short-run inputs self-disable the
-			// channel after nonMidHystStreak wasted attempts.
-			canEmitOpt1 := !isAnchoredFind(table)
-			if canEmitOpt1 {
-				// encodeNonMid only when buildFindBody is the consumer of
-				// this layout's midAcceptBytes — the lit-anchor forward
-				// scan and alt-lit branches read the table with plain
-				// `!= 0` accept semantics and dispatch non-mid via
-				// state-ID compares (unchanged).
-				applyDominantStateEncoding(l,
-					p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
-			} else {
-				l.dominantStates = nil
-			}
-			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
-			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-				fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
-					buildOpts.tableMemIdx)
-				p.setFind(fb, fmode)
-				p.findNeutralBody = twin
-				p.findTwinCallOff = twinPatch
-				if (twin != nil) != (twinPatch >= 0) {
-					panic("compile: find twin and its handoff call-site patch must be emitted together")
+			// Which find: today's, the start-anywhere find alone, or today's
+			// with the work counter (start_anywhere.go). Decided HERE — after
+			// today's body is known, before it is built — because the
+			// classifier's proofs are about that body.
+			strategy, why := p.chooseFindStrategy(re, table, l, lap, patMandLit, anchored, buildOpts)
+			if strategy == findNewSearch {
+				trial := &compiledPattern{}
+				if trial.buildStartAnywhereFind(re, cur, buildOpts) {
+					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
+					p.dataSegCount = segMark + trial.dataSegCount
+					p.litAnchorBackScanBody, p.altLitAnchorBranches = nil, nil
+					p.saFwdBody, p.saRevBody = trial.saFwdBody, trial.saRevBody
+					p.startAnywhere = true
+					p.tableEnd = trial.tableEnd
+				} else {
+					strategy, why = findToday, "start-anywhere automaton over the limits"
 				}
 			}
+			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
+			if !p.startAnywhere {
+				// Dominant-self-loop SIMD bulk-skip. Default-on for all
+				// modes, mid-accept and non-mid-accept alike (2026-07-05).
+				// Non-mid was
+				// previously LM-gated because the original side-table dispatch
+				// caused a 48-57% no-match regression; replaced with a
+				// state-ID-compare emission (commit dbb4dfa9) that shrinks the
+				// no-match cost to ~18-21% wall time (0% fuel) on the patterns
+				// that show it at all — a real, measured trade-off against a
+				// much larger match-path win, not a fully regression-free win.
+				// Anchored find uses a separate builder (buildAnchoredFindBody)
+				// whose midAccept consumers don't decode the encoding, so we
+				// skip it there.
+				//
+				// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
+				// decodes the encoding; both channels (mid + non-mid) are kept
+				// unconditionally there. History: commit 36f91ab (2026-07-12)
+				// dropped the MID channel at this site to fix a fuel-flat
+				// wall-time regression on url-find-100kb — that delta was later
+				// proven to be instruction-placement noise on the Kaby Lake dev
+				// machine (2026-07-18 padding-scan experiment), and the drop
+				// cost a real 20x fuel / ~40x time
+				// regression on lit-anchor patterns whose post-literal body IS
+				// the mid-accept dominant state (likelytest
+				// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
+				// 40,600 -> 813,127, bisect-confirmed to that commit). Reverted
+				// 2026-07-18. The non-mid channel here carries bt-find-mand-lit's
+				// genuine -58% fuel win (the `.*` before its alternation), so it
+				// stays too.
+				//
+				// Since 2026-07-18: buildFindBody's own call site (the
+				// litAnchorBackScanBody == nil branch below) emits the
+				// non-mid channel for every LikelyMode again, replacing task
+				// 36's LikelyMatch-only gate. The short-run fuel harm that
+				// gate protected against (dense short runs in the dominant
+				// state — an input property no compile-time gate can see) is
+				// now handled at runtime by the hysteresis wrapped around the
+				// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
+				// the −90% long-run win and short-run inputs self-disable the
+				// channel after nonMidHystStreak wasted attempts.
+				canEmitOpt1 := !isAnchoredFind(table)
+				if canEmitOpt1 {
+					// encodeNonMid only when buildFindBody is the consumer of
+					// this layout's midAcceptBytes — the lit-anchor forward
+					// scan and alt-lit branches read the table with plain
+					// `!= 0` accept semantics and dispatch non-mid via
+					// state-ID compares (unchanged).
+					applyDominantStateEncoding(l,
+						p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
+				} else {
+					l.dominantStates = nil
+				}
+				l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
+				// A switch builds the start-anywhere find FIRST, above today's
+				// tables, because whether it can be built decides whether today's
+				// body may carry the counter: a body that can answer the handover
+				// sentinel with nothing to hand over to would be a wrong answer.
+				var sw *compiledPattern
+				if strategy == findSwitch && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					sw = &compiledPattern{}
+					if sw.buildStartAnywhereFind(re, utils.PageAlign(l.tableEnd), buildOpts) {
+						l.switchN = switchNFor(buildOpts)
+					} else {
+						sw = nil
+					}
+				}
+				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
+						buildOpts.tableMemIdx)
+					p.setFind(fb, fmode)
+					p.findNeutralBody = twin
+					p.findTwinCallOff = twinPatch
+					if (twin != nil) != (twinPatch >= 0) {
+						panic("compile: find twin and its handoff call-site patch must be emitted together")
+					}
+				}
 
-			// Note the asymmetry with the single-pattern lit-anchor case just
-			// above: that path unconditionally emits l/table's data segments
-			// because it REUSES the whole pattern's forward LF DFA for its
-			// own Phase 3 (litAnchorFindLayout/litAnchorFindTable = l/table).
-			// The alternation path does NOT reuse l/table at all — each
-			// branch compiles its own independent forward DFA inside
-			// compileAltLitAnchorBranches — so l's combined-alternation
-			// tables would be dead weight here and are skipped.
-			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody, false))
-			if p.altLitAnchorBranches == nil {
-				p.dataBytes = append(p.dataBytes, rawData...)
-				p.dataSegCount += segCount
-			}
-			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-				p.tableEnd = l.tableEnd
+				// Note the asymmetry with the single-pattern lit-anchor case just
+				// above: that path unconditionally emits l/table's data segments
+				// because it REUSES the whole pattern's forward LF DFA for its
+				// own Phase 3 (litAnchorFindLayout/litAnchorFindTable = l/table).
+				// The alternation path does NOT reuse l/table at all — each
+				// branch compiles its own independent forward DFA inside
+				// compileAltLitAnchorBranches — so l's combined-alternation
+				// tables would be dead weight here and are skipped.
+				rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody, false))
+				if p.altLitAnchorBranches == nil {
+					p.dataBytes = append(p.dataBytes, rawData...)
+					p.dataSegCount += segCount
+				}
+				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					p.tableEnd = l.tableEnd
+				}
+				// The literal-anchored bodies are built at assembly time, so their
+				// counter is decided here, above their own tables. It needs a
+				// module global for the backward walkers (and the alternation's
+				// forward verifiers) to stamp where they stopped, so a compile
+				// with no global allocator keeps today's body.
+				if strategy == findSwitch && sw == nil && (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) &&
+					buildOpts.globals != nil {
+					sw = &compiledPattern{}
+					if sw.buildStartAnywhereFind(re, utils.PageAlign(p.tableEnd), buildOpts) {
+						p.switchN = switchNFor(buildOpts)
+						p.backStampP1 = int32(buildOpts.globals.Alloc()) + 1 //nolint:gosec // a global index
+						if p.litAnchorBackScanBody != nil {
+							p.litAnchorBackScanBody = buildLitAnchorBackScanBodyStamped(p.litAnchorRevL, p.litAnchorRevTable,
+								buildOpts.tableMemIdx, true, false, p.backStampP1-1)
+						} else {
+							p.stampAltLitAnchorBranches(buildOpts.tableMemIdx)
+						}
+					} else {
+						sw = nil
+					}
+				}
+				if sw != nil {
+					if p.findNeutralBody != nil {
+						panic("compile: start-anywhere switch with a neutral twin")
+					}
+					p.saFwdBody, p.saRevBody = sw.saFwdBody, sw.saRevBody
+					p.dataBytes = append(p.dataBytes, sw.dataBytes...)
+					p.dataSegCount += sw.dataSegCount
+					p.tableEnd = sw.tableEnd
+					p.saSwitch = true
+				} else if strategy == findSwitch {
+					buildOpts.report().Note("find: switch unavailable — today's find kept")
+				}
 			}
 		}
 	} else if !dfaTooLarge {
@@ -2424,6 +2556,10 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotBatchGroups:       0x04,
 		slotFindWrapper:       0x03,
 		slotGroupsFromWrapper: byte(groupsFromTypeIdx), // (i32×4)→i32
+		slotSAFwd:             0x00,
+		slotSARev:             0x00,
+		slotSAGlue:            0x01,
+		slotSADispatch:        0x01,
 	}
 	var fs []byte
 	// `total` counts every function index INCLUDING the imported builtins; the
@@ -2648,8 +2784,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		} else if p.findBody != nil {
 			// LNM non-mid bulk-skip helper call-site patching was here —
 			// see archive Section 16.
-			cs = p.appendFindBodyWithTwin(cs, base+findOff)
+			cs = p.appendFindBodyWithTwin(cs, base+p.todayFindOff())
 		}
+		cs = p.appendStartAnywhereBodies(cs, base)
 		if p.captureBody != nil {
 			cs = p.appendCaptureBodies(cs, base+captureOff)
 			if !p.anchored {

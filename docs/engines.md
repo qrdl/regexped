@@ -212,6 +212,60 @@ The SIMD scan in Phase 1 typically eliminates ≥ 99% of input positions before 
 [main LF DFA table] → [reversed-prefix DFA table] → [literal SIMD tables (firstByteFlags / Teddy T0 / Teddy T1)]
 ```
 
+### Which find a pattern gets: linear on every input
+
+Both find bodies above try start positions one at a time. That is fast on
+ordinary text, but some shapes make it **quadratic** on a long run of bytes
+that keeps an attempt alive without ever matching: `a*b` over `a`×N (every
+attempt walks to the end), `\w+@\w+` over one long word, `\w+abc\d` over
+`abc`×N. At 64 KB that is billions of instructions for a single `find`.
+
+The fix is a second find, the **start-anywhere find** (RE2's method), which is
+linear on every input:
+
+- a **forward pass** walks the leftmost-first DFA of `(?s:.)*?(?:pat)` once from
+  `from`; its last accept is the END of the leftmost-first match;
+- a **backward pass** walks the reversed pattern, leftmost-longest, from that
+  end back down to `from`; the lowest position it accepts at is the match's
+  START.
+
+It costs about 29 instructions per byte on any input and walks each match
+twice, where the ordinary find costs 1-8 on text its SIMD skip can leap over —
+so it is not a replacement. The compiler picks per pattern, at compile time:
+
+| Pattern | Find |
+|---|---|
+| provably linear: a failed attempt walks a bounded number of bytes (no reachable cycle of non-accepting states); or both find-body shape detectors apply; or, for a literal-anchored find, neither the part before the literal nor the part after it can contain it | the ordinary find, unchanged |
+| an empty-width assertion (`\b`, `^`, `$`, `\A`, `\z`), or anchored at 0 | the ordinary find (the backward pass cannot mirror assertions) |
+| starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` keeps the ordinary find |
+| starts with such a repeat that includes the space byte (`[^,]*,`) | the switch (below); `prefer-no-match` picks the start-anywhere find alone |
+| anything else not provably linear, no hint | the **switch** |
+| anything else not provably linear, with a hint | the ordinary find |
+
+**The switch** is the ordinary find plus a work counter, with the start-anywhere
+find beside it. The counter adds up the bytes walked by attempts that FAILED;
+once that exceeds `4 × (bytes advanced since from) + 64`, the call hands the
+rest of the search to the start-anywhere find, resuming just past the last
+failed start (or from `from`, for the literal-anchored bodies, whose failed
+candidates do not prove every earlier start matchless). The counter is checked
+before the current attempt's walk is added, so one long failed walk — which is
+linear — does not trip it; the second one does. A failed attempt that walked
+32 bytes or fewer is not counted at all: most failed attempts die within a byte
+or two, and uncounted work is at most 32 bytes per start position, which is
+linear. Ordinary text never trips it,
+so it costs what the ordinary find costs plus 0-6%. The literal-anchored
+bodies also charge a FAILED backward walk: their backward walker records where
+it stopped.
+
+The start-anywhere find needs its forward automaton within `max_dfa_states`; a
+pattern whose automaton is larger keeps the ordinary find. Its tables are
+uncompressed, so a pattern that gets it — alone or behind the switch — carries a
+larger module. `--verbose` reports the choice and the reason for every pattern
+(`find: switch — not provably linear`).
+
+Sets make the same choice per member, with one difference: see
+[sets.md](sets.md#members-that-are-not-provably-linear).
+
 ---
 
 ## TDFA Engine (Tagged DFA)

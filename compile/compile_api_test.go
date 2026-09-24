@@ -2542,3 +2542,158 @@ func TestVerboseReporterNotes(t *testing.T) {
 		})
 	}
 }
+
+// TestFindClassifierVerdicts pins the compile-time find classifier
+// (start_anywhere.go) on one example of every shape it distinguishes: today's
+// find where it is provably linear, the start-anywhere find alone for the two
+// shapes that start with a repeat of a class common in prose, and today's
+// find with the work counter for the rest — and how the prefer-* hints move
+// each. A group-A pattern must also compile to exactly today's bytes.
+func TestFindClassifierVerdicts(t *testing.T) {
+	cases := []struct {
+		pat   string
+		hints []string
+		want  string
+	}{
+		{`a*b`, nil, "switch"},
+		{`[^,]*,`, nil, "switch"},
+		{`\w+@\w+`, nil, "start-anywhere"},
+		{`[a-z]+[0-9]{3}`, nil, "start-anywhere"},
+		{`[a-z]+[0-9]+z`, nil, "start-anywhere"},
+		{`(?:ab)+c`, nil, "switch"},
+		{`\w+abc\d`, nil, "switch"},
+		{`\w+_x\d`, nil, "switch"},
+		{`.*foo\d`, nil, "switch"},
+		{`(?i)select\s+.*\s+from`, nil, "switch"},
+		{`ERROR\w*y|WARN\w*z`, nil, "switch"},
+		{`foo[a-z]+bar`, nil, "switch"},
+		{`a+b`, nil, "today"},
+		{`[a-z]+@example\.com`, nil, "today"},
+		{`\w+@\w+\.com`, nil, "today"},
+		{`foo[a-z]+`, nil, "today"},
+		{`[0-9]{3}-[0-9]{4}`, nil, "today"},
+		// The hints.
+		{`\w+@\w+`, []string{"prefer-match"}, "today"},
+		{`\w+@\w+`, []string{"prefer-no-match"}, "start-anywhere"},
+		{`[^,]*,`, []string{"prefer-no-match"}, "start-anywhere"},
+		{`[^,]*,`, []string{"prefer-match"}, "switch"},
+		{`a*b`, []string{"prefer-match"}, "today"},
+		{`a*b`, []string{"prefer-no-match"}, "today"},
+		// An empty-width assertion keeps today's find: the backward pass does
+		// not mirror it.
+		{`\b\w+@\w+\b`, nil, "today"},
+	}
+	for _, c := range cases {
+		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
+		r := &Reporter{}
+		w, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{Report: r})
+		if err != nil {
+			t.Fatalf("%s %v: %v", c.pat, c.hints, err)
+		}
+		r.End()
+		got := ""
+		for _, n := range r.Patterns[0].Notes {
+			if rest, ok := strings.CutPrefix(n, "find: "); ok {
+				got, _, _ = strings.Cut(rest, " ")
+			}
+		}
+		if got != c.want {
+			t.Errorf("%s %v: find %q, want %q (notes %v)", c.pat, c.hints, got, c.want, r.Patterns[0].Notes)
+		}
+		if c.want == "today" {
+			today, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{TodayFind: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(w, today) {
+				t.Errorf("%s %v: classified today's find but the module differs from TodayFind's", c.pat, c.hints)
+			}
+		}
+	}
+}
+
+// TestFailedWalkBound pins the bounded-walk clause on both sides of it: a
+// pattern whose failed attempts can only walk a few bytes, and one whose
+// non-accepting loop lets them walk to the end — including the case where
+// that loop is reached only THROUGH an accepting state, which a successful
+// attempt walks after its last accept.
+func TestFailedWalkBound(t *testing.T) {
+	for _, c := range []struct {
+		pat     string
+		bounded bool
+	}{
+		{`foo[a-z]+`, true},
+		{`[0-9]{3}-[0-9]{4}`, true},
+		{`[0-9]+`, true},
+		{`a*b`, false},
+		{`x[a-z]*y`, false},
+		{`a*b|a`, false}, // the loop is behind the accept of `a`
+	} {
+		m, err := compile(c.pat, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := failedWalkBound(dfaTableFrom(m.(*dfa))); ok != c.bounded {
+			t.Errorf("%s: bounded = %v, want %v", c.pat, ok, c.bounded)
+		}
+	}
+}
+
+// TestSetSplitRule pins which members a gated set splits out of its buckets
+// (set_split.go): those that are not provably linear in the set's bodies.
+func TestSetSplitRule(t *testing.T) {
+	for _, c := range []struct {
+		pat   string
+		split bool
+	}{
+		{`[a-z]+X`, true},
+		{`foo[a-z]+bar`, true},
+		{`a+b`, true},
+		{`[a-z]+@example\.com`, true},
+		{`\w+@\w+`, true},
+		{`(?:a*b)?`, true},
+		{`union[ \t]+k00a+`, false},
+		{`union[ \t]+[a-z]{6}[0-9]{2}`, false},
+		{`union[ \t]+k00\w+`, false},
+		{`A="[a-z0-9]+"`, false},
+		{`AKIA[A-Z0-9]{16}`, false},
+		{`[a-z]{4}[0-9]{3}`, false},
+		{`a+`, false},
+		{`foo[a-z]+`, false},
+		{`\b[a-z]+X`, false}, // an assertion: the start-anywhere find cannot serve it
+	} {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "p", Pattern: c.pat}},
+			Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+		}
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatalf("%s: %v", c.pat, err)
+		}
+		if got := len(diags[0].SplitMembers) > 0; got != c.split {
+			t.Errorf("%s: split = %v, want %v", c.pat, got, c.split)
+		}
+	}
+
+	// The cap: a set with more such members than the merge wrapper's locals
+	// can address splits none of them.
+	for _, n := range []int{maxSplitMembers, maxSplitMembers + 1} {
+		var regexps []config.RegexEntry
+		for i := 0; i < n; i++ {
+			regexps = append(regexps, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`[a-z]+Q%d`, i)})
+		}
+		cfg := config.BuildConfig{Regexps: regexps,
+			Sets: []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}}}
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := n
+		if n > maxSplitMembers {
+			want = 0
+		}
+		if got := len(diags[0].SplitMembers); got != want {
+			t.Errorf("%d members: %d split, want %d", n, got, want)
+		}
+	}
+}

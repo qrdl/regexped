@@ -2187,7 +2187,9 @@ func TestSetMatrixDiagnostics(t *testing.T) {
 			// was excluded — capture-bearing patterns are dropped from sets by
 			// design. Say which it is rather than treating both as the same
 			// failure.
-			if len(diags[0].Buckets) == 0 {
+			// Members split out of the buckets (set_split.go) are served
+			// too, by their own start-anywhere find.
+			if len(diags[0].Buckets) == 0 && len(diags[0].SplitMembers) == 0 {
 				allCaptures := true
 				for _, pat := range c.patterns {
 					if parsed, err := syntax.Parse(pat, syntax.Perl); err == nil && parsed.MaxCap() == 0 {

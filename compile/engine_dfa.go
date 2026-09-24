@@ -2637,6 +2637,11 @@ type dfaLayout struct {
 	// containing the suffix.
 	eofSkipSafe bool
 
+	// switchN, when positive, gives the find body the start-anywhere work
+	// counter (start_anywhere.go). Set only under
+	// CompileOptions.StartAnywhereSwitchN.
+	switchN int32
+
 	// report carries the verbose Reporter to the emitters the layout reaches,
 	// so each can name the strategy IT chose rather than have the choice
 	// re-derived at a call site. Nil on every path but `compile --verbose`.
@@ -4698,6 +4703,10 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// the caller for the reason the member-skip global is: a body that reads a
 	// global its assembler never declared fails WASM validation, so the two
 	// decisions are one.
+	art.probeWalkEndGlobal = -1
+	if len(probeFlags) > 5 && probeFlags[5] && needProbes {
+		art.probeWalkEndGlobal = int32(globals.Alloc()) //nolint:gosec // a global index
+	}
 	art.walkEndGlobal = -1
 	if len(probeFlags) > 4 && probeFlags[4] {
 		if globals == nil {
@@ -4881,10 +4890,11 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	}
 
 	p := setSuffixParams{
-		l:             l,
-		midBitmaskOff: midBitmaskOff,
-		eofBitmaskOff: eofBitmaskOff,
-		immBitmaskOff: immBitmaskOff,
+		probeWalkEndP1: art.probeWalkEndGlobal + 1,
+		l:              l,
+		midBitmaskOff:  midBitmaskOff,
+		eofBitmaskOff:  eofBitmaskOff,
+		immBitmaskOff:  immBitmaskOff,
 		// Use wasmStart for lPos==0 (allows ^ anchors to fire), wasmMidStart
 		// otherwise — or wasmMidStartNewline when the byte before lPos is a
 		// '\n', so a (?m:^) in a set fires at every line start rather than
@@ -5056,6 +5066,9 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 // probes come from genAnchoredWASM over those buckets. This struct used to
 // carry one built from the find-path DFAs that nothing ever read.
 type suffixArtifacts struct {
+	// probeWalkEndGlobal is the global the scan probe stamps with how far it
+	// walked (probeFlags[5]), for the scan pair's work counter; -1 = none.
+	probeWalkEndGlobal int32
 	// sparseScratch is where a sparse body keeps its working arrays;
 	// the driver needs the same address to read back probe results.
 	sparseScratch    sparseScratch
@@ -5090,6 +5103,9 @@ type suffixArtifacts struct {
 
 // setSuffixParams describes one bucket's suffix DFA for buildSetSuffixBody.
 type setSuffixParams struct {
+	// probeWalkEndP1: one past the global the non-anchored probe stamps with
+	// the position its walk stopped at; 0 = no stamp.
+	probeWalkEndP1 int32
 	// dominantSkip lists the states the ANCHORED probe may bulk-skip through.
 	// Nil disables the skip entirely; it is purely
 	// a performance router and the emitted skip re-derives its own soundness
@@ -6208,6 +6224,7 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
+			switchN:               l.switchN,
 		}
 		fp.hasTwin = hasTwin
 		body, mode, twinPatch = buildFindBody(fp)
@@ -6994,7 +7011,7 @@ func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 //   - otherwise: increment attemptStartLocal and br outerDepth → $outer.
 func emitEofHandler(b []byte,
 	hasRetry bool, outerDepth byte,
-	acceptLimit int32, eofSkipSafe bool) []byte {
+	acceptLimit int32, eofSkipSafe bool, sw ...switchCounter) []byte {
 	const stateLocal = 0x02
 	const posLocal = 0x03
 	const lastAcceptLocal = 0x05
@@ -7015,6 +7032,7 @@ func emitEofHandler(b []byte,
 		if eofSkipSafe {
 			b = append(b, 0x0C, outerDepth+1) // br → $no_match
 		} else {
+			b = emitFindSwitchCheck(b, posLocal, attemptStartLocal, sw)
 			b = append(b, 0x20, attemptStartLocal)
 			b = append(b, 0x41, 0x01)
 			b = append(b, 0x6A)
@@ -7033,7 +7051,7 @@ func emitEofHandler(b []byte,
 // posLocal is ignored when skipSafeOnDead is false.
 func emitDeadHandler(b []byte,
 	hasRetry bool, outerDepth byte,
-	posLocal byte, skipSafeOnDead bool) []byte {
+	posLocal byte, skipSafeOnDead bool, sw ...switchCounter) []byte {
 	const attemptStartLocal = 0x04
 	const lastAcceptLocal = 0x05
 	const foundDepth = 2
@@ -7052,6 +7070,7 @@ func emitDeadHandler(b []byte,
 			b = append(b, 0x6A)
 			b = append(b, 0x21, attemptStartLocal)
 		} else {
+			b = emitFindSwitchCheck(b, posLocal, attemptStartLocal, sw)
 			b = append(b, 0x20, attemptStartLocal)
 			b = append(b, 0x41, 0x01)
 			b = append(b, 0x6A)
@@ -8047,6 +8066,14 @@ func litAnchorNumV128Locals(hasT1, hasT0, usePrefixScan bool, nFirstBytes int) i
 // path passes true, and must also build revL with forceNewline — without the
 // table this reads bytes that belong to other tables.
 func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal, nlContinue bool) []byte {
+	return buildLitAnchorBackScanBodyStamped(revL, revTable, tableMemIdx, floorFromGlobal, nlContinue, -1)
+}
+
+// buildLitAnchorBackScanBodyStamped is buildLitAnchorBackScanBody that, when
+// stampGlobal >= 0, stores the position the walk stopped at into that global
+// on every exit — which the start-anywhere switch's counter reads to charge
+// a backward walk even when it FAILED. -1 emits exactly the unstamped body.
+func buildLitAnchorBackScanBodyStamped(revL *dfaLayout, revTable *dfaTable, tableMemIdx int, floorFromGlobal, nlContinue bool, stampGlobal int32) []byte {
 	var b []byte
 
 	// ── local declarations ────────────────────────────────────────────────────
@@ -8205,6 +8232,10 @@ func buildLitAnchorBackScanBody(revL *dfaLayout, revTable *dfaTable, tableMemIdx
 	b = append(b, 0x0C, 0x00) // br 0 → $rev (restart loop)
 	b = append(b, 0x0B)       // end loop $rev
 	b = append(b, 0x0B)       // end block $done
+	if stampGlobal >= 0 {
+		b = append(b, 0x20, 0x03, 0x24) // local.get pos; global.set
+		b = utils.AppendULEB128(b, uint32(stampGlobal))
+	}
 
 	// return last_accept
 	b = append(b, 0x20, 0x04) // local.get last_accept
@@ -8358,6 +8389,10 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		panic("compile: litAnchor i32 allocation drifted from numI32Locals")
 	}
 	a.Reserve(valV128, numV128Locals)
+	var locWalked, locCandWalk byte
+	if p.switchN > 0 {
+		locWalked, locCandWalk = a.I32(), a.I32()
+	}
 	const (
 		locChunk  = 8
 		locTLo    = 9
@@ -8490,11 +8525,29 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = utils.AppendULEB128(b, uint32(revFuncIdx))
 	b = append(b, 0x21, locRevResult) // local.set rev_result
 
+	// The start-anywhere switch's counter charges the backward walk whether
+	// it found a start or not: a walk that runs to the floor and FAILS every
+	// time (`[0-9]\w+abc\d` over `abc`×N) is the quadratic case too. The
+	// walker stamped where it stopped.
+	if p.switchN > 0 {
+		// This candidate's walk so far; charged to locWalked only after the
+		// budget is checked against the EARLIER candidates (see
+		// emitFindSwitchCheck).
+		b = append(b, 0x20, locAttemptStart, 0x23)
+		b = utils.AppendULEB128(b, uint32(p.backStampP1-1)) //nolint:gosec // a global index
+		b = append(b, 0x6B, 0x21, locCandWalk)
+	}
+
 	// if rev_result < 0 (backward scan failed): advance attempt_start++; restart $lit_outer
 	b = append(b, 0x20, locRevResult) // local.get rev_result
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x48)       // i32.lt_s
 	b = append(b, 0x04, 0x40) // if (void)
+	if p.switchN > 0 {
+		b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
+			return append(b, 0x20, locCandWalk)
+		}, locAttemptStart, p.switchN, false)
+	}
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
@@ -8693,6 +8746,13 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x0B) // end if last_accept >= 0
 
 	// No match from this candidate: advance attempt_start and restart.
+	if p.switchN > 0 {
+		// The start-anywhere switch's counter: this candidate walked back
+		// (measured above) and forward from rev_result to pos.
+		b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
+			return append(b, 0x20, locCandWalk, 0x20, locPos, 0x20, locRevResult, 0x6B, 0x6A)
+		}, locAttemptStart, p.switchN, false)
+	}
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
@@ -8731,6 +8791,14 @@ type altLitAnchorFuncIdx struct {
 // the caller (the dispatcher tries the next literal/branch, or advances
 // attempt_start itself), since this function only verifies ONE candidate.
 func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
+	return buildAltLitAnchorForwardVerifyBodyStamped(t, l, tableMemIdx, -1)
+}
+
+// buildAltLitAnchorForwardVerifyBodyStamped is buildAltLitAnchorForwardVerifyBody
+// that, when stampGlobal >= 0, stores the position the forward walk stopped at
+// into that global — for the start-anywhere switch's counter. -1 emits exactly
+// the unstamped body.
+func buildAltLitAnchorForwardVerifyBodyStamped(t *dfaTable, l *dfaLayout, tableMemIdx int, stampGlobal int32) []byte {
 	var b []byte
 
 	const (
@@ -8913,6 +8981,10 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 	b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
 	b = append(b, 0x0B)         // end loop $fwd_scan
 	b = append(b, 0x0B)         // end block $fwd_done
+	if stampGlobal >= 0 {
+		b = append(b, 0x20, locPos, 0x24)
+		b = utils.AppendULEB128(b, uint32(stampGlobal))
+	}
 
 	// if last_accept >= 0: return packed i64 (rev_result << 32 | last_accept).
 	b = append(b, 0x20, locLastAccept)
@@ -8989,6 +9061,14 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 		panic("compile: altLitAnchor i32 allocation drifted from numI32Locals")
 	}
 	a.Reserve(valV128, numV128Locals)
+	// The start-anywhere switch's counter and the global the branch walkers
+	// stamp with where they stopped.
+	var locWalked, locCandWalk byte
+	var stamp uint32
+	if p.switchN > 0 {
+		locWalked, locCandWalk = a.I32(), a.I32()
+		stamp = uint32(p.backStampP1 - 1) //nolint:gosec // a global index
+	}
 	const (
 		locChunk  = 6
 		locTLo    = 7
@@ -9078,6 +9158,12 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 			b = append(b, 0x10)
 			b = utils.AppendULEB128(b, uint32(funcIdx.backScan))
 			b = append(b, 0x21, locRevResult) // local.set rev_result
+			if p.switchN > 0 {
+				// This candidate's backward walk, found a start or not.
+				b = append(b, 0x20, locCandWalk, 0x20, locAttemptStart, 0x23)
+				b = utils.AppendULEB128(b, stamp)
+				b = append(b, 0x6B, 0x6A, 0x21, locCandWalk)
+			}
 
 			// if rev_result < 0: br_if 0 → exit $try_lit
 			b = append(b, 0x20, locRevResult)
@@ -9092,6 +9178,13 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 			b = append(b, 0x10)
 			b = utils.AppendULEB128(b, uint32(funcIdx.forwardVerify))
 			b = append(b, 0x22, locPacked) // local.tee packed
+			if p.switchN > 0 {
+				// …and its forward walk (the verify stamped where it
+				// stopped); a successful verify returns below regardless.
+				b = append(b, 0x20, locCandWalk, 0x23)
+				b = utils.AppendULEB128(b, stamp)
+				b = append(b, 0x20, locRevResult, 0x6B, 0x6A, 0x21, locCandWalk)
+			}
 
 			// if packed == -1 (i64 fail sentinel): br_if 0 → exit $try_lit
 			b = append(b, 0x42, 0x7F) // i64.const -1
@@ -9106,6 +9199,15 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	}
 
 	// No branch verified at this candidate: advance attempt_start and retry.
+	if p.switchN > 0 {
+		// A failed candidate proves nothing about the starts before it, so
+		// the start-anywhere find resumes from `from`. The budget is checked
+		// against the EARLIER candidates, then this one is charged.
+		b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
+			return append(b, 0x20, locCandWalk)
+		}, locAttemptStart, p.switchN, false)
+		b = append(b, 0x41, 0x00, 0x21, locCandWalk)
+	}
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
@@ -9210,6 +9312,7 @@ type findBodyParams struct {
 	lnmAction5     bool
 	skipSafeOnDead bool
 	eofSkipSafe    bool
+	switchN        int32
 
 	// soleMidDominant: a nonzero midAccept load can only be dominantStates[0],
 	// so the dispatch needs neither the cached value nor the compare against
@@ -9273,6 +9376,18 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	lnmAction5 := p.lnmAction5
 	skipSafeOnDead := p.skipSafeOnDead
 	eofSkipSafe := p.eofSkipSafe
+	// walkedLocal is the start-anywhere switch's counter, declared as the
+	// LAST locals group of whichever layout below is emitted.
+	var walkedLocal byte
+	swArg := func() []switchCounter {
+		if p.switchN <= 0 {
+			return nil
+		}
+		if walkedLocal == 0 {
+			panic("compile: start-anywhere switch counter was never declared")
+		}
+		return []switchCounter{{walkedLocal: walkedLocal, n: p.switchN}}
+	}
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
 	// `nonMidDominantOff` parameter and the `[]int` return slot) was
@@ -9512,6 +9627,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if trailingI32 > 0 {
 			numGroups++
 		}
+		if p.switchN > 0 {
+			numGroups++
+		}
 		if i32Count <= findBodyAttemptStartLocal-2 {
 			panic("compile: buildFindBody i32 group does not cover attempt_start")
 		}
@@ -9521,6 +9639,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		}
 		if trailingI32 > 0 {
 			b = append(b, trailingI32, 0x7F)
+		}
+		if p.switchN > 0 {
+			b = append(b, 0x01, 0x7F)
+			walkedLocal = 2 + i32Count + byte(numV128ForScan) + trailingI32
 		}
 		// The find-from seed goes here and only here. This closure is the one
 		// point at which every branch of this function declares its locals, so
@@ -10270,7 +10392,12 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskScanLocal = 9
 			simdMaskLocal = 10
 			chunkScanLocal = 11
-			b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
+			if p.switchN > 0 {
+				b = append(b, 0x03, 0x09, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+				walkedLocal = 2 + 9 + 1
+			} else {
+				b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
+			}
 			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 6 i32 + N v128 (N sized to what's actually used — see
@@ -10298,7 +10425,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
+		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -10311,7 +10438,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
+		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
 		b = append(b, 0x0B) // end if
 
 		// One midAccept[state] load feeds the accept
@@ -10356,7 +10483,12 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskScanLocal = 8
 			simdMaskLocal = 9
 			chunkScanLocal = 10
-			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+			if p.switchN > 0 {
+				b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+				walkedLocal = 2 + 8 + 1
+			} else {
+				b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+			}
 			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 5 i32 + N v128 (N sized to what's actually used — see
@@ -10384,7 +10516,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
+		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
 		b = append(b, 0x0B) // end if
 
 		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -10396,7 +10528,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
+		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
 		b = append(b, 0x0B) // end if
 
 		// One midAccept[state] load feeds the accept
@@ -10430,7 +10562,12 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		scanStartLocal = 8
 		simdMaskScanLocal = 9
 		chunkScanLocal = 10
-		b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+		if p.switchN > 0 {
+			b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+			walkedLocal = 2 + 8 + 1
+		} else {
+			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
+		}
 		b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 	} else {
 		// 6 i32 + N v128 (N sized to what's actually used — see
@@ -10458,7 +10595,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe)
+	b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
 	b = append(b, 0x0B) // end if
 
 	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
@@ -10477,7 +10614,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead)
+	b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
 	b = append(b, 0x0B) // end if
 
 	// if midAccept[state]: last_accept = pos + 1

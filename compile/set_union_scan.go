@@ -1595,6 +1595,12 @@ func (cs *compiledSet) dataBlobs() []dataBlob {
 	if cs.phase2Union != nil {
 		out = append(out, dataBlob{cs.phase2Union.dataBytes, cs.phase2Union.dataSegs})
 	}
+	if cs.scanUnion != nil {
+		out = append(out, dataBlob{cs.scanUnion.dataBytes, cs.scanUnion.dataSegs})
+	}
+	if len(cs.split) > 0 {
+		out = append(out, dataBlob{cs.splitData, cs.splitSegs})
+	}
 	return out
 }
 

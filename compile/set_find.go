@@ -1035,6 +1035,13 @@ func (c *setFindCtx) emitGateJump(b []byte, lPos byte) []byte {
 // emitSuffixCall emits the call to bucket bi's suffix DFA for the pattern bits
 // in mask, with the literal at position posLocal.
 func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mask uint32) []byte {
+	mid := c.mode == capFind && c.cs.midSweepWork >= 0
+	if mid {
+		// The in-call counter measures THIS candidate's walk: seed the
+		// walk-end global with its position.
+		b = append(b, 0x20, posLocal, 0x24)
+		b = utils.AppendULEB128(b, uint32(c.cs.walkEndGlobal)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x20, c.pInPtr)
 	b = append(b, 0x20, posLocal)
 	if litLen != 0 {
@@ -1070,8 +1077,32 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	}
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.suffixFnBase+bi))
+	if mid {
+		// work += walkEnd - pos; over the budget → bail out with the
+		// sentinel, leaving the suffix call's result on the stack beneath.
+		w, bud, we := uint32(c.cs.midSweepWork), uint32(c.cs.midSweepBudget), uint32(c.cs.walkEndGlobal) //nolint:gosec // global indices
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, we)
+		b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, bud)
+		b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midSweepSentinel)
+		b = append(b, 0x0F, 0x0B) // return; end
+	}
 	return b
 }
+
+// midSweepSentinel is what an overlapping `find` body answers when its
+// in-call counter trips (compiledSet.midSweepWork); the wrapper
+// consumes it and never returns it.
+const midSweepSentinel = -9
 
 // emitBucketAt emits the complete per-candidate evaluation of bucket bi with
 // its mandatory literal at posLocal (litLen == 0 for a fallback bucket, whose
@@ -1225,6 +1256,14 @@ func (c *setFindCtx) emitRecordedSkip(b []byte, bi int) []byte {
 // emitProbeCall calls bucket bi's bitmask probe for the pattern bits in mask,
 // leaving the result in lTmp.
 func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask uint32) []byte {
+	counter := c.cs.scanSwitch(c.mode) && c.cs.buckets[bi].probeWalkEndP1 > 0
+	if counter {
+		pwe := c.cs.buckets[bi].probeWalkEndP1 - 1
+		// Seed the walk-end global with this candidate's position, so a probe
+		// that does not stamp it (the counted-chain probe) reads as no walk.
+		b = append(b, 0x20, posLocal, 0x24)
+		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x20, c.pInPtr)
 	b = append(b, 0x20, posLocal)
 	if litLen != 0 {
@@ -1240,6 +1279,51 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 	b = utils.AppendULEB128(b, uint32(c.probeIndex(bi)))
 	b = append(b, 0x21, c.lTmp)
 	b = c.emitProbeOverflowEscape(b, bi)
+	if counter {
+		// The scan pair's work counter: work += walk end - pos; once work >
+		// N × (pos - from) + 64 — the single-pattern switch's rule and
+		// constants — the rest of the call is the union automaton's, from
+		// `from`. What this body recorded so far is kept: every such hit is
+		// a real match at or after `from`, and the automaton reports each
+		// pattern at most once more (scan_all's bitmap counts 0→1 only).
+		w, pwe := c.cs.scanSwWork, c.cs.buckets[bi].probeWalkEndP1-1
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+		b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
+		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+		b = append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B, 0x41)
+		b = utils.AppendSLEB128(b, defaultSwitchN)
+		b = append(b, 0x6C, 0x41)
+		b = utils.AppendSLEB128(b, startAnywhereSwitchSlack)
+		b = append(b, 0x6A)
+		b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+		target := c.probeFnBase - c.cs.scanProbeBaseOffset() + c.cs.scanSwitchFnOffset(c.mode)
+		callTarget := func(b []byte) []byte {
+			b = append(b, 0x20, c.pInPtr, 0x20, c.pInLen, 0x20, c.pFrom)
+			if c.wideBitmap {
+				b = append(b, 0x20, c.pOutPtr)
+			}
+			b = append(b, 0x10)
+			return utils.AppendULEB128(b, uint32(target)) //nolint:gosec // a function index
+		}
+		switch {
+		case c.mode == capScanAny:
+			b = callTarget(b)
+		case c.wideBitmap:
+			b = append(b, 0x20, c.lTotal)
+			b = callTarget(b)
+			b = append(b, 0x6A) // hits so far + the automaton's new ones
+		default:
+			b = append(b, 0x20, c.lAcc)
+			b = callTarget(b)
+			b = append(b, 0x84) // i64.or
+		}
+		b = append(b, 0x0F, 0x0B)
+	}
 	return b
 }
 
@@ -1370,6 +1454,10 @@ func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
 
 // emitFindPrologue initialises the running state every body shares.
 func (c *setFindCtx) emitFindPrologue(b []byte, lPos byte) []byte {
+	if c.cs.scanSwitch(c.mode) {
+		b = append(b, 0x41, 0x00, 0x24)
+		b = utils.AppendULEB128(b, uint32(c.cs.scanSwWork)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x41, 0x00, 0x21, c.lTotal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, minStartSentinel)
@@ -1400,6 +1488,12 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 		}
 		return append(b, 0x20, c.lAcc)
 	default:
+		if c.cs.keptPosGlobal >= 0 && !c.batch {
+			// A split set's merge wrapper reads the answered position here
+			// even when out_cap = 0 wrote no tuple to read it from.
+			b = append(b, 0x20, c.lMinStart, 0x24)
+			b = utils.AppendULEB128(b, uint32(c.cs.keptPosGlobal)) //nolint:gosec // a global index
+		}
 		return append(b, 0x20, c.lTotal)
 	}
 }

@@ -595,10 +595,12 @@ func TestSetEmitUnionScanWideSetCompiles(t *testing.T) {
 //     not split;
 //   - an all-fallback set has no literal half for phase 1 to serve at all.
 func TestSetEmitCapabilityPredicatesRefuseFind(t *testing.T) {
-	// A literal-less set with both scan capabilities and a find: the union
-	// automaton is built (scan_any asked for it), so the predicate has
-	// something to say no ABOUT.
-	spec := SetSpec{Name: "s", Find: "s_find", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
+	// A literal-less set with both scan capabilities: the union automaton is
+	// built (scan_any asked for it), so the predicate has something to say no
+	// ABOUT. Without `find`: these members are not provably linear, and a
+	// gated `find` would split them out of the buckets (set_split.go), leaving
+	// the scan pair to a union over the split set instead.
+	spec := SetSpec{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
 	compiled := setEmitCovCompileSet(t, spec, litLessNeverDying, CompileSetOptions{})
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the predicate has nothing to refuse")
@@ -1398,7 +1400,9 @@ func TestSetEmitPreflightWithNoPatterns(t *testing.T) {
 // capability those switches really serve, so the coverage of each switch
 // survives the deletion.
 func TestSetEmitScanAnyCapabilityArms(t *testing.T) {
-	spec := SetSpec{Name: "s", Find: "s_find", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
+	// No `find`, for the reason TestSetEmitCapabilityPredicatesRefuseFind
+	// gives.
+	spec := SetSpec{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
 	compiled := setEmitCovCompileSet(t, spec, litLessNeverDying, CompileSetOptions{})
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the union body cannot be emitted")
