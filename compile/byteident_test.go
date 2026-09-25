@@ -209,6 +209,7 @@ func TestByteIdenticalSplitFixtures(t *testing.T) {
 	}{
 		{name: "set_split", split: true},
 		{name: "set_split_scan_union", split: true, direct: true},
+		{name: "set_split_batch", split: true},
 		{name: "set_scan_counter", count: true},
 		{name: "set_overlap_counter", inCall: true},
 		{name: "set_scalar"},

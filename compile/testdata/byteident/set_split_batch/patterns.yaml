@@ -1,0 +1,14 @@
+# A BATCHING set with members that are not provably linear: they are split out
+# as in set_split, and the merge lives in the shared per-position worker, so
+# `find` and the batch entry both reach it. The worker's resume rule — a gate
+# for every match delivered — is what a buffer smaller than a position needs.
+regexps:
+  - name: p0
+    pattern: '[a-z]+0[0-9]+'
+  - name: p1
+    pattern: 'foo'
+sets:
+  - name: s
+    find: s_find
+    hints: [batch-find]
+    patterns: all

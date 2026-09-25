@@ -29,9 +29,11 @@ import (
 // A set is split when one of its non-anchored capabilities would otherwise
 // stay quadratic: gated `find` always; overlapping `find` when the answer
 // cache cannot serve it; the scan pair when no union automaton serves it (a
-// literal frontend's counter needs one to switch to). A set with
-// `hints: [batch-find]` is never split: its batch entry resumes inside a
-// position through its own gate rule, which the merge does not reproduce.
+// literal frontend's counter needs one to switch to). In a set with
+// `hints: [batch-find]` the merge sits in the shared per-position WORKER, so
+// both entries reach it, and follows the batch resume rules there; such a set
+// gets no answer cache once split, because the batch entry serves the cache
+// without calling the worker.
 //
 // THE MERGE (`find`). Each call answers the matches at the smallest start at
 // or after `from`, which is the smallest of the kept body's answer and every
@@ -104,8 +106,8 @@ func compileSetSplit(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 	if len(cands) == 0 {
 		return compileSetWith(spec, prefixPool, suffixPool, opts, nil, false)
 	}
-	if spec.BatchFind || opts.NoSplit {
-		// Never split (see the file header); the counters still apply.
+	if opts.NoSplit {
+		// The counters still apply.
 		return compileSetWith(spec, prefixPool, suffixPool, opts, nil, true)
 	}
 	// The trial takes its globals from a copy, so a set that turns out to need
@@ -546,19 +548,25 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []int, ra *regionAl
 }
 
 // mergedCap reports whether kind's export is a merge wrapper over the kept
-// body and the split members.
+// body and the split members. A batching set's `find` is not: its export stays
+// the wrapper over the shared worker, and the worker is merged instead
+// (mergedWorker).
 func (cs *compiledSet) mergedCap(kind setCapKind) bool {
 	if len(cs.split) == 0 {
 		return false
 	}
 	switch kind {
 	case capFind:
-		return true
+		return !cs.batchFind
 	case capScanAny, capScanAll:
 		return !cs.scanUnionDirect
 	}
 	return false
 }
+
+// mergedWorker reports whether the shared per-position worker of a batching
+// set is a merge over the bucket worker and the split members.
+func (cs *compiledSet) mergedWorker() bool { return len(cs.split) > 0 && cs.batchFind }
 
 // keptIDs is every global id the buckets serve.
 func (cs *compiledSet) keptIDs() []int { return setPatternIDs(cs) }
@@ -605,12 +613,29 @@ func (cs *compiledSet) keptFnOffset(kind setCapKind) int {
 	return -1
 }
 
+// keptWorkerFnOffset is the index of the bucket worker a merged worker calls,
+// or -1. It follows the kept capability bodies.
+func (cs *compiledSet) keptWorkerFnOffset() int {
+	if !cs.mergedWorker() || cs.keptEmpty {
+		return -1
+	}
+	return cs.extraFnBaseOffset() + len(cs.keptCaps())
+}
+
+// keptWorkerCount is 1 when the kept worker exists, else 0.
+func (cs *compiledSet) keptWorkerCount() int {
+	if cs.keptWorkerFnOffset() >= 0 {
+		return 1
+	}
+	return 0
+}
+
 // scanSwitchFnOffset is the index of the union body kind's counter switches
 // to, or -1.
 func (cs *compiledSet) scanSwitchFnOffset(kind setCapKind) int {
 	for i, c := range cs.switchCaps() {
 		if c.kind == kind {
-			return cs.extraFnBaseOffset() + len(cs.keptCaps()) + i
+			return cs.extraFnBaseOffset() + len(cs.keptCaps()) + cs.keptWorkerCount() + i
 		}
 	}
 	return -1
@@ -618,13 +643,13 @@ func (cs *compiledSet) scanSwitchFnOffset(kind setCapKind) int {
 
 // splitFwdOffset / splitRevOffset index member i's two passes.
 func (cs *compiledSet) splitFwdOffset(i int) int {
-	return cs.extraFnBaseOffset() + len(cs.keptCaps()) + len(cs.switchCaps()) + 2*i
+	return cs.extraFnBaseOffset() + len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps()) + 2*i
 }
 func (cs *compiledSet) splitRevOffset(i int) int { return cs.splitFwdOffset(i) + 1 }
 
 // extraFnCount is how many functions this file adds.
 func (cs *compiledSet) extraFnCount() int {
-	return len(cs.keptCaps()) + len(cs.switchCaps()) + 2*len(cs.split)
+	return len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps()) + 2*len(cs.split)
 }
 
 // extraFnTypes lists the added functions' type indices, in layout order.
@@ -632,6 +657,9 @@ func (cs *compiledSet) extraFnTypes() []byte {
 	var out []byte
 	for _, c := range cs.keptCaps() {
 		out = append(out, c.typeIdx)
+	}
+	if cs.keptWorkerCount() > 0 {
+		out = append(out, byte(cs.workerTypeIdx()))
 	}
 	for _, c := range cs.switchCaps() {
 		out = append(out, c.typeIdx)
@@ -657,20 +685,36 @@ func (cs *compiledSet) scanUnionBody(kind setCapKind, tableMemIdx int) []byte {
 // rev[i]). Same signature and contract as the kept body. See the file header
 // for the algorithm; the transactional rule is `find`'s: a position that does
 // not fit records no gate for any pattern, kept or split.
-func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
+//
+// worker selects the other shape: the per-position WORKER a batching set's
+// `find` and batch entry share, merged the same way (task-109 decision 1). It
+// takes the gate pointer itself rather than the descriptor, calls the kept
+// WORKER, and carries the worker's trailing argument through the batch
+// resume rules: gated, `batch_mode` — 1 records a gate for every match
+// DELIVERED (index < cap) even when the position overflows, so re-entering
+// the position yields exactly the rest; overlapping, `skip` — the first k
+// matches of the position are not written. Within a position the kept
+// buckets' matches come first, then the split members' in id order, so a
+// match's index is the same on every call.
+func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool) []byte {
 	const (
 		pPtr = iota
 		pLen
 		pFrom
-		pDesc
+		pDesc // the gate pointer itself when worker
 		pOut
 		pCap
-		nparams
+		pMode // worker only: batch_mode (gated) or skip (overlapping)
 	)
+	nparams := uint32(6)
+	if worker {
+		nparams = 7
+	}
 	gated := cs.gatedFind()
 	m := len(cs.split)
 	a := newLocalAlloc(nparams)
 	lGate, lK, lS, lR := a.I32(), a.I32(), a.I32(), a.I32()
+	lU := a.I32() // how many of the kept body's report gates to undo
 	lKeptPos, lKeptDone, lBest, lBestLb := a.I32(), a.I32(), a.I32(), a.I32()
 	lQ, lE, lSt, lN, lIdx, lTmp, lDead, lV := a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
 	lLb, lSk, lTk, lDone := make([]byte, m), make([]byte, m), make([]byte, m), make([]byte, m)
@@ -679,6 +723,30 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 	}
 	if lDone[m-1] >= 0x80 {
 		panic("compile: a split set's merge wrapper ran out of one-byte local indices")
+	}
+	// pushSkip pushes how many of the position's first matches are not
+	// written: the overlapping worker's `skip`, 0 everywhere else.
+	pushSkip := func(b []byte) []byte {
+		if worker && !gated {
+			return append(b, 0x20, pMode)
+		}
+		return append(b, 0x41, 0x00)
+	}
+	// setUndo sets lU: the kept body's report gates are recorded for the
+	// matches it DELIVERED under batch_mode, for the whole position or none
+	// otherwise (`find`'s transactional rule).
+	setUndo := func(b []byte) []byte {
+		if worker {
+			// batch_mode: min(r, cap) — select's first operand wins when
+			// the mode is non-zero.
+			b = append(b, 0x20, lR, 0x20, pCap, 0x20, lR, 0x20, pCap, 0x49, 0x1B)
+		}
+		b = append(b, 0x20, lR, 0x20, pCap, 0x4C) // r <= cap
+		b = append(b, 0x04, 0x7F, 0x20, lR, 0x05, 0x41, 0x00, 0x0B)
+		if worker {
+			b = append(b, 0x20, pMode, 0x1B)
+		}
+		return append(b, 0x21, lU)
 	}
 	kept := keptIdx >= 0
 	keptIDs := cs.keptIDs()
@@ -699,12 +767,12 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 		b = storeGate(b, id, func(b []byte) []byte { return append(b, 0x20, v) })
 		return append(b, 0x0B)
 	}
-	// For every kept tuple the kept body wrote, gate[id] = local v: undoes
-	// the report gates it recorded (lR tuples, all written).
+	// For the first lU tuples the kept body wrote, gate[id] = local v: undoes
+	// the report gates it recorded for them.
 	undoKept := func(b []byte, v byte) []byte {
 		b = append(b, 0x41, 0x00, 0x21, lIdx)
 		b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop
-		b = append(b, 0x20, lIdx, 0x20, lR, 0x4E, 0x0D, 0x01)
+		b = append(b, 0x20, lIdx, 0x20, lU, 0x4E, 0x0D, 0x01)
 		b = append(b, 0x20, lGate)
 		b = append(b, 0x20, pOut, 0x20, lIdx, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
 		b = append(b, 0x28, 0x02, 0x00) // id
@@ -718,11 +786,15 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 	var b []byte
 	b = a.EmitDecls(b)
 
-	// The descriptor: check the magic, take the gate pointer.
-	b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchMagicOff, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
-	b = append(b, 0x47, 0x04, 0x40, 0x00, 0x0B)
-	b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchGateOff, 0x21, lGate)
+	if worker {
+		b = append(b, 0x20, pDesc, 0x21, lGate)
+	} else {
+		// The descriptor: check the magic, take the gate pointer.
+		b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchMagicOff, 0x41)
+		b = utils.AppendSLEB128(b, abi.FindScratchMagic)
+		b = append(b, 0x47, 0x04, 0x40, 0x00, 0x0B)
+		b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchGateOff, 0x21, lGate)
+	}
 	// from > len answers nothing.
 	b = append(b, 0x20, pFrom, 0x20, pLen, 0x4B, 0x04, 0x40, 0x41, 0x00, 0x0F, 0x0B)
 	b = append(b, 0x20, pLen, 0x41, 0x01, 0x74, 0x41, 0x02, 0x6A, 0x21, lDead) // 2*len + 2
@@ -779,7 +851,11 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 		b = append(b, 0x20, lBest, 0x41)
 		b = utils.AppendSLEB128(b, int32(m)) //nolint:gosec // a small count
 		b = append(b, 0x46, 0x04, 0x40)
-		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lK, 0x20, pDesc, 0x20, pOut, 0x20, pCap, 0x10)
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lK, 0x20, pDesc, 0x20, pOut, 0x20, pCap)
+		if worker {
+			b = append(b, 0x20, pMode)
+		}
+		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(keptIdx))                                 //nolint:gosec // a function index
 		b = append(b, 0x22, lR, 0x41, 0x00, 0x48, 0x04, 0x40, 0x20, lR, 0x0F, 0x0B) // error: pass it on
 		b = append(b, 0x41, 0x01, 0x21, lKeptDone)
@@ -842,9 +918,8 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 		b = append(b, 0x20, lR, 0x41, 0x00, 0x4A, 0x20, lKeptPos, 0x20, lS, 0x47, 0x71, 0x04, 0x40)
 		b = append(b, 0x20, lKeptPos, 0x41, 0x01, 0x74, 0x21, lV)
 		if gated {
-			b = append(b, 0x20, lR, 0x20, pCap, 0x4C, 0x04, 0x40)
+			b = setUndo(b)
 			b = undoKept(b, lV)
-			b = append(b, 0x0B)
 		}
 		for _, id := range keptIDs {
 			b = raiseGate(b, id, lV)
@@ -855,35 +930,56 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 
 	// The answer is the matches at S: the kept body's when its position is S,
 	// then every split member whose next match starts there.
+	// lIdx is a match's index within the position — kept matches first — and
+	// a split member's match is written at out[lIdx] when skip <= lIdx < cap.
 	b = append(b, 0x41, 0x00, 0x21, lIdx, 0x41, 0x00, 0x21, lN)
 	if kept {
 		b = append(b, 0x20, lR, 0x41, 0x00, 0x4A, 0x20, lKeptPos, 0x20, lS, 0x46, 0x71, 0x04, 0x40)
-		b = append(b, 0x20, lR, 0x21, lN)
-		b = append(b, 0x20, lR, 0x20, pCap, 0x20, lR, 0x20, pCap, 0x49, 0x1B, 0x21, lIdx) // min(r, cap)
-		b = append(b, 0x05, 0x41, 0x00, 0x21, lR, 0x0B)                                   // else: none of its tuples count
+		b = append(b, 0x20, lR, 0x21, lN, 0x20, lR, 0x21, lIdx)
+		b = append(b, 0x05, 0x41, 0x00, 0x21, lR, 0x0B) // else: none of its tuples count
+	}
+	reportGate := func(b []byte, k int, id int) []byte {
+		return storeGate(b, id, func(b []byte) []byte {
+			b = append(b, 0x20, lTk[k], 0x41, 0x01, 0x74)
+			b = append(b, 0x41, 0x01, 0x41, 0x02, 0x20, lTk[k], 0x20, lSk[k], 0x4A, 0x1B, 0x6A)
+			return b
+		})
 	}
 	for k, sm := range cs.split {
 		b = append(b, 0x20, lSk[k], 0x20, lS, 0x46, 0x04, 0x40)
 		b = append(b, 0x20, lN, 0x41, 0x01, 0x6A, 0x21, lN)
-		b = append(b, 0x20, lIdx, 0x20, pCap, 0x49, 0x04, 0x40)
+		b = append(b, 0x20, lIdx, 0x20, pCap, 0x49) // idx < cap
+		if worker && !gated {
+			b = append(b, 0x20, lIdx)
+			b = pushSkip(b)
+			b = append(b, 0x4F, 0x71) // && idx >= skip
+		}
+		b = append(b, 0x04, 0x40)
 		b = append(b, 0x20, pOut, 0x20, lIdx, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A, 0x22, lTmp)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(sm.id)) //nolint:gosec // a pattern id
 		b = append(b, 0x36, 0x02, 0x00)
 		b = append(b, 0x20, lTmp, 0x20, lSk[k], 0x36, 0x02, 0x04)
 		b = append(b, 0x20, lTmp, 0x20, lTk[k], 0x36, 0x02, 0x08)
+		if worker && gated {
+			// batch_mode: this match was delivered, so it is gated now.
+			b = append(b, 0x20, pMode, 0x04, 0x40)
+			b = reportGate(b, k, sm.id)
+			b = append(b, 0x0B)
+		}
+		b = append(b, 0x0B)
 		b = append(b, 0x20, lIdx, 0x41, 0x01, 0x6A, 0x21, lIdx)
-		b = append(b, 0x0B, 0x0B)
+		b = append(b, 0x0B)
+	}
+	if gated && worker {
+		// batch_mode has recorded every gate it owes already.
+		b = append(b, 0x20, pMode, 0x45, 0x04, 0x40)
 	}
 	if gated {
 		b = append(b, 0x20, lN, 0x20, pCap, 0x4D, 0x04, 0x40) // total <= cap: record every gate
 		for k, sm := range cs.split {
 			b = append(b, 0x20, lSk[k], 0x20, lS, 0x46, 0x04, 0x40)
-			b = storeGate(b, sm.id, func(b []byte) []byte {
-				b = append(b, 0x20, lTk[k], 0x41, 0x01, 0x74)
-				b = append(b, 0x41, 0x01, 0x41, 0x02, 0x20, lTk[k], 0x20, lSk[k], 0x4A, 0x1B, 0x6A)
-				return b
-			})
+			b = reportGate(b, k, sm.id)
 			b = append(b, 0x0B)
 		}
 		if kept {
@@ -891,10 +987,14 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int) []byte {
 			// fitted, and the position as a whole did not.
 			b = append(b, 0x05)
 			b = append(b, 0x20, lR, 0x41, 0x00, 0x4A, 0x20, lR, 0x20, pCap, 0x4C, 0x71, 0x04, 0x40)
+			b = append(b, 0x20, lR, 0x21, lU)
 			b = append(b, 0x20, lS, 0x41, 0x01, 0x74, 0x21, lV)
 			b = undoKept(b, lV)
 			b = append(b, 0x0B)
 		}
+		b = append(b, 0x0B)
+	}
+	if gated && worker {
 		b = append(b, 0x0B)
 	}
 	b = append(b, 0x20, lN, 0x0B)

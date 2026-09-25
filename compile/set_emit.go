@@ -42,7 +42,9 @@ type compiledSet struct {
 	// position it answered for, which a split set's merge wrapper reads
 	// back even when out_cap = 0 wrote nothing. -1 = none.
 	keptPosGlobal int32
-	name          string
+	// noSweep withholds the overlapping answer cache (see compileSetWith).
+	noSweep bool
+	name    string
 
 	// Capability export names; "" = not declared. `match` and `scan` were
 	// retired — `match_any(...) >= 0` and
@@ -711,6 +713,10 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// full is the whole set; spec, from here on, is what the buckets serve.
 	full := spec
 	spec = keptSpec(full, split)
+	// A split BATCHING set gets no answer cache: its batch entry serves the
+	// cache itself, without calling the worker the merge lives in, so a
+	// cache would answer for the kept members alone.
+	noSweep := len(split) > 0 && spec.BatchFind
 	for _, i := range split {
 		diag.SplitMembers = append(diag.SplitMembers, full.PatternIDs[i])
 	}
@@ -973,7 +979,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), wantsWalkExtent(spec, buckets, bi), scanPlan.counter)
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && wantsWalkExtent(spec, buckets, bi), scanPlan.counter)
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
 			bkt.probeWalkEndP1 = art.probeWalkEndGlobal + 1
@@ -1444,6 +1450,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		midSweepBudget:      -1,
 		scanSwWork:          -1,
 		keptPosGlobal:       -1,
+		noSweep:             noSweep,
 		walkEndGlobal:       walkEndGlobal,
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
@@ -2755,7 +2762,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			switch {
 			case c.kind == capFind && cs.mergedCap(c.kind):
-				cs_bytes = append(cs_bytes, emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev)...)
+				cs_bytes = append(cs_bytes, emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev, false)...)
 			case cs.mergedCap(c.kind):
 				cs_bytes = append(cs_bytes, emitSplitScanBody(cs, c.kind, keptIdx(c.kind), splitFwd)...)
 			case cs.scanUnionDirect && (c.kind == capScanAny || c.kind == capScanAll):
@@ -2767,7 +2774,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 		if cs.findWrapped() {
-			if cs.batchFind {
+			if cs.mergedWorker() {
+				// A split batching set: the worker slot holds the MERGE, over
+				// the bucket worker (emitted with the split set's other
+				// functions, below) and the split members.
+				kw := -1
+				if off := cs.keptWorkerFnOffset(); off >= 0 {
+					kw = base + off
+				}
+				cs_bytes = append(cs_bytes, emitSplitFindBody(cs, kw, splitFwd, splitRev, true)...)
+			} else if cs.batchFind {
 				cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
 			} else {
 				// Wrapped for the answer cache alone: the inner body is the
@@ -2827,6 +2843,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// Then a split set's functions, in extraFnTypes' order.
 		for _, c := range cs.keptCaps() {
 			cs_bytes = append(cs_bytes, capBody(c)...)
+		}
+		if cs.keptWorkerFnOffset() >= 0 {
+			cs_bytes = append(cs_bytes, emitSetWorkerBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx)...)
 		}
 		for _, c := range cs.switchCaps() {
 			cs_bytes = append(cs_bytes, cs.scanUnionBody(c.kind, tableMemIdx)...)

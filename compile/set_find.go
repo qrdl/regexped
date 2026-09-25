@@ -1488,7 +1488,7 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 		}
 		return append(b, 0x20, c.lAcc)
 	default:
-		if c.cs.keptPosGlobal >= 0 && !c.batch {
+		if c.cs.keptPosGlobal >= 0 {
 			// A split set's merge wrapper reads the answered position here
 			// even when out_cap = 0 wrote no tuple to read it from.
 			b = append(b, 0x20, c.lMinStart, 0x24)

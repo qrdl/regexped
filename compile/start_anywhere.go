@@ -30,9 +30,12 @@ import (
 //     at is the leftmost start s with [s, end) in the language; no start left
 //     of the leftmost match's start has any match, so s is that start.
 //
-// It costs ~29 fuel per byte on any input, where today's find costs 1.4-8 on
-// ordinary text that its SIMD skip can leap over, and it walks every match
-// twice. So it is not a replacement. classifyFind picks, at compile time:
+// It costs ~29 fuel per byte, except in a forward state that loops on nearly
+// every byte (l.dominantStates), whose runs emitDominantBulkSkip crosses at
+// 2-4; input that enters and leaves such a state every byte costs up to 37.
+// Today's find costs 1.4-8 on ordinary text that its SIMD skip can leap over,
+// and this one walks every match twice. So it is not a replacement.
+// classifyFind picks, at compile time:
 //
 //   - TODAY'S FIND, unchanged, where it is PROVABLY linear (group A): a failed
 //     attempt walks a bounded number of bytes (failedWalkBound), both shape
@@ -478,8 +481,21 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int) []byte {
 		locPos   = 3
 		locLast  = 4
 		locByte  = 5
+		locTmp   = 6 // bulk skip only
+		locChunk = 7 // bulk skip only (v128)
 	)
+	// The states the SIMD bulk skip serves: a state that loops on nearly
+	// every byte — `(?s:.)*?(?:[^\n]*ERROR)` sits in one looping on all but
+	// `E` — is left 16 bytes at a time instead of one. Capped, since each
+	// costs a compare on every byte.
+	dominant := l.dominantStates
+	if len(dominant) > maxForwardBulkSkipStates {
+		dominant = dominant[:maxForwardBulkSkipStates]
+	}
 	b := []byte{0x01, 0x04, 0x7F} // four i32 locals
+	if len(dominant) > 0 {
+		b = []byte{0x02, 0x05, 0x7F, 0x01, 0x7B} // five i32, one v128
+	}
 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(l.wasmStart))
@@ -521,6 +537,16 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locLast)
 	b = append(b, 0x0B)
 
+	// In a looping state, skip the run of bytes that keeps it there: pos
+	// ends on the last of them, and the loop resumes on the byte that leaves.
+	for _, info := range dominant {
+		b = append(b, 0x20, locState, 0x41)
+		b = utils.AppendSLEB128(b, info.state)
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = emitDominantBulkSkip(b, info, info.isMidAccept, locPos, locLen, locLast, locPtr, locChunk, locTmp)
+		b = append(b, 0x0B)
+	}
+
 	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos) // pos++
 	b = append(b, 0x0C, 0x00)                                   // br $fwd
 	b = append(b, 0x0B, 0x0B)                                   // end loop, end block
@@ -529,6 +555,10 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int) []byte {
 	sz := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(sz, b...)
 }
+
+// maxForwardBulkSkipStates caps how many looping states the forward pass
+// tests for on every byte.
+const maxForwardBulkSkipStates = 4
 
 // buildStartAnywhereBackBody returns the size-prefixed backward pass,
 // (ptr, scan_end) → i32: it walks input[scan_end], input[scan_end-1], … down

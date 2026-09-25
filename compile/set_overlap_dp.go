@@ -163,7 +163,7 @@ func (cs *compiledSet) overlapDPBucket() int {
 	// shared and `find` calls it too, so requiring the hint would be requiring
 	// a second entry point nobody asked for in order to make the first one
 	// linear.
-	if cs.find == "" || !cs.overlapping {
+	if cs.find == "" || !cs.overlapping || cs.noSweep {
 		return -1
 	}
 	// ONE bucket. With several, a position's tuples come from several DFAs and

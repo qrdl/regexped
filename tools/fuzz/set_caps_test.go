@@ -3945,6 +3945,54 @@ func TestSetSplitMembersAgainstOracle(t *testing.T) {
 	}
 }
 
+// TestSetSplitBatchAgainstOracle drives the BATCH entry of split sets —
+// merged inside the shared worker — at capacities that split a position
+// across calls (1, 2), fit it exactly (P) and hold several positions (64),
+// gated against FindAllIndex and overlapping against every start's match.
+// The worker's resume rules — gate what was delivered; skip the first k — are
+// what capacity 1 exercises at every multi-match position.
+func TestSetSplitBatchAgainstOracle(t *testing.T) {
+	for _, pats := range splitCases {
+		for _, ov := range []bool{false, true} {
+			entries := make([]config.RegexEntry, len(pats))
+			for i, p := range pats {
+				entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			}
+			_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+				Name: "s", Find: "f", Overlapping: ov, Hints: []string{"batch-find"}, Patterns: config.PatternSelector{All: true},
+			}}}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(diags[0].SplitMembers) == 0 && (!ov || !diags[0].InCallCounter) {
+				t.Errorf("%v overlapping=%v: a batching set neither split nor countered", pats, ov)
+			}
+		}
+		for _, input := range splitInputs {
+			t.Run(fmt.Sprint(pats)+"|"+input, func(t *testing.T) {
+				checkBatch(t, pats, input)
+
+				var want []setMatch
+				for k, p := range pats {
+					for _, sp := range allStartPositionMatches(regexp.MustCompile(p), input) {
+						want = append(want, setMatch{PatternID: k, Start: sp[0], End: sp[1]})
+					}
+				}
+				sortMatches(want)
+				runner := newBatchRunner(t, pats, input, true)
+				defer runner.release()
+				for _, outCap := range []int32{1, 2, int32(len(pats)), 64} {
+					got := runner.drive(t, outCap, true)
+					sortMatches(got)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("overlapping cap=%d: got %v, want %v", outCap, got, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestSetSplitLinear is the split's linearity obligation: over a worst-case
 // run, every non-anchored capability's cost grows at most 8× for a 4× longer
 // input. Before the split these sets were quadratic (16× and worse).
@@ -4200,6 +4248,37 @@ func TestSetCountersLinear(t *testing.T) {
 		}
 		_, small := drive(strings.Repeat("a", 4096))
 		_, large := drive(strings.Repeat("a", 16384))
+		if ratio := float64(large) / float64(small); ratio > 8 {
+			t.Errorf("fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", ratio, small, large)
+		}
+	})
+
+	t.Run("gated batch entry of a split set", func(t *testing.T) {
+		pats := []string{`[a-z]+X`, `foo`}
+		w, d := build(pats, config.SetConfig{Find: "set_find", Hints: []string{"batch-find"}})
+		if len(d.SplitMembers) == 0 {
+			t.Fatal("the batching set was not split")
+		}
+		countMask := int64(1)<<uint(config.SetCursorCountBits(len(pats))) - 1
+		drive := func(input string) uint64 {
+			x := open(w, input, len(pats), 0, 0)
+			defer x.st.Close()
+			fn := x.in.GetFunc(x.st, "set_find_batch")
+			for cursor := int64(0); ; {
+				v, err := fn.Call(x.st, x.inBase, int32(len(input)), cursor, x.desc, x.outPtr, int32(len(pats)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ret := v.(int64)
+				_ = ret & countMask
+				if uint32(ret>>32) == 0xFFFFFFFF {
+					break
+				}
+				cursor = ret
+			}
+			return used(x)
+		}
+		small, large := drive(strings.Repeat("a", 4096)), drive(strings.Repeat("a", 16384))
 		if ratio := float64(large) / float64(small); ratio > 8 {
 			t.Errorf("fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", ratio, small, large)
 		}

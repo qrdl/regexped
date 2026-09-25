@@ -72,7 +72,11 @@ regexped/
 │   │                          #   method: a forward pass over the leftmost-first DFA of
 │   │                          #   `(?s:.)*?(?:pat)` finds the END, a backward pass over the
 │   │                          #   reversed pattern finds the START) is linear on every input
-│   │                          #   at ~29 fuel/byte; the per-position find is 1-8 on ordinary
+│   │                          #   at ~29 fuel/byte (2-4 where the forward pass sits in a
+│   │                          #   state looping on nearly every byte, which it crosses
+│   │                          #   with emitDominantBulkSkip; up to 37 on input that
+│   │                          #   enters and leaves that state every byte); the
+│   │                          #   per-position find is 1-8 on ordinary
 │   │                          #   text but QUADRATIC on runs that keep an attempt alive
 │   │                          #   (`a*b` over a×N). classifyFind decides at compile time:
 │   │                          #   provably linear (failedWalkBound finite, both shape
@@ -232,7 +236,11 @@ regexped/
 │   │                          #   built. A split set's scan pair is ONE union over every
 │   │                          #   member when buildable. CompileSet compiles a TRIAL first
 │   │                          #   (globals cloned, warnings once) to learn which is needed.
-│   │                          #   Never for `hints: [batch-find]`. A set whose members are
+│   │                          #   A BATCHING set merges inside the shared worker (both
+│   │                          #   entries reach it; gated batch_mode gates what it DELIVERED,
+│   │                          #   overlapping skips the first k) and, once split, gets NO
+│   │                          #   answer cache — the batch entry serves the cache without
+│   │                          #   calling the worker. A set whose members are
 │   │                          #   all provably linear compiles exactly as before
 │   ├── set_sparse.go          # Sparse accept: per-state LISTS of pattern indices instead of a
 │   │                          #   u64 mask, which is what lets ONE bucket hold more than 32
@@ -911,7 +919,7 @@ It compares ANSWERS rather than global indices, because a wrong renumbering by
 make byteident   # from repo root
 ```
 
-Twenty-eight single-pattern configs, one per code path, plus eighteen SET configs
+Twenty-eight single-pattern configs, one per code path, plus nineteen SET configs
 spanning four frontends, both accept representations and all five
 capabilities — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
@@ -1342,7 +1350,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-09-23
+**Last Updated:** 2026-09-24
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

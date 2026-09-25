@@ -229,9 +229,16 @@ linear on every input:
   end back down to `from`; the lowest position it accepts at is the match's
   START.
 
-It costs about 29 instructions per byte on any input and walks each match
-twice, where the ordinary find costs 1-8 on text its SIMD skip can leap over —
-so it is not a replacement. The compiler picks per pattern, at compile time:
+Its forward pass costs about 29 instructions per byte, except in a state that
+loops on nearly every byte — typically one waiting for a byte that can begin
+or continue a match, as in `a*b`, `.*foo\d` or `foo[a-z]+bar` over text
+without those bytes. Runs in such a state are crossed with the SIMD bulk skip
+the ordinary DFA bodies use, at 2-4 instructions per byte; input that enters
+and leaves the state on every byte costs up to 37 instead. A pattern opening
+with a word-class repeat (`\w+@\w+`) has no such state on prose and stays at
+29. It also walks each match twice, where the ordinary find costs 1-8 on text
+its SIMD skip can leap over — so it is not a replacement. The compiler picks
+per pattern, at compile time:
 
 | Pattern | Find |
 |---|---|

@@ -507,21 +507,29 @@ is searched again before the drive reaches it. The gate array's size and its
 must never go backwards.
 
 Costs, measured at 64 KB on single-shape and mixed sets: a split member costs
-its start-anywhere find, about 29 instructions per byte, where the bucket body
-often cost 2-3 on text it could skip — so a split member's gated `find` is up to
-14× slower on ordinary text, and 21,000-77,000× faster on the worst case; mixed
-sets that were quadratic are 170-21,000× faster. Each split member adds its two
+its start-anywhere find — 2-4 instructions per byte on text its forward pass
+crosses with the SIMD bulk skip (`a*b`, `foo[a-z]+bar` away from their bytes),
+about 29 where it cannot (`\w+@\w+` over prose), up to 37 on runs that defeat
+the skip — where the bucket body often cost 2-3 on text it could skip. So on
+text without a worst-case run, with or without matches, a split member's gated
+`find` ranges from 17× faster to 14× slower; on the worst-case runs that were
+quadratic it is 19,000-66,000× faster, and mixed sets that were quadratic are
+330-20,000× faster. Each split member adds its two
 automata's tables (uncompressed) to the module. One case stays slow:
 `overlapping: true` on a set the answer cache cannot serve, over members whose
 matches are long and overlap — every start's match is walked in full, split or
 not.
 
-**Not split:** a set with `hints: [batch-find]` — its batch entry resumes inside
-a position through its own gate rule, which the merge does not reproduce — so a
-batching gated set with such members stays as it was. The overlapping in-call
-counter does apply to it. A member with an empty-width assertion, one the
+**Batching sets** (`hints: [batch-find]`) are split the same way: the merge sits
+in the per-position worker both entries share, and keeps the batch entry's
+resume rules — a position larger than the buffer continues on the next call
+with exactly the matches not yet delivered. A split batching set gets no
+answer cache, since the batch entry would serve it without the split members;
+the cache is kept for batching sets that are not split.
+
+**Not split:** a member with an empty-width assertion, one the
 compiler dropped or put on Backtracking, and one whose start-anywhere automaton
-exceeds `max_fallback_states` also stay in the buckets. At most 24 members are
+exceeds `max_fallback_states` stay in the buckets. At most 24 members are
 split out of one set; a set with more keeps all of them in its buckets.
 
 `--diag-json` reports all of it: `split_members` (the ids served outside the
