@@ -912,7 +912,7 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 	var out []setAdapter
 	for si, cs := range sets {
 		n, ok := names[cs.name]
-		if !ok {
+		if !ok || cs.internal {
 			continue
 		}
 		// The sweep column, if this set has one. It fixes the cache geometry the

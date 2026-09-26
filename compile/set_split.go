@@ -2,6 +2,7 @@ package compile
 
 import (
 	"regexp/syntax"
+	"sort"
 
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
@@ -15,12 +16,15 @@ import (
 // makes them quadratic. The single-pattern find proves some shapes linear by
 // looking at the body that will run them; a set member is walked by the SET's
 // code, so only two proofs carry over: the engine-independent one
-// (failedWalkBound: no reachable cycle of non-accepting states), and the set's
-// own literal-anchored one (setLiteralMemberLinear). Every other member that
-// the start-anywhere find can serve is SPLIT OUT:
+// (failedWalkBound: no reachable cycle on which a walk keeps going without
+// accepting), and the set's own literal-anchored one (setLiteralMemberLinear).
+// Every other member is SPLIT OUT:
 //
 //   - the buckets serve the members that stay ("kept"), exactly as before;
-//   - each split member gets its own two passes (start_anywhere.go);
+//   - each split member gets its own linear search: its start-anywhere find's
+//     two passes (start_anywhere.go), or the Backtracking find where those
+//     cannot be built, past the start-anywhere tables' budget, or for a
+//     member the set had put on a Backtracking bucket (splitCand.bt);
 //   - `find`, `scan_any` and `scan_all` become MERGE WRAPPERS over the kept
 //     body and the split members — unless a start-anywhere union over EVERY
 //     member can serve the scan pair, which then answers it alone;
@@ -54,15 +58,82 @@ import (
 // member's search from its bound is repeated only on the call that reports
 // it: each byte is walked a bounded number of times over the whole drive.
 
-// maxSplitMembers bounds how many members one set splits out. The merge
-// wrapper keeps four locals per member beside 22 of its own, and addresses
-// every local with ONE byte of ULEB128 — below 128.
-const maxSplitMembers = 24
+// splitTableBudget bounds the start-anywhere tables one set's split members
+// add to the module. Members get the start-anywhere find smallest tables
+// first while the total stays within it; the rest are served by the
+// Backtracking find (buildBTFindParts), linear per call too, whose own tables
+// are a few scan bytes and whose frame stack all of them share — the merge
+// wrapper calls one member at a time. Without a bound a set with hundreds of
+// such members compiled hundreds of automata, each up to ~1 MB.
+const splitTableBudget = 4 << 20
 
-// splitMember is one member a set serves outside its buckets.
+// splitMember is one member a set serves outside its buckets: by its
+// start-anywhere find's two passes, or — bt non-nil — by the Backtracking find.
 type splitMember struct {
 	id               int    // global pattern id
 	fwdBody, revBody []byte // size-prefixed code entries
+	// ctx: the passes are the context ones (startAnywherePasses.ctx) — the
+	// forward pass reads the whole input from the find-from global and
+	// answers an absolute end, the backward one takes (ptr, len, end).
+	ctx bool
+	bt  *btFindParts
+}
+
+// splitCand is a member the split serves: its index into the set's patterns,
+// and how — the Backtracking find (bt), or the start-anywhere find, whose two
+// automata take saBytes of tables.
+type splitCand struct {
+	idx     int
+	bt      bool
+	saBytes int64
+}
+
+// splitAnalysisStates is the state limit setMemberNeedsSplit judges a member's
+// automaton under when max_fallback_states is lower.
+const splitAnalysisStates = 4096
+
+// anyBTSplit reports whether a candidate is served by the Backtracking find.
+func anyBTSplit(split []splitCand) bool {
+	for _, c := range split {
+		if c.bt {
+			return true
+		}
+	}
+	return false
+}
+
+// splitIndices is the candidates' pattern indices.
+func splitIndices(split []splitCand) []int {
+	out := make([]int, len(split))
+	for i, c := range split {
+		out[i] = c.idx
+	}
+	return out
+}
+
+// budgetSplit gives the start-anywhere find to the candidates with the
+// smallest tables while their total stays within budget, and the Backtracking
+// find to the rest (a candidate Backtracking cannot take keeps the
+// start-anywhere find: over the budget, but linear).
+func budgetSplit(cands []splitCand, pats []*PatternInfo, opts CompileSetOptions, budget int64) []splitCand {
+	var order []int
+	for k, c := range cands {
+		if !c.bt {
+			order = append(order, k)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool { return cands[order[a]].saBytes < cands[order[b]].saBytes })
+	var total int64
+	for _, k := range order {
+		if total+cands[k].saBytes > budget {
+			if _, ok := btFindStackSize(pats[cands[k].idx].fullPattern, opts.BTWorkBudget); ok {
+				cands[k].bt = true
+				continue
+			}
+		}
+		total += cands[k].saBytes
+	}
+	return cands
 }
 
 // keptSpec is spec without the members at the split indices. It keeps the
@@ -116,10 +187,14 @@ func compileSetSplit(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 	trialOpts.globals = opts.globals.clone()
 	trial := compileSetWith(spec, prefixPool, suffixPool, trialOpts, nil, true)
 	cands = trial.keepsOnDFA(spec, cands)
-	if len(cands) == 0 || len(cands) > maxSplitMembers || !trial.needsSplit() {
+	if len(cands) == 0 || !trial.needsSplit() {
 		*opts.globals = *trialOpts.globals
+		if len(cands) > 0 {
+			trial.companion = noCacheCompanion(spec, prefixPool, suffixPool, opts, trial, cands)
+		}
 		return trial
 	}
+	cands = budgetSplit(cands, spec.Patterns, opts, splitTableBudget)
 	// The trial has already warned about every pattern this compile drops or
 	// puts on Backtracking: the split members are neither, and the others
 	// are packed by the same per-pattern rules.
@@ -127,17 +202,51 @@ func compileSetSplit(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 	return compileSetWith(spec, prefixPool, suffixPool, opts, cands, true)
 }
 
-// setSplitCandidates returns the indices, into spec.Patterns, of the members
-// the split would serve: not provably linear in a set, and servable by the
-// start-anywhere find.
-func setSplitCandidates(spec SetSpec, opts CompileSetOptions) []int {
+// noCacheCompanion builds what an overlapping set falls back to when its
+// answer cache is what keeps its not-provably-linear members linear and a drive
+// has no usable cache: no cache pointer (a raw caller, a C build with
+// -DRX_SET_CACHE=0, a component whose region was declined), or a sweep refused.
+// There the in-call counter has nothing to hand over to. The companion is the
+// SAME set split — those members served by their own linear searches, the rest
+// by buckets with no cache at all — compiled beside it, `find` (and the batch
+// entry) only, never exported; the exported entries route a cacheless drive to
+// it. nil when the set has no such cache to lose.
+func noCacheCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, primary *compiledSet, cands []splitCand) *compiledSet {
+	if !primary.hasFind() || !primary.overlapping || !primary.usesOverlapDP() {
+		return nil
+	}
+	c := spec
+	c.Find = spec.Find + "\x00no-cache" // internal: never exported
+	c.MatchAny, c.MatchAll, c.ScanAny, c.ScanAll = "", "", "", ""
+	o := opts
+	o.noCache, o.quiet = true, true
+	base := max(int64(primary.regionEnd), primary.dataTop())
+	o.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
+	comp := compileSetWith(c, prefixPool, suffixPool, o, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+	comp.internal = true
+	if primary.diag != nil && comp.diag != nil {
+		primary.diag.NoCacheSplitMembers = comp.diag.SplitMembers
+	}
+	return comp
+}
+
+// setSplitCandidates returns the members the split would serve — those not
+// provably linear in a set — and how: the start-anywhere find where it can be
+// built for the member, the Backtracking find where it cannot (an empty-width
+// assertion, or an automaton over the limits).
+func setSplitCandidates(spec SetSpec, opts CompileSetOptions) []splitCand {
 	if !spec.HasFind() && spec.ScanAny == "" && spec.ScanAll == "" {
 		return nil
 	}
-	var out []int
+	var out []splitCand
 	for i, p := range spec.Patterns {
-		if setMemberNeedsSplit(p, opts) {
-			out = append(out, i)
+		if !setMemberNeedsSplit(p, opts) {
+			continue
+		}
+		if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8); ok {
+			out = append(out, splitCand{idx: i, saBytes: sa.end})
+		} else if _, ok := btFindStackSize(p.fullPattern, opts.BTWorkBudget); ok {
+			out = append(out, splitCand{idx: i, bt: true})
 		}
 	}
 	return out
@@ -145,34 +254,42 @@ func setSplitCandidates(spec SetSpec, opts CompileSetOptions) []int {
 
 // setMemberNeedsSplit applies the set's group-A rule — the bounded-walk
 // clause, or the set's literal-anchored clause — and reports whether p fails
-// it and can be served by the start-anywhere find.
+// it. A member that matches only at 0 is linear; one whose automaton cannot be
+// built to be judged is not provably linear.
+//
+// The automaton is built for the JUDGEMENT under the larger of
+// max_fallback_states and splitAnalysisStates: that option bounds the table a
+// bucket walks at run time, not what the compiler may examine, and a member it
+// puts on a Backtracking bucket (`a+` under max_fallback_states: 1) is still
+// linear there when its automaton says so.
 func setMemberNeedsSplit(p *PatternInfo, opts CompileSetOptions) bool {
 	parsed, err := syntax.Parse(p.fullPattern, syntax.Perl)
 	if err != nil {
 		return false
 	}
 	stripCaptures(parsed)
-	if hasEmptyWidthAssertion(parsed) {
-		return false
-	}
-	limit := opts.maxFallbackStates()
+	limit := max(opts.maxFallbackStates(), splitAnalysisStates)
 	m, err := compile(p.fullPattern, CompileOptions{MaxDFAStates: limit, ForceEngine: EngineDFA,
 		LeftmostFirst: true, ByteMode: p.byteMode})
 	if err != nil {
-		return false
+		return true
 	}
 	t := dfaTableFrom(m.(*dfa))
-	if t.numStates > limit || isAnchoredFind(t) {
+	if t.numStates > limit {
+		return true
+	}
+	if isAnchoredFind(t) {
 		return false
 	}
 	if _, bounded := failedWalkBound(t); bounded {
 		return false
 	}
-	if setLiteralMemberLinear(p) {
+	// The literal clause judges accepts without the context an assertion puts
+	// on them, so it does not speak for a member that has one.
+	if !hasEmptyWidthAssertion(parsed) && setLiteralMemberLinear(p) {
 		return false
 	}
-	_, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8)
-	return ok
+	return true
 }
 
 // setLiteralMemberLinear is the set's own literal-anchored clause. A member
@@ -333,25 +450,33 @@ func splitPassOpts(p *PatternInfo, opts CompileSetOptions) CompileOptions {
 
 func align8(v int64) int64 { return (v + 7) &^ 7 }
 
-// keepsOnDFA filters cands to the members this (unsplit) compile placed in an
-// ordinary DFA bucket. A member it dropped or put on Backtracking stays
-// where it is: the split would change what the set reports, or the `_all`
-// ABI a Backtracking member selects.
-func (cs *compiledSet) keepsOnDFA(spec SetSpec, cands []int) []int {
-	onDFA := map[int]bool{}
+// keepsOnDFA filters cands to the members this (unsplit) compile placed in a
+// bucket. A member it dropped stays dropped: splitting it out would make the
+// set report a pattern it does not otherwise serve. A member it put on a
+// Backtracking bucket is split out on the Backtracking find: the bucket's
+// visited set lasts one host call, so a drive whose other members match often
+// re-walks the member's long failed walks on every call, while the merge's
+// lower bound retires a member that cannot match.
+func (cs *compiledSet) keepsOnDFA(spec SetSpec, cands []splitCand) []splitCand {
+	inBucket, onBT := map[int]bool{}, map[int]bool{}
 	for bi, bkt := range cs.buckets {
-		if bkt.btFallback != nil {
-			continue
-		}
 		for _, id := range cs.patternIDs[bi] {
-			onDFA[id] = true
+			inBucket[id] = true
+			if bkt.btFallback != nil {
+				onBT[id] = true
+			}
 		}
 	}
-	var out []int
-	for _, i := range cands {
-		if onDFA[spec.PatternIDs[i]] {
-			out = append(out, i)
+	var out []splitCand
+	for _, c := range cands {
+		id := spec.PatternIDs[c.idx]
+		if !inBucket[id] {
+			continue
 		}
+		if onBT[id] {
+			c.bt = true
+		}
+		out = append(out, c)
 	}
 	return out
 }
@@ -426,11 +551,11 @@ type scanUnionPlan struct {
 //
 // Whether the counter is actually emitted is settled later (buildScanUnion),
 // once the frontend is final; this decides whether the probes stamp.
-func planScanUnion(full, kept SetSpec, split []int, buckets []*bucket, nonLinear bool) scanUnionPlan {
+func planScanUnion(full, kept SetSpec, split []int, buckets []*bucket, nonLinear, btSplit bool) scanUnionPlan {
 	if !nonLinear || (full.ScanAny == "" && full.ScanAll == "") {
 		return scanUnionPlan{}
 	}
-	wide := setWideAll(full, buckets)
+	wide := setWideAll(full, buckets) || btSplit
 	if len(split) > 0 && unionServesScan(buildUnionScanDFA(full, 0, false), full, wide) {
 		return scanUnionPlan{target: &full, direct: true}
 	}
@@ -509,6 +634,9 @@ func (cs *compiledSet) buildScanUnion(plan scanUnionPlan, ra *regionAlloc, opts 
 	}
 	if plan.counter {
 		cs.scanSwWork = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+		if cs.scanAll != "" {
+			cs.scanSwMark = int32(opts.globals.AllocI64(0)) //nolint:gosec // a global index
+		}
 	}
 	cs.diag.ScanUnion = &ScanUnionDiag{Direct: plan.direct, Counter: plan.counter,
 		States: u.numStates, Wide: u.isWide()}
@@ -525,19 +653,56 @@ func (cs *compiledSet) scanSwitch(kind setCapKind) bool {
 
 // buildSplitMembers builds the split members' two passes, laying their tables
 // out through ra, and the global the kept body reports its position in.
-func (cs *compiledSet) buildSplitMembers(full SetSpec, split []int, ra *regionAlloc, opts CompileSetOptions) {
+func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *regionAlloc, opts CompileSetOptions) {
 	if len(split) == 0 {
 		return
 	}
-	for _, i := range split {
-		p := full.Patterns[i]
+	// One frame stack for every Backtracking member: the merge wrappers call
+	// one member at a time, and nothing else runs a member's find.
+	var stack *[2]int32
+	maxStack := 0
+	for _, c := range split {
+		if c.bt {
+			size, _ := btFindStackSize(full.Patterns[c.idx].fullPattern, opts.BTWorkBudget)
+			maxStack = max(maxStack, size)
+			stack = &[2]int32{}
+		}
+	}
+	if stack != nil {
+		base := ra.Reserve("split-bt-stack", 8)
+		ra.Commit(base + int32(maxStack)) //nolint:gosec // a stack size
+		stack[0], stack[1] = base, base+int32(maxStack)
+		if maxStack > 0 {
+			// Declare the stack in the data section, as planBTRegions does:
+			// callers find free memory from the emitted segments, and an
+			// input placed on an undeclared stack is silent corruption.
+			cs.splitData = append(cs.splitData, appendDataSegment(nil, stack[1]-1, []byte{0})...)
+			cs.splitSegs++
+		}
+	}
+	for _, c := range split {
+		p := full.Patterns[c.idx]
+		if c.bt {
+			base := ra.Reserve("split-bt-member", 8)
+			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget,
+				tableMemIdx: opts.TableMemIdx, globals: opts.globals}
+			bt, err := buildBTFindParts(p.fullPattern, nil, findMandatoryLit(p.fullPattern, p.byteMode), int64(base), &o, stack)
+			if err != nil {
+				panic("compile: a split member Backtracking was classified to take refused it: " + err.Error())
+			}
+			ra.Commit(int32(bt.end)) //nolint:gosec // table addresses fit in i32
+			cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], bt: &bt})
+			cs.splitData = append(cs.splitData, bt.data...)
+			cs.splitSegs += bt.segs
+			continue
+		}
 		base := ra.Reserve("split-member", 8)
 		sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), int64(base), align8)
 		if !ok {
 			panic("compile: a split member's start-anywhere find was classified buildable and then refused")
 		}
 		ra.Commit(int32(sa.end)) //nolint:gosec // table addresses fit in i32
-		cs.split = append(cs.split, splitMember{id: full.PatternIDs[i], fwdBody: sa.fwdBody, revBody: sa.revBody})
+		cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], fwdBody: sa.fwdBody, revBody: sa.revBody, ctx: sa.ctx})
 		cs.splitData = append(cs.splitData, sa.data...)
 		cs.splitSegs += sa.segs
 	}
@@ -641,15 +806,37 @@ func (cs *compiledSet) scanSwitchFnOffset(kind setCapKind) int {
 	return -1
 }
 
-// splitFwdOffset / splitRevOffset index member i's two passes.
+// splitFnCount is how many functions member i contributes: its two passes,
+// or its Backtracking find and — when it has one — that find's fallback.
+func (cs *compiledSet) splitFnCount(i int) int {
+	if bt := cs.split[i].bt; bt != nil {
+		if bt.fallback != nil {
+			return 2
+		}
+		return 1
+	}
+	return 2
+}
+
+// splitFwdOffset is member i's first function: its forward pass, or its
+// Backtracking find. splitRevOffset is a start-anywhere member's backward
+// pass, right after.
 func (cs *compiledSet) splitFwdOffset(i int) int {
-	return cs.extraFnBaseOffset() + len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps()) + 2*i
+	off := cs.extraFnBaseOffset() + len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps())
+	for j := 0; j < i; j++ {
+		off += cs.splitFnCount(j)
+	}
+	return off
 }
 func (cs *compiledSet) splitRevOffset(i int) int { return cs.splitFwdOffset(i) + 1 }
 
 // extraFnCount is how many functions this file adds.
 func (cs *compiledSet) extraFnCount() int {
-	return len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps()) + 2*len(cs.split)
+	n := len(cs.keptCaps()) + cs.keptWorkerCount() + len(cs.switchCaps())
+	for i := range cs.split {
+		n += cs.splitFnCount(i)
+	}
+	return n
 }
 
 // extraFnTypes lists the added functions' type indices, in layout order.
@@ -664,7 +851,17 @@ func (cs *compiledSet) extraFnTypes() []byte {
 	for _, c := range cs.switchCaps() {
 		out = append(out, c.typeIdx)
 	}
-	for range cs.split {
+	for i, sm := range cs.split {
+		if sm.bt != nil {
+			for j := 0; j < cs.splitFnCount(i); j++ {
+				out = append(out, setTypeI32I32ToI64)
+			}
+			continue
+		}
+		if sm.ctx {
+			out = append(out, setTypeI32I32ToI32, setTypeI32x3ToI32)
+			continue
+		}
 		out = append(out, setTypeI32I32ToI32, setTypeI32I32ToI32)
 	}
 	return out
@@ -687,7 +884,7 @@ func (cs *compiledSet) scanUnionBody(kind setCapKind, tableMemIdx int) []byte {
 // not fit records no gate for any pattern, kept or split.
 //
 // worker selects the other shape: the per-position WORKER a batching set's
-// `find` and batch entry share, merged the same way (task-109 decision 1). It
+// `find` and batch entry share, merged the same way. It
 // takes the gate pointer itself rather than the descriptor, calls the kept
 // WORKER, and carries the worker's trailing argument through the batch
 // resume rules: gated, `batch_mode` — 1 records a gate for every match
@@ -717,13 +914,21 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	lU := a.I32() // how many of the kept body's report gates to undo
 	lKeptPos, lKeptDone, lBest, lBestLb := a.I32(), a.I32(), a.I32(), a.I32()
 	lQ, lE, lSt, lN, lIdx, lTmp, lDead, lV := a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
-	lLb, lSk, lTk, lDone := make([]byte, m), make([]byte, m), make([]byte, m), make([]byte, m)
+	// Four locals per member: their count grows with the set, so their
+	// indices are full width and every reference to one goes through lw.
+	lLb, lSk, lTk, lDone := make([]uint32, m), make([]uint32, m), make([]uint32, m), make([]uint32, m)
 	for k := 0; k < m; k++ {
-		lLb[k], lSk[k], lTk[k], lDone[k] = a.I32(), a.I32(), a.I32(), a.I32()
+		lLb[k], lSk[k], lTk[k], lDone[k] = a.I32W(), a.I32W(), a.I32W(), a.I32W()
 	}
-	if lDone[m-1] >= 0x80 {
-		panic("compile: a split set's merge wrapper ran out of one-byte local indices")
+	// A Backtracking member's search answers one i64: (start << 32) | end.
+	var lR64 uint32
+	for _, sm := range cs.split {
+		if sm.bt != nil {
+			lR64 = a.I64W()
+			break
+		}
 	}
+	lw := func(b []byte, op byte, idx uint32) []byte { return utils.AppendULEB128(append(b, op), idx) }
 	// pushSkip pushes how many of the position's first matches are not
 	// written: the overlapping worker's `skip`, 0 everywhere else.
 	pushSkip := func(b []byte) []byte {
@@ -812,10 +1017,10 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	// Each split member's lower bound, and its done flag.
 	for k, sm := range cs.split {
 		b = loadGate(b, sm.id)
-		b = append(b, 0x41, 0x01, 0x76, 0x22, lLb[k])
-		b = append(b, 0x20, pFrom, 0x49, 0x04, 0x40, 0x20, pFrom, 0x21, lLb[k], 0x0B)
-		b = append(b, 0x41, 0x00, 0x21, lDone[k])
-		b = append(b, 0x41, 0x7F, 0x21, lSk[k])
+		b = lw(append(b, 0x41, 0x01, 0x76), 0x22, lLb[k])
+		b = append(lw(append(b, 0x20, pFrom, 0x49, 0x04, 0x40, 0x20, pFrom), 0x21, lLb[k]), 0x0B)
+		b = lw(append(b, 0x41, 0x00), 0x21, lDone[k])
+		b = lw(append(b, 0x41, 0x7F), 0x21, lSk[k])
 	}
 	b = append(b, 0x41, 0x7F, 0x21, lS)
 	b = append(b, 0x41, 0x00, 0x21, lR)
@@ -830,17 +1035,17 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	// lower bound, while that bound is at or before the best start so far.
 	b = append(b, 0x02, 0x40, 0x03, 0x40) // block $exit, loop $sel
 	b = append(b, 0x41, 0x7F, 0x21, lBest, 0x41, 0x7F, 0x21, lBestLb)
-	consider := func(b []byte, doneLocal, lbLocal byte, idx int32) []byte {
-		b = append(b, 0x20, doneLocal, 0x45)
-		b = append(b, 0x20, lbLocal, 0x20, lS, 0x4D, 0x71) // lb <= S
-		b = append(b, 0x20, lbLocal, 0x20, lBestLb, 0x49, 0x71)
+	consider := func(b []byte, doneLocal, lbLocal uint32, idx int32) []byte {
+		b = append(lw(b, 0x20, doneLocal), 0x45)
+		b = append(lw(b, 0x20, lbLocal), 0x20, lS, 0x4D, 0x71) // lb <= S
+		b = append(lw(b, 0x20, lbLocal), 0x20, lBestLb, 0x49, 0x71)
 		b = append(b, 0x04, 0x40, 0x41)
 		b = utils.AppendSLEB128(b, idx)
-		b = append(b, 0x21, lBest, 0x20, lbLocal, 0x21, lBestLb, 0x0B)
+		b = append(lw(append(b, 0x21, lBest), 0x20, lbLocal), 0x21, lBestLb, 0x0B)
 		return b
 	}
 	if kept {
-		b = consider(b, lKeptDone, lK, int32(m)) //nolint:gosec // a small count
+		b = consider(b, uint32(lKeptDone), uint32(lK), int32(m)) //nolint:gosec // a small count
 	}
 	for k := 0; k < m; k++ {
 		b = consider(b, lDone[k], lLb[k], int32(k)) //nolint:gosec // a small count
@@ -870,24 +1075,60 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = append(b, 0x20, lBest, 0x41)
 		b = utils.AppendSLEB128(b, int32(k)) //nolint:gosec // a small count
 		b = append(b, 0x46, 0x04, 0x40)
-		b = append(b, 0x41, 0x01, 0x21, lDone[k])
-		b = append(b, 0x20, lLb[k], 0x21, lQ)
+		b = lw(append(b, 0x41, 0x01), 0x21, lDone[k])
+		b = append(lw(b, 0x20, lLb[k]), 0x21, lQ)
 		b = append(b, 0x02, 0x40, 0x03, 0x40) // block $found, loop $retry
-		// Past the end, or no match from q: the member is done for the drive.
-		b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
-		b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
-		b = append(b, 0x20, pPtr, 0x20, lQ, 0x6A, 0x20, pLen, 0x20, lQ, 0x6B, 0x10)
-		b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
-		b = append(b, 0x0B)
-		b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
-		b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
-		b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
-		b = append(b, 0x20, lE, 0x20, lQ, 0x6A, 0x21, lE)
-		b = append(b, 0x20, lQ)
-		b = emitFindFromSetFromStack(b)
-		b = append(b, 0x20, pPtr, 0x20, lE, 0x41, 0x01, 0x6B, 0x10)
-		b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
-		b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+		if sm.bt != nil {
+			// The Backtracking find from q: (start << 32) | end, -1 for no
+			// match, or its "gave up" error, which is this call's answer.
+			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+			b = append(b, 0x04, 0x7E, 0x42, 0x7F, 0x05) // if (i64) -1 else
+			b = append(b, 0x20, lQ)
+			b = emitFindFromSetFromStack(b)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+			b = append(b, 0x0B)
+			b = lw(b, 0x22, lR64)
+			b = append(b, 0x42, 0x00, 0x53, 0x04, 0x40) // r < 0
+			b = append(lw(b, 0x20, lR64), 0x42, 0x7F, 0x53, 0x04, 0x40)
+			b = append(lw(b, 0x20, lR64), 0xA7, 0x0F, 0x0B) // r < -1: pass the error on
+			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
+			b = append(lw(b, 0x20, lR64), 0x42, 0x20, 0x88, 0xA7, 0x21, lSt)
+			b = append(lw(b, 0x20, lR64), 0xA7, 0x21, lE)
+		} else if sm.ctx {
+			// The context passes: both read the whole input, the forward one
+			// from q and the backward one down to q, through the global.
+			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+			b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
+			b = append(b, 0x20, lQ)
+			b = emitFindFromSetFromStack(b)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+			b = append(b, 0x0B)
+			b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
+			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lE, 0x10)
+			b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
+			b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+		} else {
+			// Past the end, or no match from q: the member is done for the drive.
+			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+			b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
+			b = append(b, 0x20, pPtr, 0x20, lQ, 0x6A, 0x20, pLen, 0x20, lQ, 0x6B, 0x10)
+			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+			b = append(b, 0x0B)
+			b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
+			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
+			b = append(b, 0x20, lE, 0x20, lQ, 0x6A, 0x21, lE)
+			b = append(b, 0x20, lQ)
+			b = emitFindFromSetFromStack(b)
+			b = append(b, 0x20, pPtr, 0x20, lE, 0x41, 0x01, 0x6B, 0x10)
+			b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
+			b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+		}
 		if gated {
 			// An empty match where the gate forbids one (right after this
 			// member's previous match): the next start may still match.
@@ -897,7 +1138,7 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 			b = append(b, 0x49, 0x71, 0x04, 0x40)                                  // 2s < gate
 			b = append(b, 0x20, lSt, 0x41, 0x01, 0x6A, 0x21, lQ, 0x0C, 0x01, 0x0B) // retry
 		}
-		b = append(b, 0x20, lSt, 0x21, lSk[k], 0x20, lE, 0x21, lTk[k])
+		b = lw(append(lw(append(b, 0x20, lSt), 0x21, lSk[k]), 0x20, lE), 0x21, lTk[k])
 		b = append(b, 0x20, lSt, 0x41, 0x01, 0x74, 0x21, lV)
 		b = raiseGate(b, sm.id, lV)
 		b = append(b, 0x20, lSt, 0x20, lS, 0x49, 0x04, 0x40, 0x20, lSt, 0x21, lS, 0x0B)
@@ -940,13 +1181,13 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	}
 	reportGate := func(b []byte, k int, id int) []byte {
 		return storeGate(b, id, func(b []byte) []byte {
-			b = append(b, 0x20, lTk[k], 0x41, 0x01, 0x74)
-			b = append(b, 0x41, 0x01, 0x41, 0x02, 0x20, lTk[k], 0x20, lSk[k], 0x4A, 0x1B, 0x6A)
+			b = append(lw(b, 0x20, lTk[k]), 0x41, 0x01, 0x74)
+			b = append(lw(lw(append(b, 0x41, 0x01, 0x41, 0x02), 0x20, lTk[k]), 0x20, lSk[k]), 0x4A, 0x1B, 0x6A)
 			return b
 		})
 	}
 	for k, sm := range cs.split {
-		b = append(b, 0x20, lSk[k], 0x20, lS, 0x46, 0x04, 0x40)
+		b = append(lw(b, 0x20, lSk[k]), 0x20, lS, 0x46, 0x04, 0x40)
 		b = append(b, 0x20, lN, 0x41, 0x01, 0x6A, 0x21, lN)
 		b = append(b, 0x20, lIdx, 0x20, pCap, 0x49) // idx < cap
 		if worker && !gated {
@@ -959,8 +1200,8 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(sm.id)) //nolint:gosec // a pattern id
 		b = append(b, 0x36, 0x02, 0x00)
-		b = append(b, 0x20, lTmp, 0x20, lSk[k], 0x36, 0x02, 0x04)
-		b = append(b, 0x20, lTmp, 0x20, lTk[k], 0x36, 0x02, 0x08)
+		b = append(lw(append(b, 0x20, lTmp), 0x20, lSk[k]), 0x36, 0x02, 0x04)
+		b = append(lw(append(b, 0x20, lTmp), 0x20, lTk[k]), 0x36, 0x02, 0x08)
 		if worker && gated {
 			// batch_mode: this match was delivered, so it is gated now.
 			b = append(b, 0x20, pMode, 0x04, 0x40)
@@ -978,7 +1219,7 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	if gated {
 		b = append(b, 0x20, lN, 0x20, pCap, 0x4D, 0x04, 0x40) // total <= cap: record every gate
 		for k, sm := range cs.split {
-			b = append(b, 0x20, lSk[k], 0x20, lS, 0x46, 0x04, 0x40)
+			b = append(lw(b, 0x20, lSk[k]), 0x20, lS, 0x46, 0x04, 0x40)
 			b = reportGate(b, k, sm.id)
 			b = append(b, 0x0B)
 		}
@@ -1021,6 +1262,13 @@ func emitSplitScanBody(cs *compiledSet, kind setCapKind, keptIdx int, fwd []int)
 	if kind == capScanAll && !wide {
 		lAcc = a.I64()
 	}
+	var lR64 byte
+	for _, sm := range cs.split {
+		if sm.bt != nil {
+			lR64 = a.I64()
+			break
+		}
+	}
 	var b []byte
 	b = a.EmitDecls(b)
 	callKept := func(b []byte) []byte {
@@ -1031,6 +1279,28 @@ func emitSplitScanBody(cs *compiledSet, kind setCapKind, keptIdx int, fwd []int)
 		return utils.AppendULEB128(b, uint32(keptIdx)) //nolint:gosec // a function index
 	}
 	fwdHit := func(b []byte, k int) []byte {
+		if cs.split[k].bt != nil {
+			// The Backtracking find from off; its "gave up" error is the
+			// capability's answer.
+			b = append(b, 0x20, pOff)
+			b = emitFindFromSetFromStack(b)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+			b = append(b, 0x22, lR64, 0x42, 0x7F, 0x53, 0x04, 0x40, 0x20, lR64)
+			if kind == capScanAll && !wide {
+				b = append(b, 0x0F, 0x0B) // the i64 answer as it is
+			} else {
+				b = append(b, 0xA7, 0x0F, 0x0B)
+			}
+			return append(b, 0x20, lR64, 0x42, 0x00, 0x59) // >= 0
+		}
+		if cs.split[k].ctx {
+			b = append(b, 0x20, pOff)
+			b = emitFindFromSetFromStack(b)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+			return append(b, 0x41, 0x00, 0x4E)         // >= 0
+		}
 		b = append(b, 0x20, pPtr, 0x20, pOff, 0x6A, 0x20, pLen, 0x20, pOff, 0x6B, 0x10)
 		b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
 		return append(b, 0x41, 0x00, 0x4E)         // >= 0

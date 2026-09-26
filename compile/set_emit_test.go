@@ -2976,7 +2976,10 @@ func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet 
 // CONDITIONAL is half the contract — a set with no BT member must keep the
 // cheap i64 form, so this asserts both directions on the same patterns.
 func TestSetBTForcesMemoryAllABI(t *testing.T) {
-	pats := []string{`(?:ab|cd)+xyz`, `hello`}
+	// `(?:ab|cd)+` is linear, so under max_fallback_states: 1 it stays on its
+	// Backtracking bucket (a member that is not linear is split out instead;
+	// see the end of this test).
+	pats := []string{`(?:ab|cd)+`, `hello`}
 
 	plain := compileBTABISet(t, pats, 0)
 	if plain.hasBTMember() {
@@ -2996,6 +2999,17 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	}
 	if !bt.wideAll() {
 		t.Error("a set with a BT member must use the memory _all form even at a 2-id space")
+	}
+
+	// A member that is not linear leaves its Backtracking bucket for a split
+	// member on the Backtracking find, and the form must STAY wide: the stub
+	// generator decides it from the unsplit packing (SetAdmitsBacktracking).
+	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1)
+	if split.hasBTMember() || len(split.split) == 0 || split.split[0].bt == nil {
+		t.Fatal("`(?:ab|cd)+xyz` under max_fallback_states=1 should be a Backtracking split member")
+	}
+	if !split.wideAll() {
+		t.Error("a split Backtracking member must keep the memory _all form the unsplit packing selects")
 	}
 }
 

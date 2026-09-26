@@ -106,11 +106,21 @@ type SetDiag struct {
 	// each" — which is the whole cost difference between 154 fuel and 700 —
 	// was invisible to everything but a disassembler.
 	AnchoredUnion *AnchoredUnionDiag `json:"anchored_union,omitempty"`
-	// SplitMembers lists the ids of the members served by their own
-	// start-anywhere find instead of by the buckets: `find`, `scan_any` and
-	// `scan_all` merge their answers with the buckets'. Empty for a set whose
-	// members are all provably linear in its bodies.
+	// SplitMembers lists the ids of the members served by their own linear
+	// search instead of by the buckets: `find`, `scan_any` and `scan_all`
+	// merge their answers with the buckets'. Empty for a set whose members are
+	// all provably linear in its bodies.
 	SplitMembers []int `json:"split_members,omitempty"`
+	// SplitBacktracking is the subset of SplitMembers whose search is the
+	// Backtracking find rather than the start-anywhere find: the members that
+	// find refuses (an empty-width assertion, an automaton over the limits),
+	// and those past the start-anywhere tables' budget.
+	SplitBacktracking []int `json:"split_backtracking,omitempty"`
+	// NoCacheSplitMembers lists the members an overlapping set's no-cache
+	// companion splits out: the set's answer cache keeps them linear, and a
+	// drive that has no usable cache is routed to the companion, which serves
+	// them by their own linear searches.
+	NoCacheSplitMembers []int `json:"no_cache_split_members,omitempty"`
 	// ScanUnion reports the scan pair's own union automaton: its whole body
 	// (Direct, when members are split out) or the target a literal
 	// frontend's work counter switches to (Counter).

@@ -195,11 +195,18 @@ func (r *Reporter) Render(w io.Writer) {
 		// Members served outside the buckets, and the work counters: each
 		// changes the set's cost by large factors and shows nowhere else.
 		if len(d.SplitMembers) > 0 {
+			bt := map[int]bool{}
+			for _, id := range d.SplitBacktracking {
+				bt[id] = true
+			}
 			ids := make([]string, len(d.SplitMembers))
 			for i, id := range d.SplitMembers {
 				ids[i] = fmt.Sprintf("#%d", id)
+				if bt[id] {
+					ids[i] += " (Backtracking)"
+				}
 			}
-			fmt.Fprintf(w, "  split out (not provably linear; own start-anywhere find): %s\n", strings.Join(ids, ", "))
+			fmt.Fprintf(w, "  split out (not provably linear; own linear search): %s\n", strings.Join(ids, ", "))
 		}
 		if u := d.ScanUnion; u != nil {
 			switch {
@@ -211,6 +218,13 @@ func (r *Reporter) Render(w io.Writer) {
 		}
 		if d.InCallCounter {
 			fmt.Fprintf(w, "  overlapping find: in-call counter sweeps the answer cache\n")
+		}
+		if len(d.NoCacheSplitMembers) > 0 {
+			ids := make([]string, len(d.NoCacheSplitMembers))
+			for i, id := range d.NoCacheSplitMembers {
+				ids[i] = fmt.Sprintf("#%d", id)
+			}
+			fmt.Fprintf(w, "  overlapping find without a usable cache: companion splits out %s\n", strings.Join(ids, ", "))
 		}
 	}
 }

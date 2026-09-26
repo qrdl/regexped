@@ -229,21 +229,33 @@ linear on every input:
   end back down to `from`; the lowest position it accepts at is the match's
   START.
 
-Its forward pass costs about 29 instructions per byte, except in a state that
-loops on nearly every byte — typically one waiting for a byte that can begin
-or continue a match, as in `a*b`, `.*foo\d` or `foo[a-z]+bar` over text
-without those bytes. Runs in such a state are crossed with the SIMD bulk skip
-the ordinary DFA bodies use, at 2-4 instructions per byte; input that enters
-and leaves the state on every byte costs up to 37 instead. A pattern opening
-with a word-class repeat (`\w+@\w+`) has no such state on prose and stays at
-29. It also walks each match twice, where the ordinary find costs 1-8 on text
-its SIMD skip can leap over — so it is not a replacement. The compiler picks
-per pattern, at compile time:
+For a pattern with an empty-width assertion (`\b`, `\B`, `^`, `$`, `\A`, `\z`,
+`(?m:^)`, `(?m:$)`) both passes read the whole input rather than a slice
+starting at `from`, so every assertion is judged against the real neighbouring
+bytes: the forward pass picks the state it starts in from the byte before
+`from`, and the backward pass walks the pattern reversed with its assertions
+mirrored (`\b` and `\B` unchanged, `^`↔`$`, `\A`↔`\z`, `(?m:^)`↔`(?m:$)`),
+judging each against the byte on the far side of the position — below `from`
+included.
+
+Its cost, measured at 64 KB over the find test corpus's 29 shapes, each on its
+worst-case run, on prose, and on every two-byte alternation of its own bytes
+that does not match: the forward pass costs about 29 instructions per byte,
+except in a state that loops on nearly every byte — typically one waiting for a
+byte that can begin or continue a match, as in `a*b`, `.*foo\d` or
+`foo[a-z]+bar` over text without those bytes. Runs in such a state are crossed
+with the SIMD bulk skip the ordinary DFA bodies use, at 1.6-4 instructions per
+byte; input that enters and leaves the state on every byte costs up to 52
+instead (`ERROR\w*y|WARN\w*z` over ` E`×N). A pattern opening with a word-class
+repeat (`\w+@\w+`) has no such state on prose and stays at 29. The passes for
+a pattern with an assertion cost 34-45. It also walks each match twice, where
+the ordinary find costs 1-8 on text its SIMD skip can leap over — so it is not
+a replacement. The compiler picks per pattern, at compile time:
 
 | Pattern | Find |
 |---|---|
-| provably linear: a failed attempt walks a bounded number of bytes (no reachable cycle of non-accepting states); or both find-body shape detectors apply; or, for a literal-anchored find, neither the part before the literal nor the part after it can contain it | the ordinary find, unchanged |
-| an empty-width assertion (`\b`, `^`, `$`, `\A`, `\z`), or anchored at 0 | the ordinary find (the backward pass cannot mirror assertions) |
+| provably linear: a failed attempt walks a bounded number of bytes (no reachable cycle on which it keeps going without accepting and from which it can still end that way — an accept an assertion conditions counts only where its condition can hold); or, without an assertion, both find-body shape detectors apply, or for a literal-anchored find neither the part before the literal nor the part after it can contain it | the ordinary find, unchanged |
+| anchored at 0 | the ordinary find |
 | starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` keeps the ordinary find |
 | starts with such a repeat that includes the space byte (`[^,]*,`) | the switch (below); `prefer-no-match` picks the start-anywhere find alone |
 | anything else not provably linear, no hint | the **switch** |
@@ -262,13 +274,21 @@ or two, and uncounted work is at most 32 bytes per start position, which is
 linear. Ordinary text never trips it,
 so it costs what the ordinary find costs plus 0-6%. The literal-anchored
 bodies also charge a FAILED backward walk: their backward walker records where
-it stopped.
+it stopped. On a worst-case run the ordinary body walks the run about twice
+before the counter trips, so the switch costs more there than the start-anywhere
+find alone: 42-137 instructions per byte on the corpus's switch shapes at 64 KB
+(`a*b` over `a`×N: 67.6), against 1.6-45 — linear either way.
 
-The start-anywhere find needs its forward automaton within `max_dfa_states`; a
-pattern whose automaton is larger keeps the ordinary find. Its tables are
-uncompressed, so a pattern that gets it — alone or behind the switch — carries a
-larger module. `--verbose` reports the choice and the reason for every pattern
-(`find: switch — not provably linear`).
+The start-anywhere find needs its automata within `max_dfa_states` and the
+memory bound, and able to represent every assertion exactly. Where they are
+not, the switch hands over to the **Backtracking find** instead: the engine a
+pattern whose DFA is too large gets, whose fallback body memoises every
+(instruction, position) it tries, so it is linear per call too — slower, up to
+236 instructions per byte on the one such corpus shape's worst-case run. The
+start-anywhere find's two automata add their tables to the module, as any DFA's
+do. `--verbose` reports the choice and the reason for every pattern
+(`find: switch — not provably linear`, and `switch handover: Backtracking` with
+its reason).
 
 Sets make the same choice per member, with one difference: see
 [sets.md](sets.md#members-that-are-not-provably-linear).

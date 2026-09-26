@@ -2579,9 +2579,17 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		{`[^,]*,`, []string{"prefer-match"}, "switch"},
 		{`a*b`, []string{"prefer-match"}, "today"},
 		{`a*b`, []string{"prefer-no-match"}, "today"},
-		// An empty-width assertion keeps today's find: the backward pass does
-		// not mirror it.
-		{`\b\w+@\w+\b`, nil, "today"},
+		// Empty-width assertions: classified like any pattern, the accept
+		// conditions taken into account. `\b\w+@\w+\b` and `a+$` / `a+\b`
+		// (every attempt over `a`×N then `b` walks the run and fails) get the
+		// switch; `(?m:^)ERROR:.*(?m:$)` and `\bfoo\w*\b` are linear — their
+		// loops can only end where the condition holds.
+		{`\b\w+@\w+\b`, nil, "switch"},
+		{`a+$`, nil, "switch"},
+		{`a+\b`, nil, "switch"},
+		{`(?m:^)ERROR:.*(?m:$)`, nil, "today"},
+		{`\bfoo\w*\b`, nil, "today"},
+		{`^a*b`, nil, "today"},
 	}
 	for _, c := range cases {
 		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
@@ -2660,7 +2668,14 @@ func TestSetSplitRule(t *testing.T) {
 		{`[a-z]{4}[0-9]{3}`, false},
 		{`a+`, false},
 		{`foo[a-z]+`, false},
-		{`\b[a-z]+X`, false}, // an assertion: the start-anywhere find cannot serve it
+		// Assertions: judged with their conditions; the start-anywhere find
+		// serves them through its context passes.
+		{`\b[a-z]+X`, true},
+		{`[a-z]+X\b`, true},
+		{`\bfoo\w*\b`, false},
+		// Its start-anywhere automaton is over the state limit (2^11 states
+		// for `a[ab]{11}`), so the Backtracking find serves it.
+		{`a[ab]{11}c[a-z]*X`, true},
 	} {
 		cfg := config.BuildConfig{
 			Regexps: []config.RegexEntry{{Name: "p", Pattern: c.pat}},
@@ -2673,11 +2688,16 @@ func TestSetSplitRule(t *testing.T) {
 		if got := len(diags[0].SplitMembers) > 0; got != c.split {
 			t.Errorf("%s: split = %v, want %v", c.pat, got, c.split)
 		}
+		wantBT := c.pat == `a[ab]{11}c[a-z]*X`
+		if got := len(diags[0].SplitBacktracking) > 0; got != wantBT {
+			t.Errorf("%s: Backtracking split = %v, want %v", c.pat, got, wantBT)
+		}
 	}
 
-	// The cap: a set with more such members than the merge wrapper's locals
-	// can address splits none of them.
-	for _, n := range []int{maxSplitMembers, maxSplitMembers + 1} {
+	// No count cap: the merge wrapper's per-member locals are full width, so
+	// a set with more members than one byte of local indices addresses splits
+	// every one of them.
+	for _, n := range []int{24, 40} {
 		var regexps []config.RegexEntry
 		for i := 0; i < n; i++ {
 			regexps = append(regexps, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`[a-z]+Q%d`, i)})
@@ -2688,12 +2708,23 @@ func TestSetSplitRule(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := n
-		if n > maxSplitMembers {
-			want = 0
+		if got := len(diags[0].SplitMembers); got != n {
+			t.Errorf("%d members: %d split, want %d", n, got, n)
 		}
-		if got := len(diags[0].SplitMembers); got != want {
-			t.Errorf("%d members: %d split, want %d", n, got, want)
+	}
+}
+
+// TestSetSplitBudget pins the start-anywhere tables' budget: the smallest
+// tables get the start-anywhere find while the total fits, the rest the
+// Backtracking find, and a candidate already on Backtracking stays there.
+func TestSetSplitBudget(t *testing.T) {
+	pats := []*PatternInfo{{fullPattern: `[a-z]+Q1`}, {fullPattern: `[a-z]+Q2`}, {fullPattern: `[a-z]+Q3`}, {fullPattern: `\b[a-z]+X`}}
+	cands := []splitCand{{idx: 0, saBytes: 300}, {idx: 1, saBytes: 100}, {idx: 2, saBytes: 200}, {idx: 3, bt: true}}
+	got := budgetSplit(cands, pats, CompileSetOptions{}, 350)
+	want := []bool{true, false, false, true} // 100 + 200 fit; 300 does not
+	for i, c := range got {
+		if c.bt != want[i] {
+			t.Errorf("candidate %d (%d bytes): Backtracking = %v, want %v", c.idx, c.saBytes, c.bt, want[i])
 		}
 	}
 }

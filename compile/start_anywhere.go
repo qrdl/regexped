@@ -32,7 +32,9 @@ import (
 //
 // It costs ~29 fuel per byte, except in a forward state that loops on nearly
 // every byte (l.dominantStates), whose runs emitDominantBulkSkip crosses at
-// 2-4; input that enters and leaves such a state every byte costs up to 37.
+// 1.6-4; input that enters and leaves such a state every byte costs up to 52
+// (the find test corpus's shapes at 64 KB), and the context passes of a
+// pattern with an assertion 34-45.
 // Today's find costs 1.4-8 on ordinary text that its SIMD skip can leap over,
 // and this one walks every match twice. So it is not a replacement.
 // classifyFind picks, at compile time:
@@ -188,16 +190,17 @@ const (
 
 // classifyFind decides how the pattern's find is served and why.
 func classifyFind(in findClassInput) (findStrategy, string) {
-	if hasEmptyWidthAssertion(in.parsed) {
-		return findToday, "empty-width assertion"
-	}
 	if in.anchor {
 		return findToday, "matches only at 0"
 	}
 	if k, ok := failedWalkBound(in.table); ok {
 		return findToday, fmt.Sprintf("linear: a failed attempt walks at most %d bytes", k)
 	}
-	if !in.inSet {
+	// The shape proofs below reason about accepts without the context an
+	// empty-width assertion puts on them, so a pattern with one gets neither:
+	// it is served by the switch, whose handover is the start-anywhere find or,
+	// where that cannot be built, the Backtracking find.
+	if !in.inSet && !hasEmptyWidthAssertion(in.parsed) {
 		switch in.body {
 		case bodyGeneral:
 			if in.l.skipSafeOnDead && in.l.eofSkipSafe {
@@ -291,19 +294,66 @@ func regexpCanContain(re *syntax.Regexp, lit []byte) bool {
 	return false
 }
 
-// failedWalkBound reports the longest walk an attempt can make without ever
-// being in an accepting state, from either find start state, and whether it
-// is finite. It is finite exactly when no cycle of NON-accepting states is
-// reachable at all — through accepting states included, because a successful
-// attempt keeps walking after its last accept and the next search re-walks
-// those bytes. A finite bound makes every attempt's wasted walk at most that
-// many bytes, so any find that tries start positions one at a time is linear,
-// whichever code does the walking.
+// failedWalkBound returns how many bytes a find attempt can walk without
+// accepting and then end — a FAILED walk, or the wasted tail a successful one
+// walks past its last accept — from any find start state, and whether that is
+// finite. It is finite exactly when no cycle is reachable on which a walk can
+// keep going without accepting and from which it can still end that way;
+// reachable through accepting states included, because a successful attempt
+// keeps walking after its last accept and the next search re-walks those bytes.
+// A finite bound makes every attempt's wasted walk at most that many bytes, so
+// any find that tries start positions one at a time is linear, whichever code
+// does the walking.
+//
+// "Accepting" is exact, empty-width assertions included:
+//
+//   - a state in midAcceptStates accepts on arrival, unconditionally;
+//   - a state in midAcceptNW/W/NL accepts before the next byte only when that
+//     byte is a non-word / word / newline byte — so taking such a byte accepts,
+//     and taking any other does not;
+//   - a walk that ENDS — a dead transition, or the end of the input — has
+//     failed there only when that end does not accept: the dead byte does not
+//     meet the state's condition, or the state is not in acceptStates.
+//
+// `a+\b` over `a`×N then `b` fails every attempt at the `b` after walking the
+// whole run; `(?m:^)ERROR:.*(?m:$)` never fails inside `.*`, whose only exits —
+// a newline and the end of the input — both accept. Without an assertion every
+// non-accepting state fails at the end of the input (the EOF accepts are the
+// mid accepts: 0 of 5,650 such corpus patterns differ), so for those patterns
+// this is the plain rule — no reachable cycle of non-accepting states.
 func failedWalkBound(t *dfaTable) (int, bool) {
-	accepting := func(s int) bool { return t.midAcceptStates[s] != 0 || t.acceptStates[s] != 0 }
+	accepting := func(s int) bool { return t.midAcceptStates[s] != 0 }
+	// edgeAccepts: the walk accepts at s before consuming c.
+	edgeAccepts := func(s, c int) bool {
+		w := isWordByte(byte(c))
+		return (t.midAcceptNWStates[s] != 0 && !w) || (t.midAcceptWStates[s] != 0 && w) ||
+			(t.midAcceptNLStates[s] != 0 && c == '\n')
+	}
+	// canFailHere: a walk can end at s without accepting.
+	canFailHere := func(s int) bool {
+		if t.acceptStates[s] == 0 {
+			return true
+		}
+		for c := 0; c < 256; c++ {
+			if t.transitions[s*256+c] < 0 && !edgeAccepts(s, c) {
+				return true
+			}
+		}
+		return false
+	}
+	// next reports the successor of s on c inside the graph of walks that have
+	// not accepted: -1 when the edge accepts, dies, or reaches an accepting
+	// state.
+	next := func(s, c int) int {
+		n := t.transitions[s*256+c]
+		if n < 0 || accepting(n) || edgeAccepts(s, c) {
+			return -1
+		}
+		return n
+	}
 	reach := make([]bool, t.numStates)
 	var stack []int
-	for _, r := range []int{t.startState, t.midStartState} {
+	for _, r := range []int{t.startState, t.midStartState, t.midStartWordState, t.midStartNewlineState} {
 		if r >= 0 && r < t.numStates && !reach[r] {
 			reach[r] = true
 			stack = append(stack, r)
@@ -319,14 +369,42 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 			}
 		}
 	}
-	// Longest path through non-accepting reachable states, by an iterative
-	// DFS with colours; a grey successor is a cycle.
+	// live: reachable, non-accepting, and able to end a walk without
+	// accepting — through non-accepting edges — from here.
+	live := make([]bool, t.numStates)
+	preds := make([][]int, t.numStates)
+	for s := 0; s < t.numStates; s++ {
+		if !reach[s] || accepting(s) {
+			continue
+		}
+		for c := 0; c < 256; c++ {
+			if n := next(s, c); n >= 0 {
+				preds[n] = append(preds[n], s)
+			}
+		}
+		if canFailHere(s) {
+			live[s] = true
+			stack = append(stack, s)
+		}
+	}
+	for len(stack) > 0 {
+		s := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range preds[s] {
+			if !live[p] {
+				live[p] = true
+				stack = append(stack, p)
+			}
+		}
+	}
+	// Longest path through live states, by an iterative DFS with colours; a
+	// grey successor is a cycle.
 	const white, grey, black = 0, 1, 2
 	colour := make([]int, t.numStates)
 	longest := make([]int, t.numStates)
 	type frame struct{ s, c int }
 	for root := 0; root < t.numStates; root++ {
-		if !reach[root] || accepting(root) || colour[root] != white {
+		if !live[root] || colour[root] != white {
 			continue
 		}
 		colour[root] = grey
@@ -336,7 +414,7 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 			if f.c == 256 {
 				best := 0
 				for c := 0; c < 256; c++ {
-					if n := t.transitions[f.s*256+c]; n >= 0 && reach[n] && !accepting(n) && longest[n] > best {
+					if n := next(f.s, c); n >= 0 && live[n] && longest[n] > best {
 						best = longest[n]
 					}
 				}
@@ -345,9 +423,9 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 				frames = frames[:len(frames)-1]
 				continue
 			}
-			n := t.transitions[f.s*256+f.c]
+			n := next(f.s, f.c)
 			f.c++
-			if n < 0 || !reach[n] || accepting(n) {
+			if n < 0 || !live[n] {
 				continue
 			}
 			switch colour[n] {
@@ -361,7 +439,7 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 	}
 	bound := 0
 	for s := 0; s < t.numStates; s++ {
-		if reach[s] && longest[s] > bound {
+		if live[s] && longest[s] > bound {
 			bound = longest[s]
 		}
 	}
@@ -375,11 +453,43 @@ func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int6
 	if !ok {
 		return false
 	}
-	p.saFwdBody, p.saRevBody = sa.fwdBody, sa.revBody
+	p.saFwdBody, p.saRevBody, p.saCtx = sa.fwdBody, sa.revBody, sa.ctx
 	p.dataBytes = append(p.dataBytes, sa.data...)
 	p.dataSegCount += sa.segs
 	p.tableEnd = sa.end
 	return true
+}
+
+// buildSwitchHandover builds what a switch hands over to, with its tables at
+// base: the start-anywhere find, or — when that cannot be built for the
+// pattern — the Backtracking find (buildBTFindParts), which is linear per call
+// too: its fallback body memoises every (instruction, position) it has tried.
+// False when neither can be built; the Backtracking find's fallback needs the
+// module's global allocator.
+func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, table *dfaTable, mandLit *mandatoryLit, opts CompileOptions) bool {
+	if p.buildStartAnywhereFind(re, base, opts) {
+		return true
+	}
+	if opts.globals == nil {
+		return false
+	}
+	parts, err := buildBTFindParts(re.Pattern, table, mandLit, base, &opts, nil)
+	if err != nil {
+		return false
+	}
+	p.saBT = &parts
+	p.dataBytes = append(p.dataBytes, parts.data...)
+	p.dataSegCount += parts.segs
+	p.tableEnd = parts.end
+	return true
+}
+
+// startAnywhereRefusal names why buildStartAnywherePasses refuses pattern.
+func startAnywhereRefusal(pattern string) string {
+	if parsed, err := syntax.Parse(pattern, syntax.Perl); err == nil && hasEmptyWidthAssertion(parsed) {
+		return "its automaton is over the limits, or cannot represent an assertion exactly"
+	}
+	return "its automaton is over the limits"
 }
 
 // startAnywherePasses is the start-anywhere find's two passes: their
@@ -389,21 +499,25 @@ type startAnywherePasses struct {
 	data             []byte
 	segs             int
 	end              int64
+	// ctx: the pattern has an empty-width assertion, and the passes are the
+	// context ones — the forward pass (ptr, len) → absolute end from the
+	// find-from global, the backward pass (ptr, len, end) → start.
+	ctx bool
 }
 
 // buildStartAnywherePasses builds both passes for pattern, the forward
-// tables at base and the backward ones at align(the forward end). Refused
-// (false) for an empty-width assertion, an unsupported rune, or an automaton
-// over opts' state or memory limit.
+// tables at base and the backward ones at align(the forward end) — the
+// context passes for a pattern with an empty-width assertion. Refused (false)
+// for an unsupported rune, an automaton over opts' state or memory limit, or
+// one with an ambiguous boundary target (dfaHasAmbiguousBoundaryTarget: the
+// automaton cannot represent the assertion exactly).
 func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, align func(int64) int64) (startAnywherePasses, bool) {
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return startAnywherePasses{}, false
 	}
 	stripCaptures(parsed)
-	if hasEmptyWidthAssertion(parsed) {
-		return startAnywherePasses{}, false
-	}
+	ctx := hasEmptyWidthAssertion(parsed)
 	maxStates := resolveMaxDFAStates(&opts)
 	memLimit := resolveMaxDFAMemory(&opts)
 	build := func(re *syntax.Regexp, lf bool) *dfaTable {
@@ -419,7 +533,7 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 			return nil
 		}
 		t := dfaTableFrom(d)
-		if t.numStates > maxStates || (memLimit > 0 && dfaTableBytes(t) > memLimit) {
+		if t.numStates > maxStates || (memLimit > 0 && dfaTableBytes(t) > memLimit) || dfaHasAmbiguousBoundaryTarget(t) {
 			return nil
 		}
 		return t
@@ -444,13 +558,20 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 
 	fwdRaw, fwdSegs := stripSegCount(dfaDataSegments(fwdL, true, false))
 	revRaw, revSegs := stripSegCount(dfaDataSegments(revL, true, false))
-	return startAnywherePasses{
-		fwdBody: buildStartAnywhereForwardBody(fwdL, opts.tableMemIdx),
-		revBody: buildStartAnywhereBackBody(revL, opts.tableMemIdx),
-		data:    append(fwdRaw, revRaw...),
-		segs:    fwdSegs + revSegs,
-		end:     revL.tableEnd,
-	}, true
+	sa := startAnywherePasses{
+		data: append(fwdRaw, revRaw...),
+		segs: fwdSegs + revSegs,
+		end:  revL.tableEnd,
+		ctx:  ctx,
+	}
+	if ctx {
+		sa.fwdBody = buildStartAnywhereForwardBodyCtx(fwdL, opts.tableMemIdx)
+		sa.revBody = buildStartAnywhereBackBodyCtx(revL, opts.tableMemIdx)
+	} else {
+		sa.fwdBody = buildStartAnywhereForwardBody(fwdL, opts.tableMemIdx)
+		sa.revBody = buildStartAnywhereBackBody(revL, opts.tableMemIdx)
+	}
+	return sa, true
 }
 
 // emitWalkerTransition emits one transition of state on the byte at ptr+pos,
@@ -625,6 +746,239 @@ func buildStartAnywhereBackBody(l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x20, locLast, 0x0B)
 	sz := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(sz, b...)
+}
+
+// ── Patterns with empty-width assertions ─────────────────────────────────
+//
+// The two passes above read a slice and judge every accept by the state alone.
+// An assertion makes an accept depend on a NEIGHBOURING byte: the state a
+// walk starts in depends on the byte before it (text start, word, newline),
+// `\b`/`\B`/`(?m:$)` accept only before a byte of the right kind (the
+// midAcceptNW/W/NL tables), and `$` only at the end of the input. So the
+// forward pass takes the WHOLE input and starts at the find-from global, and
+// the backward pass takes the whole input and the match end: every assertion,
+// the start position's included, is judged against the real bytes. The
+// backward pass walks the pattern reversed, whose assertions reverseRegexp
+// mirrors (`\b`/`\B` unchanged, `^`/`$`, `\A`/`\z` and `(?m:^)`/`(?m:$)`
+// swapped), so at position p it judges them against the byte at p-1 — and at
+// the find-from floor that is the real byte below the floor, not a text edge.
+//
+// A conditional accept is the generic find body's: 1 records the position and
+// keeps walking (a higher-priority thread may still win), 2 records it and
+// stops (it IS the leftmost-first winner). The backward pass is
+// leftmost-longest and takes every accept.
+
+// emitCtxStartState pushes the state a walk starts in: wasmStart when
+// atStart leaves true on the stack, else the mid start the byte prev leaves on
+// the stack selects — word, newline, or neither.
+func emitCtxStartState(b []byte, l *dfaLayout, atStart, prev func([]byte) []byte, tableMemIdx int) []byte {
+	midOrNewline := func(b []byte) []byte {
+		if l.midAcceptNLBytes == nil {
+			b = append(b, 0x41)
+			return utils.AppendSLEB128(b, int32(l.wasmMidStart))
+		}
+		b = prev(b)
+		b = append(b, 0x41, 0x0A, 0x46, 0x04, 0x7F, 0x41) // == '\n'; if (result i32)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
+		b = append(b, 0x05, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+		return append(b, 0x0B)
+	}
+	b = atStart(b)
+	b = append(b, 0x04, 0x7F, 0x41) // if (result i32)
+	b = utils.AppendSLEB128(b, int32(l.wasmStart))
+	b = append(b, 0x05)
+	if l.needWordCharTable {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.wordCharTableOff)
+		b = prev(b)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x04, 0x7F, 0x41) // if prev is a word byte (result i32)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartWord))
+		b = append(b, 0x05)
+		b = midOrNewline(b)
+		b = append(b, 0x0B)
+	} else {
+		b = midOrNewline(b)
+	}
+	return append(b, 0x0B)
+}
+
+// emitCtxCondAccept records pos in last when state accepts before the byte in
+// cLocal — its unconditional mid accept, or the word/non-word/newline one the
+// byte meets. stopDepth >= 0 also branches that far out on a dominant (2)
+// conditional accept, from inside the if it is emitted in plus stopDepth.
+func emitCtxCondAccept(b []byte, l *dfaLayout, stateLocal, posLocal, lastLocal, cLocal, vLocal byte, stopDepth int, tableMemIdx int) []byte {
+	loadAt := func(b []byte, off int32) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, off)
+		b = append(b, 0x20, stateLocal, 0x6A)
+		return appendTableLoad8u(b, tableMemIdx)
+	}
+	b = loadAt(b, l.midAcceptOff)
+	b = append(b, 0x04, 0x40, 0x20, posLocal, 0x21, lastLocal, 0x0B)
+	record := func(b []byte) []byte {
+		b = append(b, 0x22, vLocal, 0x04, 0x40, 0x20, posLocal, 0x21, lastLocal)
+		if stopDepth >= 0 {
+			b = append(b, 0x20, vLocal, 0x41, 0x02, 0x46, 0x0D) // == 2: br_if out
+			b = utils.AppendULEB128(b, uint32(stopDepth+1))     //nolint:gosec // a small depth
+		}
+		return append(b, 0x0B)
+	}
+	if l.needWordCharTable {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.wordCharTableOff)
+		b = append(b, 0x20, cLocal, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x04, 0x7F) // if a word byte (result i32)
+		b = loadAt(b, l.midAcceptWOff)
+		b = append(b, 0x05)
+		b = loadAt(b, l.midAcceptNWOff)
+		b = append(b, 0x0B)
+		b = record(b)
+	}
+	if l.midAcceptNLBytes != nil {
+		b = append(b, 0x20, cLocal, 0x41, 0x0A, 0x46, 0x04, 0x7F) // == '\n' (result i32)
+		b = loadAt(b, l.midAcceptNLOff)
+		b = append(b, 0x05, 0x41, 0x00, 0x0B)
+		b = record(b)
+	}
+	return b
+}
+
+// buildStartAnywhereForwardBodyCtx is the forward pass for a pattern with an
+// assertion: (ptr, len) → i32 over the whole input from the find-from
+// global, returning the ABSOLUTE end of the leftmost-first match, or -1.
+func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
+	const (
+		locPtr   = 0
+		locLen   = 1
+		locState = 2
+		locPos   = 3
+		locLast  = 4
+		locByte  = 5
+		locC     = 6
+		locV     = 7
+	)
+	b := []byte{0x01, 0x06, 0x7F} // six i32 locals
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
+	b = append(b, 0x21, locPos)
+	b = emitCtxStartState(b, l,
+		func(b []byte) []byte { return append(b, 0x20, locPos, 0x45) },
+		func(b []byte) []byte {
+			b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A, 0x41, 0x01, 0x6B)
+			return appendInputLoad8u(b)
+		}, tableMemIdx)
+	b = append(b, 0x21, locState)
+	b = append(b, 0x41, 0x7F, 0x21, locLast)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $fwd
+	// End of input: an end-of-input accept ends a match here, then stop.
+	b = append(b, 0x20, locPos, 0x20, locLen, 0x4E, 0x04, 0x40)
+	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+	b = append(b, 0x04, 0x40, 0x20, locLen, 0x21, locLast, 0x0B)
+	b = append(b, 0x0C, 0x02, 0x0B) // br $done
+	// An accept at pos, judged against the byte it would read next.
+	b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A)
+	b = appendInputLoad8u(b)
+	b = append(b, 0x21, locC)
+	b = emitCtxCondAccept(b, l, locState, locPos, locLast, locC, locV, 1, tableMemIdx)
+	b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
+	b = append(b, 0x20, locState, 0x45, 0x0D, 0x01) // dead → $done
+	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos)
+	b = append(b, 0x0C, 0x00) // br $fwd
+	b = append(b, 0x0B, 0x0B)
+
+	b = append(b, 0x20, locLast, 0x0B)
+	sz := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(sz, b...)
+}
+
+// buildStartAnywhereBackBodyCtx is the backward pass for a pattern with an
+// assertion: (ptr, len, end) → i32, walking input[end-1], input[end-2], … down
+// to the find-from global on the reversed, leftmost-longest DFA, and returning
+// the lowest position it accepted at (the match start), or -1.
+func buildStartAnywhereBackBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
+	const (
+		locPtr   = 0
+		locLen   = 1
+		locEnd   = 2
+		locState = 3
+		locPos   = 4
+		locLast  = 5
+		locByte  = 6
+		locC     = 7
+		locV     = 8
+	)
+	b := []byte{0x01, 0x06, 0x7F} // six i32 locals
+	b = append(b, 0x20, locEnd, 0x21, locPos)
+	// Reversed, the text starts at the input's end; elsewhere the byte AT end
+	// is the one before the walk.
+	b = emitCtxStartState(b, l,
+		func(b []byte) []byte { return append(b, 0x20, locEnd, 0x20, locLen, 0x46) },
+		func(b []byte) []byte {
+			b = append(b, 0x20, locPtr, 0x20, locEnd, 0x6A)
+			return appendInputLoad8u(b)
+		}, tableMemIdx)
+	b = append(b, 0x21, locState)
+	b = append(b, 0x41, 0x7F, 0x21, locLast)
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop $rev
+	// At 0 the reversed text ends: an end-of-input accept starts a match here.
+	b = append(b, 0x20, locPos, 0x45, 0x04, 0x40)
+	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+	b = append(b, 0x04, 0x40, 0x41, 0x00, 0x21, locLast, 0x0B)
+	b = append(b, 0x0C, 0x02, 0x0B) // br $done
+	// An accept at pos, judged against input[pos-1] — below the floor too,
+	// where it is the real byte the start follows.
+	b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A, 0x41, 0x01, 0x6B)
+	b = appendInputLoad8u(b)
+	b = append(b, 0x21, locC)
+	b = emitCtxCondAccept(b, l, locState, locPos, locLast, locC, locV, -1, tableMemIdx)
+	// At the floor: no start below it.
+	b = append(b, 0x20, locPos, 0x23)
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
+	b = append(b, 0x4C, 0x0D, 0x01)                             // i32.le_s; br_if $done
+	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6B, 0x21, locPos) // pos--
+	b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
+	b = append(b, 0x20, locState, 0x45, 0x0D, 0x01) // dead → $done
+	b = append(b, 0x0C, 0x00)                       // br $rev
+	b = append(b, 0x0B, 0x0B)
+
+	b = append(b, 0x20, locLast, 0x0B)
+	sz := utils.AppendULEB128(nil, uint32(len(b)))
+	return append(sz, b...)
+}
+
+// buildStartAnywhereFindBodyCtx joins the two context passes into a find
+// body, (ptr, len) → i64: both read `from` from the find-from global, the
+// forward pass as its start and the backward pass as its floor.
+func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMode) {
+	const (
+		locPtr = 0
+		locLen = 1
+	)
+	a := newLocalAlloc(2)
+	cur := a.ScanCursor()
+	locEnd := a.I32()
+	locStart := a.I32()
+	var b []byte
+	b = a.EmitDecls(b)
+	b, mode := emitFindFromSeed(b, cur)
+	b = append(b, 0x20, locPtr, 0x20, locLen, 0x10)
+	b = utils.AppendULEB128(b, uint32(fwdFuncIdx))
+	b = append(b, 0x22, locEnd, 0x41, 0x00, 0x48, 0x04, 0x40, 0x42, 0x7F, 0x0F, 0x0B) // < 0: return -1
+	b = append(b, 0x20, locPtr, 0x20, locLen, 0x20, locEnd, 0x10)
+	b = utils.AppendULEB128(b, uint32(revFuncIdx))
+	b = append(b, 0x22, locStart, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+	b = append(b, 0x20, locStart, 0xAD, 0x42, 0x20, 0x86)
+	b = append(b, 0x20, locEnd, 0xAD, 0x84)
+	b = append(b, 0x0B)
+	return b, mode
 }
 
 // buildStartAnywhereFindBody joins the two passes into a find body,
@@ -805,12 +1159,29 @@ func emitFindFromSetFromStack(b []byte) []byte {
 // and settles the pattern's findFromMode. Both assemblers call it, after
 // today's find, so the two cannot lay the slots out differently.
 func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte {
+	if p.saBT != nil {
+		// A switch whose handover is the Backtracking find: its body (the
+		// fallback patched in), then the dispatcher.
+		if !p.saSwitch || p.saFwdBody != nil {
+			panic("compile: a Backtracking handover outside a switch, or beside the start-anywhere find")
+		}
+		if p.saBT.mode != p.findFromMode {
+			panic("compile: start-anywhere switch: today's find and the Backtracking handover read `from` differently")
+		}
+		cs = appendWithBTFallback(cs, p.saBT.fast, p.saBT.fallback, p.saBT.callOffs, base+p.slotIndex(slotSABTFallback))
+		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT))
+		cs = utils.AppendULEB128(cs, uint32(len(d)))
+		return append(cs, d...)
+	}
 	if p.saFwdBody == nil {
 		return cs
 	}
 	cs = append(cs, p.saFwdBody...)
 	cs = append(cs, p.saRevBody...)
 	glue, glueMode := buildStartAnywhereFindBody(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARev))
+	if p.saCtx {
+		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx))
+	}
 	cs = utils.AppendULEB128(cs, uint32(len(glue)))
 	cs = append(cs, glue...)
 	if !p.saSwitch {

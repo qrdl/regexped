@@ -1134,8 +1134,11 @@ func TestOverlapCacheRefusesOneByteUnderTheMinimum(t *testing.T) {
 	short := &cacheDriveOpt{}
 	got := canonByPosition(driveCacheFindOpt(t, pats, input, 0, int32(len(pats)),
 		true, int32(minimum-1), engageNever, short))
-	if ready := int32(short.header[2]); ready != -1 {
-		t.Fatalf("ready = %d for a region one byte under the minimum, want -1 (refused)", ready)
+	// -1 is refused; -2 is refused and handed to the set's no-cache
+	// companion (a set whose cache keeps a member linear carries one), which
+	// marks the header when it takes a drive over.
+	if ready := int32(short.header[2]); ready != -1 && ready != -2 {
+		t.Fatalf("ready = %d for a region one byte under the minimum, want -1 or -2 (refused)", ready)
 	}
 	if len(want) != len(got) {
 		t.Fatalf("the walk answered %d tuples, the engaged drive %d", len(got), len(want))
@@ -1822,7 +1825,20 @@ func TestOverlappingPreflightRunsOncePerDrive(t *testing.T) {
 			t.Fatalf("gate[%d] = %d before the drive, want 0", i, v)
 		}
 	}
-	r.call(t, "cap_find", r.inBase, int32(len(input)), int32(0), r.scratchPtr(), r.outPtr, int32(r.npat))
+	// With a cache offered: the answer cache is what keeps `[^\n]*ERROR`
+	// linear here, so a drive WITHOUT one is handed to the set's no-cache
+	// companion, whose kept members are linear and need no preflight. The
+	// preflight pinned here is the one on the cache-backed path.
+	const page = 65536
+	length, stride := overlapCacheFor(input, pats)
+	cache := (r.outPtr + 2*page) &^ (page - 1)
+	if need := uint64((int64(cache) + int64(length) + page) / page); need > r.mem.Size(r.store) {
+		if _, err := r.mem.Grow(r.store, need-r.mem.Size(r.store)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	desc := writeFindScratchStride(r.store, r.mem, r.gatePtr, int32(len(pats)), cache, length, stride)
+	r.call(t, "cap_find", r.inBase, int32(len(input)), int32(0), desc, r.outPtr, int32(r.npat))
 
 	buf = r.mem.UnsafeData(r.store)
 	var zero []int

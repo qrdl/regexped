@@ -467,6 +467,15 @@ type compiledPattern struct {
 	saRevBody     []byte
 	switchN       int32
 	backStampP1   int32
+	// saBT is what a switch hands over to when the start-anywhere find cannot
+	// be built for the pattern (an empty-width assertion, or an automaton over
+	// the limits): the Backtracking find, linear per call, laid out in
+	// slotSABT / slotSABTFallback. Its fields are buildBTFindParts's.
+	saBT *btFindParts
+	// saCtx: saFwdBody/saRevBody are the context passes of a pattern with an
+	// empty-width assertion, and the backward one takes (ptr, len, end), laid
+	// out in slotSARevCtx.
+	saCtx bool
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were removed with the rest of that infrastructure.
 
@@ -641,6 +650,9 @@ const (
 	slotSARev             // …its backward pass
 	slotSAGlue            // …and the find body joining them
 	slotSADispatch        // today's find or the start-anywhere find, for a switch
+	slotSARevCtx          // the context backward pass (saCtx)
+	slotSABT              // a switch's Backtracking handover find (saBT)
+	slotSABTFallback      // …and its memoised fallback
 )
 
 // funcSlot is one entry of a pattern's function layout. branch is the
@@ -692,11 +704,21 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 	}
 	if p.saFwdBody != nil {
 		add(slotSAFwd)
-		add(slotSARev)
-		add(slotSAGlue)
-		if p.saSwitch {
-			add(slotSADispatch)
+		if p.saCtx {
+			add(slotSARevCtx)
+		} else {
+			add(slotSARev)
 		}
+		add(slotSAGlue)
+	}
+	if p.saBT != nil {
+		add(slotSABT)
+		if p.saBT.fallback != nil {
+			add(slotSABTFallback)
+		}
+	}
+	if p.saSwitch {
+		add(slotSADispatch)
 	}
 	if p.captureBody != nil {
 		add(slotCapture)
@@ -886,6 +908,140 @@ func appendWithBTFallback(cs, fast, fallback []byte, callOffs []int, fallbackFun
 	}
 	cs = append(cs, patchBTFallbackCall(fast, callOffs, fallbackFuncIdx)...)
 	return append(cs, fallback...)
+}
+
+// btFindParts is a no-capture Backtracking find laid out above some address:
+// its body (the ordinary one, or the bare tail call to the fallback), the
+// memoised fallback, the call sites to patch with the fallback's index, and the
+// tables and frame stack placed for them.
+type btFindParts struct {
+	fast, fallback []byte
+	callOffs       []int
+	mode           findFromMode
+	data           []byte
+	segs           int
+	end            int64
+}
+
+// buildBTFindParts builds the Backtracking find for pattern at cur: the find a
+// pattern whose DFA is too large gets, and what a start-anywhere switch hands
+// over to when the start-anywhere find cannot be built. table is the
+// pattern's (large) find DFA when one was built, for its literal prefix; nil
+// otherwise. stack, when non-nil, is the frame stack [base, limit) to use
+// instead of one placed above the tables — how a set's Backtracking members,
+// which never run at the same time, share one (btFindStackSize sizes it).
+func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions, stack *[2]int32) (btFindParts, error) {
+	var parts btFindParts
+	btProg := compileBTProg(pattern)
+	if len(btProg.Inst) > maxBTFallbackInstructions {
+		return parts, ErrBTProgramTooLarge
+	}
+	bt := newBacktrack(btProg)
+	bt.numGroups = 0
+	// Choose scan strategy (in priority order):
+	//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
+	//   2. Mandatory interior literal via two-level outer loop.
+	//   3. First-byte SIMD/Teddy tables from NFA (fallback).
+	var btScanParams prefixScanParams
+	var btScanDataBytes []byte
+	var btScanSegCnt int
+	var btMandLit *mandatoryLit
+	// table is nil only in the rare dfaStateLimitExceeded backstop
+	// case (construction itself was too expensive to finish, not
+	// just "too many states to use as the primary engine") — no
+	// prefix optimisation is available then, falls through to
+	// btMandLit/nfaFirstBytes below.
+	var btPrefix []byte
+	if table != nil {
+		btPrefix = computePrefix(table)
+		if len(btPrefix) > maxBTFallbackPrefixLen {
+			btPrefix = btPrefix[:maxBTFallbackPrefixLen]
+		}
+	}
+	if len(btPrefix) >= 2 {
+		// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
+		btScanParams = prefixScanParams{
+			Prefix: btPrefix,
+			// The layout is buildBTFindBody's, and comes from the
+			// allocation that decides it — not from five indices
+			// written out here, in a different file.
+			Locals:        btScanLocalsOnly(),
+			EngineDepth:   2,
+			LikelyNoMatch: o.LikelyMode == LikelyNoMatch,
+		}
+	} else if mandLit != nil {
+		// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
+		btMandLit = mandLit
+	} else {
+		// Fallback: first-byte SIMD/Teddy tables from NFA.
+		btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
+		btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+		btScanParams.TableMemIdx = o.tableMemIdx
+		btScanParams.LikelyNoMatch = o.LikelyMode == LikelyNoMatch
+	}
+	parts.data, parts.segs = btScanDataBytes, btScanSegCnt
+	// Allocate BT stack after SIMD tables.
+	btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
+	// As on the Backtracking match path: the fallback reserves nothing, and
+	// nor does a fast body that is the bare tail call.
+	plan := planBT(bt, o.BTWorkBudget)
+	btStackSize := btAllocSizes(bt)
+	if plan.force {
+		btStackSize = 0
+	}
+	if stack != nil {
+		if int(stack[1]-stack[0]) < btStackSize {
+			panic("compile: a shared Backtracking stack smaller than a member's")
+		}
+		btBase, btStackSize = cur+int64(len(btScanDataBytes)), 0
+	} else if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
+		return parts, err
+	}
+	btStackBase := int32(btBase)
+	btStackLimit := btStackBase + int32(btStackSize)
+	if stack != nil {
+		btStackBase, btStackLimit = stack[0], stack[1]
+	}
+	var fallbackMode findFromMode
+	if plan.fallback {
+		scratch := o.btScratch()
+		parts.fallback, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch)
+	}
+	if plan.force {
+		// The stub forwards (ptr, len) and never reads `from`; the
+		// fallback it calls does, so the stub reports the fallback's mode.
+		var stub []byte
+		stub, parts.callOffs = btTailCallBody(2)
+		parts.fast, parts.mode = stub, fallbackMode
+	} else {
+		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil)
+		if plan.fallback && mode != fallbackMode {
+			panic("compile: a Backtracking find body and its fallback read `from` differently")
+		}
+		parts.fast, parts.mode = fast, mode
+		parts.callOffs = offs
+	}
+	parts.end = utils.PageAlign(btBase + int64(btStackSize))
+	if stack != nil {
+		parts.end = btBase
+	}
+	return parts, nil
+}
+
+// btFindStackSize is the frame stack buildBTFindParts gives pattern's find:
+// none when its ordinary body is the bare tail call to the fallback, whose
+// stack is run-time scratch. ok is false when Backtracking cannot take it.
+func btFindStackSize(pattern string, budget int) (size int, ok bool) {
+	prog := compileBTProg(pattern)
+	if len(prog.Inst) > maxBTFallbackInstructions {
+		return 0, false
+	}
+	bt := newBacktrack(prog)
+	bt.numGroups = 0
+	if planBT(bt, budget).force {
+		return 0, true
+	}
+	return btAllocSizes(bt), true
 }
 
 // appendMatchBodies appends matchBody and its fallback, if any; matchFuncIdx is
@@ -1697,89 +1853,16 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if needFindBody {
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
-			btProg := compileBTProg(re.Pattern)
-			if len(btProg.Inst) > maxBTFallbackInstructions {
-				return nil, ErrBTProgramTooLarge
-			}
-			bt := newBacktrack(btProg)
-			bt.numGroups = 0
-			// Choose scan strategy (in priority order):
-			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
-			//   2. Mandatory interior literal via two-level outer loop.
-			//   3. First-byte SIMD/Teddy tables from NFA (fallback).
-			var btScanParams prefixScanParams
-			var btScanDataBytes []byte
-			var btScanSegCnt int
-			var btMandLit *mandatoryLit
-			// table is nil only in the rare dfaStateLimitExceeded backstop
-			// case (construction itself was too expensive to finish, not
-			// just "too many states to use as the primary engine") — no
-			// prefix optimisation is available then, falls through to
-			// btMandLit/nfaFirstBytes below.
-			var btPrefix []byte
-			if table != nil {
-				btPrefix = computePrefix(table)
-				if len(btPrefix) > maxBTFallbackPrefixLen {
-					btPrefix = btPrefix[:maxBTFallbackPrefixLen]
-				}
-			}
-			if len(btPrefix) >= 2 {
-				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
-				btScanParams = prefixScanParams{
-					Prefix: btPrefix,
-					// The layout is buildBTFindBody's, and comes from the
-					// allocation that decides it — not from five indices
-					// written out here, in a different file.
-					Locals:        btScanLocalsOnly(),
-					EngineDepth:   2,
-					LikelyNoMatch: buildOpts.LikelyMode == LikelyNoMatch,
-				}
-			} else if patMandLit != nil {
-				// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
-				btMandLit = patMandLit
-			} else {
-				// Fallback: first-byte SIMD/Teddy tables from NFA.
-				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
-				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
-				btScanParams.TableMemIdx = buildOpts.tableMemIdx
-				btScanParams.LikelyNoMatch = buildOpts.LikelyMode == LikelyNoMatch
-			}
-			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
-			p.dataSegCount += btScanSegCnt
-			// Allocate BT stack after SIMD tables.
-			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
-			// See the match path above: the fallback reserves nothing, and nor
-			// does a fast body that is the bare tail call.
-			plan := planBT(bt, buildOpts.BTWorkBudget)
-			btStackSize := btAllocSizes(bt)
-			if plan.force {
-				btStackSize = 0
-			}
-			if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
+			parts, err := buildBTFindParts(re.Pattern, table, patMandLit, cur, &buildOpts, nil)
+			if err != nil {
 				return nil, err
 			}
-			btStackBase := int32(btBase)
-			btStackLimit := btStackBase + int32(btStackSize)
-			var fallbackMode findFromMode
-			if plan.fallback {
-				scratch := buildOpts.btScratch()
-				p.findFallbackBody, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, 0, false, &scratch)
-			}
-			if plan.force {
-				// The stub forwards (ptr, len) and never reads `from`; the
-				// fallback it calls does, so the stub reports the fallback's mode.
-				var stub []byte
-				stub, p.findFallbackCallOffs = btTailCallBody(2)
-				p.setFind(stub, fallbackMode)
-			} else {
-				fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, plan.k, plan.fallback, nil)
-				if plan.fallback && mode != fallbackMode {
-					panic("compile: a Backtracking find body and its fallback read `from` differently")
-				}
-				p.setFind(fast, mode)
-				p.findFallbackCallOffs = offs
-			}
-			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize))
+			p.dataBytes = append(p.dataBytes, parts.data...)
+			p.dataSegCount += parts.segs
+			p.findFallbackBody = parts.fallback
+			p.setFind(parts.fast, parts.mode)
+			p.findFallbackCallOffs = parts.callOffs
+			p.tableEnd = parts.end
 		} else {
 			// Where today's literal-anchored tables start: a pattern the
 			// classifier sends to the start-anywhere find drops them again.
@@ -1996,11 +2079,13 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
 					p.dataSegCount = segMark + trial.dataSegCount
 					p.litAnchorBackScanBody, p.altLitAnchorBranches = nil, nil
-					p.saFwdBody, p.saRevBody = trial.saFwdBody, trial.saRevBody
+					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
 					p.startAnywhere = true
 					p.tableEnd = trial.tableEnd
 				} else {
-					strategy, why = findToday, "start-anywhere automaton over the limits"
+					// Today's body with the counter, handing over to the
+					// Backtracking find (buildSwitchHandover) — linear either way.
+					strategy, why = findSwitch, why+"; start-anywhere find refused: "+startAnywhereRefusal(re.Pattern)
 				}
 			}
 			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
@@ -2064,7 +2149,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				var sw *compiledPattern
 				if strategy == findSwitch && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 					sw = &compiledPattern{}
-					if sw.buildStartAnywhereFind(re, utils.PageAlign(l.tableEnd), buildOpts) {
+					if sw.buildSwitchHandover(re, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts) {
 						l.switchN = switchNFor(buildOpts)
 					} else {
 						sw = nil
@@ -2105,7 +2190,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				if strategy == findSwitch && sw == nil && (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) &&
 					buildOpts.globals != nil {
 					sw = &compiledPattern{}
-					if sw.buildStartAnywhereFind(re, utils.PageAlign(p.tableEnd), buildOpts) {
+					if sw.buildSwitchHandover(re, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts) {
 						p.switchN = switchNFor(buildOpts)
 						p.backStampP1 = int32(buildOpts.globals.Alloc()) + 1 //nolint:gosec // a global index
 						if p.litAnchorBackScanBody != nil {
@@ -2122,11 +2207,15 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					if p.findNeutralBody != nil {
 						panic("compile: start-anywhere switch with a neutral twin")
 					}
-					p.saFwdBody, p.saRevBody = sw.saFwdBody, sw.saRevBody
+					p.saFwdBody, p.saRevBody, p.saBT, p.saCtx = sw.saFwdBody, sw.saRevBody, sw.saBT, sw.saCtx
 					p.dataBytes = append(p.dataBytes, sw.dataBytes...)
 					p.dataSegCount += sw.dataSegCount
 					p.tableEnd = sw.tableEnd
 					p.saSwitch = true
+					if sw.saBT != nil {
+						buildOpts.report().Note("switch handover: Backtracking — start-anywhere find refused: " +
+							startAnywhereRefusal(re.Pattern))
+					}
 				} else if strategy == findSwitch {
 					buildOpts.report().Note("find: switch unavailable — today's find kept")
 				}
@@ -2560,6 +2649,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotSARev:             0x00,
 		slotSAGlue:            0x01,
 		slotSADispatch:        0x01,
+		slotSARevCtx:          0x02,
+		slotSABT:              0x01,
+		slotSABTFallback:      0x01,
 	}
 	var fs []byte
 	// `total` counts every function index INCLUDING the imported builtins; the

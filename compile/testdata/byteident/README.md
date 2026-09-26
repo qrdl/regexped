@@ -74,10 +74,10 @@ that reads one table through another's bytes.
 | `set_overlap_sweep` | `overlapping: true` over LITERAL-LESS patterns, which is what puts a SWEEP in the module: the checkpoint pass, the block materialiser, the projection table and the successor scratch. `set_overlap` above is eight literals and contains none of them | scalar |
 | `set_overlap_sweep_batch` | the same sweep with `hints: [batch-find]`. Only SERVING is per-entry — `find` returns a position's total where the batch entry returns what it wrote — so the two serving paths are separate code and are pinned separately | scalar |
 | `set_split` | members that are not provably linear in a set's bodies SPLIT OUT to their own start-anywhere find: the merge wrapper `find` becomes, the member passes, the position global the bucket body stamps, and — the `\b` member refusing a union automaton — the merged scan wrappers | scalar |
-| `set_split_batch` | the split in a BATCHING set: the merge sits in the shared per-position worker both entries call, and follows the batch resume rule (gate every match delivered) | scalar |
+| `set_split_batch` | the split in a BATCHING set: the merge sits in the shared per-position worker both entries call, and follows the batch resume rule (gate every match delivered) | packed-pair |
 | `set_split_scan_union` | the same split with a union automaton over every member serving the scan pair on its own, so only `find` is merged | packed-pair |
-| `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks and the scan bodies carry the work counter that hands the call to a union automaton | packed-pair |
-| `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would | scalar |
+| `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks, and the scan bodies carry the work counter — charged only for walks that recorded nothing new, checked after the probe is recorded — that hands the call to a union automaton | packed-pair |
+| `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would, and the NO-CACHE COMPANION — the same set split, compiled beside it and never exported — that `find` hands a drive with no usable cache to | scalar |
 
 `TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
 capability list from the diagnostics on every run, for the same reason the

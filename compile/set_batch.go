@@ -183,9 +183,19 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			lV64 = a.I64()
 		}
 	}
+	// The descriptor itself, which the no-cache companion's `find` takes: the
+	// parameter is overwritten with the gate pointer below.
+	var lDesc byte
+	companion := cs.companion != nil && dpIdx >= 0
+	if companion {
+		lDesc = a.I32()
+	}
 
 	var b []byte
 	b = a.EmitDecls(b)
+	if companion {
+		b = append(b, 0x20, pScratch, 0x21, lDesc)
+	}
 	// emitSweepAndServe sweeps (when the trigger allows) and answers from a
 	// live cache; the in-call counter's bail path runs it a second time.
 	var emitSweepAndServe func([]byte) []byte
@@ -212,6 +222,9 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		lReady: lReady, lWork: lWork, lSweepRet: lSweepRet,
 		lCumBase: lCumBase, lBlockBase: lBlockBase,
 		walkEndGlobal: cs.walkEndGlobal,
+	}
+	if cs.midSweepWork >= 0 && dpIdx >= 0 {
+		cache.midWorkP1 = cs.midSweepWork + 1
 	}
 
 	if dpIdx >= 0 {
@@ -384,6 +397,9 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		b = emitSweepAndServe(b)
 		b = append(b, 0x0B) // end if/else the cache is present
 	}
+	if companion {
+		b = emitNoCacheRoute(cs, b, cache, pScratch, lDesc, nparams, cs.companionFindIdx)
+	}
 
 	// The walk.
 	mid := cs.midSweepWork >= 0 && dpIdx >= 0
@@ -458,6 +474,11 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
 			b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x21, lWork)
 			b = emitSweepAndServe(b)
+			if companion {
+				// Refused: this call has delivered nothing yet, so the
+				// companion answers it whole instead of an unbudgeted walk.
+				b = emitNoCacheRoute(cs, b, cache, pScratch, lDesc, nparams, cs.companionFindIdx)
+			}
 			b = append(b, 0x41, 0x7F, 0x24)                       // no budget
 			b = utils.AppendULEB128(b, uint32(cs.midSweepBudget)) //nolint:gosec // a global index
 			for i := 0; i < nparams; i++ {
@@ -494,6 +515,38 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	b = append(b, 0x0B)
 	body := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(body, b...)
+}
+
+// emitNoCacheRoute hands a drive with no usable answer cache to the set's
+// no-cache companion (compiledSet.companion): `ready` is negative — no cache
+// offered, or its sweep refused — so the in-call counter would have nothing to
+// hand over to. The first such call after a refusal finds the gate array
+// holding THIS body's preflight verdicts, which mean something else to the
+// companion's merge; it zeroes the array — "nothing known", which every body
+// reads safely — and marks the header -2 so it happens once. A drive offered no
+// cache at all started with the array zeroed. gate is the local holding the
+// gate pointer, desc the descriptor; the call forwards every parameter, with
+// desc in the descriptor's place, and returns the companion's answer.
+func emitNoCacheRoute(cs *compiledSet, b []byte, cache overlapCacheCtx, gate, desc byte, nparams int, target int) []byte {
+	b = append(b, 0x20, cache.lReady, 0x41, 0x00, 0x48, 0x04, 0x40) // ready < 0: if
+	b = append(b, 0x20, cache.pCache, 0x41, 0x00, 0x47)
+	b = append(b, 0x20, cache.lReady, 0x41, 0x7F, 0x46, 0x71, 0x04, 0x40) // cache offered && ready == -1: if
+	b = append(b, 0x20, gate, 0x41, 0x00, 0x41)
+	b = utils.AppendSLEB128(b, int32(cs.idSpaceSize()*4)) //nolint:gosec // a small size
+	b = append(b, 0xFC, 0x0B, 0x00)                       // memory.fill
+	b = append(b, 0x20, cache.pCache, 0x41, 0x7E)         // -2: switched
+	b = hdrStoreOp(b, ckptHdrReady)
+	b = append(b, 0x0B)
+	for i := 0; i < nparams; i++ {
+		if byte(i) == gate {
+			b = append(b, 0x20, desc)
+			continue
+		}
+		b = append(b, 0x20, byte(i))
+	}
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(target)) //nolint:gosec // a function index
+	return append(b, 0x0F, 0x0B)               // return; end if
 }
 
 // emitSetFindBatchBody emits the exported find_batch loop.
@@ -874,7 +927,7 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 	// resume cursor, leaving x.lPos where it is; the next call re-enters at the
 	// same position, the worker overflows again with nothing delivered, and
 	// the sentinel goes out with a genuinely-zero count and untouched gates.
-	if cs.hasBTMember() {
+	if cs.hasBTMember() || cs.btSplit {
 		b = append(b, 0x20, x.lTotal)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
@@ -1112,6 +1165,11 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		lBudget, lDesc = a.I32(), a.I32()
 		lV64 = a.I64()
 	}
+	// The no-cache companion's batch entry takes the descriptor too.
+	companion := cs.companion != nil && cs.companionBatchIdx >= 0 && dpIdx >= 0
+	if companion && lDesc == 0 {
+		lDesc = a.I32()
+	}
 
 	//
 	// The sweep costs a flat numStates x patterns per input byte. The walk's
@@ -1145,6 +1203,9 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		// The batch export returns an i64 cursor+count, so an error is a
 		// RESERVED RESUME POSITION rather than a negative count.
 		i64Ret: true,
+	}
+	if cs.midSweepWork >= 0 && dpIdx >= 0 {
+		cache.midWorkP1 = cs.midSweepWork + 1
 	}
 
 	var b []byte
@@ -1241,6 +1302,21 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		b = append(b, 0x76, 0x41)
 		b = utils.AppendSLEB128(b, kMask)
 		b = append(b, 0x71, 0x21, lK)
+	}
+	if companion {
+		// A drive with no usable cache goes to the no-cache companion. Within
+		// one position the walk and the companion order the tuples
+		// differently, so a position begun on one path is finished on it:
+		// a drive offered no cache (cache 0) or already switched (ready -2)
+		// began every position on the companion, whatever k; one whose sweep
+		// was just refused (ready -1) switches only at a boundary (k == 0) and
+		// lets the walk finish the position it is in.
+		b = append(b, 0x20, lK, 0x45)                       // k == 0
+		b = append(b, 0x20, pScratch, 0x45, 0x72)           // || cache == 0
+		b = append(b, 0x20, lReady, 0x41, 0x7E, 0x46, 0x72) // || ready == -2
+		b = append(b, 0x04, 0x40)
+		b = emitNoCacheRoute(cs, b, cache, pGate, lDesc, 6, cs.companionBatchIdx)
+		b = append(b, 0x0B)
 	}
 	b = append(b, 0x41, 0x00, 0x21, lCount)
 	// lDone = cap < 1. A buffer with no room can deliver nothing and would

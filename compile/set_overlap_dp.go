@@ -473,6 +473,12 @@ type overlapCacheCtx struct {
 	// no such store. Seeded with the call's `from` before the walk and read
 	// back after it, so the difference is the bytes this call WALKED.
 	walkEndGlobal int32
+	// midWorkP1 is one past the in-call counter's global (compiledSet.
+	// midSweepWork), 0 = none. That counter sums every candidate's walk in
+	// the call, where walkEndGlobal — re-seeded per candidate for it — ends
+	// up holding only the last candidate's stop; emitStoreWork folds it into
+	// the drive's work so the between-calls trigger sees every walk.
+	midWorkP1 int32
 }
 
 // hdrLoadOp appends an i32.load of the cache header field at byte offset off;
@@ -792,6 +798,18 @@ func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 // call would start from zero and a drive of many short calls could never cross
 // the line.
 func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
+	if c.midWorkP1 > 0 {
+		// work += this call's candidate walks, saturating (both are
+		// non-negative, so a sum past the i32 maximum reads negative); then
+		// zero them, so a second store in the call does not count them again.
+		g := uint32(c.midWorkP1 - 1) //nolint:gosec // a global index
+		b = append(b, 0x20, c.lWork, 0x23)
+		b = utils.AppendULEB128(b, g)
+		b = append(b, 0x6A, 0x22, c.lWork, 0x41, 0x00, 0x48, 0x04, 0x40)
+		b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x21, c.lWork, 0x0B)
+		b = append(b, 0x41, 0x00, 0x24)
+		b = utils.AppendULEB128(b, g)
+	}
 	b = append(b, 0x20, c.pCache)
 	b = append(b, 0x20, c.lWork)
 	b = hdrStoreOp(b, ckptHdrWork)

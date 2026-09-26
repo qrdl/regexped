@@ -50,6 +50,22 @@ func New(nParams uint32) *Alloc {
 }
 
 func (a *Alloc) alloc(ty byte) byte {
+	idx := a.allocWide(ty)
+	if idx > 0x7F {
+		// The byte-indexed emitters write the index as ONE byte, which is a
+		// ULEB128 only below 128: 128..255 reads as a continuation byte and
+		// swallows the next opcode (a split set's merge wrapper built such a
+		// module). Every emitter here is far below this, and emitFindFromSeed
+		// documents what a wrong index costs: the validator accepts it as a
+		// DIFFERENT local. Fail loudly rather than emit one; an emitter whose
+		// local count grows with its input takes I32W/I64W.
+		panic("compile: local index exceeds 127 — the byte-indexed emitters cannot address it")
+	}
+	return byte(idx)
+}
+
+// allocWide allocates a local of type ty and returns its index at full width.
+func (a *Alloc) allocWide(ty byte) uint32 {
 	if n := len(a.groups); n > 0 && a.groups[n-1].ty == ty {
 		a.groups[n-1].n++
 	} else {
@@ -57,14 +73,15 @@ func (a *Alloc) alloc(ty byte) byte {
 	}
 	idx := a.next
 	a.next++
-	if idx > 0xFF {
-		// Every emitter here is far below this, and emitFindFromSeed already
-		// documents what a truncated index costs: the validator accepts it as
-		// a DIFFERENT local. Fail loudly rather than emit one.
-		panic("compile: local index exceeds 255 — the byte-indexed emitters cannot address it")
-	}
-	return byte(idx)
+	return idx
 }
+
+// I32W and I64W allocate a local whose index may not fit one byte, for an
+// emitter that writes every reference to it as ULEB128 — one whose local count
+// grows with its input, like a split set's merge wrapper with a slot per
+// member.
+func (a *Alloc) I32W() uint32 { return a.allocWide(ValI32) }
+func (a *Alloc) I64W() uint32 { return a.allocWide(ValI64) }
 
 // Next is the index the next allocation will receive — the count of locals
 // declared so far plus the parameters. Emitters with a hand-computed layout

@@ -1165,6 +1165,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		} else {
 			b = c.emitProbeCall(b, bi, litLen, posLocal, g.mask)
 			b = c.emitRecordProbe(b, bi)
+			b = c.emitScanCounter(b, bi, posLocal)
 		}
 		b = append(b, 0x0B) // end block $skip_group
 	}
@@ -1254,15 +1255,21 @@ func (c *setFindCtx) emitRecordedSkip(b []byte, bi int) []byte {
 }
 
 // emitProbeCall calls bucket bi's bitmask probe for the pattern bits in mask,
-// leaving the result in lTmp.
+// leaving the result in lTmp. Where the scan pair's work counter runs it also
+// seeds the probe's walk-end global and, for `scan_all`, snapshots the answer
+// so far (emitScanCounter reads both after the probe is recorded).
 func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask uint32) []byte {
-	counter := c.cs.scanSwitch(c.mode) && c.cs.buckets[bi].probeWalkEndP1 > 0
-	if counter {
+	if c.scanCounts(bi) {
 		pwe := c.cs.buckets[bi].probeWalkEndP1 - 1
 		// Seed the walk-end global with this candidate's position, so a probe
 		// that does not stamp it (the counted-chain probe) reads as no walk.
 		b = append(b, 0x20, posLocal, 0x24)
 		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+		if c.mode == capScanAll {
+			b = c.pushScanAnswer(b)
+			b = append(b, 0x24)
+			b = utils.AppendULEB128(b, uint32(c.cs.scanSwMark)) //nolint:gosec // a global index
+		}
 	}
 	b = append(b, 0x20, c.pInPtr)
 	b = append(b, 0x20, posLocal)
@@ -1278,53 +1285,95 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.probeIndex(bi)))
 	b = append(b, 0x21, c.lTmp)
-	b = c.emitProbeOverflowEscape(b, bi)
-	if counter {
-		// The scan pair's work counter: work += walk end - pos; once work >
-		// N × (pos - from) + 64 — the single-pattern switch's rule and
-		// constants — the rest of the call is the union automaton's, from
-		// `from`. What this body recorded so far is kept: every such hit is
-		// a real match at or after `from`, and the automaton reports each
-		// pattern at most once more (scan_all's bitmap counts 0→1 only).
-		w, pwe := c.cs.scanSwWork, c.cs.buckets[bi].probeWalkEndP1-1
-		b = append(b, 0x23)
-		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-		b = append(b, 0x23)
-		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
-		b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
-		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-		b = append(b, 0x23)
-		b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-		b = append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B, 0x41)
-		b = utils.AppendSLEB128(b, defaultSwitchN)
-		b = append(b, 0x6C, 0x41)
-		b = utils.AppendSLEB128(b, startAnywhereSwitchSlack)
-		b = append(b, 0x6A)
-		b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
-		target := c.probeFnBase - c.cs.scanProbeBaseOffset() + c.cs.scanSwitchFnOffset(c.mode)
-		callTarget := func(b []byte) []byte {
-			b = append(b, 0x20, c.pInPtr, 0x20, c.pInLen, 0x20, c.pFrom)
-			if c.wideBitmap {
-				b = append(b, 0x20, c.pOutPtr)
-			}
-			b = append(b, 0x10)
-			return utils.AppendULEB128(b, uint32(target)) //nolint:gosec // a function index
-		}
-		switch {
-		case c.mode == capScanAny:
-			b = callTarget(b)
-		case c.wideBitmap:
-			b = append(b, 0x20, c.lTotal)
-			b = callTarget(b)
-			b = append(b, 0x6A) // hits so far + the automaton's new ones
-		default:
-			b = append(b, 0x20, c.lAcc)
-			b = callTarget(b)
-			b = append(b, 0x84) // i64.or
-		}
-		b = append(b, 0x0F, 0x0B)
+	return c.emitProbeOverflowEscape(b, bi)
+}
+
+// scanCounts reports whether bucket bi's probes run under the scan pair's
+// work counter.
+func (c *setFindCtx) scanCounts(bi int) bool {
+	return c.cs.scanSwitch(c.mode) && c.cs.buckets[bi].probeWalkEndP1 > 0
+}
+
+// pushScanAnswer pushes `scan_all`'s answer so far as an i64: the id mask, or
+// the wide form's hit count.
+func (c *setFindCtx) pushScanAnswer(b []byte) []byte {
+	if c.wideBitmap {
+		return append(b, 0x20, c.lTotal, 0xAD) // i64.extend_i32_u
 	}
-	return b
+	return append(b, 0x20, c.lAcc)
+}
+
+// emitScanCounter is the scan pair's work counter, after bucket bi's probe at
+// posLocal has been RECORDED — so a hand-over loses nothing it found. It is
+// the single-pattern switch's rule (emitFindSwitchCharge): only a FAILED walk
+// is charged — one that recorded no pattern not already recorded — and only
+// one longer than switchShortWalk; the budget, N × (pos − from) + 64, is
+// checked before the current walk is added, so one long failed walk does not
+// trip it. Successes need no charge: each records a new pattern, so there are
+// at most as many as the set has. Once it trips, the rest of the call is the
+// union automaton's, from `from`: every hit recorded so far is a real match at
+// or after `from`, and the automaton reports each pattern at most once more
+// (`scan_all`'s bitmap counts 0→1 only).
+func (c *setFindCtx) emitScanCounter(b []byte, bi int, posLocal byte) []byte {
+	if !c.scanCounts(bi) {
+		return b
+	}
+	w, pwe := c.cs.scanSwWork, c.cs.buckets[bi].probeWalkEndP1-1
+	// Failed: nothing new recorded.
+	if c.mode == capScanAll {
+		b = c.pushScanAnswer(b)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(c.cs.scanSwMark)) //nolint:gosec // a global index
+		b = append(b, 0x51)                                 // i64.eq
+	} else {
+		b = append(b, 0x20, c.lTmp, 0x45)
+	}
+	b = append(b, 0x04, 0x40) // if failed
+	// walk > switchShortWalk
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+	b = append(b, 0x20, posLocal, 0x6B, 0x41)
+	b = utils.AppendSLEB128(b, switchShortWalk)
+	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+	// work > N × (pos − from) + 64: hand over.
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	b = append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B, 0x41)
+	b = utils.AppendSLEB128(b, defaultSwitchN)
+	b = append(b, 0x6C, 0x41)
+	b = utils.AppendSLEB128(b, startAnywhereSwitchSlack)
+	b = append(b, 0x6A)
+	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+	target := c.probeFnBase - c.cs.scanProbeBaseOffset() + c.cs.scanSwitchFnOffset(c.mode)
+	callTarget := func(b []byte) []byte {
+		b = append(b, 0x20, c.pInPtr, 0x20, c.pInLen, 0x20, c.pFrom)
+		if c.wideBitmap {
+			b = append(b, 0x20, c.pOutPtr)
+		}
+		b = append(b, 0x10)
+		return utils.AppendULEB128(b, uint32(target)) //nolint:gosec // a function index
+	}
+	switch {
+	case c.mode == capScanAny:
+		b = callTarget(b)
+	case c.wideBitmap:
+		b = append(b, 0x20, c.lTotal)
+		b = callTarget(b)
+		b = append(b, 0x6A) // hits so far + the automaton's new ones
+	default:
+		b = append(b, 0x20, c.lAcc)
+		b = callTarget(b)
+		b = append(b, 0x84) // i64.or
+	}
+	b = append(b, 0x0F, 0x0B) // return; end if over budget
+	// work += walk
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+	b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
+	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	return append(b, 0x0B, 0x0B)          // end if long; end if failed
 }
 
 // emitProbeOverflowEscape returns abi.BTStackOverflow out of the whole

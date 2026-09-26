@@ -687,6 +687,11 @@ type CompileSetOptions struct {
 	// that produced it.
 	globals *moduleGlobals
 
+	// noCache compiles a split set without the overlapping answer cache: the
+	// no-cache companion (set_split.go), which exists for drives that have
+	// none.
+	noCache bool
+
 	// quiet suppresses the set's warnings. CompileSet compiles a set a
 	// second time when it splits members out (see set_split.go); the first
 	// compile has already warned about every pattern the second one drops or

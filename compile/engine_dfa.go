@@ -4693,8 +4693,11 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// scanProbe itself gets the cheap exit and no second body is emitted.
 	firstHit := len(probeFlags) > 0 && probeFlags[0] && needProbes
 	soleFirstHit := len(probeFlags) > 1 && probeFlags[1] && needProbes
-	// probeFlags[2]: emit the liveness table and exit.
-	needFuture := len(probeFlags) > 2 && probeFlags[2] && needProbes
+	// probeFlags[2]: emit the liveness table and exit. probeFlags[6]: emit it
+	// whether or not there are probes — a LITERAL bucket whose members can
+	// outlive one another (livenessCanFire), where the tuple-writing body's
+	// exit is what stops a walk kept going for members no longer wanted.
+	needFuture := (len(probeFlags) > 2 && probeFlags[2] && needProbes) || (len(probeFlags) > 6 && probeFlags[6])
 	// probeFlags[3]: the tuple-writing body carries the batch `skip` parameter.
 	// Independent of needProbes — it is about the WRITE path, not the probes.
 	needSkip := len(probeFlags) > 3 && probeFlags[3]
@@ -4995,7 +4998,8 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 			wasmStart:    uint32(t.startState + 1),
 			wasmMidStart: uint32(t.midStartState + 1),
 			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
-			memberGlobal: memberGlobal,
+			memberGlobal:   memberGlobal,
+			probeWalkEndP1: art.probeWalkEndGlobal + 1,
 		}
 		art.fnBody = sizePrefixed(buildSparseSuffixBody(sp))
 		if needProbes {

@@ -2423,6 +2423,44 @@ var findStrategyShapes = []struct {
 	// The attempt at 0 walks the whole input and fails, and a match starts at
 	// 1: a counter that trips on that walk must resume the search AT 1.
 	{`a\w*X|b\w*Y`, "b", "Y", []string{"a" + strings.Repeat("b", 300) + "Y", "aa" + strings.Repeat("b", 300) + "Y"}},
+	// Empty-width assertions, served by the start-anywhere find's context
+	// passes; every one of the first five is quadratic under today's find on
+	// its run. The last two are linear — their loops can only end where the
+	// assertion holds — and keep today's.
+	{`a+b\b`, "a", "aab", nil},
+	{`a*b$`, "a", "ab", nil},
+	{`\w+@\w+\b`, "a", "a@b", nil},
+	{`\b[a-z ]+X`, "a ", "aX", nil},
+	{`a+x(?m:$)`, "a", "ax", nil},
+	{`\bfoo\w*\b`, "foo ", "foox", nil},
+	{`(?m:^)ERROR:.*(?m:$)`, "ERROR:", "ERROR:x\n", nil},
+	// Its start-anywhere automaton is over the state limit (2^11 states for
+	// `a[ab]{11}`), so the switch hands over to the Backtracking find.
+	{`a[ab]{11}c[a-z]*X`, "abbbbbbbbbbbc", "abbbbbbbbbbbcX", nil},
+}
+
+// hasEmptyWidthAssertion reports whether pat carries \b, \B, ^, $, \A or \z,
+// which the start-anywhere find refuses.
+func hasEmptyWidthAssertion(pat string) bool {
+	re, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	var walk func(*syntax.Regexp) bool
+	walk = func(r *syntax.Regexp) bool {
+		switch r.Op {
+		case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText,
+			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+			return true
+		}
+		for _, s := range r.Sub {
+			if walk(s) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(re)
 }
 
 // TestFindStrategiesMatchGo drives every find strategy — today's find, the
@@ -2467,9 +2505,15 @@ func TestFindStrategiesMatchGo(t *testing.T) {
 					t.Fatal(err)
 				}
 				r.End()
-				served := false
+				served, refused := false, false
 				for _, n := range r.Patterns[0].Notes {
 					served = served || strings.HasPrefix(n, st.note)
+					refused = refused || strings.HasPrefix(n, "switch handover: Backtracking")
+				}
+				if st.name == "start-anywhere" && refused {
+					// Forced, but the automaton is over the limits: the switch
+					// with the Backtracking handover serves it instead.
+					served = true
 				}
 				if !served {
 					t.Fatalf("not served by %q: notes %v", st.note, r.Patterns[0].Notes)
@@ -2519,6 +2563,10 @@ func TestFindStrategiesLinear(t *testing.T) {
 			t.Fatal(err)
 		}
 		copy(inst.GetExport(st, "memory").Memory().UnsafeData(st)[pathsInputBase:], in)
+		// Backtracking handovers place their memo above the input.
+		if err := setScratchBase(st, inst, pathsInputBase+int32((len(in)+65535)/65536*65536)); err != nil {
+			t.Fatal(err)
+		}
 		fn := inst.GetFunc(st, "find")
 		for from := 0; from <= len(in); {
 			v, err := fn.Call(st, pathsInputBase, int32(len(in)), int32(from))

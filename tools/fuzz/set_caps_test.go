@@ -3412,12 +3412,14 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 								nBT++
 							}
 						}
+						// Split out onto the Backtracking find: Backtracking too.
+						nBT += len(d.SplitBacktracking)
 					}
 					// The stub side must agree with what was emitted, since a
 					// disagreement there is a wrong signature rather than a
 					// failed load.
 					if got := compile.SetAdmitsBacktracking(sc, cfg); got != (nBT > 0) {
-						t.Errorf("SetAdmitsBacktracking=%v but %d bt-fallback buckets emitted", got, nBT)
+						t.Errorf("SetAdmitsBacktracking=%v but %d Backtracking members emitted", got, nBT)
 					}
 					f := t.TempDir() + "/m.wasm"
 					if err := os.WriteFile(f, w, 0644); err != nil {
@@ -3795,14 +3797,28 @@ var splitCases = [][]string{
 	{`[a-z]+X`, `a*`, `\bq`},
 	{`x[a-z]*y`, `zz`, `x`},
 	{`[a-z]+X`, `[a-z]+Y`, `[a-z]+X`, `aa`},
+	// Members with empty-width assertions: the start-anywhere find's context
+	// passes, alone and beside members without one.
+	{`\b[a-z ]+X`, `foo`},
+	{`a+x\b`, `zz`, `[a-z]+X`},
+	{`a*b$`, `(?m:^)q\w+z`, `b`},
+	{`\ba\w*X`, `[a-z]+Y`, `x`},
+	// A member whose start-anywhere automaton is over the state limit: the
+	// Backtracking find, beside a context member and a plain one.
+	{`a[ab]{11}c[a-z]*X`, `\bq[a-z]*Y`, `[a-z]+Z`},
+	// A member whose own automaton is over the state limit, which the set
+	// used to keep on a Backtracking bucket: split out onto the Backtracking
+	// find, since the bucket re-walks its failed walks on every call.
+	{`[a-z]*a[a-z]{9}c[0-9]X`, `foo`},
 	splitMany(),
 }
 
-// splitMany is the most members one set splits out (compile's
-// maxSplitMembers), which is what reaches the merge wrapper's last locals.
+// splitMany is more members than one byte of local indices can address in
+// the merge wrapper (four per member), which is what reaches its full-width
+// locals.
 func splitMany() []string {
 	var p []string
-	for i := 0; i < 24; i++ {
+	for i := 0; i < 40; i++ {
 		p = append(p, fmt.Sprintf(`[a-z]+Q%d`, i))
 	}
 	return p
@@ -3811,7 +3827,9 @@ func splitMany() []string {
 var splitInputs = []string{
 	"", "a", "aaaa", "foo", "abcX", "aXbX", "fooabcbar", "foofoo", "a@b c@d", "aab", "b", "ab",
 	"zzxyx", "12-x", "aaaa@", "q qa", "xaxbxy", "aYaX", "catfoocat", "ab-x9-x",
-	"abQ1 cQ12xQ5 aaQ23Q2",
+	"abQ1 cQ12xQ5 aaQ23Q2", "a a aX", "foo aX b", "aax", "aax bx", "aab\nqabz", "q\nqaz b",
+	"aXb aX", "abQ39 xQ38Q1", "abbbbbbbbbbbcqX", "aabababababababcX qY", "abbbbbbbbbbbcabbbbbbbbbbbcX",
+	"xyabcdefghijkac7X foo", "abfooabfooaqwertyuiopac1X", "zzabcdefghijc5X foo zabcdefghijc5X",
 }
 
 // splitDiag compiles pats as a gated set and returns its split member ids.
@@ -4008,6 +4026,13 @@ func TestSetSplitLinear(t *testing.T) {
 		{[]string{`[a-z]+X`, `foo`}, "a"},
 		{[]string{`foo[a-z]+bar`, `zz`}, "foo"},
 		{[]string{`\w+@\w+`, `a*b`, `cat`}, "ab"},
+		// Backtracking members.
+		{[]string{`\b[a-z ]+X`, `foo`}, "a "},
+		{[]string{`a+x\b`, `zz`, `[a-z]+X`}, "a"},
+		{[]string{`a*b$`, `b`}, "a"},
+		// Formerly a Backtracking bucket: every call of a drive `foo` keeps
+		// returning re-walked the member's failed walk to the end.
+		{[]string{`[a-z]*a[a-z]{9}c[0-9]X`, `foo`}, "abfoo"},
 	}
 	for _, c := range cases {
 		for _, overlapping := range []bool{false, true} {
@@ -4042,6 +4067,9 @@ func TestSetSplitLinear(t *testing.T) {
 					}
 				}
 				copy(mem.UnsafeData(st)[inBase:], input)
+				if err := setScratchBase(st, inst, outPtr+page); err != nil {
+					t.Fatal(err)
+				}
 				scratch := writeFindScratch(st, mem, gatePtr, int32(len(c.pats)), 0, 0)
 				fn := inst.GetFunc(st, capName)
 				n := int32(len(input))
@@ -4194,6 +4222,99 @@ func TestSetCountersLinear(t *testing.T) {
 		}
 	})
 
+	t.Run("a long early match does not trip the scan counter", func(t *testing.T) {
+		// A SUCCESSFUL walk is not charged, and a probe's hit is recorded
+		// before any hand-over: `foo` + 1,000 × `a` + `bar` used to trip the
+		// counter on its own walk and hand the rest of 60 KB to the union
+		// automaton, 6.4× the cost of a short match.
+		pats := []string{`foo[a-z]+bar`, `zzz\d`}
+		w, d := build(pats, config.SetConfig{ScanAny: "sa", ScanAll: "sl"})
+		if d.ScanUnion == nil || !d.ScanUnion.Counter {
+			t.Fatalf("want the counter, got scan union %+v", d.ScanUnion)
+		}
+		pad := strings.Repeat(" ", 60000)
+		short, long := "fooabar"+pad, "foo"+strings.Repeat("a", 1000)+"bar"+pad
+		for _, name := range []string{"sa", "sl"} {
+			var f [2]uint64
+			for i, input := range []string{short, long} {
+				x := open(w, input, len(pats), 0, 0)
+				v, err := x.in.GetFunc(x.st, name).Call(x.st, x.inBase, int32(len(input)), int32(0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				// From 0 a plain match answers "matches anywhere";
+				// oracleScanAll compiles one probe per position, which on
+				// 60 KB costs gigabytes.
+				var want []int
+				for k, p := range pats {
+					if regexp.MustCompile(p).MatchString(input) {
+						want = append(want, k)
+					}
+				}
+				if name == "sl" {
+					if got := idsFromMask(uint64(v.(int64)), len(pats)); !eqIDs(append([]int(nil), want...), got) {
+						t.Fatalf("scan_all = %v, want %v", got, want)
+					}
+				} else if id := int(v.(int32)); id < 0 || !containsInt(want, id) {
+					t.Fatalf("scan_any = %d, want one of %v", id, want)
+				}
+				f[i] = used(x)
+				x.st.Close()
+			}
+			// scan_any stops at its first hit, so its cost IS the match's
+			// walk; scan_all goes on over the 60 KB after it, which is where
+			// a tripped counter re-scanned from the start.
+			if ratio := float64(f[1]) / float64(f[0]); name == "sl" && ratio > 1.5 {
+				t.Errorf("%s: a 1,000-byte early match cost %.1f× a short one (%d → %d)", name, ratio, f[0], f[1])
+			}
+		}
+	})
+
+	t.Run("scan pair of a sparse bucket switches to the union automaton", func(t *testing.T) {
+		// 33 members sharing `foo` make one SPARSE bucket, whose probe must
+		// stamp its walk end like the bitmask probe does: without the stamp the
+		// counter read every walk as zero bytes and scan_all over `foo`×N was
+		// quadratic while --diag-json reported the counter.
+		var pats []string
+		for i := 0; i < 32; i++ {
+			pats = append(pats, fmt.Sprintf(`foo\d+bar%d`, i))
+		}
+		pats = append(pats, `foo[a-z]+bar`)
+		w, d := build(pats, config.SetConfig{ScanAny: "sa", ScanAll: "sl"})
+		if len(d.SplitMembers) != 0 || d.ScanUnion == nil || !d.ScanUnion.Counter {
+			t.Fatalf("want the counter and no split, got split %v scan union %+v", d.SplitMembers, d.ScanUnion)
+		}
+		for _, input := range []string{strings.Repeat("foo", 40), strings.Repeat("foo", 40) + "xbar", "foo12bar7" + strings.Repeat("foo", 30), strings.Repeat("foo", 30) + "foo3bar31"} {
+			x := open(w, input, len(pats), 0, 0)
+			n := int32(len(input))
+			for from := 0; from <= len(input); from += 7 {
+				want := oracleScanAll(pats, input, from, nil)
+				v, err := x.in.GetFunc(x.st, "sl").Call(x.st, x.inBase, n, int32(from))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := idsFromMask(uint64(v.(int64)), len(pats)); !eqIDs(append([]int(nil), want...), got) {
+					t.Fatalf("%q scan_all(from=%d) = %v, want %v", input, from, got, want)
+				}
+			}
+			x.st.Close()
+		}
+		for _, name := range []string{"sa", "sl"} {
+			var f [2]uint64
+			for i, size := range []int{4096, 16384} {
+				x := open(w, strings.Repeat("foo", size/3), len(pats), 0, 0)
+				if _, err := x.in.GetFunc(x.st, name).Call(x.st, x.inBase, int32(size/3*3), int32(0)); err != nil {
+					t.Fatal(err)
+				}
+				f[i] = used(x)
+				x.st.Close()
+			}
+			if ratio := float64(f[1]) / float64(f[0]); ratio > 8 {
+				t.Errorf("%s: fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", name, ratio, f[0], f[1])
+			}
+		}
+	})
+
 	t.Run("overlapping find sweeps inside the call", func(t *testing.T) {
 		pats := []string{`[a-z]+X`}
 		w, d := build(pats, config.SetConfig{Find: "set_find", Overlapping: true})
@@ -4253,6 +4374,141 @@ func TestSetCountersLinear(t *testing.T) {
 		}
 	})
 
+	t.Run("a merged literal walk stops once no wanted member can accept", func(t *testing.T) {
+		// Each member is linear on its own, but they share one literal
+		// bucket and walk ONE merged automaton: `foo\w+` keeps the walk going
+		// over `foo`×N long after `foo[0-9]` is dead. The liveness exit stops
+		// it once every member still wanted — not gated out, not recorded —
+		// can no longer accept. Overlapping `find` is not here: it reports
+		// every start's long match, which is walked in full by definition.
+		for _, c := range []struct {
+			pats []string
+			fill string
+		}{
+			{[]string{`foo\w+`, `foo[0-9]`}, "foo"},
+			{[]string{`k[a-z]+`, `k[0-9]`, `k-`}, "ka"},
+		} {
+			for _, input := range []string{"", c.fill, strings.Repeat(c.fill, 30), strings.Repeat(c.fill, 30) + "7", c.fill + "9 " + c.fill + "x", "k- k5 kab foo1 fooz"} {
+				checkGated(t, c.pats, input)
+				w, _ := build(c.pats, config.SetConfig{ScanAll: "sl"})
+				x := open(w, input, len(c.pats), 0, 0)
+				v, err := x.in.GetFunc(x.st, "sl").Call(x.st, x.inBase, int32(len(input)), int32(0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := idsFromMask(uint64(v.(int64)), len(c.pats)), oracleScanAll(c.pats, input, 0, nil); !eqIDs(append([]int(nil), want...), got) {
+					t.Fatalf("%v %q: scan_all = %v, want %v", c.pats, input, got, want)
+				}
+				x.st.Close()
+			}
+			gw, _ := build(c.pats, config.SetConfig{Find: "f"})
+			sw, _ := build(c.pats, config.SetConfig{ScanAny: "sa", ScanAll: "sl"})
+			fuel := func(input, name string) uint64 {
+				w := sw
+				if name == "f" {
+					w = gw
+				}
+				x := open(w, input, len(c.pats), 0, 0)
+				defer x.st.Close()
+				fn := x.in.GetFunc(x.st, name)
+				n := int32(len(input))
+				if name != "f" {
+					if _, err := fn.Call(x.st, x.inBase, n, int32(0)); err != nil {
+						t.Fatal(err)
+					}
+					return used(x)
+				}
+				for from := int32(0); from <= n; {
+					v, err := fn.Call(x.st, x.inBase, n, from, x.desc, x.outPtr, int32(len(c.pats)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if v.(int32) <= 0 {
+						break
+					}
+					from = int32(binary.LittleEndian.Uint32(x.mem.UnsafeData(x.st)[x.outPtr+4:])) + 1
+				}
+				return used(x)
+			}
+			for _, name := range []string{"f", "sa", "sl"} {
+				small := fuel(strings.Repeat(c.fill, 4096/len(c.fill)), name)
+				large := fuel(strings.Repeat(c.fill, 16384/len(c.fill)), name)
+				if ratio := float64(large) / float64(small); ratio > 8 {
+					t.Errorf("%v %s: fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", c.pats, name, ratio, small, large)
+				}
+			}
+		}
+	})
+
+	t.Run("overlapping find without a usable cache takes the split", func(t *testing.T) {
+		// The answer cache is what keeps `[a-z]+X` linear here; a drive with
+		// no cache — none offered, or one too small, which the sweep refuses
+		// mid-drive — is routed to the set's no-cache companion, which splits
+		// the member out.
+		pats := []string{`[a-z]+X`}
+		w, d := build(pats, config.SetConfig{Find: "set_find", Overlapping: true})
+		if len(d.SplitMembers) != 0 || len(d.NoCacheSplitMembers) == 0 {
+			t.Fatalf("want no split and a no-cache companion, got split %v, companion %v", d.SplitMembers, d.NoCacheSplitMembers)
+		}
+		for _, mode := range []string{"no cache", "cache too small"} {
+			drive := func(input string) ([]setMatch, uint64) {
+				var length, stride int32
+				if mode == "cache too small" {
+					_, stride = overlapCacheFor(input, pats)
+					length = 64
+				}
+				x := open(w, input, len(pats), length, stride)
+				defer x.st.Close()
+				var out []setMatch
+				n := int32(len(input))
+				for from := int32(0); from <= n; {
+					v, err := x.in.GetFunc(x.st, "set_find").Call(x.st, x.inBase, n, from, x.desc, x.outPtr, int32(len(pats)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					total := int(v.(int32))
+					if total < 0 {
+						t.Fatalf("%s: set_find(from=%d) = %d", mode, from, total)
+					}
+					if total == 0 {
+						break
+					}
+					buf := x.mem.UnsafeData(x.st)
+					var start int32
+					for i := 0; i < total; i++ {
+						b := int(x.outPtr) + 12*i
+						m := setMatch{
+							PatternID: int(int32(binary.LittleEndian.Uint32(buf[b:]))),
+							Start:     int(int32(binary.LittleEndian.Uint32(buf[b+4:]))),
+							End:       int(int32(binary.LittleEndian.Uint32(buf[b+8:]))),
+						}
+						start = int32(m.Start)
+						out = append(out, m)
+					}
+					from = start + 1
+				}
+				return out, used(x)
+			}
+			for _, input := range []string{strings.Repeat("a", 300), strings.Repeat("a", 300) + "X", "abXcdX" + strings.Repeat("b", 200) + "X"} {
+				got, _ := drive(input)
+				var want []setMatch
+				for s := 0; s <= len(input); s++ {
+					if e := anchoredExtent(pats[0], input, s); e >= 0 {
+						want = append(want, setMatch{PatternID: 0, Start: s, End: e})
+					}
+				}
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s, %q: got %v, want %v", mode, input, got, want)
+				}
+			}
+			_, small := drive(strings.Repeat("a", 4096))
+			_, large := drive(strings.Repeat("a", 16384))
+			if ratio := float64(large) / float64(small); ratio > 8 {
+				t.Errorf("%s: fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", mode, ratio, small, large)
+			}
+		}
+	})
+
 	t.Run("gated batch entry of a split set", func(t *testing.T) {
 		pats := []string{`[a-z]+X`, `foo`}
 		w, d := build(pats, config.SetConfig{Find: "set_find", Hints: []string{"batch-find"}})
@@ -4285,60 +4541,90 @@ func TestSetCountersLinear(t *testing.T) {
 	})
 
 	t.Run("overlapping batch entry sweeps inside the call", func(t *testing.T) {
-		pats := []string{`[a-z]+X`}
-		w, d := build(pats, config.SetConfig{Find: "set_find", Overlapping: true, Hints: []string{"batch-find"}})
-		if !d.InCallCounter {
-			t.Fatal("the set carries no in-call counter")
-		}
-		countMask := int64(1)<<uint(config.SetCursorCountBits(len(pats))) - 1
-		drive := func(input string, outCap int32) ([]setMatch, uint64) {
-			length, stride := overlapCacheFor(input, pats)
-			x := open(w, input, len(pats), length, stride)
-			defer x.st.Close()
-			var out []setMatch
-			fn := x.in.GetFunc(x.st, "set_find_batch")
-			for cursor, calls := int64(0), 0; ; calls++ {
-				if calls > 4*len(input)+16 {
-					t.Fatalf("%q: the drive did not terminate", input)
-				}
-				v, err := fn.Call(x.st, x.inBase, int32(len(input)), cursor, x.desc, x.outPtr, outCap)
-				if err != nil {
-					t.Fatal(err)
-				}
-				ret := v.(int64)
-				buf := x.mem.UnsafeData(x.st)
-				for i := int64(0); i < ret&countMask; i++ {
-					b := int(x.outPtr) + 12*int(i)
-					out = append(out, setMatch{
-						PatternID: int(int32(binary.LittleEndian.Uint32(buf[b:]))),
-						Start:     int(int32(binary.LittleEndian.Uint32(buf[b+4:]))),
-						End:       int(int32(binary.LittleEndian.Uint32(buf[b+8:]))),
-					})
-				}
-				if uint32(ret>>32) == 0xFFFFFFFF {
-					break
-				}
-				cursor = ret
+		// The second set has several members matching at every position, so at
+		// capacity 1 a position spans calls — the resume a drive routed to the
+		// no-cache companion must keep on the companion (it answered a tuple
+		// twice and lost another when a k > 0 call went back to the walk).
+		for _, pats := range [][]string{{`[a-z]+X`}, {`[a-z]+X`, `[a-z]*`, `a*`}} {
+			w, d := build(pats, config.SetConfig{Find: "set_find", Overlapping: true, Hints: []string{"batch-find"}})
+			if !d.InCallCounter {
+				t.Fatal("the set carries no in-call counter")
 			}
-			return out, used(x)
-		}
-		for _, input := range []string{strings.Repeat("a", 300), strings.Repeat("a", 300) + "X", "abXcdX" + strings.Repeat("b", 200) + "X"} {
-			var want []setMatch
-			for s := 0; s <= len(input); s++ {
-				if e := anchoredExtent(pats[0], input, s); e >= 0 {
-					want = append(want, setMatch{PatternID: 0, Start: s, End: e})
+			countMask := int64(1)<<uint(config.SetCursorCountBits(len(pats))) - 1
+			// With a cache, and without a usable one — none offered, or one the
+			// sweep refuses as too small — which the entry hands to the set's
+			// no-cache companion at a position boundary.
+			mode := ""
+			drive := func(input string, outCap int32) ([]setMatch, uint64) {
+				length, stride := overlapCacheFor(input, pats)
+				switch mode {
+				case "no cache":
+					length, stride = 0, 0
+				case "cache too small":
+					length = 64
+				}
+				x := open(w, input, len(pats), length, stride)
+				defer x.st.Close()
+				var out []setMatch
+				fn := x.in.GetFunc(x.st, "set_find_batch")
+				for cursor, calls := int64(0), 0; ; calls++ {
+					if calls > 4*len(input)+16 {
+						t.Fatalf("%q: the drive did not terminate", input)
+					}
+					v, err := fn.Call(x.st, x.inBase, int32(len(input)), cursor, x.desc, x.outPtr, outCap)
+					if err != nil {
+						t.Fatal(err)
+					}
+					ret := v.(int64)
+					buf := x.mem.UnsafeData(x.st)
+					for i := int64(0); i < ret&countMask; i++ {
+						b := int(x.outPtr) + 12*int(i)
+						out = append(out, setMatch{
+							PatternID: int(int32(binary.LittleEndian.Uint32(buf[b:]))),
+							Start:     int(int32(binary.LittleEndian.Uint32(buf[b+4:]))),
+							End:       int(int32(binary.LittleEndian.Uint32(buf[b+8:]))),
+						})
+					}
+					if uint32(ret>>32) == 0xFFFFFFFF {
+						break
+					}
+					cursor = ret
+				}
+				return out, used(x)
+			}
+			if len(d.NoCacheSplitMembers) == 0 {
+				t.Fatal("the set has no no-cache companion")
+			}
+			for _, mode = range []string{"cache", "no cache", "cache too small"} {
+				for _, input := range []string{"", "a", strings.Repeat("a", 300), strings.Repeat("a", 300) + "X", "abXcdX" + strings.Repeat("b", 200) + "X"} {
+					var want []setMatch
+					for s := 0; s <= len(input); s++ {
+						for k := range pats {
+							if e := anchoredExtent(pats[k], input, s); e >= 0 {
+								want = append(want, setMatch{PatternID: k, Start: s, End: e})
+							}
+						}
+					}
+					sortMatches(want)
+					for _, c := range []int32{1, 2, 7, 64} {
+						got, _ := drive(input, c)
+						sortMatches(got)
+						if fmt.Sprint(got) != fmt.Sprint(want) {
+							t.Fatalf("%v %s, %q cap %d: got %v, want %v", pats, mode, input, c, got, want)
+						}
+					}
+				}
+				if len(pats) > 1 {
+					// Long overlapping matches at every start: walked in
+					// full by definition without a cache, split or not.
+					continue
+				}
+				_, small := drive(strings.Repeat("a", 4096), 16)
+				_, large := drive(strings.Repeat("a", 16384), 16)
+				if ratio := float64(large) / float64(small); ratio > 8 {
+					t.Errorf("%s: fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", mode, ratio, small, large)
 				}
 			}
-			for _, c := range []int32{1, 7, 64} {
-				if got, _ := drive(input, c); fmt.Sprint(got) != fmt.Sprint(want) {
-					t.Fatalf("%q cap %d: got %v, want %v", input, c, got, want)
-				}
-			}
-		}
-		_, small := drive(strings.Repeat("a", 4096), 16)
-		_, large := drive(strings.Repeat("a", 16384), 16)
-		if ratio := float64(large) / float64(small); ratio > 8 {
-			t.Errorf("fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", ratio, small, large)
 		}
 	})
 }

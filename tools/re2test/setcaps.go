@@ -1198,6 +1198,10 @@ func newSetRunner(
 				wideAll = true
 			}
 		}
+		// A member split out onto the Backtracking find forces it too.
+		if len(d.SplitBacktracking) > 0 {
+			wideAll = true
+		}
 	}
 
 	outBase := inBase + span

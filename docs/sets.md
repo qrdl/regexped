@@ -477,25 +477,48 @@ same problem with a second, linear find (see
 set applies the same machinery per member.
 
 A member is **provably linear** in a set when a failed attempt walks a bounded
-number of bytes (no reachable cycle of non-accepting states — `ERROR`,
-`AKIA[A-Z0-9]{16}`, `[a-z]{4}[0-9]{3}`), or when it sits in a literal bucket
-and the part after its literal cannot read that literal without accepting
-(`KEY="[a-z0-9]+"`, `union[ \t]+k00\w+`): a walk then never runs past the next
-occurrence without having matched. A set whose members are all provably linear
-compiles exactly as before. Otherwise:
+number of bytes (no reachable cycle on which a walk keeps going without
+accepting — `ERROR`, `AKIA[A-Z0-9]{16}`, `[a-z]{4}[0-9]{3}`), or when it sits in
+a literal bucket and the part after its literal cannot read that literal
+without accepting (`KEY="[a-z0-9]+"`, `union[ \t]+k00\w+`): a walk then never
+runs past the next occurrence without having matched. An accept that an
+empty-width assertion conditions counts only where its condition can hold — a
+loop that can only end where the assertion holds is linear (`\bfoo\w*\b`), one
+that can fail at a byte it does not like is not (`[a-z]+X\b`) — and the
+literal clause does not speak for a member with an assertion.
+
+Members linear on their own can still walk too far TOGETHER: members that share
+a literal bucket walk one merged automaton, so `foo\w+` keeps the walk going
+over `foo`×N long after `foo[0-9]` is dead. Such a bucket stops a walk as soon
+as no member still wanted — not gated out, not already recorded — can accept.
+A set whose members are all provably linear otherwise compiles exactly as
+before. When one is not:
 
 | Capability | What the set does |
 |---|---|
-| `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own start-anywhere find, and `find` merges their answers with the buckets' |
-| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes |
+| `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own linear search, and `find` merges their answers with the buckets' |
+| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary |
 | `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find` |
-| `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks (`4 × bytes advanced + 64`, the single-pattern rule) that hands the call to a start-anywhere union automaton over the set |
+| `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks — the single-pattern rule: only a walk that recorded nothing new and walked more than 32 bytes is charged, the budget `4 × bytes advanced + 64` is checked before the walk is added, and the probe's hits are recorded first — that hands the call to a start-anywhere union automaton over the set |
 | `scan_any`, `scan_all`, where no union automaton can be built | split out |
+
+A split member's search is its **start-anywhere find** — for a member with an
+assertion, the context passes that judge every assertion against the real
+neighbouring bytes — or, where that cannot be built (an automaton over
+`max_fallback_states` or the memory bound, or one that cannot represent an
+assertion exactly), the **Backtracking find**, which memoises every
+(instruction, position) it tries and is linear per call too. A member the set
+had put on a Backtracking bucket is split out the same way: its bucket's
+memory of failed walks lasts one host call, so a drive whose other members
+match often would re-walk them on every call. Start-anywhere members are chosen
+smallest tables first while their tables total at most 4 MB; the rest take the
+Backtracking find, whose own tables are a few scan bytes and which all share
+one frame stack. There is no limit on how many members are split.
 
 When members are split out, every non-anchored capability serves them the
 same way: `find` merges, and the scan pair uses one union automaton over EVERY
 member when one can be built (one pass, however many members were split),
-otherwise the buckets' answer plus one forward pass per split member.
+otherwise the buckets' answer plus one search per split member.
 `match_any` and `match_all` are anchored and never change.
 
 The merge keeps `find`'s contract exactly — the matches at the smallest start
@@ -509,16 +532,29 @@ must never go backwards.
 Costs, measured at 64 KB on single-shape and mixed sets: a split member costs
 its start-anywhere find — 2-4 instructions per byte on text its forward pass
 crosses with the SIMD bulk skip (`a*b`, `foo[a-z]+bar` away from their bytes),
-about 29 where it cannot (`\w+@\w+` over prose), up to 37 on runs that defeat
-the skip — where the bucket body often cost 2-3 on text it could skip. So on
+about 29 where it cannot (`\w+@\w+` over prose), up to 52 on runs that defeat
+the skip, 34-45 for a member with an assertion — where the bucket body often
+cost 2-3 on text it could skip. So on
 text without a worst-case run, with or without matches, a split member's gated
 `find` ranges from 17× faster to 14× slower; on the worst-case runs that were
 quadratic it is 19,000-66,000× faster, and mixed sets that were quadratic are
-330-20,000× faster. Each split member adds its two
-automata's tables (uncompressed) to the module. One case stays slow:
-`overlapping: true` on a set the answer cache cannot serve, over members whose
-matches are long and overlap — every start's match is walked in full, split or
-not.
+330-20,000× faster. Each split start-anywhere member adds its two automata's
+tables to the module. The cost grows with the number of split members: each
+walks its own search, so on ordinary text 100 split members of the
+`foo[a-z]+bar<i>` or `k<i>[a-z0-9]+z` families cost 332-407 instructions per
+byte against 2.8-4.1 for the buckets alone (and 825-4,503 on their worst-case
+runs, which the buckets could not finish). A Backtracking member costs a pass
+of the Backtracking find over the input: in perftest's 10-pattern secrets set,
+`eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.` — its start-anywhere automaton
+is over the state limit — adds 2.8 instructions per byte on 100 KB (+34% for
+the set), and on a single pattern's worst-case run the Backtracking find costs
+up to 236 per byte.
+
+Two cases stay quadratic, both outside what a split can reach:
+`overlapping: true` over members whose matches are long and overlap, when no
+answer cache serves the set — every start's match is walked in full, split or
+not — and a `find` over input that matches at every byte while each attempt
+keeps walking for a longer match (`a*b|a` over `a`×N).
 
 **Batching sets** (`hints: [batch-find]`) are split the same way: the merge sits
 in the per-position worker both entries share, and keeps the batch entry's
@@ -527,14 +563,13 @@ with exactly the matches not yet delivered. A split batching set gets no
 answer cache, since the batch entry would serve it without the split members;
 the cache is kept for batching sets that are not split.
 
-**Not split:** a member with an empty-width assertion, one the
-compiler dropped or put on Backtracking, and one whose start-anywhere automaton
-exceeds `max_fallback_states` stay in the buckets. At most 24 members are
-split out of one set; a set with more keeps all of them in its buckets.
+**Not split:** a member the compiler dropped from the set stays dropped.
 
 `--diag-json` reports all of it: `split_members` (the ids served outside the
-buckets), `scan_union` (`direct` when it is the scan pair's whole body,
-`counter` when it is the counter's switch target) and `in_call_counter`.
+buckets), `split_backtracking` (those of them on the Backtracking find),
+`no_cache_split_members` (the members the no-cache companion splits out),
+`scan_union` (`direct` when it is the scan pair's whole body, `counter` when it
+is the counter's switch target) and `in_call_counter`.
 
 ## Output formats
 
