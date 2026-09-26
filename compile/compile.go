@@ -2078,7 +2078,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				if trial.buildStartAnywhereFind(re, cur, buildOpts) {
 					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
 					p.dataSegCount = segMark + trial.dataSegCount
-					p.litAnchorBackScanBody, p.altLitAnchorBranches = nil, nil
+					p.clearLitAnchor()
 					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
 					p.startAnywhere = true
 					p.tableEnd = trial.tableEnd
@@ -3790,6 +3790,29 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
 	b = append(b, 0x0F) //   return
 	return append(b, 0x0B)
+}
+
+// clearLitAnchor drops every literal-anchored find artifact, for a pattern
+// whose find the start-anywhere find replaced after they were built: the two
+// bodies are what the assembler keys on, but a reader keying on any other
+// field — a layout, a table, the literal set, a prefilter offset — would find
+// a find this pattern no longer has.
+func (p *compiledPattern) clearLitAnchor() {
+	p.litAnchorBackScanBody = nil
+	p.litAnchorFindLayout, p.litAnchorFindTable = nil, nil
+	p.litAnchorFirstByteOff, p.litAnchorFirstByteFlags, p.litAnchorFirstBytes = 0, [256]byte{}, nil
+	p.litAnchorTeddyLoOff, p.litAnchorTeddyHiOff = 0, 0
+	p.litAnchorTeddyLoBytes, p.litAnchorTeddyHiBytes = nil, nil
+	p.litAnchorTeddyT1LoOff, p.litAnchorTeddyT1HiOff = 0, 0
+	p.litAnchorTeddyT1LoBytes, p.litAnchorTeddyT1HiBytes = nil, nil
+	p.litAnchorLitSet = nil
+	p.litAnchorRevL, p.litAnchorRevTable = nil, nil
+	p.altLitAnchorBranches = nil
+	p.altLitAnchorFirstByteOff, p.altLitAnchorFirstByteFlags, p.altLitAnchorFirstBytes = 0, [256]byte{}, nil
+	p.altLitAnchorTeddyLoOff, p.altLitAnchorTeddyHiOff = 0, 0
+	p.altLitAnchorTeddyLoBytes, p.altLitAnchorTeddyHiBytes = nil, nil
+	p.altLitAnchorTeddyT1LoOff, p.altLitAnchorTeddyT1HiOff = 0, 0
+	p.altLitAnchorTeddyT1LoBytes, p.altLitAnchorTeddyT1HiBytes = nil, nil
 }
 
 // buildBatchFindWrapperBody emits the WASM body for the batch find

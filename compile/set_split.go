@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"log/slog"
 	"regexp/syntax"
 	"sort"
 
@@ -216,7 +217,11 @@ func noCacheCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compil
 		return nil
 	}
 	c := spec
-	c.Find = spec.Find + "\x00no-cache" // internal: never exported
+	// Internal, and NAMED so: every consumer keyed by a set's name or export
+	// name (SetNames, the component resources, the stubs) misses it by
+	// construction rather than by each remembering to test cs.internal.
+	c.Name = spec.Name + "\x00no-cache"
+	c.Find = spec.Find + "\x00no-cache" // never exported
 	c.MatchAny, c.MatchAll, c.ScanAny, c.ScanAll = "", "", "", ""
 	o := opts
 	o.noCache, o.quiet = true, true
@@ -226,8 +231,32 @@ func noCacheCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compil
 	comp.internal = true
 	if primary.diag != nil && comp.diag != nil {
 		primary.diag.NoCacheSplitMembers = comp.diag.SplitMembers
+		primary.diag.NoCacheSplitBacktracking = comp.diag.SplitBacktracking
+	}
+	// The companion compiles quietly — its packing repeats the primary's, and
+	// so would every warning — but a member it serves by the Backtracking find
+	// is the companion's alone, and would otherwise go unmentioned.
+	if !opts.quiet && comp.diag != nil {
+		for _, id := range comp.diag.SplitBacktracking {
+			for k, pid := range spec.PatternIDs {
+				if pid == id {
+					warnNoCacheOnBacktracking(spec.Patterns[k])
+				}
+			}
+		}
 	}
 	return comp
+}
+
+// warnNoCacheOnBacktracking reports a member the no-cache companion serves by
+// the Backtracking find: its start-anywhere find cannot be built, or is past
+// the tables' budget.
+func warnNoCacheOnBacktracking(p *PatternInfo) {
+	ref := patternRefFor(p)
+	slog.Warn("Set member runs on Backtracking when no answer cache is offered",
+		"pattern", ref.Name, "id", ref.ID,
+		"effect", "an overlapping find with no cache (a raw caller, C with -DRX_SET_CACHE=0) searches it with the Backtracking find, which answers 'unknown' when memory cannot grow",
+		"hint", "offer the answer cache, as every generated stub does")
 }
 
 // setSplitCandidates returns the members the split would serve — those not

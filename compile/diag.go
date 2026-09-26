@@ -121,6 +121,9 @@ type SetDiag struct {
 	// drive that has no usable cache is routed to the companion, which serves
 	// them by their own linear searches.
 	NoCacheSplitMembers []int `json:"no_cache_split_members,omitempty"`
+	// NoCacheSplitBacktracking lists which of those the companion serves by
+	// the Backtracking find rather than the start-anywhere find.
+	NoCacheSplitBacktracking []int `json:"no_cache_split_backtracking,omitempty"`
 	// ScanUnion reports the scan pair's own union automaton: its whole body
 	// (Direct, when members are split out) or the target a literal
 	// frontend's work counter switches to (Counter).

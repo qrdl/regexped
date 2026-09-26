@@ -988,6 +988,13 @@ make run        # from tools/perftest/
 Benchmarks regexped vs regex crate (via wasmtime), showing per-pattern ns/op and speedup factor.
 Harnesses must be pre-built with `make harnesses` if changed.
 
+**`--sets` rows are timed INSIDE wasm since 2026-09-26** (`benchshim.BuildSetFind`),
+as the regex crate side and every single-pattern row always were. Before, the
+regexped set drive was timed from Go, one wasmtime call per matching position at
+~3.5 µs each, so a match-dense row measured the crossing: log-levels-dense read
+0.16× and reads 11.3× now. Set timings from before that date are not comparable
+with later ones, and `baseline_sets_time.txt` needs re-capturing.
+
 ### Cross-engine set benchmarks (`tools/setperf/`)
 
 ```bash

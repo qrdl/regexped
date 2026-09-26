@@ -537,18 +537,26 @@ func dfaWalksNest(t *dfaTable) bool {
 		return -1
 	}
 	comp := aliveSCCs(n, alive, reps, step)
-	// A component is a cycle when it has two states, or one with a self-loop.
-	size := map[int]int{}
+	// Each component's states, once, and every state's index within its own:
+	// the pair's second half lives in one component, so the search indexes
+	// pairs (x, y) as x*|C| + idx[y].
+	var members [][]int
+	idx := make([]int, n)
 	for q := 0; q < n; q++ {
-		if comp[q] >= 0 {
-			size[comp[q]]++
+		if c := comp[q]; c >= 0 {
+			for len(members) <= c {
+				members = append(members, nil)
+			}
+			idx[q] = len(members[c])
+			members[c] = append(members[c], q)
 		}
 	}
+	// A component is a cycle when it has two states, or one with a self-loop.
 	onCycle := func(q int) bool {
 		if comp[q] < 0 {
 			return false
 		}
-		if size[comp[q]] > 1 {
+		if len(members[comp[q]]) > 1 {
 			return true
 		}
 		for _, c := range reps {
@@ -564,46 +572,52 @@ func dfaWalksNest(t *dfaTable) bool {
 			starts = append(starts, st)
 		}
 	}
-	const maxNestWork = 1 << 26
+	// The budget counts every pair step AND every pair slot a search's seen
+	// set spans: a large component's n*|C| slots are work too, and counting
+	// only the steps let a component of a thousand states allocate gigabytes.
+	// One component's seen set is capped on its own as well (16 MB).
+	const maxNestWork, maxNestSlots = 1 << 26, 1 << 22
 	work := 0
-	for q := 0; q < n; q++ {
-		if !onCycle(q) {
+	type pair struct{ x, y int }
+	var queue []pair
+	for c, cm := range members {
+		if len(cm) == 0 || !onCycle(cm[0]) {
 			continue
 		}
-		// The component's states, indexed, for the pair's second half.
-		var members []int
-		idx := map[int]int{}
-		for y := 0; y < n; y++ {
-			if comp[y] == comp[q] {
-				idx[y] = len(members)
-				members = append(members, y)
-			}
+		width := len(cm)
+		if work += n * width; work > maxNestWork || n*width > maxNestSlots {
+			return true
 		}
-		for _, st := range starts {
-			if st == q {
-				return true // the start state is on the cycle: W is the cycle
-			}
-			seen := make([]bool, n*len(members))
-			type pair struct{ x, y int }
-			queue := []pair{{st, q}}
-			seen[st*len(members)+idx[q]] = true
-			for len(queue) > 0 {
-				p := queue[0]
-				queue = queue[1:]
-				for _, c := range reps {
-					if work++; work > maxNestWork {
-						return true
-					}
-					x, y := step(p.x, c), step(p.y, c)
-					if x < 0 || y < 0 || comp[y] != comp[q] {
-						continue
-					}
-					if x == q && y == q {
-						return true
-					}
-					if k := x*len(members) + idx[y]; !seen[k] {
-						seen[k] = true
-						queue = append(queue, pair{x, y})
+		// One seen set per component, reused across its searches: a slot is
+		// seen when it holds the current search's stamp.
+		seen := make([]uint32, n*width)
+		stamp := uint32(0)
+		for _, q := range cm {
+			for _, st := range starts {
+				if st == q {
+					return true // the start state is on the cycle: W is the cycle
+				}
+				stamp++
+				queue = append(queue[:0], pair{st, q})
+				seen[st*width+idx[q]] = stamp
+				for len(queue) > 0 {
+					p := queue[0]
+					queue = queue[1:]
+					for _, b := range reps {
+						if work++; work > maxNestWork {
+							return true
+						}
+						x, y := step(p.x, b), step(p.y, b)
+						if x < 0 || y < 0 || comp[y] != c {
+							continue
+						}
+						if x == q && y == q {
+							return true
+						}
+						if k := x*width + idx[y]; seen[k] != stamp {
+							seen[k] = stamp
+							queue = append(queue, pair{x, y})
+						}
 					}
 				}
 			}
@@ -737,7 +751,19 @@ func dfaReachCo(t *dfaTable) (reach, co []bool) {
 // The per-position work is the COLUMN, one update per cell — which under lever
 // C is the projected width and not states x patterns, the figure this was
 // spelled as in two places. And under checkpointing a position may be swept
-// TWICE: once by the pass and once when its block is rebuilt. So 2 * cells.
+// TWICE: once by the pass and once when its block is rebuilt — 2 * cells.
+//
+// The threshold is HALF that: `cells`. Measured on setperf (fuel), against
+// 2 * cells: the dense overlap rows −25% to −31%, greedy-3's quadratic rows
+// −0.6% to 0.0% where the in-call counter charges each walk once, and no row
+// worse; ×0.25 gained more but doubles the worst case again. The price is that
+// worst case: a drive whose walk would have ended just past the threshold pays
+// a sweep it did not need — up to ~3× walking alone, where 2 * cells bounded
+// it at ~2×.
+//
+// The per-byte rate alone misses what STARTING a sweep costs, which is why the
+// threshold is priced over overlapSweepSetupBytes more bytes than the input
+// has — see there.
 //
 // The units are not comparable in any exact sense — one side counts matched
 // bytes, the other column updates — and never were. What the constant has to
@@ -748,7 +774,38 @@ func (cs *compiledSet) overlapSweepCostPerByte() int64 {
 	if cells <= 0 {
 		return 1
 	}
-	return int64(2 * cells)
+	return int64(cells)
+}
+
+// overlapSweepSetupBytes is what STARTING a sweep costs, in bytes of sweeping:
+// the drive engages once its work passes (len + this) × costPerByte.
+//
+// A per-byte rate alone prices a sweep over a 3-byte input at three bytes'
+// worth, and the drives that then crossed paid more than walking — measured
+// (fuel, sweep against the same module kept on the walk): `a+` over "aaa"
+// +24%, `a*` +14%, `[^\n]*ERROR` over 13 bytes +4%, greedy-3's batch entry at
+// capacity 1 over the same 13 bytes +23%. Their work at the end of the walk
+// exceeded len × cells by at most 5 × cells, and every drive where the sweep
+// won (`a+` from 8 bytes, −12%; `[^\n]*ERROR` and greedy-3 from 32, −24% to
+// −34%) by at least 16 × cells — so the allowance scales with the column,
+// which is what the setup work does, and sits between the two. A flat constant
+// fitted the same drives only inside [35, 48) work units. At 100 KB the
+// allowance moves the line by eight bytes and nothing measurable.
+const overlapSweepSetupBytes = 8
+
+// emitSweepThreshold pushes the i64 (len + overlapSweepSetupBytes) ×
+// costPerByte, with len the input-length parameter pInLen. The ONE spelling of
+// the line: the between-calls trigger and both in-call budgets compare against
+// it, and two of three drifting apart would have a call's budget run out on a
+// drive the trigger says is cheap.
+func emitSweepThreshold(b []byte, pInLen byte, costPerByte int64) []byte {
+	b = append(b, 0x20, pInLen, 0xAD) // (u64) len
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, overlapSweepSetupBytes)
+	b = append(b, 0x7C) // i64.add
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, costPerByte)
+	return append(b, 0x7E) // i64.mul
 }
 
 // overlapCacheGeometry is everything the two serving paths need to know about
@@ -992,9 +1049,9 @@ func hdrStoreOp(b []byte, off int) []byte {
 }
 
 // emitWorkExceedsSweep pushes 1 when the walk has already spent more than the
-// sweep would cost.
+// sweep would cost (emitSweepThreshold).
 //
-// Computed in i64 because len * cost overflows i32 on a large input, which
+// Computed in i64 because the threshold overflows i32 on a large input, which
 // would make the test wrap and fire at random.
 //
 // A SATURATED counter counts as over the line. work is an i32 that stops at
@@ -1007,10 +1064,7 @@ func (c overlapCacheCtx) emitWorkExceedsSweep(b []byte) []byte {
 	b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // 0x7FFFFFFF
 	b = append(b, 0x46)                               // i32.eq -> saturated
 	b = append(b, 0x20, c.lWork, 0xAD)                // (u64) work
-	b = append(b, 0x20, c.pInLen, 0xAD)
-	b = append(b, 0x42)
-	b = utils.AppendSLEB128_64(b, c.costPerByte)
-	b = append(b, 0x7E) // i64.mul
+	b = emitSweepThreshold(b, c.pInLen, c.costPerByte)
 	b = append(b, 0x56) // i64.gt_u
 	b = append(b, 0x72) // i32.or: saturated, or over the threshold
 	return b
@@ -1378,7 +1432,12 @@ func (c overlapCacheCtx) emitSeedWalkEnd(b []byte, fromLocal byte) []byte {
 // and one that walked far), and taking the larger of the two would let a dense
 // drive under-report.
 func (c overlapCacheCtx) emitChargeWalkExtent(b []byte, fromLocal, tmpLocal byte) []byte {
-	if c.walkEndGlobal < 0 {
+	// Not with the in-call counter: it re-seeds the global per candidate and
+	// sums every candidate's walk into midSweepWork, which emitStoreWork folds
+	// into the drive's work — so walkEnd - from here would charge the LAST
+	// candidate's walk a second time, and the sweep would engage earlier than
+	// the trigger's model says.
+	if c.walkEndGlobal < 0 || c.midWorkP1 > 0 {
 		return b
 	}
 	b = append(b, 0x23)

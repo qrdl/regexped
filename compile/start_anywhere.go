@@ -42,10 +42,10 @@ import (
 //   - TODAY'S FIND, unchanged, where it is PROVABLY linear (group A): a failed
 //     attempt walks a bounded number of bytes (failedWalkBound), both shape
 //     detectors apply, or the literal-anchored find's parts around its literal
-//     cannot contain that literal (litAnchorLinear). Also for anything the
-//     start-anywhere find cannot serve: an empty-width assertion (the backward
-//     pass does not mirror `\b`, `^`, `$`, `\A`, `\z`), a hinted pattern
-//     outside the two shapes below, a pattern anchored at 0.
+//     cannot contain that literal (litAnchorLinear) — the last two only for a
+//     pattern with no empty-width assertion, since they reason about accepts
+//     without the context one puts on them. Also for a hinted pattern outside
+//     the two shapes below, and a pattern anchored at 0.
 //   - THE START-ANYWHERE FIND ALONE for two shapes, both starting with an
 //     unbounded repeat of a class common in prose (byte-rarity score ≥ 40, the
 //     Shufti threshold): without the space byte and with no literal to scan
@@ -57,8 +57,11 @@ import (
 //     64, the call hands over to the start-anywhere find. Ordinary text never
 //     trips it, so it costs what today's find costs plus 0-6% (perftest).
 //
-// The start-anywhere find needs its forward automaton within max_dfa_states;
-// a pattern whose automaton is larger keeps today's find.
+// A pattern with `\b`, `\B`, `^`, `$`, `\A` or `\z` gets the CONTEXT passes:
+// the backward pass mirrors each assertion and judges it against the real
+// bytes at both ends of its walk. Where the start-anywhere find cannot be built
+// — its automaton over max_dfa_states, or an ambiguous boundary target — the
+// switch hands over to the Backtracking find instead.
 
 // findStrategy is how one pattern's find is served.
 type findStrategy uint8
@@ -539,11 +542,15 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 		return t
 	}
 
-	// Forward pass: the start-anywhere automaton, leftmost-first.
-	fwdRe, err := syntax.Parse(`(?s:.)*?(?:`+parsed.String()+`)`, syntax.Perl)
+	// Forward pass: the start-anywhere automaton, leftmost-first — built from
+	// the SAME tree the backward pass reverses. It used to re-parse
+	// parsed.String(), and any drift in that round trip would have made the
+	// two passes disagree about a match, which the glue body traps on.
+	lead, err := syntax.Parse(`(?s:.)*?`, syntax.Perl)
 	if err != nil {
 		return startAnywherePasses{}, false
 	}
+	fwdRe := &syntax.Regexp{Op: syntax.OpConcat, Flags: lead.Flags, Sub: []*syntax.Regexp{lead, parsed}}
 	fwdTable := build(fwdRe, true)
 	if fwdTable == nil {
 		return startAnywherePasses{}, false

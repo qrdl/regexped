@@ -341,9 +341,14 @@ The answer cache removes most of that quadratic cost, with or without
 `hints: [batch-find]`. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
 counting the bytes it has covered — the extent it matched, plus how far each
-call's walk actually ran — and once that exceeds what a single backward sweep
-would cost it sweeps the rest of the input in one pass and answers the
-remaining calls out of the result. A scan the walk handles cheaply never
+call's walk actually ran — and once that exceeds half of what a backward sweep
+would cost, plus a fixed allowance for starting one, it sweeps the rest of the
+input in one pass and answers the remaining calls out of the result. Half, not
+all: measured, switching that much earlier cut the dense rows' cost by a
+quarter to a third; the worst case, a walk that would have ended just past the
+line, pays up to about three times what walking alone would have cost. The
+allowance is what keeps an input of a few bytes on the walk, where starting a
+sweep costs more than the whole walk does. A scan the walk handles cheaply never
 sweeps and costs exactly what it did before.
 
 The sweep needs an automaton over the set's members. A set that packs into

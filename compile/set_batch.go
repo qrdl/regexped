@@ -406,16 +406,14 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	if mid {
 		// The in-call counter's budget: what the sweep would cost, less the
 		// drive's earlier work, when a cache exists and has not swept; no
-		// budget otherwise. Computed in i64 (len × cost overflows i32) and
+		// budget otherwise. Computed in i64 (the threshold overflows i32) and
 		// capped at the i32 maximum.
 		b = append(b, 0x41, 0x00, 0x24)
 		b = utils.AppendULEB128(b, uint32(cs.midSweepWork)) //nolint:gosec // a global index
 		b = append(b, 0x20, lCache, 0x41, 0x00, 0x47)       // cache != 0
 		b = append(b, 0x20, lReady, 0x45, 0x71)             // && ready == 0
 		b = append(b, 0x04, 0x7F)                           // if (result i32)
-		b = append(b, 0x20, pInLen, 0xAD, 0x42)
-		b = utils.AppendSLEB128_64(b, sweepCostPerByte)
-		b = append(b, 0x7E)                    // len * cost
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
 		b = append(b, 0x20, lWork, 0xAD, 0x7D) // - work
 		b = append(b, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // MAX
@@ -820,8 +818,9 @@ type batchWalkLocals struct {
 	lWork, lWorkIdx, lWorkTmp, lReady, lCacheSweepRet               byte
 	// The in-call counter's (compiledSet.midSweepWork): this call's budget,
 	// and the descriptor the entry was given, for the call it makes to
-	// itself when the counter trips. 0 when the set carries no counter.
-	lBudget, lDesc byte
+	// itself when the counter trips; lV64 holds that call's answer. 0 when
+	// the set carries no counter.
+	lBudget, lDesc, lV64 byte
 }
 
 // emitBatchWalk is the WALK half of the batching entry: call the per-position
@@ -903,8 +902,26 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x20, x.lCap, 0x20, x.lCount, 0x6B)
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(selfIdx)) //nolint:gosec // a function index
-		b = append(b, 0x20, x.lCount, 0xAD, 0x7C)   // + count, into the count field
-		b = append(b, 0x0F, 0x0B)                   // return; end if
+		b = append(b, 0x22, x.lV64)                 // local.tee
+		// A RESERVED position word — overflow, a malformed header, a resume
+		// below the floor — carries a zero count by contract, so the tuples
+		// already delivered cannot ride in it: return them under the ordinary
+		// resume cursor instead (br $exit, as the overflow guard below does),
+		// with x.lPos where it is. The next call re-enters there and reports
+		// the error with nothing delivered. The three words are the three
+		// below 0xFFFFFFFF, the done word, which carries a count.
+		b = append(b, 0x42, 0x20, 0x88, 0xA7) // (i32)(v >> 32)
+		lowest := uint32(config.SetCursorOutOfOrderPos)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(lowest))       //nolint:gosec // a reserved bit pattern
+		b = append(b, 0x6B, 0x41, 0x03, 0x49)           // - lowest reserved; u< 3
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A) // count > 0
+		b = append(b, 0x71, 0x04, 0x40)                 // and; if
+		// br 3: 0 = this if, 1 = the counter's if, 2 = loop $L, 3 = block $exit.
+		b = append(b, 0x0C, 0x03, 0x0B)
+		b = append(b, 0x20, x.lV64)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x7C) // + count, into the count field
+		b = append(b, 0x0F, 0x0B)                 // return; end if
 	}
 
 	// The worker can return abi.BTStackOverflow instead of a count when a
@@ -1047,12 +1064,21 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 			return append(b, 0x20, x.lPos)
 		})
 		b = append(b, 0x04, 0x40)
-		// A MALFORMED header is reported here too, and is tested BEFORE the
-		// refusal: this arm is the only one a pure `find_batch` drive can
-		// reach (the entry sweep runs on a cursor this entry never receives),
-		// so without it a caller who wrote a nonsense stride was silently
-		// given a walk — the degradation the sentinel exists to prevent.
-		b = cache.emitMalformedReturn(b, cache.i64Ret)
+		// A MALFORMED header is reported too, and is tested BEFORE the
+		// refusal: a caller who wrote a nonsense stride and was silently given
+		// a walk is the degradation the sentinel exists to prevent. But NOT
+		// from here: this call has delivered at least one position, and a
+		// reserved word carries a zero count by contract, so reporting now
+		// would drop those tuples. They go back under the ordinary cursor with
+		// the work stored over the line, and the next call's ENTRY sweep —
+		// which runs before anything is delivered — reports the header.
+		b = append(b, 0x20, cache.lSweepRet, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = cache.emitStoreWork(b)
+		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x84)
+		b = append(b, 0x0F, 0x0B) // return (x.lPos << 32) | count; end if
 		b = cache.emitMarkRefused(b)
 		b = append(b, 0x41, 0x7F, 0x21, x.lReady) // and stop asking
 		b = append(b, 0x05)
@@ -1335,9 +1361,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		b = append(b, 0x20, pScratch, 0x41, 0x00, 0x47)
 		b = append(b, 0x20, lReady, 0x45, 0x71)
 		b = append(b, 0x04, 0x7F)
-		b = append(b, 0x20, pInLen, 0xAD, 0x42)
-		b = utils.AppendSLEB128_64(b, sweepCostPerByte)
-		b = append(b, 0x7E, 0x20, lWork, 0xAD, 0x7D, 0x21, lV64)
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
+		b = append(b, 0x20, lWork, 0xAD, 0x7D, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x20, lV64)
 		b = append(b, 0x20, lV64, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x55, 0x1B, 0xA7)
 		b = append(b, 0x05, 0x41, 0x7F, 0x0B)
@@ -1347,7 +1372,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		lPos: lPos, lK: lK, lCount: lCount, lTotal: lTotal, lStart: lStart,
 		lAvail: lAvail, lDeliver: lDeliver, lDone: lDone, lCap: lCap,
 		lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lReady: lReady,
-		lCacheSweepRet: lCacheSweepRet, lBudget: lBudget, lDesc: lDesc,
+		lCacheSweepRet: lCacheSweepRet, lBudget: lBudget, lDesc: lDesc, lV64: lV64,
 	}, pInPtr, pInLen, pGate, pOutPtr, pScratch, workerIdx, selfIdx, dpIdx, countBits, maxCount, gated)
 
 	// The work counter is drive state, so it goes back to the caller's scratch

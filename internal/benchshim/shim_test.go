@@ -31,6 +31,45 @@ var shims = []struct {
 	{"groups", "groups", BuildGroups},
 }
 
+// TestSetFindShim covers the set shim, whose contract differs from the three
+// above: it imports the regexped module's MEMORY as well as its function — a
+// set `find` answers in that memory — and re-exports it as "memory", which
+// WASI's clock_time_get writes through.
+func TestSetFindShim(t *testing.T) {
+	mod := BuildSetFind()
+	if argv := wasmValidator(); argv != nil {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "set_find.wasm")
+		if err := os.WriteFile(path, mod, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(argv[0], append(append([]string{}, argv[1:]...), path)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("set shim fails %s: %v\n%s", argv[0], err, out)
+		}
+	}
+	want := [][2]string{
+		{"wasi_snapshot_preview1", "clock_time_get"},
+		{"regexped", "set_find"},
+		{"regexped", "memory"},
+	}
+	imports := decodeImports(t, mod)
+	if len(imports) != len(want) {
+		t.Fatalf("imports = %v, want %v", imports, want)
+	}
+	for i, w := range want {
+		if imports[i] != w {
+			t.Errorf("import %d = %v, want %v", i, imports[i], w)
+		}
+	}
+	exports := decodeExports(t, mod)
+	for _, name := range []string{"memory", "bench"} {
+		if _, ok := exports[name]; !ok {
+			t.Errorf("missing export %q (have %v)", name, exports)
+		}
+	}
+}
+
 // wasmValidator locates a WASM validator once per test binary. Copied in shape
 // from compile/compile_api_test.go: this module has no wasmtime dependency
 // (CLAUDE.md lists it under tools/ only), so validation shells out.
@@ -225,14 +264,26 @@ func decodeImports(t *testing.T, mod []byte) [][2]string {
 		name, p = readName(t, c, p)
 		kind := c[p]
 		p++
-		if kind != 0x00 {
-			t.Fatalf("import %s.%s has kind %d; the shims import only functions", mod, name, kind)
+		switch kind {
+		case 0x00: // function: a type index
+			_, w, err := utils.DecodeULEB128(c[p:])
+			if err != nil {
+				t.Fatalf("malformed type index: %v", err)
+			}
+			p += w
+		case 0x02: // memory (the set shim's): limits flag, min, and max when flagged
+			flag := c[p]
+			p++
+			for n := 0; n < 1+int(flag&1); n++ {
+				_, w, err := utils.DecodeULEB128(c[p:])
+				if err != nil {
+					t.Fatalf("malformed memory limits: %v", err)
+				}
+				p += w
+			}
+		default:
+			t.Fatalf("import %s.%s has kind %d; the shims import only functions and a memory", mod, name, kind)
 		}
-		_, w, err := utils.DecodeULEB128(c[p:]) // type index
-		if err != nil {
-			t.Fatalf("malformed type index: %v", err)
-		}
-		p += w
 		out = append(out, [2]string{mod, name})
 	}
 	return out

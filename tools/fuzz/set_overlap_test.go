@@ -513,17 +513,17 @@ const overlapDPReadyOffset = config.SetOverlapHdrReadyOff
 // engages once the counter saturates.
 //
 // work is an i32 that saturates at 0x7FFFFFFF, and the trigger compares it with
-// `len * 2 * cells` in i64. For classchain-32 any input past about 3 MB has a
+// the shape's SweepThreshold in i64. For classchain-32 any input past a few MB has a
 // threshold the counter can never exceed, so the cache was offered, sized and
 // reserved — and never engaged, leaving the drive quadratic with nothing to say
 // so. A saturated counter now counts as over the line.
 func TestOverlapCacheEngagesPastCounterSaturation(t *testing.T) {
 	pats := classChain32()
 	sh := overlapShapeOf(t, pats)
-	inputLen := int(int64(0x7FFFFFFF)/int64(2*sh.Cells)) + 4096
+	inputLen := int(int64(0x7FFFFFFF)/sh.CostPerByte) + 4096
 	unit := "the quick brown fox " // no digit follows a letter run: nothing matches
 	input := strings.Repeat(unit, inputLen/len(unit)+1)[:inputLen]
-	if th := int64(len(input)) * int64(2*sh.Cells); th <= 0x7FFFFFFF {
+	if th := sh.SweepThreshold(len(input)); th <= 0x7FFFFFFF {
 		t.Fatalf("threshold %d is reachable by the counter: lengthen the input", th)
 	}
 	full, stride := overlapCacheFor(input, pats)
@@ -954,16 +954,16 @@ func TestOverlapCacheSkipsEmptyBlocks(t *testing.T) {
 	pats := []string{`a+`, `[^\n]*ERROR`}
 	// The leading run is what CROSSES THE TRIGGER, and it has to be long
 	// enough to: `engageAlways` asserts engagement, it cannot force it, and the
-	// rule is `work > len * 2 * cells` where work is the delivered match
-	// bytes. With this shape (9 cells) a 300-byte run delivers 45,150
-	// against a threshold of 99,000 and the sweep never runs — which is how the
+	// rule is `work > SweepThreshold(len)` where work is the delivered match
+	// bytes — read from the shape, not re-derived, since the engine's constant
+	// is what decides. A run too short to cross never sweeps, which is how the
 	// earlier version of this test drove the walk at every stride and compared
 	// it with itself. 500 delivers 125,250 and crosses inside the run, so the
 	// span the sweep then covers contains the empty middle.
 	const lead, tail = 500, 200
 	input := strings.Repeat("a", lead) + strings.Repeat(".", 5000) + strings.Repeat("a", tail)
 	work := lead*(lead+1)/2 + tail*(tail+1)/2
-	if threshold := len(input) * 2 * overlapShapeOf(t, pats).Cells; work <= threshold {
+	if threshold := int(overlapShapeOf(t, pats).SweepThreshold(len(input))); work <= threshold {
 		t.Fatalf("this shape can no longer cross the trigger: %d delivered bytes against a "+
 			"threshold of %d — lengthen the leading run", work, threshold)
 	}
@@ -1522,6 +1522,61 @@ func TestOverlapCacheBatchReportsMalformedHeader(t *testing.T) {
 			if count != 0 {
 				t.Fatalf("the sentinel carried a count of %d; it must be zero, since "+
 					"nothing was written", count)
+			}
+		})
+	}
+}
+
+// TestOverlapCacheBatchMidCallTripKeepsTuples pins what the batch entry does
+// when the sweep reports a malformed header in the MIDDLE of a call that has
+// already delivered tuples. A reserved position word carries a zero count by
+// contract, so the tuples in hand cannot ride in it: the call must return them
+// under the ordinary resume cursor and leave the error to the next call, whose
+// entry sweep reports it before delivering anything. Two ways in: the
+// between-positions trigger after a delivered position, and the in-call
+// counter tripping inside a worker call, whose hand-over calls the entry again
+// — which used to ADD its count into the reserved word.
+func TestOverlapCacheBatchMidCallTripKeepsTuples(t *testing.T) {
+	pats := []string{`a+`, `[^\n]*ERROR`, `x?y`}
+	for _, tc := range []struct{ name, input string }{
+		// ERROR at the end keeps the preflight from retiring the member, and
+		// its walk from every position of the second line then runs to it,
+		// delivering as it goes: the between-positions trigger fires.
+		{"between positions", "a\n" + strings.Repeat("x", 4000) + "ERROR"},
+		// ERROR at the start keeps it alive; every walk on the long line then
+		// FAILS, inside one worker call: the in-call counter trips there.
+		{"inside a worker call", "ERROR\na\n" + strings.Repeat("x", 4000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			full, _ := overlapCacheFor(tc.input, pats)
+			d := newCacheDrive(t, pats, tc.input, cacheLayout{batch: true, scratchLen: full, offer: true, stride: 0})
+			defer d.release()
+			countMask := int64(config.SetCursorMaxCount(len(pats)))
+			cursor, delivered := int64(0), int32(0)
+			for calls := 0; ; calls++ {
+				if calls > 100 {
+					t.Fatal("drive did not terminate")
+				}
+				res, err := d.fn.Call(d.store, d.inBase, int32(len(tc.input)), cursor, d.desc, d.outPtr, int32(64))
+				if err != nil {
+					t.Fatalf("set_find_batch: %v", err)
+				}
+				ret := res.(int64)
+				pos, n := uint32(ret>>32), int32(ret&countMask)
+				if pos == config.SetCursorMalformedPos {
+					if n != 0 {
+						t.Fatalf("the malformed sentinel carried %d tuples; they must be returned first", n)
+					}
+					if delivered == 0 {
+						t.Fatal("the error came before the first matches were delivered")
+					}
+					return
+				}
+				if pos == 0xFFFFFFFF || n == 0 {
+					t.Fatalf("the drive finished (pos 0x%X, count %d) without reporting the malformed header", pos, n)
+				}
+				delivered += n
+				cursor = ret
 			}
 		})
 	}

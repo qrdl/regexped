@@ -867,8 +867,8 @@ func TestSetOverlapCacheShapeHandComputed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 18 {
-		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 18 per byte", sh)
+	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 9 {
+		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 9 per byte", sh)
 	}
 }
 

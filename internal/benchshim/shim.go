@@ -415,3 +415,113 @@ func BuildGroups() []byte {
 		shimCodeSection(b),
 	)
 }
+
+// --------------------------------------------------------------------------
+// BuildSetFind
+//
+// bench(ptr i32, len i32, desc i32, out i32, cap i32, gate i32, gate_bytes i32,
+//
+//	iters i32, tbase i32) → void
+//
+// For a SET's `find`, which the three shims above cannot drive: it writes its
+// tuples into the regexped module's memory and returns only their count, and
+// the next call starts at the first tuple's start + 1. So this shim IMPORTS
+// that memory (regexped.memory), declares none of its own and re-exports that
+// one (WASI needs a "memory" export), and keeps its samples there too: Iters u32 timings at tbase, the 8-byte clock scratch right
+// after them — tbase must be 8-aligned and TimingsBytes+8 bytes must be free.
+//
+// Per outer iteration: zero the gate array (a drive starts from a zeroed one),
+// call set_find(ptr, len, from, desc, out, cap) until it answers 0 or less,
+// then record the elapsed time. The descriptor at desc is the caller's, written
+// once. Without this the harness timed the drive from Go, one host call per
+// match — 3.5 µs each, most of a match-dense drive's time.
+//
+// Params:  ptr(0) len(1) desc(2) out(3) cap(4) gate(5) gate_bytes(6) iters(7) tbase(8)
+// Locals:  i(9 i32) from(10 i32) n(11 i32) t_prev(12 i64)
+func BuildSetFind() []byte {
+	const (
+		pPtr, pLen, pDesc, pOut, pCap, pGate, pGateBytes, pIters, pTBase = 0, 1, 2, 3, 4, 5, 6, 7, 8
+		lI, lFrom, lN, lTPrev                                            = 9, 10, 11, 12
+	)
+	scratch := func(b []byte) []byte { // tbase + TimingsBytes
+		b = append(b, 0x20, pTBase, 0x41)
+		b = utils.AppendSLEB128(b, int32(TimingsBytes))
+		return append(b, 0x6A)
+	}
+	clockGet := func(b []byte) []byte {
+		b = append(b, 0x41, 0x01, 0x42, 0x00) // CLOCK_MONOTONIC, precision 0
+		b = scratch(b)
+		return append(b, 0x10, 0x00, 0x1A) // call clock_time_get; drop errno
+	}
+	loadClock := func(b []byte) []byte {
+		b = scratch(b)
+		return append(b, 0x29, 0x03, 0x00) // i64.load align=3
+	}
+
+	var b []byte
+	b = append(b, 0x02, 0x03, 0x7F, 0x01, 0x7E) // locals: 3×i32, 1×i64
+
+	b = clockGet(b)
+	b = loadClock(b)
+	b = append(b, 0x21, lTPrev)
+
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop (outer)
+	b = append(b, 0x20, lI, 0x20, pIters, 0x4E, 0x0D, 0x01)
+
+	// memory.fill(gate, 0, gate_bytes)
+	b = append(b, 0x20, pGate, 0x41, 0x00, 0x20, pGateBytes, 0xFC, 0x0B, 0x00)
+	b = append(b, 0x41, 0x00, 0x21, lFrom)
+
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop (inner)
+	b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lFrom, 0x20, pDesc, 0x20, pOut, 0x20, pCap)
+	b = append(b, 0x10, 0x01, 0x22, lN)          // call set_find; local.tee n
+	b = append(b, 0x41, 0x00, 0x4C, 0x0D, 0x01)  // n <= 0: br_if (exit inner)
+	b = append(b, 0x20, pOut, 0x28, 0x02, 0x04)  // i32.load out+4: the first tuple's start
+	b = append(b, 0x41, 0x01, 0x6A, 0x21, lFrom) // from = start + 1
+	b = append(b, 0x0C, 0x00, 0x0B, 0x0B)        // br inner; end loop; end block
+
+	// timings[i] = u32(t_cur - t_prev), at tbase + i*4
+	b = clockGet(b)
+	b = append(b, 0x20, pTBase, 0x20, lI, 0x41, 0x04, 0x6C, 0x6A)
+	b = loadClock(b)
+	b = append(b, 0x20, lTPrev, 0x7D, 0xA7, 0x36, 0x02, 0x00)
+	b = loadClock(b)
+	b = append(b, 0x21, lTPrev)
+
+	b = append(b, 0x20, lI, 0x41, 0x01, 0x6A, 0x21, lI)
+	b = append(b, 0x0C, 0x00, 0x0B, 0x0B, 0x0B) // br outer; end loop; end block; end fn
+
+	// Types: 0 clock_time_get, 1 set_find, 2 bench.
+	types := []byte{0x03}
+	types = append(types, 0x60, 0x03, 0x7F, 0x7E, 0x7F, 0x01, 0x7F)
+	types = append(types, 0x60, 0x06, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+	types = append(types, 0x60, 0x09, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x00)
+
+	imports := []byte{0x03}
+	imports = append(imports, shimStr("wasi_snapshot_preview1")...)
+	imports = append(imports, shimStr("clock_time_get")...)
+	imports = append(imports, 0x00, 0x00)
+	imports = append(imports, shimStr("regexped")...)
+	imports = append(imports, shimStr("set_find")...)
+	imports = append(imports, 0x00, 0x01)
+	imports = append(imports, shimStr("regexped")...)
+	imports = append(imports, shimStr("memory")...)
+	imports = append(imports, 0x02, 0x00, 0x01) // memory, no max, min 1 page
+
+	// The imported memory is RE-exported: WASI's clock_time_get writes its
+	// result through the CALLING instance's "memory" export, and traps with
+	// "missing required memory export" without one.
+	exports := []byte{0x02}
+	exports = append(exports, shimStr("memory")...)
+	exports = append(exports, 0x02, 0x00)
+	exports = append(exports, shimStr("bench")...)
+	exports = append(exports, 0x00, 0x02)
+
+	return assembleShim(
+		shimSection(0x01, types),
+		shimSection(0x02, imports),
+		shimFunctionSection(),
+		shimSection(0x07, exports),
+		shimCodeSection(b),
+	)
+}

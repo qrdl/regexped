@@ -223,9 +223,16 @@ func (r *Reporter) Render(w io.Writer) {
 			fmt.Fprintf(w, "  overlapping find: the answer cache sweeps a whole-set automaton (%d states, %d cells)\n", s.States, s.Cells)
 		}
 		if len(d.NoCacheSplitMembers) > 0 {
+			bt := map[int]bool{}
+			for _, id := range d.NoCacheSplitBacktracking {
+				bt[id] = true
+			}
 			ids := make([]string, len(d.NoCacheSplitMembers))
 			for i, id := range d.NoCacheSplitMembers {
 				ids[i] = fmt.Sprintf("#%d", id)
+				if bt[id] {
+					ids[i] += " (Backtracking)"
+				}
 			}
 			fmt.Fprintf(w, "  overlapping find without a usable cache: companion splits out %s\n", strings.Join(ids, ", "))
 		}

@@ -41,10 +41,16 @@ type OverlapCacheShape struct {
 
 	// CostPerByte is what sweeping one input byte costs in the drive's work
 	// units. The engine engages the sweep once the walk's accumulated work
-	// passes inputLen × CostPerByte (strictly), or once the counter saturates,
-	// so a harness asking whether a drive SHOULD have engaged reads it here
-	// rather than re-deriving the engine's rule.
+	// passes SweepThreshold (strictly), or once the counter saturates.
 	CostPerByte int64
+}
+
+// SweepThreshold is the work past which a drive over inputLen bytes engages
+// the sweep: CostPerByte per byte plus a fixed allowance for starting one. A
+// harness asking whether a drive SHOULD have engaged reads it here rather than
+// re-deriving the engine's rule.
+func (sh OverlapCacheShape) SweepThreshold(inputLen int) int64 {
+	return (int64(inputLen) + overlapSweepSetupBytes) * sh.CostPerByte
 }
 
 // SetOverlapCacheShape compiles `sc` and reports what sizing its `find` needs.
