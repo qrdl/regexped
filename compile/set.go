@@ -2296,31 +2296,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 	if !p.splittable {
 		// Non-splittable: use the full pattern so the suffix DFA handles all matching.
-		re, err := syntax.Parse(p.fullPattern, syntax.Perl)
-		if err != nil {
-			return nil
-		}
-		// Captures must go, and this branch was the ONLY place in the set
-		// pipeline that kept them. Everything else is already capture-free:
-		// analyzePattern strips the tree it parses, and p.suffixAST below is a
-		// SUBTREE of that stripped tree — so this branch alone returned a
-		// different representation of the same pattern than the rest of the
-		// pipeline uses, which is a bug in its own right.
-		//
-		// It was invisible to the DFA emitters, which treat InstCapture as a
-		// pass-through epsilon, and fatal to the Backtracking one: a
-		// capture-bearing program makes buildBacktrackBody emit capture-slot
-		// writes at locals `7 + slot`, while admitBTFallback has set
-		// numGroups = 0 so no capture locals are declared at all. The result is
-		// a module that does not VALIDATE — "unknown local 9: local index out
-		// of bounds" for a single `(a)` group. The
-		// single-pattern BT path never hit it because compileBTProg strips
-		// captures before compiling; this is the same contract, applied here.
-		//
-		// Mutating in place is safe precisely because this tree is freshly
-		// parsed on every call and shared with nobody.
-		stripCaptures(re)
-		return re
+		return fullPatternAST(p)
 	}
 	if p.suffixAST != nil {
 		return p.suffixAST
@@ -2328,6 +2304,37 @@ func patternSuffixAST(p *PatternInfo) *syntax.Regexp {
 	// The mandatory literal IS the whole pattern; suffix is empty.
 	empty, _ := syntax.Parse("", syntax.Perl)
 	return empty
+}
+
+// fullPatternAST is p's WHOLE pattern, captures stripped: what a non-splittable
+// member's fallback bucket merges, and what a set's whole-set automaton merges
+// for every member (planWholeSetSweep). nil when it does not parse.
+func fullPatternAST(p *PatternInfo) *syntax.Regexp {
+	re, err := syntax.Parse(p.fullPattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	// Captures must go, and this branch was the ONLY place in the set
+	// pipeline that kept them. Everything else is already capture-free:
+	// analyzePattern strips the tree it parses, and p.suffixAST below is a
+	// SUBTREE of that stripped tree — so this branch alone returned a
+	// different representation of the same pattern than the rest of the
+	// pipeline uses, which is a bug in its own right.
+	//
+	// It was invisible to the DFA emitters, which treat InstCapture as a
+	// pass-through epsilon, and fatal to the Backtracking one: a
+	// capture-bearing program makes buildBacktrackBody emit capture-slot
+	// writes at locals `7 + slot`, while admitBTFallback has set
+	// numGroups = 0 so no capture locals are declared at all. The result is
+	// a module that does not VALIDATE — "unknown local 9: local index out
+	// of bounds" for a single `(a)` group. The
+	// single-pattern BT path never hit it because compileBTProg strips
+	// captures before compiling; this is the same contract, applied here.
+	//
+	// Mutating in place is safe precisely because this tree is freshly
+	// parsed on every call and shared with nobody.
+	stripCaptures(re)
+	return re
 }
 
 // warnPatternDropped reports, at warning level, that a pattern has been

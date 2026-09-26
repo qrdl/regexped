@@ -454,7 +454,7 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 	spec := SetSpec{Name: "s", Find: "s_find", BatchFind: true, Overlapping: true}
 	compiled := setEmitCovCompileSet(t, spec, []string{wideButU8}, CompileSetOptions{})
 	bucket := compiled.overlapDPBucket()
-	if bucket < 0 {
+	if bucket < 0 || !compiled.usesOverlapDP() {
 		t.Fatalf("the sweep refused %s; it no longer reaches the compressed-table arm", wideButU8)
 	}
 	if !compiled.buckets[bucket].dp.l.useCompression {

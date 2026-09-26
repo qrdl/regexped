@@ -1331,7 +1331,10 @@ func TestSetWideAllForm(t *testing.T) {
 // compile-time property, and `overlapping: true` emits no gating code at all
 // — so the two bodies cannot be byte-identical.
 func TestSetOverlappingFlagChangesFindBody(t *testing.T) {
-	pats := []string{`a+`, `b`}
+	// Bounded members: a member whose overlapping walks can nest (`a+`) gives
+	// the overlapping set a whole-set sweep for its answer cache, which is more
+	// code than the gating it drops.
+	pats := []string{`a{1,3}`, `b`}
 	gated, _, err := CompileFile(setConfigWith(pats, false, "find"), "")
 	if err != nil {
 		t.Fatal(err)

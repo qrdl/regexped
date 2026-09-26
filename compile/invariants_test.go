@@ -501,18 +501,19 @@ func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 			patternIDs: [][]int{make([]int, n)},
 		}
 	}
-	if got := mk(bucketMaskBits).overlapDPBucket(); got != 0 {
-		t.Fatalf("a %d-pattern bucket was refused (%d): the synthetic bucket no longer "+
-			"passes the other gates, so this test proves nothing", bucketMaskBits, got)
+	if mk(bucketMaskBits).sweepSrc() == nil {
+		t.Fatalf("a %d-pattern bucket was refused: the synthetic bucket no longer "+
+			"passes the other gates, so this test proves nothing", bucketMaskBits)
 	}
-	if got := mk(bucketMaskBits + 1).overlapDPBucket(); got != -1 {
+	if mk(bucketMaskBits+1).sweepSrc() != nil {
 		t.Fatalf("a %d-pattern bucket was admitted to the sweep, whose row mask has %d bits",
 			bucketMaskBits+1, bucketMaskBits)
 	}
 	// The emitter refuses on its own too, so a gate that drifts later cannot
-	// reach the i32 mask without a loud failure.
+	// reach the i32 mask without a loud failure: a resolved sweep past the gate.
 	cs := mk(bucketMaskBits)
-	cs.patternIDs = [][]int{make([]int, bucketMaskBits+1)}
+	cs.sweepDone = true
+	cs.sweep = &overlapSweep{dp: cs.buckets[0].dp, ids: make([]int, bucketMaskBits+1)}
 	recoverContains(t, "bucketMaskBits", func() { newCkptEmit(cs, 0, 0) })
 }
 

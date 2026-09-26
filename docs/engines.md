@@ -290,6 +290,30 @@ do. `--verbose` reports the choice and the reason for every pattern
 (`find: switch — not provably linear`, and `switch handover: Backtracking` with
 its reason).
 
+**One shape stays quadratic over a whole drive**, whichever find serves it: a
+pattern with a SHORT, lower-priority way to end a match — a later alternative,
+or a lazy repeat — while a higher-priority branch keeps walking over bytes
+where that short ending comes up again. `a*b|a` over `a`×N matches at every
+byte, but each `find` call has to read to the end of the run before it may
+answer `[p, p+1)` (a `b` there would make the match `[p, N+1)`), and the next
+call, one byte on, reads the same run again: N matches cost about N²/2 bytes.
+Other examples: `\d+px|\d` over a run of digits, `foo\w+bar|foo` over
+`foo`×N, `a+?b|a`,
+`[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Inc|[A-Z][a-z]+` over a long run of
+capitalised words. Each call is still linear; it is the sequence of calls that
+is not, because `find` keeps nothing between calls. Go's `regexp` behaves the
+same way (`FindAllIndex` for `a*b|a` over 8 KB and 32 KB of `a`: 0.63 s and
+10.3 s).
+
+A GREEDY pattern does not have this shape, however long it walks past a match:
+the walk would itself accept wherever a later match could end, so it extends
+the match instead of leaving a new one behind — email, URL, `SELECT … FROM`,
+`X([a-zA-Z]+)Y` and CSV-row patterns all walk past their matches and are
+linear over a drive. Of the 135 patterns in this repository's example configs
+and benchmarks, 15 walk past their matches and none has the shape. To avoid
+it, bound the higher-priority branch's repeat (`\d{1,10}px|\d`): a bounded
+walk past each match keeps the drive linear.
+
 Sets make the same choice per member, with one difference: see
 [sets.md](sets.md#members-that-are-not-provably-linear).
 

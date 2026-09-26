@@ -310,11 +310,16 @@ type compiledSet struct {
 	// sweep.
 	overlapDPColOff int32
 
-	// Lever C: the projection, computed once, plus the addresses of the tables
-	// it needs — projTab (pattern x state -> cell byte offset) and a one-byte
-	// per state successor scratch the per-position step fills before updating.
-	overlapProj       *overlapProj
-	overlapProjDone   bool
+	// The answer cache's sweep, resolved once by sweepSrc: what it runs over
+	// and the column's projection. wholeSweep is the whole-set automaton
+	// compileSetWith built for a set whose buckets the sweep cannot run over
+	// (planWholeSetSweep), nil otherwise.
+	wholeSweep *overlapSweep
+	sweep      *overlapSweep
+	sweepDone  bool
+	// Lever C's tables: projTab (pattern x state -> cell byte offset) and the
+	// successor scratch, one entry per state (a byte, or two for 16-bit ids),
+	// the per-position step fills before updating.
 	overlapProjTabOff int32
 	overlapSuccOff    int32
 
@@ -770,6 +775,12 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		patternIDs[bi] = ids
 	}
 
+	// An overlapping set whose buckets the answer cache's sweep cannot run
+	// over directly is swept over a whole-set automaton instead. Decided HERE,
+	// before any bucket body is emitted: every one of them must then stamp how
+	// far it walked, which is what the cache's trigger charges.
+	wholeSet := planWholeSetSweep(spec, buckets, patternIDs, opts, noSweep, len(split) > 0)
+
 	// Determine frontend and collect unique literals.
 	var lits [][]byte
 	litSeen := make(map[string]bool)
@@ -976,9 +987,11 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		base int32
 	}
 	suffixDedup := map[uint64][]suffixSlot{}
-	// The module global the tuple-writing body stamps with its walk's reach, or
-	// -1 when no bucket carries the store. At most one bucket ever does — the
-	// sweep runs on a single-bucket set — so one variable holds it.
+	// The module global the tuple-writing bodies stamp with their walk's reach,
+	// or -1 when no bucket carries the store. ONE global: a single-bucket set's
+	// one body allocates it, and under a whole-set sweep every later bucket
+	// stamps the one the first allocated (genSuffixWASMWalkEnd), since the
+	// trigger reads one.
 	walkEndGlobal := int32(-1)
 	for bi, bkt := range buckets {
 		// A Backtracking fallback bucket has no table at all — that is the
@@ -1000,7 +1013,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASM(bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && wantsWalkExtent(spec, buckets, bi), scanPlan.counter,
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEnd(walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
 			fe != frontendScalar && !bkt.isFallback && !bkt.sparse && livenessCanFire(bkt.suffixDFA))
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
@@ -1037,6 +1050,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		if bkt.suffixDFA != nil && !bkt.sparse {
 			suffixDedup[fp] = append(suffixDedup[fp], suffixSlot{bkt.suffixDFA, base})
 		}
+	}
+
+	// The whole-set automaton's tables, after every bucket's: its own layout,
+	// read by the sweep alone.
+	var wholeSweep *overlapSweep
+	if wholeSet != nil {
+		dp, dataBytes, dataSegs, nextOffset := genSweepTables(wholeSet.t, int64(tableOffset))
+		wholeSweep = vetSweep(&overlapSweep{dp: dp, ids: wholeSet.ids, wholeSet: true}, func() bool { return true })
+		if wholeSweep == nil {
+			panic("compile: a whole-set sweep passed its trial layout and failed at its real base")
+		}
+		tableOffset = nextOffset
+		allDataBytes = append(allDataBytes, dataBytes...)
+		totalDataSegs += dataSegs
 	}
 
 	// Second pass: build prefix DFA function bodies (after suffix data, to avoid address overlap).
@@ -1476,6 +1503,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		keptPosGlobal:       -1,
 		noSweep:             noSweep,
 		walkEndGlobal:       walkEndGlobal,
+		wholeSweep:          wholeSweep,
 		declaredIDSpace:     spec.IDSpaceSize,
 		suffixFnBodies:      suffixFnBodies,
 		scanProbeBodies:     scanProbeBodies,
@@ -1524,6 +1552,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		cs.midSweepWork = int32(opts.globals.Alloc())   //nolint:gosec // a global index
 		cs.midSweepBudget = int32(opts.globals.Alloc()) //nolint:gosec // a global index
 		diag.InCallCounter = true
+	}
+	if sw := cs.sweepSrc(); sw != nil && sw.wholeSet {
+		diag.WholeSetSweep = &WholeSetSweepDiag{States: sw.dp.numWASM - 1, Cells: cs.overlapCells()}
 	}
 	// Anchored-capability automata: a separate packing over the full
 	// patterns with leftmost-first pruning disabled.
@@ -1790,12 +1821,16 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				appendDataSegment(nil, cs.overlapProjTabOff, tab)...)
 			cs.startableDataSegs++
 
-			// One byte per state: delta(state, byte) for the position being
-			// swept. The projected update reads it at a CONSTANT offset per
-			// cell, which is what lets every other address in the step be a
-			// compile-time constant.
-			ns := int32(cs.buckets[cs.overlapDPBucket()].dp.numWASM)
-			cs.overlapSuccOff = ra.Bump("overlap-succ", ns, 1)
+			// One entry per state — a byte, two for 16-bit ids: delta(state,
+			// byte) for the position being swept. The projected update reads
+			// it at a CONSTANT offset per cell, which is what lets every other
+			// address in the step be a compile-time constant.
+			sw := cs.sweepSrc()
+			ns, align := int32(sw.dp.numWASM), int32(1)
+			if !sw.dp.l.useU8 {
+				ns, align = 2*ns, 2
+			}
+			cs.overlapSuccOff = ra.Bump("overlap-succ", ns, align)
 			cs.startableDataBytes = append(cs.startableDataBytes,
 				appendDataSegment(nil, cs.overlapSuccOff, make([]byte, ns))...)
 			cs.startableDataSegs++

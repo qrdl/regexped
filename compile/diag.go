@@ -128,6 +128,17 @@ type SetDiag struct {
 	// InCallCounter is set when the overlapping `find` carries the work
 	// counter that sweeps the answer cache INSIDE a call.
 	InCallCounter bool `json:"in_call_counter,omitempty"`
+	// WholeSetSweep reports the automaton the overlapping answer cache sweeps
+	// when the set's buckets cannot be swept directly: every member's full
+	// pattern merged, beside the buckets the walk keeps.
+	WholeSetSweep *WholeSetSweepDiag `json:"whole_set_sweep,omitempty"`
+}
+
+// WholeSetSweepDiag is the whole-set automaton's size: its states, and the
+// cells of the sweep column (which sizes every caller's answer cache).
+type WholeSetSweepDiag struct {
+	States int `json:"states"`
+	Cells  int `json:"cells"`
 }
 
 // ScanUnionDiag reports the scan pair's own union automaton.

@@ -3,6 +3,7 @@ package fuzz
 import (
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"regexp"
 	"regexp/syntax"
 	"sort"
@@ -184,6 +185,152 @@ func TestOverlapCacheEngagesOnQuadraticDrives(t *testing.T) {
 	}
 }
 
+// wholeSetSweepSets are overlapping sets the sweep runs over a WHOLE-SET
+// automaton: literal buckets, several buckets, the word-boundary and newline
+// channels, and automata past 255 states (16-bit ids). Each has a member whose
+// matches are long and overlap from many starts, which is what made the walk
+// quadratic; `adv` is a unit whose repetition does that.
+func wholeSetSweepSets(t *testing.T) []struct {
+	name string
+	pats []string
+	adv  string
+} {
+	t.Helper()
+	load := func(path, set string) []string {
+		bc, err := config.LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		byName := map[string]string{}
+		var all []string
+		for _, r := range bc.Regexps {
+			if r.Pattern != "" {
+				byName[r.Name] = r.Pattern
+				all = append(all, r.Pattern)
+			}
+		}
+		for _, sc := range bc.Sets {
+			if sc.Name != set {
+				continue
+			}
+			if sc.Patterns.All {
+				return all
+			}
+			var ps []string
+			for _, n := range sc.Patterns.Names {
+				ps = append(ps, byName[n])
+			}
+			return ps
+		}
+		t.Fatalf("no set %q in %s", set, path)
+		return nil
+	}
+	return []struct {
+		name string
+		pats []string
+		adv  string
+	}{
+		{"one-literal-member", []string{`foo\w+`}, "foo"},
+		{"xox", []string{`xox[baprs]-[0-9a-zA-Z\-]{10,}`}, "xoxb-aaaaaaaaaa"},
+		{"literal-and-fallback", []string{`X([a-zA-Z]+)Y`, `[a-z]+@`, `:[ -~]{10,}`}, "XaY:a@"},
+		{"sql-validator", load("../../examples/node/sql-validator/regexped.yaml", "sql"), "SELECT a FROM t "},
+		{"word-boundary", []string{`\bfoo\w*`, `bar\b`, `\Bx\w+`}, "foo xfoo barx "},
+		{"line-anchors", []string{`(?m:^)ab+`, `ab+(?m:$)`, `c+`}, "abb\nab\nc"},
+		{"url-guard (620 states, \\b)", load("../../examples/fastedge/url-guard/regexped.yaml", "attacks"), "{$"},
+		{"secret-scanner (358 states)", load("../../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner"), "xoxb-aaaaaaaaaa"},
+	}
+}
+
+// wholeSetAlphabet is the bytes a set's patterns name, plus a word byte, a
+// non-word byte and a newline, so every boundary channel sees both sides.
+func wholeSetAlphabet(pats []string) []byte {
+	seen := map[byte]bool{'a': true, ' ': true, '\n': true, '0': true}
+	for _, p := range pats {
+		for i := 0; i < len(p); i++ {
+			if c := p[i]; c >= ' ' && c < 0x7F && !strings.ContainsRune(`\[](){}*+?|^$.`, rune(c)) {
+				seen[c] = true
+			}
+		}
+	}
+	out := make([]byte, 0, len(seen))
+	for c := range seen {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// TestOverlapWholeSetSweepMatchesGo drives every whole-set shape with the sweep
+// FORCED from the first call — the work counter pre-armed — through `find` and
+// the batch entry, over short random inputs against Go and the walk, and over a
+// long run against the walk: the sweep reads its own automaton rather than the
+// walk's tables, so agreement is not structural and has to be shown. Then the
+// natural trigger over the long run, which must agree whichever engine it
+// picks.
+func TestOverlapWholeSetSweepMatchesGo(t *testing.T) {
+	rng := rand.New(rand.NewSource(111))
+	for _, set := range wholeSetSweepSets(t) {
+		t.Run(set.name, func(t *testing.T) {
+			if sh := overlapShapeOf(t, set.pats); !sh.Eligible {
+				t.Fatal("the answer cache does not serve this set")
+			}
+			alpha := wholeSetAlphabet(set.pats)
+			inputs := []string{"", set.adv, strings.Repeat(set.adv, 3)}
+			// Every drive compiles its module, and the two example sets' are
+			// over a megabyte: fewer random inputs there.
+			random := 12
+			if len(set.pats) > 8 {
+				random = 3
+			}
+			for i := 0; i < random; i++ {
+				b := make([]byte, rng.Intn(48))
+				for j := range b {
+					b[j] = alpha[rng.Intn(len(alpha))]
+				}
+				inputs = append(inputs, string(b))
+			}
+			for _, in := range inputs {
+				want := overlapCacheOracle(set.pats, in)
+				opt := &cacheDriveOpt{preArmWork: true}
+				got := canonCache(driveCacheFindOpt(t, set.pats, in, 0, int32(len(set.pats)), true,
+					cacheFindScratchLen(in, set.pats), engageAlways, opt))
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("sweep over %q:\n  got  %v\n  want %v", in, got, want)
+				}
+				walk := canonCache(driveCacheFindOpt(t, set.pats, in, 0, int32(len(set.pats)), false,
+					cacheFindScratchLen(in, set.pats), engageNever, nil))
+				if fmt.Sprint(walk) != fmt.Sprint(want) {
+					t.Fatalf("walk over %q:\n  got  %v\n  want %v", in, walk, want)
+				}
+				batch := canonCache(driveOverlapCacheArmed(t, set.pats, in, 0, 3, true,
+					cacheFindScratchLen(in, set.pats), engageAlways, nil, true))
+				if fmt.Sprint(batch) != fmt.Sprint(want) {
+					t.Fatalf("batch sweep over %q:\n  got  %v\n  want %v", in, batch, want)
+				}
+			}
+			long := strings.Repeat(set.adv, 3000/len(set.adv)+1)[:3000]
+			scratch := cacheFindScratchLen(long, set.pats)
+			walk := fmt.Sprint(canonCache(driveCacheFindOpt(t, set.pats, long, 0, int32(len(set.pats)), false,
+				scratch, engageNever, nil)))
+			for _, d := range []struct {
+				name string
+				got  [][3]int
+			}{
+				{"find, forced", driveCacheFindOpt(t, set.pats, long, 0, int32(len(set.pats)), true,
+					scratch, engageAlways, &cacheDriveOpt{preArmWork: true})},
+				{"find, natural", driveCacheFindOpt(t, set.pats, long, 0, int32(len(set.pats)), true,
+					scratch, engageAny, nil)},
+				{"find_batch, forced", driveOverlapCacheArmed(t, set.pats, long, 0, 3, true, scratch, engageAlways, nil, true)},
+				{"find_batch, natural", driveOverlapCacheArmed(t, set.pats, long, 0, 3, true, scratch, engageAny, nil, false)},
+			} {
+				if got := fmt.Sprint(canonCache(d.got)); got != walk {
+					t.Fatalf("%s: cache and walk disagree over the long run", d.name)
+				}
+			}
+		})
+	}
+}
+
 // assertAscending checks the ACROSS-position contract: starts never go
 // backwards over a drive. This is what a mid-drive switch could break, and no
 // per-call check would catch it.
@@ -282,11 +429,20 @@ func driveOverlapCacheStride(t *testing.T, pats []string, input string, offset, 
 	useCache bool, scratchLen int32, want engageWant, strideOverride *int32,
 ) [][3]int {
 	t.Helper()
+	return driveOverlapCacheArmed(t, pats, input, offset, outCap, useCache, scratchLen, want, strideOverride, false)
+}
+
+// driveOverlapCacheArmed is driveOverlapCacheStride with the work counter
+// optionally PRE-ARMED, so the first call sweeps whatever the drive would cost.
+func driveOverlapCacheArmed(t *testing.T, pats []string, input string, offset, outCap int32,
+	useCache bool, scratchLen int32, want engageWant, strideOverride *int32, preArm bool,
+) [][3]int {
+	t.Helper()
 	_, stride := overlapCacheFor(input, pats)
 	if strideOverride != nil {
 		stride = *strideOverride
 	}
-	d := newCacheDrive(t, pats, input, cacheLayout{batch: true, scratchLen: scratchLen, offer: useCache, stride: stride})
+	d := newCacheDrive(t, pats, input, cacheLayout{batch: true, scratchLen: scratchLen, offer: useCache, stride: stride, preArmWork: preArm})
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc

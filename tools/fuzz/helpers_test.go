@@ -3,6 +3,7 @@ package fuzz
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"testing"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
@@ -52,16 +53,35 @@ func writeFindScratchStride(store *wasmtime.Store, mem *wasmtime.Memory, gatePtr
 // a generated `init` would: it recompiles the set to learn the sweep column,
 // then asks config for both numbers so the test and the sweep cannot disagree.
 func overlapCacheFor(input string, pats []string) (length, stride int32) {
-	cfg := overlapSizingCfg(pats)
-	// One helper for both numbers: the region is sized FROM the stride, and a
-	// harness that computed them separately would hand the sweep a header it
-	// reports as malformed.
-	bytes, k, err := compile.SetOverlapCacheSizing(cfg.Sets[0], cfg, len(input))
+	sh, err := cachedOverlapShape(pats)
 	if err != nil {
 		return int32(config.SetOverlapCheckpointHeaderBytes), 1
 	}
+	// One helper for both numbers: the region is sized FROM the stride, and a
+	// harness that computed them separately would hand the sweep a header it
+	// reports as malformed.
+	bytes, k := sh.Sizing(len(input))
 	return int32(bytes), int32(k)
 }
+
+// cachedOverlapShape is compile.SetOverlapCacheShape for overlapSizingCfg's set,
+// learned once per pattern list: it recompiles the set, and a test driving one
+// set many times sized every drive by recompiling it again.
+func cachedOverlapShape(pats []string) (compile.OverlapCacheShape, error) {
+	key := setKey(pats)
+	if v, ok := overlapShapeMemo.Load(key); ok {
+		return v.(compile.OverlapCacheShape), nil
+	}
+	cfg := overlapSizingCfg(pats)
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil {
+		return sh, err
+	}
+	overlapShapeMemo.Store(key, sh)
+	return sh, nil
+}
+
+var overlapShapeMemo sync.Map
 
 // overlapCacheForK sizes a region for a CHOSEN stride rather than the formula's.
 //
@@ -141,7 +161,10 @@ func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *
 		set.Hints = []string{"batch-find"}
 		export = "set_find_batch"
 	}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+	w, err := cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%s", lay.batch, setKey(pats)), func() ([]byte, error) {
+		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+		return w, err
+	})
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}

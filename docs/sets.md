@@ -346,6 +346,25 @@ would cost it sweeps the rest of the input in one pass and answers the
 remaining calls out of the result. A scan the walk handles cheaply never
 sweeps and costs exactly what it did before.
 
+The sweep needs an automaton over the set's members. A set that packs into
+one fallback bucket is swept over that bucket's own tables. Any other set —
+literal buckets, several buckets — is swept over a **whole-set automaton**:
+every member's full pattern merged, compiled beside the buckets the walk
+keeps, and read by the sweep alone. The whole-set automaton is built only when
+a drive can have arbitrarily many walks alive at once — some input of the form
+`W`×N starts a walk every few bytes that is still going at the end, as `foo\w+`
+over `foo`×N does, where `union[ \t]+[a-z]{3}` can match unboundedly long but
+no match holds the start of another — since otherwise every drive is linear
+already, and within these limits: at most 32 members, no member on
+Backtracking, no non-greedy member, at most `max_fallback_states` states and
+a projected column of at most 16,383 cells. `\b`, `\B`, `(?m:^)` and
+`(?m:$)` are supported, with one exception: in a set of several members, a
+member whose word-boundary accept must win over a later match of the same
+member gets no whole-set automaton. The sweep answers such a set exactly as
+the walk does, only slower. In the example configs, the SQL validator's
+four members give a 139-state automaton, the secret scanner's ten give 358,
+and the URL guard's twenty-two, four of them with `\b`, give 620.
+
 Both halves of that count are needed. Matched extent alone cannot see a pattern
 whose walk is long and whose match is short or empty — `(?:a*b)?` over a run of
 `a`s runs to the end of the input from every start and reports a zero-length
@@ -550,11 +569,16 @@ is over the state limit — adds 2.8 instructions per byte on 100 KB (+34% for
 the set), and on a single pattern's worst-case run the Backtracking find costs
 up to 236 per byte.
 
-Two cases stay quadratic, both outside what a split can reach:
-`overlapping: true` over members whose matches are long and overlap, when no
-answer cache serves the set — every start's match is walked in full, split or
-not — and a `find` over input that matches at every byte while each attempt
-keeps walking for a longer match (`a*b|a` over `a`×N).
+Two cases stay quadratic, both outside what a split can reach.
+`overlapping: true` over members whose matches are long and overlap — every
+start's match is walked in full, split or not — when no answer cache serves the
+drive: none offered (a C build with `-DRX_SET_CACHE=0`, a raw caller), or a set
+outside the sweep's limits (see "Overlap policy"). And a `find` over input
+that matches at every byte while each attempt keeps walking for a longer match
+(`a*b|a` over `a`×N). The second is a shape of the pattern, not of the set, and
+is the same for a single pattern: see
+[engines.md](engines.md#which-find-a-pattern-gets-linear-on-every-input) for
+which patterns have it and how to avoid it.
 
 **Batching sets** (`hints: [batch-find]`) are split the same way: the merge sits
 in the per-position worker both entries share, and keeps the batch entry's

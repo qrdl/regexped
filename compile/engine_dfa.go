@@ -4688,6 +4688,15 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 // per-pattern override: the hint that governs this body is the one on the
 // set.
 func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+	return genSuffixWASMWalkEnd(-1, t, tableBase, tableMemIdx, patternIDs, prefixFixedLens, lm, needProbes, gated, globals, probeFlags...)
+}
+
+// genSuffixWASMWalkEnd is genSuffixWASM with the walk-extent global
+// (probeFlags[4]) SHARED: walkEnd >= 0 is a global an earlier bucket of the
+// same set allocated, and this body stamps that one rather than a new one. A
+// set swept over its whole-set automaton has every bucket stamp the same
+// global, since the trigger reads one.
+func genSuffixWASMWalkEnd(walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4712,10 +4721,14 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	}
 	art.walkEndGlobal = -1
 	if len(probeFlags) > 4 && probeFlags[4] {
-		if globals == nil {
+		switch {
+		case walkEnd >= 0:
+			art.walkEndGlobal = walkEnd
+		case globals == nil:
 			panic("compile: a walk-extent bucket needs the module's global allocator")
+		default:
+			art.walkEndGlobal = int32(globals.Alloc()) //nolint:gosec // a global index
 		}
-		art.walkEndGlobal = int32(globals.Alloc()) //nolint:gosec // a global index
 	}
 	scanExit := probeExitMaskComplete
 	if soleFirstHit {
@@ -4820,18 +4833,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	eofBitmaskOff := midBitmaskOff + int32(l.numWASM)*8
 	immBitmaskOff := eofBitmaskOff + int32(l.numWASM)*8
 
-	writeBitmask := func(m map[int]uint64) []byte {
-		bs := make([]byte, l.numWASM*8)
-		for gs, bits := range m {
-			if bits != 0 {
-				off := (gs + 1) * 8
-				for i := 0; i < 8; i++ {
-					bs[off+i] = byte(bits >> uint(i*8))
-				}
-			}
-		}
-		return bs
-	}
+	writeBitmask := func(m map[int]uint64) []byte { return stateMaskBytes(m, l.numWASM) }
 
 	// Word-boundary bitmask tables (8 bytes per state, per-pattern bitmasks).
 	// Only present when t.hasWordBoundary; placed after the standard 3 bitmask tables.
@@ -5023,17 +5025,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 	// writeBitmask walked: "computed on the same table the sweep reads" is
 	// then true by construction, where two loops over the same source can
 	// drift on a renumbering and merge states the projection must keep apart.
-	readBitmask := func(bs []byte) []uint64 {
-		out := make([]uint64, l.numWASM)
-		for w := range out {
-			var v uint64
-			for i := 0; i < 8; i++ {
-				v |= uint64(bs[w*8+i]) << uint(i*8)
-			}
-			out[w] = v
-		}
-		return out
-	}
+	readBitmask := func(bs []byte) []uint64 { return stateMaskValues(bs, l.numWASM) }
 	dpMid := readBitmask(writeBitmask(t.midAcceptStates))
 	dpEOF := readBitmask(writeBitmask(t.acceptStates))
 	art.dp = overlapDPTables{
@@ -5050,6 +5042,7 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 		hasNewlineBoundary: p.hasNewlineBoundary,
 		dominant:           len(l.dominantStates) > 0 || len(p.memberSkip) > 0,
 	}
+	fillSweepBoundary(&art.dp, t, l)
 	art.fnBody = sizePrefixed(buildSetSuffixBody(p))
 	if needProbes {
 		art.scanProbe = sizePrefixed(buildSetProbeBodyExit(p, false, scanExit))

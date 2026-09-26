@@ -468,7 +468,7 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 			spec := SetSpec{Name: "s", Find: "s_find", Overlapping: true}
 			cs := setEmitCovCompileSet(t, spec, shape.pats, CompileSetOptions{})
 			bi := cs.overlapDPBucket()
-			if bi < 0 {
+			if bi < 0 || !cs.usesOverlapDP() {
 				if shape.decline != "nosweep" {
 					t.Fatalf("this shape gets no sweep; want %q", shape.decline)
 				}
@@ -476,7 +476,7 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 			}
 			bkt := cs.buckets[bi]
 			numPat := len(bkt.patterns)
-			pr := buildOverlapProj(bkt.dp, numPat)
+			pr := buildOverlapProj(bkt.dp, numPat, false)
 			if pr == nil {
 				if shape.decline != "nosaving" {
 					t.Fatalf("the projection saved nothing and was declined; want %q", shape.decline)
@@ -533,10 +533,48 @@ func noSweepSet(t *testing.T) *compiledSet {
 	t.Helper()
 	spec := SetSpec{Name: "s", Find: "s_find"}
 	cs := setEmitCovCompileSet(t, spec, []string{`[0-9][a-c][0-9]`}, CompileSetOptions{})
-	if bi := cs.overlapDPBucket(); bi >= 0 {
-		t.Fatalf("a gated find got a sweep bucket (%d); this fixture no longer isolates the no-sweep path", bi)
+	if cs.usesOverlapDP() {
+		t.Fatal("a gated find got a sweep; this fixture no longer isolates the no-sweep path")
 	}
 	return cs
+}
+
+// TestDFAWalksNest pins the condition a whole-set sweep is built on: an
+// overlapping drive can have arbitrarily many walks alive at once. `union[
+// \t]+…` matches unboundedly long and must NOT qualify — no match can hold
+// the start of another, and building the sweep for it cost a match-dense drive
+// 8% for nothing.
+func TestDFAWalksNest(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want bool
+	}{
+		{`foo\w+`, true},
+		{`X[a-zA-Z]+Y`, true},
+		{`(?:ab)+`, true},
+		{`a+`, true},
+		{`[^\n]*ERROR`, true},
+		{`\Bx\w+`, true},
+		{`xox[baprs]-[0-9a-zA-Z\-]{10,}`, true},
+		{`union[ \t]+[a-z]{3}[0-9]`, false},
+		{`ghp_[0-9a-z]{36}`, false},
+		{`abc`, false},
+		{`a{1,3}`, false},
+		{`k00a+`, false}, // one `k00` per match: a+ cannot hold another
+		{`\{[^}]*\$`, true},
+	} {
+		re, err := syntax.Parse(c.pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := dfaWalksNest(tb); got != c.want {
+			t.Errorf("%s: dfaWalksNest = %v, want %v", c.pat, got, c.want)
+		}
+	}
 }
 
 // TestOverlapAccessorsWithoutSweep covers every derived quantity on a set that
@@ -587,7 +625,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 	}
 	good := cs.buckets[bi].dp
 	numPat := len(cs.buckets[bi].patterns)
-	if buildOverlapProj(good, numPat) == nil {
+	if buildOverlapProj(good, numPat, false) == nil {
 		t.Fatal("the reference bucket declined the projection; the guards below prove nothing")
 	}
 
@@ -604,7 +642,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 		{"no-patterns", func(d overlapDPTables) overlapDPTables { return d }, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := buildOverlapProj(tc.dp(good), tc.pats); got != nil {
+			if got := buildOverlapProj(tc.dp(good), tc.pats, false); got != nil {
 				t.Errorf("buildOverlapProj declined nothing: got %d cells", got.cells)
 			}
 		})
@@ -624,7 +662,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 			tc.mutex(&layout)
 			d := good
 			d.l = &layout
-			if got := buildOverlapProj(d, numPat); got != nil {
+			if got := buildOverlapProj(d, numPat, false); got != nil {
 				t.Errorf("buildOverlapProj read a layout it cannot read: got %d cells", got.cells)
 			}
 		})
@@ -660,7 +698,7 @@ func TestBuildOverlapProjPanicsOnGeometryMismatch(t *testing.T) {
 			t.Errorf("panic = %q, want it to name the projection", msg)
 		}
 	}()
-	buildOverlapProj(d, len(cs.buckets[bi].patterns))
+	buildOverlapProj(d, len(cs.buckets[bi].patterns), false)
 }
 
 // overlapShapeCfg is a set whose `find` gets the backward sweep: overlapping,

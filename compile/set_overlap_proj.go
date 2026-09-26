@@ -58,10 +58,17 @@ type overlapProj struct {
 	owner []int32
 }
 
-// buildOverlapProj computes the projection for a bucket, or nil when it would
-// not pay — when no two states share a class there is nothing to merge and the
-// indirection would be pure cost.
-func buildOverlapProj(dp overlapDPTables, numPat int) *overlapProj {
+// buildOverlapProj computes the projection for an automaton, or nil when it
+// would not pay — when no two states share a class there is nothing to merge
+// and the indirection would be pure cost.
+//
+// force is for a sweep past the original limits (vetSweep): 16-bit ids, a
+// boundary channel, a column too wide unprojected. Only the projected step
+// carries those, so a forced projection is returned whether or not it narrows,
+// and it reads 16-bit and row-deduplicated tables, which the unforced one
+// declines so that a sweep inside the original limits is built exactly as it
+// always was.
+func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 	if !dp.ok || dp.l == nil || dp.midMasks == nil || dp.eofMasks == nil {
 		return nil
 	}
@@ -73,26 +80,42 @@ func buildOverlapProj(dp overlapDPTables, numPat int) *overlapProj {
 	if dp.l.useCompression {
 		cellsPerState = dp.l.numClasses
 	}
-	// The sweep's own gate refuses a u16 table and row dedup, and this code
-	// reads ONE byte per cell — so if either ever reached here it would read
-	// half of a two-byte entry and merge states that are not equivalent, which
-	// is a wrong answer with nothing to signal it. Declining is the safe
-	// direction: no projection means the plain column, which is correct at
-	// every width.
-	if dp.l.useRowDedup || !dp.l.useU8 {
+	// Unforced, a u16 table and row dedup are declined: no projection means
+	// the plain column, which is correct at every width, and it is the column
+	// such a sweep always had.
+	if !force && (dp.l.useRowDedup || !dp.l.useU8) {
 		return nil
 	}
-	// delta(w, c) over the SAME table the forward body and the sweep read.
+	// delta(w, c) over the SAME table the sweep reads, indexed as
+	// emitOverlapDPTransition indexes it. Reading one byte of a two-byte entry,
+	// or a state's row instead of its deduplicated one, would merge states
+	// that are not equivalent — a wrong answer with nothing to signal it.
+	width := 1
+	if !dp.l.useU8 {
+		width = 2
+	}
 	delta := func(w, c int) int {
-		idx := w*cellsPerState + c
-		if idx < 0 || idx >= len(dp.l.tableBytes) {
+		row := w
+		if dp.l.useRowDedup {
+			row = int(dp.l.rowMapBytes[w])
+		}
+		idx := (row*cellsPerState + c) * width
+		if idx < 0 || idx+width > len(dp.l.tableBytes) {
 			// Not recoverable and not to be guessed at: returning "dead" here
 			// would turn a geometry mismatch into MISSING MATCHES, silently.
 			panic(fmt.Sprintf("overlap projection: table index %d out of %d for state %d class %d",
 				idx, len(dp.l.tableBytes), w, c))
 		}
+		if width == 2 {
+			return int(dp.l.tableBytes[idx]) | int(dp.l.tableBytes[idx+1])<<8
+		}
 		return int(dp.l.tableBytes[idx])
 	}
+	// has reports a state's bit in an optional mask table. The dominant ones
+	// count only for a one-pattern automaton, which is the only kind the sweep
+	// reads them for (see overlapDPTables).
+	has := func(m []uint64, w int, bit uint64) bool { return m != nil && m[w]&bit != 0 }
+	domToo := numPat == 1
 
 	p := &overlapProj{cellOf: make([][]int32, numPat)}
 	p.rep = append(p.rep, 0)      // cell 0: dead
@@ -105,10 +128,12 @@ func buildOverlapProj(dp overlapDPTables, numPat int) *overlapProj {
 		// accept bits. State 0 is the DFA's dead state and is dead for every
 		// pattern by definition.
 		cls := make([]int32, n)
-		key := map[[2]bool]int32{}
+		key := map[[7]bool]int32{}
 		next := int32(1)
 		for w := 1; w < n; w++ {
-			k := [2]bool{dp.midMasks[w]&bit != 0, dp.eofMasks[w]&bit != 0}
+			k := [7]bool{dp.midMasks[w]&bit != 0, dp.eofMasks[w]&bit != 0,
+				has(dp.wMasks, w, bit), has(dp.nwMasks, w, bit), has(dp.nlMasks, w, bit),
+				domToo && has(dp.wDomMasks, w, bit), domToo && has(dp.nwDomMasks, w, bit)}
 			id, ok := key[k]
 			if !ok {
 				id = next
@@ -147,10 +172,12 @@ func buildOverlapProj(dp overlapDPTables, numPat int) *overlapProj {
 			}
 		}
 		// A class is DEAD for this pattern when it can never accept and every
-		// transition stays dead. Compute by fixpoint from "accepts nothing".
+		// transition stays dead. Compute by fixpoint from "accepts nothing" —
+		// a boundary accept being an accept.
 		alive := make([]bool, next)
 		for w := 1; w < n; w++ {
-			if dp.midMasks[w]&bit != 0 || dp.eofMasks[w]&bit != 0 {
+			if dp.midMasks[w]&bit != 0 || dp.eofMasks[w]&bit != 0 ||
+				has(dp.wMasks, w, bit) || has(dp.nwMasks, w, bit) || has(dp.nlMasks, w, bit) {
 				alive[cls[w]] = true
 			}
 		}
@@ -200,7 +227,7 @@ func buildOverlapProj(dp overlapDPTables, numPat int) *overlapProj {
 	// (n-1)*numPat — state 0 is the DFA's dead state and is dead for every
 	// pattern. Against n*numPat this could only ever fire for a one-pattern
 	// bucket, since cells <= 1 + (n-1)*numPat always holds.
-	if p.cells-1 >= (n-1)*numPat {
+	if !force && p.cells-1 >= (n-1)*numPat {
 		return nil
 	}
 	return p

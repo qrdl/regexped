@@ -219,6 +219,9 @@ func (r *Reporter) Render(w io.Writer) {
 		if d.InCallCounter {
 			fmt.Fprintf(w, "  overlapping find: in-call counter sweeps the answer cache\n")
 		}
+		if s := d.WholeSetSweep; s != nil {
+			fmt.Fprintf(w, "  overlapping find: the answer cache sweeps a whole-set automaton (%d states, %d cells)\n", s.States, s.Cells)
+		}
 		if len(d.NoCacheSplitMembers) > 0 {
 			ids := make([]string, len(d.NoCacheSplitMembers))
 			for i, id := range d.NoCacheSplitMembers {

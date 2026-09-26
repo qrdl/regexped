@@ -4374,6 +4374,53 @@ func TestSetCountersLinear(t *testing.T) {
 		}
 	})
 
+	t.Run("overlapping long matches sweep a whole-set automaton", func(t *testing.T) {
+		// Literal buckets and several buckets, whose walk is quadratic on long
+		// overlapping matches; the cache serves them over a whole-set
+		// automaton. Answers are TestOverlapWholeSetSweepMatchesGo's; this is
+		// the growth.
+		for _, c := range []struct {
+			pats []string
+			unit string
+		}{
+			{[]string{`foo\w+`}, "foo"},
+			{[]string{`X([a-zA-Z]+)Y`, `:[ -~]{10,}`}, "XaY"},
+			{[]string{`\Bx\w+`, `bar\b`}, "x"},
+		} {
+			w, d := build(c.pats, config.SetConfig{Find: "set_find", Overlapping: true})
+			if len(d.SplitMembers) != 0 || d.WholeSetSweep == nil {
+				t.Fatalf("%v: want a whole-set sweep and nothing split, got sweep %+v, split %v",
+					c.pats, d.WholeSetSweep, d.SplitMembers)
+			}
+			fuel := func(n int) uint64 {
+				input := strings.Repeat(c.unit, n/len(c.unit)+1)[:n]
+				length, stride := overlapCacheFor(input, c.pats)
+				x := open(w, input, len(c.pats), length, stride)
+				defer x.st.Close()
+				ln := int32(len(input))
+				for from := int32(0); from <= ln; {
+					v, err := x.in.GetFunc(x.st, "set_find").Call(x.st, x.inBase, ln, from, x.desc, x.outPtr, int32(len(c.pats)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					total := v.(int32)
+					if total < 0 {
+						t.Fatalf("%v: set_find(from=%d) = %d", c.pats, from, total)
+					}
+					if total == 0 {
+						break
+					}
+					from = int32(binary.LittleEndian.Uint32(x.mem.UnsafeData(x.st)[x.outPtr+4:])) + 1
+				}
+				return used(x)
+			}
+			small, large := fuel(4096), fuel(16384)
+			if ratio := float64(large) / float64(small); ratio > 8 {
+				t.Errorf("%v: fuel grew %.1f× for a 4× longer run (%d → %d): quadratic", c.pats, ratio, small, large)
+			}
+		}
+	})
+
 	t.Run("a merged literal walk stops once no wanted member can accept", func(t *testing.T) {
 		// Each member is linear on its own, but they share one literal
 		// bucket and walk ONE merged automaton: `foo\w+` keeps the walk going
