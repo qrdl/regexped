@@ -1933,6 +1933,53 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 	}
 }
 
+// TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses is the NEGATIVE half
+// of the test above: when the DFA path cannot serve a member and Backtracking
+// refuses it too — past maxBTFallbackInstructions — the member is dropped, with
+// a warning and a StateLimitDropped entry, never kept in a bucket that cannot
+// answer for it. Both of admitOrDropFallback's reasons: no DFA at all, and a
+// DFA over max_fallback_states.
+func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
+	// 21 × Q{1000} puts the program past 20,000 instructions in an alternative
+	// that dies on its first byte, so the DFA's states stay cheap to build.
+	manyInsts := strings.Repeat(`Q{1000}`, 21)
+	var alts []string
+	for k := 0; k < 21; k++ {
+		alts = append(alts, fmt.Sprintf("a{0,%d}b", 1000-k))
+	}
+	cases := []struct {
+		name    string
+		pattern string
+		opts    CompileSetOptions
+	}{
+		// Non-greedy, so isolated; its own merge has 2^12 states.
+		{"own-dfa-unbuildable", `x*?[ab]*a[ab]{11}X|` + manyInsts, CompileSetOptions{}},
+		// A ~1000-state DFA over a 100-state max_fallback_states.
+		{"over-max-fallback-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := setCoreCovAnalyze(t, tc.pattern)
+			if newBTBucket(info) != nil {
+				t.Fatalf("Backtracking admits %q; this case needs one it refuses", tc.name)
+			}
+			buf, restore := captureWarnings(t)
+			defer restore()
+			diag := &SetDiag{Name: tc.name}
+			buckets := compileFallback([]*PatternInfo{info}, tc.opts, diag)
+			if len(buckets) != 0 {
+				t.Errorf("%d buckets, want the member dropped", len(buckets))
+			}
+			if len(diag.StateLimitDropped) != 1 {
+				t.Errorf("StateLimitDropped = %v, want the member", diag.StateLimitDropped)
+			}
+			if !strings.Contains(buf.String(), "Pattern dropped from set") {
+				t.Errorf("no drop warning; got %q", buf.String())
+			}
+		})
+	}
+}
+
 // setCoreCovNullableUnbuildable has minLen 0, so analyzePattern returns early
 // with suffixDFA nil — the NON-isolated twin of the case above. Its own merge
 // then fails, which reached a nil dereference until the sibling guard the

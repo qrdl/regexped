@@ -692,6 +692,85 @@ func aliveSCCs(n int, alive []bool, reps []int, step func(q, c int) int) []int {
 	return comp
 }
 
+// dfaRoots are the states a walk of t can begin in: the start state and the
+// three mid-start states (after a non-word byte, after a word byte, after a
+// newline). The ONE list every analysis of where a walk can go starts from —
+// three copies of it once had to be kept in step, and a start state added to
+// one and not the others would have a soundness proof examine a smaller graph.
+func dfaRoots(t *dfaTable) []int {
+	return []int{t.startState, t.midStartState, t.midStartWordState, t.midStartNewlineState}
+}
+
+// dfaReachable reports the states of t a walk can reach from dfaRoots.
+func dfaReachable(t *dfaTable) []bool {
+	reach := make([]bool, t.numStates)
+	var stack []int
+	for _, r := range dfaRoots(t) {
+		if r >= 0 && r < t.numStates && !reach[r] {
+			reach[r] = true
+			stack = append(stack, r)
+		}
+	}
+	for len(stack) > 0 {
+		s := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for c := 0; c < 256; c++ {
+			if n := t.transitions[s*256+c]; n >= 0 && !reach[n] {
+				reach[n] = true
+				stack = append(stack, n)
+			}
+		}
+	}
+	return reach
+}
+
+// longestPaths walks the graph of the n nodes `in` admits, whose edges are
+// next(s, c) for c in 0..255 (-1 for none, and an edge to a node `in` refuses
+// is ignored). It returns each node's longest path in nodes — itself counted —
+// or cyclic when a cycle is reachable within the graph, in which case longest
+// is meaningless. An iterative DFS with colours: a grey successor is a cycle.
+func longestPaths(n int, in func(s int) bool, next func(s, c int) int) (longest []int, cyclic bool) {
+	const white, grey, black = 0, 1, 2
+	colour := make([]int, n)
+	longest = make([]int, n)
+	type frame struct{ s, c int }
+	for root := 0; root < n; root++ {
+		if !in(root) || colour[root] != white {
+			continue
+		}
+		colour[root] = grey
+		frames := []frame{{root, 0}}
+		for len(frames) > 0 {
+			f := &frames[len(frames)-1]
+			if f.c == 256 {
+				best := 0
+				for c := 0; c < 256; c++ {
+					if m := next(f.s, c); m >= 0 && in(m) && longest[m] > best {
+						best = longest[m]
+					}
+				}
+				longest[f.s] = best + 1
+				colour[f.s] = black
+				frames = frames[:len(frames)-1]
+				continue
+			}
+			m := next(f.s, f.c)
+			f.c++
+			if m < 0 || !in(m) {
+				continue
+			}
+			switch colour[m] {
+			case grey:
+				return nil, true
+			case white:
+				colour[m] = grey
+				frames = append(frames, frame{m, 0})
+			}
+		}
+	}
+	return longest, false
+}
+
 // dfaReachCo returns which states a walk reaches from a start state, and which
 // can still reach an accepting one — a boundary accept or an end-of-input one
 // counting — through any path.
@@ -701,30 +780,19 @@ func dfaReachCo(t *dfaTable) (reach, co []bool) {
 		return t.midAcceptStates[s] != 0 || t.acceptStates[s] != 0 || t.midAcceptNWStates[s] != 0 ||
 			t.midAcceptWStates[s] != 0 || t.midAcceptNLStates[s] != 0
 	}
-	reach = make([]bool, n)
-	var stack []int
-	for _, r := range []int{t.startState, t.midStartState, t.midStartWordState, t.midStartNewlineState} {
-		if r >= 0 && r < n && !reach[r] {
-			reach[r] = true
-			stack = append(stack, r)
-		}
-	}
+	reach = dfaReachable(t)
 	preds := make([][]int, n)
-	for len(stack) > 0 {
-		s := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
+	for s := 0; s < n; s++ {
+		if !reach[s] {
+			continue
+		}
 		for c := 0; c < 256; c++ {
-			m := t.transitions[s*256+c]
-			if m < 0 {
-				continue
-			}
-			preds[m] = append(preds[m], s)
-			if !reach[m] {
-				reach[m] = true
-				stack = append(stack, m)
+			if m := t.transitions[s*256+c]; m >= 0 {
+				preds[m] = append(preds[m], s)
 			}
 		}
 	}
+	var stack []int
 	co = make([]bool, n)
 	for s := 0; s < n; s++ {
 		if reach[s] && accepts(s) {

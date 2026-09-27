@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp/syntax"
 	"sort"
@@ -527,17 +528,17 @@ func (cs *compiledSet) needsSplit() bool {
 	return false
 }
 
-// capName is the export name of a scan capability, "" when not declared.
+// capName is the export name of a scan capability, "" when not declared. Any
+// other kind is a caller's mistake, refused rather than answered with a scan
+// capability's name.
 func (cs *compiledSet) capName(kind setCapKind) string {
 	switch kind {
 	case capScanAny:
 		return cs.scanAny
 	case capScanAll:
 		return cs.scanAll
-	case capFind:
-		return cs.find
 	}
-	return ""
+	panic(fmt.Sprintf("compile: capName asked for capability %d, which is not a scan", kind))
 }
 
 // clone returns an independent copy of the allocator.
@@ -662,7 +663,7 @@ func (cs *compiledSet) buildScanUnion(plan scanUnionPlan, ra *regionAlloc, opts 
 		}
 	}
 	if plan.counter {
-		cs.scanSwWork = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+		cs.scanSwWork = int32(opts.globals.AllocI64(0)) //nolint:gosec // a global index; i64, see emitAddWalk
 		if cs.scanAll != "" {
 			cs.scanSwMark = int32(opts.globals.AllocI64(0)) //nolint:gosec // a global index
 		}
@@ -1356,10 +1357,8 @@ func emitSplitScanBody(cs *compiledSet, kind setCapKind, keptIdx int, fwd []int)
 		}
 		b = append(b, 0x21, lAcc)
 		b = append(b, 0x20, pOff, 0x20, pLen, 0x4B, 0x04, 0x40, 0x20, lAcc, 0x0F, 0x0B)
+		// Every id is below 64 here: a larger one makes the set wideAll.
 		for k, sm := range cs.split {
-			if sm.id >= 64 {
-				continue // outside the narrow ABI; unreachable, wideAll would hold
-			}
 			b = fwdHit(b, k)
 			b = append(b, 0x04, 0x40, 0x20, lAcc, 0x42)
 			b = utils.AppendSLEB128_64(b, int64(1)<<uint(sm.id))

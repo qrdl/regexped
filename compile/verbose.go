@@ -82,6 +82,23 @@ func (r *Reporter) Note(note string) {
 	r.cur.Notes = append(r.cur.Notes, note)
 }
 
+// noteMark is the number of notes the open scope holds, for truncateNotes.
+func (r *Reporter) noteMark() int {
+	if r == nil || r.cur == nil {
+		return 0
+	}
+	return len(r.cur.Notes)
+}
+
+// truncateNotes drops the notes recorded since mark — for a body that was
+// described and then replaced, so the report names only what was emitted.
+func (r *Reporter) truncateNotes(mark int) {
+	if r == nil || r.cur == nil || mark > len(r.cur.Notes) {
+		return
+	}
+	r.cur.Notes = r.cur.Notes[:mark]
+}
+
 // HasEngine reports whether the open scope already knows its engine.
 func (r *Reporter) HasEngine() bool {
 	return r != nil && r.cur != nil && r.cur.Engine != 0

@@ -10,11 +10,13 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
@@ -2048,6 +2050,7 @@ func TestReporterNilSafety(t *testing.T) {
 	r.Reason("reason")
 	r.End()
 	r.Render(&bytes.Buffer{})
+	r.truncateNotes(r.noteMark())
 	if r.HasEngine() {
 		t.Error("nil Reporter reports HasEngine")
 	}
@@ -2193,6 +2196,19 @@ func TestReporterRenderSets(t *testing.T) {
 			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
 			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}},
 			FrontendDemotion:          &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
+			// Members served outside the buckets and the work counters: each
+			// changes the set's cost by large factors and shows nowhere else.
+			SplitMembers:             []int{3, 4},
+			SplitBacktracking:        []int{4},
+			ScanUnion:                &ScanUnionDiag{Direct: true, States: 17},
+			InCallCounter:            true,
+			WholeSetSweep:            &WholeSetSweepDiag{States: 40, Cells: 12},
+			NoCacheSplitMembers:      []int{5, 6},
+			NoCacheSplitBacktracking: []int{6},
+		}, {
+			Name:      "counted",
+			Frontend:  "scalar",
+			ScanUnion: &ScanUnionDiag{Counter: true, States: 9},
 		}},
 	}
 	var b bytes.Buffer
@@ -2218,6 +2234,12 @@ func TestReporterRenderSets(t *testing.T) {
 		"dropped from match_any/match_all (unparseable): bad",
 		"id space:   9",
 		"DOWNGRADED frontend:",
+		"split out (not provably linear; own linear search): #3, #4 (Backtracking)",
+		"scan pair: one union automaton over every member (17 states)",
+		"overlapping find: in-call counter sweeps the answer cache",
+		"overlapping find: the answer cache sweeps a whole-set automaton (40 states, 12 cells)",
+		"overlapping find without a usable cache: companion splits out #5, #6 (Backtracking)",
+		"scan pair: work counter switching to a union automaton (9 states)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q\n--- got ---\n%s", want, out)
@@ -2592,6 +2614,15 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		{`(?m:^)ERROR:.*(?m:$)`, nil, "today"},
 		{`\bfoo\w*\b`, nil, "today"},
 		{`^a*b`, nil, "today"},
+		// A case-folded leading repeat is the SAME repeat under both cases,
+		// and a bounded one is not a leading repeat at all.
+		{`(?i)a+x\w*y`, nil, "switch"},
+		{`(?i)A+x\w*y`, nil, "switch"},
+		{`a{2,5}\w*y`, nil, "switch"},
+		// A lenient literal-chain alternation whose DFA branch can walk
+		// without accepting: its specialised body has no counter, so it takes
+		// the ordinary find and the switch.
+		{`ab?c|x[a-z]*Y`, nil, "switch"},
 	}
 	for _, c := range cases {
 		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
@@ -2617,6 +2648,237 @@ func TestFindClassifierVerdicts(t *testing.T) {
 			}
 			if !bytes.Equal(w, today) {
 				t.Errorf("%s %v: classified today's find but the module differs from TodayFind's", c.pat, c.hints)
+			}
+		}
+	}
+}
+
+// TestLenientAltLinear pins the gate on the lenient literal-chain alternation
+// find, which carries no work counter: it keeps its specialised body only for
+// patterns proven linear — by a bounded failed walk, or by no branch's
+// continuation being able to read a branch literal.
+func TestLenientAltLinear(t *testing.T) {
+	for _, c := range []struct {
+		pat    string
+		linear bool
+	}{
+		{`ab?c|x[a-z]*Y`, false},    // [a-z]* runs over `x`×N from every x
+		{`ab?c|x[a-z]{2,5}Y`, true}, // bounded walks
+		{`'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`, true},
+		{`ab\w*c|b\w*d`, false},            // \w* can read the other literal
+		{`ab[^a]*c|bc[0-9]*d`, false},      // [^a]* can read "bc"
+		{`ab[0-9]*c|bc[0-9]*d`, true},      // neither continuation reads a literal
+		{`(?i)ab[0-9]*c|bc[0-9]*d`, false}, // a folded literal is not a fence
+	} {
+		if got := lenientAltLinear(c.pat, CompileOptions{}); got != c.linear {
+			t.Errorf("%s: linear = %v, want %v", c.pat, got, c.linear)
+		}
+	}
+}
+
+// TestVerboseReportsTheStartAnywhereFind pins that a find the start-anywhere
+// find replaced is reported as what shipped: not today's engine, dispatch or
+// SIMD skip, which describe a body that was never emitted.
+func TestVerboseReportsTheStartAnywhereFind(t *testing.T) {
+	for _, c := range []struct {
+		pat string
+		lm  LikelyMode
+	}{
+		{`[^,]*,foo`, LikelyNoMatch},
+		{`\w+@\w+`, LikelyNeutral},
+	} {
+		r := &Reporter{}
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 0, true,
+			CompileOptions{LikelyMode: c.lm, Report: r}); err != nil {
+			t.Fatal(err)
+		}
+		r.End()
+		pr := r.Patterns[0]
+		if pr.Engine != EngineDFA || !strings.Contains(pr.Reason, "start-anywhere") {
+			t.Errorf("%s: engine %v (%s), want the start-anywhere find", c.pat, pr.Engine, pr.Reason)
+		}
+		for _, n := range pr.Notes {
+			if strings.Contains(n, "SIMD bulk skip") || strings.Contains(n, "state ids") ||
+				strings.Contains(n, "literal-anchored") || strings.Contains(n, "mandatory literal") {
+				t.Errorf("%s: note %q describes a body that was not emitted", c.pat, n)
+			}
+		}
+	}
+	// And the other way round: a note-mark past the end truncates nothing.
+	r := &Reporter{}
+	r.Begin("n", "p")
+	r.Note("kept")
+	r.truncateNotes(5)
+	r.End()
+	if len(r.Patterns[0].Notes) != 1 {
+		t.Errorf("truncateNotes past the end dropped notes: %v", r.Patterns[0].Notes)
+	}
+}
+
+// TestSwitchCounterArithmetic runs the work counter's arithmetic: an i64
+// counter against an i64 budget. In i32 the budget N × dist + 64 wraps past
+// 1 GiB and the counter past 4 GiB of work, and either wrap makes the check
+// pass forever on exactly the input it exists to catch. Executed through the
+// wasmtime CLI; skipped without it.
+func TestSwitchCounterArithmetic(t *testing.T) {
+	wt, err := exec.LookPath("wasmtime")
+	if err != nil {
+		t.Skip("wasmtime not in PATH")
+	}
+	local := func(i byte) func([]byte) []byte { return func(b []byte) []byte { return append(b, 0x20, i) } }
+	body := func(code []byte) []byte {
+		fn := append([]byte{0x00}, code...) // no locals
+		fn = append(fn, 0x0B)
+		return append(utils.AppendULEB128(nil, uint32(len(fn))), fn...)
+	}
+	// over(walked i64, dist i32) i32 and add(w i64, walk i32) i64.
+	over := body(emitSwitchOverBudget(nil, local(0), local(1), 4))
+	add := body(append(emitAddWalk(nil, local(0),
+		func(b []byte) []byte { return append(b, 0x21, 0) }, local(1)), 0x20, 0))
+	var m []byte
+	m = append(m, 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00)
+	m = appendSection(m, 1, []byte{0x02,
+		0x60, 0x02, 0x7E, 0x7F, 0x01, 0x7F,
+		0x60, 0x02, 0x7E, 0x7F, 0x01, 0x7E})
+	m = appendSection(m, 3, []byte{0x02, 0x00, 0x01})
+	m = appendSection(m, 7, []byte{0x02, 0x04, 'o', 'v', 'e', 'r', 0x00, 0x00, 0x03, 'a', 'd', 'd', 0x00, 0x01})
+	m = appendSection(m, 10, append(append([]byte{0x02}, over...), add...))
+	path := filepath.Join(t.TempDir(), "m.wasm")
+	if err := os.WriteFile(path, m, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	call := func(fn string, a uint64, b uint32) uint64 {
+		t.Helper()
+		out, err := exec.Command(wt, "run", "--invoke", fn, path,
+			fmt.Sprint(int64(a)), fmt.Sprint(int32(b))).Output()
+		if err != nil {
+			t.Fatalf("%s(%d, %d): %v", fn, a, b, err)
+		}
+		v, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		if err != nil {
+			t.Fatalf("%s(%d, %d): output %q", fn, a, b, out)
+		}
+		return uint64(v)
+	}
+	for _, c := range []struct {
+		walked uint64
+		dist   uint32
+		want   uint64
+	}{
+		{104, 10, 0},                // 4 × 10 + 64: at the line
+		{105, 10, 1},                // past it
+		{1<<32 + 64, 0x40000000, 0}, // budget 2^32 + 64, at the line: an i32 wraps it to 64
+		{1<<32 + 65, 0x40000000, 1}, // past it
+		{1 << 34, 0xFFFFFFFF, 0},    // budget 4 × (2^32 − 1) + 64 > 2^34
+	} {
+		if got := call("over", c.walked, c.dist); got != c.want {
+			t.Errorf("over(%#x, %#x) = %d, want %d", c.walked, c.dist, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		w    uint64
+		walk uint32
+		want uint64
+	}{
+		{5, 7, 12},
+		{0xFFFFFFF0, 0x20, 0x100000010},       // an i32 counter wraps this to 0x10
+		{0xFFFFFFFF, 0xFFFFFFFF, 0x1FFFFFFFE}, // the walk is unsigned
+	} {
+		if got := call("add", c.w, c.walk); got != c.want {
+			t.Errorf("add(%#x, %#x) = %#x, want %#x", c.w, c.walk, got, c.want)
+		}
+	}
+}
+
+// TestFindStrategyOverrides pins the three measurement knobs: each forces its
+// strategy whatever the classifier would pick, and the report says so — a knob
+// that quietly fell back to the classifier would measure the wrong body.
+func TestFindStrategyOverrides(t *testing.T) {
+	for _, c := range []struct {
+		opts CompileOptions
+		want string
+	}{
+		{CompileOptions{TodayFind: true}, "find: today — forced"},
+		{CompileOptions{StartAnywhereFind: true}, "find: start-anywhere — forced"},
+		{CompileOptions{StartAnywhereSwitchN: 2}, "find: switch — forced"},
+	} {
+		r := &Reporter{}
+		o := c.opts
+		o.Report = r
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: `[a-z]+@example\.com`, FindFunc: "f"}}, 0, true, o); err != nil {
+			t.Fatal(err)
+		}
+		r.End()
+		found := false
+		for _, n := range r.Patterns[0].Notes {
+			found = found || n == c.want
+		}
+		if !found {
+			t.Errorf("%+v: notes %v, want %q", c.opts, r.Patterns[0].Notes, c.want)
+		}
+	}
+	if got := switchNFor(CompileOptions{StartAnywhereSwitchN: 7}); got != 7 {
+		t.Errorf("switchNFor with the override = %d, want 7", got)
+	}
+}
+
+// TestFindStrategiesValidate compiles find-strategy shapes under every hint and
+// every forced strategy and validates each module. The strategies change the
+// find body's local declarations and its tail (the counter, the handover), and
+// the hints change which body they are added to, so the product reaches
+// emitter arms no single configuration does: 16-bit state ids, a mandatory
+// literal, a begin anchor that accepts at 0, and a prefer-no-match twin.
+func TestFindStrategiesValidate(t *testing.T) {
+	shapes := []string{
+		`a*b`, `[^,]*,`, `\w+@\w+`, `<[^>]+>`, `[a-zA-Z][^;]*[;,]`,
+		`[a-z]+@example\.com`, `x{3}abc\w*z|y{3}ghi\w*z`, `a+b\b`, `(?m:^)ab+`,
+		`[ab]*a[ab]{8}X`, `[ab]*a[ab]{8}FOO\w*X`, `(?:^|x)y*z`, `^b*|ab*c`,
+	}
+	strategies := []CompileOptions{{}, {TodayFind: true}, {StartAnywhereFind: true}, {StartAnywhereSwitchN: 1}}
+	for _, pat := range shapes {
+		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			for _, st := range strategies {
+				o := st
+				o.LikelyMode = lm
+				w, _, err := Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "f"}}, 0, true, o)
+				if err != nil {
+					t.Fatalf("%s %v %+v: %v", pat, lm, st, err)
+				}
+				validateWASM(t, w)
+			}
+		}
+	}
+}
+
+// TestOddShapesValidate compiles shapes that sit at the edges of the
+// literal-chain, literal-anchored and boundary analysers — an end anchor that
+// can never hold, a multiline anchor, more branches than the one-byte Teddy
+// holds, lazy ranges, a range after a prefix — as match, find and groups under
+// every hint, and validates each module. Most are refused by some analyser and
+// served by another; what must hold is that whichever serves them emits a
+// valid module.
+func TestOddShapesValidate(t *testing.T) {
+	for _, p := range []string{
+		`ab{3}\A|cd{3}`, `ab{2,3}\A|cd{2,3}`, `(?m:^)ab{3}|cd{3}`, `ab{2,5}?|cd{2,5}?`, `ab{2,5}?x|cd{2,5}?y`,
+		`a1{3}|b2{3}|c3{3}|d4{3}|e5{3}|f6{3}|g7{3}|h8{3}|i9{3}`,
+		`a1{2,4}|b2{2,4}|c3{2,4}|d4{2,4}|e5{2,4}|f6{2,4}|g7{2,4}|h8{2,4}|i9{2,4}`,
+		`[0-9]{8}ghp_[a-z]{3,5}`, `(?P<d>[0-9]{8})ghp_(?P<k>[a-z]{3,5})`,
+		`ab[a-z]{3}|cd[a-z]{3}`, `a[a-z]{3}|b[b-z]{3}`, `ab[b-z]{3}`,
+		`x{3}abc\w*z|y{3}ghi\w*z|z{3}jkl\w*q`, `\w{3}abc\w*z|\d{3}ghi\w*z`, `[^a]{3}abc\w*z|[^b]{3}ghi\w*z`,
+		`abc|abd|x+`, `\b`, `\B`, `a?\b`, `\b|x`, `(?:\B|y)`, `\bx?`, `(?:\b|\B)a`,
+		`a(?m:$)`, `(?m:$)`, `(?m:^)[^\n]*x`, `[^\n]*(?m:$)`, `^?abc`, `(?:^|x)abc`, `(?:\A|x)abcd`,
+		`(?s:.)*abcd`, `ab(?m:$)|cd`, `(?i)abcd{3}`, `(?:abcd|efgh)[a-z]*X`, `abcd[a-z]*X|efgh[0-9]*Y`,
+		`[a-z]{0,200}X\w*Y`, `(?:[ab]{9})+X`, `\bab{3}\b|cd{3}`, `ab{3}\b|cd{3}\B`, `\Bab{3}|cd{3}\z`,
+	} {
+		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			for _, e := range []config.RegexEntry{
+				{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}, {Pattern: p, GroupsFunc: "g"},
+			} {
+				w, _, err := Compile([]config.RegexEntry{e}, 0, true, CompileOptions{LikelyMode: lm})
+				if err != nil {
+					t.Fatalf("%s %v: %v", p, lm, err)
+				}
+				validateWASM(t, w)
 			}
 		}
 	}
@@ -2713,6 +2975,83 @@ func TestSetSplitRule(t *testing.T) {
 		if got := len(diags[0].SplitMembers); got != n {
 			t.Errorf("%d members: %d split, want %d", n, got, n)
 		}
+	}
+}
+
+// TestSetSplitPaths drives the split paths the rule table above does not: a
+// scan pair whose split member needs the start-anywhere find's context passes,
+// an overlapping set whose no-cache companion splits a member onto
+// Backtracking, a second set compiled after a first allocated i64 globals, and
+// a spec built without its id space.
+func TestSetSplitPaths(t *testing.T) {
+	compileDiag := func(t *testing.T, regexps []config.RegexEntry, sets []config.SetConfig) []SetDiag {
+		t.Helper()
+		_, _, diags, err := CompileFileDiag(config.BuildConfig{Regexps: regexps, Sets: sets}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return diags
+	}
+	all := config.PatternSelector{All: true}
+
+	t.Run("scan pair with an assertion member", func(t *testing.T) {
+		d := compileDiag(t, []config.RegexEntry{{Name: "p", Pattern: `\b[a-z]+X`}},
+			[]config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl", Patterns: all}})
+		if len(d[0].SplitMembers) != 1 {
+			t.Errorf("split members %v, want the one member", d[0].SplitMembers)
+		}
+	})
+
+	t.Run("no-cache companion on Backtracking", func(t *testing.T) {
+		d := compileDiag(t, []config.RegexEntry{{Name: "a", Pattern: `a+`}, {Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}},
+			[]config.SetConfig{{Name: "s", Find: "f", Overlapping: true, Patterns: all}})
+		if len(d[0].NoCacheSplitBacktracking) != 1 {
+			t.Errorf("companion Backtracking members %v, want member 1", d[0].NoCacheSplitBacktracking)
+		}
+	})
+
+	t.Run("a second set after i64 globals", func(t *testing.T) {
+		d := compileDiag(t,
+			[]config.RegexEntry{{Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}, {Name: "c", Pattern: `[a-z]+Q`}},
+			[]config.SetConfig{
+				{Name: "s1", Find: "f1", Patterns: config.PatternSelector{Names: []string{"b"}}},
+				{Name: "s2", Find: "f2", Patterns: config.PatternSelector{Names: []string{"c"}}},
+			})
+		if len(d) != 2 || len(d[0].SplitBacktracking) != 1 || len(d[1].SplitMembers) != 1 {
+			t.Errorf("diags %+v, want s1 split onto Backtracking and s2 split", d)
+		}
+	})
+
+	t.Run("a spec without its id space", func(t *testing.T) {
+		var prefixPool, suffixPool dfaPool
+		info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z]+X`}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := SetSpec{Name: "s", Find: "f", ScanAny: "sa",
+			DeclaredPatternCount: 1, Patterns: []*PatternInfo{info}, PatternIDs: []int{0}}
+		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+		if len(cs.split) != 1 || cs.wideAll() {
+			t.Errorf("split %d members, wideAll %v; want 1 and narrow", len(cs.split), cs.wideAll())
+		}
+	})
+}
+
+// TestModuleGlobalsCloneIsIndependent pins what the split trial relies on: a
+// clone allocates, and gives initial values, without touching the original.
+func TestModuleGlobalsCloneIsIndependent(t *testing.T) {
+	g := &moduleGlobals{}
+	a := g.AllocInit(5)
+	b := g.AllocI64(7)
+	c := g.clone()
+	c.setInit(a, 9)
+	c.AllocI64(1)
+	c.i64[b] = 8
+	if g.inits[a] != 5 || g.i64[b] != 7 || g.Count() != 3 {
+		t.Errorf("the original changed: inits %v, i64 %v, count %d", g.inits, g.i64, g.Count())
+	}
+	if c.inits[a] != 9 || c.i64[b] != 8 || c.Count() != 4 {
+		t.Errorf("the clone did not keep its own values: inits %v, i64 %v, count %d", c.inits, c.i64, c.Count())
 	}
 }
 

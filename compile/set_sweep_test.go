@@ -577,6 +577,94 @@ func TestDFAWalksNest(t *testing.T) {
 	}
 }
 
+// TestWholeSetSweepShapes compiles the overlapping sets the answer cache
+// sweeps over a WHOLE-SET automaton — word-boundary and newline channels, and
+// an automaton past 255 states (16-bit ids) — and pins that each gets one. The
+// sweep's own answers are checked against Go by tools/fuzz; this pins that the
+// shapes still take the path, and emits every arm of its column advance.
+func TestWholeSetSweepShapes(t *testing.T) {
+	load := func(path, set string) []config.RegexEntry {
+		bc, err := config.LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sc := range bc.Sets {
+			if sc.Name != set {
+				continue
+			}
+			want := map[string]bool{}
+			for _, n := range sc.Patterns.Names {
+				want[n] = true
+			}
+			var out []config.RegexEntry
+			for _, r := range bc.Regexps {
+				if r.Pattern != "" && (sc.Patterns.All || want[r.Name]) {
+					out = append(out, config.RegexEntry{Name: r.Name, Pattern: r.Pattern})
+				}
+			}
+			return out
+		}
+		t.Fatalf("no set %q in %s", set, path)
+		return nil
+	}
+	named := func(pats ...string) []config.RegexEntry {
+		out := make([]config.RegexEntry, len(pats))
+		for i, p := range pats {
+			out[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name    string
+		regexps []config.RegexEntry
+	}{
+		{"word-boundary", named(`\bfoo\w*`, `bar\b`, `\Bx\w+`)},
+		{"line-anchors", named(`(?m:^)ab+`, `ab+(?m:$)`, `c+`)},
+		{"url-guard", load("../examples/fastedge/url-guard/regexped.yaml", "attacks")},
+		{"secret-scanner", load("../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := config.BuildConfig{Regexps: c.regexps, Sets: []config.SetConfig{{
+				Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true},
+			}}}
+			_, _, diags, err := CompileFileDiag(cfg, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diags[0].WholeSetSweep == nil {
+				t.Fatalf("no whole-set sweep: %+v", diags[0])
+			}
+			t.Logf("%d states, %d cells", diags[0].WholeSetSweep.States, diags[0].WholeSetSweep.Cells)
+		})
+	}
+}
+
+// TestOverlapSweepBoundaryChannels pins that one-member overlapping sets with a
+// word-boundary accept — including a dominant one, which the column reads as
+// final — are served by the answer cache, so their sweep's boundary arms are
+// emitted.
+func TestOverlapSweepBoundaryChannels(t *testing.T) {
+	for _, p := range []string{`a+\b`, `\Ba+`, `[a-z]+\b`, `\W+\b`, `a\b|a\w+`, `a\b|a\B\w*`} {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "p", Pattern: p}},
+			Sets: []config.SetConfig{{Name: "s", Find: "f", Overlapping: true,
+				Patterns: config.PatternSelector{All: true}}},
+		}
+		sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sh.Eligible {
+			t.Errorf("%s: not served by the answer cache", p)
+		}
+		w, _, err := CompileFile(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, w)
+	}
+}
+
 // TestOverlapAccessorsWithoutSweep covers every derived quantity on a set that
 // has no sweep. They are asked for unconditionally by the emitters, so each one
 // has to answer rather than assume a bucket exists — and the answers have to be
@@ -869,6 +957,11 @@ func TestSetOverlapCacheShapeHandComputed(t *testing.T) {
 	}
 	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 9 {
 		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 9 per byte", sh)
+	}
+	// The line a harness checks engagement against: CostPerByte per byte plus
+	// the fixed allowance for starting a sweep.
+	if got, want := sh.SweepThreshold(100), int64(100+overlapSweepSetupBytes)*9; got != want {
+		t.Errorf("SweepThreshold(100) = %d, want %d", got, want)
 	}
 }
 

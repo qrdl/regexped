@@ -2445,6 +2445,10 @@ var findStrategyShapes = []struct {
 	// byte is a candidate, so the hinted body hands the call to the twin,
 	// whose own counter then trips.
 	{`[a-zA-Z][^;]*[;,]`, "a", "a;", nil},
+	// A lenient literal-chain alternation (one branch a literal chain, one a
+	// DFA branch starting with a literal): its specialised body carries no
+	// counter, so where its failed walks are unbounded it must not be used.
+	{`ab?c|x[a-z]*Y`, "x", "xY", nil},
 }
 
 // hasEmptyWidthAssertion reports whether pat carries \b, \B, ^, $, \A or \z,

@@ -1319,7 +1319,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
 		// TDFA-correct capture semantics for DFA branches.
 		if !needMatch {
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
 				parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
 				if perr == nil && parsed.MaxCap() > 0 {
 					prog, cerr := syntax.Compile(parsed.Simplify())
@@ -1560,8 +1560,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			// Phase 2a: lenient alternation — at least one branch is non-lit-chain
 			// but starts with a literal. DFA branches are inlined as anchored DFA
-			// verifies from the candidate position.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
+			// verifies from the candidate position. Only where its failed walks
+			// are bounded: the body has no work counter, and a DFA branch that
+			// keeps walking without accepting makes it quadratic, so such a
+			// pattern takes the ordinary find, which gets the switch.
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
 				layout := planLenAltLayout(lenAltp, tableBase, true)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
@@ -1762,10 +1765,23 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	var l *dfaLayout
+	// saReplaced is set when the start-anywhere find replaces today's: the
+	// layout below then ships nothing, and layoutNotes marks where the notes
+	// describing it (and the literal-anchored find it also replaced) begin,
+	// so the report can drop them rather than describe a body that was never
+	// emitted.
+	var saReplaced bool
+	var layoutNotes int
 	if !dfaTooLarge {
 		defer func() {
 			rep := buildOpts.report()
 			if rep == nil || l == nil {
+				return
+			}
+			if saReplaced {
+				if !rep.HasEngine() {
+					rep.Engine(EngineDFA, "no captures; start-anywhere find — a forward and a backward DFA pass")
+				}
 				return
 			}
 			if !rep.HasEngine() {
@@ -1796,6 +1812,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				rep.Note("skip-safe-on-dead")
 			}
 		}()
+		layoutNotes = buildOpts.report().noteMark()
 		l = buildDFALayout(dfaLayoutParams{
 			report:               buildOpts.report(),
 			t:                    table,
@@ -2082,6 +2099,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
 					p.startAnywhere = true
 					p.tableEnd = trial.tableEnd
+					saReplaced = true
+					buildOpts.report().truncateNotes(layoutNotes)
 				} else {
 					// Today's body with the counter, handing over to the
 					// Backtracking find (buildSwitchHandover) — linear either way.

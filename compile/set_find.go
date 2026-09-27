@@ -5,6 +5,7 @@ import (
 
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
+	"github.com/qrdl/regexped/internal/wlocals"
 )
 
 // Set `find` body support.
@@ -509,7 +510,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 // one, otherwise straight from the caller's array.
 func (c *setFindCtx) emitGateValue(b []byte, gid int) []byte {
 	if c.gateLocalBase != 0 && gid >= 0 && gid < c.cs.idSpaceSize() &&
-		int(c.gateLocalBase)+gid < 256 {
+		int(c.gateLocalBase)+gid <= wlocals.MaxByteLocal {
 		return append(b, 0x20, byte(int(c.gateLocalBase)+gid))
 	}
 	return append(append(b, 0x20, c.pGate, 0x28, 0x02),
@@ -522,7 +523,7 @@ func (c *setFindCtx) emitGateLocalsPrologue(b []byte) []byte {
 		return b
 	}
 	for gid := 0; gid < c.cs.idSpaceSize(); gid++ {
-		if int(c.gateLocalBase)+gid >= 256 {
+		if int(c.gateLocalBase)+gid > wlocals.MaxByteLocal {
 			break
 		}
 		b = append(b, 0x20, c.pGate, 0x28, 0x02)
@@ -553,13 +554,14 @@ func (c *setFindCtx) emitGateLocalsPrologue(b []byte) []byte {
 // absolute terms, which is the only bound available without knowing the input.
 //
 // Also bounded by the local index space: local indices are emitted as a single
-// byte throughout these emitters, so the whole block must sit below 256.
+// byte throughout these emitters, and a single byte of ULEB128 stops at 127
+// (wlocals.MaxByteLocal) — 128..255 would read as a continuation byte.
 func gateLocalsProfitable(cs *compiledSet, gated bool, localCount int) bool {
 	if !gated || !hasSetFallbackBuckets(cs) {
 		return false
 	}
 	n := cs.idSpaceSize()
-	return n > 0 && n <= maxHoistedGateLocals && localCount+n < 256
+	return n > 0 && n <= maxHoistedGateLocals && localCount+n <= wlocals.MaxByteLocal+1
 }
 
 // maxHoistedGateLocals bounds F2's per-call prologue. See gateLocalsProfitable.
@@ -1335,15 +1337,15 @@ func (c *setFindCtx) emitScanCounter(b []byte, bi int, posLocal byte) []byte {
 	b = append(b, 0x20, posLocal, 0x6B, 0x41)
 	b = utils.AppendSLEB128(b, switchShortWalk)
 	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
-	// work > N × (pos − from) + 64: hand over.
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-	b = append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B, 0x41)
-	b = utils.AppendSLEB128(b, defaultSwitchN)
-	b = append(b, 0x6C, 0x41)
-	b = utils.AppendSLEB128(b, startAnywhereSwitchSlack)
-	b = append(b, 0x6A)
-	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+	// work > N × (pos − from) + 64, in i64: hand over.
+	getWork := func(b []byte) []byte {
+		b = append(b, 0x23)
+		return utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	}
+	b = emitSwitchOverBudget(b, getWork, func(b []byte) []byte {
+		return append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B)
+	}, defaultSwitchN)
+	b = append(b, 0x04, 0x40) // if
 	target := c.probeFnBase - c.cs.scanProbeBaseOffset() + c.cs.scanSwitchFnOffset(c.mode)
 	callTarget := func(b []byte) []byte {
 		b = append(b, 0x20, c.pInPtr, 0x20, c.pInLen, 0x20, c.pFrom)
@@ -1366,14 +1368,17 @@ func (c *setFindCtx) emitScanCounter(b []byte, bi int, posLocal byte) []byte {
 		b = append(b, 0x84) // i64.or
 	}
 	b = append(b, 0x0F, 0x0B) // return; end if over budget
-	// work += walk
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
-	b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
-	b = utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
-	return append(b, 0x0B, 0x0B)          // end if long; end if failed
+	// work += walk, in i64.
+	walk := func(b []byte) []byte {
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+		return append(b, 0x20, posLocal, 0x6B)
+	}
+	b = emitAddWalk(b, getWork, func(b []byte) []byte {
+		b = append(b, 0x24)
+		return utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	}, walk)
+	return append(b, 0x0B, 0x0B) // end if long; end if failed
 }
 
 // emitProbeOverflowEscape returns abi.BTStackOverflow out of the whole
@@ -1504,7 +1509,7 @@ func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
 // emitFindPrologue initialises the running state every body shares.
 func (c *setFindCtx) emitFindPrologue(b []byte, lPos byte) []byte {
 	if c.cs.scanSwitch(c.mode) {
-		b = append(b, 0x41, 0x00, 0x24)
+		b = append(b, 0x42, 0x00, 0x24)                     // i64.const 0: the counter
 		b = utils.AppendULEB128(b, uint32(c.cs.scanSwWork)) //nolint:gosec // a global index
 	}
 	b = append(b, 0x41, 0x00, 0x21, c.lTotal)

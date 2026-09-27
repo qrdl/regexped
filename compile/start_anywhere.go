@@ -241,6 +241,97 @@ func classifyFind(in findClassInput) (findStrategy, string) {
 	return findSwitch, "not provably linear"
 }
 
+// lenientAltLinear reports whether the lenient literal-chain alternation find
+// is linear on pattern. The body carries no work counter, so a pattern this
+// cannot prove takes the ordinary find, which the classifier can switch. Two
+// proofs, either enough:
+//
+//   - a failed walk of the pattern's own leftmost-first find DFA is bounded
+//     (failedWalkBound). The body verifies the branches at a candidate in
+//     priority order and stops at the first match, so a failed verify is a
+//     walk the union DFA fails too;
+//   - lenientAltLiteralFence: no walk can run past the next occurrence of a
+//     branch literal, so walks from different candidates barely overlap.
+//     `'\s*(?:OR|AND)\s+[0-9]+…|UNION\s+…` needs this one — its `\s*` loops
+//     without accepting, but never across a `'` or a `UNION`.
+func lenientAltLinear(pattern string, opts CompileOptions) bool {
+	m, err := compile(pattern, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true,
+		ByteMode: opts.ByteMode, Unicode: opts.Unicode})
+	if err != nil {
+		return false
+	}
+	d, ok := m.(*dfa)
+	if !ok {
+		return false
+	}
+	if _, bounded := failedWalkBound(dfaTableFrom(d)); bounded {
+		return true
+	}
+	return lenientAltLiteralFence(pattern, opts.ByteMode)
+}
+
+// lenientAltLiteralFence reports whether every branch of an alternation of
+// literal-led branches either has a bounded continuation after its literal or
+// has one that cannot read ANY branch's literal without dying.
+//
+// Why that is linear: the body tries a branch only at an occurrence of its
+// literal, and a walk from occurrence c then reads the continuation. If the
+// continuation cannot contain a literal, the walk ends before the end of the
+// first literal occurrence that starts past c's own literal — so each walk
+// covers at most the gap to the next occurrence plus one literal, and at most
+// maxLiteral occurrences can start in any one gap. The total is linear in the
+// input, with the longest literal as the constant. The same argument as
+// litAnchorLinear's, over several literals.
+func lenientAltLiteralFence(pattern string, byteMode bool) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpAlternate {
+		return false
+	}
+	type branch struct {
+		lit  []byte
+		rest *syntax.Regexp
+	}
+	var branches []branch
+	for _, sub := range re.Sub {
+		for sub.Op == syntax.OpCapture && len(sub.Sub) == 1 {
+			sub = sub.Sub[0]
+		}
+		litNode, rest := sub, &syntax.Regexp{Op: syntax.OpEmptyMatch}
+		if sub.Op == syntax.OpConcat && len(sub.Sub) > 0 {
+			litNode = sub.Sub[0]
+			rest = &syntax.Regexp{Op: syntax.OpConcat, Sub: sub.Sub[1:], Flags: sub.Flags}
+		}
+		if litNode.Op != syntax.OpLiteral || litNode.Flags&syntax.FoldCase != 0 {
+			return false
+		}
+		lit := make([]byte, 0, len(litNode.Rune))
+		for _, r := range litNode.Rune {
+			if r > 0x7F {
+				return false
+			}
+			lit = append(lit, byte(r))
+		}
+		branches = append(branches, branch{lit, rest})
+	}
+	for _, b := range branches {
+		if _, maxLen := regexpMinMaxLen(b.rest, byteMode); maxLen >= 0 {
+			continue // a bounded walk, whatever it reads
+		}
+		for _, o := range branches {
+			if regexpCanContain(b.rest, o.lit) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // litAnchorLinear reports whether a literal-anchored find over lap is linear:
 // every attempt starts at an occurrence of the literal, and when neither the
 // part before it nor the part after it can contain the literal, the backward
@@ -360,24 +451,8 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 		}
 		return n
 	}
-	reach := make([]bool, t.numStates)
+	reach := dfaReachable(t)
 	var stack []int
-	for _, r := range []int{t.startState, t.midStartState, t.midStartWordState, t.midStartNewlineState} {
-		if r >= 0 && r < t.numStates && !reach[r] {
-			reach[r] = true
-			stack = append(stack, r)
-		}
-	}
-	for len(stack) > 0 {
-		s := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for c := 0; c < 256; c++ {
-			if n := t.transitions[s*256+c]; n >= 0 && !reach[n] {
-				reach[n] = true
-				stack = append(stack, n)
-			}
-		}
-	}
 	// live: reachable, non-accepting, and able to end a walk without
 	// accepting — through non-accepting edges — from here.
 	live := make([]bool, t.numStates)
@@ -406,45 +481,11 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 			}
 		}
 	}
-	// Longest path through live states, by an iterative DFS with colours; a
-	// grey successor is a cycle.
-	const white, grey, black = 0, 1, 2
-	colour := make([]int, t.numStates)
-	longest := make([]int, t.numStates)
-	type frame struct{ s, c int }
-	for root := 0; root < t.numStates; root++ {
-		if !live[root] || colour[root] != white {
-			continue
-		}
-		colour[root] = grey
-		frames := []frame{{root, 0}}
-		for len(frames) > 0 {
-			f := &frames[len(frames)-1]
-			if f.c == 256 {
-				best := 0
-				for c := 0; c < 256; c++ {
-					if n := next(f.s, c); n >= 0 && live[n] && longest[n] > best {
-						best = longest[n]
-					}
-				}
-				longest[f.s] = best + 1
-				colour[f.s] = black
-				frames = frames[:len(frames)-1]
-				continue
-			}
-			n := next(f.s, f.c)
-			f.c++
-			if n < 0 || !live[n] {
-				continue
-			}
-			switch colour[n] {
-			case grey:
-				return 0, false
-			case white:
-				colour[n] = grey
-				frames = append(frames, frame{n, 0})
-			}
-		}
+	// Longest path through live states; a cycle among them is an unbounded
+	// failed walk.
+	longest, cyclic := longestPaths(t.numStates, func(s int) bool { return live[s] }, next)
+	if cyclic {
+		return 0, false
 	}
 	bound := 0
 	for s := 0; s < t.numStates; s++ {
@@ -1112,10 +1153,10 @@ func emitFindSwitchCheck(b []byte, posLocal, attemptStartLocal byte, sw []switch
 const switchShortWalk = 32
 
 // emitFindSwitchCharge charges one failed attempt's walk — pushed by walk,
-// which must be free of side effects, since it is emitted twice — to the
+// which must be free of side effects, since it is emitted twice — to the i64
 // counter in w: the budget is checked against the EARLIER attempts (see
-// emitFindSwitchCheck), then the walk is added. A walk of at most
-// switchShortWalk bytes is not charged at all.
+// emitFindSwitchCheck), then the walk is added (emitAddWalk). A walk of at
+// most switchShortWalk bytes is not charged at all.
 //
 // Computing the walk ONCE into a scratch local was measured and rejected: it
 // moved ~3,400 fuel from bt-find-mand-lit (long failed walks, which it saves
@@ -1127,28 +1168,50 @@ func emitFindSwitchCharge(b []byte, w byte, walk func([]byte) []byte, attemptSta
 	b = utils.AppendSLEB128(b, switchShortWalk)
 	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
 	b = emitFindSwitchBudget(b, w, attemptStartLocal, n, resumeNext)
-	b = append(b, 0x20, w)
-	b = walk(b)
-	b = append(b, 0x6A, 0x21, w) // walked += walk
+	b = emitAddWalk(b,
+		func(b []byte) []byte { return append(b, 0x20, w) },
+		func(b []byte) []byte { return append(b, 0x21, w) }, walk)
 	return append(b, 0x0B)
 }
 
+// emitAddWalk adds walk, an i32, to an i64 work counter. An i64 because the
+// bytes a find walks pass 4 GiB on a large enough input, and a counter that
+// wrapped would read as small again and keep the check passing on exactly the
+// input it exists to catch. get and set read and write the counter (a local or
+// a global).
+func emitAddWalk(b []byte, get, set, walk func([]byte) []byte) []byte {
+	b = get(b)
+	b = walk(b)
+	b = append(b, 0xAD, 0x7C) // i64.extend_i32_u; i64.add
+	return set(b)
+}
+
+// emitSwitchOverBudget pushes 1 when an i64 work counter is past its budget,
+// N × dist + slack. The budget is in i64 too: N × dist wraps an i32 on an
+// input past 1 GiB, and a wrapped budget trips early or never. walked pushes
+// the i64 counter and dist an i32.
+func emitSwitchOverBudget(b []byte, walked, dist func([]byte) []byte, n int32) []byte {
+	b = walked(b)
+	b = dist(b)
+	b = append(b, 0xAD, 0x42) // i64.extend_i32_u; i64.const
+	b = utils.AppendSLEB128_64(b, int64(n))
+	b = append(b, 0x7E, 0x42) // i64.mul; i64.const
+	b = utils.AppendSLEB128_64(b, startAnywhereSwitchSlack)
+	return append(b, 0x7C, 0x56) // i64.add; i64.gt_u
+}
+
 // emitFindSwitchBudget compares the counter with N × (attempt_start - from)
-// + slack and, when it is over, returns the sentinel. resumeNext moves the
+// + slack (emitSwitchOverBudget) and, when it is over, returns the sentinel. resumeNext moves the
 // find-from global to attempt_start + 1 first; without it the start-anywhere
 // find searches again from `from`, for a body (the literal-anchored ones)
 // whose failed candidates do not prove every earlier start matchless.
 func emitFindSwitchBudget(b []byte, w, attemptStartLocal byte, n int32, resumeNext bool) []byte {
-	b = append(b, 0x20, w)
-	// N × (attempt_start - from) + slack
-	b = append(b, 0x20, attemptStartLocal, 0x23)
-	b = utils.AppendULEB128(b, findFromGlobalIdx)
-	b = append(b, 0x6B, 0x41)
-	b = utils.AppendSLEB128(b, n)
-	b = append(b, 0x6C, 0x41)
-	b = utils.AppendSLEB128(b, startAnywhereSwitchSlack)
-	b = append(b, 0x6A)
-	b = append(b, 0x4B)       // i32.gt_u
+	b = emitSwitchOverBudget(b, func(b []byte) []byte { return append(b, 0x20, w) },
+		func(b []byte) []byte {
+			b = append(b, 0x20, attemptStartLocal, 0x23)
+			b = utils.AppendULEB128(b, findFromGlobalIdx)
+			return append(b, 0x6B) // attempt_start - from
+		}, n)
 	b = append(b, 0x04, 0x40) // if
 	if resumeNext {
 		b = append(b, 0x20, attemptStartLocal, 0x41, 0x01, 0x6A)

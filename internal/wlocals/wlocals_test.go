@@ -133,6 +133,9 @@ func TestAllocRefusesIndexPastAByte(t *testing.T) {
 	if idx := w.I32W(); idx != 128 {
 		t.Fatalf("I32W past the byte limit = %d, want 128", idx)
 	}
+	if idx := w.I64W(); idx != 129 {
+		t.Fatalf("I64W past the byte limit = %d, want 129", idx)
+	}
 	a := New(0)
 	a.Reserve(ValI32, 128) // fills 0..127
 	if a.Next() != 128 {

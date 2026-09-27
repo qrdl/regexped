@@ -1327,9 +1327,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 
 	if leftmostFirst && isImmediateAccepting(startSet, prog) {
 		bits := nfaAcceptBits(startSet)
-		if bits == 0 {
-			bits = 1
-		}
 		dfa.immediateAccepting[0] |= bits
 	}
 
@@ -1355,9 +1352,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		dfa.midStart = id
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
-			if bits == 0 {
-				bits = 1
-			}
 			dfa.immediateAccepting[dfa.midStart] |= bits
 		}
 	} else {
@@ -1384,9 +1378,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		}
 		if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 			bits := nfaAcceptBits(midStartSet)
-			if bits == 0 {
-				bits = 1
-			}
 			dfa.immediateAccepting[dfa.midStart] |= bits
 		}
 		queue = append(queue, workItem{dfaState: dfa.midStart, nfaSet: midStartSet, prevWasWord: false})
@@ -1422,9 +1413,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	}
 	if leftmostFirst && isImmediateAccepting(midStartSet, prog) {
 		bits := nfaAcceptBits(midStartSet)
-		if bits == 0 {
-			bits = 1
-		}
 		dfa.immediateAccepting[dfa.midStartWord] |= bits
 	}
 	queue = append(queue, workItem{dfaState: dfa.midStartWord, nfaSet: midStartSet, prevWasWord: true})
@@ -1465,9 +1453,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
 			bits := nfaAcceptBits(midStartNewlineSet)
-			if bits == 0 {
-				bits = 1
-			}
 			dfa.immediateAccepting[dfa.midStartNewline] |= bits
 		}
 		queue = append(queue, workItem{dfaState: dfa.midStartNewline, nfaSet: midStartNewlineSet, prevWasNewline: true, beginCtx: ecBeginLine})
@@ -1684,9 +1669,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 						dfa.immediateAccepting[nextDFAState] |= immBits
 					} else if isImmediateAccepting(nextSet, prog) {
 						bits := nfaAcceptBits(nextSet)
-						if bits == 0 {
-							bits = 1
-						}
 						dfa.immediateAccepting[nextDFAState] |= bits
 					}
 				}
@@ -8388,7 +8370,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	a.Reserve(valV128, numV128Locals)
 	var locWalked, locCandWalk byte
 	if p.switchN > 0 {
-		locWalked, locCandWalk = a.I32(), a.I32()
+		locWalked, locCandWalk = a.I64(), a.I32()
 	}
 	const (
 		locChunk  = 8
@@ -9063,7 +9045,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	var locWalked, locCandWalk byte
 	var stamp uint32
 	if p.switchN > 0 {
-		locWalked, locCandWalk = a.I32(), a.I32()
+		locWalked, locCandWalk = a.I64(), a.I32()
 		stamp = uint32(p.backStampP1 - 1) //nolint:gosec // a global index
 	}
 	const (
@@ -9638,7 +9620,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			b = append(b, trailingI32, 0x7F)
 		}
 		if p.switchN > 0 {
-			b = append(b, 0x01, 0x7F)
+			b = append(b, 0x01, 0x7E) // the counter, i64
 			walkedLocal = 2 + i32Count + byte(numV128ForScan) + trailingI32
 		}
 		// The find-from seed goes here and only here. This closure is the one
@@ -10390,7 +10372,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskLocal = 10
 			chunkScanLocal = 11
 			if p.switchN > 0 {
-				b = append(b, 0x03, 0x09, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+				b = append(b, 0x03, 0x09, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
 				walkedLocal = 2 + 9 + 1
 			} else {
 				b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
@@ -10481,7 +10463,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskLocal = 9
 			chunkScanLocal = 10
 			if p.switchN > 0 {
-				b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+				b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
 				walkedLocal = 2 + 8 + 1
 			} else {
 				b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
@@ -10560,7 +10542,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		simdMaskScanLocal = 9
 		chunkScanLocal = 10
 		if p.switchN > 0 {
-			b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7F)
+			b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
 			walkedLocal = 2 + 8 + 1
 		} else {
 			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)

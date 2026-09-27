@@ -1356,3 +1356,105 @@ func TestRegionAllocSkipLeavesFrontier(t *testing.T) {
 		t.Errorf("base after Skip = %d, want 110", got)
 	}
 }
+
+// TestEmitterGuardsFire fires the invariant guards of the small emitters and
+// helpers, each on the broken input it exists to refuse. Every one of them
+// stands between an internal inconsistency and a module that validates and
+// answers wrongly, and none can be reached through a valid pattern.
+func TestEmitterGuardsFire(t *testing.T) {
+	analyzed := func(t *testing.T, pats ...string) ([]*PatternInfo, *dfaPool, *dfaPool) {
+		t.Helper()
+		var prefixPool, suffixPool dfaPool
+		var out []*PatternInfo
+		for _, p := range pats {
+			info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, info)
+		}
+		return out, &prefixPool, &suffixPool
+	}
+	wideUnion := &unionScanDFA{wideAccept: true, midWordsOff: -1, eofWordsOff: -1}
+
+	for _, c := range []struct {
+		name, want string
+		fn         func(t *testing.T)
+	}{
+		{"a capability name for a capability that is not a scan", "not a scan", func(*testing.T) {
+			(&compiledSet{}).capName(capFind)
+		}},
+		{"btScratch without globals", "global allocator", func(*testing.T) {
+			(&CompileOptions{}).btScratch()
+		}},
+		{"a drive prologue into something that is not one code entry", "not one code entry", func(*testing.T) {
+			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{})
+		}},
+		{"batch groups over an anchored capture body", "batch groups", func(*testing.T) {
+			buildBatchLitChainGroupsWrapperBody(0, 1, findFromMode(0))
+		}},
+		{"a fallback body never called", "never calls it", func(*testing.T) {
+			patchBTFallbackCall([]byte{0x01, 0x0B}, nil, 1)
+		}},
+		{"a stale fallback call offset", "placeholder", func(*testing.T) {
+			patchBTFallbackCall([]byte{0x07, 0x00, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05}, []int{3}, 1)
+		}},
+		{"copies to one register twice", "duplicate destination", func(*testing.T) {
+			sequentializeCopies([]tdfaTagOp{{dst: 1, src: 2}, {dst: 1, src: 3}})
+		}},
+		{"an Aho-Corasick root with output", "root carries output", func(*testing.T) {
+			buildACLayoutMode(&acAutomaton{nodes: []acNode{{output: []int{0}}}}, 0, false)
+		}},
+		{"a narrow scan_all bitmap beside a Backtracking bucket", "wide bitmap", func(*testing.T) {
+			c := &setFindCtx{mode: capScanAll, cs: &compiledSet{
+				buckets: []*bucket{{btFallback: &btBucketInfo{}}}, patternIDs: [][]int{{0}}}}
+			c.emitRecordedSkip(nil, 0)
+		}},
+		{"the narrow scan body over a wide automaton", "narrow union scan body emitted for a wide union automaton", func(*testing.T) {
+			emitUnionScanBody(wideUnion, capScanAny, 1, 0, false)
+		}},
+		{"the wide scan body over a narrow automaton", "narrow union automaton", func(*testing.T) {
+			emitUnionScanWideBody(&unionScanDFA{}, capScanAny, 0, false)
+		}},
+		{"the wide scan body for find", "unsupported capability", func(*testing.T) {
+			emitUnionScanWideBody(wideUnion, capFind, 0, false)
+		}},
+		{"a wide scan_all without accept rows", "without accept bitmap rows", func(*testing.T) {
+			emitUnionScanWideBody(wideUnion, capScanAll, 0, false)
+		}},
+		{"a wide alive mask without accept rows", "without accept bitmap rows", func(*testing.T) {
+			emitUnionAliveMask(nil, wideUnion, 0, 0, 0, 0, 0, 0, nil)
+		}},
+		{"a checkpoint emitter for a set with no sweep", "no sweep", func(*testing.T) {
+			newCkptEmit(&compiledSet{sweepDone: true}, 0, 0)
+		}},
+		{"a twin beside a Backtracking fallback", "both a neutral twin and a Backtracking fallback", func(*testing.T) {
+			(&compiledPattern{findFallbackBody: []byte{0}, findNeutralBody: []byte{0}}).appendFindBodyWithTwin(nil, 0)
+		}},
+		{"a twin handoff outside the body", "outside the body", func(*testing.T) {
+			(&compiledPattern{findBody: []byte{0}, findNeutralBody: []byte{0}, findTwinCallOff: -1}).appendFindBodyWithTwin(nil, 0)
+		}},
+		{"a Backtracking handover outside a switch", "outside a switch", func(*testing.T) {
+			(&compiledPattern{saBT: &btFindParts{}}).appendStartAnywhereBodies(nil, 0)
+		}},
+		{"a Backtracking handover reading from differently", "read `from` differently", func(*testing.T) {
+			(&compiledPattern{saBT: &btFindParts{mode: ffNative}, saSwitch: true, findFromMode: ffAnchoredZeroOnly}).
+				appendStartAnywhereBodies(nil, 0)
+		}},
+		{"a start-anywhere find reading from differently", "read `from` differently", func(*testing.T) {
+			(&compiledPattern{saFwdBody: []byte{0}, saRevBody: []byte{0}, saSwitch: true, findFromMode: ffAnchoredZeroOnly}).
+				appendStartAnywhereBodies(nil, 0)
+		}},
+		{"a set member's Backtracking body in window mode", "window mode", func(*testing.T) {
+			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{})
+		}},
+		{"Backtracking regions without globals", "global allocator", func(t *testing.T) {
+			infos, _, _ := analyzed(t, `a+b`)
+			planBTRegions([]*bucket{newBTBucket(infos[0])}, 0, nil, 0)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustPanic(t, c.want, func() { c.fn(t) })
+		})
+	}
+}

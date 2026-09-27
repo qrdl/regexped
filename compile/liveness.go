@@ -125,55 +125,9 @@ func livenessCanFire(t *dfaTable) bool {
 	if bits.OnesCount64(full) < 2 {
 		return false
 	}
-	reach := make([]bool, t.numStates)
-	var stack []int
-	for _, r := range []int{t.startState, t.midStartState, t.midStartWordState, t.midStartNewlineState} {
-		if r >= 0 && r < t.numStates && !reach[r] {
-			reach[r] = true
-			stack = append(stack, r)
-		}
-	}
-	for len(stack) > 0 {
-		s := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for c := 0; c < 256; c++ {
-			if n := t.transitions[s*256+c]; n >= 0 && !reach[n] {
-				reach[n] = true
-				stack = append(stack, n)
-			}
-		}
-	}
+	reach := dfaReachable(t)
 	partial := func(s int) bool { return reach[s] && fa[s] != 0 && fa[s] != full }
-	// A cycle through partial states: iterative DFS with colours.
-	const white, grey, black = 0, 1, 2
-	colour := make([]int, t.numStates)
-	type frame struct{ s, c int }
-	for root := 0; root < t.numStates; root++ {
-		if !partial(root) || colour[root] != white {
-			continue
-		}
-		colour[root] = grey
-		frames := []frame{{root, 0}}
-		for len(frames) > 0 {
-			f := &frames[len(frames)-1]
-			if f.c == 256 {
-				colour[f.s] = black
-				frames = frames[:len(frames)-1]
-				continue
-			}
-			n := t.transitions[f.s*256+f.c]
-			f.c++
-			if n < 0 || !partial(n) {
-				continue
-			}
-			switch colour[n] {
-			case grey:
-				return true
-			case white:
-				colour[n] = grey
-				frames = append(frames, frame{n, 0})
-			}
-		}
-	}
-	return false
+	// A cycle through partial states.
+	_, cyclic := longestPaths(t.numStates, partial, func(s, c int) int { return t.transitions[s*256+c] })
+	return cyclic
 }

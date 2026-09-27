@@ -49,9 +49,13 @@ func New(nParams uint32) *Alloc {
 	return &Alloc{next: nParams}
 }
 
+// MaxByteLocal is the largest local index a byte-indexed emitter may write:
+// one byte of ULEB128 holds 0..127.
+const MaxByteLocal = 0x7F
+
 func (a *Alloc) alloc(ty byte) byte {
 	idx := a.allocWide(ty)
-	if idx > 0x7F {
+	if idx > MaxByteLocal {
 		// The byte-indexed emitters write the index as ONE byte, which is a
 		// ULEB128 only below 128: 128..255 reads as a continuation byte and
 		// swallows the next opcode (a split set's merge wrapper built such a
