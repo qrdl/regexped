@@ -41,10 +41,16 @@ type OverlapCacheShape struct {
 
 	// CostPerByte is what sweeping one input byte costs in the drive's work
 	// units. The engine engages the sweep once the walk's accumulated work
-	// passes inputLen × CostPerByte (strictly), or once the counter saturates,
-	// so a harness asking whether a drive SHOULD have engaged reads it here
-	// rather than re-deriving the engine's rule.
+	// passes SweepThreshold (strictly), or once the counter saturates.
 	CostPerByte int64
+}
+
+// SweepThreshold is the work past which a drive over inputLen bytes engages
+// the sweep: CostPerByte per byte plus a fixed allowance for starting one. A
+// harness asking whether a drive SHOULD have engaged reads it here rather than
+// re-deriving the engine's rule.
+func (sh OverlapCacheShape) SweepThreshold(inputLen int) int64 {
+	return (int64(inputLen) + overlapSweepSetupBytes) * sh.CostPerByte
 }
 
 // SetOverlapCacheShape compiles `sc` and reports what sizing its `find` needs.
@@ -68,18 +74,17 @@ func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over 
 	if err != nil {
 		return OverlapCacheShape{}, err
 	}
-	bi := cs.overlapDPBucket()
-	if bi < 0 {
+	sw := cs.sweepSrc()
+	if sw == nil {
 		return OverlapCacheShape{}, nil
 	}
-	bkt := cs.buckets[bi]
 	// Lever C makes the column one cell per PROJECTION rather than per
 	// (state, pattern); overlapCells is the one place that decides which, so a
 	// caller cannot size a region for a column the sweep does not have.
 	return OverlapCacheShape{
 		Eligible:    true,
 		Cells:       cs.overlapCells(),
-		Patterns:    len(bkt.patterns),
+		Patterns:    len(sw.ids),
 		CostPerByte: cs.overlapSweepCostPerByte(),
 	}, nil
 }
@@ -106,9 +111,16 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 	if err != nil {
 		return 0, 0, err
 	}
+	bytes, stride = sh.Sizing(inputLen)
+	return bytes, stride, nil
+}
+
+// Sizing is SetOverlapCacheSizing for a shape already in hand: a caller that
+// sizes many drives of one set learns the shape once and asks this per input.
+func (sh OverlapCacheShape) Sizing(inputLen int) (bytes, stride int) {
 	if !sh.Eligible {
-		return config.SetOverlapCheckpointHeaderBytes, 1, nil
+		return config.SetOverlapCheckpointHeaderBytes, 1
 	}
 	return config.SetOverlapCheckpointBytes(inputLen, sh.Cells, sh.Patterns),
-		config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns), nil
+		config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns)
 }

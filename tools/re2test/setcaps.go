@@ -261,6 +261,11 @@ type setCapStats struct {
 	// region (-1). Legitimate — the answer is identical, only slower — but it
 	// must be visible rather than inferred from a count that does not move.
 	refusedCache int
+	// forcedSwept / forcedDeclined count the forced-sweep legs by what `ready`
+	// said afterwards. A declined one is not a failure — a drive whose
+	// preflight retired every pattern has nothing to sweep — but a count that
+	// stays near zero means the leg is checking the walk.
+	forcedSwept, forcedDeclined int
 
 	// skippedCache counts find / find_batch legs that asked for the answer cache and
 	// got no region, so the leg was identical to the nocache one and would
@@ -378,6 +383,9 @@ func (s *setCapStats) report() {
 	if s.engagedCache > 0 || s.refusedCache > 0 {
 		fmt.Printf("  find cache legs that SWEPT: %d (refused the region: %d)\n",
 			s.engagedCache, s.refusedCache)
+	}
+	if s.forcedSwept > 0 || s.forcedDeclined > 0 {
+		fmt.Printf("  forced-sweep legs: swept %d, did not sweep %d\n", s.forcedSwept, s.forcedDeclined)
 	}
 	for _, prof := range s.cacheProfiles {
 		c := s.cacheByProfile[prof]
@@ -786,12 +794,17 @@ type setRunner struct {
 	// allocation; this harness is that init's stand-in, and leaving it zero is
 	// a malformed header the sweep reports rather than guesses at.
 	cacheStride int32
-	npat        int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
-	idSpace     int    // largest reportable global id + 1 — sizes gates and bitmaps
-	inSet       []bool // by chunk index: is this pattern a member of the set?
-	outCap      int32  // = npat: the exact worst case for one position
-	bmpLen      int32
-	wide        bool // idSpace > 64: the `_all` capabilities take an out_ptr
+	// forceSweep pre-arms the cache header's work counter when a drive starts,
+	// so the FIRST call sweeps: the forced-sweep leg. The corpus's inputs are
+	// a few bytes long and the adaptive trigger almost never fires on them, so
+	// without it the cache legs test the walk and the sweep goes unchecked.
+	forceSweep bool
+	npat       int    // patterns IN THE SET — sizes the tuple buffer and the cursor's k
+	idSpace    int    // largest reportable global id + 1 — sizes gates and bitmaps
+	inSet      []bool // by chunk index: is this pattern a member of the set?
+	outCap     int32  // = npat: the exact worst case for one position
+	bmpLen     int32
+	wide       bool // idSpace > 64: the `_all` capabilities take an out_ptr
 
 	// Patterns this compile excluded; see the dropHandler comment.
 	droppedFind     map[int]bool
@@ -892,6 +905,14 @@ func (r *setRunner) cacheReady() int32 {
 
 // recordCacheLeg tallies what the leg just driven actually exercised.
 func (r *setRunner) recordCacheLeg() {
+	if r.forceSweep {
+		if r.cacheReady() == 1 {
+			setStats.forcedSwept++
+		} else {
+			setStats.forcedDeclined++
+		}
+		return
+	}
 	switch r.cacheReady() {
 	case 1:
 		setStats.engagedCache++
@@ -908,6 +929,11 @@ func (r *setRunner) startCacheDrive() {
 		buf[r.cachePtr+i] = 0
 	}
 	binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
+	if r.forceSweep {
+		// The counter's own saturation value: what a drive that had already
+		// spent everything would have left there.
+		binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrWorkOff:], 0x7FFFFFFF)
+	}
 	r.offerCache(r.cachePtr, r.cacheLen)
 }
 
@@ -1197,6 +1223,10 @@ func newSetRunner(
 			if b.Type == "bt-fallback" {
 				wideAll = true
 			}
+		}
+		// A member split out onto the Backtracking find forces it too.
+		if len(d.SplitBacktracking) > 0 {
+			wideAll = true
 		}
 	}
 
@@ -1488,20 +1518,25 @@ func runSetProfile(
 				// never fire — which is exactly the leg worth checking here,
 				// since "offered and declined" runs on EVERY call and must cost
 				// nothing but a header read. The engaging path needs inputs the
-				// corpus does not have and is covered in tools/fuzz.
-				cacheLegs := []bool{false}
+				// corpus does not have, so a third leg FORCES it: the work
+				// counter pre-armed, every drive sweeps from its first call,
+				// and the whole corpus checks the sweep against the oracle.
+				cacheLegs := []cacheLeg{legWalk}
 				if c.spec.overlapping {
 					if r.cachePtr != 0 {
-						cacheLegs = append(cacheLegs, true)
+						cacheLegs = append(cacheLegs, legCache, legForced)
 					} else {
 						setStats.skipCacheLeg(r.profile)
 					}
 				}
-				for _, withCache := range cacheLegs {
+				for _, leg := range cacheLegs {
+					withCache := leg != legWalk
+					r.forceSweep = leg == legForced
 					gotM, hang, e := r.driveFind(c.find, text, c.spec.overlapping, withCache)
 					if withCache {
 						r.recordCacheLeg()
 					}
+					r.forceSweep = false
 					if errors.Is(e, errBTUnknown) {
 						// The engine said "unknown"; there is nothing to
 						// compare against. Counted, not scored.
@@ -1509,15 +1544,11 @@ func runSetProfile(
 					} else if e != nil {
 						return e
 					}
-					cacheLbl := "nocache"
-					if withCache {
-						cacheLbl = "cache"
-					}
 					if hang {
 						setStats.timeouts++
 					} else {
 						compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping,
-							"find/"+mode+"/"+cacheLbl, verbose, r.findEligible)
+							"find/"+mode+"/"+leg.label(), verbose, r.findEligible)
 					}
 				}
 				// The same scan through an under-sized buffer, checking
@@ -1570,7 +1601,8 @@ func runSetProfile(
 				for _, cap := range caps {
 					// Both engines behind the one export: without the cache
 					// (the ordinary walk) and with it.
-					for _, withCache := range []bool{false, true} {
+					for _, leg := range []cacheLeg{legWalk, legCache, legForced} {
+						withCache := leg != legWalk
 						// Only an OVERLAPPING set reads a cache. Before the
 						// region was sized from the profile's overlapping set,
 						// a gated set's batch never had one to be offered; now
@@ -1586,10 +1618,12 @@ func runSetProfile(
 							setStats.skipCacheLeg(r.profile)
 							continue
 						}
+						r.forceSweep = leg == legForced
 						gotM, hang, e := r.driveFindBatch(c.findBatch, text, c.spec.overlapping, cap, withCache)
 						if withCache {
 							r.recordCacheLeg()
 						}
+						r.forceSweep = false
 						if errors.Is(e, errBTUnknown) {
 							hang = true
 						} else if e != nil {
@@ -1599,12 +1633,8 @@ func runSetProfile(
 							setStats.timeouts++
 							continue
 						}
-						cacheLbl := "nocache"
-						if withCache {
-							cacheLbl = "cache"
-						}
 						label := fmt.Sprintf("find_batch/%s/cap=%s/%s", mode,
-							batchCapLabel(cap, r.outCap), cacheLbl)
+							batchCapLabel(cap, r.outCap), leg.label())
 						compareSetMatches(chunk, strs, si, orc, gotM, c.spec.overlapping, label, verbose, r.findEligible)
 					}
 				}
@@ -1618,6 +1648,27 @@ func runSetProfile(
 		}
 	}
 	return nil
+}
+
+// cacheLeg is one of the engines an overlapping drive can take: the walk (no
+// cache offered), the cache as a generated stub offers it (the trigger
+// decides), and the cache with the sweep forced from the first call.
+type cacheLeg int
+
+const (
+	legWalk cacheLeg = iota
+	legCache
+	legForced
+)
+
+func (l cacheLeg) label() string {
+	switch l {
+	case legCache:
+		return "cache"
+	case legForced:
+		return "cache-forced"
+	}
+	return "nocache"
 }
 
 // driveUnicodePinned drives the GATED `find` over a non-ASCII input and

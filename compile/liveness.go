@@ -1,5 +1,7 @@
 package compile
 
+import "math/bits"
+
 // Per-state liveness for set probes.
 //
 // futureAccepts[s] answers "which patterns can still accept at or after state
@@ -99,4 +101,33 @@ func futureAcceptsBytes(t *dfaTable, numWASM int) []byte {
 		}
 	}
 	return bs
+}
+
+// livenessCanFire reports whether a bucket's walk can outlive one of its
+// members for arbitrarily long: whether a cycle is reachable through states
+// from which some member of the bucket can no longer accept while another
+// still can. That is where the liveness exit pays in a LITERAL bucket — the
+// members share one merged walk, so a member with an accepting loop
+// (`foo\w+`) keeps the walk going for a sibling that is long dead (`foo[0-9]`
+// after `fooa`), and once the looping member is gated out or recorded,
+// nothing but the exit stops that walk. Without such a cycle the walk past a
+// dead member is bounded, so the exit could only ever save a bounded amount
+// and costs a load and a branch on every byte; it is not emitted.
+func livenessCanFire(t *dfaTable) bool {
+	fa := futureAccepts(t)
+	if fa == nil {
+		return false
+	}
+	var full uint64
+	for _, m := range fa {
+		full |= m
+	}
+	if bits.OnesCount64(full) < 2 {
+		return false
+	}
+	reach := dfaReachable(t)
+	partial := func(s int) bool { return reach[s] && fa[s] != 0 && fa[s] != full }
+	// A cycle through partial states.
+	_, cyclic := longestPaths(t.numStates, partial, func(s, c int) int { return t.transitions[s*256+c] })
+	return cyclic
 }

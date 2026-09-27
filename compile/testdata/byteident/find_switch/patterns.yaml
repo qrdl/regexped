@@ -1,0 +1,6 @@
+# Today's general find WITH the work counter: not provably linear, so its
+# failed-attempt exits charge a counter that hands the call over to the
+# start-anywhere find, laid out beside it behind a dispatcher.
+regexps:
+  - pattern: 'a*b'
+    find_func: switch_find

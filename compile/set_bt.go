@@ -122,43 +122,23 @@ func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []
 // It re-runs the analysis rather than reading a compile artefact so `generate`
 // stays runnable on a config alone, with no ordering dependency on a previous
 // `compile`. Compile time is free by this project's stated principle; a wrong
-// stub is not. Correctness rests on it walking the SAME code path CompileSet
-// does — setPatternInfos then binPack — rather than a reimplementation of the
-// admission rule.
+// stub is not. Correctness rests on it walking the SAME code path CompileFile
+// does — compileSetForInspection compiles the set in full — rather than a
+// reimplementation of the admission rule: the packing alone no longer answers,
+// since a member can reach Backtracking by being split out as well.
 //
 // An unresolvable pattern reports false: the real compile will fail on it and
 // report properly, and this predicate must never be the thing that errors.
 func SetAdmitsBacktracking(sc config.SetConfig, cfg config.BuildConfig) bool {
-	nameIdx := map[string]int{}
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
-		}
-	}
-	var selectedIdx []int
-	if sc.Patterns.All {
-		for i := range cfg.Regexps {
-			selectedIdx = append(selectedIdx, i)
-		}
-	} else {
-		for _, name := range sc.Patterns.Names {
-			idx, ok := nameIdx[name]
-			if !ok {
-				return false
-			}
-			selectedIdx = append(selectedIdx, idx)
-		}
-	}
-	var prefixPool, suffixPool dfaPool
-	infos, _, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+	// The COMPILED set is asked, through the path CompileFile takes: a member
+	// reaches the Backtracking engine on a bucket, or split out onto the
+	// Backtracking find (set_split.go) — which the packing alone does not
+	// show, and whose "unknown" answer the narrow `_all` form cannot carry.
+	cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
 	if err != nil {
 		return false
 	}
-	opts := CompileSetOptions{
-		LikelyMode:        resolveHints(sc.Hints),
-		MaxFallbackStates: cfg.MaxFallbackStates,
-	}
-	return hasBTBucketIn(binPack(infos, opts, nil))
+	return cs.hasBTMember() || cs.btSplit
 }
 
 // hasBTBucketIn reports whether any bucket was admitted on the Backtracking

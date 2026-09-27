@@ -118,6 +118,10 @@ type ckptEmit struct {
 	// count.
 	lSum byte
 
+	// lIsWord and lIsNL hold whether input[lPos] is a word byte / a '\n',
+	// for a column with boundary accepts; allocated only for one.
+	lIsWord, lIsNL byte
+
 	// proj is the column's projection, or nil when the column stays one cell per
 	// (state, pattern). When set, the column is indexed by CELL and a runtime
 	// successor table stands between the state loop and the update.
@@ -148,27 +152,26 @@ func (e *ckptEmit) colBytes() int32 {
 // been one letter apart since the block buffer stopped holding tuples.
 func (e *ckptEmit) rowBytesB() int32 { return int32(config.SetOverlapBlockRowBytes(e.numPat)) }
 
-// newCkptEmit derives the geometry from the compiled bucket.
+// newCkptEmit derives the geometry from the set's sweep source.
 func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
-	bi := cs.overlapDPBucket()
-	if bi < 0 {
-		panic("compile: newCkptEmit called for a set with no sweep bucket")
+	sw := cs.sweepSrc()
+	if sw == nil {
+		panic("compile: newCkptEmit called for a set with no sweep")
 	}
-	// The block row's mask is an i32 (`1 << k`), so a bucket wider than
-	// bucketMaskBits would drop its high patterns from every row. overlapDPBucket
+	// The block row's mask is an i32 (`1 << k`), so an automaton wider than
+	// bucketMaskBits would drop its high patterns from every row. vetSweep
 	// refuses one; this refuses it again at the one place the mask width is
 	// assumed, so a gate that drifts cannot reach it silently.
-	numPat := len(cs.patternIDs[bi])
+	numPat := len(sw.ids)
 	if numPat > bucketMaskBits {
-		panic(fmt.Sprintf("compile: a sweep bucket of %d patterns: the block row's mask "+
-			"is an i32, so a bucket may hold at most bucketMaskBits (%d)", numPat, bucketMaskBits))
+		panic(fmt.Sprintf("compile: a sweep over %d patterns: the block row's mask "+
+			"is an i32, so it may cover at most bucketMaskBits (%d)", numPat, bucketMaskBits))
 	}
-	bkt := cs.buckets[bi]
 	e := &ckptEmit{
-		dp:        bkt.dp,
+		dp:        sw.dp,
 		tableMem:  tableMemIdx,
 		numPat:    numPat,
-		numStates: bkt.dp.numWASM,
+		numStates: sw.dp.numWASM,
 	}
 	e.rowBytes = int32(e.numPat * 4)
 	e.proj = cs.overlapProjFor()
@@ -176,7 +179,27 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 	e.succOff = cs.overlapSuccOff
 	e.colA = colOff
 	e.colB = colOff + e.colBytes()
+	// The boundary channels and 16-bit ids are carried by the PROJECTED step
+	// only; vetSweep always projects such a column.
+	if e.proj == nil && (e.hasBoundary() || !e.dp.l.useU8) {
+		panic("compile: a sweep with a boundary channel or 16-bit ids needs the projected column")
+	}
 	return e
+}
+
+// hasBoundary reports a column with the word-boundary or newline channel.
+func (e *ckptEmit) hasBoundary() bool { return e.dp.hasWordChar || e.dp.hasNewlineBoundary }
+
+// allocBoundary allocates lIsWord / lIsNL for a column that reads them, after
+// every other local, so a column without them declares exactly what it always
+// did.
+func (e *ckptEmit) allocBoundary(a *localAlloc) {
+	if e.dp.hasWordChar {
+		e.lIsWord = a.I32()
+	}
+	if e.dp.hasNewlineBoundary {
+		e.lIsNL = a.I32()
+	}
 }
 
 // emitBlockCount emits ceil(m / stride) as `(m + stride - 1) / stride`,
@@ -415,11 +438,7 @@ func (e *ckptEmit) emitAdvance(b []byte) []byte {
 // emitted from one function so the "which patterns match here" test cannot fork
 // between counting and writing: a block whose count and contents disagree would
 // make cum[] describe a block that is not there.
-func (e *ckptEmit) emitAtPosition(b []byte, atZero bool, write bool) []byte {
-	startState := e.dp.wasmMidStart
-	if atZero {
-		startState = e.dp.wasmStart
-	}
+func (e *ckptEmit) emitAtPosition(b []byte, startState uint32, write bool) []byte {
 	if e.proj == nil {
 		b = e.get(b, e.lCur)
 		b = e.konst(b, int32(startState)*e.rowBytes)
@@ -491,15 +510,52 @@ func (e *ckptEmit) emitAtPosition(b []byte, atZero bool, write bool) []byte {
 	return b
 }
 
-// emitAtPositionGuarded picks the begin-anchored start state at position 0 and
-// the mid one elsewhere.
+// emitAtPositionGuarded picks the start state a walk from lPos begins in, as
+// the forward body's emitSetEntryState does: the begin-anchored one at position
+// 0, and elsewhere the mid one — or, for a column with a boundary channel, the
+// one the byte BEFORE lPos selects: a word byte, else a '\n', else neither.
+// The word test fronts the newline test for the reason emitSetEntryState gives:
+// '\n' is never a word byte, and a first-match switch on the two channels
+// once left a set carrying both unable to reach the newline state.
 func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
 	b = e.get(b, e.lPos)
 	b = append(b, 0x45) // i32.eqz
 	b = append(b, 0x04, 0x40)
-	b = e.emitAtPosition(b, true, write)
+	b = e.emitAtPosition(b, e.dp.wasmStart, write)
 	b = append(b, 0x05)
-	b = e.emitAtPosition(b, false, write)
+	prevByte := func(b []byte) []byte {
+		b = e.get(b, e.pPtr)
+		b = e.get(b, e.lPos)
+		b = append(b, 0x6A)
+		b = e.konst(b, 1)
+		b = append(b, 0x6B)
+		return appendInputLoad8u(b)
+	}
+	midOrNewline := func(b []byte) []byte {
+		if !e.dp.hasNewlineBoundary {
+			return e.emitAtPosition(b, e.dp.wasmMidStart, write)
+		}
+		b = prevByte(b)
+		b = e.konst(b, '\n')
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = e.emitAtPosition(b, e.dp.wasmMidStartNewline, write)
+		b = append(b, 0x05)
+		b = e.emitAtPosition(b, e.dp.wasmMidStart, write)
+		return append(b, 0x0B)
+	}
+	if e.dp.hasWordChar {
+		b = e.konst(b, e.dp.wordCharTableOff)
+		b = prevByte(b)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, e.tableMem) // wordChar[input[lPos-1]]
+		b = append(b, 0x04, 0x40)
+		b = e.emitAtPosition(b, e.dp.wasmMidStartWord, write)
+		b = append(b, 0x05)
+		b = midOrNewline(b)
+		b = append(b, 0x0B)
+	} else {
+		b = midOrNewline(b)
+	}
 	b = append(b, 0x0B)
 	return b
 }
@@ -764,6 +820,7 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	// The layout is computed in i64 (see the prologue): nb*cellBytes passes
 	// 2^31 at a stride of 1 on a large input with a wide column.
 	lCnt64, lBlk64 := a.I64(), a.I64()
+	e.allocBoundary(a)
 
 	cellBytes := e.colBytes()
 
@@ -1045,6 +1102,7 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	lNextCkpt := a.I32()
 	e.lRowBase, e.lBlkBase, e.lMask = a.I32(), a.I32(), a.I32()
 	e.lMidMask, e.lEofMask = a.I64(), a.I64()
+	e.allocBoundary(a)
 
 	cellBytes := e.colBytes()
 
@@ -1305,16 +1363,39 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 	b = append(b, 0x0D, 0x01)
 	b = e.konst(b, e.succOff)
 	b = e.get(b, e.lState)
+	if !e.dp.l.useU8 {
+		b = e.konst(b, 1)
+		b = append(b, 0x74) // i32.shl: two bytes per 16-bit id
+	}
 	b = append(b, 0x6A)
 	b = emitOverlapDPTransition(b, e.dp, e.tableMem, e.lState, e.lCell, e.lNext)
 	b = e.get(b, e.lNext)
-	b = appendTableStore8(b, e.tableMem)
+	if e.dp.l.useU8 {
+		b = appendTableStore8(b, e.tableMem)
+	} else {
+		b = appendTableStore16(b, e.tableMem)
+	}
 	b = e.get(b, e.lState)
 	b = e.konst(b, 1)
 	b = append(b, 0x6A)
 	b = e.set(b, e.lState)
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B, 0x0B)
+
+	// The byte's boundary classes, once per position, for the accepts below.
+	if e.dp.hasWordChar {
+		b = e.konst(b, e.dp.wordCharTableOff)
+		b = e.get(b, e.lByte)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, e.tableMem)
+		b = e.set(b, e.lIsWord)
+	}
+	if e.dp.hasNewlineBoundary {
+		b = e.get(b, e.lByte)
+		b = e.konst(b, '\n')
+		b = append(b, 0x46)
+		b = e.set(b, e.lIsNL)
+	}
 
 	// Phase 2: one update per CELL, unrolled.
 	for pat := 0; pat < e.numPat; pat++ {
@@ -1324,12 +1405,39 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 				continue
 			}
 			w := int(e.proj.rep[c])
+			has := func(m []uint64) bool { return m != nil && m[w]&bit != 0 }
 			b = e.get(b, e.lCur)
 
 			// w' = succ[rep], at a constant address.
-			b = e.konst(b, e.succOff+int32(w))
-			b = appendTableLoad8u(b, e.tableMem)
+			if e.dp.l.useU8 {
+				b = e.konst(b, e.succOff+int32(w))
+				b = appendTableLoad8u(b, e.tableMem)
+			} else {
+				b = e.konst(b, e.succOff+2*int32(w))
+				b = appendTableLoad16u(b, e.tableMem)
+			}
 			b = e.set(b, e.lNext)
+
+			// A DOMINANT boundary accept is final: once its boundary holds,
+			// the answer is this position whatever the suffix says, as the
+			// forward body writes the tuple and retires the pattern. Read only
+			// for a one-pattern automaton — see overlapDPTables.
+			wDom := e.numPat == 1 && has(e.dp.wDomMasks)
+			nwDom := e.numPat == 1 && has(e.dp.nwDomMasks)
+			if wDom || nwDom {
+				switch {
+				case wDom && nwDom:
+					b = e.konst(b, 1)
+				case wDom:
+					b = e.get(b, e.lIsWord)
+				default:
+					b = e.get(b, e.lIsWord)
+					b = append(b, 0x45) // i32.eqz
+				}
+				b = append(b, 0x04, 0x7F) // if (result i32)
+				b = e.get(b, e.lPos)
+				b = append(b, 0x05)
+			}
 
 			// The suffix answer: prev[projTab[pat][w']]. A dead successor
 			// lands on cell 0, which holds -1 permanently, so the "is it dead"
@@ -1348,12 +1456,42 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 			b = append(b, 0x04, 0x7F)
 			b = e.get(b, e.lVal)
 			b = append(b, 0x05)
-			if e.dp.midMasks[w]&bit != 0 {
+			// No suffix answer: this position, if the state accepts here — on
+			// arrival, or before a byte of the class its boundary accept names.
+			wAcc, nwAcc, nlAcc := has(e.dp.wMasks), has(e.dp.nwMasks), has(e.dp.nlMasks)
+			switch {
+			case e.dp.midMasks[w]&bit != 0 || (wAcc && nwAcc):
 				b = e.get(b, e.lPos)
-			} else {
+			case !wAcc && !nwAcc && !nlAcc:
 				b = e.konst(b, -1)
+			default:
+				or := false
+				push := func(f func([]byte) []byte) {
+					b = f(b)
+					if or {
+						b = append(b, 0x72) // i32.or
+					}
+					or = true
+				}
+				if wAcc {
+					push(func(b []byte) []byte { return e.get(b, e.lIsWord) })
+				}
+				if nwAcc {
+					push(func(b []byte) []byte { return append(e.get(b, e.lIsWord), 0x45) })
+				}
+				if nlAcc {
+					push(func(b []byte) []byte { return e.get(b, e.lIsNL) })
+				}
+				b = append(b, 0x04, 0x7F) // if (result i32)
+				b = e.get(b, e.lPos)
+				b = append(b, 0x05)
+				b = e.konst(b, -1)
+				b = append(b, 0x0B)
 			}
 			b = append(b, 0x0B)
+			if wDom || nwDom {
+				b = append(b, 0x0B) // end if dominant
+			}
 			b = appendTableStore32(b, e.tableMem, uint32(c*4))
 		}
 	}

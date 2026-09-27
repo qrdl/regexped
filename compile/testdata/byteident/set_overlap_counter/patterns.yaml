@@ -1,0 +1,11 @@
+# An overlapping `find` the answer cache serves, over a member that is not
+# provably linear: the walk carries the IN-CALL counter, which bails out to
+# the sweep once the call's walks have cost what the sweep would.
+regexps:
+  - name: p0
+    pattern: '[a-z]+X'
+sets:
+  - name: s
+    find: s_find
+    overlapping: true
+    patterns: all

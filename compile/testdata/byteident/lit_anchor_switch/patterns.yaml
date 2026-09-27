@@ -1,0 +1,6 @@
+# The literal-anchored find WITH the work counter: the part before the literal
+# can contain the literal, so it is not provably linear. Its backward walker
+# stamps where it stopped, so a walk that FAILS is charged too.
+regexps:
+  - pattern: '\w+abc\d'
+    find_func: la_switch_find

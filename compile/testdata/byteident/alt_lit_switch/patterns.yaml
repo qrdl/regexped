@@ -1,0 +1,5 @@
+# The alternation literal-anchored find WITH the work counter: each branch's
+# backward walker and forward verifier stamp where they stopped.
+regexps:
+  - pattern: 'x{3}abc\w*z|y{3}ghi\w*z'
+    find_func: alt_switch_find

@@ -952,8 +952,12 @@ func compileUnionPreflightSetWidth(t *testing.T, pats []string, wide bool) []byt
 		ScanAll:  "cap_scan_all",
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	w, _, diags, err := compile.CompileFileDiag(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	// NoSplit: these members are not provably linear in a set's bodies, and a
+	// gated `find` would serve them outside the buckets — where no preflight
+	// runs. The bucket body still serves them wherever the split does not
+	// apply (a batching set), so the preflight is still reached in production.
+	w, _, diags, err := compile.CompileFileOpts(
+		config.BuildConfig{Regexps: entries, Sets: sets}, "", compile.CompileSetOptions{NoSplit: true})
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}

@@ -154,6 +154,10 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			litSet:            br.lap.litSet,
 			backScanBody:      bsBody,
 			forwardVerifyBody: fvBody,
+			revL:              revL,
+			revTable:          revTable,
+			fwdL:              l,
+			fwdTable:          table,
 		})
 		allLits = append(allLits, br.lap.litSet...)
 
