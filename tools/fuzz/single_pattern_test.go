@@ -2437,6 +2437,14 @@ var findStrategyShapes = []struct {
 	// Its start-anywhere automaton is over the state limit (2^11 states for
 	// `a[ab]{11}`), so the switch hands over to the Backtracking find.
 	{`a[ab]{11}c[a-z]*X`, "abbbbbbbbbbbc", "abbbbbbbbbbbcX", nil},
+	// Quadratic under today's find with or without a hint, and a hint does not
+	// change its body: it has to be switched under all three modes.
+	{`<[^>]+>`, "<", "<b>", nil},
+	// Under prefer-no-match its body carries a NEUTRAL TWIN (no mandatory
+	// literal, a first-byte set in the adaptive Shufti band): on its run every
+	// byte is a candidate, so the hinted body hands the call to the twin,
+	// whose own counter then trips.
+	{`[a-zA-Z][^;]*[;,]`, "a", "a;", nil},
 }
 
 // hasEmptyWidthAssertion reports whether pat carries \b, \B, ^, $, \A or \z,
@@ -2469,6 +2477,10 @@ func hasEmptyWidthAssertion(pat string) bool {
 // position, against the whole-input Go oracle. The long inputs are worst-case
 // runs, which is what trips the counter, so the handover to the start-anywhere
 // find is exercised mid-call and not only on its first attempt.
+//
+// The hinted rows exist because a hint changes the body the counter is added
+// to — under prefer-no-match, sometimes into a pair, the hinted body and the
+// neutral twin it hands the call to, each with a counter of its own.
 func TestFindStrategiesMatchGo(t *testing.T) {
 	strategies := []struct {
 		name string
@@ -2479,6 +2491,10 @@ func TestFindStrategiesMatchGo(t *testing.T) {
 		{"start-anywhere", compile.CompileOptions{StartAnywhereFind: true}, "find: start-anywhere"},
 		{"switch-n1", compile.CompileOptions{StartAnywhereSwitchN: 1}, "find: switch"},
 		{"classifier", compile.CompileOptions{}, "find: "},
+		{"switch-n1/prefer-match", compile.CompileOptions{StartAnywhereSwitchN: 1, LikelyMode: compile.LikelyMatch}, "find: switch"},
+		{"switch-n1/prefer-no-match", compile.CompileOptions{StartAnywhereSwitchN: 1, LikelyMode: compile.LikelyNoMatch}, "find: switch"},
+		{"classifier/prefer-match", compile.CompileOptions{LikelyMode: compile.LikelyMatch}, "find: "},
+		{"classifier/prefer-no-match", compile.CompileOptions{LikelyMode: compile.LikelyNoMatch}, "find: "},
 	}
 	rng := rand.New(rand.NewSource(105))
 	for _, c := range findStrategyShapes {
@@ -2548,7 +2564,9 @@ func TestFindStrategiesMatchGo(t *testing.T) {
 // run. It is measured in fuel over the whole iteration at two lengths 4×
 // apart — linear grows ~4×, quadratic ~16× — so a counter that stopped
 // charging some walk (the literal-anchored find's failed backward walks, say)
-// fails here even though every answer it gives is still right.
+// fails here even though every answer it gives is still right. Under every
+// hint too: a hinted pattern kept today's find unswitched once, and `<[^>]+>`
+// was quadratic under both hints while linear without one.
 func TestFindStrategiesLinear(t *testing.T) {
 	cfg := wasmtime.NewConfig()
 	cfg.SetConsumeFuel(true)
@@ -2587,25 +2605,32 @@ func TestFindStrategiesLinear(t *testing.T) {
 		left, _ := st.GetFuel()
 		return uint64(1<<62) - left
 	}
+	modes := []struct {
+		name string
+		lm   compile.LikelyMode
+	}{{"neutral", compile.LikelyNeutral}, {"prefer-match", compile.LikelyMatch}, {"prefer-no-match", compile.LikelyNoMatch}}
 	for _, c := range findStrategyShapes {
-		t.Run(c.pat, func(t *testing.T) {
-			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true)
-			if err != nil {
-				t.Fatal(err)
-			}
-			mod, err := wasmtime.NewModule(engine, w)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer mod.Close()
-			runs := []string{strings.Repeat(c.fill, 4096/len(c.fill)), strings.Repeat(c.fill, 16384/len(c.fill))}
-			if len(c.extra) > 0 {
-				runs = []string{"a" + strings.Repeat("b", 4096), "a" + strings.Repeat("b", 16384)}
-			}
-			small, large := fuelFor(mod, runs[0]), fuelFor(mod, runs[1])
-			if ratio := float64(large) / float64(small); ratio > 8 {
-				t.Errorf("fuel grew %.1f× for a 4× longer worst-case run (%d → %d): quadratic", ratio, small, large)
-			}
-		})
+		for _, m := range modes {
+			t.Run(c.pat+"/"+m.name, func(t *testing.T) {
+				w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true,
+					compile.CompileOptions{LikelyMode: m.lm})
+				if err != nil {
+					t.Fatal(err)
+				}
+				mod, err := wasmtime.NewModule(engine, w)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer mod.Close()
+				runs := []string{strings.Repeat(c.fill, 4096/len(c.fill)), strings.Repeat(c.fill, 16384/len(c.fill))}
+				if len(c.extra) > 0 {
+					runs = []string{"a" + strings.Repeat("b", 4096), "a" + strings.Repeat("b", 16384)}
+				}
+				small, large := fuelFor(mod, runs[0]), fuelFor(mod, runs[1])
+				if ratio := float64(large) / float64(small); ratio > 8 {
+					t.Errorf("fuel grew %.1f× for a 4× longer worst-case run (%d → %d): quadratic", ratio, small, large)
+				}
+			})
+		}
 	}
 }

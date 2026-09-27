@@ -89,8 +89,10 @@ regexped/
 │   │                          #   a failed walk of <= 32 bytes is not charged at all, which
 │   │                          #   took bt-find-prefix from +14.5% to +5.4% fuel) and
 │   │                          #   handing over through a -3 sentinel the dispatcher consumes.
-│   │                          #   Hinted patterns outside the two leading-repeat shapes keep
-│   │                          #   today's find byte for byte. ASSERTIONS: failedWalkBound
+│   │                          #   A HINT never keeps today's find unswitched: a hinted body
+│   │                          #   takes the counter too, and a prefer-no-match body's
+│   │                          #   NEUTRAL TWIN carries its own, so the handoff between
+│   │                          #   them keeps the find linear. ASSERTIONS: failedWalkBound
 │   │                          #   counts an accept an assertion conditions only where the
 │   │                          #   condition can hold (a walk FAILS only at a dead byte that
 │   │                          #   misses it, or at EOF without an EOF accept), and the

@@ -94,16 +94,17 @@ provably linear — see
 
 - `prefer-match` on a pattern that starts with an unbounded run of a word-like
   class and has no literal to scan for (`\w+@\w+`) keeps the ordinary find,
-  which is faster on match-dense text; without it the pattern gets the
-  start-anywhere find, which is linear on every input and much faster when
-  matches are rare.
+  which is faster on match-dense text, with the work counter that keeps it
+  linear; without it the pattern gets the start-anywhere find, which is linear
+  on every input and much faster when matches are rare.
 - `prefer-no-match` on a pattern that starts with an unbounded run including
   the space byte (`[^,]*,`) gets the start-anywhere find alone; without it the
   pattern gets the ordinary find with a work counter.
-- On any other pattern that is not provably linear, a hint keeps the ordinary
-  find exactly as it was — without the work counter an unhinted pattern gets —
-  so a long run that keeps an attempt alive without matching stays quadratic
-  for it. If your input can contain such runs, leave the hint off.
+- On any other pattern that is not provably linear, a hinted pattern gets
+  what an unhinted one gets: the ordinary find — tuned by the hint — with the
+  work counter, so a find is linear on every input whatever its hints. The
+  counter costs up to ~5% on match-dense text and nothing measurable on
+  no-match text.
 
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.

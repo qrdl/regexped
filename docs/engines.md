@@ -256,10 +256,9 @@ a replacement. The compiler picks per pattern, at compile time:
 |---|---|
 | provably linear: a failed attempt walks a bounded number of bytes (no reachable cycle on which it keeps going without accepting and from which it can still end that way — an accept an assertion conditions counts only where its condition can hold); or, without an assertion, both find-body shape detectors apply, or for a literal-anchored find neither the part before the literal nor the part after it can contain it | the ordinary find, unchanged |
 | anchored at 0 | the ordinary find |
-| starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` keeps the ordinary find |
+| starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` picks the switch, which keeps the ordinary find |
 | starts with such a repeat that includes the space byte (`[^,]*,`) | the switch (below); `prefer-no-match` picks the start-anywhere find alone |
-| anything else not provably linear, no hint | the **switch** |
-| anything else not provably linear, with a hint | the ordinary find |
+| anything else not provably linear, with or without a hint | the **switch** |
 
 **The switch** is the ordinary find plus a work counter, with the start-anywhere
 find beside it. The counter adds up the bytes walked by attempts that FAILED;

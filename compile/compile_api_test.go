@@ -2572,13 +2572,15 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		{`\w+@\w+\.com`, nil, "today"},
 		{`foo[a-z]+`, nil, "today"},
 		{`[0-9]{3}-[0-9]{4}`, nil, "today"},
-		// The hints.
-		{`\w+@\w+`, []string{"prefer-match"}, "today"},
+		// The hints. A hint never keeps today's find unswitched: prefer-match
+		// keeps today's BODY under the leading word repeat, with the counter.
+		{`\w+@\w+`, []string{"prefer-match"}, "switch"},
 		{`\w+@\w+`, []string{"prefer-no-match"}, "start-anywhere"},
 		{`[^,]*,`, []string{"prefer-no-match"}, "start-anywhere"},
 		{`[^,]*,`, []string{"prefer-match"}, "switch"},
-		{`a*b`, []string{"prefer-match"}, "today"},
-		{`a*b`, []string{"prefer-no-match"}, "today"},
+		{`a*b`, []string{"prefer-match"}, "switch"},
+		{`a*b`, []string{"prefer-no-match"}, "switch"},
+		{`[a-zA-Z][^;]*[;,]`, []string{"prefer-no-match"}, "switch"}, // with a neutral twin
 		// Empty-width assertions: classified like any pattern, the accept
 		// conditions taken into account. `\b\w+@\w+\b` and `a+$` / `a+\b`
 		// (every attempt over `a`×N then `b` walks the run and fails) get the

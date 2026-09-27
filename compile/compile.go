@@ -2204,9 +2204,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					}
 				}
 				if sw != nil {
-					if p.findNeutralBody != nil {
-						panic("compile: start-anywhere switch with a neutral twin")
-					}
+					// A prefer-no-match body's NEUTRAL TWIN is built from the
+					// same layout, so it carries the counter too, and the
+					// handoff seeds find_from with the twin's first start: the
+					// twin's budget counts its own part of the call, and its
+					// sentinel returns through the handoff to the dispatcher.
 					p.saFwdBody, p.saRevBody, p.saBT, p.saCtx = sw.saFwdBody, sw.saRevBody, sw.saBT, sw.saCtx
 					p.dataBytes = append(p.dataBytes, sw.dataBytes...)
 					p.dataSegCount += sw.dataSegCount

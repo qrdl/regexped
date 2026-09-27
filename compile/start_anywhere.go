@@ -44,8 +44,7 @@ import (
 //     detectors apply, or the literal-anchored find's parts around its literal
 //     cannot contain that literal (litAnchorLinear) — the last two only for a
 //     pattern with no empty-width assertion, since they reason about accepts
-//     without the context one puts on them. Also for a hinted pattern outside
-//     the two shapes below, and a pattern anchored at 0.
+//     without the context one puts on them. Also for a pattern anchored at 0.
 //   - THE START-ANYWHERE FIND ALONE for two shapes, both starting with an
 //     unbounded repeat of a class common in prose (byte-rarity score ≥ 40, the
 //     Shufti threshold): without the space byte and with no literal to scan
@@ -223,15 +222,22 @@ func classifyFind(in findClassInput) (findStrategy, string) {
 			return findSwitch, "leading repeat crosses words"
 		}
 		if !in.literal {
+			// prefer-match keeps today's body, which is what the hint tuned,
+			// and adds the counter: the start-anywhere find alone measured
+			// 15× today's fuel on `[a-z]{50,}[0-9]` over match-dense input,
+			// the counter +0.25%.
 			if in.lm == LikelyMatch {
-				return findToday, "leading word repeat, prefer-match"
+				return findSwitch, "leading word repeat, prefer-match"
 			}
 			return findNewSearch, "leading word repeat, no literal to scan for"
 		}
 	}
-	if in.lm != LikelyNeutral {
-		return findToday, "hinted"
-	}
+	// A hinted pattern takes the switch like any other: its hint tunes today's
+	// body, which the switch keeps, and the counter is what makes it linear.
+	// Keeping today's find alone left `<[^>]+>` quadratic under either hint
+	// (1.4 billion fuel over 8 KB of `<`, against 372 thousand switched) for a
+	// body the hint had not changed at all; the counter costs +0.7% to +4.5%
+	// on match-dense input and nothing measurable on no-match.
 	return findSwitch, "not provably linear"
 }
 
