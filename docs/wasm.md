@@ -36,7 +36,7 @@ The same two values apply to the `i64` find exports, sign-extended (`i64.const -
 
 For the `_batch` exports, which return a match **count**, `-2` appears as a negative count; a successful call always returns a count ≥ 0. Returning the count collected so far would be a silent truncation the host could not distinguish from a completed scan.
 
-`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling). A Backtracking call that outgrows its compile-time regions hands itself to a fallback body that sizes its memory from the input, so `-2` means linear memory could not grow far enough — WASM32's 4 GiB, or a lower limit the host set — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
+`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling). A Backtracking capture body claims its frame stack when a call starts and grows it with the search, and any Backtracking call that outgrows its stack hands itself to a fallback body that sizes its memory from the input, so `-2` means linear memory could not grow far enough — WASM32's 4 GiB, the config's `max_memory` (declared as the memory's maximum), or a lower limit the host set — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
 
 `$from` on the capture exports means what it means on `$find`: where the
 SEARCH starts, with `$ptr`/`$len` still describing the whole input. Slot
@@ -72,10 +72,11 @@ not have the global and need nothing.
 
 **Why it exists.** A standalone module has one memory, and the host has no
 other way to pass data: it writes its input, and the buffers it reads answers
-from, into the module's exported `memory`. A Backtracking call that needs more
-room than its compile-time regions — see [engines.md](engines.md) "Work budget
-and the fallback body" — also works in that same memory, and it cannot tell
-which parts of it the host is using. The exported mutable `i32` global
+from, into the module's exported `memory`. A Backtracking call also works in
+that same memory — a `groups_func` search keeps its frame stack there on EVERY
+call, and any search that outgrows its stack continues in a fallback whose
+memory is sized from the input (see [engines.md](engines.md) "Work budget and
+the fallback body") — and it cannot tell which parts of it the host is using. The exported mutable `i32` global
 **`regexped:scratch_base`** is how the host tells it: "everything from this
 address up is free while a call runs".
 
@@ -101,7 +102,9 @@ last one did.
 
 **If you leave it at 0** (its initial value), answers stay correct, but every
 call that needs this working memory takes new pages at the end of memory, and
-WebAssembly memory never shrinks. Measured with perftest's html-tags pattern
+WebAssembly memory never shrinks. A Backtracking `groups_func` call always
+needs it: each one takes at least its frame stack's starting size, so such a
+host's memory grows on every call until it reaches 4 GiB or `max_memory`. Measured with perftest's html-tags pattern
 (`groups_func`) looping over the tags of a 10 KB HTML page, one call per tag:
 
 | documents processed | memory, global at 0 | memory, global set |

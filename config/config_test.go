@@ -112,6 +112,136 @@ func TestLoadConfigNotFound(t *testing.T) {
 	}
 }
 
+// TestParseMemorySize pins max_memory's spelling: KB/MB/GB are powers of 1,000
+// and KiB/MiB/GiB powers of 1,024, in any letter case, with or without a space;
+// fractions are allowed and the product is rounded down to whole bytes, and
+// then to whole 64 KiB pages.
+func TestParseMemorySize(t *testing.T) {
+	cases := []struct {
+		in    string
+		bytes uint64
+		pages uint32
+	}{
+		{"0", 0, 0},
+		{"65535", 65535, 0},
+		{"65536", 65536, 1},
+		{"1048576", 1 << 20, 16},
+		{"100KB", 100_000, 1},
+		{"100kb", 100_000, 1},
+		{"100MB", 100_000_000, 1525},
+		{"100 MB", 100_000_000, 1525},
+		{"100mb", 100_000_000, 1525},
+		{"1GB", 1_000_000_000, 15258},
+		{"64KiB", 64 << 10, 1},
+		{"100Mib", 100 << 20, 1600},
+		{"100MIB", 100 << 20, 1600},
+		{"2GiB", 2 << 30, 32768},
+		{"1.5GB", 1_500_000_000, 22888},
+		{"0.1GB", 100_000_000, 1525}, // exact: not one byte short
+		{".5MiB", 1 << 19, 8},
+		{"1.MiB", 1 << 20, 16},
+		{"1.5", 1, 0}, // a bare number is bytes, rounded down
+		{"  128KiB  ", 128 << 10, 2},
+		{"4GiB", 4 << 30, 65536},
+	}
+	for _, c := range cases {
+		m, err := ParseMemorySize(c.in)
+		if err != nil {
+			t.Errorf("ParseMemorySize(%q): %v", c.in, err)
+			continue
+		}
+		if !m.IsSet() || m.Bytes() != c.bytes {
+			t.Errorf("ParseMemorySize(%q) = %d bytes (set %v), want %d", c.in, m.Bytes(), m.IsSet(), c.bytes)
+		}
+		if p, clamped := m.Pages(); p != c.pages || clamped {
+			t.Errorf("ParseMemorySize(%q).Pages() = %d (clamped %v), want %d", c.in, p, clamped, c.pages)
+		}
+	}
+	for _, bad := range []string{"", "MB", "-1MB", "+1MB", "1e6", "0x10", "100B", "100TB", "100 M B", "1.5.5GB", "ten MB", "100MBs"} {
+		if _, err := ParseMemorySize(bad); err == nil {
+			t.Errorf("ParseMemorySize(%q) = nil error, want a refusal", bad)
+		}
+	}
+}
+
+// TestMemorySizeAbove4GiB: past what a 32-bit memory can hold the cap is 4 GiB,
+// and Pages says so, so the compiler can warn.
+func TestMemorySizeAbove4GiB(t *testing.T) {
+	for _, in := range []string{"8GB", "4.5GiB", "4294967297", "99999999999999999999999GB"} {
+		m, err := ParseMemorySize(in)
+		if err != nil {
+			t.Fatalf("ParseMemorySize(%q): %v", in, err)
+		}
+		if p, clamped := m.Pages(); p != MaxWasmMemoryPages || !clamped {
+			t.Errorf("ParseMemorySize(%q).Pages() = %d (clamped %v), want %d, clamped", in, p, clamped, MaxWasmMemoryPages)
+		}
+	}
+}
+
+// TestLoadConfigMaxMemory drives max_memory through LoadConfig: unset is no cap,
+// quoted and unquoted values parse, and a malformed one is a LINE-NUMBERED load
+// error, like every other key's.
+func TestLoadConfigMaxMemory(t *testing.T) {
+	load := func(t *testing.T, line string) (BuildConfig, error) {
+		t.Helper()
+		body := "wasm_file: x.wasm\n" + line + "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+		path := filepath.Join(t.TempDir(), "regexped.yaml")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(path)
+	}
+	t.Run("unset", func(t *testing.T) {
+		cfg, err := load(t, "")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MaxMemory.IsSet() {
+			t.Errorf("max_memory absent but set: %+v", cfg.MaxMemory)
+		}
+	})
+	t.Run("null", func(t *testing.T) {
+		cfg, err := load(t, "max_memory:\n")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MaxMemory.IsSet() {
+			t.Errorf("max_memory null but set: %+v", cfg.MaxMemory)
+		}
+	})
+	for _, c := range []struct {
+		line  string
+		bytes uint64
+	}{
+		{"max_memory: 100MB\n", 100_000_000},
+		{"max_memory: \"100 MiB\"\n", 100 << 20},
+		{"max_memory: 1.5gb\n", 1_500_000_000},
+		{"max_memory: 1048576\n", 1 << 20},
+		{"max_memory: 1.5\n", 1},
+	} {
+		t.Run(c.line, func(t *testing.T) {
+			cfg, err := load(t, c.line)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if !cfg.MaxMemory.IsSet() || cfg.MaxMemory.Bytes() != c.bytes {
+				t.Errorf("max_memory = %d bytes (set %v), want %d", cfg.MaxMemory.Bytes(), cfg.MaxMemory.IsSet(), c.bytes)
+			}
+		})
+	}
+	for _, line := range []string{"max_memory: 100XB\n", "max_memory: -5MB\n", "max_memory: [1]\n", "max_memory: true\n", "max_memory: 1e6\n"} {
+		t.Run(line, func(t *testing.T) {
+			_, err := load(t, line)
+			if err == nil {
+				t.Fatal("LoadConfig = nil error, want a refusal")
+			}
+			if !strings.Contains(err.Error(), "[2:") || !strings.Contains(err.Error(), "max_memory") {
+				t.Errorf("error is not a line-numbered max_memory error: %v", err)
+			}
+		})
+	}
+}
+
 func TestPatternSelector_UnmarshalYAML_All(t *testing.T) {
 	var s struct {
 		P PatternSelector `yaml:"patterns"`

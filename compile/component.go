@@ -27,7 +27,8 @@ import (
 // Everything here is emitted ONLY under asmOpts.Component. With it off the
 // assembler must produce today's bytes exactly, which `make byteident` proves.
 
-// asmOpts carries the assembler's component configuration.
+// asmOpts carries the assembler's component configuration, and the memory's
+// maximum.
 //
 // Its ZERO VALUE MEANS MODULE, which is why it is a struct rather than two
 // positional parameters: every existing call site passes asmOpts{} and cannot
@@ -35,6 +36,10 @@ import (
 // `standalone` bool waiting to be transposed. Validation is not implied by the
 // type — see validate.
 type asmOpts struct {
+	// MaxPages is the maximum the module's own memory declares, from
+	// max_memory; 0 declares none. Never below the declared minimum:
+	// memoryMaxPages refuses such a cap before anything is assembled.
+	MaxPages uint32
 	// Component emits the allocator, the post-return and the adapters.
 	Component bool
 	// ComponentPackage is the interface prefix every adapter export name is

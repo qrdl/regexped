@@ -1831,6 +1831,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
 			MaxDFAStates:              cfg.MaxDFAStates,
 			MaxTDFARegs:               cfg.MaxTDFARegs,
+			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
 			BTWorkBudget:              over.BTWorkBudget, // test-only override, as below
 			Component:                 comp.Component,
@@ -1959,6 +1960,11 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			diags = append(diags, *cs.diag)
 		}
 	}
+	maxPages, err := memoryMaxPages(cfg.MaxMemory, moduleDeclPages(memPages, comp.Component))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	comp.MaxPages = maxPages
 	// dataTop, not lastTableEnd. The second return value is "where is it safe
 	// to put input", and lastTableEnd covers only the PER-PATTERN tables — a
 	// caller trusting it on a set-bearing module wrote its input over the
@@ -2304,12 +2310,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// check, so the page has to exist before the first allocation.
 	{
 		var mem []byte
-		mem = append(mem, 0x01, 0x00)
-		declPages := memPages
-		if opts.Component {
-			declPages++
-		}
-		mem = utils.AppendULEB128(mem, uint32(declPages))
+		mem = append(mem, 0x01) // one memory
+		mem = appendMemoryLimits(mem, moduleDeclPages(memPages, opts.Component), opts.MaxPages)
 		out = appendSection(out, 5, mem)
 	}
 

@@ -548,7 +548,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 				// Set BT buckets are driven directly, not through the groups
 				// wrapper, and use window mode — their slots are already absolute.
 				-1,
-				plan.k, plan.fallback, nil, member)
+				plan.k, plan.fallback, nil, member, nil)
 		}
 		if plan.fallback {
 			// Built here like the driver, so its real index is known and the
@@ -558,7 +558,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
 				btNoCaptureFrameSize,
 				true, tableMemIdx, cs.btRegions.winGlobal, -1,
-				0, false, &cs.btRegions.scratch, member)
+				0, false, &cs.btRegions.scratch, member, nil)
 			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
 			call.member = member
 			call.route = !plan.force && member != nil

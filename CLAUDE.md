@@ -472,6 +472,13 @@ stub_file:     "src/stubs.rs"        # stub output file; extension determines ty
 stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
 max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024)
 max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
+max_memory:     100MB                # optional; declared as the module memory's MAXIMUM, so the engine
+                                     #   refuses every grow past it. Unset = no cap. KB/MB/GB = powers of
+                                     #   1,000, KiB/MiB/GiB = 1,024, any case, fractions ok; bare = bytes;
+                                     #   rounded DOWN to 64 KiB pages; >4 GiB → 4 GiB with a warning.
+                                     #   Counts tables, JS/TS input buffers and search working memory; a
+                                     #   search past it answers -2, a JS input that alone does not fit
+                                     #   throws RangeError, static size over it is a compile error
 regexps:
   - pattern: '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'
 

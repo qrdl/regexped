@@ -119,7 +119,9 @@ once, and raise it only if your buffers ever need more room.
 
 **Leaving it at 0 is not safe for a long-running host.** Answers stay correct,
 but every call that needs the working memory takes new pages, and WebAssembly
-memory never shrinks: perftest's html-tags pattern looping over the tags of 10 KB
+memory never shrinks. Every `groups_func` call of a Backtracking pattern needs
+it — its frame stack lives there, so at 0 each call takes at least the stack's starting size — and so does
+any call that reaches the fallback: perftest's html-tags pattern looping over the tags of 10 KB
 HTML pages reached 300 MB after 10 pages and 3.0 GB after 100 on one instance,
 against a flat 1.2 MB with the global set. At 4 GB such calls start answering
 `-2`.

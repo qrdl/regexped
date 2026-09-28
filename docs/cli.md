@@ -41,6 +41,9 @@ max_tdfa_regs:  32         # optional; max TDFA registers before falling back to
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
                            #   A member over it moves to the Backtracking engine, with a warning;
                            #   `compile --verbose` prints each bucket's engine
+max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
+                           #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
+                           #   fractions allowed; a bare number is bytes. See "max_memory:" below
 
 regexps:
   - pattern: 'https?://...' # RE2 regexp pattern
@@ -179,6 +182,47 @@ Setting `groups_func` triggers capture-tracking compilation:
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
+
+### `max_memory:` — a cap on the module's memory
+
+Every pattern and set in a config compiles into ONE module with one memory,
+and WebAssembly memory never shrinks. `max_memory` caps it: the value is
+declared as the memory's **maximum**, so the WebAssembly engine refuses every
+grow past it, whoever asks. Unset — the default — there is no cap.
+
+```yaml
+max_memory: 100MB    # 100,000,000 bytes → 1,525 pages of 64 KiB
+```
+
+**Spelling.** A number, fractions allowed, optionally followed by a unit, with
+or without a space: `100MB`, `100 MB`, `1.5GB`, `64KiB`, `100mib`. `KB`, `MB`
+and `GB` are powers of 1,000; `KiB`, `MiB` and `GiB` powers of 1,024; letter
+case does not matter. A bare number is bytes. The value is rounded **down** to
+whole 64 KiB pages, the unit a memory is declared in. Anything else — a sign,
+an exponent, another unit — is a line-numbered load error.
+
+**What it counts:** all of the module's own memory — its tables, the buffers a
+JS/TS stub copies each input into and reads answers from, and a search's
+working memory (the Backtracking engine's frame stacks and memo). In a merged
+Rust/Go/C build the input lives in the host's memory, so there the cap covers
+the tables and the search's working memory only.
+
+**What happens at the cap:**
+
+- A search that needs more memory than the cap leaves answers "gave up" (`-2`),
+  which every stub reports as an error rather than as "no match" — never a
+  wrong answer.
+- In JS/TS, an input that does not fit under the cap by itself makes the call
+  **throw** a `RangeError` ("Maximum memory size exceeded") before any search
+  runs — for every pattern, whatever its engine. `init()` grows memory by two
+  pages, so a cap only just above the tables compiles but makes `init()` throw.
+- In a component, the allocator traps when an input does not fit.
+- A module whose tables — plus the stacks the Backtracking `match_func` and
+  `find_func` paths still reserve at compile time — are already over the cap is
+  a **compile error** naming the cap and the size. A value below 64 KiB rounds
+  down to 0 pages and always gets it.
+- A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
+  4 GiB, with a compile warning saying so.
 
 ### `byte_mode:` — matching raw bytes above 127
 

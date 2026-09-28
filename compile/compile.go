@@ -116,6 +116,41 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 	return nil
 }
 
+// ErrMemoryCapTooSmall is the compile error for a max_memory below what the
+// module needs before any call runs: its tables, and every stack a path still
+// reserves at compile time. A memory whose minimum is above its maximum does
+// not validate, so without this the module would fail at load, with a message
+// about memory limits rather than about the config.
+var ErrMemoryCapTooSmall = errors.New("compile: max_memory is below the module's static memory")
+
+// memoryMaxPages resolves max_memory for a module that declares declPages
+// pages: the maximum its memory declares, 0 meaning none. A value above what a
+// 32-bit memory can hold is treated as that much, with a warning — it caps
+// nothing, but the user asked for a cap and should know it is not one.
+func memoryMaxPages(m config.MemorySize, declPages int32) (uint32, error) {
+	if !m.IsSet() {
+		return 0, nil
+	}
+	pages, clamped := m.Pages()
+	if clamped {
+		slog.Warn("max_memory is above 4 GiB, the most a WebAssembly memory can hold; treating it as 4 GiB",
+			"max_memory", m.String())
+	}
+	if int64(pages) < int64(declPages) {
+		return 0, fmt.Errorf("%w: max_memory %s rounds down to %s (%d bytes), but the module needs %s (%d bytes) before any call — its tables and every region reserved at compile time",
+			ErrMemoryCapTooSmall, m.String(), pagesOf(int64(pages)), int64(pages)*65536, pagesOf(int64(declPages)), int64(declPages)*65536)
+	}
+	return pages, nil
+}
+
+// pagesOf spells a page count for a message.
+func pagesOf(n int64) string {
+	if n == 1 {
+		return "1 page of 64 KiB"
+	}
+	return fmt.Sprintf("%d pages of 64 KiB", n)
+}
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -294,6 +329,17 @@ type CompileOptions struct {
 	// existed; BTWorkBudgetForceFallback → the fallback answers every call.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTWorkBudget int
+	// BTStackStart is how many bytes a Backtracking CAPTURE body's frame stack
+	// is given when a call starts, before it first doubles; 0 means
+	// defaultBTStackStart. The stack lives in the run-time scratch region, not
+	// in the module's tables, so this is claimed per call and only where memory
+	// does not already have it. A measurement knob.
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	BTStackStart int
+	// MaxMemory is the config's max_memory: the module's memory declares it as
+	// its maximum, and a module whose static memory already exceeds it does not
+	// compile. The zero value is no cap.
+	MaxMemory config.MemorySize
 
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
@@ -2158,25 +2204,16 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 		bt := newBacktrack(prog)
 
-		// Stack placed directly after all find-mode DFA and lit-anchor tables.
-		// p.tableEnd includes lit-anchor reversed-DFA and SIMD tables when active;
-		// using l.tableEnd would overlap those tables and corrupt them at runtime.
+		// Nothing is reserved in the tables for this body: its frame stack is
+		// placed at call time, in the run-time scratch region, and grows with the
+		// search (btGrowth) — and the fallback's memo and stack are sized at call
+		// time too (bt_scratch.go). The tables stay page-aligned, as they were
+		// when the stack sat directly after them.
 		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
 		frameSize := 4 + numCapLocs*4 + 4 // pos, captures, retryPC
-		maxFrames := bt.numAlts * 4096
-		if maxFrames < 4096 {
-			maxFrames = 4096
-		}
-		stackSize := maxFrames * frameSize
 
-		// The fallback's memo and stack are sized at call time
-		// (bt_scratch.go), so only the fast body's stack is reserved — and
-		// nothing when the fast body is the bare tail call.
 		plan := planBT(bt, buildOpts.BTWorkBudget)
-		if plan.force {
-			stackSize = 0
-		}
 
 		// Window mode: patterns whose assertions are defined against the
 		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
@@ -2193,11 +2230,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// eight bytes never decided a verdict.
 		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
 
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)); err != nil {
+		if err := checkBTMemoryBudget(btBase, 0); err != nil {
 			return nil, err
 		}
-		stackBase := int32(btBase)
-		stackLimit := stackBase + int32(stackSize)
 
 		// The window offsets are two module globals, so no table region is
 		// reserved for them any more.
@@ -2209,10 +2244,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			winGlobal = int32(buildOpts.globals.Alloc())
 			buildOpts.globals.Alloc() // endOff, at winGlobal+1
 		}
-		// Kept in int64: the reservation's end can pass 2GiB, where an int32
-		// would go negative and hide an over-ceiling reservation from the
-		// tableEnd bookkeeping.
-		p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
+		p.tableEnd = btBase
 
 		p.numGroups = bt.numGroups
 		p.winGlobalP1 = winGlobal + 1
@@ -2228,17 +2260,46 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if plan.force {
 			p.captureBody, p.captureFallbackCallOffs = btTailCallBody(3)
 		} else {
-			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil)
+			// The same scratch globals as the fallback: the two bodies share
+			// the region, one after the other.
+			growth := &btGrowth{
+				scratch: buildOpts.btScratch(),
+				start:   btStackStart(buildOpts.BTStackStart, int32(frameSize)),
+			}
+			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, growth)
 		}
 		if plan.fallback {
 			// The same globals and frame layout as the fast body; its own
 			// run-time memory.
 			scratch := buildOpts.btScratch()
-			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil)
+			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, nil)
 		}
 	}
 
 	return p, nil
+}
+
+// moduleDeclPages is the minimum a module's own memory declares: the pages its
+// tables span, plus, for a component, one for the allocator's free-list heads,
+// which sit at the static top and are written without a bounds check.
+func moduleDeclPages(memPages int32, component bool) int32 {
+	if component {
+		return memPages + 1
+	}
+	return memPages
+}
+
+// appendMemoryLimits appends one memory's limits: the minimum, and the maximum
+// when max_memory set one. With no maximum the bytes are the ones every module
+// has always had.
+func appendMemoryLimits(b []byte, minPages int32, maxPages uint32) []byte {
+	if maxPages == 0 {
+		b = append(b, 0x00) // flags: no maximum
+		return utils.AppendULEB128(b, uint32(minPages))
+	}
+	b = append(b, 0x01) // flags: a maximum follows
+	b = utils.AppendULEB128(b, uint32(minPages))
+	return utils.AppendULEB128(b, maxPages)
 }
 
 // assembleModule builds a single WASM module from multiple compiled patterns.
@@ -2462,14 +2523,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	// standalone modules export it; embedded modules do not (wasm-merge renumbers).
 	{
 		var mem []byte
-		mem = append(mem, 0x01, 0x00)
-		declPages := memPages
-		if opts.Component {
-			// One page for the allocator's free-list heads, which sit at the
-			// static top and are written without a bounds check.
-			declPages++
-		}
-		mem = utils.AppendULEB128(mem, uint32(declPages))
+		mem = append(mem, 0x01) // one memory
+		mem = appendMemoryLimits(mem, moduleDeclPages(memPages, opts.Component), opts.MaxPages)
 		out = appendSection(out, 5, mem)
 	}
 
@@ -2842,7 +2897,13 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts(nil)), lastTableEnd, nil
+	asm := opts.asmOpts(nil)
+	maxPages, err := memoryMaxPages(opts.MaxMemory, moduleDeclPages(memPages, opts.Component))
+	if err != nil {
+		return nil, 0, err
+	}
+	asm.MaxPages = maxPages
+	return assembleModule(compiled, memPages, standalone, globals, asm), lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a
@@ -2885,6 +2946,7 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			MaxMemory:    cfg.MaxMemory,
 			Report:       rep,
 		}
 		standalone := cfg.Output == ""

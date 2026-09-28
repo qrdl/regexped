@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
 )
 
 // BuildConfig is the top-level structure of the YAML config file.
@@ -85,6 +88,11 @@ type BuildConfig struct {
 	Namespace    string `yaml:"namespace"`
 	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
 	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
+	// MaxMemory caps ALL of the module's memory — its tables, the buffers a
+	// JS/TS stub copies inputs into, and a search's working memory — and is
+	// declared as the WASM memory's maximum, so the engine refuses every grow
+	// past it. Unset means no cap. See MemorySize for the spelling.
+	MaxMemory MemorySize `yaml:"max_memory"`
 	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback
 	// bucket in a SET. It is a different budget from MaxDFAStates: that one
 	// bounds a whole single-pattern automaton, this one bounds one bucket of
@@ -900,6 +908,119 @@ func ExpandHome(path string) string {
 		}
 	}
 	return path
+}
+
+// ---------------------------------------------------------------------------
+// max_memory.
+
+// MaxWasmMemoryPages is the most a 32-bit WebAssembly memory can hold: 65,536
+// pages of 64 KiB, 4 GiB — in every output kind, components included. A
+// max_memory above it is treated as it, with a compile warning.
+const MaxWasmMemoryPages = 1 << 16
+
+// wasmPageBytes is one WebAssembly memory page; a cap is rounded DOWN to whole
+// pages, because a memory's maximum is declared in pages.
+const wasmPageBytes = 64 << 10
+
+// MemorySize is a `max_memory:` value: a number, fractions allowed, optionally
+// followed by a unit — KB, MB, GB (powers of 1,000) or KiB, MiB, GiB (powers
+// of 1,024), in any letter case, with or without a space before it. A bare
+// number is bytes. Anything else is a load error.
+//
+// The ZERO VALUE MEANS UNSET — no cap — and is what a config without the key
+// decodes to. That is why "set" is its own field rather than a sentinel byte
+// count: 0 is a value a user can write, and it caps memory at 0 pages, which
+// no module fits under.
+type MemorySize struct {
+	set   bool
+	bytes uint64 // whole bytes, rounded down; saturates at MaxUint64
+	text  string // as written, for messages
+}
+
+// memorySizeRE is the whole grammar: a decimal with an optional fraction, then
+// an optional unit. No sign and no exponent, so a typo cannot read as a size.
+var memorySizeRE = regexp.MustCompile(`^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)[ \t]*([A-Za-z]*)$`)
+
+// memoryUnits maps a lower-cased unit to its size in bytes.
+var memoryUnits = map[string]int64{
+	"":    1,
+	"kb":  1_000,
+	"mb":  1_000_000,
+	"gb":  1_000_000_000,
+	"kib": 1 << 10,
+	"mib": 1 << 20,
+	"gib": 1 << 30,
+}
+
+// ParseMemorySize parses s as a max_memory value. The product is computed
+// exactly, as a rational, so "0.1GB" is 100,000,000 bytes and not one short of
+// it, and only then rounded down to whole bytes.
+func ParseMemorySize(s string) (MemorySize, error) {
+	m := memorySizeRE.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return MemorySize{}, fmt.Errorf("%q is not a size: want a number of bytes, optionally followed by KB, MB, GB, KiB, MiB or GiB (e.g. 100MB)", s)
+	}
+	unit, ok := memoryUnits[strings.ToLower(m[2])]
+	if !ok {
+		return MemorySize{}, fmt.Errorf("%q: unknown unit %q; want KB, MB, GB (powers of 1,000) or KiB, MiB, GiB (powers of 1,024)", s, m[2])
+	}
+	num := m[1]
+	if strings.HasPrefix(num, ".") {
+		num = "0" + num
+	}
+	num = strings.TrimSuffix(num, ".")
+	r, ok := new(big.Rat).SetString(num)
+	if !ok {
+		return MemorySize{}, fmt.Errorf("%q is not a size", s)
+	}
+	r.Mul(r, new(big.Rat).SetInt64(unit))
+	whole := new(big.Int).Quo(r.Num(), r.Denom()) // both non-negative: truncation is rounding down
+	bytes := uint64(math.MaxUint64)
+	if whole.IsUint64() {
+		bytes = whole.Uint64()
+	}
+	return MemorySize{set: true, bytes: bytes, text: strings.TrimSpace(s)}, nil
+}
+
+// UnmarshalYAML implements yaml.NodeUnmarshaler. It takes the NODE, not a
+// decoded value, for two reasons: the value is parsed from the text as written
+// (`1.5GB` and `1048576` alike), and a refusal carries the node's token, which
+// is what makes it a line-numbered error like every other load error. A null
+// value never reaches here and leaves the cap unset, as it leaves every other
+// key at its default.
+func (m *MemorySize) UnmarshalYAML(node ast.Node) error {
+	switch node.(type) {
+	case *ast.StringNode, *ast.IntegerNode, *ast.FloatNode:
+	default:
+		return &yaml.SyntaxError{
+			Message: "max_memory: want a size such as 100MB, got " + node.Type().String(),
+			Token:   node.GetToken(),
+		}
+	}
+	v, err := ParseMemorySize(node.GetToken().Value)
+	if err != nil {
+		return &yaml.SyntaxError{Message: "max_memory: " + err.Error(), Token: node.GetToken()}
+	}
+	*m = v
+	return nil
+}
+
+// IsSet reports whether max_memory was given.
+func (m MemorySize) IsSet() bool { return m.set }
+
+// Bytes is the value in whole bytes, before rounding to pages.
+func (m MemorySize) Bytes() uint64 { return m.bytes }
+
+// String is the value as written.
+func (m MemorySize) String() string { return m.text }
+
+// Pages is the cap in whole 64 KiB pages, rounded down, and whether the value
+// was above MaxWasmMemoryPages and had to be lowered to it.
+func (m MemorySize) Pages() (pages uint32, clamped bool) {
+	if m.bytes > MaxWasmMemoryPages*wasmPageBytes {
+		return MaxWasmMemoryPages, true
+	}
+	return uint32(m.bytes / wasmPageBytes), false
 }
 
 // ---------------------------------------------------------------------------

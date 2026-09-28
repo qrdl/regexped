@@ -252,19 +252,23 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Used for:** `groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
 
-**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's compile-time stack; a call that outgrows it is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
+**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's frame stack — claimed at call time and grown with the search for `groups_func`, reserved at compile time for `match_func` and `find_func`; a call that outgrows it is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
 
 ### How it works
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. The fast body's stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. For `match_func` and `find_func` the fast body's stack is reserved at compile time in WASM linear memory immediately after the DFA tables; for `groups_func` it is claimed when a call starts — see [The capture body's stack](#the-capture-bodys-stack).
 
-**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, the fast body hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next section.
+**Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, a capture body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
+
+### The capture body's stack
+
+A `groups_func` body used to reserve its stack like the others — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input: a pattern with many branches claimed megabytes to match ten bytes. It reserves nothing now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size, growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. When memory cannot grow, the body hands over to the fallback as a full fixed stack does.
 
 ### Frame budget and the `-2` sentinel
 
-The fast body's backtrack stack is sized **at compile time**:
+For `match_func` and `find_func`, the fast body's backtrack stack is sized **at compile time**:
 
 ```
 maxFrames = max(numAlts × 4096, 4096)      # numAlts = InstAlt count in the NFA
@@ -276,7 +280,7 @@ The real requirement, however, scales with **input length**: a pattern that leav
 
 When that stack runs out, the fast body does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body, whose stack grows with the input (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff`, a test knob, still stops at this ceiling.
 
-The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, or a lower limit the host set), or, with the budget off, the compile-time stack ran out. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
+The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, the config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), or a lower limit the host set), or, with the budget off, the compile-time stack ran out or a capture body's stack could not grow. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
 
 | value | meaning |
 |---|---|
@@ -334,11 +338,11 @@ The ordinary (fast) body memoises nothing and carries **no loop guard**. It runs
 
 **Memory layout:**
 ```
-[DFA find tables] → [backtrack stack]
+[DFA find tables] → [backtrack stack]      # match_func / find_func; a groups_func stack is at the scratch base
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region. The fallback body's run-time memory lies outside all of them; see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from).
 
-**Thread safety:** the backtrack stack is allocated at a fixed compile-time address, and the fallback's scratch is found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
+**Thread safety:** a `match_func`/`find_func` backtrack stack is allocated at a fixed compile-time address, and a `groups_func` stack and the fallback's scratch are found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
 
 ### Work budget and the fallback body
 
@@ -360,8 +364,8 @@ popped as the search goes, so it is never exhausted.
    runs in window mode. A call that never backtracks pays nothing for it.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
-   compile-time frame stack runs out, which arms the counter to trip on the next
-   pop. It is the same emitter over the same program with a `(pc, pos)` visited
+   frame stack runs out (a compile-time one, or a capture body's growing one
+   when memory cannot grow), which arms the counter to trip on the next pop. It is the same emitter over the same program with a `(pc, pos)` visited
    bitset at EVERY alternation — Go `regexp`'s bitstate discipline. It restarts
    the call from scratch on the caller's own arguments and globals, and sizes
    its own frame stack and bitset from the input at call time.
@@ -445,6 +449,9 @@ fast body's descent plus the fallback's whole run.
 
 #### Where the fallback's memory comes from
 
+A capture body's ordinary stack is placed at the same base, on every call; the
+fallback only ever runs after it has handed over, so the two share the region.
+
 The fallback sizes its memory at the head of the call — a find body at its first
 attempt, so a call with no candidate never touches it — from the span the search
 covers (the input, the window, or `len − from` for a find):
@@ -494,7 +501,7 @@ by 7,984 pages with the host global at 0; with it, 58,597,434 fuel and one page.
 `-2` remains only where memory cannot grow: the memo must fit below WASM32's
 4 GiB (`numInstructions × inputLen / 8` bytes, so a 20,000-instruction program
 over a 1.7 MB input is already too much), and the stack must fit beside it, or
-the host has set a lower limit.
+the config's `max_memory` or the host has set a lower limit.
 
 **Knobs.** `CompileOptions.BTWorkBudget` and `CompileSetOptions.BTWorkBudget`,
 neither reachable from YAML: `0` is the default multiplier of 8, a positive

@@ -378,6 +378,11 @@ func runGroupsIter(t *testing.T, w []byte, input string, numGroups int) ([][]int
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
+	// Every call of a Backtracking capture body needs run-time scratch; with the
+	// global at 0 each one would take fresh pages.
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		t.Fatal(err)
+	}
 	fn := inst.GetFunc(store, "groups")
 	if fn == nil {
 		t.Fatal("module has no groups export")
@@ -1571,6 +1576,10 @@ func TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall(t *testing.T) {
 			defer release()
 			if err != nil {
 				t.Fatalf("instantiate: %v", err)
+			}
+			// Three calls on one instance: see runGroupsIter.
+			if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+				t.Fatal(err)
 			}
 			copy(mem.UnsafeData(store)[pathsInputBase:], input)
 

@@ -164,8 +164,8 @@ func btLocalGet(b []byte, idx uint32) []byte {
 // appendBacktrackCodeEntry appends a size-prefixed capture body. callOffs are
 // the byte offsets, within the returned slice, of the fallback calls'
 // placeholder immediates (none when the body makes no such call).
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember) (out []byte, callOffs []int) {
-	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (out []byte, callOffs []int) {
+	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member, growth)
 	sized, offs := btSizePrefix(body, offs)
 	return append(cs, sized...), btShiftOffs(offs, len(cs))
 }
@@ -204,16 +204,25 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // through the globals fallback names (bt_scratch.go). stackBase and stackLimit
 // are then unused.
 //
+// growth non-nil gives the ORDINARY body its frame stack at call time instead
+// of the fixed region stackBase..stackLimit (see btGrowth): placed through the
+// fallback's scratch arrangement, started at growth.start bytes, doubled when
+// full. The capture path asks for it; a set member does not.
+//
 // Neither body carries a loop guard. The ordinary body runs only programs
 // without a zero-width cycle (planBT), where no guard can fire; the fallback's
 // memo is what terminates it on the others.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember) (_ []byte, callOffs []int) {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (_ []byte, callOffs []int) {
 	if member != nil && winGlobal < 0 {
 		panic("compile: a set member's Backtracking body runs in window mode")
 	}
 	if fallback != nil {
 		workK = 0
 		tripCalls = false
+		growth = nil
+	}
+	if growth != nil && member != nil {
+		panic("compile: a set member's ordinary Backtracking body keeps its fixed stack")
 	}
 
 	prog := bt.prog
@@ -262,6 +271,11 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 			dyn.origin, dyn.memoEnd = dynBase+4, dynBase+5
 			totalLocals += 2
 		}
+	} else if growth != nil {
+		dyn = newBTGrowDyn(growth, tableMemIdx, frameSize)
+		dynBase := uint32(3 + totalLocals)
+		dyn.stackBase, dyn.stackTop = dynBase, dynBase+1
+		totalLocals += 2
 	}
 
 	var body []byte
@@ -339,6 +353,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
 	}
 
+	// ── Growing frame stack (ordinary capture body) ─────────────────────────
+	// Placed before the work budget is set: the entry arithmetic borrows the
+	// work counter's i64 local, which the budget then overwrites.
+	if dyn != nil && dyn.grow {
+		body = emitBTGrowStackInit(body, dyn, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
+		body = btLocalGet(body, dyn.stackBase)
+		body = append(body, 0x21, localSP) // local.set sp
+	}
+
 	// ── Work budget ─────────────────────────────────────────────────────────
 	// Over the WINDOW in window mode, not the input: a composed groups call
 	// runs this body once per match, and a budget sized from the whole input
@@ -369,7 +392,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		}
 		return append(b, 0x20, localLen)
 	}
-	if dyn != nil {
+	if dyn != nil && !dyn.grow {
 		if dyn.member != nil {
 			body = emitBTScratchInitMember(body, dyn, winStartLocal, winEndLocal, btWorkTripI32)
 		} else {
@@ -612,7 +635,7 @@ func emitBTInstHandler(
 		// first visit would already have returned. Every cycle in a
 		// syntax.Prog passes through an Alt, and an Alt is entered at a given
 		// pos at most once per call.
-		if dyn != nil {
+		if dyn != nil && !dyn.grow {
 			body = emitBitStateGuardDyn(body, dyn, p, memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
 		}
 		body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx, dyn)
@@ -1293,18 +1316,28 @@ func btWorkTripI32(b []byte) []byte {
 // instead of giving up, and overflowFn runs only when memory cannot grow — it
 // must then leave the function by `return`, since the branch depth it is handed
 // does not count the guard's own nesting.
+//
+// dyn.grow is the ORDINARY capture body's growing stack: the guard grows memory
+// too, and overflowFn — the body's usual overflow, which may branch — runs when
+// it cannot, handed a depth that does count the guard's extra block.
 func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int, dyn *btDyn) []byte {
-	overflow := func(b []byte) []byte {
-		if overflowFn != nil {
-			return overflowFn(b, brDepth)
+	overflowAt := func(depth uint32) func([]byte) []byte {
+		return func(b []byte) []byte {
+			if overflowFn != nil {
+				return overflowFn(b, depth)
+			}
+			b = append(b, 0x41) // i32.const abi.BTStackOverflow
+			b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+			return append(b, 0x0F) // return
 		}
-		b = append(b, 0x41) // i32.const abi.BTStackOverflow
-		b = utils.AppendSLEB128(b, abi.BTStackOverflow)
-		return append(b, 0x0F) // return
 	}
-	if dyn != nil {
+	overflow := overflowAt(brDepth)
+	switch {
+	case dyn != nil && dyn.grow:
+		b = emitBTGrowPushCheck(b, dyn, overflowAt(brDepth+1))
+	case dyn != nil:
 		b = emitBTDynPushCheck(b, dyn, overflow)
-	} else {
+	default:
 		// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 		b = append(b, 0x20, localSP)
 		b = append(b, 0x41)

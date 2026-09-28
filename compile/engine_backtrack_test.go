@@ -7,10 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"regexp/syntax"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 func compileBTTestProg(t *testing.T, pattern string) *syntax.Prog {
@@ -2080,3 +2082,216 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The capture body's frame stack is placed at call time, and max_memory is the
+// memory's declared maximum.
+
+// testMemoryLimits decodes a module's own memory declaration: the minimum, and
+// the maximum when one is declared.
+func testMemoryLimits(t *testing.T, w []byte) (minPages, maxPages uint64, hasMax bool) {
+	t.Helper()
+	off := 8
+	for off < len(w) {
+		id := w[off]
+		size, n, err := utils.DecodeULEB128(w[off+1:])
+		if err != nil {
+			t.Fatalf("section size: %v", err)
+		}
+		body := w[off+1+n : off+1+n+int(size)]
+		off += 1 + n + int(size)
+		if id != 5 {
+			continue
+		}
+		count, n, _ := utils.DecodeULEB128(body)
+		if count != 1 {
+			t.Fatalf("memory section declares %d memories, want 1", count)
+		}
+		flags := body[n]
+		minPages, m, _ := utils.DecodeULEB128(body[n+1:])
+		if flags&1 == 0 {
+			return minPages, 0, false
+		}
+		maxPages, _, _ = utils.DecodeULEB128(body[n+1+m:])
+		return minPages, maxPages, true
+	}
+	t.Fatal("module declares no memory of its own")
+	return 0, 0, false
+}
+
+func mustMemorySize(t *testing.T, s string) config.MemorySize {
+	t.Helper()
+	m, err := config.ParseMemorySize(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// TestBTCaptureStackNotReservedAtLoad: a capture pattern's memory no longer
+// scales with its branch count. Before, a capture pattern reserved numAlts ×
+// 4,096 frames in its tables, claimed at load whatever the input.
+func TestBTCaptureStackNotReservedAtLoad(t *testing.T) {
+	pattern := `((?:a|bc){1,60}?)x`
+	if eng, err := SelectEngine(pattern, CompileOptions{}); err != nil || eng != EngineBacktrack {
+		t.Fatalf("SelectEngine = %v, %v; want Backtracking — witness no longer has the shape", eng, err)
+	}
+	numAlts := newBacktrack(compileBTTestProg(t, pattern)).numAlts
+	if numAlts < 60 {
+		t.Fatalf("witness has %d Alts, want at least 60", numAlts)
+	}
+	w, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	validateWASM(t, w)
+	// numAlts × 4,096 frames of 24 bytes was over 90 pages; the tables are a
+	// page or two.
+	if minPages, _, _ := testMemoryLimits(t, w); minPages > 2 {
+		t.Errorf("module declares %d pages at load for %d Alts, want the tables alone", minPages, numAlts)
+	}
+}
+
+// TestMaxMemoryDeclaredAsMaximum: max_memory becomes the memory's declared
+// maximum on every assembly path, rounded down to pages; unset declares none,
+// which is the bytes every module had before.
+func TestMaxMemoryDeclaredAsMaximum(t *testing.T) {
+	entries := []config.RegexEntry{{Pattern: `(a.*?b)(c+)`, GroupsFunc: "g"}, {Pattern: `foo`, FindFunc: "f"}}
+	capped := CompileOptions{MaxMemory: mustMemorySize(t, "1.5MiB")} // 24 pages
+	for _, c := range []struct {
+		name       string
+		standalone bool
+		opts       CompileOptions
+	}{
+		{"standalone", true, capped},
+		{"embedded", false, capped},
+		{"component", true, func() CompileOptions { o := componentOpts(entries); o.MaxMemory = capped.MaxMemory; return o }()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w, _, err := Compile(entries, 0, c.standalone, c.opts)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			validateWASM(t, w)
+			if _, max, has := testMemoryLimits(t, w); !has || max != 24 {
+				t.Errorf("declared maximum = %d (declared %v), want 24 pages", max, has)
+			}
+			uncapped := c.opts
+			uncapped.MaxMemory = config.MemorySize{}
+			w, _, err = Compile(entries, 0, c.standalone, uncapped)
+			if err != nil {
+				t.Fatalf("Compile (no cap): %v", err)
+			}
+			if _, _, has := testMemoryLimits(t, w); has {
+				t.Error("no max_memory, but the memory declares a maximum")
+			}
+		})
+	}
+	t.Run("sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			MaxMemory: capped.MaxMemory,
+			Regexps:   []config.RegexEntry{{Name: "a", Pattern: `foo[0-9]+`}, {Name: "b", Pattern: `bar`}},
+			Sets:      []config.SetConfig{{Name: "s", ScanAny: "s_any", Patterns: config.PatternSelector{All: true}}},
+		}
+		w, _, err := CompileFile(cfg, "")
+		if err != nil {
+			t.Fatalf("CompileFile: %v", err)
+		}
+		validateWASM(t, w)
+		if _, max, has := testMemoryLimits(t, w); !has || max != 24 {
+			t.Errorf("declared maximum = %d (declared %v), want 24 pages", max, has)
+		}
+	})
+}
+
+// TestMaxMemoryBelowStaticSizeIsCompileError: a cap below what the module
+// declares before any call is refused at compile time, naming the cap and the
+// size — including the regions the match and find paths still reserve at
+// compile time, and a component's extra allocator page.
+func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
+	// A Backtracking match keeps its compile-time stack: numAlts × 4,096 frames
+	// of 8 bytes, several pages.
+	entries := []config.RegexEntry{{Pattern: `(?:ab|cd|ef|gh|ij|kl|mn|op)*?xyzuvw`, MatchFunc: "m"}}
+	opts := CompileOptions{MaxDFAStates: 2}
+	w, _, err := Compile(entries, 0, true, opts)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	static, _, _ := testMemoryLimits(t, w)
+	if static < 3 {
+		t.Fatalf("witness declares %d pages; want a compile-time region above the tables", static)
+	}
+	at := func(pages uint64) config.MemorySize {
+		return mustMemorySize(t, itoa(pages*65536+65535)) // rounds down to pages
+	}
+
+	opts.MaxMemory = at(static)
+	if _, _, err := Compile(entries, 0, true, opts); err != nil {
+		t.Errorf("a cap equal to the static size must compile: %v", err)
+	}
+	opts.MaxMemory = at(static - 1)
+	_, _, err = Compile(entries, 0, true, opts)
+	if !errors.Is(err, ErrMemoryCapTooSmall) {
+		t.Fatalf("a cap one page below the static size: err = %v, want ErrMemoryCapTooSmall", err)
+	}
+	for _, want := range []string{opts.MaxMemory.String(), itoa(static * 65536)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name %q: %v", want, err)
+		}
+	}
+
+	t.Run("below_one_page", func(t *testing.T) {
+		_, _, err := Compile([]config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}, 0, true,
+			CompileOptions{MaxMemory: mustMemorySize(t, "60KB")})
+		if !errors.Is(err, ErrMemoryCapTooSmall) {
+			t.Errorf("60KB rounds down to 0 pages: err = %v, want ErrMemoryCapTooSmall", err)
+		}
+	})
+	t.Run("component_allocator_page", func(t *testing.T) {
+		e := []config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}
+		w, _, err := Compile(e, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages, _, _ := testMemoryLimits(t, w)
+		o := componentOpts(e)
+		o.MaxMemory = at(pages)
+		if _, _, err := Compile(e, 0, true, o); !errors.Is(err, ErrMemoryCapTooSmall) {
+			t.Errorf("a component needs one page more than its module: err = %v, want ErrMemoryCapTooSmall", err)
+		}
+		o.MaxMemory = at(pages + 1)
+		if _, _, err := Compile(e, 0, true, o); err != nil {
+			t.Errorf("Compile(component at its size): %v", err)
+		}
+	})
+	t.Run("sets", func(t *testing.T) {
+		cfg := config.BuildConfig{
+			MaxMemory: mustMemorySize(t, "1KB"),
+			Regexps:   []config.RegexEntry{{Name: "a", Pattern: `foo[0-9]+`}, {Name: "b", Pattern: `bar`}},
+			Sets:      []config.SetConfig{{Name: "s", ScanAny: "s_any", Patterns: config.PatternSelector{All: true}}},
+		}
+		if _, _, err := CompileFile(cfg, ""); !errors.Is(err, ErrMemoryCapTooSmall) {
+			t.Errorf("CompileFile: err = %v, want ErrMemoryCapTooSmall", err)
+		}
+	})
+}
+
+// TestMaxMemoryAbove4GiBWarns: past what a 32-bit memory holds the cap is 4
+// GiB, declared as such, with a warning that says so.
+func TestMaxMemoryAbove4GiBWarns(t *testing.T) {
+	buf, restore := captureWarnings(t)
+	defer restore()
+	w, _, err := Compile([]config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}, 0, true,
+		CompileOptions{MaxMemory: mustMemorySize(t, "8GB")})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if _, max, has := testMemoryLimits(t, w); !has || max != config.MaxWasmMemoryPages {
+		t.Errorf("declared maximum = %d (declared %v), want %d", max, has, config.MaxWasmMemoryPages)
+	}
+	if !strings.Contains(buf.String(), "4 GiB") || !strings.Contains(buf.String(), "8GB") {
+		t.Errorf("no warning naming the value and 4 GiB: %q", buf.String())
+	}
+}
+
+func itoa(n uint64) string { return strconv.FormatUint(n, 10) }

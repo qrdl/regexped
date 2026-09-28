@@ -34,6 +34,11 @@ import (
 // (requireFallbackAnswers). Without that control a later raise of the fast
 // body's static stack would let every test here pass without executing a byte
 // of bt_scratch.go.
+//
+// A CAPTURE body's ordinary frame stack is no static region any more: it is
+// placed in the same run-time scratch, and grows. A groups case without a
+// zero-width cycle therefore exercises that stack, in the same three places,
+// and its control is the opposite one: the ordinary body alone must answer.
 
 // btScratchInCap is the input window below the tables; the slots buffer sits
 // right above it.
@@ -153,11 +158,12 @@ func (c btScratchCase) check(t *testing.T, got int64, slots []int) {
 }
 
 // requireFallbackAnswers is the control every test here runs first: it proves
-// the answer the test then requires can only have come from the fallback's
-// run-time memory. A program with a zero-width cycle gets no ordinary body in
-// any build, so for one the proof is the cycle itself. Any other program is
-// built with compile.BTWorkBudgetOff — the fast body alone, no fallback — and
-// must answer -2.
+// the answer the test then requires can only have come from run-time memory. A
+// program with a zero-width cycle gets no ordinary body in any build, so for
+// one the proof is the cycle itself. Any other program is built with
+// compile.BTWorkBudgetOff — the fast body alone, no fallback — and a match or
+// find body must answer -2, having run past its static stack. A capture body
+// has none: its stack is the run-time one, so alone it must ANSWER.
 func (c btScratchCase) requireFallbackAnswers(t *testing.T) {
 	t.Helper()
 	pat := c.entry.Pattern
@@ -188,7 +194,12 @@ func (c btScratchCase) requireFallbackAnswers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("control instantiate: %v", err)
 	}
-	if got, _ := c.call(t, store, inst, inst.GetExport(store, "memory").Memory(), c.numSlots()); got != abi.BTStackOverflow {
+	got, slots := c.call(t, store, inst, inst.GetExport(store, "memory").Memory(), c.numSlots())
+	if c.entry.GroupsFunc != "" {
+		c.check(t, got, slots)
+		return
+	}
+	if got != abi.BTStackOverflow {
 		t.Fatalf("control: the fast body alone answered %d, want %d — the case no longer reaches past its static regions", got, abi.BTStackOverflow)
 	}
 }
@@ -396,41 +407,52 @@ func TestBTFallbackScratchEmbedded(t *testing.T) {
 // fallback's scratch is the space above cabi_realloc's heap top. Both inputs
 // are lowered into the heap and adopted by their scanners before either runs,
 // so a scratch placed anywhere below the heap top would overwrite one of them.
+// `^(aa|a)*b` has no zero-width cycle, so it runs the ordinary capture body,
+// whose frame stack is placed there too.
 func TestBTFallbackScratchComponent(t *testing.T) {
-	const pattern = `^(\w*|)*c`
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
-	n := res["g"]
-	if h.inst.GetExport(h.store, abi.ScratchBaseExport) != nil {
-		t.Errorf("a component core exports %q; its allocator owns the heap", abi.ScratchBaseExport)
-	}
+	for _, c := range []struct {
+		pattern  string
+		inA, inB string
+	}{
+		{`^(\w*|)*c`, strings.Repeat("w", 100000) + "c", strings.Repeat("w", 90000) + "c"},
+		{`^(aa|a)*b`, strings.Repeat("a", 80000) + "b", strings.Repeat("a", 70001) + "b"},
+	} {
+		t.Run(c.pattern, func(t *testing.T) {
+			pattern := c.pattern
+			h, res := newPatternResourceHarness(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			n := res["g"]
+			if h.inst.GetExport(h.store, abi.ScratchBaseExport) != nil {
+				t.Errorf("a component core exports %q; its allocator owns the heap", abi.ScratchBaseExport)
+			}
 
-	inA := strings.Repeat("w", 100000) + "c"
-	inB := strings.Repeat("w", 90000) + "c"
-	for _, in := range []string{inA, inB} {
-		btScratchCase{entry: config.RegexEntry{Pattern: pattern, GroupsFunc: "g"}, input: in}.requireFallbackAnswers(t)
-	}
-	pa, la := h.writeInput(inA)
-	a := h.call(n.Constructor, pa, la, int32(0))
-	pb, lb := h.writeInput(inB)
-	b := h.call(n.Constructor, pb, lb, int32(0))
+			inA, inB := c.inA, c.inB
+			for _, in := range []string{inA, inB} {
+				btScratchCase{entry: config.RegexEntry{Pattern: pattern, GroupsFunc: "g"}, input: in}.requireFallbackAnswers(t)
+			}
+			pa, la := h.writeInput(inA)
+			a := h.call(n.Constructor, pa, la, int32(0))
+			pb, lb := h.writeInput(inB)
+			b := h.call(n.Constructor, pb, lb, int32(0))
 
-	// group 0 of groups' next: result<list<option<tuple<u32,u32>>>, error-code>.
-	group0 := func(handle int32, input string) {
-		t.Helper()
-		ret := h.call(n.Next, handle)
-		data := h.mem.UnsafeData(h.store)
-		if data[ret] == 1 {
-			t.Fatalf("next reported an error (backtrack-overflow): the fallback did not answer")
-		}
-		ptr := int32(h.u32(ret + 4))
-		loc := regexp.MustCompile(pattern).FindStringSubmatchIndex(input)
-		got := [3]uint32{uint32(h.mem.UnsafeData(h.store)[ptr]), h.u32(ptr + 4), h.u32(ptr + 8)}
-		if want := [3]uint32{1, uint32(loc[0]), uint32(loc[1])}; got != want {
-			t.Fatalf("group 0 = %v, want %v", got, want)
-		}
+			// group 0 of groups' next: result<list<option<tuple<u32,u32>>>, error-code>.
+			group0 := func(handle int32, input string) {
+				t.Helper()
+				ret := h.call(n.Next, handle)
+				data := h.mem.UnsafeData(h.store)
+				if data[ret] == 1 {
+					t.Fatalf("next reported an error (backtrack-overflow): the search did not get its memory")
+				}
+				ptr := int32(h.u32(ret + 4))
+				loc := regexp.MustCompile(pattern).FindStringSubmatchIndex(input)
+				got := [3]uint32{uint32(h.mem.UnsafeData(h.store)[ptr]), h.u32(ptr + 4), h.u32(ptr + 8)}
+				if want := [3]uint32{1, uint32(loc[0]), uint32(loc[1])}; got != want {
+					t.Fatalf("group 0 = %v, want %v", got, want)
+				}
+			}
+			group0(b, inB)
+			group0(a, inA)
+			h.call(n.Dtor, a)
+			h.call(n.Dtor, b)
+		})
 	}
-	group0(b, inB)
-	group0(a, inA)
-	h.call(n.Dtor, a)
-	h.call(n.Dtor, b)
 }

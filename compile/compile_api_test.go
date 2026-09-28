@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/qrdl/regexped/config"
 )
@@ -2538,6 +2540,590 @@ func TestVerboseReporterNotes(t *testing.T) {
 			o.Report = &Reporter{}
 			if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 65536, true, o); err != nil {
 				t.Fatalf("Compile(%q): %v", c.pat, err)
+			}
+		})
+	}
+}
+
+// lowerBatteryClasses are the single classes the UTF-8 lowering is checked
+// against exhaustively. Beyond the obvious ones, each range is there for a
+// split it forces: `[\x{80}-\x{7ff}]` is exactly the two-byte encodings,
+// `[\x{d7ff}-\x{e000}]` straddles the surrogates (which must lower to
+// nothing), `\x{10ffff}` is the last encodable codepoint, and
+// `[a-\x{10ffff}]` crosses every length boundary from ASCII up.
+var lowerBatteryClasses = []string{
+	`\pL`, `\p{Greek}`, `[^a]`, `.`, `(?s:.)`,
+	`[\x{80}-\x{7ff}]`, `[\x{d7ff}-\x{e000}]`, `\x{10ffff}`, `[a-\x{10ffff}]`,
+	`[\p{L}\p{N}_]`,
+}
+
+// lowerTestProgs compiles pattern the way the compiler does — parse,
+// Simplify, syntax.Compile — and returns the program before and after
+// lowerUTF8, the lowered one already checked for the shape engines rely on.
+func lowerTestProgs(t *testing.T, pattern string) (orig, low *syntax.Prog) {
+	t.Helper()
+	orig, err := syntax.Compile(parseTestRe(t, pattern).Simplify())
+	if err != nil {
+		t.Fatalf("syntax.Compile(%q): %v", pattern, err)
+	}
+	low = lowerUTF8(orig)
+	checkLoweredShape(t, pattern, low)
+	return orig, low
+}
+
+// checkLoweredShape asserts what every engine relies on in a lowered
+// program: it consumes byte ranges only — InstRune/InstRune1 over
+// 0x00-0xFF, with no FoldCase and no InstRuneAny* — and every successor is a
+// real PC.
+func checkLoweredShape(t *testing.T, pattern string, p *syntax.Prog) {
+	t.Helper()
+	isPC := func(pc uint32) bool { return int(pc) < len(p.Inst) }
+	if p.Start < 0 || p.Start >= len(p.Inst) {
+		t.Fatalf("%q: Start %d outside %d instructions", pattern, p.Start, len(p.Inst))
+	}
+	for pc := range p.Inst {
+		inst := &p.Inst[pc]
+		switch inst.Op {
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			t.Fatalf("%q: lowered pc %d is %v, which consumes a codepoint", pattern, pc, inst.Op)
+		case syntax.InstRune, syntax.InstRune1:
+			if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+				t.Fatalf("%q: lowered pc %d carries FoldCase", pattern, pc)
+			}
+			if len(inst.Rune) == 0 || (inst.Op == syntax.InstRune && len(inst.Rune)%2 != 0) {
+				t.Fatalf("%q: lowered pc %d has malformed ranges %v", pattern, pc, inst.Rune)
+			}
+			for _, r := range inst.Rune {
+				if r < 0 || r > 0xFF {
+					t.Fatalf("%q: lowered pc %d consumes %#x, not a byte", pattern, pc, r)
+				}
+			}
+		}
+		switch inst.Op {
+		case syntax.InstMatch, syntax.InstFail:
+		case syntax.InstAlt, syntax.InstAltMatch:
+			if !isPC(inst.Out) || !isPC(inst.Arg) {
+				t.Fatalf("%q: lowered pc %d branches outside the program", pattern, pc)
+			}
+		default:
+			if !isPC(inst.Out) {
+				t.Fatalf("%q: lowered pc %d continues outside the program", pattern, pc)
+			}
+		}
+	}
+}
+
+// lowerClosure follows every epsilon edge from pcs and returns the consuming
+// instructions reached, sorted, and whether Match was reached. The acceptance
+// simulator below runs single classes, which carry no assertion; guessing an
+// assertion's context would test nothing, so meeting one fails the test.
+func lowerClosure(t *testing.T, p *syntax.Prog, pcs []uint32) ([]uint32, bool) {
+	t.Helper()
+	seen := make(map[uint32]bool)
+	var consume []uint32
+	match := false
+	stack := slices.Clone(pcs)
+	for len(stack) > 0 {
+		pc := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[pc] {
+			continue
+		}
+		seen[pc] = true
+		inst := &p.Inst[pc]
+		switch inst.Op {
+		case syntax.InstMatch:
+			match = true
+		case syntax.InstFail:
+		case syntax.InstAlt, syntax.InstAltMatch:
+			stack = append(stack, inst.Out, inst.Arg)
+		case syntax.InstNop, syntax.InstCapture:
+			stack = append(stack, inst.Out)
+		case syntax.InstEmptyWidth:
+			t.Fatalf("pc %d: the acceptance simulator does not model assertions", pc)
+		default:
+			consume = append(consume, pc)
+		}
+	}
+	slices.Sort(consume)
+	return consume, match
+}
+
+// lowerDFA answers whether a lowered program matches an input EXACTLY, by
+// Thompson simulation memoised on (thread set, byte) — a lazily built DFA.
+// The memo is what makes the exhaustive battery affordable: ~1.1M inputs per
+// class, through programs of up to ~2,000 instructions, all starting from the
+// same closure. State 0 is the start.
+type lowerDFA struct {
+	t      *testing.T
+	prog   *syntax.Prog
+	ids    map[string]int32
+	sets   [][]uint32
+	accept []bool
+	next   [][256]int32 // -1 until built
+}
+
+func newLowerDFA(t *testing.T, p *syntax.Prog) *lowerDFA {
+	d := &lowerDFA{t: t, prog: p, ids: make(map[string]int32)}
+	d.intern(lowerClosure(t, p, []uint32{uint32(p.Start)}))
+	return d
+}
+
+func (d *lowerDFA) intern(set []uint32, match bool) int32 {
+	key := fmt.Sprint(match, set)
+	if id, ok := d.ids[key]; ok {
+		return id
+	}
+	id := int32(len(d.sets))
+	d.ids[key] = id
+	d.sets = append(d.sets, set)
+	d.accept = append(d.accept, match)
+	var row [256]int32
+	for i := range row {
+		row[i] = -1
+	}
+	d.next = append(d.next, row)
+	return id
+}
+
+func (d *lowerDFA) step(s int32, b byte) int32 {
+	if n := d.next[s][b]; n >= 0 {
+		return n
+	}
+	var outs []uint32
+	for _, pc := range d.sets[s] {
+		if inst := &d.prog.Inst[pc]; inst.MatchRune(rune(b)) {
+			outs = append(outs, inst.Out)
+		}
+	}
+	n := d.intern(lowerClosure(d.t, d.prog, outs))
+	d.next[s][b] = n
+	return n
+}
+
+func (d *lowerDFA) accepts(in []byte) bool {
+	s := int32(0)
+	for _, b := range in {
+		s = d.step(s, b)
+	}
+	return d.accept[s]
+}
+
+// count returns how many distinct byte strings the program accepts from
+// state s, entered after depth bytes. A class accepts nothing longer than
+// four bytes, so a thread still alive after four fails the test rather than
+// being followed.
+func (d *lowerDFA) count(s int32, depth int, memo map[[2]int32]int) int {
+	if n, ok := memo[[2]int32{s, int32(depth)}]; ok {
+		return n
+	}
+	n := 0
+	if d.accept[s] {
+		n = 1
+	}
+	if len(d.sets[s]) > 0 {
+		if depth == utf8.UTFMax {
+			d.t.Fatalf("a thread is still alive after %d bytes", depth)
+		}
+		for b := range 256 {
+			n += d.count(d.step(s, byte(b)), depth+1, memo)
+		}
+	}
+	memo[[2]int32{s, int32(depth)}] = n
+	return n
+}
+
+// lowerRuneOracle returns the membership test of the single class the
+// ORIGINAL program p matches: whether p matches exactly the one-codepoint
+// string c. The answer comes from Go's own Inst.MatchRune over codepoints,
+// not from anything the lowering computes.
+func lowerRuneOracle(t *testing.T, p *syntax.Prog) func(rune) bool {
+	type arm struct {
+		inst    *syntax.Inst
+		accepts bool
+	}
+	var arms []arm
+	start, _ := lowerClosure(t, p, []uint32{uint32(p.Start)})
+	for _, pc := range start {
+		_, m := lowerClosure(t, p, []uint32{p.Inst[pc].Out})
+		arms = append(arms, arm{&p.Inst[pc], m})
+	}
+	return func(c rune) bool {
+		for _, a := range arms {
+			if a.accepts && a.inst.MatchRune(c) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// TestLowerUTF8ClassBattery checks every lowered battery class against its
+// original over the whole codespace: the UTF-8 of every codepoint in the
+// class is accepted and that of every codepoint outside it rejected, over
+// 0..U+10FFFF minus the surrogates, which have no encoding. That shows the
+// lowered language holds exactly the class's encodings among the valid
+// ones; counting every byte string the lowered program accepts, and finding
+// the class's size, shows it holds nothing else — no invalid sequence either.
+//
+// It also asserts the suffix sharing: no two consuming instructions agree on
+// both their ranges and their successor, where a flat lowering repeats
+// [80-BF]→exit once per multi-byte sequence.
+func TestLowerUTF8ClassBattery(t *testing.T) {
+	for _, pat := range lowerBatteryClasses {
+		t.Run(pat, func(t *testing.T) {
+			orig, low := lowerTestProgs(t, pat)
+			inClass := lowerRuneOracle(t, orig)
+			d := newLowerDFA(t, low)
+			var buf [utf8.UTFMax]byte
+			members := 0
+			for c := rune(0); c <= unicode.MaxRune; c++ {
+				if c >= 0xD800 && c <= 0xDFFF {
+					continue
+				}
+				want := inClass(c)
+				n := utf8.EncodeRune(buf[:], c)
+				if got := d.accepts(buf[:n]); got != want {
+					t.Fatalf("U+%04X (% X): lowered accepts = %v, class membership = %v",
+						c, buf[:n], got, want)
+				}
+				if want {
+					members++
+				}
+			}
+			if members == 0 {
+				t.Fatal("the class has no members; the case tests nothing")
+			}
+			if got := d.count(0, 0, make(map[[2]int32]int)); got != members {
+				t.Fatalf("the lowered program accepts %d byte strings but the class has %d "+
+					"codepoints: it accepts something that encodes none of them", got, members)
+			}
+			seen := make(map[string]int)
+			for pc, inst := range low.Inst {
+				if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
+					continue
+				}
+				k := fmt.Sprint(inst.Rune, inst.Out)
+				if prev, ok := seen[k]; ok {
+					t.Fatalf("pcs %d and %d are the same range with the same successor: "+
+						"a suffix was not shared", prev, pc)
+				}
+				seen[k] = pc
+			}
+			t.Logf("%d instructions, %d lowered; %d codepoints", len(orig.Inst), len(low.Inst), members)
+		})
+	}
+}
+
+// TestLowerUTF8RejectsInvalid drives byte strings that are not UTF-8 through
+// every lowered battery class, and each non-empty prefix of them too: an
+// overlong form, a surrogate, a value past U+10FFFF, a stray continuation
+// byte and a truncated sequence must all fail, including under `.` and
+// `[^a]`, which accept every VALID codepoint. The overlongs sit on the
+// boundaries the sequence split cuts at. Every string checked is asserted
+// invalid first, so the battery says nothing about a valid one.
+func TestLowerUTF8RejectsInvalid(t *testing.T) {
+	invalid := []struct {
+		name string
+		b    []byte
+	}{
+		{"overlong U+0000 in 2 bytes", []byte{0xC0, 0x80}},
+		{"overlong U+007F in 2 bytes", []byte{0xC1, 0xBF}},
+		{"overlong U+0000 in 3 bytes", []byte{0xE0, 0x80, 0x80}},
+		{"overlong U+07FF in 3 bytes", []byte{0xE0, 0x9F, 0xBF}},
+		{"overlong U+0000 in 4 bytes", []byte{0xF0, 0x80, 0x80, 0x80}},
+		{"overlong U+FFFF in 4 bytes", []byte{0xF0, 0x8F, 0xBF, 0xBF}},
+		{"surrogate U+D800", []byte{0xED, 0xA0, 0x80}},
+		{"surrogate U+DFFF", []byte{0xED, 0xBF, 0xBF}},
+		{"U+110000", []byte{0xF4, 0x90, 0x80, 0x80}},
+		{"lead byte F5", []byte{0xF5, 0x80, 0x80, 0x80}},
+		{"byte FF", []byte{0xFF}},
+		{"stray continuation 80", []byte{0x80}},
+		{"stray continuation BF", []byte{0xBF}},
+		{"two stray continuations", []byte{0x80, 0xBF}},
+		{"truncated U+20AC", []byte{0xE2, 0x82}},
+		{"truncated U+1F600", []byte{0xF0, 0x9F, 0x98}},
+	}
+	for _, pat := range lowerBatteryClasses {
+		_, low := lowerTestProgs(t, pat)
+		d := newLowerDFA(t, low)
+		for _, c := range invalid {
+			for n := 1; n <= len(c.b); n++ {
+				b := c.b[:n]
+				if utf8.Valid(b) {
+					t.Fatalf("test data: %s prefix % X is valid UTF-8", c.name, b)
+				}
+				if d.accepts(b) {
+					t.Errorf("%q accepts % X (%s)", pat, b, c.name)
+				}
+			}
+		}
+	}
+}
+
+// TestLowerUTF8SurrogatesLowerToNothing: surrogates have no encoding, so a
+// class of nothing else must lower to a program that accepts nothing, and a
+// class whose only other member is ASCII to exactly that byte.
+func TestLowerUTF8SurrogatesLowerToNothing(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want int
+	}{
+		{`[\x{d800}-\x{dfff}]`, 0},
+		{`[a\x{d800}-\x{dfff}]`, 1},
+	} {
+		_, low := lowerTestProgs(t, c.pat)
+		d := newLowerDFA(t, low)
+		if got := d.count(0, 0, make(map[[2]int32]int)); got != c.want {
+			t.Errorf("%q: lowered program accepts %d byte strings, want %d", c.pat, got, c.want)
+		}
+		if c.want == 1 && !d.accepts([]byte("a")) {
+			t.Errorf("%q: lowered program rejects \"a\"", c.pat)
+		}
+	}
+}
+
+// lowerPikeFind is a leftmost-first Pike VM — Go regexp's semantics — that
+// returns the capture slots of the first match in byte offsets, or nil. With
+// runes set it steps prog one decoded codepoint at a time, which is how the
+// ORIGINAL program is read; otherwise one byte at a time, each byte handed to
+// MatchRune as its value, which is how every engine here reads a lowered one.
+func lowerPikeFind(prog *syntax.Prog, in []byte, runes bool) []int {
+	type thread struct {
+		pc  uint32
+		cap []int
+	}
+	type queue struct {
+		th []thread
+		on []bool
+	}
+	symAt := func(pos int) (rune, int) {
+		if pos >= len(in) {
+			return -1, 0
+		}
+		if runes {
+			return utf8.DecodeRune(in[pos:])
+		}
+		return rune(in[pos]), 1
+	}
+	before := func(pos int) rune {
+		if pos == 0 {
+			return -1
+		}
+		if runes {
+			r, _ := utf8.DecodeLastRune(in[:pos])
+			return r
+		}
+		return rune(in[pos-1])
+	}
+	var add func(q *queue, pc uint32, pos int, cap []int)
+	add = func(q *queue, pc uint32, pos int, cap []int) {
+		if q.on[pc] {
+			return
+		}
+		q.on[pc] = true
+		switch inst := &prog.Inst[pc]; inst.Op {
+		case syntax.InstFail:
+		case syntax.InstAlt, syntax.InstAltMatch:
+			add(q, inst.Out, pos, cap)
+			add(q, inst.Arg, pos, cap)
+		case syntax.InstNop:
+			add(q, inst.Out, pos, cap)
+		case syntax.InstCapture:
+			c := slices.Clone(cap)
+			if int(inst.Arg) < len(c) {
+				c[inst.Arg] = pos
+			}
+			add(q, inst.Out, pos, c)
+		case syntax.InstEmptyWidth:
+			after, _ := symAt(pos)
+			if syntax.EmptyOp(inst.Arg)&^syntax.EmptyOpContext(before(pos), after) == 0 {
+				add(q, inst.Out, pos, cap)
+			}
+		default:
+			q.th = append(q.th, thread{pc, cap})
+		}
+	}
+	run := &queue{on: make([]bool, len(prog.Inst))}
+	next := &queue{on: make([]bool, len(prog.Inst))}
+	var matched []int
+	for pos := 0; ; {
+		if matched == nil {
+			cap := make([]int, prog.NumCap)
+			for i := range cap {
+				cap[i] = -1
+			}
+			cap[0] = pos
+			add(run, uint32(prog.Start), pos, cap)
+		}
+		r, w := symAt(pos)
+		for _, th := range run.th {
+			inst := &prog.Inst[th.pc]
+			if inst.Op == syntax.InstMatch {
+				matched = slices.Clone(th.cap)
+				matched[1] = pos
+				break // every later thread has lower priority
+			}
+			if w > 0 && inst.MatchRune(r) {
+				add(next, inst.Out, pos+w, th.cap)
+			}
+		}
+		if w == 0 || (matched != nil && len(next.th) == 0) {
+			return matched
+		}
+		run, next = next, run
+		next.th = next.th[:0]
+		clear(next.on)
+		pos += w
+	}
+}
+
+// TestLowerUTF8Priority checks that lowering leaves leftmost-first answers
+// alone: the first match of every pattern over every input has the same
+// capture slots before lowering (read codepoint by codepoint) and after it
+// (read byte by byte), and the codepoint reading agrees with Go's regexp, so
+// the simulator is itself checked. A lowered class's arms need no order —
+// only the original program's own alternations have a priority to keep.
+// `a|\pL` and `[ab]|\pL` are merged into one class by Go's parser; the
+// capturing spellings are not, so they make leftmost-first choose between an
+// ASCII arm and a lowered class, and between arms of different lengths, which
+// is where a reordering would show. Every pattern consumes at least one
+// codepoint: an empty match inside a codepoint is a question for the find
+// machinery, not for this pass.
+func TestLowerUTF8Priority(t *testing.T) {
+	patterns := []string{
+		`a|\pL`, `[ab]|\pL`,
+		`(a)|(\pL)`, `(\pL)|(a)`, `([ab])|(\pL)`,
+		`(a)|(\pL\pL)`, `(\pL)|(\pL\pL)`, `(\pL\pL)|(\pL)`,
+		`(é)|([^a]+)`, `(\pL+?)(\pL*)`, `(\pL+)@(\pL+)`,
+		`^(é|a)+\b`, `(?m)^.$`, `(.)(.)`,
+	}
+	inputs := []string{
+		"", "a", "b", "é", "ab", "aé", "éa", "éé", "1é", "x@y", "é@ж",
+		"日本@語", "\U0001D538b", "aK", "x\nй\n", "é\U0001F600a",
+	}
+	for _, pat := range patterns {
+		orig, low := lowerTestProgs(t, pat)
+		goRE := regexp.MustCompile(pat)
+		for _, in := range inputs {
+			want := lowerPikeFind(orig, []byte(in), true)
+			if goWant := goRE.FindStringSubmatchIndex(in); !slices.Equal(want, goWant) {
+				t.Fatalf("simulator disagrees with Go: %q over %q = %v, Go says %v", pat, in, want, goWant)
+			}
+			if got := lowerPikeFind(low, []byte(in), false); !slices.Equal(got, want) {
+				t.Errorf("%q over %q: lowered %v, original %v", pat, in, got, want)
+			}
+		}
+	}
+}
+
+// TestLowerUTF8ASCIIUnchanged: an unfolded program with no codepoint past
+// 0x7F lowers to an instruction-for-instruction copy of itself — a rune ≤ 0x7F
+// is its own encoding, and nothing else is rewritten.
+func TestLowerUTF8ASCIIUnchanged(t *testing.T) {
+	for _, pat := range []string{`abc`, `(a+|b)\bc$`, `[a-z0-9_]*?x`, `(?m)^\w+$`, `a[\x00-\x7f]b`} {
+		orig, low := lowerTestProgs(t, pat)
+		same := orig.Start == low.Start && orig.NumCap == low.NumCap &&
+			slices.EqualFunc(orig.Inst, low.Inst, func(a, b syntax.Inst) bool {
+				return a.Op == b.Op && a.Out == b.Out && a.Arg == b.Arg && slices.Equal(a.Rune, b.Rune)
+			})
+		if !same {
+			t.Errorf("%q changed under lowering:\n%v\nbecame\n%v", pat, orig, low)
+		}
+	}
+}
+
+// lowerHasFoldCase reports whether any rune instruction of p carries
+// syntax.FoldCase. Only rune instructions are read: in an InstEmptyWidth the
+// same bit is EmptyBeginLine.
+func lowerHasFoldCase(p *syntax.Prog) bool {
+	for _, inst := range p.Inst {
+		if (inst.Op == syntax.InstRune || inst.Op == syntax.InstRune1) &&
+			syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLowerUTF8FoldCase checks case folding expanded in codepoint space. Each
+// folded literal lowers to exactly the UTF-8 of its unicode.SimpleFold orbit:
+// the listed spellings are checked against Go's regexp first, then the whole
+// codespace against Inst.MatchRune on the ORIGINAL program, which folds by
+// itself, so the oracle never sees the expansion; and the orbit is exactly
+// the listed spellings. ß's orbit is {ß, ẞ}: simple folding maps one
+// codepoint to one, and "ss" is full folding, which Go does not do. `(?i)a`
+// is the literal whose orbit stays ASCII, where the flag must go all the same.
+//
+// Every battery class runs under `(?i)` too. Go's parser closes a class under
+// folding itself, so those programs arrive with no flag; they are here for
+// the whole-codespace check and the FoldCase walk over what lowering returns.
+func TestLowerUTF8FoldCase(t *testing.T) {
+	type foldCase struct {
+		pat            string
+		accept, reject []string // nil accept: a battery class, no flag expected
+	}
+	cases := []foldCase{
+		{`(?i)k`, []string{"k", "K", "K"}, nil},
+		{`(?i)s`, []string{"s", "S", "ſ"}, nil},
+		{`(?i)σ`, []string{"σ", "ς", "Σ"}, nil},
+		{`(?i)ß`, []string{"ß", "ẞ"}, []string{"ss"}},
+		{`(?i)a`, []string{"a", "A"}, nil},
+	}
+	for _, pat := range lowerBatteryClasses {
+		cases = append(cases, foldCase{pat: `(?i)` + pat})
+	}
+	for _, c := range cases {
+		t.Run(c.pat, func(t *testing.T) {
+			orig, low := lowerTestProgs(t, c.pat)
+			literal := c.accept != nil
+			if literal && !lowerHasFoldCase(orig) {
+				t.Fatal("the original program carries no FoldCase; the case tests nothing")
+			}
+			if lowerHasFoldCase(low) {
+				t.Fatal("FoldCase survived lowering")
+			}
+			d := newLowerDFA(t, low)
+			goRE := regexp.MustCompile(`^(?:` + c.pat + `)$`)
+			for _, in := range c.accept {
+				if !goRE.MatchString(in) {
+					t.Fatalf("test data: Go rejects %q", in)
+				}
+				if !d.accepts([]byte(in)) {
+					t.Errorf("lowered program rejects %q (% X)", in, in)
+				}
+			}
+			for _, in := range c.reject {
+				if goRE.MatchString(in) {
+					t.Fatalf("test data: Go accepts %q", in)
+				}
+				if d.accepts([]byte(in)) {
+					t.Errorf("lowered program accepts %q (% X)", in, in)
+				}
+			}
+			inClass := lowerRuneOracle(t, orig)
+			var buf [utf8.UTFMax]byte
+			members := 0
+			for r := rune(0); r <= unicode.MaxRune; r++ {
+				if r >= 0xD800 && r <= 0xDFFF {
+					continue
+				}
+				want := inClass(r)
+				n := utf8.EncodeRune(buf[:], r)
+				if got := d.accepts(buf[:n]); got != want {
+					t.Fatalf("U+%04X (% X): lowered accepts = %v, original matches = %v",
+						r, buf[:n], got, want)
+				}
+				if want {
+					members++
+				}
+			}
+			if got := d.count(0, 0, make(map[[2]int32]int)); got != members {
+				t.Fatalf("the lowered program accepts %d byte strings but the original "+
+					"matches %d codepoints", got, members)
+			}
+			if literal && members != len(c.accept) {
+				t.Fatalf("the orbit has %d codepoints, not the %d listed", members, len(c.accept))
 			}
 		})
 	}
