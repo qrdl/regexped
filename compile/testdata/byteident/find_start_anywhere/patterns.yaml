@@ -1,0 +1,7 @@
+# The start-anywhere find ALONE: a leading repeat of a class common in prose,
+# without the space byte and with no literal to scan for, so the compile-time
+# find classifier replaces today's find with a forward start-anywhere pass
+# plus a backward pass (compile/start_anywhere.go).
+regexps:
+  - pattern: '\w+@\w+'
+    find_func: sa_find

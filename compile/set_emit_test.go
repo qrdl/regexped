@@ -454,7 +454,7 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 	spec := SetSpec{Name: "s", Find: "s_find", BatchFind: true, Overlapping: true}
 	compiled := setEmitCovCompileSet(t, spec, []string{wideButU8}, CompileSetOptions{})
 	bucket := compiled.overlapDPBucket()
-	if bucket < 0 {
+	if bucket < 0 || !compiled.usesOverlapDP() {
 		t.Fatalf("the sweep refused %s; it no longer reaches the compressed-table arm", wideButU8)
 	}
 	if !compiled.buckets[bucket].dp.l.useCompression {
@@ -595,10 +595,12 @@ func TestSetEmitUnionScanWideSetCompiles(t *testing.T) {
 //     not split;
 //   - an all-fallback set has no literal half for phase 1 to serve at all.
 func TestSetEmitCapabilityPredicatesRefuseFind(t *testing.T) {
-	// A literal-less set with both scan capabilities and a find: the union
-	// automaton is built (scan_any asked for it), so the predicate has
-	// something to say no ABOUT.
-	spec := SetSpec{Name: "s", Find: "s_find", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
+	// A literal-less set with both scan capabilities: the union automaton is
+	// built (scan_any asked for it), so the predicate has something to say no
+	// ABOUT. Without `find`: these members are not provably linear, and a
+	// gated `find` would split them out of the buckets (set_split.go), leaving
+	// the scan pair to a union over the split set instead.
+	spec := SetSpec{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
 	compiled := setEmitCovCompileSet(t, spec, litLessNeverDying, CompileSetOptions{})
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the predicate has nothing to refuse")
@@ -1398,7 +1400,9 @@ func TestSetEmitPreflightWithNoPatterns(t *testing.T) {
 // capability those switches really serve, so the coverage of each switch
 // survives the deletion.
 func TestSetEmitScanAnyCapabilityArms(t *testing.T) {
-	spec := SetSpec{Name: "s", Find: "s_find", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
+	// No `find`, for the reason TestSetEmitCapabilityPredicatesRefuseFind
+	// gives.
+	spec := SetSpec{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all"}
 	compiled := setEmitCovCompileSet(t, spec, litLessNeverDying, CompileSetOptions{})
 	if compiled.unionScan == nil {
 		t.Fatal("no union automaton was built; the union body cannot be emitted")
@@ -1924,6 +1928,60 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 			}
 			if out := buf.String(); strings.Contains(out, "Pattern dropped from set") {
 				t.Errorf("%s: a BT-admitted pattern must not warn about being dropped; got %q", tc.name, out)
+			}
+		})
+	}
+}
+
+// TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses is the NEGATIVE half
+// of the test above: when the DFA path cannot serve a member and Backtracking
+// refuses it too — past maxBTFallbackInstructions — the member is dropped, with
+// a warning and a StateLimitDropped entry, never kept in a bucket that cannot
+// answer for it. Both of admitOrDropFallback's reasons: no DFA at all, and a
+// DFA over max_fallback_states.
+func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
+	// 21 × Q{1000} puts the program past 20,000 instructions in an alternative
+	// that dies on its first byte, so the DFA's states stay cheap to build.
+	manyInsts := strings.Repeat(`Q{1000}`, 21)
+	var alts []string
+	for k := 0; k < 21; k++ {
+		alts = append(alts, fmt.Sprintf("a{0,%d}b", 1000-k))
+	}
+	cases := []struct {
+		name    string
+		pattern string
+		opts    CompileSetOptions
+	}{
+		// Non-greedy, so isolated; its own merge has 2^12 states.
+		{"own-dfa-unbuildable", `x*?[ab]*a[ab]{11}X|` + manyInsts, CompileSetOptions{}},
+		// A ~1000-state DFA over a 100-state max_fallback_states.
+		{"over-max-fallback-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
+		// Its DFA loses the `\B` branch's priority, so there is no DFA to
+		// fall back to; 20,001 assertions put its program past 20,000
+		// instructions without adding a DFA state.
+		{"boundary-ambiguous", `(?:\B|a|)a|` + strings.Repeat(`\B`, 20001) + `Z`, CompileSetOptions{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := setCoreCovAnalyze(t, tc.pattern)
+			if info.boundaryAmbiguous != (tc.name == "boundary-ambiguous") {
+				t.Fatalf("boundaryAmbiguous = %v; this case needs the other packer branch", info.boundaryAmbiguous)
+			}
+			if newBTBucket(info) != nil {
+				t.Fatalf("Backtracking admits %q; this case needs one it refuses", tc.name)
+			}
+			buf, restore := captureWarnings(t)
+			defer restore()
+			diag := &SetDiag{Name: tc.name}
+			buckets := compileFallback([]*PatternInfo{info}, tc.opts, diag)
+			if len(buckets) != 0 {
+				t.Errorf("%d buckets, want the member dropped", len(buckets))
+			}
+			if len(diag.StateLimitDropped) != 1 {
+				t.Errorf("StateLimitDropped = %v, want the member", diag.StateLimitDropped)
+			}
+			if !strings.Contains(buf.String(), "Pattern dropped from set") {
+				t.Errorf("no drop warning; got %q", buf.String())
 			}
 		})
 	}
@@ -2972,7 +3030,10 @@ func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet 
 // CONDITIONAL is half the contract — a set with no BT member must keep the
 // cheap i64 form, so this asserts both directions on the same patterns.
 func TestSetBTForcesMemoryAllABI(t *testing.T) {
-	pats := []string{`(?:ab|cd)+xyz`, `hello`}
+	// `(?:ab|cd)+` is linear, so under max_fallback_states: 1 it stays on its
+	// Backtracking bucket (a member that is not linear is split out instead;
+	// see the end of this test).
+	pats := []string{`(?:ab|cd)+`, `hello`}
 
 	plain := compileBTABISet(t, pats, 0)
 	if plain.hasBTMember() {
@@ -2992,6 +3053,17 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	}
 	if !bt.wideAll() {
 		t.Error("a set with a BT member must use the memory _all form even at a 2-id space")
+	}
+
+	// A member that is not linear leaves its Backtracking bucket for a split
+	// member on the Backtracking find, and the form must STAY wide: the stub
+	// generator decides it from the unsplit packing (SetAdmitsBacktracking).
+	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1)
+	if split.hasBTMember() || len(split.split) == 0 || split.split[0].bt == nil {
+		t.Fatal("`(?:ab|cd)+xyz` under max_fallback_states=1 should be a Backtracking split member")
+	}
+	if !split.wideAll() {
+		t.Error("a split Backtracking member must keep the memory _all form the unsplit packing selects")
 	}
 }
 

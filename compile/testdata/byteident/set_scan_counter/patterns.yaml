@@ -1,0 +1,14 @@
+# A literal frontend's scan pair with a member that is not provably linear
+# (the part after `foo` can read `foo`) and no `find` to split it out for: the
+# probes stamp how far they walked, and the scan bodies carry the work counter
+# that hands the call to a union automaton over the set.
+regexps:
+  - name: p0
+    pattern: 'foo[a-z]+bar'
+  - name: p1
+    pattern: 'zz'
+sets:
+  - name: s
+    scan_any: s_scan_any
+    scan_all: s_scan_all
+    patterns: all

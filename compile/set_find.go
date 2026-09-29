@@ -5,6 +5,7 @@ import (
 
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
+	"github.com/qrdl/regexped/internal/wlocals"
 )
 
 // Set `find` body support.
@@ -509,7 +510,7 @@ func (c *setFindCtx) emitGateMask(b []byte, bi int, mask uint32) []byte {
 // one, otherwise straight from the caller's array.
 func (c *setFindCtx) emitGateValue(b []byte, gid int) []byte {
 	if c.gateLocalBase != 0 && gid >= 0 && gid < c.cs.idSpaceSize() &&
-		int(c.gateLocalBase)+gid < 256 {
+		int(c.gateLocalBase)+gid <= wlocals.MaxByteLocal {
 		return append(b, 0x20, byte(int(c.gateLocalBase)+gid))
 	}
 	return append(append(b, 0x20, c.pGate, 0x28, 0x02),
@@ -522,7 +523,7 @@ func (c *setFindCtx) emitGateLocalsPrologue(b []byte) []byte {
 		return b
 	}
 	for gid := 0; gid < c.cs.idSpaceSize(); gid++ {
-		if int(c.gateLocalBase)+gid >= 256 {
+		if int(c.gateLocalBase)+gid > wlocals.MaxByteLocal {
 			break
 		}
 		b = append(b, 0x20, c.pGate, 0x28, 0x02)
@@ -553,13 +554,14 @@ func (c *setFindCtx) emitGateLocalsPrologue(b []byte) []byte {
 // absolute terms, which is the only bound available without knowing the input.
 //
 // Also bounded by the local index space: local indices are emitted as a single
-// byte throughout these emitters, so the whole block must sit below 256.
+// byte throughout these emitters, and a single byte of ULEB128 stops at 127
+// (wlocals.MaxByteLocal) — 128..255 would read as a continuation byte.
 func gateLocalsProfitable(cs *compiledSet, gated bool, localCount int) bool {
 	if !gated || !hasSetFallbackBuckets(cs) {
 		return false
 	}
 	n := cs.idSpaceSize()
-	return n > 0 && n <= maxHoistedGateLocals && localCount+n < 256
+	return n > 0 && n <= maxHoistedGateLocals && localCount+n <= wlocals.MaxByteLocal+1
 }
 
 // maxHoistedGateLocals bounds F2's per-call prologue. See gateLocalsProfitable.
@@ -1035,6 +1037,13 @@ func (c *setFindCtx) emitGateJump(b []byte, lPos byte) []byte {
 // emitSuffixCall emits the call to bucket bi's suffix DFA for the pattern bits
 // in mask, with the literal at position posLocal.
 func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mask uint32) []byte {
+	mid := c.mode == capFind && c.cs.midSweepWork >= 0
+	if mid {
+		// The in-call counter measures THIS candidate's walk: seed the
+		// walk-end global with its position.
+		b = append(b, 0x20, posLocal, 0x24)
+		b = utils.AppendULEB128(b, uint32(c.cs.walkEndGlobal)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x20, c.pInPtr)
 	b = append(b, 0x20, posLocal)
 	if litLen != 0 {
@@ -1070,8 +1079,32 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	}
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.suffixFnBase+bi))
+	if mid {
+		// work += walkEnd - pos; over the budget → bail out with the
+		// sentinel, leaving the suffix call's result on the stack beneath.
+		w, bud, we := uint32(c.cs.midSweepWork), uint32(c.cs.midSweepBudget), uint32(c.cs.walkEndGlobal) //nolint:gosec // global indices
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, we)
+		b = append(b, 0x20, posLocal, 0x6B, 0x6A, 0x24)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, w)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, bud)
+		b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midSweepSentinel)
+		b = append(b, 0x0F, 0x0B) // return; end
+	}
 	return b
 }
+
+// midSweepSentinel is what an overlapping `find` body answers when its
+// in-call counter trips (compiledSet.midSweepWork); the wrapper
+// consumes it and never returns it.
+const midSweepSentinel = -9
 
 // emitBucketAt emits the complete per-candidate evaluation of bucket bi with
 // its mandatory literal at posLocal (litLen == 0 for a fallback bucket, whose
@@ -1134,6 +1167,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		} else {
 			b = c.emitProbeCall(b, bi, litLen, posLocal, g.mask)
 			b = c.emitRecordProbe(b, bi)
+			b = c.emitScanCounter(b, bi, posLocal)
 		}
 		b = append(b, 0x0B) // end block $skip_group
 	}
@@ -1223,8 +1257,22 @@ func (c *setFindCtx) emitRecordedSkip(b []byte, bi int) []byte {
 }
 
 // emitProbeCall calls bucket bi's bitmask probe for the pattern bits in mask,
-// leaving the result in lTmp.
+// leaving the result in lTmp. Where the scan pair's work counter runs it also
+// seeds the probe's walk-end global and, for `scan_all`, snapshots the answer
+// so far (emitScanCounter reads both after the probe is recorded).
 func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask uint32) []byte {
+	if c.scanCounts(bi) {
+		pwe := c.cs.buckets[bi].probeWalkEndP1 - 1
+		// Seed the walk-end global with this candidate's position, so a probe
+		// that does not stamp it (the counted-chain probe) reads as no walk.
+		b = append(b, 0x20, posLocal, 0x24)
+		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+		if c.mode == capScanAll {
+			b = c.pushScanAnswer(b)
+			b = append(b, 0x24)
+			b = utils.AppendULEB128(b, uint32(c.cs.scanSwMark)) //nolint:gosec // a global index
+		}
+	}
 	b = append(b, 0x20, c.pInPtr)
 	b = append(b, 0x20, posLocal)
 	if litLen != 0 {
@@ -1239,8 +1287,98 @@ func (c *setFindCtx) emitProbeCall(b []byte, bi, litLen int, posLocal byte, mask
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(c.probeIndex(bi)))
 	b = append(b, 0x21, c.lTmp)
-	b = c.emitProbeOverflowEscape(b, bi)
-	return b
+	return c.emitProbeOverflowEscape(b, bi)
+}
+
+// scanCounts reports whether bucket bi's probes run under the scan pair's
+// work counter.
+func (c *setFindCtx) scanCounts(bi int) bool {
+	return c.cs.scanSwitch(c.mode) && c.cs.buckets[bi].probeWalkEndP1 > 0
+}
+
+// pushScanAnswer pushes `scan_all`'s answer so far as an i64: the id mask, or
+// the wide form's hit count.
+func (c *setFindCtx) pushScanAnswer(b []byte) []byte {
+	if c.wideBitmap {
+		return append(b, 0x20, c.lTotal, 0xAD) // i64.extend_i32_u
+	}
+	return append(b, 0x20, c.lAcc)
+}
+
+// emitScanCounter is the scan pair's work counter, after bucket bi's probe at
+// posLocal has been RECORDED — so a hand-over loses nothing it found. It is
+// the single-pattern switch's rule (emitFindSwitchCharge): only a FAILED walk
+// is charged — one that recorded no pattern not already recorded — and only
+// one longer than switchShortWalk; the budget, N × (pos − from) + 64, is
+// checked before the current walk is added, so one long failed walk does not
+// trip it. Successes need no charge: each records a new pattern, so there are
+// at most as many as the set has. Once it trips, the rest of the call is the
+// union automaton's, from `from`: every hit recorded so far is a real match at
+// or after `from`, and the automaton reports each pattern at most once more
+// (`scan_all`'s bitmap counts 0→1 only).
+func (c *setFindCtx) emitScanCounter(b []byte, bi int, posLocal byte) []byte {
+	if !c.scanCounts(bi) {
+		return b
+	}
+	w, pwe := c.cs.scanSwWork, c.cs.buckets[bi].probeWalkEndP1-1
+	// Failed: nothing new recorded.
+	if c.mode == capScanAll {
+		b = c.pushScanAnswer(b)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(c.cs.scanSwMark)) //nolint:gosec // a global index
+		b = append(b, 0x51)                                 // i64.eq
+	} else {
+		b = append(b, 0x20, c.lTmp, 0x45)
+	}
+	b = append(b, 0x04, 0x40) // if failed
+	// walk > switchShortWalk
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+	b = append(b, 0x20, posLocal, 0x6B, 0x41)
+	b = utils.AppendSLEB128(b, switchShortWalk)
+	b = append(b, 0x4B, 0x04, 0x40) // i32.gt_u; if
+	// work > N × (pos − from) + 64, in i64: hand over.
+	getWork := func(b []byte) []byte {
+		b = append(b, 0x23)
+		return utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	}
+	b = emitSwitchOverBudget(b, getWork, func(b []byte) []byte {
+		return append(b, 0x20, posLocal, 0x20, c.pFrom, 0x6B)
+	}, defaultSwitchN)
+	b = append(b, 0x04, 0x40) // if
+	target := c.probeFnBase - c.cs.scanProbeBaseOffset() + c.cs.scanSwitchFnOffset(c.mode)
+	callTarget := func(b []byte) []byte {
+		b = append(b, 0x20, c.pInPtr, 0x20, c.pInLen, 0x20, c.pFrom)
+		if c.wideBitmap {
+			b = append(b, 0x20, c.pOutPtr)
+		}
+		b = append(b, 0x10)
+		return utils.AppendULEB128(b, uint32(target)) //nolint:gosec // a function index
+	}
+	switch {
+	case c.mode == capScanAny:
+		b = callTarget(b)
+	case c.wideBitmap:
+		b = append(b, 0x20, c.lTotal)
+		b = callTarget(b)
+		b = append(b, 0x6A) // hits so far + the automaton's new ones
+	default:
+		b = append(b, 0x20, c.lAcc)
+		b = callTarget(b)
+		b = append(b, 0x84) // i64.or
+	}
+	b = append(b, 0x0F, 0x0B) // return; end if over budget
+	// work += walk, in i64.
+	walk := func(b []byte) []byte {
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(pwe)) //nolint:gosec // a global index
+		return append(b, 0x20, posLocal, 0x6B)
+	}
+	b = emitAddWalk(b, getWork, func(b []byte) []byte {
+		b = append(b, 0x24)
+		return utils.AppendULEB128(b, uint32(w)) //nolint:gosec // a global index
+	}, walk)
+	return append(b, 0x0B, 0x0B) // end if long; end if failed
 }
 
 // emitProbeOverflowEscape returns abi.BTStackOverflow out of the whole
@@ -1370,6 +1508,10 @@ func (c *setFindCtx) emitRecordSparseProbe(b []byte, bi int) []byte {
 
 // emitFindPrologue initialises the running state every body shares.
 func (c *setFindCtx) emitFindPrologue(b []byte, lPos byte) []byte {
+	if c.cs.scanSwitch(c.mode) {
+		b = append(b, 0x42, 0x00, 0x24)                     // i64.const 0: the counter
+		b = utils.AppendULEB128(b, uint32(c.cs.scanSwWork)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x41, 0x00, 0x21, c.lTotal)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, minStartSentinel)
@@ -1400,6 +1542,12 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 		}
 		return append(b, 0x20, c.lAcc)
 	default:
+		if c.cs.keptPosGlobal >= 0 {
+			// A split set's merge wrapper reads the answered position here
+			// even when out_cap = 0 wrote no tuple to read it from.
+			b = append(b, 0x20, c.lMinStart, 0x24)
+			b = utils.AppendULEB128(b, uint32(c.cs.keptPosGlobal)) //nolint:gosec // a global index
+		}
 		return append(b, 0x20, c.lTotal)
 	}
 }

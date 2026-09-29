@@ -1660,3 +1660,55 @@ func TestComponentPatternScannersAreIndependent(t *testing.T) {
 	h.call(n.Dtor, a)
 	h.call(n.Dtor, b)
 }
+
+// TestComponentSplitSet drives a set whose members are split out of the
+// buckets (compile/set_split.go) through the component interface: the find
+// resource calls the merge wrapper, and `\bbar` refuses a union automaton, so
+// the scan pair is merged too. Answers against Go.
+func TestComponentSplitSet(t *testing.T) {
+	const cfgYAML = `
+wasm_format: component
+wit_package: t
+import_module: t
+regexps:
+  - pattern: '[a-z]+X'
+  - pattern: 'foo'
+  - pattern: '\bbar'
+sets:
+  - name: s
+    patterns: all
+    scan_any: any_hit
+    scan_all: all_hits
+    find: scan_it
+`
+	pats := []string{`[a-z]+X`, `foo`, `\bbar`}
+	h := newSetHarness(t, cfgYAML)
+	for _, text := range []string{"", "abX", "foo bar fooX", "aaaaaaaa", "barfoo abXcdX", "xfoo xbar"} {
+		var want [][3]uint32
+		for _, m := range gatedOracle(pats, text) {
+			want = append(want, [3]uint32{uint32(m.PatternID), uint32(m.Start), uint32(m.End)})
+		}
+		sort.Slice(want, func(i, j int) bool {
+			if want[i][1] != want[j][1] {
+				return want[i][1] < want[j][1]
+			}
+			return want[i][0] < want[j][0]
+		})
+		got := h.drain("scan-it", text, 0)
+		sort.SliceStable(got, func(i, j int) bool { return got[i][1] < got[j][1] || (got[i][1] == got[j][1] && got[i][0] < got[j][0]) })
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%q: find drive = %v, want %v", text, got, want)
+		}
+		ptr, n := h.writeInput(text)
+		for from := 0; from <= len(text); from++ {
+			var wantAll []uint32
+			for _, id := range oracleScanAll(pats, text, from, nil) {
+				wantAll = append(wantAll, uint32(id))
+			}
+			gotAll, errored := h.list(h.call(h.pkg+"#all-hits", ptr, n, int32(from)))
+			if errored || fmt.Sprint(gotAll) != fmt.Sprint(wantAll) {
+				t.Errorf("%q: scan_all(from=%d) = %v (err %v), want %v", text, from, gotAll, errored, wantAll)
+			}
+		}
+	}
+}

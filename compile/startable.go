@@ -50,10 +50,8 @@ func firstByteSet(pat string) []bool {
 		return nil
 	}
 	stripCaptures(parsed)
-	prog, err := syntax.Compile(parsed.Simplify())
-	if err != nil {
-		return nil
-	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(parsed.Simplify())
 	runes := getFirstRuneSet(prog, prog.Start)
 	if len(runes) == 0 {
 		return nil // undetermined — assume every byte

@@ -340,6 +340,15 @@ type CompileOptions struct {
 	// its maximum, and a module whose static memory already exceeds it does not
 	// compile. The zero value is no cap.
 	MaxMemory config.MemorySize
+	// The three FIND-STRATEGY overrides, for tests and measurement only — no
+	// YAML key sets them. Unset, classifyFind (start_anywhere.go) decides.
+	// TodayFind keeps today's find with nothing added (the baseline);
+	// StartAnywhereFind serves the find with the start-anywhere find alone,
+	// wherever it can be built; StartAnywhereSwitchN > 0 gives today's find
+	// the work counter with that N. The first one set wins.
+	TodayFind            bool
+	StartAnywhereFind    bool
+	StartAnywhereSwitchN int
 
 	tableMemIdx int // 0 = standalone (own memory[0]), 1 = embedded (memory[1] for tables)
 
@@ -483,6 +492,36 @@ type compiledPattern struct {
 	litAnchorTeddyT1LoBytes []byte
 	litAnchorTeddyT1HiBytes []byte
 	litAnchorLitSet         [][]byte // raw literals for post-Teddy scalar verification
+	// litAnchorRevL / litAnchorRevTable: the reversed-prefix DFA the backward
+	// walker was built from, kept so a start-anywhere switch can rebuild the
+	// walker stamping where it stopped.
+	litAnchorRevL     *dfaLayout
+	litAnchorRevTable *dfaTable
+	// The start-anywhere find (start_anywhere.go): saFwdBody and saRevBody
+	// are its two passes, laid out in slotSAFwd/slotSARev with the glue that
+	// joins them (slotSAGlue) built at assembly time. startAnywhere: the glue
+	// IS the pattern's find. saSwitch: today's find stays and carries the work
+	// counter, and a dispatcher (slotSADispatch) fronts both — every caller of
+	// the find reaches it. switchN is the counter's N for a body built at
+	// assembly time (the literal-anchored ones); the general body reads its
+	// layout's. backStampP1 is one PAST the global the counting
+	// literal-anchored bodies' backward walkers stamp with where they
+	// stopped (0 = none) — plus one because the zero value is a real index.
+	startAnywhere bool
+	saSwitch      bool
+	saFwdBody     []byte
+	saRevBody     []byte
+	switchN       int32
+	backStampP1   int32
+	// saBT is what a switch hands over to when the start-anywhere find cannot
+	// be built for the pattern (an empty-width assertion, or an automaton over
+	// the limits): the Backtracking find, linear per call, laid out in
+	// slotSABT / slotSABTFallback. Its fields are buildBTFindParts's.
+	saBT *btFindParts
+	// saCtx: saFwdBody/saRevBody are the context passes of a pattern with an
+	// empty-width assertion, and the backward one takes (ptr, len, end), laid
+	// out in slotSARevCtx.
+	saCtx bool
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were removed with the rest of that infrastructure.
 
@@ -595,6 +634,12 @@ type altLitAnchorCompiledBranch struct {
 	litSet            [][]byte // this branch's own literal(s), for the scalar verify chain
 	backScanBody      []byte   // size-prefixed; built by buildLitAnchorBackScanBody, reused unchanged
 	forwardVerifyBody []byte   // size-prefixed; built by buildAltLitAnchorForwardVerifyBody
+	// The tables both bodies were built from, kept so a start-anywhere switch
+	// can rebuild them stamping where they stopped (stampAltLitAnchorBranches).
+	revL     *dfaLayout
+	revTable *dfaTable
+	fwdL     *dfaLayout
+	fwdTable *dfaTable
 }
 
 // setFind records this pattern's find body together with the way its
@@ -647,6 +692,13 @@ const (
 	slotMatchFallback     // a Backtracking matchBody's fallback, right after it
 	slotFindFallback      // a Backtracking findBody's fallback, after it and its twin
 	slotCaptureFallback   // a Backtracking captureBody's fallback, right after it
+	slotSAFwd             // the start-anywhere find's forward pass
+	slotSARev             // …its backward pass
+	slotSAGlue            // …and the find body joining them
+	slotSADispatch        // today's find or the start-anywhere find, for a switch
+	slotSARevCtx          // the context backward pass (saCtx)
+	slotSABT              // a switch's Backtracking handover find (saBT)
+	slotSABTFallback      // …and its memoised fallback
 )
 
 // funcSlot is one entry of a pattern's function layout. branch is the
@@ -696,6 +748,24 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 			add(slotFindFallback)
 		}
 	}
+	if p.saFwdBody != nil {
+		add(slotSAFwd)
+		if p.saCtx {
+			add(slotSARevCtx)
+		} else {
+			add(slotSARev)
+		}
+		add(slotSAGlue)
+	}
+	if p.saBT != nil {
+		add(slotSABT)
+		if p.saBT.fallback != nil {
+			add(slotSABTFallback)
+		}
+	}
+	if p.saSwitch {
+		add(slotSADispatch)
+	}
 	if p.captureBody != nil {
 		add(slotCapture)
 		if p.captureFallbackBody != nil {
@@ -734,7 +804,8 @@ func (p *compiledPattern) slotIndex(k funcSlotKind) int {
 // of its three shapes: a plain body, the lit-anchor pair (whose find half is
 // generated at assembleModule time), or the alt-lit-anchor branch dispatcher.
 func (p *compiledPattern) hasFindFunc() bool {
-	return p.findBody != nil || p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil
+	return p.findBody != nil || p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil ||
+		p.saFwdBody != nil
 }
 
 // findWrapperOffset returns the sub-index of the exported find wrapper — the
@@ -805,16 +876,28 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 	backwardScanOff = p.slotIndex(slotLitAnchorBackScan)
 	captureOff = p.slotIndex(slotCapture)
 	wrapperOff = p.slotIndex(slotGroupsWrapper)
-	// findOff names whichever function fronts the find: the alt dispatcher,
-	// the lit-anchor forward half, or a plain body.
+	// findOff names whichever function fronts the find: the start-anywhere
+	// dispatcher of a switch, the alt dispatcher, the lit-anchor forward half,
+	// a plain body, or — for the start-anywhere find alone — its glue.
 	findOff = -1
-	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
+	for _, k := range []funcSlotKind{slotSADispatch, slotAltDispatch, slotLitAnchorFind, slotFind, slotSAGlue} {
 		if i := p.slotIndex(k); i >= 0 {
 			findOff = i
 			break
 		}
 	}
 	return
+}
+
+// todayFindOff is the sub-index of TODAY'S find function — findOff minus the
+// start-anywhere dispatcher a switch puts in front of it — or -1.
+func (p *compiledPattern) todayFindOff() int {
+	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
+		if i := p.slotIndex(k); i >= 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 // appendFindBodyWithTwin appends the plain-find body, patching its handoff call
@@ -871,6 +954,140 @@ func appendWithBTFallback(cs, fast, fallback []byte, callOffs []int, fallbackFun
 	}
 	cs = append(cs, patchBTFallbackCall(fast, callOffs, fallbackFuncIdx)...)
 	return append(cs, fallback...)
+}
+
+// btFindParts is a no-capture Backtracking find laid out above some address:
+// its body (the ordinary one, or the bare tail call to the fallback), the
+// memoised fallback, the call sites to patch with the fallback's index, and the
+// tables and frame stack placed for them.
+type btFindParts struct {
+	fast, fallback []byte
+	callOffs       []int
+	mode           findFromMode
+	data           []byte
+	segs           int
+	end            int64
+}
+
+// buildBTFindParts builds the Backtracking find for pattern at cur: the find a
+// pattern whose DFA is too large gets, and what a start-anywhere switch hands
+// over to when the start-anywhere find cannot be built. table is the
+// pattern's (large) find DFA when one was built, for its literal prefix; nil
+// otherwise. stack, when non-nil, is the frame stack [base, limit) to use
+// instead of one placed above the tables — how a set's Backtracking members,
+// which never run at the same time, share one (btFindStackSize sizes it).
+func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions, stack *[2]int32) (btFindParts, error) {
+	var parts btFindParts
+	btProg := compileBTProg(pattern)
+	if len(btProg.Inst) > maxBTFallbackInstructions {
+		return parts, ErrBTProgramTooLarge
+	}
+	bt := newBacktrack(btProg)
+	bt.numGroups = 0
+	// Choose scan strategy (in priority order):
+	//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
+	//   2. Mandatory interior literal via two-level outer loop.
+	//   3. First-byte SIMD/Teddy tables from NFA (fallback).
+	var btScanParams prefixScanParams
+	var btScanDataBytes []byte
+	var btScanSegCnt int
+	var btMandLit *mandatoryLit
+	// table is nil only in the rare dfaStateLimitExceeded backstop
+	// case (construction itself was too expensive to finish, not
+	// just "too many states to use as the primary engine") — no
+	// prefix optimisation is available then, falls through to
+	// btMandLit/nfaFirstBytes below.
+	var btPrefix []byte
+	if table != nil {
+		btPrefix = computePrefix(table)
+		if len(btPrefix) > maxBTFallbackPrefixLen {
+			btPrefix = btPrefix[:maxBTFallbackPrefixLen]
+		}
+	}
+	if len(btPrefix) >= 2 {
+		// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
+		btScanParams = prefixScanParams{
+			Prefix: btPrefix,
+			// The layout is buildBTFindBody's, and comes from the
+			// allocation that decides it — not from five indices
+			// written out here, in a different file.
+			Locals:        btScanLocalsOnly(),
+			EngineDepth:   2,
+			LikelyNoMatch: o.LikelyMode == LikelyNoMatch,
+		}
+	} else if mandLit != nil {
+		// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
+		btMandLit = mandLit
+	} else {
+		// Fallback: first-byte SIMD/Teddy tables from NFA.
+		btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
+		btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
+		btScanParams.TableMemIdx = o.tableMemIdx
+		btScanParams.LikelyNoMatch = o.LikelyMode == LikelyNoMatch
+	}
+	parts.data, parts.segs = btScanDataBytes, btScanSegCnt
+	// Allocate BT stack after SIMD tables.
+	btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
+	// As on the Backtracking match path: the fallback reserves nothing, and
+	// nor does a fast body that is the bare tail call.
+	plan := planBT(bt, o.BTWorkBudget)
+	btStackSize := btAllocSizes(bt)
+	if plan.force {
+		btStackSize = 0
+	}
+	if stack != nil {
+		if int(stack[1]-stack[0]) < btStackSize {
+			panic("compile: a shared Backtracking stack smaller than a member's")
+		}
+		btBase, btStackSize = cur+int64(len(btScanDataBytes)), 0
+	} else if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
+		return parts, err
+	}
+	btStackBase := int32(btBase)
+	btStackLimit := btStackBase + int32(btStackSize)
+	if stack != nil {
+		btStackBase, btStackLimit = stack[0], stack[1]
+	}
+	var fallbackMode findFromMode
+	if plan.fallback {
+		scratch := o.btScratch()
+		parts.fallback, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch)
+	}
+	if plan.force {
+		// The stub forwards (ptr, len) and never reads `from`; the
+		// fallback it calls does, so the stub reports the fallback's mode.
+		var stub []byte
+		stub, parts.callOffs = btTailCallBody(2)
+		parts.fast, parts.mode = stub, fallbackMode
+	} else {
+		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil)
+		if plan.fallback && mode != fallbackMode {
+			panic("compile: a Backtracking find body and its fallback read `from` differently")
+		}
+		parts.fast, parts.mode = fast, mode
+		parts.callOffs = offs
+	}
+	parts.end = utils.PageAlign(btBase + int64(btStackSize))
+	if stack != nil {
+		parts.end = btBase
+	}
+	return parts, nil
+}
+
+// btFindStackSize is the frame stack buildBTFindParts gives pattern's find:
+// none when its ordinary body is the bare tail call to the fallback, whose
+// stack is run-time scratch. ok is false when Backtracking cannot take it.
+func btFindStackSize(pattern string, budget int) (size int, ok bool) {
+	prog := compileBTProg(pattern)
+	if len(prog.Inst) > maxBTFallbackInstructions {
+		return 0, false
+	}
+	bt := newBacktrack(prog)
+	bt.numGroups = 0
+	if planBT(bt, budget).force {
+		return 0, true
+	}
+	return btAllocSizes(bt), true
 }
 
 // appendMatchBodies appends matchBody and its fallback, if any; matchFuncIdx is
@@ -1148,7 +1365,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
 		// TDFA-correct capture semantics for DFA branches.
 		if !needMatch {
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
 				parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
 				if perr == nil && parsed.MaxCap() > 0 {
 					prog, cerr := syntax.Compile(parsed.Simplify())
@@ -1389,8 +1606,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			// Phase 2a: lenient alternation — at least one branch is non-lit-chain
 			// but starts with a literal. DFA branches are inlined as anchored DFA
-			// verifies from the candidate position.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok {
+			// verifies from the candidate position. Only where its failed walks
+			// are bounded: the body has no work counter, and a DFA branch that
+			// keeps walking without accepting makes it quadratic, so such a
+			// pattern takes the ordinary find, which gets the switch.
+			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
 				layout := planLenAltLayout(lenAltp, tableBase, true)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
@@ -1591,10 +1811,23 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	var l *dfaLayout
+	// saReplaced is set when the start-anywhere find replaces today's: the
+	// layout below then ships nothing, and layoutNotes marks where the notes
+	// describing it (and the literal-anchored find it also replaced) begin,
+	// so the report can drop them rather than describe a body that was never
+	// emitted.
+	var saReplaced bool
+	var layoutNotes int
 	if !dfaTooLarge {
 		defer func() {
 			rep := buildOpts.report()
 			if rep == nil || l == nil {
+				return
+			}
+			if saReplaced {
+				if !rep.HasEngine() {
+					rep.Engine(EngineDFA, "no captures; start-anywhere find — a forward and a backward DFA pass")
+				}
 				return
 			}
 			if !rep.HasEngine() {
@@ -1625,6 +1858,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				rep.Note("skip-safe-on-dead")
 			}
 		}()
+		layoutNotes = buildOpts.report().noteMark()
 		l = buildDFALayout(dfaLayoutParams{
 			report:               buildOpts.report(),
 			t:                    table,
@@ -1682,90 +1916,20 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if needFindBody {
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
-			btProg := compileBTProg(re.Pattern)
-			if len(btProg.Inst) > maxBTFallbackInstructions {
-				return nil, ErrBTProgramTooLarge
-			}
-			bt := newBacktrack(btProg)
-			bt.numGroups = 0
-			// Choose scan strategy (in priority order):
-			//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
-			//   2. Mandatory interior literal via two-level outer loop.
-			//   3. First-byte SIMD/Teddy tables from NFA (fallback).
-			var btScanParams prefixScanParams
-			var btScanDataBytes []byte
-			var btScanSegCnt int
-			var btMandLit *mandatoryLit
-			// table is nil only in the rare dfaStateLimitExceeded backstop
-			// case (construction itself was too expensive to finish, not
-			// just "too many states to use as the primary engine") — no
-			// prefix optimisation is available then, falls through to
-			// btMandLit/nfaFirstBytes below.
-			var btPrefix []byte
-			if table != nil {
-				btPrefix = computePrefix(table)
-				if len(btPrefix) > maxBTFallbackPrefixLen {
-					btPrefix = btPrefix[:maxBTFallbackPrefixLen]
-				}
-			}
-			if len(btPrefix) >= 2 {
-				// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
-				btScanParams = prefixScanParams{
-					Prefix: btPrefix,
-					// The layout is buildBTFindBody's, and comes from the
-					// allocation that decides it — not from five indices
-					// written out here, in a different file.
-					Locals:        btScanLocalsOnly(),
-					EngineDepth:   2,
-					LikelyNoMatch: buildOpts.LikelyMode == LikelyNoMatch,
-				}
-			} else if patMandLit != nil {
-				// Mandatory interior literal: two-level outer loop; no first-byte tables needed.
-				btMandLit = patMandLit
-			} else {
-				// Fallback: first-byte SIMD/Teddy tables from NFA.
-				btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
-				btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
-				btScanParams.TableMemIdx = buildOpts.tableMemIdx
-				btScanParams.LikelyNoMatch = buildOpts.LikelyMode == LikelyNoMatch
-			}
-			p.dataBytes = append(p.dataBytes, btScanDataBytes...)
-			p.dataSegCount += btScanSegCnt
-			// Allocate BT stack after SIMD tables.
-			btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
-			// See the match path above: the fallback reserves nothing, and nor
-			// does a fast body that is the bare tail call.
-			plan := planBT(bt, buildOpts.BTWorkBudget)
-			btStackSize := btAllocSizes(bt)
-			if plan.force {
-				btStackSize = 0
-			}
-			if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
+			parts, err := buildBTFindParts(re.Pattern, table, patMandLit, cur, &buildOpts, nil)
+			if err != nil {
 				return nil, err
 			}
-			btStackBase := int32(btBase)
-			btStackLimit := btStackBase + int32(btStackSize)
-			var fallbackMode findFromMode
-			if plan.fallback {
-				scratch := buildOpts.btScratch()
-				p.findFallbackBody, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, 0, false, &scratch)
-			}
-			if plan.force {
-				// The stub forwards (ptr, len) and never reads `from`; the
-				// fallback it calls does, so the stub reports the fallback's mode.
-				var stub []byte
-				stub, p.findFallbackCallOffs = btTailCallBody(2)
-				p.setFind(stub, fallbackMode)
-			} else {
-				fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, buildOpts.tableMemIdx, plan.k, plan.fallback, nil)
-				if plan.fallback && mode != fallbackMode {
-					panic("compile: a Backtracking find body and its fallback read `from` differently")
-				}
-				p.setFind(fast, mode)
-				p.findFallbackCallOffs = offs
-			}
-			p.tableEnd = utils.PageAlign(btBase + int64(btStackSize))
+			p.dataBytes = append(p.dataBytes, parts.data...)
+			p.dataSegCount += parts.segs
+			p.findFallbackBody = parts.fallback
+			p.setFind(parts.fast, parts.mode)
+			p.findFallbackCallOffs = parts.callOffs
+			p.tableEnd = parts.end
 		} else {
+			// Where today's literal-anchored tables start: a pattern the
+			// classifier sends to the start-anywhere find drops them again.
+			dataMark, segMark := len(p.dataBytes), p.dataSegCount
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Pattern)
 			// Reject prefixes containing `\b`/`\B` explicitly. The
@@ -1893,6 +2057,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 						buildOpts.report().Note("literal-anchored find (SIMD literal scan + backward DFA)")
 						p.litAnchorBackScanBody = bsBody
+						p.litAnchorRevL, p.litAnchorRevTable = revL, revTable
 						// findFromMode is deliberately NOT set here. This
 						// pair's find half is built at assembleModule time and
 						// records its own mode there. Leaving the field at its
@@ -1966,84 +2131,161 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				}
 			}
 
-			// Dominant-self-loop SIMD bulk-skip. Default-on for all
-			// modes, mid-accept and non-mid-accept alike (2026-07-05).
-			// Non-mid was
-			// previously LM-gated because the original side-table dispatch
-			// caused a 48-57% no-match regression; replaced with a
-			// state-ID-compare emission (commit dbb4dfa9) that shrinks the
-			// no-match cost to ~18-21% wall time (0% fuel) on the patterns
-			// that show it at all — a real, measured trade-off against a
-			// much larger match-path win, not a fully regression-free win.
-			// Anchored find uses a separate builder (buildAnchoredFindBody)
-			// whose midAccept consumers don't decode the encoding, so we
-			// skip it there.
-			//
-			// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
-			// decodes the encoding; both channels (mid + non-mid) are kept
-			// unconditionally there. History: commit 36f91ab (2026-07-12)
-			// dropped the MID channel at this site to fix a fuel-flat
-			// wall-time regression on url-find-100kb — that delta was later
-			// proven to be instruction-placement noise on the Kaby Lake dev
-			// machine (2026-07-18 padding-scan experiment), and the drop
-			// cost a real 20x fuel / ~40x time
-			// regression on lit-anchor patterns whose post-literal body IS
-			// the mid-accept dominant state (likelytest
-			// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
-			// 40,600 -> 813,127, bisect-confirmed to that commit). Reverted
-			// 2026-07-18. The non-mid channel here carries bt-find-mand-lit's
-			// genuine -58% fuel win (the `.*` before its alternation), so it
-			// stays too.
-			//
-			// Since 2026-07-18: buildFindBody's own call site (the
-			// litAnchorBackScanBody == nil branch below) emits the
-			// non-mid channel for every LikelyMode again, replacing task
-			// 36's LikelyMatch-only gate. The short-run fuel harm that
-			// gate protected against (dense short runs in the dominant
-			// state — an input property no compile-time gate can see) is
-			// now handled at runtime by the hysteresis wrapped around the
-			// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
-			// the −90% long-run win and short-run inputs self-disable the
-			// channel after nonMidHystStreak wasted attempts.
-			canEmitOpt1 := !isAnchoredFind(table)
-			if canEmitOpt1 {
-				// encodeNonMid only when buildFindBody is the consumer of
-				// this layout's midAcceptBytes — the lit-anchor forward
-				// scan and alt-lit branches read the table with plain
-				// `!= 0` accept semantics and dispatch non-mid via
-				// state-ID compares (unchanged).
-				applyDominantStateEncoding(l,
-					p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
-			} else {
-				l.dominantStates = nil
-			}
-			l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
-			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-				fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
-					buildOpts.tableMemIdx)
-				p.setFind(fb, fmode)
-				p.findNeutralBody = twin
-				p.findTwinCallOff = twinPatch
-				if (twin != nil) != (twinPatch >= 0) {
-					panic("compile: find twin and its handoff call-site patch must be emitted together")
+			// Which find: today's, the start-anywhere find alone, or today's
+			// with the work counter (start_anywhere.go). Decided HERE — after
+			// today's body is known, before it is built — because the
+			// classifier's proofs are about that body.
+			strategy, why := p.chooseFindStrategy(re, table, l, lap, patMandLit, anchored, buildOpts)
+			if strategy == findNewSearch {
+				trial := &compiledPattern{}
+				if trial.buildStartAnywhereFind(re, cur, buildOpts) {
+					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
+					p.dataSegCount = segMark + trial.dataSegCount
+					p.clearLitAnchor()
+					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
+					p.startAnywhere = true
+					p.tableEnd = trial.tableEnd
+					saReplaced = true
+					buildOpts.report().truncateNotes(layoutNotes)
+				} else {
+					// Today's body with the counter, handing over to the
+					// Backtracking find (buildSwitchHandover) — linear either way.
+					strategy, why = findSwitch, why+"; start-anywhere find refused: "+startAnywhereRefusal(re.Pattern)
 				}
 			}
+			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
+			if !p.startAnywhere {
+				// Dominant-self-loop SIMD bulk-skip. Default-on for all
+				// modes, mid-accept and non-mid-accept alike (2026-07-05).
+				// Non-mid was
+				// previously LM-gated because the original side-table dispatch
+				// caused a 48-57% no-match regression; replaced with a
+				// state-ID-compare emission (commit dbb4dfa9) that shrinks the
+				// no-match cost to ~18-21% wall time (0% fuel) on the patterns
+				// that show it at all — a real, measured trade-off against a
+				// much larger match-path win, not a fully regression-free win.
+				// Anchored find uses a separate builder (buildAnchoredFindBody)
+				// whose midAccept consumers don't decode the encoding, so we
+				// skip it there.
+				//
+				// Lit-anchor's forward DFA scan (buildLitAnchorFindBody) also
+				// decodes the encoding; both channels (mid + non-mid) are kept
+				// unconditionally there. History: commit 36f91ab (2026-07-12)
+				// dropped the MID channel at this site to fix a fuel-flat
+				// wall-time regression on url-find-100kb — that delta was later
+				// proven to be instruction-placement noise on the Kaby Lake dev
+				// machine (2026-07-18 padding-scan experiment), and the drop
+				// cost a real 20x fuel / ~40x time
+				// regression on lit-anchor patterns whose post-literal body IS
+				// the mid-accept dominant state (likelytest
+				// lit-anchor-dominant-body, `[0-9]{4}INFO:[^\n]+`: match fuel
+				// 40,600 -> 813,127, bisect-confirmed to that commit). Reverted
+				// 2026-07-18. The non-mid channel here carries bt-find-mand-lit's
+				// genuine -58% fuel win (the `.*` before its alternation), so it
+				// stays too.
+				//
+				// Since 2026-07-18: buildFindBody's own call site (the
+				// litAnchorBackScanBody == nil branch below) emits the
+				// non-mid channel for every LikelyMode again, replacing task
+				// 36's LikelyMatch-only gate. The short-run fuel harm that
+				// gate protected against (dense short runs in the dominant
+				// state — an input property no compile-time gate can see) is
+				// now handled at runtime by the hysteresis wrapped around the
+				// dispatch (emitNonMidBulkSkipHyst), so neutral callers keep
+				// the −90% long-run win and short-run inputs self-disable the
+				// channel after nonMidHystStreak wasted attempts.
+				canEmitOpt1 := !isAnchoredFind(table)
+				if canEmitOpt1 {
+					// encodeNonMid only when buildFindBody is the consumer of
+					// this layout's midAcceptBytes — the lit-anchor forward
+					// scan and alt-lit branches read the table with plain
+					// `!= 0` accept semantics and dispatch non-mid via
+					// state-ID compares (unchanged).
+					applyDominantStateEncoding(l,
+						p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
+				} else {
+					l.dominantStates = nil
+				}
+				l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
+				// A switch builds the start-anywhere find FIRST, above today's
+				// tables, because whether it can be built decides whether today's
+				// body may carry the counter: a body that can answer the handover
+				// sentinel with nothing to hand over to would be a wrong answer.
+				var sw *compiledPattern
+				if strategy == findSwitch && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					sw = &compiledPattern{}
+					if sw.buildSwitchHandover(re, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts) {
+						l.switchN = switchNFor(buildOpts)
+					} else {
+						sw = nil
+					}
+				}
+				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
+						buildOpts.tableMemIdx)
+					p.setFind(fb, fmode)
+					p.findNeutralBody = twin
+					p.findTwinCallOff = twinPatch
+					if (twin != nil) != (twinPatch >= 0) {
+						panic("compile: find twin and its handoff call-site patch must be emitted together")
+					}
+				}
 
-			// Note the asymmetry with the single-pattern lit-anchor case just
-			// above: that path unconditionally emits l/table's data segments
-			// because it REUSES the whole pattern's forward LF DFA for its
-			// own Phase 3 (litAnchorFindLayout/litAnchorFindTable = l/table).
-			// The alternation path does NOT reuse l/table at all — each
-			// branch compiles its own independent forward DFA inside
-			// compileAltLitAnchorBranches — so l's combined-alternation
-			// tables would be dead weight here and are skipped.
-			rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody, false))
-			if p.altLitAnchorBranches == nil {
-				p.dataBytes = append(p.dataBytes, rawData...)
-				p.dataSegCount += segCount
-			}
-			if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-				p.tableEnd = l.tableEnd
+				// Note the asymmetry with the single-pattern lit-anchor case just
+				// above: that path unconditionally emits l/table's data segments
+				// because it REUSES the whole pattern's forward LF DFA for its
+				// own Phase 3 (litAnchorFindLayout/litAnchorFindTable = l/table).
+				// The alternation path does NOT reuse l/table at all — each
+				// branch compiles its own independent forward DFA inside
+				// compileAltLitAnchorBranches — so l's combined-alternation
+				// tables would be dead weight here and are skipped.
+				rawData, segCount := stripSegCount(dfaDataSegments(l, needFindBody, false))
+				if p.altLitAnchorBranches == nil {
+					p.dataBytes = append(p.dataBytes, rawData...)
+					p.dataSegCount += segCount
+				}
+				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+					p.tableEnd = l.tableEnd
+				}
+				// The literal-anchored bodies are built at assembly time, so their
+				// counter is decided here, above their own tables. It needs a
+				// module global for the backward walkers (and the alternation's
+				// forward verifiers) to stamp where they stopped, so a compile
+				// with no global allocator keeps today's body.
+				if strategy == findSwitch && sw == nil && (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) &&
+					buildOpts.globals != nil {
+					sw = &compiledPattern{}
+					if sw.buildSwitchHandover(re, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts) {
+						p.switchN = switchNFor(buildOpts)
+						p.backStampP1 = int32(buildOpts.globals.Alloc()) + 1 //nolint:gosec // a global index
+						if p.litAnchorBackScanBody != nil {
+							p.litAnchorBackScanBody = buildLitAnchorBackScanBodyStamped(p.litAnchorRevL, p.litAnchorRevTable,
+								buildOpts.tableMemIdx, true, false, p.backStampP1-1)
+						} else {
+							p.stampAltLitAnchorBranches(buildOpts.tableMemIdx)
+						}
+					} else {
+						sw = nil
+					}
+				}
+				if sw != nil {
+					// A prefer-no-match body's NEUTRAL TWIN is built from the
+					// same layout, so it carries the counter too, and the
+					// handoff seeds find_from with the twin's first start: the
+					// twin's budget counts its own part of the call, and its
+					// sentinel returns through the handoff to the dispatcher.
+					p.saFwdBody, p.saRevBody, p.saBT, p.saCtx = sw.saFwdBody, sw.saRevBody, sw.saBT, sw.saCtx
+					p.dataBytes = append(p.dataBytes, sw.dataBytes...)
+					p.dataSegCount += sw.dataSegCount
+					p.tableEnd = sw.tableEnd
+					p.saSwitch = true
+					if sw.saBT != nil {
+						buildOpts.report().Note("switch handover: Backtracking — start-anywhere find refused: " +
+							startAnywhereRefusal(re.Pattern))
+					}
+				} else if strategy == findSwitch {
+					buildOpts.report().Note("find: switch unavailable — today's find kept")
+				}
 			}
 		}
 	} else if !dfaTooLarge {
@@ -2060,19 +2302,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 	p.groupsExport = re.GroupsFunc // only set when groups_func explicitly requested
 
-	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
-	if err != nil {
-		return nil, fmt.Errorf("parse error: %w", err)
-	}
+	// Neither can fail here: compile() above parsed this same string, and
+	// returned for an unsupported rune under these same ByteMode and Unicode
+	// options, on every path to this line. syntax.Compile never returns a
+	// non-nil error (see its stdlib source).
+	parsed, _ := syntax.Parse(re.Pattern, syntax.Perl)
 	prog, _ := syntax.Compile(parsed.Simplify())
-	// Mode-aware, unlike the strict predicate the optimisation guards use: this
-	// one decides whether the PATTERN compiles, and a byte-mode pattern's
-	// 0x80-0xFF runes are legal. Redundant with the check at the top of this
-	// function and kept anyway — it is the guard for the capture path, which
-	// reaches here through several early returns.
-	if bad := unsupportedRune(prog, buildOpts.ByteMode); bad >= 0 && !buildOpts.Unicode {
-		return nil, unsupportedRuneError(bad)
-	}
 
 	p.groupNames = extractGroupNames(parsed)
 
@@ -2485,6 +2720,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotBatchGroups:       0x04,
 		slotFindWrapper:       0x03,
 		slotGroupsFromWrapper: byte(groupsFromTypeIdx), // (i32×4)→i32
+		slotSAFwd:             0x00,
+		slotSARev:             0x00,
+		slotSAGlue:            0x01,
+		slotSADispatch:        0x01,
+		slotSARevCtx:          0x02,
+		slotSABT:              0x01,
+		slotSABTFallback:      0x01,
 	}
 	var fs []byte
 	// `total` counts every function index INCLUDING the imported builtins; the
@@ -2703,8 +2945,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		} else if p.findBody != nil {
 			// LNM non-mid bulk-skip helper call-site patching was here —
 			// see archive Section 16.
-			cs = p.appendFindBodyWithTwin(cs, base+findOff)
+			cs = p.appendFindBodyWithTwin(cs, base+p.todayFindOff())
 		}
+		cs = p.appendStartAnywhereBodies(cs, base)
 		if p.captureBody != nil {
 			cs = p.appendCaptureBodies(cs, base+captureOff)
 			if !p.anchored {
@@ -3206,10 +3449,8 @@ func BacktrackHasZeroWidthCycle(pattern string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("parse error: %w", err)
 	}
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return false, err
-	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(re.Simplify())
 	return progHasZeroWidthCycle(prog), nil
 }
 
@@ -3623,6 +3864,29 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
 	b = append(b, 0x0F) //   return
 	return append(b, 0x0B)
+}
+
+// clearLitAnchor drops every literal-anchored find artifact, for a pattern
+// whose find the start-anywhere find replaced after they were built: the two
+// bodies are what the assembler keys on, but a reader keying on any other
+// field — a layout, a table, the literal set, a prefilter offset — would find
+// a find this pattern no longer has.
+func (p *compiledPattern) clearLitAnchor() {
+	p.litAnchorBackScanBody = nil
+	p.litAnchorFindLayout, p.litAnchorFindTable = nil, nil
+	p.litAnchorFirstByteOff, p.litAnchorFirstByteFlags, p.litAnchorFirstBytes = 0, [256]byte{}, nil
+	p.litAnchorTeddyLoOff, p.litAnchorTeddyHiOff = 0, 0
+	p.litAnchorTeddyLoBytes, p.litAnchorTeddyHiBytes = nil, nil
+	p.litAnchorTeddyT1LoOff, p.litAnchorTeddyT1HiOff = 0, 0
+	p.litAnchorTeddyT1LoBytes, p.litAnchorTeddyT1HiBytes = nil, nil
+	p.litAnchorLitSet = nil
+	p.litAnchorRevL, p.litAnchorRevTable = nil, nil
+	p.altLitAnchorBranches = nil
+	p.altLitAnchorFirstByteOff, p.altLitAnchorFirstByteFlags, p.altLitAnchorFirstBytes = 0, [256]byte{}, nil
+	p.altLitAnchorTeddyLoOff, p.altLitAnchorTeddyHiOff = 0, 0
+	p.altLitAnchorTeddyLoBytes, p.altLitAnchorTeddyHiBytes = nil, nil
+	p.altLitAnchorTeddyT1LoOff, p.altLitAnchorTeddyT1HiOff = 0, 0
+	p.altLitAnchorTeddyT1LoBytes, p.altLitAnchorTeddyT1HiBytes = nil, nil
 }
 
 // buildBatchFindWrapperBody emits the WASM body for the batch find

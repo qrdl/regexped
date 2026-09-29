@@ -969,10 +969,10 @@ func ParseMemorySize(s string) (MemorySize, error) {
 		num = "0" + num
 	}
 	num = strings.TrimSuffix(num, ".")
-	r, ok := new(big.Rat).SetString(num)
-	if !ok {
-		return MemorySize{}, fmt.Errorf("%q is not a size", s)
-	}
+	// Cannot fail: memorySizeRE admits only digits with at most one dot, and
+	// the two lines above turn ".5" and "1." into "0.5" and "1", all of which
+	// big.Rat parses.
+	r, _ := new(big.Rat).SetString(num)
 	r.Mul(r, new(big.Rat).SetInt64(unit))
 	whole := new(big.Int).Quo(r.Num(), r.Denom()) // both non-negative: truncation is rounding down
 	bytes := uint64(math.MaxUint64)

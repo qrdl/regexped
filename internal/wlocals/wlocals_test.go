@@ -126,17 +126,27 @@ func TestAllocAppendsToExistingBuffer(t *testing.T) {
 // would be truncated into a DIFFERENT local — a module that validates and
 // silently reads the wrong slot. The allocator panics instead.
 func TestAllocRefusesIndexPastAByte(t *testing.T) {
+	// One byte of ULEB128 holds 0..127: a byte-indexed emitter writing 128
+	// writes a continuation byte. The wide allocators go on past it.
+	w := New(0)
+	w.Reserve(ValI32, 128)
+	if idx := w.I32W(); idx != 128 {
+		t.Fatalf("I32W past the byte limit = %d, want 128", idx)
+	}
+	if idx := w.I64W(); idx != 129 {
+		t.Fatalf("I64W past the byte limit = %d, want 129", idx)
+	}
 	a := New(0)
-	a.Reserve(ValI32, 256) // fills 0..255
-	if a.Next() != 256 {
-		t.Fatalf("Next() = %d, want 256", a.Next())
+	a.Reserve(ValI32, 128) // fills 0..127
+	if a.Next() != 128 {
+		t.Fatalf("Next() = %d, want 128", a.Next())
 	}
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("allocating a 257th local did not panic")
+			t.Fatal("allocating a 129th byte-indexed local did not panic")
 		}
-		if msg, ok := r.(string); !ok || !contains(msg, "exceeds 255") {
+		if msg, ok := r.(string); !ok || !contains(msg, "exceeds 127") {
 			t.Errorf("panic %v does not name the limit", r)
 		}
 	}()

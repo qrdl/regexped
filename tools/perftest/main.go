@@ -23,6 +23,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/benchshim"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -2287,8 +2288,14 @@ func benchRegexSet(sc setTestCase, input string, regexWasmBytes []byte, engine *
 }
 
 // benchRegexpedSet compiles the patterns as a regexped set and benchmarks find_all.
-// Timing is Go-level (one time.Since per full-input exhaustion pass).
-// CGo overhead (~1µs per call) is negligible vs. 100KB input scan times.
+//
+// Timed INSIDE wasm, through benchshim.BuildSetFind, as the regex crate side
+// and every single-pattern row are. It used to be timed from Go, one wasmtime
+// call per matching position, on the belief that the crossing was negligible
+// against a 100 KB scan. It is not on dense input: 1,545 matches cost 3.5 µs of
+// crossing each, ~80% of the drive, which made log-levels-dense read 0.16×
+// against a regex crate that crosses once per pass. Rows measured before
+// 2026-09-26 are not comparable with rows after it.
 func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct int) benchResult {
 	entries := make([]config.RegexEntry, len(sc.patterns))
 	for i, p := range sc.patterns {
@@ -2324,6 +2331,30 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	if mem == nil || findFn == nil {
 		return benchResult{}
 	}
+	shimMod, err := wasmtime.NewModule(engine, benchshim.BuildSetFind())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped set shim parse: %v\n", err)
+		return benchResult{}
+	}
+	linker := wasmtime.NewLinker(engine)
+	if err := linker.DefineWasi(); err != nil {
+		return benchResult{}
+	}
+	if err := linker.Define(store, "regexped", "set_find", findFn); err != nil {
+		return benchResult{}
+	}
+	if err := linker.Define(store, "regexped", "memory", mem); err != nil {
+		return benchResult{}
+	}
+	shimInst, err := linker.Instantiate(store, shimMod)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped set shim instantiate: %v\n", err)
+		return benchResult{}
+	}
+	benchFn := shimInst.GetFunc(store, "bench")
+	if benchFn == nil {
+		return benchResult{}
+	}
 
 	// Determine memory layout: input goes after tables, output after input.
 	// tableEnd covers per-pattern tables; set DFA tables also start near 0.
@@ -2336,8 +2367,15 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(len(input)) + 4096
-	// Ensure enough memory pages (tuples + gate array both live above outBase).
-	neededPages := uint64((int64(outBase) + 4096*4 + pageSize - 1) / pageSize)
+	// out_cap is patterns_in_set: the exact worst case for a single position,
+	// so the exhaustion loop never overflows. Above the tuples: the gate
+	// array, the scratch descriptor, then the shim's samples and clock scratch.
+	outCap := int32(len(sc.patterns))
+	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
+	scratchPtr := gatePtr + outCap*4
+	timingsBase := (scratchPtr + abi.FindScratchBytes + 7) &^ 7
+	// Ensure enough memory pages for all of it.
+	neededPages := uint64((int64(timingsBase) + int64(timingsBytes) + 8 + pageSize - 1) / pageSize)
 	curPages := mem.Size(store)
 	if neededPages > curPages {
 		mem.Grow(store, neededPages-curPages) //nolint:errcheck
@@ -2351,39 +2389,31 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 		}
 	}
 
-	// Write input into WASM memory.
+	// Write the input and the scratch descriptor (no answer cache: every set
+	// this harness drives is non-overlapping) into WASM memory.
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))
+	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
 
-	// out_cap is patterns_in_set: the exact worst case for a single position,
-	// so the exhaustion loop never overflows.
-	outCap := int32(len(sc.patterns))
-	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
-
-	// Warmup: exhaust all matches a few times.
+	bench := func(iters int32) error {
+		_, err := wcall(benchFn, store, inBase, int32(len(input)), scratchPtr, outBase, outCap,
+			gatePtr, outCap*4, iters, timingsBase)
+		return err
+	}
+	// Warmup, then one timed call of benchIters exhaustion passes, each timed
+	// inside wasm.
 	for warmupEnd := time.Now().Add(50 * time.Millisecond); time.Now().Before(warmupEnd); {
-		exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
+		if err := bench(10); err != nil {
+			fmt.Fprintf(os.Stderr, "  regexped set bench: %v\n", err)
+			return benchResult{}
+		}
 	}
-
-	// Benchmark: time each full exhaustion pass.
-	const setIters = 1000
-	timings := make([]time.Duration, setIters)
-	for i := range timings {
-		t0 := time.Now()
-		exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
-		timings[i] = time.Since(t0)
+	if err := bench(int32(benchIters)); err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped set bench: %v\n", err)
+		return benchResult{}
 	}
-
-	// Compute pct percentile.
-	ns := make([]byte, setIters*4)
-	for i, d := range timings {
-		v := uint32(d.Nanoseconds())
-		ns[i*4] = byte(v)
-		ns[i*4+1] = byte(v >> 8)
-		ns[i*4+2] = byte(v >> 16)
-		ns[i*4+3] = byte(v >> 24)
-	}
-	return benchResult{avgExec: computeStat(ns, pct), wasmSize: len(wasmBytes)}
+	buf = mem.UnsafeData(store)
+	return benchResult{avgExec: computeStat(buf[timingsBase:timingsBase+timingsBytes], pct), wasmSize: len(wasmBytes)}
 }
 
 // exhaustSetFind drives a set `find` export to exhaustion, the way a generated

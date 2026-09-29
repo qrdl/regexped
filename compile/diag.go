@@ -106,6 +106,50 @@ type SetDiag struct {
 	// each" — which is the whole cost difference between 154 fuel and 700 —
 	// was invisible to everything but a disassembler.
 	AnchoredUnion *AnchoredUnionDiag `json:"anchored_union,omitempty"`
+	// SplitMembers lists the ids of the members served by their own linear
+	// search instead of by the buckets: `find`, `scan_any` and `scan_all`
+	// merge their answers with the buckets'. Empty for a set whose members are
+	// all provably linear in its bodies.
+	SplitMembers []int `json:"split_members,omitempty"`
+	// SplitBacktracking is the subset of SplitMembers whose search is the
+	// Backtracking find rather than the start-anywhere find: the members that
+	// find refuses (an empty-width assertion, an automaton over the limits),
+	// and those past the start-anywhere tables' budget.
+	SplitBacktracking []int `json:"split_backtracking,omitempty"`
+	// NoCacheSplitMembers lists the members an overlapping set's no-cache
+	// companion splits out: the set's answer cache keeps them linear, and a
+	// drive that has no usable cache is routed to the companion, which serves
+	// them by their own linear searches.
+	NoCacheSplitMembers []int `json:"no_cache_split_members,omitempty"`
+	// NoCacheSplitBacktracking lists which of those the companion serves by
+	// the Backtracking find rather than the start-anywhere find.
+	NoCacheSplitBacktracking []int `json:"no_cache_split_backtracking,omitempty"`
+	// ScanUnion reports the scan pair's own union automaton: its whole body
+	// (Direct, when members are split out) or the target a literal
+	// frontend's work counter switches to (Counter).
+	ScanUnion *ScanUnionDiag `json:"scan_union,omitempty"`
+	// InCallCounter is set when the overlapping `find` carries the work
+	// counter that sweeps the answer cache INSIDE a call.
+	InCallCounter bool `json:"in_call_counter,omitempty"`
+	// WholeSetSweep reports the automaton the overlapping answer cache sweeps
+	// when the set's buckets cannot be swept directly: every member's full
+	// pattern merged, beside the buckets the walk keeps.
+	WholeSetSweep *WholeSetSweepDiag `json:"whole_set_sweep,omitempty"`
+}
+
+// WholeSetSweepDiag is the whole-set automaton's size: its states, and the
+// cells of the sweep column (which sizes every caller's answer cache).
+type WholeSetSweepDiag struct {
+	States int `json:"states"`
+	Cells  int `json:"cells"`
+}
+
+// ScanUnionDiag reports the scan pair's own union automaton.
+type ScanUnionDiag struct {
+	Direct  bool `json:"direct,omitempty"`
+	Counter bool `json:"counter,omitempty"`
+	States  int  `json:"states"`
+	Wide    bool `json:"wide,omitempty"`
 }
 
 // AnchoredUnionDiag reports the anchored trio's body selection.

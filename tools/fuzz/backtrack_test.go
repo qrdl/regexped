@@ -423,7 +423,10 @@ func TestSetBTMemberRegionReplacedBelowOrigin(t *testing.T) {
 			Patterns: config.PatternSelector{Names: names},
 		}},
 	}
-	w, _, diags, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{BTWorkBudget: 1})
+	// NoSplit: `(aa|a)*b` is not linear, so a set would split it out onto the
+	// Backtracking find; the Backtracking BUCKET machinery under test here is
+	// what a linear member forced onto Backtracking still gets.
+	w, _, diags, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{BTWorkBudget: 1, NoSplit: true})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

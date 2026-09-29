@@ -1,0 +1,21 @@
+# A set whose members are not all provably linear in the set's bodies: the two
+# letter-run members are SPLIT OUT and served by their own start-anywhere find
+# (compile/set_split.go), and `find`, `scan_any` and `scan_all` become merge
+# wrappers over the buckets' bodies and theirs. The `\b` member keeps a union
+# automaton from serving the scan pair, which is what puts the MERGED scan
+# wrappers (the kept body plus one forward pass per split member) here.
+regexps:
+  - name: p0
+    pattern: '[a-z]+0[0-9]+'
+  - name: p1
+    pattern: '[a-z]+1[0-9]+'
+  - name: p2
+    pattern: 'foo'
+  - name: p3
+    pattern: '\bbar'
+sets:
+  - name: s
+    find: s_find
+    scan_any: s_scan_any
+    scan_all: s_scan_all
+    patterns: all

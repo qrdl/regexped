@@ -82,6 +82,23 @@ func (r *Reporter) Note(note string) {
 	r.cur.Notes = append(r.cur.Notes, note)
 }
 
+// noteMark is the number of notes the open scope holds, for truncateNotes.
+func (r *Reporter) noteMark() int {
+	if r == nil || r.cur == nil {
+		return 0
+	}
+	return len(r.cur.Notes)
+}
+
+// truncateNotes drops the notes recorded since mark — for a body that was
+// described and then replaced, so the report names only what was emitted.
+func (r *Reporter) truncateNotes(mark int) {
+	if r == nil || r.cur == nil || mark > len(r.cur.Notes) {
+		return
+	}
+	r.cur.Notes = r.cur.Notes[:mark]
+}
+
 // HasEngine reports whether the open scope already knows its engine.
 func (r *Reporter) HasEngine() bool {
 	return r != nil && r.cur != nil && r.cur.Engine != 0
@@ -191,6 +208,50 @@ func (r *Reporter) Render(w io.Writer) {
 		}
 		if d.FrontendDemotion != nil {
 			fmt.Fprintf(w, "  DOWNGRADED frontend: %+v\n", *d.FrontendDemotion)
+		}
+		// Members served outside the buckets, and the work counters: each
+		// changes the set's cost by large factors and shows nowhere else.
+		if len(d.SplitMembers) > 0 {
+			bt := map[int]bool{}
+			for _, id := range d.SplitBacktracking {
+				bt[id] = true
+			}
+			ids := make([]string, len(d.SplitMembers))
+			for i, id := range d.SplitMembers {
+				ids[i] = fmt.Sprintf("#%d", id)
+				if bt[id] {
+					ids[i] += " (Backtracking)"
+				}
+			}
+			fmt.Fprintf(w, "  split out (not provably linear; own linear search): %s\n", strings.Join(ids, ", "))
+		}
+		if u := d.ScanUnion; u != nil {
+			switch {
+			case u.Direct:
+				fmt.Fprintf(w, "  scan pair: one union automaton over every member (%d states)\n", u.States)
+			case u.Counter:
+				fmt.Fprintf(w, "  scan pair: work counter switching to a union automaton (%d states)\n", u.States)
+			}
+		}
+		if d.InCallCounter {
+			fmt.Fprintf(w, "  overlapping find: in-call counter sweeps the answer cache\n")
+		}
+		if s := d.WholeSetSweep; s != nil {
+			fmt.Fprintf(w, "  overlapping find: the answer cache sweeps a whole-set automaton (%d states, %d cells)\n", s.States, s.Cells)
+		}
+		if len(d.NoCacheSplitMembers) > 0 {
+			bt := map[int]bool{}
+			for _, id := range d.NoCacheSplitBacktracking {
+				bt[id] = true
+			}
+			ids := make([]string, len(d.NoCacheSplitMembers))
+			for i, id := range d.NoCacheSplitMembers {
+				ids[i] = fmt.Sprintf("#%d", id)
+				if bt[id] {
+					ids[i] += " (Backtracking)"
+				}
+			}
+			fmt.Fprintf(w, "  overlapping find without a usable cache: companion splits out %s\n", strings.Join(ids, ", "))
 		}
 	}
 }

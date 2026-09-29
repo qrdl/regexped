@@ -462,6 +462,9 @@ type sparseSuffixParams struct {
 	// verdict, or -1 when this bucket carries no skip. See sparseScratch's
 	// comment for what the verdict is and why it re-probes.
 	memberGlobal int32
+	// probeWalkEndP1 is one past the global the scan probe stamps with how far
+	// its walk reached (the scan pair's work counter reads it); 0 = none.
+	probeWalkEndP1 int32
 }
 
 // buildSparseSuffixBody emits the tuple-writing suffix function for a
@@ -951,6 +954,14 @@ func buildSparseProbeBody(p sparseSuffixParams) []byte {
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B)
 	b = append(b, 0x0B)
+	if p.probeWalkEndP1 > 0 {
+		// How far the walk reached, for the scan pair's work counter — the
+		// bitmask probe's stamp (set_probe.go). Without it the counter, which
+		// seeds the global with the candidate's position, reads every sparse
+		// walk as zero bytes and never trips.
+		b = append(b, 0x20, lPos, 0x24)
+		b = utils.AppendULEB128(b, uint32(p.probeWalkEndP1-1)) //nolint:gosec // a global index
+	}
 	b = append(b, 0x20, lPos, 0x20, pLen, 0x46, 0x04, 0x40)
 	b = collect(b, p.tabs.eofOff, p.tabs.eofList)
 	b = append(b, 0x0B)

@@ -344,6 +344,10 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block
+	if !anchored && p.probeWalkEndP1 > 0 {
+		b = append(b, 0x20, lScanPos, 0x24)
+		b = utils.AppendULEB128(b, uint32(p.probeWalkEndP1-1)) //nolint:gosec // a global index
+	}
 
 	// EOF accepts count only when the whole input was consumed. A run that
 	// died early (dead state) left lScanPos < paramLen, and for the anchored

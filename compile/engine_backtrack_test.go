@@ -1077,6 +1077,40 @@ func TestEnginesCovTDFAEpsCapOpsTo(t *testing.T) {
 	if ok, ops := tdfaEpsCapOpsTo(failProg, 0, 5, map[int]bool{}); ok || ops != nil {
 		t.Errorf("tdfaEpsCapOpsTo(InstFail) = (%v, %v), want (false, nil)", ok, ops)
 	}
+
+	// A path with no capture on it is found with no ops: from the assertion
+	// straight to the consumer.
+	if ok, ops := tdfaEpsCapOpsTo(prog, 1, 2, map[int]bool{}); !ok || ops != nil {
+		t.Errorf("tdfaEpsCapOpsTo(capture-free path) = (%v, %v), want (true, nil)", ok, ops)
+	}
+}
+
+// The walker's visited array is stamped with a generation counter rather than
+// cleared per call. When the counter wraps, a stamp left by an old generation
+// can equal the new one, so every stamp must be cleared first — otherwise the
+// PC it names reads as already visited and a reachable target is missed.
+func TestEnginesCovEpsWalkerGenerationWrap(t *testing.T) {
+	prog := &syntax.Prog{
+		Inst: []syntax.Inst{
+			{Op: syntax.InstCapture, Arg: 2, Out: 1},
+			{Op: syntax.InstEmptyWidth, Out: 2},
+			{Op: syntax.InstRune1, Rune: []rune{'x'}},
+		},
+		Start: 0,
+	}
+	w := newEpsWalker(prog)
+	w.gen = ^uint32(0) // the next find wraps it
+	w.seen[1] = 1      // a stamp from generation 1, the one the wrap lands on
+	found, ops := w.find(0, 2)
+	if !found {
+		t.Fatal("find after the generation wrap missed a reachable target: a stale stamp read as visited")
+	}
+	if len(ops) != 1 || !ops[0].open || ops[0].group != 1 {
+		t.Errorf("ops = %+v, want one open of group 1", ops)
+	}
+	if w.gen != 1 {
+		t.Errorf("generation after the wrap = %d, want 1", w.gen)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,6 +2115,93 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 			validateWASM(t, off)
 		}
 	}
+}
+
+// TestBTWorkBudgetOffAcyclicDropsTheFallback is the other half: a program with
+// no zero-width cycle keeps its ordinary body under BTWorkBudgetOff, with no
+// work counter and no fallback body behind it — so the module is smaller than
+// the default one, which carries both. That holds for the no-capture match and
+// find bodies and for a set's Backtracking bucket driver, whose frame stack
+// is a fixed region rather than one grown at run time.
+func TestBTWorkBudgetOffAcyclicDropsTheFallback(t *testing.T) {
+	for _, p := range []string{`^(aa|a)*b`, `x(?:ab|a)*y`} {
+		if cyc, err := BacktrackHasZeroWidthCycle(p); err != nil || cyc {
+			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — witness no longer acyclic", p, cyc, err)
+		}
+		for _, e := range []config.RegexEntry{{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}} {
+			def, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{MaxDFAStates: 1})
+			if err != nil {
+				t.Fatalf("Compile(%q): %v", p, err)
+			}
+			off, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+				CompileOptions{MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
+			if err != nil {
+				t.Fatalf("Compile(%q, Off): %v", p, err)
+			}
+			if len(off) >= len(def) {
+				t.Errorf("%q %+v: Off module is %d bytes, default %d; want it smaller (no counter, no fallback)",
+					p, e, len(off), len(def))
+			}
+			validateWASM(t, off)
+		}
+	}
+
+	// A set member whose DFA would lose the `\B` branch's priority goes to a
+	// Backtracking bucket.
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p", Pattern: `(?:\B|a|)a`}},
+		Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+	}
+	if !SetAdmitsBacktracking(cfg.Sets[0], cfg) {
+		t.Fatal("the member is not on Backtracking; this case needs a Backtracking bucket")
+	}
+	def, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	off, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{BTWorkBudget: BTWorkBudgetOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(off) >= len(def) {
+		t.Errorf("set: Off module is %d bytes, default %d; want it smaller (no counter, no fallback)", len(off), len(def))
+	}
+	validateWASM(t, off)
+}
+
+// TestBTStackStartResolution pins how CompileOptions.BTStackStart becomes the
+// bytes a capture body's growing frame stack starts with: the default page when
+// unset or out of range, the option otherwise, and never less than one frame.
+func TestBTStackStartResolution(t *testing.T) {
+	for _, c := range []struct {
+		opt       int
+		frameSize int32
+		want      int32
+	}{
+		{0, 40, defaultBTStackStart},
+		{4096, 40, 4096},
+		{8, 40, 40}, // below one frame
+		{btScratchMaxEnd, 40, defaultBTStackStart},
+	} {
+		if got := btStackStart(c.opt, c.frameSize); got != c.want {
+			t.Errorf("btStackStart(%d, %d) = %d, want %d", c.opt, c.frameSize, got, c.want)
+		}
+	}
+	// Through Compile: the start is a constant in the capture body, so a
+	// different start builds a different, still valid, module.
+	e := []config.RegexEntry{{Pattern: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}}
+	def, _, err := CompileForced(e, 65536, true, EngineBacktrack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, _, err := CompileForced(e, 65536, true, EngineBacktrack, CompileOptions{BTStackStart: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(def, small) {
+		t.Error("BTStackStart: 8 built the default module; the option did not reach the capture body")
+	}
+	validateWASM(t, small)
 }
 
 // ---------------------------------------------------------------------------

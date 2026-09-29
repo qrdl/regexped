@@ -10,13 +10,13 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 func parseTestRe(t *testing.T, pattern string) *syntax.Regexp {
@@ -2050,6 +2050,7 @@ func TestReporterNilSafety(t *testing.T) {
 	r.Reason("reason")
 	r.End()
 	r.Render(&bytes.Buffer{})
+	r.truncateNotes(r.noteMark())
 	if r.HasEngine() {
 		t.Error("nil Reporter reports HasEngine")
 	}
@@ -2195,6 +2196,19 @@ func TestReporterRenderSets(t *testing.T) {
 			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
 			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}},
 			FrontendDemotion:          &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
+			// Members served outside the buckets and the work counters: each
+			// changes the set's cost by large factors and shows nowhere else.
+			SplitMembers:             []int{3, 4},
+			SplitBacktracking:        []int{4},
+			ScanUnion:                &ScanUnionDiag{Direct: true, States: 17},
+			InCallCounter:            true,
+			WholeSetSweep:            &WholeSetSweepDiag{States: 40, Cells: 12},
+			NoCacheSplitMembers:      []int{5, 6},
+			NoCacheSplitBacktracking: []int{6},
+		}, {
+			Name:      "counted",
+			Frontend:  "scalar",
+			ScanUnion: &ScanUnionDiag{Counter: true, States: 9},
 		}},
 	}
 	var b bytes.Buffer
@@ -2220,6 +2234,12 @@ func TestReporterRenderSets(t *testing.T) {
 		"dropped from match_any/match_all (unparseable): bad",
 		"id space:   9",
 		"DOWNGRADED frontend:",
+		"split out (not provably linear; own linear search): #3, #4 (Backtracking)",
+		"scan pair: one union automaton over every member (17 states)",
+		"overlapping find: in-call counter sweeps the answer cache",
+		"overlapping find: the answer cache sweeps a whole-set automaton (40 states, 12 cells)",
+		"overlapping find without a usable cache: companion splits out #5, #6 (Backtracking)",
+		"scan pair: work counter switching to a union automaton (9 states)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q\n--- got ---\n%s", want, out)
@@ -2545,586 +2565,548 @@ func TestVerboseReporterNotes(t *testing.T) {
 	}
 }
 
-// lowerBatteryClasses are the single classes the UTF-8 lowering is checked
-// against exhaustively. Beyond the obvious ones, each range is there for a
-// split it forces: `[\x{80}-\x{7ff}]` is exactly the two-byte encodings,
-// `[\x{d7ff}-\x{e000}]` straddles the surrogates (which must lower to
-// nothing), `\x{10ffff}` is the last encodable codepoint, and
-// `[a-\x{10ffff}]` crosses every length boundary from ASCII up.
-var lowerBatteryClasses = []string{
-	`\pL`, `\p{Greek}`, `[^a]`, `.`, `(?s:.)`,
-	`[\x{80}-\x{7ff}]`, `[\x{d7ff}-\x{e000}]`, `\x{10ffff}`, `[a-\x{10ffff}]`,
-	`[\p{L}\p{N}_]`,
-}
-
-// lowerTestProgs compiles pattern the way the compiler does — parse,
-// Simplify, syntax.Compile — and returns the program before and after
-// lowerUTF8, the lowered one already checked for the shape engines rely on.
-func lowerTestProgs(t *testing.T, pattern string) (orig, low *syntax.Prog) {
-	t.Helper()
-	orig, err := syntax.Compile(parseTestRe(t, pattern).Simplify())
-	if err != nil {
-		t.Fatalf("syntax.Compile(%q): %v", pattern, err)
-	}
-	low = lowerUTF8(orig)
-	checkLoweredShape(t, pattern, low)
-	return orig, low
-}
-
-// checkLoweredShape asserts what every engine relies on in a lowered
-// program: it consumes byte ranges only — InstRune/InstRune1 over
-// 0x00-0xFF, with no FoldCase and no InstRuneAny* — and every successor is a
-// real PC.
-func checkLoweredShape(t *testing.T, pattern string, p *syntax.Prog) {
-	t.Helper()
-	isPC := func(pc uint32) bool { return int(pc) < len(p.Inst) }
-	if p.Start < 0 || p.Start >= len(p.Inst) {
-		t.Fatalf("%q: Start %d outside %d instructions", pattern, p.Start, len(p.Inst))
-	}
-	for pc := range p.Inst {
-		inst := &p.Inst[pc]
-		switch inst.Op {
-		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-			t.Fatalf("%q: lowered pc %d is %v, which consumes a codepoint", pattern, pc, inst.Op)
-		case syntax.InstRune, syntax.InstRune1:
-			if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
-				t.Fatalf("%q: lowered pc %d carries FoldCase", pattern, pc)
-			}
-			if len(inst.Rune) == 0 || (inst.Op == syntax.InstRune && len(inst.Rune)%2 != 0) {
-				t.Fatalf("%q: lowered pc %d has malformed ranges %v", pattern, pc, inst.Rune)
-			}
-			for _, r := range inst.Rune {
-				if r < 0 || r > 0xFF {
-					t.Fatalf("%q: lowered pc %d consumes %#x, not a byte", pattern, pc, r)
-				}
-			}
-		}
-		switch inst.Op {
-		case syntax.InstMatch, syntax.InstFail:
-		case syntax.InstAlt, syntax.InstAltMatch:
-			if !isPC(inst.Out) || !isPC(inst.Arg) {
-				t.Fatalf("%q: lowered pc %d branches outside the program", pattern, pc)
-			}
-		default:
-			if !isPC(inst.Out) {
-				t.Fatalf("%q: lowered pc %d continues outside the program", pattern, pc)
-			}
-		}
-	}
-}
-
-// lowerClosure follows every epsilon edge from pcs and returns the consuming
-// instructions reached, sorted, and whether Match was reached. The acceptance
-// simulator below runs single classes, which carry no assertion; guessing an
-// assertion's context would test nothing, so meeting one fails the test.
-func lowerClosure(t *testing.T, p *syntax.Prog, pcs []uint32) ([]uint32, bool) {
-	t.Helper()
-	seen := make(map[uint32]bool)
-	var consume []uint32
-	match := false
-	stack := slices.Clone(pcs)
-	for len(stack) > 0 {
-		pc := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if seen[pc] {
-			continue
-		}
-		seen[pc] = true
-		inst := &p.Inst[pc]
-		switch inst.Op {
-		case syntax.InstMatch:
-			match = true
-		case syntax.InstFail:
-		case syntax.InstAlt, syntax.InstAltMatch:
-			stack = append(stack, inst.Out, inst.Arg)
-		case syntax.InstNop, syntax.InstCapture:
-			stack = append(stack, inst.Out)
-		case syntax.InstEmptyWidth:
-			t.Fatalf("pc %d: the acceptance simulator does not model assertions", pc)
-		default:
-			consume = append(consume, pc)
-		}
-	}
-	slices.Sort(consume)
-	return consume, match
-}
-
-// lowerDFA answers whether a lowered program matches an input EXACTLY, by
-// Thompson simulation memoised on (thread set, byte) — a lazily built DFA.
-// The memo is what makes the exhaustive battery affordable: ~1.1M inputs per
-// class, through programs of up to ~2,000 instructions, all starting from the
-// same closure. State 0 is the start.
-type lowerDFA struct {
-	t      *testing.T
-	prog   *syntax.Prog
-	ids    map[string]int32
-	sets   [][]uint32
-	accept []bool
-	next   [][256]int32 // -1 until built
-}
-
-func newLowerDFA(t *testing.T, p *syntax.Prog) *lowerDFA {
-	d := &lowerDFA{t: t, prog: p, ids: make(map[string]int32)}
-	d.intern(lowerClosure(t, p, []uint32{uint32(p.Start)}))
-	return d
-}
-
-func (d *lowerDFA) intern(set []uint32, match bool) int32 {
-	key := fmt.Sprint(match, set)
-	if id, ok := d.ids[key]; ok {
-		return id
-	}
-	id := int32(len(d.sets))
-	d.ids[key] = id
-	d.sets = append(d.sets, set)
-	d.accept = append(d.accept, match)
-	var row [256]int32
-	for i := range row {
-		row[i] = -1
-	}
-	d.next = append(d.next, row)
-	return id
-}
-
-func (d *lowerDFA) step(s int32, b byte) int32 {
-	if n := d.next[s][b]; n >= 0 {
-		return n
-	}
-	var outs []uint32
-	for _, pc := range d.sets[s] {
-		if inst := &d.prog.Inst[pc]; inst.MatchRune(rune(b)) {
-			outs = append(outs, inst.Out)
-		}
-	}
-	n := d.intern(lowerClosure(d.t, d.prog, outs))
-	d.next[s][b] = n
-	return n
-}
-
-func (d *lowerDFA) accepts(in []byte) bool {
-	s := int32(0)
-	for _, b := range in {
-		s = d.step(s, b)
-	}
-	return d.accept[s]
-}
-
-// count returns how many distinct byte strings the program accepts from
-// state s, entered after depth bytes. A class accepts nothing longer than
-// four bytes, so a thread still alive after four fails the test rather than
-// being followed.
-func (d *lowerDFA) count(s int32, depth int, memo map[[2]int32]int) int {
-	if n, ok := memo[[2]int32{s, int32(depth)}]; ok {
-		return n
-	}
-	n := 0
-	if d.accept[s] {
-		n = 1
-	}
-	if len(d.sets[s]) > 0 {
-		if depth == utf8.UTFMax {
-			d.t.Fatalf("a thread is still alive after %d bytes", depth)
-		}
-		for b := range 256 {
-			n += d.count(d.step(s, byte(b)), depth+1, memo)
-		}
-	}
-	memo[[2]int32{s, int32(depth)}] = n
-	return n
-}
-
-// lowerRuneOracle returns the membership test of the single class the
-// ORIGINAL program p matches: whether p matches exactly the one-codepoint
-// string c. The answer comes from Go's own Inst.MatchRune over codepoints,
-// not from anything the lowering computes.
-func lowerRuneOracle(t *testing.T, p *syntax.Prog) func(rune) bool {
-	type arm struct {
-		inst    *syntax.Inst
-		accepts bool
-	}
-	var arms []arm
-	start, _ := lowerClosure(t, p, []uint32{uint32(p.Start)})
-	for _, pc := range start {
-		_, m := lowerClosure(t, p, []uint32{p.Inst[pc].Out})
-		arms = append(arms, arm{&p.Inst[pc], m})
-	}
-	return func(c rune) bool {
-		for _, a := range arms {
-			if a.accepts && a.inst.MatchRune(c) {
-				return true
-			}
-		}
-		return false
-	}
-}
-
-// TestLowerUTF8ClassBattery checks every lowered battery class against its
-// original over the whole codespace: the UTF-8 of every codepoint in the
-// class is accepted and that of every codepoint outside it rejected, over
-// 0..U+10FFFF minus the surrogates, which have no encoding. That shows the
-// lowered language holds exactly the class's encodings among the valid
-// ones; counting every byte string the lowered program accepts, and finding
-// the class's size, shows it holds nothing else — no invalid sequence either.
-//
-// It also asserts the suffix sharing: no two consuming instructions agree on
-// both their ranges and their successor, where a flat lowering repeats
-// [80-BF]→exit once per multi-byte sequence.
-func TestLowerUTF8ClassBattery(t *testing.T) {
-	for _, pat := range lowerBatteryClasses {
-		t.Run(pat, func(t *testing.T) {
-			orig, low := lowerTestProgs(t, pat)
-			inClass := lowerRuneOracle(t, orig)
-			d := newLowerDFA(t, low)
-			var buf [utf8.UTFMax]byte
-			members := 0
-			for c := rune(0); c <= unicode.MaxRune; c++ {
-				if c >= 0xD800 && c <= 0xDFFF {
-					continue
-				}
-				want := inClass(c)
-				n := utf8.EncodeRune(buf[:], c)
-				if got := d.accepts(buf[:n]); got != want {
-					t.Fatalf("U+%04X (% X): lowered accepts = %v, class membership = %v",
-						c, buf[:n], got, want)
-				}
-				if want {
-					members++
-				}
-			}
-			if members == 0 {
-				t.Fatal("the class has no members; the case tests nothing")
-			}
-			if got := d.count(0, 0, make(map[[2]int32]int)); got != members {
-				t.Fatalf("the lowered program accepts %d byte strings but the class has %d "+
-					"codepoints: it accepts something that encodes none of them", got, members)
-			}
-			seen := make(map[string]int)
-			for pc, inst := range low.Inst {
-				if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
-					continue
-				}
-				k := fmt.Sprint(inst.Rune, inst.Out)
-				if prev, ok := seen[k]; ok {
-					t.Fatalf("pcs %d and %d are the same range with the same successor: "+
-						"a suffix was not shared", prev, pc)
-				}
-				seen[k] = pc
-			}
-			t.Logf("%d instructions, %d lowered; %d codepoints", len(orig.Inst), len(low.Inst), members)
-		})
-	}
-}
-
-// TestLowerUTF8RejectsInvalid drives byte strings that are not UTF-8 through
-// every lowered battery class, and each non-empty prefix of them too: an
-// overlong form, a surrogate, a value past U+10FFFF, a stray continuation
-// byte and a truncated sequence must all fail, including under `.` and
-// `[^a]`, which accept every VALID codepoint. The overlongs sit on the
-// boundaries the sequence split cuts at. Every string checked is asserted
-// invalid first, so the battery says nothing about a valid one.
-func TestLowerUTF8RejectsInvalid(t *testing.T) {
-	invalid := []struct {
-		name string
-		b    []byte
+// TestFindClassifierVerdicts pins the compile-time find classifier
+// (start_anywhere.go) on one example of every shape it distinguishes: today's
+// find where it is provably linear, the start-anywhere find alone for the two
+// shapes that start with a repeat of a class common in prose, and today's
+// find with the work counter for the rest — and how the prefer-* hints move
+// each. A group-A pattern must also compile to exactly today's bytes.
+func TestFindClassifierVerdicts(t *testing.T) {
+	cases := []struct {
+		pat   string
+		hints []string
+		want  string
 	}{
-		{"overlong U+0000 in 2 bytes", []byte{0xC0, 0x80}},
-		{"overlong U+007F in 2 bytes", []byte{0xC1, 0xBF}},
-		{"overlong U+0000 in 3 bytes", []byte{0xE0, 0x80, 0x80}},
-		{"overlong U+07FF in 3 bytes", []byte{0xE0, 0x9F, 0xBF}},
-		{"overlong U+0000 in 4 bytes", []byte{0xF0, 0x80, 0x80, 0x80}},
-		{"overlong U+FFFF in 4 bytes", []byte{0xF0, 0x8F, 0xBF, 0xBF}},
-		{"surrogate U+D800", []byte{0xED, 0xA0, 0x80}},
-		{"surrogate U+DFFF", []byte{0xED, 0xBF, 0xBF}},
-		{"U+110000", []byte{0xF4, 0x90, 0x80, 0x80}},
-		{"lead byte F5", []byte{0xF5, 0x80, 0x80, 0x80}},
-		{"byte FF", []byte{0xFF}},
-		{"stray continuation 80", []byte{0x80}},
-		{"stray continuation BF", []byte{0xBF}},
-		{"two stray continuations", []byte{0x80, 0xBF}},
-		{"truncated U+20AC", []byte{0xE2, 0x82}},
-		{"truncated U+1F600", []byte{0xF0, 0x9F, 0x98}},
-	}
-	for _, pat := range lowerBatteryClasses {
-		_, low := lowerTestProgs(t, pat)
-		d := newLowerDFA(t, low)
-		for _, c := range invalid {
-			for n := 1; n <= len(c.b); n++ {
-				b := c.b[:n]
-				if utf8.Valid(b) {
-					t.Fatalf("test data: %s prefix % X is valid UTF-8", c.name, b)
-				}
-				if d.accepts(b) {
-					t.Errorf("%q accepts % X (%s)", pat, b, c.name)
-				}
-			}
-		}
-	}
-}
-
-// TestLowerUTF8SurrogatesLowerToNothing: surrogates have no encoding, so a
-// class of nothing else must lower to a program that accepts nothing, and a
-// class whose only other member is ASCII to exactly that byte.
-func TestLowerUTF8SurrogatesLowerToNothing(t *testing.T) {
-	for _, c := range []struct {
-		pat  string
-		want int
-	}{
-		{`[\x{d800}-\x{dfff}]`, 0},
-		{`[a\x{d800}-\x{dfff}]`, 1},
-	} {
-		_, low := lowerTestProgs(t, c.pat)
-		d := newLowerDFA(t, low)
-		if got := d.count(0, 0, make(map[[2]int32]int)); got != c.want {
-			t.Errorf("%q: lowered program accepts %d byte strings, want %d", c.pat, got, c.want)
-		}
-		if c.want == 1 && !d.accepts([]byte("a")) {
-			t.Errorf("%q: lowered program rejects \"a\"", c.pat)
-		}
-	}
-}
-
-// lowerPikeFind is a leftmost-first Pike VM — Go regexp's semantics — that
-// returns the capture slots of the first match in byte offsets, or nil. With
-// runes set it steps prog one decoded codepoint at a time, which is how the
-// ORIGINAL program is read; otherwise one byte at a time, each byte handed to
-// MatchRune as its value, which is how every engine here reads a lowered one.
-func lowerPikeFind(prog *syntax.Prog, in []byte, runes bool) []int {
-	type thread struct {
-		pc  uint32
-		cap []int
-	}
-	type queue struct {
-		th []thread
-		on []bool
-	}
-	symAt := func(pos int) (rune, int) {
-		if pos >= len(in) {
-			return -1, 0
-		}
-		if runes {
-			return utf8.DecodeRune(in[pos:])
-		}
-		return rune(in[pos]), 1
-	}
-	before := func(pos int) rune {
-		if pos == 0 {
-			return -1
-		}
-		if runes {
-			r, _ := utf8.DecodeLastRune(in[:pos])
-			return r
-		}
-		return rune(in[pos-1])
-	}
-	var add func(q *queue, pc uint32, pos int, cap []int)
-	add = func(q *queue, pc uint32, pos int, cap []int) {
-		if q.on[pc] {
-			return
-		}
-		q.on[pc] = true
-		switch inst := &prog.Inst[pc]; inst.Op {
-		case syntax.InstFail:
-		case syntax.InstAlt, syntax.InstAltMatch:
-			add(q, inst.Out, pos, cap)
-			add(q, inst.Arg, pos, cap)
-		case syntax.InstNop:
-			add(q, inst.Out, pos, cap)
-		case syntax.InstCapture:
-			c := slices.Clone(cap)
-			if int(inst.Arg) < len(c) {
-				c[inst.Arg] = pos
-			}
-			add(q, inst.Out, pos, c)
-		case syntax.InstEmptyWidth:
-			after, _ := symAt(pos)
-			if syntax.EmptyOp(inst.Arg)&^syntax.EmptyOpContext(before(pos), after) == 0 {
-				add(q, inst.Out, pos, cap)
-			}
-		default:
-			q.th = append(q.th, thread{pc, cap})
-		}
-	}
-	run := &queue{on: make([]bool, len(prog.Inst))}
-	next := &queue{on: make([]bool, len(prog.Inst))}
-	var matched []int
-	for pos := 0; ; {
-		if matched == nil {
-			cap := make([]int, prog.NumCap)
-			for i := range cap {
-				cap[i] = -1
-			}
-			cap[0] = pos
-			add(run, uint32(prog.Start), pos, cap)
-		}
-		r, w := symAt(pos)
-		for _, th := range run.th {
-			inst := &prog.Inst[th.pc]
-			if inst.Op == syntax.InstMatch {
-				matched = slices.Clone(th.cap)
-				matched[1] = pos
-				break // every later thread has lower priority
-			}
-			if w > 0 && inst.MatchRune(r) {
-				add(next, inst.Out, pos+w, th.cap)
-			}
-		}
-		if w == 0 || (matched != nil && len(next.th) == 0) {
-			return matched
-		}
-		run, next = next, run
-		next.th = next.th[:0]
-		clear(next.on)
-		pos += w
-	}
-}
-
-// TestLowerUTF8Priority checks that lowering leaves leftmost-first answers
-// alone: the first match of every pattern over every input has the same
-// capture slots before lowering (read codepoint by codepoint) and after it
-// (read byte by byte), and the codepoint reading agrees with Go's regexp, so
-// the simulator is itself checked. A lowered class's arms need no order —
-// only the original program's own alternations have a priority to keep.
-// `a|\pL` and `[ab]|\pL` are merged into one class by Go's parser; the
-// capturing spellings are not, so they make leftmost-first choose between an
-// ASCII arm and a lowered class, and between arms of different lengths, which
-// is where a reordering would show. Every pattern consumes at least one
-// codepoint: an empty match inside a codepoint is a question for the find
-// machinery, not for this pass.
-func TestLowerUTF8Priority(t *testing.T) {
-	patterns := []string{
-		`a|\pL`, `[ab]|\pL`,
-		`(a)|(\pL)`, `(\pL)|(a)`, `([ab])|(\pL)`,
-		`(a)|(\pL\pL)`, `(\pL)|(\pL\pL)`, `(\pL\pL)|(\pL)`,
-		`(é)|([^a]+)`, `(\pL+?)(\pL*)`, `(\pL+)@(\pL+)`,
-		`^(é|a)+\b`, `(?m)^.$`, `(.)(.)`,
-	}
-	inputs := []string{
-		"", "a", "b", "é", "ab", "aé", "éa", "éé", "1é", "x@y", "é@ж",
-		"日本@語", "\U0001D538b", "aK", "x\nй\n", "é\U0001F600a",
-	}
-	for _, pat := range patterns {
-		orig, low := lowerTestProgs(t, pat)
-		goRE := regexp.MustCompile(pat)
-		for _, in := range inputs {
-			want := lowerPikeFind(orig, []byte(in), true)
-			if goWant := goRE.FindStringSubmatchIndex(in); !slices.Equal(want, goWant) {
-				t.Fatalf("simulator disagrees with Go: %q over %q = %v, Go says %v", pat, in, want, goWant)
-			}
-			if got := lowerPikeFind(low, []byte(in), false); !slices.Equal(got, want) {
-				t.Errorf("%q over %q: lowered %v, original %v", pat, in, got, want)
-			}
-		}
-	}
-}
-
-// TestLowerUTF8ASCIIUnchanged: an unfolded program with no codepoint past
-// 0x7F lowers to an instruction-for-instruction copy of itself — a rune ≤ 0x7F
-// is its own encoding, and nothing else is rewritten.
-func TestLowerUTF8ASCIIUnchanged(t *testing.T) {
-	for _, pat := range []string{`abc`, `(a+|b)\bc$`, `[a-z0-9_]*?x`, `(?m)^\w+$`, `a[\x00-\x7f]b`} {
-		orig, low := lowerTestProgs(t, pat)
-		same := orig.Start == low.Start && orig.NumCap == low.NumCap &&
-			slices.EqualFunc(orig.Inst, low.Inst, func(a, b syntax.Inst) bool {
-				return a.Op == b.Op && a.Out == b.Out && a.Arg == b.Arg && slices.Equal(a.Rune, b.Rune)
-			})
-		if !same {
-			t.Errorf("%q changed under lowering:\n%v\nbecame\n%v", pat, orig, low)
-		}
-	}
-}
-
-// lowerHasFoldCase reports whether any rune instruction of p carries
-// syntax.FoldCase. Only rune instructions are read: in an InstEmptyWidth the
-// same bit is EmptyBeginLine.
-func lowerHasFoldCase(p *syntax.Prog) bool {
-	for _, inst := range p.Inst {
-		if (inst.Op == syntax.InstRune || inst.Op == syntax.InstRune1) &&
-			syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// TestLowerUTF8FoldCase checks case folding expanded in codepoint space. Each
-// folded literal lowers to exactly the UTF-8 of its unicode.SimpleFold orbit:
-// the listed spellings are checked against Go's regexp first, then the whole
-// codespace against Inst.MatchRune on the ORIGINAL program, which folds by
-// itself, so the oracle never sees the expansion; and the orbit is exactly
-// the listed spellings. ß's orbit is {ß, ẞ}: simple folding maps one
-// codepoint to one, and "ss" is full folding, which Go does not do. `(?i)a`
-// is the literal whose orbit stays ASCII, where the flag must go all the same.
-//
-// Every battery class runs under `(?i)` too. Go's parser closes a class under
-// folding itself, so those programs arrive with no flag; they are here for
-// the whole-codespace check and the FoldCase walk over what lowering returns.
-func TestLowerUTF8FoldCase(t *testing.T) {
-	type foldCase struct {
-		pat            string
-		accept, reject []string // nil accept: a battery class, no flag expected
-	}
-	cases := []foldCase{
-		{`(?i)k`, []string{"k", "K", "K"}, nil},
-		{`(?i)s`, []string{"s", "S", "ſ"}, nil},
-		{`(?i)σ`, []string{"σ", "ς", "Σ"}, nil},
-		{`(?i)ß`, []string{"ß", "ẞ"}, []string{"ss"}},
-		{`(?i)a`, []string{"a", "A"}, nil},
-	}
-	for _, pat := range lowerBatteryClasses {
-		cases = append(cases, foldCase{pat: `(?i)` + pat})
+		{`a*b`, nil, "switch"},
+		{`[^,]*,`, nil, "switch"},
+		{`\w+@\w+`, nil, "start-anywhere"},
+		{`[a-z]+[0-9]{3}`, nil, "start-anywhere"},
+		{`[a-z]+[0-9]+z`, nil, "start-anywhere"},
+		{`(?:ab)+c`, nil, "switch"},
+		{`\w+abc\d`, nil, "switch"},
+		{`\w+_x\d`, nil, "switch"},
+		{`.*foo\d`, nil, "switch"},
+		{`(?i)select\s+.*\s+from`, nil, "switch"},
+		{`ERROR\w*y|WARN\w*z`, nil, "switch"},
+		{`foo[a-z]+bar`, nil, "switch"},
+		{`a+b`, nil, "today"},
+		{`[a-z]+@example\.com`, nil, "today"},
+		{`\w+@\w+\.com`, nil, "today"},
+		{`foo[a-z]+`, nil, "today"},
+		{`[0-9]{3}-[0-9]{4}`, nil, "today"},
+		// The hints. A hint never keeps today's find unswitched: prefer-match
+		// keeps today's BODY under the leading word repeat, with the counter.
+		{`\w+@\w+`, []string{"prefer-match"}, "switch"},
+		{`\w+@\w+`, []string{"prefer-no-match"}, "start-anywhere"},
+		{`[^,]*,`, []string{"prefer-no-match"}, "start-anywhere"},
+		{`[^,]*,`, []string{"prefer-match"}, "switch"},
+		{`a*b`, []string{"prefer-match"}, "switch"},
+		{`a*b`, []string{"prefer-no-match"}, "switch"},
+		{`[a-zA-Z][^;]*[;,]`, []string{"prefer-no-match"}, "switch"}, // with a neutral twin
+		// Empty-width assertions: classified like any pattern, the accept
+		// conditions taken into account. `\b\w+@\w+\b` and `a+$` / `a+\b`
+		// (every attempt over `a`×N then `b` walks the run and fails) get the
+		// switch; `(?m:^)ERROR:.*(?m:$)` and `\bfoo\w*\b` are linear — their
+		// loops can only end where the condition holds.
+		{`\b\w+@\w+\b`, nil, "switch"},
+		{`a+$`, nil, "switch"},
+		{`a+\b`, nil, "switch"},
+		{`(?m:^)ERROR:.*(?m:$)`, nil, "today"},
+		{`\bfoo\w*\b`, nil, "today"},
+		{`^a*b`, nil, "today"},
+		// A case-folded leading repeat is the SAME repeat under both cases,
+		// and a bounded one is not a leading repeat at all.
+		{`(?i)a+x\w*y`, nil, "switch"},
+		{`(?i)A+x\w*y`, nil, "switch"},
+		{`a{2,5}\w*y`, nil, "switch"},
+		// A lenient literal-chain alternation whose DFA branch can walk
+		// without accepting: its specialised body has no counter, so it takes
+		// the ordinary find and the switch.
+		{`ab?c|x[a-z]*Y`, nil, "switch"},
 	}
 	for _, c := range cases {
-		t.Run(c.pat, func(t *testing.T) {
-			orig, low := lowerTestProgs(t, c.pat)
-			literal := c.accept != nil
-			if literal && !lowerHasFoldCase(orig) {
-				t.Fatal("the original program carries no FoldCase; the case tests nothing")
+		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
+		r := &Reporter{}
+		w, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{Report: r})
+		if err != nil {
+			t.Fatalf("%s %v: %v", c.pat, c.hints, err)
+		}
+		r.End()
+		got := ""
+		for _, n := range r.Patterns[0].Notes {
+			if rest, ok := strings.CutPrefix(n, "find: "); ok {
+				got, _, _ = strings.Cut(rest, " ")
 			}
-			if lowerHasFoldCase(low) {
-				t.Fatal("FoldCase survived lowering")
+		}
+		if got != c.want {
+			t.Errorf("%s %v: find %q, want %q (notes %v)", c.pat, c.hints, got, c.want, r.Patterns[0].Notes)
+		}
+		if c.want == "today" {
+			today, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{TodayFind: true})
+			if err != nil {
+				t.Fatal(err)
 			}
-			d := newLowerDFA(t, low)
-			goRE := regexp.MustCompile(`^(?:` + c.pat + `)$`)
-			for _, in := range c.accept {
-				if !goRE.MatchString(in) {
-					t.Fatalf("test data: Go rejects %q", in)
-				}
-				if !d.accepts([]byte(in)) {
-					t.Errorf("lowered program rejects %q (% X)", in, in)
-				}
+			if !bytes.Equal(w, today) {
+				t.Errorf("%s %v: classified today's find but the module differs from TodayFind's", c.pat, c.hints)
 			}
-			for _, in := range c.reject {
-				if goRE.MatchString(in) {
-					t.Fatalf("test data: Go accepts %q", in)
-				}
-				if d.accepts([]byte(in)) {
-					t.Errorf("lowered program accepts %q (% X)", in, in)
-				}
+		}
+	}
+}
+
+// TestLenientAltLinear pins the gate on the lenient literal-chain alternation
+// find, which carries no work counter: it keeps its specialised body only for
+// patterns proven linear — by a bounded failed walk, or by no branch's
+// continuation being able to read a branch literal.
+func TestLenientAltLinear(t *testing.T) {
+	for _, c := range []struct {
+		pat    string
+		linear bool
+	}{
+		{`ab?c|x[a-z]*Y`, false},    // [a-z]* runs over `x`×N from every x
+		{`ab?c|x[a-z]{2,5}Y`, true}, // bounded walks
+		{`'\s*(?:OR|AND)\s+[0-9]+\s*=\s*[0-9]+|UNION\s+(?:ALL\s+)?SELECT|'\s*;\s*(?:DROP|TRUNCATE)\s+TABLE`, true},
+		{`ab\w*c|b\w*d`, false},            // \w* can read the other literal
+		{`ab[^a]*c|bc[0-9]*d`, false},      // [^a]* can read "bc"
+		{`ab[0-9]*c|bc[0-9]*d`, true},      // neither continuation reads a literal
+		{`(?i)ab[0-9]*c|bc[0-9]*d`, false}, // a folded literal is not a fence
+		{`(ab[0-9]*c|bc[0-9]*d)`, true},    // a capture around the alternation
+	} {
+		if got := lenientAltLinear(c.pat, CompileOptions{}); got != c.linear {
+			t.Errorf("%s: linear = %v, want %v", c.pat, got, c.linear)
+		}
+	}
+}
+
+// TestVerboseReportsTheStartAnywhereFind pins that a find the start-anywhere
+// find replaced is reported as what shipped: not today's engine, dispatch or
+// SIMD skip, which describe a body that was never emitted.
+func TestVerboseReportsTheStartAnywhereFind(t *testing.T) {
+	for _, c := range []struct {
+		pat string
+		lm  LikelyMode
+	}{
+		{`[^,]*,foo`, LikelyNoMatch},
+		{`\w+@\w+`, LikelyNeutral},
+	} {
+		r := &Reporter{}
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 0, true,
+			CompileOptions{LikelyMode: c.lm, Report: r}); err != nil {
+			t.Fatal(err)
+		}
+		r.End()
+		pr := r.Patterns[0]
+		if pr.Engine != EngineDFA || !strings.Contains(pr.Reason, "start-anywhere") {
+			t.Errorf("%s: engine %v (%s), want the start-anywhere find", c.pat, pr.Engine, pr.Reason)
+		}
+		for _, n := range pr.Notes {
+			if strings.Contains(n, "SIMD bulk skip") || strings.Contains(n, "state ids") ||
+				strings.Contains(n, "literal-anchored") || strings.Contains(n, "mandatory literal") {
+				t.Errorf("%s: note %q describes a body that was not emitted", c.pat, n)
 			}
-			inClass := lowerRuneOracle(t, orig)
-			var buf [utf8.UTFMax]byte
-			members := 0
-			for r := rune(0); r <= unicode.MaxRune; r++ {
-				if r >= 0xD800 && r <= 0xDFFF {
-					continue
+		}
+	}
+	// And the other way round: a note-mark past the end truncates nothing.
+	r := &Reporter{}
+	r.Begin("n", "p")
+	r.Note("kept")
+	r.truncateNotes(5)
+	r.End()
+	if len(r.Patterns[0].Notes) != 1 {
+		t.Errorf("truncateNotes past the end dropped notes: %v", r.Patterns[0].Notes)
+	}
+}
+
+// TestSwitchCounterArithmetic runs the work counter's arithmetic: an i64
+// counter against an i64 budget. In i32 the budget N × dist + 64 wraps past
+// 1 GiB and the counter past 4 GiB of work, and either wrap makes the check
+// pass forever on exactly the input it exists to catch. Executed through the
+// wasmtime CLI; skipped without it.
+func TestSwitchCounterArithmetic(t *testing.T) {
+	wt, err := exec.LookPath("wasmtime")
+	if err != nil {
+		t.Skip("wasmtime not in PATH")
+	}
+	local := func(i byte) func([]byte) []byte { return func(b []byte) []byte { return append(b, 0x20, i) } }
+	body := func(code []byte) []byte {
+		fn := append([]byte{0x00}, code...) // no locals
+		fn = append(fn, 0x0B)
+		return append(utils.AppendULEB128(nil, uint32(len(fn))), fn...)
+	}
+	// over(walked i64, dist i32) i32 and add(w i64, walk i32) i64.
+	over := body(emitSwitchOverBudget(nil, local(0), local(1), 4))
+	add := body(append(emitAddWalk(nil, local(0),
+		func(b []byte) []byte { return append(b, 0x21, 0) }, local(1)), 0x20, 0))
+	var m []byte
+	m = append(m, 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00)
+	m = appendSection(m, 1, []byte{0x02,
+		0x60, 0x02, 0x7E, 0x7F, 0x01, 0x7F,
+		0x60, 0x02, 0x7E, 0x7F, 0x01, 0x7E})
+	m = appendSection(m, 3, []byte{0x02, 0x00, 0x01})
+	m = appendSection(m, 7, []byte{0x02, 0x04, 'o', 'v', 'e', 'r', 0x00, 0x00, 0x03, 'a', 'd', 'd', 0x00, 0x01})
+	m = appendSection(m, 10, append(append([]byte{0x02}, over...), add...))
+	path := filepath.Join(t.TempDir(), "m.wasm")
+	if err := os.WriteFile(path, m, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	call := func(fn string, a uint64, b uint32) uint64 {
+		t.Helper()
+		out, err := exec.Command(wt, "run", "--invoke", fn, path,
+			fmt.Sprint(int64(a)), fmt.Sprint(int32(b))).Output()
+		if err != nil {
+			t.Fatalf("%s(%d, %d): %v", fn, a, b, err)
+		}
+		v, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		if err != nil {
+			t.Fatalf("%s(%d, %d): output %q", fn, a, b, out)
+		}
+		return uint64(v)
+	}
+	for _, c := range []struct {
+		walked uint64
+		dist   uint32
+		want   uint64
+	}{
+		{104, 10, 0},                // 4 × 10 + 64: at the line
+		{105, 10, 1},                // past it
+		{1<<32 + 64, 0x40000000, 0}, // budget 2^32 + 64, at the line: an i32 wraps it to 64
+		{1<<32 + 65, 0x40000000, 1}, // past it
+		{1 << 34, 0xFFFFFFFF, 0},    // budget 4 × (2^32 − 1) + 64 > 2^34
+	} {
+		if got := call("over", c.walked, c.dist); got != c.want {
+			t.Errorf("over(%#x, %#x) = %d, want %d", c.walked, c.dist, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		w    uint64
+		walk uint32
+		want uint64
+	}{
+		{5, 7, 12},
+		{0xFFFFFFF0, 0x20, 0x100000010},       // an i32 counter wraps this to 0x10
+		{0xFFFFFFFF, 0xFFFFFFFF, 0x1FFFFFFFE}, // the walk is unsigned
+	} {
+		if got := call("add", c.w, c.walk); got != c.want {
+			t.Errorf("add(%#x, %#x) = %#x, want %#x", c.w, c.walk, got, c.want)
+		}
+	}
+}
+
+// TestFindStrategyOverrides pins the three measurement knobs: each forces its
+// strategy whatever the classifier would pick, and the report says so — a knob
+// that quietly fell back to the classifier would measure the wrong body.
+func TestFindStrategyOverrides(t *testing.T) {
+	for _, c := range []struct {
+		opts CompileOptions
+		want string
+	}{
+		{CompileOptions{TodayFind: true}, "find: today — forced"},
+		{CompileOptions{StartAnywhereFind: true}, "find: start-anywhere — forced"},
+		{CompileOptions{StartAnywhereSwitchN: 2}, "find: switch — forced"},
+	} {
+		r := &Reporter{}
+		o := c.opts
+		o.Report = r
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: `[a-z]+@example\.com`, FindFunc: "f"}}, 0, true, o); err != nil {
+			t.Fatal(err)
+		}
+		r.End()
+		found := false
+		for _, n := range r.Patterns[0].Notes {
+			found = found || n == c.want
+		}
+		if !found {
+			t.Errorf("%+v: notes %v, want %q", c.opts, r.Patterns[0].Notes, c.want)
+		}
+	}
+	if got := switchNFor(CompileOptions{StartAnywhereSwitchN: 7}); got != 7 {
+		t.Errorf("switchNFor with the override = %d, want 7", got)
+	}
+}
+
+// TestFindStrategiesValidate compiles find-strategy shapes under every hint and
+// every forced strategy and validates each module. The strategies change the
+// find body's local declarations and its tail (the counter, the handover), and
+// the hints change which body they are added to, so the product reaches
+// emitter arms no single configuration does: 16-bit state ids, a mandatory
+// literal, a begin anchor that accepts at 0, and a prefer-no-match twin.
+func TestFindStrategiesValidate(t *testing.T) {
+	shapes := []string{
+		`a*b`, `[^,]*,`, `\w+@\w+`, `<[^>]+>`, `[a-zA-Z][^;]*[;,]`,
+		`[a-z]+@example\.com`, `x{3}abc\w*z|y{3}ghi\w*z`, `a+b\b`, `(?m:^)ab+`,
+		`[ab]*a[ab]{8}X`, `[ab]*a[ab]{8}FOO\w*X`, `(?:^|x)y*z`, `^b*|ab*c`,
+	}
+	strategies := []CompileOptions{{}, {TodayFind: true}, {StartAnywhereFind: true}, {StartAnywhereSwitchN: 1}}
+	for _, pat := range shapes {
+		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			for _, st := range strategies {
+				o := st
+				o.LikelyMode = lm
+				w, _, err := Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "f"}}, 0, true, o)
+				if err != nil {
+					t.Fatalf("%s %v %+v: %v", pat, lm, st, err)
 				}
-				want := inClass(r)
-				n := utf8.EncodeRune(buf[:], r)
-				if got := d.accepts(buf[:n]); got != want {
-					t.Fatalf("U+%04X (% X): lowered accepts = %v, original matches = %v",
-						r, buf[:n], got, want)
+				validateWASM(t, w)
+			}
+		}
+	}
+}
+
+// TestOddShapesValidate compiles shapes that sit at the edges of the
+// literal-chain, literal-anchored and boundary analysers — an end anchor that
+// can never hold, a multiline anchor, more branches than the one-byte Teddy
+// holds, lazy ranges, a range after a prefix — as match, find and groups under
+// every hint, and validates each module. Most are refused by some analyser and
+// served by another; what must hold is that whichever serves them emits a
+// valid module.
+func TestOddShapesValidate(t *testing.T) {
+	for _, p := range []string{
+		`ab{3}\A|cd{3}`, `ab{2,3}\A|cd{2,3}`, `(?m:^)ab{3}|cd{3}`, `ab{2,5}?|cd{2,5}?`, `ab{2,5}?x|cd{2,5}?y`,
+		`a1{3}|b2{3}|c3{3}|d4{3}|e5{3}|f6{3}|g7{3}|h8{3}|i9{3}`,
+		`a1{2,4}|b2{2,4}|c3{2,4}|d4{2,4}|e5{2,4}|f6{2,4}|g7{2,4}|h8{2,4}|i9{2,4}`,
+		`[0-9]{8}ghp_[a-z]{3,5}`, `(?P<d>[0-9]{8})ghp_(?P<k>[a-z]{3,5})`,
+		`ab[a-z]{3}|cd[a-z]{3}`, `a[a-z]{3}|b[b-z]{3}`, `ab[b-z]{3}`,
+		`x{3}abc\w*z|y{3}ghi\w*z|z{3}jkl\w*q`, `\w{3}abc\w*z|\d{3}ghi\w*z`, `[^a]{3}abc\w*z|[^b]{3}ghi\w*z`,
+		`abc|abd|x+`, `\b`, `\B`, `a?\b`, `\b|x`, `(?:\B|y)`, `\bx?`, `(?:\b|\B)a`,
+		`a(?m:$)`, `(?m:$)`, `(?m:^)[^\n]*x`, `[^\n]*(?m:$)`, `^?abc`, `(?:^|x)abc`, `(?:\A|x)abcd`,
+		`(?s:.)*abcd`, `ab(?m:$)|cd`, `(?i)abcd{3}`, `(?:abcd|efgh)[a-z]*X`, `abcd[a-z]*X|efgh[0-9]*Y`,
+		`[a-z]{0,200}X\w*Y`, `(?:[ab]{9})+X`, `\bab{3}\b|cd{3}`, `ab{3}\b|cd{3}\B`, `\Bab{3}|cd{3}\z`,
+	} {
+		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			for _, e := range []config.RegexEntry{
+				{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}, {Pattern: p, GroupsFunc: "g"},
+			} {
+				w, _, err := Compile([]config.RegexEntry{e}, 0, true, CompileOptions{LikelyMode: lm})
+				if err != nil {
+					t.Fatalf("%s %v: %v", p, lm, err)
 				}
-				if want {
-					members++
-				}
+				validateWASM(t, w)
 			}
-			if got := d.count(0, 0, make(map[[2]int32]int)); got != members {
-				t.Fatalf("the lowered program accepts %d byte strings but the original "+
-					"matches %d codepoints", got, members)
-			}
-			if literal && members != len(c.accept) {
-				t.Fatalf("the orbit has %d codepoints, not the %d listed", members, len(c.accept))
-			}
-		})
+		}
+	}
+}
+
+// TestFailedWalkBound pins the bounded-walk clause on both sides of it: a
+// pattern whose failed attempts can only walk a few bytes, and one whose
+// non-accepting loop lets them walk to the end — including the case where
+// that loop is reached only THROUGH an accepting state, which a successful
+// attempt walks after its last accept.
+func TestFailedWalkBound(t *testing.T) {
+	for _, c := range []struct {
+		pat     string
+		bounded bool
+	}{
+		{`foo[a-z]+`, true},
+		{`[0-9]{3}-[0-9]{4}`, true},
+		{`[0-9]+`, true},
+		{`a*b`, false},
+		{`x[a-z]*y`, false},
+		{`a*b|a`, false}, // the loop is behind the accept of `a`
+	} {
+		m, err := compile(c.pat, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := failedWalkBound(dfaTableFrom(m.(*dfa))); ok != c.bounded {
+			t.Errorf("%s: bounded = %v, want %v", c.pat, ok, c.bounded)
+		}
+	}
+}
+
+// TestSetSplitRule pins which members a gated set splits out of its buckets
+// (set_split.go): those that are not provably linear in the set's bodies.
+func TestSetSplitRule(t *testing.T) {
+	for _, c := range []struct {
+		pat   string
+		split bool
+	}{
+		{`[a-z]+X`, true},
+		{`foo[a-z]+bar`, true},
+		{`a+b`, true},
+		{`[a-z]+@example\.com`, true},
+		{`\w+@\w+`, true},
+		{`(?:a*b)?`, true},
+		{`union[ \t]+k00a+`, false},
+		{`union[ \t]+[a-z]{6}[0-9]{2}`, false},
+		{`union[ \t]+k00\w+`, false},
+		{`A="[a-z0-9]+"`, false},
+		{`AKIA[A-Z0-9]{16}`, false},
+		{`[a-z]{4}[0-9]{3}`, false},
+		{`a+`, false},
+		{`foo[a-z]+`, false},
+		// Assertions: judged with their conditions; the start-anywhere find
+		// serves them through its context passes.
+		{`\b[a-z]+X`, true},
+		{`[a-z]+X\b`, true},
+		{`\bfoo\w*\b`, false},
+		// Its start-anywhere automaton is over the state limit (2^11 states
+		// for `a[ab]{11}`), so the Backtracking find serves it.
+		{`a[ab]{11}c[a-z]*X`, true},
+	} {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "p", Pattern: c.pat}},
+			Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+		}
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatalf("%s: %v", c.pat, err)
+		}
+		if got := len(diags[0].SplitMembers) > 0; got != c.split {
+			t.Errorf("%s: split = %v, want %v", c.pat, got, c.split)
+		}
+		wantBT := c.pat == `a[ab]{11}c[a-z]*X`
+		if got := len(diags[0].SplitBacktracking) > 0; got != wantBT {
+			t.Errorf("%s: Backtracking split = %v, want %v", c.pat, got, wantBT)
+		}
+	}
+
+	// No count cap: the merge wrapper's per-member locals are full width, so
+	// a set with more members than one byte of local indices addresses splits
+	// every one of them.
+	for _, n := range []int{24, 40} {
+		var regexps []config.RegexEntry
+		for i := 0; i < n; i++ {
+			regexps = append(regexps, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`[a-z]+Q%d`, i)})
+		}
+		cfg := config.BuildConfig{Regexps: regexps,
+			Sets: []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}}}
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(diags[0].SplitMembers); got != n {
+			t.Errorf("%d members: %d split, want %d", n, got, n)
+		}
+	}
+}
+
+// TestSetSplitPaths drives the split paths the rule table above does not: a
+// scan pair whose split member needs the start-anywhere find's context passes,
+// an overlapping set whose no-cache companion splits a member onto
+// Backtracking, a second set compiled after a first allocated i64 globals, and
+// a spec built without its id space.
+func TestSetSplitPaths(t *testing.T) {
+	compileDiag := func(t *testing.T, regexps []config.RegexEntry, sets []config.SetConfig) []SetDiag {
+		t.Helper()
+		_, _, diags, err := CompileFileDiag(config.BuildConfig{Regexps: regexps, Sets: sets}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return diags
+	}
+	all := config.PatternSelector{All: true}
+
+	t.Run("scan pair with an assertion member", func(t *testing.T) {
+		d := compileDiag(t, []config.RegexEntry{{Name: "p", Pattern: `\b[a-z]+X`}},
+			[]config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl", Patterns: all}})
+		if len(d[0].SplitMembers) != 1 {
+			t.Errorf("split members %v, want the one member", d[0].SplitMembers)
+		}
+	})
+
+	t.Run("no-cache companion on Backtracking", func(t *testing.T) {
+		d := compileDiag(t, []config.RegexEntry{{Name: "a", Pattern: `a+`}, {Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}},
+			[]config.SetConfig{{Name: "s", Find: "f", Overlapping: true, Patterns: all}})
+		if len(d[0].NoCacheSplitBacktracking) != 1 {
+			t.Errorf("companion Backtracking members %v, want member 1", d[0].NoCacheSplitBacktracking)
+		}
+	})
+
+	t.Run("a second set after i64 globals", func(t *testing.T) {
+		d := compileDiag(t,
+			[]config.RegexEntry{{Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}, {Name: "c", Pattern: `[a-z]+Q`}},
+			[]config.SetConfig{
+				{Name: "s1", Find: "f1", Patterns: config.PatternSelector{Names: []string{"b"}}},
+				{Name: "s2", Find: "f2", Patterns: config.PatternSelector{Names: []string{"c"}}},
+			})
+		if len(d) != 2 || len(d[0].SplitBacktracking) != 1 || len(d[1].SplitMembers) != 1 {
+			t.Errorf("diags %+v, want s1 split onto Backtracking and s2 split", d)
+		}
+	})
+
+	t.Run("Backtracking split of a zero-width cycle", func(t *testing.T) {
+		// The start-anywhere automaton is over the state limit (2^12 states
+		// from [ab]{11}), so the member is split onto the Backtracking find;
+		// `(?:a|)+` is a cycle that consumes nothing, so that find is the
+		// fallback body alone and reserves no frame stack of its own.
+		pat := `(?:a|)+a[ab]{11}c[a-z]*X`
+		if size, ok := btFindStackSize(pat, 0); !ok || size != 0 {
+			t.Fatalf("btFindStackSize = %d, %v; want 0, true (the bare tail call)", size, ok)
+		}
+		wasm, _, d, err := CompileFileDiag(config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "z", Pattern: pat}},
+			Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: all}},
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, wasm)
+		if len(d[0].SplitBacktracking) != 1 {
+			t.Errorf("split onto Backtracking %v, want the member", d[0].SplitBacktracking)
+		}
+	})
+
+	t.Run("wide scan pair with the counter", func(t *testing.T) {
+		// Past 64 ids `scan_all` answers through the caller's bitmap, so the
+		// counter's hand-over carries the out pointer and adds the automaton's
+		// hits to the ones already counted.
+		pats := []string{`foo[a-z]+bar`}
+		for i := 0; i < 70; i++ {
+			pats = append(pats, fmt.Sprintf("kw%02dX", i))
+		}
+		wasm, _, diags, err := CompileFileDiag(setConfigWith(pats, false, "scan_any", "scan_all"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, wasm)
+		if u := diags[0].ScanUnion; u == nil || !u.Counter || !u.Wide || u.Direct {
+			t.Errorf("scan union %+v, want a wide automaton behind the counter", u)
+		}
+	})
+
+	t.Run("a spec without its id space", func(t *testing.T) {
+		var prefixPool, suffixPool dfaPool
+		info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z]+X`}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := SetSpec{Name: "s", Find: "f", ScanAny: "sa",
+			DeclaredPatternCount: 1, Patterns: []*PatternInfo{info}, PatternIDs: []int{0}}
+		cs := CompileSet(spec, &prefixPool, &suffixPool, CompileSetOptions{})
+		if len(cs.split) != 1 || cs.wideAll() {
+			t.Errorf("split %d members, wideAll %v; want 1 and narrow", len(cs.split), cs.wideAll())
+		}
+	})
+}
+
+// TestModuleGlobalsCloneIsIndependent pins what the split trial relies on: a
+// clone allocates, and gives initial values, without touching the original.
+func TestModuleGlobalsCloneIsIndependent(t *testing.T) {
+	g := &moduleGlobals{}
+	a := g.AllocInit(5)
+	b := g.AllocI64(7)
+	c := g.clone()
+	c.setInit(a, 9)
+	c.AllocI64(1)
+	c.i64[b] = 8
+	if g.inits[a] != 5 || g.i64[b] != 7 || g.Count() != 3 {
+		t.Errorf("the original changed: inits %v, i64 %v, count %d", g.inits, g.i64, g.Count())
+	}
+	if c.inits[a] != 9 || c.i64[b] != 8 || c.Count() != 4 {
+		t.Errorf("the clone did not keep its own values: inits %v, i64 %v, count %d", c.inits, c.i64, c.Count())
+	}
+}
+
+// TestSetSplitBudget pins the start-anywhere tables' budget: the smallest
+// tables get the start-anywhere find while the total fits, the rest the
+// Backtracking find, and a candidate already on Backtracking stays there.
+func TestSetSplitBudget(t *testing.T) {
+	pats := []*PatternInfo{{fullPattern: `[a-z]+Q1`}, {fullPattern: `[a-z]+Q2`}, {fullPattern: `[a-z]+Q3`}, {fullPattern: `\b[a-z]+X`}}
+	cands := []splitCand{{idx: 0, saBytes: 300}, {idx: 1, saBytes: 100}, {idx: 2, saBytes: 200}, {idx: 3, bt: true}}
+	got := budgetSplit(cands, pats, CompileSetOptions{}, 350)
+	want := []bool{true, false, false, true} // 100 + 200 fit; 300 does not
+	for i, c := range got {
+		if c.bt != want[i] {
+			t.Errorf("candidate %d (%d bytes): Backtracking = %v, want %v", c.idx, c.saBytes, c.bt, want[i])
+		}
 	}
 }

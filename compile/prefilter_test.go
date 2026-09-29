@@ -556,10 +556,10 @@ func TestMemberWalkStatesOrdersAndGuards(t *testing.T) {
 // the direct form against a deduplicated table indexes by state into a table
 // indexed by row — a valid module reading the wrong cells.
 func TestEmitOverlapDPTransitionRowDedup(t *testing.T) {
-	base := &dfaLayout{tableOff: 4096}
+	base := &dfaLayout{tableOff: 4096, useU8: true}
 	direct := emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: base}, 0, 3, 4, 5)
 
-	deduped := &dfaLayout{tableOff: 4096, useRowDedup: true, rowMapOff: 2048}
+	deduped := &dfaLayout{tableOff: 4096, useU8: true, useRowDedup: true, rowMapOff: 2048}
 	viaRowMap := emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: deduped}, 0, 3, 4, 5)
 
 	if len(viaRowMap) <= len(direct) {
@@ -577,10 +577,25 @@ func TestEmitOverlapDPTransitionRowDedup(t *testing.T) {
 
 	// Byte-class compression narrows the stride from 256 to numClasses, which
 	// is the other half of the address computation.
-	compressed := &dfaLayout{tableOff: 4096, useCompression: true, numClasses: 7}
+	compressed := &dfaLayout{tableOff: 4096, useU8: true, useCompression: true, numClasses: 7}
 	comp := emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: compressed}, 0, 3, 4, 5)
 	if bytes.Equal(comp, direct) {
 		t.Error("compression did not change the emitted stride")
+	}
+
+	// 16-bit ids read two-byte entries (i32.load16_u) at row*512 + byte*2, with
+	// or without a rowMap; an 8-bit read of such a table takes half an id.
+	for _, wide := range []*dfaLayout{
+		{tableOff: 4096},
+		{tableOff: 4096, useRowDedup: true, rowMapOff: 2048},
+	} {
+		w := emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: wide}, 0, 3, 4, 5)
+		if !bytes.Contains(w, []byte{0x2F, 0x01}) { // i32.load16_u align=1
+			t.Errorf("a 16-bit table (rowDedup=%v) was not read with i32.load16_u", wide.useRowDedup)
+		}
+		if bytes.Contains(w, rowMapConst) != wide.useRowDedup {
+			t.Errorf("a 16-bit table (rowDedup=%v) loaded its rowMap %v", wide.useRowDedup, !wide.useRowDedup)
+		}
 	}
 }
 

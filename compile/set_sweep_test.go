@@ -468,7 +468,7 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 			spec := SetSpec{Name: "s", Find: "s_find", Overlapping: true}
 			cs := setEmitCovCompileSet(t, spec, shape.pats, CompileSetOptions{})
 			bi := cs.overlapDPBucket()
-			if bi < 0 {
+			if bi < 0 || !cs.usesOverlapDP() {
 				if shape.decline != "nosweep" {
 					t.Fatalf("this shape gets no sweep; want %q", shape.decline)
 				}
@@ -476,7 +476,7 @@ func TestOverlapProjectionMatchesTheRecurrenceAndGo(t *testing.T) {
 			}
 			bkt := cs.buckets[bi]
 			numPat := len(bkt.patterns)
-			pr := buildOverlapProj(bkt.dp, numPat)
+			pr := buildOverlapProj(bkt.dp, numPat, false)
 			if pr == nil {
 				if shape.decline != "nosaving" {
 					t.Fatalf("the projection saved nothing and was declined; want %q", shape.decline)
@@ -533,10 +533,136 @@ func noSweepSet(t *testing.T) *compiledSet {
 	t.Helper()
 	spec := SetSpec{Name: "s", Find: "s_find"}
 	cs := setEmitCovCompileSet(t, spec, []string{`[0-9][a-c][0-9]`}, CompileSetOptions{})
-	if bi := cs.overlapDPBucket(); bi >= 0 {
-		t.Fatalf("a gated find got a sweep bucket (%d); this fixture no longer isolates the no-sweep path", bi)
+	if cs.usesOverlapDP() {
+		t.Fatal("a gated find got a sweep; this fixture no longer isolates the no-sweep path")
 	}
 	return cs
+}
+
+// TestDFAWalksNest pins the condition a whole-set sweep is built on: an
+// overlapping drive can have arbitrarily many walks alive at once. `union[
+// \t]+…` matches unboundedly long and must NOT qualify — no match can hold
+// the start of another, and building the sweep for it cost a match-dense drive
+// 8% for nothing.
+func TestDFAWalksNest(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want bool
+	}{
+		{`foo\w+`, true},
+		{`X[a-zA-Z]+Y`, true},
+		{`(?:ab)+`, true},
+		{`a+`, true},
+		{`[^\n]*ERROR`, true},
+		{`\Bx\w+`, true},
+		{`xox[baprs]-[0-9a-zA-Z\-]{10,}`, true},
+		{`union[ \t]+[a-z]{3}[0-9]`, false},
+		{`ghp_[0-9a-z]{36}`, false},
+		{`abc`, false},
+		{`a{1,3}`, false},
+		{`k00a+`, false}, // one `k00` per match: a+ cannot hold another
+		{`\{[^}]*\$`, true},
+	} {
+		re, err := syntax.Parse(c.pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := dfaWalksNest(tb); got != c.want {
+			t.Errorf("%s: dfaWalksNest = %v, want %v", c.pat, got, c.want)
+		}
+	}
+}
+
+// TestWholeSetSweepShapes compiles the overlapping sets the answer cache
+// sweeps over a WHOLE-SET automaton — word-boundary and newline channels, and
+// an automaton past 255 states (16-bit ids) — and pins that each gets one. The
+// sweep's own answers are checked against Go by tools/fuzz; this pins that the
+// shapes still take the path, and emits every arm of its column advance.
+func TestWholeSetSweepShapes(t *testing.T) {
+	load := func(path, set string) []config.RegexEntry {
+		bc, err := config.LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sc := range bc.Sets {
+			if sc.Name != set {
+				continue
+			}
+			want := map[string]bool{}
+			for _, n := range sc.Patterns.Names {
+				want[n] = true
+			}
+			var out []config.RegexEntry
+			for _, r := range bc.Regexps {
+				if r.Pattern != "" && (sc.Patterns.All || want[r.Name]) {
+					out = append(out, config.RegexEntry{Name: r.Name, Pattern: r.Pattern})
+				}
+			}
+			return out
+		}
+		t.Fatalf("no set %q in %s", set, path)
+		return nil
+	}
+	named := func(pats ...string) []config.RegexEntry {
+		out := make([]config.RegexEntry, len(pats))
+		for i, p := range pats {
+			out[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name    string
+		regexps []config.RegexEntry
+	}{
+		{"word-boundary", named(`\bfoo\w*`, `bar\b`, `\Bx\w+`)},
+		{"line-anchors", named(`(?m:^)ab+`, `ab+(?m:$)`, `c+`)},
+		{"url-guard", load("../examples/fastedge/url-guard/regexped.yaml", "attacks")},
+		{"secret-scanner", load("../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := config.BuildConfig{Regexps: c.regexps, Sets: []config.SetConfig{{
+				Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true},
+			}}}
+			_, _, diags, err := CompileFileDiag(cfg, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diags[0].WholeSetSweep == nil {
+				t.Fatalf("no whole-set sweep: %+v", diags[0])
+			}
+			t.Logf("%d states, %d cells", diags[0].WholeSetSweep.States, diags[0].WholeSetSweep.Cells)
+		})
+	}
+}
+
+// TestOverlapSweepBoundaryChannels pins that one-member overlapping sets with a
+// word-boundary accept — including a dominant one, which the column reads as
+// final — are served by the answer cache, so their sweep's boundary arms are
+// emitted.
+func TestOverlapSweepBoundaryChannels(t *testing.T) {
+	for _, p := range []string{`a+\b`, `\Ba+`, `[a-z]+\b`, `\W+\b`, `a\b|a\w+`, `a\b|a\B\w*`} {
+		cfg := config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "p", Pattern: p}},
+			Sets: []config.SetConfig{{Name: "s", Find: "f", Overlapping: true,
+				Patterns: config.PatternSelector{All: true}}},
+		}
+		sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sh.Eligible {
+			t.Errorf("%s: not served by the answer cache", p)
+		}
+		w, _, err := CompileFile(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, w)
+	}
 }
 
 // TestOverlapAccessorsWithoutSweep covers every derived quantity on a set that
@@ -587,7 +713,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 	}
 	good := cs.buckets[bi].dp
 	numPat := len(cs.buckets[bi].patterns)
-	if buildOverlapProj(good, numPat) == nil {
+	if buildOverlapProj(good, numPat, false) == nil {
 		t.Fatal("the reference bucket declined the projection; the guards below prove nothing")
 	}
 
@@ -604,7 +730,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 		{"no-patterns", func(d overlapDPTables) overlapDPTables { return d }, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := buildOverlapProj(tc.dp(good), tc.pats); got != nil {
+			if got := buildOverlapProj(tc.dp(good), tc.pats, false); got != nil {
 				t.Errorf("buildOverlapProj declined nothing: got %d cells", got.cells)
 			}
 		})
@@ -624,7 +750,7 @@ func TestBuildOverlapProjDeclines(t *testing.T) {
 			tc.mutex(&layout)
 			d := good
 			d.l = &layout
-			if got := buildOverlapProj(d, numPat); got != nil {
+			if got := buildOverlapProj(d, numPat, false); got != nil {
 				t.Errorf("buildOverlapProj read a layout it cannot read: got %d cells", got.cells)
 			}
 		})
@@ -660,7 +786,7 @@ func TestBuildOverlapProjPanicsOnGeometryMismatch(t *testing.T) {
 			t.Errorf("panic = %q, want it to name the projection", msg)
 		}
 	}()
-	buildOverlapProj(d, len(cs.buckets[bi].patterns))
+	buildOverlapProj(d, len(cs.buckets[bi].patterns), false)
 }
 
 // overlapShapeCfg is a set whose `find` gets the backward sweep: overlapping,
@@ -829,8 +955,13 @@ func TestSetOverlapCacheShapeHandComputed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 18 {
-		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 18 per byte", sh)
+	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 9 {
+		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 9 per byte", sh)
+	}
+	// The line a harness checks engagement against: CostPerByte per byte plus
+	// the fixed allowance for starting a sweep.
+	if got, want := sh.SweepThreshold(100), int64(100+overlapSweepSetupBytes)*9; got != want {
+		t.Errorf("SweepThreshold(100) = %d, want %d", got, want)
 	}
 }
 

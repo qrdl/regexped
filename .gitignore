@@ -81,3 +81,4 @@ tools/likelytest/*.txt
 
 # TypeScript build output of the Node examples
 examples/node/*/dist/
+scratchpad/

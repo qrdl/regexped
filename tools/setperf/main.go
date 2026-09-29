@@ -2380,13 +2380,13 @@ func verifyOverlapping(engine *wasmtime.Engine, ra *raHarness, c setCase) int {
 	// thing that tells the two apart.
 	//
 	// Whether it SHOULD have swept is measurable rather than a label. The engine
-	// engages once the walk's work passes len × cost-per-byte (strictly), or
-	// once the counter saturates; exactly at the threshold is not a failure. A
+	// engages once the walk's work passes the shape's SweepThreshold
+	// (strictly), or once the counter saturates; exactly at the threshold is not a failure. A
 	// shape with no sweep at all has nothing to engage and is not checked.
 	sc, cfg := overlapSetConfigFor(c)
 	if shape, err := compile.SetOverlapCacheShapeOpts(sc, cfg, compileSetOptions()); err == nil && shape.Eligible {
 		ready, work := r.cacheReady(), r.cacheWork()
-		threshold := uint64(len(c.input)) * uint64(shape.CostPerByte)
+		threshold := uint64(shape.SweepThreshold(len(c.input))) //nolint:gosec // non-negative
 		over := work == 0x7FFFFFFF || uint64(work) > threshold
 		sweptRows = append(sweptRows, sweptRow{c.name + "/" + c.inputLbl, ready, work, threshold})
 		switch {

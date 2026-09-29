@@ -2536,6 +2536,22 @@ func TestNilSuffixDFAEmitsNeverMatchBody(t *testing.T) {
 	}
 }
 
+// The same empty DFA's probes: with the scan pair's probes requested, both the
+// complete-mask probe and its first-hit variant must answer "no bits" (0), and
+// the first-hit one exists only when asked for.
+func TestNilSuffixDFAProbesReportNoBits(t *testing.T) {
+	// ULEB128 size prefix 0x04, then no locals, i32.const 0, end.
+	zero := []byte{0x04, 0x00, 0x41, 0x00, 0x0B}
+	art, _, _, _ := genSuffixWASM(nil, 0, 0, []int{0}, []int{0}, LikelyNeutral, true, false, nil, true)
+	if !bytes.Equal(art.scanProbe, zero) || !bytes.Equal(art.scanProbeAny, zero) {
+		t.Errorf("probes = % x / % x, want both % x", art.scanProbe, art.scanProbeAny, zero)
+	}
+	art, _, _, _ = genSuffixWASM(nil, 0, 0, []int{0}, []int{0}, LikelyNeutral, true, false, nil)
+	if !bytes.Equal(art.scanProbe, zero) || art.scanProbeAny != nil {
+		t.Errorf("without first-hit: probes = % x / % x, want % x and none", art.scanProbe, art.scanProbeAny, zero)
+	}
+}
+
 // CompileSet must refuse a bucket that has neither a suffix DFA nor a BT
 // fallback, rather than emit the never-match body for it.
 func TestCompileSetRejectsBucketWithNoSuffixDFA(t *testing.T) {

@@ -317,10 +317,8 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		if ast == nil {
 			return nil
 		}
-		pr, err := syntax.Compile(ast.Simplify())
-		if err != nil {
-			return nil
-		}
+		// syntax.Compile never returns a non-nil error (see its stdlib source).
+		pr, _ := syntax.Compile(ast.Simplify())
 		progs = append(progs, pr)
 	}
 
@@ -1594,6 +1592,12 @@ func (cs *compiledSet) dataBlobs() []dataBlob {
 	}
 	if cs.phase2Union != nil {
 		out = append(out, dataBlob{cs.phase2Union.dataBytes, cs.phase2Union.dataSegs})
+	}
+	if cs.scanUnion != nil {
+		out = append(out, dataBlob{cs.scanUnion.dataBytes, cs.scanUnion.dataSegs})
+	}
+	if len(cs.split) > 0 {
+		out = append(out, dataBlob{cs.splitData, cs.splitSegs})
 	}
 	return out
 }

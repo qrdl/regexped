@@ -912,15 +912,15 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 	var out []setAdapter
 	for si, cs := range sets {
 		n, ok := names[cs.name]
-		if !ok {
+		if !ok || cs.internal {
 			continue
 		}
 		// The sweep column, if this set has one. It fixes the cache geometry the
 		// constructor needs; everything else about the region depends on the
 		// input length, which only exists at call time.
 		cacheCells, cachePats := int32(0), int32(0)
-		if bi := cs.overlapDPBucket(); bi >= 0 {
-			cachePats = int32(len(cs.buckets[bi].patterns))
+		if sw := cs.sweepSrc(); sw != nil {
+			cachePats = int32(len(sw.ids)) //nolint:gosec // at most bucketMaskBits
 			cacheCells = int32(cs.overlapCells())
 		}
 		for i, c := range cs.capFns() {

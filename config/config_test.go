@@ -156,6 +156,11 @@ func TestParseMemorySize(t *testing.T) {
 		if p, clamped := m.Pages(); p != c.pages || clamped {
 			t.Errorf("ParseMemorySize(%q).Pages() = %d (clamped %v), want %d", c.in, p, clamped, c.pages)
 		}
+		// String is what the compiler quotes back in a cap error: the value as
+		// written, without the surrounding space.
+		if got, want := m.String(), strings.TrimSpace(c.in); got != want {
+			t.Errorf("ParseMemorySize(%q).String() = %q, want %q", c.in, got, want)
+		}
 	}
 	for _, bad := range []string{"", "MB", "-1MB", "+1MB", "1e6", "0x10", "100B", "100TB", "100 M B", "1.5.5GB", "ten MB", "100MBs"} {
 		if _, err := ParseMemorySize(bad); err == nil {
