@@ -364,7 +364,15 @@ export function %s(input, from = 0) {
 		}
 		out.WriteString("];\nexport function patternName(id) { return _patternNames[id] ?? ''; }\n")
 	}
-	return out.String()
+	// Split members' search blocks (search_stub.go).
+	section := out.String()
+	sizes := searchSizesFor(cfg)
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			section = jsSetWithBlocks(section, s.Find, sizes[s.Find].Blocks, false)
+		}
+	}
+	return section
 }
 
 // genJSStubFile generates the content of an ES module JS stub that exports
@@ -507,19 +515,26 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("}\n\n")
 
 	}
+	// Each find/groups export's per-search block, if its pattern keeps notes
+	// (search_stub.go).
+	sizes := searchSizesFor(cfg)
+	if hasSuspendableExports(cfg) && anySearchBlock(sizes) {
+		sb.WriteString(jsSearchHelpers(false, sizes))
+	}
 	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
 			sb.WriteString(genJSMatchFunc(re.MatchFunc))
 		}
 		if re.FindFunc != "" {
-			sb.WriteString(genJSFindFunc(re.FindFunc))
+			sb.WriteString(jsWithSearch(genJSFindFunc(re.FindFunc), re.FindFunc, sizes[re.FindFunc], false, false, 0))
 		}
 		if re.GroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
 				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
-			sb.WriteString(genJSGroupsFunc(re.GroupsFunc, numGroups))
+			sb.WriteString(jsWithSearch(genJSGroupsFunc(re.GroupsFunc, numGroups), re.GroupsFunc,
+				sizes[re.GroupsFunc], false, true, numGroups*2*4))
 			sb.WriteString(genJSGroupIndices(re.GroupsFunc, numGroups, namedGroups))
 		}
 	}

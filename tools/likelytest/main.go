@@ -25,6 +25,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -1737,11 +1738,26 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		// CompileFileOpts reads only ACBudgetBytes/ForceFrontend off the
 		// override, so an otherwise-zero value is CompileFile plus the pin.
 		opts := compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendScalar)
-		wasm, _, _, err := compile.CompileFileOpts(cfg, "", opts)
+		wasm, _, diags, err := compile.CompileFileOpts(cfg, "", opts)
+		noteSetBlocks(wasm, diags)
 		return wasm, err
 	}
-	wasm, _, err := compile.CompileFile(cfg, "")
+	wasm, _, diags, err := compile.CompileFileDiag(cfg, "")
+	noteSetBlocks(wasm, diags)
 	return wasm, err
+}
+
+// setBlocksOf is, per compiled set module, its split member search blocks
+// (compile.SetDiag.SearchBlocks): the `find` drive hands them over as a
+// generated iterator does.
+var setBlocksOf = map[string][]int{}
+
+func noteSetBlocks(wasm []byte, diags []compile.SetDiag) {
+	for _, d := range diags {
+		if len(d.SearchBlocks) > 0 {
+			setBlocksOf[string(wasm)] = d.SearchBlocks
+		}
+	}
 }
 
 // hintsYAML maps the compile.LikelyMode enum back to its YAML `hints:` list
@@ -1895,6 +1911,15 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
+	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
+	var sb *searchBlock
+	if tc.mode != modeAnchored {
+		if sb, err = newSearchBlock(store, inst, mem, len(input)); err != nil {
+			return 0, err
+		}
+		sb.begin(store)
+		sb.before(store)
+	}
 
 	before, _ := store.GetFuel()
 	var callErr error
@@ -1926,9 +1951,11 @@ const findExhaustIterTime = 200
 // (generate/js_stub.go genJSFindFunc): re-call with the whole buffer and a
 // rising start position, advancing past each match (or by 1 for a zero-length
 // match) until no match or EOF.
-func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
+func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32, sb *searchBlock) {
 	off := int32(0)
+	sb.begin(store)
 	for off <= inputLen {
+		sb.before(store)
 		r, err := wcall(fn, store, inputBase, inputLen, off)
 		if err != nil {
 			return
@@ -1937,6 +1964,7 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 		if packed < 0 {
 			return
 		}
+		sb.after(store)
 		// ABSOLUTE, not relative. the export takes the whole
 		// buffer plus a start position, and the packed halves are positions in
 		// that buffer — so the advance is an ASSIGNMENT, not an increment.
@@ -1963,9 +1991,11 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 // anywhere in the remaining window — retrying smaller windows would only
 // re-derive the same answer, which is stub-loop waste, not engine cost
 // this benchmark should measure.
-func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
+func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32, sb *searchBlock) {
 	off := int32(0)
+	sb.begin(store)
 	for off <= inputLen {
+		sb.before(store)
 		r, err := wcall(fn, store, inputBase, inputLen, slotsPtr, off)
 		if err != nil {
 			return
@@ -1973,6 +2003,7 @@ func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Me
 		if r.(int32) < 0 {
 			return
 		}
+		sb.after(store)
 		buf := mem.UnsafeData(store)
 		// Slots are ABSOLUTE now: the whole buffer is passed and `off` only
 		// bounds where the search starts.
@@ -2020,12 +2051,16 @@ func benchTimeExhaust(wasmBytes []byte, tc testCase, input string, engine *wasmt
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input))
+	if err != nil {
+		return 0, err
+	}
 
 	run := func() {
 		if tc.mode == modeGroups {
-			runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+			runGroupsExhaust(store, fn, mem, slotsBase, inputLen, sb)
 		} else {
-			runFindExhaust(store, fn, inputLen)
+			runFindExhaust(store, fn, inputLen, sb)
 		}
 	}
 
@@ -2086,12 +2121,16 @@ func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *w
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input))
+	if err != nil {
+		return 0, err
+	}
 
 	before, _ := store.GetFuel()
 	if tc.mode == modeGroups {
-		runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+		runGroupsExhaust(store, fn, mem, slotsBase, inputLen, sb)
 	} else {
-		runFindExhaust(store, fn, inputLen)
+		runFindExhaust(store, fn, inputLen, sb)
 	}
 	after, _ := store.GetFuel()
 	return before - after, nil
@@ -2563,6 +2602,11 @@ const (
 type setMemPlan struct {
 	inputBase  int32
 	outputBase int32
+	// The set's split member search blocks, their region and each one's
+	// notes room; blocks nil for none.
+	blocks     []int
+	blocksPtr  int32
+	notesBytes int32
 }
 
 // planSetMem computes input/output offsets that don't overlap with the set's
@@ -2575,7 +2619,16 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(inputLen) + 4096
-	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
+	plan := setMemPlan{inputBase: inBase, outputBase: outBase, blocks: setBlocksOf[string(wasmBytes)]}
+	if len(plan.blocks) > 0 {
+		nb := 0
+		for _, n := range plan.blocks {
+			nb = max(nb, n)
+		}
+		plan.blocksPtr = (outBase + setOutCap*16 + 4096 + 7) &^ 7
+		plan.notesBytes = int32((inputLen+1)*nb+7) &^ 7
+	}
+	return plan, nil
 }
 
 // setDriver resolves the export a modeSet case drives and returns a closure
@@ -2733,6 +2786,9 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 // setMemTop is one past everything a set bench writes: tuples, then the gate
 // array, both above outputBase.
 func setMemTop(plan setMemPlan) int32 {
+	if len(plan.blocks) > 0 {
+		return plan.blocksPtr + int32(len(plan.blocks))*(abi.SearchBlockBytes+plan.notesBytes) + 4096
+	}
 	return plan.outputBase + setOutCap*16 + 4096
 }
 
@@ -2789,6 +2845,10 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		buf[gatePtr+i] = 0
 	}
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
+	if len(plan.blocks) > 0 {
+		clear(buf[plan.blocksPtr : plan.blocksPtr+int32(len(plan.blocks)*abi.SearchBlockBytes)])
+		abi.WriteFindScratchBlocks(buf, scratchPtr, gatePtr, 0, 0, plan.blocksPtr)
+	}
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
@@ -2800,6 +2860,7 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		if count <= 0 {
 			return nil
 		}
+		giveSetNotes(mem.UnsafeData(store), plan, inputLen)
 		buf := mem.UnsafeData(store)
 		base := int(plan.outputBase)
 		s := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
@@ -3038,5 +3099,23 @@ func main() {
 	fmt.Fprintf(os.Stderr, "correctness: %d checks, %d failures\n", totalChecks, totalFailures)
 	if totalFailures > 0 {
 		os.Exit(1)
+	}
+}
+
+// giveSetNotes runs after a set `find` call, as a generated iterator does: a
+// split member whose search armed during it gets its notes.
+func giveSetNotes(buf []byte, plan setMemPlan, inputLen int32) {
+	notesBase := plan.blocksPtr + int32(len(plan.blocks)*abi.SearchBlockBytes)
+	for k, nb := range plan.blocks {
+		blk := plan.blocksPtr + int32(k*abi.SearchBlockBytes)
+		if nb == 0 || binary.LittleEndian.Uint32(buf[blk+abi.SearchArmedOff:]) == 0 ||
+			binary.LittleEndian.Uint32(buf[blk+abi.SearchNotesOff:]) != 0 {
+			continue
+		}
+		n := (inputLen + 1) * int32(nb)
+		notes := notesBase + int32(k)*plan.notesBytes
+		clear(buf[notes : notes+n])
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesOff:], uint32(notes))
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesCapOff:], uint32(n))
 	}
 }

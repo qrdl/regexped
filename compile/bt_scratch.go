@@ -88,6 +88,11 @@ type btDyn struct {
 	// btGrowth.
 	grow  bool
 	start int32
+
+	// search is set for a single pattern's fallback find that can use the
+	// search's own memo (bt_search.go); searchBlk is its block local.
+	search    *btSearch
+	searchBlk uint32
 }
 
 // ── The ordinary capture body's frame stack ─────────────────────────────────
@@ -281,7 +286,7 @@ func emitBTGrowPushCheck(b []byte, d *btDyn, overflow func([]byte) []byte) []byt
 // when the memo is this call's alone, the member's own memo end when other
 // members' regions may lie between it and the stack.
 func (d *btDyn) clearLimit() uint32 {
-	if d.member != nil {
+	if d.member != nil || d.search != nil {
 		return d.memoEnd
 	}
 	return d.stackBase
@@ -680,6 +685,15 @@ type btDriveMember struct {
 	memoOrigin  uint32 // i32: the position its first row stands for
 	memoEnd     uint32 // i32: one past its memo
 	cleared     uint32 // i32: every memo byte below it is known zero
+	// blk is the member's search block among its set's Backtracking bucket
+	// member blocks, whose address blocksG holds (0: the caller gave none);
+	// -1 for a member whose budget lasts the host call only. With a block
+	// the budget lasts the `find` drive: loaded from the block at the
+	// member's first candidate of a host call and stored back after every
+	// call of its ordinary body, so a drive that would burn it on every
+	// call burns it once.
+	blk     int
+	blocksG uint32
 }
 
 // allocBTDrive allocates a set's call-scoped globals. The epoch starts one
@@ -704,6 +718,7 @@ func allocBTDriveMember(g *moduleGlobals, d btDrive) *btDriveMember {
 		memoOrigin:  g.Alloc(),
 		memoEnd:     g.Alloc(),
 		cleared:     g.Alloc(),
+		blk:         -1,
 	}
 }
 
@@ -728,15 +743,15 @@ func emitBTDrivePrologue(d btDrive) []byte {
 }
 
 // injectBTDrivePrologue returns a copy of one code entry with the drive
-// prologue at the head of its code.
-func injectBTDrivePrologue(entry []byte, d btDrive) []byte {
+// prologue, then extra, at the head of its code.
+func injectBTDrivePrologue(entry []byte, d btDrive, extra []byte) []byte {
 	size, n, err := utils.DecodeULEB128(entry)
 	if err != nil || int(size)+n != len(entry) {
 		panic("compile: injectBTDrivePrologue given something that is not one code entry")
 	}
 	body := entry[n:]
 	off := localsVectorEnd(body)
-	p := emitBTDrivePrologue(d)
+	p := append(emitBTDrivePrologue(d), extra...)
 	out := make([]byte, 0, len(body)+len(p))
 	out = append(out, body[:off]...)
 	out = append(out, p...)
@@ -759,9 +774,47 @@ func emitBTWorkInitMember(b []byte, m *btDriveMember, k, n int, span func([]byte
 	b = utils.AppendSLEB128_64(b, int64(k)*int64(n))
 	b = append(b, 0x7E) // i64.mul
 	b = appendGlobalSet(b, m.budget)
+	if m.blk >= 0 {
+		// The drive's budget, once its first call has set one up.
+		b = appendGlobalGet(b, m.blocksG)
+		b = append(b, 0x04, 0x40) // if blocks
+		b = appendGlobalGet(b, m.blocksG)
+		b = append(b, 0x28, 0x02)
+		b = utils.AppendULEB128(b, m.blkField(abi.SearchBTStateOff))
+		b = append(b, 0x04, 0x40) // if state != 0
+		b = appendGlobalGet(b, m.blocksG)
+		b = append(b, 0x29, 0x03)
+		b = utils.AppendULEB128(b, m.blkField(abi.SearchBTBudgetOff))
+		b = appendGlobalSet(b, m.budget)
+		b = append(b, 0x05) // else: a new drive
+		b = appendGlobalGet(b, m.blocksG)
+		b = append(b, 0x41, 0x01, 0x36, 0x02)
+		b = utils.AppendULEB128(b, m.blkField(abi.SearchBTStateOff))
+		b = append(b, 0x0B, 0x0B)
+	}
 	b = appendGlobalGet(b, m.drive.epoch)
 	b = appendGlobalSet(b, m.budgetEpoch)
 	return append(b, 0x0B) // end if
+}
+
+// blkField is the memarg offset of the member's block field from blocksG.
+func (m *btDriveMember) blkField(field int) uint32 {
+	return uint32(m.blk*abi.SearchBlockBytes + field) //nolint:gosec // a small offset
+}
+
+// emitBTMemberSave stores what is left of the member's budget in its block
+// after a call of its ordinary body. Stack-neutral.
+func emitBTMemberSave(b []byte, m *btDriveMember) []byte {
+	if m == nil || m.blk < 0 {
+		return b
+	}
+	b = appendGlobalGet(b, m.blocksG)
+	b = append(b, 0x04, 0x40)
+	b = appendGlobalGet(b, m.blocksG)
+	b = appendGlobalGet(b, m.budget)
+	b = append(b, 0x37, 0x03)
+	b = utils.AppendULEB128(b, m.blkField(abi.SearchBTBudgetOff))
+	return append(b, 0x0B)
 }
 
 // emitBTWorkChargeMember is emitBTWorkCharge against the member's budget:

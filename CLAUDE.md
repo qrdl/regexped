@@ -56,6 +56,20 @@ regexped/
 │   │                          #   they made Backtracking refuse is now ADMITTED, not dropped).
 │   │                          #   In a SET, a member's budget, fallback region and visited set last
 │   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate
+│   ├── bt_search.go           # A Backtracking find's work budget per SEARCH, not per call: kept in
+│   │                          #   the caller's per-search block (search_notes.go), so a drive whose
+│   │                          #   every call burns the budget burns it ONCE. A tripped search goes
+│   │                          #   straight to the fallback, whose (pc, pos) memo the STUB then
+│   │                          #   allocates for the rest of the search ((len + 1) × ⌈N/8⌉, origin 0,
+│   │                          #   zeroed, so all of it counts as cleared). Its marks are failures, so
+│   │                          #   the rows of a REPORTED match's attempt are cleared before it returns
+│   │                          #   — from the attempt's start, not the call's `from` (+22% to +45%
+│   │                          #   dearer once tripped). `groups` keeps only the tripped flag. An
+│   │                          #   EMBEDDED build keeps no memo across calls: the fallback's memory is
+│   │                          #   the module's, not the host's. In a SET: a split member's find keeps
+│   │                          #   all of this in its own search block (set_split.go); a Backtracking
+│   │                          #   BUCKET member keeps only its budget there (btDriveMember.blk) —
+│   │                          #   its walks are bounded, so the per-host-call memo suffices
 │   ├── bt_scratch.go          # The FALLBACK body's run-time memory: memo and frame stack sized from
 │   │                          #   the input at call time, memory.grow when they do not fit, -2 only
 │   │                          #   when memory cannot grow. Found through two globals whose meaning
@@ -117,6 +131,27 @@ regexped/
 │   │                          #   cannot disagree. Allocation order is declaration order and
 │   │                          #   same-type runs coalesce, which is what let the conversion
 │   │                          #   be proved byte-identical
+│   ├── search_notes.go        # PER-SEARCH NOTES: what keeps a DRIVE linear when each call reads
+│   │                          #   past its match (`a*b|a` over a×n). A pattern whose find automaton
+│   │                          #   has a CYCLE state (non-accepting, on a non-accepting cycle) gets
+│   │                          #   TWO copies of its find: the ordinary one plus a waste counter in
+│   │                          #   the caller's per-search BLOCK, and a MARKED copy that stops at a
+│   │                          #   noted (state, position) and notes a wasted tail by re-walking it.
+│   │                          #   A search ARMS at waste > 4 × progress + 64; the stub then gives it
+│   │                          #   notes and the marked copy serves the rest of it. The block (layout
+│   │                          #   in internal/abi) is handed over through `regexped:search`: a
+│   │                          #   GLOBAL (standalone), a SETTER FUNCTION (embedded — a merged host
+│   │                          #   can only call exports; measured within 1% of a 4th parameter) or
+│   │                          #   the component resource itself. A pattern with no cycle state gets
+│   │                          #   no notes code, byte for byte. SearchSizes gives stubs the notes
+│   │                          #   size by recompiling the config, and the module checks notes_cap,
+│   │                          #   so a wrong size costs speed, never memory safety.
+│   │                          #   WALKER notes (start-anywhere forward pass, literal-anchored and
+│   │                          #   alternation verifies, lenient bodies) emit the marked and plain
+│   │                          #   walk in ONE body, chosen at entry (emitWalkEntry). A literal body
+│   │                          #   charges the bytes its walk read PAST the match end, not failed
+│   │                          #   walks (emitFarCharge): charging failed walks there measured a
+│   │                          #   regression on ordinary finds, and only re-read bytes are waste
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
@@ -282,14 +317,40 @@ regexped/
 │   │                          #   batch entry, after a refusal, only at k == 0 — a position
 │   │                          #   is finished on the path that began it), zeroing the gate array once
 │   │                          #   (header ready = -2) when it switches mid-drive. A set
-│   │                          #   whose members are all provably linear compiles as before
+│   │                          #   whose members are all provably linear compiles as before.
+│   │                          #   A split member with notes keeps its OWN search block,
+│   │                          #   named by the scratch descriptor's SECOND form (magic RXFB,
+│   │                          #   fifth field blocks_ptr; abi.FindScratchMagicBlocks) —
+│   │                          #   opt-in, because a fifth field every descriptor carried
+│   │                          #   would be read from callers that write four. Only a set
+│   │                          #   with such blocks accepts the magic; with the old one every
+│   │                          #   member runs with no block. The merge saves and restores
+│   │                          #   the search global around each member call.
+│   │                          #   Past 64 members (splitMergeLocalMembers) the merge keeps its
+│   │                          #   four per-member values in a table-memory region instead of
+│   │                          #   locals: at 700 members (the RE2 corpus's whole-block sets)
+│   │                          #   2,817 locals made a function Cranelift could not compile in
+│   │                          #   4 GB; in memory it compiles in 282 MB
 │   ├── set_sparse.go          # Sparse accept: per-state LISTS of pattern indices instead of a
 │   │                          #   u64 mask, which is what lets ONE bucket hold more than 32
 │   │                          #   patterns. Serves all three packers — shared-literal, fallback and
 │   │                          #   anchored. NOTHING on the candidate path may read an i32 mask as
 │   │                          #   authoritative for such a bucket (validMask, the gate pre-mask and
 │   │                          #   the empty-mask group skip are all suppressed for it); the bodies
-│   │                          #   apply the per-pattern gate rule themselves
+│   │                          #   apply the per-pattern gate rule themselves.
+│   │                          #   Liveness cannot serve a sparse bucket, so a COUNTED one (a
+│   │                          #   member whose walk can cross unboundedly many candidates —
+│   │                          #   reads the literal for ever, or in a fallback bucket has a
+│   │                          #   cycle and is not anchored at 0 — gated non-batching `find`,
+│   │                          #   no other split member) charges candidates that reported
+│   │                          #   nothing and walked
+│   │                          #   over 32 bytes; past 4 × progress + 64 it answers an internal
+│   │                          #   -9 and a wrapper hands the call — and the rest of the drive,
+│   │                          #   kept in the set's search block 0 — to a SPLIT COMPANION of the
+│   │                          #   set compiled beside it (emitSparseFindWrapperBody), with only
+│   │                          #   those members split out. "Any reachable cycle" was tried first
+│   │                          #   and cost a 128-member `union[ \t]+…` set 9 KB → 2.1 MB for a
+│   │                          #   shape that cannot go quadratic
 │   ├── component_sets.go      # The SET adapters for `wasm_format: component`: the `_all`
 │   │                          #   pair's bitmask/bitmap → list-of-ids conversion (ctz-driven,
 │   │                          #   so once per HIT), and the `find` RESOURCE — constructor,
@@ -337,7 +398,10 @@ regexped/
 │   │                          #   going over `foo`×N for a long-dead `foo[0-9]` — each member
 │   │                          #   linear alone, the bucket not — so a bucket with a reachable
 │   │                          #   cycle of states some member can no longer accept from stops
-│   │                          #   once no still-wanted member can accept. Not sparse buckets
+│   │                          #   once no still-wanted member can accept. Not sparse buckets.
+│   │                          #   Every frontend and fallback buckets too (bucketLivenessExit),
+│   │                          #   tested only when the walk ENTERS a new state: on every byte
+│   │                          #   it cost overlap-shape-3 +10.5%, on a state change +3.8%
 │   ├── region.go              # Set table-region allocation: the sequential blocks CompileSet lays out
 │   ├── set_anchored_union.go  # The ANCHORED union automaton serving match_any / match_all
 │   ├── set_bt.go              # Backtracking as the set fallback engine for members over max_fallback_states
@@ -446,6 +510,8 @@ regexped/
 │                              #   wrong local, module validates, from == 0 answers correctly,
 │                              #   `from` ignored for ever after) shipped twice before this
 ├── tools/
+│   ├── advbench/              # Adversarial DRIVES: fuel per input doubling, ×2 linear / ×4
+│   │                          #   quadratic; `make adversary` runs rows.go's table (see Testing)
 │   ├── fuzz/                  # Correctness fuzzer and property tests: compiled WASM against Go regexp
 │   ├── setperf/
 │   │   ├── main.go            # Cross-engine set comparison vs regex-automata (see Testing);
@@ -929,6 +995,17 @@ the same as the default run. `tools/fuzz`'s `FuzzGroupsBothBodies`
 (`make -C tools/fuzz seed-bodies`) is the fuzzing counterpart: fast body alone,
 fallback alone and the two together, each against Go.
 
+**Both copies of a find with notes (`make -C tools/re2test notes-armed`, in
+`make test`).** Every other target hands each drive a fresh per-search block,
+the way a generated stub does, and no corpus row re-reads enough to ARM it — so
+they check the ORDINARY copy only. `--search-block=armed` hands every drive a
+block armed before its first call, so the MARKED copy answers every call and its
+notes carry across the calls of each drive. A wrong note is a MISSED match,
+silently; this is the gate that would see it. The run prints how many drives
+carried a block, so a vacuous pass is visible. `--search-block=off` leaves the
+search global at 0 (no counter, no notes). `tools/fuzz`'s `TestFindFrom*` and
+`FuzzFindIteration` run all three modes.
+
 ### The find-from invariant (`tools/fuzz/single_pattern_test.go`)
 
 ```bash
@@ -1160,6 +1237,27 @@ not a chooser verdict but a simulated Aho-Corasick decline (`ACBudgetBytes: 1`) 
 frontend column reports what actually shipped. `make example-lnm` / `make example-shufti`
 run pre-built demonstrations of a real `prefer-no-match` win. See
 `tools/settest/README.md`.
+
+### Adversarial drives (`tools/advbench/`)
+
+```bash
+make adversary                                                        # from repo root
+make run ARGS="-pattern 'a*b|a' -fn find -gen rep:a -sizes 4096,8192"  # from tools/advbench/
+```
+
+A DRIVE is what a stub does with an iterating export: call `find`, `groups`, a set
+`find` or its batch entry until the input is exhausted. A call can be linear while the
+drive is quadratic — the per-call bounds (switch counter, detectors, Backtracking work
+budget) say nothing about bytes the NEXT call reads again — so this tool measures the
+drive: fuel at doubling input sizes, whose ratio is ×2 when the drive is linear and ×4
+when it is quadratic. Fuel is exact, so the verdict does not depend on machine load.
+
+`rows.go` is the table: rows expected LINEAR fail the run when the last ratio exceeds
+2.5; rows expected QUADRATIC are known open drives, reported with their ratio (and a
+note when one measures linear, which means the row should be flipped); REPORT rows print
+memory and correctness evidence only. Every adversarial shape found so far has a row,
+and so does every drive shape already measured linear, because those are what a change
+to a shared emitter can silently make quadratic.
 
 ## Output kinds: module and component
 

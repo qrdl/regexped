@@ -60,6 +60,30 @@ type compiledSet struct {
 	// position it answered for, which a split set's merge wrapper reads
 	// back even when out_cap = 0 wrote nothing. -1 = none.
 	keptPosGlobal int32
+	// splitSearch is the module's search global, which the merge hands each
+	// split member's search its block through (valid when splitBlocks()).
+	splitSearch uint32
+	// splitBlocksGlobal carries the descriptor's blocks pointer from the
+	// wrappers that read it to a batching set's merged worker, which takes
+	// the gate pointer alone (valid when splitBlocks() && mergedWorker()).
+	splitBlocksGlobal uint32
+	// mergeState is the table address of the split merge's per-member state
+	// (mslot), -1 when the merge keeps it in locals.
+	mergeState int32
+	// btBlockMembers is the Backtracking bucket members whose budget lasts
+	// a `find` drive, in block order (btBlocksBase); btBlocksG the global
+	// every exported capability sets on entry to the address of the first of
+	// their blocks, 0 for none (emitBTBlocksPrologue).
+	btBlockMembers []*btDriveMember
+	btBlocksG      uint32
+	// sparseCtr is the sparse buckets' work counter (set_sparse.go), nil for
+	// none; companion is then the split copy it hands a drive over to.
+	sparseCtr *sparseCounter
+	// blocksSkip is how many leading search blocks are NOT this set's: in a
+	// companion, its owner's (attachCompanion). forceAcceptBlocks: the owner
+	// hands this set the caller's descriptor whichever magic it carries.
+	blocksSkip        int
+	forceAcceptBlocks bool
 	// noSweep withholds the overlapping answer cache (see compileSetWith).
 	noSweep bool
 	name    string
@@ -491,7 +515,7 @@ const numSetTypesBase = 11
 //     epilogue cannot be spliced into a body that returns from several places,
 //     so the body becomes a callee.
 func (cs *compiledSet) findWrapped() bool {
-	return cs.hasFind() && (cs.batchFind || cs.usesOverlapDP())
+	return cs.hasFind() && (cs.batchFind || cs.usesOverlapDP() || cs.sparseCtr != nil)
 }
 
 // findInnerFnOffset returns the index of the hidden body the exported `find`
@@ -752,6 +776,13 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// bucket's scratch, which emitRecordSparseProbe reads back.
 	opts.AllowSparseAccept = true
 	buckets := binPack(spec.Patterns, opts, diag)
+	// A sparse bucket whose walk can outlive its members gets a work counter
+	// that hands a gated drive over to a split copy of the set (set_sparse.go).
+	var sparseCtr *sparseCounter
+	if spec.gated() && !spec.BatchFind && !opts.noSparseCounter && !opts.noCache && len(split) == 0 &&
+		anySparseCycle(buckets) {
+		sparseCtr = &sparseCounter{work: opts.globals.AllocI64(0), first: opts.globals.Alloc()}
+	}
 
 	// Per-pattern absence literals, used by the preflights in place of
 	// the union walk when available.
@@ -807,7 +838,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// before anything reads the scan capabilities: a counter's probes must be
 	// built to stamp their walks, and a set whose scan pair the union serves
 	// directly builds no scan machinery in its buckets at all.
-	scanPlan := planScanUnion(full, spec, splitIndices(split), buckets, nonLinear, anyBTSplit(split))
+	// A sparse bucket that can walk for ever is the scan pair's case for the
+	// counter and its union automaton too (a scan is one call).
+	scanPlan := planScanUnion(full, spec, splitIndices(split), buckets, nonLinear || anySparseCycle(buckets), anyBTSplit(split))
 	if scanPlan.direct {
 		spec.ScanAny, spec.ScanAll = "", ""
 	}
@@ -1013,8 +1046,12 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				}
 			}
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEnd(walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
-			fe != frontendScalar && !bkt.isFallback && !bkt.sparse && livenessCanFire(bkt.suffixDFA))
+		var ctr *sparseCounter
+		if bkt.sparse && sparseCycle(bkt) {
+			ctr = sparseCtr
+		}
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
+			bucketLivenessExit(bkt))
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
 			bkt.probeWalkEndP1 = art.probeWalkEndGlobal + 1
@@ -1427,6 +1464,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		numBTFallbacks++
 	}
 	btRegions := planBTRegions(buckets, int64(btBase), opts.globals, opts.BTWorkBudget)
+	var btBlockMembers []*btDriveMember
+	var btBlocksG uint32
 	if btRegions != nil && numBTFallbacks > 0 {
 		btRegions.scratch = opts.globals.BTScratch()
 		// The call-scoped state that lets one host call's candidates share a
@@ -1436,7 +1475,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		btRegions.members = map[int]*btDriveMember{}
 		for bi, bkt := range buckets {
 			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
-				btRegions.members[bi] = allocBTDriveMember(opts.globals, btRegions.drive)
+				m := allocBTDriveMember(opts.globals, btRegions.drive)
+				btRegions.members[bi] = m
+				// A member with an ordinary body keeps its budget per
+				// `find` drive in a search block (emitBTWorkInitMember).
+				if spec.Find != "" && !planBT(bkt.btFallback.bt, opts.BTWorkBudget).force {
+					m.blk = len(btBlockMembers)
+					btBlockMembers = append(btBlockMembers, m)
+				}
+			}
+		}
+		if len(btBlockMembers) > 0 {
+			btBlocksG = opts.globals.Alloc()
+			for _, m := range btBlockMembers {
+				m.blocksG = btBlocksG
 			}
 		}
 	}
@@ -1513,6 +1565,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		numBTFns:            numBTFns,
 		tableMemIdx:         opts.TableMemIdx,
 		btRegions:           btRegions,
+		btBlockMembers:      btBlockMembers,
+		mergeState:          -1,
+		btBlocksG:           btBlocksG,
 		btWorkBudget:        opts.BTWorkBudget,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
@@ -1544,6 +1599,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		litLens:             litLens,
 		diag:                diag,
 	}
+	cs.sparseCtr = sparseCtr
 	// The overlapping `find`'s in-call counter, wherever the answer cache is
 	// and a member is not provably linear: the between-calls trigger cannot
 	// fire inside the ONE call a no-match input makes, and that call is
@@ -1987,6 +2043,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
 			BTWorkBudget:              over.BTWorkBudget, // test-only override, as below
+			searchSizes:               over.searchSizes,
 			Component:                 comp.Component,
 			ComponentPackage:          comp.ComponentPackage,
 			ComponentExportNames:      comp.ExportNames,
@@ -2040,6 +2097,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	if len(compiled) > 0 {
 		lastTableEnd = compiled[len(compiled)-1].tableEnd
 	}
+	fillSearchSizes(compiled, over.searchSizes)
 
 	// Resolve and compile sets.
 	// Build name→index map.
@@ -2079,6 +2137,10 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		setOpts.TableBase = int32(setTableBase)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
 		compiledSets = append(compiledSets, cs)
+		fillSetSearchSizes(sc, cs, over.searchSizes)
+		if cs.diag != nil {
+			cs.diag.SearchBlocks, cs.diag.SearchBlocksBTMemo = diagSearchBlocks(cs.searchBlocks())
+		}
 		if cs.companion != nil {
 			// Its tables sit above the set's own; its functions follow the
 			// set's in the module.
@@ -2273,6 +2335,13 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			setTypeI32I32ToI32, setTypeI32x3ToI32, setTypeCompNext, setTypeCompVoid)
 		total += 3 + len(patAdapters) + len(setAdapters)
 	}
+	// The embedded search setter (search_notes.go) is the last function.
+	searchG, searchKind := searchExportFor(globals, standalone, opts.Component)
+	searchSetterIdx := -1
+	if searchKind == searchExportSetter {
+		searchSetterIdx = total
+		total++
+	}
 
 	var out []byte
 	out = append(out, 0x00, 0x61, 0x73, 0x6D)
@@ -2317,6 +2386,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		typeSection = append(typeSection,
 			0x60, 0x01, 0x7F, 0x00, // type 11: (i32)→()
 			0x60, 0x01, 0x7F, 0x01, 0x7F) // type 12: (i32)→i32
+	} else if searchSetterIdx >= 0 {
+		// The embedded search setter's (i32)→(), at the same index 11 a
+		// component gives it.
+		typeSection[0] = numSetTypesBase + 1
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x00)
 	}
 	out = appendSection(out, 1, typeSection)
 
@@ -2370,7 +2444,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		slotLitAnchorFind:     setTypeI32I32ToI64,
 		slotFind:              setTypeI32I32ToI64,
 		slotFindNeutral:       setTypeI32I32ToI64, // same shape as the body it twins
-		slotCapture:           setTypeI32x3ToI32,  // (i32,i32,i32)→i32
+		slotFindMarked:        setTypeI32I32ToI64,
+		slotCapture:           setTypeI32x3ToI32, // (i32,i32,i32)→i32
 		slotGroupsWrapper:     setTypeI32x3ToI32,
 		// A fallback has its fast body's signature.
 		slotMatchFallback:   setTypeI32I32ToI32,
@@ -2491,6 +2566,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			fs = append(fs, a.typeIdx)
 		}
 	}
+	if searchSetterIdx >= 0 {
+		fs = append(fs, byte(setTypeCompVoid))
+	}
 	out = appendSection(out, 3, fs)
 
 	// No function table needed: suffix DFAs are called via direct call, not call_indirect.
@@ -2536,6 +2614,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		numExports++
 	}
 	if exportScratch {
+		numExports++
+	}
+	if searchKind != searchExportNone {
 		numExports++
 	}
 	for _, p := range patterns {
@@ -2593,6 +2674,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	}
 	if exportScratch {
 		es = appendBTScratchExport(es, scratch)
+	}
+	if searchKind != searchExportNone {
+		es = appendSearchExport(es, searchKind, searchG, searchSetterIdx)
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
@@ -2792,7 +2876,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// worker instead of carrying its own copy of the bucket
 					// code. A non-batching set is wrapped for the answer cache
 					// alone, and forwards into the ordinary find body.
-					out = append(out, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
+					if cs.sparseCtr != nil {
+						out = append(out, emitSparseFindWrapperBody(cs, base+cs.findInnerFnOffset(), cs.companionFindIdx)...)
+					} else {
+						out = append(out, emitSetFindWrapperBody(cs, base+cs.findInnerFnOffset(), dpIdx, blkIdx)...)
+					}
 				} else {
 					// The EXPORTED find takes a scratch descriptor where the
 					// body reads a gate pointer, so the prologue converts one
@@ -2800,8 +2888,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					// set's export is the wrapper above, which does the same
 					// thing by hand; the shared worker keeps taking a gate,
 					// because both of its callers have already dereferenced.
-					out = append(out, injectScratchPrologue(
-						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3)...)
+					out = append(out, injectScratchPrologueBlocks(
+						rebuildSetMatchBody(cs, suffixFnBase[si], prefixFnBase[si], tableMemIdx), 3, cs.acceptsBlocks())...)
 				}
 			case capFindBatch:
 				out = append(out, emitSetFindBatchBody(cs, base+cs.findInnerFnOffset(), base+cs.capFnOffset(capFindBatch), dpIdx, blkIdx)...)
@@ -2841,7 +2929,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			// starts a new host call for it. The anchored pair cannot: no BT
 			// bucket is admitted there.
 			if cs.btRegions != nil && cs.btRegions.hasDrive && c.kind != capMatchAny && c.kind != capMatchAll {
-				out = injectBTDrivePrologue(out, cs.btRegions.drive)
+				out = injectBTDrivePrologue(out, cs.btRegions.drive, cs.emitBTBlocksPrologue(c.kind))
 			}
 			return out
 		}
@@ -2978,6 +3066,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, a := range setAdapters {
 			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
 		}
+	}
+	if searchSetterIdx >= 0 {
+		cs_bytes = appendCodeEntry(cs_bytes, searchSetterBody(searchG))
 	}
 	out = appendSection(out, 10, cs_bytes)
 
@@ -5022,4 +5113,17 @@ func wantsWalkExtent(spec SetSpec, buckets []*bucket, bi int) bool {
 	bkt := buckets[0]
 	return bkt.isFallback && !bkt.sparse && bkt.btFallback == nil &&
 		len(bkt.patterns) > 0 && len(bkt.patterns) <= bucketMaskBits
+}
+
+// bucketLivenessExit reports whether a bucket's walk carries the liveness exit
+// (compile/liveness.go): stop once no member this call still wants — and, in
+// a probe, has not yet recorded — can accept from the current state. Emitted
+// wherever such a walk can outlive a member indefinitely (livenessCanFire), on
+// EVERY frontend and for fallback buckets too: a member gated out or recorded
+// keeps the merged walk going for its siblings otherwise, quadratic in ONE
+// call (`{[A-Z], [A-Za-z]+}` over `A`×n). Sound with `\b` and `(?m)` members:
+// futureAccepts folds in every accept channel, so the exit can only fire
+// late. Not sparse buckets, whose accept is a per-state LIST no mask names.
+func bucketLivenessExit(bkt *bucket) bool {
+	return !bkt.sparse && livenessCanFire(bkt.suffixDFA)
 }

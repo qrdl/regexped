@@ -308,6 +308,25 @@ surface. See [sets.md](sets.md) for the measurements behind that.
 
 ---
 
+### Linear scans on any input
+
+A pattern such as `a*b|a` makes each `find` call read to the end of the input
+before settling for a short match, so a whole scan over `aaaa…` is quadratic.
+Each iterator for a pattern that can do this carries a 128-byte **search block**
+(a private field, so the public API is unchanged) and hands it to the module
+before every call; when the module reports that the scan has started re-reading,
+the iterator allocates its notes — `(len + 1)` bytes per pattern row — and the
+module uses them to stop at ground it has already covered (see
+[wasm.md](wasm.md), "The search block"). A scan that never re-reads never
+allocates. The notes are freed with the iterator. If they cannot be allocated
+(`try_reserve`), the item is `Err(Error::BacktrackOverflow)`: the rest of the
+scan is unknown.
+A Backtracking pattern's iterator uses the same block for its work budget,
+which then lasts the whole scan rather than one call; once it runs out, the
+iterator allocates the fallback's memo — `(len + 1) × ⌈instructions / 8⌉`
+bytes — so a scan whose every call would exhaust the budget pays for it once. The memo is freed, and its allocation fails, the same
+way.
+
 ## Backtracking stack overflow
 
 A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".

@@ -214,6 +214,7 @@ func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, 
 		b = call(b, c.fallbackIdx)
 		b = append(b, 0x05) // else
 		b = call(b, c.driverIdx)
+		b = emitBTMemberSave(b, c.member)
 		b = append(b, 0x0B) // end if
 	} else {
 		b = call(b, c.driverIdx)
@@ -667,5 +668,33 @@ func buildSetBTProbeBody(regions *btSharedRegions, call btBucketCall, tableMemId
 
 	b = append(b, 0x41, 0x01) // bit 0
 	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// emitBTBlocksPrologue sets btBlocksG on entry to an exported capability:
+// from the scratch descriptor (parameter 3) for the two `find` entries, whose
+// drives span calls; 0 for every other capability, whose budget lasts its one
+// call. Nothing when no member keeps a block.
+func (cs *compiledSet) emitBTBlocksPrologue(kind setCapKind) []byte {
+	if len(cs.btBlockMembers) == 0 {
+		return nil
+	}
+	var b []byte
+	if kind != capFind && kind != capFindBatch {
+		b = append(b, 0x41, 0x00)
+		return appendGlobalSet(b, cs.btBlocksG)
+	}
+	b = emitScratchBlocks(b, 3)
+	b = appendGlobalSet(b, cs.btBlocksG)
+	if off := cs.btBlocksBase() * abi.SearchBlockBytes; off > 0 {
+		// Past the blocks before the members', or 0 with none.
+		b = appendGlobalGet(b, cs.btBlocksG)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(off)) //nolint:gosec // a small offset
+		b = append(b, 0x6A, 0x41, 0x00)
+		b = appendGlobalGet(b, cs.btBlocksG)
+		b = append(b, 0x1B) // select
+		b = appendGlobalSet(b, cs.btBlocksG)
+	}
 	return b
 }

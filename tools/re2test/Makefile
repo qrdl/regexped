@@ -1,4 +1,4 @@
-.PHONY: test exhaustive custom adjusted sets sets-likely sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: notes-armed test exhaustive custom adjusted sets sets-likely sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -134,7 +134,24 @@ groupsonly: $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly sets sets-likely
+test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly notes-armed sets sets-likely
+
+# Every find that keeps per-search notes has two copies: the ORDINARY one, which
+# every other target drives (a stub's fresh block arms only on a drive that
+# re-reads, which no corpus row does), and the MARKED one, which serves a search
+# once it has gone bad. --search-block=armed hands every drive a block armed
+# before its first call, so the marked copy answers every call — the comparison
+# of the two copies over the corpus. A wrong note is a MISSED match, silently;
+# this is the gate that would see it.
+notes-armed: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --all-matches $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --high-bytes $(TESTDATA)
+	# A set's split members keep notes too, through the blocks the set's
+	# descriptor names: the same comparison for their searches.
+	go run . $(RE2TEST_FLAGS) --search-block=armed --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --sets --set-chunk=0 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 # ---------------------------------------------------------------------------
 # Set-capability coverage.

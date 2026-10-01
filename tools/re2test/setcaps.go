@@ -809,6 +809,10 @@ type setRunner struct {
 	// Patterns this compile excluded; see the dropHandler comment.
 	droppedFind     map[int]bool
 	droppedAnchored map[int]bool
+
+	// The split members' search blocks (search.go): per find/batch export,
+	// its block list; the region they and their notes live in.
+	setBlocks
 }
 
 // findEligible reports whether pattern pi can appear in a non-anchored answer:
@@ -849,9 +853,13 @@ func (r *setRunner) fn(name string) *wasmtime.Func { return r.inst.GetFunc(r.sto
 // call invokes an export under the watchdog. hang=true means the 2s epoch
 // deadline fired; the caller abandons the current input.
 func (r *setRunner) call(fn *wasmtime.Func, args ...interface{}) (interface{}, bool, error) {
+	bl := r.blocksBefore(r.buf(), fn, args, r.scratchPtr)
 	r.wd.Arm(r.store)
 	res, err := fn.Call(r.store, args...)
 	r.wd.Disarm()
+	if err == nil && bl {
+		r.blocksAfter(r.buf())
+	}
 	if err != nil {
 		if isTimeout(err) {
 			return nil, true, nil
@@ -878,6 +886,7 @@ func (r *setRunner) zeroGates() {
 		b[r.gatePtr+i] = 0
 	}
 	abi.WriteFindScratch(b, r.scratchPtr, r.gatePtr, 0, 0)
+	r.blocksFresh = true
 }
 
 // offerCache rewrites the descriptor with the answer cache attached, for the
@@ -1234,7 +1243,9 @@ func newSetRunner(
 	gatePtr := outBase + int32(patternCount)*int32(setOutTupleBytes)
 	scratchPtr := gatePtr + int32(idSpace)*4
 	bmpLen := int32((idSpace + 7) / 8)
-	bmpPtr := scratchPtr + abi.FindScratchBytes
+	// Room for the descriptor's fifth field, which a set whose split members
+	// keep search blocks reads (abi.FindScratchMagicBlocks).
+	bmpPtr := scratchPtr + abi.FindScratchBlocksBytes
 	cachePtr := (bmpPtr + bmpLen + 15) &^ 7
 	// The CHECKPOINTED cache. Its size needs the sweep column's width, which
 	// comes from the compiler: the set is recompiled to learn it, which is the
@@ -1274,6 +1285,7 @@ func newSetRunner(
 		end = int64(cachePtr) + int64(cacheLen)
 	}
 	top := end + 16
+	blocks := newSetBlocks(diags, maxLen, &top)
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -1294,6 +1306,7 @@ func newSetRunner(
 		outCap: int32(patternCount), bmpLen: bmpLen,
 		wide:        wideAll,
 		droppedFind: droppedFind, droppedAnchored: droppedAnchored,
+		setBlocks:   blocks,
 	}, nil
 }
 
@@ -1377,12 +1390,14 @@ func runSetProfile(
 		if c.find, e = get(s.find, s.setName+"_find"); e != nil {
 			return e
 		}
+		r.bindBlocks(c.find, s.setName)
 		// The batch entry is synthesized from `find`'s name
 		// under the hint, not declared, so its export name is derived the
 		// same way the compiler and the six generators derive it.
 		if c.findBatch, e = get(s.batchFind, config.SetBatchExportName(s.setName+"_find")); e != nil {
 			return e
 		}
+		r.bindBlocks(c.findBatch, s.setName)
 		fns = append(fns, c)
 	}
 

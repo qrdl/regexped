@@ -128,6 +128,102 @@ over the old one reads as length 0 without throwing. A JS host must read
 `memory.buffer` afresh after every call rather than keep a view across one; the
 generated stubs do.
 
+### The search block
+
+**Who needs this.** Only a host that drives `find` or `groups` exports WITHOUT
+a generated stub. Every generated stub (Rust, Go, C, AssemblyScript, JS, TS, and
+the component resources) does everything below.
+
+**Why it exists.** A *search* is what an iterator does: call `find` (or
+`groups`) from an offset, advance past the match, call again, until the input
+is exhausted. Each call is linear, but a pattern such as `a*b|a` over `aaaa…`
+reads to the end of the input on every call before settling for the one-byte
+match, so the search as a whole is quadratic — the same bytes are read again by
+the next call. The module fixes that with **notes kept across the calls of one
+search**: when a walk reads past its match without finding an accept, every
+(state, position) it passed is recorded as "nothing matches from here", and a
+later call that reaches a recorded point stops there. Each point is recorded
+once and read once, so the search is linear.
+
+Notes belong to one search, not to the module: two iterators alive over one
+instance must not disturb each other. So they live in a **block** the host owns,
+one per iterator, and the host tells the module which block the next call
+belongs to.
+
+Most searches never pay for notes. The module counts the bytes a search wastes
+(read past its matches, plus failed reads over 32 bytes) and only when that
+passes `4 × progress + 64` does the search **arm**; the host then gives it its
+notes. A pattern whose automaton cannot re-read bytes has no notes at all: its
+export ignores the block, and a stub hands nothing over for it.
+
+A **Backtracking** export uses the same block for a different purpose. Its work
+budget — the bound past which it hands a call to its memoised fallback body —
+lasts the SEARCH rather than one call, so a search whose every call would burn
+the budget burns it once. Once the budget runs out the search is **tripped**:
+every later call goes straight to the fallback, and the host gives that body a
+memo to keep for the rest of the search, so a (state, position) one call ruled
+out stays ruled out in the next. A `groups` export keeps only the tripped flag.
+
+**The block**: 128 bytes, 8-byte aligned, in the memory the input lives in (the
+host's own memory in an embedded build, the module's exported `memory`
+otherwise), zeroed when the search starts. Its layout is in `internal/abi`; the
+host touches these fields:
+
+| offset | field | host's part |
+|---|---|---|
+| 12 | `armed` (u32) | read after each call: non-zero means the search has armed |
+| 28 | `notes_ptr` (u32) | write the address of the notes, once, after the search arms |
+| 40 | `bt_state` (u32) | Backtracking only: read after each call; 2 means tripped |
+| 44 | `notes_cap` (u32) | write the notes' size in bytes |
+| 56 | `bt_memo_ptr` (u32) | Backtracking only: write the memo's address, once, after it trips |
+| 72 | `bt_memo_cap` (u32) | write the memo's size in bytes |
+
+**The notes**: `(len + 1) × notes_bytes` zeroed bytes, where `len` is the
+input's length and `notes_bytes` is a per-export constant (usually 1; the
+generators get it from `compile.SearchSizes`). The module checks `notes_cap`
+before it uses them and treats a short region as no notes, so a wrong constant
+costs speed, never memory safety. They live until the search ends.
+
+**The Backtracking memo**: `(len + 1) × bt_memo_bytes` zeroed bytes, where
+`bt_memo_bytes` is ⌈instructions / 8⌉ of the pattern's program (the generators
+get it from `compile.SearchSizes` too). It is checked against `bt_memo_cap` the
+same way; a call it does not cover uses a memo of its own. In an EMBEDDED build
+the fallback's memory is the module's own, not the host's, so it never uses a
+host-provided memo: the budget still lasts the search, and a tripped search
+still goes straight to the fallback, but each fallback call keeps its own memo.
+
+**Handing the block over**, before EVERY call of a `find`, `groups` or batch
+export whose pattern keeps notes, through the export `regexped:search`:
+
+- standalone module: a mutable `i32` **global**; write the block's address;
+- embedded module (merged): a **function** `(blk i32) → ()`; call it;
+- component: not exported — the `find` and `groups` resources do it themselves.
+
+The value is read by the call that follows. `0` means "no block": the call then
+runs exactly as it would without this mechanism — correct, and quadratic on the
+inputs above. A module in which no export keeps notes has no `regexped:search`.
+
+**What a host does:**
+
+1. When a search starts, zero a 128-byte block for it.
+2. Before each call of that search, hand the block over (and for a raw export
+   with no notes, hand over 0 or nothing).
+3. After a call that returned a match, if `armed` is set and `notes_ptr` is 0,
+   allocate the notes, zeroed, and write `notes_ptr` and `notes_cap`. Likewise,
+   for a Backtracking export, if `bt_state` is 2 and `bt_memo_ptr` is 0, allocate
+   the memo and write `bt_memo_ptr` and `bt_memo_cap`. A search that cannot get
+   the memory has an UNKNOWN answer: the generated stubs report it the way they
+   report `-2`.
+4. When the search ends, free the notes and the memo.
+
+**A block belongs to one text.** Reusing a block for a DIFFERENT text is the
+caller's mistake: notes describe the text they were written for. The module
+detects a changed `ptr`, `len` or resume position on an armed search and starts
+over, but a new text written at the same address, of the same length, resumed at
+exactly the old resume point, would read stale notes and can report wrong
+matches. Starting every search with a fresh (zeroed) block makes this
+impossible; a block reused on the SAME text at a later position is fine.
+
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
 **Standalone mode** (produced when `output` is absent, for JS/TS/browser direct load): the regexp WASM declares and exports its own single memory as `"memory"` (`memory[0]`). No import.
@@ -583,6 +679,31 @@ stale MODULE does not — the old module has no magic to compare, reads the
 descriptor's first word as a gate, and answers wrongly rather than failing.
 Rebuild the module from the same tree as the caller; `regexped` is a prerequisite
 of every example's compile rule for exactly this reason.
+
+**The descriptor's second form: search blocks.** A set member the compiler
+cannot prove linear inside the set's buckets is searched on its own (see
+[sets.md](sets.md)), and that search spans the set's calls exactly as a single
+pattern's spans its iterator's — so it needs a search block of its own (see
+"The search block" above: same size, layout and host protocol, one per member).
+So does a member on a Backtracking bucket, whose work budget lasts the drive,
+and the drive state of a shared-literal bucket's work counter. A set that takes
+blocks accepts a FIFTH field, named by a second magic word:
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `magic` | `0x52584642` ("RXFB") |
+| +4 … +15 | as above | |
+| +16 | `blocks_ptr` | `n` blocks of 128 bytes, 8-byte aligned, zeroed when the scan starts |
+
+`n`, and each block's notes size and Backtracking memo size, come from the set's
+generated block list (`compile.SearchSizes`, field `Blocks`); after each call a
+block that armed gets its notes and one that tripped its memo, exactly as a
+pattern's block does. A block that keeps neither must still be there. The same
+descriptor goes to `find` and to its batch entry. With the first magic the set runs every such search with no block —
+correct, and quadratic on the inputs that make a member re-read. A set that
+takes no blocks traps on the second magic, as on any wrong word: a caller that
+writes four fields leaves whatever follows them to be read as a pointer, so the
+fifth field is opt-in rather than always there.
 
 `in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
 search. Zero-width assertions (`\b`, `\B`, `(?m:^)`, `(?m:$)`) therefore see

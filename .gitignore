@@ -78,6 +78,7 @@ tools/pattest/pattest
 tools/settest/settest
 tools/re2test/make_sets/make_sets
 tools/likelytest/*.txt
+tools/advbench/advbench
 
 # TypeScript build output of the Node examples
 examples/node/*/dist/

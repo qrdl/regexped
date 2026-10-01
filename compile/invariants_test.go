@@ -1388,7 +1388,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			(&CompileOptions{}).btScratch()
 		}},
 		{"a drive prologue into something that is not one code entry", "not one code entry", func(*testing.T) {
-			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{})
+			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{}, nil)
 		}},
 		{"batch groups over an anchored capture body", "batch groups", func(*testing.T) {
 			buildBatchLitChainGroupsWrapperBody(0, 1, findFromMode(0))

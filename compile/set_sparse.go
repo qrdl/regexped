@@ -1,6 +1,9 @@
 package compile
 
 import (
+	"regexp/syntax"
+
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -465,6 +468,9 @@ type sparseSuffixParams struct {
 	// probeWalkEndP1 is one past the global the scan probe stamps with how far
 	// its walk reached (the scan pair's work counter reads it); 0 = none.
 	probeWalkEndP1 int32
+	// ctr is the work counter of a gated `find`'s sparse bucket whose walk can
+	// outlive its members; nil for none.
+	ctr *sparseCounter
 }
 
 // buildSparseSuffixBody emits the tuple-writing suffix function for a
@@ -842,6 +848,9 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block $noneFired
 
+	if p.ctr != nil {
+		b = p.ctr.emitCharge(b, lOut, lPos, pStart, lStart)
+	}
 	b = append(b, 0x20, lOut)
 	b = append(b, 0x0B) // end function
 	return b
@@ -1090,4 +1099,222 @@ func buildSparseAnchoredProbeBody(p sparseSuffixParams) []byte {
 	b = append(b, 0x20, lFound)
 	b = append(b, 0x0B) // end function
 	return b
+}
+
+// ── The sparse work counter ────────────────────────────────────────────────
+//
+// A sparse bucket holds more members than a mask has bits, so it has no
+// liveness exit: nothing tells its walk that the members still alive are all
+// gated out. `foo\w+` keeps the merged walk going over `foo`×n long after it
+// matched, for siblings (`foo[0-9]{k}`) that died at the first letter — every
+// candidate walks to the end of the input, quadratic in ONE call. Such a
+// bucket (one with a reachable cycle) counts the walks of the candidates that
+// reported nothing, past switchShortWalk bytes; once they pass
+// abi.SearchRuleMult × progress + abi.SearchRuleSlack — progress over the
+// whole drive when the caller gave the set its state block, over the call
+// otherwise — the call answers the sentinel, and the wrapper in front of the
+// find hands the call, and every later call of the drive, to a SPLIT COPY of
+// the set: the same set with those buckets' members served by their own linear
+// searches (compileSetSplit's companion). The split copy was measured 1,125
+// fuel/byte against 197 K on that input; the copy is only ever reached once a
+// drive has gone bad, so ordinary text pays the counter alone.
+
+// sparseHandoverSentinel is what a counted sparse bucket answers once the
+// counter trips. It never leaves the module: the find wrapper consumes it.
+const sparseHandoverSentinel = -9
+
+// sparseCounter is a set's sparse counter: its globals, loaded from and saved
+// to the drive's state block (search block 0) by the wrapper.
+type sparseCounter struct {
+	work  uint32 // i64: wasted bytes so far
+	first uint32 // i32: the drive's first `from` + 1
+}
+
+// sparseCycle reports whether a sparse bucket's walks can make a drive
+// quadratic: whether some member can keep one walk going across unboundedly
+// many later candidates (sparseMemberUnbounded). A walk is alive while ANY
+// member is, so the merged automaton is unbounded exactly when a member's own
+// is: a cycle of merged states projects onto a cycle of one member's.
+func sparseCycle(bkt *bucket) bool {
+	if !bkt.sparse || bkt.suffixDFA == nil {
+		return false
+	}
+	for _, u := range sparseUnboundedMembers(bkt) {
+		if u {
+			return true
+		}
+	}
+	return false
+}
+
+// sparseUnboundedMembers is sparseMemberUnbounded for each of bkt's members,
+// in bucket order, computed once.
+func sparseUnboundedMembers(bkt *bucket) []bool {
+	if bkt.sparseUnbounded == nil {
+		bkt.sparseUnbounded = make([]bool, len(bkt.patterns))
+		for k, p := range bkt.patterns {
+			bkt.sparseUnbounded[k] = sparseMemberUnbounded(bkt, p)
+		}
+	}
+	return bkt.sparseUnbounded
+}
+
+// sparseMemberUnbounded reports whether p can keep its sparse bucket's walk
+// going across unboundedly many later candidates. The walk is not gated — a
+// member that has matched keeps it going — so it may pass accepting states.
+// A literal bucket's candidates are its literal's occurrences, so p's walk
+// must be able to read the literal for ever (`foo[a-z]*bar`, `foo\w+` over
+// foo×N); `union[ \t]+[a-z]{6}[0-9]{2}` reads `union` at most once, in its
+// bounded tail, and is linear however long its `[ \t]+` run. A fallback
+// bucket starts a walk at every position, so any reachable cycle is enough —
+// unless p matches only at 0, where its walk starts once. Unsure answers are
+// true, the safe direction.
+func sparseMemberUnbounded(bkt *bucket, p *PatternInfo) bool {
+	ast := patternSuffixAST(p)
+	if ast == nil {
+		return true
+	}
+	if bkt.literal == "" {
+		// Matching only at 0: \A (or a non-multiline ^) leading the pattern.
+		// startAnchor is not set on every path that packs a fallback member,
+		// so it is read off the pattern here.
+		if full := fullPatternAST(p); p.startAnchor || full != nil && topLevelBeginAnchorKind(full) == beginAnchorText {
+			return false
+		}
+	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(ast.Simplify())
+	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	if !ok {
+		return true
+	}
+	t := dfaTableFrom(d)
+	if bkt.literal != "" {
+		return dfaCrossesLiteralUnboundedly(t, []byte(bkt.literal), true)
+	}
+	reach := dfaReachable(t)
+	_, cyclic := longestPaths(t.numStates, func(s int) bool { return reach[s] },
+		func(s, c int) int { return t.transitions[s*256+c] })
+	return cyclic
+}
+
+func anySparseCycle(buckets []*bucket) bool {
+	for _, bkt := range buckets {
+		if sparseCycle(bkt) {
+			return true
+		}
+	}
+	return false
+}
+
+// emitCharge goes at the end of a counted sparse body: a candidate that
+// reported nothing (lOut == 0) and walked more than switchShortWalk bytes is
+// waste. The budget is checked BEFORE the walk is added, as the switch counter
+// does, so one long walk alone does not hand over.
+func (ctr *sparseCounter) emitCharge(b []byte, lOut, lPos, pStart, lStart byte) []byte {
+	b = append(b, 0x20, lOut, 0x45)                     // nothing reported
+	b = append(b, 0x20, lPos, 0x20, pStart, 0x6B, 0x41) // walk
+	b = utils.AppendSLEB128(b, switchShortWalk)
+	b = append(b, 0x4A, 0x71, 0x04, 0x40) // gt_s; and; if
+	// work > mult × (start + 1 − first) + slack: hand over.
+	b = emitSwitchOverBudget(b,
+		func(b []byte) []byte {
+			b = append(b, 0x23)
+			return utils.AppendULEB128(b, ctr.work)
+		},
+		func(b []byte) []byte {
+			b = append(b, 0x20, lStart, 0x41, 0x01, 0x6A, 0x23)
+			b = utils.AppendULEB128(b, ctr.first)
+			return append(b, 0x6B)
+		}, abi.SearchRuleMult)
+	b = append(b, 0x04, 0x40, 0x41)
+	b = utils.AppendSLEB128(b, sparseHandoverSentinel)
+	b = append(b, 0x0F, 0x0B) // return; end if
+	b = emitAddWalk(b,
+		func(b []byte) []byte {
+			b = append(b, 0x23)
+			return utils.AppendULEB128(b, ctr.work)
+		},
+		func(b []byte) []byte {
+			b = append(b, 0x24)
+			return utils.AppendULEB128(b, ctr.work)
+		},
+		func(b []byte) []byte { return append(b, 0x20, lPos, 0x20, pStart, 0x6B) })
+	return append(b, 0x0B)
+}
+
+// Offsets of the drive's state in search block 0.
+const (
+	sparseStateWork     = 0  // i64
+	sparseStateSwitched = 8  // i32: the drive belongs to the split copy
+	sparseStateFirst    = 12 // i32: the drive's first `from` + 1
+)
+
+// emitSparseFindWrapperBody is the exported `find` of a set with a sparse
+// counter: (ptr, len, from, desc, out, cap) → i32, the inner find body at
+// innerIdx (which takes the gate pointer) and the split copy's `find` at
+// compIdx (which takes the descriptor).
+func emitSparseFindWrapperBody(cs *compiledSet, innerIdx, compIdx int) []byte {
+	const (
+		pPtr = iota
+		pLen
+		pFrom
+		pDesc
+		pOut
+		pCap
+	)
+	a := newLocalAlloc(6)
+	lGate, lBlk, lMagic, lR := a.I32(), a.I32(), a.I32(), a.I32()
+	var b []byte
+	b = a.EmitDecls(b)
+	b = cs.emitScratchMagicCheck(b, pDesc, lMagic)
+	b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchGateOff, 0x21, lGate)
+	callComp := func(b []byte) []byte {
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pFrom, 0x20, pDesc, 0x20, pOut, 0x20, pCap, 0x10)
+		return utils.AppendULEB128(b, uint32(compIdx)) //nolint:gosec // a function index
+	}
+	ctr := cs.sparseCtr
+	setG := func(b []byte, g uint32) []byte {
+		b = append(b, 0x24)
+		return utils.AppendULEB128(b, g)
+	}
+	if cs.acceptsBlocks() {
+		b = emitScratchBlocks(b, pDesc)
+		b = append(b, 0x22, lBlk, 0x04, 0x40) // if the caller gave the state block
+		b = append(b, 0x20, lBlk, 0x28, 0x02, sparseStateSwitched, 0x04, 0x40)
+		b = callComp(b)
+		b = append(b, 0x0F, 0x0B) // switched: the split copy's drive
+		b = append(b, 0x20, lBlk, 0x29, 0x03, sparseStateWork)
+		b = setG(b, ctr.work)
+		b = append(b, 0x20, lBlk, 0x28, 0x02, sparseStateFirst, 0x45, 0x04, 0x40)
+		b = append(b, 0x20, lBlk, 0x20, pFrom, 0x41, 0x01, 0x6A, 0x36, 0x02, sparseStateFirst)
+		b = append(b, 0x0B)
+		b = append(b, 0x20, lBlk, 0x28, 0x02, sparseStateFirst)
+		b = setG(b, ctr.first)
+		b = append(b, 0x05) // else: this call only
+	} else {
+		b = append(b, 0x41, 0x01, 0x04, 0x40) // if (always)
+	}
+	b = append(b, 0x42, 0x00)
+	b = setG(b, ctr.work)
+	b = append(b, 0x20, pFrom, 0x41, 0x01, 0x6A)
+	b = setG(b, ctr.first)
+	b = append(b, 0x0B)
+	b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pFrom, 0x20, lGate, 0x20, pOut, 0x20, pCap, 0x10)
+	b = utils.AppendULEB128(b, uint32(innerIdx)) //nolint:gosec // a function index
+	b = append(b, 0x22, lR, 0x41)
+	b = utils.AppendSLEB128(b, sparseHandoverSentinel)
+	b = append(b, 0x46, 0x04, 0x40) // if handed over
+	if cs.acceptsBlocks() {
+		b = append(b, 0x20, lBlk, 0x04, 0x40, 0x20, lBlk, 0x41, 0x01, 0x36, 0x02, sparseStateSwitched, 0x0B)
+	}
+	b = callComp(b)
+	b = append(b, 0x0F, 0x0B)
+	if cs.acceptsBlocks() {
+		b = append(b, 0x20, lBlk, 0x04, 0x40, 0x20, lBlk, 0x23)
+		b = utils.AppendULEB128(b, ctr.work)
+		b = append(b, 0x37, 0x03, sparseStateWork, 0x0B)
+	}
+	b = append(b, 0x20, lR, 0x0B)
+	return append(utils.AppendULEB128(nil, uint32(len(b))), b...)
 }

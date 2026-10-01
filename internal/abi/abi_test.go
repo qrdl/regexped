@@ -120,3 +120,41 @@ func TestWriteFindScratchLaysTheDocumentedLayout(t *testing.T) {
 		t.Errorf("rewritten gate_ptr = %#x, want 0x4444", got)
 	}
 }
+
+// TestSearchBlockLayout pins the per-search block: every field inside the
+// block, none overlapping another, the i64 fields 8-aligned, and every offset
+// below 128 — the compiler writes them as one-byte memarg offsets, and the
+// generated stubs carry them as literal constants, so a field that moved would
+// silently read another's bytes.
+func TestSearchBlockLayout(t *testing.T) {
+	fields := []struct {
+		name      string
+		off, size int
+	}{
+		{"wasted", SearchWastedOff, 8}, {"first", SearchFirstOff, 4}, {"armed", SearchArmedOff, 4},
+		{"resume", SearchResumeOff, 4}, {"ptr", SearchPtrOff, 4}, {"len", SearchLenOff, 4},
+		{"notes", SearchNotesOff, 4}, {"high", SearchHighOff, 4}, {"seen", SearchSeenOff, 4},
+		{"bt_state", SearchBTStateOff, 4}, {"notes_cap", SearchNotesCapOff, 4},
+		{"bt_budget", SearchBTBudgetOff, 8}, {"bt_memo", SearchBTMemoOff, 4},
+		{"bt_cap", SearchBTCapOff, 4}, {"bt_memo_cap", SearchBTMemoCapOff, 4},
+	}
+	used := make([]string, SearchBlockBytes)
+	for _, f := range fields {
+		if f.off < 0 || f.off+f.size > SearchBlockBytes || f.off >= 128 {
+			t.Errorf("%s at %d..%d is outside the %d-byte block", f.name, f.off, f.off+f.size, SearchBlockBytes)
+			continue
+		}
+		if f.off%f.size != 0 {
+			t.Errorf("%s at %d is not %d-aligned", f.name, f.off, f.size)
+		}
+		for i := f.off; i < f.off+f.size; i++ {
+			if used[i] != "" {
+				t.Errorf("%s overlaps %s at byte %d", f.name, used[i], i)
+			}
+			used[i] = f.name
+		}
+	}
+	if SearchBlockAlign != 8 || SearchBlockBytes%SearchBlockAlign != 0 {
+		t.Errorf("block %d bytes, %d-aligned: the i64 fields need 8", SearchBlockBytes, SearchBlockAlign)
+	}
+}

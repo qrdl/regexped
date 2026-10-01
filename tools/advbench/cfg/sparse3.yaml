@@ -1,0 +1,41 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo\w+'
+  - pattern: 'foo[0-9]{1}'
+  - pattern: 'foo[0-9]{2}'
+  - pattern: 'foo[0-9]{3}'
+  - pattern: 'foo[0-9]{4}'
+  - pattern: 'foo[0-9]{5}'
+  - pattern: 'foo[0-9]{6}'
+  - pattern: 'foo[0-9]{7}'
+  - pattern: 'foo[0-9]{8}'
+  - pattern: 'foo[0-9]{9}'
+  - pattern: 'foo[0-9]{10}'
+  - pattern: 'foo[0-9]{11}'
+  - pattern: 'foo[0-9]{12}'
+  - pattern: 'foo[0-9]{13}'
+  - pattern: 'foo[0-9]{14}'
+  - pattern: 'foo[0-9]{15}'
+  - pattern: 'foo[0-9]{16}'
+  - pattern: 'foo[0-9]{17}'
+  - pattern: 'foo[0-9]{18}'
+  - pattern: 'foo[0-9]{19}'
+  - pattern: 'foo[0-9]{20}'
+  - pattern: 'foo[0-9]{21}'
+  - pattern: 'foo[0-9]{22}'
+  - pattern: 'foo[0-9]{23}'
+  - pattern: 'foo[0-9]{24}'
+  - pattern: 'foo[0-9]{25}'
+  - pattern: 'foo[0-9]{26}'
+  - pattern: 'foo[0-9]{27}'
+  - pattern: 'foo[0-9]{28}'
+  - pattern: 'foo[0-9]{29}'
+  - pattern: 'foo[0-9]{30}'
+  - pattern: 'foo[0-9]{31}'
+  - pattern: 'foo[0-9]{32}'
+sets:
+  - name: s
+    find: sfind
+    scan_all: sall
+    patterns: all

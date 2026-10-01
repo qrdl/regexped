@@ -190,6 +190,10 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	if companion {
 		lDesc = a.I32()
 	}
+	var lMagic byte
+	if cs.acceptsBlocks() {
+		lMagic = a.I32()
+	}
 
 	var b []byte
 	b = a.EmitDecls(b)
@@ -205,14 +209,8 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	// steps injectScratchPrologue splices into a non-wrapped set's body. The
 	// inner body is left taking a gate, because every one of its callers has
 	// dereferenced.
-	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
-	b = append(b, 0x47)       // i32.ne
-	b = append(b, 0x04, 0x40) // if
-	b = append(b, 0x00)       // unreachable
-	b = append(b, 0x0B)       // end
+	b = cs.emitScratchMagicCheck(b, pScratch, lMagic)
+	b = cs.emitWorkerBlocks(b, pScratch)
 
 	cache := overlapCacheCtx{
 		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
@@ -1234,6 +1232,10 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		cache.midWorkP1 = cs.midSweepWork + 1
 	}
 
+	var lMagic byte
+	if cs.acceptsBlocks() {
+		lMagic = a.I32()
+	}
 	var b []byte
 	b = a.EmitDecls(b) // the i32 locals allocated above
 
@@ -1241,14 +1243,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// descriptor on entry, so the cache fields are read before the gate pointer
 	// overwrites it. The magic check turns a caller still passing a bare gate
 	// array into an immediate trap rather than a pointer read out of gate[0].
-	b = append(b, 0x20, pGate)
-	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
-	b = append(b, 0x47)       // i32.ne
-	b = append(b, 0x04, 0x40) // if
-	b = append(b, 0x00)       // unreachable
-	b = append(b, 0x0B)       // end
+	b = cs.emitScratchMagicCheck(b, pGate, lMagic)
+	b = cs.emitWorkerBlocks(b, pGate)
 	if lDesc != 0 {
 		b = append(b, 0x20, pGate, 0x21, lDesc)
 	}

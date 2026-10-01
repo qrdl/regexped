@@ -80,6 +80,17 @@ generated C stub keeps the handle inside the iterator struct and adds one
 obligation, `<func>_free`; see [c-api.md](c-api.md). A consumer binding the WIT
 DIRECTLY, with `bindgen!` or `jco`, calls the constructor and `next` itself.
 
+A resource of a pattern that can re-read input (such as `a*b|a`, whose every
+call reads to the end before settling for a short match) also keeps a 128-byte
+**search block** in its representation, hands it to the core module before each
+`next`, and — once the module reports that the scan has started re-reading —
+allocates the scan's notes through the component's own allocator, detached from
+the call like the input block, so `[dtor]` frees them. That keeps a scan over any
+input linear (see [wasm.md](wasm.md), "The search block"); the consumer's API
+does not change. A Backtracking pattern's resource uses the same block for its
+work budget, which then lasts the scan, and allocates the fallback's memo the same
+way once the budget runs out.
+
 ### The error case is not "no match"
 
 `error-code` is the only thing that distinguishes "there is no match" from

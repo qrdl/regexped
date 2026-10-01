@@ -186,6 +186,9 @@ type moduleGlobals struct {
 	// btScratchP1 is btScratch.host + 1, or 0 while no Backtracking fallback
 	// body has asked for its scratch globals.
 	btScratchP1 uint32
+	// searchP1 is the search global + 1 (search_notes.go), or 0 while no body
+	// has asked for it.
+	searchP1 uint32
 	// i64 marks the globals AllocI64 made, with their initial values. Every
 	// other global is an i32.
 	i64 map[uint32]int64

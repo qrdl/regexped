@@ -2,6 +2,7 @@ package generate
 
 import (
 	"fmt"
+	"github.com/qrdl/regexped/compile"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -28,12 +29,18 @@ func goStub(cfg config.BuildConfig, out string) error {
 			break
 		}
 	}
-	singleBody, needsIter, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
+	sizes := searchSizesFor(cfg)
+	singleBody, needsIter, err := genGoStubsBodySized(cfg.Regexps, cfg.ImportModule, sizes)
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
 	shapes := newSetShapes(cfg)
 	setBody, setNeedsIter := genGoSetBody(cfg, shapes)
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			setBody = goSetWithBlocks(setBody, s.Find, sizes[s.Find].Blocks)
+		}
+	}
 	if singleBody == "" && setBody == "" {
 		return nil
 	}
@@ -706,10 +713,19 @@ func (iter *%[1]sIter) Matches() iter.Seq[[]Span] {
 // genGoStubsBody returns the body (no header, no imports) for single-pattern stubs.
 // Returns (body string, needsIter bool).
 func genGoStubsBody(entries []config.RegexEntry, importModule string) (string, bool, error) {
+	return genGoStubsBodySized(entries, importModule, nil)
+}
+
+// genGoStubsBodySized is genGoStubsBody with each export's search block
+// (search_stub.go); nil sizes means none.
+func genGoStubsBodySized(entries []config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, bool, error) {
 	var parts []string
 	needsIter := false
+	if anySearchBlock(sizes) {
+		parts = append(parts, goSearchPreamble(importModule))
+	}
 	for _, re := range entries {
-		part, err := genGoStubsForEntry(re, importModule)
+		part, err := genGoStubsForEntrySized(re, importModule, sizes)
 		if err != nil {
 			return "", false, err
 		}
@@ -745,6 +761,10 @@ func genGoStubFile(entries []config.RegexEntry, importModule, pkgName string) (s
 
 // genGoStubsForEntry generates the Go stub content for a single regexp entry.
 func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
+	return genGoStubsForEntrySized(re, importModule, nil)
+}
+
+func genGoStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -753,7 +773,8 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		written = true
 	}
 	if re.FindFunc != "" {
-		out += genGoFindStub(importModule, re.FindFunc)
+		out += goWithSearch(genGoFindStub(importModule, re.FindFunc), re.FindFunc, "ffi_"+re.FindFunc,
+			sizes[re.FindFunc], false)
 		written = true
 	}
 	if re.GroupsFunc != "" {
@@ -761,7 +782,8 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		if err != nil {
 			return "", err
 		}
-		out += genGoGroupsStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups)
+		out += goWithSearch(genGoGroupsStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups),
+			re.GroupsFunc, "ffi_"+re.GroupsExportName(), sizes[re.GroupsFunc], true)
 		out += genGoGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups)
 		written = true
 	}

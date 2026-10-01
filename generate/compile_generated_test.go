@@ -59,8 +59,34 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			{Name: "lower", Pattern: `[a-z]+`},
 			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
 			{Name: "word", Pattern: `\w+`},
+			// Finds that keep PER-SEARCH NOTES (docs/wasm.md, "The search
+			// block"): their iterators carry a block, hand it over before
+			// every call and allocate notes once a search arms — code no other
+			// entry here generates.
+			{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun_find"},
+			{Name: "overrun_groups", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+			// A set member split out of its set whose own search keeps notes:
+			// the set iterator hands it a search block through the second
+			// form of the scratch descriptor (abi.FindScratchMagicBlocks).
+			{Name: "split_member", Pattern: `foo\w+bar|foo`},
+			// Backtracking finds whose work budget lasts the search: the
+			// iterator hands over a block and gives a tripped search its memo;
+			// the set's member is split onto the Backtracking find (its
+			// start-anywhere automaton is over the state limit), so the set
+			// iterator gives a block a memo too.
+			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+			{Name: "bt_groups", Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
+			{Name: "bt_member", Pattern: `a[ab]{11}c[a-z]*X`},
 		},
 		Sets: []config.SetConfig{{
+			Name:     "split",
+			Find:     "scan_split",
+			Patterns: config.PatternSelector{Names: []string{"split_member", "aws"}},
+		}, {
+			Name:     "btsplit",
+			Find:     "scan_btsplit",
+			Patterns: config.PatternSelector{Names: []string{"bt_member", "gh"}},
+		}, {
 			Name:        "sec",
 			MatchAny:    "which_secret",
 			MatchAll:    "all_kinds",

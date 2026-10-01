@@ -1,0 +1,9 @@
+import_module: m
+wasm_file: x.wasm
+max_fallback_states: 16
+regexps:
+  - pattern: '(?:aa|a){0,40}b|a'
+sets:
+  - name: s
+    find: sfind
+    patterns: all

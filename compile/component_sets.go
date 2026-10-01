@@ -71,6 +71,11 @@ const (
 	// constructor can fill it once.
 	repScratch = 28
 	repBytes   = repScratch + abi.FindScratchBytes
+	// A set whose split members keep search blocks carries the descriptor's
+	// fifth field — the blocks, allocated by the constructor — and is that
+	// much longer. The members' notes are found through their blocks.
+	repBlocks      = repScratch + abi.FindScratchBlocksOff
+	repBytesBlocks = repScratch + abi.FindScratchBlocksBytes
 )
 
 // buildSetAnyAdapterBody emits the adapter for `match_any` or `scan_any`:
@@ -408,6 +413,8 @@ type setScannerCtor struct {
 	// zero when the set gets no sweep.
 	cells int32
 	pats  int32
+	// blocks is how many split member search blocks the scanner owns.
+	blocks int
 }
 
 func buildSetScannerCtorBody(c setScannerCtor) []byte {
@@ -461,7 +468,11 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = append(b, 0x20, pPtr, 0x21, lCopy) // the input is the scanner's own block
 	b = append(b, 0x0B)
 
-	b = callRealloc(b, reallocIdx, 4, repBytes)
+	if c.blocks > 0 {
+		b = callRealloc(b, reallocIdx, 4, repBytesBlocks)
+	} else {
+		b = callRealloc(b, reallocIdx, 4, repBytes)
+	}
 	b = append(b, 0x21, lRep)
 
 	b = callRealloc(b, reallocIdx, 4, int32(idSpace*4))
@@ -623,9 +634,22 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		b = append(b, 0x0B)
 	}
 
-	// The descriptor, filled once: magic, the gate array, and the cache above.
+	// The descriptor, filled once: magic, the gate array, and the cache above
+	// — and the split members' search blocks, zeroed, when the set has them.
+	magic := int32(abi.FindScratchMagic)
+	if c.blocks > 0 {
+		magic = abi.FindScratchMagicBlocks
+		n := int32(c.blocks * abi.SearchBlockBytes) //nolint:gosec // a small size
+		b = callRealloc(b, reallocIdx, abi.SearchBlockAlign, n)
+		b = append(b, 0x22, lCopy) // the input block is stored; lCopy is free
+		b = append(b, 0x41, 0x00, 0x41)
+		b = utils.AppendSLEB128(b, n)
+		b = append(b, 0xFC, 0x0B, 0x00) // memory.fill
+		b = append(b, 0x20, lRep, 0x20, lCopy)
+		b = storeI32(b, repBlocks)
+	}
 	b = append(b, 0x20, lRep, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
+	b = utils.AppendSLEB128(b, magic)
 	b = storeI32(b, repScratch+abi.FindScratchMagicOff)
 	b = append(b, 0x20, lRep, 0x20, lGate)
 	b = storeI32(b, repScratch+abi.FindScratchGateOff)
@@ -662,9 +686,22 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 // The advance is the module stubs' rule: every tuple in one call shares a start,
 // so the next search begins one past it.
 func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
+	return buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount, nil, 0)
+}
+
+// buildSetScannerNextBodyBlocks is buildSetScannerNextBody that, for a set
+// that takes search blocks, gives an armed block its notes and a tripped
+// Backtracking block its memo after a call that matched — allocated from
+// cabi_realloc and detached from the call, as the pattern resources do
+// (emitResourceNotes, emitResourceBTMemo).
+func buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount int, blocks []SearchSize, callListGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	lRet, lOut, lN := alloc.I32(), alloc.I32(), alloc.I32()
+	var lBlk, lSz, lP, lChain byte
+	if len(blocks) > 0 {
+		lBlk, lSz, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
+	}
 	var b []byte
 	b = alloc.EmitDecls(b)
 
@@ -774,6 +811,54 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
 	b = storeI32(b, repPos)
+	// give allocates (len + 1) × nb zeroed bytes for block k's field at
+	// ptrOff (size at capOff) when cond — which reads the block from lBlk —
+	// holds and the field is still empty.
+	give := func(b []byte, k int, cond func([]byte) []byte, ptrOff, capOff, nb int) []byte {
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, repBlocks)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(k*abi.SearchBlockBytes)) //nolint:gosec // a small offset
+		b = append(b, 0x6A, 0x21, lBlk)
+		b = cond(b)
+		b = append(b, 0x04, 0x40) // if it needs one
+		b = append(b, 0x20, lBlk)
+		b = loadI32(b, ptrOff)
+		b = append(b, 0x45, 0x04, 0x40) // if none yet
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, callListGlobal)
+		b = append(b, 0x21, lChain)
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, repLen)
+		b = append(b, 0x41, 0x01, 0x6A, 0x41)
+		b = utils.AppendSLEB128(b, int32(nb)) //nolint:gosec // a small size
+		b = append(b, 0x6C, 0x21, lSz)        // (len + 1) * nb
+		b = callReallocDyn(b, reallocIdx, 1, lSz)
+		b = append(b, 0x22, lP)
+		b = append(b, 0x41, 0x00, 0x20, lSz, 0xFC, 0x0B, 0x00) // memory.fill(p, 0, n)
+		b = append(b, 0x20, lBlk, 0x20, lP)
+		b = storeI32(b, ptrOff)
+		b = append(b, 0x20, lBlk, 0x20, lSz)
+		b = storeI32(b, capOff)
+		b = append(b, 0x20, lChain, 0x24) // detach: the scanner owns them
+		b = utils.AppendULEB128(b, callListGlobal)
+		return append(b, 0x0B, 0x0B)
+	}
+	for k, sz := range blocks {
+		if sz.NotesBytes > 0 {
+			b = give(b, k, func(b []byte) []byte {
+				b = append(b, 0x20, lBlk)
+				return loadI32(b, abi.SearchArmedOff)
+			}, abi.SearchNotesOff, abi.SearchNotesCapOff, sz.NotesBytes)
+		}
+		if sz.BTMemoBytes > 0 {
+			b = give(b, k, func(b []byte) []byte {
+				b = append(b, 0x20, lBlk)
+				b = loadI32(b, abi.SearchBTStateOff)
+				return append(b, 0x41, 0x02, 0x46) // tripped
+			}, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, sz.BTMemoBytes)
+		}
+	}
 
 	b = append(b, 0x20, lRet, 0x20, lOut)
 	b = storeI32(b, 4)
@@ -792,9 +877,41 @@ func buildSetScannerNextBody(reallocIdx, findIdx, patternCount int) []byte {
 //
 // An absent dtor is not a compile error: dropping the handle traps instead.
 func buildSetScannerDtorBody(freeIdx int) []byte {
+	return buildSetScannerDtorBodyBlocks(freeIdx, nil)
+}
+
+// buildSetScannerDtorBodyBlocks is buildSetScannerDtorBody that also frees a
+// scanner's search blocks and whatever notes and memos they were given.
+func buildSetScannerDtorBodyBlocks(freeIdx int, blocks []SearchSize) []byte {
 	const pRep = 0x00
 	var b []byte
 	b = newLocalAlloc(1).EmitDecls(b) // no locals
+	free := func(b []byte, at int) []byte {
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, repBlocks)
+		b = loadI32(b, at)
+		b = append(b, 0x04, 0x40) // if the block was given one
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, repBlocks)
+		b = loadI32(b, at)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(freeIdx))
+		return append(b, 0x0B)
+	}
+	for k, sz := range blocks {
+		if sz.NotesBytes > 0 {
+			b = free(b, k*abi.SearchBlockBytes+abi.SearchNotesOff)
+		}
+		if sz.BTMemoBytes > 0 {
+			b = free(b, k*abi.SearchBlockBytes+abi.SearchBTMemoOff)
+		}
+	}
+	if len(blocks) > 0 {
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, repBlocks)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(freeIdx))
+	}
 
 	// The input block and the gate array are ALWAYS present; the answer cache
 	// may not be — a set with no sweep, or a region over budget, leaves it null
@@ -897,6 +1014,9 @@ type setAdapter struct {
 	// set gets no sweep and the drive walks.
 	cacheCells    int32
 	cachePatterns int32
+	// blocks is the search blocks the set's `find` takes (SearchSize.Blocks):
+	// the constructor allocates them, `next` gives them notes and memos.
+	blocks []SearchSize
 }
 
 // componentSetAdapters lists the adapters a set-bearing component needs, in
@@ -944,10 +1064,10 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 				out = append(out,
 					setAdapter{kind: setAdapterCtor, export: n.Constructor, idSpace: cs.idSpaceSize(),
 						resNewImport: resNewIdx[si], typeIdx: anyTypeIdx3,
-						cacheCells: cacheCells, cachePatterns: cachePats},
+						cacheCells: cacheCells, cachePatterns: cachePats, blocks: cs.searchBlocks()},
 					setAdapter{kind: setAdapterNext, export: n.Next, innerFunc: inner,
-						count: cs.patternCount, typeIdx: nextTypeIdx, post: true},
-					setAdapter{kind: setAdapterDtor, export: n.Dtor, typeIdx: dtorTypeIdx},
+						count: cs.patternCount, typeIdx: nextTypeIdx, post: true, blocks: cs.searchBlocks()},
+					setAdapter{kind: setAdapterDtor, export: n.Dtor, typeIdx: dtorTypeIdx, blocks: cs.searchBlocks()},
 				)
 			case capMatchAny:
 				out = append(out, setAdapter{kind: setAdapterAny, innerFunc: inner,
@@ -992,12 +1112,12 @@ func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal u
 	case setAdapterCtor:
 		return buildSetScannerCtorBody(setScannerCtor{
 			reallocIdx: reallocIdx, resNewIdx: a.resNewImport, callListGlobal: callListGlobal,
-			idSpace: a.idSpace, cells: a.cacheCells, pats: a.cachePatterns,
+			idSpace: a.idSpace, cells: a.cacheCells, pats: a.cachePatterns, blocks: len(a.blocks),
 		})
 	case setAdapterNext:
-		return buildSetScannerNextBody(reallocIdx, a.innerFunc, a.count)
+		return buildSetScannerNextBodyBlocks(reallocIdx, a.innerFunc, a.count, a.blocks, callListGlobal)
 	case setAdapterDtor:
-		return buildSetScannerDtorBody(freeIdx)
+		return buildSetScannerDtorBodyBlocks(freeIdx, a.blocks)
 	}
 	panic("compile: unknown set adapter kind")
 }

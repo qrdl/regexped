@@ -479,6 +479,31 @@ surface.
 
 ---
 
+### Linear scans on any input
+
+A pattern such as `a*b|a` makes each `find` call read to the end of the input
+before settling for a short match, so a whole scan over `aaaa…` is quadratic.
+The iterator of a pattern that can do this gains two opaque members — a 128-byte
+`search` block and a `notes` pointer — hands the block to the module before
+every call, and, when the module reports that the scan has started re-reading,
+`calloc`s its notes (`(len + 1)` bytes per pattern row), which the module uses to
+stop at ground it has already covered (see [wasm.md](wasm.md), "The search
+block"). **`<func>_free` is then REQUIRED under `wasm_format: module` too**: it
+frees the notes. A failed `calloc` makes `_next` return `RX_ERR_BT_OVERFLOW`.
+A Backtracking pattern's iterator carries the same block and a `btmemo`
+pointer: its work budget then lasts the whole scan rather than one call, and once
+it runs out `_next` `calloc`s the fallback's memo — `(len + 1) × ⌈instructions /
+8⌉` bytes — so a scan whose every call would exhaust the budget pays for it once.
+`_free` frees it, and a failed `calloc` is reported the same way.
+
+The allocator is detected like the answer cache's: `RX_SEARCH_NOTES` follows
+`RX_SET_CACHE` when that is defined, and `__has_include(<stdlib.h>)` otherwise.
+A `-nostdlib` build that passes `-DRX_SET_CACHE=0` (or `-DRX_SEARCH_NOTES=0`)
+keeps no notes: such a scan stays quadratic, with identical answers. A
+freestanding build that does keep them links `calloc` and `free`, and — like any
+freestanding C at `-O1` and above — may need a `memset`, which the compiler
+emits for the zeroing loops.
+
 ## Backtracking stack overflow
 
 A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".

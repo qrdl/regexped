@@ -1163,7 +1163,8 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		if c.mode == capFind {
 			b = c.emitSelectBase(b)
 			b = c.emitSuffixCall(b, bi, litLen, posLocal, g.mask)
-			b = c.emitCommit(b, bi < len(c.cs.buckets) && c.cs.buckets[bi].btFallback != nil)
+			b = c.emitCommit(b, bi < len(c.cs.buckets) && (c.cs.buckets[bi].btFallback != nil ||
+				c.cs.sparseCtr != nil && c.cs.buckets[bi].sparse && sparseCycle(c.cs.buckets[bi])))
 		} else {
 			b = c.emitProbeCall(b, bi, litLen, posLocal, g.mask)
 			b = c.emitRecordProbe(b, bi)
@@ -1815,6 +1816,14 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 // rewriting the count produces a module whose code section is off by the
 // prologue's length from the first spliced function onward.
 func injectScratchPrologue(entry []byte, pScratch byte) []byte {
+	return injectScratchPrologueBlocks(entry, pScratch, false)
+}
+
+// injectScratchPrologueBlocks is injectScratchPrologue that, with blocks,
+// also accepts the descriptor that names split member search blocks
+// (abi.FindScratchMagicBlocks): the kept body of a split set is called by the
+// merge with the caller's descriptor, whichever magic it carries.
+func injectScratchPrologueBlocks(entry []byte, pScratch byte, blocks bool) []byte {
 	size, n, err := utils.DecodeULEB128(entry)
 	if err != nil || int(size)+n != len(entry) {
 		panic("compile: injectScratchPrologue given something that is not one code entry")
@@ -1826,7 +1835,14 @@ func injectScratchPrologue(entry []byte, pScratch byte) []byte {
 	p = append(p, 0x28, 0x02, abi.FindScratchMagicOff) // i32.load align=4
 	p = append(p, 0x41)
 	p = utils.AppendSLEB128(p, abi.FindScratchMagic)
-	p = append(p, 0x47)       // i32.ne
+	p = append(p, 0x47) // i32.ne
+	if blocks {
+		p = append(p, 0x20, pScratch)
+		p = append(p, 0x28, 0x02, abi.FindScratchMagicOff)
+		p = append(p, 0x41)
+		p = utils.AppendSLEB128(p, abi.FindScratchMagicBlocks)
+		p = append(p, 0x47, 0x71) // i32.ne; i32.and
+	}
 	p = append(p, 0x04, 0x40) // if
 	p = append(p, 0x00)       // unreachable
 	p = append(p, 0x0B)       // end

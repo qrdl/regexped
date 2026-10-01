@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 )
@@ -37,6 +38,10 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 	if len(wsets) == 0 {
 		return "", ""
 	}
+	// The module header's scanner carries the split members' search blocks;
+	// the identical header here carries them unused (the resource keeps its
+	// own inside the component).
+	sizes := searchSizesFor(cfg)
 	var hb, cb strings.Builder
 
 	for si, s := range cfg.Sets {
@@ -46,7 +51,11 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		idN := idSpaceSize(s, cfg)
 		scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
-		gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
+		var blocks []compile.SearchSize
+		if s.Find != "" {
+			blocks = sizes[s.Find].Blocks
+		}
+		gateField := cSetGateField(idKonst, len(blocks))
 		// The two answer-cache fields the MODULE header declares for a
 		// cache-eligible overlapping set. They stay zero here — the resource
 		// owns the cache, inside the component — but the struct is part of the
@@ -61,6 +70,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 			// and a caller never touches them in either format.
 			gateField += "    unsigned *cache;\n    size_t cache_words;\n"
 		}
+		gateField += cSetBlockFields(blocks)
 
 		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 

@@ -241,6 +241,25 @@ with no boundary to amortise. The hint is a no-op there.
 
 ---
 
+### Linear scans on any input
+
+A pattern such as `a*b|a` makes each `find` call read to the end of the input
+before settling for a short match, so a whole scan over `aaaa…` is quadratic.
+The generator prevents that with a 128-byte **search block** in its own region:
+it hands the block to the module before every call, and when the module reports
+that the scan has started re-reading (it "arms"), it adds `(len + 1)` notes bytes
+per pattern row from the same arena, which the module uses to stop at ground it
+has already covered (see [wasm.md](wasm.md), "The search block"). A scan that
+never re-reads never allocates notes. Two generators alive at once each keep
+their own. A pattern that cannot re-read gets neither, and its generator is
+unchanged. If memory cannot grow for the notes, the generator throws an `Error`
+saying so: the rest of the scan is unknown, as with `-2`.
+A Backtracking pattern's generator uses the same block for its work budget,
+which then lasts the whole scan rather than one call; once it runs out, the
+generator allocates the fallback's memo — `(len + 1) × ⌈instructions / 8⌉`
+bytes — so a scan whose every call would exhaust the budget pays for it once. It comes from the same arena and
+fails the same way.
+
 ## Backtracking stack overflow
 
 A pattern compiled to the Backtracking engine hands any call its ordinary body cannot finish — too much backtracking, or an input past its compile-time frame stack or memo — to a fallback body that sizes that memory from the input. Only when the memory cannot be had (linear memory cannot grow any further: WASM32's 4 GiB, or a lower limit the host set) does the engine give up. It then cannot say whether the input matches, so the WASM returns a distinct `-2` sentinel rather than "no match".

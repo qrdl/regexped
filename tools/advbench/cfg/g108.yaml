@@ -1,0 +1,11 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'a*b'
+  - pattern: 'a'
+sets:
+  - name: s
+    find: sfind
+    scan_any: sany
+    scan_all: sall
+    patterns: all

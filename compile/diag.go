@@ -124,6 +124,19 @@ type SetDiag struct {
 	// NoCacheSplitBacktracking lists which of those the companion serves by
 	// the Backtracking find rather than the start-anywhere find.
 	NoCacheSplitBacktracking []int `json:"no_cache_split_backtracking,omitempty"`
+	// SparseSplitMembers lists the members the sparse counter's split copy
+	// serves by their own linear searches: those of a sparse bucket whose walk
+	// can outlive them. A gated `find` drive that wastes too much in such a
+	// bucket is handed over to the copy.
+	SparseSplitMembers []int `json:"sparse_split_members,omitempty"`
+	// SearchBlocks is the set's split member search blocks, in block order:
+	// each member's notes bytes per text position, 0 for one with none — what
+	// a caller sizes the blocks it hands `find` from (abi.FindScratchMagicBlocks).
+	SearchBlocks []int `json:"search_blocks,omitempty"`
+	// SearchBlocksBTMemo is, per block, the Backtracking memo bytes per text
+	// position a tripped search there keeps (abi.SearchBTMemoOff); nil when
+	// no block's search keeps one.
+	SearchBlocksBTMemo []int `json:"search_blocks_bt_memo,omitempty"`
 	// ScanUnion reports the scan pair's own union automaton: its whole body
 	// (Direct, when members are split out) or the target a literal
 	// frontend's work counter switches to (Counter).
@@ -255,4 +268,21 @@ type ConflictDiag struct {
 	CandidateBucket int                    `json:"candidate_bucket"`
 	Reason          string                 `json:"reason"`
 	Detail          map[string]interface{} `json:"detail,omitempty"`
+}
+
+// diagSearchBlocks splits a set's block list into SetDiag's two columns.
+func diagSearchBlocks(blocks []SearchSize) (notes, btMemo []int) {
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+	notes, btMemo = make([]int, len(blocks)), make([]int, len(blocks))
+	anyMemo := false
+	for k, s := range blocks {
+		notes[k], btMemo[k] = s.NotesBytes, s.BTMemoBytes
+		anyMemo = anyMemo || s.BTMemoBytes > 0
+	}
+	if !anyMemo {
+		btMemo = nil
+	}
+	return notes, btMemo
 }

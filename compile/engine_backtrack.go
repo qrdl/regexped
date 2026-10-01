@@ -23,6 +23,10 @@ type backtrack struct {
 	// byte (progHasZeroWidthCycle). Such a program gets no ordinary body —
 	// see planBT.
 	zeroWidthCycle bool
+
+	// search keeps the work budget, the tripped flag and the fallback's memo
+	// per SEARCH through the caller's block (bt_search.go); nil = per call.
+	search *btSearch
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -374,6 +378,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		}
 		return append(b, 0x20, localLen)
 	}
+	// One search's capture calls share its tripped flag (bt_search.go): once
+	// one has tripped, the rest go to the fallback directly.
+	capSearch := bt.search
+	if member != nil || fallback != nil || !useWork || !tripCalls {
+		capSearch = nil
+	}
+	if capSearch != nil {
+		body = capSearch.emitCapEntry(body, &callOffs)
+	}
 	if useWork && member != nil {
 		// A set member's budget lasts the host call (btDriveMember).
 		body = emitBTWorkInitMember(body, member, workK, N, workSpan)
@@ -428,7 +441,12 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		body = emitBTWorkChargeMember(body, member, workLocal, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
 	} else if useWork {
 		// ptr, len, out_ptr
-		body = emitBTWorkCharge(body, workLocal, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
+		giveUp := btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32)
+		if capSearch != nil {
+			inner := giveUp
+			giveUp = func(b []byte) []byte { return inner(capSearch.emitCapTripped(b)) }
+		}
+		body = emitBTWorkCharge(body, workLocal, giveUp)
 	}
 
 	// Pop frame: sp -= frameSize
@@ -1186,6 +1204,26 @@ func btTailCallBody(nParams int) (body []byte, callOffs []int) {
 	b := []byte{0x00} // no locals
 	b = emitBTFallbackCall(b, nParams, &callOffs)
 	b = append(b, 0x0B) // end (the return above makes this unreachable)
+	return btSizePrefix(b, callOffs)
+}
+
+// btTailCallBodySearch is btTailCallBody for a find that keeps its search in
+// the caller's block: it marks the search tripped before the call, so the stub
+// gives the fallback the memo it keeps for the search (bt_search.go). nil
+// search: btTailCallBody.
+func btTailCallBodySearch(nParams int, search *btSearch) (body []byte, callOffs []int) {
+	if search == nil {
+		return btTailCallBody(nParams)
+	}
+	b := []byte{0x00} // no locals
+	b = search.blk(b)
+	b = append(b, 0x04, 0x40) // if blk
+	b = search.blk(b)
+	b = append(b, 0x41, 0x02)
+	b = search.store32(b, btSearchState)
+	b = append(b, 0x0B)
+	b = emitBTFallbackCall(b, nParams, &callOffs)
+	b = append(b, 0x0B)
 	return btSizePrefix(b, callOffs)
 }
 
@@ -2143,6 +2181,23 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	if useWork {
 		workLocal = uint32(a.I64())
 	}
+	// The search's own budget and memo (bt_search.go): the ordinary body when
+	// it has a budget, the fallback when it has a region. The search memo lives
+	// in the INPUT's memory, which is the tables' memory only in a standalone
+	// or component build; an embedded fallback keeps this call's memo.
+	srch := bt.search
+	var sBlk, sTmp uint32
+	if srch != nil && ((useWork && tripCalls) || dyn != nil) {
+		sBlk, sTmp = uint32(a.I32()), uint32(a.I32())
+		if dyn != nil {
+			dyn.memoEnd = uint32(a.I32())
+			if tableMemIdx == 0 {
+				dyn.search, dyn.searchBlk = srch, sBlk
+			}
+		}
+	} else {
+		srch = nil
+	}
 	body = a.EmitDecls(body)
 
 	locAttemptStart := attemptCursor.Local()
@@ -2157,10 +2212,33 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// The work budget, once per CALL: every attempt this call makes shares
 	// it. Sized from the whole input rather than len - from — a larger budget
 	// only delays a trip, and the bound stays linear in the input.
-	if useWork {
+	if useWork && srch != nil {
+		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, len(prog.Inst), &callOffs)
+	} else if useWork {
 		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
+	}
+	// srchSave, before a return: the ordinary body hands back what is left of
+	// the search's budget; the fallback clears the memo rows of the attempt
+	// that matched, whose marks are not failures.
+	srchSave := func(b []byte) []byte {
+		switch {
+		case srch != nil && dyn == nil:
+			return srch.emitFindSave(b, sBlk, workLocal)
+		case dyn != nil && dyn.search != nil:
+			return srch.emitFallbackMatched(b, dyn, sBlk, uint32(attemptCursor.Local()), memoOrigin, sTmp)
+		}
+		return b
+	}
+	srchTrip := func(trip func([]byte) []byte) func([]byte) []byte {
+		if srch == nil || trip == nil || dyn != nil {
+			return trip
+		}
+		return func(b []byte) []byte {
+			b = srch.emitFindTripped(b, sBlk)
+			return trip(b)
+		}
 	}
 
 	// ── A fallback's memo: placed ONCE per call, not once per attempt ────────
@@ -2201,6 +2279,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	if useMemo {
 		body = append(body, 0x20, locAttemptStart, 0x21)
 		body = utils.AppendULEB128(body, memoOrigin)
+		if srch != nil {
+			body = srch.blk(body)
+			body = append(body, 0x21)
+			body = utils.AppendULEB128(body, sBlk)
+		}
 	}
 	// len - from: the span the rebased bit indices cover.
 	memoSpan := func(bb []byte) []byte {
@@ -2214,7 +2297,23 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return b
 		}
 		return emitBTOncePerCall(b, memoReady, func(b []byte) []byte {
-			return emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			if dyn.search == nil {
+				if srch != nil {
+					// Not this build's memory: this call's memo, as before.
+					b = emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+					b = btLocalGet(b, dyn.stackBase)
+					b = append(b, 0x21)
+					return utils.AppendULEB128(b, dyn.memoEnd)
+				}
+				return emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			}
+			b = srch.emitFallbackPlace(b, dyn, sBlk, memoOrigin, btUnknownI64)
+			b = append(b, 0x45, 0x04, 0x40) // not placed: this call's own memo
+			b = emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			b = btLocalGet(b, dyn.stackBase)
+			b = append(b, 0x21)
+			b = utils.AppendULEB128(b, dyn.memoEnd)
+			return append(b, 0x0B)
 		})
 	}
 
@@ -2335,6 +2434,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return append(bb, 0x0C, 0x03) // br 3 → exit $run_exit
 		}
 		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = srchSave(bb)
 			bb = append(bb, 0x20, locAttemptStart)
 			bb = append(bb, 0xAD)       // i64.extend_i32_u
 			bb = append(bb, 0x42, 0x20) // i64.const 32
@@ -2357,7 +2457,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64),
+			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
 			dyn)
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
@@ -2367,9 +2467,12 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
 		body = append(body, 0x0C, 0x00) // br 0 → $outer
 
-		body = append(body, 0x0B)       // end loop $outer (unreachable)
-		body = append(body, 0x0B)       // end loop $lit_outer (unreachable)
-		body = append(body, 0x0B)       // end block $no_match (unreachable)
+		body = append(body, 0x0B) // end loop $outer (unreachable)
+		body = append(body, 0x0B) // end loop $lit_outer (unreachable)
+		body = append(body, 0x0B) // end block $no_match (unreachable)
+		if dyn == nil {
+			body = srchSave(body)
+		}
 		body = append(body, 0x42, 0x7F) // i64.const -1
 		body = append(body, 0x0F)       // return
 		body = append(body, 0x0B)       // end function
@@ -2402,6 +2505,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		}
 		// Find matchFn: accept immediately (non-anchored, first match from attempt_start).
 		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = srchSave(bb)
 			bb = append(bb, 0x20, locAttemptStart)
 			bb = append(bb, 0xAD)       // i64.extend_i32_u
 			bb = append(bb, 0x42, 0x20) // i64.const 32
@@ -2421,7 +2525,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64),
+			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
 			dyn)
 
 		b = append(b, 0x00) // unreachable
@@ -2435,8 +2539,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
 	body = append(body, 0x0C, 0x00)
 
-	body = append(body, 0x0B)       // end loop $outer
-	body = append(body, 0x0B)       // end block $no_match
+	body = append(body, 0x0B) // end loop $outer
+	body = append(body, 0x0B) // end block $no_match
+	if dyn == nil {
+		body = srchSave(body)
+	}
 	body = append(body, 0x42, 0x7F) // i64.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end function

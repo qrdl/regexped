@@ -2,6 +2,7 @@ package generate
 
 import (
 	"fmt"
+	"github.com/qrdl/regexped/compile"
 	"os"
 	"strings"
 
@@ -12,11 +13,17 @@ import (
 // rustStub generates a Rust stub file for all regexp entries and sets in cfg.
 // out is the full output path or "-" for stdout.
 func rustStub(cfg config.BuildConfig, out string) error {
-	singleInner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)
+	sizes := searchSizesFor(cfg)
+	singleInner, err := genRustStubsInnerSized(cfg.Regexps, cfg.ImportModule, sizes)
 	if err != nil {
 		return fmt.Errorf("generate Rust stub: %w", err)
 	}
-	setInner := genRustSetInner(cfg)
+	setInner := genRustSetInnerSized(cfg, sizes)
+	if singleInner == "" && strings.Contains(setInner, "search_notes(") {
+		// The block type and the notes helper ride with the single-pattern
+		// part, which a sets-only config does not have.
+		setInner = rustSearchPreamble(cfg.ImportModule) + setInner
+	}
 	allInner := singleInner + setInner
 	if allInner == "" {
 		return nil
@@ -41,6 +48,12 @@ func rustStub(cfg config.BuildConfig, out string) error {
 // array, so gates never appear in the public surface. Every buffer is
 // declared in terms of the emitted <SET>_PATTERN_COUNT constant.
 func genRustSetInner(cfg config.BuildConfig) string {
+	return genRustSetInnerSized(cfg, nil)
+}
+
+// genRustSetInnerSized is genRustSetInner with each set's split member
+// search blocks (search_stub.go); nil sizes means none.
+func genRustSetInnerSized(cfg config.BuildConfig, sizes map[string]compile.SearchSize) string {
 	if !hasSetExports(cfg) {
 		return ""
 	}
@@ -201,8 +214,25 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			// construction, because field 1 is a pointer into `self`: an
 			// iterator that was moved after construction would otherwise carry
 			// a stale address. Four stores against a call that walks the input.
-			gateField += "    scratch: [u32; 4],\n"
-			gateInit += " scratch: [0u32; 4],"
+			blocks := sizes[s.Find].Blocks
+			if len(blocks) == 0 {
+				gateField += "    scratch: [u32; 4],\n"
+				gateInit += " scratch: [0u32; 4],"
+			} else {
+				// The split members' search blocks, one per member, and their
+				// notes once a member's search arms: named by the descriptor's
+				// fifth field (abi.FindScratchMagicBlocks). Boxed in a Vec, so
+				// moving the iterator does not move them under the module.
+				gateField += "    scratch: [u32; 5],\n" +
+					"    /// The set's search blocks and, once one arms, its notes.\n" +
+					"    blocks: Vec<SearchBlock>,\n    notes: Vec<Vec<u8>>,\n"
+				gateInit += fmt.Sprintf(" scratch: [0u32; 5], blocks: (0..%[1]d).map(|_| SearchBlock([0; %[2]d])).collect(), notes: vec![Vec::new(); %[1]d],",
+					len(blocks), abi.SearchBlockBytes)
+				if blocksBTMemo(blocks) {
+					gateField += "    /// A tripped Backtracking block's memo.\n    btmemos: Vec<Vec<u8>>,\n"
+					gateInit += fmt.Sprintf(" btmemos: vec![Vec::new(); %d],", len(blocks))
+				}
+			}
 			cacheField, cacheInit := "", ""
 			cacheArgs := "0, 0"
 			if sh := shapes.cacheShape(setIdx); sh.Eligible {
@@ -255,6 +285,21 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			gateInit += cacheInit
 			gateArg := "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagic) +
 				"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + "]; self.scratch.as_mut_ptr() }, "
+			afterCall := ""
+			if len(blocks) > 0 {
+				gateArg = "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagicBlocks) +
+					"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + ", self.blocks.as_mut_ptr() as u32]; self.scratch.as_mut_ptr() }, "
+				for k, sz := range blocks {
+					if sz.NotesBytes > 0 {
+						afterCall += fmt.Sprintf("            if let Err(e) = search_notes(&mut self.blocks[%d], &mut self.notes[%d], self.input.len(), %d) {\n"+
+							"                self.done = true;\n                return Some(Err(e));\n            }\n", k, k, sz.NotesBytes)
+					}
+					if sz.BTMemoBytes > 0 {
+						afterCall += fmt.Sprintf("            if let Err(e) = search_btmemo(&mut self.blocks[%d], &mut self.btmemos[%d], self.input.len(), %d) {\n"+
+							"                self.done = true;\n                return Some(Err(e));\n            }\n", k, k, sz.BTMemoBytes)
+					}
+				}
+			}
 			gateDoc := " and a zeroed gate array"
 			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
 /// refills at each matching position and yields that position's matches one
@@ -294,7 +339,7 @@ impl<'a> Iterator for %s<'a> {
             // And -6: the offset went below where the answer cache was built.
             if n == %d { self.done = true; return Some(Err(Error::OutOfOrder)); }
             if n <= 0 { self.done = true; return None; }
-            // The buffer is sized at the set's pattern count, the exact worst
+%s            // The buffer is sized at the set's pattern count, the exact worst
             // case for a single position, so n can never exceed it.
             self.count = n;
             self.idx = 0;
@@ -305,7 +350,7 @@ impl<'a> Iterator for %s<'a> {
 }
 
 `, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst,
-				btOverflow, malformedCache, outOfOrder)
+				btOverflow, malformedCache, outOfOrder, afterCall)
 			fmt.Fprintf(&out, "impl std::iter::FusedIterator for %s<'_> {}\n\n", iterName)
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
 				"///\n"+
@@ -344,9 +389,18 @@ func rustPatternNameFn(cfg config.BuildConfig) string {
 // genRustStubsInner generates the unindented inner content for single-pattern stubs
 // (without the pub mod wrapper). Returns "" when there is nothing to emit.
 func genRustStubsInner(entries []config.RegexEntry, importModule string) (string, error) {
+	return genRustStubsInnerSized(entries, importModule, nil)
+}
+
+// genRustStubsInnerSized is genRustStubsInner with each export's search block
+// (search_stub.go); nil sizes means none.
+func genRustStubsInnerSized(entries []config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var bodyParts []string
+	if anySearchBlock(sizes) {
+		bodyParts = append(bodyParts, rustSearchPreamble(importModule))
+	}
 	for _, re := range entries {
-		body, err := genRustStubsForEntry(re, importModule)
+		body, err := genRustStubsForEntrySized(re, importModule, sizes)
 		if err != nil {
 			return "", err
 		}
@@ -354,7 +408,7 @@ func genRustStubsInner(entries []config.RegexEntry, importModule string) (string
 			bodyParts = append(bodyParts, body)
 		}
 	}
-	if len(bodyParts) == 0 {
+	if len(bodyParts) == 0 || (len(bodyParts) == 1 && anySearchBlock(sizes)) {
 		return "", nil
 	}
 	return strings.TrimRight(strings.Join(bodyParts, ""), "\n") + "\n", nil
@@ -387,6 +441,10 @@ func genRustStubFile(entries []config.RegexEntry, importModule string) (string, 
 
 // genRustStubsForEntry generates the Rust stub content for a single entry.
 func genRustStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
+	return genRustStubsForEntrySized(re, importModule, nil)
+}
+
+func genRustStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -395,7 +453,8 @@ func genRustStubsForEntry(re config.RegexEntry, importModule string) (string, er
 		written = true
 	}
 	if re.FindFunc != "" {
-		out += genRustFindIterStub(importModule, re.FindFunc)
+		out += rustWithSearch(genRustFindIterStub(importModule, re.FindFunc), re.FindFunc,
+			iterTypeName(re.FindFunc), sizes[re.FindFunc], false)
 		written = true
 	}
 	if re.GroupsFunc != "" {
@@ -403,7 +462,8 @@ func genRustStubsForEntry(re config.RegexEntry, importModule string) (string, er
 		if err != nil {
 			return "", err
 		}
-		out += genRustGroupsIterStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups)
+		out += rustWithSearch(genRustGroupsIterStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups),
+			re.GroupsExportName(), iterTypeName(re.GroupsFunc), sizes[re.GroupsFunc], true)
 		out += genRustGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups)
 		written = true
 	}

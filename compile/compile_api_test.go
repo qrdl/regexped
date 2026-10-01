@@ -3023,6 +3023,30 @@ func TestSetSplitPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("merge state in memory", func(t *testing.T) {
+		// Past splitMergeLocalMembers the merge keeps its per-member values in
+		// the table memory: a valid module in both memory layouts, with the
+		// merge's locals no longer growing with the member count.
+		prev := splitMergeLocalMembers
+		splitMergeLocalMembers = 0
+		defer func() { splitMergeLocalMembers = prev }()
+		regexps := []config.RegexEntry{
+			{Name: "a", Pattern: `[a-z]+Q`}, {Name: "b", Pattern: `foo\w+bar|foo`},
+			{Name: "c", Pattern: `a[ab]{11}c[a-z]*X`}, {Name: "d", Pattern: `AKIA[A-Z0-9]{16}`},
+		}
+		for _, output := range []string{"", "merged.wasm"} {
+			wasm, _, d, err := CompileFileDiag(config.BuildConfig{Output: output, Regexps: regexps,
+				Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sl", Patterns: all}}}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			validateWASM(t, wasm)
+			if len(d[0].SplitMembers) < 2 {
+				t.Errorf("output %q: split members %v, want at least two", output, d[0].SplitMembers)
+			}
+		}
+	})
+
 	t.Run("Backtracking split of a zero-width cycle", func(t *testing.T) {
 		// The start-anywhere automaton is over the state limit (2^12 states
 		// from [ab]{11}), so the member is split onto the Backtracking find;

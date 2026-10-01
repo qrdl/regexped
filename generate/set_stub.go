@@ -484,14 +484,15 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
+		"searchBlock", "searchNotes", "ffi_regexped_search"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
 	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
 		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
-		"REGEXPED_TYPES_DEFINED",
+		"REGEXPED_TYPES_DEFINED", "rx_search_set_",
 	},
 	// Rust is deliberately absent: `pub mod <import_module>` already isolates
 	// every stub, so the key is a no-op there.

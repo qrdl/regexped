@@ -876,13 +876,21 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	if forcedFrontend == "" {
-		w, _, err := compile.CompileFile(cfg, "")
-		return w, err
+	w, _, diags, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
+	if err == nil {
+		for _, d := range diags {
+			if len(d.SearchBlocks) > 0 {
+				caseBlocks[string(w)] = d.SearchBlocks
+			}
+		}
 	}
-	w, _, _, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
 	return w, err
 }
+
+// caseBlocks is, per compiled module, its set's split member search blocks
+// (compile.SetDiag.SearchBlocks): the instance hands them to `find` as a
+// generated iterator does, so the rows measure what a stub's caller pays.
+var caseBlocks = map[string][]int{}
 
 // compileSetOptions is the ONE place the set-compile overrides are built. The
 // module compileCase emits and the shape overlapSetConfigFor's callers inspect
@@ -926,6 +934,12 @@ type rxInstance struct {
 	// neither engine work nor the wasmtime crossing — pure harness cost, and
 	// it inflated every one of our rows.
 	fnCache map[capability]*wasmtime.Func
+
+	// The set's split member search blocks, and their notes' region.
+	blocks      []int
+	blocksPtr   int32
+	notesPtr    int32
+	notesStride int32
 }
 
 // fnFor resolves a capability's export once and caches it.
@@ -979,7 +993,8 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	// gate pointer (internal/abi). It carries the gate array and the answer
 	// cache, so the harness builds one per instance and hands out its address.
 	scratchPtr := gatePtr + npat*4
-	bitmapPt := scratchPtr + abi.FindScratchBytes
+	// Room for the descriptor's fifth field (abi.FindScratchMagicBlocks).
+	bitmapPt := scratchPtr + abi.FindScratchBlocksBytes
 	// The batch buffer sits above the bitmap, 4 KB clear of it.
 	batchPtr := bitmapPt + int32(npat)/8 + 4096
 	cachePtr := (batchPtr + int32(batchCap)*12 + 4096 + 7) &^ 7
@@ -997,6 +1012,18 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		cacheLen, cacheStride = int32(bytes), int32(k)
 	}
 	top := int64(cachePtr) + int64(cacheLen) + 4096
+	blocks := caseBlocks[string(wasm)]
+	var blocksPtr, notesPtr, notesStride int32
+	if len(blocks) > 0 {
+		nb := 0
+		for _, n := range blocks {
+			nb = max(nb, n)
+		}
+		blocksPtr = int32((top + 7) &^ 7)
+		notesPtr = blocksPtr + int32(len(blocks)*abi.SearchBlockBytes)
+		notesStride = int32((len(c.input)+1)*nb+7) &^ 7
+		top = int64(notesPtr) + int64(len(blocks))*int64(notesStride) + 4096
+	}
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -1020,6 +1047,7 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		batchPtr: batchPtr,
 		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: npat, inLen: int32(len(c.input)),
+		blocks: blocks, blocksPtr: blocksPtr, notesPtr: notesPtr, notesStride: notesStride,
 	}, nil
 }
 
@@ -1046,6 +1074,32 @@ func (r *rxInstance) writeScratch(cache bool) {
 		binary.LittleEndian.PutUint32(buf[cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
 	}
 	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
+	if len(r.blocks) > 0 {
+		clear(buf[r.blocksPtr : r.blocksPtr+int32(len(r.blocks)*abi.SearchBlockBytes)])
+		abi.WriteFindScratchBlocks(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen, r.blocksPtr)
+	}
+	runtime.KeepAlive(r.store)
+}
+
+// giveNotes runs after a find call, as a generated iterator does: a split
+// member whose search armed during it gets its notes.
+func (r *rxInstance) giveNotes() {
+	if len(r.blocks) == 0 {
+		return
+	}
+	buf := r.mem.UnsafeData(r.store)
+	for k, nb := range r.blocks {
+		blk := r.blocksPtr + int32(k*abi.SearchBlockBytes)
+		if nb == 0 || binary.LittleEndian.Uint32(buf[blk+abi.SearchArmedOff:]) == 0 ||
+			binary.LittleEndian.Uint32(buf[blk+abi.SearchNotesOff:]) != 0 {
+			continue
+		}
+		n := (r.inLen + 1) * int32(nb)
+		notes := r.notesPtr + int32(k)*r.notesStride
+		clear(buf[notes : notes+n])
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesOff:], uint32(notes))
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesCapOff:], uint32(n))
+	}
 	runtime.KeepAlive(r.store)
 }
 
@@ -1189,6 +1243,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		if res.(int32) <= 0 {
 			return calls, nil
 		}
+		r.giveNotes()
 		buf := r.mem.UnsafeData(r.store)
 		start := int32(binary.LittleEndian.Uint32(buf[int(r.outPtr)+4:]))
 		runtime.KeepAlive(r.store)
@@ -1219,6 +1274,7 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		if uint32(packed>>32) == 0xFFFFFFFF {
 			return calls, nil
 		}
+		r.giveNotes()
 		// A cursor that does not advance is a hang, not a slow row, and this
 		// loop has no other bound.
 		if packed == cursor {

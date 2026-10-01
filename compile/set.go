@@ -628,6 +628,10 @@ type CompileSetOptions struct {
 	// caller that has not thought about probes cannot get one: see CompileSet.
 	AllowSparseAccept bool
 
+	// searchSizes, when non-nil, receives each single-pattern export's
+	// SearchSize (SearchSizes).
+	searchSizes map[string]SearchSize
+
 	// LikelyMode is the resolved set-level LikelyMode hint: consumed by the
 	// set-frontend density gate (forces Shufti for a 17..64-byte
 	// first-byte union under LikelyNoMatch).
@@ -687,6 +691,11 @@ type CompileSetOptions struct {
 	// no-cache companion (set_split.go), which exists for drives that have
 	// none.
 	noCache bool
+
+	// noSparseCounter compiles a set without the sparse buckets' work counter:
+	// the counter's own split companion (set_sparse.go), which is what the
+	// counter hands over to.
+	noSparseCounter bool
 
 	// quiet suppresses the set's warnings. CompileSet compiles a set a
 	// second time when it splits members out (see set_split.go); the first
@@ -1535,6 +1544,9 @@ type bucket struct {
 	// than the mask has bits. suffixDFA then carries the wide accept maps and
 	// the emitter takes buildSparseSuffixBody instead of buildSetSuffixBody.
 	sparse bool
+	// sparseUnbounded is, per member, sparseMemberUnbounded's verdict, filled
+	// on first use by sparseUnboundedMembers.
+	sparseUnbounded []bool
 	// sparseScratch is where this bucket's sparse body keeps its working
 	// arrays. Decided at EMIT time (genSuffixWASM lays it out after the
 	// tables), so it is written back onto the bucket rather than computed

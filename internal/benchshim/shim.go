@@ -30,6 +30,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -511,6 +512,150 @@ func BuildSetFind() []byte {
 	// The imported memory is RE-exported: WASI's clock_time_get writes its
 	// result through the CALLING instance's "memory" export, and traps with
 	// "missing required memory export" without one.
+	exports := []byte{0x02}
+	exports = append(exports, shimStr("memory")...)
+	exports = append(exports, 0x02, 0x00)
+	exports = append(exports, shimStr("bench")...)
+	exports = append(exports, 0x00, 0x02)
+
+	return assembleShim(
+		shimSection(0x01, types),
+		shimSection(0x02, imports),
+		shimFunctionSection(),
+		shimSection(0x07, exports),
+		shimCodeSection(b),
+	)
+}
+
+// --------------------------------------------------------------------------
+// BuildFindSearch / BuildGroupsSearch
+//
+// bench(ptr i32, len i32, out i32, iters i32, blk i32, notes i32, notes_cap i32,
+//
+//	tbase i32) → void
+//
+// BuildFind and BuildGroups for a module whose export keeps PER-SEARCH NOTES
+// (docs/wasm.md, "The search block"): each drive does what a generated stub
+// does — zero the block when the drive starts, hand it over through the
+// imported `regexped:search` global before every call, and once the module has
+// armed the search give it its notes (the region at notes, zeroed here as a
+// stub's allocator would). Without that the shim would time the no-block path,
+// which skips the waste counter a stub's drive pays for.
+//
+// Like BuildSetFind it imports the regexped module's memory — the block and the
+// notes must live there — declares none of its own, re-exports it for WASI, and
+// keeps its samples at tbase. `out` is the groups slot buffer; find ignores it.
+//
+// Locals: i(8) off(9) rel(10) r32(11) r64(12 i64) t_prev(13 i64).
+func BuildFindSearch() []byte { return buildSearchDrive(false) }
+
+// BuildGroupsSearch is BuildFindSearch for a groups export.
+func BuildGroupsSearch() []byte { return buildSearchDrive(true) }
+
+func buildSearchDrive(groups bool) []byte {
+	const (
+		pPtr, pLen, pOut, pIters, pBlk, pNotes, pNotesCap, pTBase = 0, 1, 2, 3, 4, 5, 6, 7
+		lI, lOff, lRel, lR32, lR64, lTPrev                        = 8, 9, 10, 11, 12, 13
+	)
+	scratch := func(b []byte) []byte { // tbase + TimingsBytes
+		b = append(b, 0x20, pTBase, 0x41)
+		b = utils.AppendSLEB128(b, int32(TimingsBytes))
+		return append(b, 0x6A)
+	}
+	clockGet := func(b []byte) []byte {
+		b = append(b, 0x41, 0x01, 0x42, 0x00) // CLOCK_MONOTONIC, precision 0
+		b = scratch(b)
+		return append(b, 0x10, 0x00, 0x1A) // call clock_time_get; drop errno
+	}
+	loadClock := func(b []byte) []byte {
+		b = scratch(b)
+		return append(b, 0x29, 0x03, 0x00) // i64.load align=3
+	}
+	blkField := func(b []byte, off int) []byte {
+		b = append(b, 0x20, pBlk, 0x28, 0x02)
+		return utils.AppendULEB128(b, uint32(off))
+	}
+
+	var b []byte
+	b = append(b, 0x02, 0x04, 0x7F, 0x02, 0x7E) // locals: 4×i32, 2×i64
+
+	b = clockGet(b)
+	b = loadClock(b)
+	b = append(b, 0x21, lTPrev)
+
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop (outer)
+	b = append(b, 0x20, lI, 0x20, pIters, 0x4E, 0x0D, 0x01)
+
+	// A drive starts with a zeroed block.
+	b = append(b, 0x20, pBlk, 0x41, 0x00, 0x41)
+	b = utils.AppendSLEB128(b, abi.SearchBlockBytes)
+	b = append(b, 0xFC, 0x0B, 0x00)
+	b = append(b, 0x41, 0x00, 0x21, lOff)
+
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop (inner)
+	b = append(b, 0x20, lOff, 0x20, pLen, 0x4E, 0x0D, 0x01)
+	b = append(b, 0x20, pBlk, 0x24, 0x00) // global.set regexped:search
+	if groups {
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pOut, 0x20, lOff, 0x10, 0x01, 0x22, lR32)
+		b = append(b, 0x41, 0x7F, 0x46, 0x0D, 0x01)             // == -1: exit inner
+		b = append(b, 0x20, lR32, 0x20, lOff, 0x6B, 0x21, lRel) // rel = end - off
+	} else {
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lOff, 0x10, 0x01, 0x22, lR64)
+		b = append(b, 0x42, 0x7F, 0x51, 0x0D, 0x01)                   // == -1: exit inner
+		b = append(b, 0x20, lR64, 0xA7, 0x20, lOff, 0x6B, 0x21, lRel) // rel = end - off
+	}
+	// Armed with no notes yet: give it the region, zeroed.
+	b = blkField(b, abi.SearchArmedOff)
+	b = append(b, 0x04, 0x40)
+	b = blkField(b, abi.SearchNotesOff)
+	b = append(b, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, pNotes, 0x41, 0x00, 0x20, pNotesCap, 0xFC, 0x0B, 0x00)
+	b = append(b, 0x20, pBlk, 0x20, pNotes, 0x36, 0x02)
+	b = utils.AppendULEB128(b, abi.SearchNotesOff)
+	b = append(b, 0x20, pBlk, 0x20, pNotesCap, 0x36, 0x02)
+	b = utils.AppendULEB128(b, abi.SearchNotesCapOff)
+	b = append(b, 0x0B, 0x0B)
+	// off += rel + eqz(rel), as BuildFind advances
+	b = append(b, 0x20, lOff, 0x20, lRel, 0x20, lRel, 0x45, 0x6A, 0x6A, 0x21, lOff)
+	b = append(b, 0x0C, 0x00, 0x0B, 0x0B) // br inner; end loop; end block
+
+	// timings[i] = u32(t_cur - t_prev), at tbase + i*4
+	b = clockGet(b)
+	b = append(b, 0x20, pTBase, 0x20, lI, 0x41, 0x04, 0x6C, 0x6A)
+	b = loadClock(b)
+	b = append(b, 0x20, lTPrev, 0x7D, 0xA7, 0x36, 0x02, 0x00)
+	b = loadClock(b)
+	b = append(b, 0x21, lTPrev)
+
+	b = append(b, 0x20, lI, 0x41, 0x01, 0x6A, 0x21, lI)
+	b = append(b, 0x0C, 0x00, 0x0B, 0x0B, 0x0B) // br outer; end loop; end block; end fn
+
+	// Types: 0 clock_time_get, 1 the regexped export, 2 bench.
+	types := []byte{0x03}
+	types = append(types, 0x60, 0x03, 0x7F, 0x7E, 0x7F, 0x01, 0x7F)
+	name := "find"
+	if groups {
+		name = "groups"
+		types = append(types, 0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+	} else {
+		types = append(types, 0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E)
+	}
+	types = append(types, 0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x00)
+
+	imports := []byte{0x04}
+	imports = append(imports, shimStr("wasi_snapshot_preview1")...)
+	imports = append(imports, shimStr("clock_time_get")...)
+	imports = append(imports, 0x00, 0x00)
+	imports = append(imports, shimStr("regexped")...)
+	imports = append(imports, shimStr(name)...)
+	imports = append(imports, 0x00, 0x01)
+	imports = append(imports, shimStr("regexped")...)
+	imports = append(imports, shimStr("memory")...)
+	imports = append(imports, 0x02, 0x00, 0x01) // memory, no max, min 1 page
+	imports = append(imports, shimStr("regexped")...)
+	imports = append(imports, shimStr(abi.SearchExport)...)
+	imports = append(imports, 0x03, 0x7F, 0x01) // global, i32, mutable
+
 	exports := []byte{0x02}
 	exports = append(exports, shimStr("memory")...)
 	exports = append(exports, 0x02, 0x00)

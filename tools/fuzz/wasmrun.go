@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -196,4 +197,93 @@ func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "interrupt")
+}
+
+// blockMode is how a find drive hands the per-search block over (docs/wasm.md,
+// "The search block").
+type blockMode int
+
+const (
+	blockNone  blockMode = iota // the search global left at 0: no counter, no notes
+	blockFresh                  // as a generated stub: zeroed per drive, notes on arming
+	blockArmed                  // armed before the first call: the MARKED copy answers every call
+)
+
+func (m blockMode) String() string {
+	return [...]string{"no-block", "fresh-block", "armed-block"}[m]
+}
+
+// maxNotesBytes over-allocates the notes; the module checks their capacity.
+const maxNotesBytes = 8
+
+// searchRegion is one instance's block and notes, at the end of its memory,
+// with the scratch base raised above them. nil when the module takes no block
+// or the mode is blockNone; every method is a no-op on nil.
+type searchRegion struct {
+	global   *wasmtime.Global
+	mem      *wasmtime.Memory
+	mode     blockMode
+	blk      int32
+	notesCap int32
+}
+
+func newSearchRegion(store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, textLen int, mode blockMode) (*searchRegion, error) {
+	if mode == blockNone {
+		return nil, nil
+	}
+	exp := inst.GetExport(store, abi.SearchExport)
+	if exp == nil || exp.Global() == nil {
+		return nil, nil
+	}
+	capacity := int64(textLen+1) * maxNotesBytes
+	at := (int64(mem.DataSize(store)) + 65535) &^ 65535
+	need := at + abi.SearchBlockBytes + capacity
+	if grow := (need - int64(mem.DataSize(store)) + 65535) / 65536; grow > 0 {
+		if _, err := mem.Grow(store, uint64(grow)); err != nil {
+			return nil, err
+		}
+	}
+	if err := setScratchBase(store, inst, int32((need+65535)&^65535)); err != nil {
+		return nil, err
+	}
+	return &searchRegion{global: exp.Global(), mem: mem, mode: mode, blk: int32(at), notesCap: int32(capacity)}, nil
+}
+
+// begin starts a drive: a zeroed block, armed with notes under blockArmed.
+func (s *searchRegion) begin(store *wasmtime.Store) {
+	if s == nil {
+		return
+	}
+	buf := s.mem.UnsafeData(store)
+	clear(buf[s.blk : s.blk+abi.SearchBlockBytes])
+	if s.mode == blockArmed {
+		binary.LittleEndian.PutUint32(buf[s.blk+abi.SearchArmedOff:], 1)
+		s.giveNotes(buf)
+	}
+}
+
+func (s *searchRegion) giveNotes(buf []byte) {
+	notes := s.blk + abi.SearchBlockBytes
+	clear(buf[notes : notes+s.notesCap])
+	binary.LittleEndian.PutUint32(buf[s.blk+abi.SearchNotesOff:], uint32(notes))
+	binary.LittleEndian.PutUint32(buf[s.blk+abi.SearchNotesCapOff:], uint32(s.notesCap))
+}
+
+// before hands the block over for the next call.
+func (s *searchRegion) before(store *wasmtime.Store) {
+	if s != nil {
+		_ = s.global.Set(store, wasmtime.ValI32(s.blk))
+	}
+}
+
+// after runs after a call that reported a match: an armed search gets notes.
+func (s *searchRegion) after(store *wasmtime.Store) {
+	if s == nil {
+		return
+	}
+	buf := s.mem.UnsafeData(store)
+	if binary.LittleEndian.Uint32(buf[s.blk+abi.SearchArmedOff:]) != 0 &&
+		binary.LittleEndian.Uint32(buf[s.blk+abi.SearchNotesOff:]) == 0 {
+		s.giveNotes(buf)
+	}
 }

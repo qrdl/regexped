@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -1239,6 +1240,13 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		fmt.Fprintf(os.Stderr, "  regexped: missing export for %s\n", tc.name)
 		return benchResult{instantiation: instantiation}
 	}
+	// An export that keeps per-search notes is driven the way a generated stub
+	// drives it: a block per drive, handed over before every call.
+	if g := inst.GetExport(store, abi.SearchExport); tc.mode != anchored && g != nil && g.Global() != nil {
+		r := benchRegexpedSearch(tc, input, engine, store, inst, mem, rpdFn, g.Global(), pct)
+		r.instantiation, r.wasmSize = instantiation, len(wasmBytes)
+		return r
+	}
 
 	// Instantiate the bench shim via a linker (needs WASI for clock_time_get).
 	var shimBytes []byte
@@ -1310,6 +1318,71 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		avgExec:       computeStat(shimBuf[:timingsBytes], pct),
 		wasmSize:      len(wasmBytes),
 	}
+}
+
+// benchRegexpedSearch times a find or groups drive through the search shims
+// (benchshim.BuildFindSearch / BuildGroupsSearch): the block, the notes region
+// and the samples live in the regexped module's memory, above everything else,
+// with the scratch base raised past them.
+func benchRegexpedSearch(tc testCase, input string, engine *wasmtime.Engine, store *wasmtime.Store,
+	inst *wasmtime.Instance, mem *wasmtime.Memory, fn *wasmtime.Func, search *wasmtime.Global, pct int) benchResult {
+	shimBytes, name := benchshim.BuildFindSearch(), "find"
+	if tc.mode == anchoredGroups {
+		shimBytes, name = benchshim.BuildGroupsSearch(), "groups"
+	}
+	shimMod, err := wasmtime.NewModule(engine, shimBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped search shim parse(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	tbase := (int64(mem.DataSize(store)) + 65535) &^ 65535
+	blk := tbase + ((int64(timingsBytes) + 8 + 7) &^ 7)
+	notes := blk + abi.SearchBlockBytes
+	notesCap := int64(len(input)+1) * maxNotesBytes
+	top := notes + notesCap
+	if grow := (top - int64(mem.DataSize(store)) + 65535) / 65536; grow > 0 {
+		if _, err := mem.Grow(store, uint64(grow)); err != nil {
+			fmt.Fprintf(os.Stderr, "  regexped search region(%s): %v\n", tc.name, err)
+			return benchResult{}
+		}
+	}
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		if err := g.Global().Set(store, wasmtime.ValI32(int32((top+65535)&^65535))); err != nil {
+			return benchResult{}
+		}
+	}
+	linker := wasmtime.NewLinker(engine)
+	if err = linker.DefineWasi(); err != nil {
+		return benchResult{}
+	}
+	for _, d := range []struct {
+		name string
+		item wasmtime.AsExtern
+	}{{name, fn}, {"memory", mem}, {abi.SearchExport, search}} {
+		if err = linker.Define(store, "regexped", d.name, d.item); err != nil {
+			fmt.Fprintf(os.Stderr, "  regexped search shim Define(%s, %s): %v\n", tc.name, d.name, err)
+			return benchResult{}
+		}
+	}
+	shimInst, err := linker.Instantiate(store, shimMod)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped search shim instantiate(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	benchFn := shimInst.GetFunc(store, "bench")
+	buf := mem.UnsafeData(store)
+	copy(buf[inputBase:], []byte(input))
+	args := []any{inputBase, int32(len(input)), slotsBase, int32(benchIters), int32(blk), int32(notes), int32(notesCap), int32(tbase)}
+	warmupEnd := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(warmupEnd) {
+		wcall(benchFn, store, args...) //nolint:errcheck
+	}
+	if _, err := wcall(benchFn, store, args...); err != nil {
+		fmt.Fprintf(os.Stderr, "  regexped search bench(%s): %v\n", tc.name, err)
+		return benchResult{}
+	}
+	buf = mem.UnsafeData(store)
+	return benchResult{avgExec: computeStat(buf[tbase:tbase+int64(timingsBytes)], pct)}
 }
 
 // benchRegex instantiates regex_bench.wasm, compiles the pattern via regex_init,
@@ -1557,6 +1630,15 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
+	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
+	if tc.mode != anchored {
+		sb, err := newSearchBlock(store, inst, mem, len(input))
+		if err != nil {
+			return 0, false
+		}
+		sb.begin(store)
+		sb.before(store)
+	}
 
 	before, _ := store.GetFuel()
 	var callErr error
@@ -2307,11 +2389,12 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
-	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
+	wasmBytes, tableEnd, diags, err := compile.CompileFileDiag(cfg, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped set compile: %v\n", err)
 		return benchResult{}
 	}
+	blocks := setSearchBlocks(diags)
 
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
@@ -2372,8 +2455,18 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	// array, the scratch descriptor, then the shim's samples and clock scratch.
 	outCap := int32(len(sc.patterns))
 	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
-	scratchPtr := gatePtr + outCap*4
-	timingsBase := (scratchPtr + abi.FindScratchBytes + 7) &^ 7
+	// The split members' search blocks, right after the gate array, so the
+	// shim's per-pass zeroing of the gates zeroes them too — a fresh block per
+	// drive, as a generated iterator hands over. No notes: this corpus is
+	// ordinary text, where a search does not arm.
+	gateBytes := outCap * 4
+	blocksPtr := int32(0)
+	if len(blocks) > 0 {
+		blocksPtr = (gatePtr + gateBytes + 7) &^ 7
+		gateBytes = blocksPtr - gatePtr + int32(len(blocks)*abi.SearchBlockBytes)
+	}
+	scratchPtr := gatePtr + gateBytes
+	timingsBase := (scratchPtr + abi.FindScratchBlocksBytes + 7) &^ 7
 	// Ensure enough memory pages for all of it.
 	neededPages := uint64((int64(timingsBase) + int64(timingsBytes) + 8 + pageSize - 1) / pageSize)
 	curPages := mem.Size(store)
@@ -2394,10 +2487,13 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	buf := mem.UnsafeData(store)
 	copy(buf[inBase:], []byte(input))
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
+	if len(blocks) > 0 {
+		abi.WriteFindScratchBlocks(buf, scratchPtr, gatePtr, 0, 0, blocksPtr)
+	}
 
 	bench := func(iters int32) error {
 		_, err := wcall(benchFn, store, inBase, int32(len(input)), scratchPtr, outBase, outCap,
-			gatePtr, outCap*4, iters, timingsBase)
+			gatePtr, gateBytes, iters, timingsBase)
 		return err
 	}
 	// Warmup, then one timed call of benchIters exhaustion passes, each timed
@@ -2428,6 +2524,13 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 // describes all of the caller's scratch.
 func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
 	inBase, inLen, gatePtr, outBase, outCap int32) int {
+	return exhaustSetFindBlocks(store, mem, findFn, inBase, inLen, gatePtr, outBase, outCap, setBlockArea{})
+}
+
+// exhaustSetFindBlocks is exhaustSetFind handing the set's split members their
+// search blocks, as a generated iterator does (sb.blocks nil: none).
+func exhaustSetFindBlocks(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
+	inBase, inLen, gatePtr, outBase, outCap int32, sb setBlockArea) int {
 	buf := mem.UnsafeData(store)
 	for i := int32(0); i < outCap*4; i++ {
 		buf[gatePtr+i] = 0
@@ -2436,6 +2539,7 @@ func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtim
 	// No answer cache: every set this harness drives is non-overlapping, and
 	// only an overlapping `find` reads one.
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
+	sb.begin(buf, scratchPtr, gatePtr)
 	total := 0
 	from := int32(0)
 	for {
@@ -2447,6 +2551,7 @@ func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtim
 		if n <= 0 {
 			return total
 		}
+		sb.after(mem.UnsafeData(store), int(inLen))
 		total += int(n)
 		b := mem.UnsafeData(store)
 		start := int32(b[int(outBase)+4]) | int32(b[int(outBase)+5])<<8 |
@@ -2468,10 +2573,11 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
 	}
-	wasmBytes, tableEnd, err := compile.CompileFile(cfg, "")
+	wasmBytes, tableEnd, diags, err := compile.CompileFileDiag(cfg, "")
 	if err != nil {
 		return 0
 	}
+	blocks := setSearchBlocks(diags)
 	mod, err := wasmtime.NewModule(fuelEngine, wasmBytes)
 	if err != nil {
 		return 0
@@ -2500,7 +2606,13 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(len(input)) + 4096
-	neededPages := uint64((int64(outBase) + 4096*4 + pageSize - 1) / pageSize)
+	sb := setBlockArea{blocks: blocks, notesBytes: maxInt(blocks) * (len(input) + 1)}
+	end := int64(outBase) + 4096*4
+	if len(blocks) > 0 {
+		sb.at = int32((end + 7) &^ 7)
+		end = int64(sb.at) + int64(sb.size()) + 16
+	}
+	neededPages := uint64((end + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); neededPages > cur {
 		mem.Grow(store, neededPages-cur) //nolint:errcheck
 	}
@@ -2517,11 +2629,11 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	gatePtr := outBase + outCap*abi.SetMatchTupleBytes
 
 	// Warmup call (uncounted).
-	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
+	exhaustSetFindBlocks(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap, sb)
 	store.SetFuel(fuelBudget) //nolint:errcheck
 
 	before, _ := store.GetFuel()
-	exhaustSetFind(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap)
+	exhaustSetFindBlocks(store, mem, findFn, inBase, int32(len(input)), gatePtr, outBase, outCap, sb)
 	after, _ := store.GetFuel()
 	return before - after
 }
@@ -3021,4 +3133,66 @@ func main() {
 		}, inputResults, *full, *pct)
 	}
 	fmt.Println()
+}
+
+// setSearchBlocks is the set's split member search blocks, from the compile's
+// diagnostics (one set per module here).
+func setSearchBlocks(diags []compile.SetDiag) []int {
+	for _, d := range diags {
+		if len(d.SearchBlocks) > 0 {
+			return d.SearchBlocks
+		}
+	}
+	return nil
+}
+
+func maxInt(v []int) int {
+	m := 0
+	for _, x := range v {
+		m = max(m, x)
+	}
+	return m
+}
+
+// setBlockArea is a set's split member search blocks at `at`, each followed
+// by room for its notes, handed to `find` the way a generated iterator does.
+type setBlockArea struct {
+	blocks     []int
+	at         int32
+	notesBytes int // per block
+}
+
+func (sb setBlockArea) stride() int32 {
+	return int32(abi.SearchBlockBytes+sb.notesBytes+7) &^ 7
+}
+
+func (sb setBlockArea) size() int32 { return int32(len(sb.blocks)) * sb.stride() }
+
+// begin zeroes the blocks and points the descriptor at them. The blocks are
+// one stride apart, so the descriptor names the first and the module finds
+// the rest at SearchBlockBytes steps — which requires stride == SearchBlockBytes
+// when there is more than one; the notes then live past all of them.
+func (sb setBlockArea) begin(buf []byte, scratchPtr, gatePtr int32) {
+	if len(sb.blocks) == 0 {
+		return
+	}
+	clear(buf[sb.at : sb.at+int32(len(sb.blocks)*abi.SearchBlockBytes)])
+	abi.WriteFindScratchBlocks(buf, scratchPtr, gatePtr, 0, 0, sb.at)
+}
+
+// after gives a member block that armed its notes, past all the blocks.
+func (sb setBlockArea) after(buf []byte, inLen int) {
+	notesBase := sb.at + int32(len(sb.blocks)*abi.SearchBlockBytes)
+	for k, nb := range sb.blocks {
+		blk := sb.at + int32(k*abi.SearchBlockBytes)
+		if nb == 0 || binary.LittleEndian.Uint32(buf[blk+abi.SearchArmedOff:]) == 0 ||
+			binary.LittleEndian.Uint32(buf[blk+abi.SearchNotesOff:]) != 0 {
+			continue
+		}
+		n := int32((inLen + 1) * nb)
+		notes := (notesBase + int32(k*sb.notesBytes) + 7) &^ 7
+		clear(buf[notes : notes+n])
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesOff:], uint32(notes))
+		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesCapOff:], uint32(n))
+	}
 }

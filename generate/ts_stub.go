@@ -180,19 +180,26 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("}\n\n")
 
 	}
+	// Each find/groups export's per-search block, if its pattern keeps notes
+	// (search_stub.go).
+	sizes := searchSizesFor(cfg)
+	if hasSuspendableExports(cfg) && anySearchBlock(sizes) {
+		sb.WriteString(jsSearchHelpers(true, sizes))
+	}
 	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
 			sb.WriteString(genTSMatchFunc(re.MatchFunc))
 		}
 		if re.FindFunc != "" {
-			sb.WriteString(genTSFindFunc(re.FindFunc))
+			sb.WriteString(jsWithSearch(genTSFindFunc(re.FindFunc), re.FindFunc, sizes[re.FindFunc], true, false, 0))
 		}
 		if re.GroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
 				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
-			sb.WriteString(genTSGroupsFunc(re.GroupsFunc, numGroups))
+			sb.WriteString(jsWithSearch(genTSGroupsFunc(re.GroupsFunc, numGroups), re.GroupsFunc,
+				sizes[re.GroupsFunc], true, true, numGroups*2*4))
 			sb.WriteString(genTSGroupIndices(re.GroupsFunc, numGroups, namedGroups))
 		}
 	}
@@ -511,7 +518,15 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 		}
 		out.WriteString("];\nexport function patternName(id: number): string { return _patternNames[id] ?? ''; }\n")
 	}
-	return out.String()
+	// Split members' search blocks (search_stub.go).
+	section := out.String()
+	sizes := searchSizesFor(cfg)
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			section = jsSetWithBlocks(section, s.Find, sizes[s.Find].Blocks, true)
+		}
+	}
+	return section
 }
 
 func genTSMatchFunc(funcName string) string {

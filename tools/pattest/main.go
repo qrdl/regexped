@@ -247,6 +247,15 @@ func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
+	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
+	if mode == "find" {
+		sb, err := newSearchBlock(store, inst, mem, len(input))
+		if err != nil {
+			return 0, err
+		}
+		sb.begin(store)
+		sb.before(store)
+	}
 
 	before, _ := store.GetFuel()
 	args := []any{inputBase, inputLen}
