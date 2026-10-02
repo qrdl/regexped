@@ -575,6 +575,12 @@ var findFromShapes = []struct{ name, pat, input string }{
 	// body — the two non-lit-chain find emitters an empty-capable pattern can
 	// reach that the shapes above do not.
 	{"bt_find_empty", `\B|(?:alpha|beta|gamma)[0-9a-f]{8}`, "xx alpha0123abcd yy"},
+	// Start-anchored Backtracking finds (an ambiguous word boundary keeps
+	// them off the DFA): a search from any position after 0 answers "no
+	// match" at once. The first has a zero-width cycle, so its find is the
+	// fallback alone.
+	{"bt_find_start_anchored", `^(\B|0)*`, "00 0a 00"},
+	{"bt_find_start_anchored_fast", `^(?:x\B|x)y`, "xy xy xxy"},
 	{"trivial_whole_empty", `([a-z]*)`, "ab cd"},
 
 	// Alternation of variable-length-prefix branches: the alt-lit-anchor

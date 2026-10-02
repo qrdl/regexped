@@ -289,29 +289,50 @@ do. `--verbose` reports the choice and the reason for every pattern
 (`find: switch — not provably linear`, and `switch handover: Backtracking` with
 its reason).
 
-**One shape stays quadratic over a whole drive**, whichever find serves it: a
-pattern with a SHORT, lower-priority way to end a match — a later alternative,
-or a lazy repeat — while a higher-priority branch keeps walking over bytes
-where that short ending comes up again. `a*b|a` over `a`×N matches at every
-byte, but each `find` call has to read to the end of the run before it may
-answer `[p, p+1)` (a `b` there would make the match `[p, N+1)`), and the next
-call, one byte on, reads the same run again: N matches cost about N²/2 bytes.
-Other examples: `\d+px|\d` over a run of digits, `foo\w+bar|foo` over
-`foo`×N, `a+?b|a`,
-`[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Inc|[A-Z][a-z]+` over a long run of
-capitalised words. Each call is still linear; it is the sequence of calls that
-is not, because `find` keeps nothing between calls. Go's `regexp` behaves the
-same way (`FindAllIndex` for `a*b|a` over 8 KB and 32 KB of `a`: 0.63 s and
-10.3 s).
+### Linear drives: notes kept for one search
 
-A GREEDY pattern does not have this shape, however long it walks past a match:
-the walk would itself accept wherever a later match could end, so it extends
-the match instead of leaving a new one behind — email, URL, `SELECT … FROM`,
-`X([a-zA-Z]+)Y` and CSV-row patterns all walk past their matches and are
-linear over a drive. Of the 135 patterns in this repository's example configs
-and benchmarks, 15 walk past their matches and none has the shape. To avoid
-it, bound the higher-priority branch's repeat (`\d{1,10}px|\d`): a bounded
-walk past each match keeps the drive linear.
+A DRIVE is what a stub does with `find`: call it, resume past the answer, call
+it again, until the input is exhausted. Every call above is linear, but a drive
+can still be quadratic when a call walks past the match it reports and the
+next call reads the same bytes again. `a*b|a` over `a`×N matches at every byte,
+yet each call has to read to the end of the run before it may answer
+`[p, p+1)` (a `b` there would make the match `[p, N+1)`), and the next call,
+one byte on, reads the same run again: N matches cost about N²/2 bytes. Other
+examples: `\d+px|\d` over a run of digits, `foo\w+bar|foo` over `foo`×N,
+`a+?b|a`, `[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Inc|[A-Z][a-z]+` over a long run
+of capitalised words. Go's `regexp` behaves the same way (`FindAllIndex` for
+`a*b|a` over 8 KB and 32 KB of `a`: 0.63 s and 10.3 s).
+
+The fix keeps NOTES for one search, in a block the caller owns and hands over
+with every call (see [wasm.md](wasm.md), "The search block"; every generated
+stub does this). A walk that runs past its last accept and then dies has
+proved, for every (state, position) it visited after that accept, that no
+match lies ahead of there. That is a fact about the text, not about the call,
+so a later call that reaches a noted (state, position) stops at once and
+answers what the walk would have. Each point is noted once and hit once, so a
+drive costs a constant per byte.
+
+Only a search that has gone bad pays for the notes. A pattern whose find
+automaton has a CYCLE STATE — a non-accepting state on a cycle of
+non-accepting states, the only place an unboundedly long walk can sit without
+accepting — carries two copies of its find:
+
+- the **ordinary copy**, the find described above plus a waste counter in the
+  block: the bytes read past each reported match, and failed reads of more
+  than 32 bytes. Once the waste exceeds `4 × (bytes the search has advanced) +
+  64`, the search is ARMED.
+- the **marked copy**, the same body testing the notes at every byte of a
+  cycle state and writing them by walking a wasted tail again. The stub
+  allocates the notes (`(len + 1) ×` a few bytes) the first time it sees the
+  search armed, and the marked copy serves the rest of the search.
+
+A pattern with no cycle state gets no notes code at all, byte for byte.
+Measured on this repository's real patterns: no cost on 85 of 151 drives (no
+cycle state), a median of +0.1% on the rest and +5.2% at worst; the bad drives
+above cost 250-380 instructions per byte, linear. A caller that passes no block
+(0) gets each call exactly as described above, and these drives stay
+quadratic for it; bounding the higher-priority branch's repeat
+(`\d{1,10}px|\d`) keeps them linear without a block.
 
 Sets make the same choice per member, with one difference: see
 [sets.md](sets.md#members-that-are-not-provably-linear).
@@ -462,10 +483,17 @@ popped as the search goes, so it is never exhausted.
 **How it is bounded.** Every Backtracking program is emitted as TWO functions
 (with one exception, below):
 
-1. **The fast body** is the ordinary body plus one `i64` counter, set once per
-   call to `(span + 1) × 8 × numInstructions` and decremented on every frame
-   POP. `span` is the input length, or the window length when a capture body
-   runs in window mode. A call that never backtracks pays nothing for it.
+1. **The fast body** is the ordinary body plus one `i64` counter, set to
+   `(span + 1) × numInstructions` and decremented on every frame POP. `span`
+   is the input length, or the window length when a capture body runs in
+   window mode. A `find` whose caller passes a search block (every generated
+   stub does) gets the counter once per SEARCH and keeps what is left in the
+   block, so a scan whose every call would burn it burns it once; otherwise it
+   is set once per call (see "Per search" below). A call that never
+   backtracks pays nothing for it. The multiplier was 8 until normal text was
+   measured never to come near 1 (124 Backtracking patterns, 160 real-pattern
+   drives: identical cost at 1, 2, 4, 8 and 16), while adversarial drives were
+   41-85% cheaper at 1.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
    frame stack runs out (a compile-time one, or a capture body's growing one
@@ -546,10 +574,52 @@ the "off" column below is the ordinary body it no longer has:
 
 A call that trips on its budget pays for the budget it burned before the
 fallback starts: on the `a`×4000 no-match row that is roughly 35× what the
-fallback alone would cost. The multiplier 8 is the lever if trips turn out to be
-common. A call that fills the fast body's stack instead hands over as soon as it
-does, so its extra cost is the depth it reached — the 132 fuel/byte row is the
-fast body's descent plus the fallback's whole run.
+fallback alone would cost (measured at the old multiplier of 8; at 1 the burn
+is an eighth of that). A call that fills the fast body's stack instead hands
+over as soon as it does, so its extra cost is the depth it reached — the 132
+fuel/byte row is the fast body's descent plus the fallback's whole run.
+
+#### Per search
+
+A budget that lasted one CALL left a drive quadratic: when every call of a
+search burns the budget before the fallback answers, the burn is paid once per
+call (`(?:a|b)*a(?:a|b){12}c|a` over `a`×N doubled its cost per byte with every
+doubling of N). With the caller's search block the budget lasts the SEARCH:
+
+- the fast body loads what is left from the block and saves it back, so a
+  search burns one budget in all;
+- once it trips, the search is TRIPPED: every later call goes straight to the
+  fallback body, and the stub gives the search one fallback memo,
+  `(len + 1) × ⌈instructions / 8⌉` bytes, which it keeps for the rest of the
+  search. A failure one call marked stops the next; the marks on the path of a
+  match a call reports are cleared before it returns, because they are not
+  failures;
+- a program with a zero-width cycle, which has no fast body, marks its search
+  tripped at the first call, so it keeps its memo from the start;
+- a program anchored at the start of the text (`^…`, `\A…`) can match only at
+  0, so a `find` from any later position answers "no match" at once
+  (`^(\B|0)*` over 400 KB of prose: 20.8 M instructions for the drive before,
+  4,577 after);
+- a capture body (`groups`) keeps only the tripped flag: its windows already
+  add up to the input, so it needs no shared memo.
+
+Measured on the adversary rows: `find` of `(?:a|b)*a(?:a|b){12}c|a` over
+`a`×N is linear at 12,808 instructions per byte, its `groups` at 13,390. With
+no block every call works as described in the sections above.
+
+#### Why there is no Pike VM
+
+A Pike VM — every thread advanced in lockstep, linear by construction — was
+the other candidate for bad inputs, and was measured before anything was
+built: 124 Backtracking programs (the 101 `groups` patterns of this
+repository's configs, tests and benchmarks that route to Backtracking, and 23
+`find` patterns forced onto it), each over prose, logs, mixed text and the
+input that cost it most. Against Backtracking with the per-search budget and
+its switch to the fallback: on `find` the Pike VM was never cheaper (+234% on
+normal text, +702% on bad input); on `groups` it won only on two adversarial
+inputs of real-config patterns, by 6-7%, and by large factors only on test
+shapes such as `^(\w*|)*c` that no real config has. Every quadratic drive was
+already linear without it, so it was not built.
 
 #### Where the fallback's memory comes from
 

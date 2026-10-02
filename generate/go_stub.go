@@ -759,11 +759,8 @@ func genGoStubFile(entries []config.RegexEntry, importModule, pkgName string) (s
 	return sb.String(), nil
 }
 
-// genGoStubsForEntry generates the Go stub content for a single regexp entry.
-func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
-	return genGoStubsForEntrySized(re, importModule, nil)
-}
-
+// genGoStubsForEntrySized generates the Go stub content for a single regexp
+// entry, with each export's search block; nil sizes means none.
 func genGoStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false

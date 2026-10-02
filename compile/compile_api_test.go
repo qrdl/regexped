@@ -3134,3 +3134,65 @@ func TestSetSplitBudget(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchSizes pins what a stub is told to allocate per search, through
+// both public entry points: notes for a find or groups export whose automaton
+// has a cycle state; the Backtracking budget for a Backtracking find, and its
+// kept memo only where the memo's memory is the input's (a standalone build,
+// not a merged one); nothing for an export that keeps no block; and one block
+// per split member for a set, under `find` and its batch entry's names alike.
+func TestSearchSizes(t *testing.T) {
+	regexps := []config.RegexEntry{
+		{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun_find"},
+		{Name: "overrun_groups", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+		{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+		{Name: "plain", Pattern: `abc`, FindFunc: "plain_find"},
+		{Name: "split_member", Pattern: `foo\w+bar|foo`},
+		{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
+	}
+	sets := []config.SetConfig{{Name: "split", Find: "scan_split",
+		Patterns: config.PatternSelector{Names: []string{"split_member", "aws"}}},
+		{Name: "plain", Find: "scan_plain", Patterns: config.PatternSelector{Names: []string{"aws"}}}}
+	for _, merged := range []bool{false, true} {
+		cfg := config.BuildConfig{ImportModule: "m", Regexps: regexps, Sets: sets}
+		if merged {
+			cfg.Output = "merged.wasm"
+		}
+		sz, err := SearchSizes(cfg)
+		if err != nil {
+			t.Fatalf("merged=%v: %v", merged, err)
+		}
+		for _, f := range []string{"overrun_find", "overrun_groups"} {
+			if sz[f].NotesBytes == 0 {
+				t.Errorf("merged=%v: %s keeps no notes", merged, f)
+			}
+		}
+		if bt := sz["bt_find"]; !bt.BTBudget || (bt.BTMemoBytes > 0) == merged {
+			t.Errorf("merged=%v: bt_find = %+v: want the budget, and a memo only standalone", merged, bt)
+		}
+		if sz["plain_find"].Block() {
+			t.Errorf("merged=%v: plain_find keeps a block it has no use for", merged)
+		}
+		if _, ok := sz["scan_plain"]; ok {
+			t.Errorf("merged=%v: a set with no split member was given blocks", merged)
+		}
+		for _, f := range []string{"scan_split", config.SetBatchExportName("scan_split")} {
+			if b := sz[f].Blocks; len(b) != 1 || b[0].NotesBytes == 0 {
+				t.Errorf("merged=%v: %s blocks = %+v, want the split member's, with notes", merged, f, b)
+			}
+		}
+	}
+	if _, err := SearchSizes(config.BuildConfig{ImportModule: "m",
+		Regexps: []config.RegexEntry{{Name: "x", Pattern: `(`, FindFunc: "f"}}}); err == nil {
+		t.Error("a config that does not compile gave sizes rather than an error")
+	}
+
+	w, _, m, err := CompileWithSearchSizes(regexps[:4], 0, true, 0, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+	if m["overrun_find"].NotesBytes == 0 || !m["bt_find"].BTBudget || m["plain_find"].Block() {
+		t.Errorf("CompileWithSearchSizes = %+v", m)
+	}
+}

@@ -990,9 +990,7 @@ sets:
 	write("guest.c", cCacheGuest)
 	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
 	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
-	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
-		"-DRX_SET_CACHE=1", "-isystem", "inc", "-o", "guest.wasm", "guest.c", "stubs.c")
-	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	want := strconv.Itoa(overlapOracle(t, ovSizingCfg(), cacheDriveInput()))
 
 	invoke := func(export string) string {
 		t.Helper()
@@ -1008,11 +1006,33 @@ sets:
 		}
 		return strings.TrimSpace(string(out))
 	}
-	if got, want := invoke("run"), strconv.Itoa(overlapOracle(t, ovSizingCfg(), cacheDriveInput())); got != want {
-		t.Errorf("the C stub reported %s tuples, Go reports %s", got, want)
-	}
-	if got := invoke("ready"); got != "1" {
-		t.Errorf("the cache header's ready word is %s after the drive, want 1 (4294967294 = no cache allocated)", got)
+	// Twice: with the stub's own allocation, and with RX_SET_CACHE off — the
+	// -nostdlib build, whose only cache is a buffer the caller hands over with
+	// <find>_set_cache. The caller's buffer must serve in BOTH builds.
+	for _, tc := range []struct {
+		flag, ready string
+	}{
+		{"-DRX_SET_CACHE=1", "1"},
+		{"-DRX_SET_CACHE=0", "-2"}, // no cache of the stub's own (0xFFFFFFFE, printed signed)
+	} {
+		run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+			tc.flag, "-isystem", "inc", "-o", "guest.wasm", "guest.c", "stubs.c")
+		run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+		if got := invoke("run"); got != want {
+			t.Errorf("%s: the C stub reported %s tuples, Go reports %s", tc.flag, got, want)
+		}
+		if got := invoke("ready"); got != tc.ready {
+			t.Errorf("%s: the cache header's ready word is %s after the drive, want %s (-2 = no cache allocated)", tc.flag, got, tc.ready)
+		}
+		if got := invoke("caller"); got != want {
+			t.Errorf("%s: with the caller's buffer the C stub reported %s tuples, Go reports %s", tc.flag, got, want)
+		}
+		if got := invoke("caller_ready"); got != "1" {
+			t.Errorf("%s: the caller's buffer's ready word is %s after the drive, want 1", tc.flag, got)
+		}
+		if got := invoke("refusals"); got != "0" {
+			t.Errorf("%s: set_cache's refusals check reported %s, want 0", tc.flag, got)
+		}
 	}
 }
 
@@ -1054,4 +1074,49 @@ int run(void) { return drive(); }
 
 __attribute__((export_name("ready")))
 unsigned ready(void) { drive(); return ready_word; }
+
+/* The caller's own buffer, handed over with _set_cache: the -nostdlib route. */
+static unsigned char cmem[4 << 20];
+
+static int drive_caller(void) {
+    for (size_t i = 0; i < sizeof input; i++) input[i] = (i % (RUN + 1)) == RUN ? ' ' : 'a';
+    used = 0;
+    size_t need = scan_ov_cache_bytes(sizeof input);
+    if (need == 0 || need > sizeof cmem) return -200;
+    if (scan_ov_init(&sc, input, sizeof input, 0) != 0) return -100;
+    if (scan_ov_set_cache(&sc, cmem, sizeof cmem) != 0) return -300;
+    rx_set_match_t buf[OV_PATTERN_COUNT];
+    int total = 0, got;
+    while ((got = scan_ov(&sc, buf, OV_PATTERN_COUNT)) > 0) total += got;
+    scan_ov_free(&sc);
+    return got < 0 ? got : total;
+}
+
+__attribute__((export_name("caller")))
+int caller(void) { return drive_caller(); }
+
+__attribute__((export_name("caller_ready")))
+unsigned caller_ready(void) {
+    drive_caller();
+    return (unsigned)cmem[8] | (unsigned)cmem[9] << 8 | (unsigned)cmem[10] << 16 | (unsigned)cmem[11] << 24;
+}
+
+/* The refusals: a short buffer and a null one change nothing, and an input
+   past the i32 range needs no buffer. 0 when every one held. */
+__attribute__((export_name("refusals")))
+int refusals(void) {
+    size_t need = scan_ov_cache_bytes(sizeof input);
+    if (scan_ov_set_cache(0, cmem, sizeof cmem) != RX_ERR_NULL_ARG) return 1;
+    if (scan_ov_init(&sc, input, sizeof input, 0) != 0) return 2;
+    unsigned *own = sc.cache;
+    if (scan_ov_set_cache(&sc, cmem, need - 1) != RX_ERR_RANGE) return 3;
+    if (scan_ov_set_cache(&sc, 0, need) != RX_ERR_NULL_ARG) return 4;
+    if (sc.cache != own) return 5;
+    scan_ov_free(&sc);
+    if (scan_ov_cache_bytes((size_t)0x80000000u) != 0) return 6;
+    if (scan_ov_init(&sc, input, 0, 0) != 0) return 7;
+    if (scan_ov_cache_bytes(0) == 0) return 8;
+    scan_ov_free(&sc);
+    return 0;
+}
 `

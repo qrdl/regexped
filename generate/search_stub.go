@@ -66,15 +66,6 @@ func blocksBTMemo(blocks []compile.SearchSize) bool {
 // setBlocksAt is the first block's offset from that descriptor.
 const setBlocksAt = (abi.FindScratchBlocksBytes + abi.SearchBlockAlign - 1) &^ (abi.SearchBlockAlign - 1)
 
-// notesOOMMsg is the diagnostic a stub raises when it cannot get memory for a
-// search's notes. It is abi.BTStackOverflow's case — the engine could not get
-// the memory the search needs, so the answer is unknown — worded for what
-// actually ran out.
-func notesOOMMsg(funcName string) string {
-	return fmt.Sprintf("regexped: %s: no memory for this search's notes — the match "+
-		"result is unknown, not negative (see docs/wasm.md)", funcName)
-}
-
 // searchKeeps reports whether some export in sizes, or some set block, keeps
 // notes, and whether one keeps a Backtracking memo: a helper nothing calls is
 // not emitted (TypeScript refuses an unused one).
@@ -758,8 +749,9 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 		e := strings.Index(body[k:], "\n") + k + 1
 		body = body[:e] + setup + body[e:]
 		if batch {
-			rep("_exp['"+config.SetBatchExportName(find)+"'](_inBase, len, cursor, scratchBase, ",
-				"_exp['"+config.SetBatchExportName(find)+"'](_inBase, len, cursor, _sd, ")
+			// The arguments only: JS calls `_exp['…'](`, TypeScript
+			// `(_exp['…'] as Function)(`.
+			rep("(_inBase, len, cursor, scratchBase, ", "(_inBase, len, cursor, _sd, ")
 			rep("        const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;\n",
 				"        const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;\n        if (!done) {\n"+notes("            ")+"        }\n")
 		} else {
@@ -768,7 +760,7 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 		}
 		section = section[:i] + body + section[i+j:]
 	}
-	edit(find, strings.Contains(section, "_exp['"+config.SetBatchExportName(find)+"']("))
+	edit(find, strings.Contains(section, "_exp['"+config.SetBatchExportName(find)+"']"))
 	return section
 }
 

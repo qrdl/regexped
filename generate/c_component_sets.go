@@ -68,7 +68,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 			// differently in the two formats is a difference. They are simply
 			// unused here — the resource inside the component owns the cache —
 			// and a caller never touches them in either format.
-			gateField += "    unsigned *cache;\n    size_t cache_words;\n"
+			gateField += cSetCacheFields
 		}
 		gateField += cSetBlockFields(blocks)
 
@@ -93,6 +93,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 			case "find":
 				hb.WriteString(cSetScannerDecls(c.Name, konst, gateField, scannerType))
 				cb.WriteString(cComponentSetFindBody(setsImportModule, kebab, c.Name, scannerType, konst))
+				cb.WriteString(cSetNoCacheAPI(c.Name, scannerType))
 			}
 		}
 	}

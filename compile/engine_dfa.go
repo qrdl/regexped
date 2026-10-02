@@ -87,6 +87,15 @@ type dfa struct {
 	acceptWide    map[int][]uint16
 	midAcceptWide map[int][]uint16
 	immAcceptWide map[int][]uint16
+	// midAcceptNWWide / midAcceptWWide / midAcceptNLWide are the same form for
+	// the boundary channels midAcceptingNW / W / NL, recorded only when the
+	// program HAS such an assertion (nil otherwise, so a sparse bucket — which
+	// refuses boundary members — builds exactly what it did). Only the
+	// overlapping sweep over a whole-set automaton of more than 64 members
+	// reads them.
+	midAcceptNWWide map[int][]uint16
+	midAcceptWWide  map[int][]uint16
+	midAcceptNLWide map[int][]uint16
 }
 
 func (d *dfa) Type() EngineType {
@@ -995,6 +1004,14 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		}
 	}
 
+	if pIdx != nil && dfa.hasWordBoundary {
+		dfa.midAcceptNWWide = make(map[int][]uint16)
+		dfa.midAcceptWWide = make(map[int][]uint16)
+	}
+	if pIdx != nil && dfa.hasNewlineBoundary {
+		dfa.midAcceptNLWide = make(map[int][]uint16)
+	}
+
 	// Map from set of NFA states to DFA state ID
 	stateMap := make(map[string]int)
 	nextStateID := 0
@@ -1126,6 +1143,21 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 			}
 		}
 		return out[:k+1]
+	}
+
+	// recordWideCh is recordWideSet's twin for ONE boundary channel: it sits
+	// beside an orAccept(dfa.midAcceptingNW/W/NL, state, acceptBitsFor(set,
+	// ctx)) with the same arguments and records the same accepts as a list.
+	// A no-op when the channel has no wide map (off the sparse path, or a
+	// program without that kind of assertion). A UNION, as orAccept is, for a
+	// state two call sites both record.
+	recordWideCh := func(m map[int][]uint16, state int, set []uint32, ctx int) {
+		if m == nil {
+			return
+		}
+		if l := acceptWideFor(set, ctx); l != nil {
+			m[state] = unionSortedU16(m[state], l)
+		}
 	}
 
 	// isDominantMidAccept: see isDominantAccept's doc for
@@ -1309,15 +1341,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// (line 517) can gate a nested ^/\A check that would otherwise never resolve.
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
 	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
+	recordWideCh(dfa.midAcceptNWWide, 0, startSet, ecBegin|ecNoWordBoundary)
 	markDominant(dfa.midAcceptingNWDominant, 0, startSet, ecBegin|ecNoWordBoundary)
 	markOutranked(dfa.midAcceptingNWOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary)
 	// midAcceptW: before word byte → \b fires (prev=non-word, next=word)
 	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecBegin|ecWordBoundary))
+	recordWideCh(dfa.midAcceptWWide, 0, startSet, ecBegin|ecWordBoundary)
 	markDominant(dfa.midAcceptingWDominant, 0, startSet, ecBegin|ecWordBoundary)
 	markOutranked(dfa.midAcceptingWOutranked, 0, startSet, ecBegin, ecBegin|ecWordBoundary)
 	// midAcceptNL: before '\n' byte → (?m:$) fires (ecEndLine | \B since prev=non-word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary|ecEndLine)
 	}
@@ -1364,15 +1399,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		recordWideSet(dfa.midStart, midStartSet, 0, ecEnd|ecNoWordBoundary)
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
+		recordWideCh(dfa.midAcceptNWWide, dfa.midStart, midStartSet, ecNoWordBoundary)
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStart, midStartSet, ecNoWordBoundary)
 		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary)
 		// midAcceptW for midStart (prevWasWord=false): before word → \b fires
 		orAccept(dfa.midAcceptingW, dfa.midStart, acceptBitsFor(midStartSet, ecWordBoundary))
+		recordWideCh(dfa.midAcceptWWide, dfa.midStart, midStartSet, ecWordBoundary)
 		markDominant(dfa.midAcceptingWDominant, dfa.midStart, midStartSet, ecWordBoundary)
 		markOutranked(dfa.midAcceptingWOutranked, dfa.midStart, midStartSet, 0, ecWordBoundary)
 		// midAcceptNL for midStart (prevWasWord=false): before '\n' → (?m:$) fires
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary|ecEndLine))
+			recordWideCh(dfa.midAcceptNLWide, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
 			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary|ecEndLine)
 		}
@@ -1399,15 +1437,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	recordWideSet(dfa.midStartWord, midStartSet, 0, ecEnd|ecWordBoundary)
 	// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 	orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
+	recordWideCh(dfa.midAcceptNWWide, dfa.midStartWord, midStartSet, ecWordBoundary)
 	markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
 	markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary)
 	// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
 	orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
+	recordWideCh(dfa.midAcceptWWide, dfa.midStartWord, midStartSet, ecNoWordBoundary)
 	markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
 	markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, 0, ecNoWordBoundary)
 	// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary|ecEndLine)
 	}
@@ -1442,13 +1483,16 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// who relaxes that refusal.
 		recordWideSet(dfa.midStartNewline, midStartNewlineSet, 0, ecBeginLine|ecEnd|ecNoWordBoundary)
 		orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
+		recordWideCh(dfa.midAcceptNWWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
 		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
 		orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecWordBoundary))
+		recordWideCh(dfa.midAcceptWWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
 		markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
 		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecWordBoundary)
 		// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
 		orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
@@ -1615,6 +1659,7 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 				}
 				nwCtx |= nlCtx
 				orAccept(dfa.midAcceptingNW, nextDFAState, acceptBitsFor(nextSet, nwCtx))
+				recordWideCh(dfa.midAcceptNWWide, nextDFAState, nextSet, nwCtx)
 				markDominant(dfa.midAcceptingNWDominant, nextDFAState, nextSet, nwCtx)
 				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, nlCtx, nwCtx)
 				var wCtx int
@@ -1625,10 +1670,12 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 				}
 				wCtx |= nlCtx
 				orAccept(dfa.midAcceptingW, nextDFAState, acceptBitsFor(nextSet, wCtx))
+				recordWideCh(dfa.midAcceptWWide, nextDFAState, nextSet, wCtx)
 				markDominant(dfa.midAcceptingWDominant, nextDFAState, nextSet, wCtx)
 				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, nlCtx, wCtx)
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
+					recordWideCh(dfa.midAcceptNLWide, nextDFAState, nextSet, nwCtx|ecEndLine)
 					markDominant(dfa.midAcceptingNLDominant, nextDFAState, nextSet, nwCtx|ecEndLine)
 					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, nlCtx, nwCtx|ecEndLine)
 				}
@@ -1820,6 +1867,12 @@ type dfaTable struct {
 	acceptWide    map[int][]uint16
 	midAcceptWide map[int][]uint16
 	immAcceptWide map[int][]uint16
+	// midAcceptNWWide / midAcceptWWide / midAcceptNLWide: the boundary
+	// channels' wide form (see dfa.midAcceptNWWide). Nil unless the sparse
+	// path built a program with a boundary assertion.
+	midAcceptNWWide map[int][]uint16
+	midAcceptWWide  map[int][]uint16
+	midAcceptNLWide map[int][]uint16
 	// midAcceptNWStatesDominant/W/NL: subset of
 	// midAcceptNW/W/NLStates where Match dominates every other live thread —
 	// see dfa.midAcceptingNWDominant/W/NL for the full explanation.
@@ -1863,6 +1916,9 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		acceptWide:                 d.acceptWide,
 		midAcceptWide:              d.midAcceptWide,
 		immAcceptWide:              d.immAcceptWide,
+		midAcceptNWWide:            d.midAcceptNWWide,
+		midAcceptWWide:             d.midAcceptWWide,
+		midAcceptNLWide:            d.midAcceptNLWide,
 		transitions:                d.transitions,
 		startBeginAccept:           d.startBeginAccept,
 		hasWordBoundary:            d.hasWordBoundary,
@@ -2045,9 +2101,43 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 		}
 		return out
 	}
-	t.acceptWide = remapWide(t.acceptWide)
-	t.midAcceptWide = remapWide(t.midAcceptWide)
-	t.immAcceptWide = remapWide(t.immAcceptWide)
+	for _, m := range t.wideMaps() {
+		*m = remapWide(*m)
+	}
+}
+
+// wideMaps is every >64-pattern accept list a table carries, for the passes
+// that must move or compare all of them alike (relabelling, minimisation,
+// dedup). One list, so a channel added later cannot be missed by one pass.
+func (t *dfaTable) wideMaps() []*map[int][]uint16 {
+	return []*map[int][]uint16{
+		&t.acceptWide, &t.midAcceptWide, &t.immAcceptWide,
+		&t.midAcceptNWWide, &t.midAcceptWWide, &t.midAcceptNLWide,
+	}
+}
+
+// unionSortedU16 merges two sorted, deduped lists into one.
+func unionSortedU16(a, b []uint16) []uint16 {
+	if len(a) == 0 {
+		return b
+	}
+	out := make([]uint16, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case j == len(b) || (i < len(a) && a[i] < b[j]):
+			out = append(out, a[i])
+			i++
+		case i == len(a) || b[j] < a[i]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	return out
 }
 
 // maxMinimizeDFAPasses bounds minimizeDFA's iterative partition-refinement
@@ -2103,8 +2193,8 @@ func minimizeDFA(t *dfaTable) {
 			return ""
 		}
 		var b strings.Builder
-		for _, m := range []map[int][]uint16{t.acceptWide, t.midAcceptWide, t.immAcceptWide} {
-			list := m[st]
+		for _, mp := range t.wideMaps() {
+			list := (*mp)[st]
 			b.WriteByte(byte(len(list)))
 			b.WriteByte(byte(len(list) >> 8))
 			for _, id := range list {
@@ -2266,31 +2356,20 @@ func minimizeDFA(t *dfaTable) {
 	// The wide lists follow their class. Taking the first list seen per class
 	// is exact BECAUSE the partition above keys on it: every state in a class
 	// carries the same list.
-	var newAcceptWide, newMidAcceptWide, newImmAcceptWide map[int][]uint16
-	if t.acceptWide != nil {
-		newAcceptWide = make(map[int][]uint16)
-	}
-	if t.midAcceptWide != nil {
-		newMidAcceptWide = make(map[int][]uint16)
-	}
-	if t.immAcceptWide != nil {
-		newImmAcceptWide = make(map[int][]uint16)
+	wideMaps := t.wideMaps()
+	newWide := make([]map[int][]uint16, len(wideMaps))
+	for i, m := range wideMaps {
+		if *m != nil {
+			newWide[i] = make(map[int][]uint16)
+		}
 	}
 	for s := 0; s < n; s++ {
 		c := classOf[s]
-		if newAcceptWide != nil {
-			if l := t.acceptWide[s]; l != nil {
-				newAcceptWide[c] = l
-			}
-		}
-		if newMidAcceptWide != nil {
-			if l := t.midAcceptWide[s]; l != nil {
-				newMidAcceptWide[c] = l
-			}
-		}
-		if newImmAcceptWide != nil {
-			if l := t.immAcceptWide[s]; l != nil {
-				newImmAcceptWide[c] = l
+		for i, m := range wideMaps {
+			if newWide[i] != nil {
+				if l := (*m)[s]; l != nil {
+					newWide[i][c] = l
+				}
 			}
 		}
 		if v := t.acceptStates[s]; v != 0 {
@@ -2339,9 +2418,9 @@ func minimizeDFA(t *dfaTable) {
 	t.numStates = numClasses
 	t.transitions = newTrans
 	t.acceptStates = newAccept
-	t.acceptWide = newAcceptWide
-	t.midAcceptWide = newMidAcceptWide
-	t.immAcceptWide = newImmAcceptWide
+	for i, m := range wideMaps {
+		*m = newWide[i]
+	}
 	t.midAcceptStates = newMidAccept
 	t.midAcceptNWStates = newMidAcceptNW
 	t.midAcceptWStates = newMidAcceptW

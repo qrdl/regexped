@@ -1060,17 +1060,33 @@ const (
 	SetOverlapHdrStrideOff = 16
 )
 
-// SetOverlapBlockRowOffsets is the row's shape, stated once: the mask at 0 and
-// pattern k's end four bytes into the row plus 4k.
+// SetOverlapRowMaskOff is where a row's shape starts, stated once: the mask at
+// 0, then pattern k's end at SetOverlapRowEndOff(k, patterns).
 //
 // The writer and both readers spelled `4 + k*4` separately, which is the kind
 // of arithmetic that is right in two places and wrong in the third.
 const SetOverlapRowMaskOff = 0
 
-// SetOverlapRowEndOff is the byte offset of pattern k's END within a row.
-func SetOverlapRowEndOff(k int) int { return 4 + 4*k }
+// SetOverlapRowMaskBytes is the width of a row's mask, bit k for pattern k: an
+// i32 up to 32 patterns, an i64 up to 64, and above that one i64 word per 64
+// patterns, word k/64 holding pattern k at bit k%64. Little-endian, so the
+// first two forms are the bitmap's first word read at its own width, and a set
+// of up to 32 patterns keeps the four-byte row it always had.
+func SetOverlapRowMaskBytes(patterns int) int {
+	switch {
+	case patterns > 64:
+		return 8 * ((patterns + 63) / 64)
+	case patterns > 32:
+		return 8
+	}
+	return 4
+}
 
-// SetOverlapBlockRowBytes is one position's worth of block buffer: a mask word
+// SetOverlapRowEndOff is the byte offset of pattern k's END within a row of a
+// set of `patterns` patterns.
+func SetOverlapRowEndOff(k, patterns int) int { return SetOverlapRowMaskBytes(patterns) + 4*k }
+
+// SetOverlapBlockRowBytes is one position's worth of block buffer: the mask
 // plus one end per pattern.
 //
 // A row is indexed by POSITION, so `id` and `start` are its own coordinates and
@@ -1078,7 +1094,7 @@ func SetOverlapRowEndOff(k int) int { return 4 + 4*k }
 // replaced, and it is why a dead cell may hold garbage: every reader consults
 // the mask first.
 func SetOverlapBlockRowBytes(patterns int) int {
-	return 4 + 4*patterns
+	return SetOverlapRowMaskBytes(patterns) + 4*patterns
 }
 
 // SetOverlapCheckpointStride is the k an init should choose: the one that

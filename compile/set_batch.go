@@ -175,7 +175,13 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		lCache, lCacheLen = a.I32(), a.I32()
 		lReady, lWork = a.I32(), a.I32()
 		lRows, lRow, lDst, lIdx = a.I32(), a.I32(), a.I32(), a.I32()
-		lStart, lSrc, lMask, lN, lTmp = a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
+		lStart, lSrc = a.I32(), a.I32()
+		if numPat > 32 {
+			lMask = a.I64()
+		} else {
+			lMask = a.I32()
+		}
+		lN, lTmp = a.I32(), a.I32()
 		lJ, lNb = a.I32(), a.I32()
 		lSweepRet = a.I32()
 		lCumBase, lBlockBase = a.I32(), a.I32()
@@ -213,7 +219,8 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	b = cs.emitWorkerBlocks(b, pScratch)
 
 	cache := overlapCacheCtx{
-		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		numPat: numPat,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: lCache, pCacheLen: lCacheLen,
@@ -329,8 +336,23 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x20, lRow, 0x20, lRows, 0x4E, 0x0D, 0x01) // past the block
 			b = cache.emitRowAddr(b, lRow)
 			b = append(b, 0x22, lSrc)
-			b = append(b, 0x28, 0x02, 0x00) // the mask
-			b = append(b, 0x22, lMask)
+			if numPat > 64 {
+				b = append(b, 0x29, 0x03, 0x00) // word 0
+				for w := 1; w < (numPat+63)/64; w++ {
+					b = append(b, 0x20, lSrc, 0x29, 0x03)
+					b = utils.AppendULEB128(b, uint32(8*w))
+					b = append(b, 0x84) // i64.or
+				}
+				b = append(b, 0x22, lMask)
+				b = append(b, 0x42, 0x00, 0x52) // i64.ne 0
+			} else if numPat > 32 {
+				b = append(b, 0x29, 0x03, 0x00) // the mask, i64
+				b = append(b, 0x22, lMask)
+				b = append(b, 0x42, 0x00, 0x52) // i64.ne 0
+			} else {
+				b = append(b, 0x28, 0x02, 0x00) // the mask
+				b = append(b, 0x22, lMask)
+			}
 			b = append(b, 0x0D, 0x01) // non-zero: this position matches
 			b = append(b, 0x20, lRow, 0x41, 0x01, 0x6A, 0x21, lRow)
 			b = append(b, 0x0C, 0x00)
@@ -360,7 +382,21 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 				b = append(b, 0x20, lStart, 0x20, lRow, 0x6A, 0x24)
 				b = utils.AppendULEB128(b, uint32(cs.keptPosGlobal)) //nolint:gosec // a global index
 			}
-			b = append(b, 0x20, lMask, 0x69) // i32.popcnt
+			if numPat > 64 {
+				for w := 0; w < (numPat+63)/64; w++ {
+					b = append(b, 0x20, lSrc, 0x29, 0x03)
+					b = utils.AppendULEB128(b, uint32(8*w))
+					b = append(b, 0x7B) // i64.popcnt
+					if w > 0 {
+						b = append(b, 0x7C) // i64.add
+					}
+				}
+				b = append(b, 0xA7)
+			} else if numPat > 32 {
+				b = append(b, 0x20, lMask, 0x7B, 0xA7) // i64.popcnt; wrap
+			} else {
+				b = append(b, 0x20, lMask, 0x69) // i32.popcnt
+			}
 			b = append(b, 0x21, lN)
 			b = append(b, 0x20, lN, 0x20, pOutCap, 0x4A) // n > cap
 			b = append(b, 0x04, 0x40)
@@ -373,9 +409,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x20, lStart, 0x20, lRow, 0x6A, 0x21, lStart) // the position
 			b = append(b, 0x41, 0x00, 0x21, lIdx)
 			for k := 0; k < numPat; k++ {
-				b = append(b, 0x20, lMask, 0x41)
-				b = utils.AppendSLEB128(b, int32(1)<<uint(k))
-				b = append(b, 0x71)       // i32.and
+				b = emitRowBitTest(b, numPat, k, lMask, lSrc)
 				b = append(b, 0x04, 0x40) // if this pattern matched here
 				b = append(b, 0x20, pOutPtr)
 				b = append(b, 0x20, lIdx, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
@@ -724,10 +758,18 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x20, x.lCacheRow, 0x20, x.lCacheRows, 0x4E, 0x0D, 0x01)
 	b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x4E, 0x0D, 0x01)
 
+	// The row's mask at its width (config.SetOverlapRowMaskBytes): an i32 to
+	// 32 patterns, an i64 to 64. Above that the test below reads pattern k's
+	// own word out of the row, so nothing is loaded here.
 	b = cache.emitRowAddr(b, x.lCacheRow)
-	b = append(b, 0x22, x.lSrc)
-	b = append(b, 0x28, 0x02, 0x00)
-	b = append(b, 0x21, x.lCacheMask)
+	switch {
+	case numPat > 64:
+		b = append(b, 0x21, x.lSrc)
+	case numPat > 32:
+		b = append(b, 0x22, x.lSrc, 0x29, 0x03, 0x00, 0x21, x.lCacheMask) // i64.load
+	default:
+		b = append(b, 0x22, x.lSrc, 0x28, 0x02, 0x00, 0x21, x.lCacheMask) // i32.load
+	}
 
 	// TWO counters, and the distinction is load-bearing. x.lCacheOrd is the
 	// ORDINAL of the set bit within this position; x.lCacheDel is how many of
@@ -739,9 +781,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x41, 0x00, 0x21, x.lCacheOrd)
 	b = append(b, 0x20, x.lCacheSkip, 0x21, x.lCacheDel)
 	for k := 0; k < numPat; k++ {
-		b = append(b, 0x20, x.lCacheMask, 0x41)
-		b = utils.AppendSLEB128(b, int32(1)<<uint(k))
-		b = append(b, 0x71)
+		b = emitRowBitTest(b, numPat, k, x.lCacheMask, x.lSrc)
 		b = append(b, 0x04, 0x40)
 		// Skip the ones a previous call already delivered at this position.
 		b = append(b, 0x20, x.lCacheOrd, 0x20, x.lCacheSkip, 0x4E) // ordinal >= skip
@@ -1173,7 +1213,12 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		lCacheRow = a.I32()
 		lCacheFloor, lCacheNext, lCacheStride = a.I32(), a.I32(), a.I32()
 		lCacheOrd = a.I32()
-		lCacheSkip, lCacheMask = a.I32(), a.I32()
+		lCacheSkip = a.I32()
+		if n, _, _, _ := cs.overlapCacheGeometry(); n > 32 {
+			lCacheMask = a.I64()
+		} else {
+			lCacheMask = a.I32()
+		}
 		lCacheDone, lCacheDel = a.I32(), a.I32()
 		lCacheSweepRet, lSrc = a.I32(), a.I32()
 		// The adaptive trigger's working locals.
@@ -1217,7 +1262,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// serve the exported `find`, which reaches a cache through the same
 	// descriptor this entry does.
 	cache := overlapCacheCtx{
-		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		numPat: numPat,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: pScratch, pCacheLen: pScratchLen,
@@ -1396,4 +1442,26 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 
 	out := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(out, b...)
+}
+
+// emitRowBitTest pushes a non-zero i32 when pattern k's bit is set in a cache
+// row of numPat patterns: from the mask already in maskLocal (an i32 to 32
+// patterns, an i64 to 64), or — above 64 — from pattern k's own word of the
+// row at srcLocal (config.SetOverlapRowMaskBytes).
+func emitRowBitTest(b []byte, numPat, k int, maskLocal, srcLocal byte) []byte {
+	switch {
+	case numPat > 64:
+		b = append(b, 0x20, srcLocal, 0x29, 0x03)    // i64.load word k/64
+		b = utils.AppendULEB128(b, uint32(8*(k/64))) //nolint:gosec // a row offset
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(uint64(1)<<uint(k%64))) //nolint:gosec // a bit
+		return append(b, 0x83, 0x42, 0x00, 0x52)                    // i64.and; i64.ne 0
+	case numPat > 32:
+		b = append(b, 0x20, maskLocal, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(uint64(1)<<uint(k))) //nolint:gosec // a bit
+		return append(b, 0x83, 0x42, 0x00, 0x52)                 // i64.and; i64.ne 0
+	}
+	b = append(b, 0x20, maskLocal, 0x41)
+	b = utils.AppendSLEB128(b, int32(1)<<uint(k))
+	return append(b, 0x71) // i32.and
 }

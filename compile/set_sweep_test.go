@@ -622,21 +622,55 @@ func TestWholeSetSweepShapes(t *testing.T) {
 		{"line-anchors", named(`(?m:^)ab+`, `ab+(?m:$)`, `c+`)},
 		{"url-guard", load("../examples/fastedge/url-guard/regexped.yaml", "attacks")},
 		{"secret-scanner", load("../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner")},
+		// Past a cache row's i32 mask: an i64 row, then a bitmap of two and of
+		// three words — the first with the word-boundary and newline channels
+		// carrying bits past 64, which only the wide construction records.
+		{"33 members (i64 rows)", named(letterRunPatterns(33)...)},
+		{"70 members, \\b and (?m) (2-word rows)", named(append(letterRunPatterns(40),
+			append(fmtPatterns(15, `\bw%d\w*`), fmtPatterns(15, `(?m:^)q%d[a-z]*`)...)...)...)},
+		{"130 members (3-word rows)", named(append(letterRunPatterns(5), fmtPatterns(125, `x%03d[a-z]*`)...)...)},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			cfg := config.BuildConfig{Regexps: c.regexps, Sets: []config.SetConfig{{
-				Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true},
-			}}}
-			_, _, diags, err := CompileFileDiag(cfg, "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diags[0].WholeSetSweep == nil {
-				t.Fatalf("no whole-set sweep: %+v", diags[0])
-			}
-			t.Logf("%d states, %d cells", diags[0].WholeSetSweep.States, diags[0].WholeSetSweep.Cells)
-		})
+		for _, batch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/batch=%v", c.name, batch), func(t *testing.T) {
+				sc := config.SetConfig{
+					Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true},
+				}
+				if batch {
+					sc.Hints = []string{"batch-find"}
+				}
+				cfg := config.BuildConfig{Regexps: c.regexps, Sets: []config.SetConfig{sc}}
+				w, _, diags, err := CompileFileDiag(cfg, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				validateWASM(t, w)
+				if diags[0].WholeSetSweep == nil {
+					t.Fatalf("no whole-set sweep: %+v", diags[0])
+				}
+				t.Logf("%d states, %d cells", diags[0].WholeSetSweep.States, diags[0].WholeSetSweep.Cells)
+			})
+		}
 	}
+}
+
+// letterRunPatterns is n members `[a-z]{k,}[0-9]`, k = 1..n: every one alive
+// over a run of letters, so walks nest.
+func letterRunPatterns(n int) []string {
+	return fmtPatterns(n, `[a-z]{%d,}[0-9]`, 1)
+}
+
+// fmtPatterns is n patterns from one format, numbered from `from` (0 unless
+// given).
+func fmtPatterns(n int, format string, from ...int) []string {
+	base := 0
+	if len(from) > 0 {
+		base = from[0]
+	}
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf(format, base+i)
+	}
+	return out
 }
 
 // TestOverlapSweepBoundaryChannels pins that one-member overlapping sets with a

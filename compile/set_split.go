@@ -285,6 +285,11 @@ func compileSetSplitPrimary(spec SetSpec, prefixPool, suffixPool *dfaPool, opts 
 	trialOpts.globals = opts.globals.clone()
 	trial := compileSetWith(spec, prefixPool, suffixPool, trialOpts, nil, true)
 	cands = trial.keepsOnDFA(spec, cands)
+	if len(cands) > 0 && trial.needsSplit() && trial.scanAloneNeedsSplit() {
+		if cs := scanSplitOnly(spec, prefixPool, suffixPool, opts, cands); cs != nil {
+			return cs
+		}
+	}
 	if len(cands) == 0 || !trial.needsSplit() {
 		*opts.globals = *trialOpts.globals
 		if len(cands) > 0 {
@@ -1717,6 +1722,60 @@ func (cs *compiledSet) searchBlocks() []SearchSize {
 		out = append(out, cs.companion.ownBlocks()...)
 	}
 	return out
+}
+
+// scanAloneNeedsSplit reports whether it is only the scan pair that needs the
+// split: `find` is overlapping and served by the answer cache. A split compile
+// cannot read the cache, so splitting the whole set for its scan pair's sake
+// made that `find` quadratic again on long overlapping matches
+// ({`foo\w+`, `k[a-z]+z`, `\bbar\b`} with `scan_all`: 90,441 fuel/byte at
+// 8 KB, ×4 per doubling, against 1,342 for the same set without `scan_all`).
+func (cs *compiledSet) scanAloneNeedsSplit() bool {
+	if !cs.hasFind() || !cs.overlapping || !cs.usesOverlapDP() {
+		return false
+	}
+	for _, kind := range []setCapKind{capScanAny, capScanAll} {
+		if cs.capName(kind) != "" && !cs.usesUnionScan(kind) && !cs.scanSwitch(kind) {
+			return true
+		}
+	}
+	return false
+}
+
+// scanSplitOnly compiles a set whose scan pair alone needs the split as two:
+// the set without its scan pair — unsplit, so its `find` keeps the answer
+// cache (and the no-cache companion a cacheless drive needs) — and an internal
+// SPLIT copy with only the scan pair, to which the set's scan exports forward.
+// nil when the two would not agree on the `_all` ABI, which a stub reads off
+// the set alone; the caller then splits the whole set as before.
+func scanSplitOnly(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, cands []splitCand) *compiledSet {
+	saved := opts.globals.clone()
+	ps := spec
+	ps.ScanAny, ps.ScanAll = "", ""
+	primary := compileSetWith(ps, prefixPool, suffixPool, opts, nil, true)
+	if primary.needsSplit() {
+		*opts.globals = *saved
+		return nil
+	}
+	primary.attachCompanion(noCacheCompanion(spec, prefixPool, suffixPool, opts, primary, cands))
+	sc := spec
+	sc.Name = spec.Name + "\x00scan"
+	sc.Find, sc.BatchFind, sc.MatchAny, sc.MatchAll = "", false, "", ""
+	so := opts
+	so.quiet = true
+	base := max(int64(primary.regionEnd), primary.dataTop())
+	if primary.companion != nil {
+		base = max(base, int64(primary.companion.regionEnd), primary.companion.dataTop())
+	}
+	so.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
+	comp := compileSetWith(sc, prefixPool, suffixPool, so, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+	if comp.wideAll() != primary.wideAll() {
+		*opts.globals = *saved
+		return nil
+	}
+	comp.internal = true
+	primary.scanComp, primary.fwdScanAny, primary.fwdScanAll = comp, spec.ScanAny, spec.ScanAll
+	return primary
 }
 
 // attachCompanion makes comp the set's companion, its blocks after the set's

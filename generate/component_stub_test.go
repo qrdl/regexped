@@ -858,8 +858,13 @@ func TestCComponentInitReadsNoPriorState(t *testing.T) {
 			t.Errorf("module _init reads prior state (%q):\n%s", banned, minit)
 		}
 	}
-	if mfree := cFunctionBody(t, mc, "void scan_ov_free("); !strings.Contains(mfree, "if (s->cache) { free(s->cache); s->cache = 0;") {
-		t.Errorf("module _free does not free and clear the cache:\n%s", mfree)
+	// _free frees only a cache the scanner allocated — a buffer handed over
+	// through _set_cache is the caller's — and clears the fields either way.
+	mfree := cFunctionBody(t, mc, "void scan_ov_free(")
+	for _, want := range []string{"if (s->cache_own) free(s->cache);", "s->cache = 0; s->cache_words = 0; s->cache_own = 0;"} {
+		if !strings.Contains(mfree, want) {
+			t.Errorf("module _free is missing %q:\n%s", want, mfree)
+		}
 	}
 }
 

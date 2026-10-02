@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -83,10 +84,21 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			Find:     "scan_split",
 			Patterns: config.PatternSelector{Names: []string{"split_member", "aws"}},
 		}, {
+			// The same with its batching entry, which the blocks are spliced
+			// into as well.
+			Name:     "splitb",
+			Find:     "scan_splitb",
+			Patterns: config.PatternSelector{Names: []string{"split_member", "gh"}},
+			Hints:    []string{"batch-find"},
+		}, {
 			Name:     "btsplit",
 			Find:     "scan_btsplit",
 			Patterns: config.PatternSelector{Names: []string{"bt_member", "gh"}},
 		}, {
+			// Every pattern, the Backtracking find among them, whose own
+			// automaton a set cannot build: it goes to Backtracking. Its
+			// failing the set's compile once left every stub here without a
+			// search block (searchSizesFor), which the check below catches.
 			Name:        "sec",
 			MatchAny:    "which_secret",
 			MatchAll:    "all_kinds",
@@ -116,35 +128,72 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		}},
 	}
 
-	for _, lang := range []struct {
-		name     string
-		file     string
-		write    func(config.BuildConfig, string) error
-		compiler string // "" means the language needs no external tool beyond Go
-		compile  func(t *testing.T, dir, path string)
-	}{
-		{"rust", "stubs.rs", rustStub, "rustc", compileRust},
-		{"go", "stubs.go", goStub, "", compileGo},
-		{"c", "stubs.h", cStub, "cc", compileCModule},
-		{"js", "stubs.js", jsStub, "node", checkJS},
-		{"as", "stubs.ts", asStub, "asc", compileAS},
-		{"ts", "stubs.ts", tsStub, "tsc", compileTS},
-	} {
-		t.Run(lang.name, func(t *testing.T) {
-			if lang.compiler != "" {
-				if _, err := exec.LookPath(lang.compiler); err != nil {
-					t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
+	// The config must COMPILE, and must give the stubs search blocks: the
+	// generators take their blocks from a compile of it and, by design, carry
+	// none when it fails. A pattern added here once made it fail, and every
+	// block, notes and memo path below then compiled nothing.
+	sizes, err := compile.SearchSizes(cfg)
+	if err != nil {
+		t.Fatalf("the config does not compile, so no stub would carry a search block: %v", err)
+	}
+	for _, f := range []string{"overrun_find", "bt_find", "scan_split", "scan_splitb", "scan_btsplit"} {
+		if s := sizes[f]; !s.Block() && len(s.Blocks) == 0 {
+			t.Fatalf("%s has no search block: this test would check none of that code", f)
+		}
+	}
+	// STANDALONE (no `output:`) as well: only there does a Backtracking
+	// search keep a memo — a merged build's fallback memory is the module's
+	// own — so only there do the stubs carry the memo code.
+	standalone := cfg
+	standalone.Output = ""
+	if ss, err := compile.SearchSizes(standalone); err != nil || ss["bt_find"].BTMemoBytes == 0 {
+		t.Fatalf("the standalone build keeps no Backtracking memo (%v): its stub code would go unchecked", err)
+	}
+
+	// SETS ONLY: a stub with no single-pattern part carries the block type and
+	// the notes helper itself, which the single-pattern part otherwise brings.
+	setsOnly := cfg
+	setsOnly.Regexps = nil
+	for _, re := range cfg.Regexps {
+		re.MatchFunc, re.FindFunc, re.GroupsFunc = "", "", ""
+		setsOnly.Regexps = append(setsOnly.Regexps, re)
+	}
+	setsOnly.Sets = cfg.Sets[:2]
+
+	for _, variant := range []struct {
+		suffix string
+		cfg    config.BuildConfig
+	}{{"", cfg}, {"-standalone", standalone}, {"-sets-only", setsOnly}} {
+		for _, lang := range []struct {
+			name     string
+			file     string
+			write    func(config.BuildConfig, string) error
+			compiler string // "" means the language needs no external tool beyond Go
+			compile  func(t *testing.T, dir, path string)
+		}{
+			{"rust", "stubs.rs", rustStub, "rustc", compileRust},
+			{"go", "stubs.go", goStub, "", compileGo},
+			{"c", "stubs.h", cStub, "cc", compileCModule},
+			{"js", "stubs.js", jsStub, "node", checkJS},
+			{"as", "stubs.ts", asStub, "asc", compileAS},
+			{"ts", "stubs.ts", tsStub, "tsc", compileTS},
+		} {
+			t.Run(lang.name+variant.suffix, func(t *testing.T) {
+				if lang.compiler != "" {
+					if _, err := exec.LookPath(lang.compiler); err != nil {
+						t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
+					}
 				}
-			}
-			dir := t.TempDir()
-			path := filepath.Join(dir, lang.file)
-			cfg := cfg
-			cfg.StubFile = lang.file
-			if err := lang.write(cfg, path); err != nil {
-				t.Fatalf("generate %s stub: %v", lang.name, err)
-			}
-			lang.compile(t, dir, path)
-		})
+				dir := t.TempDir()
+				path := filepath.Join(dir, lang.file)
+				cfg := variant.cfg
+				cfg.StubFile = lang.file
+				if err := lang.write(cfg, path); err != nil {
+					t.Fatalf("generate %s stub: %v", lang.name, err)
+				}
+				lang.compile(t, dir, path)
+			})
+		}
 	}
 
 	// The COMPONENT C stub, compiled the same way. It is a different generator
@@ -169,8 +218,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		ccfg.Output = "" // a component's merge target, not its memory mode
 		// `hints: [batch-find]` has no component form and is refused at load,
 		// so the overlapping set keeps its shape without it.
-		ccfg.Sets = append([]config.SetConfig(nil), cfg.Sets...)
-		ccfg.Sets[1].Hints = nil
+		ccfg.Sets = withoutBatchHint(cfg.Sets)
 		dir := t.TempDir()
 		path := filepath.Join(dir, "stubs.h")
 		ccfg.StubFile = "stubs.h"
@@ -197,8 +245,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		rcfg.WitPackage = "demo"
 		rcfg.WasmFile = "demo.wasm"
 		rcfg.Output = ""
-		rcfg.Sets = append([]config.SetConfig(nil), cfg.Sets...)
-		rcfg.Sets[1].Hints = nil // batching has no component form
+		rcfg.Sets = withoutBatchHint(cfg.Sets) // batching has no component form
 		dir := t.TempDir()
 		if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
 			t.Fatal(err)
@@ -277,6 +324,18 @@ func compileGo(t *testing.T, dir, _ string) {
 	write("go.mod", "module generatedstub\n\ngo 1.23\n")
 	write("main.go", "//go:build wasip1\n\npackage main\n\nfunc main() {}\n")
 	run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "./...")
+}
+
+// withoutBatchHint copies sets with every set's hints cleared: `hints:
+// [batch-find]` has no component form. Every set's, not one picked by index:
+// an index went stale once a set was inserted before the batching one, and
+// then cleared nothing.
+func withoutBatchHint(sets []config.SetConfig) []config.SetConfig {
+	out := append([]config.SetConfig(nil), sets...)
+	for i := range out {
+		out[i].Hints = nil
+	}
+	return out
 }
 
 // compileC syntax-checks the .c, which includes the .h the generator wrote

@@ -44,16 +44,12 @@ func cStub(cfg config.BuildConfig, out string) error {
 	return writeStub(base+".c", []byte(cContent))
 }
 
-// cTypesPreamble is the shared head of every generated C header: the include
-// guard, the position/extent types and the error sentinels. Extracted so the
-// component generator emits a byte-identical preamble rather than a lookalike —
-// the header IS the API, and two copies would drift.
-func cTypesPreamble(wantCache bool) string {
-	return cTypesPreambleNotes(wantCache, false)
-}
-
-// cTypesPreambleNotes is cTypesPreamble plus, when wantNotes, the switch that
-// lets a find or groups iterator allocate its search's notes (search_stub.go).
+// cTypesPreambleNotes is the shared head of every generated C header: the
+// include guard, the position/extent types and the error sentinels, plus, when
+// wantNotes, the switch that lets a find or groups iterator allocate its
+// search's notes (search_stub.go). Shared so the component generator emits a
+// byte-identical preamble rather than a lookalike — the header IS the API, and
+// two copies would drift.
 func cTypesPreambleNotes(wantCache, wantNotes bool) string {
 	s := cTypesPreambleCache(wantCache)
 	if wantNotes {
@@ -133,7 +129,8 @@ func cTypesPreambleCache(wantCache bool) string {
    RX_SET_CACHE yourself to force it on or off.
 
    ON  -> an overlapping set's find is linear.
-   OFF -> it walks, quadratic, with identical answers.
+   OFF -> it walks, quadratic, with identical answers -- unless you hand the
+          scanner a buffer with <find>_set_cache, which needs no allocator.
 
    Your build decides this, not your source.
 
@@ -156,6 +153,7 @@ func cTypesPreambleCache(wantCache bool) string {
 
 #if RX_SET_CACHE
 #include <stdlib.h>
+#endif
 /* The stride is a square root, and it has to be THE square root: every other
    stub computes it in IEEE double and truncates, and a stride one apart from
    the region it sized is a header the sweep reports as malformed. A Newton
@@ -165,7 +163,6 @@ func cTypesPreambleCache(wantCache bool) string {
    __builtin_sqrt lowers to the wasm f64.sqrt instruction with no libm and no
    call, so this costs nothing and is exact. */
 #define rx_sqrt_(x) __builtin_sqrt(x)
-#endif
 
 `)
 	return hb.String()
@@ -370,6 +367,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// cache it double-frees — and the header says so.
 			cacheSet := "s->scratch[2] = 0, s->scratch[3] = 0"
 			cacheField, cacheAlloc, cacheFree := "", "", ""
+			cacheAPI := cSetNoCacheAPI(s.Find, scannerType)
 			if sh := shapes.cacheShape(setIdx); sh.Eligible {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, and the ONE place the C stub
@@ -383,52 +381,95 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 				// needing no libc or sysroot. `__has_include(<stdlib.h>)`
 				// settles it at COMPILE time with nothing for the consumer to
 				// declare: with a sysroot the drive is linear, without one the
-				// cache is declined and the drive walks, exactly as it does
-				// today. RX_SET_CACHE forces either way.
+				// cache is declined and the drive walks unless the caller hands
+				// a buffer over through `<find>_set_cache`. RX_SET_CACHE forces
+				// either way.
 				//
-				// The consequence is real and must stay documented: a C
-				// consumer's performance on an overlapping set depends on how
-				// they built, not on what they wrote.
-				cacheField = "    unsigned *cache;\n    size_t cache_words;\n"
+				// The sizing lives in ONE static function that _init,
+				// `<find>_cache_bytes` and `<find>_set_cache` all call, so a
+				// caller's buffer and the stub's own allocation cannot be sized
+				// by two formulas.
+				cacheField = cSetCacheFields
+				cacheAPI = fmt.Sprintf(`/* The answer cache's size for an input of len, and its stride; 0 when the
+   input is too long for one. ONE formula for _init, _cache_bytes and
+   _set_cache. */
+static size_t rx_%[9]s_cache_plan_(size_t len, unsigned *stride) {
+    if (len > 0x7FFFFFFF) return 0;
+    unsigned long long m = (unsigned long long)len + 1;
+    unsigned long long row = %[5]dULL;
+    unsigned long long cell = %[6]dULL;
+    unsigned long long k = m;
+    if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
+        k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
+        if (k < 16) k = 16;
+        if (k > m) k = m;
+    }
+    unsigned long long nb = (m + k - 1) / k;
+    unsigned long long bytes = %[3]dULL + nb * cell + 4 + k * row;
+    if (bytes > %[4]dULL) return 0;
+    *stride = (unsigned)k;
+    return (size_t)bytes;
+}
+
+/* The header only: the engine reads nothing past it before the pass writes
+   it, so zeroing the whole region would be a pass over memory the cache is
+   about to fill anyway. Byte stores, so a caller's buffer needs no alignment. */
+static void rx_%[9]s_cache_head_(void *mem, unsigned stride) {
+    unsigned char *c = (unsigned char *)mem;
+    for (size_t i = 0; i < %[7]d; i++) c[i] = 0;
+    for (int i = 0; i < 4; i++) c[%[8]d + i] = (unsigned char)(stride >> (8 * i));
+}
+
+size_t %[9]s_cache_bytes(size_t len) {
+    unsigned k;
+    return rx_%[9]s_cache_plan_(len, &k);
+}
+
+int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
+    if (!s) return RX_ERR_NULL_ARG;
+    unsigned k;
+    size_t need = rx_%[9]s_cache_plan_(s->len, &k);
+    if (need == 0) return 0; /* this input gets no cache: nothing to hand over */
+    if (!buf) return RX_ERR_NULL_ARG;
+    if (bytes < need) return RX_ERR_RANGE;
+#if RX_SET_CACHE
+    if (s->cache_own) free(s->cache);
+#endif
+    rx_%[9]s_cache_head_(buf, k);
+    s->cache = (unsigned *)buf; s->cache_words = need / 4; s->cache_own = 0;
+    return 0;
+}
+
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes,
+					config.SetOverlapHdrStrideOff, s.Find, scannerType)
 				cacheAlloc = fmt.Sprintf(`    /* Writes only: a scanner that owns a cache must be _free'd before it is
        initialised again, so nothing here reads what the struct held. */
-    s->cache = 0; s->cache_words = 0;
+    s->cache = 0; s->cache_words = 0; s->cache_own = 0;
 #if RX_SET_CACHE
     {
-        unsigned long long m = (unsigned long long)len + 1;
-        unsigned long long row = %[5]dULL;
-        unsigned long long cell = %[6]dULL;
-        unsigned long long k = m;
-        if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
-            k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
-            if (k < 16) k = 16;
-            if (k > m) k = m;
-        }
-        unsigned long long nb = (m + k - 1) / k;
-        unsigned long long bytes = %[3]dULL + nb * cell + 4 + k * row;
-        if (bytes <= %[4]dULL) {
-            s->cache = (unsigned *)malloc((size_t)bytes);
+        unsigned k;
+        size_t bytes = rx_%[1]s_cache_plan_(len, &k);
+        if (bytes) {
+            s->cache = (unsigned *)malloc(bytes);
             if (s->cache) {
-                /* The header only: the engine reads nothing past it before the
-                   pass writes it, so zeroing the whole region was a pass over
-                   memory the cache is about to fill anyway. */
-                for (size_t w = 0; w < %[7]d; w++) s->cache[w] = 0;
-                s->cache[%[8]d] = (unsigned)k;
-                s->cache_words = (size_t)((bytes + 3) / 4);
+                rx_%[1]s_cache_head_(s->cache, k);
+                s->cache_words = bytes / 4;
+                s->cache_own = 1;
             }
         }
     }
 #endif
-`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
-					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes/4,
-					config.SetOverlapHdrStrideOff/4)
+`, s.Find)
 				cacheFree = `#if RX_SET_CACHE
-    if (s->cache) { free(s->cache); s->cache = 0; s->cache_words = 0; }
+    if (s->cache_own) free(s->cache);
 #endif
+    s->cache = 0; s->cache_words = 0; s->cache_own = 0;
 `
 				cacheSet = "s->scratch[2] = (unsigned)(size_t)s->cache, " +
 					"s->scratch[3] = (unsigned)(s->cache_words * 4)"
 			}
+			cb.WriteString(cacheAPI)
 			gateField += cacheField + cSetBlockFields(blocks)
 			gateInit += cacheAlloc
 			gateArg := "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
@@ -546,19 +587,15 @@ type entryGroups struct {
 	named map[string]int
 }
 
-// genCPartsForEntry generates the .h and .c fragments for one regexp entry.
+// genCPartsForEntrySized generates the .h and .c fragments for one regexp
+// entry, with each export's search block. The component generator passes the
+// SAME sizes, so the header — the API — stays identical between the two
+// formats; its .c half is the module's alone.
 //
 // It RETURNS the group info it parsed. The component generator needs the same
 // numbers for its own .c bodies, and parsing the pattern a second time there
-// gave that call an error branch no config could reach — genCPartsForEntry has
+// gave that call an error branch no config could reach — this function has
 // already failed on exactly the same pattern by then.
-func genCPartsForEntry(re config.RegexEntry, importModule string) (hPart, cPart string, groups entryGroups, err error) {
-	return genCPartsForEntrySized(re, importModule, nil)
-}
-
-// genCPartsForEntrySized is genCPartsForEntry with each export's search block.
-// The component generator passes the SAME sizes, so the header — the API —
-// stays identical between the two formats; its .c half is the module's alone.
 func genCPartsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (hPart, cPart string, groups entryGroups, err error) {
 	var hb, cb strings.Builder
 
@@ -1080,6 +1117,33 @@ typedef struct {
 int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);
 int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
 
+/* The answer cache, in YOUR memory: for a build with no allocator
+   (-DRX_SET_CACHE=0), or one that wants to place the cache itself.
+
+   %[1]s_cache_bytes says how many bytes the cache needs for an input of len.
+   0 means the scan needs none from you: the set has no answer cache, the
+   input is too long for one, or the build is wasm_format: component, whose
+   regexp component keeps its own. %[1]s_set_cache hands a buffer of at least
+   that many bytes to a scanner; call it after _init and before the first
+   %[1]s. Without a cache an overlapping scan that keeps long matches alive
+   costs time quadratic in the input; the answers are the same either way.
+
+       size_t need = %[1]s_cache_bytes(len);
+       %[1]s_init(&sc, input, len, 0);
+       if (need && need <= sizeof mem) %[1]s_set_cache(&sc, mem, sizeof mem);
+
+   0 on success, and when no buffer is needed (buf is then not used).
+   RX_ERR_RANGE when bytes is below what this input needs, RX_ERR_NULL_ARG for
+   a null scanner or a null buf that is needed; on an error the scanner is
+   unchanged and keeps whatever cache _init gave it. A cache _init allocated
+   itself is freed here and replaced by yours.
+
+   The buffer must outlive the scan and serve ONE scanner at a time; _free
+   never frees it, and _init forgets it, so a restarted scan hands it over
+   again. Any alignment works. */
+size_t %[1]s_cache_bytes(size_t len);
+int %[1]s_set_cache(%[4]s *s, void *buf, size_t bytes);
+
 /* Releases whatever the scanner holds. Call it: with RX_SET_CACHE on, an
    overlapping set's scanner OWNS a heap region and abandoning one leaks it.
    Without the cache it is a no-op — the scanner is caller-owned, by value, and
@@ -1126,6 +1190,31 @@ func cSetGateField(idKonst string, nblocks int) string {
 		words = 5
 	}
 	return fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[%d];\n", idKonst, words)
+}
+
+// cSetCacheFields is the answer-cache fields of a cache-eligible overlapping
+// set's scanner, shared by the module and component headers so the two stay
+// identical: the region, its size, and whether the scanner allocated it (a
+// buffer handed over through `<find>_set_cache` is the caller's to free).
+const cSetCacheFields = "    unsigned *cache;\n    size_t cache_words;\n    int cache_own;\n"
+
+// cSetNoCacheAPI is `<find>_cache_bytes` / `<find>_set_cache` for a scanner
+// that takes no buffer from its caller — a set with no answer cache, and every
+// set under `wasm_format: component`, whose regexp component keeps its own.
+// The pair exists for every `find` so that the same source compiles against
+// any set and either output kind.
+func cSetNoCacheAPI(find, scannerType string) string {
+	return fmt.Sprintf(`size_t %[1]s_cache_bytes(size_t len) {
+    (void)len;
+    return 0;
+}
+
+int %[1]s_set_cache(%[2]s *s, void *buf, size_t bytes) {
+    (void)buf; (void)bytes;
+    return s ? 0 : RX_ERR_NULL_ARG;
+}
+
+`, find, scannerType)
 }
 
 // cSetBlockFields is the scanner's search blocks, their notes and their

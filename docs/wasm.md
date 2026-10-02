@@ -836,7 +836,9 @@ no exported sizing function to call — the column width is a compile-time
 property of the set, so `generate` recompiles the set to learn it and bakes
 `CELLS` in:
 
-    row    = 4 + 4 * PATTERNS          one position's row
+    mask   = 4 if PATTERNS <= 32, 8 if PATTERNS <= 64,
+             else 8 * ceil(PATTERNS / 64)
+    row    = mask + 4 * PATTERNS       one position's row
     cell   = CELLS * 4 + 4             one column snapshot, plus its count
     m      = input_len + 1
     single = 48 + cell + 4 + m * row
@@ -847,7 +849,9 @@ property of the set, so `generate` recompiles the set to learn it and bakes
 
 `CELLS` is the sweep column's width and comes from the COMPILER — it falls out
 of the DFA construction and nothing in your config implies it. Every stub is
-generated with it baked in.
+generated with it baked in. `PATTERNS` is the set's member count: a row holds a
+bit per member (an i32 to 32, an i64 to 64, then one i64 word per 64 members,
+little-endian, member k at bit k%64 of word k/64) and then each member's end.
 
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
@@ -908,11 +912,12 @@ The rules:
   `from` goes undetected.
 
 The engine may decline even when offered a large enough region: the sweep is
-emitted only where it reproduces the per-position semantics exactly (one
-bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
-no Backtracking member, and no more patterns than the row mask's 32 bits —
-`bucketMaskBits`). Declining is invisible from the
-caller's side and costs nothing but speed.
+emitted only where it reproduces the per-position semantics exactly — no
+Backtracking member, no non-greedy member, an automaton within
+`max_fallback_states` — and only where a drive can have arbitrarily many walks
+alive at once (see [sets.md](sets.md), "Overlap policy"). The member count is no
+limit. Declining is invisible from the caller's side and costs nothing but
+speed.
 
 ### find return value and overflow
 

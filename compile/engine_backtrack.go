@@ -1056,7 +1056,16 @@ const BTWorkBudgetOff = -1
 const BTWorkBudgetForceFallback = -2
 
 // defaultBTWorkK is the budget multiplier when CompileOptions.BTWorkBudget is 0.
-const defaultBTWorkK = 8
+//
+// 1, down from 8: the budget is only how much a search may waste before the
+// fallback takes over, and nothing ordinary came near it. Measured over the
+// 124 corpus patterns that run on Backtracking (normal text and an input
+// built against each), 160 real-pattern drives, setperf and perftest: every
+// normal-text drive cost the same at k = 1, 2, 4, 8 and 16 and none ran out of
+// budget, while the adversarial drives got 41-85% cheaper at k = 1
+// (`(?:a|b)*a(?:a|b){12}c|a`: 88,010 → 12,808 fuel/byte). An integer k cannot
+// go lower.
+const defaultBTWorkK = 1
 
 // btWorkK returns the work-budget multiplier a body for bt must carry, or 0 for
 // no counter.
@@ -1205,6 +1214,14 @@ func btTailCallBody(nParams int) (body []byte, callOffs []int) {
 	b = emitBTFallbackCall(b, nParams, &callOffs)
 	b = append(b, 0x0B) // end (the return above makes this unreachable)
 	return btSizePrefix(b, callOffs)
+}
+
+// btStartAnchored reports whether every match of prog must start at position
+// 0: its leading empty-width conditions include \A (Go's StartCond walks the
+// instructions every match begins with). A program that cannot match at all
+// reports every condition, which is also true.
+func btStartAnchored(prog *syntax.Prog) bool {
+	return prog.StartCond()&syntax.EmptyBeginText != 0
 }
 
 // btTailCallBodySearch is btTailCallBody for a find that keeps its search in
@@ -2208,6 +2225,20 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
 	// was simply never told where to start.
 	body, findFrom = emitFindFromSeed(body, attemptCursor)
+
+	// A program that can only match at position 0 (every match starts with
+	// \A or a non-multiline ^) answers a search from any later position at
+	// once. Without this the attempt loop tried every position to the end,
+	// each failing at ^ at its first instruction: `^(\B|0)*` — on this engine
+	// because its word boundary has no DFA — cost 20.8 M fuel for the second
+	// call of a scan over 400 KB of prose, for an answer known in advance.
+	// The DFA find has the same rule (isAnchoredFind, ffAnchoredZeroOnly).
+	if btStartAnchored(bt.prog) {
+		body = append(body, 0x20, locAttemptStart)
+		body = append(body, 0x04, 0x40) // if attempt_start != 0
+		body = append(body, 0x42, 0x7F) // i64.const -1
+		body = append(body, 0x0F, 0x0B) // return; end
+	}
 
 	// The work budget, once per CALL: every attempt this call makes shares
 	// it. Sized from the whole input rather than len - from — a larger budget

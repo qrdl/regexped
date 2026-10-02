@@ -119,6 +119,35 @@ func TestWriteFindScratchLaysTheDocumentedLayout(t *testing.T) {
 	if got := read(FindScratchGateOff); got != 0x4444 {
 		t.Errorf("rewritten gate_ptr = %#x, want 0x4444", got)
 	}
+
+	// The second form: its own magic, the same four fields, then blocks_ptr —
+	// and nothing past FindScratchBlocksBytes.
+	big := make([]byte, off+FindScratchBlocksBytes+8)
+	for i := off + FindScratchBlocksBytes; i < len(big); i++ {
+		big[i] = 0xAB
+	}
+	WriteFindScratchBlocks(big, off, 0x1111, 0x2222, 0x3333, 0x5555)
+	readB := func(at int) uint32 { return binary.LittleEndian.Uint32(big[off+at:]) }
+	for _, c := range []struct {
+		name string
+		at   int
+		want uint32
+	}{
+		{"magic", FindScratchMagicOff, FindScratchMagicBlocks},
+		{"gate_ptr", FindScratchGateOff, 0x1111},
+		{"cache_ptr", FindScratchCacheOff, 0x2222},
+		{"cache_len", FindScratchCacheLenOff, 0x3333},
+		{"blocks_ptr", FindScratchBlocksOff, 0x5555},
+	} {
+		if got := readB(c.at); got != c.want {
+			t.Errorf("blocks form: %s at +%d = %#x, want %#x", c.name, c.at, got, c.want)
+		}
+	}
+	for i := off + FindScratchBlocksBytes; i < len(big); i++ {
+		if big[i] != 0xAB {
+			t.Fatalf("byte %d past the blocks descriptor was overwritten", i-off)
+		}
+	}
 }
 
 // TestSearchBlockLayout pins the per-search block: every field inside the

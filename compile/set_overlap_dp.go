@@ -142,6 +142,72 @@ type overlapDPTables struct {
 	// presence means the forward body's per-position cost is not the sweep's,
 	// which matters when comparing the two.
 	dominant bool
+
+	// wide is an automaton of MORE than 64 patterns' accepts, one bitset of
+	// ⌈n/64⌉ words per WASM state per channel (wideMid … wideNL), from the
+	// per-state lists the wide construction records. nil below 65 patterns,
+	// where the u64 masks above are the whole story. Above it those masks say
+	// nothing — the wide construction degrades every one to bit 0 — so every
+	// compile-time reader asks through the *Has methods, and the sweep's
+	// runtime-table tier, which reads the u64 tables, is never chosen.
+	wide [wideChannels][][]uint64
+}
+
+// The wide channels, in overlapDPTables.wide.
+const (
+	wideMid = iota
+	wideEOF
+	wideW
+	wideNW
+	wideNL
+	wideChannels
+)
+
+// isWide reports an automaton of more than 64 patterns.
+func (dp *overlapDPTables) isWide() bool { return dp.wide[wideMid] != nil }
+
+// has reports pattern pat's bit in WASM state w's accepts on one channel: the
+// u64 mask below 65 patterns, the wide bitset above. A channel the automaton
+// does not have accepts nothing.
+func (dp *overlapDPTables) has(ch int, narrow []uint64, w, pat int) bool {
+	if dp.isWide() {
+		// A word past the bitset is a pattern no state accepts (an
+		// unsatisfiable member), not an error.
+		m := dp.wide[ch]
+		return m != nil && pat/64 < len(m[w]) && m[w][pat/64]>>uint(pat%64)&1 != 0
+	}
+	return narrow != nil && pat < 64 && narrow[w]>>uint(pat)&1 != 0
+}
+
+func (dp *overlapDPTables) midHas(w, pat int) bool { return dp.has(wideMid, dp.midMasks, w, pat) }
+func (dp *overlapDPTables) eofHas(w, pat int) bool { return dp.has(wideEOF, dp.eofMasks, w, pat) }
+func (dp *overlapDPTables) wHas(w, pat int) bool   { return dp.has(wideW, dp.wMasks, w, pat) }
+func (dp *overlapDPTables) nwHas(w, pat int) bool  { return dp.has(wideNW, dp.nwMasks, w, pat) }
+func (dp *overlapDPTables) nlHas(w, pat int) bool  { return dp.has(wideNL, dp.nlMasks, w, pat) }
+
+// wDomHas / nwDomHas: the dominant flags, which are one per STATE and so mean
+// anything only for a one-pattern automaton — the only kind the sweep reads
+// them for. Never wide.
+func (dp *overlapDPTables) wDomHas(w int) bool { return dp.wDomMasks != nil && dp.wDomMasks[w]&1 != 0 }
+func (dp *overlapDPTables) nwDomHas(w int) bool {
+	return dp.nwDomMasks != nil && dp.nwDomMasks[w]&1 != 0
+}
+
+// wideBits turns a channel's per-state accept LISTS (table state gs at WASM
+// state gs+1) into one bitset of `words` words per WASM state. A nil map
+// accepts nothing: all-zero bitsets, never nil, since a nil mid channel would
+// read as "not wide".
+func wideBits(m map[int][]uint16, numWASM, words int) [][]uint64 {
+	out := make([][]uint64, numWASM)
+	for i := range out {
+		out[i] = make([]uint64, words)
+	}
+	for gs, l := range m {
+		for _, p := range l {
+			out[gs+1][int(p)/64] |= uint64(1) << uint(int(p)%64)
+		}
+	}
+	return out
 }
 
 // stateMaskBytes encodes a per-state accept map as the 8-byte-per-state table
@@ -189,6 +255,34 @@ func fillSweepBoundary(dp *overlapDPTables, t *dfaTable, l *dfaLayout) {
 	if dp.hasNewlineBoundary {
 		dp.nlMasks = vals(t.midAcceptNLStates)
 	}
+	if t.acceptWide == nil && t.midAcceptWide == nil {
+		return
+	}
+	// A wide automaton: its lists, as bitsets, on the channels it has.
+	words := max((wideTablePatterns(t)+63)/64, 1)
+	dp.wide[wideMid] = wideBits(t.midAcceptWide, l.numWASM, words)
+	dp.wide[wideEOF] = wideBits(t.acceptWide, l.numWASM, words)
+	if dp.hasWordChar {
+		dp.wide[wideW] = wideBits(t.midAcceptWWide, l.numWASM, words)
+		dp.wide[wideNW] = wideBits(t.midAcceptNWWide, l.numWASM, words)
+	}
+	if dp.hasNewlineBoundary {
+		dp.wide[wideNL] = wideBits(t.midAcceptNLWide, l.numWASM, words)
+	}
+}
+
+// wideTablePatterns is one past the highest pattern index a wide table's
+// accept lists name.
+func wideTablePatterns(t *dfaTable) int {
+	n := 0
+	for _, m := range t.wideMaps() {
+		for _, l := range *m {
+			for _, p := range l {
+				n = max(n, int(p)+1)
+			}
+		}
+	}
+	return n
 }
 
 // genSweepTables lays out a WHOLE-SET automaton's tables for the sweep alone:
@@ -362,19 +456,21 @@ func vetSweep(sw *overlapSweep, nests func() bool) *overlapSweep {
 	if !dp.ok || dp.l == nil || dp.numWASM < 2 {
 		return nil
 	}
-	// A block row's MASK is an i32 — `1 << k` in the checkpoint bodies and in
-	// the batch serve — so a pattern k >= bucketMaskBits would vanish from
-	// every row, silently. The dense packer already caps a bucket at
-	// bucketMaskBits and a larger one goes sparse; the whole-set automaton is
-	// capped where it is built. This is where the mask is written, so the
-	// invariant is enforced here too.
-	if n == 0 || n > bucketMaskBits {
+	// A block row's mask is as wide as the sweep (config.SetOverlapRowMaskBytes),
+	// so the pattern count itself is no limit. The AUTOMATON's is: its u64
+	// accept masks hold 64 patterns, so a sweep over more must come from the
+	// wide construction, whose per-state lists every compile-time reader then
+	// uses. One that does not would lose its high patterns from every row,
+	// silently.
+	if n == 0 || (n > 64 && !dp.isWide()) {
 		return nil
 	}
 	// numWASM <= 255 is the condition the layout itself uses to pick u8, but
 	// assert the flag rather than infer it: they are two decisions and only one
-	// is ours.
-	original := dp.l.useU8 && dp.numWASM <= 255 && !dp.hasWordChar && !dp.hasNewlineBoundary
+	// is ours. A WIDE automaton (more than 64 patterns) is never original: that
+	// tier reads the u64 accept tables at run time, and on a wide automaton
+	// they carry no per-pattern bits.
+	original := dp.l.useU8 && dp.numWASM <= 255 && !dp.hasWordChar && !dp.hasNewlineBoundary && !dp.isWide()
 	if original && dp.numWASM*n <= overlapDPMaxColumn {
 		sw.proj = buildOverlapProj(dp, n, false)
 		return sw
@@ -405,8 +501,7 @@ type wholeSetPlan struct {
 // its answers agree with the walk's only where the two automata agree. Every
 // refusal below is a member whose semantics the merge does not keep:
 //
-//   - a Backtracking member has no DFA at all, and a sparse bucket means more
-//     members than a row's i32 mask holds;
+//   - a Backtracking member has no DFA at all;
 //   - a NON-GREEDY member is isolated in a bucket of its own precisely because
 //     merging it contaminates the merged automaton's other patterns
 //     (analyzePattern);
@@ -434,7 +529,7 @@ func planWholeSetSweep(spec SetSpec, buckets []*bucket, patternIDs [][]int, opts
 	var asts []*syntax.Regexp
 	var ids []int
 	for bi, bkt := range buckets {
-		if bkt.btFallback != nil || bkt.sparse {
+		if bkt.btFallback != nil {
 			return nil
 		}
 		for j, p := range bkt.patterns {
@@ -449,10 +544,24 @@ func planWholeSetSweep(spec SetSpec, buckets []*bucket, patternIDs [][]int, opts
 			ids = append(ids, patternIDs[bi][j])
 		}
 	}
-	if len(asts) == 0 || len(asts) > bucketMaskBits {
+	if len(asts) == 0 {
 		return nil
 	}
-	t, _, err := mergeSuffixDFA(asts, opts)
+	// The automaton's accept form follows its width: the bucket's own u32
+	// masks up to 32 members (the merge a fallback bucket makes, so a set
+	// that always qualified builds exactly what it did), u64 masks up to 64,
+	// and per-state lists above — the sparse construction, the only one with
+	// no ceiling.
+	var t *dfaTable
+	var err error
+	switch {
+	case len(asts) <= bucketMaskBits:
+		t, _, err = mergeSuffixDFA(asts, opts)
+	case len(asts) <= 64:
+		t, err = mergeSuffixDFAWidth(asts, 64)
+	default:
+		t, _, err = mergeSuffixDFASparseSet(asts, opts)
+	}
 	if err != nil || t.numStates > opts.maxFallbackStates() || !dfaWalksNest(t) {
 		return nil
 	}
@@ -777,8 +886,16 @@ func longestPaths(n int, in func(s int) bool, next func(s, c int) int) (longest 
 func dfaReachCo(t *dfaTable) (reach, co []bool) {
 	n := t.numStates
 	accepts := func(s int) bool {
-		return t.midAcceptStates[s] != 0 || t.acceptStates[s] != 0 || t.midAcceptNWStates[s] != 0 ||
-			t.midAcceptWStates[s] != 0 || t.midAcceptNLStates[s] != 0
+		if t.midAcceptStates[s] != 0 || t.acceptStates[s] != 0 || t.midAcceptNWStates[s] != 0 ||
+			t.midAcceptWStates[s] != 0 || t.midAcceptNLStates[s] != 0 {
+			return true
+		}
+		for _, m := range t.wideMaps() {
+			if len((*m)[s]) > 0 {
+				return true
+			}
+		}
+		return false
 	}
 	reach = dfaReachable(t)
 	preds := make([][]int, n)
@@ -889,7 +1006,7 @@ func (cs *compiledSet) overlapCacheGeometry() (numPat int, ids []int, rowBytes i
 		return 0, nil, 0, costPerByte
 	}
 	numPat = len(sw.ids)
-	rowBytes = int32(config.SetOverlapBlockRowBytes(numPat)) //nolint:gosec // a row is a few hundred bytes
+	rowBytes = int32(config.SetOverlapBlockRowBytes(numPat)) //nolint:gosec // a row is at most a few KB
 	return numPat, sw.ids, rowBytes, cs.overlapSweepCostPerByte()
 }
 
@@ -1064,6 +1181,9 @@ type overlapCacheCtx struct {
 	// position's row in the block buffer.
 	cellBytes int32
 	rowBytes  int32
+	// numPat is the sweep's pattern count, which fixes the row's mask width
+	// and so where each pattern's end sits (config.SetOverlapRowEndOff).
+	numPat int
 
 	pInPtr    byte // input pointer parameter
 	pInLen    byte // input length parameter
@@ -1640,7 +1760,7 @@ func (c overlapCacheCtx) emitStoreTuple(b []byte, k, id int, dstLocal, srcLocal 
 	b = append(b, 0x36, 0x02, 0x04)
 	b = append(b, 0x20, dstLocal)
 	b = append(b, 0x20, srcLocal, 0x28, 0x02)
-	b = utils.AppendULEB128(b, uint32(config.SetOverlapRowEndOff(k))) //nolint:gosec // a row offset
+	b = utils.AppendULEB128(b, uint32(config.SetOverlapRowEndOff(k, c.numPat))) //nolint:gosec // a row offset
 	b = append(b, 0x36, 0x02, 0x08)
 	return b
 }

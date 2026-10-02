@@ -553,7 +553,9 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = storeI32(b, repCacheLen)
 
 	if cells > 0 {
-		row := int64(4 + 4*pats)
+		// The row's width from the one definition every stub sizes by: the
+		// mask grows past four bytes above 32 patterns.
+		row := int64(config.SetOverlapBlockRowBytes(int(pats)))
 		cell := int64(cells)*4 + 4
 		// m = len + 1
 		// i64.extend_i32_u: `len` is a u32 byte count, and sign-extending it
@@ -1040,7 +1042,7 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 		// input length, which only exists at call time.
 		cacheCells, cachePats := int32(0), int32(0)
 		if sw := cs.sweepSrc(); sw != nil {
-			cachePats = int32(len(sw.ids)) //nolint:gosec // at most bucketMaskBits
+			cachePats = int32(len(sw.ids)) //nolint:gosec // at most maxPatternsPerBucket
 			cacheCells = int32(cs.overlapCells())
 		}
 		for i, c := range cs.capFns() {

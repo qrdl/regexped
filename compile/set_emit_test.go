@@ -1822,30 +1822,59 @@ func TestSetCoreAnalyzePatternPrefixAssertionsRouteToFallback(t *testing.T) {
 }
 
 func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
-	// A set member whose own helper DFA cannot be built is an ERROR, not a
-	// silent drop: CompileFile reports it and the pattern stays out of the
-	// set. Three chained {1000} repeats give a 3001-state chain against
-	// maxHelperDFAStates == 2048.
+	// A set member whose own helper DFA cannot be built is NOT an error: the
+	// same pattern compiles alone, on Backtracking, and a set must not fail
+	// for holding it. analyzePattern marks it (noOwnDFA) and routes it whole
+	// to the fallback packer, which offers it to Backtracking at once. Three
+	// chained {1000} repeats give a 3001-state chain against
+	// maxHelperDFAStates == 2048, and `x[ab]*a[ab]{11}c` a literal-split
+	// pattern whose suffix needs 2^12 states.
 	//
-	// This covers the SUFFIX direction only. The matching prefix branch could
-	// not be reached: findMandatoryLitRec refuses any literal past offset 256,
-	// so a prefix is at most 256 bytes, and the prefix DFA is built by
-	// determinising the REVERSED prefix — which by Brzozowski's theorem yields
-	// the MINIMAL DFA of the reversed prefix language. Every natural
-	// fixed-length prefix (chains, counted classes, keyword alternations)
-	// therefore minimises well below 2048: a 2730-word 12-byte alternation
-	// measured 705 states. Reaching the limit needs a language deliberately
-	// built to have thousands of distinct residuals, not a pattern anyone
-	// would write, so the branch is left uncovered rather than faked.
-	const chain = `[a-z]{1000}[0-9]{1000}[a-z]{1000}`
-
-	var prefixPool, suffixPool dfaPool
-	_, err := analyzePattern(config.RegexEntry{Pattern: chain}, &prefixPool, &suffixPool)
-	if err == nil {
-		t.Fatal("analyzePattern with an over-limit SUFFIX returned no error")
+	// The matching PREFIX branch could not be reached: findMandatoryLitRec
+	// refuses any literal past offset 256, so a prefix is at most 256 bytes,
+	// and the prefix DFA is built by determinising the REVERSED prefix — which
+	// by Brzozowski's theorem yields the MINIMAL DFA of the reversed prefix
+	// language. Every natural fixed-length prefix (chains, counted classes,
+	// keyword alternations) therefore minimises well below 2048: a 2730-word
+	// 12-byte alternation measured 705 states. It shares the suffix branch's
+	// handling (noOwnDFA) rather than carrying its own.
+	for _, pat := range []string{`[a-z]{1000}[0-9]{1000}[a-z]{1000}`, `x[ab]*a[ab]{11}c`} {
+		var prefixPool, suffixPool dfaPool
+		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		if err != nil {
+			t.Fatalf("%s: analyzePattern failed instead of routing to Backtracking: %v", pat, err)
+		}
+		if !info.noOwnDFA || info.splittable || info.prefixDFA != nil || info.suffixDFA != nil {
+			t.Errorf("%s: info = noOwnDFA %v, splittable %v, prefix %v, suffix %v: want the whole pattern on the fallback path",
+				pat, info.noOwnDFA, info.splittable, info.prefixDFA != nil, info.suffixDFA != nil)
+		}
+		if len(prefixPool.tables)+len(suffixPool.tables) != 0 {
+			t.Errorf("%s: a pattern with no DFA of its own left %d tables in the pools",
+				pat, len(prefixPool.tables)+len(suffixPool.tables))
+		}
 	}
-	if !strings.Contains(err.Error(), "suffix") {
-		t.Errorf("suffix state-limit error should name the suffix; got %v", err)
+
+	// In a set it lands on a Backtracking bucket, not in an error.
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "chain", Pattern: `[a-z]{1000}[0-9]{1000}[a-z]{1000}`},
+			{Name: "zz", Pattern: `zz`},
+		},
+		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sa", Patterns: config.PatternSelector{All: true}}},
+	}
+	w, _, diags, err := CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatalf("a set with an over-limit member failed to compile: %v", err)
+	}
+	validateWASM(t, w)
+	onBT := false
+	for _, b := range diags[0].Buckets {
+		for _, p := range b.Patterns {
+			onBT = onBT || (p.Name == "chain" && b.Type == "bt-fallback")
+		}
+	}
+	if !onBT {
+		t.Errorf("the over-limit member is not on a Backtracking bucket: %+v", diags[0].Buckets)
 	}
 }
 

@@ -480,12 +480,11 @@ func TestSetComponentCacheGeometry(t *testing.T) {
 	}
 }
 
-// TestOverlapSweepGateMatchesTheRowMask pins the sweep's pattern-count gate to
-// the width of the row mask the checkpoint bodies write. That mask is an i32
-// (`1 << k`), so a bucket of 33..64 patterns would drop every pattern k >= 32
-// from every row, silently. No config reaches it today — the packer caps a
-// dense bucket at bucketMaskBits and a larger one goes sparse, which the sweep
-// refuses — so the gate is driven with a synthetic bucket.
+// The row mask is as wide as the sweep, but an automaton's u64 accept masks
+// are not: past 64 patterns a sweep must come from the wide construction,
+// whose per-state lists the compile-time readers use. A narrow automaton over
+// more is refused — it would drop its high patterns from every row, silently.
+// Up to 64 any width is admitted: the row grows to an i64 mask past 32.
 func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 	mk := func(n int) *compiledSet {
 		pats := make([]*PatternInfo, n)
@@ -501,20 +500,43 @@ func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 			patternIDs: [][]int{make([]int, n)},
 		}
 	}
-	if mk(bucketMaskBits).sweepSrc() == nil {
-		t.Fatalf("a %d-pattern bucket was refused: the synthetic bucket no longer "+
-			"passes the other gates, so this test proves nothing", bucketMaskBits)
+	for _, n := range []int{bucketMaskBits, bucketMaskBits + 1, 64} {
+		if mk(n).sweepSrc() == nil {
+			t.Errorf("a %d-pattern bucket was refused: the row mask holds it", n)
+		}
 	}
-	if mk(bucketMaskBits+1).sweepSrc() != nil {
-		t.Fatalf("a %d-pattern bucket was admitted to the sweep, whose row mask has %d bits",
-			bucketMaskBits+1, bucketMaskBits)
+	if mk(65).sweepSrc() != nil {
+		t.Errorf("a 65-pattern sweep over u64 accept masks was admitted")
 	}
-	// The emitter refuses on its own too, so a gate that drifts later cannot
-	// reach the i32 mask without a loud failure: a resolved sweep past the gate.
-	cs := mk(bucketMaskBits)
-	cs.sweepDone = true
-	cs.sweep = &overlapSweep{dp: cs.buckets[0].dp, ids: make([]int, bucketMaskBits+1)}
-	recoverContains(t, "bucketMaskBits", func() { newCkptEmit(cs, 0, 0) })
+	// The emitter builds a wide row's mask an i64 word at a time.
+	cs := mk(bucketMaskBits + 1)
+	if e := newCkptEmit(cs, 0, 0); !e.maskWide() {
+		t.Errorf("a %d-pattern sweep's row mask is not wide", bucketMaskBits+1)
+	}
+}
+
+// TestSearchPiecesWithoutABlock: the per-search pieces are asked
+// unconditionally by their callers, and must answer "none" — leave the body
+// as it is, hand back nil — when the pattern or the member keeps no block,
+// rather than a zero-sized version of something.
+func TestSearchPiecesWithoutABlock(t *testing.T) {
+	if g := (&notesPlan{}).resumeGlobal(); g != nil {
+		t.Errorf("a plan with no notes has a resume global (%d)", *g)
+	}
+	if r := handoverNotesReq(8, CompileOptions{}); r != nil {
+		t.Errorf("a handover with no global allocator asked for notes: %+v", r)
+	}
+	body := []byte{0x01}
+	if b := (&notesCtx{copy: notesOrdinary}).emitRecord(body); len(b) != 1 {
+		t.Errorf("the ordinary copy recorded notes: % x", b)
+	}
+	cs := &compiledSet{split: []splitMember{{}}}
+	if b := cs.emitMemberBlock(body, 0, 0); len(b) != 1 {
+		t.Errorf("a member with no block was handed one: % x", b)
+	}
+	if b := cs.emitRestoreSearch(body, 0, 0); len(b) != 1 {
+		t.Errorf("a member with no block restored the search global: % x", b)
+	}
 }
 
 // Unit coverage for emitters and helpers whose branches the end-to-end paths do

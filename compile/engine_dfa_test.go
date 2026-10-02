@@ -2514,3 +2514,20 @@ func TestNfaBuildInputMapHandBuiltPrograms(t *testing.T) {
 		}
 	})
 }
+
+// TestUnionSortedU16: two call sites may record one state's wide boundary
+// accepts, and the second must add to the first — sorted and without
+// duplicates, since the list is part of the state's identity in minimisation.
+func TestUnionSortedU16(t *testing.T) {
+	for _, c := range []struct{ a, b, want []uint16 }{
+		{nil, []uint16{3}, []uint16{3}},
+		{[]uint16{1, 4}, nil, []uint16{1, 4}},
+		{[]uint16{1, 4, 9}, []uint16{2, 4, 10}, []uint16{1, 2, 4, 9, 10}},
+		{[]uint16{5}, []uint16{1, 2}, []uint16{1, 2, 5}},
+		{[]uint16{1, 2}, []uint16{1, 2}, []uint16{1, 2}},
+	} {
+		if got := unionSortedU16(c.a, c.b); fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("unionSortedU16(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}

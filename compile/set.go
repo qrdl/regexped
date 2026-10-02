@@ -45,6 +45,11 @@ type PatternInfo struct {
 	// a \b / \B / (?m:$) branch (dfaHasAmbiguousBoundaryTarget), so the find
 	// packers give it a Backtracking bucket instead of a DFA one.
 	boundaryAmbiguous bool
+	// noOwnDFA: the pattern's own DFA (its prefix or suffix automaton) could
+	// not be built within maxHelperDFAStates — `(?:a|b)*a(?:a|b){12}c|a` has
+	// 2^13 suffix states. No bucket can merge it, so the fallback packer offers
+	// it to Backtracking at once, as a single pattern goes to Backtracking.
+	noOwnDFA bool
 
 	suffixDFA      *dfaTable // built from suffixAST
 	suffixClasses  int       // numClasses after computeByteClasses (Phase 2)
@@ -123,8 +128,8 @@ func dfaFingerprint(t *dfaTable) uint64 {
 		// fallback) hash identically no matter which patterns they accept —
 		// the aliasing this key exists to prevent. Length-prefixed so `[1,2]` and
 		// `[12]` cannot collide.
-		for _, m := range []map[int][]uint16{t.acceptWide, t.midAcceptWide, t.immAcceptWide} {
-			list := m[s]
+		for _, m := range t.wideMaps() {
+			list := (*m)[s]
 			writeU64(uint64(len(list)))
 			for _, v := range list {
 				writeU64(uint64(v))
@@ -187,15 +192,21 @@ func dfaTableEqual(a, b *dfaTable) bool {
 		}
 		return true
 	}
-	return eqMaps(a.acceptStates, b.acceptStates) &&
+	if !(eqMaps(a.acceptStates, b.acceptStates) &&
 		eqMaps(a.midAcceptStates, b.midAcceptStates) &&
 		eqMaps(a.midAcceptNWStates, b.midAcceptNWStates) &&
 		eqMaps(a.midAcceptWStates, b.midAcceptWStates) &&
 		eqMaps(a.midAcceptNLStates, b.midAcceptNLStates) &&
-		eqMaps(a.immediateAcceptStates, b.immediateAcceptStates) &&
-		eqWide(a.acceptWide, b.acceptWide) &&
-		eqWide(a.midAcceptWide, b.midAcceptWide) &&
-		eqWide(a.immAcceptWide, b.immAcceptWide)
+		eqMaps(a.immediateAcceptStates, b.immediateAcceptStates)) {
+		return false
+	}
+	wa, wb := a.wideMaps(), b.wideMaps()
+	for i := range wa {
+		if !eqWide(*wa[i], *wb[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasBeginAnchor reports whether re contains a BeginText or BeginLine
@@ -543,18 +554,32 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 		info.prefixMaxLen = maxLen
 	}
 
-	// Build prefix DFA (reversed prefix AST).
+	// A pattern whose own automaton cannot be built goes to the fallback
+	// packer whole, which gives it Backtracking (noOwnDFA) — not an error that
+	// fails the set's compile, since the same pattern compiles alone. Nothing
+	// is added to either pool for it.
+	noOwnDFA := func() (*PatternInfo, error) {
+		info.splittable = false
+		info.prefixAST, info.suffixAST, info.prefixDFA = nil, nil, nil
+		info.prefixID, info.trivialPrefix, info.prefixMaxLen = -1, true, 0
+		info.startAnchor, info.lineAnchor = false, false
+		info.setTopLevelAnchor(parsed)
+		info.noOwnDFA = true
+		return info, nil
+	}
+
+	// Build prefix DFA (reversed prefix AST). It joins its pool only once the
+	// suffix DFA is built too.
+	var prefixTable *dfaTable
 	if !info.trivialPrefix {
 		revRe := reverseRegexp(info.prefixAST)
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
 		revProg, _ := syntax.Compile(revRe.Simplify())
 		revD, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
 		if !revOk {
-			return nil, fmt.Errorf("analyzePattern: prefix %q: %w", re.Pattern, ErrDFAStateLimit)
+			return noOwnDFA()
 		}
-		prefixTable := dfaTableFromCanonical(revD)
-		info.prefixDFA = prefixTable
-		info.prefixID = prefixPool.Add(prefixTable)
+		prefixTable = dfaTableFromCanonical(revD)
 	}
 
 	// Build suffix DFA (suffix AST, or full pattern when no split).
@@ -570,7 +595,11 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 	prog, _ := syntax.Compile(suffixTarget.Simplify())
 	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
 	if !ok {
-		return nil, fmt.Errorf("analyzePattern: suffix %q: %w", re.Pattern, ErrDFAStateLimit)
+		return noOwnDFA()
+	}
+	if prefixTable != nil {
+		info.prefixDFA = prefixTable
+		info.prefixID = prefixPool.Add(prefixTable)
 	}
 	suffixTable := dfaTableFromCanonical(d)
 	info.suffixDFA = suffixTable
@@ -874,6 +903,23 @@ func mergeSuffixDFA(asts []*syntax.Regexp, opts CompileSetOptions) (*dfaTable, A
 	}
 	t := dfaTableFromCanonical(d)
 	return t, AcceptBitmask, nil
+}
+
+// mergeSuffixDFAWidth is mergeSuffixDFA at a stated mask width up to 64,
+// past the 32 a bucket's per-candidate path can hold. The overlapping sweep's
+// whole-set automaton is its one caller: its masks are read at compile time
+// and written to a cache row as wide as the set, so the bucket's i32 limit does
+// not apply to it.
+func mergeSuffixDFAWidth(asts []*syntax.Regexp, bw int) (*dfaTable, error) {
+	if len(asts) == 0 || len(asts) > bw || bw > 64 {
+		return nil, fmt.Errorf("mergeSuffixDFAWidth: %d patterns at width %d", len(asts), bw)
+	}
+	unionProg, patternBits := buildUnionProg(compileSetASTs(asts), bw)
+	d, ok := newDFA(unionProg, false, true, maxHelperDFAStates, patternBits)
+	if !ok {
+		return nil, ErrDFAStateLimit
+	}
+	return dfaTableFromCanonical(d), nil
 }
 
 // compileSetASTs compiles each AST into its own NFA program, which is the
@@ -2165,6 +2211,15 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 				"simplify the pattern or move it out of the set", -1, -1)
 			if diag != nil {
 				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
+			}
+			continue
+		}
+		// No DFA of its own (analyzePattern): nothing to merge, and every
+		// packing attempt below would rebuild the same automaton and fail
+		// again. Straight to Backtracking, or the warned drop.
+		if p.noOwnDFA {
+			if nb := admitOrDropFallback(p, nil, "fallback bucket", opts, diag); nb != nil {
+				buckets = append(buckets, nb)
 			}
 			continue
 		}

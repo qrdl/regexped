@@ -154,10 +154,8 @@ func detectClassChainPrefix(l *dfaLayout, t *dfaTable) (classChainPrefix, bool) 
 			}
 		}
 		// The >64-pattern accept form, nil off the sparse path.
-		for _, m := range []map[int][]uint16{
-			t.acceptWide, t.midAcceptWide, t.immAcceptWide,
-		} {
-			if len(m[ts]) > 0 {
+		for _, m := range t.wideMaps() {
+			if len((*m)[ts]) > 0 {
 				return true
 			}
 		}

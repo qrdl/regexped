@@ -418,10 +418,19 @@ func (r *capRunner) allIDs(t *testing.T, fn string, args ...interface{}) []int {
 // Shufti frontend was checked by a copy that could drift from the original.
 func checkCapsAgainstOracle(t *testing.T, r *capRunner, pats []string, input string) {
 	t.Helper()
+	checkCapsAgainstOracleDropped(t, r, pats, input, nil)
+}
+
+// checkCapsAgainstOracleDropped is checkCapsAgainstOracle for a set whose
+// anchored pair legitimately dropped the members in anchoredDropped (the
+// anchored packer drops a member over its state limit, with a warning); every
+// other capability must still answer for them.
+func checkCapsAgainstOracleDropped(t *testing.T, r *capRunner, pats []string, input string, anchoredDropped map[int]bool) {
+	t.Helper()
 	n := int32(len(input))
 
 	// match: anchored, whole input.
-	wantAnchored := oracleAnchored(pats, input, nil)
+	wantAnchored := oracleAnchored(pats, input, anchoredDropped)
 
 	// match_any: membership, never value equality.
 	gotAny := r.call(t, "cap_match_any", r.inBase, n).(int32)
@@ -495,6 +504,28 @@ func checkCapsAgainstOracle(t *testing.T, r *capRunner, pats []string, input str
 		if !eqIDs(append([]int(nil), wantIDs...), gotIDs) {
 			t.Fatalf("find(from=%d) ids = %v, want %v", from, gotIDs, wantIDs)
 		}
+	}
+}
+
+// TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
+// 2^13 suffix states against the 2,048-state helper limit — is served on
+// Backtracking, as the same pattern is alone, instead of failing the set's
+// compile. Every non-anchored capability answers as Go does, gated `find`
+// included; match_any and match_all drop such a member, with a warning, as
+// they drop any member over the anchored state limit.
+func TestSetMemberWithoutAnOwnDFA(t *testing.T) {
+	pats := []string{`(?:a|b)*a(?:a|b){12}c|a`, `zz`, `x[ab]*a[ab]{11}c`}
+	inputs := []string{"", "b", "zz", "a", strings.Repeat("a", 13) + "c",
+		"bbbb" + strings.Repeat("a", 13) + "c zz", "x" + strings.Repeat("a", 12) + "c",
+		"xb" + strings.Repeat("ab", 6) + "c bab"}
+	anchoredDropped := map[int]bool{0: true, 2: true}
+	for _, in := range inputs {
+		t.Run("caps/"+in, func(t *testing.T) {
+			r := newCapRunner(t, pats, in, true)
+			defer r.Close()
+			checkCapsAgainstOracleDropped(t, r, pats, in, anchoredDropped)
+		})
+		t.Run("gated/"+in, func(t *testing.T) { checkGated(t, pats, in) })
 	}
 }
 

@@ -111,10 +111,8 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 		}
 		return int(dp.l.tableBytes[idx])
 	}
-	// has reports a state's bit in an optional mask table. The dominant ones
-	// count only for a one-pattern automaton, which is the only kind the sweep
-	// reads them for (see overlapDPTables).
-	has := func(m []uint64, w int, bit uint64) bool { return m != nil && m[w]&bit != 0 }
+	// The dominant flags count only for a one-pattern automaton, which is the
+	// only kind the sweep reads them for (see overlapDPTables).
 	domToo := numPat == 1
 
 	p := &overlapProj{cellOf: make([][]int32, numPat)}
@@ -123,7 +121,6 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 	p.cells = 1
 
 	for pat := 0; pat < numPat; pat++ {
-		bit := uint64(1) << uint(pat)
 		// Initial partition: the dead class (0), then states split by their own
 		// accept bits. State 0 is the DFA's dead state and is dead for every
 		// pattern by definition.
@@ -131,9 +128,9 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 		key := map[[7]bool]int32{}
 		next := int32(1)
 		for w := 1; w < n; w++ {
-			k := [7]bool{dp.midMasks[w]&bit != 0, dp.eofMasks[w]&bit != 0,
-				has(dp.wMasks, w, bit), has(dp.nwMasks, w, bit), has(dp.nlMasks, w, bit),
-				domToo && has(dp.wDomMasks, w, bit), domToo && has(dp.nwDomMasks, w, bit)}
+			k := [7]bool{dp.midHas(w, pat), dp.eofHas(w, pat),
+				dp.wHas(w, pat), dp.nwHas(w, pat), dp.nlHas(w, pat),
+				domToo && dp.wDomHas(w), domToo && dp.nwDomHas(w)}
 			id, ok := key[k]
 			if !ok {
 				id = next
@@ -176,8 +173,8 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 		// a boundary accept being an accept.
 		alive := make([]bool, next)
 		for w := 1; w < n; w++ {
-			if dp.midMasks[w]&bit != 0 || dp.eofMasks[w]&bit != 0 ||
-				has(dp.wMasks, w, bit) || has(dp.nwMasks, w, bit) || has(dp.nlMasks, w, bit) {
+			if dp.midHas(w, pat) || dp.eofHas(w, pat) ||
+				dp.wHas(w, pat) || dp.nwHas(w, pat) || dp.nlHas(w, pat) {
 				alive[cls[w]] = true
 			}
 		}

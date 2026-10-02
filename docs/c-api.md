@@ -352,12 +352,17 @@ typedef struct {
     unsigned gates[<SET>_ID_SPACE];        /* every set with find, either policy */
     unsigned scratch[4];                   /* the descriptor the export takes    */
     unsigned *cache;                       /* a cache-eligible overlapping set:  */
-    size_t cache_words;                    /*   its answer cache                 */
+    size_t cache_words;                    /*   its answer cache, and whether    */
+    int cache_own;                         /*   _init allocated it               */
 } rx_<set>_scanner_t;
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
 int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
-void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache, if any */
+void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache _init allocated */
+
+/* the answer cache in your own memory: bytes needed (0 = none), and the handover */
+size_t <find>_cache_bytes(size_t len);
+int <find>_set_cache(rx_<set>_scanner_t *s, void *buf, size_t bytes);
 
 /* only if any set in the config sets emit_name_map: true */
 const char *pattern_name(int id);
@@ -543,9 +548,41 @@ has nothing. So the feature is DETECTED rather than demanded:
 | your build | behaviour |
 |---|---|
 | with a sysroot (`wasi-sdk`, a host compiler) | `<find>_init` reserves the cache, an overlapping drive is **linear**, and `<find>_free` releases it |
-| freestanding (`-nostdlib`, no sysroot) | no cache, the drive **walks** — same answers, quadratic |
+| freestanding (`-nostdlib`, no sysroot) | no cache of the stub's own: the drive **walks** — same answers, quadratic — unless you hand one over (below) |
 
 Define `RX_SET_CACHE` yourself to force it either way.
+
+**A cache in your own memory.** A build with no allocator can still have a
+linear drive: the stub tells you the size and you hand a buffer over.
+
+```c
+static unsigned char mem[1 << 20];          /* any memory that outlives the scan */
+rx_<set>_scanner_t sc;
+size_t need = <find>_cache_bytes(len);      /* 0: this scan needs none */
+<find>_init(&sc, input, len, 0);
+if (need && need <= sizeof mem)
+    <find>_set_cache(&sc, mem, sizeof mem);
+/* ... drive <find> as usual, then <find>_free(&sc) ... */
+```
+
+- `<find>_cache_bytes(len)` is the size the stub would allocate itself, for an
+  input of `len` bytes. It is 0 when the scan needs no buffer: the set has no
+  answer cache, the input is too long for one, or the build is
+  `wasm_format: component`, whose regexp component keeps its own. The pair
+  exists for every set with `find`, so the same source compiles against any
+  set and either output kind.
+- `<find>_set_cache` goes after `<find>_init` and before the first `<find>`. It
+  returns 0 (also when no buffer is needed, and then `buf` is not used),
+  `RX_ERR_RANGE` when `bytes` is below what the input needs, or
+  `RX_ERR_NULL_ARG`; on an error the scanner is unchanged. A cache `_init`
+  allocated itself is freed and replaced by yours.
+- The buffer is yours: `<find>_free` never frees it, and `<find>_init` forgets
+  it, so a restarted scan hands it over again. One buffer serves ONE scanner at
+  a time. Any alignment works.
+
+Memory: about 4 bytes per set member per input byte, up to the 64 MiB point
+where the cache switches to checkpoints and grows with the square root of the
+input instead.
 
 **A `-nostdlib` build must pass `-DRX_SET_CACHE=0`.** The preprocessor cannot see
 link flags. `-nostdlib` removes libc from the *link*, not `<stdlib.h>` from the

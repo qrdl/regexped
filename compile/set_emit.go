@@ -35,6 +35,15 @@ type compiledSet struct {
 	internal                            bool
 	companionFindIdx, companionBatchIdx int
 	regionEnd                           int32
+	// scanComp is the SPLIT copy of a set whose scan pair alone needs the
+	// split (attachScanCompanion): the set itself is compiled without the
+	// scan pair, so its overlapping `find` keeps the answer cache a split
+	// compile cannot read, and its two scan exports, named fwdScanAny /
+	// fwdScanAll, forward to scanComp's — scanCompIdx, settled by the
+	// assembler.
+	scanComp               *compiledSet
+	fwdScanAny, fwdScanAll string
+	scanCompIdx            map[setCapKind]int
 	// scanSwWork is the scan pair's work counter, emitted where scanUnion is
 	// its switch target (see scanSwitch); -1 = none. scanSwMark is the i64
 	// global a `scan_all` body snapshots its answer in before each probe, so
@@ -396,11 +405,17 @@ func (cs *compiledSet) capFns() []setCapFn {
 	if cs.batchFind {
 		batchName = config.SetBatchExportName(cs.find)
 	}
+	scanAny, scanAll := cs.scanAny, cs.scanAll
+	if cs.scanComp != nil {
+		// Forwarded to the scan companion, whose `_all` form must be this
+		// set's (attachScanCompanion checks).
+		scanAny, scanAll = cs.fwdScanAny, cs.fwdScanAll
+	}
 	all := []setCapFn{
 		{cs.find, capFind, findType},
 		{batchName, capFindBatch, batchType},
-		{cs.scanAny, capScanAny, setTypeI32x3ToI32},
-		{cs.scanAll, capScanAll, scanAllType},
+		{scanAny, capScanAny, setTypeI32x3ToI32},
+		{scanAll, capScanAll, scanAllType},
 		{cs.matchAny, capMatchAny, setTypeI32I32ToI32},
 		{cs.matchAll, capMatchAll, allType},
 	}
@@ -2149,6 +2164,13 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 				setTableBase = top
 			}
 		}
+		if cs.scanComp != nil {
+			// Above the set's and its no-cache companion's tables.
+			compiledSets = append(compiledSets, cs.scanComp)
+			if top := max(cs.scanComp.dataTop(), int64(cs.scanComp.regionEnd)); top > setTableBase {
+				setTableBase = top
+			}
+		}
 		// Advance to where this set's tables ACTUALLY end. This used to
 		// add up the encoded blob lengths, which is not
 		// the extent of anything: the blobs carry per-segment headers, and
@@ -2296,6 +2318,25 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		if cs.companionFindIdx == 0 {
 			panic(fmt.Sprintf("compile: set %d's no-cache companion is not in the module", si))
+		}
+	}
+	// A scan companion's two entries, for the set whose scan exports forward.
+	for si, cs := range sets {
+		if cs.scanComp == nil {
+			continue
+		}
+		cs.scanCompIdx = map[setCapKind]int{}
+		for cj, c := range sets {
+			if c == cs.scanComp {
+				for _, kind := range []setCapKind{capScanAny, capScanAll} {
+					if off := c.capFnOffset(kind); off >= 0 {
+						cs.scanCompIdx[kind] = setBaseIdx[cj] + off
+					}
+				}
+			}
+		}
+		if len(cs.scanCompIdx) == 0 {
+			panic(fmt.Sprintf("compile: set %d's scan companion is not in the module", si))
 		}
 	}
 
@@ -2869,6 +2910,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		// instead, and this body moves behind it (keptFnOffset).
 		capBody := func(c setCapFn) []byte {
 			var out []byte
+			if cs.scanComp != nil && (c.kind == capScanAny || c.kind == capScanAll) {
+				return emitForwardBody(setTypeParams(c.typeIdx), cs.scanCompIdx[c.kind])
+			}
 			switch c.kind {
 			case capFind:
 				if cs.findWrapped() {
@@ -5126,4 +5170,31 @@ func wantsWalkExtent(spec SetSpec, buckets []*bucket, bi int) bool {
 // late. Not sparse buckets, whose accept is a per-state LIST no mask names.
 func bucketLivenessExit(bkt *bucket) bool {
 	return !bkt.sparse && livenessCanFire(bkt.suffixDFA)
+}
+
+// setTypeParams is how many i32 parameters a set capability's function type
+// takes.
+func setTypeParams(typeIdx byte) int {
+	switch typeIdx {
+	case setTypeI32I32ToI32, setTypeI32I32ToI64:
+		return 2
+	case setTypeI32x3ToI32, setTypeI32x3ToI64:
+		return 3
+	case setTypeI32x4ToI32:
+		return 4
+	}
+	panic(fmt.Sprintf("compile: setTypeParams for set function type %d", typeIdx))
+}
+
+// emitForwardBody is a code entry that calls fnIdx with its own n parameters
+// and returns what it returns.
+func emitForwardBody(n, fnIdx int) []byte {
+	b := []byte{0x00} // no locals
+	for i := 0; i < n; i++ {
+		b = append(b, 0x20, byte(i))
+	}
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(fnIdx)) //nolint:gosec // a function index
+	b = append(b, 0x0B)
+	return append(utils.AppendULEB128(nil, uint32(len(b))), b...)
 }

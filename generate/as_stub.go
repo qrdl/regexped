@@ -157,7 +157,7 @@ export function %s(input: ArrayBuffer): Array<i32> | null {
     // uncatchable abort. Array is a reference type, so null is legal.
     if (n == %d) return null;
     const out = new Array<i32>();
-    for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
+    for (let k = 0; k < %s; k++) if ((<i32>bits[k >> 3]) & (1 << (k & 7))) out.push(k);
     return out;
 }
 `, s.MatchAll, idKonst, s.MatchAll, btOverflow, idKonst)
@@ -207,7 +207,7 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
     // uncatchable abort. Array is a reference type, so null is legal.
     if (n == %d) return null;
     const out = new Array<i32>();
-    for (let k = 0; k < %s; k++) if (bits[k >> 3] & (1 << (k & 7))) out.push(k);
+    for (let k = 0; k < %s; k++) if ((<i32>bits[k >> 3]) & (1 << (k & 7))) out.push(k);
     return out;
 }
 `, s.ScanAll, idKonst, s.ScanAll, btOverflow, idKonst)
@@ -389,13 +389,9 @@ export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
 	return out.String()
 }
 
-// genASStubsForEntry generates the AS stub content for a single regexp entry.
-func genASStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
-	return genASStubsForEntrySized(re, importModule, nil)
-}
-
-// genASStubsForEntrySized is genASStubsForEntry with each export's search
-// block (search_stub.go); nil sizes means none.
+// genASStubsForEntrySized generates the AS stub content for a single regexp
+// entry, with each export's search block (search_stub.go); nil sizes means
+// none.
 func genASStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false

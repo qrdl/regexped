@@ -324,7 +324,7 @@ type CompileOptions struct {
 	// exponential whenever a loop can split its input more than one way, and
 	// nothing else bounds the search — see btWorkK and planBT.
 	//
-	// 0 → the default (8); a positive value → that k; BTWorkBudgetOff → no
+	// 0 → the default (1); a positive value → that k; BTWorkBudgetOff → no
 	// counter and no fallback, the bytes every body had before the budget
 	// existed; BTWorkBudgetForceFallback → the fallback answers every call.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
@@ -1127,8 +1127,14 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 		// trip it, and the stub would never hand the fallback the memo it
 		// keeps for the search — each call would walk the rest of the input
 		// again (`(0*\b|)*0` over 0×4096: 359 K fuel/byte, 820 with the memo).
+		// A program that matches only at 0 makes one attempt per search, so
+		// a memo kept across its calls would buy nothing: it is not tripped.
 		var stub []byte
-		stub, parts.callOffs = btTailCallBodySearch(2, bt.search)
+		stubSearch := bt.search
+		if btStartAnchored(bt.prog) {
+			stubSearch = nil
+		}
+		stub, parts.callOffs = btTailCallBodySearch(2, stubSearch)
 		parts.fast, parts.mode = stub, fallbackMode
 	} else {
 		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil)

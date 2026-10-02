@@ -132,14 +132,18 @@ var rows = []row{
 	{Name: "bt-budget/set find member (?:aa|a){0,40}b|a", Expect: linear, Why: "a set member's budget lasts one host call",
 		spec: spec{Config: "cfg/setbt4.yaml", Fn: "find", Gen: "rep:a", Sizes: sz(256, 512, 1024)}},
 
-	// ---- Overlapping sets the answer cache does not serve.
-	{Name: "overlap/40 unbounded members", Expect: quadratic, Why: "over the whole-set sweep's member limit",
+	// ---- Overlapping sets and the answer cache.
+	{Name: "overlap/40 unbounded members", Expect: linear, Why: "the answer cache's rows widen past 32 members",
 		spec: spec{Config: "cfg/unb40.yaml", Fn: "find", Gen: "rep:a|suf:0", Sizes: sz(256, 512, 1024)}},
-	{Name: "overlap/35 members sharing foo", Expect: quadratic, Why: "the same through a literal bucket",
+	{Name: "overlap/35 members sharing foo", Expect: linear, Why: "the same through a literal bucket",
 		spec: spec{Config: "cfg/ovl35.yaml", Fn: "find", Gen: "rep:foo|suf:0", Sizes: sz(2048, 4096, 8192)}},
+	{Name: "overlap/96 unbounded members", Expect: linear, Why: "past 64 members the row's mask is a bitmap",
+		spec: spec{Config: "cfg/unb96.yaml", Fn: "find", Gen: "rep:a|suf:0", Sizes: sz(256, 512, 1024)}},
+	{Name: "overlap/128 members sharing foo", Expect: linear, Why: "the same through a literal bucket; the sweep pays off later, past 8 KB",
+		spec: spec{Config: "cfg/ovl128.yaml", Fn: "find", Gen: "rep:foo|suf:0", Sizes: sz(16384, 32768, 65536)}},
 	{Name: "overlap/cache declined", Expect: quadratic, Why: "the host offers no cache",
 		spec: spec{Config: "cfg/ovl.yaml", Fn: "find", NoCache: true, Gen: "rep:foo", Sizes: sz(2048, 4096, 8192)}},
-	{Name: "overlap/scan pair forces a split", Expect: quadratic, Why: "a split compile gets no whole-set sweep",
+	{Name: "overlap/scan pair forces a split", Expect: linear, Why: "the scan pair's split no longer costs `find` its cache",
 		spec: spec{Config: "cfg/ovlsplit.yaml", Fn: "find", Gen: "rep:foo", Sizes: sz(2048, 4096, 8192)}},
 
 	// ---- Set walks a retired or recorded sibling keeps alive.
@@ -157,6 +161,8 @@ var rows = []row{
 	// ---- Evidence rows: printed, never judged.
 	{Name: "report/groups_batch anchored ^([a-z]+)=([0-9]+)", Expect: report, Why: "Go reports ONE record here; more is the anchored-resume bug",
 		spec: spec{Pattern: `^([a-z]+)=([0-9]+)`, Fn: "batchgroups", NGroups: 3, Gen: "rep:a=1", Sizes: sz(300)}},
+	{Name: `report/start-anchored Backtracking find ^(\B|0)*`, Expect: report, Why: "a search from after 0 answers at once (was ~52 fuel/byte: every position tried)",
+		spec: spec{Pattern: `^(\B|0)*`, Fn: "find", Gen: "rep:ab ", Sizes: sz(16384, 65536)}},
 	{Name: `report/memory fallback memo ^(\w*|)*c`, Expect: report, Why: "pages the Backtracking fallback grows with the input",
 		spec: spec{Pattern: `^(\w*|)*c`, Fn: "groups", Gen: "rep:w", Sizes: sz(1<<20, 4<<20)}},
 	{Name: "report/memory load-time reservation, 1,000 alternations", Expect: report, Why: "pages a Backtracking find reserves at load",

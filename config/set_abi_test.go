@@ -294,17 +294,24 @@ func TestSetOverlapRowEndOff(t *testing.T) {
 	if SetOverlapRowMaskOff != 0 {
 		t.Fatalf("mask offset = %d, want 0", SetOverlapRowMaskOff)
 	}
-	for k := 0; k < 8; k++ {
-		if got, want := SetOverlapRowEndOff(k), 4+4*k; got != want {
-			t.Errorf("SetOverlapRowEndOff(%d) = %d, want %d", k, got, want)
+	// The mask's width: an i32 to 32 patterns, an i64 to 64, then one i64 per
+	// 64. Up to 32 the row is the four-byte-mask row it always was.
+	for _, tc := range []struct{ pats, mask int }{
+		{1, 4}, {32, 4}, {33, 8}, {64, 8}, {65, 16}, {128, 16}, {129, 24}, {4096, 512},
+	} {
+		if got := SetOverlapRowMaskBytes(tc.pats); got != tc.mask {
+			t.Errorf("SetOverlapRowMaskBytes(%d) = %d, want %d", tc.pats, got, tc.mask)
 		}
-	}
-	// The last end must sit inside the row, and the row must hold nothing
-	// beyond it: a row is exactly a mask plus one end per pattern.
-	for _, pats := range []int{1, 3, 64} {
-		row := SetOverlapBlockRowBytes(pats)
-		if got := SetOverlapRowEndOff(pats-1) + 4; got != row {
-			t.Errorf("pats=%d: last end ends at %d, row is %d bytes", pats, got, row)
+		for k := 0; k < 8 && k < tc.pats; k++ {
+			if got, want := SetOverlapRowEndOff(k, tc.pats), tc.mask+4*k; got != want {
+				t.Errorf("SetOverlapRowEndOff(%d, %d) = %d, want %d", k, tc.pats, got, want)
+			}
+		}
+		// The last end must sit inside the row, and the row must hold nothing
+		// beyond it: a row is exactly a mask plus one end per pattern.
+		row := SetOverlapBlockRowBytes(tc.pats)
+		if got := SetOverlapRowEndOff(tc.pats-1, tc.pats) + 4; got != row {
+			t.Errorf("pats=%d: last end ends at %d, row is %d bytes", tc.pats, got, row)
 		}
 	}
 }

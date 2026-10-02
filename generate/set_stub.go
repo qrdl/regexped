@@ -685,7 +685,7 @@ func (p *setShapes) anyWantsCache() bool {
 // LITERALS, derived once from the compiled shape.
 //
 // Six languages spell that prelude, and each spelled these three itself:
-// `4 + 4*P` for a row, `cells*4 + 4` for a checkpoint column, and the header
+// the mask plus 4*P for a row, `cells*4 + 4` for a checkpoint column, and the header
 // beside them. The arithmetic that remains language-specific is only the
 // stride and the block count — a square root and a ceiling — because those are
 // the parts that need the input length, which exists only at call time.

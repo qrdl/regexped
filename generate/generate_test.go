@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -1753,6 +1754,44 @@ func TestABISpellersHandleEveryParam(t *testing.T) {
 				seen[got] = p
 			}
 		})
+	}
+}
+
+// TestSearchSplicersAssertTheirAnchors: each search-block splicer edits a
+// generator's output at fixed anchors and refuses, loudly, source that lacks
+// one — which is how a change to the generator it edits shows up, rather than
+// as a stub that silently hands no block over.
+func TestSearchSplicersAssertTheirAnchors(t *testing.T) {
+	blk := compile.SearchSize{NotesBytes: 1}
+	blocks := []compile.SearchSize{blk}
+	for _, c := range []struct {
+		name string
+		f    func()
+	}{
+		{"js", func() { jsWithSearch("nothing", "f", blk, false, false, 0) }},
+		{"rust", func() { rustWithSearch("nothing", "f", "FIter", blk, false) }},
+		{"go", func() { goWithSearch("nothing", "f", "ffi_f", blk, false) }},
+		{"c", func() { cWithSearch("nothing", "nothing", "f", "f_iter_t", "ffi_f", blk, false) }},
+		{"as", func() { asWithSearch("nothing", "f", "ffi_f", blk, false) }},
+		{"js set, no generator", func() { jsSetWithBlocks("nothing", "f", blocks, false) }},
+		{"js set, unterminated generator", func() { jsSetWithBlocks("export function* f(", "f", blocks, false) }},
+		{"js set, no descriptor", func() { jsSetWithBlocks("export function* f(\n}\n", "f", blocks, false) }},
+		{"js set, no call", func() { jsSetWithBlocks("export function* f(x, scratchBase, 4).set([1]);\n}\n", "f", blocks, false) }},
+		{"go set, no iterator", func() { goSetWithBlocks("nothing", "f", blocks) }},
+		{"go set, no scratch", func() { goSetWithBlocks("type fIter struct {\n}\n", "f", blocks) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Error("source without the anchors was spliced instead of refused")
+				}
+			}()
+			c.f()
+		})
+	}
+	// With no block there is nothing to splice.
+	if p := jsSearch("f", compile.SearchSize{}, "0", false); p != (jsSearchParts{}) {
+		t.Errorf("jsSearch without a block = %+v, want nothing", p)
 	}
 }
 

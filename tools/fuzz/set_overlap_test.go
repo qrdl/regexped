@@ -238,7 +238,49 @@ func wholeSetSweepSets(t *testing.T) []struct {
 		{"line-anchors", []string{`(?m:^)ab+`, `ab+(?m:$)`, `c+`}, "abb\nab\nc"},
 		{"url-guard (620 states, \\b)", load("../../examples/fastedge/url-guard/regexped.yaml", "attacks"), "{$"},
 		{"secret-scanner (358 states)", load("../../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner"), "xoxb-aaaaaaaaaa"},
+		// Past a row's i32 mask: an i64 row (33 members), a two-word bitmap
+		// with the word-boundary and newline channels (70), a three-word one
+		// (130). The run is long enough for every member to match.
+		{"33 members (i64 rows)", letterRuns(33), strings.Repeat("abcdefghij", 4) + "0 "},
+		{"70 members, \\b and (?m) (2-word rows)", wideBoundaryMembers(),
+			strings.Repeat("abcdefghij", 4) + "0 w1 wx3\nq2ab q4\n"},
+		{"130 members (3-word rows)", literalMembers(125, 5), "x000ab x070cd x129ef abcdefg0 "},
 	}
+}
+
+// letterRuns is n members `[a-z]{k,}[0-9]`, k = 1..n: every one alive over a
+// run of letters, so walks nest and every member's bit is set in long runs.
+func letterRuns(n int) []string {
+	out := make([]string, n)
+	for k := range out {
+		out[k] = fmt.Sprintf("[a-z]{%d,}[0-9]", k+1)
+	}
+	return out
+}
+
+// literalMembers is n members `x%03d[a-z]*` after `runs` letter runs: a wide
+// set whose module stays small, since only the runs are split out of the
+// no-cache companion, and whose high members are reached by naming them.
+func literalMembers(n, runs int) []string {
+	out := letterRuns(runs)
+	for k := runs; k < runs+n; k++ {
+		out = append(out, fmt.Sprintf("x%03d[a-z]*", k))
+	}
+	return out
+}
+
+// wideBoundaryMembers is 70 members over two bitmap words: letter runs, word-
+// boundary members and (?m) line-start members, so the boundary and newline
+// channels carry bits past 64.
+func wideBoundaryMembers() []string {
+	out := letterRuns(40)
+	for k := 0; k < 15; k++ {
+		out = append(out, fmt.Sprintf(`\bw%d\w*`, k))
+	}
+	for k := 0; k < 15; k++ {
+		out = append(out, fmt.Sprintf(`(?m:^)q%d[a-z]*`, k))
+	}
+	return out
 }
 
 // wholeSetAlphabet is the bytes a set's patterns name, plus a word byte, a
