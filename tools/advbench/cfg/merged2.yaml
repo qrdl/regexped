@@ -1,0 +1,10 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: '[0-9]+'
+  - pattern: '[0-9][a-z]'
+sets:
+  - name: s
+    find: sfind
+    scan_all: sall
+    patterns: all

@@ -1,0 +1,75 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - name: p0
+    pattern: 'foo'
+  - name: p1
+    pattern: 'foo\w+'
+  - name: p2
+    pattern: 'foo[0-9]{1}'
+  - name: p3
+    pattern: 'foo[0-9]{2}'
+  - name: p4
+    pattern: 'foo[0-9]{3}'
+  - name: p5
+    pattern: 'foo[0-9]{4}'
+  - name: p6
+    pattern: 'foo[0-9]{5}'
+  - name: p7
+    pattern: 'foo[0-9]{6}'
+  - name: p8
+    pattern: 'foo[0-9]{7}'
+  - name: p9
+    pattern: 'foo[0-9]{8}'
+  - name: p10
+    pattern: 'foo[0-9]{9}'
+  - name: p11
+    pattern: 'foo[0-9]{10}'
+  - name: p12
+    pattern: 'foo[0-9]{11}'
+  - name: p13
+    pattern: 'foo[0-9]{12}'
+  - name: p14
+    pattern: 'foo[0-9]{13}'
+  - name: p15
+    pattern: 'foo[0-9]{14}'
+  - name: p16
+    pattern: 'foo[0-9]{15}'
+  - name: p17
+    pattern: 'foo[0-9]{16}'
+  - name: p18
+    pattern: 'foo[0-9]{17}'
+  - name: p19
+    pattern: 'foo[0-9]{18}'
+  - name: p20
+    pattern: 'foo[0-9]{19}'
+  - name: p21
+    pattern: 'foo[0-9]{20}'
+  - name: p22
+    pattern: 'foo[0-9]{21}'
+  - name: p23
+    pattern: 'foo[0-9]{22}'
+  - name: p24
+    pattern: 'foo[0-9]{23}'
+  - name: p25
+    pattern: 'foo[0-9]{24}'
+  - name: p26
+    pattern: 'foo[0-9]{25}'
+  - name: p27
+    pattern: 'foo[0-9]{26}'
+  - name: p28
+    pattern: 'foo[0-9]{27}'
+  - name: p29
+    pattern: 'foo[0-9]{28}'
+  - name: p30
+    pattern: 'foo[0-9]{29}'
+  - name: p31
+    pattern: 'foo[0-9]{30}'
+  - name: p32
+    pattern: 'foo[0-9]{31}'
+  - name: p33
+    pattern: 'foo[0-9]{32}'
+sets:
+  - name: s
+    find: s_find
+    patterns: all

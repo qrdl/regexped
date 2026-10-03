@@ -186,6 +186,9 @@ type moduleGlobals struct {
 	// btScratchP1 is btScratch.host + 1, or 0 while no Backtracking fallback
 	// body has asked for its scratch globals.
 	btScratchP1 uint32
+	// searchP1 is the search global + 1 (search_notes.go), or 0 while no body
+	// has asked for it.
+	searchP1 uint32
 	// i64 marks the globals AllocI64 made, with their initial values. Every
 	// other global is an i32.
 	i64 map[uint32]int64
@@ -204,6 +207,14 @@ type btScratch struct {
 	// floor is the end of the module's own tables, which no host value may
 	// place the scratch below.
 	floor uint32
+	// An EMBEDDED build keeps a tripped search's memo in the INPUT's memory
+	// (the host's: the stub allocates it), while the fallback's own region —
+	// frame stack, a per-call memo — is in the table memory. A memory index is
+	// an immediate, so the fallback FIND is emitted twice there: searchTwin
+	// marks the per-call body, which hands a call whose search has a usable
+	// memo to the function right after it; memoInInput marks that body, which
+	// reads and writes the memo in memory 0. Neither is set elsewhere.
+	searchTwin, memoInInput bool
 }
 
 // BTScratch returns the module's fallback-scratch globals, allocating them on
@@ -308,13 +319,21 @@ func (g *moduleGlobals) Section() []byte {
 // ABI flip separable from the semantic fix: narrowing by zero is a no-op, so
 // switching the export to this wrapper while every pattern is still
 // ffLegacyNarrow cannot change any answer anywhere.
-func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32) []byte {
+//
+// def, when non-nil, is the export's default search state for a caller that
+// hands no block over (default_search.go); only an ffNative find has one.
+func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch) []byte {
 	var b []byte
 
-	switch mode {
-	case ffLegacyNarrow:
+	switch {
+	case def != nil && mode == ffNative:
+		// Locals 3, 4, 5: i32 area and scratch; 6, 7: i64 sizes; 8: i64 r.
+		b = append(b, 0x02, 0x03, 0x7F, 0x03, 0x7E)
+	case def != nil:
+		panic("compile: a default search state on a " + mode.String() + " find")
+	case mode == ffLegacyNarrow:
 		b = append(b, 0x01, 0x01, 0x7E) // one i64 local: r (local 3)
-	case ffNative, ffAnchoredZeroOnly:
+	case mode == ffNative, mode == ffAnchoredZeroOnly:
 		b = append(b, 0x00) // no locals
 	default:
 		panic("compile: buildFindFromWrapperBody with " + mode.String() + " mode")
@@ -377,6 +396,17 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32) 
 		b = append(b, 0x0B)       // end if
 	}
 
+	if mode == ffNative && def != nil {
+		l := defLocals{a: 3, t: 4, s: 5, n: 6, n2: 7}
+		b = def.emitEnter(b, 0, 1, 2, l)
+		b = emitFindFromSet(b, 0x02)          // find_from = from
+		b = append(b, 0x20, 0x00, 0x20, 0x01) // ptr, len — the WHOLE buffer
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(findFuncIdx))
+		b = append(b, 0x22, 0x08) // local.tee r: the result
+		b = def.emitFindWindow(b, l, 8)
+		return append(b, 0x0B) // end function
+	}
 	if mode == ffNative {
 		b = emitFindFromSet(b, 0x02)          // find_from = from
 		b = append(b, 0x20, 0x00, 0x20, 0x01) // ptr, len — the WHOLE buffer
@@ -423,8 +453,8 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32) 
 }
 
 // appendFindFromWrapperCodeEntry appends a size-prefixed find wrapper body.
-func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, minLen int32) []byte {
-	body := buildFindFromWrapperBody(findFuncIdx, mode, minLen)
+func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch) []byte {
+	body := buildFindFromWrapperBody(findFuncIdx, mode, minLen, def)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -534,8 +564,33 @@ func anyGroupsExport(patterns []*compiledPattern) bool {
 // anchored at 0. Such a body can only report a match beginning at 0, so any
 // from != 0 is answered "no match" without calling it. That case cannot be
 // handled by seeding the channel, because captureBody does not read it.
-func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool) []byte {
+//
+// def, when non-nil, is the export's default search state (default_search.go);
+// an anchored-only wrapper, one call per drive, has none.
+func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
 	var b []byte
+	if def != nil {
+		if anchoredOnly {
+			panic("compile: a default search state on an anchored-only groups wrapper")
+		}
+		// Locals 4, 5, 6: i32 area and scratch; 7, 8: i64 sizes; 9: i32 r.
+		b = append(b, 0x03, 0x03, 0x7F, 0x02, 0x7E, 0x01, 0x7F)
+		l := defLocals{a: 4, t: 5, s: 6, n: 7, n2: 8}
+		b = append(b, 0x20, 0x03, 0x20, 0x01, 0x4B) // from > len (u)
+		b = append(b, 0x04, 0x40, 0x41, 0x7F, 0x0F, 0x0B)
+		b = def.emitEnter(b, 0, 1, 3, l)
+		b = emitFindFromSet(b, 0x03)
+		b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02) // ptr, len, out_ptr
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(innerFuncIdx))
+		b = append(b, 0x22, 0x09) // local.tee r: the result
+		// The window from the match's group-0 slots: [start, end + 1].
+		b = def.emitWindow(b, l,
+			func(b []byte) []byte { return append(b, 0x20, 0x09, 0x41, 0x00, 0x4E) }, // r >= 0
+			func(b []byte) []byte { return append(b, 0x20, 0x02, 0x28, 0x02, 0x00) },
+			func(b []byte) []byte { return append(b, 0x20, 0x02, 0x28, 0x02, 0x04, 0x41, 0x01, 0x6A) })
+		return append(b, 0x0B)
+	}
 	b = append(b, 0x00) // no locals
 
 	if anchoredOnly {
@@ -565,8 +620,8 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool) []byte {
 }
 
 // appendGroupsFromWrapperCodeEntry appends a size-prefixed groups-from wrapper.
-func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool) []byte {
-	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly)
+func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
+	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly, def)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

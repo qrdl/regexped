@@ -64,6 +64,7 @@ import (
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/benchshim"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -604,6 +605,26 @@ type memPlan struct {
 	cacheLen    int32
 	cacheStride int32
 	needTop     int64
+	// The set's split member search blocks, handed to `find` as a generated
+	// iterator does, with the region for their notes and memos
+	// (internal/searchblock); nil for none.
+	blocks *searchblock.Blocks
+}
+
+// withBlocks lays the set's split member search blocks (and their notes and
+// memos) out above everything else the plan holds.
+func (p memPlan) withBlocks(d compile.SetDiag, maxInputLen int) memPlan {
+	sizes := make([]searchblock.Size, len(d.SearchBlocks))
+	for k, n := range d.SearchBlocks {
+		sizes[k].Notes = n
+		if d.SearchBlocksBTMemo != nil {
+			sizes[k].Memo = d.SearchBlocksBTMemo[k]
+		}
+	}
+	if p.blocks = searchblock.Layout(p.needTop, sizes, maxInputLen, searchblock.Fresh); p.blocks != nil {
+		p.needTop = p.blocks.End() + 64
+	}
+	return p
 }
 
 func planMem(wasmBytes []byte, maxInputLen, patternCount, idSpace int, cache cacheSpec) (memPlan, error) {
@@ -803,6 +824,10 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		runtime.KeepAlive(r.store)
 	}
 	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, p.cacheLen)
+	if err := p.blocks.Begin(r.data, int(inputLen)); err != nil {
+		return false, err
+	}
+	p.blocks.Describe(r.mem.UnsafeData(r.store), p.scratchPtr)
 	found := false
 	for from := int32(0); ; {
 		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.scratchPtr, p.outBase, r.outCap)
@@ -811,6 +836,9 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		}
 		if n.(int32) <= 0 {
 			return found, nil
+		}
+		if err := r.giveNotes(); err != nil {
+			return found, err
 		}
 		found = true
 		buf := r.mem.UnsafeData(r.store)
@@ -861,6 +889,7 @@ func measureMode(b build, kind capKind, export string, inputs []string, iters in
 		}
 	}
 	plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
+	plan = plan.withBlocks(b.diag, maxLen)
 	if err != nil {
 		return nil, err
 	}
@@ -938,6 +967,7 @@ func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idS
 			continue
 		}
 		plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
+		plan = plan.withBlocks(b.diag, maxLen)
 		if err != nil {
 			return err
 		}
@@ -1246,3 +1276,14 @@ func fmtFuel(n uint64) string {
 	}
 	return string(b)
 }
+
+// giveNotes runs after a `find` call, as a generated iterator does: a split
+// member whose search armed during it gets its notes, one whose Backtracking
+// budget tripped its memo.
+func (r *runner) giveNotes() error {
+	err := r.plan.blocks.After(r.data)
+	runtime.KeepAlive(r.store)
+	return err
+}
+
+func (r *runner) data() []byte { return r.mem.UnsafeData(r.store) }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -59,8 +60,57 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			{Name: "lower", Pattern: `[a-z]+`},
 			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
 			{Name: "word", Pattern: `\w+`},
+			// Finds that keep PER-SEARCH NOTES (docs/wasm.md, "The search
+			// block"): their iterators carry a block, hand it over before
+			// every call and allocate notes once a search arms — code no other
+			// entry here generates.
+			{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun_find"},
+			{Name: "overrun_groups", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+			// A set member split out of its set whose own search keeps notes:
+			// the set iterator hands it a search block through the second
+			// form of the scratch descriptor (abi.FindScratchMagicBlocks).
+			{Name: "split_member", Pattern: `foo\w+bar|foo`},
+			// Backtracking finds whose work budget lasts the search: the
+			// iterator hands over a block and gives a tripped search its memo;
+			// the set's member is split onto the Backtracking find (its
+			// start-anywhere automaton is over the state limit), so the set
+			// iterator gives a block a memo too.
+			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+			{Name: "bt_groups", Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
+			{Name: "bt_member", Pattern: `a[ab]{11}c[a-z]*X`},
+			// Non-greedy, so not provably linear in an overlapping set's
+			// bodies: split out, with its answers from a PROGRAM SWEEP the
+			// stubs size a second part of the cache region for.
+			{Name: "ng_member", Pattern: `a[a-z]*?z`},
+			{Name: "foo_word", Pattern: `foo\w+`},
+			// A kept member no cache can serve: the sets below that pair it with
+			// ng_member reserve the program sweep's part after a bare header.
+			{Name: "lit_abc", Pattern: `abc`},
+			// A find that keeps BOTH notes and a Backtracking memo (its switch
+			// hands over to the Backtracking find): the C iterator slices one
+			// caller buffer into the two.
+			{Name: "notes_memo", Pattern: `(?:\ba|b\B)*c|a`, FindFunc: "notes_memo_find"},
 		},
 		Sets: []config.SetConfig{{
+			Name:     "split",
+			Find:     "scan_split",
+			Patterns: config.PatternSelector{Names: []string{"split_member", "aws"}},
+		}, {
+			// The same with its batching entry, which the blocks are spliced
+			// into as well.
+			Name:     "splitb",
+			Find:     "scan_splitb",
+			Patterns: config.PatternSelector{Names: []string{"split_member", "gh"}},
+			Hints:    []string{"batch-find"},
+		}, {
+			Name:     "btsplit",
+			Find:     "scan_btsplit",
+			Patterns: config.PatternSelector{Names: []string{"bt_member", "gh"}},
+		}, {
+			// Every pattern, the Backtracking find among them, whose own
+			// automaton a set cannot build: it goes to Backtracking. Its
+			// failing the set's compile once left every stub here without a
+			// search block (searchSizesFor), which the check below catches.
 			Name:        "sec",
 			MatchAny:    "which_secret",
 			MatchAll:    "all_kinds",
@@ -87,38 +137,128 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			Find:        "scan_overlapping_plain",
 			Patterns:    config.PatternSelector{Names: []string{"lower", "alnum", "word"}},
 			Overlapping: true,
+		}, {
+			// A program sweep beside the kept members' cache, both entries.
+			Name:        "sweep",
+			Find:        "scan_sweep",
+			Patterns:    config.PatternSelector{Names: []string{"foo_word", "ng_member"}},
+			Overlapping: true,
+			Hints:       []string{"batch-find"},
+		}, {
+			Name:        "sweep_plain",
+			Find:        "scan_sweep_plain",
+			Patterns:    config.PatternSelector{Names: []string{"foo_word", "ng_member"}},
+			Overlapping: true,
+		}, {
+			Name:        "sweep_only",
+			Find:        "scan_sweep_only",
+			Patterns:    config.PatternSelector{Names: []string{"lit_abc", "ng_member"}},
+			Overlapping: true,
+			Hints:       []string{"batch-find"},
+		}, {
+			Name:        "sweep_only_plain",
+			Find:        "scan_sweep_only_plain",
+			Patterns:    config.PatternSelector{Names: []string{"lit_abc", "ng_member"}},
+			Overlapping: true,
 		}},
 	}
+	if sz, err := compile.SearchSizes(cfg); err != nil || sz["notes_memo_find"].NotesBytes == 0 || sz["notes_memo_find"].BTMemoBytes == 0 {
+		t.Fatalf("notes_memo_find keeps notes and a memo no longer (%+v, %v): its C buffer split goes unchecked", sz["notes_memo_find"], err)
+	}
+	for _, sc := range cfg.Sets[len(cfg.Sets)-4:] {
+		sh, err := compile.SetOverlapCacheShape(sc, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sh.SweepCells == 0 {
+			t.Fatalf("set %s has no program sweep: the stubs' sweep sizing would go unchecked", sc.Name)
+		}
+		if strings.HasPrefix(sc.Name, "sweep_only") == sh.Eligible {
+			t.Fatalf("set %s: cache-eligible = %v, the opposite of what its name promises", sc.Name, sh.Eligible)
+		}
+	}
 
-	for _, lang := range []struct {
-		name     string
-		file     string
-		write    func(config.BuildConfig, string) error
-		compiler string // "" means the language needs no external tool beyond Go
-		compile  func(t *testing.T, dir, path string)
-	}{
-		{"rust", "stubs.rs", rustStub, "rustc", compileRust},
-		{"go", "stubs.go", goStub, "", compileGo},
-		{"c", "stubs.h", cStub, "cc", compileCModule},
-		{"js", "stubs.js", jsStub, "node", checkJS},
-		{"as", "stubs.ts", asStub, "asc", compileAS},
-		{"ts", "stubs.ts", tsStub, "tsc", compileTS},
-	} {
-		t.Run(lang.name, func(t *testing.T) {
-			if lang.compiler != "" {
-				if _, err := exec.LookPath(lang.compiler); err != nil {
-					t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
+	// The config must COMPILE, and must give the stubs search blocks: the
+	// generators take their blocks from a compile of it and, by design, carry
+	// none when it fails. A pattern added here once made it fail, and every
+	// block, notes and memo path below then compiled nothing.
+	sizes, err := compile.SearchSizes(cfg)
+	if err != nil {
+		t.Fatalf("the config does not compile, so no stub would carry a search block: %v", err)
+	}
+	for _, f := range []string{"overrun_find", "bt_find", "scan_split", "scan_splitb", "scan_btsplit"} {
+		if s := sizes[f]; !s.Block() && len(s.Blocks) == 0 {
+			t.Fatalf("%s has no search block: this test would check none of that code", f)
+		}
+	}
+	// The merged build keeps a tripped Backtracking search's memo in the
+	// host's memory (its second fallback body), so the stubs carry the memo
+	// code here.
+	if sizes["bt_find"].BTMemoBytes == 0 {
+		t.Fatal("the merged build keeps no Backtracking memo: the stubs' memo code would go unchecked")
+	}
+
+	// SETS ONLY: a stub with no single-pattern part carries the block type and
+	// the notes helper itself, which the single-pattern part otherwise brings.
+	setsOnly := cfg
+	setsOnly.Regexps = nil
+	for _, re := range cfg.Regexps {
+		re.MatchFunc, re.FindFunc, re.GroupsFunc = "", "", ""
+		setsOnly.Regexps = append(setsOnly.Regexps, re)
+	}
+	setsOnly.Sets = cfg.Sets[:2]
+	// Sets only, with no block that keeps notes: btsplit's Backtracking
+	// member keeps a budget and a memo, so the stub names the block type and
+	// calls no notes helper — the Rust preamble once went missing exactly
+	// there.
+	setsOnlyBT := setsOnly
+	setsOnlyBT.Sets = cfg.Sets[2:3]
+	// Sets only, and the only region a program sweep's: no set is
+	// cache-eligible, so nothing else would pull in the C header's allocator
+	// machinery and rx_sqrt_, or the Go stub's `math` — both once went missing
+	// exactly there.
+	sweepOnly := setsOnly
+	sweepOnly.Sets = nil
+	for _, sc := range cfg.Sets {
+		if strings.HasPrefix(sc.Name, "sweep_only") {
+			sweepOnly.Sets = append(sweepOnly.Sets, sc)
+		}
+	}
+
+	for _, variant := range []struct {
+		suffix string
+		cfg    config.BuildConfig
+	}{{"", cfg}, {"-sets-only", setsOnly}, {"-sets-only-bt", setsOnlyBT}, {"-sweep-only", sweepOnly}} {
+		for _, lang := range []struct {
+			name     string
+			file     string
+			write    func(config.BuildConfig, string) error
+			compiler string // "" means the language needs no external tool beyond Go
+			compile  func(t *testing.T, dir, path string)
+		}{
+			{"rust", "stubs.rs", rustStub, "rustc", compileRust},
+			{"go", "stubs.go", goStub, "", compileGo},
+			{"c", "stubs.h", cStub, "cc", compileCModule},
+			{"js", "stubs.js", jsStub, "node", checkJS},
+			{"as", "stubs.ts", asStub, "asc", compileAS},
+			{"ts", "stubs.ts", tsStub, "tsc", compileTS},
+		} {
+			t.Run(lang.name+variant.suffix, func(t *testing.T) {
+				if lang.compiler != "" {
+					if _, err := exec.LookPath(lang.compiler); err != nil {
+						t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
+					}
 				}
-			}
-			dir := t.TempDir()
-			path := filepath.Join(dir, lang.file)
-			cfg := cfg
-			cfg.StubFile = lang.file
-			if err := lang.write(cfg, path); err != nil {
-				t.Fatalf("generate %s stub: %v", lang.name, err)
-			}
-			lang.compile(t, dir, path)
-		})
+				dir := t.TempDir()
+				path := filepath.Join(dir, lang.file)
+				cfg := variant.cfg
+				cfg.StubFile = lang.file
+				if err := lang.write(cfg, path); err != nil {
+					t.Fatalf("generate %s stub: %v", lang.name, err)
+				}
+				lang.compile(t, dir, path)
+			})
+		}
 	}
 
 	// The COMPONENT C stub, compiled the same way. It is a different generator
@@ -143,8 +283,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		ccfg.Output = "" // a component's merge target, not its memory mode
 		// `hints: [batch-find]` has no component form and is refused at load,
 		// so the overlapping set keeps its shape without it.
-		ccfg.Sets = append([]config.SetConfig(nil), cfg.Sets...)
-		ccfg.Sets[1].Hints = nil
+		ccfg.Sets = withoutBatchHint(cfg.Sets)
 		dir := t.TempDir()
 		path := filepath.Join(dir, "stubs.h")
 		ccfg.StubFile = "stubs.h"
@@ -171,8 +310,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		rcfg.WitPackage = "demo"
 		rcfg.WasmFile = "demo.wasm"
 		rcfg.Output = ""
-		rcfg.Sets = append([]config.SetConfig(nil), cfg.Sets...)
-		rcfg.Sets[1].Hints = nil // batching has no component form
+		rcfg.Sets = withoutBatchHint(cfg.Sets) // batching has no component form
 		dir := t.TempDir()
 		if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
 			t.Fatal(err)
@@ -251,6 +389,18 @@ func compileGo(t *testing.T, dir, _ string) {
 	write("go.mod", "module generatedstub\n\ngo 1.23\n")
 	write("main.go", "//go:build wasip1\n\npackage main\n\nfunc main() {}\n")
 	run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "./...")
+}
+
+// withoutBatchHint copies sets with every set's hints cleared: `hints:
+// [batch-find]` has no component form. Every set's, not one picked by index:
+// an index went stale once a set was inserted before the batching one, and
+// then cleared nothing.
+func withoutBatchHint(sets []config.SetConfig) []config.SetConfig {
+	out := append([]config.SetConfig(nil), sets...)
+	for i := range out {
+		out[i].Hints = nil
+	}
+	return out
 }
 
 // compileC syntax-checks the .c, which includes the .h the generator wrote

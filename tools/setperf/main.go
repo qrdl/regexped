@@ -57,6 +57,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -876,13 +877,28 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	if forcedFrontend == "" {
-		w, _, err := compile.CompileFile(cfg, "")
-		return w, err
+	w, _, diags, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
+	if err == nil {
+		for _, d := range diags {
+			if len(d.SearchBlocks) > 0 {
+				sizes := make([]searchblock.Size, len(d.SearchBlocks))
+				for k, n := range d.SearchBlocks {
+					sizes[k].Notes = n
+					if d.SearchBlocksBTMemo != nil {
+						sizes[k].Memo = d.SearchBlocksBTMemo[k]
+					}
+				}
+				caseBlocks[string(w)] = sizes
+			}
+		}
 	}
-	w, _, _, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
 	return w, err
 }
+
+// caseBlocks is, per compiled module, its set's split member search blocks
+// (compile.SetDiag.SearchBlocks): the instance hands them to `find` as a
+// generated iterator does, so the rows measure what a stub's caller pays.
+var caseBlocks = map[string][]searchblock.Size{}
 
 // compileSetOptions is the ONE place the set-compile overrides are built. The
 // module compileCase emits and the shape overlapSetConfigFor's callers inspect
@@ -926,6 +942,10 @@ type rxInstance struct {
 	// neither engine work nor the wasmtime crossing — pure harness cost, and
 	// it inflated every one of our rows.
 	fnCache map[capability]*wasmtime.Func
+
+	// The set's split member search blocks and the region for their notes
+	// and memos (internal/searchblock); nil for none.
+	blocks *searchblock.Blocks
 }
 
 // fnFor resolves a capability's export once and caches it.
@@ -979,7 +999,8 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 	// gate pointer (internal/abi). It carries the gate array and the answer
 	// cache, so the harness builds one per instance and hands out its address.
 	scratchPtr := gatePtr + npat*4
-	bitmapPt := scratchPtr + abi.FindScratchBytes
+	// Room for the descriptor's fifth field (abi.FindScratchMagicBlocks).
+	bitmapPt := scratchPtr + abi.FindScratchBlocksBytes
 	// The batch buffer sits above the bitmap, 4 KB clear of it.
 	batchPtr := bitmapPt + int32(npat)/8 + 4096
 	cachePtr := (batchPtr + int32(batchCap)*12 + 4096 + 7) &^ 7
@@ -997,6 +1018,10 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		cacheLen, cacheStride = int32(bytes), int32(k)
 	}
 	top := int64(cachePtr) + int64(cacheLen) + 4096
+	blocks := searchblock.Layout(top, caseBlocks[string(wasm)], len(c.input), searchblock.Fresh)
+	if blocks != nil {
+		top = blocks.End() + 4096
+	}
 	needed := uint64((top + pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -1020,6 +1045,7 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 		batchPtr: batchPtr,
 		cachePtr: cachePtr, cacheLen: cacheLen, cacheStride: cacheStride,
 		npat: npat, inLen: int32(len(c.input)),
+		blocks: blocks,
 	}, nil
 }
 
@@ -1030,7 +1056,11 @@ func newRxInstance(engine *wasmtime.Engine, wasm []byte, c setCase, withFuel boo
 // iterator does: it is the one policy whose drive the backward sweep can
 // answer. A gated drive is handed 0, 0 and walks, so those rows keep measuring
 // what they measured before the cache existed.
-func (r *rxInstance) writeScratch(cache bool) {
+//
+// batch: the drive goes through the batch entry, whose blocks get their
+// notes up front (searchblock.BeginBatch), as a generated batching iterator
+// gives them.
+func (r *rxInstance) writeScratch(cache, batch bool) {
 	buf := r.mem.UnsafeData(r.store)
 	for i := int32(0); i < r.npat*4; i++ {
 		buf[r.gatePtr+i] = 0
@@ -1046,6 +1076,26 @@ func (r *rxInstance) writeScratch(cache bool) {
 		binary.LittleEndian.PutUint32(buf[cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
 	}
 	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
+	begin := r.blocks.Begin
+	if batch {
+		begin = r.blocks.BeginBatch
+	}
+	if err := begin(r.data, int(r.inLen)); err != nil {
+		panic(err) // the region is laid out for this input: a harness bug
+	}
+	r.blocks.Describe(buf, r.scratchPtr)
+	runtime.KeepAlive(r.store)
+}
+
+func (r *rxInstance) data() []byte { return r.mem.UnsafeData(r.store) }
+
+// giveNotes runs after a find call, as a generated iterator does: a split
+// member whose search armed during it gets its notes, one whose Backtracking
+// budget tripped its memo.
+func (r *rxInstance) giveNotes() {
+	if err := r.blocks.After(r.data); err != nil {
+		panic(err) // the region is laid out for this input: a harness bug
+	}
 	runtime.KeepAlive(r.store)
 }
 
@@ -1175,7 +1225,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 	// This is what the `find(overlapping)` rows of the input-length family
 	// measure, so it changes what those rows mean: before it they were the
 	// quadratic walk with a cache the body could not read.
-	r.writeScratch(!gated)
+	r.writeScratch(!gated, false)
 	from := int32(0)
 	calls := 0
 	for {
@@ -1189,6 +1239,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		if res.(int32) <= 0 {
 			return calls, nil
 		}
+		r.giveNotes()
 		buf := r.mem.UnsafeData(r.store)
 		start := int32(binary.LittleEndian.Uint32(buf[int(r.outPtr)+4:]))
 		runtime.KeepAlive(r.store)
@@ -1204,7 +1255,7 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 // stop, and reading the tuples would add harness work to a timed loop that is
 // meant to measure the engine.
 func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error) {
-	r.writeScratch(!gated)
+	r.writeScratch(!gated, true)
 	cursor := int64(0)
 	calls := 0
 	for {
@@ -1219,6 +1270,7 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		if uint32(packed>>32) == 0xFFFFFFFF {
 			return calls, nil
 		}
+		r.giveNotes()
 		// A cursor that does not advance is a hang, not a slow row, and this
 		// loop has no other bound.
 		if packed == cursor {
@@ -2477,7 +2529,7 @@ func rxCollectFind(r *rxInstance, cache bool) []setTuple {
 		fmt.Fprintln(os.Stderr, "HARNESS ERROR: our module has no export \"cap_find\"")
 		os.Exit(1)
 	}
-	r.writeScratch(cache)
+	r.writeScratch(cache, false)
 	var out []setTuple
 	from := int32(0)
 	for {
@@ -2489,6 +2541,7 @@ func rxCollectFind(r *rxInstance, cache bool) []setTuple {
 		if n <= 0 {
 			return out
 		}
+		r.giveNotes()
 		buf := r.mem.UnsafeData(r.store)
 		for i := int32(0); i < n && i < r.npat; i++ {
 			base := int(r.outPtr) + int(i)*12
@@ -2519,7 +2572,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 	// (compile/set_batch.go). The sweep is exercised by the overlapping
 	// module verifyOverlapping builds below, which is what this comment used
 	// to claim for itself.
-	r.writeScratch(true)
+	r.writeScratch(true, true)
 	countMask := int64(1)<<uint(config.SetCursorCountBits(int(r.npat))) - 1
 	var out []setTuple
 	cursor := int64(0)
@@ -2543,6 +2596,7 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 		if uint32(packed>>32) == 0xFFFFFFFF || n == 0 {
 			return out
 		}
+		r.giveNotes()
 		cursor = packed
 	}
 }

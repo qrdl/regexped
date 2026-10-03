@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -903,7 +904,7 @@ func TestGenGoSetSection(t *testing.T) {
 
 func TestGenJSSetSection(t *testing.T) {
 	cfg := setTestCfg()
-	out := genJSSetSection(cfg)
+	out := genJSSetSection(cfg, searchSizesFor(cfg))
 	required := []string{
 		"set_find",
 		"probe_any",
@@ -928,7 +929,7 @@ func TestGenJSSetSection(t *testing.T) {
 
 func TestGenTSSetSection(t *testing.T) {
 	cfg := setTestCfg()
-	out := genTSSetSection(cfg)
+	out := genTSSetSection(cfg, searchSizesFor(cfg))
 	required := []string{
 		"SetMatch",
 		"set_find",
@@ -1016,10 +1017,10 @@ func TestSetSection_NoSets_Empty(t *testing.T) {
 	if s := genGoSetSection(cfg, "m"); s != "" {
 		t.Errorf("genGoSetSection with no sets: got non-empty %q", s)
 	}
-	if s := genJSSetSection(cfg); s != "" {
+	if s := genJSSetSection(cfg, searchSizesFor(cfg)); s != "" {
 		t.Errorf("genJSSetSection with no sets: got non-empty %q", s)
 	}
-	if s := genTSSetSection(cfg); s != "" {
+	if s := genTSSetSection(cfg, searchSizesFor(cfg)); s != "" {
 		t.Errorf("genTSSetSection with no sets: got non-empty %q", s)
 	}
 	if s := genASSetSection(cfg); s != "" {
@@ -1147,8 +1148,8 @@ func TestSetAllDecodesOverIDSpace(t *testing.T) {
 	for _, lang := range []struct{ name, out, count, idSpace string }{
 		{"rust", genRustSetInner(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
 		{"go", genGoSetSection(cfg, "mymod"), "ScannerPatternCount", "ScannerIDSpace"},
-		{"js", genJSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
-		{"ts", genTSSetSection(cfg), "scannerPatternCount", "scannerIdSpace"},
+		{"js", genJSSetSection(cfg, searchSizesFor(cfg)), "scannerPatternCount", "scannerIdSpace"},
+		{"ts", genTSSetSection(cfg, searchSizesFor(cfg)), "scannerPatternCount", "scannerIdSpace"},
 		{"as", genASSetSection(cfg), "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
 		{"c", hStub + cStub, "SCANNER_PATTERN_COUNT", "SCANNER_ID_SPACE"},
 	} {
@@ -1217,8 +1218,8 @@ func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 	for _, lang := range []struct{ name, out string }{
 		{"rust", genRustSetInner(cfg)},
 		{"go", genGoSetSection(cfg, "mymod")},
-		{"js", genJSSetSection(cfg)},
-		{"ts", genTSSetSection(cfg)},
+		{"js", genJSSetSection(cfg, searchSizesFor(cfg))},
+		{"ts", genTSSetSection(cfg, searchSizesFor(cfg))},
 		{"as", genASSetSection(cfg)},
 		{"c", hStub + cStub},
 	} {
@@ -1271,7 +1272,7 @@ func TestSetBatchFindIsJSTSOnly(t *testing.T) {
 			}
 		}
 	}
-	for lang, out := range map[string]string{"js": genJSSetSection(cfg), "ts": genTSSetSection(cfg)} {
+	for lang, out := range map[string]string{"js": genJSSetSection(cfg, searchSizesFor(cfg)), "ts": genTSSetSection(cfg, searchSizesFor(cfg))} {
 		for _, want := range []string{"batchSize", "scannerBatchMaxSize", "set_find_batch"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s set stub: missing %q", lang, want)
@@ -1292,8 +1293,8 @@ func TestSetBatchSizeAbsentWithoutHint(t *testing.T) {
 	outs := map[string]string{
 		"rust": genRustSetInner(cfg),
 		"go":   genGoSetSection(cfg, "mymod"),
-		"js":   genJSSetSection(cfg),
-		"ts":   genTSSetSection(cfg),
+		"js":   genJSSetSection(cfg, searchSizesFor(cfg)),
+		"ts":   genTSSetSection(cfg, searchSizesFor(cfg)),
 		"as":   genASSetSection(cfg),
 	}
 	for lang, out := range outs {
@@ -1753,6 +1754,53 @@ func TestABISpellersHandleEveryParam(t *testing.T) {
 				seen[got] = p
 			}
 		})
+	}
+}
+
+// TestSearchSplicersAssertTheirAnchors: each search-block splicer edits a
+// generator's output at fixed anchors and refuses, loudly, source that lacks
+// one — which is how a change to the generator it edits shows up, rather than
+// as a stub that silently hands no block over.
+func TestSearchSplicersAssertTheirAnchors(t *testing.T) {
+	blk := compile.SearchSize{NotesBytes: 1}
+	blocks := []compile.SearchSize{blk}
+	for _, c := range []struct {
+		name string
+		f    func()
+	}{
+		{"js", func() { jsWithSearch("nothing", "f", blk, false, false, 0) }},
+		{"rust", func() { rustWithSearch("nothing", "f", "FIter", blk, false) }},
+		{"go", func() { goWithSearch("nothing", "f", "ffi_f", blk, false) }},
+		{"c", func() { cWithSearch("nothing", "nothing", "f", "f_iter_t", "ffi_f", blk, false) }},
+		{"as", func() { asWithSearch("nothing", "f", "ffi_f", blk, false) }},
+		{"js set, no generator", func() { jsSetWithBlocks("nothing", "f", blocks, false) }},
+		{"js set, unterminated generator", func() { jsSetWithBlocks("export function* f(", "f", blocks, false) }},
+		{"js set, no descriptor", func() { jsSetWithBlocks("export function* f(\n}\n", "f", blocks, false) }},
+		{"js set, no call", func() { jsSetWithBlocks("export function* f(x, scratchBase, 4).set([1]);\n}\n", "f", blocks, false) }},
+		{"go set, no iterator", func() { goSetWithBlocks("nothing", "f", blocks) }},
+		{"go set, no scratch", func() { goSetWithBlocks("type fIter struct {\n}\n", "f", blocks) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Error("source without the anchors was spliced instead of refused")
+				}
+			}()
+			c.f()
+		})
+	}
+	// With no block there is nothing to splice.
+	if p := jsSearch("f", compile.SearchSize{}, "0", false); p != (jsSearchParts{}) {
+		t.Errorf("jsSearch without a block = %+v, want nothing", p)
+	}
+}
+
+// TestCIdentSafe: the C stub names its search setter after the import module
+// (`rx_search_set_<module>`), and a module name may carry bytes no C
+// identifier can.
+func TestCIdentSafe(t *testing.T) {
+	if got := cIdentSafe("my-mod.v2_X9"); got != "my_mod_v2_X9" {
+		t.Errorf("cIdentSafe = %q, want my_mod_v2_X9", got)
 	}
 }
 

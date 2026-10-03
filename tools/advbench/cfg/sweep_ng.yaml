@@ -1,0 +1,10 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo\w+'
+  - pattern: 'a[a-z]*?z'
+sets:
+  - name: s
+    find: sfind
+    overlapping: true
+    patterns: all

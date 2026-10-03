@@ -12,7 +12,7 @@ GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go g
 # `docker` MUST stay in this list: it is now a directory as well as a target, so
 # without it make compares docker/'s mtime against regexped's and reports the
 # image "up to date" rather than building it.
-.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross byteident examples clean unittest lint fmt docker
+.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross adversary byteident examples clean unittest lint fmt docker
 
 build: regexped
 
@@ -91,6 +91,14 @@ setperf-check:
 # quote when wall-clock would only report this machine's placement noise.
 setperf-fuel-cross:
 	$(MAKE) -C tools/setperf fuel-cross
+
+# Adversarial drives: every input shape known to make a drive quadratic, and
+# the drives already measured linear. Fails when a row expected linear grows
+# faster than x2.5 per input doubling; known quadratic rows are reported. Fuel
+# is exact, so the verdict does not depend on machine load. See
+# tools/advbench/rows.go.
+adversary:
+	$(MAKE) -C tools/advbench adversary
 
 # Byte-identical regression net for the single-pattern paths: one fixture
 # per code path, compared byte for byte —

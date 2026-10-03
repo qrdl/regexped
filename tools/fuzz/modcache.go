@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/qrdl/regexped/internal/searchblock"
 )
 
 // modCacheSize is how many compiled modules one worker process keeps.
@@ -37,9 +39,10 @@ const modCacheSize = 16
 // instantiate copies what it needs — so sharing is safe, and a copy per hit
 // would give back most of what the cache saves.
 type modCacheEntry struct {
-	key  string
-	wasm []byte
-	err  error
+	key   string
+	wasm  []byte
+	sizes []searchblock.Size // the find export's search blocks, when recorded
+	err   error
 }
 
 var (
@@ -54,6 +57,17 @@ var (
 // the expensive ones are exactly the resource ceilings a slow pattern hits, so
 // not caching them would leave the worst case uncached.
 func cachedCompile(key string, build func() ([]byte, error)) ([]byte, error) {
+	wasm, _, err := cachedCompileSized(key, func() ([]byte, []searchblock.Size, error) {
+		w, err := build()
+		return w, nil, err
+	})
+	return wasm, err
+}
+
+// cachedCompileSized is cachedCompile for a compile that also reports what its
+// find export's searches keep (searchblock.Of), which a drive handing the
+// per-search block over needs.
+func cachedCompileSized(key string, build func() ([]byte, []searchblock.Size, error)) ([]byte, []searchblock.Size, error) {
 	modCacheMu.Lock()
 	if modCacheIdx == nil {
 		modCacheLRU, modCacheIdx = list.New(), map[string]*list.Element{}
@@ -62,28 +76,28 @@ func cachedCompile(key string, build func() ([]byte, error)) ([]byte, error) {
 		modCacheLRU.MoveToFront(el)
 		e := el.Value.(*modCacheEntry)
 		modCacheMu.Unlock()
-		return e.wasm, e.err
+		return e.wasm, e.sizes, e.err
 	}
 	modCacheMu.Unlock()
 
 	// Compiled OUTSIDE the lock: a compile can take seconds, and holding the
 	// lock across it would serialise workers that share a process.
-	wasm, err := build()
+	wasm, sizes, err := build()
 
 	modCacheMu.Lock()
 	defer modCacheMu.Unlock()
 	if el, ok := modCacheIdx[key]; ok { // another goroutine won the race
 		modCacheLRU.MoveToFront(el)
 		e := el.Value.(*modCacheEntry)
-		return e.wasm, e.err
+		return e.wasm, e.sizes, e.err
 	}
-	modCacheIdx[key] = modCacheLRU.PushFront(&modCacheEntry{key: key, wasm: wasm, err: err})
+	modCacheIdx[key] = modCacheLRU.PushFront(&modCacheEntry{key: key, wasm: wasm, sizes: sizes, err: err})
 	for modCacheLRU.Len() > modCacheSize {
 		oldest := modCacheLRU.Back()
 		modCacheLRU.Remove(oldest)
 		delete(modCacheIdx, oldest.Value.(*modCacheEntry).key)
 	}
-	return wasm, err
+	return wasm, sizes, err
 }
 
 // setCacheEntry is a compiled SET plus the per-set fact its callers need

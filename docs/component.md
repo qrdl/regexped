@@ -80,6 +80,17 @@ generated C stub keeps the handle inside the iterator struct and adds one
 obligation, `<func>_free`; see [c-api.md](c-api.md). A consumer binding the WIT
 DIRECTLY, with `bindgen!` or `jco`, calls the constructor and `next` itself.
 
+A resource of a pattern that can re-read input (such as `a*b|a`, whose every
+call reads to the end before settling for a short match) also keeps a 128-byte
+**search block** in its representation, hands it to the core module before each
+`next`, and — once the module reports that the scan has started re-reading —
+allocates the scan's notes through the component's own allocator, detached from
+the call like the input block, so `[dtor]` frees them. That keeps a scan over any
+input linear (see [wasm.md](wasm.md), "The search block"); the consumer's API
+does not change. A Backtracking pattern's resource uses the same block for its
+work budget, which then lasts the scan, and allocates the fallback's memo the same
+way once the budget runs out.
+
 ### The error case is not "no match"
 
 `error-code` is the only thing that distinguishes "there is no match" from
@@ -288,10 +299,9 @@ reads the host's memory directly. `wac plug` produces a component holding two
 instances with two memories, and every call crosses the canonical ABI and copies
 its input. Same command, different cost model — see [Costs](#costs).
 
-**Several regexp components in one call** works, with one asymmetry against the
-module format. Regexp *modules* may all share an `import_module` name, because
-nothing imports it — it is a label with no consumers. Regexp *components* are
-matched by their interface name, `regexped:<wit_package>/matcher`, which the
+**Several regexp components in one call** works, and needs a distinct name per
+component, as the module format needs a distinct `import_module` per module.
+Regexp *components* are matched by their interface name, `regexped:<wit_package>/matcher`, which the
 socket genuinely imports, so two components built from configs sharing a
 `wit_package` export the same interface and `wac` cannot tell which should
 satisfy the import. **Composing several therefore requires distinct

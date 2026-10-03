@@ -120,10 +120,8 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 		if ast == nil {
 			return nil
 		}
-		pr, err := syntax.Compile(ast.Simplify())
-		if err != nil {
-			return nil
-		}
+		// syntax.Compile never returns a non-nil error (see its stdlib source).
+		pr, _ := syntax.Compile(ast.Simplify())
 		progs = append(progs, pr)
 	}
 

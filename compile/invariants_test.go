@@ -480,12 +480,11 @@ func TestSetComponentCacheGeometry(t *testing.T) {
 	}
 }
 
-// TestOverlapSweepGateMatchesTheRowMask pins the sweep's pattern-count gate to
-// the width of the row mask the checkpoint bodies write. That mask is an i32
-// (`1 << k`), so a bucket of 33..64 patterns would drop every pattern k >= 32
-// from every row, silently. No config reaches it today — the packer caps a
-// dense bucket at bucketMaskBits and a larger one goes sparse, which the sweep
-// refuses — so the gate is driven with a synthetic bucket.
+// The row mask is as wide as the sweep, but an automaton's u64 accept masks
+// are not: past 64 patterns a sweep must come from the wide construction,
+// whose per-state lists the compile-time readers use. A narrow automaton over
+// more is refused — it would drop its high patterns from every row, silently.
+// Up to 64 any width is admitted: the row grows to an i64 mask past 32.
 func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 	mk := func(n int) *compiledSet {
 		pats := make([]*PatternInfo, n)
@@ -501,20 +500,43 @@ func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 			patternIDs: [][]int{make([]int, n)},
 		}
 	}
-	if mk(bucketMaskBits).sweepSrc() == nil {
-		t.Fatalf("a %d-pattern bucket was refused: the synthetic bucket no longer "+
-			"passes the other gates, so this test proves nothing", bucketMaskBits)
+	for _, n := range []int{bucketMaskBits, bucketMaskBits + 1, 64} {
+		if mk(n).sweepSrc() == nil {
+			t.Errorf("a %d-pattern bucket was refused: the row mask holds it", n)
+		}
 	}
-	if mk(bucketMaskBits+1).sweepSrc() != nil {
-		t.Fatalf("a %d-pattern bucket was admitted to the sweep, whose row mask has %d bits",
-			bucketMaskBits+1, bucketMaskBits)
+	if mk(65).sweepSrc() != nil {
+		t.Errorf("a 65-pattern sweep over u64 accept masks was admitted")
 	}
-	// The emitter refuses on its own too, so a gate that drifts later cannot
-	// reach the i32 mask without a loud failure: a resolved sweep past the gate.
-	cs := mk(bucketMaskBits)
-	cs.sweepDone = true
-	cs.sweep = &overlapSweep{dp: cs.buckets[0].dp, ids: make([]int, bucketMaskBits+1)}
-	recoverContains(t, "bucketMaskBits", func() { newCkptEmit(cs, 0, 0) })
+	// The emitter builds a wide row's mask an i64 word at a time.
+	cs := mk(bucketMaskBits + 1)
+	if e := newCkptEmit(cs, 0, 0); !e.maskWide() {
+		t.Errorf("a %d-pattern sweep's row mask is not wide", bucketMaskBits+1)
+	}
+}
+
+// TestSearchPiecesWithoutABlock: the per-search pieces are asked
+// unconditionally by their callers, and must answer "none" — leave the body
+// as it is, hand back nil — when the pattern or the member keeps no block,
+// rather than a zero-sized version of something.
+func TestSearchPiecesWithoutABlock(t *testing.T) {
+	if g := (&notesPlan{}).resumeGlobal(); g != nil {
+		t.Errorf("a plan with no notes has a resume global (%d)", *g)
+	}
+	if r := handoverNotesReq(8, CompileOptions{}); r != nil {
+		t.Errorf("a handover with no global allocator asked for notes: %+v", r)
+	}
+	body := []byte{0x01}
+	if b := (&notesCtx{copy: notesOrdinary}).emitRecord(body); len(b) != 1 {
+		t.Errorf("the ordinary copy recorded notes: % x", b)
+	}
+	cs := &compiledSet{split: []splitMember{{}}}
+	if b := cs.emitMemberBlock(body, 0, 0); len(b) != 1 {
+		t.Errorf("a member with no block was handed one: % x", b)
+	}
+	if b := cs.emitRestoreSearch(body, 0, 0); len(b) != 1 {
+		t.Errorf("a member with no block restored the search global: % x", b)
+	}
 }
 
 // Unit coverage for emitters and helpers whose branches the end-to-end paths do
@@ -555,9 +577,9 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil)
 
 	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
 		if len(body) == 0 {
@@ -596,12 +618,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -1053,7 +1075,7 @@ func TestFindFromWrapperBodyAllModes(t *testing.T) {
 
 func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
 	{
-		body := buildFindFromWrapperBody(7, mode, minLen)
+		body := buildFindFromWrapperBody(7, mode, minLen, nil)
 		if len(body) == 0 {
 			t.Fatalf("mode %v: emitted nothing", mode)
 		}
@@ -1089,7 +1111,7 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 			t.Errorf("panic message %q does not name the offending mode", msg)
 		}
 	}()
-	buildFindFromWrapperBody(7, findFromMode(0), 0)
+	buildFindFromWrapperBody(7, findFromMode(0), 0, nil)
 }
 
 // TestEmitFindCallFromPos covers the shared call sequence the BATCH wrappers
@@ -1388,7 +1410,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			(&CompileOptions{}).btScratch()
 		}},
 		{"a drive prologue into something that is not one code entry", "not one code entry", func(*testing.T) {
-			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{})
+			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{}, nil)
 		}},
 		{"batch groups over an anchored capture body", "batch groups", func(*testing.T) {
 			buildBatchLitChainGroupsWrapperBody(0, 1, findFromMode(0))
@@ -1446,7 +1468,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 				appendStartAnywhereBodies(nil, 0)
 		}},
 		{"a set member's Backtracking body in window mode", "window mode", func(*testing.T) {
-			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{})
+			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{}, nil)
 		}},
 		{"Backtracking regions without globals", "global allocator", func(t *testing.T) {
 			infos, _, _ := analyzed(t, `a+b`)

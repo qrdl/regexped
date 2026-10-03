@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -10,9 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // EVERY generated stub reserves an answer cache for a cache-eligible
@@ -693,7 +696,7 @@ func TestGeneratedSizingMatchesConfig(t *testing.T) {
 	t.Run("as", func(t *testing.T) {
 		need(t, "asc", "node")
 		dir, src := gen(t, asStub, "stubs.ts")
-		snip := sizingSnippet(t, src, "const m: u64 = <u64>input.byteLength + 1;", "const bytes: u64 = ")
+		snip := sizingSnippet(t, src, "const m: u64 = <u64>input.byteLength + 1;", "let bytes: u64 = ")
 		snip = strings.ReplaceAll(snip, "input.byteLength", "len")
 		prog := "export function sizeK(len: i32): u64 {\n" + snip + "    return k;\n}\n" +
 			"export function sizeBytes(len: i32): u64 {\n" + snip + "    return bytes;\n}\n"
@@ -749,6 +752,203 @@ func TestGeneratedSizingMatchesConfig(t *testing.T) {
 			t.Fatalf("run: %v", err)
 		}
 		checkSizingOutput(t, out, lens, cells, pats)
+	})
+}
+
+// TestGeneratedSweepSizingMatchesConfig is TestGeneratedSizingMatchesConfig for
+// a set with a PROGRAM SWEEP: the region is the kept members' cache and, past
+// it 8-aligned, the sweep's own checkpointed part, which every stub spells for
+// itself. A stub that reserved too little would not be unsafe — the module
+// checks the region's length — but its drive would never sweep, and the split
+// member would walk quadratically with nothing to say so.
+func TestGeneratedSweepSizingMatchesConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs five probes per set; skipped in -short")
+	}
+	// A kept member the cache serves, and one it does not: the region is then
+	// the bare header before the sweep's part.
+	for _, kept := range []struct {
+		pat      string
+		eligible bool
+	}{{`foo\w+`, true}, {`abc`, false}} {
+		t.Run(kept.pat, func(t *testing.T) { sweepSizingMatchesConfig(t, kept.pat, kept.eligible) })
+	}
+}
+
+func sweepSizingMatchesConfig(t *testing.T, keptPat string, eligible bool) {
+	cfg := config.BuildConfig{
+		Output:       "merged.wasm",
+		ImportModule: "demo",
+		Regexps: []config.RegexEntry{
+			{Name: "kept", Pattern: keptPat},
+			{Name: "ng", Pattern: `a[a-z]*?z`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "sw", Find: "scan_sw",
+			Patterns: config.PatternSelector{All: true}, Overlapping: true,
+		}},
+	}
+	sh := overlapCacheShapeFor(cfg.Sets[0], cfg)
+	if sh.Eligible != eligible || sh.SweepCells == 0 {
+		t.Fatalf("the fixture set's shape moved (want eligible=%v and a program sweep): %+v", eligible, sh)
+	}
+	lens := sizingLengths(sh.Cells, sh.Patterns)
+	for m := 1; ; m++ { // the sweep part's own single-block crossover
+		if config.SetOverlapCheckpointHeaderBytes+(sh.SweepCells*4+4)+4+m*sh.SweepRow > config.SetOverlapCacheMaxBytes {
+			for d := -10; d <= 10; d++ {
+				lens = append(lens, m-1+d)
+			}
+			break
+		}
+	}
+	check := func(t *testing.T, out []byte) {
+		t.Helper()
+		got := strings.Fields(string(out))
+		if len(got) != len(lens) {
+			t.Fatalf("the probe printed %d lines for %d lengths:\n%s", len(got), len(lens), out)
+		}
+		for i, n := range lens {
+			bytes, k := sh.Sizing(n)
+			if want := fmt.Sprintf("%d,%d", k, bytes); got[i] != want {
+				t.Fatalf("len=%d: the generated arithmetic computes %s, Sizing computes %s", n, got[i], want)
+			}
+		}
+	}
+	gen := func(t *testing.T, write func(config.BuildConfig, string) error, file string) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, file)
+		c := cfg
+		c.StubFile = file
+		if err := write(c, path); err != nil {
+			t.Fatalf("generate: %v", err)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dir, string(raw)
+	}
+	need := func(t *testing.T, tools ...string) {
+		t.Helper()
+		for _, tool := range tools {
+			if _, err := exec.LookPath(tool); err != nil {
+				t.Skipf("%s not on PATH; this spelling is unchecked here", tool)
+			}
+		}
+	}
+	runOut := func(t *testing.T, dir, name string, args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return out
+	}
+
+	t.Run("rust", func(t *testing.T) {
+		need(t, "rustc")
+		dir, src := gen(t, rustStub, "stubs.rs")
+		snip := sizingSnippet(t, src, "let m = (input.len() + 1) as u64;", "if sb <= 67108864")
+		snip = strings.ReplaceAll(snip, "input.len()", "len")
+		prog := "fn size(len: usize) -> (u64, u64) {\n" + snip + "    };\n    let _ = fits;\n    (k, bytes)\n}\n" +
+			"fn main() {\n    for &len in [" + joinInts(lens) + "usize].iter() {\n" +
+			"        let (k, b) = size(len);\n        println!(\"{},{}\", k, b);\n    }\n}\n"
+		if err := os.WriteFile(filepath.Join(dir, "size.rs"), []byte(prog), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, nil, "rustc", "--edition=2021", "-O", "-o", "size", "size.rs")
+		check(t, runOut(t, dir, filepath.Join(dir, "size")))
+	})
+
+	t.Run("go", func(t *testing.T) {
+		need(t, "go", "wasmtime")
+		dir, src := gen(t, goStub, "stubs.go")
+		snip := sizingSnippet(t, src, "m := uint64(len(iter.input)) + 1", "n = (n+7)&^7 + sb")
+		snip = strings.ReplaceAll(snip, "len(iter.input)", "L")
+		prog := "//go:build wasip1\n\npackage main\n\nimport (\n\t\"fmt\"\n\t\"math\"\n)\n\n" +
+			"func size(L int) (uint64, uint64) {\n" + snip + "\t}\n\treturn k, n\n\t}\n\treturn k, 0\n}\n\n" +
+			"func main() {\n\tfor _, L := range []int{" + joinInts(lens) + "} {\n" +
+			"\t\tk, b := size(L)\n\t\tfmt.Printf(\"%d,%d\\n\", k, b)\n\t}\n}\n"
+		for name, body := range map[string]string{"main.go": prog, "go.mod": "module sizeprobe\n\ngo 1.23\n"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Remove(filepath.Join(dir, "stubs.go")); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "-o", "size.wasm", ".")
+		check(t, runOut(t, dir, "wasmtime", "size.wasm"))
+	})
+
+	t.Run("as", func(t *testing.T) {
+		need(t, "asc", "node")
+		dir, src := gen(t, asStub, "stubs.ts")
+		snip := sizingSnippet(t, src, "const m: u64 = <u64>input.byteLength + 1;", "if (sb <= 67108864)")
+		snip = strings.ReplaceAll(snip, "input.byteLength", "len") + "    }\n"
+		prog := "export function sizeK(len: i32): u64 {\n" + snip + "    return k;\n}\n" +
+			"export function sizeBytes(len: i32): u64 {\n" + snip + "    return bytes;\n}\n"
+		if err := os.WriteFile(filepath.Join(dir, "size.ts"), []byte(prog), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(dir, "stubs.ts")); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, nil, "asc", "size.ts", "--outFile", "size.wasm", "--runtime", "stub")
+		driver := "import { readFileSync } from 'node:fs';\n" +
+			"const { instance } = await WebAssembly.instantiate(readFileSync('./size.wasm'), { env: { abort() { throw new Error('abort'); } } });\n" +
+			"const out = [];\nfor (const n of [" + joinInts(lens) + "]) out.push(`${instance.exports.sizeK(n)},${instance.exports.sizeBytes(n)}`);\n" +
+			"console.log(out.join('\\n'));\n"
+		if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		check(t, runOut(t, dir, "node", "drive.mjs"))
+	})
+
+	t.Run("c", func(t *testing.T) {
+		need(t, "cc")
+		dir, hdr := gen(t, cStub, "stubs.h")
+		body, err := os.ReadFile(filepath.Join(dir, "stubs.c"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := hdr + string(body)
+		snip := sizingSnippet(t, src, "unsigned long long m = (unsigned long long)len + 1;", "if (sb <= 67108864ULL)")
+		def := regexp.MustCompile(`(?m)^#define rx_sqrt_\(x\).*$`).FindString(src)
+		if def == "" {
+			t.Fatal("the generated C stub has no rx_sqrt_ definition")
+		}
+		prog := "#include <stdio.h>\n#include <stddef.h>\n" + def + "\n" +
+			"static int size(size_t len, unsigned long long *ko, unsigned long long *bo) {\n" + snip +
+			"    }\n    *ko = k; *bo = bytes;\n    return 1;\n}\n" +
+			"static const size_t LENS[] = {" + joinInts(lens) + "};\n" +
+			"int main(void) {\n    for (size_t i = 0; i < sizeof LENS / sizeof LENS[0]; i++) {\n" +
+			"        unsigned long long k = 0, b = 0;\n        size(LENS[i], &k, &b);\n" +
+			"        printf(\"%llu,%llu\\n\", k, b);\n    }\n    return 0;\n}\n"
+		if err := os.WriteFile(filepath.Join(dir, "size.c"), []byte(prog), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, nil, "cc", "-O2", "-o", "size", "size.c", "-lm")
+		check(t, runOut(t, dir, filepath.Join(dir, "size")))
+	})
+
+	t.Run("js", func(t *testing.T) {
+		need(t, "node")
+		src, err := genJSStubFile(cfg)
+		if err != nil {
+			t.Fatalf("generate: %v", err)
+		}
+		snip := sizingSnippet(t, src, "const _cacheFor = (_len) => {", "return [_k, _sb <= 67108864")
+		dir := t.TempDir()
+		js := snip + "    };\nconst out = [];\nfor (const n of [" + joinInts(lens) + "]) { const [k, b] = _cacheFor(n); out.push(k + ',' + b); }\n" +
+			"console.log(out.join('\\n'));\n"
+		if err := os.WriteFile(filepath.Join(dir, "size.js"), []byte(js), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		check(t, runOut(t, dir, "node", "size.js"))
 	})
 }
 
@@ -990,9 +1190,7 @@ sets:
 	write("guest.c", cCacheGuest)
 	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
 	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
-	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
-		"-DRX_SET_CACHE=1", "-isystem", "inc", "-o", "guest.wasm", "guest.c", "stubs.c")
-	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	want := strconv.Itoa(overlapOracle(t, ovSizingCfg(), cacheDriveInput()))
 
 	invoke := func(export string) string {
 		t.Helper()
@@ -1008,13 +1206,415 @@ sets:
 		}
 		return strings.TrimSpace(string(out))
 	}
-	if got, want := invoke("run"), strconv.Itoa(overlapOracle(t, ovSizingCfg(), cacheDriveInput())); got != want {
-		t.Errorf("the C stub reported %s tuples, Go reports %s", got, want)
-	}
-	if got := invoke("ready"); got != "1" {
-		t.Errorf("the cache header's ready word is %s after the drive, want 1 (4294967294 = no cache allocated)", got)
+	// Twice: with the stub's own allocation, and with RX_SET_CACHE off — the
+	// -nostdlib build, whose only cache is a buffer the caller hands over with
+	// <find>_set_cache. The caller's buffer must serve in BOTH builds.
+	for _, tc := range []struct {
+		flag, ready string
+	}{
+		{"-DRX_SET_CACHE=1", "1"},
+		{"-DRX_SET_CACHE=0", "-2"}, // no cache of the stub's own (0xFFFFFFFE, printed signed)
+	} {
+		run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+			tc.flag, "-isystem", "inc", "-o", "guest.wasm", "guest.c", "stubs.c")
+		run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+		if got := invoke("run"); got != want {
+			t.Errorf("%s: the C stub reported %s tuples, Go reports %s", tc.flag, got, want)
+		}
+		if got := invoke("ready"); got != tc.ready {
+			t.Errorf("%s: the cache header's ready word is %s after the drive, want %s (-2 = no cache allocated)", tc.flag, got, tc.ready)
+		}
+		if got := invoke("caller"); got != want {
+			t.Errorf("%s: with the caller's buffer the C stub reported %s tuples, Go reports %s", tc.flag, got, want)
+		}
+		if got := invoke("caller_ready"); got != "1" {
+			t.Errorf("%s: the caller's buffer's ready word is %s after the drive, want 1", tc.flag, got)
+		}
+		if got := invoke("refusals"); got != "0" {
+			t.Errorf("%s: set_cache's refusals check reported %s, want 0", tc.flag, got)
+		}
 	}
 }
+
+// TestCStubsMergeTwoModulesWithNotes RUNS a merged program of TWO regexp
+// modules, each with a pattern that keeps per-search notes, through their
+// generated C stubs: each module is named by the import_module its config
+// gives it, and each search gets its own block — before, the two shared one
+// module name, every stub's setter call bound to one module, and the other
+// scanned without notes, quadratic on input like `aaaa…`. Also the one
+// runtime test of notes in a MERGED (two-memory) build. A shared name is
+// refused by `regexped merge`.
+func TestCStubsMergeTwoModulesWithNotes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := func(name, mod, pattern, fn string) string {
+		return "import_module: " + mod + "\nwasm_file: " + name + ".wasm\noutput: merged.wasm\nstub_file: " + name + ".h\n" +
+			"wasm_merge_path: '" + merge + "'\nregexps:\n  - name: p\n    pattern: '" + pattern + "'\n    find_func: " + fn + "\n"
+	}
+	write("a.yaml", cfg("a", "ma", "a*b|a", "ova_find"))
+	write("b.yaml", cfg("b", "mb", "x*y|x", "ovb_find"))
+	write("inc/stdlib.h", "#pragma once\n#include <stddef.h>\nvoid *malloc(size_t);\nvoid *calloc(size_t, size_t);\nvoid free(void *);\n")
+	write("guest.c", cTwoModuleGuest)
+	for _, c := range []string{"a.yaml", "b.yaml"} {
+		run(t, dir, nil, bin, "compile", "--config="+c)
+		run(t, dir, nil, bin, "generate", "--config="+c)
+	}
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=1", "-isystem", "inc", "-o", "guest.wasm", "guest.c", "a.c", "b.c")
+	run(t, dir, nil, bin, "merge", "--config=a.yaml", "--main=guest.wasm", "a.wasm", "b.wasm")
+	for _, export := range []string{"a_notes", "b_notes"} {
+		cmd := exec.Command("wasmtime", "run", "--invoke", export, "merged.wasm")
+		cmd.Dir = dir
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("wasmtime %s: %v\n%s", export, err, out)
+		}
+		// 100000: the search got its notes; 1: all 8,192 matches came back.
+		if got := strings.TrimSpace(string(out)); got != "100001" {
+			t.Errorf("%s = %s, want 100001 (notes given, every match found)", export, got)
+		}
+	}
+
+	// The same two modules under ONE name: refused.
+	write("b.yaml", cfg("b", "ma", "x*y|x", "ovb_find"))
+	run(t, dir, nil, bin, "compile", "--config=b.yaml")
+	cmd := exec.Command(bin, "merge", "--config=a.yaml", "--main=guest.wasm", "a.wasm", "b.wasm")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "both named") {
+		t.Errorf("merging two modules named \"ma\": err = %v\n%s", err, out)
+	}
+}
+
+// TestCStubMergedBacktrackingKeepsMemo: a MERGED build's Backtracking find
+// whose every call would burn its whole work budget —
+// `(?:a|b)*a(?:a|b){12}c|a` over a run of `a` — trips once, and from then on
+// its fallback keeps the memo the C stub allocated in the host's memory, so a
+// (state, position) one call ruled out stays ruled out in the next. Without
+// it each call re-walks the rest of the input: 64 KB takes over a minute, and
+// the timeout is the verdict. Also asserts the stub did allocate the memo.
+func TestCStubMergedBacktrackingKeepsMemo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("bt.yaml", "import_module: mbt\nwasm_file: bt.wasm\noutput: merged.wasm\nstub_file: bt.h\n"+
+		"wasm_merge_path: '"+merge+"'\nregexps:\n  - name: p\n    pattern: '(?:a|b)*a(?:a|b){12}c|a'\n    find_func: bt_find\n")
+	write("inc/stdlib.h", "#pragma once\n#include <stddef.h>\nvoid *malloc(size_t);\nvoid *calloc(size_t, size_t);\nvoid free(void *);\n")
+	write("guest.c", cBTMemoGuest)
+	run(t, dir, nil, bin, "compile", "--config=bt.yaml")
+	run(t, dir, nil, bin, "generate", "--config=bt.yaml")
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=1", "-isystem", "inc", "-o", "guest.wasm", "guest.c", "bt.c")
+	run(t, dir, nil, bin, "merge", "--config=bt.yaml", "--main=guest.wasm", "bt.wasm")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wasmtime", "run", "--invoke", "bt_memo", "merged.wasm")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		t.Fatal("the drive did not finish in 60 s: quadratic, the tripped search kept no memo")
+	}
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s", err, out)
+	}
+	// 100000: the stub gave the tripped search its memo; 1: every match came back.
+	if got := strings.TrimSpace(string(out)); got != "100001" {
+		t.Errorf("bt_memo = %s, want 100001 (memo given, every match found)", got)
+	}
+}
+
+// TestCStubNotesInCallersBuffer: the documented allocator-free C build
+// (-nostdlib -DRX_SET_CACHE=0, so RX_SEARCH_NOTES 0) hands its iterators and
+// scanners their notes and Backtracking memo through `<func>_set_notes`, a
+// static buffer sized by `<func>_notes_bytes`. Three drives that are quadratic
+// without them, 64 KB each: a find whose every call reads to the end (notes),
+// a Backtracking find whose every call burns its budget (memo), and a set
+// whose split member keeps notes in its own block. Each must finish within the
+// timeout, find every match, and have its block pointing INTO the caller's
+// buffer.
+// TestCSetNotesSliceOrder pins where each block's notes and memo sit among a
+// set scanner's caller-buffer slices: in block order, a block's notes before
+// its memo, a block with neither taking no slice. No compiled set has a block
+// with both today (a split member keeps notes OR a memo), which is why this is
+// checked on the helper and not through a generated stub.
+func TestCSetNotesSliceOrder(t *testing.T) {
+	blocks := []compile.SearchSize{
+		{NotesBytes: 1},
+		{},
+		{NotesBytes: 2, BTMemoBytes: 3},
+		{BTMemoBytes: 4},
+	}
+	if got, want := cSetNotesSlices(blocks), []int{1, 2, 3, 4}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("slices %v, want %v", got, want)
+	}
+	for _, c := range []struct {
+		k    int
+		memo bool
+		want int
+	}{{0, false, 0}, {2, false, 1}, {2, true, 2}, {3, true, 3}} {
+		if got := cSetNotesSlice(blocks, c.k, c.memo); got != c.want {
+			t.Errorf("block %d memo=%v: slice %d, want %d", c.k, c.memo, got, c.want)
+		}
+	}
+}
+
+func TestCStubNotesInCallersBuffer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `import_module: given
+wasm_file: re.wasm
+output: merged.wasm
+stub_file: stubs.h
+wasm_merge_path: '`+merge+`'
+regexps:
+  - name: overrun
+    pattern: 'a*b|a'
+    find_func: ov_find
+  - name: bt
+    pattern: '(?:a|b)*a(?:a|b){12}c|a'
+    find_func: bt_find
+  - name: member
+    pattern: 'foo\w+bar|foo'
+  - name: aws
+    pattern: 'AKIA[A-Z0-9]{16}'
+sets:
+  - name: s
+    patterns: [member, aws]
+    find: scan_s
+`)
+	write("guest.c", strings.NewReplacer("NOTES_W", strconv.Itoa(abi.SearchNotesOff/4),
+		"MEMO_W", strconv.Itoa(abi.SearchBTMemoOff/4)).Replace(cGivenNotesGuest))
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=0", "-o", "guest.wasm", "guest.c", "stubs.c")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	for _, export := range []string{"given_notes", "given_memo", "given_set"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		cmd := exec.CommandContext(ctx, "wasmtime", "run", "--invoke", export, "merged.wasm")
+		cmd.Dir = dir
+		out, err := cmd.Output()
+		timedOut := ctx.Err() != nil
+		cancel()
+		if timedOut {
+			t.Fatalf("%s did not finish in 60 s: quadratic, the caller's buffer was not used", export)
+		}
+		if err != nil {
+			t.Fatalf("wasmtime %s: %v\n%s", export, err, out)
+		}
+		// 100000: the block points into the caller's buffer; 1: every match.
+		if got := strings.TrimSpace(string(out)); got != "100001" {
+			t.Errorf("%s = %s, want 100001 (the caller's buffer used, every match found)", export, got)
+		}
+	}
+}
+
+// cGivenNotesGuest drives the three scans of TestCStubNotesInCallersBuffer
+// with no allocator at all, each with a static buffer handed over.
+const cGivenNotesGuest = `#include "stubs.h"
+
+#define N 65536
+static char in[N];
+static unsigned char buf[1 << 20];
+static rx_ov_find_iter_t fi;
+static rx_bt_find_iter_t bi;
+static rx_s_scanner_t sc;
+
+static unsigned word(const unsigned long long *blk, int w) { return ((const unsigned *)blk)[w]; }
+
+__attribute__((export_name("given_notes")))
+int given_notes(void) {
+    for (int i = 0; i < N; i++) in[i] = 'a';
+    if (ov_find_notes_bytes(N) == 0 || ov_find_notes_bytes(N) > sizeof buf) return -10;
+    ov_find_init(&fi, in, N, 0);
+    if (ov_find_set_notes(&fi, buf, 1) != RX_ERR_RANGE) return -11;
+    if (ov_find_set_notes(&fi, buf, sizeof buf) != 0) return -12;
+    rx_match_t m;
+    int n = 0, r;
+    while ((r = ov_find_next(&fi, &m)) == 1) n++;
+    if (r != 0) return r;
+    int used = word(fi.search, NOTES_W) == (unsigned)(size_t)buf && fi.notes == 0;
+    ov_find_free(&fi);
+    return used * 100000 + (n == N ? 1 : 0);
+}
+
+__attribute__((export_name("given_memo")))
+int given_memo(void) {
+    for (int i = 0; i < N; i++) in[i] = 'a';
+    if (bt_find_notes_bytes(N) == 0 || bt_find_notes_bytes(N) > sizeof buf) return -10;
+    bt_find_init(&bi, in, N, 0);
+    if (bt_find_set_notes(&bi, buf, sizeof buf) != 0) return -12;
+    rx_match_t m;
+    int n = 0, r;
+    while ((r = bt_find_next(&bi, &m)) == 1) n++;
+    if (r != 0) return r;
+    int used = word(bi.search, MEMO_W) == (unsigned)(size_t)buf && bi.btmemo == 0;
+    bt_find_free(&bi);
+    return used * 100000 + (n == N ? 1 : 0);
+}
+
+__attribute__((export_name("given_set")))
+int given_set(void) {
+    int len = N / 3 * 3;
+    for (int i = 0; i < len; i++) in[i] = "foo"[i % 3];
+    if (scan_s_notes_bytes(len) == 0 || scan_s_notes_bytes(len) > sizeof buf) return -10;
+    scan_s_init(&sc, in, len, 0);
+    if (scan_s_set_notes(&sc, buf, sizeof buf) != 0) return -12;
+    rx_set_match_t out[S_PATTERN_COUNT];
+    int n = 0, got;
+    while ((got = scan_s(&sc, out, S_PATTERN_COUNT)) > 0) n += got;
+    if (got < 0) return got;
+    int used = 0;
+    for (int k = 0; k < (int)(sizeof sc.blocks / sizeof sc.blocks[0]); k++)
+        if (word(sc.blocks[k], NOTES_W) == (unsigned)(size_t)buf && sc.notes[k] == 0) used = 1;
+    scan_s_free(&sc);
+    return used * 100000 + (n == len / 3 ? 1 : 0);
+}
+`
+
+// cBTMemoGuest drives the Backtracking find over 64 KB of `a`, one match per
+// byte, and reports whether the search got a memo. Measured at 32 KB: 0.5 s
+// with the memo, 24 s without.
+const cBTMemoGuest = `#include "bt.h"
+
+static unsigned char arena[64 << 20];
+static size_t used;
+void *malloc(size_t n) { size_t at = (used + 7) & ~(size_t)7; if (at + n > sizeof arena) return 0; used = at + n; return arena + at; }
+void *calloc(size_t n, size_t m) { unsigned char *p = malloc(n * m); if (p) for (size_t i = 0; i < n * m; i++) p[i] = 0; return p; }
+void free(void *p) { (void)p; }
+
+#define N 65536
+static char in[N];
+static rx_bt_find_iter_t it;
+
+__attribute__((export_name("bt_memo")))
+int bt_memo(void) {
+    for (int i = 0; i < N; i++) in[i] = 'a';
+    rx_match_t m;
+    bt_find_init(&it, in, N, 0);
+    int n = 0, r;
+    while ((r = bt_find_next(&it, &m)) == 1) {
+        if (m.start != n || m.end != n + 1) return -1;
+        n++;
+    }
+    if (r != 0) return r;
+    int got = it.btmemo != 0;
+    bt_find_free(&it);
+    return got * 100000 + (n == N ? 1 : 0);
+}
+`
+
+// cTwoModuleGuest drives one notes-keeping find of each module over 8 KB that
+// makes every call read to the end, and reports whether the search got notes.
+const cTwoModuleGuest = `#include "a.h"
+#include "b.h"
+
+static unsigned char arena[16 << 20];
+static size_t used;
+void *malloc(size_t n) { size_t at = (used + 7) & ~(size_t)7; if (at + n > sizeof arena) return 0; used = at + n; return arena + at; }
+void *calloc(size_t n, size_t m) { unsigned char *p = malloc(n * m); if (p) for (size_t i = 0; i < n * m; i++) p[i] = 0; return p; }
+void free(void *p) { (void)p; }
+
+#define N 8192
+static char in[N];
+static rx_ova_find_iter_t ia;
+static rx_ovb_find_iter_t ib;
+
+__attribute__((export_name("a_notes")))
+int a_notes(void) {
+    for (int i = 0; i < N; i++) in[i] = 'a';
+    rx_match_t m;
+    ova_find_init(&ia, in, N, 0);
+    int n = 0; while (ova_find_next(&ia, &m) == 1) n++;
+    int got = ia.notes != 0;
+    ova_find_free(&ia);
+    return got * 100000 + (n == N ? 1 : 0);
+}
+
+__attribute__((export_name("b_notes")))
+int b_notes(void) {
+    for (int i = 0; i < N; i++) in[i] = 'x';
+    rx_match_t m;
+    ovb_find_init(&ib, in, N, 0);
+    int n = 0; while (ovb_find_next(&ib, &m) == 1) n++;
+    int got = ib.notes != 0;
+    ovb_find_free(&ib);
+    return got * 100000 + (n == N ? 1 : 0);
+}
+`
 
 // cCacheGuest drives the overlapping set over the same input cacheDriveInput
 // builds, and reports the tuple count or the header's ready word.
@@ -1054,4 +1654,49 @@ int run(void) { return drive(); }
 
 __attribute__((export_name("ready")))
 unsigned ready(void) { drive(); return ready_word; }
+
+/* The caller's own buffer, handed over with _set_cache: the -nostdlib route. */
+static unsigned char cmem[4 << 20];
+
+static int drive_caller(void) {
+    for (size_t i = 0; i < sizeof input; i++) input[i] = (i % (RUN + 1)) == RUN ? ' ' : 'a';
+    used = 0;
+    size_t need = scan_ov_cache_bytes(sizeof input);
+    if (need == 0 || need > sizeof cmem) return -200;
+    if (scan_ov_init(&sc, input, sizeof input, 0) != 0) return -100;
+    if (scan_ov_set_cache(&sc, cmem, sizeof cmem) != 0) return -300;
+    rx_set_match_t buf[OV_PATTERN_COUNT];
+    int total = 0, got;
+    while ((got = scan_ov(&sc, buf, OV_PATTERN_COUNT)) > 0) total += got;
+    scan_ov_free(&sc);
+    return got < 0 ? got : total;
+}
+
+__attribute__((export_name("caller")))
+int caller(void) { return drive_caller(); }
+
+__attribute__((export_name("caller_ready")))
+unsigned caller_ready(void) {
+    drive_caller();
+    return (unsigned)cmem[8] | (unsigned)cmem[9] << 8 | (unsigned)cmem[10] << 16 | (unsigned)cmem[11] << 24;
+}
+
+/* The refusals: a short buffer and a null one change nothing, and an input
+   past the i32 range needs no buffer. 0 when every one held. */
+__attribute__((export_name("refusals")))
+int refusals(void) {
+    size_t need = scan_ov_cache_bytes(sizeof input);
+    if (scan_ov_set_cache(0, cmem, sizeof cmem) != RX_ERR_NULL_ARG) return 1;
+    if (scan_ov_init(&sc, input, sizeof input, 0) != 0) return 2;
+    unsigned *own = sc.cache;
+    if (scan_ov_set_cache(&sc, cmem, need - 1) != RX_ERR_RANGE) return 3;
+    if (scan_ov_set_cache(&sc, 0, need) != RX_ERR_NULL_ARG) return 4;
+    if (sc.cache != own) return 5;
+    scan_ov_free(&sc);
+    if (scan_ov_cache_bytes((size_t)0x80000000u) != 0) return 6;
+    if (scan_ov_init(&sc, input, 0, 0) != 0) return 7;
+    if (scan_ov_cache_bytes(0) == 0) return 8;
+    scan_ov_free(&sc);
+    return 0;
+}
 `

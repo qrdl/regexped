@@ -58,10 +58,8 @@ func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
 	if ast == nil {
 		return nil
 	}
-	prog, err := syntax.Compile(ast.Simplify())
-	if err != nil {
-		return nil
-	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(ast.Simplify())
 	if len(prog.Inst) > maxBTFallbackInstructions {
 		return nil
 	}
@@ -137,6 +135,10 @@ func SetAdmitsBacktracking(sc config.SetConfig, cfg config.BuildConfig) bool {
 	cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
 	if err != nil {
 		return false
+	}
+	if cs.scanComp != nil && (cs.scanComp.hasBTMember() || cs.scanComp.btSplit) {
+		// The scan pair forwards to its split copy, which can.
+		return true
 	}
 	return cs.hasBTMember() || cs.btSplit
 }
@@ -216,13 +218,14 @@ func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, 
 		b = call(b, c.fallbackIdx)
 		b = append(b, 0x05) // else
 		b = call(b, c.driverIdx)
+		b = emitBTMemberSave(b, c.member)
 		b = append(b, 0x0B) // end if
 	} else {
 		b = call(b, c.driverIdx)
 	}
 	b = append(b, 0x21, end)
 	if c.member != nil {
-		b = emitBTMemberMatched(b, c.member, end)
+		b = emitBTMemberMatched(b, c.member, end, regions.winGlobal)
 	}
 	return b
 }
@@ -528,7 +531,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 				// Set BT buckets are driven directly, not through the groups
 				// wrapper, and use window mode — their slots are already absolute.
 				-1,
-				plan.k, plan.fallback, nil, member)
+				plan.k, plan.fallback, nil, member, nil)
 		}
 		if plan.fallback {
 			// Built here like the driver, so its real index is known and the
@@ -538,7 +541,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
 				btNoCaptureFrameSize,
 				true, tableMemIdx, cs.btRegions.winGlobal, -1,
-				0, false, &cs.btRegions.scratch, member)
+				0, false, &cs.btRegions.scratch, member, nil)
 			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
 			call.member = member
 			call.route = !plan.force && member != nil
@@ -669,5 +672,33 @@ func buildSetBTProbeBody(regions *btSharedRegions, call btBucketCall, tableMemId
 
 	b = append(b, 0x41, 0x01) // bit 0
 	b = append(b, 0x0B)       // end function
+	return b
+}
+
+// emitBTBlocksPrologue sets btBlocksG on entry to an exported capability:
+// from the scratch descriptor (parameter 3) for the two `find` entries, whose
+// drives span calls; 0 for every other capability, whose budget lasts its one
+// call. Nothing when no member keeps a block.
+func (cs *compiledSet) emitBTBlocksPrologue(kind setCapKind) []byte {
+	if len(cs.btBlockMembers) == 0 {
+		return nil
+	}
+	var b []byte
+	if kind != capFind && kind != capFindBatch {
+		b = append(b, 0x41, 0x00)
+		return appendGlobalSet(b, cs.btBlocksG)
+	}
+	b = cs.emitScratchBlocks(b, 3)
+	b = appendGlobalSet(b, cs.btBlocksG)
+	if off := cs.btBlocksBase() * abi.SearchBlockBytes; off > 0 {
+		// Past the blocks before the members', or 0 with none.
+		b = appendGlobalGet(b, cs.btBlocksG)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(off)) //nolint:gosec // a small offset
+		b = append(b, 0x6A, 0x41, 0x00)
+		b = appendGlobalGet(b, cs.btBlocksG)
+		b = append(b, 0x1B) // select
+		b = appendGlobalSet(b, cs.btBlocksG)
+	}
 	return b
 }

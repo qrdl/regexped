@@ -39,18 +39,35 @@ type OverlapCacheShape struct {
 	// here, and sizing off the wrong one over-reserves or under-reserves.
 	Patterns int
 
-	// CostPerByte is what sweeping one input byte costs in the drive's work
-	// units. The engine engages the sweep once the walk's accumulated work
+	// CostPerByte is the trigger's per-byte rate in the drive's work units: a
+	// sixteenth of what sweeping one input byte costs (at least 1), so a
+	// drive switches long before its walk has cost a sweep. The engine
+	// engages the sweep once the walk's accumulated work
 	// passes SweepThreshold (strictly), or once the counter saturates.
 	CostPerByte int64
+	// SetupWork is the start-up allowance added to the line, at the full
+	// per-byte rate.
+	SetupWork int64
+
+	// SweepCells and SweepRow are the program sweep's geometry
+	// (program_sweep.go), 0 when no split member has one: its column width
+	// and a position's row, 4 bytes per swept member. Its answers live after
+	// the cache in the same region, checkpointed by the same formula
+	// (config.SetOverlapCheckpointSizingRow), so a caller reserves both.
+	SweepCells, SweepRow int
 }
 
+// Offered reports whether a caller reserves a region for this set's `find`
+// at all: for the answer cache, or for the program sweep alone (the cache's
+// part is then the bare header).
+func (sh OverlapCacheShape) Offered() bool { return sh.Eligible || sh.SweepCells > 0 }
+
 // SweepThreshold is the work past which a drive over inputLen bytes engages
-// the sweep: CostPerByte per byte plus a fixed allowance for starting one. A
+// the sweep: CostPerByte per byte plus SetupWork for starting one. A
 // harness asking whether a drive SHOULD have engaged reads it here rather than
 // re-deriving the engine's rule.
 func (sh OverlapCacheShape) SweepThreshold(inputLen int) int64 {
-	return (int64(inputLen) + overlapSweepSetupBytes) * sh.CostPerByte
+	return int64(inputLen)*sh.CostPerByte + sh.SetupWork
 }
 
 // SetOverlapCacheShape compiles `sc` and reports what sizing its `find` needs.
@@ -74,19 +91,27 @@ func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over 
 	if err != nil {
 		return OverlapCacheShape{}, err
 	}
+	var sh OverlapCacheShape
+	if ps := cs.progSweep; ps != nil {
+		sh.SweepCells, sh.SweepRow = ps.cells(), ps.rowBytes()
+	}
+	if cs.keptCache != nil {
+		// The kept members' own set reads the cache (keptCacheSet).
+		cs = cs.keptCache
+	}
 	sw := cs.sweepSrc()
 	if sw == nil {
-		return OverlapCacheShape{}, nil
+		return sh, nil
 	}
 	// Lever C makes the column one cell per PROJECTION rather than per
 	// (state, pattern); overlapCells is the one place that decides which, so a
 	// caller cannot size a region for a column the sweep does not have.
-	return OverlapCacheShape{
-		Eligible:    true,
-		Cells:       cs.overlapCells(),
-		Patterns:    len(sw.ids),
-		CostPerByte: cs.overlapSweepCostPerByte(),
-	}, nil
+	sh.Eligible = true
+	sh.Cells = cs.overlapCells()
+	sh.Patterns = len(sw.ids)
+	sh.CostPerByte = cs.overlapSweepCostPerByte()
+	sh.SetupWork = cs.overlapSweepSetupWork()
+	return sh, nil
 }
 
 // SetOverlapCacheSizing is the region and stride a caller should reserve for one
@@ -117,10 +142,19 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 
 // Sizing is SetOverlapCacheSizing for a shape already in hand: a caller that
 // sizes many drives of one set learns the shape once and asks this per input.
+//
+// A program sweep's part follows the cache's, 8-aligned, when it fits the
+// budget; the stride is the cache's, the one header field a caller writes.
 func (sh OverlapCacheShape) Sizing(inputLen int) (bytes, stride int) {
-	if !sh.Eligible {
-		return config.SetOverlapCheckpointHeaderBytes, 1
+	bytes, stride = config.SetOverlapCheckpointHeaderBytes, 1
+	if sh.Eligible {
+		bytes = config.SetOverlapCheckpointBytes(inputLen, sh.Cells, sh.Patterns)
+		stride = config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns)
 	}
-	return config.SetOverlapCheckpointBytes(inputLen, sh.Cells, sh.Patterns),
-		config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns)
+	if sh.SweepCells > 0 {
+		if sb, _ := config.SetOverlapCheckpointSizingRow(inputLen, sh.SweepCells, sh.SweepRow); sb <= config.SetOverlapCacheMaxBytes {
+			bytes = (bytes+7)&^7 + sb
+		}
+	}
+	return bytes, stride
 }

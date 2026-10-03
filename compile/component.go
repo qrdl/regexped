@@ -2,6 +2,7 @@ package compile
 
 import (
 	"errors"
+	"github.com/qrdl/regexped/internal/abi"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -27,7 +28,8 @@ import (
 // Everything here is emitted ONLY under asmOpts.Component. With it off the
 // assembler must produce today's bytes exactly, which `make byteident` proves.
 
-// asmOpts carries the assembler's component configuration.
+// asmOpts carries the assembler's component configuration, and the memory's
+// maximum.
 //
 // Its ZERO VALUE MEANS MODULE, which is why it is a struct rather than two
 // positional parameters: every existing call site passes asmOpts{} and cannot
@@ -35,6 +37,10 @@ import (
 // `standalone` bool waiting to be transposed. Validation is not implied by the
 // type — see validate.
 type asmOpts struct {
+	// MaxPages is the maximum the module's own memory declares, from
+	// max_memory; 0 declares none. Never below the declared minimum:
+	// memoryMaxPages refuses such a cap before anything is assembled.
+	MaxPages uint32
 	// Component emits the allocator, the post-return and the adapters.
 	Component bool
 	// ComponentPackage is the interface prefix every adapter export name is
@@ -90,7 +96,29 @@ type componentAdapter struct {
 	// constructor calls. A different index space from funcIdx, which is why it
 	// is a separate field rather than one reused for both.
 	resNewImport int
+	// notes, for the resource trio of a pattern whose find keeps per-search
+	// notes (search_notes.go): the search block lives in the representation,
+	// and `next` hands it over and gives it its notes once it arms.
+	notes resourceNotes
 }
+
+// resourceNotes is what a resource needs to keep per-search notes: the module's
+// search global and the notes' bytes per position. The zero value means none.
+type resourceNotes struct {
+	search      uint32
+	bytesPerPos int32
+	// bt: a Backtracking body keeps its budget per search in the block
+	// (bt_search.go); btMemoBytes is the memo bytes per position a search that
+	// tripped is given, 0 for none.
+	bt          bool
+	btMemoBytes int32
+	// heap is the allocator's heap-top global, which the reserve check reads
+	// before the notes or memo are allocated (emitTryReserve); set at
+	// emission (buildPatternAdapterBody).
+	heap uint32
+}
+
+func (n resourceNotes) on() bool { return n.bytesPerPos > 0 || n.bt }
 
 type adapterKind int
 
@@ -192,10 +220,10 @@ func componentAdapters(patterns []*compiledPattern, names map[string]string,
 		}
 		out = append(out,
 			componentAdapter{kind: adapterPatCtor, export: r.res.Constructor,
-				resNewImport: resIdx[r.funcName], numGroups: r.numGroups},
+				resNewImport: resIdx[r.funcName], numGroups: r.numGroups, notes: r.notes},
 			componentAdapter{kind: nextKind, export: r.res.Next,
-				funcIdx: r.inner, numGroups: r.numGroups},
-			componentAdapter{kind: adapterPatDtor, export: r.res.Dtor},
+				funcIdx: r.inner, numGroups: r.numGroups, notes: r.notes},
+			componentAdapter{kind: adapterPatDtor, export: r.res.Dtor, numGroups: r.numGroups, notes: r.notes},
 		)
 	}
 	return out
@@ -210,6 +238,7 @@ type patternResource struct {
 	res       ComponentPatternResource
 	inner     int
 	numGroups int
+	notes     resourceNotes
 }
 
 // orderedPatternResources lists the iterating exports that have a resource
@@ -235,7 +264,7 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 		if p.findExport != "" && findOff >= 0 {
 			if r, ok := resources[p.findExport]; ok && !r.Groups {
 				out = append(out, patternResource{
-					funcName: p.findExport, res: r, inner: base + p.findWrapperOffset(),
+					funcName: p.findExport, res: r, inner: base + p.findWrapperOffset(), notes: p.patternResource(),
 				})
 			}
 		}
@@ -243,7 +272,7 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 			if r, ok := resources[p.groupsExport]; ok && r.Groups {
 				out = append(out, patternResource{
 					funcName: p.groupsExport, res: r,
-					inner: base + p.groupsFromWrapperOffsets(), numGroups: p.numGroups,
+					inner: base + p.groupsFromWrapperOffsets(), numGroups: p.numGroups, notes: p.patternResource(),
 				})
 			}
 		}
@@ -253,17 +282,18 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 
 // buildPatternAdapterBody dispatches to the body emitter for one resource
 // adapter. The function-shaped kinds are the caller's own business.
-func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal uint32) []byte {
+func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32) []byte {
+	a.notes.heap = heapGlobal
 	switch a.kind {
 	case adapterPatCtor:
 		return buildPatternScannerCtorBody(reallocIdx, a.resNewImport, callListGlobal,
-			a.numGroups > 0, a.numGroups)
+			a.numGroups > 0, a.numGroups, a.notes)
 	case adapterPatFindNext:
-		return buildPatternFindNextBody(reallocIdx, a.funcIdx)
+		return buildPatternFindNextBody(reallocIdx, a.funcIdx, a.notes, callListGlobal)
 	case adapterPatGroupsNext:
-		return buildPatternGroupsNextBody(reallocIdx, a.funcIdx, a.numGroups)
+		return buildPatternGroupsNextBody(reallocIdx, a.funcIdx, a.numGroups, a.notes, callListGlobal)
 	case adapterPatDtor:
-		return buildPatternScannerDtorBody(freeIdx)
+		return buildPatternScannerDtorBody(freeIdx, a.numGroups, a.notes)
 	}
 	panic("compile: not a pattern resource adapter kind")
 }
@@ -636,6 +666,67 @@ func callReallocDyn(b []byte, reallocIdx int, align int32, sizeLocal byte) []byt
 	return utils.AppendULEB128(b, uint32(reallocIdx))
 }
 
+// emitTryReserve pushes 1 when cabi_realloc can serve a request of size bytes
+// (the i64 local sizeLocal) without growing memory — growing it here first
+// when it must — and 0 when it cannot: a size the allocator would trap on, or
+// a grow the engine refuses (`max_memory`). A search's OPTIONAL memory — its
+// notes, its Backtracking memo, a set's answer cache — asks first, so a refusal
+// leaves its pointer 0 and the module runs without it, as a module build does;
+// calling the allocator straight would trap the whole call. A fresh carve is a
+// power-of-two size class, at most 2 × (size + 8) bytes above the heap top,
+// which is what is reserved. needLocal is an i64 scratch local.
+func emitTryReserve(b []byte, heapGlobal uint32, sizeLocal, needLocal byte) []byte {
+	b = append(b, 0x20, sizeLocal, 0x42)
+	b = utils.AppendSLEB128_64(b, 0x7FFFFFF0)
+	b = append(b, 0x56, 0x04, 0x7F) // i64.gt_u; if (result i32): a size the allocator traps on
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x05)
+	// need = heap + 2 × (size + 8)
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0xAD, 0x20, sizeLocal, 0x42, 0x08, 0x7C, 0x42, 0x01, 0x86, 0x7C, 0x22, needLocal)
+	b = append(b, 0x3F, 0x00, 0xAD, 0x42, 0x10, 0x86) // memory.size × 64 KiB, in i64
+	b = append(b, 0x58, 0x04, 0x7F)                   // i64.le_u; if (result i32): it fits
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x05) // else: grow by what is missing, rounded up to pages
+	b = append(b, 0x20, needLocal, 0x3F, 0x00, 0xAD, 0x42, 0x10, 0x86, 0x7D)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, 0xFFFF)
+	b = append(b, 0x7C, 0x42, 0x10, 0x88, 0xA7) // + 0xFFFF; >> 16; wrap
+	b = append(b, 0x40, 0x00, 0x41, 0x7F, 0x47) // memory.grow; != -1
+	return append(b, 0x0B, 0x0B)
+}
+
+// emitGiveSearchMemory gives a search block its optional memory: (len + 1) ×
+// nb zeroed bytes, pointed at by the block's (ptrOff, capOff) and DETACHED
+// from the per-call chain (the scanner owns them; its dtor frees them) — or,
+// when emitTryReserve refuses, nothing, leaving the pointer 0 so the module
+// runs that search without it. lenPush pushes the text length (i32); the block
+// is in lBlk. lSz, lP, lChain are i32 locals; lSz64, lNeed i64.
+func emitGiveSearchMemory(b []byte, lenPush func([]byte) []byte, nb int32, ptrOff, capOff, reallocIdx int,
+	heapGlobal, callListGlobal uint32, lBlk, lSz, lP, lChain, lSz64, lNeed byte) []byte {
+	b = lenPush(b)
+	b = append(b, 0xAD, 0x42, 0x01, 0x7C, 0x42) // i64: len + 1
+	b = utils.AppendSLEB128_64(b, int64(nb))
+	b = append(b, 0x7E, 0x21, lSz64) // × nb
+	b = emitTryReserve(b, heapGlobal, lSz64, lNeed)
+	b = append(b, 0x04, 0x40) // if the allocator can serve it
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x21, lChain)
+	b = append(b, 0x20, lSz64, 0xA7, 0x21, lSz)
+	b = callReallocDyn(b, reallocIdx, 1, lSz)
+	b = append(b, 0x22, lP)
+	b = append(b, 0x41, 0x00, 0x20, lSz, 0xFC, 0x0B, 0x00) // memory.fill(p, 0, n)
+	b = append(b, 0x20, lBlk, 0x20, lP)
+	b = storeI32(b, ptrOff)
+	b = append(b, 0x20, lBlk, 0x20, lSz)
+	b = storeI32(b, capOff)
+	b = append(b, 0x20, lChain, 0x24) // detach: the scanner owns them
+	b = utils.AppendULEB128(b, callListGlobal)
+	return append(b, 0x0B)
+}
+
 // callRealloc pushes a cabi_realloc(0, 0, align, size) call.
 func callRealloc(b []byte, reallocIdx int, align, size int32) []byte {
 	b = append(b, 0x41, 0x00) // old_ptr
@@ -941,6 +1032,49 @@ func patRepSize(groups bool, numGroups int) int32 {
 	return patRepBytes + int32(numGroups*slotPairLen) //nolint:gosec // a group count
 }
 
+// patRepBlockOff is where a representation keeps its search block when the
+// pattern keeps per-search notes: after its own fields, 8-aligned for the
+// block's i64 fields. numGroups is 0 for a find resource.
+func patRepBlockOff(numGroups int) int32 {
+	return (patRepSize(numGroups > 0, numGroups) + 7) &^ 7
+}
+
+// emitResourceSearch hands a resource's search block to the module: the global
+// is read by the call that follows.
+func emitResourceSearch(b []byte, notes resourceNotes, pRep byte, numGroups int) []byte {
+	b = append(b, 0x20, pRep, 0x41)
+	b = utils.AppendSLEB128(b, patRepBlockOff(numGroups))
+	b = append(b, 0x6A, 0x24)
+	return utils.AppendULEB128(b, notes.search)
+}
+
+// emitResourceNotes gives a resource's search its notes once the module has
+// armed it — (len + 1) × bytesPerPos zeroed bytes — DETACHED from the per-call
+// chain like the constructor's blocks, since they outlive this call; the
+// destructor frees them. Emitted after a call that reported a match.
+func emitResourceNotes(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain, lSz64, lNeed byte) []byte {
+	if notes.btMemoBytes > 0 {
+		b = emitResourceBTMemo(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+	}
+	if notes.bytesPerPos == 0 {
+		return b
+	}
+	b = append(b, 0x20, pRep, 0x41)
+	b = utils.AppendSLEB128(b, patRepBlockOff(numGroups))
+	b = append(b, 0x6A, 0x22, lBlk)
+	b = loadI32(b, abi.SearchArmedOff)
+	b = append(b, 0x04, 0x40) // if armed
+	b = append(b, 0x20, lBlk)
+	b = loadI32(b, abi.SearchNotesOff)
+	b = append(b, 0x45, 0x04, 0x40) // if no notes yet
+	b = emitGiveSearchMemory(b, func(b []byte) []byte {
+		b = append(b, 0x20, pRep)
+		return loadI32(b, patRepLen)
+	}, notes.bytesPerPos, abi.SearchNotesOff, abi.SearchNotesCapOff, reallocIdx,
+		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+	return append(b, 0x0B, 0x0B)
+}
+
 // buildPatternScannerCtorBody emits `[constructor]<res>`:
 //
 //	(ptr, len, start) → handle
@@ -956,7 +1090,7 @@ func patRepSize(groups bool, numGroups int) int32 {
 //     call and hands it to the destructor.
 //   - `len` reaches the representation unchanged; nothing here does region
 //     arithmetic on it.
-func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, groups bool, numGroups int) []byte {
+func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint32, groups bool, numGroups int, notes resourceNotes) []byte {
 	const (
 		pPtr   = 0x00
 		pLen   = 0x01
@@ -989,7 +1123,12 @@ func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint3
 	b = append(b, 0x20, pPtr, 0x21, lCopy)
 	b = append(b, 0x0B)
 
-	b = callRealloc(b, reallocIdx, 4, patRepSize(groups, numGroups))
+	if notes.on() {
+		// The search block follows the representation's own fields, 8-aligned.
+		b = callRealloc(b, reallocIdx, 8, patRepBlockOff(numGroups)+abi.SearchBlockBytes)
+	} else {
+		b = callRealloc(b, reallocIdx, 4, patRepSize(groups, numGroups))
+	}
 	b = append(b, 0x21, lRep)
 
 	// The FALLBACK copy, only when the input was not taken over.
@@ -1017,6 +1156,14 @@ func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint3
 	b = storeI32(b, patRepPos)
 	b = append(b, 0x20, lRep, 0x41, 0x00)
 	b = storeI32(b, patRepDone)
+	if notes.on() {
+		// A fresh search: its block zeroed (memory.fill).
+		b = append(b, 0x20, lRep, 0x41)
+		b = utils.AppendSLEB128(b, patRepBlockOff(numGroups))
+		b = append(b, 0x6A, 0x41, 0x00, 0x41)
+		b = utils.AppendSLEB128(b, abi.SearchBlockBytes)
+		b = append(b, 0xFC, 0x0B, 0x00)
+	}
 
 	// Detach: the chain goes back to what it held on entry, so the blocks above
 	// belong to the handle rather than to this call.
@@ -1036,10 +1183,27 @@ func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint3
 // It frees exactly what the constructor detached from the call chain: the input
 // block and the representation. Everything a `next` allocated was freed by that
 // call's post-return.
-func buildPatternScannerDtorBody(freeIdx int) []byte {
+func buildPatternScannerDtorBody(freeIdx, numGroups int, notes resourceNotes) []byte {
 	const pRep = 0x00
+	alloc := newLocalAlloc(1)
+	var lNotes byte
+	if notes.on() {
+		lNotes = alloc.I32()
+	}
 	var b []byte
-	b = newLocalAlloc(1).EmitDecls(b)
+	b = alloc.EmitDecls(b)
+	if notes.on() {
+		// The notes a search that armed was given, and the memo one that
+		// tripped was, detached like the input.
+		for _, off := range []int{abi.SearchNotesOff, abi.SearchBTMemoOff} {
+			b = append(b, 0x20, pRep)
+			b = loadI32(b, int(patRepBlockOff(numGroups))+off)
+			b = append(b, 0x22, lNotes, 0x04, 0x40)
+			b = append(b, 0x20, lNotes, 0x10)
+			b = utils.AppendULEB128(b, uint32(freeIdx))
+			b = append(b, 0x0B)
+		}
+	}
 
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, patRepInput)
@@ -1067,12 +1231,17 @@ func buildPatternScannerDtorBody(freeIdx int) []byte {
 // consumer stub, where the module-format stubs also keep it: it is a reporting
 // rule rather than a scanning one, and moving it here would make the raw
 // resource answer differently from the raw module export.
-func buildPatternFindNextBody(reallocIdx, innerIdx int) []byte {
+func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, callListGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	lRet := alloc.I32()
 	lR := alloc.I64()
 	lStart, lEnd, lState := alloc.I32(), alloc.I32(), alloc.I32()
+	var lBlk, lN, lP, lChain, lSz64, lNeed byte
+	if notes.on() {
+		lBlk, lN, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
+		lSz64, lNeed = alloc.I64(), alloc.I64()
+	}
 	var b []byte
 	b = alloc.EmitDecls(b)
 
@@ -1101,6 +1270,9 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int) []byte {
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
 
+	if notes.on() {
+		b = emitResourceSearch(b, notes, pRep, 0)
+	}
 	// find(input, len, pos)
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, patRepInput)
@@ -1132,6 +1304,9 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int) []byte {
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
 
+	if notes.on() {
+		b = emitResourceNotes(b, notes, pRep, 0, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+	}
 	// start = wrap(r >> 32), end = wrap(r)
 	b = append(b, 0x20, lR, 0x42, 0x20, 0x88, 0xA7, 0x21, lStart)
 	b = append(b, 0x20, lR, 0xA7, 0x21, lEnd)
@@ -1174,7 +1349,7 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int) []byte {
 // participated. The per-group copy is unrolled: numGroups is a compile-time
 // constant, so a loop would cost a counter and a bounds test per group to save
 // nothing.
-func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int) []byte {
+func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resourceNotes, callListGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	var (
@@ -1186,6 +1361,11 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int) []byte {
 		lEnd   = alloc.I32()
 		lState = alloc.I32()
 	)
+	var lBlk, lN, lP, lChain, lSz64, lNeed byte
+	if notes.on() {
+		lBlk, lN, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
+		lSz64, lNeed = alloc.I64(), alloc.I64()
+	}
 	var b []byte
 	b = alloc.EmitDecls(b)
 
@@ -1220,6 +1400,9 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int) []byte {
 	b = utils.AppendSLEB128(b, patRepSlots)
 	b = append(b, 0x6A, 0x21, lSlots)
 
+	if notes.on() {
+		b = emitResourceSearch(b, notes, pRep, numGroups)
+	}
 	// groups(input, len, slots, pos)
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, patRepInput)
@@ -1254,6 +1437,9 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int) []byte {
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
 
+	if notes.on() {
+		b = emitResourceNotes(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+	}
 	b = callRealloc(b, reallocIdx, 4, int32(numGroups*groupElemLen))
 	b = append(b, 0x21, lElems)
 
@@ -1307,4 +1493,23 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int) []byte {
 	b = append(b, 0x20, lRet)
 	b = append(b, 0x0B)
 	return b
+}
+
+// emitResourceBTMemo gives a resource's Backtracking search its memo once it
+// has tripped — (len + 1) × btMemoBytes zeroed bytes, detached like the notes.
+func emitResourceBTMemo(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain, lSz64, lNeed byte) []byte {
+	b = append(b, 0x20, pRep, 0x41)
+	b = utils.AppendSLEB128(b, patRepBlockOff(numGroups))
+	b = append(b, 0x6A, 0x22, lBlk)
+	b = loadI32(b, abi.SearchBTStateOff)
+	b = append(b, 0x41, abi.SearchBTTripped, 0x46, 0x04, 0x40) // if tripped
+	b = append(b, 0x20, lBlk)
+	b = loadI32(b, abi.SearchBTMemoOff)
+	b = append(b, 0x45, 0x04, 0x40) // if no memo yet
+	b = emitGiveSearchMemory(b, func(b []byte) []byte {
+		b = append(b, 0x20, pRep)
+		return loadI32(b, patRepLen)
+	}, notes.btMemoBytes, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, reallocIdx,
+		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+	return append(b, 0x0B, 0x0B)
 }

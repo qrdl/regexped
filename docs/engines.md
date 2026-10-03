@@ -289,29 +289,55 @@ do. `--verbose` reports the choice and the reason for every pattern
 (`find: switch — not provably linear`, and `switch handover: Backtracking` with
 its reason).
 
-**One shape stays quadratic over a whole drive**, whichever find serves it: a
-pattern with a SHORT, lower-priority way to end a match — a later alternative,
-or a lazy repeat — while a higher-priority branch keeps walking over bytes
-where that short ending comes up again. `a*b|a` over `a`×N matches at every
-byte, but each `find` call has to read to the end of the run before it may
-answer `[p, p+1)` (a `b` there would make the match `[p, N+1)`), and the next
-call, one byte on, reads the same run again: N matches cost about N²/2 bytes.
-Other examples: `\d+px|\d` over a run of digits, `foo\w+bar|foo` over
-`foo`×N, `a+?b|a`,
-`[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Inc|[A-Z][a-z]+` over a long run of
-capitalised words. Each call is still linear; it is the sequence of calls that
-is not, because `find` keeps nothing between calls. Go's `regexp` behaves the
-same way (`FindAllIndex` for `a*b|a` over 8 KB and 32 KB of `a`: 0.63 s and
-10.3 s).
+### Linear drives: notes kept for one search
 
-A GREEDY pattern does not have this shape, however long it walks past a match:
-the walk would itself accept wherever a later match could end, so it extends
-the match instead of leaving a new one behind — email, URL, `SELECT … FROM`,
-`X([a-zA-Z]+)Y` and CSV-row patterns all walk past their matches and are
-linear over a drive. Of the 135 patterns in this repository's example configs
-and benchmarks, 15 walk past their matches and none has the shape. To avoid
-it, bound the higher-priority branch's repeat (`\d{1,10}px|\d`): a bounded
-walk past each match keeps the drive linear.
+A DRIVE is what a stub does with `find`: call it, resume past the answer, call
+it again, until the input is exhausted. Every call above is linear, but a drive
+can still be quadratic when a call walks past the match it reports and the
+next call reads the same bytes again. `a*b|a` over `a`×N matches at every byte,
+yet each call has to read to the end of the run before it may answer
+`[p, p+1)` (a `b` there would make the match `[p, N+1)`), and the next call,
+one byte on, reads the same run again: N matches cost about N²/2 bytes. Other
+examples: `\d+px|\d` over a run of digits, `foo\w+bar|foo` over `foo`×N,
+`a+?b|a`, `[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Inc|[A-Z][a-z]+` over a long run
+of capitalised words. Go's `regexp` behaves the same way (`FindAllIndex` for
+`a*b|a` over 8 KB and 32 KB of `a`: 0.63 s and 10.3 s).
+
+The fix keeps NOTES for one search, in a block the caller owns and hands over
+with every call (see [wasm.md](wasm.md), "The search block"; every generated
+stub does this). A walk that runs past its last accept and then dies has
+proved, for every (state, position) it visited after that accept, that no
+match lies ahead of there. That is a fact about the text, not about the call,
+so a later call that reaches a noted (state, position) stops at once and
+answers what the walk would have. Each point is noted once and hit once, so a
+drive costs a constant per byte.
+
+Only a search that has gone bad pays for the notes. A pattern whose find
+automaton has a CYCLE STATE — a non-accepting state on a cycle of
+non-accepting states, the only place an unboundedly long walk can sit without
+accepting — carries two copies of its find:
+
+- the **ordinary copy**, the find described above plus a waste counter in the
+  block: the bytes read past each reported match, and the part of each failed
+  read of more than 32 bytes that lies below the farthest position an earlier
+  failed read of the search reached — the only part read twice. Once the waste
+  exceeds `4 × (bytes the search has advanced) + 64`, the search is ARMED.
+- the **marked copy**, the same body testing the notes at every byte of a
+  cycle state and writing them by walking a wasted tail again. The stub
+  allocates the notes (`(len + 1) ×` a few bytes) the first time it sees the
+  search armed, and the marked copy serves the rest of the search.
+
+A pattern with no cycle state gets no notes code at all, byte for byte.
+Measured on this repository's real patterns: no cost on 85 of 151 drives (no
+cycle state), a median of +0.1% on the rest and +5.2% at worst; the bad drives
+above cost 130-382 instructions per byte, linear. A caller that passes no block
+(0) to a STANDALONE module gets a default block the module keeps itself, which
+carries over while the caller keeps driving the same text forward (see
+[wasm.md](wasm.md), "Handing the block over"): `a*b|a` over `a`×8 K costs 474
+instructions per byte that way. In a merged build a call with no block runs
+exactly as described above and these drives stay quadratic; bounding the
+higher-priority branch's repeat (`\d{1,10}px|\d`) keeps them linear without a
+block. [complexity.md](complexity.md) gathers every mechanism of this kind.
 
 Sets make the same choice per member, with one difference: see
 [sets.md](sets.md#members-that-are-not-provably-linear).
@@ -356,19 +382,23 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Used for:** `groups_func` when the pattern has captures but is not TDFA-eligible; and `match_func`, `find_func` when the DFA exceeds `MaxDFAStates` states (default 1024).
 
-**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's compile-time stack; a call that outgrows it is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
+**Complexity:** every call is bounded by the [work budget](#work-budget-and-the-fallback-body): linear work in the fast body before it either finishes or hands over, then O(numInstructions × inputLen) in the memoised fallback body. Space is the fast body's frame stack — claimed at call time and grown with the search for `groups_func`, reserved at compile time for `match_func` and `find_func`; a call that outgrows it is answered by the fallback, whose stack and bitset are sized from the input at call time. The answer is `-2` (unknown) only when linear memory cannot grow far enough for them — never a hang.
 
 ### How it works
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. The fast body's stack is reserved at compile time in WASM linear memory immediately after the DFA tables.
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. For `match_func` and `find_func` the fast body's stack is reserved at compile time in WASM linear memory immediately after the DFA tables; for `groups_func` it is claimed when a call starts — see [The capture body's stack](#the-capture-bodys-stack).
 
-**Stack overflow guard:** before each frame push, the engine checks `sp + frameSize > stackLimit`. If the limit is exceeded, the fast body hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next section.
+**Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, a capture body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
+
+### The capture body's stack
+
+A `groups_func` body used to reserve its stack like the others — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input: a pattern with many branches claimed megabytes to match ten bytes. It reserves nothing now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size, growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. When memory cannot grow, the body hands over to the fallback as a full fixed stack does.
 
 ### Frame budget and the `-2` sentinel
 
-The fast body's backtrack stack is sized **at compile time**:
+For `match_func` and `find_func`, the fast body's backtrack stack is sized **at compile time**:
 
 ```
 maxFrames = max(numAlts × 4096, 4096)      # numAlts = InstAlt count in the NFA
@@ -380,7 +410,7 @@ The real requirement, however, scales with **input length**: a pattern that leav
 
 When that stack runs out, the fast body does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body, whose stack grows with the input (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff`, a test knob, still stops at this ceiling.
 
-The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, or a lower limit the host set), or, with the budget off, the compile-time stack ran out. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
+The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, the config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), or a lower limit the host set), or, with the budget off, the compile-time stack ran out or a capture body's stack could not grow. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
 
 | value | meaning |
 |---|---|
@@ -438,11 +468,11 @@ The ordinary (fast) body memoises nothing and carries **no loop guard**. It runs
 
 **Memory layout:**
 ```
-[DFA find tables] → [backtrack stack]
+[DFA find tables] → [backtrack stack]      # match_func / find_func; a groups_func stack is at the scratch base
 ```
 All regions are page-aligned and strictly non-overlapping. The input buffer is placed at address 0 by the host and never overlaps with the tables region. The fallback body's run-time memory lies outside all of them; see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from).
 
-**Thread safety:** the backtrack stack is allocated at a fixed compile-time address, and the fallback's scratch is found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
+**Thread safety:** a `match_func`/`find_func` backtrack stack is allocated at a fixed compile-time address, and a `groups_func` stack and the fallback's scratch are found through module globals. Single-threaded use only — concurrent calls on the same module instance would race on both.
 
 ### Work budget and the fallback body
 
@@ -458,14 +488,21 @@ popped as the search goes, so it is never exhausted.
 **How it is bounded.** Every Backtracking program is emitted as TWO functions
 (with one exception, below):
 
-1. **The fast body** is the ordinary body plus one `i64` counter, set once per
-   call to `(span + 1) × 8 × numInstructions` and decremented on every frame
-   POP. `span` is the input length, or the window length when a capture body
-   runs in window mode. A call that never backtracks pays nothing for it.
+1. **The fast body** is the ordinary body plus one `i64` counter, set to
+   `(span + 1) × numInstructions` and decremented on every frame POP. `span`
+   is the input length, or the window length when a capture body runs in
+   window mode. A `find` whose caller passes a search block (every generated
+   stub does) gets the counter once per SEARCH and keeps what is left in the
+   block, so a scan whose every call would burn it burns it once; otherwise it
+   is set once per call (see "Per search" below). A call that never
+   backtracks pays nothing for it. The multiplier was 8 until normal text was
+   measured never to come near 1 (124 Backtracking patterns, 160 real-pattern
+   drives: identical cost at 1, 2, 4, 8 and 16), while adversarial drives were
+   41-85% cheaper at 1.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
-   compile-time frame stack runs out, which arms the counter to trip on the next
-   pop. It is the same emitter over the same program with a `(pc, pos)` visited
+   frame stack runs out (a compile-time one, or a capture body's growing one
+   when memory cannot grow), which arms the counter to trip on the next pop. It is the same emitter over the same program with a `(pc, pos)` visited
    bitset at EVERY alternation — Go `regexp`'s bitstate discipline. It restarts
    the call from scratch on the caller's own arguments and globals, and sizes
    its own frame stack and bitset from the input at call time.
@@ -542,12 +579,65 @@ the "off" column below is the ordinary body it no longer has:
 
 A call that trips on its budget pays for the budget it burned before the
 fallback starts: on the `a`×4000 no-match row that is roughly 35× what the
-fallback alone would cost. The multiplier 8 is the lever if trips turn out to be
-common. A call that fills the fast body's stack instead hands over as soon as it
-does, so its extra cost is the depth it reached — the 132 fuel/byte row is the
-fast body's descent plus the fallback's whole run.
+fallback alone would cost (measured at the old multiplier of 8; at 1 the burn
+is an eighth of that). A call that fills the fast body's stack instead hands
+over as soon as it does, so its extra cost is the depth it reached — the 132
+fuel/byte row is the fast body's descent plus the fallback's whole run.
+
+#### Per search
+
+A budget that lasted one CALL left a drive quadratic: when every call of a
+search burns the budget before the fallback answers, the burn is paid once per
+call (`(?:a|b)*a(?:a|b){12}c|a` over `a`×N doubled its cost per byte with every
+doubling of N). With the caller's search block the budget lasts the SEARCH:
+
+- the fast body loads what is left from the block and saves it back, so a
+  search burns one budget in all;
+- once it trips, the search is TRIPPED: every later call goes straight to the
+  fallback body, and the stub gives the search one fallback memo,
+  `(len + 1) × ⌈instructions / 8⌉` bytes, which it keeps for the rest of the
+  search. A failure one call marked stops the next; the marks on the path of a
+  match a call reports are cleared before it returns, because they are not
+  failures;
+- a program with a zero-width cycle, which has no fast body, marks its search
+  tripped at the first call, so it keeps its memo from the start;
+- a program anchored at the start of the text (`^…`, `\A…`) can match only at
+  0, so a `find` from any later position answers "no match" at once
+  (`^(\B|0)*` over 400 KB of prose: 20.8 M instructions for the drive before,
+  4,577 after);
+- a capture body (`groups`) keeps only the tripped flag: its windows already
+  add up to the input, so it needs no shared memo.
+
+The memo lives in the memory the input lives in. A merged build's fallback
+body keeps its own scratch in the module's memory, so the module carries a
+SECOND copy of the fallback body that reads the memo from the host's memory,
+and a call whose block names a memo runs that one: merged and standalone builds
+keep the memo alike (a merged C drive over 32 KB: 0.6 s, against 24 s with a
+fresh memo per call).
+
+Measured on the adversary rows: `find` of `(?:a|b)*a(?:a|b){12}c|a` over
+`a`×N is linear at 12,808 instructions per byte, its `groups` at 13,390. With
+no block a standalone module uses a default block of its own (12,924 and
+13,506); a merged build works as described in the sections above.
+
+#### Why there is no Pike VM
+
+A Pike VM — every thread advanced in lockstep, linear by construction — was
+the other candidate for bad inputs, and was measured before anything was
+built: 124 Backtracking programs (the 101 `groups` patterns of this
+repository's configs, tests and benchmarks that route to Backtracking, and 23
+`find` patterns forced onto it), each over prose, logs, mixed text and the
+input that cost it most. Against Backtracking with the per-search budget and
+its switch to the fallback: on `find` the Pike VM was never cheaper (+234% on
+normal text, +702% on bad input); on `groups` it won only on two adversarial
+inputs of real-config patterns, by 6-7%, and by large factors only on test
+shapes such as `^(\w*|)*c` that no real config has. Every quadratic drive was
+already linear without it, so it was not built.
 
 #### Where the fallback's memory comes from
+
+A capture body's ordinary stack is placed at the same base, on every call; the
+fallback only ever runs after it has handed over, so the two share the region.
 
 The fallback sizes its memory at the head of the call — a find body at its first
 attempt, so a call with no candidate never touches it — from the span the search
@@ -598,10 +688,10 @@ by 7,984 pages with the host global at 0; with it, 58,597,434 fuel and one page.
 `-2` remains only where memory cannot grow: the memo must fit below WASM32's
 4 GiB (`numInstructions × inputLen / 8` bytes, so a 20,000-instruction program
 over a 1.7 MB input is already too much), and the stack must fit beside it, or
-the host has set a lower limit.
+the config's `max_memory` or the host has set a lower limit.
 
 **Knobs.** `CompileOptions.BTWorkBudget` and `CompileSetOptions.BTWorkBudget`,
-neither reachable from YAML: `0` is the default multiplier of 8, a positive
+neither reachable from YAML: `0` is the default multiplier of 1, a positive
 value replaces it, `compile.BTWorkBudgetOff` emits neither counter nor fallback
 — the ordinary body alone, which is how tests drive it by itself; a program
 with a zero-width cycle still gets the fallback alone — and

@@ -1,0 +1,43 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo\w+0'
+  - pattern: 'foo\w+1'
+  - pattern: 'foo\w+2'
+  - pattern: 'foo\w+3'
+  - pattern: 'foo\w+4'
+  - pattern: 'foo\w+5'
+  - pattern: 'foo\w+6'
+  - pattern: 'foo\w+7'
+  - pattern: 'foo\w+8'
+  - pattern: 'foo\w+9'
+  - pattern: 'foo\w+10'
+  - pattern: 'foo\w+11'
+  - pattern: 'foo\w+12'
+  - pattern: 'foo\w+13'
+  - pattern: 'foo\w+14'
+  - pattern: 'foo\w+15'
+  - pattern: 'foo\w+16'
+  - pattern: 'foo\w+17'
+  - pattern: 'foo\w+18'
+  - pattern: 'foo\w+19'
+  - pattern: 'foo\w+20'
+  - pattern: 'foo\w+21'
+  - pattern: 'foo\w+22'
+  - pattern: 'foo\w+23'
+  - pattern: 'foo\w+24'
+  - pattern: 'foo\w+25'
+  - pattern: 'foo\w+26'
+  - pattern: 'foo\w+27'
+  - pattern: 'foo\w+28'
+  - pattern: 'foo\w+29'
+  - pattern: 'foo\w+30'
+  - pattern: 'foo\w+31'
+  - pattern: 'foo\w+32'
+  - pattern: 'foo\w+33'
+  - pattern: 'foo\w+34'
+sets:
+  - name: s
+    find: sfind
+    overlapping: true
+    patterns: all

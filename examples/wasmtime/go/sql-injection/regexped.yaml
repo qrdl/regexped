@@ -5,6 +5,20 @@ stub_file:     "stub.go"
 stub_type:     "go"
 max_dfa_states: 1  # forces Backtracking engine for match and find
 
+# Caps this module's OWN memory: its tables plus the Backtracking engine's
+# frame stacks and fallback memo, which grow with the input when a search
+# backtracks hard. The input, and the memo the stub keeps for a whole scan,
+# live in the Go program's memory in this merged build, so the cap limits
+# neither how long a value you can scan nor the Go heap: it stops one hostile
+# value from growing the module's memory toward 4 GiB. A search that would
+# need more answers "unknown" instead (is_sqli and the iterators' Err()
+# return ErrBacktrackOverflow), and every other search is unaffected.
+#
+# 1 MiB is barely above this module's own 960 KiB of tables and reserved
+# stack, so main.go's 64 KiB hostile value runs into it. A real deployment
+# sets the cap from the largest value it must still answer for.
+max_memory: 1MiB
+
 regexps:
   - pattern: |-
       (?i)(?P<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?P<payload>[^\n]*)

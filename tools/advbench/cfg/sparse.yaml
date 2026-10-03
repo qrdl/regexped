@@ -1,0 +1,44 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo[a-z]*bar'
+  - pattern: 'foox0'
+  - pattern: 'foox1'
+  - pattern: 'foox2'
+  - pattern: 'foox3'
+  - pattern: 'foox4'
+  - pattern: 'foox5'
+  - pattern: 'foox6'
+  - pattern: 'foox7'
+  - pattern: 'foox8'
+  - pattern: 'foox9'
+  - pattern: 'foox10'
+  - pattern: 'foox11'
+  - pattern: 'foox12'
+  - pattern: 'foox13'
+  - pattern: 'foox14'
+  - pattern: 'foox15'
+  - pattern: 'foox16'
+  - pattern: 'foox17'
+  - pattern: 'foox18'
+  - pattern: 'foox19'
+  - pattern: 'foox20'
+  - pattern: 'foox21'
+  - pattern: 'foox22'
+  - pattern: 'foox23'
+  - pattern: 'foox24'
+  - pattern: 'foox25'
+  - pattern: 'foox26'
+  - pattern: 'foox27'
+  - pattern: 'foox28'
+  - pattern: 'foox29'
+  - pattern: 'foox30'
+  - pattern: 'foox31'
+  - pattern: 'foox32'
+  - pattern: 'foox33'
+sets:
+  - name: s
+    find: sfind
+    scan_any: sany
+    scan_all: sall
+    patterns: all

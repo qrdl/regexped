@@ -317,10 +317,8 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		if ast == nil {
 			return nil
 		}
-		pr, err := syntax.Compile(ast.Simplify())
-		if err != nil {
-			return nil
-		}
+		// syntax.Compile never returns a non-nil error (see its stdlib source).
+		pr, _ := syntax.Compile(ast.Simplify())
 		progs = append(progs, pr)
 	}
 

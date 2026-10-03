@@ -87,6 +87,15 @@ type dfa struct {
 	acceptWide    map[int][]uint16
 	midAcceptWide map[int][]uint16
 	immAcceptWide map[int][]uint16
+	// midAcceptNWWide / midAcceptWWide / midAcceptNLWide are the same form for
+	// the boundary channels midAcceptingNW / W / NL, recorded only when the
+	// program HAS such an assertion (nil otherwise, so a sparse bucket — which
+	// refuses boundary members — builds exactly what it did). Only the
+	// overlapping sweep over a whole-set automaton of more than 64 members
+	// reads them.
+	midAcceptNWWide map[int][]uint16
+	midAcceptWWide  map[int][]uint16
+	midAcceptNLWide map[int][]uint16
 }
 
 func (d *dfa) Type() EngineType {
@@ -995,6 +1004,14 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		}
 	}
 
+	if pIdx != nil && dfa.hasWordBoundary {
+		dfa.midAcceptNWWide = make(map[int][]uint16)
+		dfa.midAcceptWWide = make(map[int][]uint16)
+	}
+	if pIdx != nil && dfa.hasNewlineBoundary {
+		dfa.midAcceptNLWide = make(map[int][]uint16)
+	}
+
 	// Map from set of NFA states to DFA state ID
 	stateMap := make(map[string]int)
 	nextStateID := 0
@@ -1126,6 +1143,21 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 			}
 		}
 		return out[:k+1]
+	}
+
+	// recordWideCh is recordWideSet's twin for ONE boundary channel: it sits
+	// beside an orAccept(dfa.midAcceptingNW/W/NL, state, acceptBitsFor(set,
+	// ctx)) with the same arguments and records the same accepts as a list.
+	// A no-op when the channel has no wide map (off the sparse path, or a
+	// program without that kind of assertion). A UNION, as orAccept is, for a
+	// state two call sites both record.
+	recordWideCh := func(m map[int][]uint16, state int, set []uint32, ctx int) {
+		if m == nil {
+			return
+		}
+		if l := acceptWideFor(set, ctx); l != nil {
+			m[state] = unionSortedU16(m[state], l)
+		}
 	}
 
 	// isDominantMidAccept: see isDominantAccept's doc for
@@ -1309,15 +1341,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	// (line 517) can gate a nested ^/\A check that would otherwise never resolve.
 	// midAcceptNW: before non-word byte → \B fires (prev=non-word, next=non-word)
 	orAccept(dfa.midAcceptingNW, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary))
+	recordWideCh(dfa.midAcceptNWWide, 0, startSet, ecBegin|ecNoWordBoundary)
 	markDominant(dfa.midAcceptingNWDominant, 0, startSet, ecBegin|ecNoWordBoundary)
 	markOutranked(dfa.midAcceptingNWOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary)
 	// midAcceptW: before word byte → \b fires (prev=non-word, next=word)
 	orAccept(dfa.midAcceptingW, 0, acceptBitsFor(startSet, ecBegin|ecWordBoundary))
+	recordWideCh(dfa.midAcceptWWide, 0, startSet, ecBegin|ecWordBoundary)
 	markDominant(dfa.midAcceptingWDominant, 0, startSet, ecBegin|ecWordBoundary)
 	markOutranked(dfa.midAcceptingWOutranked, 0, startSet, ecBegin, ecBegin|ecWordBoundary)
 	// midAcceptNL: before '\n' byte → (?m:$) fires (ecEndLine | \B since prev=non-word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, 0, acceptBitsFor(startSet, ecBegin|ecNoWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, 0, startSet, ecBegin|ecNoWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, 0, startSet, ecBegin, ecBegin|ecNoWordBoundary|ecEndLine)
 	}
@@ -1364,15 +1399,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		recordWideSet(dfa.midStart, midStartSet, 0, ecEnd|ecNoWordBoundary)
 		// midAcceptNW for midStart (prevWasWord=false): before non-word → \B fires
 		orAccept(dfa.midAcceptingNW, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary))
+		recordWideCh(dfa.midAcceptNWWide, dfa.midStart, midStartSet, ecNoWordBoundary)
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStart, midStartSet, ecNoWordBoundary)
 		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary)
 		// midAcceptW for midStart (prevWasWord=false): before word → \b fires
 		orAccept(dfa.midAcceptingW, dfa.midStart, acceptBitsFor(midStartSet, ecWordBoundary))
+		recordWideCh(dfa.midAcceptWWide, dfa.midStart, midStartSet, ecWordBoundary)
 		markDominant(dfa.midAcceptingWDominant, dfa.midStart, midStartSet, ecWordBoundary)
 		markOutranked(dfa.midAcceptingWOutranked, dfa.midStart, midStartSet, 0, ecWordBoundary)
 		// midAcceptNL for midStart (prevWasWord=false): before '\n' → (?m:$) fires
 		if dfa.hasNewlineBoundary {
 			orAccept(dfa.midAcceptingNL, dfa.midStart, acceptBitsFor(midStartSet, ecNoWordBoundary|ecEndLine))
+			recordWideCh(dfa.midAcceptNLWide, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
 			markDominant(dfa.midAcceptingNLDominant, dfa.midStart, midStartSet, ecNoWordBoundary|ecEndLine)
 			markOutranked(dfa.midAcceptingNLOutranked, dfa.midStart, midStartSet, 0, ecNoWordBoundary|ecEndLine)
 		}
@@ -1399,15 +1437,18 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	recordWideSet(dfa.midStartWord, midStartSet, 0, ecEnd|ecWordBoundary)
 	// midAcceptNW for midStartWord (prevWasWord=true): before non-word → \b fires
 	orAccept(dfa.midAcceptingNW, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary))
+	recordWideCh(dfa.midAcceptNWWide, dfa.midStartWord, midStartSet, ecWordBoundary)
 	markDominant(dfa.midAcceptingNWDominant, dfa.midStartWord, midStartSet, ecWordBoundary)
 	markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary)
 	// midAcceptW for midStartWord (prevWasWord=true): before word → \B fires
 	orAccept(dfa.midAcceptingW, dfa.midStartWord, acceptBitsFor(midStartSet, ecNoWordBoundary))
+	recordWideCh(dfa.midAcceptWWide, dfa.midStartWord, midStartSet, ecNoWordBoundary)
 	markDominant(dfa.midAcceptingWDominant, dfa.midStartWord, midStartSet, ecNoWordBoundary)
 	markOutranked(dfa.midAcceptingWOutranked, dfa.midStartWord, midStartSet, 0, ecNoWordBoundary)
 	// midAcceptNL for midStartWord (prevWasWord=true): before '\n' → (?m:$) fires (\b since prev=word)
 	if dfa.hasNewlineBoundary {
 		orAccept(dfa.midAcceptingNL, dfa.midStartWord, acceptBitsFor(midStartSet, ecWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, dfa.midStartWord, midStartSet, ecWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartWord, midStartSet, 0, ecWordBoundary|ecEndLine)
 	}
@@ -1442,13 +1483,16 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		// who relaxes that refusal.
 		recordWideSet(dfa.midStartNewline, midStartNewlineSet, 0, ecBeginLine|ecEnd|ecNoWordBoundary)
 		orAccept(dfa.midAcceptingNW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary))
+		recordWideCh(dfa.midAcceptNWWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
 		markDominant(dfa.midAcceptingNWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary)
 		markOutranked(dfa.midAcceptingNWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary)
 		orAccept(dfa.midAcceptingW, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecWordBoundary))
+		recordWideCh(dfa.midAcceptWWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
 		markDominant(dfa.midAcceptingWDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecWordBoundary)
 		markOutranked(dfa.midAcceptingWOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecWordBoundary)
 		// midAcceptNL for midStartNewline (prevWasWord=false): before '\n' → (?m:$) fires (\B since prev=newline=non-word)
 		orAccept(dfa.midAcceptingNL, dfa.midStartNewline, acceptBitsFor(midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine))
+		recordWideCh(dfa.midAcceptNLWide, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		markDominant(dfa.midAcceptingNLDominant, dfa.midStartNewline, midStartNewlineSet, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		markOutranked(dfa.midAcceptingNLOutranked, dfa.midStartNewline, midStartNewlineSet, ecBeginLine, ecBeginLine|ecNoWordBoundary|ecEndLine)
 		if leftmostFirst && isImmediateAccepting(midStartNewlineSet, prog) {
@@ -1615,6 +1659,7 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 				}
 				nwCtx |= nlCtx
 				orAccept(dfa.midAcceptingNW, nextDFAState, acceptBitsFor(nextSet, nwCtx))
+				recordWideCh(dfa.midAcceptNWWide, nextDFAState, nextSet, nwCtx)
 				markDominant(dfa.midAcceptingNWDominant, nextDFAState, nextSet, nwCtx)
 				markOutranked(dfa.midAcceptingNWOutranked, nextDFAState, nextSet, nlCtx, nwCtx)
 				var wCtx int
@@ -1625,10 +1670,12 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 				}
 				wCtx |= nlCtx
 				orAccept(dfa.midAcceptingW, nextDFAState, acceptBitsFor(nextSet, wCtx))
+				recordWideCh(dfa.midAcceptWWide, nextDFAState, nextSet, wCtx)
 				markDominant(dfa.midAcceptingWDominant, nextDFAState, nextSet, wCtx)
 				markOutranked(dfa.midAcceptingWOutranked, nextDFAState, nextSet, nlCtx, wCtx)
 				if dfa.hasNewlineBoundary {
 					orAccept(dfa.midAcceptingNL, nextDFAState, acceptBitsFor(nextSet, nwCtx|ecEndLine))
+					recordWideCh(dfa.midAcceptNLWide, nextDFAState, nextSet, nwCtx|ecEndLine)
 					markDominant(dfa.midAcceptingNLDominant, nextDFAState, nextSet, nwCtx|ecEndLine)
 					markOutranked(dfa.midAcceptingNLOutranked, nextDFAState, nextSet, nlCtx, nwCtx|ecEndLine)
 				}
@@ -1820,6 +1867,12 @@ type dfaTable struct {
 	acceptWide    map[int][]uint16
 	midAcceptWide map[int][]uint16
 	immAcceptWide map[int][]uint16
+	// midAcceptNWWide / midAcceptWWide / midAcceptNLWide: the boundary
+	// channels' wide form (see dfa.midAcceptNWWide). Nil unless the sparse
+	// path built a program with a boundary assertion.
+	midAcceptNWWide map[int][]uint16
+	midAcceptWWide  map[int][]uint16
+	midAcceptNLWide map[int][]uint16
 	// midAcceptNWStatesDominant/W/NL: subset of
 	// midAcceptNW/W/NLStates where Match dominates every other live thread —
 	// see dfa.midAcceptingNWDominant/W/NL for the full explanation.
@@ -1863,6 +1916,9 @@ func dfaTableFrom(d *dfa) *dfaTable {
 		acceptWide:                 d.acceptWide,
 		midAcceptWide:              d.midAcceptWide,
 		immAcceptWide:              d.immAcceptWide,
+		midAcceptNWWide:            d.midAcceptNWWide,
+		midAcceptWWide:             d.midAcceptWWide,
+		midAcceptNLWide:            d.midAcceptNLWide,
 		transitions:                d.transitions,
 		startBeginAccept:           d.startBeginAccept,
 		hasWordBoundary:            d.hasWordBoundary,
@@ -2045,9 +2101,43 @@ func applyStateRemap(t *dfaTable, oldToNew []int) {
 		}
 		return out
 	}
-	t.acceptWide = remapWide(t.acceptWide)
-	t.midAcceptWide = remapWide(t.midAcceptWide)
-	t.immAcceptWide = remapWide(t.immAcceptWide)
+	for _, m := range t.wideMaps() {
+		*m = remapWide(*m)
+	}
+}
+
+// wideMaps is every >64-pattern accept list a table carries, for the passes
+// that must move or compare all of them alike (relabelling, minimisation,
+// dedup). One list, so a channel added later cannot be missed by one pass.
+func (t *dfaTable) wideMaps() []*map[int][]uint16 {
+	return []*map[int][]uint16{
+		&t.acceptWide, &t.midAcceptWide, &t.immAcceptWide,
+		&t.midAcceptNWWide, &t.midAcceptWWide, &t.midAcceptNLWide,
+	}
+}
+
+// unionSortedU16 merges two sorted, deduped lists into one.
+func unionSortedU16(a, b []uint16) []uint16 {
+	if len(a) == 0 {
+		return b
+	}
+	out := make([]uint16, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case j == len(b) || (i < len(a) && a[i] < b[j]):
+			out = append(out, a[i])
+			i++
+		case i == len(a) || b[j] < a[i]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	return out
 }
 
 // maxMinimizeDFAPasses bounds minimizeDFA's iterative partition-refinement
@@ -2103,8 +2193,8 @@ func minimizeDFA(t *dfaTable) {
 			return ""
 		}
 		var b strings.Builder
-		for _, m := range []map[int][]uint16{t.acceptWide, t.midAcceptWide, t.immAcceptWide} {
-			list := m[st]
+		for _, mp := range t.wideMaps() {
+			list := (*mp)[st]
 			b.WriteByte(byte(len(list)))
 			b.WriteByte(byte(len(list) >> 8))
 			for _, id := range list {
@@ -2266,31 +2356,20 @@ func minimizeDFA(t *dfaTable) {
 	// The wide lists follow their class. Taking the first list seen per class
 	// is exact BECAUSE the partition above keys on it: every state in a class
 	// carries the same list.
-	var newAcceptWide, newMidAcceptWide, newImmAcceptWide map[int][]uint16
-	if t.acceptWide != nil {
-		newAcceptWide = make(map[int][]uint16)
-	}
-	if t.midAcceptWide != nil {
-		newMidAcceptWide = make(map[int][]uint16)
-	}
-	if t.immAcceptWide != nil {
-		newImmAcceptWide = make(map[int][]uint16)
+	wideMaps := t.wideMaps()
+	newWide := make([]map[int][]uint16, len(wideMaps))
+	for i, m := range wideMaps {
+		if *m != nil {
+			newWide[i] = make(map[int][]uint16)
+		}
 	}
 	for s := 0; s < n; s++ {
 		c := classOf[s]
-		if newAcceptWide != nil {
-			if l := t.acceptWide[s]; l != nil {
-				newAcceptWide[c] = l
-			}
-		}
-		if newMidAcceptWide != nil {
-			if l := t.midAcceptWide[s]; l != nil {
-				newMidAcceptWide[c] = l
-			}
-		}
-		if newImmAcceptWide != nil {
-			if l := t.immAcceptWide[s]; l != nil {
-				newImmAcceptWide[c] = l
+		for i, m := range wideMaps {
+			if newWide[i] != nil {
+				if l := (*m)[s]; l != nil {
+					newWide[i][c] = l
+				}
 			}
 		}
 		if v := t.acceptStates[s]; v != 0 {
@@ -2339,9 +2418,9 @@ func minimizeDFA(t *dfaTable) {
 	t.numStates = numClasses
 	t.transitions = newTrans
 	t.acceptStates = newAccept
-	t.acceptWide = newAcceptWide
-	t.midAcceptWide = newMidAcceptWide
-	t.immAcceptWide = newImmAcceptWide
+	for i, m := range wideMaps {
+		*m = newWide[i]
+	}
 	t.midAcceptStates = newMidAccept
 	t.midAcceptNWStates = newMidAcceptNW
 	t.midAcceptWStates = newMidAcceptW
@@ -2562,6 +2641,12 @@ type dfaLayout struct {
 
 	// tableEnd is the highest memory address used by any table in this layout.
 	tableEnd int64
+
+	// notes, when non-nil, gives the plain find a marked copy and the ordinary
+	// copy a waste counter (search_notes.go); notesSearch is the module's
+	// search global the bodies read the block address from.
+	notes       *notesRows
+	notesSearch uint32
 
 	// useHybridDispatch is true when the hybrid path is chosen: table-driven
 	// state transitions combined with compiled self-loop inner blocks.
@@ -4679,6 +4764,12 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 // set swept over its whole-set automaton has every bucket stamp the same
 // global, since the trigger reads one.
 func genSuffixWASMWalkEnd(walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+	return genSuffixWASMWalkEndCtr(nil, walkEnd, t, tableBase, tableMemIdx, patternIDs, prefixFixedLens, lm, needProbes, gated, globals, probeFlags...)
+}
+
+// genSuffixWASMWalkEndCtr is genSuffixWASMWalkEnd with, for a sparse bucket,
+// the sparse work counter (set_sparse.go); nil for none.
+func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -4984,8 +5075,13 @@ func genSuffixWASMWalkEnd(walkEnd int32, t *dfaTable, tableBase int64, tableMemI
 			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
 			memberGlobal:   memberGlobal,
 			probeWalkEndP1: art.probeWalkEndGlobal + 1,
+			walkEndP1:      art.walkEndGlobal + 1,
+		}
+		if gated {
+			sp.ctr = ctr
 		}
 		art.fnBody = sizePrefixed(buildSparseSuffixBody(sp))
+		sp.ctr = nil // the probes answer the scan pair, which has its own counter
 		if needProbes {
 			probe := sizePrefixed(buildSparseProbeBody(sp))
 			art.scanProbe = probe
@@ -5354,18 +5450,36 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// alone must still declare it.
 	haveDominants := len(l.dominantStates) > 0 || len(p.memberSkip) > 0
 
-	var b []byte
-	// Local declaration: (7 + n) × i32, 3 × i64, optionally 1 × v128.
+	// lLiveState: the state the liveness exit last tested. The exit's answer
+	// is a function of the state alone (validMask is fixed for the call), so
+	// it is tested only when the walk ENTERS a state: a run that stays in one
+	// state — the long walks, and every byte of a dense match — pays a compare
+	// instead of the table load. Declared last, in a group of its own, so the
+	// locals above keep their indices.
+	lLiveState := lBulkChunk
 	if haveDominants {
-		b = append(b, 0x03) // 3 groups
-	} else {
-		b = append(b, 0x02) // 2 groups
+		lLiveState++
 	}
+
+	var b []byte
+	// Local declaration: (7 + n) × i32, 3 × i64, optionally 1 × v128, then
+	// lLiveState.
+	groups := byte(2)
+	if haveDominants {
+		groups++
+	}
+	if p.futureOff != 0 {
+		groups++
+	}
+	b = append(b, groups)
 	b = utils.AppendULEB128(b, uint32(7+n))
 	b = append(b, 0x7F) // i32
 	b = append(b, byte(nI64), 0x7E)
 	if haveDominants {
 		b = append(b, 0x01, 0x7B) // 1 × v128
+	}
+	if p.futureOff != 0 {
+		b = append(b, 0x01, 0x7F) // lLiveState, 0 = none tested yet
 	}
 
 	b = emitSetEntryState(b, p, paramPtr, paramStart)
@@ -5647,13 +5761,16 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	// without that this is the reverted Candidate A, costing every byte and
 	// never firing.
 	if p.futureOff != 0 {
+		b = append(b, 0x20, lState, 0x20, lLiveState, 0x47, 0x04, 0x40) // if the state changed
+		b = append(b, 0x20, lState, 0x21, lLiveState)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, p.futureOff)
 		b = append(b, 0x20, lState, 0x41, 0x03, 0x74, 0x6A)
 		b = appendTableLoad64(b, tableMemIdx)
 		b = append(b, 0xA7) // i32.wrap_i64 — a bucket holds at most 32 patterns
 		b = append(b, 0x20, paramValidMask, 0x71)
-		b = append(b, 0x45, 0x0D, 0x01) // eqz -> br $done
+		b = append(b, 0x45, 0x0D, 0x02) // eqz -> br $done
+		b = append(b, 0x0B)
 	}
 
 	// Zero-width pre-transition accept checks (before consuming current byte).
@@ -6060,7 +6177,26 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
-// appendFindCodeEntryTwinned is appendFindCodeEntry plus the NEUTRAL TWIN: when
+
+// findCodeEntry is a pattern's plain find: the body, its neutral twin, and —
+// under per-search notes (search_notes.go) — its marked copy, with the call
+// sites the assembler patches once function indices are known. Every body is
+// size-prefixed; every offset is from the start of its size-prefixed entry.
+type findCodeEntry struct {
+	body      []byte
+	mode      findFromMode
+	twin      []byte // the neutral twin, or nil
+	twinPatch int    // in body: the handoff to the twin, or -1
+	marked    []byte // the marked copy, or nil
+	// markedCall is the handoff to the marked copy in body, and twinMarkedCall
+	// the same in twin; markedBack is the marked copy's handback to body.
+	markedCall, twinMarkedCall, markedBack int
+}
+
+// buildFindCodeEntry builds the plain find for layout l, its neutral twin
+// (below) when it qualifies, and its marked copy when l.notes is set.
+//
+// THE NEUTRAL TWIN (findCodeEntry.twin): when
 // this layout's find body carries a runtime escape that can judge its own hint
 // wrong, a second body is emitted exactly as a neutral compile would emit it,
 // and the returned twin is non-nil.
@@ -6085,8 +6221,7 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // An earlier design selected between the two bodies in the wrapper on a
 // verdict global, and that is what the moduleGlobals allocator was built for;
 // the handoff replaced it, and the allocator now has no consumer in this file.
-func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode, []byte, int) {
-	var twin []byte
+func buildFindCodeEntry(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) findCodeEntry {
 	var hasTwin bool
 	// The twin is worth building only when the hinted body would actually carry
 	// the escape. shuftiPrefixPlan is the one predicate that decides that, and
@@ -6097,13 +6232,30 @@ func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryL
 			hasTwin = true
 		}
 	}
-	cs, mode, twin, patch := appendFindCodeEntryInner(cs, l, t, mandatoryLit, tableMemIdx, hasTwin)
-	return cs, mode, twin, patch
+	return buildFindCodeEntryInner(l, t, mandatoryLit, tableMemIdx, hasTwin)
 }
 
-func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin bool) ([]byte, findFromMode, []byte, int) {
-	var body, twinBody []byte
-	twinPatch := -1
+func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin bool) findCodeEntry {
+	e := findCodeEntry{twinPatch: -1, markedCall: -1, twinMarkedCall: -1, markedBack: -1}
+	var body []byte
+	// notes returns a fresh emission context for one copy, or nil when the
+	// pattern has no notes. Each body needs its own: the context records where
+	// that body's locals start and where its handoff call sits.
+	notes := func(c notesCopy) *notesCtx {
+		if l.notes == nil || isAnchoredFind(t) {
+			return nil
+		}
+		return newBodyNotes(l.notes, l, c, tableMemIdx, l.notesSearch)
+	}
+	sized := func(b []byte, patches ...*int) []byte {
+		prefix := utils.AppendULEB128(nil, uint32(len(b)))
+		for _, p := range patches {
+			if *p >= 0 {
+				*p += len(prefix)
+			}
+		}
+		return append(prefix, b...)
+	}
 	// mode is decided by WHICH body this dispatch picks.
 	//
 	// The two anchored arms are ffAnchoredZeroOnly and their bodies are used
@@ -6112,23 +6264,17 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 	// position 0 — so a search starting anywhere else has nothing to find, and
 	// the wrapper answers -1 without calling the body at all. The claim is
 	// made here, where the predicate is actually evaluated.
-	var mode findFromMode
+	var build func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int)
 	if l.useHybridDispatch {
 		if isAnchoredFind(t) {
-			body, mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
+			body, e.mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			body, mode, twinPatch = buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, l.lnmAction5)
-			if hasTwin {
-				tb, tmode, _ := buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, false, false)
-				if tmode != mode {
-					panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
-				}
-				twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
-				twinBody = append(twinBody, tb...)
+			build = func(hasTwin, lnm bool, nc *notesCtx, _ *Reporter) ([]byte, findFromMode, int) {
+				return buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, lnm, nc)
 			}
 		}
 	} else if isAnchoredFind(t) {
-		mode = ffAnchoredZeroOnly
+		e.mode = ffAnchoredZeroOnly
 		body = buildAnchoredFindBody(anchoredFindBodyParams{
 			startState:         l.wasmStart,
 			tableOff:           l.tableOff,
@@ -6153,7 +6299,6 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 		})
 	} else {
 		fp := findBodyParams{
-			report:                l.report,
 			startState:            l.wasmStart,
 			midStartState:         l.wasmMidStart,
 			midStartWordState:     l.wasmMidStartWord,
@@ -6200,40 +6345,64 @@ func appendFindCodeEntryInner(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit
 			dominantStates:        l.dominantStates,
 			soleMidDominant:       soleMidDominant(l),
 			classChain:            classChainFor(l, t),
-			lnmAction5:            l.lnmAction5,
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
 			switchN:               l.switchN,
 		}
-		fp.hasTwin = hasTwin
-		body, mode, twinPatch = buildFindBody(fp)
-		if hasTwin {
-			// The neutral twin: the SAME layout and tables, emitted the way a
-			// neutral compile would emit them. lnmAction5=false is the whole
-			// difference — it un-forces Shufti, so the scan falls back to the
-			// scalar first-byte loop and shuftiPrefixPlan reports no adaptive
-			// switch, which removes both the gate and the counter. The twin
-			// never writes the verdict; only the hinted body does.
-			np := fp
-			np.lnmAction5 = false
-			np.hasTwin = false
-			np.report = nil // the strategy note belongs to the shipped body
-			tb, tmode, _ := buildFindBody(np)
-			if tmode != mode {
-				panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
-			}
-			twinBody = utils.AppendULEB128(nil, uint32(len(tb)))
-			twinBody = append(twinBody, tb...)
+		build = func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int) {
+			bp := fp
+			bp.hasTwin = hasTwin
+			bp.lnmAction5 = lnm
+			bp.notes = nc
+			bp.report = report
+			return buildFindBody(bp)
 		}
 	}
-	sizePrefix := utils.AppendULEB128(nil, uint32(len(body)))
-	if twinPatch >= 0 {
-		// Report the patch offset relative to the START of the size-prefixed
-		// entry, which is what the assembler holds.
-		twinPatch += len(sizePrefix)
+	if build == nil {
+		e.body = sized(body)
+		return e
 	}
-	cs = append(cs, sizePrefix...)
-	return append(cs, body...), mode, twinBody, twinPatch
+	nc := notes(notesOrdinary)
+	body, e.mode, e.twinPatch = build(hasTwin, l.lnmAction5, nc, l.report)
+	if nc != nil {
+		e.markedCall = nc.callOff
+	}
+	e.body = sized(body, &e.twinPatch, &e.markedCall)
+	if hasTwin {
+		// The neutral twin: the SAME layout and tables, emitted the way a
+		// neutral compile would emit them. lnmAction5=false is the whole
+		// difference — it un-forces Shufti, so the scan falls back to the
+		// scalar first-byte loop and shuftiPrefixPlan reports no adaptive
+		// switch, which removes both the gate and the counter. The twin never
+		// writes the verdict; only the hinted body does. Under notes it carries
+		// the waste counter too: calls the hinted body hands over are part of
+		// the same search.
+		tnc := notes(notesOrdinary)
+		tb, tmode, _ := build(false, false, tnc, nil) // the strategy note belongs to the shipped body
+		if tmode != e.mode {
+			panic("compile: neutral find twin disagrees with its hinted body about findFromMode")
+		}
+		if tnc != nil {
+			e.twinMarkedCall = tnc.callOff
+		}
+		e.twin = sized(tb, &e.twinMarkedCall)
+	}
+	if nc != nil {
+		// The marked copy: built neutral, since it serves only searches that
+		// have already gone bad, where the notes and not the prefilter decide
+		// the cost.
+		mnc := notes(notesMarked)
+		mb, mmode, _ := build(false, false, mnc, nil)
+		if mmode != e.mode {
+			panic("compile: marked find copy disagrees with its ordinary copy about findFromMode")
+		}
+		e.markedBack = mnc.callOff
+		e.marked = sized(mb, &e.markedBack)
+		if e.markedCall < 0 || e.markedBack < 0 || (e.twin != nil && e.twinMarkedCall < 0) {
+			panic("compile: a find copy under notes emitted no handoff call")
+		}
+	}
+	return e
 }
 
 // emitCompressedU8Transition emits the compressed u8 DFA transition:
@@ -6560,7 +6729,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
 	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte,
-	soleMid bool) []byte {
+	soleMid bool, nc *notesCtx) []byte {
 
 	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
@@ -6579,7 +6748,9 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		b = append(b, 0x41, 0x01)
 		b = append(b, 0x6A)                  // pos + 1
 		b = append(b, 0x21, lastAcceptLocal) // local.set last_accept
-		return b
+		// A mid-accept dominant's bulk skip below keeps the state, so the
+		// state recorded here stays the state at the updated last_accept.
+		return nc.emitAcceptHook(b, stateLocal)
 	}
 	emitMidChain := func(b []byte) []byte {
 		for _, info := range mid {
@@ -6991,6 +7162,20 @@ func emitImmAcceptCheckFindStart(b []byte, immAcceptLimit int32,
 func emitEofHandler(b []byte,
 	hasRetry bool, outerDepth byte,
 	acceptLimit int32, eofSkipSafe bool, sw ...switchCounter) []byte {
+	return emitEofHandlerNotes(b, hasRetry, outerDepth, acceptLimit, eofSkipSafe, nil, sw...)
+}
+
+// emitEofHandlerNotes is emitEofHandler for a find body with per-search notes
+// (search_notes.go): the marked copy notes the walk's wasted tail, and the
+// ordinary copy charges a failed walk to the search's waste counter. nc == nil
+// emits exactly emitEofHandler's code.
+//
+// Under eofSkipSafe a walk that reaches the end without an accept ends the
+// whole search, so its tail can never be read again and only a RETURNED
+// match's tail is noted.
+func emitEofHandlerNotes(b []byte,
+	hasRetry bool, outerDepth byte,
+	acceptLimit int32, eofSkipSafe bool, nc *notesCtx, sw ...switchCounter) []byte {
 	const stateLocal = 0x02
 	const posLocal = 0x03
 	const lastAcceptLocal = 0x05
@@ -7004,10 +7189,18 @@ func emitEofHandler(b []byte,
 	if !hasRetry {
 		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
 	} else {
-		b = append(b, 0x20, lastAcceptLocal)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x4E)             // i32.ge_s
-		b = append(b, 0x0D, foundDepth) // br_if → $found
+		if nc.marked() && eofSkipSafe {
+			b = append(b, 0x20, lastAcceptLocal, 0x41, 0x00, 0x4E, 0x04, 0x40) // if last_accept >= 0
+			b = nc.emitEofHook(b)
+			b = append(b, 0x0C, foundDepth+1, 0x0B)
+		} else {
+			b = nc.emitEofHook(b)
+			b = append(b, 0x20, lastAcceptLocal)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x4E)             // i32.ge_s
+			b = append(b, 0x0D, foundDepth) // br_if → $found
+		}
+		b = nc.emitFailHook(b)
 		if eofSkipSafe {
 			b = append(b, 0x0C, outerDepth+1) // br → $no_match
 		} else {
@@ -7031,16 +7224,34 @@ func emitEofHandler(b []byte,
 func emitDeadHandler(b []byte,
 	hasRetry bool, outerDepth byte,
 	posLocal byte, skipSafeOnDead bool, sw ...switchCounter) []byte {
+	return emitDeadHandlerNotes(b, hasRetry, outerDepth, posLocal, skipSafeOnDead, nil, sw...)
+}
+
+// emitDeadHandlerNotes is emitDeadHandler for a find body with per-search
+// notes; see emitEofHandlerNotes. Under skipSafeOnDead the next attempt starts
+// past everything a failed walk read, so its notes could never be read and
+// only a returned match's tail is noted.
+func emitDeadHandlerNotes(b []byte,
+	hasRetry bool, outerDepth byte,
+	posLocal byte, skipSafeOnDead bool, nc *notesCtx, sw ...switchCounter) []byte {
 	const attemptStartLocal = 0x04
 	const lastAcceptLocal = 0x05
 	const foundDepth = 2
 	if !hasRetry {
 		b = append(b, 0x0C, foundDepth) // br → $found (unconditional, anchored)
 	} else {
-		b = append(b, 0x20, lastAcceptLocal)
-		b = append(b, 0x41, 0x00)
-		b = append(b, 0x4E)             // i32.ge_s
-		b = append(b, 0x0D, foundDepth) // br_if → $found
+		if nc.marked() && skipSafeOnDead {
+			b = append(b, 0x20, lastAcceptLocal, 0x41, 0x00, 0x4E, 0x04, 0x40) // if last_accept >= 0
+			b = nc.emitDeadHook(b)
+			b = append(b, 0x0C, foundDepth+1, 0x0B)
+		} else {
+			b = nc.emitDeadHook(b)
+			b = append(b, 0x20, lastAcceptLocal)
+			b = append(b, 0x41, 0x00)
+			b = append(b, 0x4E)             // i32.ge_s
+			b = append(b, 0x0D, foundDepth) // br_if → $found
+		}
+		b = nc.emitFailHook(b)
 		if skipSafeOnDead {
 			// attempt_start = pos + 1. Skips intermediate attempts
 			// from K+1..pos-1 since they would also die at pos (or earlier).
@@ -7087,6 +7298,17 @@ func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNW
 	hasWordBoundary bool,
 	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
 	tableMemIdx int) []byte {
+	return emitWBPreAcceptCheckNotes(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff,
+		hasWordBoundary, ptrLocal, posLocal, stateLocal, lastAcceptLocal, tableMemIdx, nil)
+}
+
+// emitWBPreAcceptCheckNotes is emitWBPreAcceptCheck telling a find body's notes
+// (search_notes.go) the state at each accept it records. nc == nil emits
+// exactly emitWBPreAcceptCheck's code.
+func emitWBPreAcceptCheckNotes(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNWOff int32,
+	hasWordBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	tableMemIdx int, nc *notesCtx) []byte {
 	if !hasWordBoundary {
 		return b
 	}
@@ -7125,6 +7347,7 @@ func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNW
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, lastAcceptLocal)
+	b = nc.emitAcceptHook(b, stateLocal)
 	b = emitDominantBr(b, midAcceptWOff)
 	b = append(b, 0x0B)
 	b = append(b, 0x05) // else: non-word
@@ -7136,6 +7359,7 @@ func emitWBPreAcceptCheck(b []byte, wordCharTableOff, midAcceptWOff, midAcceptNW
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, lastAcceptLocal)
+	b = nc.emitAcceptHook(b, stateLocal)
 	b = emitDominantBr(b, midAcceptNWOff)
 	b = append(b, 0x0B)
 	b = append(b, 0x0B) // end if isWordChar
@@ -7160,6 +7384,16 @@ func emitNLPreAcceptCheck(b []byte, midAcceptNLOff int32,
 		0x00, posLocal, stateLocal, 0x05, tableMemIdx)
 }
 
+// emitNLPreAcceptCheckNotes is emitNLPreAcceptCheck telling a find body's
+// notes the state at each accept it records; see emitWBPreAcceptCheckNotes.
+func emitNLPreAcceptCheckNotes(b []byte, midAcceptNLOff int32,
+	hasNewlineBoundary bool,
+	posLocal, stateLocal byte,
+	tableMemIdx int, nc *notesCtx) []byte {
+	return emitNLPreAcceptCheckLocalsNotes(b, midAcceptNLOff, hasNewlineBoundary,
+		0x00, posLocal, stateLocal, 0x05, tableMemIdx, nc)
+}
+
 // emitNLPreAcceptCheckLocals is emitNLPreAcceptCheck for a body whose input
 // pointer and last-accept position are not locals 0 and 5 — the lenient
 // alternation's inline DFA verify, whose shape ([loop $dfa] directly inside
@@ -7169,6 +7403,14 @@ func emitNLPreAcceptCheckLocals(b []byte, midAcceptNLOff int32,
 	hasNewlineBoundary bool,
 	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
 	tableMemIdx int) []byte {
+	return emitNLPreAcceptCheckLocalsNotes(b, midAcceptNLOff, hasNewlineBoundary,
+		ptrLocal, posLocal, stateLocal, lastAcceptLocal, tableMemIdx, nil)
+}
+
+func emitNLPreAcceptCheckLocalsNotes(b []byte, midAcceptNLOff int32,
+	hasNewlineBoundary bool,
+	ptrLocal, posLocal, stateLocal, lastAcceptLocal byte,
+	tableMemIdx int, nc *notesCtx) []byte {
 	if !hasNewlineBoundary {
 		return b
 	}
@@ -7188,6 +7430,7 @@ func emitNLPreAcceptCheckLocals(b []byte, midAcceptNLOff int32,
 	b = append(b, 0x04, 0x40)             // if (void)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x21, lastAcceptLocal)
+	b = nc.emitAcceptHook(b, stateLocal)
 	// Re-check the dominant-accept value (2) before stopping the scan; see
 	// emitWBPreAcceptCheck's emitDominantBr for why this is a reload rather
 	// than a cached local.
@@ -8372,6 +8615,17 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	if p.switchN > 0 {
 		locWalked, locCandWalk = a.I64(), a.I32()
 	}
+	// Per-search notes (search_notes.go) for the forward walk: a marked copy
+	// of Phase 3 beside the plain one, chosen once per call.
+	var nc *notesCtx
+	if p.notes != nil && p.notes.find != nil {
+		base := a.I32()
+		for i := 1; i < walkNotesLocals; i++ {
+			a.I32()
+		}
+		nc = newWalkNotes(p.notes.find, l, tableMemIdx, p.notes.search,
+			locPtr, locLen, locState, locPos, locLastAccept, noBias, base)
+	}
 	const (
 		locChunk  = 8
 		locTLo    = 9
@@ -8387,6 +8641,9 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	// additionally reads the same global as its floor so it cannot walk left
 	// past the caller's start position.
 	b, findFrom = emitFindFromSeed(b, attemptCursor)
+	if nc != nil {
+		b = nc.emitWalkEntry(b, true)
+	}
 
 	// ── outer control flow ────────────────────────────────────────────────────
 	// block $no_match (depth 1 from inside $lit_outer)
@@ -8535,185 +8792,237 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x0B)                  // end if
 
 	// ── Phase 3: forward DFA scan from rev_result ─────────────────────────────
-	// Initial state:
-	//   rev_result == 0              → wasmStart (match starts at input begin)
-	//   ptr[rev_result-1] == '\n'    → wasmMidStartNewline
-	//   otherwise                    → wasmMidStart
-	// For patterns without newline boundaries wasmMidStart == wasmMidStartNewline
-	// (dfa.midStartNewline aliases dfa.midStart at construction in that case,
-	// the byte check is still emitted for correctness and
-	// future-proofing.
-	b = append(b, 0x20, locRevResult) // local.get rev_result
-	b = append(b, 0x45)               // i32.eqz
-	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x05) // else
-	// load byte at ptr + rev_result - 1
-	b = append(b, 0x20, locPtr)       // local.get ptr
-	b = append(b, 0x20, locRevResult) // local.get rev_result
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6B)             // i32.sub (rev_result - 1)
-	b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
-	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-	b = append(b, 0x41, 0x0A)       // i32.const '\n'
-	b = append(b, 0x46)             // i32.eq
-	b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
-	b = append(b, 0x05) // else
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
-	b = append(b, 0x0B)           // end if newline
-	b = append(b, 0x0B)           // end if start
-	b = append(b, 0x21, locState) // local.set state
-
-	b = append(b, 0x20, locRevResult)
-	b = append(b, 0x21, locPos) // local.set pos = rev_result
-
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x21, locLastAccept) // last_accept = -1
-
-	// Initial midAccept check at start position.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x20, locState)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x21, locLastAccept) // last_accept = pos
-	b = append(b, 0x0B)                // end if
-
-	// Optional immediateAccept check at start position.
-	// br depth: 0=if, 1=$fwd_done (block, opened just below)
-	// We open $fwd_done first, then emit the start immAccept check inside it.
-	b = append(b, 0x02, 0x40) // block $fwd_done
-	if l.hasImmAccept {
-		// state-ID partition: WASM states 1..immAcceptLimit are imm-accepting.
-		b = append(b, 0x20, locState) // local.get state
+	// Emitted once, or — under notes — twice: the marked walk and the plain
+	// one, chosen by the entry's verdict.
+	var onStop func([]byte) []byte
+	if nc != nil && p.switchN > 0 {
+		onStop = nc.emitStopCharge(locCandWalk)
+	}
+	phase3 := func(b []byte, marked bool) []byte {
+		var mnc *notesCtx // the hooks' context: nil emits nothing
+		if marked {
+			mnc = nc
+		}
+		// Initial state:
+		//   rev_result == 0              → wasmStart (match starts at input begin)
+		//   ptr[rev_result-1] == '\n'    → wasmMidStartNewline
+		//   otherwise                    → wasmMidStart
+		// For patterns without newline boundaries wasmMidStart == wasmMidStartNewline
+		// (dfa.midStartNewline aliases dfa.midStart at construction in that case,
+		// the byte check is still emitted for correctness and
+		// future-proofing.
+		b = append(b, 0x20, locRevResult) // local.get rev_result
+		b = append(b, 0x45)               // i32.eqz
+		b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
-		b = append(b, 0x4D)                          // i32.le_u
-		b = append(b, 0x04, 0x40)                    // if (void)
-		b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
-		b = append(b, 0x0B)                          // end if
-	}
+		b = utils.AppendSLEB128(b, int32(l.wasmStart))
+		b = append(b, 0x05) // else
+		// load byte at ptr + rev_result - 1
+		b = append(b, 0x20, locPtr)       // local.get ptr
+		b = append(b, 0x20, locRevResult) // local.get rev_result
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6B)             // i32.sub (rev_result - 1)
+		b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x41, 0x0A)       // i32.const '\n'
+		b = append(b, 0x46)             // i32.eq
+		b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
+		b = append(b, 0x05) // else
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+		b = append(b, 0x0B)           // end if newline
+		b = append(b, 0x0B)           // end if start
+		b = append(b, 0x21, locState) // local.set state
 
-	// Inner forward DFA scan loop.
-	// Control flow depths inside $fwd_scan (relative to inner if blocks):
-	//   depth 0=if, depth 1=$fwd_scan(loop), depth 2=$fwd_done(block)
-	b = append(b, 0x03, 0x40) // loop $fwd_scan
+		b = append(b, 0x20, locRevResult)
+		b = append(b, 0x21, locPos) // local.set pos = rev_result
 
-	// if pos >= len: EOF check, then exit $fwd_done.
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x20, locLen)
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x04, 0x40) // if (void)
-	// if accept[state] != 0: last_accept = pos (EOF accept)
-	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x21, locLastAccept) // last_accept = pos
-	b = append(b, 0x0B)                // end if accept
-	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done (0=eof_if, 1=$fwd_scan, 2=$fwd_done)
-	b = append(b, 0x0B)                // end if pos>=len
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x21, locLastAccept) // last_accept = -1
 
-	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx)
-
-	// DFA transition.
-	if l.useCompression {
-		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
-	} else {
-		b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
-	}
-
-	// if state == 0 (dead): exit $fwd_done.
-	b = append(b, 0x20, locState)
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x0C, 0x02) // br 2 → $fwd_done (0=dead_if, 1=$fwd_scan, 2=$fwd_done)
-	b = append(b, 0x0B)       // end if dead
-
-	// if midAccept[state]: last_accept = pos + 1
-	// Suggestion 3: dispatch dominant bulk-skip from inside lit-anchor's
-	// forward DFA scan. Mid-accept entries piggyback on the midAccept load
-	// (same shape as buildFindBody). Non-mid entries use state-ID compares
-	// outside the midAccept block (LM-gated via dominantStates filtering
-	// in compile.go).
-	hasMidDom := false
-	hasNonMidDom := false
-	for _, info := range l.dominantStates {
-		if info.isMidAccept {
-			hasMidDom = true
-		} else {
-			hasNonMidDom = true
+		// Initial midAccept check at start position.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		b = append(b, 0x04, 0x40)             // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x21, locLastAccept) // last_accept = pos
+		b = append(b, 0x0B)                // end if
+		if marked {
+			b = nc.emitWalkInit(b)
 		}
-	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x20, locState)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	if hasMidDom {
-		b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
-	}
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A) // pos + 1
-	b = append(b, 0x21, locLastAccept)
-	if hasMidDom {
-		for _, info := range l.dominantStates {
-			if !info.isMidAccept {
-				continue
-			}
-			b = append(b, 0x20, locSimdOrClass)
+
+		// Optional immediateAccept check at start position.
+		// br depth: 0=if, 1=$fwd_done (block, opened just below)
+		// We open $fwd_done first, then emit the start immAccept check inside it.
+		b = append(b, 0x02, 0x40) // block $fwd_done
+		if l.hasImmAccept {
+			// state-ID partition: WASM states 1..immAcceptLimit are imm-accepting.
+			b = append(b, 0x20, locState) // local.get state
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(info.encodedByte))
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, true,
-				locPos, locLen, locLastAccept, locPtr,
-				locChunk, locSimdOrClass)
-			b = append(b, 0x0B) // end if (per-dominant gate)
+			b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
+			b = append(b, 0x4D)                          // i32.le_u
+			b = append(b, 0x04, 0x40)                    // if (void)
+			b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
+			b = append(b, 0x0B)                          // end if
 		}
-	}
-	b = append(b, 0x0B) // end if midAccept
-	if hasNonMidDom {
+
+		// Inner forward DFA scan loop.
+		// Control flow depths inside $fwd_scan (relative to inner if blocks):
+		//   depth 0=if, depth 1=$fwd_scan(loop), depth 2=$fwd_done(block)
+		b = append(b, 0x03, 0x40) // loop $fwd_scan
+
+		// if pos >= len: EOF check, then exit $fwd_done.
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (void)
+		// if accept[state] != 0: last_accept = pos (EOF accept)
+		b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x21, locLastAccept) // last_accept = pos
+		if marked {
+			b = mnc.emitAcceptHook(b, locState)
+		}
+		b = append(b, 0x0B)       // end if accept
+		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done (0=eof_if, 1=$fwd_scan, 2=$fwd_done)
+		b = append(b, 0x0B)       // end if pos>=len
+
+		b = emitNLPreAcceptCheckNotes(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx, mnc)
+
+		// DFA transition.
+		if l.useCompression {
+			b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+				locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+		} else {
+			b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
+		}
+
+		// if state == 0 (dead): exit $fwd_done.
+		b = append(b, 0x20, locState)
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done (0=dead_if, 1=$fwd_scan, 2=$fwd_done)
+		b = append(b, 0x0B)       // end if dead
+		if marked {
+			b = nc.emitWalkArrivalStop(b, 1, onStop)
+		}
+
+		// if midAccept[state]: last_accept = pos + 1
+		// Suggestion 3: dispatch dominant bulk-skip from inside lit-anchor's
+		// forward DFA scan. Mid-accept entries piggyback on the midAccept load
+		// (same shape as buildFindBody). Non-mid entries use state-ID compares
+		// outside the midAccept block (LM-gated via dominantStates filtering
+		// in compile.go).
+		hasMidDom := false
+		hasNonMidDom := false
 		for _, info := range l.dominantStates {
 			if info.isMidAccept {
-				continue
+				hasMidDom = true
+			} else {
+				hasNonMidDom = true
 			}
-			b = append(b, 0x20, locState)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, info.state)
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, false,
-				locPos, locLen, locLastAccept, locPtr,
-				locChunk, locSimdOrClass)
-			b = append(b, 0x0B) // end if (state == K)
 		}
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		if hasMidDom {
+			b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
+		}
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // pos + 1
+		b = append(b, 0x21, locLastAccept)
+		if marked {
+			b = mnc.emitAcceptHook(b, locState)
+		}
+		if hasMidDom {
+			for _, info := range l.dominantStates {
+				if !info.isMidAccept {
+					continue
+				}
+				b = append(b, 0x20, locSimdOrClass)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(info.encodedByte))
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info, true,
+					locPos, locLen, locLastAccept, locPtr,
+					locChunk, locSimdOrClass)
+				b = append(b, 0x0B) // end if (per-dominant gate)
+			}
+		}
+		b = append(b, 0x0B) // end if midAccept
+		if hasNonMidDom {
+			for _, info := range l.dominantStates {
+				if info.isMidAccept {
+					continue
+				}
+				b = append(b, 0x20, locState)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, info.state)
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info, false,
+					locPos, locLen, locLastAccept, locPtr,
+					locChunk, locSimdOrClass)
+				if marked {
+					// The skip strides over the notes: test where it stopped
+					// (see buildStartAnywhereForwardBody).
+					b = nc.emitWalkArrivalStop(b, 2, onStop)
+				}
+				b = append(b, 0x0B) // end if (state == K)
+			}
+		}
+
+		b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
+
+		// pos++; restart scan.
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locPos) // pos++
+		b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
+		b = append(b, 0x0B)         // end loop $fwd_scan
+		b = append(b, 0x0B)         // end block $fwd_done
+		return b
 	}
-
-	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
-
-	// pos++; restart scan.
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A)
-	b = append(b, 0x21, locPos) // pos++
-	b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
-	b = append(b, 0x0B)         // end loop $fwd_scan
-	b = append(b, 0x0B)         // end block $fwd_done
+	if nc == nil {
+		b = phase3(b, false)
+	} else {
+		b = append(b, 0x20, nc.lMarked(), 0x04, 0x40) // if (marked)
+		b = phase3(b, true)
+		b = nc.emitWalkAfterAll(b)
+		b = append(b, 0x05)
+		b = phase3(b, false)
+		b = nc.emitFarUpdate(b)
+		b = append(b, 0x0B)
+	}
 
 	// if last_accept >= 0: return packed i64 (rev_result << 32 | last_accept).
 	b = append(b, 0x20, locLastAccept)
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x4E)       // i32.ge_s
 	b = append(b, 0x04, 0x40) // if (void)
+	if nc != nil {
+		// Where the host resumes: the marked walk's next call checks it. The
+		// plain walks charge what they read past the match.
+		b = append(b, 0x20, nc.lMarked(), 0x04, 0x40)
+		b = emitStoreResume(b, nc.search, nc.lBlk(),
+			func(b []byte) []byte { return append(b, 0x20, locRevResult) },
+			func(b []byte) []byte { return append(b, 0x20, locLastAccept) })
+		b = append(b, 0x05)
+		b = nc.emitFarCharge(b, locLastAccept)
+		b = append(b, 0x0B)
+	}
 	b = append(b, 0x20, locRevResult)
 	b = append(b, 0xAD)       // i64.extend_i32_u
 	b = append(b, 0x42, 0x20) // i64.const 32
@@ -8778,6 +9087,23 @@ func buildAltLitAnchorForwardVerifyBody(t *dfaTable, l *dfaLayout, tableMemIdx i
 // into that global — for the start-anywhere switch's counter. -1 emits exactly
 // the unstamped body.
 func buildAltLitAnchorForwardVerifyBodyStamped(t *dfaTable, l *dfaLayout, tableMemIdx int, stampGlobal int32) []byte {
+	return buildAltLitAnchorForwardVerifyBodyNotes(t, l, tableMemIdx, stampGlobal, nil)
+}
+
+// verifyNotes is an alternation branch's per-search notes (search_notes.go):
+// its rows, the search global, and the global through which the dispatcher
+// hands every verify of one call its verdict — the notes' address for the
+// marked walk, 0 for the plain one.
+type verifyNotes struct {
+	rows   *notesRows
+	search uint32
+	marked uint32
+	end    uint32 // the plain walk stores where it stopped here
+}
+
+// buildAltLitAnchorForwardVerifyBodyNotes is buildAltLitAnchorForwardVerifyBodyStamped
+// with, when vn is non-nil, the marked walk beside the plain one.
+func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMemIdx int, stampGlobal int32, vn *verifyNotes) []byte {
 	var b []byte
 
 	const (
@@ -8803,166 +9129,229 @@ func buildAltLitAnchorForwardVerifyBodyStamped(t *dfaTable, l *dfaLayout, tableM
 	needChunk := hasMidDom || hasNonMidDom
 
 	// ── local declarations ────────────────────────────────────────────────
-	if needChunk {
+	var nc *notesCtx
+	switch {
+	case vn != nil && needChunk:
+		b = append(b, 0x03, 0x04, 0x7F, 0x01, 0x7B, notesNumLocals, 0x7F)
+		nc = newWalkNotes(vn.rows, l, tableMemIdx, vn.search, locPtr, locLen, locState, locPos, locLastAccept, noBias, locChunk+1)
+	case vn != nil:
+		b = append(b, 0x01, 4+notesNumLocals, 0x7F)
+		nc = newWalkNotes(vn.rows, l, tableMemIdx, vn.search, locPtr, locLen, locState, locPos, locLastAccept, noBias, locSimdOrClass+1)
+	case needChunk:
 		b = append(b, 0x02)       // 2 local groups
 		b = append(b, 0x04, 0x7F) // 4 × i32: state, pos, last_accept, simdOrClass
 		b = append(b, 0x01, 0x7B) // 1 × v128: chunk
-	} else {
+	default:
 		b = append(b, 0x01)       // 1 local group
 		b = append(b, 0x04, 0x7F) // 4 × i32
 	}
+	walk := func(b []byte, marked bool) []byte {
+		var mnc *notesCtx // the hooks' context: nil emits nothing
+		if marked {
+			mnc = nc
+		}
 
-	// Initial state, from rev_result (parameter, not a local computation):
-	//   rev_result == 0           → wasmStart (match starts at input begin)
-	//   ptr[rev_result-1] == '\n' → wasmMidStartNewline
-	//   otherwise                 → wasmMidStart
-	b = append(b, 0x20, locRevResult) // local.get rev_result
-	b = append(b, 0x45)               // i32.eqz
-	b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x05)               // else
-	b = append(b, 0x20, locPtr)       // local.get ptr
-	b = append(b, 0x20, locRevResult) // local.get rev_result
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6B)             // i32.sub (rev_result - 1)
-	b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
-	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
-	b = append(b, 0x41, 0x0A)       // i32.const '\n'
-	b = append(b, 0x46)             // i32.eq
-	b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
-	b = append(b, 0x05) // else
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
-	b = append(b, 0x0B)           // end if newline
-	b = append(b, 0x0B)           // end if start
-	b = append(b, 0x21, locState) // local.set state
-
-	b = append(b, 0x20, locRevResult)
-	b = append(b, 0x21, locPos) // local.set pos = rev_result
-
-	b = append(b, 0x41, 0x7F)
-	b = append(b, 0x21, locLastAccept) // last_accept = -1
-
-	// Initial midAccept check at start position.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x20, locState)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	b = append(b, 0x04, 0x40)             // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x21, locLastAccept) // last_accept = pos
-	b = append(b, 0x0B)                // end if
-
-	// Optional immediateAccept check at start position.
-	b = append(b, 0x02, 0x40) // block $fwd_done
-	if l.hasImmAccept {
-		b = append(b, 0x20, locState) // local.get state
+		// Initial state, from rev_result (parameter, not a local computation):
+		//   rev_result == 0           → wasmStart (match starts at input begin)
+		//   ptr[rev_result-1] == '\n' → wasmMidStartNewline
+		//   otherwise                 → wasmMidStart
+		b = append(b, 0x20, locRevResult) // local.get rev_result
+		b = append(b, 0x45)               // i32.eqz
+		b = append(b, 0x04, 0x7F)         // if (result i32) — start of input
 		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
-		b = append(b, 0x4D)                          // i32.le_u
-		b = append(b, 0x04, 0x40)                    // if (void)
-		b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
-		b = append(b, 0x0B)                          // end if
+		b = utils.AppendSLEB128(b, int32(l.wasmStart))
+		b = append(b, 0x05)               // else
+		b = append(b, 0x20, locPtr)       // local.get ptr
+		b = append(b, 0x20, locRevResult) // local.get rev_result
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6B)             // i32.sub (rev_result - 1)
+		b = append(b, 0x6A)             // i32.add (ptr + rev_result - 1)
+		b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+		b = append(b, 0x41, 0x0A)       // i32.const '\n'
+		b = append(b, 0x46)             // i32.eq
+		b = append(b, 0x04, 0x7F)       // if (result i32) — preceded by '\n'
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStartNewline))
+		b = append(b, 0x05) // else
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmMidStart))
+		b = append(b, 0x0B)           // end if newline
+		b = append(b, 0x0B)           // end if start
+		b = append(b, 0x21, locState) // local.set state
+
+		b = append(b, 0x20, locRevResult)
+		b = append(b, 0x21, locPos) // local.set pos = rev_result
+
+		b = append(b, 0x41, 0x7F)
+		b = append(b, 0x21, locLastAccept) // last_accept = -1
+
+		// Initial midAccept check at start position.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		b = append(b, 0x04, 0x40)             // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x21, locLastAccept) // last_accept = pos
+		b = append(b, 0x0B)                // end if
+		if marked {
+			b = nc.emitWalkInit(b)
+		}
+
+		// Optional immediateAccept check at start position.
+		b = append(b, 0x02, 0x40) // block $fwd_done
+		if l.hasImmAccept {
+			b = append(b, 0x20, locState) // local.get state
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, l.immAcceptLimit) // i32.const immAcceptLimit
+			b = append(b, 0x4D)                          // i32.le_u
+			b = append(b, 0x04, 0x40)                    // if (void)
+			b = append(b, 0x0C, 0x01)                    // br 1 → $fwd_done
+			b = append(b, 0x0B)                          // end if
+		}
+
+		// Inner forward DFA scan loop.
+		b = append(b, 0x03, 0x40) // loop $fwd_scan
+
+		// if pos >= len: EOF check, then exit $fwd_done.
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x20, locLen)
+		b = append(b, 0x4F)       // i32.ge_u
+		b = append(b, 0x04, 0x40) // if (void)
+		b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x21, locLastAccept) // last_accept = pos
+		b = mnc.emitAcceptHook(b, locState)
+		b = append(b, 0x0B)       // end if accept
+		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
+		b = append(b, 0x0B)       // end if pos>=len
+
+		b = emitNLPreAcceptCheckNotes(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx, mnc)
+
+		// DFA transition.
+		if l.useCompression {
+			b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
+				locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+		} else {
+			b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
+		}
+
+		// if state == 0 (dead): exit $fwd_done.
+		b = append(b, 0x20, locState)
+		b = append(b, 0x45)       // i32.eqz
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
+		b = append(b, 0x0B)       // end if dead
+		if marked {
+			b = nc.emitWalkArrival(b, 1)
+		}
+
+		// if midAccept[state]: last_accept = pos + 1 (+ dominant bulk-skip dispatch)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, locState)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
+		if hasMidDom {
+			b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
+		}
+		b = append(b, 0x04, 0x40) // if (void)
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A) // pos + 1
+		b = append(b, 0x21, locLastAccept)
+		b = mnc.emitAcceptHook(b, locState)
+		if hasMidDom {
+			for _, info := range l.dominantStates {
+				if !info.isMidAccept {
+					continue
+				}
+				b = append(b, 0x20, locSimdOrClass)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(info.encodedByte))
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info, true,
+					locPos, locLen, locLastAccept, locPtr,
+					locChunk, locSimdOrClass)
+				b = append(b, 0x0B) // end if (per-dominant gate)
+			}
+		}
+		b = append(b, 0x0B) // end if midAccept
+		if hasNonMidDom {
+			for _, info := range l.dominantStates {
+				if info.isMidAccept {
+					continue
+				}
+				b = append(b, 0x20, locState)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, info.state)
+				b = append(b, 0x46)       // i32.eq
+				b = append(b, 0x04, 0x40) // if (void)
+				b = emitDominantBulkSkip(b, info, false,
+					locPos, locLen, locLastAccept, locPtr,
+					locChunk, locSimdOrClass)
+				if marked {
+					// The skip strides over the notes: test where it stopped
+					// (see buildStartAnywhereForwardBody).
+					b = nc.emitWalkArrival(b, 2)
+				}
+				b = append(b, 0x0B) // end if (state == K)
+			}
+		}
+
+		b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
+
+		// pos++; restart scan.
+		b = append(b, 0x20, locPos)
+		b = append(b, 0x41, 0x01)
+		b = append(b, 0x6A)
+		b = append(b, 0x21, locPos) // pos++
+		b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
+		b = append(b, 0x0B)         // end loop $fwd_scan
+		b = append(b, 0x0B)         // end block $fwd_done
+		return b
 	}
-
-	// Inner forward DFA scan loop.
-	b = append(b, 0x03, 0x40) // loop $fwd_scan
-
-	// if pos >= len: EOF check, then exit $fwd_done.
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x20, locLen)
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x04, 0x40) // if (void)
-	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x21, locLastAccept) // last_accept = pos
-	b = append(b, 0x0B)                // end if accept
-	b = append(b, 0x0C, 0x02)          // br 2 → $fwd_done
-	b = append(b, 0x0B)                // end if pos>=len
-
-	b = emitNLPreAcceptCheck(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx)
-
-	// DFA transition.
-	if l.useCompression {
-		b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
-			locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
+	stampAt := func(b []byte, extra bool) []byte {
+		if stampGlobal < 0 {
+			return b
+		}
+		b = append(b, 0x20, locPos)
+		if extra {
+			b = append(b, 0x20, locSimdOrClass, 0x6A)
+		}
+		b = append(b, 0x24)
+		return utils.AppendULEB128(b, uint32(stampGlobal))
+	}
+	if nc == nil {
+		b = walk(b, false)
+		b = stampAt(b, false)
 	} else {
-		b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
-	}
-
-	// if state == 0 (dead): exit $fwd_done.
-	b = append(b, 0x20, locState)
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x0C, 0x02) // br 2 → $fwd_done
-	b = append(b, 0x0B)       // end if dead
-
-	// if midAccept[state]: last_accept = pos + 1 (+ dominant bulk-skip dispatch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x20, locState)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	if hasMidDom {
-		b = append(b, 0x22, locSimdOrClass) // local.tee — cache value
-	}
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A) // pos + 1
-	b = append(b, 0x21, locLastAccept)
-	if hasMidDom {
-		for _, info := range l.dominantStates {
-			if !info.isMidAccept {
-				continue
-			}
-			b = append(b, 0x20, locSimdOrClass)
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, vn.marked)
+		b = append(b, 0x22, nc.lNotes(), 0x04, 0x40) // tee notes; if (marked)
+		b = nc.gget(b)
+		b = append(b, 0x21, nc.lBlk())
+		b = walk(b, true)
+		if stampGlobal >= 0 {
+			// A stop at a note with no accept counts as a failed read for the
+			// switch counter (see emitStop): stamp it 2 × switchShortWalk
+			// further on.
+			b = append(b, 0x20, nc.lEnd(), 0x41, 0x7E, 0x47, 0x20, locLastAccept, 0x41, 0x00, 0x48, 0x71)
 			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(info.encodedByte))
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, true,
-				locPos, locLen, locLastAccept, locPtr,
-				locChunk, locSimdOrClass)
-			b = append(b, 0x0B) // end if (per-dominant gate)
+			b = utils.AppendSLEB128(b, 2*switchShortWalk)
+			b = append(b, 0x6C, 0x21, locSimdOrClass) // flag × 64
 		}
-	}
-	b = append(b, 0x0B) // end if midAccept
-	if hasNonMidDom {
-		for _, info := range l.dominantStates {
-			if info.isMidAccept {
-				continue
-			}
-			b = append(b, 0x20, locState)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, info.state)
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, false,
-				locPos, locLen, locLastAccept, locPtr,
-				locChunk, locSimdOrClass)
-			b = append(b, 0x0B) // end if (state == K)
-		}
-	}
-
-	b = emitImmAcceptCheckFindMid(b, l.immAcceptLimit, l.hasImmAccept, locState, locPos, tableMemIdx)
-
-	// pos++; restart scan.
-	b = append(b, 0x20, locPos)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A)
-	b = append(b, 0x21, locPos) // pos++
-	b = append(b, 0x0C, 0x00)   // br 0 → $fwd_scan
-	b = append(b, 0x0B)         // end loop $fwd_scan
-	b = append(b, 0x0B)         // end block $fwd_done
-	if stampGlobal >= 0 {
+		b = nc.emitWalkAfterAll(b)
+		b = stampAt(b, true)
+		b = append(b, 0x05)
+		b = walk(b, false)
 		b = append(b, 0x20, locPos, 0x24)
-		b = utils.AppendULEB128(b, uint32(stampGlobal))
+		b = utils.AppendULEB128(b, vn.end)
+		b = stampAt(b, false)
+		b = append(b, 0x0B)
 	}
 
 	// if last_accept >= 0: return packed i64 (rev_result << 32 | last_accept).
@@ -9048,6 +9437,16 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 		locWalked, locCandWalk = a.I64(), a.I32()
 		stamp = uint32(p.backStampP1 - 1) //nolint:gosec // a global index
 	}
+	// Per-search notes: the dispatcher decides marked or plain once per call
+	// and hands the verdict to every branch's verify through a global.
+	var nc *notesCtx
+	if an := p.notes.altRows(); an != nil {
+		base := a.I32()
+		for i := 1; i < walkNotesLocals; i++ {
+			a.I32()
+		}
+		nc = newWalkNotes(an, nil, tableMemIdx, p.notes.search, locPtr, locLen, 0xFF, 0xFF, 0xFF, noBias, base)
+	}
 	const (
 		locChunk  = 6
 		locTLo    = 7
@@ -9070,6 +9469,11 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 	// and each branch's backward scan reads the same global as its floor, so
 	// neither can look left of the caller's start position.
 	b, findFrom = emitFindFromSeed(b, attemptCursor)
+	if nc != nil {
+		b = nc.emitWalkEntry(b, true)
+		b = append(b, 0x20, nc.lNotes(), 0x41, 0x00, 0x20, nc.lMarked(), 0x1B, 0x24) // marked ? notes : 0
+		b = utils.AppendULEB128(b, p.notes.altMarked)
+	}
 
 	b = append(b, 0x02, 0x40) // block $no_match
 	b = append(b, 0x03, 0x40) // loop $outer
@@ -9157,6 +9561,15 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 			b = append(b, 0x10)
 			b = utils.AppendULEB128(b, uint32(funcIdx.forwardVerify))
 			b = append(b, 0x22, locPacked) // local.tee packed
+			if nc != nil && p.notes.alt[bi] != nil {
+				// Where the plain verify stopped (a marked one leaves the
+				// global alone, and its call charges nothing).
+				b = append(b, 0x23)
+				b = utils.AppendULEB128(b, p.notes.altEnd)
+				b = append(b, 0x20, nc.lFar(), 0x4A, 0x04, 0x40, 0x23)
+				b = utils.AppendULEB128(b, p.notes.altEnd)
+				b = append(b, 0x21, nc.lFar(), 0x0B)
+			}
 			if p.switchN > 0 {
 				// …and its forward walk (the verify stamped where it
 				// stopped); a successful verify returns below regardless.
@@ -9171,6 +9584,17 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 			b = append(b, 0x0D, 0x00) // br_if 0
 
 			// Success: return packed.
+			if nc != nil {
+				// Where the host resumes: the marked walk's next call checks it.
+				b = append(b, 0x20, nc.lMarked(), 0x04, 0x40)
+				b = emitStoreResume(b, nc.search, nc.lBlk(),
+					func(b []byte) []byte { return append(b, 0x20, locRevResult) },
+					func(b []byte) []byte { return append(b, 0x20, locPacked, 0xA7) })
+				b = append(b, 0x05)
+				b = append(b, 0x20, locPacked, 0xA7, 0x21, nc.lM()) // the match's end
+				b = nc.emitFarCharge(b, nc.lM())
+				b = append(b, 0x0B)
+			}
 			b = append(b, 0x20, locPacked)
 			b = append(b, 0x0F) // return
 			b = append(b, 0x0B) // end $try_lit
@@ -9293,6 +9717,11 @@ type findBodyParams struct {
 	eofSkipSafe    bool
 	switchN        int32
 
+	// notes, when non-nil, makes this body one of a pattern's two copies
+	// under per-search notes (search_notes.go): the ORDINARY copy with the
+	// waste counter, or the MARKED copy that reads and writes the notes.
+	notes *notesCtx
+
 	// soleMidDominant: a nonzero midAccept load can only be dominantStates[0],
 	// so the dispatch needs neither the cached value nor the compare against
 	// its encoding. See soleMidDominant().
@@ -9366,6 +9795,34 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			panic("compile: start-anywhere switch counter was never declared")
 		}
 		return []switchCounter{{walkedLocal: walkedLocal, n: p.switchN}}
+	}
+	nc := p.notes
+	if nc != nil {
+		nc.sw = swArg
+	}
+	// mlLocals declares a mandatory-literal path's locals, which bypass
+	// appendLocalGroups: n i32, one v128, then the switch counter and the
+	// notes group when the body has them.
+	mlLocals := func(b []byte, n byte) []byte {
+		groups := byte(2)
+		if p.switchN > 0 {
+			groups++
+		}
+		if nc != nil {
+			groups++
+		}
+		b = append(b, groups, n, 0x7F, 0x01, 0x7B)
+		next := 2 + n + 1
+		if p.switchN > 0 {
+			b = append(b, 0x01, 0x7E) // + the counter, i64
+			walkedLocal = next
+			next++
+		}
+		if nc != nil {
+			b = append(b, notesNumLocals, 0x7F)
+			nc.base = next
+		}
+		return b
 	}
 	// The non-mid-accept dispatch tracked call-site offsets for later
 	// patching at assembleModule time. That extension (along with the
@@ -9589,7 +10046,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			b = utils.AppendSLEB128(b, denseSwitchThreshold)
 			b = append(b, 0x21, denseCounterLocal)
 		}
-		return b
+		return nc.emitEntry(b)
 	}
 	appendLocalGroups := func(b []byte, i32Count byte) []byte {
 		trailingI32 := byte(0)
@@ -9609,6 +10066,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if p.switchN > 0 {
 			numGroups++
 		}
+		if nc != nil {
+			numGroups++
+		}
 		if i32Count <= findBodyAttemptStartLocal-2 {
 			panic("compile: buildFindBody i32 group does not cover attempt_start")
 		}
@@ -9622,6 +10082,13 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if p.switchN > 0 {
 			b = append(b, 0x01, 0x7E) // the counter, i64
 			walkedLocal = 2 + i32Count + byte(numV128ForScan) + trailingI32
+		}
+		if nc != nil {
+			b = append(b, notesNumLocals, 0x7F)
+			nc.base = 2 + i32Count + byte(numV128ForScan) + trailingI32
+			if p.switchN > 0 {
+				nc.base++
+			}
 		}
 		// The find-from seed goes here and only here. This closure is the one
 		// point at which every branch of this function declares its locals, so
@@ -10116,7 +10583,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 					b = append(b, 0x21, 0x05) // local.set last_accept
 					b = append(b, 0x0B)       // end if
 				}
-				return b
+				return nc.emitPrologue(b)
 			},
 		}
 		params.Report = p.report
@@ -10132,6 +10599,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 
 	// ── helper: emit the packed-i64 return and close loops ──────────────────
 	emitReturn := func(b []byte) []byte {
+		b = nc.emitReturnHook(b)
 		// return (attempt_start << 32) | last_accept
 		b = append(b, 0x20, 0x04) // local.get attempt_start
 		b = append(b, 0xAD)       // i64.extend_i32_u
@@ -10257,7 +10725,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			b = append(b, 0x21, 0x05)
 			b = append(b, 0x0B)
 		}
-		return b
+		return nc.emitPrologue(b)
 	}
 
 	// emitMLRangeCheck emits the range check at the top of $outer.
@@ -10371,12 +10839,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskScanLocal = 9
 			simdMaskLocal = 10
 			chunkScanLocal = 11
-			if p.switchN > 0 {
-				b = append(b, 0x03, 0x09, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
-				walkedLocal = 2 + 9 + 1
-			} else {
-				b = append(b, 0x02, 0x09, 0x7F, 0x01, 0x7B)
-			}
+			b = mlLocals(b, 9)
 			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 6 i32 + N v128 (N sized to what's actually used — see
@@ -10404,11 +10867,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
+		b = emitEofHandlerNotes(b, true, 3, acceptLimit, eofSkipSafe, nc, swArg()...)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
+		b = emitWBPreAcceptCheckNotes(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx, nc)
+		b = emitNLPreAcceptCheckNotes(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx, nc)
 
 		b = emitCompressedU8Transition(b, tableOff, classMapOff, numClasses,
 			0x02, 0x06, 0x00, 0x03, 0xff, tableMemIdx)
@@ -10417,8 +10880,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
+		b = emitDeadHandlerNotes(b, true, 3, 0x03, skipSafeOnDead, nc, swArg()...)
 		b = append(b, 0x0B) // end if
+		b = nc.emitArrivalTest(b)
 
 		// One midAccept[state] load feeds the accept
 		// update AND both dominant channels via the value ranges written
@@ -10434,7 +10898,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, 0x06,
-			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -10462,12 +10926,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			simdMaskScanLocal = 8
 			simdMaskLocal = 9
 			chunkScanLocal = 10
-			if p.switchN > 0 {
-				b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
-				walkedLocal = 2 + 8 + 1
-			} else {
-				b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
-			}
+			b = mlLocals(b, 8)
 			b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 		} else {
 			// 5 i32 + N v128 (N sized to what's actually used — see
@@ -10495,11 +10954,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x01) // local.get len
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
+		b = emitEofHandlerNotes(b, true, 3, acceptLimit, eofSkipSafe, nc, swArg()...)
 		b = append(b, 0x0B) // end if
 
-		b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-		b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
+		b = emitWBPreAcceptCheckNotes(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx, nc)
+		b = emitNLPreAcceptCheckNotes(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx, nc)
 
 		b = emitSimpleU8Transition(b, tableOff, 0x02, 0x00, 0x03, 0xff, tableMemIdx)
 
@@ -10507,8 +10966,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x20, 0x02) // local.get state
 		b = append(b, 0x45)       // i32.eqz
 		b = append(b, 0x04, 0x40) // if (void)
-		b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
+		b = emitDeadHandlerNotes(b, true, 3, 0x03, skipSafeOnDead, nc, swArg()...)
 		b = append(b, 0x0B) // end if
+		b = nc.emitArrivalTest(b)
 
 		// One midAccept[state] load feeds the accept
 		// update and both dominant channels — see the u8+compressed path
@@ -10518,7 +10978,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, simdMaskLocal,
-			bulkHystCounterLocal, bulkHystPosLocal, soleMid)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -10541,12 +11001,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		scanStartLocal = 8
 		simdMaskScanLocal = 9
 		chunkScanLocal = 10
-		if p.switchN > 0 {
-			b = append(b, 0x03, 0x08, 0x7F, 0x01, 0x7B, 0x01, 0x7E) // + the counter, i64
-			walkedLocal = 2 + 8 + 1
-		} else {
-			b = append(b, 0x02, 0x08, 0x7F, 0x01, 0x7B)
-		}
+		b = mlLocals(b, 8)
 		b = seedFindFrom(b) // inline locals bypass appendLocalGroups
 	} else {
 		// 6 i32 + N v128 (N sized to what's actually used — see
@@ -10574,11 +11029,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x20, 0x01) // local.get len
 	b = append(b, 0x4F)       // i32.ge_u
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitEofHandler(b, true, 3, acceptLimit, eofSkipSafe, swArg()...)
+	b = emitEofHandlerNotes(b, true, 3, acceptLimit, eofSkipSafe, nc, swArg()...)
 	b = append(b, 0x0B) // end if
 
-	b = emitWBPreAcceptCheck(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx)
-	b = emitNLPreAcceptCheck(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx)
+	b = emitWBPreAcceptCheckNotes(b, wordCharTableOff, midAcceptWOff, midAcceptNWOff, hasWordBoundary, 0x00, 0x03, 0x02, 0x05, tableMemIdx, nc)
+	b = emitNLPreAcceptCheckNotes(b, midAcceptNLOff, hasNewlineBoundary, 0x03, 0x02, tableMemIdx, nc)
 
 	// byte = mem[ptr+pos]
 	b = append(b, 0x20, 0x00)
@@ -10593,8 +11048,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x20, 0x02) // local.get state
 	b = append(b, 0x45)       // i32.eqz
 	b = append(b, 0x04, 0x40) // if (void)
-	b = emitDeadHandler(b, true, 3, 0x03, skipSafeOnDead, swArg()...)
+	b = emitDeadHandlerNotes(b, true, 3, 0x03, skipSafeOnDead, nc, swArg()...)
 	b = append(b, 0x0B) // end if
+	b = nc.emitArrivalTest(b)
 
 	// if midAccept[state]: last_accept = pos + 1
 	// The u16 path emits no dominant dispatch, but when non-mid entries
@@ -10624,7 +11080,8 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
 	b = append(b, 0x21, 0x05) // local.set last_accept
-	b = append(b, 0x0B)       // end if
+	b = nc.emitAcceptHook(b, 0x02)
+	b = append(b, 0x0B) // end if
 
 	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -15117,10 +15574,8 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 		}
 		// Compile the FULL branch (including literal) to an anchored DFA.
 		simplified := cur.Simplify()
-		prog, err := syntax.Compile(simplified)
-		if err != nil {
-			return nil, false
-		}
+		// syntax.Compile never returns a non-nil error (see its stdlib source).
+		prog, _ := syntax.Compile(simplified)
 		if needsUnicodeSupport(prog) {
 			return nil, false
 		}

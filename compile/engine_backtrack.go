@@ -23,6 +23,10 @@ type backtrack struct {
 	// byte (progHasZeroWidthCycle). Such a program gets no ordinary body —
 	// see planBT.
 	zeroWidthCycle bool
+
+	// search keeps the work budget, the tripped flag and the fallback's memo
+	// per SEARCH through the caller's block (bt_search.go); nil = per call.
+	search *btSearch
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -164,8 +168,8 @@ func btLocalGet(b []byte, idx uint32) []byte {
 // appendBacktrackCodeEntry appends a size-prefixed capture body. callOffs are
 // the byte offsets, within the returned slice, of the fallback calls'
 // placeholder immediates (none when the body makes no such call).
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember) (out []byte, callOffs []int) {
-	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (out []byte, callOffs []int) {
+	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member, growth)
 	sized, offs := btSizePrefix(body, offs)
 	return append(cs, sized...), btShiftOffs(offs, len(cs))
 }
@@ -204,16 +208,25 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // through the globals fallback names (bt_scratch.go). stackBase and stackLimit
 // are then unused.
 //
+// growth non-nil gives the ORDINARY body its frame stack at call time instead
+// of the fixed region stackBase..stackLimit (see btGrowth): placed through the
+// fallback's scratch arrangement, started at growth.start bytes, doubled when
+// full. The capture path asks for it; a set member does not.
+//
 // Neither body carries a loop guard. The ordinary body runs only programs
 // without a zero-width cycle (planBT), where no guard can fire; the fallback's
 // memo is what terminates it on the others.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember) (_ []byte, callOffs []int) {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (_ []byte, callOffs []int) {
 	if member != nil && winGlobal < 0 {
 		panic("compile: a set member's Backtracking body runs in window mode")
 	}
 	if fallback != nil {
 		workK = 0
 		tripCalls = false
+		growth = nil
+	}
+	if growth != nil && member != nil {
+		panic("compile: a set member's ordinary Backtracking body keeps its fixed stack")
 	}
 
 	prog := bt.prog
@@ -262,6 +275,11 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 			dyn.origin, dyn.memoEnd = dynBase+4, dynBase+5
 			totalLocals += 2
 		}
+	} else if growth != nil {
+		dyn = newBTGrowDyn(growth, tableMemIdx, frameSize)
+		dynBase := uint32(3 + totalLocals)
+		dyn.stackBase, dyn.stackTop = dynBase, dynBase+1
+		totalLocals += 2
 	}
 
 	var body []byte
@@ -339,6 +357,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		body = utils.AppendULEB128(body, capStartLocal(0)+uint32(i))
 	}
 
+	// ── Growing frame stack (ordinary capture body) ─────────────────────────
+	// Placed before the work budget is set: the entry arithmetic borrows the
+	// work counter's i64 local, which the budget then overwrites.
+	if dyn != nil && dyn.grow {
+		body = emitBTGrowStackInit(body, dyn, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
+		body = btLocalGet(body, dyn.stackBase)
+		body = append(body, 0x21, localSP) // local.set sp
+	}
+
 	// ── Work budget ─────────────────────────────────────────────────────────
 	// Over the WINDOW in window mode, not the input: a composed groups call
 	// runs this body once per match, and a budget sized from the whole input
@@ -350,6 +377,15 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 			return append(b, 0x6B) // i32.sub
 		}
 		return append(b, 0x20, localLen)
+	}
+	// One search's capture calls share its tripped flag (bt_search.go): once
+	// one has tripped, the rest go to the fallback directly.
+	capSearch := bt.search
+	if member != nil || fallback != nil || !useWork || !tripCalls {
+		capSearch = nil
+	}
+	if capSearch != nil {
+		body = capSearch.emitCapEntry(body, &callOffs)
 	}
 	if useWork && member != nil {
 		// A set member's budget lasts the host call (btDriveMember).
@@ -369,7 +405,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		}
 		return append(b, 0x20, localLen)
 	}
-	if dyn != nil {
+	if dyn != nil && !dyn.grow {
 		if dyn.member != nil {
 			body = emitBTScratchInitMember(body, dyn, winStartLocal, winEndLocal, btWorkTripI32)
 		} else {
@@ -405,7 +441,12 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		body = emitBTWorkChargeMember(body, member, workLocal, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
 	} else if useWork {
 		// ptr, len, out_ptr
-		body = emitBTWorkCharge(body, workLocal, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
+		giveUp := btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32)
+		if capSearch != nil {
+			inner := giveUp
+			giveUp = func(b []byte) []byte { return inner(capSearch.emitCapTripped(b)) }
+		}
+		body = emitBTWorkCharge(body, workLocal, giveUp)
 	}
 
 	// Pop frame: sp -= frameSize
@@ -612,7 +653,7 @@ func emitBTInstHandler(
 		// first visit would already have returned. Every cycle in a
 		// syntax.Prog passes through an Alt, and an Alt is entered at a given
 		// pos at most once per call.
-		if dyn != nil {
+		if dyn != nil && !dyn.grow {
 			body = emitBitStateGuardDyn(body, dyn, p, memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
 		}
 		body = btPushFrame(body, numCapLocals, inst.Arg, stackLimit, frameSize, brRunNested, overflowFn, tableMemIdx, dyn)
@@ -1015,7 +1056,16 @@ const BTWorkBudgetOff = -1
 const BTWorkBudgetForceFallback = -2
 
 // defaultBTWorkK is the budget multiplier when CompileOptions.BTWorkBudget is 0.
-const defaultBTWorkK = 8
+//
+// 1, down from 8: the budget is only how much a search may waste before the
+// fallback takes over, and nothing ordinary came near it. Measured over the
+// 124 corpus patterns that run on Backtracking (normal text and an input
+// built against each), 160 real-pattern drives, setperf and perftest: every
+// normal-text drive cost the same at k = 1, 2, 4, 8 and 16 and none ran out of
+// budget, while the adversarial drives got 41-85% cheaper at k = 1
+// (`(?:a|b)*a(?:a|b){12}c|a`: 88,010 → 12,808 fuel/byte). An integer k cannot
+// go lower.
+const defaultBTWorkK = 1
 
 // btWorkK returns the work-budget multiplier a body for bt must carry, or 0 for
 // no counter.
@@ -1129,9 +1179,10 @@ var btFallbackCallPlaceholder = utils.AppendPaddedULEB128(nil, 0, twinCallImmWid
 // exactly the inputs the caller gave. The placeholder's byte offset within b is
 // appended to *callOffs.
 //
-// A body has one such site, the work-budget trip on the pop path. A
-// frame-stack overflow needs none of its own — it arms the budget to trip on
-// the next pop (btArmTrip).
+// A body's sites: the work-budget trip on the pop path and, for a body that
+// keeps its search in the caller's block, the entry's "already tripped" branch
+// (bt_search.go: emitFindEntry, emitCapEntry). A frame-stack overflow needs
+// none of its own — it arms the budget to trip on the next pop (btArmTrip).
 func emitBTFallbackCall(b []byte, nParams int, callOffs *[]int) []byte {
 	for i := 0; i < nParams; i++ {
 		b = append(b, 0x20, byte(i)) // local.get param
@@ -1163,6 +1214,34 @@ func btTailCallBody(nParams int) (body []byte, callOffs []int) {
 	b := []byte{0x00} // no locals
 	b = emitBTFallbackCall(b, nParams, &callOffs)
 	b = append(b, 0x0B) // end (the return above makes this unreachable)
+	return btSizePrefix(b, callOffs)
+}
+
+// btStartAnchored reports whether every match of prog must start at position
+// 0: its leading empty-width conditions include \A (Go's StartCond walks the
+// instructions every match begins with). A program that cannot match at all
+// reports every condition, which is also true.
+func btStartAnchored(prog *syntax.Prog) bool {
+	return prog.StartCond()&syntax.EmptyBeginText != 0
+}
+
+// btTailCallBodySearch is btTailCallBody for a find that keeps its search in
+// the caller's block: it marks the search tripped before the call, so the stub
+// gives the fallback the memo it keeps for the search (bt_search.go). nil
+// search: btTailCallBody.
+func btTailCallBodySearch(nParams int, search *btSearch) (body []byte, callOffs []int) {
+	if search == nil {
+		return btTailCallBody(nParams)
+	}
+	b := []byte{0x00} // no locals
+	b = search.blk(b)
+	b = append(b, 0x04, 0x40) // if blk
+	b = search.blk(b)
+	b = append(b, 0x41, abi.SearchBTTripped)
+	b = search.store32(b, btSearchState)
+	b = append(b, 0x0B)
+	b = emitBTFallbackCall(b, nParams, &callOffs)
+	b = append(b, 0x0B)
 	return btSizePrefix(b, callOffs)
 }
 
@@ -1209,8 +1288,10 @@ func patchBTFallbackCall(body []byte, offs []int, fallbackIdx int) []byte {
 // the i32 length the search ranges over: the window in window mode, the input
 // otherwise. i64 because N·(span+1)·k overflows i32 at 1 MB for N ≥ 256.
 //
-// Set once per CALL. A find body's attempts share it, and it is never saved
-// into a frame: it is a bound on the whole call's work, not per-path state.
+// Set once per CALL — or once per SEARCH, kept in the caller's block between
+// calls, when there is one (bt_search.go). A find body's attempts share it,
+// and it is never saved into a frame: it bounds the call's (or the search's)
+// whole work, not per-path state.
 func emitBTWorkInit(b []byte, workLocal uint32, k, n int, span func([]byte) []byte) []byte {
 	b = span(b)
 	b = append(b, 0xAD)       // i64.extend_i32_u
@@ -1293,18 +1374,28 @@ func btWorkTripI32(b []byte) []byte {
 // instead of giving up, and overflowFn runs only when memory cannot grow — it
 // must then leave the function by `return`, since the branch depth it is handed
 // does not count the guard's own nesting.
+//
+// dyn.grow is the ORDINARY capture body's growing stack: the guard grows memory
+// too, and overflowFn — the body's usual overflow, which may branch — runs when
+// it cannot, handed a depth that does count the guard's extra block.
 func btPushFrame(b []byte, numCapLocals int, retryPC uint32, stackLimit, frameSize int32, brDepth uint32, overflowFn func([]byte, uint32) []byte, tableMemIdx int, dyn *btDyn) []byte {
-	overflow := func(b []byte) []byte {
-		if overflowFn != nil {
-			return overflowFn(b, brDepth)
+	overflowAt := func(depth uint32) func([]byte) []byte {
+		return func(b []byte) []byte {
+			if overflowFn != nil {
+				return overflowFn(b, depth)
+			}
+			b = append(b, 0x41) // i32.const abi.BTStackOverflow
+			b = utils.AppendSLEB128(b, abi.BTStackOverflow)
+			return append(b, 0x0F) // return
 		}
-		b = append(b, 0x41) // i32.const abi.BTStackOverflow
-		b = utils.AppendSLEB128(b, abi.BTStackOverflow)
-		return append(b, 0x0F) // return
 	}
-	if dyn != nil {
+	overflow := overflowAt(brDepth)
+	switch {
+	case dyn != nil && dyn.grow:
+		b = emitBTGrowPushCheck(b, dyn, overflowAt(brDepth+1))
+	case dyn != nil:
 		b = emitBTDynPushCheck(b, dyn, overflow)
-	} else {
+	default:
 		// Guard: if sp + frameSize > stackLimit → fail (treat as no-match).
 		b = append(b, 0x20, localSP)
 		b = append(b, 0x41)
@@ -2110,7 +2201,34 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	if useWork {
 		workLocal = uint32(a.I64())
 	}
+	// The search's own budget and memo (bt_search.go): the ordinary body when
+	// it has a budget, the fallback when it has a region. The search memo lives
+	// in the INPUT's memory, which is the tables' memory only in a standalone
+	// or component build; an embedded fallback keeps this call's memo.
+	srch := bt.search
+	var sBlk, sTmp uint32
+	if srch != nil && ((useWork && tripCalls) || dyn != nil) {
+		sBlk, sTmp = uint32(a.I32()), uint32(a.I32())
+		if dyn != nil {
+			dyn.memoEnd = uint32(a.I32())
+			switch {
+			case tableMemIdx == 0:
+				dyn.search = srch
+			case fallback.memoInInput:
+				// An embedded build's second fallback: the search's memo, in
+				// the input's memory.
+				dyn.search, dyn.memoMemIdx = srch, 0
+			}
+		}
+	} else {
+		srch = nil
+	}
 	body = a.EmitDecls(body)
+	if dyn != nil && dyn.search == nil && srch != nil && fallback.searchTwin {
+		// An embedded build's per-call fallback: a search with a usable memo
+		// is the next body's.
+		body = srch.emitMemoTwinDispatch(body, sBlk, dyn.rowBytes, &callOffs)
+	}
 
 	locAttemptStart := attemptCursor.Local()
 
@@ -2121,13 +2239,51 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// was simply never told where to start.
 	body, findFrom = emitFindFromSeed(body, attemptCursor)
 
-	// The work budget, once per CALL: every attempt this call makes shares
-	// it. Sized from the whole input rather than len - from — a larger budget
-	// only delays a trip, and the bound stays linear in the input.
-	if useWork {
+	// A program that can only match at position 0 (every match starts with
+	// \A or a non-multiline ^) answers a search from any later position at
+	// once. Without this the attempt loop tried every position to the end,
+	// each failing at ^ at its first instruction: `^(\B|0)*` — on this engine
+	// because its word boundary has no DFA — cost 20.8 M fuel for the second
+	// call of a scan over 400 KB of prose, for an answer known in advance.
+	// The DFA find has the same rule (isAnchoredFind, ffAnchoredZeroOnly).
+	if btStartAnchored(bt.prog) {
+		body = append(body, 0x20, locAttemptStart)
+		body = append(body, 0x04, 0x40) // if attempt_start != 0
+		body = append(body, 0x42, 0x7F) // i64.const -1
+		body = append(body, 0x0F, 0x0B) // return; end
+	}
+
+	// The work budget, once per CALL — or once per SEARCH from the caller's
+	// block (emitFindEntry): every attempt shares it. Sized from the whole
+	// input rather than len - from — a larger budget only delays a trip, and
+	// the bound stays linear in the input.
+	if useWork && srch != nil {
+		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, len(prog.Inst), &callOffs)
+	} else if useWork {
 		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
+	}
+	// srchSave, before a return: the ordinary body hands back what is left of
+	// the search's budget; the fallback clears the memo rows of the attempt
+	// that matched, whose marks are not failures.
+	srchSave := func(b []byte) []byte {
+		switch {
+		case srch != nil && dyn == nil:
+			return srch.emitFindSave(b, sBlk, workLocal)
+		case dyn != nil && dyn.search != nil:
+			return srch.emitFallbackMatched(b, dyn, sBlk, uint32(attemptCursor.Local()), memoOrigin, sTmp)
+		}
+		return b
+	}
+	srchTrip := func(trip func([]byte) []byte) func([]byte) []byte {
+		if srch == nil || trip == nil || dyn != nil {
+			return trip
+		}
+		return func(b []byte) []byte {
+			b = srch.emitFindTripped(b, sBlk)
+			return trip(b)
+		}
 	}
 
 	// ── A fallback's memo: placed ONCE per call, not once per attempt ────────
@@ -2168,6 +2324,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	if useMemo {
 		body = append(body, 0x20, locAttemptStart, 0x21)
 		body = utils.AppendULEB128(body, memoOrigin)
+		if srch != nil {
+			body = srch.blk(body)
+			body = append(body, 0x21)
+			body = utils.AppendULEB128(body, sBlk)
+		}
 	}
 	// len - from: the span the rebased bit indices cover.
 	memoSpan := func(bb []byte) []byte {
@@ -2181,7 +2342,29 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return b
 		}
 		return emitBTOncePerCall(b, memoReady, func(b []byte) []byte {
-			return emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			if dyn.search == nil {
+				if srch != nil {
+					// Not this build's memory: this call's memo, as before.
+					b = emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+					b = btLocalGet(b, dyn.stackBase)
+					b = append(b, 0x21)
+					return utils.AppendULEB128(b, dyn.memoEnd)
+				}
+				return emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			}
+			b = srch.emitFallbackPlace(b, dyn, sBlk, memoOrigin, btUnknownI64)
+			b = append(b, 0x45, 0x04, 0x40) // not placed: this call's own memo
+			if dyn.memoMemIdx != dyn.memIdx {
+				// An embedded build's memo body is entered only with a usable
+				// memo (emitMemoTwinDispatch tests the same condition), and has
+				// no memory of its own a per-call memo could go in.
+				return append(b, 0x00, 0x0B) // unreachable
+			}
+			b = emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
+			b = btLocalGet(b, dyn.stackBase)
+			b = append(b, 0x21)
+			b = utils.AppendULEB128(b, dyn.memoEnd)
+			return append(b, 0x0B)
 		})
 	}
 
@@ -2302,6 +2485,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			return append(bb, 0x0C, 0x03) // br 3 → exit $run_exit
 		}
 		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = srchSave(bb)
 			bb = append(bb, 0x20, locAttemptStart)
 			bb = append(bb, 0xAD)       // i64.extend_i32_u
 			bb = append(bb, 0x42, 0x20) // i64.const 32
@@ -2324,7 +2508,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64),
+			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
 			dyn)
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
@@ -2334,9 +2518,12 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
 		body = append(body, 0x0C, 0x00) // br 0 → $outer
 
-		body = append(body, 0x0B)       // end loop $outer (unreachable)
-		body = append(body, 0x0B)       // end loop $lit_outer (unreachable)
-		body = append(body, 0x0B)       // end block $no_match (unreachable)
+		body = append(body, 0x0B) // end loop $outer (unreachable)
+		body = append(body, 0x0B) // end loop $lit_outer (unreachable)
+		body = append(body, 0x0B) // end block $no_match (unreachable)
+		if dyn == nil {
+			body = srchSave(body)
+		}
 		body = append(body, 0x42, 0x7F) // i64.const -1
 		body = append(body, 0x0F)       // return
 		body = append(body, 0x0B)       // end function
@@ -2369,6 +2556,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		}
 		// Find matchFn: accept immediately (non-anchored, first match from attempt_start).
 		matchFn := func(bb []byte, _ uint32) []byte {
+			bb = srchSave(bb)
 			bb = append(bb, 0x20, locAttemptStart)
 			bb = append(bb, 0xAD)       // i64.extend_i32_u
 			bb = append(bb, 0x42, 0x20) // i64.const 32
@@ -2388,7 +2576,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64),
+			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
 			dyn)
 
 		b = append(b, 0x00) // unreachable
@@ -2402,8 +2590,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	body = append(body, 0x20, locAttemptStart, 0x41, 0x01, 0x6A, 0x21, locAttemptStart)
 	body = append(body, 0x0C, 0x00)
 
-	body = append(body, 0x0B)       // end loop $outer
-	body = append(body, 0x0B)       // end block $no_match
+	body = append(body, 0x0B) // end loop $outer
+	body = append(body, 0x0B) // end block $no_match
+	if dyn == nil {
+		body = srchSave(body)
+	}
 	body = append(body, 0x42, 0x7F) // i64.const -1
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end function

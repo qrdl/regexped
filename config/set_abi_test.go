@@ -294,17 +294,24 @@ func TestSetOverlapRowEndOff(t *testing.T) {
 	if SetOverlapRowMaskOff != 0 {
 		t.Fatalf("mask offset = %d, want 0", SetOverlapRowMaskOff)
 	}
-	for k := 0; k < 8; k++ {
-		if got, want := SetOverlapRowEndOff(k), 4+4*k; got != want {
-			t.Errorf("SetOverlapRowEndOff(%d) = %d, want %d", k, got, want)
+	// The mask's width: an i32 to 32 patterns, an i64 to 64, then one i64 per
+	// 64. Up to 32 the row is the four-byte-mask row it always was.
+	for _, tc := range []struct{ pats, mask int }{
+		{1, 4}, {32, 4}, {33, 8}, {64, 8}, {65, 16}, {128, 16}, {129, 24}, {4096, 512},
+	} {
+		if got := SetOverlapRowMaskBytes(tc.pats); got != tc.mask {
+			t.Errorf("SetOverlapRowMaskBytes(%d) = %d, want %d", tc.pats, got, tc.mask)
 		}
-	}
-	// The last end must sit inside the row, and the row must hold nothing
-	// beyond it: a row is exactly a mask plus one end per pattern.
-	for _, pats := range []int{1, 3, 64} {
-		row := SetOverlapBlockRowBytes(pats)
-		if got := SetOverlapRowEndOff(pats-1) + 4; got != row {
-			t.Errorf("pats=%d: last end ends at %d, row is %d bytes", pats, got, row)
+		for k := 0; k < 8 && k < tc.pats; k++ {
+			if got, want := SetOverlapRowEndOff(k, tc.pats), tc.mask+4*k; got != want {
+				t.Errorf("SetOverlapRowEndOff(%d, %d) = %d, want %d", k, tc.pats, got, want)
+			}
+		}
+		// The last end must sit inside the row, and the row must hold nothing
+		// beyond it: a row is exactly a mask plus one end per pattern.
+		row := SetOverlapBlockRowBytes(tc.pats)
+		if got := SetOverlapRowEndOff(tc.pats-1, tc.pats) + 4; got != row {
+			t.Errorf("pats=%d: last end ends at %d, row is %d bytes", tc.pats, got, row)
 		}
 	}
 }
@@ -391,6 +398,44 @@ func TestSetOverlapBytesForStrideClampsAboveSpan(t *testing.T) {
 // TestLoadConfigUnresolvablePath covers the filepath.Abs failure. It is
 // reachable only with no working directory, which is why the error is reported
 // by the path rather than assumed impossible.
+// TestSetOverlapCheckpointSizingRow: the program sweep's sizing is the cache's
+// formula over a caller-given row. With the cache's own row it must give the
+// cache's answer exactly, on both sides of the single-block budget; and it
+// keeps that formula's clamps.
+func TestSetOverlapCheckpointSizingRow(t *testing.T) {
+	for _, pats := range []int{1, 3, 40} {
+		row := SetOverlapBlockRowBytes(pats)
+		for _, n := range []int{0, 1, 100, 1 << 20, 20_000_000} {
+			for _, cells := range []int{3, 70} {
+				b, k := SetOverlapCheckpointSizingRow(n, cells, row)
+				if wb, wk := SetOverlapCheckpointBytes(n, cells, pats), SetOverlapCheckpointStride(n, cells, pats); b != wb || k != wk {
+					t.Errorf("n=%d cells=%d pats=%d: got (%d, %d), the cache's formula (%d, %d)", n, cells, pats, b, k, wb, wk)
+				}
+			}
+		}
+	}
+	cases := []struct {
+		name                 string
+		n, cells, row, wantK int
+	}{
+		{"a negative length is one position", -5, 3, 4, 1},
+		{"one block while it fits", 100, 3, 4, 101},
+		{"the square root above the budget", 20_000_000, 3, 4, 7745},
+		{"never below 16", 20_000_000, 0, 4, 16},
+		{"never past the span", 3, 3, 1 << 25, 4},
+		{"a row count that would overflow", 1 << 60, 3, 8, 1315059792}, // √(1.5 × 2⁶⁰)
+	}
+	for _, c := range cases {
+		b, k := SetOverlapCheckpointSizingRow(c.n, c.cells, c.row)
+		if k != c.wantK {
+			t.Errorf("%s: stride %d, want %d", c.name, k, c.wantK)
+		}
+		if b <= SetOverlapCheckpointHeaderBytes {
+			t.Errorf("%s: %d bytes, not even past the header", c.name, b)
+		}
+	}
+}
+
 func TestLoadConfigUnresolvablePath(t *testing.T) {
 	gone := t.TempDir()
 	sub := filepath.Join(gone, "cwd")

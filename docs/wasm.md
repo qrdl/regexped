@@ -36,7 +36,7 @@ The same two values apply to the `i64` find exports, sign-extended (`i64.const -
 
 For the `_batch` exports, which return a match **count**, `-2` appears as a negative count; a successful call always returns a count ≥ 0. Returning the count collected so far would be a silent truncation the host could not distinguish from a completed scan.
 
-`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling). A Backtracking call that outgrows its compile-time regions hands itself to a fallback body that sizes its memory from the input, so `-2` means linear memory could not grow far enough — WASM32's 4 GiB, or a lower limit the host set — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
+`-2` originates only in Backtracking bodies (the DFA, Compiled DFA and TDFA engines have no such ceiling). A Backtracking capture body claims its frame stack when a call starts and grows it with the search, and any Backtracking call that outgrows its stack hands itself to a fallback body that sizes its memory from the input, so `-2` means linear memory could not grow far enough — WASM32's 4 GiB, the config's `max_memory` (declared as the memory's maximum), or a lower limit the host set — see [engines.md](engines.md) "Frame budget and the `-2` sentinel" for when it is reachable and how each generated stub surfaces it. The constants are defined once, in `internal/abi`, and shared by the compiler and the stub generators.
 
 `$from` on the capture exports means what it means on `$find`: where the
 SEARCH starts, with `$ptr`/`$len` still describing the whole input. Slot
@@ -72,10 +72,11 @@ not have the global and need nothing.
 
 **Why it exists.** A standalone module has one memory, and the host has no
 other way to pass data: it writes its input, and the buffers it reads answers
-from, into the module's exported `memory`. A Backtracking call that needs more
-room than its compile-time regions — see [engines.md](engines.md) "Work budget
-and the fallback body" — also works in that same memory, and it cannot tell
-which parts of it the host is using. The exported mutable `i32` global
+from, into the module's exported `memory`. A Backtracking call also works in
+that same memory — a `groups_func` search keeps its frame stack there on EVERY
+call, and any search that outgrows its stack continues in a fallback whose
+memory is sized from the input (see [engines.md](engines.md) "Work budget and
+the fallback body") — and it cannot tell which parts of it the host is using. The exported mutable `i32` global
 **`regexped:scratch_base`** is how the host tells it: "everything from this
 address up is free while a call runs".
 
@@ -101,7 +102,9 @@ last one did.
 
 **If you leave it at 0** (its initial value), answers stay correct, but every
 call that needs this working memory takes new pages at the end of memory, and
-WebAssembly memory never shrinks. Measured with perftest's html-tags pattern
+WebAssembly memory never shrinks. A Backtracking `groups_func` call always
+needs it: each one takes at least its frame stack's starting size, so such a
+host's memory grows on every call until it reaches 4 GiB or `max_memory`. Measured with perftest's html-tags pattern
 (`groups_func`) looping over the tags of a 10 KB HTML page, one call per tag:
 
 | documents processed | memory, global at 0 | memory, global set |
@@ -124,6 +127,135 @@ a call replaces the `ArrayBuffer` behind `memory.buffer`, and every typed array
 over the old one reads as length 0 without throwing. A JS host must read
 `memory.buffer` afresh after every call rather than keep a view across one; the
 generated stubs do.
+
+### The search block
+
+**Who needs this.** Only a host that drives `find` or `groups` exports WITHOUT
+a generated stub. Every generated stub (Rust, Go, C, AssemblyScript, JS, TS, and
+the component resources) does everything below.
+
+**Why it exists.** A *search* is what an iterator does: call `find` (or
+`groups`) from an offset, advance past the match, call again, until the input
+is exhausted. Each call is linear, but a pattern such as `a*b|a` over `aaaa…`
+reads to the end of the input on every call before settling for the one-byte
+match, so the search as a whole is quadratic — the same bytes are read again by
+the next call. The module fixes that with **notes kept across the calls of one
+search**: when a walk reads past its match without finding an accept, every
+(state, position) it passed is recorded as "nothing matches from here", and a
+later call that reaches a recorded point stops there. Each point is recorded
+once and read once, so the search is linear.
+
+Notes belong to one search, not to the module: two iterators alive over one
+instance must not disturb each other. So they live in a **block** the host owns,
+one per iterator, and the host tells the module which block the next call
+belongs to.
+
+Most searches never pay for notes. The module counts the bytes a search wastes
+(read past its matches, plus the part of a failed read over 32 bytes that an
+earlier failed read of the same search already covered — block field `far`) and
+only when that passes `4 × progress + 64` does the search **arm**; the host then
+gives it its notes. A pattern whose automaton cannot re-read bytes has no notes
+at all, and unless it is Backtracking (below) its export ignores the block and a
+stub hands nothing over for it.
+
+A **Backtracking** export uses the same block for a different purpose. Its work
+budget — the bound past which it hands a call to its memoised fallback body —
+lasts the SEARCH rather than one call, so a search whose every call would burn
+the budget burns it once. Once the budget runs out the search is **tripped**:
+every later call goes straight to the fallback, and the host gives that body a
+memo to keep for the rest of the search, so a (state, position) one call ruled
+out stays ruled out in the next. A `groups` export keeps only the tripped flag.
+
+**The block**: 128 bytes, 8-byte aligned, in the memory the input lives in (the
+host's own memory in an embedded build, the module's exported `memory`
+otherwise), zeroed when the search starts. Its layout is in `internal/abi`; the
+host touches these fields:
+
+| offset | field | host's part |
+|---|---|---|
+| 12 | `armed` (u32) | read after each call: non-zero means the search has armed |
+| 28 | `notes_ptr` (u32) | write the address of the notes, once, after the search arms |
+| 40 | `bt_state` (u32) | Backtracking only: read after each call; 2 means tripped |
+| 44 | `notes_cap` (u32) | write the notes' size in bytes |
+| 56 | `bt_memo_ptr` (u32) | Backtracking only: write the memo's address, once, after it trips |
+| 72 | `bt_memo_cap` (u32) | write the memo's size in bytes |
+
+**The notes**: `(len + 1) × notes_bytes` zeroed bytes, where `len` is the
+input's length and `notes_bytes` is a per-export constant (usually 1; the
+generators get it from `compile.SearchSizes`). The module checks `notes_cap`
+before it uses them and treats a short region as no notes, so a wrong constant
+costs speed, never memory safety. They live until the search ends.
+
+**The Backtracking memo**: `(len + 1) × bt_memo_bytes` zeroed bytes, where
+`bt_memo_bytes` is ⌈instructions / 8⌉ of the pattern's program (the generators
+get it from `compile.SearchSizes` too). It is checked against `bt_memo_cap` the
+same way; a call it does not cover uses a memo of its own. An EMBEDDED build
+carries a second copy of the fallback body that reads its memo from the host's
+memory, and a call whose block names a memo runs that copy — so a merged build
+keeps the memo across a search exactly as a standalone one does, and
+`compile.SearchSizes` reports `bt_memo_bytes` for both.
+
+**Handing the block over**, before EVERY call of a `find`, `groups` or batch
+export whose pattern uses a block — it keeps notes, or a Backtracking work
+budget — through the export `regexped:search`:
+
+- standalone module: a mutable `i32` **global**; write the block's address;
+- embedded module (merged): a **function** `(blk i32) → ()`; call it;
+- component: not exported — the `find` and `groups` resources do it themselves.
+
+The value is read by the call that follows. A module in which no export uses
+a block has no `regexped:search`. `0` means "no block", and what the call does
+then depends on the output kind:
+
+- **standalone module**: the module uses a **default state** of its own — a
+  block, and the notes, memo and (for a set) answer cache it needs — in memory
+  it grows itself, and puts the global back to 0 after the call. The state
+  carries over to the next call only when that call CONTINUES the previous one:
+  the same text (address and length) and, for a pattern's export, a `from`
+  inside the previous answer's window (`[start, end + 1]` for `find` and
+  `groups`, the next position for a batch call); for a set, the same gate array
+  and a `from` (or batch cursor) that has advanced. Anything else starts a new
+  drive. So a raw caller that drives an export the way a stub does — the same
+  text, `from` moving forward — is linear without handing anything over. One
+  default serves one drive at a time: two drives interleaved over one instance
+  keep resetting each other (correct, but each call starts fresh), and a caller
+  that rewrites its text in place and resumes inside the window reads the old
+  text's state. Regions are grown on first use and reused, grown again to at
+  least twice the size only when a drive needs more, so an instance holds at
+  most about twice its largest drive's state. A caller that hands its own state
+  over pays ~1-9 fuel per call for the check;
+- **embedded module** (merged): no default. The call runs exactly as it would
+  without this mechanism — correct, and quadratic on the inputs above. A merged
+  host that drives the raw exports must hand blocks over itself;
+- **component**: not applicable — the resources keep their own state.
+
+[complexity.md](complexity.md) lists every mechanism of this kind, what each
+costs, and what is still not linear.
+
+**What a host does:**
+
+1. When a search starts, zero a 128-byte block for it.
+2. Before each call of that search, hand the block over (and for a raw export
+   that uses no block, hand over 0 or nothing). A Backtracking export with no
+   notes still reads it: without one its work budget lasts one call, and a
+   search whose every call exhausts it is quadratic.
+3. After a call that returned a match, if `armed` is set and `notes_ptr` is 0,
+   allocate the notes, zeroed, and write `notes_ptr` and `notes_cap`. Likewise,
+   for a Backtracking export, if `bt_state` is 2 and `bt_memo_ptr` is 0, allocate
+   the memo and write `bt_memo_ptr` and `bt_memo_cap`. A search that cannot get
+   the memory has an UNKNOWN answer: the generated stubs report it the way they
+   report `-2`.
+4. When the search ends, free the notes and the memo.
+
+**A block belongs to one text.** Reusing a block for a DIFFERENT text is the
+caller's mistake: notes and a Backtracking memo describe the text they were
+written for. The module detects a changed `ptr`, `len` or resume position on an
+armed search and starts over, and a changed `ptr` or `len` on a call that uses
+the memo, whose marks it then clears for the new text. But a new text written at
+the same address, of the same length (and, for notes, resumed at exactly the old
+resume point) would read stale notes or memo marks and can report wrong matches.
+Starting every search with a fresh (zeroed) block makes this impossible; a block
+reused on the SAME text at a later position is fine.
 
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 
@@ -581,6 +713,35 @@ descriptor's first word as a gate, and answers wrongly rather than failing.
 Rebuild the module from the same tree as the caller; `regexped` is a prerequisite
 of every example's compile rule for exactly this reason.
 
+**The descriptor's second form: search blocks.** A set member the compiler
+cannot prove linear inside the set's buckets is searched on its own (see
+[sets.md](sets.md)), and that search spans the set's calls exactly as a single
+pattern's spans its iterator's — so it needs a search block of its own (see
+"The search block" above: same size, layout and host protocol, one per member).
+So does a member on a Backtracking bucket, whose work budget lasts the drive,
+and the drive state of a shared-literal bucket's work counter. A set that takes
+blocks accepts two more fields, named by a second magic word (24 bytes in all):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `magic` | `0x52584642` ("RXFB") |
+| +4 … +15 | as above | |
+| +16 | `blocks_ptr` | `n` blocks of 128 bytes, 8-byte aligned, zeroed when the scan starts |
+| +20 | `blocks_n` | `n` |
+
+`n`, and each block's notes size and Backtracking memo size, come from the set's
+generated block list (`compile.SearchSizes`, field `Blocks`); after each call a
+block that armed gets its notes and one that tripped its memo, exactly as a
+pattern's block does. A block that keeps neither must still be there. The same
+descriptor goes to `find` and to its batch entry. The module uses the blocks
+only when `blocks_n` is the count its set expects; otherwise — and with the
+first magic — it runs every such search with no block: correct, and quadratic
+on the inputs that make a member re-read, but never an access past the
+caller's array. A set that takes no blocks traps on the second magic, as on
+any wrong word: a caller that writes four fields leaves whatever follows them
+to be read as a pointer, so the extra fields are opt-in rather than always
+there.
+
 `in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
 search. Zero-width assertions (`\b`, `\B`, `(?m:^)`, `(?m:$)`) therefore see
 real context at any resume index — the same shape as `Input::span` in Rust's
@@ -712,7 +873,9 @@ no exported sizing function to call — the column width is a compile-time
 property of the set, so `generate` recompiles the set to learn it and bakes
 `CELLS` in:
 
-    row    = 4 + 4 * PATTERNS          one position's row
+    mask   = 4 if PATTERNS <= 32, 8 if PATTERNS <= 64,
+             else 8 * ceil(PATTERNS / 64)
+    row    = mask + 4 * PATTERNS       one position's row
     cell   = CELLS * 4 + 4             one column snapshot, plus its count
     m      = input_len + 1
     single = 48 + cell + 4 + m * row
@@ -723,7 +886,29 @@ property of the set, so `generate` recompiles the set to learn it and bakes
 
 `CELLS` is the sweep column's width and comes from the COMPILER — it falls out
 of the DFA construction and nothing in your config implies it. Every stub is
-generated with it baked in.
+generated with it baked in. `PATTERNS` is the set's member count: a row holds a
+bit per member (an i32 to 32, an i64 to 64, then one i64 word per 64 members,
+little-endian, member k at bit k%64 of word k/64) and then each member's end.
+
+**A set that splits a member** (see [sets.md](sets.md), "Overlap policy")
+sizes its cache from the members it KEEPS — `CELLS` and `PATTERNS` are theirs —
+and, when a split member gets a **program sweep**, adds the sweep's own part
+after it, at the next multiple of 8, by the same formula over the sweep's
+geometry:
+
+    srow   = 4 * SWEPT                 one end per swept member
+    scell  = SWEEP_CELLS * 4 + 4
+    single = 48 + scell + 4 + m * srow
+    if single <= 64 MiB:  sstride = m
+    else:                 sstride = clamp(sqrt(m*SWEEP_CELLS*4/srow), 16, m)
+    sbytes = 48 + ceil(m / sstride) * scell + 4 + sstride * srow
+    if sbytes <= 64 MiB:  bytes = ceil8(bytes) + sbytes
+
+`SWEEP_CELLS` (the swept members' program roots together) and `SWEPT` come from
+the compiler too, and the stubs bake them in. A set with no cache-eligible kept
+members passes the bare 48-byte header as the cache part. The sweep keeps its
+state in the header's words at offsets 0, 4 and 32, which the zeroing already
+covers; its stride is its own business, not a header field.
 
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
@@ -741,8 +926,13 @@ Measured region sizes, for shapes the sweep accepts:
 
 The rules:
 
-- **It is optional.** `cache_ptr = 0` is legal and is what a caller who does
-  not want to pay for it passes. The drive then walks position by position.
+- **It is optional.** `cache_len = 0` is legal. In an embedded module the
+  drive then walks position by position. A standalone module instead uses a
+  region of its own, grown in its memory on first need and reused by later
+  drives (see "Handing the block over" above): a raw caller gets the linear
+  drive without sizing anything. The module reserves that region when a drive
+  starts, as a generated stub does, so a standalone caller cannot decline the
+  memory by passing no cache.
 - **Zero the 48-byte header** before the first call of a drive, exactly as you
   zero the gate array, then write the stride. The rest of the region needs no
   zeroing: it is written before it is read.
@@ -784,11 +974,13 @@ The rules:
   `from` goes undetected.
 
 The engine may decline even when offered a large enough region: the sweep is
-emitted only where it reproduces the per-position semantics exactly (one
-bucket, no anchors, no word-boundary or newline channel, a dense accept mask,
-no Backtracking member, and no more patterns than the row mask's 32 bits —
-`bucketMaskBits`). Declining is invisible from the
-caller's side and costs nothing but speed.
+emitted only where it reproduces the per-position semantics exactly — an
+automaton within `max_fallback_states`, no member whose answers the automaton
+cannot give (a Backtracking or non-greedy member is SPLIT out instead, and gets
+the program sweep) — and only where a drive can have arbitrarily many walks
+alive at once (see [sets.md](sets.md), "Overlap policy"). The member count is no
+limit. Declining is invisible from the caller's side and costs nothing but
+speed.
 
 ### find return value and overflow
 

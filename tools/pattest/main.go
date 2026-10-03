@@ -30,6 +30,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -186,9 +187,16 @@ func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, er
 		re.FindFunc = "find"
 	}
 	opts := compile.CompileOptions{LikelyMode: likely}
-	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	if err == nil {
+		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc])
+	}
 	return wasm, err
 }
+
+// searchSizesOf is, per compiled module, what its find export's searches keep
+// (internal/searchblock), so a drive hands the block over as a stub does.
+var searchSizesOf = map[string][]searchblock.Size{}
 
 // measureOne compiles-once-uses-many: runs fuel (single call) and time
 // (benchIters calls via the WASM bench shim) measurement for one
@@ -247,6 +255,15 @@ func benchFuel(wasmBytes []byte, mode, input string, fuelEngine *wasmtime.Engine
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
+	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
+	if mode == "find" {
+		sb, err := newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)])
+		if err != nil {
+			return 0, err
+		}
+		sb.begin(store)
+		sb.before(store)
+	}
 
 	before, _ := store.GetFuel()
 	args := []any{inputBase, inputLen}

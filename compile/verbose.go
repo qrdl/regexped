@@ -3,8 +3,11 @@ package compile
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
+
+	"github.com/qrdl/regexped/config"
 )
 
 // ── Verbose compile reporting ──────────────────────────
@@ -46,6 +49,36 @@ type Reporter struct {
 	cur      *PatternReport
 	Patterns []PatternReport
 	Sets     []SetDiag
+	// Backtracking: the assembled module carries Backtracking code — a
+	// pattern on that engine, a find whose switch hands over to it, or a set
+	// member on it — whose memory grows with the input (WarnUnboundedMemory).
+	Backtracking bool
+}
+
+// noteModule records what the assembled module carries that the CLI warns
+// about. The fallback-scratch globals exist exactly when Backtracking code was
+// emitted (bt_scratch.go), so they are the one test that sees every route in.
+func (r *Reporter) noteModule(g *moduleGlobals) {
+	if r == nil || g == nil {
+		return
+	}
+	if _, ok := g.btScratchGlobals(); ok {
+		r.Backtracking = true
+	}
+}
+
+// WarnUnboundedMemory warns, once, when the module carries Backtracking code
+// and the config sets no max_memory: that engine's frame stacks and fallback
+// memo grow with the input, so without a cap an adversarial input can grow
+// the module's memory until the host runs out of it. With a cap the search
+// answers "unknown" (-2) instead. rep is the Reporter the compile filled.
+func WarnUnboundedMemory(cfg config.BuildConfig, rep *Reporter) {
+	if rep == nil || !rep.Backtracking || cfg.MaxMemory.IsSet() {
+		return
+	}
+	slog.Warn("Backtracking engine selected and max_memory is not set: memory is not limited, possible out-of-memory on adversarial input",
+		"hint", "set max_memory (for example `max_memory: 64MiB`): a search that would need more answers \"unknown\" (-2) instead of growing memory",
+		"which", "`compile --verbose` names the patterns on Backtracking")
 }
 
 // Begin opens a per-pattern scope. Ending one that is already open flushes it,

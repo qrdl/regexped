@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"regexp/syntax"
 	"strings"
@@ -911,5 +912,17 @@ func TestCountedChainEmission(t *testing.T) {
 	fmt.Printf("counted-chain suffix: bodyLen=%d dataBytesLen=%d dataSegCount=%d\n", len(body), len(dataBytes), dataSegCount)
 	if dataSegCount != 0 {
 		t.Errorf("expected 0 data segments (pure SIMD, no table), got %d", dataSegCount)
+	}
+
+	// With the scan pair's probes, both rules included: a counted chain is
+	// one SIMD verification with no walk to exit early from, so the
+	// first-hit probe is the complete-mask probe, byte for byte, and neither
+	// needs a table either.
+	art, _, dataSegCount, _ = genSuffixWASM(table, 0, 0, []int{5}, []int{0}, LikelyNeutral, true, false, nil, true)
+	if len(art.scanProbe) == 0 || !bytes.Equal(art.scanProbe, art.scanProbeAny) {
+		t.Errorf("probes = % x / % x, want one non-empty body twice", art.scanProbe, art.scanProbeAny)
+	}
+	if dataSegCount != 0 {
+		t.Errorf("with probes: expected 0 data segments, got %d", dataSegCount)
 	}
 }

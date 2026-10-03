@@ -1,0 +1,12 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo\w+'
+  - pattern: 'k[a-z]+z'
+  - pattern: '\bbar\b'
+sets:
+  - name: s
+    find: sfind
+    overlapping: true
+    scan_all: sall
+    patterns: all

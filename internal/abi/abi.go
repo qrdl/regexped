@@ -167,6 +167,139 @@ const (
 // the old buffer; a JS host must read the buffer afresh after each call.
 const ScratchBaseExport = "regexped:scratch_base"
 
+// --- the per-search block ----------------------------------------------------
+//
+// A DRIVE — a stub calling `find` or `groups` until the input is exhausted — can
+// cost O(n²) even though every call is linear: a call reads bytes past the match
+// it reports, and the next call reads them again. The cure keeps notes across
+// the calls of ONE search: "from this (state, position) nothing matches", one
+// bit per (state, position), written once and read once. Those notes belong to
+// the search, not to the module — two iterators alive over one instance must
+// not clear each other's — so they live in a block the STUB owns, one per
+// iterator, and the stub tells the module which block the next call belongs to.
+//
+// The module keeps an ordinary copy of every find that can re-read bytes, plus
+// a per-search waste counter; only a search whose waste passes 4 × progress + 64
+// ARMS, after which a marked copy that reads and writes the notes serves the
+// rest of it. The notes themselves are allocated by the stub when it sees the
+// armed flag, so a search that never goes bad costs one block and no notes.
+//
+// The block, SearchBlockBytes, 8-byte aligned, in the memory the input lives in
+// (the host's memory in an embedded build), zeroed by the stub when it creates
+// the iterator. Every field starts at 0 and the stub writes only `notes_ptr`,
+// `notes_cap` and the two Backtracking memo fields; everything else is the
+// module's:
+//
+//	+0   wasted      i64  bytes read past reported matches, and failed reads
+//	                      over 32 bytes, this search
+//	+8   first       i32  `from` + 1 of the first call that wasted anything
+//	+12  armed       i32  1 once the search has gone bad
+//	+16  resume      i32  the resume point the last marked call handed out
+//	+20  ptr         i32  the text the notes describe (marked copy)
+//	+24  len         i32  its length
+//	+28  notes_ptr   i32  STUB: this search's notes, 0 = none yet
+//	+32  high        i32  one past the highest position holding a note
+//	+36  seen        i32  1 once a marked call has recorded ptr/len/resume
+//	+40  bt_state    i32  Backtracking find: 0 new, 1 budget live, 2 tripped
+//	+44  notes_cap   i32  STUB: bytes allocated at notes_ptr
+//	+48  bt_budget   i64  Backtracking find: work budget left, this search
+//	+56  bt_memo_ptr i32  STUB: the Backtracking fallback's kept memo, 0 = none
+//	+60  bt_text     i32  the text (ptr) the kept memo's marks describe
+//	+64  bt_text_len i32  its length + 1; 0 until the memo is first used
+//	+68  bt_cap      i32  Backtracking capture body: 2 once a call tripped
+//	+72  bt_memo_cap i32  STUB: bytes allocated at bt_memo_ptr
+//	+76  far         i32  one past the farthest position a failed walk of the
+//	                      general find body has read this search: only a walk
+//	                      reaching back below it re-reads, and only that part
+//	                      is waste
+//	+80 … +127            reserved, 0
+//
+// The notes: `(len + 1) × notes_bytes` zeroed bytes, where notes_bytes is a
+// per-pattern constant the stub generator writes into the stub. The module
+// checks `notes_cap` against what it is about to address and treats a short
+// region as "no notes", so a stub that disagrees about the constant costs speed,
+// never memory safety.
+//
+// The Backtracking memo: once `bt_state` reads 2 (tripped) the stub allocates
+// `(len + 1) × bt_memo_bytes` zeroed bytes, one row per text position starting
+// at position 0, where bt_memo_bytes is ⌈instructions / 8⌉ of the pattern's
+// program (SearchSize.BTMemoBytes). The module checks `bt_memo_cap` the same
+// way and uses a memo of its own for a call it does not cover. Its marks are
+// failures on one text: the first call that uses the memo records that text's
+// ptr and length in bt_text / bt_text_len, and a later call over another clears
+// the rows it reads and records its own, so a block reused for another text
+// costs time, not answers — unless the new text has the same address and length.
+//
+// How the module finds the block: SearchExport. The stub hands the block's
+// address over before EVERY call of an export whose pattern uses one; the value
+// is read by that call only. 0 means "no block", and the search runs exactly as
+// it would without this mechanism. A caller that drives the raw exports without
+// a generated stub must hand over 0, or a block of its own, before each such
+// call — a stale address left by another search is that search's state.
+const (
+	SearchBlockBytes = 128
+	SearchBlockAlign = 8
+
+	SearchWastedOff    = 0
+	SearchFirstOff     = 8
+	SearchArmedOff     = 12
+	SearchResumeOff    = 16
+	SearchPtrOff       = 20
+	SearchLenOff       = 24
+	SearchNotesOff     = 28
+	SearchHighOff      = 32
+	SearchSeenOff      = 36
+	SearchBTStateOff   = 40
+	SearchNotesCapOff  = 44
+	SearchBTBudgetOff  = 48
+	SearchBTMemoOff    = 56
+	SearchBTTextOff    = 60
+	SearchBTTextLenOff = 64
+	SearchBTCapOff     = 68
+	SearchBTMemoCapOff = 72
+	SearchFarOff       = 76
+)
+
+// bt_state's values; bt_cap uses SearchBTTripped too.
+const (
+	SearchBTNew     = 0 // a new search: no budget set up yet
+	SearchBTLive    = 1 // the search's budget is live in the block
+	SearchBTTripped = 2 // the budget ran out: the fallback serves the rest of the search
+)
+
+// SearchExport is the export through which the host names the current search's
+// block. Its KIND depends on the output kind, because the hosts differ in what
+// they can touch:
+//
+//   - standalone (JS/TS, the harnesses): a mutable i32 GLOBAL the host writes;
+//   - embedded (Rust, Go, C, AssemblyScript through wasm-merge): a FUNCTION
+//     `(blk i32) → ()` the host calls, since a merged host can only call the
+//     module's exports. Measured against a fourth parameter on every find
+//     export: within 1% on every drive measured, and one name instead of a
+//     second export per pattern;
+//   - component: not exported; the find / groups resource sets it itself.
+//
+// The colon keeps it out of the namespace a config can name, as
+// ScratchBaseExport's does.
+const SearchExport = "regexped:search"
+
+// ImportModuleSection is the custom section in which `regexped compile`
+// records an EMBEDDED module's import_module, the module name its stubs import
+// from. `regexped merge` names each regexp module from it rather than from the
+// one config it is given, so modules built from configs with distinct
+// import_module values merge into one program, and two modules under the SAME
+// name — whose setter exports (SearchExport) the merge would otherwise bind to
+// only one of — are refused. The payload is the name's UTF-8 bytes.
+const ImportModuleSection = "regexped:import_module"
+
+// SearchRuleMult and SearchRuleSlack are the arming rule, shared with the
+// Backtracking per-search budget: a search arms once its waste exceeds
+// SearchRuleMult × (progress) + SearchRuleSlack.
+const (
+	SearchRuleMult  = 4
+	SearchRuleSlack = 64
+)
+
 // SetMatchTupleBytes is one set match as the find exports write it: {pattern
 // id, start, end}, three i32. Every writer of a tuple buffer and every reader
 // that sizes or indexes one takes the stride from here.
@@ -195,3 +328,48 @@ func WriteFindScratch(buf []byte, off int32, gatePtr, cachePtr, cacheLen int32) 
 	put(FindScratchCacheOff, cachePtr)
 	put(FindScratchCacheLenOff, cacheLen)
 }
+
+// WriteFindScratchBlocks fills a descriptor that also names a set's split
+// member search blocks: FindScratchMagicBlocks, then WriteFindScratch's
+// fields, then blocksPtr and the number of blocks there. buf[off:] must hold
+// FindScratchBlocksBytes.
+func WriteFindScratchBlocks(buf []byte, off int32, gatePtr, cachePtr, cacheLen, blocksPtr, blocksN int32) {
+	WriteFindScratch(buf, off, gatePtr, cachePtr, cacheLen)
+	binary.LittleEndian.PutUint32(buf[off+FindScratchMagicOff:], FindScratchMagicBlocks)
+	binary.LittleEndian.PutUint32(buf[off+FindScratchBlocksOff:], uint32(blocksPtr))
+	binary.LittleEndian.PutUint32(buf[off+FindScratchBlocksCountOff:], uint32(blocksN))
+}
+
+// --- a split set member's search block ---------------------------------------
+//
+// A set member whose search is split out of the set's buckets keeps its OWN
+// per-search block (the single-pattern block above: same size, layout and
+// host protocol), because the member's search spans the set's calls just as a
+// pattern's spans its iterator's. A caller hands the blocks over through the
+// scratch descriptor, in two fields that only a descriptor carrying
+// FindScratchMagicBlocks has:
+//
+//	+16 blocks_ptr  n × SearchBlockBytes, SearchBlockAlign-aligned, zeroed
+//	                when a scan starts; n and each block's notes size are
+//	                the set's generated block list
+//	+20 blocks_n    n, the number of blocks at blocks_ptr
+//
+// The module uses the blocks only when blocks_n is the count its set expects
+// and otherwise runs every member with no block — correct, only slower — so a
+// stub and a module that disagree about the list (a stub generated for another
+// build of the config) cannot make the module write past the caller's array.
+//
+// A second magic rather than a field every descriptor carries, because a
+// caller that knows nothing of blocks writes four fields and whatever follows
+// them would be read as a pointer the module then writes through. With the
+// old magic the module runs every member search with no block: correct, and
+// as fast as before blocks existed. Only a set with such members accepts the
+// new magic; any other traps on it as on any wrong word.
+const (
+	// FindScratchMagicBlocks is "RXFB" in little-endian bytes.
+	FindScratchMagicBlocks    = 0x52584642
+	FindScratchBlocksOff      = 16
+	FindScratchBlocksCountOff = 20
+	// FindScratchBlocksBytes is the size of a descriptor that names blocks.
+	FindScratchBlocksBytes = 24
+)

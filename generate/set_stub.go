@@ -484,14 +484,15 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
+		"searchBlock", "searchNotes", "searchBTMemo", "ffi_regexped_search"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
 	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
 		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
-		"REGEXPED_TYPES_DEFINED",
+		"REGEXPED_TYPES_DEFINED", "rx_search_set_",
 	},
 	// Rust is deliberately absent: `pub mod <import_module>` already isolates
 	// every stub, so the key is a no-op there.
@@ -664,16 +665,19 @@ func (p *setShapes) wideAll(i int) bool {
 	return *p.wide[i]
 }
 
-// anyWantsCache reports whether any set in this config gets an overlapping
-// answer cache, which is what decides whether the C header carries the
-// allocator machinery at all, and whether the Go stub imports `math`.
+// anyWantsCache reports whether any set in this config gets a region — an
+// overlapping answer cache, or a program sweep's part after a bare header —
+// which is what decides whether the C header carries the allocator machinery
+// (and rx_sqrt_) at all, and whether the Go stub imports `math`. A sweep-only
+// set sizes its part with the same square root, and testing Eligible alone
+// left both out for a config whose only region was a sweep's.
 //
 // A config with no sets, or none overlapping, must not: the header documents
 // itself as needing no libc, and emitting the feature test would pull
 // <stdlib.h> into builds that rely on that.
 func (p *setShapes) anyWantsCache() bool {
 	for i := range p.cfg.Sets {
-		if p.cacheShape(i).Eligible {
+		if p.cacheShape(i).Offered() {
 			return true
 		}
 	}
@@ -684,7 +688,7 @@ func (p *setShapes) anyWantsCache() bool {
 // LITERALS, derived once from the compiled shape.
 //
 // Six languages spell that prelude, and each spelled these three itself:
-// `4 + 4*P` for a row, `cells*4 + 4` for a checkpoint column, and the header
+// the mask plus 4*P for a row, `cells*4 + 4` for a checkpoint column, and the header
 // beside them. The arithmetic that remains language-specific is only the
 // stride and the block count — a square root and a ceiling — because those are
 // the parts that need the input length, which exists only at call time.

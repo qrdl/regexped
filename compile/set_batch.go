@@ -175,7 +175,13 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		lCache, lCacheLen = a.I32(), a.I32()
 		lReady, lWork = a.I32(), a.I32()
 		lRows, lRow, lDst, lIdx = a.I32(), a.I32(), a.I32(), a.I32()
-		lStart, lSrc, lMask, lN, lTmp = a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
+		lStart, lSrc = a.I32(), a.I32()
+		if numPat > 32 {
+			lMask = a.I64()
+		} else {
+			lMask = a.I32()
+		}
+		lN, lTmp = a.I32(), a.I32()
 		lJ, lNb = a.I32(), a.I32()
 		lSweepRet = a.I32()
 		lCumBase, lBlockBase = a.I32(), a.I32()
@@ -190,9 +196,17 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	if companion {
 		lDesc = a.I32()
 	}
+	var lMagic byte
+	if cs.acceptsBlocks() {
+		lMagic = a.I32()
+	}
 
 	var b []byte
 	b = a.EmitDecls(b)
+	// A batching set whose kept members have a set of their own: the merge in
+	// the worker reads its descriptor, and this is `find`, which takes a
+	// position that does not fit whole the transactional way.
+	b = cs.emitKeptCacheEntry(b, pScratch, false)
 	if companion {
 		b = append(b, 0x20, pScratch, 0x21, lDesc)
 	}
@@ -205,17 +219,14 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	// steps injectScratchPrologue splices into a non-wrapped set's body. The
 	// inner body is left taking a gate, because every one of its callers has
 	// dereferenced.
-	b = append(b, 0x20, pScratch)
-	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
-	b = append(b, 0x47)       // i32.ne
-	b = append(b, 0x04, 0x40) // if
-	b = append(b, 0x00)       // unreachable
-	b = append(b, 0x0B)       // end
+	if !cs.trustDesc {
+		b = cs.emitScratchMagicCheck(b, pScratch, lMagic)
+	}
+	b = cs.emitWorkerBlocks(b, pScratch)
 
 	cache := overlapCacheCtx{
-		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		numPat: numPat,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte, setupWork: cs.overlapSweepSetupWork(),
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: lCache, pCacheLen: lCacheLen,
@@ -331,8 +342,23 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x20, lRow, 0x20, lRows, 0x4E, 0x0D, 0x01) // past the block
 			b = cache.emitRowAddr(b, lRow)
 			b = append(b, 0x22, lSrc)
-			b = append(b, 0x28, 0x02, 0x00) // the mask
-			b = append(b, 0x22, lMask)
+			if numPat > 64 {
+				b = append(b, 0x29, 0x03, 0x00) // word 0
+				for w := 1; w < (numPat+63)/64; w++ {
+					b = append(b, 0x20, lSrc, 0x29, 0x03)
+					b = utils.AppendULEB128(b, uint32(8*w))
+					b = append(b, 0x84) // i64.or
+				}
+				b = append(b, 0x22, lMask)
+				b = append(b, 0x42, 0x00, 0x52) // i64.ne 0
+			} else if numPat > 32 {
+				b = append(b, 0x29, 0x03, 0x00) // the mask, i64
+				b = append(b, 0x22, lMask)
+				b = append(b, 0x42, 0x00, 0x52) // i64.ne 0
+			} else {
+				b = append(b, 0x28, 0x02, 0x00) // the mask
+				b = append(b, 0x22, lMask)
+			}
 			b = append(b, 0x0D, 0x01) // non-zero: this position matches
 			b = append(b, 0x20, lRow, 0x41, 0x01, 0x6A, 0x21, lRow)
 			b = append(b, 0x0C, 0x00)
@@ -362,7 +388,21 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 				b = append(b, 0x20, lStart, 0x20, lRow, 0x6A, 0x24)
 				b = utils.AppendULEB128(b, uint32(cs.keptPosGlobal)) //nolint:gosec // a global index
 			}
-			b = append(b, 0x20, lMask, 0x69) // i32.popcnt
+			if numPat > 64 {
+				for w := 0; w < (numPat+63)/64; w++ {
+					b = append(b, 0x20, lSrc, 0x29, 0x03)
+					b = utils.AppendULEB128(b, uint32(8*w))
+					b = append(b, 0x7B) // i64.popcnt
+					if w > 0 {
+						b = append(b, 0x7C) // i64.add
+					}
+				}
+				b = append(b, 0xA7)
+			} else if numPat > 32 {
+				b = append(b, 0x20, lMask, 0x7B, 0xA7) // i64.popcnt; wrap
+			} else {
+				b = append(b, 0x20, lMask, 0x69) // i32.popcnt
+			}
 			b = append(b, 0x21, lN)
 			b = append(b, 0x20, lN, 0x20, pOutCap, 0x4A) // n > cap
 			b = append(b, 0x04, 0x40)
@@ -375,9 +415,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 			b = append(b, 0x20, lStart, 0x20, lRow, 0x6A, 0x21, lStart) // the position
 			b = append(b, 0x41, 0x00, 0x21, lIdx)
 			for k := 0; k < numPat; k++ {
-				b = append(b, 0x20, lMask, 0x41)
-				b = utils.AppendSLEB128(b, int32(1)<<uint(k))
-				b = append(b, 0x71)       // i32.and
+				b = emitRowBitTest(b, numPat, k, lMask, lSrc)
 				b = append(b, 0x04, 0x40) // if this pattern matched here
 				b = append(b, 0x20, pOutPtr)
 				b = append(b, 0x20, lIdx, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
@@ -413,7 +451,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		b = append(b, 0x20, lCache, 0x41, 0x00, 0x47)       // cache != 0
 		b = append(b, 0x20, lReady, 0x45, 0x71)             // && ready == 0
 		b = append(b, 0x04, 0x7F)                           // if (result i32)
-		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte, cs.overlapSweepSetupWork())
 		b = append(b, 0x20, lWork, 0xAD, 0x7D) // - work
 		b = append(b, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // MAX
@@ -726,10 +764,18 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x20, x.lCacheRow, 0x20, x.lCacheRows, 0x4E, 0x0D, 0x01)
 	b = append(b, 0x20, x.lDeliver, 0x20, x.lCap, 0x4E, 0x0D, 0x01)
 
+	// The row's mask at its width (config.SetOverlapRowMaskBytes): an i32 to
+	// 32 patterns, an i64 to 64. Above that the test below reads pattern k's
+	// own word out of the row, so nothing is loaded here.
 	b = cache.emitRowAddr(b, x.lCacheRow)
-	b = append(b, 0x22, x.lSrc)
-	b = append(b, 0x28, 0x02, 0x00)
-	b = append(b, 0x21, x.lCacheMask)
+	switch {
+	case numPat > 64:
+		b = append(b, 0x21, x.lSrc)
+	case numPat > 32:
+		b = append(b, 0x22, x.lSrc, 0x29, 0x03, 0x00, 0x21, x.lCacheMask) // i64.load
+	default:
+		b = append(b, 0x22, x.lSrc, 0x28, 0x02, 0x00, 0x21, x.lCacheMask) // i32.load
+	}
 
 	// TWO counters, and the distinction is load-bearing. x.lCacheOrd is the
 	// ORDINAL of the set bit within this position; x.lCacheDel is how many of
@@ -741,9 +787,7 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	b = append(b, 0x41, 0x00, 0x21, x.lCacheOrd)
 	b = append(b, 0x20, x.lCacheSkip, 0x21, x.lCacheDel)
 	for k := 0; k < numPat; k++ {
-		b = append(b, 0x20, x.lCacheMask, 0x41)
-		b = utils.AppendSLEB128(b, int32(1)<<uint(k))
-		b = append(b, 0x71)
+		b = emitRowBitTest(b, numPat, k, x.lCacheMask, x.lSrc)
 		b = append(b, 0x04, 0x40)
 		// Skip the ones a previous call already delivered at this position.
 		b = append(b, 0x20, x.lCacheOrd, 0x20, x.lCacheSkip, 0x4E) // ordinal >= skip
@@ -821,6 +865,11 @@ type batchWalkLocals struct {
 	// itself when the counter trips; lV64 holds that call's answer. 0 when
 	// the set carries no counter.
 	lBudget, lDesc, lV64 byte
+	// sparse: the set carries a sparse counter, whose tripped answer hands
+	// the rest of the call — and of the drive, through block 0 (lBlk0, 0 for
+	// none) — to the split copy's batch entry.
+	sparse bool
+	lBlk0  byte
 }
 
 // emitBatchWalk is the WALK half of the batching entry: call the per-position
@@ -858,31 +907,51 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 
 	// total = worker(ptr, len, pos, gate, out_ptr + (count-k)*12,
 	//                avail + k [, k])
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, x.lPos)
-	b = append(b, 0x20, pGate)
-	b = append(b, 0x20, pOutPtr, 0x20, x.lCount)
-	if !gated {
-		b = append(b, 0x20, x.lK, 0x6B)
+	callWorker := func(b []byte) []byte {
+		b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, x.lPos)
+		b = append(b, 0x20, pGate)
+		b = append(b, 0x20, pOutPtr, 0x20, x.lCount)
+		if !gated {
+			b = append(b, 0x20, x.lK, 0x6B)
+		}
+		b = append(b, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x20, x.lAvail)
+		if !gated {
+			b = append(b, 0x20, x.lK, 0x6A)
+		}
+		if gated {
+			// batch_mode = 1: gate what is DELIVERED rather than only a position
+			// that fitted whole (sharing this worker between both entries made this a runtime argument, so
+			// the exported `find` can share this worker by passing 0).
+			b = append(b, 0x41, 0x01)
+		} else {
+			b = append(b, 0x20, x.lK)
+		}
+		// Seeded with the position this call walks from, immediately before the
+		// call, so the global comes back holding a position at or above it.
+		b = cache.emitSeedWalkEnd(b, x.lPos)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(workerIdx))
+		return append(b, 0x21, x.lTotal)
 	}
-	b = append(b, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
-	b = append(b, 0x20, x.lAvail)
-	if !gated {
-		b = append(b, 0x20, x.lK, 0x6A)
+	b = callWorker(b)
+	if cs.keptCache != nil && cs.keptBatchGlobal >= 0 {
+		// The worker's position does not fit what is left of the buffer
+		// (keptNoFitSentinel): end this call before it when something is
+		// already delivered — the next call starts there with the whole
+		// buffer — and otherwise ask again for it delivered in part.
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, keptNoFitSentinel)
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		// br 3: 0 = this if, 1 = the no-fit if, 2 = loop $L, 3 = block $exit.
+		b = append(b, 0x20, x.lCount, 0x04, 0x40, 0x0C, 0x03, 0x0B)
+		b = append(b, 0x41, keptBatchPartial, 0x24)
+		b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+		b = callWorker(b)
+		b = append(b, 0x41, keptBatchWhole, 0x24)
+		b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+		b = append(b, 0x0B)
 	}
-	if gated {
-		// batch_mode = 1: gate what is DELIVERED rather than only a position
-		// that fitted whole (sharing this worker between both entries made this a runtime argument, so
-		// the exported `find` can share this worker by passing 0).
-		b = append(b, 0x41, 0x01)
-	} else {
-		b = append(b, 0x20, x.lK)
-	}
-	// Seeded with the position this call walks from, immediately before the
-	// call, so the global comes back holding a position at or above it.
-	b = cache.emitSeedWalkEnd(b, x.lPos)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(workerIdx))
-	b = append(b, 0x21, x.lTotal)
 
 	if mid {
 		// The counter tripped: this call's walks have cost what the sweep
@@ -922,6 +991,38 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x20, x.lV64)
 		b = append(b, 0x20, x.lCount, 0xAD, 0x7C) // + count, into the count field
 		b = append(b, 0x0F, 0x0B)                 // return; end if
+	}
+
+	if x.sparse {
+		// The sparse counter tripped at this position: the split copy serves
+		// the rest of this call from here, and the drive is marked switched so
+		// every later call goes straight to it. Its answer is returned the way
+		// the mid-sweep path above returns its own call's.
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, sparseHandoverSentinel)
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = emitSparseSwitch(b, x.lBlk0)
+		b = append(b, 0x20, pInPtr, 0x20, pInLen)
+		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86) // (i64)pos << 32
+		b = append(b, 0x20, x.lDesc)
+		b = append(b, 0x20, pOutPtr, 0x20, x.lCount, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x20, x.lCap, 0x20, x.lCount, 0x6B)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(cs.companionBatchIdx)) //nolint:gosec // a function index
+		b = append(b, 0x22, x.lV64)
+		// A reserved position word with tuples already delivered: return them
+		// under the ordinary resume cursor, as above (br 3 = block $exit).
+		b = append(b, 0x42, 0x20, 0x88, 0xA7)
+		lowest := uint32(config.SetCursorOutOfOrderPos)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(lowest)) //nolint:gosec // a reserved bit pattern
+		b = append(b, 0x6B, 0x41, 0x03, 0x49)
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A)
+		b = append(b, 0x71, 0x04, 0x40)
+		b = append(b, 0x0C, 0x03, 0x0B)
+		b = append(b, 0x20, x.lV64)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x7C) // + count, into the count field
+		b = append(b, 0x0F, 0x0B)
 	}
 
 	// The worker can return abi.BTStackOverflow instead of a count when a
@@ -1175,7 +1276,12 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		lCacheRow = a.I32()
 		lCacheFloor, lCacheNext, lCacheStride = a.I32(), a.I32(), a.I32()
 		lCacheOrd = a.I32()
-		lCacheSkip, lCacheMask = a.I32(), a.I32()
+		lCacheSkip = a.I32()
+		if n, _, _, _ := cs.overlapCacheGeometry(); n > 32 {
+			lCacheMask = a.I64()
+		} else {
+			lCacheMask = a.I32()
+		}
 		lCacheDone, lCacheDel = a.I32(), a.I32()
 		lCacheSweepRet, lSrc = a.I32(), a.I32()
 		// The adaptive trigger's working locals.
@@ -1195,6 +1301,19 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	companion := cs.companion != nil && cs.companionBatchIdx >= 0 && dpIdx >= 0
 	if companion && lDesc == 0 {
 		lDesc = a.I32()
+	}
+	// The sparse counter's: its handover calls the split copy with the
+	// descriptor and returns that call's answer through lV64; lBlk0 is the
+	// drive's state block.
+	var lBlk0 byte
+	if cs.sparseCtr != nil {
+		if lDesc == 0 {
+			lDesc = a.I32()
+		}
+		if lV64 == 0 {
+			lV64 = a.I64()
+		}
+		lBlk0 = a.I32()
 	}
 
 	//
@@ -1219,7 +1338,8 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// serve the exported `find`, which reaches a cache through the same
 	// descriptor this entry does.
 	cache := overlapCacheCtx{
-		dpIdx: dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		numPat: numPat,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte, setupWork: cs.overlapSweepSetupWork(),
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: pScratch, pCacheLen: pScratchLen,
@@ -1234,6 +1354,10 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		cache.midWorkP1 = cs.midSweepWork + 1
 	}
 
+	var lMagic byte
+	if cs.acceptsBlocks() {
+		lMagic = a.I32()
+	}
 	var b []byte
 	b = a.EmitDecls(b) // the i32 locals allocated above
 
@@ -1241,14 +1365,9 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// descriptor on entry, so the cache fields are read before the gate pointer
 	// overwrites it. The magic check turns a caller still passing a bare gate
 	// array into an immediate trap rather than a pointer read out of gate[0].
-	b = append(b, 0x20, pGate)
-	b = append(b, 0x28, 0x02, abi.FindScratchMagicOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, abi.FindScratchMagic)
-	b = append(b, 0x47)       // i32.ne
-	b = append(b, 0x04, 0x40) // if
-	b = append(b, 0x00)       // unreachable
-	b = append(b, 0x0B)       // end
+	b = cs.emitScratchMagicCheck(b, pGate, lMagic)
+	b = cs.emitWorkerBlocks(b, pGate)
+	b = cs.emitKeptCacheEntry(b, pGate, true)
 	if lDesc != 0 {
 		b = append(b, 0x20, pGate, 0x21, lDesc)
 	}
@@ -1361,18 +1480,34 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		b = append(b, 0x20, pScratch, 0x41, 0x00, 0x47)
 		b = append(b, 0x20, lReady, 0x45, 0x71)
 		b = append(b, 0x04, 0x7F)
-		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte, cs.overlapSweepSetupWork())
 		b = append(b, 0x20, lWork, 0xAD, 0x7D, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x20, lV64)
 		b = append(b, 0x20, lV64, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x55, 0x1B, 0xA7)
 		b = append(b, 0x05, 0x41, 0x7F, 0x0B)
 		b = append(b, 0x21, lBudget)
 	}
+	if ctr := cs.sparseCtr; ctr != nil {
+		// The drive's state in block 0: a switched drive's call goes to the
+		// split copy whole; otherwise the counter, read lazily on a charge.
+		if cs.companionBatchIdx < 0 {
+			panic("compile: a batching set's sparse companion has no batch entry")
+		}
+		b = cs.emitScratchBlocks(b, lDesc)
+		b = append(b, 0x21, lBlk0)
+		b = ctr.emitEnter(b, lBlk0,
+			func(b []byte) []byte { return append(b, 0x20, lPos) },
+			func(b []byte) []byte {
+				b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, pCursor, 0x20, lDesc, 0x20, pOutPtr, 0x20, pOutCap, 0x10)
+				return utils.AppendULEB128(b, uint32(cs.companionBatchIdx)) //nolint:gosec // a function index
+			})
+	}
 	b = cs.emitBatchWalk(b, cache, batchWalkLocals{
 		lPos: lPos, lK: lK, lCount: lCount, lTotal: lTotal, lStart: lStart,
 		lAvail: lAvail, lDeliver: lDeliver, lDone: lDone, lCap: lCap,
 		lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lReady: lReady,
 		lCacheSweepRet: lCacheSweepRet, lBudget: lBudget, lDesc: lDesc, lV64: lV64,
+		sparse: cs.sparseCtr != nil, lBlk0: lBlk0,
 	}, pInPtr, pInLen, pGate, pOutPtr, pScratch, workerIdx, selfIdx, dpIdx, countBits, maxCount, gated)
 
 	// The work counter is drive state, so it goes back to the caller's scratch
@@ -1400,4 +1535,26 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 
 	out := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(out, b...)
+}
+
+// emitRowBitTest pushes a non-zero i32 when pattern k's bit is set in a cache
+// row of numPat patterns: from the mask already in maskLocal (an i32 to 32
+// patterns, an i64 to 64), or — above 64 — from pattern k's own word of the
+// row at srcLocal (config.SetOverlapRowMaskBytes).
+func emitRowBitTest(b []byte, numPat, k int, maskLocal, srcLocal byte) []byte {
+	switch {
+	case numPat > 64:
+		b = append(b, 0x20, srcLocal, 0x29, 0x03)    // i64.load word k/64
+		b = utils.AppendULEB128(b, uint32(8*(k/64))) //nolint:gosec // a row offset
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(uint64(1)<<uint(k%64))) //nolint:gosec // a bit
+		return append(b, 0x83, 0x42, 0x00, 0x52)                    // i64.and; i64.ne 0
+	case numPat > 32:
+		b = append(b, 0x20, maskLocal, 0x42)
+		b = utils.AppendSLEB128_64(b, int64(uint64(1)<<uint(k))) //nolint:gosec // a bit
+		return append(b, 0x83, 0x42, 0x00, 0x52)                 // i64.and; i64.ne 0
+	}
+	b = append(b, 0x20, maskLocal, 0x41)
+	b = utils.AppendSLEB128(b, int32(1)<<uint(k))
+	return append(b, 0x71) // i32.and
 }

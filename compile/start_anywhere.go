@@ -260,10 +260,7 @@ func lenientAltLinear(pattern string, opts CompileOptions) bool {
 	if err != nil {
 		return false
 	}
-	d, ok := m.(*dfa)
-	if !ok {
-		return false
-	}
+	d := m.(*dfa) // compile builds only a *dfa
 	if _, bounded := failedWalkBound(dfaTableFrom(d)); bounded {
 		return true
 	}
@@ -354,10 +351,8 @@ func litAnchorLinear(lap *litAnchorPoint) bool {
 // without dying — from any state it can reach. Unsure answers (the automaton
 // cannot be built) are true, the safe direction.
 func regexpCanContain(re *syntax.Regexp, lit []byte) bool {
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return true
-	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(re.Simplify())
 	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
 	if !ok {
 		return true
@@ -498,12 +493,13 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 
 // buildStartAnywhereFind fills p with the two passes and reports whether it
 // did. false leaves p untouched, and the caller keeps today's find.
-func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int64, opts CompileOptions) bool {
-	sa, ok := buildStartAnywherePasses(re.Pattern, opts, base, utils.PageAlign)
+// nr, when non-nil, asks for per-search notes in the forward pass.
+func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int64, opts CompileOptions, nr *walkNotesReq) bool {
+	sa, ok := buildStartAnywherePasses(re.Pattern, opts, base, utils.PageAlign, nr)
 	if !ok {
 		return false
 	}
-	p.saFwdBody, p.saRevBody, p.saCtx = sa.fwdBody, sa.revBody, sa.ctx
+	p.saFwdBody, p.saRevBody, p.saCtx, p.saNotes = sa.fwdBody, sa.revBody, sa.ctx, sa.fwdNotes
 	p.dataBytes = append(p.dataBytes, sa.data...)
 	p.dataSegCount += sa.segs
 	p.tableEnd = sa.end
@@ -516,8 +512,8 @@ func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int6
 // too: its fallback body memoises every (instruction, position) it has tried.
 // False when neither can be built; the Backtracking find's fallback needs the
 // module's global allocator.
-func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, table *dfaTable, mandLit *mandatoryLit, opts CompileOptions) bool {
-	if p.buildStartAnywhereFind(re, base, opts) {
+func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, table *dfaTable, mandLit *mandatoryLit, opts CompileOptions, nr *walkNotesReq) bool {
+	if p.buildStartAnywhereFind(re, base, opts, nr) {
 		return true
 	}
 	if opts.globals == nil {
@@ -553,6 +549,8 @@ type startAnywherePasses struct {
 	// context ones — the forward pass (ptr, len) → absolute end from the
 	// find-from global, the backward pass (ptr, len, end) → start.
 	ctx bool
+	// fwdNotes: the forward pass's notes rows, nil for none.
+	fwdNotes *notesRows
 }
 
 // buildStartAnywherePasses builds both passes for pattern, the forward
@@ -560,8 +558,10 @@ type startAnywherePasses struct {
 // context passes for a pattern with an empty-width assertion. Refused (false)
 // for an unsupported rune, an automaton over opts' state or memory limit, or
 // one with an ambiguous boundary target (dfaHasAmbiguousBoundaryTarget: the
-// automaton cannot represent the assertion exactly).
-func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, align func(int64) int64) (startAnywherePasses, bool) {
+// automaton cannot represent the assertion exactly). nr, when non-nil, gives
+// the forward pass per-search notes (search_notes.go), their row tables
+// placed right after its own.
+func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, align func(int64) int64, nr *walkNotesReq) (startAnywherePasses, bool) {
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return startAnywherePasses{}, false
@@ -571,10 +571,8 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 	maxStates := resolveMaxDFAStates(&opts)
 	memLimit := resolveMaxDFAMemory(&opts)
 	build := func(re *syntax.Regexp, lf bool) *dfaTable {
-		prog, err := syntax.Compile(re.Simplify())
-		if err != nil {
-			return nil
-		}
+		// syntax.Compile never returns a non-nil error (see its stdlib source).
+		prog, _ := syntax.Compile(re.Simplify())
 		if unsupportedRune(prog, opts.ByteMode) >= 0 && !opts.Unicode {
 			return nil
 		}
@@ -593,16 +591,21 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 	// the SAME tree the backward pass reverses. It used to re-parse
 	// parsed.String(), and any drift in that round trip would have made the
 	// two passes disagree about a match, which the glue body traps on.
-	lead, err := syntax.Parse(`(?s:.)*?`, syntax.Perl)
-	if err != nil {
-		return startAnywherePasses{}, false
-	}
+	// A constant pattern that parses, so the error is always nil.
+	lead, _ := syntax.Parse(`(?s:.)*?`, syntax.Perl)
 	fwdRe := &syntax.Regexp{Op: syntax.OpConcat, Flags: lead.Flags, Sub: []*syntax.Regexp{lead, parsed}}
 	fwdTable := build(fwdRe, true)
 	if fwdTable == nil {
 		return startAnywherePasses{}, false
 	}
 	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true})
+	var fwdNotes *notesRows
+	if nr != nil {
+		if fwdNotes = newNotesRows(fwdTable, fwdL); fwdNotes != nil {
+			fwdNotes.at = nr.at
+			fwdNotes.stride = nr.at + fwdNotes.bytes
+		}
+	}
 	// Backward pass: the whole pattern reversed, leftmost-longest.
 	revTable := build(reverseRegexp(parsed), false)
 	if revTable == nil {
@@ -613,16 +616,24 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 	fwdRaw, fwdSegs := stripSegCount(dfaDataSegments(fwdL, true, false))
 	revRaw, revSegs := stripSegCount(dfaDataSegments(revL, true, false))
 	sa := startAnywherePasses{
-		data: append(fwdRaw, revRaw...),
-		segs: fwdSegs + revSegs,
-		end:  revL.tableEnd,
-		ctx:  ctx,
+		data:     append(fwdRaw, revRaw...),
+		segs:     fwdSegs + revSegs,
+		end:      revL.tableEnd,
+		ctx:      ctx,
+		fwdNotes: fwdNotes,
+	}
+	var search uint32
+	var checkResume bool
+	if fwdNotes != nil {
+		sa.data = append(sa.data, fwdNotes.dataSegment()...)
+		sa.segs++
+		search, checkResume = nr.globals.Search(), nr.checkResume
 	}
 	if ctx {
-		sa.fwdBody = buildStartAnywhereForwardBodyCtx(fwdL, opts.tableMemIdx)
+		sa.fwdBody = buildStartAnywhereForwardBodyCtx(fwdL, opts.tableMemIdx, fwdNotes, search, checkResume)
 		sa.revBody = buildStartAnywhereBackBodyCtx(revL, opts.tableMemIdx)
 	} else {
-		sa.fwdBody = buildStartAnywhereForwardBody(fwdL, opts.tableMemIdx)
+		sa.fwdBody = buildStartAnywhereForwardBody(fwdL, opts.tableMemIdx, fwdNotes, search, checkResume)
 		sa.revBody = buildStartAnywhereBackBody(revL, opts.tableMemIdx)
 	}
 	return sa, true
@@ -648,7 +659,11 @@ func emitWalkerTransition(b []byte, l *dfaLayout, stateLocal, ptrLocal, posLocal
 // (ptr, len) → i32: it walks input[0:len) from the start state and returns
 // the position after the last accept, or -1 when nothing accepted. The
 // caller passes (ptr + from, len - from), so the answer is relative to from.
-func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int) []byte {
+//
+// With nr (search_notes.go) it carries the per-search notes: a marked walk
+// and the plain one, chosen at entry; nr == nil emits the plain walk alone,
+// byte for byte what it was before notes existed.
+func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int, nr *notesRows, search uint32, checkResume bool) []byte {
 	const (
 		locPtr   = 0
 		locLen   = 1
@@ -667,64 +682,115 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int) []byte {
 	if len(dominant) > maxForwardBulkSkipStates {
 		dominant = dominant[:maxForwardBulkSkipStates]
 	}
-	b := []byte{0x01, 0x04, 0x7F} // four i32 locals
-	if len(dominant) > 0 {
+	var nc *notesCtx
+	var b []byte
+	switch {
+	case nr == nil && len(dominant) > 0:
 		b = []byte{0x02, 0x05, 0x7F, 0x01, 0x7B} // five i32, one v128
+	case nr == nil:
+		b = []byte{0x01, 0x04, 0x7F} // four i32 locals
+	case len(dominant) > 0:
+		// five i32, one v128, then the bias and the notes group
+		b = []byte{0x03, 0x05, 0x7F, 0x01, 0x7B, 1 + walkNotesLocals, 0x7F}
+		nc = newWalkNotes(nr, l, tableMemIdx, search, locPtr, locLen, locState, locPos, locLast, locChunk+1, locChunk+2)
+	default:
+		b = []byte{0x01, 4 + 1 + walkNotesLocals, 0x7F}
+		nc = newWalkNotes(nr, l, tableMemIdx, search, locPtr, locLen, locState, locPos, locLast, locByte+1, locByte+2)
+	}
+	if nc != nil {
+		// The walk is handed input[from:], so from is its positions' bias.
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, findFromGlobalIdx)
+		b = append(b, 0x21, nc.bias)
+		b = nc.emitWalkEntry(b, checkResume)
 	}
 
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x21, locState)
-	b = append(b, 0x41, 0x00, 0x21, locPos)  // pos = 0
-	b = append(b, 0x41, 0x7F, 0x21, locLast) // last = -1
+	walk := func(b []byte, marked bool) []byte {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmStart))
+		b = append(b, 0x21, locState)
+		b = append(b, 0x41, 0x00, 0x21, locPos)  // pos = 0
+		b = append(b, 0x41, 0x7F, 0x21, locLast) // last = -1
 
-	// An empty match at the start.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(l.wasmStart))
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40, 0x41, 0x00, 0x21, locLast, 0x0B) // if: last = 0
+		// An empty match at the start.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(l.wasmStart))
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x04, 0x40, 0x41, 0x00, 0x21, locLast, 0x0B) // if: last = 0
+		if marked {
+			b = nc.emitWalkInit(b)
+		}
 
-	b = append(b, 0x02, 0x40) // block $done
-	b = append(b, 0x03, 0x40) // loop $fwd
+		b = append(b, 0x02, 0x40) // block $done
+		b = append(b, 0x03, 0x40) // loop $fwd
 
-	// End of input: an accepting state accepts here, then stop.
-	b = append(b, 0x20, locPos, 0x20, locLen, 0x4E) // pos >= len (signed)
-	b = append(b, 0x04, 0x40)
-	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
-	b = append(b, 0x04, 0x40, 0x20, locLen, 0x21, locLast, 0x0B) // if: last = len
-	b = append(b, 0x0C, 0x02)                                    // br $done
-	b = append(b, 0x0B)
+		// End of input: an accepting state accepts here, then stop.
+		b = append(b, 0x20, locPos, 0x20, locLen, 0x4E) // pos >= len (signed)
+		b = append(b, 0x04, 0x40)
+		b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+		b = append(b, 0x04, 0x40, 0x20, locLen, 0x21, locLast) // if: last = len
+		if marked {
+			b = nc.emitAcceptHook(b, locState)
+		}
+		b = append(b, 0x0B)
+		b = append(b, 0x0C, 0x02) // br $done
+		b = append(b, 0x0B)
 
-	b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
+		b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
 
-	// Dead: every thread is gone, so no later accept can come.
-	b = append(b, 0x20, locState, 0x45, 0x04, 0x40, 0x0C, 0x02, 0x0B)
+		// Dead: every thread is gone, so no later accept can come.
+		b = append(b, 0x20, locState, 0x45, 0x04, 0x40, 0x0C, 0x02, 0x0B)
+		if marked {
+			b = nc.emitWalkArrival(b, 1)
+		}
 
-	// An accept after this byte ends a match at pos + 1.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, l.midAcceptOff)
-	b = append(b, 0x20, locState, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locLast)
-	b = append(b, 0x0B)
+		// An accept after this byte ends a match at pos + 1.
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, l.midAcceptOff)
+		b = append(b, 0x20, locState, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locLast)
+		if marked {
+			b = nc.emitAcceptHook(b, locState)
+		}
+		b = append(b, 0x0B)
 
-	// In a looping state, skip the run of bytes that keeps it there: pos
-	// ends on the last of them, and the loop resumes on the byte that leaves.
-	for _, info := range dominant {
-		b = append(b, 0x20, locState, 0x41)
-		b = utils.AppendSLEB128(b, info.state)
-		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
-		b = emitDominantBulkSkip(b, info, info.isMidAccept, locPos, locLen, locLast, locPtr, locChunk, locTmp)
+		// In a looping state, skip the run of bytes that keeps it there: pos
+		// ends on the last of them, and the loop resumes on the byte that leaves.
+		for _, info := range dominant {
+			b = append(b, 0x20, locState, 0x41)
+			b = utils.AppendSLEB128(b, info.state)
+			b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+			b = emitDominantBulkSkip(b, info, info.isMidAccept, locPos, locLen, locLast, locPtr, locChunk, locTmp)
+			if marked {
+				// The skip strides over the notes: test where it stopped. The
+				// walk sat in this state the whole run, and a noted point's
+				// whole path onward is noted, so a note inside the run means
+				// one at its end.
+				b = nc.emitWalkArrival(b, 2)
+			}
+			b = append(b, 0x0B)
+		}
+
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos) // pos++
+		b = append(b, 0x0C, 0x00)                                   // br $fwd
+		return append(b, 0x0B, 0x0B)                                // end loop, end block
+	}
+	if nc == nil {
+		b = walk(b, false)
+	} else {
+		b = append(b, 0x20, nc.lMarked(), 0x04, 0x40) // if (marked)
+		b = walk(b, true)
+		b = nc.emitWalkAfter(b)
+		b = append(b, 0x05)
+		b = walk(b, false)
+		b = nc.emitWalkWaste(b)
 		b = append(b, 0x0B)
 	}
-
-	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos) // pos++
-	b = append(b, 0x0C, 0x00)                                   // br $fwd
-	b = append(b, 0x0B, 0x0B)                                   // end loop, end block
 
 	b = append(b, 0x20, locLast, 0x0B)
 	sz := utils.AppendULEB128(nil, uint32(len(b)))
@@ -740,8 +806,8 @@ const maxForwardBulkSkipStates = 4
 // to the find-from global on the reversed, leftmost-longest DFA and returns
 // the lowest position it accepted at (the match start), or -1. It is the
 // literal-anchored find's backward walker without the line-anchor handling —
-// the start-anywhere find serves no pattern with an assertion — and on any
-// table width.
+// a pattern with an assertion gets the CONTEXT passes instead
+// (buildStartAnywhereBackBodyCtx) — and on any table width.
 func buildStartAnywhereBackBody(l *dfaLayout, tableMemIdx int) []byte {
 	const (
 		locPtr     = 0
@@ -864,6 +930,20 @@ func emitCtxStartState(b []byte, l *dfaLayout, atStart, prev func([]byte) []byte
 // byte meets. stopDepth >= 0 also branches that far out on a dominant (2)
 // conditional accept, from inside the if it is emitted in plus stopDepth.
 func emitCtxCondAccept(b []byte, l *dfaLayout, stateLocal, posLocal, lastLocal, cLocal, vLocal byte, stopDepth int, tableMemIdx int) []byte {
+	return emitCtxCondAcceptHook(b, l, stateLocal, posLocal, lastLocal, cLocal, vLocal, stopDepth, tableMemIdx, nil)
+}
+
+// emitCtxCondAcceptHook is emitCtxCondAccept with onAccept, when non-nil,
+// emitted wherever it records pos in last.
+func emitCtxCondAcceptHook(b []byte, l *dfaLayout, stateLocal, posLocal, lastLocal, cLocal, vLocal byte, stopDepth int, tableMemIdx int,
+	onAccept func([]byte) []byte,
+) []byte {
+	hook := func(b []byte) []byte {
+		if onAccept != nil {
+			b = onAccept(b)
+		}
+		return b
+	}
 	loadAt := func(b []byte, off int32) []byte {
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, off)
@@ -871,9 +951,12 @@ func emitCtxCondAccept(b []byte, l *dfaLayout, stateLocal, posLocal, lastLocal, 
 		return appendTableLoad8u(b, tableMemIdx)
 	}
 	b = loadAt(b, l.midAcceptOff)
-	b = append(b, 0x04, 0x40, 0x20, posLocal, 0x21, lastLocal, 0x0B)
+	b = append(b, 0x04, 0x40, 0x20, posLocal, 0x21, lastLocal)
+	b = hook(b)
+	b = append(b, 0x0B)
 	record := func(b []byte) []byte {
 		b = append(b, 0x22, vLocal, 0x04, 0x40, 0x20, posLocal, 0x21, lastLocal)
+		b = hook(b)
 		if stopDepth >= 0 {
 			b = append(b, 0x20, vLocal, 0x41, 0x02, 0x46, 0x0D) // == 2: br_if out
 			b = utils.AppendULEB128(b, uint32(stopDepth+1))     //nolint:gosec // a small depth
@@ -904,7 +987,8 @@ func emitCtxCondAccept(b []byte, l *dfaLayout, stateLocal, posLocal, lastLocal, 
 // buildStartAnywhereForwardBodyCtx is the forward pass for a pattern with an
 // assertion: (ptr, len) → i32 over the whole input from the find-from
 // global, returning the ABSOLUTE end of the leftmost-first match, or -1.
-func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
+// nr adds the per-search notes, as buildStartAnywhereForwardBody's does.
+func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int, nr *notesRows, search uint32, checkResume bool) []byte {
 	const (
 		locPtr   = 0
 		locLen   = 1
@@ -915,36 +999,69 @@ func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
 		locC     = 6
 		locV     = 7
 	)
+	var nc *notesCtx
 	b := []byte{0x01, 0x06, 0x7F} // six i32 locals
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, findFromGlobalIdx)
-	b = append(b, 0x21, locPos)
-	b = emitCtxStartState(b, l,
-		func(b []byte) []byte { return append(b, 0x20, locPos, 0x45) },
-		func(b []byte) []byte {
-			b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A, 0x41, 0x01, 0x6B)
-			return appendInputLoad8u(b)
-		}, tableMemIdx)
-	b = append(b, 0x21, locState)
-	b = append(b, 0x41, 0x7F, 0x21, locLast)
+	if nr != nil {
+		b = []byte{0x01, 6 + walkNotesLocals, 0x7F}
+		nc = newWalkNotes(nr, l, tableMemIdx, search, locPtr, locLen, locState, locPos, locLast, noBias, locV+1)
+		b = nc.emitWalkEntry(b, checkResume)
+	}
+	walk := func(b []byte, marked bool) []byte {
+		var hook func([]byte) []byte
+		if marked {
+			hook = func(b []byte) []byte { return nc.emitAcceptHook(b, locState) }
+		}
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, findFromGlobalIdx)
+		b = append(b, 0x21, locPos)
+		b = emitCtxStartState(b, l,
+			func(b []byte) []byte { return append(b, 0x20, locPos, 0x45) },
+			func(b []byte) []byte {
+				b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A, 0x41, 0x01, 0x6B)
+				return appendInputLoad8u(b)
+			}, tableMemIdx)
+		b = append(b, 0x21, locState)
+		b = append(b, 0x41, 0x7F, 0x21, locLast)
+		if marked {
+			b = nc.emitWalkInit(b)
+		}
 
-	b = append(b, 0x02, 0x40) // block $done
-	b = append(b, 0x03, 0x40) // loop $fwd
-	// End of input: an end-of-input accept ends a match here, then stop.
-	b = append(b, 0x20, locPos, 0x20, locLen, 0x4E, 0x04, 0x40)
-	b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
-	b = append(b, 0x04, 0x40, 0x20, locLen, 0x21, locLast, 0x0B)
-	b = append(b, 0x0C, 0x02, 0x0B) // br $done
-	// An accept at pos, judged against the byte it would read next.
-	b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A)
-	b = appendInputLoad8u(b)
-	b = append(b, 0x21, locC)
-	b = emitCtxCondAccept(b, l, locState, locPos, locLast, locC, locV, 1, tableMemIdx)
-	b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
-	b = append(b, 0x20, locState, 0x45, 0x0D, 0x01) // dead → $done
-	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos)
-	b = append(b, 0x0C, 0x00) // br $fwd
-	b = append(b, 0x0B, 0x0B)
+		b = append(b, 0x02, 0x40) // block $done
+		b = append(b, 0x03, 0x40) // loop $fwd
+		// End of input: an end-of-input accept ends a match here, then stop.
+		b = append(b, 0x20, locPos, 0x20, locLen, 0x4E, 0x04, 0x40)
+		b = emitAcceptBitOnStack(b, locState, l.acceptLimit)
+		b = append(b, 0x04, 0x40, 0x20, locLen, 0x21, locLast)
+		if marked {
+			b = hook(b)
+		}
+		b = append(b, 0x0B)
+		b = append(b, 0x0C, 0x02, 0x0B) // br $done
+		// An accept at pos, judged against the byte it would read next.
+		b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A)
+		b = appendInputLoad8u(b)
+		b = append(b, 0x21, locC)
+		b = emitCtxCondAcceptHook(b, l, locState, locPos, locLast, locC, locV, 1, tableMemIdx, hook)
+		b = emitWalkerTransition(b, l, locState, locPtr, locPos, locByte, tableMemIdx)
+		b = append(b, 0x20, locState, 0x45, 0x0D, 0x01) // dead → $done
+		if marked {
+			b = nc.emitWalkArrival(b, 1)
+		}
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos)
+		b = append(b, 0x0C, 0x00) // br $fwd
+		return append(b, 0x0B, 0x0B)
+	}
+	if nc == nil {
+		b = walk(b, false)
+	} else {
+		b = append(b, 0x20, nc.lMarked(), 0x04, 0x40) // if (marked)
+		b = walk(b, true)
+		b = nc.emitWalkAfter(b)
+		b = append(b, 0x05)
+		b = walk(b, false)
+		b = nc.emitWalkWaste(b)
+		b = append(b, 0x0B)
+	}
 
 	b = append(b, 0x20, locLast, 0x0B)
 	sz := utils.AppendULEB128(nil, uint32(len(b)))
@@ -1011,7 +1128,10 @@ func buildStartAnywhereBackBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
 // buildStartAnywhereFindBodyCtx joins the two context passes into a find
 // body, (ptr, len) → i64: both read `from` from the find-from global, the
 // forward pass as its start and the backward pass as its floor.
-func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMode) {
+//
+// resume, when non-nil, is the search global: the body stores where the host
+// resumes after its match in the search's block (search_notes.go).
+func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int, resume *uint32) ([]byte, findFromMode) {
 	const (
 		locPtr = 0
 		locLen = 1
@@ -1020,6 +1140,10 @@ func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int) ([]byte, findFrom
 	cur := a.ScanCursor()
 	locEnd := a.I32()
 	locStart := a.I32()
+	var locBlk byte
+	if resume != nil {
+		locBlk = a.I32()
+	}
 	var b []byte
 	b = a.EmitDecls(b)
 	b, mode := emitFindFromSeed(b, cur)
@@ -1029,6 +1153,11 @@ func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int) ([]byte, findFrom
 	b = append(b, 0x20, locPtr, 0x20, locLen, 0x20, locEnd, 0x10)
 	b = utils.AppendULEB128(b, uint32(revFuncIdx))
 	b = append(b, 0x22, locStart, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+	if resume != nil {
+		b = emitStoreResume(b, *resume, locBlk,
+			func(b []byte) []byte { return append(b, 0x20, locStart) },
+			func(b []byte) []byte { return append(b, 0x20, locEnd) })
+	}
 	b = append(b, 0x20, locStart, 0xAD, 0x42, 0x20, 0x86)
 	b = append(b, 0x20, locEnd, 0xAD, 0x84)
 	b = append(b, 0x0B)
@@ -1038,7 +1167,8 @@ func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int) ([]byte, findFrom
 // buildStartAnywhereFindBody joins the two passes into a find body,
 // (ptr, len) → i64, returning (start << 32 | end) or -1. It is built at
 // assembly time, when both passes' function indices are known. Unsized.
-func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMode) {
+// resume is buildStartAnywhereFindBodyCtx's.
+func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int, resume *uint32) ([]byte, findFromMode) {
 	const (
 		locPtr = 0
 		locLen = 1
@@ -1048,6 +1178,10 @@ func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMod
 	locFrom := cur.Local()
 	locEnd := a.I32()
 	locStart := a.I32()
+	var locBlk byte
+	if resume != nil {
+		locBlk = a.I32()
+	}
 	var b []byte
 	b = a.EmitDecls(b)
 	b, mode := emitFindFromSeed(b, cur)
@@ -1075,6 +1209,11 @@ func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMod
 	b = append(b, 0x04, 0x40)       // if
 	b = append(b, 0x00)             // unreachable
 	b = append(b, 0x0B)             // end if
+	if resume != nil {
+		b = emitStoreResume(b, *resume, locBlk,
+			func(b []byte) []byte { return append(b, 0x20, locStart) },
+			func(b []byte) []byte { return append(b, 0x20, locEnd) })
+	}
 
 	b = append(b, 0x20, locStart, 0xAD, 0x42, 0x20, 0x86) // i64(start) << 32
 	b = append(b, 0x20, locEnd, 0xAD, 0x84)               // | i64(end)
@@ -1087,13 +1226,21 @@ func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int) ([]byte, findFromMod
 // batch entries alike: today's body first, and the start-anywhere find when
 // today's answers the sentinel (having already set the find-from global to
 // where the search resumes). (ptr, len) → i64. Unsized.
-func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int) []byte {
+//
+// resume, when non-nil, is the search global: a handed-over call's match is
+// where the host resumes, and today's marked copy checks the next call
+// against it (search_notes.go), so the dispatcher stores it.
+func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int, resume *uint32) []byte {
 	const (
 		locPtr = 0
 		locLen = 1
 		locR   = 2
+		locBlk = 3 // resume only
 	)
 	b := []byte{0x01, 0x01, 0x7E} // one i64 local: r
+	if resume != nil {
+		b = []byte{0x02, 0x01, 0x7E, 0x01, 0x7F} // r, blk
+	}
 	b = append(b, 0x20, locPtr, 0x20, locLen, 0x10)
 	b = utils.AppendULEB128(b, uint32(todayFuncIdx))
 	b = append(b, 0x22, locR, 0x42)
@@ -1101,6 +1248,13 @@ func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int) []by
 	b = append(b, 0x51, 0x04, 0x40) // i64.eq; if
 	b = append(b, 0x20, locPtr, 0x20, locLen, 0x10)
 	b = utils.AppendULEB128(b, uint32(startAnywhereFuncIdx))
+	if resume != nil {
+		b = append(b, 0x22, locR, 0x42, 0x00, 0x59, 0x04, 0x40) // tee r; i64.ge_s 0; if
+		b = emitStoreResume(b, *resume, locBlk,
+			func(b []byte) []byte { return append(b, 0x20, locR, 0x42, 0x20, 0x88, 0xA7) }, // i32(r >> 32)
+			func(b []byte) []byte { return append(b, 0x20, locR, 0xA7) })                   // i32(r)
+		b = append(b, 0x0B, 0x20, locR)
+	}
 	b = append(b, 0x0F, 0x0B) // return; end if
 	b = append(b, 0x20, locR, 0x0B)
 	return b
@@ -1244,8 +1398,8 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 		if p.saBT.mode != p.findFromMode {
 			panic("compile: start-anywhere switch: today's find and the Backtracking handover read `from` differently")
 		}
-		cs = appendWithBTFallback(cs, p.saBT.fast, p.saBT.fallback, p.saBT.callOffs, base+p.slotIndex(slotSABTFallback))
-		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT))
+		cs = appendBTFindParts(cs, p.saBT.fast, *p.saBT, base+p.slotIndex(slotSABT))
+		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT), p.notes.resumeGlobal())
 		cs = utils.AppendULEB128(cs, uint32(len(d)))
 		return append(cs, d...)
 	}
@@ -1254,9 +1408,15 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 	}
 	cs = append(cs, p.saFwdBody...)
 	cs = append(cs, p.saRevBody...)
-	glue, glueMode := buildStartAnywhereFindBody(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARev))
+	// The glue stores the resume point only when it is the whole find: a
+	// switch's dispatcher does it for both bodies.
+	var glueResume *uint32
+	if !p.saSwitch {
+		glueResume = p.notes.resumeGlobal()
+	}
+	glue, glueMode := buildStartAnywhereFindBody(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARev), glueResume)
 	if p.saCtx {
-		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx))
+		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx), glueResume)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(glue)))
 	cs = append(cs, glue...)
@@ -1269,7 +1429,7 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 	if glueMode != p.findFromMode {
 		panic("compile: start-anywhere switch: today's find and the start-anywhere find read `from` differently")
 	}
-	d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSAGlue))
+	d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSAGlue), p.notes.resumeGlobal())
 	cs = utils.AppendULEB128(cs, uint32(len(d)))
 	return append(cs, d...)
 }

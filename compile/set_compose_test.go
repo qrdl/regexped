@@ -2536,6 +2536,22 @@ func TestNilSuffixDFAEmitsNeverMatchBody(t *testing.T) {
 	}
 }
 
+// The same empty DFA's probes: with the scan pair's probes requested, both the
+// complete-mask probe and its first-hit variant must answer "no bits" (0), and
+// the first-hit one exists only when asked for.
+func TestNilSuffixDFAProbesReportNoBits(t *testing.T) {
+	// ULEB128 size prefix 0x04, then no locals, i32.const 0, end.
+	zero := []byte{0x04, 0x00, 0x41, 0x00, 0x0B}
+	art, _, _, _ := genSuffixWASM(nil, 0, 0, []int{0}, []int{0}, LikelyNeutral, true, false, nil, true)
+	if !bytes.Equal(art.scanProbe, zero) || !bytes.Equal(art.scanProbeAny, zero) {
+		t.Errorf("probes = % x / % x, want both % x", art.scanProbe, art.scanProbeAny, zero)
+	}
+	art, _, _, _ = genSuffixWASM(nil, 0, 0, []int{0}, []int{0}, LikelyNeutral, true, false, nil)
+	if !bytes.Equal(art.scanProbe, zero) || art.scanProbeAny != nil {
+		t.Errorf("without first-hit: probes = % x / % x, want % x and none", art.scanProbe, art.scanProbeAny, zero)
+	}
+}
+
 // CompileSet must refuse a bucket that has neither a suffix DFA nor a BT
 // fallback, rather than emit the never-match body for it.
 func TestCompileSetRejectsBucketWithNoSuffixDFA(t *testing.T) {
@@ -2969,4 +2985,50 @@ func TestCompileFileEmbeddedSet(t *testing.T) {
 		t.Fatalf("CompileFile: %v", err)
 	}
 	validateWASM(t, wasm)
+}
+
+// TestSparseCounterModulesBuild compiles the sparse bucket's counter wherever
+// it sits — a plain gated set, a batching set, beside a split member (one on
+// its start-anywhere find, one on the Backtracking find), and with splitting
+// turned off — and validates each module. The drives are checked against Go
+// in tools/fuzz (TestSparseCounterHandoverMatchesGo); this keeps the
+// emitters inside this package's own tests.
+func TestSparseCounterModulesBuild(t *testing.T) {
+	members := []string{`foo`, `foo\w+`}
+	for k := 1; k <= 32; k++ {
+		members = append(members, fmt.Sprintf(`foo[0-9]{%d}`, k))
+	}
+	for _, v := range []struct {
+		name  string
+		extra string
+		batch bool
+		opts  CompileSetOptions
+	}{
+		{"plain", "", false, CompileSetOptions{}},
+		{"batching", "", true, CompileSetOptions{}},
+		{"beside a split member", `[a-z]+@(?:[a-z@]*X)?`, false, CompileSetOptions{}},
+		{"beside a Backtracking split member", `(?:a|b)*a(?:a|b){12}c`, false, CompileSetOptions{}},
+		{"batching beside a split member", `[a-z]+@(?:[a-z@]*X)?`, true, CompileSetOptions{}},
+		{"splitting off", "", false, CompileSetOptions{NoSplit: true}},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			var res []config.RegexEntry
+			for i, p := range append(append([]string(nil), members...), v.extra) {
+				if p != "" {
+					res = append(res, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p})
+				}
+			}
+			set := config.SetConfig{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true}}
+			if v.batch {
+				set.Hints = []string{"batch-find"}
+			}
+			for _, out := range []string{"", "merged.wasm"} {
+				w, _, _, err := CompileFileOpts(config.BuildConfig{Output: out, Regexps: res, Sets: []config.SetConfig{set}}, "", v.opts)
+				if err != nil {
+					t.Fatalf("output=%q: %v", out, err)
+				}
+				validateWASM(t, w)
+			}
+		})
+	}
 }

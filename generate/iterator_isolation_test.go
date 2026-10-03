@@ -1,15 +1,18 @@
 package generate
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // Standalone JS/TS stubs must COPY the caller's input into WASM memory, because
@@ -359,3 +362,401 @@ const alone = f => [...f];
 
 console.log("OK " + checks);
 `
+
+// TestJSSearchNotesAtRuntime drives a find and a groups iterator whose patterns
+// keep per-search notes (docs/wasm.md, "The search block") over input that
+// makes every call read to the end: `a*b|a` and `(x)(?:[a-z]*y)?` over 200 KB of
+// one letter. Without notes each drive is quadratic — hundreds of billions of
+// instructions, hours — and with them linear, well under a second; the test's
+// timeout is the verdict. Two iterators are interleaved, so a search that
+// shared or reset the other's notes would fall back to quadratic here too.
+func TestJSSearchNotesAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	cfg := config.BuildConfig{
+		ImportModule: "notes",
+		Regexps: []config.RegexEntry{
+			{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun"},
+			{Name: "greedy", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "greedy"},
+		},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !strings.Contains(src, "_notes(_blk") {
+		t.Fatal("the stub hands no search block over: the patterns kept no notes")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const n = 200000;
+const as = 'a'.repeat(n), xs = 'x'.repeat(n);
+const f = stubs.overrun(as), g = stubs.greedy(xs);
+let i = 0, j = 0;
+for (;;) {
+    const a = f.next(), b = g.next();
+    if (a.done && b.done) break;
+    if (!a.done) {
+        if (a.value[0] !== i || a.value[1] !== i + 1) { console.error('find ' + i + ': ' + a.value); process.exit(1); }
+        i++;
+    }
+    if (!b.done) {
+        const m = b.value;
+        if (m[0][0] !== j || m[0][1] !== j + 1 || m[1][0] !== j || m[1][1] !== j + 1) { console.error('groups ' + j + ': ' + JSON.stringify(m)); process.exit(1); }
+        j++;
+    }
+}
+if (i !== n || j !== n) { console.error('counts ' + i + ' ' + j); process.exit(1); }
+console.log('OK ' + (i + j));
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("the drives did not finish in 60 s: quadratic, the notes are not working\n%s", out)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != "OK 400000" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+// TestJSSetSearchBlocksAtRuntime drives a set whose member `foo\w+bar|foo` is
+// split out of the set's buckets and keeps notes in its own search block, which
+// the generated set iterator hands over through the second form of the scratch
+// descriptor. Over `foo`×n every call's member search reads to the end of the
+// input; with the block the drive is linear, without it it does not finish.
+func TestJSSetSearchBlocksAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	cfg := config.BuildConfig{
+		ImportModule: "notes",
+		Regexps: []config.RegexEntry{
+			{Name: "member", Pattern: `foo\w+bar|foo`},
+			{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", Find: "scan", Patterns: config.PatternSelector{Names: []string{"member", "aws"}},
+		}},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !strings.Contains(src, "const _sd = _align(_bump)") {
+		t.Fatal("the set iterator hands no search blocks over: the split member kept no notes")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const n = 150000;
+let i = 0;
+for (const m of stubs.scan('foo'.repeat(n))) {
+    if (m.patternId !== 0 || m.start !== 3 * i || m.end !== 3 * i + 3) { console.error('match ' + i + ': ' + JSON.stringify(m)); process.exit(1); }
+    i++;
+}
+if (i !== n) { console.error('count ' + i); process.exit(1); }
+console.log('OK ' + i);
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("the drive did not finish in 30 s: quadratic, the member's search block is not working\n%s", out)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != "OK 150000" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+// TestJSBatchNotesUpFrontAtRuntime drives a BATCHING set iterator whose split
+// member `a*b|a` keeps notes, with a batch size covering every match: the
+// whole drive is ONE call, so notes the stub handed over only between calls,
+// once the search armed, would never arrive — 200 K finds each reading to the
+// end, hours. The stub hands a batching iterator its notes up front, and the
+// module uses them from the call after the one that arms, inside the same
+// batch call. The pattern's own batch export (`hints: [batch-find]` on the
+// entry) is driven too.
+func TestJSBatchNotesUpFrontAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	cfg := config.BuildConfig{
+		ImportModule: "batchnotes",
+		Regexps: []config.RegexEntry{
+			{Name: "member", Pattern: `a*b|a`},
+			{Name: "lit", Pattern: `zzz`},
+			{Name: "own", Pattern: `a*b|a`, FindFunc: "own", Hints: []string{"batch-find"}},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", Find: "scan", Hints: []string{"batch-find"},
+			Patterns: config.PatternSelector{Names: []string{"member", "lit"}},
+		}},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{"_notes(_sd + ", "if (_batched) _fail = _notes(_blk, len, "} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("the stub asks for no notes up front: %q missing", want)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const n = 200000;
+const as = 'a'.repeat(n);
+let i = 0;
+for (const m of stubs.scan(as, 0, n)) {
+    if (m.patternId !== 0 || m.start !== i || m.end !== i + 1) { console.error('set match ' + i + ': ' + JSON.stringify(m)); process.exit(1); }
+    i++;
+}
+let j = 0;
+for (const m of stubs.own(as)) {
+    if (m[0] !== j || m[1] !== j + 1) { console.error('own match ' + j + ': ' + m); process.exit(1); }
+    j++;
+}
+if (i !== n || j !== n) { console.error('counts ' + i + ' ' + j); process.exit(1); }
+console.log('OK ' + (i + j));
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("the drives did not finish in 60 s: quadratic, the batch call ran without notes\n%s", out)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != "OK 400000" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+// TestJSBacktrackingBudgetPerSearchAtRuntime drives two Backtracking searches
+// whose every call would burn the whole work budget before the fallback
+// answers — a pattern's find and a set's Backtracking bucket member — through
+// the generated JS stub: the budget lasts the SEARCH (docs/wasm.md, "The
+// search block"), so each drive is linear. With the budget per call both are
+// quadratic and do not finish in the timeout.
+func TestJSBacktrackingBudgetPerSearchAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	cfg := config.BuildConfig{
+		ImportModule: "btsearch",
+		// The member's suffix DFA (82 states) is over this, so it runs on
+		// Backtracking in its bucket.
+		MaxFallbackStates: 16,
+		Regexps: []config.RegexEntry{
+			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+			{Name: "member", Pattern: `(?:aa|a){0,40}b|a`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "s", Find: "scan", Patterns: config.PatternSelector{Names: []string{"member"}},
+		}},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !strings.Contains(src, "const _sd = _align(_bump)") {
+		t.Fatal("the set iterator hands no search blocks over: the Backtracking member keeps no budget per search")
+	}
+	if !strings.Contains(src, "_btmemo(_blk, len,") {
+		t.Fatal("the find iterator gives a tripped search no memo")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const n = 65536, k = 2048;
+let i = 0;
+for (const [s, e] of stubs.bt_find('a'.repeat(n))) {
+    if (s !== i || e !== i + 1) { console.error('find ' + i + ': ' + s + ',' + e); process.exit(1); }
+    i++;
+}
+if (i !== n) { console.error('find count ' + i); process.exit(1); }
+let j = 0;
+for (const m of stubs.scan('a'.repeat(k))) {
+    if (m.patternId !== 1 || m.start !== j || m.end !== j + 1) { console.error('set ' + j + ': ' + JSON.stringify(m)); process.exit(1); }
+    j++;
+}
+if (j !== k) { console.error('set count ' + j); process.exit(1); }
+console.log('OK ' + i + ' ' + j);
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("the drives did not finish in 30 s: quadratic, the budget is not lasting the search\n%s", out)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != "OK 65536 2048" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+// TestJSNotesFailureDeliversTheMatch: when a search's notes cannot be had —
+// here `max_memory` leaves room for the input but not for its notes — the
+// iterator delivers the match of the call that asked for them and throws at
+// the NEXT call. It used to throw first and lose that match. `a*b|a` over a
+// run of `a` arms in its first call, so exactly one match comes before the
+// error.
+func TestJSNotesFailureDeliversTheMatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	load := func(maxMemory string) config.BuildConfig {
+		t.Helper()
+		yml := "import_module: m\nstub_file: stubs.js\n" + maxMemory +
+			"regexps:\n  - name: ov\n    pattern: 'a*b|a'\n    find_func: ov_find\n"
+		p := filepath.Join(dir, "regexped.yaml")
+		if err := os.WriteFile(p, []byte(yml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.LoadConfig(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	// Room for the tables and a 200 KB input, not for its 400 KB of notes.
+	probe, _, err := compile.CompileFile(load(""), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	top, err := utils.ParseDataSectionBytes(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := load(fmt.Sprintf("max_memory: %d\n", utils.PageAlign(top)+6*65536))
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+let got = 0;
+try {
+    // Bytes, not a string: a string reserves three bytes per character.
+    for (const [s, e] of stubs.ov_find(new TextEncoder().encode('a'.repeat(200000)))) {
+        if (s !== got || e !== got + 1) { console.error('match ' + got + ': ' + s + ',' + e); process.exit(1); }
+        got++;
+    }
+    console.error('no error after ' + got + ' matches'); process.exit(1);
+} catch (e) {
+    if (!String(e.message).includes('no memory for this search')) { console.error(e); process.exit(1); }
+}
+console.log('OK ' + got);
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "OK 1" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}

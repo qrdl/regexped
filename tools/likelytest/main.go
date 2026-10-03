@@ -39,6 +39,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -1696,7 +1697,10 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		re.GroupsFunc = "groups"
 	}
 	opts := compile.CompileOptions{LikelyMode: mode}
-	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	if err == nil && tc.mode != modeAnchored {
+		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc+re.GroupsFunc])
+	}
 	return wasm, err
 }
 
@@ -1737,11 +1741,34 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		// CompileFileOpts reads only ACBudgetBytes/ForceFrontend off the
 		// override, so an otherwise-zero value is CompileFile plus the pin.
 		opts := compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendScalar)
-		wasm, _, _, err := compile.CompileFileOpts(cfg, "", opts)
+		wasm, _, diags, err := compile.CompileFileOpts(cfg, "", opts)
+		noteSetBlocks(wasm, diags)
 		return wasm, err
 	}
-	wasm, _, err := compile.CompileFile(cfg, "")
+	wasm, _, diags, err := compile.CompileFileDiag(cfg, "")
+	noteSetBlocks(wasm, diags)
 	return wasm, err
+}
+
+// searchSizesOf is, per compiled module, the search blocks its driven export
+// takes (internal/searchblock): a pattern's find or groups block, or a set's
+// split member blocks (compile.SetDiag.SearchBlocks). Every drive hands them
+// over as a generated stub does.
+var searchSizesOf = map[string][]searchblock.Size{}
+
+func noteSetBlocks(wasm []byte, diags []compile.SetDiag) {
+	for _, d := range diags {
+		if len(d.SearchBlocks) > 0 {
+			sizes := make([]searchblock.Size, len(d.SearchBlocks))
+			for k, n := range d.SearchBlocks {
+				sizes[k].Notes = n
+				if d.SearchBlocksBTMemo != nil {
+					sizes[k].Memo = d.SearchBlocksBTMemo[k]
+				}
+			}
+			searchSizesOf[string(wasm)] = sizes
+		}
+	}
 }
 
 // hintsYAML maps the compile.LikelyMode enum back to its YAML `hints:` list
@@ -1895,6 +1922,15 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	buf := mem.UnsafeData(store)
 	copy(buf[inputBase:], []byte(input))
 	inputLen := int32(len(input))
+	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
+	var sb *searchBlock
+	if tc.mode != modeAnchored {
+		if sb, err = newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)]); err != nil {
+			return 0, err
+		}
+		sb.begin(store)
+		sb.before(store)
+	}
 
 	before, _ := store.GetFuel()
 	var callErr error
@@ -1926,9 +1962,11 @@ const findExhaustIterTime = 200
 // (generate/js_stub.go genJSFindFunc): re-call with the whole buffer and a
 // rising start position, advancing past each match (or by 1 for a zero-length
 // match) until no match or EOF.
-func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
+func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32, sb *searchBlock) {
 	off := int32(0)
+	sb.begin(store)
 	for off <= inputLen {
+		sb.before(store)
 		r, err := wcall(fn, store, inputBase, inputLen, off)
 		if err != nil {
 			return
@@ -1937,6 +1975,7 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 		if packed < 0 {
 			return
 		}
+		sb.after(store)
 		// ABSOLUTE, not relative. the export takes the whole
 		// buffer plus a start position, and the packed halves are positions in
 		// that buffer — so the advance is an ASSIGNMENT, not an increment.
@@ -1963,9 +2002,11 @@ func runFindExhaust(store *wasmtime.Store, fn *wasmtime.Func, inputLen int32) {
 // anywhere in the remaining window — retrying smaller windows would only
 // re-derive the same answer, which is stub-loop waste, not engine cost
 // this benchmark should measure.
-func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32) {
+func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Memory, slotsPtr, inputLen int32, sb *searchBlock) {
 	off := int32(0)
+	sb.begin(store)
 	for off <= inputLen {
+		sb.before(store)
 		r, err := wcall(fn, store, inputBase, inputLen, slotsPtr, off)
 		if err != nil {
 			return
@@ -1973,6 +2014,7 @@ func runGroupsExhaust(store *wasmtime.Store, fn *wasmtime.Func, mem *wasmtime.Me
 		if r.(int32) < 0 {
 			return
 		}
+		sb.after(store)
 		buf := mem.UnsafeData(store)
 		// Slots are ABSOLUTE now: the whole buffer is passed and `off` only
 		// bounds where the search starts.
@@ -2020,12 +2062,16 @@ func benchTimeExhaust(wasmBytes []byte, tc testCase, input string, engine *wasmt
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)])
+	if err != nil {
+		return 0, err
+	}
 
 	run := func() {
 		if tc.mode == modeGroups {
-			runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+			runGroupsExhaust(store, fn, mem, slotsBase, inputLen, sb)
 		} else {
-			runFindExhaust(store, fn, inputLen)
+			runFindExhaust(store, fn, inputLen, sb)
 		}
 	}
 
@@ -2086,12 +2132,16 @@ func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *w
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)])
+	if err != nil {
+		return 0, err
+	}
 
 	before, _ := store.GetFuel()
 	if tc.mode == modeGroups {
-		runGroupsExhaust(store, fn, mem, slotsBase, inputLen)
+		runGroupsExhaust(store, fn, mem, slotsBase, inputLen, sb)
 	} else {
-		runFindExhaust(store, fn, inputLen)
+		runFindExhaust(store, fn, inputLen, sb)
 	}
 	after, _ := store.GetFuel()
 	return before - after, nil
@@ -2563,6 +2613,9 @@ const (
 type setMemPlan struct {
 	inputBase  int32
 	outputBase int32
+	// The set's split member search blocks and the region for their notes
+	// and memos; nil for none.
+	blocks *searchblock.Blocks
 }
 
 // planSetMem computes input/output offsets that don't overlap with the set's
@@ -2575,7 +2628,9 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(inputLen) + 4096
-	return setMemPlan{inputBase: inBase, outputBase: outBase}, nil
+	plan := setMemPlan{inputBase: inBase, outputBase: outBase,
+		blocks: searchblock.Layout(int64(outBase+setOutCap*16+4096), searchSizesOf[string(wasmBytes)], inputLen, searchblock.Fresh)}
+	return plan, nil
 }
 
 // setDriver resolves the export a modeSet case drives and returns a closure
@@ -2733,6 +2788,9 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 // setMemTop is one past everything a set bench writes: tuples, then the gate
 // array, both above outputBase.
 func setMemTop(plan setMemPlan) int32 {
+	if plan.blocks != nil {
+		return int32(plan.blocks.End()) + 4096
+	}
 	return plan.outputBase + setOutCap*16 + 4096
 }
 
@@ -2789,6 +2847,11 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		buf[gatePtr+i] = 0
 	}
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
+	data := func() []byte { return mem.UnsafeData(store) }
+	if err := plan.blocks.Begin(data, int(inputLen)); err != nil {
+		return err
+	}
+	plan.blocks.Describe(buf, scratchPtr)
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
@@ -2799,6 +2862,9 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		count := n.(int32)
 		if count <= 0 {
 			return nil
+		}
+		if err := plan.blocks.After(data); err != nil {
+			return err
 		}
 		buf := mem.UnsafeData(store)
 		base := int(plan.outputBase)

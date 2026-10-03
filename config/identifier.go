@@ -527,14 +527,15 @@ func quoteAll(names []string) []string {
 // (TestSharedSymbolsMirrorIsInStep), which is the only thing that keeps a copy
 // honest.
 var stubSharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName"},
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
+		"searchBlock", "searchNotes", "searchBTMemo", "ffi_regexped_search"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
 	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
 		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
 		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
-		"REGEXPED_TYPES_DEFINED",
+		"REGEXPED_TYPES_DEFINED", "rx_search_set_",
 	},
 	// Rust is deliberately absent from the SHARED list for the same reason it
 	// is in generate: `pub mod <import_module>` isolates every stub. Its own
@@ -557,7 +558,7 @@ var stubPrivateHelpers = map[string][]string{
 	"js": {
 		"init", "_exp", "_mem", "_staticTop", "_bump", "_live", "_enc",
 		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
-		"_att", "_patternNames",
+		"_att", "_patternNames", "_notes", "_btmemo",
 	},
 	// Go declares no private helpers of its own, but `init` is reserved by the
 	// LANGUAGE: `func init(input []byte) (uint, bool, error)` is a compile
@@ -569,9 +570,10 @@ var stubPrivateHelpers = map[string][]string{
 	"c": {
 		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release", "regexped_cabi_foreign_allocator",
 		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "rx_pattern_names", "RX_CABI_EXPECT_OURS",
+		"rx_search_notes_", "rx_search_btmemo_",
 	},
-	"rust": {"Span", "Error", "Result", "SetMatch"},
-	"as":   {"Span"},
+	"rust": {"Span", "Error", "Result", "SetMatch", "SearchBlock", "search_notes", "search_btmemo", "ffi_regexped_search"},
+	"as":   {"Span", "_ffi_regexped_search", "_searchNotes", "_searchBTMemo"},
 }
 
 func init() { stubPrivateHelpers["ts"] = stubPrivateHelpers["js"] }

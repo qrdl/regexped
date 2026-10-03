@@ -4,6 +4,12 @@ Detects SQL injection patterns in input strings using the **Backtracking engine*
 
 Named groups extracted: `type` (attack type), `payload` (remainder of the matched line).
 
+It also shows `max_memory` at work: the config caps the module's memory at
+1 MiB, just above its own tables, and a hostile 64 KiB value (`UNION` and
+spaces, no `SELECT`) that would make the Backtracking engine grow memory with
+the value is answered "unknown" (`ErrBacktrackOverflow`) instead — and
+rejected, since unknown is not clean. The next search answers as before.
+
 ## Prerequisites
 
 The Makefile installs nothing. Install these first:

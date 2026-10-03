@@ -41,6 +41,9 @@ max_tdfa_regs:  32         # optional; max TDFA registers before falling back to
 max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
                            #   A member over it moves to the Backtracking engine, with a warning;
                            #   `compile --verbose` prints each bucket's engine
+max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
+                           #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
+                           #   fractions allowed; a bare number is bytes. See "max_memory:" below
 
 regexps:
   - pattern: 'https?://...' # RE2 regexp pattern
@@ -179,6 +182,70 @@ Setting `groups_func` triggers capture-tracking compilation:
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
+
+### `max_memory:` — a cap on the module's memory
+
+Every pattern and set in a config compiles into ONE module with one memory,
+and WebAssembly memory never shrinks. `max_memory` caps it: the value is
+declared as the memory's **maximum**, so the WebAssembly engine refuses every
+grow past it, whoever asks. Unset — the default — there is no cap.
+
+**When to set it.** The Backtracking engine's frame stacks and fallback memo
+grow with the input when a search backtracks hard, so a module that carries
+Backtracking code — a pattern on that engine, a `find` whose switch hands over
+to it, or a set member on it — can be made to grow its memory by an
+adversarial input until the host runs out. `regexped compile` therefore warns
+when such a module has no cap:
+
+```
+WARN Backtracking engine selected and max_memory is not set: memory is not limited, possible out-of-memory on adversarial input
+```
+
+`compile --verbose` names the patterns on Backtracking. With a cap, a search
+that would need more answers "unknown" (`-2`) instead, and every other search
+is unaffected; `examples/wasmtime/go/sql-injection` sets one. See
+[complexity.md](complexity.md) for every per-input-byte memory cost.
+
+```yaml
+max_memory: 100MB    # 100,000,000 bytes → 1,525 pages of 64 KiB
+```
+
+**Spelling.** A number, fractions allowed, optionally followed by a unit, with
+or without a space: `100MB`, `100 MB`, `1.5GB`, `64KiB`, `100mib`. `KB`, `MB`
+and `GB` are powers of 1,000; `KiB`, `MiB` and `GiB` powers of 1,024; letter
+case does not matter. A bare number is bytes. The value is rounded **down** to
+whole 64 KiB pages, the unit a memory is declared in. Anything else — a sign,
+an exponent, another unit — is a line-numbered load error.
+
+**What it counts:** all of the module's own memory — its tables, the buffers a
+JS/TS stub copies each input into and reads answers from, and a search's
+working memory (the Backtracking engine's frame stacks and memo, and the
+default search state a standalone module keeps for a raw caller). In a merged
+Rust/Go/C build the input lives in the host's memory, so there the cap covers
+the tables and the search's working memory only.
+
+**What happens at the cap:**
+
+- A search that needs more memory than the cap leaves answers "gave up" (`-2`),
+  which every stub reports as an error rather than as "no match" — never a
+  wrong answer.
+- In JS/TS, an input that does not fit under the cap by itself makes the call
+  **throw** a `RangeError` ("Maximum memory size exceeded") before any search
+  runs — for every pattern, whatever its engine. `init()` grows memory by two
+  pages, so a cap only just above the tables compiles but makes `init()` throw.
+- In a component, the allocator traps when an input does not fit. The
+  optional working memory — a set's overlapping answer cache, a search's
+  notes and its kept Backtracking memo — is never a trap: when it does not
+  fit under the cap the component goes without it, as a module's stubs do,
+  and answers the same. So does the default state a standalone module keeps
+  for a caller that hands it none (see [wasm.md](wasm.md), "Handing the block
+  over").
+- A module whose tables — plus the stacks the Backtracking `match_func` and
+  `find_func` paths still reserve at compile time — are already over the cap is
+  a **compile error** naming the cap and the size. A value below 64 KiB rounds
+  down to 0 pages and always gets it.
+- A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
+  4 GiB, with a compile warning saying so.
 
 ### `byte_mode:` — matching raw bytes above 127
 
@@ -601,6 +668,7 @@ You may invoke either tool directly. For modules:
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
+  --enable-nontrapping-float-to-int \
   <main.wasm> main <regexp.wasm> <module_name> ... \
   --rename-export-conflicts -o output.wasm
 ```
@@ -613,7 +681,7 @@ wac plug --plug <regexp1.wasm> --plug <regexp2.wasm> -o output.wasm <main.wasm>
 
 **Composition is not merging.** `wasm-merge` produces ONE module whose regexp code reads the host's memory directly; `wac plug` produces a component holding two instances with two memories, where each call crosses the canonical ABI and copies its `list<u8>` input. Same command, different cost model — see [component.md](component.md).
 
-**Several regexp artifacts in one call** works for both kinds, with one asymmetry. Regexp *modules* may all share an `import_module` name, because nothing imports it. Regexp *components* are matched by their WIT interface name, `regexped:<wit_package>/matcher`, which the socket genuinely imports — so composing several requires **distinct `wit_package` values**, or `wac` cannot tell which component should satisfy which import. `wac` reports that case with the same text a genuine name mismatch gives, so `merge` checks first: it runs `wasm-tools component wit` on every plug and refuses a repeated interface by name ("plugs a.wasm and b.wasm both export regexped:pkg/matcher"). A component merge therefore needs `wasm-tools` as well as `wac`, which every component pipeline already has, since a component cannot be compiled without it.
+**Several regexp artifacts in one call** works for both kinds, and both need a distinct name per artifact. Regexp *modules* need **distinct `import_module` values**: `compile` records each module's `import_module` in the module, `merge` names every module by its own record (a module built before the record existed gets the config's `import_module`, else its file name), and two modules under one name are refused ("a.wasm and b.wasm are both named "m": give each config its own import_module") — each module exports the setter its stubs hand the search block to under one fixed name, and a shared module name would bind every stub's setter call to one module only. Regexp *components* are matched by their WIT interface name, `regexped:<wit_package>/matcher`, which the socket genuinely imports — so composing several requires **distinct `wit_package` values**, or `wac` cannot tell which component should satisfy which import. `wac` reports that case with the same text a genuine name mismatch gives, so `merge` checks first: it runs `wasm-tools component wit` on every plug and refuses a repeated interface by name ("plugs a.wasm and b.wasm both export regexped:pkg/matcher"). A component merge therefore needs `wasm-tools` as well as `wac`, which every component pipeline already has, since a component cannot be compiled without it.
 
 **Flags:**
 

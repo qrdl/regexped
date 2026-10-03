@@ -88,6 +88,22 @@ var overlapCacheInputs = []string{
 	"the quick brown fox",
 }
 
+// cheapEngage is what a cheap drive over input may do with the cache. Up to
+// overlapNeverSweepLen bytes the walk must finish alone: the start-up
+// allowance keeps such inputs under the line whatever they match. Longer
+// ones — 13 and 19 bytes here — may cross it on dense input, since the line
+// rises at a sixteenth of a sweep's per-byte cost; there the sweep and the
+// walk measured within ±12% of each other either way, so only the answers
+// are checked.
+func cheapEngage(input string) engageWant {
+	if len(input) <= overlapNeverSweepLen {
+		return engageNever
+	}
+	return engageAny
+}
+
+const overlapNeverSweepLen = 8
+
 func TestOverlapCacheMatchesGo(t *testing.T) {
 	for si, tc := range overlapCacheSets {
 		pats := tc.pats
@@ -96,8 +112,8 @@ func TestOverlapCacheMatchesGo(t *testing.T) {
 				name := fmt.Sprintf("set%d/%q/cap%d", si, input, outCap)
 				t.Run(name, func(t *testing.T) {
 					want := overlapCacheOracle(pats, input)
-					// engage=cheap: these drives must DECLINE to sweep.
-					withCache := driveOverlapCacheEngage(t, pats, input, 0, outCap, true, engageNever)
+					// engage=cheap: the short ones must DECLINE to sweep.
+					withCache := driveOverlapCacheEngage(t, pats, input, 0, outCap, true, cheapEngage(input))
 					withoutCache := driveOverlapCache(t, pats, input, outCap, false)
 
 					if got := canonCache(withCache); fmt.Sprint(got) != fmt.Sprint(want) {
@@ -238,7 +254,65 @@ func wholeSetSweepSets(t *testing.T) []struct {
 		{"line-anchors", []string{`(?m:^)ab+`, `ab+(?m:$)`, `c+`}, "abb\nab\nc"},
 		{"url-guard (620 states, \\b)", load("../../examples/fastedge/url-guard/regexped.yaml", "attacks"), "{$"},
 		{"secret-scanner (358 states)", load("../../examples/wasmtime/go/secret-scanner/regexped.yaml", "scanner"), "xoxb-aaaaaaaaaa"},
+		// Past a row's i32 mask: an i64 row (33 members), a two-word bitmap
+		// with the word-boundary and newline channels (70), a three-word one
+		// (130). The run is long enough for every member to match.
+		{"33 members (i64 rows)", letterRuns(33), strings.Repeat("abcdefghij", 4) + "0 "},
+		{"70 members, \\b and (?m) (2-word rows)", wideBoundaryMembers(),
+			strings.Repeat("abcdefghij", 4) + "0 w1 wx3\nq2ab q4\n"},
+		{"130 members (3-word rows)", literalMembers(125, 5), "x000ab x070cd x129ef abcdefg0 "},
+		// The same channels from TRAILING assertions, which are what populate
+		// the next-byte-dependent accept lists past bit 64.
+		{"70 members, trailing \\b, \\B and (?m:$) (2-word rows)", wideTrailingBoundaryMembers(),
+			strings.Repeat("abcdefghij", 4) + "0 w9a v9ab q9\nv8a w7 "},
 	}
+}
+
+// wideTrailingBoundaryMembers is 70 members over two bitmap words: letter runs,
+// then members ENDING in `\b`, `\B` and `(?m:$)`, interleaved so each kind
+// has members past index 64.
+func wideTrailingBoundaryMembers() []string {
+	out := letterRuns(40)
+	for k := 0; k < 10; k++ {
+		out = append(out, fmt.Sprintf(`w%d[a-z]*\b`, k), fmt.Sprintf(`v%d[a-z]+\B`, k),
+			fmt.Sprintf(`q%d[a-z]*(?m:$)`, k))
+	}
+	return out
+}
+
+// letterRuns is n members `[a-z]{k,}[0-9]`, k = 1..n: every one alive over a
+// run of letters, so walks nest and every member's bit is set in long runs.
+func letterRuns(n int) []string {
+	out := make([]string, n)
+	for k := range out {
+		out[k] = fmt.Sprintf("[a-z]{%d,}[0-9]", k+1)
+	}
+	return out
+}
+
+// literalMembers is n members `x%03d[a-z]*` after `runs` letter runs: a wide
+// set whose module stays small, since only the runs are split out of the
+// no-cache companion, and whose high members are reached by naming them.
+func literalMembers(n, runs int) []string {
+	out := letterRuns(runs)
+	for k := runs; k < runs+n; k++ {
+		out = append(out, fmt.Sprintf("x%03d[a-z]*", k))
+	}
+	return out
+}
+
+// wideBoundaryMembers is 70 members over two bitmap words: letter runs, word-
+// boundary members and (?m) line-start members, so the boundary and newline
+// channels carry bits past 64.
+func wideBoundaryMembers() []string {
+	out := letterRuns(40)
+	for k := 0; k < 15; k++ {
+		out = append(out, fmt.Sprintf(`\bw%d\w*`, k))
+	}
+	for k := 0; k < 15; k++ {
+		out = append(out, fmt.Sprintf(`(?m:^)q%d[a-z]*`, k))
+	}
+	return out
 }
 
 // wholeSetAlphabet is the bytes a set's patterns name, plus a word byte, a
@@ -442,7 +516,15 @@ func driveOverlapCacheArmed(t *testing.T, pats []string, input string, offset, o
 	if strideOverride != nil {
 		stride = *strideOverride
 	}
-	d := newCacheDrive(t, pats, input, cacheLayout{batch: true, scratchLen: scratchLen, offer: useCache, stride: stride, preArmWork: preArm})
+	return driveOverlapCacheLay(t, pats, input, offset, outCap, want,
+		cacheLayout{batch: true, scratchLen: scratchLen, offer: useCache, stride: stride, preArmWork: preArm})
+}
+
+// driveOverlapCacheLay is the batch drive over a layout the caller built.
+func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, outCap int32, want engageWant, lay cacheLayout) [][3]int {
+	t.Helper()
+	stride := lay.stride
+	d := newCacheDrive(t, pats, input, lay)
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
@@ -593,6 +675,7 @@ type cacheDriveOpt struct {
 	preArmWork  bool  // make the FIRST call sweep, whatever it costs
 	canaryBytes int32 // bytes of 0xA5 to lay down immediately BELOW the region
 	canaryAfter int32 // and immediately ABOVE it
+	sweepBudget int64 // > 0: compile with the program sweep checkpointing past it
 
 	// Filled in by the drive.
 	lastResult int32 // the raw return of the LAST call, negative codes included
@@ -628,7 +711,7 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 	}
 	d := newCacheDrive(t, pats, input, cacheLayout{
 		scratchLen: scratchLen, offer: useCache, stride: stride, preArmWork: opt.preArmWork,
-		canaryBelow: opt.canaryBytes, canaryAbove: opt.canaryAfter,
+		canaryBelow: opt.canaryBytes, canaryAbove: opt.canaryAfter, sweepBudget: opt.sweepBudget,
 	})
 	defer d.release()
 	store, mem, fn := d.store, d.mem, d.fn
@@ -784,15 +867,15 @@ func TestOverlapCacheFindEngagesOnQuadraticDrives(t *testing.T) {
 }
 
 // TestOverlapCacheFindMatchesGoAndDeclines is the cheap-drive half. The walk
-// finishes these for far less than a sweep would cost, so `find` must decline
-// to sweep and still agree with Go.
+// finishes these for less than a sweep would cost, so `find` must decline to
+// sweep on the short ones (cheapEngage) and agree with Go on all of them.
 func TestOverlapCacheFindMatchesGoAndDeclines(t *testing.T) {
 	for si, tc := range overlapCacheSets {
 		pats := tc.pats
 		for _, input := range overlapCacheInputs {
 			t.Run(fmt.Sprintf("set%d/%q", si, input), func(t *testing.T) {
 				scratch := cacheFindScratchLen(input, pats)
-				got := canonCache(driveCacheFind(t, pats, input, 0, int32(len(pats)), true, scratch, engageNever))
+				got := canonCache(driveCacheFind(t, pats, input, 0, int32(len(pats)), true, scratch, cheapEngage(input)))
 				want := overlapCacheOracle(pats, input)
 				if fmt.Sprint(got) != fmt.Sprint(want) {
 					t.Fatalf("cache path over %q:\n  got  %v\n  want %v", input, got, want)
@@ -2188,4 +2271,152 @@ func TestOverlapDPModuleValidates(t *testing.T) {
 		t.Fatalf("emitted module does not validate:\n%v", err)
 	}
 	t.Logf("validated, %d bytes", len(wasm))
+}
+
+// TestProgramSweepMatchesGo: an overlapping set's split members answer through
+// the program sweep (compile/program_sweep.go) once their own searches have
+// walked past the drive's bound — every start's answer in one backward pass
+// over the member's program. Go's answers in every shape the sweep has to get
+// right: a non-greedy member, a Backtracking one, assertions judged per column
+// (\b, \B, ^, $), and zero-width cycles under the drop-the-second-arrival
+// rule; beside a kept member and alone; through `find` with the cache region
+// offered and with none (the module's own region then serves), and through the
+// batch entry at capacities 1, 3 and 64. On a run long enough, the header must
+// say the sweep ran, or the table went unchecked.
+func TestProgramSweepMatchesGo(t *testing.T) {
+	// Each member, and an input over which its own searches re-read a long
+	// tail from every start — the drive the sweep exists for, which must have
+	// run it — or "" where every such input retires the member after one
+	// failed search instead (a word boundary only at the ends, ^ only at line
+	// starts), which needs no sweep.
+	members := []struct{ pat, trigger string }{
+		{`a[a-z]*?z`, strings.Repeat("a", 700) + "z"},
+		{`(?:a|b)*a(?:a|b){12}c`, strings.Repeat("a", 700) + "c"},
+		{`\ba[a-z]*?z\b`, ""},
+		{`\Ba[a-z]*?z`, strings.Repeat("a", 700) + "z"},
+		{`(?m:^)a[a-z]*?z`, ""},
+		{`a[a-z]*?z(?m:$)`, strings.Repeat("a", 700) + "z"},
+		{`a[a-z]*?z$`, strings.Repeat("a", 700) + "z"},
+		{`(?:a|)*?z`, strings.Repeat("a", 700) + "z"},
+		{`x(?:ab|a)*?y`, ""},
+	}
+	rng := rand.New(rand.NewSource(25))
+	random := func(n int) string {
+		const alpha = "abxyz\n "
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = alpha[rng.Intn(len(alpha))]
+		}
+		return string(b)
+	}
+	for _, mem := range members {
+		m := mem.pat
+		long := []string{
+			strings.Repeat("a", 700) + "z",
+			strings.Repeat("a", 700) + "c",
+			strings.Repeat("ab", 300) + "c" + strings.Repeat("a", 20) + "z",
+			strings.Repeat("xa", 300) + "y",
+			strings.Repeat("a", 300) + "\n" + strings.Repeat("a", 300) + "z\n",
+		}
+		inputs := append([]string{"", "z", "az", "aaz baz", "\naz\n"}, long...)
+		for i := 0; i < 6; i++ {
+			inputs = append(inputs, random(rng.Intn(240)))
+		}
+		for _, pats := range [][]string{{`foo\w+`, m}, {m, `b[a-z]*?y`}} {
+			sh, err := cachedOverlapShape(pats)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sh.SweepCells == 0 {
+				t.Fatalf("%v: no program sweep — the set did not split %s, or the sweep refused it", pats, m)
+			}
+			for _, in := range inputs {
+				want := overlapOracleCtx(t, pats, in)
+				name := fmt.Sprintf("%v/%d", pats, len(in))
+				scratch, _ := overlapCacheFor(in, pats)
+				opt := &cacheDriveOpt{}
+				got := driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAny, opt)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s find: got %v\nwant %v", name, got, want)
+				}
+				if mem.trigger != "" && in == mem.trigger && opt.header[0] != 1 {
+					t.Fatalf("%s: the sweep never ran (header word 0 = %d): the table went unchecked", name, opt.header[0])
+				}
+				if got := driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), false, scratch, engageAny, nil); fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s find, no cache offered: got %v\nwant %v", name, got, want)
+				}
+				for _, cp := range []int32{1, 3, 64} {
+					if got := driveOverlapCache(t, pats, in, cp, true); fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("%s batch cap %d: got %v\nwant %v", name, cp, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestProgramSweepCheckpointsMatchGo is TestProgramSweepMatchesGo over the
+// CHECKPOINTED sweep: compiled with a one-byte budget, every sweep keeps a
+// column every stride positions and rebuilds the answers a block at a time as
+// the drive moves forward, which at the real budget takes a region over 64 MiB.
+// The header's block word says the drive crossed into a later block, so a
+// drive that stayed in one block cannot pass for this test.
+func TestProgramSweepCheckpointsMatchGo(t *testing.T) {
+	members := []struct{ pat, trigger string }{
+		{`a[a-z]*?z`, strings.Repeat("a", 700) + "z"},
+		{`(?:a|b)*a(?:a|b){12}c`, strings.Repeat("a", 700) + "c"},
+		{`\Ba[a-z]*?z`, strings.Repeat("a", 700) + "z"},
+		{`a[a-z]*?z$`, strings.Repeat("a", 700) + "z"},
+	}
+	for _, mem := range members {
+		inputs := []string{
+			mem.trigger,
+			strings.Repeat("ab", 300) + "c" + strings.Repeat("a", 20) + "z",
+			strings.Repeat("a", 300) + "z" + strings.Repeat("a", 300) + "z",
+			strings.Repeat("aaaaz ", 120),
+		}
+		for _, pats := range [][]string{{`foo\w+`, mem.pat}, {mem.pat, `b[a-z]*?y`}} {
+			for _, in := range inputs {
+				want := overlapOracleCtx(t, pats, in)
+				name := fmt.Sprintf("%v/%d", pats, len(in))
+				scratch, stride := overlapCacheFor(in, pats)
+				scratch *= 2
+				opt := &cacheDriveOpt{sweepBudget: 1}
+				got := driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAny, opt)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s find: got %v\nwant %v", name, got, want)
+				}
+				if in == mem.trigger && (opt.header[0] != 1 || opt.header[1] < 2) {
+					t.Fatalf("%s: the sweep did not cross a block (ready %d, block word %d)", name, opt.header[0], opt.header[1])
+				}
+				for _, cp := range []int32{1, 3, 64} {
+					lay := cacheLayout{batch: true, scratchLen: scratch, offer: true, stride: stride, sweepBudget: 1}
+					if got := driveOverlapCacheLay(t, pats, in, 0, cp, engageAny, lay); fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("%s batch cap %d: got %v\nwant %v", name, cp, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// overlapOracleCtx is overlapOracle with each start's LEFT CONTEXT: the probe
+// is anchored at position s of the whole input (\A(?s:.{s})), so \b, \B and
+// (?m:^) judge the byte before s rather than a slice's edge. Go caps a
+// repetition at 1,000, which bounds the inputs it takes.
+func overlapOracleCtx(t *testing.T, pats []string, input string) [][3]int {
+	t.Helper()
+	if len(input) > 1000 {
+		t.Fatalf("overlapOracleCtx takes inputs up to 1,000 bytes, got %d", len(input))
+	}
+	var out [][3]int
+	for s := 0; s <= len(input); s++ {
+		for k, p := range pats {
+			re := regexp.MustCompile(fmt.Sprintf(`\A(?s:.{%d})(?:%s)`, s, p))
+			if m := re.FindStringIndex(input); m != nil {
+				out = append(out, [3]int{k, s, m[1]})
+			}
+		}
+	}
+	return out
 }

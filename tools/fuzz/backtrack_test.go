@@ -1079,6 +1079,11 @@ func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs .
 // budget on — what ships — an overflow hands the call to the fallback, whose
 // stack grows with the input, so the same blown input must then get the real
 // answer (wantBlown). Both builds are driven.
+//
+// A CAPTURE body has no compile-time ceiling any more: its ordinary stack
+// grows with the search too, and the only ceiling left is memory. So the
+// groups rows put it there, with max_memory (btCaptureCap), and blow it with
+// an input whose stack needs far more.
 func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	if eng, err := compile.SelectEngine(btCapturePattern, compile.CompileOptions{}); err != nil {
 		t.Fatalf("SelectEngine: %v", err)
@@ -1091,6 +1096,8 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	noCapIn := func(n int) string { return strings.Repeat("ab", n) + "xyzuvw" }
 	squeezed := compile.CompileOptions{MaxDFAStates: 2}
 	off := compile.CompileOptions{BTWorkBudget: compile.BTWorkBudgetOff}
+	cappedOff := off
+	cappedOff.MaxMemory = btCaptureCap(t)
 	squeezedOff := squeezed
 	squeezedOff.BTWorkBudget = compile.BTWorkBudgetOff
 
@@ -1114,9 +1121,9 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			extra:     []int32{pathsOutBase, 0}, // out_ptr, from
 			ok:        capIn(8191),
 			wantOK:    8192, // match end position
-			blown:     capIn(8192),
-			wantBlown: 8193,
-			offOpts:   []compile.CompileOptions{off},
+			blown:     capIn(btCaptureBlown),
+			wantBlown: btCaptureBlown + 1,
+			offOpts:   []compile.CompileOptions{cappedOff},
 			numCaps:   btCaptureGroups,
 		},
 		{
@@ -1126,9 +1133,9 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			extra:     []int32{pathsOutBase, 16, 0},
 			ok:        capIn(8191),
 			wantOK:    1, // one match collected
-			blown:     capIn(8192),
+			blown:     capIn(btCaptureBlown),
 			wantBlown: 1,
-			offOpts:   []compile.CompileOptions{off},
+			offOpts:   []compile.CompileOptions{cappedOff},
 		},
 		{
 			name:      "match",
@@ -1213,25 +1220,181 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	}
 }
 
-// TestBTStackOverflowThreshold pins the ceiling to numAlts*4096 frames. If a
-// future change to btAllocSizes moves it, this fails loudly rather than
-// silently shifting the input size at which callers start seeing errors — with
-// the budget on, the input size at which calls start paying for the fallback.
-// Measured with compile.BTWorkBudgetOff, the one build where it answers -2.
-func TestBTStackOverflowThreshold(t *testing.T) {
-	w, _, err := compile.Compile(
-		[]config.RegexEntry{{Pattern: btCapturePattern, GroupsFunc: "groups"}},
-		pathsTableBase, true, compile.CompileOptions{BTWorkBudget: compile.BTWorkBudgetOff})
+// btCaptureBlown is an input length whose btCapturePattern search needs far
+// more stack than btCaptureCap leaves: one live 32-byte frame per byte, 3.2 MB,
+// against a 1 MiB cap. capIn(8191) needs 256 KB and fits.
+const btCaptureBlown = 100000
+
+// btCaptureCap is the max_memory the capture rows are capped at.
+func btCaptureCap(t *testing.T) config.MemorySize {
+	t.Helper()
+	m, err := config.ParseMemorySize("1MiB")
 	if err != nil {
-		t.Fatalf("compile: %v", err)
+		t.Fatal(err)
 	}
-	const wantLast = 8191 // numAlts(2) * 4096 == 8192 frames, one per input byte
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast)+"c", pathsOutBase, 0); got < 0 {
-		t.Errorf("%d-byte input already overflows (= %d); ceiling moved down", wantLast+1, got)
+	return m
+}
+
+// btGroupsDrive calls the groups export of a standalone btCapturePattern module
+// over each input in turn, on ONE instance whose scratch base sits at the
+// tables, and returns the memory's size in pages after each call. Each answer
+// must be Go's, or BTStackOverflow where wantOverflow says so.
+func btGroupsDrive(t *testing.T, w []byte, inputs []string, wantOverflow []bool) []uint64 {
+	t.Helper()
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
 	}
-	if got := btRawCall(t, w, "groups", strings.Repeat("a", wantLast+1)+"c", pathsOutBase, 0); got != abi.BTStackOverflow {
-		t.Errorf("%d-byte input = %d, want BTStackOverflow; ceiling moved up", wantLast+2, got)
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		t.Fatal(err)
 	}
+	fn := inst.GetFunc(store, "groups")
+	re := regexp.MustCompile(btCapturePattern)
+	var sizes []uint64
+	for i, in := range inputs {
+		buf := mem.UnsafeData(store)
+		copy(buf[pathsInputBase:], in)
+		for k := 0; k < 2*btCaptureGroups; k++ {
+			binary.LittleEndian.PutUint32(buf[int(pathsOutBase)+k*4:], 0xFFFFFFFF)
+		}
+		_, wd := sharedEngine()
+		wd.Arm(store)
+		res, err := fn.Call(store, pathsInputBase, int32(len(in)), pathsOutBase, int32(0))
+		wd.Disarm()
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		got := int64(res.(int32))
+		if wantOverflow[i] {
+			if got != abi.BTStackOverflow {
+				t.Errorf("call %d (%d bytes) = %d, want %d (BTStackOverflow)", i, len(in), got, abi.BTStackOverflow)
+			}
+		} else {
+			loc := re.FindStringSubmatchIndex(in)
+			buf = mem.UnsafeData(store)
+			for k, want := range loc {
+				if s := int(int32(binary.LittleEndian.Uint32(buf[int(pathsOutBase)+k*4:]))); s != want {
+					t.Fatalf("call %d (%d bytes): slot %d = %d, want %d (answer %d)", i, len(in), k, s, want, got)
+				}
+			}
+		}
+		sizes = append(sizes, mem.Size(store))
+	}
+	return sizes
+}
+
+// TestBTCaptureStackGrows: a capture body's ordinary frame stack is given
+// BTStackStart bytes when a call starts and DOUBLES when full. btCapturePattern
+// leaves one 32-byte frame per input byte, so a×100000 needs 3.2 MB — fifty
+// times a 64 KiB start. Built with BTWorkBudgetOff there is no fallback to hand
+// over to, so an answer there can only come from a stack that grew. And the
+// region is reused: memory grows by exactly the starting size on the first
+// call, then only when a search needs more than every one before it.
+func TestBTCaptureStackGrows(t *testing.T) {
+	small, big := strings.Repeat("a", 100)+"c", strings.Repeat("a", btCaptureBlown)+"c"
+	for _, start := range []int{64 << 10, 256 << 10} {
+		t.Run(fmt.Sprintf("start-%dKiB", start>>10), func(t *testing.T) {
+			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: btCapturePattern, GroupsFunc: "groups"}},
+				pathsTableBase, true, compile.CompileOptions{BTWorkBudget: compile.BTWorkBudgetOff, BTStackStart: start})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			store, _, mem, release, err := instantiate(w)
+			if err != nil {
+				t.Fatalf("instantiate: %v", err)
+			}
+			static := mem.Size(store)
+			release()
+
+			sizes := btGroupsDrive(t, w, []string{small, big, big, small}, []bool{false, false, false, false})
+			// The drive hands no search block, so a standalone module also
+			// grows its own default search state on the first call: one page.
+			const defaultArea = 1
+			if got := sizes[0] - static; got != uint64(start>>16)+defaultArea {
+				t.Errorf("the first call grew memory by %d pages, want the starting size, %d, plus the default search state's page", got, start>>16)
+			}
+			if need := uint64(len(big)) * 32; (sizes[1]-static)*65536 < need {
+				t.Errorf("the big call left %d pages above the tables, less than the %d bytes its stack needs", sizes[1]-static, need)
+			}
+			if sizes[2] != sizes[1] || sizes[3] != sizes[1] {
+				t.Errorf("memory kept growing once the stack had room: %v pages after each call (static %d)", sizes, static)
+			}
+		})
+	}
+}
+
+// TestBTCaptureMemoryCapAnswersUnknown: max_memory bounds a call. A capture
+// search that needs more than the cap — its ordinary stack cannot double, and
+// its fallback cannot place a memo either — answers BTStackOverflow rather than
+// a wrong answer, memory never passes the cap, even the host cannot grow it
+// past, and the instance still answers the next search that fits. As shipped,
+// with the work budget on.
+func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
+	memCap := btCaptureCap(t)
+	capPages, _ := memCap.Pages()
+	small, big := strings.Repeat("a", 100)+"c", strings.Repeat("a", btCaptureBlown)+"c"
+	entry := config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups"}
+
+	t.Run("standalone", func(t *testing.T) {
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, compile.CompileOptions{MaxMemory: memCap})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		sizes := btGroupsDrive(t, w, []string{small, big, small}, []bool{false, true, false})
+		for i, s := range sizes {
+			if s > uint64(capPages) {
+				t.Errorf("after call %d memory is %d pages, past the %d-page cap", i, s, capPages)
+			}
+		}
+		store, _, mem, release, err := instantiate(w)
+		defer release()
+		if err != nil {
+			t.Fatalf("instantiate: %v", err)
+		}
+		if _, err := mem.Grow(store, uint64(capPages)-mem.Size(store)+1); err == nil {
+			t.Error("the host grew memory past max_memory: the cap is not the declared maximum")
+		}
+	})
+
+	t.Run("embedded", func(t *testing.T) {
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, 0, false, compile.CompileOptions{MaxMemory: memCap})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		engine, _ := sharedEngine()
+		mod, err := wasmtime.NewModule(engine, w)
+		if err != nil {
+			t.Fatalf("module: %v", err)
+		}
+		defer mod.Close()
+		store := wasmtime.NewStore(engine)
+		defer store.Close()
+		store.SetEpochDeadline(1)
+		mt, err := wasmtime.NewMemoryType(uint32(btScratchTableBase/65536), false, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, err := wasmtime.NewMemory(store, mt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{host})
+		if err != nil {
+			t.Fatalf("instantiate: %v", err)
+		}
+		c := func(in string) btScratchCase { return btScratchCase{entry: entry, input: in} }
+		for _, in := range []string{small, big, small} {
+			got, slots := c(in).call(t, store, inst, host, 2*btCaptureGroups)
+			if len(in) == len(big) {
+				if got != abi.BTStackOverflow {
+					t.Errorf("%d bytes under a %s cap = %d, want %d (BTStackOverflow)", len(in), memCap, got, abi.BTStackOverflow)
+				}
+				continue
+			}
+			c(in).check(t, got, slots)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,4 +1610,88 @@ func TestBTFindIterationMatchesGo(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A block reused for ANOTHER text — the caller's mistake; a generated stub
+// zeroes it per search — must not carry the first text's kept memo into it:
+// the marks are failures on that text, and a match the new text has through a
+// marked (pc, position) was silently missed. The fallback records the text
+// the memo describes and clears the rows a call over another text reads. Text
+// A matches nowhere, so its marks cover every row B and C read; B is another
+// address at the same length, C a shorter text at A's address.
+func TestBTKeptMemoFollowsTheText(t *testing.T) {
+	const pat = `(?:a?)+?xyz` // a zero-width cycle: the fallback answers every call
+	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
+	w, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{entry}, pathsTableBase, true, 0,
+		compile.CompileOptions{MaxDFAStates: 1})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	memoPer := sizes["find"].BTMemoBytes
+	if memoPer == 0 {
+		t.Fatalf("%q keeps no Backtracking memo: %+v", pat, sizes["find"])
+	}
+	cfg := wasmtime.NewConfig()
+	cfg.SetWasmSIMD(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+	store := wasmtime.NewStore(engine)
+	defer store.Close()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatalf("module: %v", err)
+	}
+	defer mod.Close()
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	search := inst.GetExport(store, abi.SearchExport).Global()
+	fn := inst.GetFunc(store, "find")
+
+	const a, b = "aaaaaaaaaaaa", "aaaaaaaaaxyz"
+	const ptrA, ptrB = int32(0), int32(4096)
+	blk := (int64(mem.DataSize(store)) + 65535) &^ 65535
+	memo := blk + abi.SearchBlockBytes
+	memoCap := int64(len(a)+1) * int64(memoPer)
+	if _, err := mem.Grow(store, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := setScratchBase(store, inst, int32(blk+65536)); err != nil {
+		t.Fatal(err)
+	}
+	buf := mem.UnsafeData(store)
+	clear(buf[blk : memo+memoCap])
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTStateOff:], abi.SearchBTTripped)
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTMemoOff:], uint32(memo))
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTMemoCapOff:], uint32(memoCap))
+
+	re := regexp.MustCompile(pat)
+	find := func(ptr int32, text string) {
+		t.Helper()
+		copy(mem.UnsafeData(store)[ptr:], text)
+		if err := search.Set(store, wasmtime.ValI32(int32(blk))); err != nil {
+			t.Fatal(err)
+		}
+		r, err := fn.Call(store, ptr, int32(len(text)), int32(0))
+		if err != nil {
+			t.Fatalf("find(%q): %v", text, err)
+		}
+		got, want := fmt.Sprint([]int{-1}), fmt.Sprint([]int{-1})
+		if p := r.(int64); p >= 0 {
+			got = fmt.Sprint([]int{int(p >> 32), int(uint32(p))})
+		}
+		if loc := re.FindStringIndex(text); loc != nil {
+			want = fmt.Sprint(loc)
+		}
+		if got != want {
+			t.Errorf("find(%q) at %d through the block of an earlier text = %s, want %s", text, ptr, got, want)
+		}
+	}
+	find(ptrA, a)
+	if bytes.Count(mem.UnsafeData(store)[memo:memo+memoCap], []byte{0}) == int(memoCap) {
+		t.Fatal("the search over A left no mark in the kept memo: nothing below is tested")
+	}
+	find(ptrB, b)
+	find(ptrA, "aaxyz")
 }

@@ -1,11 +1,8 @@
 package compile
 
 import (
-	"fmt"
-
-	"github.com/qrdl/regexped/internal/abi"
-
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -158,15 +155,9 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 	if sw == nil {
 		panic("compile: newCkptEmit called for a set with no sweep")
 	}
-	// The block row's mask is an i32 (`1 << k`), so an automaton wider than
-	// bucketMaskBits would drop its high patterns from every row. vetSweep
-	// refuses one; this refuses it again at the one place the mask width is
-	// assumed, so a gate that drifts cannot reach it silently.
+	// The block row's mask is as wide as the sweep (config.SetOverlapRowMaskBytes),
+	// so every pattern has its bit whatever the count.
 	numPat := len(sw.ids)
-	if numPat > bucketMaskBits {
-		panic(fmt.Sprintf("compile: a sweep over %d patterns: the block row's mask "+
-			"is an i32, so it may cover at most bucketMaskBits (%d)", numPat, bucketMaskBits))
-	}
 	e := &ckptEmit{
 		dp:        sw.dp,
 		tableMem:  tableMemIdx,
@@ -461,11 +452,21 @@ func (e *ckptEmit) emitAtPosition(b []byte, startState uint32, write bool) []byt
 		b = e.konst(b, e.rowBytesB())
 		b = append(b, 0x6C, 0x6A)
 		b = e.set(b, e.lWrite)
-		b = e.konst(b, 0)
-		b = e.set(b, e.lMask)
+		if !e.maskWide() {
+			b = e.konst(b, 0)
+			b = e.set(b, e.lMask)
+		}
 	}
 
 	for k := 0; k < e.numPat; k++ {
+		// A wide mask is built one 64-bit WORD at a time in the one i64
+		// local, stored when its last pattern is done: the patterns are
+		// unrolled in order, so a word's are consecutive, and the local count
+		// does not grow with the set.
+		if write && e.maskWide() && k%64 == 0 {
+			b = e.konst64(b, 0)
+			b = e.set(b, e.lMask)
+		}
 		b = e.get(b, e.lStart)
 		if e.proj != nil {
 			b = appendTableLoad32(b, e.tableMem, uint32(e.cellFor(k, int(startState))))
@@ -486,10 +487,15 @@ func (e *ckptEmit) emitAtPosition(b []byte, startState uint32, write bool) []byt
 			b = e.get(b, e.lWrite)
 			b = e.get(b, e.lVal)
 			b = append(b, 0x36, 0x02)
-			b = utils.AppendULEB128(b, uint32(config.SetOverlapRowEndOff(k))) //nolint:gosec // a row offset
+			b = utils.AppendULEB128(b, uint32(config.SetOverlapRowEndOff(k, e.numPat))) //nolint:gosec // a row offset
 			b = e.get(b, e.lMask)
-			b = e.konst(b, int32(1)<<uint(k))
-			b = append(b, 0x72) // i32.or
+			if e.maskWide() {
+				b = e.konst64(b, uint64(1)<<uint(k%64))
+				b = append(b, 0x84) // i64.or
+			} else {
+				b = e.konst(b, int32(1)<<uint(k))
+				b = append(b, 0x72) // i32.or
+			}
 			b = e.set(b, e.lMask)
 		}
 		b = e.get(b, e.lCount)
@@ -497,18 +503,27 @@ func (e *ckptEmit) emitAtPosition(b []byte, startState uint32, write bool) []byt
 		b = append(b, 0x6A)
 		b = e.set(b, e.lCount)
 		b = append(b, 0x0B)
+		// The mask is stored ALWAYS, zero included: it is what tells a reader
+		// the row holds nothing, and it is how serving skips a run of
+		// non-matching positions without consulting anything else.
+		if write && e.maskWide() && (k%64 == 63 || k == e.numPat-1) {
+			b = e.get(b, e.lWrite)
+			b = e.get(b, e.lMask)
+			b = append(b, 0x37, 0x03) // i64.store
+			b = utils.AppendULEB128(b, uint32(8*(k/64)))
+		}
 	}
-
-	// The mask is stored ALWAYS, zero included: it is what tells a reader the
-	// row holds nothing, and it is how serving skips a run of non-matching
-	// positions without consulting anything else.
-	if write {
+	if write && !e.maskWide() {
 		b = e.get(b, e.lWrite)
 		b = e.get(b, e.lMask)
 		b = append(b, 0x36, 0x02, 0x00)
 	}
 	return b
 }
+
+// maskWide reports a row mask of 64-bit words — more than 32 patterns — which
+// lMask then builds one word at a time as an i64.
+func (e *ckptEmit) maskWide() bool { return config.SetOverlapRowMaskBytes(e.numPat) > 4 }
 
 // emitAtPositionGuarded picks the start state a walk from lPos begins in, as
 // the forward body's emitSetEntryState does: the begin-anchored one at position
@@ -567,6 +582,15 @@ func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
 // one in the middle would renumber every local after it in itself alone. The
 // order is the emitted order and is load-bearing; nothing here may be
 // reordered without regenerating both sweep fixtures.
+// allocMask is lMask at the row mask's width: an i32 to 32 patterns, an i64
+// (one word of the bitmap at a time) above.
+func (e *ckptEmit) allocMask(a *localAlloc) byte {
+	if e.maskWide() {
+		return a.I64()
+	}
+	return a.I32()
+}
+
 func (e *ckptEmit) allocCommon(a *localAlloc) {
 	e.lCur, e.lPrev = a.I32(), a.I32()
 	e.lPos, e.lByte, e.lCell = a.I32(), a.I32(), a.I32()
@@ -814,7 +838,8 @@ func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	e.allocCommon(a)
 	e.lTmp, e.lHi, e.lLo = a.I32(), a.I32(), a.I32()
 	lM, lBlkIdx, lBound, lBlk0End := a.I32(), a.I32(), a.I32(), a.I32()
-	e.lRowBase, e.lBlkBase, e.lMask = a.I32(), a.I32(), a.I32()
+	e.lRowBase, e.lBlkBase = a.I32(), a.I32()
+	e.lMask = e.allocMask(a)
 	e.lSum = a.I32()
 	e.lMidMask, e.lEofMask = a.I64(), a.I64()
 	// The layout is computed in i64 (see the prologue): nb*cellBytes passes
@@ -1100,7 +1125,8 @@ func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
 	e.allocCommon(a)
 	e.lHi, e.lLo = a.I32(), a.I32()
 	lNextCkpt := a.I32()
-	e.lRowBase, e.lBlkBase, e.lMask = a.I32(), a.I32(), a.I32()
+	e.lRowBase, e.lBlkBase = a.I32(), a.I32()
+	e.lMask = e.allocMask(a)
 	e.lMidMask, e.lEofMask = a.I64(), a.I64()
 	e.allocBoundary(a)
 
@@ -1308,14 +1334,13 @@ func (e *ckptEmit) cellFor(pat, w int) int32 { return e.proj.cellOf[pat][w] * 4 
 // is what lets a read through a dead projection skip its own branch.
 func (e *ckptEmit) emitEOFColumnProj(b []byte) []byte {
 	for pat := 0; pat < e.numPat; pat++ {
-		bit := uint64(1) << uint(pat)
 		for c := 1; c < e.proj.cells; c++ {
 			if e.proj.owner[c] != int32(pat) {
 				continue // this cell belongs to another pattern
 			}
 			w := int(e.proj.rep[c])
 			b = e.get(b, e.lCur)
-			if e.dp.eofMasks[w]&bit != 0 {
+			if e.dp.eofHas(w, pat) {
 				b = e.get(b, e.pLen)
 			} else {
 				b = e.konst(b, -1)
@@ -1399,13 +1424,11 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 
 	// Phase 2: one update per CELL, unrolled.
 	for pat := 0; pat < e.numPat; pat++ {
-		bit := uint64(1) << uint(pat)
 		for c := 1; c < e.proj.cells; c++ {
 			if e.proj.owner[c] != int32(pat) {
 				continue
 			}
 			w := int(e.proj.rep[c])
-			has := func(m []uint64) bool { return m != nil && m[w]&bit != 0 }
 			b = e.get(b, e.lCur)
 
 			// w' = succ[rep], at a constant address.
@@ -1422,8 +1445,8 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 			// the answer is this position whatever the suffix says, as the
 			// forward body writes the tuple and retires the pattern. Read only
 			// for a one-pattern automaton — see overlapDPTables.
-			wDom := e.numPat == 1 && has(e.dp.wDomMasks)
-			nwDom := e.numPat == 1 && has(e.dp.nwDomMasks)
+			wDom := e.numPat == 1 && e.dp.wDomHas(w)
+			nwDom := e.numPat == 1 && e.dp.nwDomHas(w)
 			if wDom || nwDom {
 				switch {
 				case wDom && nwDom:
@@ -1458,9 +1481,9 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 			b = append(b, 0x05)
 			// No suffix answer: this position, if the state accepts here — on
 			// arrival, or before a byte of the class its boundary accept names.
-			wAcc, nwAcc, nlAcc := has(e.dp.wMasks), has(e.dp.nwMasks), has(e.dp.nlMasks)
+			wAcc, nwAcc, nlAcc := e.dp.wHas(w, pat), e.dp.nwHas(w, pat), e.dp.nlHas(w, pat)
 			switch {
-			case e.dp.midMasks[w]&bit != 0 || (wAcc && nwAcc):
+			case e.dp.midHas(w, pat) || (wAcc && nwAcc):
 				b = e.get(b, e.lPos)
 			case !wAcc && !nwAcc && !nlAcc:
 				b = e.konst(b, -1)
@@ -1516,4 +1539,91 @@ func (e *ckptEmit) emitSeedDeadCell(b []byte) []byte {
 		b = appendTableStore32(b, e.tableMem, 0)
 	}
 	return b
+}
+
+// emitCkptSizing computes, inside WASM, the checkpointed answer cache's stride
+// and region for an input of the i32 local lenL bytes: m = len + 1 in the i64
+// local lM, the stride k in lK and the region's bytes in lBytes. It is the
+// arithmetic every stub spells in its own language and MUST agree with
+// config.SetOverlapCheckpointStride / …Bytes, since the sweep validates the
+// stride it is handed: i64 throughout (m × row passes 2^32 on a large input),
+// f64 for the square root. The component's find constructor and a standalone
+// module's default cache (default_search.go) size theirs with it. row is
+// config.SetOverlapBlockRowBytes of the set's pattern count.
+//
+// The single-block budget is config.SetOverlapCacheMaxBytes; emitCkptSizingBudget
+// takes another, for the program sweep's test-only knob.
+func emitCkptSizing(b []byte, lenL, lM, lK, lBytes uint32, cells int, row int64) []byte {
+	return emitCkptSizingBudget(b, lenL, lM, lK, lBytes, cells, row, overlapCacheMaxBytes)
+}
+
+func emitCkptSizingBudget(b []byte, lenL, lM, lK, lBytes uint32, cells int, row int64, budget int64) []byte {
+	cell := int64(cells)*4 + 4
+	// m = len + 1
+	// i64.extend_i32_u: `len` is a u32 byte count, and sign-extending it
+	// made every input above 2 GiB compute a negative span.
+	b = lget(b, lenL)
+	b = append(b, 0xAD, 0x42, 0x01, 0x7C)
+	b = lset(b, lM)
+	// single = HDR + cell + 4 + m*row
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes)+cell+4)
+	b = lget(b, lM)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, row)
+	b = append(b, 0x7E, 0x7C) // i64.mul, i64.add
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, budget)
+	b = append(b, 0x56)       // i64.gt_u -> over budget, checkpoint
+	b = append(b, 0x04, 0x40) // if
+	// k = trunc(sqrt(m * cells*4 / row)), clamped to [16, m].
+	//
+	// Multiply THEN divide, in that order, because that is the order
+	// config.SetOverlapCheckpointStride evaluates and f64 arithmetic is not
+	// associative: folding cells*4/row into one constant at compile time
+	// lands up to an ulp away, and trunc() then turns that into a stride
+	// one apart from every other language's.
+	b = lget(b, lM)
+	b = append(b, 0xB9) // f64.convert_i64_u
+	b = append(b, 0x44)
+	b = appendF64(b, float64(cells)*4)
+	b = append(b, 0xA2) // f64.mul
+	b = append(b, 0x44)
+	b = appendF64(b, float64(row))
+	b = append(b, 0xA3, 0x9F) // f64.div, f64.sqrt
+	b = append(b, 0xB0)       // i64.trunc_f64_u
+	b = lset(b, lK)
+	b = lget(b, lK)
+	b = append(b, 0x42, 0x10, 0x54) // k < 16
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x42, 0x10)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	b = lget(b, lK)
+	b = lget(b, lM)
+	b = append(b, 0x56) // k > m
+	b = append(b, 0x04, 0x40)
+	b = lget(b, lM)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	b = append(b, 0x05) // else: one block, the whole span
+	b = lget(b, lM)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	// bytes = HDR + ceil(m/k)*cell + 4 + k*row
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes)+4)
+	b = lget(b, lM)
+	b = lget(b, lK)
+	b = append(b, 0x7C, 0x42, 0x01, 0x7D) // m + k - 1
+	b = lget(b, lK)
+	b = append(b, 0x80) // (m+k-1)/k
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, cell)
+	b = append(b, 0x7E, 0x7C)
+	b = lget(b, lK)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, row)
+	b = append(b, 0x7E, 0x7C)
+	return lset(b, lBytes)
 }

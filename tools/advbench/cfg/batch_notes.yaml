@@ -1,0 +1,10 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'a*b|a'
+  - pattern: 'zzz'
+sets:
+  - name: s
+    find: sfind
+    patterns: all
+    hints: [batch-find]

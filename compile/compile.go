@@ -116,6 +116,41 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 	return nil
 }
 
+// ErrMemoryCapTooSmall is the compile error for a max_memory below what the
+// module needs before any call runs: its tables, and every stack a path still
+// reserves at compile time. A memory whose minimum is above its maximum does
+// not validate, so without this the module would fail at load, with a message
+// about memory limits rather than about the config.
+var ErrMemoryCapTooSmall = errors.New("compile: max_memory is below the module's static memory")
+
+// memoryMaxPages resolves max_memory for a module that declares declPages
+// pages: the maximum its memory declares, 0 meaning none. A value above what a
+// 32-bit memory can hold is treated as that much, with a warning — it caps
+// nothing, but the user asked for a cap and should know it is not one.
+func memoryMaxPages(m config.MemorySize, declPages int32) (uint32, error) {
+	if !m.IsSet() {
+		return 0, nil
+	}
+	pages, clamped := m.Pages()
+	if clamped {
+		slog.Warn("max_memory is above 4 GiB, the most a WebAssembly memory can hold; treating it as 4 GiB",
+			"max_memory", m.String())
+	}
+	if int64(pages) < int64(declPages) {
+		return 0, fmt.Errorf("%w: max_memory %s rounds down to %s (%d bytes), but the module needs %s (%d bytes) before any call — its tables and every region reserved at compile time",
+			ErrMemoryCapTooSmall, m.String(), pagesOf(int64(pages)), int64(pages)*65536, pagesOf(int64(declPages)), int64(declPages)*65536)
+	}
+	return pages, nil
+}
+
+// pagesOf spells a page count for a message.
+func pagesOf(n int64) string {
+	if n == 1 {
+		return "1 page of 64 KiB"
+	}
+	return fmt.Sprintf("%d pages of 64 KiB", n)
+}
+
 // EngineType represents the type of regexp engine implementation.
 type EngineType byte
 
@@ -289,11 +324,22 @@ type CompileOptions struct {
 	// exponential whenever a loop can split its input more than one way, and
 	// nothing else bounds the search — see btWorkK and planBT.
 	//
-	// 0 → the default (8); a positive value → that k; BTWorkBudgetOff → no
+	// 0 → the default (1); a positive value → that k; BTWorkBudgetOff → no
 	// counter and no fallback, the bytes every body had before the budget
 	// existed; BTWorkBudgetForceFallback → the fallback answers every call.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTWorkBudget int
+	// BTStackStart is how many bytes a Backtracking CAPTURE body's frame stack
+	// is given when a call starts, before it first doubles; 0 means
+	// defaultBTStackStart. The stack lives in the run-time scratch region, not
+	// in the module's tables, so this is claimed per call and only where memory
+	// does not already have it. A measurement knob.
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	BTStackStart int
+	// MaxMemory is the config's max_memory: the module's memory declares it as
+	// its maximum, and a module whose static memory already exceeds it does not
+	// compile. The zero value is no cap.
+	MaxMemory config.MemorySize
 	// The three FIND-STRATEGY overrides, for tests and measurement only — no
 	// YAML key sets them. Unset, classifyFind (start_anywhere.go) decides.
 	// TodayFind keeps today's find with nothing added (the baseline);
@@ -313,6 +359,10 @@ type CompileOptions struct {
 	// paths that compile a body without assembling a module (helper DFAs,
 	// SelectEngine); those allocate nothing, so nothing dereferences it.
 	globals *moduleGlobals
+
+	// searchSizes, when non-nil, receives each export's SearchSize: what a
+	// generated stub allocates for its searches (SearchSizes).
+	searchSizes map[string]SearchSize
 }
 
 // btScratch returns the module's Backtracking fallback-scratch globals. A
@@ -476,6 +526,9 @@ type compiledPattern struct {
 	// empty-width assertion, and the backward one takes (ptr, len, end), laid
 	// out in slotSARevCtx.
 	saCtx bool
+	// saNotes is the start-anywhere forward pass's per-search notes rows, nil
+	// for none (search_notes.go).
+	saNotes *notesRows
 	// Non-mid-accept bulk-skip helper fields (nonMidHelperBody,
 	// findBodyCallSites) were removed with the rest of that infrastructure.
 
@@ -531,6 +584,25 @@ type compiledPattern struct {
 	// assembleModule, where the twin's function index is finally known.
 	findTwinCallOff int
 
+	// findMarkedBody is the MARKED copy of the find body under per-search
+	// notes (search_notes.go), laid out after findBody and its neutral twin.
+	// findMarkedCallOff and findTwinMarkedCallOff are the handoffs to it in
+	// findBody and findNeutralBody, findMarkedBackOff its handback to
+	// findBody; all four are patched in the assemblers, like findTwinCallOff.
+	findMarkedBody        []byte
+	findMarkedCallOff     int
+	findTwinMarkedCallOff int
+	findMarkedBackOff     int
+	// btSearch: a Backtracking body of the pattern keeps its work budget per
+	// search in the caller's block (bt_search.go); btMemoBytes is the memo
+	// bytes per position the stub gives a search that tripped (0: none).
+	btSearch    bool
+	btSearchG   uint32
+	btMemoBytes int
+	// notes is the pattern's per-search notes, nil for none. Its bytes per
+	// position is the constant a generated stub allocates a search's notes by.
+	notes *notesPlan
+
 	// Backtracking FALLBACK bodies, one per budgeted fast body (matchBody,
 	// findBody, captureBody): the memoised body a fast body tail-calls when
 	// its work budget trips or its frame stack overflows (see planBT). Each is laid out
@@ -541,12 +613,22 @@ type compiledPattern struct {
 	// (INCLUDING its size prefix) of each call's five-byte placeholder
 	// immediate, patched by both assemblers through appendWithBTFallback.
 	// Meaningful only when the matching fallback body is non-nil.
-	matchFallbackBody       []byte
-	matchFallbackCallOffs   []int
-	findFallbackBody        []byte
-	findFallbackCallOffs    []int
-	captureFallbackBody     []byte
-	captureFallbackCallOffs []int
+	matchFallbackBody     []byte
+	matchFallbackCallOffs []int
+	findFallbackBody      []byte
+	findFallbackCallOffs  []int
+	// findFallbackMemoBody is an embedded build's second find fallback, which
+	// keeps the search's memo in the host's memory (btFindParts.memoFallback);
+	// findFallbackMemoCallOffs are its call sites in findFallbackBody.
+	findFallbackMemoBody     []byte
+	findFallbackMemoCallOffs []int
+
+	// The default search state of each export that keeps state, for a
+	// standalone module's callers that hand no block over
+	// (default_search.go); nil for none. Set by assignDefaults.
+	defFind, defGroups, defBatchFind, defBatchGroups *defaultSearch
+	captureFallbackBody                              []byte
+	captureFallbackCallOffs                          []int
 
 	// altLitAnchorFindBody (the dispatcher) is NOT a field here — like
 	// litAnchorFindBody, it's built at assembleModule time and appended
@@ -653,6 +735,11 @@ const (
 	slotSARevCtx          // the context backward pass (saCtx)
 	slotSABT              // a switch's Backtracking handover find (saBT)
 	slotSABTFallback      // …and its memoised fallback
+	slotFindMarked        // the marked copy of a plain find body, after its twin
+	// An embedded build's second Backtracking find fallback, which keeps the
+	// search's memo in the host's memory, right after the first.
+	slotFindFallbackMemo
+	slotSABTFallbackMemo
 )
 
 // funcSlot is one entry of a pattern's function layout. branch is the
@@ -698,8 +785,14 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 		if p.findNeutralBody != nil {
 			add(slotFindNeutral)
 		}
+		if p.findMarkedBody != nil {
+			add(slotFindMarked)
+		}
 		if p.findFallbackBody != nil {
 			add(slotFindFallback)
+			if p.findFallbackMemoBody != nil {
+				add(slotFindFallbackMemo)
+			}
 		}
 	}
 	if p.saFwdBody != nil {
@@ -715,6 +808,9 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 		add(slotSABT)
 		if p.saBT.fallback != nil {
 			add(slotSABTFallback)
+			if p.saBT.memoFallback != nil {
+				add(slotSABTFallbackMemo)
+			}
 		}
 	}
 	if p.saSwitch {
@@ -870,30 +966,55 @@ func (p *compiledPattern) todayFindOff() int {
 // emission is what keeps the two sides of that layout from drifting again.
 func (p *compiledPattern) appendFindBodyWithTwin(cs []byte, findFuncIdx int) []byte {
 	if p.findFallbackBody != nil {
+		// Nothing emits both today: a twin or a marked copy comes from the DFA
+		// find path, a fallback from the Backtracking one. Refuse rather than
+		// guess an order the fallback's index would silently depend on.
 		if p.findNeutralBody != nil {
-			// Nothing emits both today: a twin comes from the DFA find path, a
-			// fallback from the Backtracking one. Refuse rather than guess an
-			// order the fallback's index would silently depend on.
 			panic("compile: a find body with both a neutral twin and a Backtracking fallback")
 		}
-		// funcLayout places slotFindFallback directly after slotFind.
-		return appendWithBTFallback(cs, p.findBody, p.findFallbackBody, p.findFallbackCallOffs, findFuncIdx+1)
+		if p.findMarkedBody != nil {
+			panic("compile: a find body with both a marked copy and a Backtracking fallback")
+		}
+		// funcLayout places slotFindFallback directly after slotFind, and
+		// slotFindFallbackMemo after that.
+		return appendBTFindParts(cs, p.findBody, btFindParts{fallback: p.findFallbackBody, callOffs: p.findFallbackCallOffs,
+			memoFallback: p.findFallbackMemoBody, memoCallOffs: p.findFallbackMemoCallOffs}, findFuncIdx)
 	}
-	if p.findNeutralBody == nil {
+	if p.findNeutralBody == nil && p.findMarkedBody == nil {
 		return append(cs, p.findBody...)
 	}
-	body := append([]byte(nil), p.findBody...)
-	off := p.findTwinCallOff
-	if off < 0 || off+twinCallImmWidth > len(body) {
-		panic("compile: find twin handoff patch offset outside the body")
+	// funcLayout: slotFind, then slotFindNeutral, then slotFindMarked.
+	twinIdx, markedIdx := findFuncIdx+1, findFuncIdx+1
+	if p.findNeutralBody != nil {
+		markedIdx++
 	}
-	copy(body[off:off+twinCallImmWidth],
-		utils.AppendPaddedULEB128(nil, uint32(findFuncIdx+1), twinCallImmWidth))
+	patch := func(body []byte, off, target int, what string) []byte {
+		if off < 0 || off+twinCallImmWidth > len(body) {
+			panic("compile: find " + what + " patch offset outside the body")
+		}
+		copy(body[off:off+twinCallImmWidth],
+			utils.AppendPaddedULEB128(nil, uint32(target), twinCallImmWidth))
+		return body
+	}
+	body := append([]byte(nil), p.findBody...)
+	if p.findNeutralBody != nil {
+		body = patch(body, p.findTwinCallOff, twinIdx, "twin handoff")
+	}
+	if p.findMarkedBody != nil {
+		body = patch(body, p.findMarkedCallOff, markedIdx, "marked-copy handoff")
+	}
 	cs = append(cs, body...)
-	// The neutral twin follows immediately, matching funcLayout's
-	// slotFind → slotFindNeutral order. Both are already size-prefixed by
-	// their emitter.
-	return append(cs, p.findNeutralBody...)
+	if p.findNeutralBody != nil {
+		twin := p.findNeutralBody
+		if p.findMarkedBody != nil {
+			twin = patch(append([]byte(nil), twin...), p.findTwinMarkedCallOff, markedIdx, "twin's marked-copy handoff")
+		}
+		cs = append(cs, twin...)
+	}
+	if p.findMarkedBody != nil {
+		cs = append(cs, patch(append([]byte(nil), p.findMarkedBody...), p.findMarkedBackOff, findFuncIdx, "marked-copy handback")...)
+	}
+	return cs
 }
 
 // appendWithBTFallback appends a Backtracking fast body and, when it has one,
@@ -917,10 +1038,23 @@ func appendWithBTFallback(cs, fast, fallback []byte, callOffs []int, fallbackFun
 type btFindParts struct {
 	fast, fallback []byte
 	callOffs       []int
-	mode           findFromMode
-	data           []byte
-	segs           int
-	end            int64
+	// memoFallback is an EMBEDDED build's second fallback, laid out right
+	// after the first, which hands it a call whose search has a usable memo
+	// (memoCallOffs, in the first fallback): the memo is in the host's
+	// memory, the first fallback's region in the table memory, and a memory
+	// index is an immediate. nil in every other build.
+	memoFallback []byte
+	memoCallOffs []int
+	mode         findFromMode
+	data         []byte
+	segs         int
+	end          int64
+	// search: the bodies keep the budget per search in the caller's block
+	// (bt_search.go); memoBytes is the memo bytes per text position the stub
+	// gives a search that tripped, 0 when the fallback keeps this call's.
+	search    bool
+	searchG   uint32
+	memoBytes int
 }
 
 // buildBTFindParts builds the Backtracking find for pattern at cur: the find a
@@ -985,6 +1119,7 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 	// As on the Backtracking match path: the fallback reserves nothing, and
 	// nor does a fast body that is the bare tail call.
 	plan := planBT(bt, o.BTWorkBudget)
+	bt.search = btSearchFor(o)
 	btStackSize := btAllocSizes(bt)
 	if plan.force {
 		btStackSize = 0
@@ -1005,13 +1140,36 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 	var fallbackMode findFromMode
 	if plan.fallback {
 		scratch := o.btScratch()
-		parts.fallback, fallbackMode, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch)
+		if o.tableMemIdx != 0 && bt.search != nil {
+			// Embedded: the per-call body, and the one that keeps the
+			// search's memo in the host's memory (btScratch.memoInInput).
+			memo := scratch
+			memo.memoInInput = true
+			parts.memoFallback, _, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &memo)
+			scratch.searchTwin = true
+		}
+		parts.fallback, fallbackMode, parts.memoCallOffs = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch)
+		if parts.memoFallback == nil {
+			parts.memoCallOffs = nil
+		}
 	}
 	if plan.force {
 		// The stub forwards (ptr, len) and never reads `from`; the
 		// fallback it calls does, so the stub reports the fallback's mode.
+		//
+		// With a search, the stub marks it tripped first: a program with a
+		// zero-width cycle runs its fallback alone, so nothing else would ever
+		// trip it, and the stub would never hand the fallback the memo it
+		// keeps for the search — each call would walk the rest of the input
+		// again (`(0*\b|)*0` over 0×4096: 359 K fuel/byte, 820 with the memo).
+		// A program that matches only at 0 makes one attempt per search, so
+		// a memo kept across its calls would buy nothing: it is not tripped.
 		var stub []byte
-		stub, parts.callOffs = btTailCallBody(2)
+		stubSearch := bt.search
+		if btStartAnchored(bt.prog) {
+			stubSearch = nil
+		}
+		stub, parts.callOffs = btTailCallBodySearch(2, stubSearch)
 		parts.fast, parts.mode = stub, fallbackMode
 	} else {
 		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil)
@@ -1025,7 +1183,37 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 	if stack != nil {
 		parts.end = btBase
 	}
+	if bt.search != nil {
+		parts.search, parts.searchG = true, bt.search.g
+		// Every output kind: an embedded build keeps it through its second
+		// fallback.
+		parts.memoBytes = btMemoBytes(bt)
+	}
 	return parts, nil
+}
+
+// funcs is how many functions the parts lay out: the find body, its fallback
+// and an embedded build's memo fallback.
+func (parts btFindParts) funcs() int {
+	n := 1
+	if parts.fallback != nil {
+		n++
+	}
+	if parts.memoFallback != nil {
+		n++
+	}
+	return n
+}
+
+// appendBTFindParts appends the parts' functions, the find body at fastIdx and
+// each fallback right after it, with every call patched.
+func appendBTFindParts(cs []byte, fast []byte, parts btFindParts, fastIdx int) []byte {
+	if parts.memoFallback == nil {
+		return appendWithBTFallback(cs, fast, parts.fallback, parts.callOffs, fastIdx+1)
+	}
+	cs = append(cs, patchBTFallbackCall(fast, parts.callOffs, fastIdx+1)...)
+	cs = append(cs, patchBTFallbackCall(parts.fallback, parts.memoCallOffs, fastIdx+2)...)
+	return append(cs, parts.memoFallback...)
 }
 
 // btFindStackSize is the frame stack buildBTFindParts gives pattern's find:
@@ -1737,6 +1925,22 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// DFA answers these patterns itself; custom-tests.txt Category 39 guards it.
 	dfaTooLarge := dfaStateLimitExceeded || table.numStates > maxStates || (memLimit > 0 && dfaTableBytes(table) > memLimit) ||
 		dfaHasAmbiguousBoundaryTarget(table)
+	// A find whose automaton has more cycle states than a search's notes can
+	// carry rows for would run with NO notes, and a drive over input that
+	// makes each call re-read (`aaaa…` for `…|a`) would be quadratic again.
+	// It goes to the Backtracking find instead, whose budget lasts the search
+	// and whose memo is kept once it trips: linear, at about 2.5× the cost on
+	// ordinary text (`(?:a|b)*a(?:a|b){10}c|a` under max_dfa_states 20000:
+	// 75,904 → 10,339 fuel/byte at 4 KB of `a`, 12.9 → 32.2 on prose). Only
+	// reachable with max_dfa_states raised past what the rows hold.
+	notesOverflow := !dfaTooLarge && needFindBody && !anchored && buildOpts.globals != nil && notesRowsOverflow(table)
+	if notesOverflow {
+		dfaTooLarge = true
+		slog.Warn("Pattern runs on Backtracking: its find automaton has more cycle states than per-search notes can cover",
+			"pattern", re.Pattern, "cycle_states", countCycleStates(table), "limit", maxNotesBytesPerPos*8,
+			"effect", "linear on every input, about 2.5x the cost on ordinary text",
+			"hint", "lower max_dfa_states or simplify the pattern to keep it on a DFA with notes")
+	}
 
 	// The real DFA-vs-Backtracking decision for the no-capture paths, recorded
 	// where it is MADE. An earlier version of --verbose asked SelectEngine
@@ -1761,6 +1965,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			rep.Limit("DFA table bytes", dfaTableBytes(table), memLimit)
 		case dfaHasAmbiguousBoundaryTarget(table):
 			rep.Engine(EngineBacktrack, "DFA has an ambiguous word-boundary target")
+		case notesOverflow:
+			rep.Engine(EngineBacktrack, "find automaton has more cycle states than per-search notes cover")
 		}
 	}
 
@@ -1877,9 +2083,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			p.dataBytes = append(p.dataBytes, parts.data...)
 			p.dataSegCount += parts.segs
 			p.findFallbackBody = parts.fallback
+			p.findFallbackMemoBody, p.findFallbackMemoCallOffs = parts.memoFallback, parts.memoCallOffs
 			p.setFind(parts.fast, parts.mode)
 			p.findFallbackCallOffs = parts.callOffs
 			p.tableEnd = parts.end
+			p.btSearch, p.btSearchG, p.btMemoBytes = parts.search, parts.searchG, parts.memoBytes
 		} else {
 			// Where today's literal-anchored tables start: a pattern the
 			// classifier sends to the start-anywhere find drops them again.
@@ -2092,11 +2300,18 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			strategy, why := p.chooseFindStrategy(re, table, l, lap, patMandLit, anchored, buildOpts)
 			if strategy == findNewSearch {
 				trial := &compiledPattern{}
-				if trial.buildStartAnywhereFind(re, cur, buildOpts) {
+				var nr *walkNotesReq
+				if buildOpts.globals != nil {
+					nr = &walkNotesReq{globals: buildOpts.globals, checkResume: true}
+				}
+				if trial.buildStartAnywhereFind(re, cur, buildOpts, nr) {
 					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
 					p.dataSegCount = segMark + trial.dataSegCount
 					p.clearLitAnchor()
 					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
+					if trial.saNotes != nil {
+						p.notes = &notesPlan{walk: trial.saNotes, search: buildOpts.globals.Search()}
+					}
 					p.startAnywhere = true
 					p.tableEnd = trial.tableEnd
 					saReplaced = true
@@ -2161,6 +2376,17 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					l.dominantStates = nil
 				}
 				l.lnmAction5 = buildOpts.LikelyMode == LikelyNoMatch
+				// Per-search notes for the plain find (search_notes.go): rows
+				// for the automaton's cycle states, placed above its tables and
+				// below the switch's, which are laid out from l.tableEnd next.
+				// The search global needs the module's allocator, so a compile
+				// without one keeps today's find.
+				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil &&
+					!isAnchoredFind(table) && buildOpts.globals != nil {
+					if l.notes = newNotesRows(table, l); l.notes != nil {
+						l.notesSearch = buildOpts.globals.Search()
+					}
+				}
 				// A switch builds the start-anywhere find FIRST, above today's
 				// tables, because whether it can be built decides whether today's
 				// body may carry the counter: a body that can answer the handover
@@ -2168,20 +2394,38 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				var sw *compiledPattern
 				if strategy == findSwitch && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 					sw = &compiledPattern{}
-					if sw.buildSwitchHandover(re, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts) {
+					var notesAt int32
+					if l.notes != nil {
+						notesAt = l.notes.bytes
+					}
+					if sw.buildSwitchHandover(re, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(notesAt, buildOpts)) {
 						l.switchN = switchNFor(buildOpts)
+						if sw.saNotes != nil && l.notes != nil {
+							// One record per position holds both automata's rows.
+							l.notes.stride = sw.saNotes.stride
+						}
 					} else {
 						sw = nil
 					}
 				}
 				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
-					fb, fmode, twin, twinPatch := appendFindCodeEntryTwinned(nil, l, table, patMandLit,
-						buildOpts.tableMemIdx)
-					p.setFind(fb, fmode)
-					p.findNeutralBody = twin
-					p.findTwinCallOff = twinPatch
-					if (twin != nil) != (twinPatch >= 0) {
+					e := buildFindCodeEntry(l, table, patMandLit, buildOpts.tableMemIdx)
+					p.setFind(e.body, e.mode)
+					p.findNeutralBody = e.twin
+					p.findTwinCallOff = e.twinPatch
+					if (e.twin != nil) != (e.twinPatch >= 0) {
 						panic("compile: find twin and its handoff call-site patch must be emitted together")
+					}
+					if e.marked != nil {
+						p.findMarkedBody = e.marked
+						p.findMarkedCallOff, p.findTwinMarkedCallOff, p.findMarkedBackOff = e.markedCall, e.twinMarkedCall, e.markedBack
+						p.notes = &notesPlan{find: l.notes, search: l.notesSearch}
+					}
+					if sw != nil && sw.saNotes != nil {
+						if p.notes == nil {
+							p.notes = &notesPlan{search: buildOpts.globals.Search()}
+						}
+						p.notes.walk = sw.saNotes
 					}
 				}
 
@@ -2198,6 +2442,10 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					p.dataBytes = append(p.dataBytes, rawData...)
 					p.dataSegCount += segCount
 				}
+				if p.findMarkedBody != nil {
+					p.dataBytes = append(p.dataBytes, l.notes.dataSegment()...)
+					p.dataSegCount++
+				}
 				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
 					p.tableEnd = l.tableEnd
 				}
@@ -2206,11 +2454,23 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				// module global for the backward walkers (and the alternation's
 				// forward verifiers) to stamp where they stopped, so a compile
 				// with no global allocator keeps today's body.
+				// Per-search notes for their forward walks, placed above their
+				// tables and below a switch's.
+				if (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) && buildOpts.globals != nil {
+					p.buildLitNotes(table, l, buildOpts)
+				}
 				if strategy == findSwitch && sw == nil && (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) &&
 					buildOpts.globals != nil {
 					sw = &compiledPattern{}
-					if sw.buildSwitchHandover(re, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts) {
+					if sw.buildSwitchHandover(re, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(p.notes.bytesPerPos(), buildOpts)) {
 						p.switchN = switchNFor(buildOpts)
+						if sw.saNotes != nil {
+							if p.notes == nil {
+								p.notes = &notesPlan{search: buildOpts.globals.Search()}
+							}
+							p.notes.walk = sw.saNotes
+							p.notes.setStride()
+						}
 						p.backStampP1 = int32(buildOpts.globals.Alloc()) + 1 //nolint:gosec // a global index
 						if p.litAnchorBackScanBody != nil {
 							p.litAnchorBackScanBody = buildLitAnchorBackScanBodyStamped(p.litAnchorRevL, p.litAnchorRevTable,
@@ -2229,6 +2489,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					// twin's budget counts its own part of the call, and its
 					// sentinel returns through the handoff to the dispatcher.
 					p.saFwdBody, p.saRevBody, p.saBT, p.saCtx = sw.saFwdBody, sw.saRevBody, sw.saBT, sw.saCtx
+					if sw.saBT != nil {
+						p.btSearch, p.btSearchG, p.btMemoBytes = sw.saBT.search, sw.saBT.searchG, sw.saBT.memoBytes
+					}
 					p.dataBytes = append(p.dataBytes, sw.dataBytes...)
 					p.dataSegCount += sw.dataSegCount
 					p.tableEnd = sw.tableEnd
@@ -2239,6 +2502,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					}
 				} else if strategy == findSwitch {
 					buildOpts.report().Note("find: switch unavailable — today's find kept")
+				}
+				if p.notes.altRows() != nil {
+					p.noteAltLitAnchorBranches(buildOpts.tableMemIdx)
 				}
 			}
 		}
@@ -2256,19 +2522,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 	p.groupsExport = re.GroupsFunc // only set when groups_func explicitly requested
 
-	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
-	if err != nil {
-		return nil, fmt.Errorf("parse error: %w", err)
-	}
+	// Neither can fail here: compile() above parsed this same string, and
+	// returned for an unsupported rune under these same ByteMode and Unicode
+	// options, on every path to this line. syntax.Compile never returns a
+	// non-nil error (see its stdlib source).
+	parsed, _ := syntax.Parse(re.Pattern, syntax.Perl)
 	prog, _ := syntax.Compile(parsed.Simplify())
-	// Mode-aware, unlike the strict predicate the optimisation guards use: this
-	// one decides whether the PATTERN compiles, and a byte-mode pattern's
-	// 0x80-0xFF runes are legal. Redundant with the check at the top of this
-	// function and kept anyway — it is the guard for the capture path, which
-	// reaches here through several early returns.
-	if bad := unsupportedRune(prog, buildOpts.ByteMode); bad >= 0 && !buildOpts.Unicode {
-		return nil, unsupportedRuneError(bad)
-	}
 
 	p.groupNames = extractGroupNames(parsed)
 
@@ -2400,25 +2659,16 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 		bt := newBacktrack(prog)
 
-		// Stack placed directly after all find-mode DFA and lit-anchor tables.
-		// p.tableEnd includes lit-anchor reversed-DFA and SIMD tables when active;
-		// using l.tableEnd would overlap those tables and corrupt them at runtime.
+		// Nothing is reserved in the tables for this body: its frame stack is
+		// placed at call time, in the run-time scratch region, and grows with the
+		// search (btGrowth) — and the fallback's memo and stack are sized at call
+		// time too (bt_scratch.go). The tables stay page-aligned, as they were
+		// when the stack sat directly after them.
 		btBase := utils.PageAlign(p.tableEnd)
 		numCapLocs := bt.numGroups * 2
 		frameSize := 4 + numCapLocs*4 + 4 // pos, captures, retryPC
-		maxFrames := bt.numAlts * 4096
-		if maxFrames < 4096 {
-			maxFrames = 4096
-		}
-		stackSize := maxFrames * frameSize
 
-		// The fallback's memo and stack are sized at call time
-		// (bt_scratch.go), so only the fast body's stack is reserved — and
-		// nothing when the fast body is the bare tail call.
 		plan := planBT(bt, buildOpts.BTWorkBudget)
-		if plan.force {
-			stackSize = 0
-		}
 
 		// Window mode: patterns whose assertions are defined against the
 		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
@@ -2435,11 +2685,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// eight bytes never decided a verdict.
 		needWindow := !anchored && (btHasWordBoundary(prog) || btHasTextLineAnchors(prog))
 
-		if err := checkBTMemoryBudget(btBase, int64(stackSize)); err != nil {
+		if err := checkBTMemoryBudget(btBase, 0); err != nil {
 			return nil, err
 		}
-		stackBase := int32(btBase)
-		stackLimit := stackBase + int32(stackSize)
 
 		// The window offsets are two module globals, so no table region is
 		// reserved for them any more.
@@ -2451,10 +2699,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			winGlobal = int32(buildOpts.globals.Alloc())
 			buildOpts.globals.Alloc() // endOff, at winGlobal+1
 		}
-		// Kept in int64: the reservation's end can pass 2GiB, where an int32
-		// would go negative and hide an over-ceiling reservation from the
-		// tableEnd bookkeeping.
-		p.tableEnd = utils.PageAlign(btBase + int64(stackSize))
+		p.tableEnd = btBase
 
 		p.numGroups = bt.numGroups
 		p.winGlobalP1 = winGlobal + 1
@@ -2470,17 +2715,51 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if plan.force {
 			p.captureBody, p.captureFallbackCallOffs = btTailCallBody(3)
 		} else {
-			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, stackBase, stackLimit, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil)
+			// The same scratch globals as the fallback: the two bodies share
+			// the region, one after the other.
+			growth := &btGrowth{
+				scratch: buildOpts.btScratch(),
+				start:   btStackStart(buildOpts.BTStackStart, int32(frameSize)),
+			}
+			bt.search = btSearchFor(&buildOpts)
+			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, growth)
+			if bt.search != nil {
+				p.btSearch, p.btSearchG = true, bt.search.g
+			}
+			bt.search = nil
 		}
 		if plan.fallback {
 			// The same globals and frame layout as the fast body; its own
 			// run-time memory.
 			scratch := buildOpts.btScratch()
-			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil)
+			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, nil)
 		}
 	}
 
 	return p, nil
+}
+
+// moduleDeclPages is the minimum a module's own memory declares: the pages its
+// tables span, plus, for a component, one for the allocator's free-list heads,
+// which sit at the static top and are written without a bounds check.
+func moduleDeclPages(memPages int32, component bool) int32 {
+	if component {
+		return memPages + 1
+	}
+	return memPages
+}
+
+// appendMemoryLimits appends one memory's limits: the minimum, and the maximum
+// when max_memory set one. With no maximum the bytes are the ones every module
+// has always had.
+func appendMemoryLimits(b []byte, minPages int32, maxPages uint32) []byte {
+	if maxPages == 0 {
+		b = append(b, 0x00) // flags: no maximum
+		return utils.AppendULEB128(b, uint32(minPages))
+	}
+	b = append(b, 0x01) // flags: a maximum follows
+	b = utils.AppendULEB128(b, uint32(minPages))
+	return utils.AppendULEB128(b, maxPages)
 }
 
 // assembleModule builds a single WASM module from multiple compiled patterns.
@@ -2533,6 +2812,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		postIdx = total + 2
 		firstAdapterIdx = total + 3
 		total += 3 + len(adapters)
+	}
+	// The embedded search setter (search_notes.go) is the last function.
+	searchG, searchKind := searchExportFor(globals, standalone, opts.Component)
+	searchSetterIdx := -1
+	if searchKind == searchExportSetter {
+		searchSetterIdx = total
+		total++
 	}
 
 	var out []byte
@@ -2604,6 +2890,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x01, 0x7F)
 		numTypes++
 	}
+	setterTypeIdx := -1
+	if searchSetterIdx >= 0 {
+		setterTypeIdx = numTypes
+		typeSection = append(typeSection, 0x60, 0x01, 0x7F, 0x00) // (i32)→()
+		numTypes++
+	}
 	typeSection[0] = byte(numTypes)
 	out = appendSection(out, 1, typeSection)
 
@@ -2656,6 +2948,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotLitAnchorFind:     0x01,
 		slotFind:              0x01,
 		slotFindNeutral:       0x01, // same (i32,i32)→i64 shape as the body it twins
+		slotFindMarked:        0x01,
 		slotCapture:           0x02, // (i32,i32,i32)→i32
 		slotGroupsWrapper:     0x02,
 		// A fallback has its fast body's signature.
@@ -2673,6 +2966,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		slotSARevCtx:          0x02,
 		slotSABT:              0x01,
 		slotSABTFallback:      0x01,
+		slotFindFallbackMemo:  0x01,
+		slotSABTFallbackMemo:  0x01,
 	}
 	var fs []byte
 	// `total` counts every function index INCLUDING the imported builtins; the
@@ -2705,20 +3000,17 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			}
 		}
 	}
+	if searchSetterIdx >= 0 {
+		fs = append(fs, byte(setterTypeIdx))
+	}
 	out = appendSection(out, 3, fs)
 
 	// Memory section: own memory for both standalone and embedded.
 	// standalone modules export it; embedded modules do not (wasm-merge renumbers).
 	{
 		var mem []byte
-		mem = append(mem, 0x01, 0x00)
-		declPages := memPages
-		if opts.Component {
-			// One page for the allocator's free-list heads, which sit at the
-			// static top and are written without a bounds check.
-			declPages++
-		}
-		mem = utils.AppendULEB128(mem, uint32(declPages))
+		mem = append(mem, 0x01) // one memory
+		mem = appendMemoryLimits(mem, moduleDeclPages(memPages, opts.Component), opts.MaxPages)
 		out = appendSection(out, 5, mem)
 	}
 
@@ -2746,6 +3038,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		callListGlobal = globals.AllocInit(0)
 	}
 	scratch, exportScratch := placeBTScratch(globals, staticTop, standalone, opts.Component)
+	// The module's own search state for callers that hand none over
+	// (default_search.go): its globals before the section is written.
+	assignDefaults(newDefaultModule(globals, standalone, opts.Component), patterns, nil)
 	if moduleUsesFindFrom(patterns) || globals.Count() > 1 {
 		out = appendSection(out, 6, globals.Section())
 	}
@@ -2756,6 +3051,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		numExports++
 	}
 	if exportScratch {
+		numExports++
+	}
+	if searchKind != searchExportNone {
 		numExports++
 	}
 	for _, p := range patterns {
@@ -2797,6 +3095,9 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	}
 	if exportScratch {
 		es = appendBTScratchExport(es, scratch)
+	}
+	if searchKind != searchExportNone {
+		es = appendSearchExport(es, searchKind, searchG, searchSetterIdx)
 	}
 	for i, p := range patterns {
 		base := baseIdx[i]
@@ -2917,7 +3218,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		// LNM non-mid bulk-skip helper body append was here —
 		// see archive Section 16.
 		if p.batchFindExport != "" {
-			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode)
+			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.defBatchFind)
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -2933,7 +3234,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal())
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups)
 			}
 		}
 		if p.hasFindFunc() {
@@ -2941,7 +3242,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen)
+			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen, p.defFind)
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -2954,7 +3255,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				anchoredOnly = p.captureFromMode == ffAnchoredZeroOnly
 			}
 			assertGroupsFromWrapperMode(p, anchoredOnly)
-			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly)
+			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly, p.defGroups)
 		}
 	}
 	if opts.Component {
@@ -2970,9 +3271,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			case adapterGroups:
 				cs = appendCodeEntry(cs, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
 			default:
-				cs = appendCodeEntry(cs, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal))
+				cs = appendCodeEntry(cs, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal))
 			}
 		}
+	}
+	if searchSetterIdx >= 0 {
+		cs = appendCodeEntry(cs, searchSetterBody(searchG))
 	}
 	out = appendSection(out, 10, cs)
 
@@ -3084,6 +3388,7 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 			cur = utils.PageAlign(p.tableEnd)
 		}
 	}
+	fillSearchSizes(compiled, opts.searchSizes)
 	if len(compiled) == 0 {
 		return nil, tableBase, nil
 	}
@@ -3092,7 +3397,15 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	if memPages < 1 {
 		memPages = 1
 	}
-	return assembleModule(compiled, memPages, standalone, globals, opts.asmOpts(nil)), lastTableEnd, nil
+	asm := opts.asmOpts(nil)
+	maxPages, err := memoryMaxPages(opts.MaxMemory, moduleDeclPages(memPages, opts.Component))
+	if err != nil {
+		return nil, 0, err
+	}
+	asm.MaxPages = maxPages
+	w := assembleModule(compiled, memPages, standalone, globals, asm)
+	opts.Report.noteModule(globals)
+	return w, lastTableEnd, nil
 }
 
 // CmdCompile compiles all regexp patterns (and optional sets) from cfg to a
@@ -3115,10 +3428,9 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 	outPath := output
 	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "output", outPath)
 
-	var rep *Reporter
-	if report != nil {
-		rep = &Reporter{}
-	}
+	// Always a Reporter: it only records, and WarnUnboundedMemory reads what
+	// the compile found. It is rendered only under --verbose.
+	rep := &Reporter{}
 
 	var wasmBytes []byte
 	if len(cfg.Sets) > 0 {
@@ -3128,13 +3440,12 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		if err != nil {
 			return fmt.Errorf("compile: %w", err)
 		}
-		if rep != nil {
-			rep.Sets = diags
-		}
+		rep.Sets = diags
 	} else {
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,
 			MaxTDFARegs:  cfg.MaxTDFARegs,
+			MaxMemory:    cfg.MaxMemory,
 			Report:       rep,
 		}
 		standalone := cfg.Output == ""
@@ -3145,6 +3456,12 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		}
 	}
 	rep.Render(report)
+	WarnUnboundedMemory(cfg, rep)
+	// An embedded module records the module name its stubs import from, which
+	// is what `regexped merge` names it by (abi.ImportModuleSection).
+	if cfg.Output != "" && cfg.ImportModule != "" {
+		wasmBytes = appendImportModuleSection(wasmBytes, cfg.ImportModule)
+	}
 
 	if outPath == "-" {
 		if _, err := os.Stdout.Write(wasmBytes); err != nil {
@@ -3394,10 +3711,8 @@ func BacktrackHasZeroWidthCycle(pattern string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("parse error: %w", err)
 	}
-	prog, err := syntax.Compile(re.Simplify())
-	if err != nil {
-		return false, err
-	}
+	// syntax.Compile never returns a non-nil error (see its stdlib source).
+	prog, _ := syntax.Compile(re.Simplify())
 	return progHasZeroWidthCycle(prog), nil
 }
 
@@ -3851,19 +4166,34 @@ func (p *compiledPattern) clearLitAnchor() {
 //
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32.
-func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode) []byte {
+//
+// def, when non-nil, is the export's default search state for a caller that
+// hands no block over (default_search.go).
+func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
 
 	var b []byte
-	// Locals: 2×i32 (pos, count), 1×i64 (r), 3×i32 (relStart, relEnd, prevEnd).
-	b = append(b, 0x03)
+	// Locals: 2×i32 (pos, count), 1×i64 (r), 3×i32 (relStart, relEnd, prevEnd)
+	// — and with a default, 3×i32 (area, scratch) and 2×i64 (sizes) after.
+	if def != nil {
+		b = append(b, 0x05)
+	} else {
+		b = append(b, 0x03)
+	}
 	b = append(b, 0x02, 0x7F)
 	b = append(b, 0x01, 0x7E)
 	b = append(b, 0x03, 0x7F)
+	dl := defLocals{a: 11, t: 12, s: 13, n: 14, n2: 15}
+	if def != nil {
+		b = append(b, 0x03, 0x7F, 0x02, 0x7E)
+	}
 
 	// pos = start_pos; count = 0; prevEnd = -1
 	b = append(b, 0x20, 0x04, 0x21, 0x05)
 	b = append(b, 0x41, 0x00, 0x21, 0x06)
 	b = append(b, 0x41, 0x7F, 0x21, 0x0A)
+	if def != nil {
+		b = def.emitEnter(b, 0, 1, 4, dl)
+	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $L
@@ -3934,14 +4264,27 @@ func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode) []byte {
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
+	if def != nil {
+		b = emitBatchWindow(b, def, dl, 0x06, 0x05)
+	}
 	b = append(b, 0x20, 0x06) // return count
 	b = append(b, 0x0B)       // end function
 	return b
 }
 
+// emitBatchWindow records a batch call's continuation for its default: the
+// next call starts where this one left off (pos), and a call that found
+// nothing ended the drive.
+func emitBatchWindow(b []byte, def *defaultSearch, l defLocals, count, pos byte) []byte {
+	return def.emitWindow(b, l,
+		func(b []byte) []byte { return append(b, 0x20, count, 0x41, 0x00, 0x4A) }, // count > 0
+		func(b []byte) []byte { return append(b, 0x20, pos) },
+		func(b []byte) []byte { return append(b, 0x20, pos) })
+}
+
 // appendBatchFindWrapperCodeEntry appends a size-prefixed batch find wrapper body to cs.
-func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode) []byte {
-	body := buildBatchFindWrapperBody(findFuncIdx, mode)
+func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
+	body := buildBatchFindWrapperBody(findFuncIdx, mode, def)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -3990,7 +4333,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -4001,16 +4344,28 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 
 	var b []byte
 	// Locals: 2×i32 (pos, count), 1×i64 (r), 9×i32 (relStart, relEnd,
-	// absStart, matchLen, recBase, capRes, adj, slotVal, prevEnd).
-	b = append(b, 0x03)
+	// absStart, matchLen, recBase, capRes, adj, slotVal, prevEnd) — and with
+	// a default (default_search.go), 3×i32 and 2×i64 after.
+	if def != nil {
+		b = append(b, 0x05)
+	} else {
+		b = append(b, 0x03)
+	}
 	b = append(b, 0x02, 0x7F)
 	b = append(b, 0x01, 0x7E)
 	b = append(b, 0x09, 0x7F)
+	dl := defLocals{a: 17, t: 18, s: 19, n: 20, n2: 21}
+	if def != nil {
+		b = append(b, 0x03, 0x7F, 0x02, 0x7E)
+	}
 
 	// pos = start_pos; count = 0; prevEnd = -1
 	b = append(b, 0x20, 0x04, 0x21, 0x05)
 	b = append(b, 0x41, 0x00, 0x21, 0x06)
 	b = append(b, 0x41, 0x7F, 0x21, 0x10)
+	if def != nil {
+		b = def.emitEnter(b, 0, 1, 4, dl)
+	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $L
@@ -4151,14 +4506,17 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x0B)       // end loop
 	b = append(b, 0x0B)       // end block $done
 
+	if def != nil {
+		b = emitBatchWindow(b, def, dl, 0x06, 0x05)
+	}
 	b = append(b, 0x20, 0x06) // return count
 	b = append(b, 0x0B)       // end function
 	return b
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

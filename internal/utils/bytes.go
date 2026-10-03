@@ -251,6 +251,38 @@ func ParseDataSectionBytes(raw []byte) (int64, error) {
 	return 0, nil
 }
 
+// CustomSection returns the payload of the first custom section named name in
+// a complete WASM binary, and whether there is one. Anything that is not a
+// well-formed module, or a section that runs past the end, reads as absent.
+func CustomSection(raw []byte, name string) ([]byte, bool) {
+	if len(raw) < 8 || string(raw[:4]) != "\x00asm" {
+		return nil, false
+	}
+	off := 8
+	for off < len(raw) {
+		sectionID := raw[off]
+		off++
+		secSize, n, err := DecodeULEB128(raw[off:])
+		if err != nil || secSize > uint64(len(raw)-off-n) {
+			return nil, false
+		}
+		off += n
+		sec := raw[off : off+int(secSize)]
+		off += int(secSize)
+		if sectionID != 0 {
+			continue
+		}
+		nameLen, m, err := DecodeULEB128(sec)
+		if err != nil || nameLen > uint64(len(sec)-m) {
+			return nil, false
+		}
+		if string(sec[m:m+int(nameLen)]) == name {
+			return sec[m+int(nameLen):], true
+		}
+	}
+	return nil, false
+}
+
 // ParseMemorySection returns the total byte size of the minimum memory
 // reservation (minPages × 64 KiB) across all memories in the section.
 // This represents the maximum address that the runtime may use at startup

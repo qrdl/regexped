@@ -1,0 +1,9 @@
+import_module: m
+wasm_file: x.wasm
+regexps:
+  - pattern: 'foo\w+bar|foo'
+sets:
+  - name: s
+    find: sfind
+    scan_all: sall
+    patterns: all

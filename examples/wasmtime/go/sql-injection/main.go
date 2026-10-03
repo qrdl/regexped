@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -73,4 +74,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, "parse_sqli:", err)
 		os.Exit(2)
 	}
+
+	fmt.Println("\n=== max_memory: a hostile value the cap stops ===")
+	// "UNION", 64 KiB of spaces, and no SELECT. `\s+` takes every space and
+	// then gives them back one at a time looking for SELECT, so the
+	// Backtracking engine needs a frame per space: past the stack the module
+	// reserves (about 50 KiB of spaces here) it grows memory for a frame stack
+	// and memo sized from the value — and the config's max_memory, 1 MiB, is
+	// barely above the module's own tables. The engine then stops and answers
+	// "unknown" instead of growing the module's memory further, and the stub
+	// reports that as ErrBacktrackOverflow. Unknown is NOT clean: a checker
+	// should reject such a value.
+	hostile := "UNION" + strings.Repeat(" ", 64<<10)
+	if _, _, err := is_sqli([]byte(hostile)); errors.Is(err, ErrBacktrackOverflow) {
+		fmt.Printf("  [unknown  ] %d-byte value: rejected, the search needed more than max_memory\n", len(hostile))
+	} else {
+		fmt.Fprintf(os.Stderr, "is_sqli: the hostile value was answered (err = %v); is max_memory set?\n", err)
+		os.Exit(2)
+	}
+	// The instance is unharmed: every search that fits still answers.
+	if _, matched, err := is_sqli([]byte("OR '1'='1")); err != nil || !matched {
+		fmt.Fprintln(os.Stderr, "is_sqli after the hostile value:", matched, err)
+		os.Exit(2)
+	}
+	fmt.Println("  [INJECTION] OR '1'='1   (the next search answers as before)")
 }

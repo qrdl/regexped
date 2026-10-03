@@ -2,6 +2,7 @@ package generate
 
 import (
 	"fmt"
+	"github.com/qrdl/regexped/compile"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -28,12 +29,18 @@ func goStub(cfg config.BuildConfig, out string) error {
 			break
 		}
 	}
-	singleBody, needsIter, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
+	sizes := searchSizesFor(cfg)
+	singleBody, needsIter, err := genGoStubsBodySized(cfg.Regexps, cfg.ImportModule, sizes)
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
 	shapes := newSetShapes(cfg)
 	setBody, setNeedsIter := genGoSetBody(cfg, shapes)
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			setBody = goSetWithBlocks(setBody, s.Find, sizes[s.Find].Blocks)
+		}
+	}
 	if singleBody == "" && setBody == "" {
 		return nil
 	}
@@ -280,7 +287,7 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			gateDecl += "\t\titer.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) + "\n" +
 				"\t\titer.scratch[1] = uint32(uintptr(unsafe.Pointer(&iter.gates[0])))\n"
 			cacheField := ""
-			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, allocated ONCE for the scan.
 				// Without one an overlapping drive is quadratic, and `find`
@@ -293,9 +300,9 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				// this arithmetic MUST match config.SetOverlapCheckpoint* —
 				// the sweep validates what it is handed.
 				cacheField = "\t// The overlapping answer cache; see docs/wasm.md.\n\tcache []uint32\n"
-				gateDecl += fmt.Sprintf(`		if iter.cache == nil {
-			m := uint64(len(iter.input)) + 1
-			row := uint64(%[5]d)
+				gateDecl += "\t\tif iter.cache == nil {\n\t\t\tm := uint64(len(iter.input)) + 1\n"
+				if sh.Eligible {
+					gateDecl += fmt.Sprintf(`			row := uint64(%[5]d)
 			cell := uint64(%[6]d)
 			k := m
 			if %[3]d+cell+4+m*row > %[4]d {
@@ -308,9 +315,38 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				}
 			}
 			nb := (m + k - 1) / k
-			if n := %[3]d + nb*cell + 4 + k*row; n <= %[4]d {
-				iter.cache = make([]uint32, (n+3)/4)
-				iter.cache[%[7]d] = uint32(k)
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+						consts.Row, consts.Cell)
+				} else {
+					// No answer cache, only the program sweep's part.
+					gateDecl += "\t\t\tk := uint64(1)\n"
+				}
+				cacheN := "%[1]d + nb*cell + 4 + k*row"
+				if !sh.Eligible {
+					cacheN = "uint64(%[1]d)" // the bare header
+				}
+				sweep := ""
+				if sh.SweepCells > 0 {
+					// The program sweep's part, after the cache's, checkpointed
+					// by the same formula over its own geometry.
+					sweep = fmt.Sprintf(`				srow, scell, sk := uint64(%[3]d), uint64(%[4]d), m
+				if %[1]d+scell+4+m*srow > %[2]d {
+					sk = uint64(math.Sqrt(float64(m) * %[5]d * 4 / float64(srow)))
+					if sk < 16 {
+						sk = 16
+					}
+					if sk > m {
+						sk = m
+					}
+				}
+				if sb := %[1]d + (m+sk-1)/sk*scell + 4 + sk*srow; sb <= %[2]d {
+					n = (n+7)&^7 + sb
+				}
+`, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+				}
+				gateDecl += fmt.Sprintf(`			if n := `+cacheN+`; n <= %[2]d {
+`+sweep+`				iter.cache = make([]uint32, (n+3)/4)
+				iter.cache[%[3]d] = uint32(k)
 			} else {
 				iter.cache = []uint32{}
 			}
@@ -321,8 +357,7 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			iter.scratch[2] = uint32(uintptr(unsafe.Pointer(&iter.cache[0])))
 			iter.scratch[3] = uint32(len(iter.cache) * 4)
 		}
-`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
-					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
+`, consts.Hdr, consts.Max, config.SetOverlapHdrStrideOff/4)
 			} else {
 				gateDecl += "\t\titer.scratch[2], iter.scratch[3] = 0, 0\n"
 			}
@@ -706,10 +741,19 @@ func (iter *%[1]sIter) Matches() iter.Seq[[]Span] {
 // genGoStubsBody returns the body (no header, no imports) for single-pattern stubs.
 // Returns (body string, needsIter bool).
 func genGoStubsBody(entries []config.RegexEntry, importModule string) (string, bool, error) {
+	return genGoStubsBodySized(entries, importModule, nil)
+}
+
+// genGoStubsBodySized is genGoStubsBody with each export's search block
+// (search_stub.go); nil sizes means none.
+func genGoStubsBodySized(entries []config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, bool, error) {
 	var parts []string
 	needsIter := false
+	if anySearchBlock(sizes) {
+		parts = append(parts, goSearchPreamble(importModule))
+	}
 	for _, re := range entries {
-		part, err := genGoStubsForEntry(re, importModule)
+		part, err := genGoStubsForEntrySized(re, importModule, sizes)
 		if err != nil {
 			return "", false, err
 		}
@@ -743,8 +787,9 @@ func genGoStubFile(entries []config.RegexEntry, importModule, pkgName string) (s
 	return sb.String(), nil
 }
 
-// genGoStubsForEntry generates the Go stub content for a single regexp entry.
-func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, error) {
+// genGoStubsForEntrySized generates the Go stub content for a single regexp
+// entry, with each export's search block; nil sizes means none.
+func genGoStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -753,7 +798,8 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		written = true
 	}
 	if re.FindFunc != "" {
-		out += genGoFindStub(importModule, re.FindFunc)
+		out += goWithSearch(genGoFindStub(importModule, re.FindFunc), re.FindFunc, "ffi_"+re.FindFunc,
+			sizes[re.FindFunc], false)
 		written = true
 	}
 	if re.GroupsFunc != "" {
@@ -761,7 +807,8 @@ func genGoStubsForEntry(re config.RegexEntry, importModule string) (string, erro
 		if err != nil {
 			return "", err
 		}
-		out += genGoGroupsStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups)
+		out += goWithSearch(genGoGroupsStub(importModule, re.GroupsFunc, re.GroupsExportName(), true, numGroups),
+			re.GroupsFunc, "ffi_"+re.GroupsExportName(), sizes[re.GroupsFunc], true)
 		out += genGoGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups)
 		written = true
 	}

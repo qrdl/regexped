@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 )
@@ -29,7 +30,7 @@ func jsStub(cfg config.BuildConfig, out string) error {
 
 // genJSSetSection returns JS set wrappers appended to the module body.
 // Called from genJSStubFile's inner builder when cfg.Sets is non-empty.
-func genJSSetSection(cfg config.BuildConfig) string {
+func genJSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize) string {
 	if !hasSetExports(cfg) {
 		return ""
 	}
@@ -364,7 +365,14 @@ export function %s(input, from = 0) {
 		}
 		out.WriteString("];\nexport function patternName(id) { return _patternNames[id] ?? ''; }\n")
 	}
-	return out.String()
+	// Split members' search blocks (search_stub.go).
+	section := out.String()
+	for _, s := range cfg.Sets {
+		if s.Find != "" {
+			section = jsSetWithBlocks(section, s.Find, sizes[s.Find].Blocks, false)
+		}
+	}
+	return section
 }
 
 // genJSStubFile generates the content of an ES module JS stub that exports
@@ -507,24 +515,31 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("}\n\n")
 
 	}
+	// Each find/groups export's per-search block, if its pattern keeps notes
+	// (search_stub.go).
+	sizes := searchSizesFor(cfg)
+	if hasSuspendableExports(cfg) && anySearchBlock(sizes) {
+		sb.WriteString(jsSearchHelpers(false, sizes))
+	}
 	for _, re := range cfg.Regexps {
 		if re.MatchFunc != "" {
 			sb.WriteString(genJSMatchFunc(re.MatchFunc))
 		}
 		if re.FindFunc != "" {
-			sb.WriteString(genJSFindFunc(re.FindFunc))
+			sb.WriteString(jsWithSearch(genJSFindFunc(re.FindFunc), re.FindFunc, sizes[re.FindFunc], false, false, 0))
 		}
 		if re.GroupsFunc != "" {
 			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
 			if err != nil {
 				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
 			}
-			sb.WriteString(genJSGroupsFunc(re.GroupsFunc, numGroups))
+			sb.WriteString(jsWithSearch(genJSGroupsFunc(re.GroupsFunc, numGroups), re.GroupsFunc,
+				sizes[re.GroupsFunc], false, true, numGroups*2*4))
 			sb.WriteString(genJSGroupIndices(re.GroupsFunc, numGroups, namedGroups))
 		}
 	}
 
-	sb.WriteString(genJSSetSection(cfg))
+	sb.WriteString(genJSSetSection(cfg, sizes))
 	return sb.String(), nil
 }
 
@@ -824,14 +839,15 @@ func jsFindGateRegion(s config.SetConfig, cfg config.BuildConfig, idN int) int {
 // call, the post-open seeding, and the descriptor's cache arguments.
 func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre, dest, reserve, post, args string) {
 	args = "0, 0"
-	if !s.Overlapping || !sh.Eligible {
+	if !s.Overlapping || !sh.Offered() {
 		return pre, dest, reserve, post, args
 	}
 	// The sweep column's width comes from the compiler — the set is recompiled
 	// to learn it — and is baked in as a constant; everything else is
 	// arithmetic on the input length, which only exists at call time.
 	k := overlapCacheConstsFor(sh)
-	pre = fmt.Sprintf(`    // [stride, bytes] of the answer cache for an input of _len bytes; _open
+	if sh.Eligible {
+		pre = fmt.Sprintf(`    // [stride, bytes] of the answer cache for an input of _len bytes; _open
     // calls it with the count the input actually took.
     const _cacheFor = (_len) => {
         const _m = _len + 1;
@@ -848,10 +864,38 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
         }
         const _nb = Math.ceil(_m / _k);
         const cacheNeeded = %[6]d + _nb * _cell + 4 + _k * _row;
-        const cacheBytes = cacheNeeded <= %[4]d ? cacheNeeded : 0;
+`, k.Row, k.Cell, k.Base, k.Max, k.Cells, k.Hdr)
+	} else {
+		// No answer cache, only the program sweep's part: the cache's is its
+		// bare header.
+		pre = fmt.Sprintf(`    // [stride, bytes] of the region for an input of _len bytes; _open calls it
+    // with the count the input actually took.
+    const _cacheFor = (_len) => {
+        const _m = _len + 1;
+        const _k = 1;
+        const cacheNeeded = %d;
+`, k.Hdr)
+	}
+	if sh.SweepCells == 0 {
+		pre += fmt.Sprintf(`        const cacheBytes = cacheNeeded <= %[1]d ? cacheNeeded : 0;
         return [_k, cacheBytes];
     };
-`, k.Row, k.Cell, k.Base, k.Max, k.Cells, k.Hdr)
+`, k.Max)
+	} else {
+		// The program sweep's part, after the cache's, checkpointed by the
+		// same formula over its own geometry.
+		pre += fmt.Sprintf(`        if (cacheNeeded > %[2]d) return [_k, 0];
+        let _sk = _m;
+        if (%[1]d + %[4]d + 4 + _m * %[3]d > %[2]d) {
+            _sk = Math.floor(Math.sqrt(_m * %[5]d * 4 / %[3]d));
+            if (_sk < 16) _sk = 16;
+            if (_sk > _m) _sk = _m;
+        }
+        const _sb = %[1]d + Math.ceil(_m / _sk) * %[4]d + 4 + _sk * %[3]d;
+        return [_k, _sb <= %[2]d ? Math.ceil(cacheNeeded / 8) * 8 + _sb : cacheNeeded];
+    };
+`, k.Hdr, k.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+	}
 	// _open returns the cache it could actually reserve — 0 when a memory
 	// ceiling refused the grow — and the stride it was sized with.
 	dest = ", cacheBytes, _k"

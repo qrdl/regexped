@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -856,8 +858,13 @@ func TestCComponentInitReadsNoPriorState(t *testing.T) {
 			t.Errorf("module _init reads prior state (%q):\n%s", banned, minit)
 		}
 	}
-	if mfree := cFunctionBody(t, mc, "void scan_ov_free("); !strings.Contains(mfree, "if (s->cache) { free(s->cache); s->cache = 0;") {
-		t.Errorf("module _free does not free and clear the cache:\n%s", mfree)
+	// _free frees only a cache the scanner allocated — a buffer handed over
+	// through _set_cache is the caller's — and clears the fields either way.
+	mfree := cFunctionBody(t, mc, "void scan_ov_free(")
+	for _, want := range []string{"if (s->cache_own) free(s->cache);", "s->cache = 0; s->cache_words = 0; s->cache_own = 0;"} {
+		if !strings.Contains(mfree, want) {
+			t.Errorf("module _free is missing %q:\n%s", want, mfree)
+		}
 	}
 }
 
@@ -1125,7 +1132,7 @@ func TestWitSetKebabPanicsOnDisagreement(t *testing.T) {
 // trio. The declarations are the module stub's, checked by the header-parity test.
 func TestCComponentSetParts(t *testing.T) {
 	cfg0 := setStubCfg()
-	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets", newSetShapes(cfg0))
+	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets", newSetShapes(cfg0), searchSizesFor(cfg0))
 	for _, want := range []string{
 		"#define S_PATTERN_COUNT 2",
 		"#define S_ID_SPACE 2",
@@ -1165,7 +1172,7 @@ func TestCComponentSetParts(t *testing.T) {
 
 	cfg := setStubCfg()
 	cfg.Sets = nil
-	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets", newSetShapes(cfg)); h != "" || c != "" {
+	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets", newSetShapes(cfg), searchSizesFor(cfg)); h != "" || c != "" {
 		t.Errorf("genCComponentSetParts(no sets) = %q/%q, want empty", h, c)
 	}
 }
@@ -1610,3 +1617,93 @@ int external(void) {
     return 0;
 }
 `
+
+// TestCComponentSearchNotesEndToEnd drives a component's find and groups
+// RESOURCES whose patterns keep per-search notes (docs/wasm.md, "The search
+// block") over input that makes every `next` read to the end: `a*b|a` and
+// `(x)(?:[a-z]*y)?` over 200 KB of one letter. Inside a component the resource
+// keeps the block in its representation, hands it over before every call and
+// allocates the notes itself — hand-emitted WASM that nothing else runs. Without
+// notes the two drives take about 90 s of wasmtime and with them well under
+// one; the timeout is the verdict, and the guest checks every match.
+func TestCComponentSearchNotesEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a composed component; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi: the component resources are not driven here")
+	}
+	for _, tool := range []string{"go", "wasm-tools", "wac", "wasmtime"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH: the component resources are not driven here", tool)
+		}
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `wasm_format: component
+wit_package: notes
+import_module: notes
+wasm_file: notes.wasm
+output: composed.wasm
+stub_file: stub.h
+regexps:
+  - pattern: 'a*b|a'
+    find_func: overrun
+  - pattern: '(x)(?:[a-z]*y)?'
+    groups_func: greedy
+`)
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	consumer, err := os.ReadFile(filepath.Join(dir, "wit", "consumer.wit"))
+	if err != nil {
+		t.Fatalf("generate wrote no consumer world: %v", err)
+	}
+	cw := string(consumer)
+	end := strings.LastIndex(cw, "}")
+	write(filepath.Join("wit", "consumer.wit"), cw[:end]+"    export drive: func() -> s32;\n"+cw[end:])
+	write("main.c", `#include "stub.h"
+static char as[200000], xs[200000];
+__attribute__((export_name("drive"))) int drive(void) {
+    int n = 200000;
+    for (int i = 0; i < n; i++) { as[i] = 'a'; xs[i] = 'x'; }
+    rx_overrun_iter_t f; rx_match_t m; int i = 0, st;
+    if (overrun_init(&f, as, n, 0) != 0) return 1;
+    while ((st = overrun_next(&f, &m)) == 1) { if (m.start != i || m.end != i + 1) return 2; i++; }
+    overrun_free(&f);
+    if (st != 0 || i != n) return 3;
+    rx_greedy_iter_t g; rx_group_t gs[GREEDY_GROUPS]; int j = 0;
+    if (greedy_init(&g, xs, n, 0) != 0) return 4;
+    while ((st = greedy_next(&g, gs)) == 1) { if (gs[0].start != j || gs[1].end != j + 1) return 5; j++; }
+    greedy_free(&g);
+    if (st != 0 || j != n) return 6;
+    return 0;
+}
+`)
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry", "-DRX_SET_CACHE=0",
+		"-o", "core.wasm", "main.c", "stub.c")
+	run(t, dir, nil, "wasm-tools", "component", "embed", "wit", "core.wasm",
+		"--world", "notes-consumer", "-o", "embedded.wasm")
+	run(t, dir, nil, "wasm-tools", "component", "new", "embedded.wasm", "-o", "guest.wasm")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "notes.wasm")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wasmtime", "run", "--invoke", "drive()", "composed.wasm")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("the drives did not finish in 20 s: quadratic, the resources keep no notes\n%s", out)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != "0" {
+		t.Fatalf("drive(): %v\n%s (the number is the failing check)", err, out)
+	}
+}

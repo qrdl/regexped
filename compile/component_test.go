@@ -2,6 +2,7 @@ package compile
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -620,8 +621,8 @@ func TestSetAdapterBodyFraming(t *testing.T) {
 		// shapes are checked: the arithmetic is emitted only when the set has a
 		// sweep, and an empty or malformed body would be invisible otherwise.
 		{"constructor (with cache)", buildSetScannerCtorBody(setScannerCtor{reallocIdx: 9, callListGlobal: 1, idSpace: 12, cells: 33, pats: 3})},
-		{"next", buildSetScannerNextBody(9, 3, 12)},
-		{"dtor", buildSetScannerDtorBody(10)},
+		{"next", buildSetScannerNextBodyBlocks(9, 3, 12, nil, 0, 0)},
+		{"dtor", buildSetScannerDtorBodyBlocks(10, nil)},
 	} {
 		if len(c.body) == 0 {
 			t.Errorf("%s: empty body", c.name)
@@ -641,7 +642,7 @@ func TestSetAdapterBodyUnknownKindPanics(t *testing.T) {
 			t.Error("an unknown adapter kind returned silently")
 		}
 	}()
-	buildSetAdapterBody(setAdapter{kind: setAdapterKind(99)}, 1, 2, 3)
+	buildSetAdapterBody(setAdapter{kind: setAdapterKind(99)}, 1, 2, 3, 4)
 }
 
 // TestSetComponentMixedWithPatterns is the case that had NO test and was broken:
@@ -888,7 +889,7 @@ func TestPatternAdapterBodyUnknownKindPanics(t *testing.T) {
 			t.Error("a function-shaped kind reached the resource dispatcher without a panic")
 		}
 	}()
-	buildPatternAdapterBody(componentAdapter{kind: adapterMatch}, 0, 0, 0)
+	buildPatternAdapterBody(componentAdapter{kind: adapterMatch}, 0, 0, 0, 0)
 }
 
 func TestPatRepSize(t *testing.T) {
@@ -929,5 +930,65 @@ func TestOrderedPatternResources(t *testing.T) {
 	}
 	if got := orderedPatternResources(compiled, flipped, 0); len(got) != 0 {
 		t.Errorf("contradicting Groups flags: got %d resources, want none", len(got))
+	}
+}
+
+// TestComponentResourcesWithSearchBlocks builds the component adapters for
+// searches that keep a block — per-search notes, and the Backtracking budget
+// with its kept memo — on a find and a groups resource each, and for sets whose
+// split members keep blocks of their own (one with notes, one on the
+// Backtracking find). The emitters that hand a block over, give it notes or a
+// memo and free them in the dtor are reached only here inside this package;
+// tools/fuzz drives them at run time.
+func TestComponentResourcesWithSearchBlocks(t *testing.T) {
+	entries := []config.RegexEntry{
+		{Pattern: `a*b|a`, FindFunc: "overrun_find"},
+		{Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+		{Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+		{Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
+	}
+	wasm, _, err := Compile(entries, 0, true, CompileOptions{
+		Component:                 true,
+		ComponentPackage:          "regexped:test/matcher",
+		ComponentExportNames:      matchOnlyNames(entries),
+		ComponentPatternResources: patternResourceNames(entries),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, wasm)
+	for _, want := range []string{
+		"regexped:test/matcher#[constructor]overrun-find", "regexped:test/matcher#[dtor]overrun-groups",
+		"regexped:test/matcher#[method]bt-find.next", "regexped:test/matcher#[dtor]bt-groups",
+	} {
+		if !strings.Contains(string(wasm), want) {
+			t.Errorf("export %q missing from the module", want)
+		}
+	}
+
+	for _, c := range []struct {
+		name string
+		mfs  int
+		pats []string
+	}{
+		{"split member with notes", 0, []string{`foo\w+bar|foo`, `AKIA[A-Z0-9]{16}`}},
+		{"split member on the Backtracking find", 3, []string{`\w+@\w+`, `ghp_[0-9a-zA-Z]{36}`}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "t", WitPackage: "t",
+				MaxFallbackStates: c.mfs,
+				Sets:              []config.SetConfig{{Name: "s", Patterns: config.PatternSelector{All: true}, Find: "scan_it"}}}
+			for i, p := range c.pats {
+				cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Name: "p" + strconv.Itoa(i), Pattern: p})
+			}
+			sz, err := SearchSizes(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b := sz["scan_it"].Blocks; len(b) == 0 || (b[0].NotesBytes == 0 && b[0].BTMemoBytes == 0) {
+				t.Fatalf("blocks = %+v: the set keeps nothing these adapters give", b)
+			}
+			buildSetComponent(t, cfg)
+		})
 	}
 }

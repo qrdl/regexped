@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 )
@@ -33,10 +34,13 @@ import (
 // every kebab name here is one the WIT document also contains and nothing can
 // fail. Re-deriving them from the config would add an error branch for a failure
 // witSets has already ruled out.
-func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string, shapes *setShapes) (hPart, cPart string) {
+func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string, shapes *setShapes, sizes map[string]compile.SearchSize) (hPart, cPart string) {
 	if len(wsets) == 0 {
 		return "", ""
 	}
+	// The module header's scanner carries the split members' search blocks
+	// (sizes, from the caller's one compile); the identical header here
+	// carries them unused (the resource keeps its own inside the component).
 	var hb, cb strings.Builder
 
 	for si, s := range cfg.Sets {
@@ -46,21 +50,26 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		idKonst := screamingCase(s.Name) + "_ID_SPACE"
 		idN := idSpaceSize(s, cfg)
 		scannerType := "rx_" + setConstBase(s.Name) + "_scanner_t"
-		gateField := fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[4];\n", idKonst)
+		var blocks []compile.SearchSize
+		if s.Find != "" {
+			blocks = sizes[s.Find].Blocks
+		}
+		gateField := cSetGateField(idKonst, len(blocks))
 		// The two answer-cache fields the MODULE header declares for a
 		// cache-eligible overlapping set. They stay zero here — the resource
 		// owns the cache, inside the component — but the struct is part of the
 		// PUBLIC header, and the two formats promise an identical one. Omitting
 		// them made the headers differ for exactly the configs the parity test
 		// did not cover.
-		if sh := shapes.cacheShape(si); s.Overlapping && sh.Eligible && s.Find != "" {
+		if sh := shapes.cacheShape(si); s.Overlapping && sh.Offered() && s.Find != "" {
 			// Byte-for-byte what c_stub.go emits, comments included: the parity
 			// test compares header TEXT, and a field that explains itself
 			// differently in the two formats is a difference. They are simply
 			// unused here — the resource inside the component owns the cache —
 			// and a caller never touches them in either format.
-			gateField += "    unsigned *cache;\n    size_t cache_words;\n"
+			gateField += cSetCacheFields
 		}
+		gateField += cSetBlockFields(blocks)
 
 		hb.WriteString(cSetConstDecls(s.Name, konst, idKonst, n, idN))
 
@@ -83,6 +92,8 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 			case "find":
 				hb.WriteString(cSetScannerDecls(c.Name, konst, gateField, scannerType))
 				cb.WriteString(cComponentSetFindBody(setsImportModule, kebab, c.Name, scannerType, konst))
+				cb.WriteString(cSetNoCacheAPI(c.Name, scannerType))
+				cb.WriteString(cNotesPairNoop(c.Name, scannerType))
 			}
 		}
 	}

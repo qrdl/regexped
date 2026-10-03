@@ -2,6 +2,7 @@ package benchshim
 
 import (
 	"encoding/binary"
+	"github.com/qrdl/regexped/internal/abi"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +68,51 @@ func TestSetFindShim(t *testing.T) {
 		if _, ok := exports[name]; !ok {
 			t.Errorf("missing export %q (have %v)", name, exports)
 		}
+	}
+}
+
+// TestSearchDriveShims covers the two shims that hand a per-search block over:
+// they import the regexped module's memory and its `regexped:search` global as
+// well as the export, and re-export the memory for WASI.
+func TestSearchDriveShims(t *testing.T) {
+	for _, s := range []struct {
+		name  string
+		build func() []byte
+	}{{"find", BuildFindSearch}, {"groups", BuildGroupsSearch}} {
+		t.Run(s.name, func(t *testing.T) {
+			mod := s.build()
+			if argv := wasmValidator(); argv != nil {
+				path := filepath.Join(t.TempDir(), "search.wasm")
+				if err := os.WriteFile(path, mod, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				cmd := exec.Command(argv[0], append(append([]string{}, argv[1:]...), path)...)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%s search shim fails %s: %v\n%s", s.name, argv[0], err, out)
+				}
+			}
+			want := [][2]string{
+				{"wasi_snapshot_preview1", "clock_time_get"},
+				{"regexped", s.name},
+				{"regexped", "memory"},
+				{"regexped", abi.SearchExport},
+			}
+			imports := decodeImports(t, mod)
+			if len(imports) != len(want) {
+				t.Fatalf("imports = %v, want %v", imports, want)
+			}
+			for i, w := range want {
+				if imports[i] != w {
+					t.Errorf("import %d = %v, want %v", i, imports[i], w)
+				}
+			}
+			exports := decodeExports(t, mod)
+			for _, name := range []string{"memory", "bench"} {
+				if _, ok := exports[name]; !ok {
+					t.Errorf("missing export %q (have %v)", name, exports)
+				}
+			}
+		})
 	}
 }
 
@@ -281,8 +327,10 @@ func decodeImports(t *testing.T, mod []byte) [][2]string {
 				}
 				p += w
 			}
+		case 0x03: // global (the search shims'): value type, mutability
+			p += 2
 		default:
-			t.Fatalf("import %s.%s has kind %d; the shims import only functions and a memory", mod, name, kind)
+			t.Fatalf("import %s.%s has kind %d; the shims import only functions, a memory and a global", mod, name, kind)
 		}
 		out = append(out, [2]string{mod, name})
 	}

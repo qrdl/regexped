@@ -100,8 +100,16 @@ func main() {
 	highByteCheck := flag.Bool("high-bytes-check-corpus", false, "with --high-bytes, also cross-check the corpus's own columns against the twin oracle. Sound ONLY for a corpus whose expectations were written for a BYTE engine (custom-tests.txt); the RE2-derived corpora carry UTF-8 answers that legitimately differ")
 	allMatches := flag.Bool("all-matches", false, "synthesise col4 (EVERY match) from a Go oracle for rows whose corpus line has no such column, so later matches are checked and not just the first. re2-exhaustive.txt has four columns, so without this only one match per row is ever verified")
 	highBytes := flag.Bool("high-bytes", false, "stop skipping corpus inputs that contain bytes above 0x7F: judge them against a Go oracle run on an ASCII twin of the input (see highbytes.go). The corpus columns come from RE2, which decodes UTF-8, and cannot judge a byte engine on such input")
+	searchBlock := flag.String("search-block", "fresh", "per-search block handed to find and groups (see internal/abi): off = none, the search global left at 0; fresh = a zeroed block per drive and notes allocated when it arms, as a generated stub does; armed = a block ARMED before the first call, so the MARKED copy of every find with notes answers every call — the comparison of the two copies over the corpus")
 	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the alt-prefixed find body, the alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
+	switch *searchBlock {
+	case "off", "fresh", "armed":
+		searchMode = *searchBlock
+	default:
+		fmt.Fprintf(os.Stderr, "--search-block must be off, fresh or armed, got %q\n", *searchBlock)
+		os.Exit(2)
+	}
 
 	if flag.NArg() < 1 {
 		fmt.Fprintf(os.Stderr, "usage: %s [options] <test-file>\n", os.Args[0])
@@ -377,7 +385,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			if btFallbackAlways {
 				compileOpts.BTWorkBudget = compile.BTWorkBudgetForceFallback
 			}
-			wasmBytes, _, compErr := compile.CompileForced([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
+			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -410,6 +418,9 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				memory = exp.Memory()
 			}
 			findMemory = memory
+			if err := beginSearchRegion(store, inst, memory, searchSizes, testStrings); err != nil {
+				return fmt.Errorf("%s:%d: %q: %w", testFile, lineno, pattern, err)
+			}
 			isCompiledDFA = !forceBacktrack && (engineType == compile.EngineCompiledDFA)
 
 			if re.GroupsFunc != "" {
@@ -648,6 +659,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				if findFn == nil {
 					skipCount[skipNonAnchored]++
 				} else {
+					curSearch.begin(store, len(text))
 					got, callErr := callFind(wd, store, findFn, findMemory, text, 0)
 					if callErr != nil {
 						if errors.Is(callErr, errBTOverflow) {
@@ -804,6 +816,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					var gotAll [][2]int
 					offset := 0
 					prevEnd := -1
+					curSearch.begin(store, len(text))
 					for offset <= len(text) {
 						r, callErr := callFind(wd, store, findFn, findMemory, text, offset)
 						if callErr != nil {
@@ -945,6 +958,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 					offset := int32(0)
 					prevEnd := int32(-1)
 					textLen := int32(len(text))
+					curSearch.begin(groupsStore, int(textLen))
 					for offset <= textLen {
 						endPos, slots, callErr := callGroupsAt(wd, groupsStore, groupsFn, groupsMemory, inputBase, textLen, offset, numGroups)
 						if callErr != nil {
@@ -1060,6 +1074,13 @@ done:
 		// something a reader comparing totals across runs has to be able to see.
 		fmt.Printf("  %-38s %d\n", "high-byte inputs (--high-bytes):", nHighByte)
 	}
+	if searchDrives > 0 {
+		// Drives that carried a per-search block: a run where this is 0 has not
+		// exercised either copy of a find with notes.
+		fmt.Printf("  %-38s %d\n", "drives with a search block ("+searchMode+"):", searchDrives)
+		fmt.Printf("  %-38s %d\n", "  of them given notes:", notesDrives)
+		fmt.Printf("  %-38s %d\n", "  of them given a Backtracking memo:", memoDrives)
+	}
 	fmt.Printf("failed:  %d\n", nfail)
 	if nDataErrors > 0 {
 		fmt.Printf("data errors (--validate-go): %d\n", nDataErrors)
@@ -1115,6 +1136,16 @@ done:
 	}
 	if setGateFailures > 0 {
 		return fmt.Errorf("%d set run-level gate(s) failed", setGateFailures)
+	}
+	// An armed run that handed out no notes (no Backtracking memo under
+	// --force-backtrack, where the finds keep none) compared nothing.
+	if searchMode == "armed" {
+		if forceBacktrack && memoDrives == 0 {
+			return fmt.Errorf("--search-block=armed --force-backtrack gave no drive a Backtracking memo")
+		}
+		if !forceBacktrack && notesDrives == 0 {
+			return fmt.Errorf("--search-block=armed gave no drive notes")
+		}
 	}
 	return nil
 }
@@ -1444,12 +1475,16 @@ func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmt
 		buf := mem.UnsafeData(store)
 		copy(buf[inputBase:], text)
 	}
+	curSearch.before(store)
 	result, err := fn.Call(store, inputBase, int32(len(text)), int32(from))
 	if err != nil {
 		return 0, err
 	}
 	if result.(int64) == abi.BTStackOverflow {
 		return 0, errBTOverflow
+	}
+	if result.(int64) >= 0 {
+		curSearch.after(store)
 	}
 	return result.(int64), nil
 }
@@ -1474,6 +1509,8 @@ func callGroups(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *was
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
+	curSearch.begin(store, len(text))
+	curSearch.before(store)
 	result, err := fn.Call(store, inputBase, int32(len(text)), slotsBase, int32(0))
 	if err != nil {
 		return 0, nil, err
@@ -1519,6 +1556,7 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 	}
 	wd.Arm(store)
 	defer wd.Disarm()
+	curSearch.before(store)
 	result, err := fn.Call(store, ptr, length, slotsBase, from)
 	if err != nil {
 		return 0, nil, err
@@ -1530,6 +1568,7 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 	if endPos < 0 {
 		return -1, nil, nil
 	}
+	curSearch.after(store)
 	buf = mem.UnsafeData(store)
 	slots := make([]int32, numGroups*2)
 	for i := range slots {

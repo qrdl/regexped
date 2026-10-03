@@ -146,9 +146,11 @@ func (cs *compiledSet) hasBTMember() bool { return cs.numBTFns > 0 }
 //     negative.
 //
 // CONDITIONAL, deliberately: a set with no BT member keeps the cheap i64 form
-// untouched, so nothing that exists today changes shape.
+// untouched, so nothing that exists today changes shape. The one exception is
+// a caller's decision (forceWideAll): a set whose scan pair forwards to an
+// internal copy takes the copy's form, so the two agree.
 func (cs *compiledSet) wideAll() bool {
-	return cs.idSpaceSize() > wideBitmapThreshold || cs.hasBTMember() || cs.btSplit
+	return cs.idSpaceSize() > wideBitmapThreshold || cs.hasBTMember() || cs.btSplit || cs.forceWideAll
 }
 
 // emitWideBitmapSet emits the wide `_all` read-modify-write: set the bit for

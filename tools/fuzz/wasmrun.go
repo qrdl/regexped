@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 )
 
 // errBTOverflow reports that an export returned abi.BTStackOverflow: the
@@ -43,10 +45,22 @@ const (
 // non-anchored find function, with no captures — the DFA/Compiled DFA find
 // body (Layer 1's target).
 func compileFind(pat string) ([]byte, error) {
-	return cachedCompile("find\x00"+pat, func() ([]byte, error) {
+	w, _, err := compileFindSized(pat)
+	return w, err
+}
+
+// compileFindSized is compileFind plus what the find export's searches keep.
+func compileFindSized(pat string) ([]byte, []searchblock.Size, error) {
+	return compileFindOpts("find\x00"+pat, pat, tableBase, compile.CompileOptions{})
+}
+
+// compileFindOpts compiles pat's find export under opts, cached under key, with
+// what its searches keep.
+func compileFindOpts(key, pat string, base int64, opts compile.CompileOptions) ([]byte, []searchblock.Size, error) {
+	return cachedCompileSized(key, func() ([]byte, []searchblock.Size, error) {
 		entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-		wasmBytes, _, err := compile.Compile([]config.RegexEntry{entry}, tableBase, true)
-		return wasmBytes, err
+		w, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{entry}, base, true, 0, opts)
+		return w, searchblock.Of(sizes["find"]), err
 	})
 }
 
@@ -196,4 +210,72 @@ func (w *watchdog) Disarm() { w.disarm <- struct{}{} }
 // isTimeout reports whether a wasmtime error is an epoch interruption.
 func isTimeout(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "interrupt")
+}
+
+// searchRegion is one instance's block, notes and memo, at the end of its
+// memory, with the scratch base raised above them, handed over through the
+// shared helper (internal/searchblock) as a generated stub does. nil when the
+// module takes no block or the mode is Off; every method is a no-op on nil.
+type searchRegion struct {
+	global  *wasmtime.Global
+	mem     *wasmtime.Memory
+	blocks  *searchblock.Blocks
+	textLen int
+}
+
+func newSearchRegion(store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, textLen int, sizes []searchblock.Size, mode searchblock.Mode) (*searchRegion, error) {
+	exp := inst.GetExport(store, abi.SearchExport)
+	if exp == nil || exp.Global() == nil {
+		return nil, nil
+	}
+	at := (int64(mem.DataSize(store)) + 65535) &^ 65535
+	blocks := searchblock.Layout(at, sizes, textLen, mode)
+	if blocks == nil {
+		return nil, nil
+	}
+	need := blocks.End()
+	if grow := (need - int64(mem.DataSize(store)) + 65535) / 65536; grow > 0 {
+		if _, err := mem.Grow(store, uint64(grow)); err != nil {
+			return nil, err
+		}
+	}
+	if err := setScratchBase(store, inst, int32((need+65535)&^65535)); err != nil {
+		return nil, err
+	}
+	return &searchRegion{global: exp.Global(), mem: mem, blocks: blocks, textLen: textLen}, nil
+}
+
+func (s *searchRegion) data(store *wasmtime.Store) func() []byte {
+	return func() []byte { return s.mem.UnsafeData(store) }
+}
+
+// notesGiven counts, over the process, the blocks given notes: a test whose
+// armed run leaves it unchanged compared nothing.
+var notesGiven atomic.Int64
+
+// begin starts a drive: a zeroed block, armed with notes and memo under Armed.
+func (s *searchRegion) begin(store *wasmtime.Store) error {
+	if s == nil {
+		return nil
+	}
+	n := s.blocks.NotesGiven
+	err := s.blocks.Begin(s.data(store), s.textLen)
+	notesGiven.Add(int64(s.blocks.NotesGiven - n))
+	return err
+}
+
+// before hands the block over for the next call.
+func (s *searchRegion) before(store *wasmtime.Store) {
+	if s != nil {
+		_ = s.global.Set(store, wasmtime.ValI32(s.blocks.At))
+	}
+}
+
+// after runs after a call that reported a match: an armed search gets notes,
+// a tripped one its memo.
+func (s *searchRegion) after(store *wasmtime.Store) error {
+	if s == nil {
+		return nil
+	}
+	return s.blocks.After(s.data(store))
 }

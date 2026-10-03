@@ -284,10 +284,13 @@ stride drops and the region shrinks to its square root.
 **Your stub does this for you.** It is generated with the sweep column's width
 baked in — that number comes from the compiler, not from your config — and sizes
 and seeds the region at construction. A C consumer is the one exception: the
-header needs no libc, so it enables the cache only where `<stdlib.h>` can be
-included, and a build without it walks. A `-nostdlib` build that still has a
-sysroot on its include path must pass `-DRX_SET_CACHE=0`, or supply `malloc` and
-`free`: the header then finds `<stdlib.h>`, but nothing links against it. See
+header needs no libc, so it allocates the cache only where `<stdlib.h>` can be
+included, and a build without it walks unless the caller hands a buffer over
+with `<find>_set_cache` (sized by `<find>_cache_bytes`; see
+[c-api.md](c-api.md#the-overlapping-answer-cache)). A `-nostdlib` build that
+still has a sysroot on its include path must pass `-DRX_SET_CACHE=0`, or supply
+`malloc` and `free`: the header then finds `<stdlib.h>`, but nothing links
+against it. See
 [wasm.md](wasm.md#the-overlapping-answer-cache) for the arithmetic and the
 header layout if you are driving the raw ABI.
 
@@ -341,15 +344,20 @@ The answer cache removes most of that quadratic cost, with or without
 `hints: [batch-find]`. Either find entry can be handed a scratch region, and it will
 use it if — and only if — the drive turns out to be expensive: it walks,
 counting the bytes it has covered — the extent it matched, plus how far each
-call's walk actually ran — and once that exceeds half of what a backward sweep
-would cost, plus a fixed allowance for starting one, it sweeps the rest of the
-input in one pass and answers the remaining calls out of the result. Half, not
-all: measured, switching that much earlier cut the dense rows' cost by a
-quarter to a third; the worst case, a walk that would have ended just past the
-line, pays up to about three times what walking alone would have cost. The
-allowance is what keeps an input of a few bytes on the walk, where starting a
-sweep costs more than the whole walk does. A scan the walk handles cheaply never
-sweeps and costs exactly what it did before.
+call's walk actually ran — and once that exceeds a sixteenth of what a backward
+sweep would cost, plus a fixed allowance for starting one, it sweeps the rest of
+the input in one pass and answers the remaining calls out of the result. A
+sixteenth, not all: at the full cost a wide set walked up to two sweeps' worth
+first, quadratically up to that point (96 members over `a`×N switched only at
+16 KB, 281,595 instructions per byte; now 108,705 from 2 KB), while
+match-heavy drives moved −36% to +2.3% and ordinary text still never switches —
+its work per byte stays 11 to 134 times under the line. A drive whose walk would
+have ended just past the line pays a sweep it did not need. The allowance —
+eight bytes of sweeping at the FULL rate — is what keeps an input of a few
+bytes on the walk, where starting a sweep costs more than the whole walk does;
+on inputs of 13-19 bytes with many matches the line can be crossed, and there
+the sweep measured between 8% cheaper and 12% dearer than walking. A scan the walk handles cheaply never sweeps and
+costs exactly what it did before.
 
 The sweep needs an automaton over the set's members. A set that packs into
 one fallback bucket is swept over that bucket's own tables. Any other set —
@@ -360,9 +368,17 @@ a drive can have arbitrarily many walks alive at once — some input of the form
 `W`×N starts a walk every few bytes that is still going at the end, as `foo\w+`
 over `foo`×N does, where `union[ \t]+[a-z]{3}` can match unboundedly long but
 no match holds the start of another — since otherwise every drive is linear
-already, and within these limits: at most 32 members, no member on
-Backtracking, no non-greedy member, at most `max_fallback_states` states and
-a projected column of at most 16,383 cells. `\b`, `\B`, `(?m:^)` and
+already, and within these limits: at most `max_fallback_states` states and a
+projected column of at most 16,383 cells. A member the automaton cannot answer
+for exactly — a Backtracking or non-greedy member — is not a limit on the set:
+it is split out (see "Members that are not provably linear" below), the members
+kept keep the cache, and
+the split member gets a **program sweep** of its own. The member count is no limit: a cache row holds one bit per
+member, an i32 to 32 members, an i64 to 64 and a bitmap of 64-bit words above,
+so a set past 32 members pays a wider row — about 4 bytes per member per input
+byte, up to the 64 MiB point where the cache switches to checkpoints — and a
+larger module (+31-40% measured on 40-128 members). A set of up to 32 members
+compiles exactly as before. `\b`, `\B`, `(?m:^)` and
 `(?m:$)` are supported, with one exception: in a set of several members, a
 member whose word-boundary accept must win over a later match of the same
 member gets no whole-set automaton. The sweep answers such a set exactly as
@@ -376,11 +392,28 @@ whose walk is long and whose match is short or empty — `(?:a*b)?` over a run o
 match at each, so a counter watching only what it delivered stays at zero while
 the drive is quadratic.
 
+**The program sweep** answers for a split member the way the cache answers for
+the rest: one backward pass over the member's own compiled program, one column
+per position, holding for every start the end of the member's leftmost-first
+match there — the per-position answer the overlapping `find` needs, which the
+member's own search can only give by walking from each start. It runs only once
+the member's searches have walked more than `4 × len + 64` bytes in the drive,
+so ordinary text pays for the counter alone; its answers live in the same
+caller's region, after the cache, checkpointed exactly as the cache is. It
+supports every assertion (`\b`, `\B`, `^`, `$`, `(?m)`) and zero-width cycles.
+Measured over `{foo\w+, a[a-z]*?z}` and `a`×N + `z`: 131,456 → 795
+instructions per byte; with `(?:a|b)*a(?:a|b){12}c`, a Backtracking member,
+124,939 → 1,052. A member whose program has more than 4,096 roots (consuming
+instructions, together with the set's other swept members) or whose closures
+exceed 65,536 items keeps its ordinary search.
+
 EVERY generated stub reserves that region for you and sizes it from the input,
 whether or not the set carries the batching hint; a caller driving the raw ABI
 opts in by passing a region in the scratch descriptor (see "The overlapping
-answer cache" in [wasm.md](wasm.md)). It is optional everywhere, and declining
-it — or offering too little — changes the speed and never the answer.
+answer cache" in [wasm.md](wasm.md)). A STANDALONE module whose caller passes
+none uses a region of its own, so a raw caller of a module loaded directly gets
+the linear drive too. It is optional everywhere, and declining it — or offering
+too little — changes the speed and never the answer.
 
 The one exception is C, which is the only target whose allocator lives outside
 the toolchain's output: the header enables the cache where `<stdlib.h>` exists
@@ -515,16 +548,26 @@ Members linear on their own can still walk too far TOGETHER: members that share
 a literal bucket walk one merged automaton, so `foo\w+` keeps the walk going
 over `foo`×N long after `foo[0-9]` is dead. Such a bucket stops a walk as soon
 as no member still wanted — not gated out, not already recorded — can accept.
+A bucket of more than 32 members (a sparse bucket, see "Bin-packing and merge
+constraints") cannot tell that,
+so where one of its members can keep a walk going across unboundedly many
+candidates, gated `find` counts instead: per candidate whose walk ran past 32
+bytes, the bytes it walked past the farthest end it delivered (so a member that
+matches at every candidate, `foo` beside `foo\w+`, cannot hide the walk). Past
+`4 × progress + 64` the call — and the rest of the drive — goes to a copy of the
+set compiled beside it with those members split out. The count lasts the drive
+when the caller passes the set's search blocks (every generated stub does), and
+it works beside other split members and in batching sets.
 A set whose members are all provably linear otherwise compiles exactly as
 before. When one is not:
 
 | Capability | What the set does |
 |---|---|
 | `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own linear search, and `find` merges their answers with the buckets' |
-| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary |
-| `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find` |
+| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller of a merged build, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary |
+| `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find`. The members kept become an internal set of their own, never exported, that the merge reads for the buckets' part — so when THEY qualify for the answer cache, the drive keeps it (`{foo\w+, a[a-z]*?z}` over `foo`×N: 90,354 → 542 instructions per byte), and the split members get the program sweep (see "Overlap policy") |
 | `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks — the single-pattern rule: only a walk that recorded nothing new and walked more than 32 bytes is charged, the budget `4 × bytes advanced + 64` is checked before the walk is added, and the probe's hits are recorded first — that hands the call to a start-anywhere union automaton over the set |
-| `scan_any`, `scan_all`, where no union automaton can be built | split out |
+| `scan_any`, `scan_all`, where no union automaton can be built | split out. When the set's `find` is `overlapping: true` and served by the answer cache, only the scan pair is split: it lives in a split copy of the set compiled beside it, never exported, to which the set's two scan exports forward — so `find` keeps its cache. (Splitting the whole set for its scan pair's sake made that `find` quadratic again on long overlapping matches: 90,441 fuel/byte at 8 KB against 1,342.) |
 
 A split member's search is its **start-anywhere find** — for a member with an
 assertion, the context passes that judge every assertion against the real
@@ -574,23 +617,30 @@ is over the state limit — adds 2.8 instructions per byte on 100 KB (+34% for
 the set), and on a single pattern's worst-case run the Backtracking find costs
 up to 236 per byte.
 
-Two cases stay quadratic, both outside what a split can reach.
-`overlapping: true` over members whose matches are long and overlap — every
-start's match is walked in full, split or not — when no answer cache serves the
-drive: none offered (a C build with `-DRX_SET_CACHE=0`, a raw caller), or a set
-outside the sweep's limits (see "Overlap policy"). And a `find` over input
-that matches at every byte while each attempt keeps walking for a longer match
-(`a*b|a` over `a`×N). The second is a shape of the pattern, not of the set, and
-is the same for a single pattern: see
-[engines.md](engines.md#which-find-a-pattern-gets-linear-on-every-input) for
-which patterns have it and how to avoid it.
+What stays quadratic: `overlapping: true` over members whose matches are long
+and overlap — every start's match is walked in full — when nothing serves the
+drive's answers:
+
+- no region: a MERGED build whose caller offers none — a raw caller, or a C
+  build with `-DRX_SET_CACHE=0` that hands no buffer over with
+  `<find>_set_cache` (a standalone module uses a region of its own);
+- the kept members outside the cache's limits (see "Overlap policy");
+- a split member outside the program sweep's limits.
+
+A `find` over input that matches at every byte while each attempt keeps walking
+for a longer match (`a*b|a` over `a`×N) is linear when the caller passes the
+search blocks every generated stub passes, or — in a standalone module — passes
+none (see [wasm.md](wasm.md), "The search block"). See
+[complexity.md](complexity.md) for every mechanism and what each leaves.
 
 **Batching sets** (`hints: [batch-find]`) are split the same way: the merge sits
 in the per-position worker both entries share, and keeps the batch entry's
 resume rules — a position larger than the buffer continues on the next call
-with exactly the matches not yet delivered. A split batching set gets no
-answer cache, since the batch entry would serve it without the split members;
-the cache is kept for batching sets that are not split.
+with exactly the matches not yet delivered. An overlapping batching set that
+splits reads the kept members' cache through the same worker — a position that
+does not fit what is left of the buffer ends the call, and is split across
+calls only when it does not fit an empty one — and gives its split members the
+program sweep.
 
 **Not split:** a member the compiler dropped from the set stays dropped.
 
@@ -977,6 +1027,14 @@ must match `[1,2)` from position 1, and a DFA answers `[1,3)`. Like the other
 route, this switches the set's `match_all` and `scan_all` to the `out_ptr` form.
 Unlike it, the member stays in `match_any` and `match_all`, whose whole-input
 answer does not depend on which branch wins.
+
+A member whose own DFA cannot be built at all goes to Backtracking too, as the
+same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a` needs 2^13
+states, past the internal limit of 2,048 on one member's set automaton, and
+`max_fallback_states` cannot raise that limit. Such a member used to fail the
+whole set's compile. Like the `max_fallback_states` route, it is absent from
+`match_any` and `match_all` (`anchored_state_limit_dropped`, with its own
+warning) and switches `match_all` and `scan_all` to the `out_ptr` form.
 
 A member Backtracking cannot take either is still excluded, still warned
 about, and still recorded in `--diag-json`'s `state_limit_dropped` — for either

@@ -998,7 +998,7 @@ func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 			if isAnchoredFind(table) {
 				t.Fatalf("%q routes to buildAnchoredFindBody, not buildFindBody — case is not testing what it claims", tc.pattern)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1055,7 +1055,7 @@ func TestDFALayoutFindBodyPrefixWalkDivergence(t *testing.T) {
 				t.Fatalf("%q: all four prefix-end states agree (%d) — nothing diverges to emit",
 					tc.pattern, layout.wasmPrefixEnd)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1088,7 +1088,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	if nonMid == 0 {
 		t.Fatalf("%q: expected at least one non-mid dominant state", pattern)
 	}
-	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern, false), 0)
+	body := buildFindCodeEntry(layout, table, findMandatoryLit(pattern, false), 0).body
 	if len(body) == 0 {
 		t.Fatalf("%q: empty find body", pattern)
 	}
@@ -1128,7 +1128,7 @@ func TestDFALayoutFindBodyMandatoryLit(t *testing.T) {
 			if layout.useCompression != tc.wantCompress {
 				t.Fatalf("%q: useCompression = %v, want %v (numWASM=%d)", tc.pattern, layout.useCompression, tc.wantCompress, layout.numWASM)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, lit, 0)
+			body := buildFindCodeEntry(layout, table, lit, 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -2513,4 +2513,21 @@ func TestNfaBuildInputMapHandBuiltPrograms(t *testing.T) {
 			t.Error("pattern 1's consumer was dropped by pattern 0's Match")
 		}
 	})
+}
+
+// TestUnionSortedU16: two call sites may record one state's wide boundary
+// accepts, and the second must add to the first — sorted and without
+// duplicates, since the list is part of the state's identity in minimisation.
+func TestUnionSortedU16(t *testing.T) {
+	for _, c := range []struct{ a, b, want []uint16 }{
+		{nil, []uint16{3}, []uint16{3}},
+		{[]uint16{1, 4}, nil, []uint16{1, 4}},
+		{[]uint16{1, 4, 9}, []uint16{2, 4, 10}, []uint16{1, 2, 4, 9, 10}},
+		{[]uint16{5}, []uint16{1, 2}, []uint16{1, 2, 5}},
+		{[]uint16{1, 2}, []uint16{1, 2}, []uint16{1, 2}},
+	} {
+		if got := unionSortedU16(c.a, c.b); fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("unionSortedU16(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
 }
