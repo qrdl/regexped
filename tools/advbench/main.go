@@ -266,7 +266,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		r.N = n
+		r.N = len(input) // what was driven: file: may be shorter, pre:/suf: longer
 		out = append(out, r)
 		if r.Err != "" {
 			break // a size that ran out of fuel or time: larger ones will too
@@ -299,6 +299,10 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if capN == 0 {
 		capN = idSpace
 	}
+	// The output area holds whatever a call may write: a set `find` asked
+	// for more than capN is retried with that many, at most one tuple per
+	// pattern, so the area is sized for the larger of the two.
+	outRoom := int64(max(capN, idSpace)) * abi.SetMatchTupleBytes
 	useCache := isSet && !sp.NoCache && sc.Overlapping
 	extra := int64(1 << 20)
 	var cacheBytes, cacheStride int
@@ -308,7 +312,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			extra += int64(b) + int64(idSpace)*16
 		}
 	}
-	need := inBase + int64(len(input)) + extra + int64(capN)*12 + 16
+	need := inBase + int64(len(input)) + extra + outRoom + 16
 	for int64(mem.DataSize(store)) < need {
 		if _, err := mem.Grow(store, uint64((need-int64(mem.DataSize(store)))/65536+1)); err != nil {
 			return r, fmt.Errorf("grow: %w", err)
@@ -338,7 +342,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			outPtr = blocksPtr + int64(len(setBlocks)*abi.SearchBlockBytes) + 16
 			clear(buf[gatePtr:outPtr])
 		}
-		cachePtr = outPtr + int64(capN*12+16)
+		cachePtr = outPtr + outRoom + 16
 		if cacheBytes > 0 {
 			clear(buf[cachePtr : cachePtr+config.SetOverlapCheckpointHeaderBytes])
 			putU32(buf, cachePtr+config.SetOverlapHdrStrideOff, uint32(cacheStride))
@@ -680,7 +684,9 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 		}
 	case isSet && (sp.Fn == "match_any" || sp.Fn == "match_all"):
 		var e error
-		if sp.Fn == "match_all" && idSpace > 64 {
+		// The wide `_all` form takes the bitmap pointer: read it off the
+		// export's type, since a Backtracking member selects it at any width.
+		if len(f.Type(store).Params()) == 3 {
 			_, e = f.Call(store, ib, L, int32(outPtr))
 		} else {
 			_, e = f.Call(store, ib, L)

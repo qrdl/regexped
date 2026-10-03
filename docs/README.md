@@ -61,9 +61,6 @@ docker pull qrdl/regexped
 docker run --rm -v $(pwd):/work -w /work qrdl/regexped <command> [flags]
 ```
 
-No `--user` flag is needed: everything the image writes is handed to the owner
-of the directory it lands in.
-
 See [docker.md](docker.md) for full Docker usage and workflow examples.
 
 ## Usage
@@ -120,17 +117,34 @@ See [`examples/README.md`](../examples/README.md) for more details, including wh
 
 **SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
 
-**Comparison vs [regex crate](https://crates.io/crates/regex)** (benchmarked via wasmtime, measured in fuel consumed and median execution time):
+**Comparison vs [regex crate](https://crates.io/crates/regex)** (both compiled to WASM and run in wasmtime by `tools/perftest`; ratio = regex ÷ regexped, so above 1× regexped is ahead):
 
-| Scenario | Fuel consumed | Median latency |
+| Scenario | Instructions executed | Median time |
 |---|---|---|
-| Anchored match (email, URL) | 1.1–2.2× less | 1.0–1.6× faster |
-| Non-anchored find (secrets, SQL injection) | 1.7–7.8× less | 1.6–7.2× faster |
-| Multi-pattern find (combined secrets, 100 KB) | 8.2–8.4× less | 12.9–13.9× faster |
-| TDFA capture groups (URL parse) | 2.3–6.9× less | 3.0–5.1× faster |
-| Backtracking capture groups | 1.9–12.3× less | 1.7–21.4× faster |
-| No-match fast-reject | up to 21.9× less | up to 12.7× faster |
-| Pattern sets vs `RegexSet`+rescan (8–20 patterns, 100 KB) | — | 2.0–18.5× faster |
+| Anchored match (email, URL) | 1.1–2.4× | 1.1–1.7× |
+| Non-anchored find (secrets, URLs, SQL injection, comments; 1–100 KB) | 1.0–26× | 1.3–28× |
+| Multi-pattern alternation find (combined secrets, 10–100 KB) | 5.6–11× | 4.0–13× |
+| TDFA capture groups (URL parse, log fields) | 0.7–8.2× | 1.3–14× |
+| Backtracking capture groups (CSV, HTML, logs) | 2.2–10× | 2.0–8.8× |
+| No-match fast reject (9–300 bytes) | 7.0–33× | 1.8–16× |
+
+**Pattern sets.** A set's `find` against `RegexSet` plus a per-pattern rescan (8–20 patterns, 100 KB): **3.2–27× faster**. Against [regex-automata](https://crates.io/crates/regex-automata), the engine under `regex`, per capability (`tools/setperf`, instructions executed over one whole input, 41 corpora of 2–128 patterns):
+
+| Capability | Median | Worst |
+|---|---|---|
+| `match_any` | 3.6× | 0.9× |
+| `match_all` | 122× | 0.9× |
+| `scan_any` | 4.0× | 1.2× |
+| `scan_all` | 10× | 3.1× |
+| `find` | 26× | 1.2× |
+
+## Resistance to hostile input
+
+Regexped-generated code is built to withstand ReDoS — input crafted to make a matcher take exponential or quadratic time, or unbounded memory:
+
+- **Linear time.** DFA and TDFA read each byte once; a Backtracking search that exhausts its work budget moves to a memoised body that tries each (instruction, position) pair at most once. Iterating `find`/`groups`, and pattern sets, stay linear over the whole scan, not just per call.
+- **Bounded memory.** `max_memory:` caps the module; a search that would need more reports "unknown", never a false "no match". `regexped compile` warns when Backtracking code has no cap.
+- **Sandboxed and tested.** Everything runs inside WebAssembly with every caller buffer size-checked; `make adversary` checks that 76 hostile input shapes stay linear.
 
 ## Limitations
 
