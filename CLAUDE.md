@@ -64,7 +64,10 @@ regexped/
 │   │                          #   zeroed, so all of it counts as cleared). Its marks are failures, so
 │   │                          #   the rows of a REPORTED match's attempt are cleared before it returns
 │   │                          #   — from the attempt's start, not the call's `from` (+22% to +45%
-│   │                          #   dearer once tripped). `groups` keeps only the tripped flag. An
+│   │                          #   dearer once tripped). Marks are failures on ONE text: the first call
+│   │                          #   to use the memo records (ptr, len) in bt_text / bt_text_len, and a
+│   │                          #   call over another (a block reused by a raw caller) clears the rows it
+│   │                          #   reads first. `groups` keeps only the tripped flag. An
 │   │                          #   EMBEDDED build carries a SECOND fallback body whose memo is in the
 │   │                          #   host's memory (memory 0, btDyn.memoMemIdx; emitMemoTwinDispatch
 │   │                          #   picks it when the block names a memo), so it keeps the memo too —
@@ -1390,7 +1393,9 @@ that same core module into a Component Model component:
   same reason: as functions the input would cross — and be copied — once per
   match. The Rust stub's public API does not change (the iterator holds the
   resource and drops it); the C header gains `scratch[2]` in each iterator struct
-  and a `<func>_free`, mandatory under `component` and a no-op under `module`.
+  and a `<func>_free`, mandatory under `component`, and under `module` too for a
+  pattern whose iterator keeps search notes or a Backtracking memo (a no-op for
+  the rest).
   `next` advances itself; Go's adjacent-empty suppression stays in the stubs.
   `groups`' `next` returns a plain list, empty meaning finished.
 - **A `wasm_format: module` build is byte-identical to what it always was**, and

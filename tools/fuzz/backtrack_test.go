@@ -1611,3 +1611,87 @@ func TestBTFindIterationMatchesGo(t *testing.T) {
 		})
 	}
 }
+
+// A block reused for ANOTHER text — the caller's mistake; a generated stub
+// zeroes it per search — must not carry the first text's kept memo into it:
+// the marks are failures on that text, and a match the new text has through a
+// marked (pc, position) was silently missed. The fallback records the text
+// the memo describes and clears the rows a call over another text reads. Text
+// A matches nowhere, so its marks cover every row B and C read; B is another
+// address at the same length, C a shorter text at A's address.
+func TestBTKeptMemoFollowsTheText(t *testing.T) {
+	const pat = `(?:a?)+?xyz` // a zero-width cycle: the fallback answers every call
+	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
+	w, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{entry}, pathsTableBase, true, 0,
+		compile.CompileOptions{MaxDFAStates: 1})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	memoPer := sizes["find"].BTMemoBytes
+	if memoPer == 0 {
+		t.Fatalf("%q keeps no Backtracking memo: %+v", pat, sizes["find"])
+	}
+	cfg := wasmtime.NewConfig()
+	cfg.SetWasmSIMD(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+	store := wasmtime.NewStore(engine)
+	defer store.Close()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatalf("module: %v", err)
+	}
+	defer mod.Close()
+	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := inst.GetExport(store, "memory").Memory()
+	search := inst.GetExport(store, abi.SearchExport).Global()
+	fn := inst.GetFunc(store, "find")
+
+	const a, b = "aaaaaaaaaaaa", "aaaaaaaaaxyz"
+	const ptrA, ptrB = int32(0), int32(4096)
+	blk := (int64(mem.DataSize(store)) + 65535) &^ 65535
+	memo := blk + abi.SearchBlockBytes
+	memoCap := int64(len(a)+1) * int64(memoPer)
+	if _, err := mem.Grow(store, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := setScratchBase(store, inst, int32(blk+65536)); err != nil {
+		t.Fatal(err)
+	}
+	buf := mem.UnsafeData(store)
+	clear(buf[blk : memo+memoCap])
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTStateOff:], abi.SearchBTTripped)
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTMemoOff:], uint32(memo))
+	binary.LittleEndian.PutUint32(buf[blk+abi.SearchBTMemoCapOff:], uint32(memoCap))
+
+	re := regexp.MustCompile(pat)
+	find := func(ptr int32, text string) {
+		t.Helper()
+		copy(mem.UnsafeData(store)[ptr:], text)
+		if err := search.Set(store, wasmtime.ValI32(int32(blk))); err != nil {
+			t.Fatal(err)
+		}
+		r, err := fn.Call(store, ptr, int32(len(text)), int32(0))
+		if err != nil {
+			t.Fatalf("find(%q): %v", text, err)
+		}
+		got, want := fmt.Sprint([]int{-1}), fmt.Sprint([]int{-1})
+		if p := r.(int64); p >= 0 {
+			got = fmt.Sprint([]int{int(p >> 32), int(uint32(p))})
+		}
+		if loc := re.FindStringIndex(text); loc != nil {
+			want = fmt.Sprint(loc)
+		}
+		if got != want {
+			t.Errorf("find(%q) at %d through the block of an earlier text = %s, want %s", text, ptr, got, want)
+		}
+	}
+	find(ptrA, a)
+	if bytes.Count(mem.UnsafeData(store)[memo:memo+memoCap], []byte{0}) == int(memoCap) {
+		t.Fatal("the search over A left no mark in the kept memo: nothing below is tested")
+	}
+	find(ptrB, b)
+	find(ptrA, "aaxyz")
+}

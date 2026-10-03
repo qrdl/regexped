@@ -74,6 +74,8 @@ const (
 	btSearchWork    = abi.SearchBTBudgetOff  // i64: budget left
 	btSearchMemo    = abi.SearchBTMemoOff    // i32: the memo (STUB), 0 = none yet
 	btSearchMemoCap = abi.SearchBTMemoCapOff // i32: its size (STUB)
+	btSearchText    = abi.SearchBTTextOff    // i32: the text the memo's marks describe
+	btSearchTextLen = abi.SearchBTTextLenOff // i32: its length + 1, 0 = not recorded yet
 	btSearchCapSt   = abi.SearchBTCapOff     // i32: capture body: abi.SearchBTTripped once tripped
 )
 
@@ -142,9 +144,11 @@ func (c *btSearch) emitFindTripped(b []byte, blk uint32) []byte {
 // emitFallbackPlace is the fallback find body's once-per-call region set-up
 // with the search's memo: rows are absolute positions (origin 0), the stub
 // zeroed the whole memo, so all of it counts as cleared; the frame stack is
-// this call's, at the scratch base. It leaves 1 on the stack when it placed
-// the search's memo, 0 when there is none to use (no memo yet, or one too
-// small for this text) and the caller must place this call's own.
+// this call's, at the scratch base. A call over another text than the one the
+// memo's marks were made on clears the rows it reads first. It leaves 1 on the
+// stack when it placed the search's memo, 0 when there is none to use (no memo
+// yet, or one too small for this text) and the caller must place this call's
+// own.
 func (c *btSearch) emitFallbackPlace(b []byte, d *btDyn, blk, origin uint32, unknown func([]byte) []byte) []byte {
 	b = btLocalGet(b, blk)
 	b = append(b, 0x04, 0x7F) // if blk (result i32)
@@ -172,6 +176,34 @@ func (c *btSearch) emitFallbackPlace(b []byte, d *btDyn, blk, origin uint32, unk
 	b = utils.AppendULEB128(b, d.memoEnd)
 	b = append(b, 0x21)
 	b = utils.AppendULEB128(b, d.cleared)
+	// The marks are failures on ONE text. The first call to use the memo
+	// records it; a call over another — a block reused for a new text, the
+	// caller's mistake — clears the rows it reads and records its own, so the
+	// old text's marks cannot hide a match in the new one.
+	b = btLocalGet(b, blk)
+	b = c.load32(b, btSearchText)
+	b = append(b, 0x20, localPtr, 0x47) // i32.ne
+	b = btLocalGet(b, blk)
+	b = c.load32(b, btSearchTextLen)
+	b = append(b, 0x20, localLen, 0x41, 0x01, 0x6A, 0x47, 0x72) // len + 1; i32.ne; i32.or
+	b = append(b, 0x04, 0x40)                                   // if another text, or none yet
+	b = btLocalGet(b, blk)
+	b = c.load32(b, btSearchTextLen)
+	b = append(b, 0x04, 0x40) // if another text: drop its marks
+	b = btLocalGet(b, d.memoBase)
+	b = append(b, 0x41, 0x00)
+	b = btLocalGet(b, d.memoEnd)
+	b = btLocalGet(b, d.memoBase)
+	b = append(b, 0x6B) // i32.sub
+	b = appendTableMemoryFill(b, d.memoMemIdx)
+	b = append(b, 0x0B)
+	b = btLocalGet(b, blk)
+	b = append(b, 0x20, localPtr)
+	b = c.store32(b, btSearchText)
+	b = btLocalGet(b, blk)
+	b = append(b, 0x20, localLen, 0x41, 0x01, 0x6A)
+	b = c.store32(b, btSearchTextLen)
+	b = append(b, 0x0B)
 	// The frame stack: this call's, at the scratch base — but never below the
 	// search's memo. A generated stub raises the scratch base past every
 	// region it allocates; a raw caller that put the memo above the base

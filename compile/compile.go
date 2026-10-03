@@ -3440,9 +3440,7 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		if err != nil {
 			return fmt.Errorf("compile: %w", err)
 		}
-		if rep != nil {
-			rep.Sets = diags
-		}
+		rep.Sets = diags
 	} else {
 		compOpts := CompileOptions{
 			MaxDFAStates: cfg.MaxDFAStates,

@@ -590,7 +590,7 @@ __attribute__((unused)) static int rx_search_btmemo_(unsigned long long *blk, un
 func cIdentSafe(s string) string {
 	b := []byte(s)
 	for i, c := range b {
-		if !(c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		if c != '_' && (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
 			b[i] = '_'
 		}
 	}
@@ -612,7 +612,7 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 	rep(&h, "    unsigned scratch[2];\n} "+iterType+";",
 		"    unsigned scratch[2];\n"+
 			"    /* This search's block and, once it arms, its notes (docs/wasm.md, \"The\n"+
-			"       search block\"). Opaque; _free releases the notes. */\n"+
+			"       search block\"). Opaque; _free releases the notes and memo. */\n"+
 			fmt.Sprintf("    unsigned long long search[%d];\n", abi.SearchBlockBytes/8)+
 			"    unsigned char *notes, *btmemo, *given;\n"+
 			"    /* Notes or a memo that could not be had: returned by the NEXT call,\n"+
@@ -654,10 +654,10 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 			"   format.\n",
 			"   iterator strands the input copy and the scan state inside the regexp\n"+
 				"   component for the life of the process. Under wasm_format: module it is\n"+
-				"   REQUIRED as well: it frees the notes a scan over input that makes each\n"+
-				"   call read past its match was given (docs/wasm.md). For the same reason\n"+
-				"   the iterator is NOT COPYABLE once initialised: a copy and two _free\n"+
-				"   calls free the notes twice.\n")
+				"   REQUIRED as well: it frees the notes or Backtracking memo a scan over\n"+
+				"   input that makes each call re-read was given (docs/wasm.md). For the\n"+
+				"   same reason the iterator is NOT COPYABLE once initialised: a copy and\n"+
+				"   two _free calls free them twice.\n")
 		rep(&c, "    if (!iter || !out_match) return RX_ERR_NULL_ARG;\n", "    if (!iter || !out_match) return RX_ERR_NULL_ARG;\n"+pendingCheck)
 		rep(&c, "        long long packed = "+ffi+"(", "        rx_search_set_(iter->search);\n        long long packed = "+ffi+"(")
 		rep(&c, "        if (packed < 0) { iter->done = 1; return 0; }\n",
@@ -668,9 +668,9 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 		"   including before initialising the same iterator again. */",
 		"   wasm_format: component it drops the resource handle and is REQUIRED,\n"+
 			"   including before initialising the same iterator again; under\n"+
-			"   wasm_format: module it frees the scan's notes (docs/wasm.md) and is\n"+
-			"   REQUIRED too, and the iterator is NOT COPYABLE once initialised: a\n"+
-			"   copy and two _free calls free the notes twice. */")
+			"   wasm_format: module it frees the scan's notes or memo (docs/wasm.md)\n"+
+			"   and is REQUIRED too, and the iterator is NOT COPYABLE once\n"+
+			"   initialised: a copy and two _free calls free them twice. */")
 	rep(&c, "    if (!iter || !out_groups) return RX_ERR_NULL_ARG;\n", "    if (!iter || !out_groups) return RX_ERR_NULL_ARG;\n"+pendingCheck)
 	rep(&c, "        int status = "+ffi+"(", "        rx_search_set_(iter->search);\n        int status = "+ffi+"(")
 	rep(&c, "        size_t start = (size_t)slots[0];\n", notes+"        size_t start = (size_t)slots[0];\n")

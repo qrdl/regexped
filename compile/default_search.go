@@ -117,7 +117,7 @@ func assignDefaults(m *defaultModule, patterns []*compiledPattern, sets []*compi
 		if p.hasFindFunc() && p.findFromMode == ffNative {
 			p.defFind = m.forPattern(p, false)
 		}
-		if p.hasGroupsFromWrapper() && !(p.anchored && p.captureFromMode == ffAnchoredZeroOnly) {
+		if p.hasGroupsFromWrapper() && (!p.anchored || p.captureFromMode != ffAnchoredZeroOnly) {
 			p.defGroups = m.forPattern(p, false)
 		}
 		if p.batchFindExport != "" {
@@ -252,12 +252,13 @@ func (m *defaultModule) emitRegion(b []byte, blkFn func([]byte) []byte, ptrOff, 
 // notes region (notes_ptr, notes_cap) and the high-water mark the module
 // clears that region by when the next search arms. blkFn pushes the block.
 func emitResetBlock(b []byte, blkFn func([]byte) []byte) []byte {
-	for _, off := range []uint32{abi.SearchWastedOff, abi.SearchArmedOff, abi.SearchPtrOff, abi.SearchSeenOff, abi.SearchBTBudgetOff} {
+	for _, off := range []uint32{abi.SearchWastedOff, abi.SearchArmedOff, abi.SearchPtrOff, abi.SearchSeenOff,
+		abi.SearchBTBudgetOff, abi.SearchBTMemoOff, abi.SearchBTTextLenOff} {
 		b = blkFn(b)
 		b = i64c(b, 0)
-		b = st64(b, off) // wasted; armed+resume; ptr+len; seen+bt_state; budget
+		b = st64(b, off) // wasted; armed+resume; ptr+len; seen+bt_state; budget; memo+text; text_len+bt_cap
 	}
-	for _, off := range []uint32{abi.SearchFirstOff, abi.SearchBTMemoOff, abi.SearchBTCapOff, abi.SearchFarOff} {
+	for _, off := range []uint32{abi.SearchFirstOff, abi.SearchFarOff} {
 		b = blkFn(b)
 		b = i32c(b, 0)
 		b = st32(b, off)

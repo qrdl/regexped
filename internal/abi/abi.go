@@ -204,7 +204,8 @@ const ScratchBaseExport = "regexped:scratch_base"
 //	+44  notes_cap   i32  STUB: bytes allocated at notes_ptr
 //	+48  bt_budget   i64  Backtracking find: work budget left, this search
 //	+56  bt_memo_ptr i32  STUB: the Backtracking fallback's kept memo, 0 = none
-//	+60 … +67             reserved, 0
+//	+60  bt_text     i32  the text (ptr) the kept memo's marks describe
+//	+64  bt_text_len i32  its length + 1; 0 until the memo is first used
 //	+68  bt_cap      i32  Backtracking capture body: 2 once a call tripped
 //	+72  bt_memo_cap i32  STUB: bytes allocated at bt_memo_ptr
 //	+76  far         i32  one past the farthest position a failed walk of the
@@ -223,7 +224,11 @@ const ScratchBaseExport = "regexped:scratch_base"
 // `(len + 1) × bt_memo_bytes` zeroed bytes, one row per text position starting
 // at position 0, where bt_memo_bytes is ⌈instructions / 8⌉ of the pattern's
 // program (SearchSize.BTMemoBytes). The module checks `bt_memo_cap` the same
-// way and uses a memo of its own for a call it does not cover.
+// way and uses a memo of its own for a call it does not cover. Its marks are
+// failures on one text: the first call that uses the memo records that text's
+// ptr and length in bt_text / bt_text_len, and a later call over another clears
+// the rows it reads and records its own, so a block reused for another text
+// costs time, not answers — unless the new text has the same address and length.
 //
 // How the module finds the block: SearchExport. The stub hands the block's
 // address over before EVERY call of an export whose pattern uses one; the value
@@ -248,6 +253,8 @@ const (
 	SearchNotesCapOff  = 44
 	SearchBTBudgetOff  = 48
 	SearchBTMemoOff    = 56
+	SearchBTTextOff    = 60
+	SearchBTTextLenOff = 64
 	SearchBTCapOff     = 68
 	SearchBTMemoCapOff = 72
 	SearchFarOff       = 76

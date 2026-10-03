@@ -248,12 +248,14 @@ costs, and what is still not linear.
 4. When the search ends, free the notes and the memo.
 
 **A block belongs to one text.** Reusing a block for a DIFFERENT text is the
-caller's mistake: notes describe the text they were written for. The module
-detects a changed `ptr`, `len` or resume position on an armed search and starts
-over, but a new text written at the same address, of the same length, resumed at
-exactly the old resume point, would read stale notes and can report wrong
-matches. Starting every search with a fresh (zeroed) block makes this
-impossible; a block reused on the SAME text at a later position is fine.
+caller's mistake: notes and a Backtracking memo describe the text they were
+written for. The module detects a changed `ptr`, `len` or resume position on an
+armed search and starts over, and a changed `ptr` or `len` on a call that uses
+the memo, whose marks it then clears for the new text. But a new text written at
+the same address, of the same length (and, for notes, resumed at exactly the old
+resume point) would read stale notes or memo marks and can report wrong matches.
+Starting every search with a fresh (zeroed) block makes this impossible; a block
+reused on the SAME text at a later position is fine.
 
 **Embedded mode** (produced when `output` is set in config, for use with `regexped merge`): the regexp WASM **imports** the host's `"main"` memory as `memory[0]` (used for reading input) and declares its own memory for DFA tables. After `wasm-merge`, the host retains `memory[0]` and the regexp module's own memory becomes `memory[1]` (or higher). The multi-memory layout is established at compile time, not by wasm-merge.
 

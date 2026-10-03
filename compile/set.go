@@ -192,12 +192,12 @@ func dfaTableEqual(a, b *dfaTable) bool {
 		}
 		return true
 	}
-	if !(eqMaps(a.acceptStates, b.acceptStates) &&
-		eqMaps(a.midAcceptStates, b.midAcceptStates) &&
-		eqMaps(a.midAcceptNWStates, b.midAcceptNWStates) &&
-		eqMaps(a.midAcceptWStates, b.midAcceptWStates) &&
-		eqMaps(a.midAcceptNLStates, b.midAcceptNLStates) &&
-		eqMaps(a.immediateAcceptStates, b.immediateAcceptStates)) {
+	if !eqMaps(a.acceptStates, b.acceptStates) ||
+		!eqMaps(a.midAcceptStates, b.midAcceptStates) ||
+		!eqMaps(a.midAcceptNWStates, b.midAcceptNWStates) ||
+		!eqMaps(a.midAcceptWStates, b.midAcceptWStates) ||
+		!eqMaps(a.midAcceptNLStates, b.midAcceptNLStates) ||
+		!eqMaps(a.immediateAcceptStates, b.immediateAcceptStates) {
 		return false
 	}
 	wa, wb := a.wideMaps(), b.wideMaps()

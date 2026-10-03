@@ -1068,7 +1068,7 @@ func (cs *compiledSet) keptCaps() []setCapFn {
 	}
 	var out []setCapFn
 	for _, c := range cs.capFns() {
-		if cs.mergedCap(c.kind) && !(c.kind == capFind && cs.keptCache != nil) {
+		if cs.mergedCap(c.kind) && (c.kind != capFind || cs.keptCache == nil) {
 			// With a kept-members set the merge calls ITS `find`, so the
 			// bucket body for `find` is not emitted.
 			out = append(out, c)

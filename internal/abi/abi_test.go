@@ -166,6 +166,7 @@ func TestSearchBlockLayout(t *testing.T) {
 		{"notes", SearchNotesOff, 4}, {"high", SearchHighOff, 4}, {"seen", SearchSeenOff, 4},
 		{"bt_state", SearchBTStateOff, 4}, {"notes_cap", SearchNotesCapOff, 4},
 		{"bt_budget", SearchBTBudgetOff, 8}, {"bt_memo", SearchBTMemoOff, 4},
+		{"bt_text", SearchBTTextOff, 4}, {"bt_text_len", SearchBTTextLenOff, 4},
 		{"bt_cap", SearchBTCapOff, 4}, {"bt_memo_cap", SearchBTMemoCapOff, 4},
 		{"far", SearchFarOff, 4},
 	}
