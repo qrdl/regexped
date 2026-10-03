@@ -222,21 +222,15 @@ func compileSetSplit(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 	return cs
 }
 
-// sparseCompanion builds what a set's sparse counter hands a drive over to:
-// the SAME set with the members of its counted sparse buckets split out, each
-// served by its own linear search — `find` only, internal, never exported.
-func sparseCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, primary *compiledSet) *compiledSet {
-	idx := map[*PatternInfo]int{}
-	for i, p := range spec.Patterns {
-		idx[p] = i
-	}
+// sparseSplitCands is the members of every counted sparse bucket that keep
+// its walk going, as split candidates: without them the bucket's walks are
+// bounded again.
+func sparseSplitCands(spec SetSpec, opts CompileSetOptions, buckets []*bucket, idx map[*PatternInfo]int) []splitCand {
 	var cands []splitCand
-	for _, bkt := range primary.buckets {
+	for _, bkt := range buckets {
 		if !sparseCycle(bkt) {
 			continue
 		}
-		// Only the members that keep the walk going: without them the
-		// bucket's walks are bounded again.
 		unb := sparseUnboundedMembers(bkt)
 		for k, p := range bkt.patterns {
 			if !unb[k] {
@@ -248,6 +242,38 @@ func sparseCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 			} else if _, ok := btFindStackSize(p.fullPattern, opts.BTWorkBudget); ok {
 				cands = append(cands, splitCand{idx: i, bt: true})
 			}
+		}
+	}
+	return cands
+}
+
+// sparseCompanion builds what a set's sparse counter hands a drive over to:
+// the SAME set with the members of its counted sparse buckets split out, each
+// served by its own linear search — `find` only, internal, never exported.
+// A member the primary already splits stays split, on the search the primary
+// gave it.
+func sparseCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, primary *compiledSet) *compiledSet {
+	idx := map[*PatternInfo]int{}
+	for i, p := range spec.Patterns {
+		idx[p] = i
+	}
+	cands := sparseSplitCands(spec, opts, primary.buckets, idx)
+	have := map[int]bool{}
+	for _, c := range cands {
+		have[c.idx] = true
+	}
+	for _, sm := range primary.split {
+		for k, pid := range spec.PatternIDs {
+			if pid != sm.id || have[k] {
+				continue
+			}
+			p := spec.Patterns[k]
+			if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok && sm.bt == nil {
+				cands = append(cands, splitCand{idx: k, saBytes: sa.end})
+			} else {
+				cands = append(cands, splitCand{idx: k, bt: true})
+			}
+			have[k] = true
 		}
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].idx < cands[j].idx })
@@ -302,7 +328,116 @@ func compileSetSplitPrimary(spec SetSpec, prefixPool, suffixPool *dfaPool, opts 
 	// puts on Backtracking: the split members are neither, and the others
 	// are packed by the same per-pattern rules.
 	opts.quiet = true
-	return compileSetWith(spec, prefixPool, suffixPool, opts, cands, true)
+	cs := compileSetWith(spec, prefixPool, suffixPool, opts, cands, true)
+	cs.keptCache = keptCacheSet(spec, prefixPool, suffixPool, opts, cs, cands)
+	if cs.keptCache != nil && cs.diag != nil {
+		cs.diag.KeptCache = true
+	}
+	return cs
+}
+
+// keptCacheSet is the KEPT members of an overlapping set that splits members,
+// compiled as an internal unsplit overlapping set of their own: a split
+// compile reads no answer cache, so the kept members' walk was quadratic on
+// long overlapping matches (`{foo\w+, k[a-z]+?z}` over `foo`×n: 45,296
+// fuel/byte, ×4 per doubling, with a cache offered) while the split members'
+// own searches were linear. The merge wrapper calls this set's cache-reading
+// `find` for the kept part, passing the caller's descriptor through — the
+// cache region is the caller's and this set alone reads it, so the stubs size
+// it from this set's column (SetOverlapCacheShape); the gate array is shared,
+// which is sound because every value either side writes is a lower bound in
+// the one gate encoding (the preflight's dead and alive marks, the merge's
+// raised bounds). Measured: 740 fuel/byte linear on that input, +10.7% on
+// match-dense text, 0% on prose.
+//
+// A BATCHING set's merge is in its worker, which delivers part of a position
+// that does not fit the room left; the kept set's `find` cannot, so the batch
+// entry ends its call before such a position instead (keptNoFitSentinel) and
+// only a position larger than its whole buffer is delivered in part — through
+// the kept members' own bucket worker, which walks.
+//
+// nil — the merge keeps the kept body — when the set is not an overlapping
+// `find`, keeps nothing, has no cache, or the kept set would need a split,
+// search blocks or a sweep of its own it cannot have.
+func keptCacheSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, cs *compiledSet, cands []splitCand) *compiledSet {
+	if !spec.Overlapping || !spec.HasFind() || cs.keptEmpty || opts.noCache {
+		return nil
+	}
+	split := map[int]bool{}
+	for _, c := range cands {
+		split[c.idx] = true
+	}
+	ks := spec
+	ks.Patterns, ks.PatternIDs = nil, nil
+	for i, p := range spec.Patterns {
+		if !split[i] {
+			ks.Patterns = append(ks.Patterns, p)
+			ks.PatternIDs = append(ks.PatternIDs, spec.PatternIDs[i])
+		}
+	}
+	ks.Name = spec.Name + "\x00kept"
+	ks.Find = spec.Find + "\x00kept" // never exported
+	ks.MatchAny, ks.MatchAll, ks.ScanAny, ks.ScanAll = "", "", "", ""
+	saved := opts.globals.clone()
+	ko := opts
+	ko.quiet = true
+	base := max(int64(cs.regionEnd), cs.dataTop())
+	ko.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
+	inner := compileSetWith(ks, prefixPool, suffixPool, ko, nil, true)
+	if !inner.usesOverlapDP() || inner.needsSplit() || len(inner.ownBlocks()) > 0 || inner.sparseCtr != nil {
+		*opts.globals = *saved
+		return nil
+	}
+	inner.internal = true
+	inner.keptPosGlobal = cs.keptPosGlobal
+	// The merge has already checked the descriptor it passes through.
+	inner.trustDesc = true
+	inner.forceAcceptBlocks = cs.acceptsBlocks()
+	if spec.BatchFind {
+		// The merge sits in the worker, which takes the gate pointer: the
+		// entries in front of it leave the descriptor and their kind here.
+		if cs.keptDescGlobal < 0 {
+			cs.keptDescGlobal = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+		}
+		cs.keptBatchGlobal = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+	}
+	return inner
+}
+
+// What the entry in front of a batching split set's worker says about the
+// position the worker's merge is asked for, when the kept members have a set
+// of their own (keptBatchGlobal): `find` takes a position that does not fit
+// whole the transactional way; the batch entry wants to hear that it does not
+// fit (keptNoFitSentinel), so it can end its call before the position; and,
+// asked again with an empty buffer, wants it delivered in part.
+const (
+	keptBatchFind    = 0
+	keptBatchWhole   = 1
+	keptBatchPartial = 2
+)
+
+// keptNoFitSentinel is what the worker's merge answers the batch entry for a
+// position that does not fit the room left. It never leaves the module.
+const keptNoFitSentinel = -11
+
+// emitKeptCacheEntry, in an entry in front of a batching split set's worker
+// (descLocal holds the descriptor), records the descriptor and the entry's
+// kind for the merge (keptCacheSet). Nothing for any other set.
+func (cs *compiledSet) emitKeptCacheEntry(b []byte, descLocal byte, batch bool) []byte {
+	if cs.keptDescGlobal < 0 {
+		return b
+	}
+	b = append(b, 0x20, descLocal, 0x24)
+	b = utils.AppendULEB128(b, uint32(cs.keptDescGlobal)) //nolint:gosec // a global index
+	if cs.keptBatchGlobal < 0 {
+		return b
+	}
+	kind := int32(keptBatchFind)
+	if batch {
+		kind = keptBatchWhole
+	}
+	b = append(i32c(b, kind), 0x24)
+	return utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
 }
 
 // noCacheCompanion builds what an overlapping set falls back to when its
@@ -854,6 +989,23 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 		cs.splitData = append(cs.splitData, sa.data...)
 		cs.splitSegs += sa.segs
 	}
+	// Each member's overlapping answers in one backward pass, once its
+	// searches have shown the drive needs them (program_sweep.go). Not in the
+	// no-cache companion: it serves drives with no region to keep them in —
+	// none offered, or one too small for the cache, which a generated stub
+	// never hands over — so there it would be code that never runs.
+	var sweepData []byte
+	var sweepSegs int
+	if !opts.noCache {
+		cs.progSweep, sweepData, sweepSegs = placeProgramSweeps(full, split, ra)
+	}
+	cs.splitData = append(cs.splitData, sweepData...)
+	cs.splitSegs += sweepSegs
+	if cs.progSweep != nil && full.BatchFind {
+		// The merge sits in the worker, which takes the gate pointer: the
+		// entries in front of it leave the descriptor here.
+		cs.keptDescGlobal = int32(opts.globals.Alloc()) //nolint:gosec // a global index
+	}
 	cs.mergeState = -1
 	if len(cs.split) > splitMergeLocalMembers {
 		// The merge's per-member state, in the table memory rather than in
@@ -916,7 +1068,9 @@ func (cs *compiledSet) keptCaps() []setCapFn {
 	}
 	var out []setCapFn
 	for _, c := range cs.capFns() {
-		if cs.mergedCap(c.kind) {
+		if cs.mergedCap(c.kind) && !(c.kind == capFind && cs.keptCache != nil) {
+			// With a kept-members set the merge calls ITS `find`, so the
+			// bucket body for `find` is not emitted.
 			out = append(out, c)
 		}
 	}
@@ -973,13 +1127,11 @@ func (cs *compiledSet) scanSwitchFnOffset(kind setCapKind) int {
 }
 
 // splitFnCount is how many functions member i contributes: its two passes,
-// or its Backtracking find and — when it has one — that find's fallback.
+// or its Backtracking find and — when it has them — that find's fallback and
+// an embedded build's memo fallback (btFindParts.funcs).
 func (cs *compiledSet) splitFnCount(i int) int {
 	if bt := cs.split[i].bt; bt != nil {
-		if bt.fallback != nil {
-			return 2
-		}
-		return 1
+		return bt.funcs()
 	}
 	return 2
 }
@@ -1002,7 +1154,20 @@ func (cs *compiledSet) extraFnCount() int {
 	for i := range cs.split {
 		n += cs.splitFnCount(i)
 	}
+	if cs.progSweep != nil {
+		n++ // the program sweep's one function (program_sweep.go)
+	}
 	return n
+}
+
+// sweepFnOffset is the program sweep's function, after every split member's
+// functions. -1 for a set with no sweep.
+func (cs *compiledSet) sweepFnOffset() int {
+	if cs.progSweep == nil {
+		return -1
+	}
+	off := cs.splitFwdOffset(len(cs.split) - 1)
+	return off + cs.splitFnCount(len(cs.split)-1)
 }
 
 // extraFnTypes lists the added functions' type indices, in layout order.
@@ -1029,6 +1194,9 @@ func (cs *compiledSet) extraFnTypes() []byte {
 			continue
 		}
 		out = append(out, setTypeI32I32ToI32, setTypeI32I32ToI32)
+	}
+	if cs.progSweep != nil {
+		out = append(out, setTypeI32x4ToI32)
 	}
 	return out
 }
@@ -1089,6 +1257,27 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	if notes {
 		lBlocks, lSaved = a.I32(), a.I32()
 	}
+	// A counted sparse bucket's handover: the exported merge does it; the
+	// merge in a batching set's worker slot leaves it to the batch entry and
+	// the find wrapper in front of the worker.
+	sparse := cs.sparseCtr != nil && !worker
+	var lBlk0 byte
+	if sparse {
+		lBlk0 = a.I32()
+	}
+	// The program sweep's (program_sweep.go): the caller's cache region and
+	// its length, whether this call has located the sweep's part of it, and
+	// the locals emitSweepArea fills. Byte-indexed ones before the per-member
+	// locals, as above.
+	var lSwRegion, lSwRegionLen, lSwLocated byte
+	var swGeo sweepGeo
+	if cs.progSweep != nil {
+		lSwRegion, lSwRegionLen, lSwLocated = a.I32(), a.I32(), a.I32()
+		swGeo = sweepGeo{region: lSwRegion}
+		swGeo.area, swGeo.k, swGeo.rows, swGeo.cacheB, swGeo.nb = uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
+		swGeo.m64, swGeo.k64, swGeo.b64 = uint32(a.I64()), uint32(a.I64()), uint32(a.I64())
+	}
+	swIdx := cs.sweepIdx
 	// Four values per member — its lower bound, the start and end of its
 	// answer, its done flag — in four locals each, or past
 	// splitMergeLocalMembers in the set's merge state region; every
@@ -1206,7 +1395,7 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = cs.emitScratchMagicCheck(b, pDesc, lTmp)
 		b = append(b, 0x20, pDesc, 0x28, 0x02, abi.FindScratchGateOff, 0x21, lGate)
 		if notes {
-			b = emitScratchBlocks(b, pDesc)
+			b = cs.emitScratchBlocks(b, pDesc)
 			if base := cs.blocksBase(); base > 0 {
 				// Past the blocks before the set's own, or 0 with no blocks.
 				b = append(b, 0x22, lBlocks, 0x41)
@@ -1220,6 +1409,37 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = append(b, 0x23)
 		b = utils.AppendULEB128(b, cs.splitSearch)
 		b = append(b, 0x21, lSaved)
+	}
+	if cs.progSweep != nil {
+		// The cache region the sweep's answers live after: the descriptor's,
+		// from the global a batching set's entries leave it in.
+		desc := func(b []byte) []byte {
+			if worker {
+				b = append(b, 0x23)
+				return utils.AppendULEB128(b, uint32(cs.keptDescGlobal)) //nolint:gosec // a global index
+			}
+			return append(b, 0x20, pDesc)
+		}
+		b = desc(b)
+		b = ld32(b, abi.FindScratchCacheLenOff)
+		b = append(b, 0x22, lSwRegionLen, 0x04, 0x7F)
+		b = desc(b)
+		b = ld32(b, abi.FindScratchCacheOff)
+		b = append(b, 0x05, 0x41, 0x00, 0x0B)
+		b = append(b, 0x21, lSwRegion)
+	}
+	callComp := func(b []byte) []byte {
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pFrom, 0x20, pDesc, 0x20, pOut, 0x20, pCap, 0x10)
+		return utils.AppendULEB128(b, uint32(cs.companionFindIdx)) //nolint:gosec
+	}
+	if sparse {
+		// The sparse counter's handover is done HERE, not by a wrapper in the
+		// kept body's slot: one wrapper per call (findWrapped).
+		b = cs.emitScratchBlocks(b, pDesc)
+		b = append(b, 0x21, lBlk0)
+		b = cs.sparseCtr.emitEnter(b, lBlk0,
+			func(b []byte) []byte { return append(b, 0x20, pFrom) },
+			callComp)
 	}
 	// from > len answers nothing.
 	b = append(b, 0x20, pFrom, 0x20, pLen, 0x4B, 0x04, 0x40, 0x41, 0x00, 0x0F, 0x0B)
@@ -1273,16 +1493,63 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	}
 	b = append(b, 0x20, lBest, 0x41, 0x7F, 0x46, 0x0D, 0x01) // none → $exit
 
+	keptWorker := func(b []byte, skip func([]byte) []byte) []byte {
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lK, 0x20, pDesc, 0x20, pOut, 0x20, pCap)
+		b = skip(b)
+		b = append(b, 0x10)
+		return utils.AppendULEB128(b, uint32(keptIdx)) //nolint:gosec // a function index
+	}
 	if kept {
 		b = append(b, 0x20, lBest, 0x41)
 		b = utils.AppendSLEB128(b, int32(m)) //nolint:gosec // a small count
 		b = append(b, 0x46, 0x04, 0x40)
-		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lK, 0x20, pDesc, 0x20, pOut, 0x20, pCap)
-		if worker {
-			b = append(b, 0x20, pMode)
+		switch {
+		case worker && cs.keptCache != nil:
+			// The kept members' own set answers a position the batch entry
+			// starts (skip 0) from the cache; a position it does not fit
+			// whole is the batch entry's to decide (emitKeptCacheEntry), and
+			// one it resumes is the kept bucket worker's, which walks.
+			b = append(b, 0x20, pMode, 0x45, 0x04, 0x7F) // skip == 0: if (result i32)
+			b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lK, 0x23)
+			b = utils.AppendULEB128(b, uint32(cs.keptDescGlobal)) //nolint:gosec // a global index
+			b = append(b, 0x20, pOut, 0x20, pCap, 0x10)
+			b = utils.AppendULEB128(b, uint32(cs.keptCacheFindIdx)) //nolint:gosec // a function index
+			b = append(b, 0x22, lR, 0x20, pCap, 0x4A)               // r > cap (an error is negative)
+			b = append(b, 0x04, 0x40)
+			b = append(b, 0x23)
+			b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+			b = append(b, 0x41, keptBatchWhole, 0x46, 0x04, 0x40)
+			b = i32c(b, keptNoFitSentinel)
+			b = append(b, 0x0F, 0x0B)
+			b = append(b, 0x23)
+			b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+			b = append(b, 0x41, keptBatchPartial, 0x46, 0x04, 0x40)
+			b = keptWorker(b, func(b []byte) []byte { return append(b, 0x41, 0x00) })
+			b = append(b, 0x21, lR, 0x0B)
+			b = append(b, 0x0B)
+			b = append(b, 0x20, lR)
+			b = append(b, 0x05) // else: resuming inside the position
+			b = keptWorker(b, func(b []byte) []byte { return append(b, 0x20, pMode) })
+			b = append(b, 0x0B)
+		case worker:
+			b = keptWorker(b, func(b []byte) []byte { return append(b, 0x20, pMode) })
+		default:
+			// With a kept-members set (keptCacheSet) this is its
+			// cache-reading `find`, which takes the descriptor this wrapper
+			// was given.
+			b = keptWorker(b, func(b []byte) []byte { return b })
 		}
-		b = append(b, 0x10)
-		b = utils.AppendULEB128(b, uint32(keptIdx))                                 //nolint:gosec // a function index
+		if sparse {
+			// The counter tripped: this call and the rest of the drive go to
+			// the split copy, from this call's own `from`.
+			b = append(b, 0x22, lR, 0x41)
+			b = utils.AppendSLEB128(b, sparseHandoverSentinel)
+			b = append(b, 0x46, 0x04, 0x40)
+			b = emitSparseSwitch(b, lBlk0)
+			b = callComp(b)
+			b = append(b, 0x0F, 0x0B)
+			b = append(b, 0x20, lR)
+		}
 		b = append(b, 0x22, lR, 0x41, 0x00, 0x48, 0x04, 0x40, 0x20, lR, 0x0F, 0x0B) // error: pass it on
 		b = append(b, 0x41, 0x01, 0x21, lKeptDone)
 		b = append(b, 0x20, lR, 0x04, 0x40)
@@ -1299,67 +1566,88 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = lw(append(b, 0x41, 0x01), 0x21, lDone[k])
 		b = append(lw(b, 0x20, lLb[k]), 0x21, lQ)
 		b = append(b, 0x02, 0x40, 0x03, 0x40) // block $found, loop $retry
-		if sm.bt != nil {
-			// The Backtracking find from q: (start << 32) | end, -1 for no
-			// match, or its "gave up" error, which is this call's answer.
-			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
-			b = append(b, 0x04, 0x7E, 0x42, 0x7F, 0x05) // if (i64) -1 else
-			b = append(b, 0x20, lQ)
-			b = emitFindFromSetFromStack(b)
-			b = cs.emitMemberBlock(b, k, lBlocks)
-			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
-			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
-			b = cs.emitRestoreSearch(b, k, lSaved)
-			b = append(b, 0x0B)
-			b = lw(b, 0x22, lR64)
-			b = append(b, 0x42, 0x00, 0x53, 0x04, 0x40) // r < 0
-			b = append(lw(b, 0x20, lR64), 0x42, 0x7F, 0x53, 0x04, 0x40)
-			b = append(lw(b, 0x20, lR64), 0xA7, 0x0F, 0x0B) // r < -1: pass the error on
-			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
-			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
-			b = append(lw(b, 0x20, lR64), 0x42, 0x20, 0x88, 0xA7, 0x21, lSt)
-			b = append(lw(b, 0x20, lR64), 0xA7, 0x21, lE)
-		} else if sm.ctx {
-			// The context passes: both read the whole input, the forward one
-			// from q and the backward one down to q, through the global.
-			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
-			b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
-			b = append(b, 0x20, lQ)
-			b = emitFindFromSetFromStack(b)
-			b = cs.emitMemberBlock(b, k, lBlocks)
-			b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
-			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
-			b = cs.emitRestoreSearch(b, k, lSaved)
-			b = append(b, 0x0B)
-			b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
-			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
-			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
-			b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lE, 0x10)
-			b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
-			b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
-		} else {
-			// Past the end, or no match from q: the member is done for the drive.
-			b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
-			b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
-			if sm.notes != nil {
-				// The pass is handed input[q:]; it reads q from the global.
+		// search is the member's own search from q, leaving its answer in lSt
+		// and lE; with none it runs onNone, records the member done and
+		// branches `depth` out to $found.
+		search := func(b []byte, depth byte, onNone func([]byte) []byte) []byte {
+			if sm.bt != nil {
+				// The Backtracking find from q: (start << 32) | end, -1 for no
+				// match, or its "gave up" error, which is this call's answer.
+				b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+				b = append(b, 0x04, 0x7E, 0x42, 0x7F, 0x05) // if (i64) -1 else
 				b = append(b, 0x20, lQ)
 				b = emitFindFromSetFromStack(b)
+				b = cs.emitMemberBlock(b, k, lBlocks)
+				b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+				b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+				b = cs.emitRestoreSearch(b, k, lSaved)
+				b = append(b, 0x0B)
+				b = lw(b, 0x22, lR64)
+				b = append(b, 0x42, 0x00, 0x53, 0x04, 0x40) // r < 0
+				b = append(lw(b, 0x20, lR64), 0x42, 0x7F, 0x53, 0x04, 0x40)
+				b = append(lw(b, 0x20, lR64), 0xA7, 0x0F, 0x0B) // r < -1: pass the error on
+				b = onNone(b)
+				b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+				b = append(b, 0x0C, depth, 0x0B) // br $found (with sk = -1)
+				b = append(lw(b, 0x20, lR64), 0x42, 0x20, 0x88, 0xA7, 0x21, lSt)
+				b = append(lw(b, 0x20, lR64), 0xA7, 0x21, lE)
+			} else if sm.ctx {
+				// The context passes: both read the whole input, the forward one
+				// from q and the backward one down to q, through the global.
+				b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+				b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
+				b = append(b, 0x20, lQ)
+				b = emitFindFromSetFromStack(b)
+				b = cs.emitMemberBlock(b, k, lBlocks)
+				b = append(b, 0x20, pPtr, 0x20, pLen, 0x10)
+				b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+				b = cs.emitRestoreSearch(b, k, lSaved)
+				b = append(b, 0x0B)
+				b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
+				b = onNone(b)
+				b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+				b = append(b, 0x0C, depth, 0x0B) // br $found (with sk = -1)
+				b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lE, 0x10)
+				b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
+				b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+			} else {
+				// Past the end, or no match from q: the member is done for the drive.
+				b = append(b, 0x20, lQ, 0x20, pLen, 0x4B)
+				b = append(b, 0x04, 0x7F, 0x41, 0x7F, 0x05)
+				if sm.notes != nil {
+					// The pass is handed input[q:]; it reads q from the global.
+					b = append(b, 0x20, lQ)
+					b = emitFindFromSetFromStack(b)
+				}
+				b = cs.emitMemberBlock(b, k, lBlocks)
+				b = append(b, 0x20, pPtr, 0x20, lQ, 0x6A, 0x20, pLen, 0x20, lQ, 0x6B, 0x10)
+				b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
+				b = cs.emitRestoreSearch(b, k, lSaved)
+				b = append(b, 0x0B)
+				b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
+				b = onNone(b)
+				b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+				b = append(b, 0x0C, depth, 0x0B) // br $found (with sk = -1)
+				b = append(b, 0x20, lE, 0x20, lQ, 0x6A, 0x21, lE)
+				b = append(b, 0x20, lQ)
+				b = emitFindFromSetFromStack(b)
+				b = append(b, 0x20, pPtr, 0x20, lE, 0x41, 0x01, 0x6B, 0x10)
+				b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
+				b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
 			}
-			b = cs.emitMemberBlock(b, k, lBlocks)
-			b = append(b, 0x20, pPtr, 0x20, lQ, 0x6A, 0x20, pLen, 0x20, lQ, 0x6B, 0x10)
-			b = utils.AppendULEB128(b, uint32(fwd[k])) //nolint:gosec // a function index
-			b = cs.emitRestoreSearch(b, k, lSaved)
-			b = append(b, 0x0B)
-			b = append(b, 0x22, lE, 0x41, 0x00, 0x48, 0x04, 0x40)
-			b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
-			b = append(b, 0x0C, 0x02, 0x0B) // br $found (with sk = -1)
-			b = append(b, 0x20, lE, 0x20, lQ, 0x6A, 0x21, lE)
-			b = append(b, 0x20, lQ)
-			b = emitFindFromSetFromStack(b)
-			b = append(b, 0x20, pPtr, 0x20, lE, 0x41, 0x01, 0x6B, 0x10)
-			b = utils.AppendULEB128(b, uint32(rev[k]))                         //nolint:gosec // a function index
-			b = append(b, 0x22, lSt, 0x41, 0x00, 0x48, 0x04, 0x40, 0x00, 0x0B) // the forward pass proved a match
+			return b
+		}
+		if sw := cs.progSweep; sw != nil && sw.members[k] != nil {
+			b = cs.emitSweptMember(b, k, sweepMerge{pPtr: pPtr, pLen: pLen, lQ: lQ, lSt: lSt, lE: lE, lV: lV, lTmp: lTmp,
+				lRegion: lSwRegion, lRegionLen: lSwRegionLen, lLocated: lSwLocated, g: swGeo,
+				sweepIdx: swIdx},
+				func(b []byte) []byte {
+					b = storeGate(b, sm.id, func(b []byte) []byte { return append(b, 0x20, lDead) })
+					return append(b, 0x0C, 0x03) // br $found: 0 = $got, 1 = swept if, 2 = $retry, 3 = $found
+				},
+				func(b []byte, onNone func([]byte) []byte) []byte { return search(b, 3, onNone) })
+		} else {
+			b = search(b, 2, func(b []byte) []byte { return b })
 		}
 		if gated {
 			// An empty match where the gate forbids one (right after this
@@ -1469,6 +1757,19 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	}
 	if gated && worker {
 		b = append(b, 0x0B)
+	}
+	if worker && cs.keptCache != nil {
+		// A position the batch entry starts that does not fit the room left
+		// whole: say so, and the entry ends its call before it (see the kept
+		// part above).
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+		b = append(b, 0x41, keptBatchWhole, 0x46)
+		b = append(b, 0x20, pMode, 0x45, 0x71)
+		b = append(b, 0x20, lN, 0x20, pCap, 0x4A, 0x71) // n > cap
+		b = append(b, 0x04, 0x40)
+		b = i32c(b, keptNoFitSentinel)
+		b = append(b, 0x0F, 0x0B)
 	}
 	b = append(b, 0x20, lN, 0x0B)
 	return append(utils.AppendULEB128(nil, uint32(len(b))), b...)
@@ -1700,13 +2001,27 @@ func (cs *compiledSet) emitScratchMagicCheck(b []byte, descLocal, tmp byte) []by
 }
 
 // emitScratchBlocks pushes the descriptor's blocks pointer: its fifth field
-// under abi.FindScratchMagicBlocks, 0 (no blocks) under the plain magic.
-func emitScratchBlocks(b []byte, descLocal byte) []byte {
+// under abi.FindScratchMagicBlocks when its sixth, the block count, is the
+// count the caller's array must hold (blocksTotal); 0 (no blocks) under the
+// plain magic or a count that disagrees, so a stub generated for another
+// build of the config cannot make the module index past the caller's array.
+func (cs *compiledSet) emitScratchBlocks(b []byte, descLocal byte) []byte {
 	b = append(b, 0x20, descLocal, 0x28, 0x02, abi.FindScratchMagicOff, 0x41)
 	b = utils.AppendSLEB128(b, abi.FindScratchMagicBlocks)
-	b = append(b, 0x46, 0x04, 0x7F) // eq; if (result i32)
+	b = append(b, 0x46, 0x20, descLocal, 0x28, 0x02, abi.FindScratchBlocksCountOff, 0x41)
+	b = utils.AppendSLEB128(b, int32(cs.blocksTotal())) //nolint:gosec // a small count
+	b = append(b, 0x46, 0x71, 0x04, 0x7F)               // eq; eq; and; if (result i32)
 	b = append(b, 0x20, descLocal, 0x28, 0x02, abi.FindScratchBlocksOff)
 	return append(b, 0x05, 0x41, 0x00, 0x0B)
+}
+
+// blocksTotal is how many blocks the caller's array holds: the exported set's
+// whole list, which a companion's blocks are a slice of.
+func (cs *compiledSet) blocksTotal() int {
+	if cs.blocksOwner != nil {
+		return cs.blocksOwner.blocksTotal()
+	}
+	return len(cs.searchBlocks())
 }
 
 // searchBlocks is every search block the set's `find` takes, in order
@@ -1746,36 +2061,50 @@ func (cs *compiledSet) scanAloneNeedsSplit() bool {
 // the set without its scan pair — unsplit, so its `find` keeps the answer
 // cache (and the no-cache companion a cacheless drive needs) — and an internal
 // SPLIT copy with only the scan pair, to which the set's scan exports forward.
-// nil when the two would not agree on the `_all` ABI, which a stub reads off
-// the set alone; the caller then splits the whole set as before.
+//
+// The two must agree on the `_all` ABI, which a stub reads off the set once.
+// They are compiled as they choose first; when they disagree — a member split
+// onto the Backtracking find makes the copy's form the wide one, while the
+// unsplit half has no Backtracking at all — both are compiled again with the
+// wide form forced. Before that retry such a set was split WHOLE, and its
+// `find` then read no cache: 90,441 fuel/byte at 8 KB, ×4 per doubling.
+// nil only when the set without its scan pair still needs the split; the
+// caller then splits the whole set.
 func scanSplitOnly(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, cands []splitCand) *compiledSet {
 	saved := opts.globals.clone()
-	ps := spec
-	ps.ScanAny, ps.ScanAll = "", ""
-	primary := compileSetWith(ps, prefixPool, suffixPool, opts, nil, true)
-	if primary.needsSplit() {
-		*opts.globals = *saved
-		return nil
+	for _, wide := range []bool{false, true} {
+		*opts.globals = *saved.clone()
+		ps := spec
+		ps.ScanAny, ps.ScanAll = "", ""
+		// Quiet: the trial has already warned about every pattern this compile
+		// drops or puts on Backtracking, by the same per-pattern rules.
+		po := opts
+		po.quiet, po.forceWideAll = true, wide
+		primary := compileSetWith(ps, prefixPool, suffixPool, po, nil, true)
+		if primary.needsSplit() {
+			*opts.globals = *saved
+			return nil
+		}
+		primary.attachCompanion(noCacheCompanion(spec, prefixPool, suffixPool, opts, primary, cands))
+		sc := spec
+		sc.Name = spec.Name + "\x00scan"
+		sc.Find, sc.BatchFind, sc.MatchAny, sc.MatchAll = "", false, "", ""
+		so := opts
+		so.quiet, so.forceWideAll = true, wide
+		base := max(int64(primary.regionEnd), primary.dataTop())
+		if primary.companion != nil {
+			base = max(base, int64(primary.companion.regionEnd), primary.companion.dataTop())
+		}
+		so.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
+		comp := compileSetWith(sc, prefixPool, suffixPool, so, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+		if comp.wideAll() != primary.wideAll() {
+			continue
+		}
+		comp.internal = true
+		primary.scanComp, primary.fwdScanAny, primary.fwdScanAll = comp, spec.ScanAny, spec.ScanAll
+		return primary
 	}
-	primary.attachCompanion(noCacheCompanion(spec, prefixPool, suffixPool, opts, primary, cands))
-	sc := spec
-	sc.Name = spec.Name + "\x00scan"
-	sc.Find, sc.BatchFind, sc.MatchAny, sc.MatchAll = "", false, "", ""
-	so := opts
-	so.quiet = true
-	base := max(int64(primary.regionEnd), primary.dataTop())
-	if primary.companion != nil {
-		base = max(base, int64(primary.companion.regionEnd), primary.companion.dataTop())
-	}
-	so.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
-	comp := compileSetWith(sc, prefixPool, suffixPool, so, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
-	if comp.wideAll() != primary.wideAll() {
-		*opts.globals = *saved
-		return nil
-	}
-	comp.internal = true
-	primary.scanComp, primary.fwdScanAny, primary.fwdScanAll = comp, spec.ScanAny, spec.ScanAll
-	return primary
+	panic("compile: a set and its scan copy disagree on the `_all` form with both forced wide")
 }
 
 // attachCompanion makes comp the set's companion, its blocks after the set's
@@ -1784,6 +2113,7 @@ func (cs *compiledSet) attachCompanion(comp *compiledSet) {
 	cs.companion = comp
 	if comp != nil {
 		comp.blocksSkip = cs.blocksBase() + len(cs.ownBlocks())
+		comp.blocksOwner = cs
 	}
 }
 
@@ -1794,7 +2124,7 @@ func (cs *compiledSet) emitWorkerBlocks(b []byte, descLocal byte) []byte {
 	if !cs.splitBlocks() || !cs.mergedWorker() {
 		return b
 	}
-	b = emitScratchBlocks(b, descLocal)
+	b = cs.emitScratchBlocks(b, descLocal)
 	b = append(b, 0x24)
 	return utils.AppendULEB128(b, cs.splitBlocksGlobal)
 }

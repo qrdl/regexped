@@ -144,6 +144,10 @@ type SetDiag struct {
 	// InCallCounter is set when the overlapping `find` carries the work
 	// counter that sweeps the answer cache INSIDE a call.
 	InCallCounter bool `json:"in_call_counter,omitempty"`
+	// KeptCache is set when the set splits a member out of an overlapping
+	// `find` and its KEPT members are served behind the merge wrapper by an
+	// internal set of their own, which reads the answer cache.
+	KeptCache bool `json:"kept_cache,omitempty"`
 	// WholeSetSweep reports the automaton the overlapping answer cache sweeps
 	// when the set's buckets cannot be swept directly: every member's full
 	// pattern merged, beside the buckets the walk keeps.

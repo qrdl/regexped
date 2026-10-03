@@ -2,7 +2,8 @@
 
 # Every adversarial drive shape found so far, plus the drives already measured
 # linear. Rows expected LINEAR fail the run when their fuel ratio per input
-# doubling exceeds 2.5 at the largest size; rows expected QUADRATIC are known
+# doubling exceeds 2.5 at the largest size, or when a ratio RISES past 2.1
+# (a quadratic share climbs; fixed costs only fade); rows expected QUADRATIC are known
 # open drives, reported with their ratio; REPORT rows print memory and
 # correctness evidence. Fuel is exact, so the run needs no quiet machine —
 # but it is memory-hungry: run it alone.

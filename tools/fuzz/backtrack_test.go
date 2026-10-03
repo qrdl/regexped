@@ -1308,8 +1308,11 @@ func TestBTCaptureStackGrows(t *testing.T) {
 			release()
 
 			sizes := btGroupsDrive(t, w, []string{small, big, big, small}, []bool{false, false, false, false})
-			if got := sizes[0] - static; got != uint64(start>>16) {
-				t.Errorf("the first call grew memory by %d pages, want the starting size, %d", got, start>>16)
+			// The drive hands no search block, so a standalone module also
+			// grows its own default search state on the first call: one page.
+			const defaultArea = 1
+			if got := sizes[0] - static; got != uint64(start>>16)+defaultArea {
+				t.Errorf("the first call grew memory by %d pages, want the starting size, %d, plus the default search state's page", got, start>>16)
 			}
 			if need := uint64(len(big)) * 32; (sizes[1]-static)*65536 < need {
 				t.Errorf("the big call left %d pages above the tables, less than the %d bytes its stack needs", sizes[1]-static, need)

@@ -954,16 +954,36 @@ func dfaReachCo(t *dfaTable) (reach, co []bool) {
 // bytes, the other column updates — and never were. What the constant has to
 // do is scale like the sweep does, so that a drive whose walk is genuinely
 // quadratic crosses and a drive the walk handles cheaply does not.
+//
+// The rate is then divided by overlapSweepTriggerDiv, so the line sits at a
+// sixteenth of a sweep's cost — see there.
 func (cs *compiledSet) overlapSweepCostPerByte() int64 {
 	cells := cs.overlapCells()
 	if cells <= 0 {
 		return 1
 	}
-	return int64(cells)
+	return max(1, int64(cells)/overlapSweepTriggerDiv)
 }
 
-// overlapSweepSetupBytes is what STARTING a sweep costs, in bytes of sweeping:
-// the drive engages once its work passes (len + this) × costPerByte.
+// overlapSweepTriggerDiv lowers the trigger to 1/16 of a sweep's per-byte
+// cost. At the full cost a WIDE set walked up to about two sweeps' worth
+// before switching — linear, but ×4 per doubling up to that point: 96
+// members over `a`×n fired only at 16 KB (281,595 fuel/byte). Measured at
+// ÷16: that row 108,705 from 2 KB, 40 members 49,072 → 21,120, 128 members
+// 56,052 → 23,440; match-heavy drives −36% to +2.3%; setperf's overlapping
+// rows no dearer (overlap-shape-3 −27% to −34%); and ordinary text never
+// fires — its work per byte stays 11× to 134× under the line (÷64 gained only
+// 6-8% more on hostile input and left as little as 2.8×). A sweep fired on
+// ordinary text costs 30× to 250× the walk, which is why there is a line at
+// all.
+const overlapSweepTriggerDiv = 16
+
+// overlapSweepSetupBytes is what STARTING a sweep costs, in bytes of sweeping
+// at the FULL per-byte rate (`cells`): the drive engages once its work passes
+// len × costPerByte + this × cells (overlapSweepSetupWork). The allowance is
+// not divided by overlapSweepTriggerDiv with the rate — dividing it put 3- to
+// 13-byte inputs back over the line, onto a sweep that costs them more than
+// the walk (the losses measured below).
 //
 // A per-byte rate alone prices a sweep over a 3-byte input at three bytes'
 // worth, and the drives that then crossed paid more than walking — measured
@@ -978,19 +998,25 @@ func (cs *compiledSet) overlapSweepCostPerByte() int64 {
 // allowance moves the line by eight bytes and nothing measurable.
 const overlapSweepSetupBytes = 8
 
-// emitSweepThreshold pushes the i64 (len + overlapSweepSetupBytes) ×
-// costPerByte, with len the input-length parameter pInLen. The ONE spelling of
-// the line: the between-calls trigger and both in-call budgets compare against
-// it, and two of three drifting apart would have a call's budget run out on a
-// drive the trigger says is cheap.
-func emitSweepThreshold(b []byte, pInLen byte, costPerByte int64) []byte {
+// overlapSweepSetupWork is the start-up allowance in work units:
+// overlapSweepSetupBytes at the full per-byte rate.
+func (cs *compiledSet) overlapSweepSetupWork() int64 {
+	return overlapSweepSetupBytes * max(1, int64(cs.overlapCells()))
+}
+
+// emitSweepThreshold pushes the i64 len × costPerByte + setupWork, with len
+// the input-length parameter pInLen. The ONE spelling of the line: the
+// between-calls trigger and both in-call budgets compare against it, and two
+// of three drifting apart would have a call's budget run out on a drive the
+// trigger says is cheap.
+func emitSweepThreshold(b []byte, pInLen byte, costPerByte, setupWork int64) []byte {
 	b = append(b, 0x20, pInLen, 0xAD) // (u64) len
 	b = append(b, 0x42)
-	b = utils.AppendSLEB128_64(b, overlapSweepSetupBytes)
-	b = append(b, 0x7C) // i64.add
-	b = append(b, 0x42)
 	b = utils.AppendSLEB128_64(b, costPerByte)
-	return append(b, 0x7E) // i64.mul
+	b = append(b, 0x7E) // i64.mul
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, setupWork)
+	return append(b, 0x7C) // i64.add
 }
 
 // overlapCacheGeometry is everything the two serving paths need to know about
@@ -1176,6 +1202,8 @@ type overlapCacheCtx struct {
 	// currency the work counter uses (matched bytes). See
 	// overlapSweepCostPerByte.
 	costPerByte int64
+	// setupWork is the start-up allowance (overlapSweepSetupWork).
+	setupWork int64
 	// cellBytes and rowBytes are the layout constants the serving validator
 	// checks the caller's header against: one checkpoint column, and one
 	// position's row in the block buffer.
@@ -1252,7 +1280,7 @@ func (c overlapCacheCtx) emitWorkExceedsSweep(b []byte) []byte {
 	b = append(b, 0x41, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // 0x7FFFFFFF
 	b = append(b, 0x46)                               // i32.eq -> saturated
 	b = append(b, 0x20, c.lWork, 0xAD)                // (u64) work
-	b = emitSweepThreshold(b, c.pInLen, c.costPerByte)
+	b = emitSweepThreshold(b, c.pInLen, c.costPerByte, c.setupWork)
 	b = append(b, 0x56) // i64.gt_u
 	b = append(b, 0x72) // i32.or: saturated, or over the threshold
 	return b

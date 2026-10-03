@@ -1132,7 +1132,7 @@ func TestWitSetKebabPanicsOnDisagreement(t *testing.T) {
 // trio. The declarations are the module stub's, checked by the header-parity test.
 func TestCComponentSetParts(t *testing.T) {
 	cfg0 := setStubCfg()
-	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets", newSetShapes(cfg0))
+	h, c := genCComponentSetParts(cfg0, setStubWit(t, cfg0), "regexped:t/sets", newSetShapes(cfg0), searchSizesFor(cfg0))
 	for _, want := range []string{
 		"#define S_PATTERN_COUNT 2",
 		"#define S_ID_SPACE 2",
@@ -1172,7 +1172,7 @@ func TestCComponentSetParts(t *testing.T) {
 
 	cfg := setStubCfg()
 	cfg.Sets = nil
-	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets", newSetShapes(cfg)); h != "" || c != "" {
+	if h, c := genCComponentSetParts(cfg, nil, "regexped:t/sets", newSetShapes(cfg), searchSizesFor(cfg)); h != "" || c != "" {
 		t.Errorf("genCComponentSetParts(no sets) = %q/%q, want empty", h, c)
 	}
 }

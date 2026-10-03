@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -567,7 +569,7 @@ func TestCmdCompile(t *testing.T) {
 	t.Run("file output embedded", func(t *testing.T) {
 		dir := t.TempDir()
 		out := filepath.Join(dir, "out.wasm")
-		cfg := config.BuildConfig{Regexps: entries, Output: "final.wasm"} // Output set → embedded
+		cfg := config.BuildConfig{Regexps: entries, Output: "final.wasm", ImportModule: "rx"} // Output set → embedded
 		if err := CmdCompile(cfg, out); err != nil {
 			t.Fatalf("CmdCompile: %v", err)
 		}
@@ -577,6 +579,26 @@ func TestCmdCompile(t *testing.T) {
 		}
 		if !bytes.HasPrefix(data, wasmMagic) {
 			t.Error("output is not valid WASM")
+		}
+		// An embedded module names the module its stubs import from, which
+		// is what `regexped merge` names it by.
+		if name, ok := utils.CustomSection(data, abi.ImportModuleSection); !ok || string(name) != "rx" {
+			t.Errorf("import_module record = %q, %v; want \"rx\"", name, ok)
+		}
+		validateWASM(t, data)
+	})
+
+	t.Run("standalone carries no import_module record", func(t *testing.T) {
+		out := filepath.Join(t.TempDir(), "out.wasm")
+		if err := CmdCompile(config.BuildConfig{Regexps: entries, ImportModule: "rx"}, out); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := utils.CustomSection(data, abi.ImportModuleSection); ok {
+			t.Error("a standalone module, which is never merged, records an import_module")
 		}
 	})
 
@@ -2496,8 +2518,8 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 					"covers the dispatch shape it was written for",
 					l.useHybridDispatch, tc.hybrid)
 			}
-			_, _, twin, patch := appendFindCodeEntryTwinned(
-				nil, l, table, findMandatoryLit(tc.pattern, false), 0)
+			e := buildFindCodeEntry(l, table, findMandatoryLit(tc.pattern, false), 0)
+			twin, patch := e.twin, e.twinPatch
 			if (twin != nil) != tc.wantTwin {
 				t.Errorf("twin emitted = %v, want %v", twin != nil, tc.wantTwin)
 			}
@@ -2538,6 +2560,46 @@ func TestCmdCompileVerboseSets(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	validateWASM(t, data)
+}
+
+// TestWarnUnboundedMemory: `regexped compile` warns, once, when the module
+// carries Backtracking code and the config sets no max_memory — through a
+// pattern's own engine and through a set-bearing build alike — and is silent
+// with a cap, or with no Backtracking code at all.
+func TestWarnUnboundedMemory(t *testing.T) {
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	capped, err := config.ParseMemorySize("64MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt := config.RegexEntry{Name: "bt", Pattern: `^(aa|a)*b`, GroupsFunc: "bt_groups"}
+	dfa := config.RegexEntry{Name: "dfa", Pattern: `abc`, FindFunc: "dfa_find"}
+	set := []config.SetConfig{{Name: "s", Find: "s_find", Patterns: config.PatternSelector{Names: []string{"dfa"}}}}
+	cases := []struct {
+		name string
+		cfg  config.BuildConfig
+		want int
+	}{
+		{"backtracking, no cap", config.BuildConfig{Regexps: []config.RegexEntry{bt}}, 1},
+		{"backtracking, capped", config.BuildConfig{Regexps: []config.RegexEntry{bt}, MaxMemory: capped}, 0},
+		{"no backtracking", config.BuildConfig{Regexps: []config.RegexEntry{dfa}}, 0},
+		{"backtracking beside a set, no cap", config.BuildConfig{Regexps: []config.RegexEntry{bt, dfa}, Sets: set}, 1},
+		{"a set, no backtracking", config.BuildConfig{Regexps: []config.RegexEntry{dfa}, Sets: set}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var log bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			if err := CmdCompileVerbose(c.cfg, filepath.Join(t.TempDir(), "out.wasm"), nil); err != nil {
+				t.Fatalf("CmdCompileVerbose: %v", err)
+			}
+			if got := strings.Count(log.String(), "max_memory is not set"); got != c.want {
+				t.Errorf("warned %d times, want %d:\n%s", got, c.want, log.String())
+			}
+		})
+	}
+	WarnUnboundedMemory(config.BuildConfig{}, nil) // no compile ran: nothing to say
 }
 
 func TestVerboseReporterNotes(t *testing.T) {
@@ -2912,6 +2974,44 @@ func TestFailedWalkBound(t *testing.T) {
 	}
 }
 
+// TestScanSplitOnlyAgreesOnAllForm: an overlapping set whose `scan_all` alone
+// needs the split, with the split member on the Backtracking find. The scan
+// copy's `_all` form is the wide one; the unsplit half, which keeps the answer
+// cache for `find`, must take the same form instead of making the whole set
+// split (which cost that `find` its cache: ×4 per doubling).
+func TestScanSplitOnlyAgreesOnAllForm(t *testing.T) {
+	sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "sa", Overlapping: true,
+		Patterns: config.PatternSelector{All: true}}
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "a", Pattern: `foo\w+`},
+			{Name: "b", Pattern: `a[ab]{12}c[a-z]*z`},
+			{Name: "c", Pattern: `\bbar\b`},
+		},
+		Sets: []config.SetConfig{sc},
+	}
+	cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs.scanComp == nil {
+		t.Fatal("the scan pair did not forward to a split copy")
+	}
+	if len(cs.split) != 0 {
+		t.Errorf("the set itself split %d members; only its scan copy should", len(cs.split))
+	}
+	if !cs.usesOverlapDP() {
+		t.Error("the unsplit half lost the answer cache")
+	}
+	if !cs.scanComp.btSplit || !cs.wideAll() || !cs.scanComp.wideAll() {
+		t.Errorf("wide forms: set %v, scan copy %v (Backtracking split %v), want both wide",
+			cs.wideAll(), cs.scanComp.wideAll(), cs.scanComp.btSplit)
+	}
+	if !SetAdmitsBacktracking(sc, cfg) {
+		t.Error("SetAdmitsBacktracking = false, but the scan copy's member can answer unknown")
+	}
+}
+
 // TestSetSplitRule pins which members a gated set splits out of its buckets
 // (set_split.go): those that are not provably linear in the set's bodies.
 func TestSetSplitRule(t *testing.T) {
@@ -3167,8 +3267,10 @@ func TestSearchSizes(t *testing.T) {
 				t.Errorf("merged=%v: %s keeps no notes", merged, f)
 			}
 		}
-		if bt := sz["bt_find"]; !bt.BTBudget || (bt.BTMemoBytes > 0) == merged {
-			t.Errorf("merged=%v: bt_find = %+v: want the budget, and a memo only standalone", merged, bt)
+		// Every build keeps a tripped search's memo: a merged one in the
+		// host's memory, through its second fallback body.
+		if bt := sz["bt_find"]; !bt.BTBudget || bt.BTMemoBytes == 0 {
+			t.Errorf("merged=%v: bt_find = %+v: want the budget and a memo", merged, bt)
 		}
 		if sz["plain_find"].Block() {
 			t.Errorf("merged=%v: plain_find keeps a block it has no use for", merged)

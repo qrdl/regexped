@@ -398,6 +398,44 @@ func TestSetOverlapBytesForStrideClampsAboveSpan(t *testing.T) {
 // TestLoadConfigUnresolvablePath covers the filepath.Abs failure. It is
 // reachable only with no working directory, which is why the error is reported
 // by the path rather than assumed impossible.
+// TestSetOverlapCheckpointSizingRow: the program sweep's sizing is the cache's
+// formula over a caller-given row. With the cache's own row it must give the
+// cache's answer exactly, on both sides of the single-block budget; and it
+// keeps that formula's clamps.
+func TestSetOverlapCheckpointSizingRow(t *testing.T) {
+	for _, pats := range []int{1, 3, 40} {
+		row := SetOverlapBlockRowBytes(pats)
+		for _, n := range []int{0, 1, 100, 1 << 20, 20_000_000} {
+			for _, cells := range []int{3, 70} {
+				b, k := SetOverlapCheckpointSizingRow(n, cells, row)
+				if wb, wk := SetOverlapCheckpointBytes(n, cells, pats), SetOverlapCheckpointStride(n, cells, pats); b != wb || k != wk {
+					t.Errorf("n=%d cells=%d pats=%d: got (%d, %d), the cache's formula (%d, %d)", n, cells, pats, b, k, wb, wk)
+				}
+			}
+		}
+	}
+	cases := []struct {
+		name                 string
+		n, cells, row, wantK int
+	}{
+		{"a negative length is one position", -5, 3, 4, 1},
+		{"one block while it fits", 100, 3, 4, 101},
+		{"the square root above the budget", 20_000_000, 3, 4, 7745},
+		{"never below 16", 20_000_000, 0, 4, 16},
+		{"never past the span", 3, 3, 1 << 25, 4},
+		{"a row count that would overflow", 1 << 60, 3, 8, 1315059792}, // √(1.5 × 2⁶⁰)
+	}
+	for _, c := range cases {
+		b, k := SetOverlapCheckpointSizingRow(c.n, c.cells, c.row)
+		if k != c.wantK {
+			t.Errorf("%s: stride %d, want %d", c.name, k, c.wantK)
+		}
+		if b <= SetOverlapCheckpointHeaderBytes {
+			t.Errorf("%s: %d bytes, not even past the header", c.name, b)
+		}
+	}
+}
+
 func TestLoadConfigUnresolvablePath(t *testing.T) {
 	gone := t.TempDir()
 	sub := filepath.Join(gone, "cwd")

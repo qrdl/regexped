@@ -64,6 +64,7 @@ import (
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/benchshim"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -605,26 +606,24 @@ type memPlan struct {
 	cacheStride int32
 	needTop     int64
 	// The set's split member search blocks, handed to `find` as a generated
-	// iterator does, and each one's notes room; blocks nil for none.
-	blocks     []int
-	blocksPtr  int32
-	notesBytes int32
+	// iterator does, with the region for their notes and memos
+	// (internal/searchblock); nil for none.
+	blocks *searchblock.Blocks
 }
 
-// withBlocks lays the set's split member search blocks (and their notes) out
-// above everything else the plan holds.
-func (p memPlan) withBlocks(blocks []int, maxInputLen int) memPlan {
-	if len(blocks) == 0 {
-		return p
+// withBlocks lays the set's split member search blocks (and their notes and
+// memos) out above everything else the plan holds.
+func (p memPlan) withBlocks(d compile.SetDiag, maxInputLen int) memPlan {
+	sizes := make([]searchblock.Size, len(d.SearchBlocks))
+	for k, n := range d.SearchBlocks {
+		sizes[k].Notes = n
+		if d.SearchBlocksBTMemo != nil {
+			sizes[k].Memo = d.SearchBlocksBTMemo[k]
+		}
 	}
-	nb := 0
-	for _, n := range blocks {
-		nb = max(nb, n)
+	if p.blocks = searchblock.Layout(p.needTop, sizes, maxInputLen, searchblock.Fresh); p.blocks != nil {
+		p.needTop = p.blocks.End() + 64
 	}
-	p.blocks = blocks
-	p.blocksPtr = int32((p.needTop + 7) &^ 7)
-	p.notesBytes = int32((maxInputLen+1)*nb+7) &^ 7
-	p.needTop = int64(p.blocksPtr) + int64(len(blocks))*int64(abi.SearchBlockBytes+p.notesBytes) + 64
 	return p
 }
 
@@ -825,10 +824,10 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		runtime.KeepAlive(r.store)
 	}
 	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, p.cacheLen)
-	if len(p.blocks) > 0 {
-		r.zero(p.blocksPtr, int32(len(p.blocks)*abi.SearchBlockBytes))
-		abi.WriteFindScratchBlocks(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, p.cacheLen, p.blocksPtr)
+	if err := p.blocks.Begin(r.data, int(inputLen)); err != nil {
+		return false, err
 	}
+	p.blocks.Describe(r.mem.UnsafeData(r.store), p.scratchPtr)
 	found := false
 	for from := int32(0); ; {
 		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.scratchPtr, p.outBase, r.outCap)
@@ -838,7 +837,9 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		if n.(int32) <= 0 {
 			return found, nil
 		}
-		r.giveNotes(inputLen)
+		if err := r.giveNotes(); err != nil {
+			return found, err
+		}
 		found = true
 		buf := r.mem.UnsafeData(r.store)
 		base := int(p.outBase)
@@ -888,7 +889,7 @@ func measureMode(b build, kind capKind, export string, inputs []string, iters in
 		}
 	}
 	plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
-	plan = plan.withBlocks(b.diag.SearchBlocks, maxLen)
+	plan = plan.withBlocks(b.diag, maxLen)
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +967,7 @@ func sanityCheck(builds [3]build, kind capKind, export string, patternCount, idS
 			continue
 		}
 		plan, err := planMem(b.wasm, maxLen, patternCount, idSpace, cache)
-		plan = plan.withBlocks(b.diag.SearchBlocks, maxLen)
+		plan = plan.withBlocks(b.diag, maxLen)
 		if err != nil {
 			return err
 		}
@@ -1277,25 +1278,12 @@ func fmtFuel(n uint64) string {
 }
 
 // giveNotes runs after a `find` call, as a generated iterator does: a split
-// member whose search armed during it gets its notes.
-func (r *runner) giveNotes(inputLen int32) {
-	p := r.plan
-	if len(p.blocks) == 0 {
-		return
-	}
-	buf := r.mem.UnsafeData(r.store)
-	notesBase := p.blocksPtr + int32(len(p.blocks)*abi.SearchBlockBytes)
-	for k, nb := range p.blocks {
-		blk := p.blocksPtr + int32(k*abi.SearchBlockBytes)
-		if nb == 0 || binary.LittleEndian.Uint32(buf[blk+abi.SearchArmedOff:]) == 0 ||
-			binary.LittleEndian.Uint32(buf[blk+abi.SearchNotesOff:]) != 0 {
-			continue
-		}
-		n := (inputLen + 1) * int32(nb)
-		notes := notesBase + int32(k)*p.notesBytes
-		clear(buf[notes : notes+n])
-		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesOff:], uint32(notes))
-		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesCapOff:], uint32(n))
-	}
+// member whose search armed during it gets its notes, one whose Backtracking
+// budget tripped its memo.
+func (r *runner) giveNotes() error {
+	err := r.plan.blocks.After(r.data)
 	runtime.KeepAlive(r.store)
+	return err
 }
+
+func (r *runner) data() []byte { return r.mem.UnsafeData(r.store) }

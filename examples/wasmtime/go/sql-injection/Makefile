@@ -40,6 +40,11 @@ $(FINAL_WASM): $(APP_WASM) $(REGEX_WASM) regexped.yaml $(REGEXPED)
 merge: $(FINAL_WASM)
 
 # Step 5 – run
+# The last section's "[unknown  ]" line is EXPECTED: main.go feeds is_sqli a
+# 64 KiB hostile value that needs more memory than regexped.yaml's
+# max_memory (1 MiB) allows, so the search answers "unknown"
+# (ErrBacktrackOverflow) instead of growing memory, and the program rejects
+# the value, since unknown is not clean. The run still exits 0.
 run: $(FINAL_WASM)
 	@echo "=== SQL injection detection (Backtracking engine) ==="
 	wasmtime $(FINAL_WASM)

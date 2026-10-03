@@ -989,12 +989,18 @@ func TestSetOverlapCacheShapeHandComputed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 9 {
-		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 9 per byte", sh)
+	// 9 cells cost 9 per byte, and the trigger fires at a sixteenth of that,
+	// which floors at 1.
+	if !sh.Eligible || sh.Cells != 9 || sh.Patterns != 2 || sh.CostPerByte != 1 {
+		t.Errorf("shape = %+v, want eligible, 9 cells, 2 patterns, cost 1 per byte", sh)
 	}
 	// The line a harness checks engagement against: CostPerByte per byte plus
-	// the fixed allowance for starting a sweep.
-	if got, want := sh.SweepThreshold(100), int64(100+overlapSweepSetupBytes)*9; got != want {
+	// the allowance for starting a sweep, at the FULL rate (9 cells), so a
+	// few-byte input stays on the walk.
+	if sh.SetupWork != overlapSweepSetupBytes*9 {
+		t.Errorf("SetupWork = %d, want %d", sh.SetupWork, overlapSweepSetupBytes*9)
+	}
+	if got, want := sh.SweepThreshold(100), int64(100+overlapSweepSetupBytes*9); got != want {
 		t.Errorf("SweepThreshold(100) = %d, want %d", got, want)
 	}
 }
@@ -1646,5 +1652,88 @@ func TestCacheEmittersWithoutWalkEnd(t *testing.T) {
 	i64 := overlapCacheCtx{pInLen: 1, i64Ret: true}.emitPastEndCheck(nil, 2)
 	if bytes.Equal(i32, i64) {
 		t.Error("the past-end check must answer differently for find (0) and the batch entry (the done cursor)")
+	}
+}
+
+// TestProgramSweepModulesBuild compiles every shape the program sweep and the
+// kept members' cache take — each assertion kind, zero-width cycles, a
+// capture, a Backtracking member (a member anchored at 0 is provably linear
+// and is not split, so `\A` is tested inside an alternation); kept members
+// that are cache-eligible and
+// ones that are not; with and without the batch entry; standalone and
+// embedded; checkpointed under the test budget; and as a component — and
+// validates each module. The answers are checked against Go in tools/fuzz
+// (TestProgramSweepMatchesGo, TestProgramSweepCheckpointsMatchGo); this keeps
+// the emitters inside this package's own tests.
+func TestProgramSweepModulesBuild(t *testing.T) {
+	members := []string{
+		`a[a-z]*?z`, `\ba[a-z]*?z\b`, `\Ba[a-z]*?z`, `(?m:^)a[a-z]*?z`, `a[a-z]*?z(?m:$)`,
+		`a[a-z]*?z$`, `(?:\A|x)a[a-z]*?z`, `a[a-z]*?z\z`, `(?:a|)*?z`, `x(?:ab|a)*?y`, `(a)[a-z]*?z`,
+		`(?:a|b)*a(?:a|b){12}c`, `a(?s:.)*?z`, `a.*?z`,
+	}
+	cfgFor := func(kept, member string, batch bool) config.BuildConfig {
+		set := config.SetConfig{Name: "s", Find: "s_find", Overlapping: true, Patterns: config.PatternSelector{All: true}}
+		if batch {
+			set.Hints = []string{"batch-find"}
+		}
+		return config.BuildConfig{
+			Regexps: []config.RegexEntry{{Name: "k", Pattern: kept}, {Name: "m", Pattern: member}},
+			Sets:    []config.SetConfig{set},
+		}
+	}
+	for _, m := range members {
+		for _, kept := range []string{`foo\w+`, `abc`} {
+			for _, batch := range []bool{false, true} {
+				cfg := cfgFor(kept, m, batch)
+				sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sh.SweepCells == 0 || !sh.Offered() {
+					t.Errorf("{%s, %s}: no program sweep (%+v)", kept, m, sh)
+				}
+				if b, _ := sh.Sizing(1 << 20); b <= config.SetOverlapCheckpointHeaderBytes {
+					t.Errorf("{%s, %s}: a region of %d bytes cannot hold the sweep", kept, m, b)
+				}
+				for _, out := range []string{"", "merged.wasm"} {
+					cfg.Output = out
+					w, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+					if err != nil {
+						t.Fatalf("{%s, %s} batch=%v output=%q: %v", kept, m, batch, out, err)
+					}
+					validateWASM(t, w)
+				}
+			}
+		}
+	}
+	// Past the sweep's root limit a member keeps its ordinary search: alone,
+	// the set has no sweep; beside a member that fits, only that one is swept.
+	huge := `a(?:[a-z][0-9]c[A-Z]d){0,1000}?z` // ~5,000 roots
+	cfg := cfgFor(`foo\w+`, huge, false)
+	if sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg); err != nil || sh.SweepCells != 0 {
+		t.Errorf("%s alone: a sweep past the root limit (%+v, %v)", huge, sh, err)
+	}
+	cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Name: "m2", Pattern: members[0]})
+	sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || sh.SweepCells == 0 || sh.SweepRow != 4 {
+		t.Errorf("%s beside %s: want one swept member (%+v, %v)", huge, members[0], sh, err)
+	}
+	w, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+	// Checkpointed: the sweep's own budget at one byte.
+	w, _, _, err = CompileFileOpts(cfgFor(`foo\w+`, members[0], false), "", CompileSetOptions{}.WithSweepBudget(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+	// A component: its constructor reserves the sweep's part too.
+	for _, kept := range []string{`foo\w+`, `abc`} {
+		cfg := cfgFor(kept, members[0], false)
+		cfg.WasmFormat = "component"
+		cfg.Sets[0].Find = "scan_it"
+		buildSetComponent(t, cfg)
 	}
 }

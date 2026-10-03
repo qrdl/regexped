@@ -98,6 +98,7 @@ See [docker.md](docker.md) for full Docker usage and workflow examples.
 
 **Internals**
 - [Engines](engines.md) — DFA, TDFA, Backtracking, engine selection
+- [Keeping time and memory linear](complexity.md) — every mechanism against quadratic scans and unbounded memory, what each costs, and what is still not linear
 - [RE2 test coverage](re2.md) — pass/skip counts per engine and skip reasons
 - [WASM internals](wasm.md) — WASM interface, memory layout, table formats
 

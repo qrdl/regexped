@@ -1152,6 +1152,33 @@ func singleBlockBytes(m, cells, patterns int) int {
 	return n
 }
 
+// SetOverlapCheckpointSizingRow is SetOverlapCheckpointBytes and …Stride for
+// a region whose per-position row is rowBytes wide rather than one pattern
+// mask and end per pattern: a set's program sweep (compile/program_sweep.go)
+// keeps one answer per swept member a position, checkpointed by the very same
+// formula. Same rules: one block while it fits SetOverlapCacheMaxBytes, the
+// square-root stride above. bytes over the budget means the region cannot be
+// had (the caller reserves none of it).
+func SetOverlapCheckpointSizingRow(inputLen, cells, rowBytes int) (bytes, stride int) {
+	m := inputLen + 1
+	if m < 1 {
+		m = 1
+	}
+	cell := cells*4 + 4
+	k := m
+	if rowBytes > 0 && m > (1<<62)/rowBytes || SetOverlapCheckpointHeaderBytes+cell+4+m*rowBytes > SetOverlapCacheMaxBytes {
+		k = int(math.Sqrt(float64(m) * float64(cells) * 4 / float64(rowBytes)))
+		if k < 16 {
+			k = 16
+		}
+		if k > m {
+			k = m
+		}
+	}
+	nb := (m + k - 1) / k
+	return SetOverlapCheckpointHeaderBytes + nb*cell + 4 + k*rowBytes, k
+}
+
 // SetOverlapCheckpointBytesForStride is the region for a CHOSEN stride.
 //
 // The stride is a continuous knob, not a switch. At the square-root optimum it

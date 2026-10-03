@@ -140,7 +140,9 @@ type notesRows struct {
 
 // maxNotesBytesPerPos caps one automaton's record: a row index must fit the
 // byte-offset table's u8, and past 2,040 rows the notes are no longer "a few
-// bits per input byte". Such an automaton keeps today's find.
+// bits per input byte". A pattern's find with such an automaton is routed to
+// the Backtracking find (notesRowsOverflow); anywhere else the automaton keeps
+// its find without notes.
 const maxNotesBytesPerPos = 255
 
 // newNotesRows builds the row tables for t, placing them at l.tableEnd, or
@@ -186,6 +188,24 @@ func newNotesRowsAt(t *dfaTable, numWASM int, off int64) *notesRows {
 	return r
 }
 
+// countCycleStates is how many rows a find automaton's notes would need.
+func countCycleStates(t *dfaTable) int {
+	n := 0
+	for _, c := range dfaCycleStates(t) {
+		if c {
+			n++
+		}
+	}
+	return n
+}
+
+// notesRowsOverflow reports a find automaton with more cycle states than a
+// search's notes carry rows for: newNotesRows would refuse it, and the find
+// would keep no notes at all.
+func notesRowsOverflow(t *dfaTable) bool {
+	return countCycleStates(t) > maxNotesBytesPerPos*8
+}
+
 // dataSegment is the two tables as one active data segment.
 func (r *notesRows) dataSegment() []byte {
 	data := append(append([]byte(nil), r.mask...), r.off...)
@@ -224,6 +244,7 @@ const (
 	blkNotes    = byte(abi.SearchNotesOff)
 	blkHigh     = byte(abi.SearchHighOff)
 	blkSeen     = byte(abi.SearchSeenOff)
+	blkFar      = byte(abi.SearchFarOff)
 	blkNotesCap = byte(abi.SearchNotesCapOff)
 )
 
@@ -576,8 +597,17 @@ func (c *notesCtx) emitReturnHook(b []byte) []byte {
 	return b
 }
 
-// emitFailHook goes where an attempt has been proved to have no match: a
-// failed read over switchShortWalk bytes is waste.
+// emitFailHook goes where an attempt has been proved to have no match. Of a
+// failed read over switchShortWalk bytes, only the part BELOW the farthest
+// position an earlier failed walk of this search read is waste — that part is
+// read twice; the rest is ground no walk has covered. Charging the whole walk
+// armed searches whose walks never overlap: `[a-z]+@` over
+// `(a×40 ␠)×2000 b@ (a×40 ␠)×2000 c@` armed in its first call and paid the
+// marked copy (+22.7%) for the rest of the search, re-reading nothing. The
+// literal-anchored bodies use the same idea through lFar (emitFarCharge).
+//
+// waste += max(0, min(pos, far) − start); far = max(far, pos). lB is free
+// here: the walk is over and the recording re-walk is not running.
 func (c *notesCtx) emitFailHook(b []byte) []byte {
 	if !c.ordinary() {
 		return b
@@ -586,11 +616,24 @@ func (c *notesCtx) emitFailHook(b []byte) []byte {
 	b = nConst(b, switchShortWalk)
 	b = append(b, 0x4A, 0x04, 0x40)           // gt_s; if — the cheap test first
 	b = append(b, 0x20, c.lBlk(), 0x04, 0x40) // if (block)
-	b = c.addWasted(b, func(b []byte) []byte {
-		return append(b, 0x20, nPos, 0x20, nStart, 0x6B)
-	})
+	// min(pos, far) − start, signed: negative when the walk began past far.
+	b = append(b, 0x20, nPos)
+	b = c.ld(b, blkFar)
+	b = append(b, 0x20, nPos)
+	b = c.ld(b, blkFar)
+	b = append(b, 0x49, 0x1B) // lt_u; select: min(pos, far)
+	b = append(b, 0x20, nStart, 0x6B, 0x22, c.lB())
+	b = nConst(b, 0)
+	b = append(b, 0x4A, 0x04, 0x40) // gt_s; if — something was read twice
+	b = c.addWasted(b, func(b []byte) []byte { return append(b, 0x20, c.lB()) })
 	b = c.emitJudge(b)
-	return append(b, 0x0B, 0x0B)
+	b = append(b, 0x0B)
+	// far = max(far, pos)
+	b = append(b, 0x20, nPos)
+	b = c.ld(b, blkFar)
+	b = append(b, 0x4B, 0x04, 0x40) // gt_u; if
+	b = c.stLocal(b, blkFar, nPos)
+	return append(b, 0x0B, 0x0B, 0x0B)
 }
 
 // emitEntry goes right after the find-from seed.
@@ -628,30 +671,10 @@ func (c *notesCtx) emitEntry(b []byte) []byte {
 		b = append(b, 0x21, c.lBlk())
 		b = c.ld(b, blkNotes)
 		b = append(b, 0x21, c.lNotes())
-		b = append(b, 0x02, 0x40) // block $ok
-		b = c.ld(b, blkSeen)
-		b = append(b, 0x45, 0x04, 0x40) // eqz; if: the first marked call of this arming
-		b = c.ld(b, blkHigh)
-		b = append(b, 0x04, 0x40)
-		b = c.emitClear(b)
-		b = append(b, 0x0B)
-		b = c.stLocal(b, blkPtr, nPtr)
-		b = c.stLocal(b, blkLen, nLen)
-		b = c.stConst(b, blkSeen, 1)
-		b = append(b, 0x0C, 0x01, 0x0B) // br $ok; end if
-		b = append(b, 0x20, nPtr)
-		b = c.ld(b, blkPtr)
-		b = append(b, 0x46, 0x20, nLen)
-		b = c.ld(b, blkLen)
-		b = append(b, 0x46, 0x71, 0x20, nStart)
-		b = c.ld(b, blkResume)
-		b = append(b, 0x46, 0x71, 0x0D, 0x00) // eq; and; br_if $ok
-		// Another text: drop the notes and the search's state.
-		b = c.emitClear(b)
-		b = append(b, 0x20, c.lBlk(), 0x42, 0x00, 0x37, 0x03, blkWasted)
-		b = c.stConst(b, blkFirst, 0)
-		b = c.stConst(b, blkArmed, 0)
-		b = c.stConst(b, blkSeen, 0)
+		b = c.emitTextCheck(b,
+			func(b []byte) []byte { return append(b, 0x20, nPtr) },
+			func(b []byte) []byte { return append(b, 0x20, nLen) },
+			func(b []byte) []byte { return append(b, 0x20, nStart) })
 		b = append(b, 0x20, nPtr, 0x20, nLen, 0x10)
 		c.callOff = len(b)
 		b = utils.AppendPaddedULEB128(b, 0, twinCallImmWidth)
@@ -660,7 +683,57 @@ func (c *notesCtx) emitEntry(b []byte) []byte {
 	return b
 }
 
-// emitClear zeroes the notes up to the high-water position.
+// emitTextCheck opens `block $ok` and checks that a marked call continues the
+// text its notes describe. The first marked call of an arming records the text
+// — ptr and length — clearing what an earlier arming left, and branches to $ok;
+// a later one branches to $ok when ptr, length and, when resume is non-nil, the
+// call's start position (against the resume point the last marked call handed
+// out) all match. Falling through means ANOTHER text, the caller's mistake: the
+// notes and the search's state are dropped, and the caller emits what runs
+// instead and closes the block. Shared by the general body's marked copy and
+// the walkers, so the two cannot drift.
+func (c *notesCtx) emitTextCheck(b []byte, ptr, length, resume func([]byte) []byte) []byte {
+	b = append(b, 0x02, 0x40) // block $ok
+	b = c.ld(b, blkSeen)
+	b = append(b, 0x45, 0x04, 0x40) // eqz; if: the first marked call of this arming
+	b = c.ld(b, blkHigh)
+	b = append(b, 0x04, 0x40)
+	b = c.emitClear(b)
+	b = append(b, 0x0B)
+	b = append(b, 0x20, c.lBlk())
+	b = ptr(b)
+	b = append(b, 0x36, 0x02, blkPtr)
+	b = append(b, 0x20, c.lBlk())
+	b = length(b)
+	b = append(b, 0x36, 0x02, blkLen)
+	b = c.stConst(b, blkSeen, 1)
+	b = append(b, 0x0C, 0x01, 0x0B) // br $ok; end if
+	b = ptr(b)
+	b = c.ld(b, blkPtr)
+	b = append(b, 0x46)
+	b = length(b)
+	b = c.ld(b, blkLen)
+	b = append(b, 0x46, 0x71)
+	if resume != nil {
+		b = resume(b)
+		b = c.ld(b, blkResume)
+		b = append(b, 0x46, 0x71)
+	}
+	b = append(b, 0x0D, 0x00) // same text: br_if $ok
+	// Another text: drop the notes and the search's state.
+	b = c.emitClear(b)
+	b = append(b, 0x20, c.lBlk(), 0x42, 0x00, 0x37, 0x03, blkWasted)
+	b = c.stConst(b, blkFirst, 0)
+	b = c.stConst(b, blkArmed, 0)
+	b = c.stConst(b, blkSeen, 0)
+	return c.stConst(b, blkFar, 0)
+}
+
+// emitClear zeroes the notes up to the high-water position — and never past
+// notes_cap: a block reused for a SHORTER text with a fresh, smaller notes
+// buffer still carries the old text's high, and `high × stride` would then
+// write past the buffer the caller sized (host memory in an embedded build).
+// lB is free here: every caller clears at entry, before any transition.
 func (c *notesCtx) emitClear(b []byte) []byte {
 	b = append(b, 0x20, c.lNotes())
 	b = nConst(b, 0)
@@ -669,6 +742,11 @@ func (c *notesCtx) emitClear(b []byte) []byte {
 		b = nConst(b, c.rows.stride)
 		b = append(b, 0x6C)
 	}
+	b = append(b, 0x22, c.lB()) // tee: high × stride
+	b = c.ld(b, blkNotesCap)
+	b = append(b, 0x20, c.lB())
+	b = c.ld(b, blkNotesCap)
+	b = append(b, 0x49, 0x1B)       // lt_u; select: min(high × stride, cap)
 	b = append(b, 0xFC, 0x0B, 0x00) // memory.fill (the input's memory)
 	return c.stConst(b, blkHigh, 0)
 }
@@ -831,9 +909,8 @@ type SearchSize struct {
 	// budget per search in the block (bt_search.go), so a stub hands one over
 	// even when the export keeps no notes. BTMemoBytes is the memo bytes per
 	// text position a search that TRIPPED gets — (len + 1) × BTMemoBytes,
-	// zeroed, written to bt_memo/bt_memo_cap — 0 when the module keeps the
-	// fallback's memo per call (an embedded build, whose memo is not in the
-	// input's memory).
+	// zeroed, written to bt_memo/bt_memo_cap — in an embedded build too,
+	// whose second fallback body reads it from the input's memory.
 	BTBudget    bool
 	BTMemoBytes int
 	// Blocks, for a set's `find` (and its batch entry), is one entry per
@@ -948,39 +1025,14 @@ func (c *notesCtx) emitWalkEntry(b []byte, checkResume bool) []byte {
 	b = append(b, 0xAD, 0x42, 0x01, 0x7C, 0x42)
 	b = utils.AppendSLEB128_64(b, int64(c.rows.stride))
 	b = append(b, 0x7E, 0x5A, 0x04, 0x40) // cap >= (len + 1) × stride
-	b = append(b, 0x02, 0x40)             // block $ok
-	b = c.ld(b, blkSeen)
-	b = append(b, 0x45, 0x04, 0x40) // first marked call of this arming
-	b = c.ld(b, blkHigh)
-	b = append(b, 0x04, 0x40)
-	b = c.emitClear(b)
-	b = append(b, 0x0B)
-	b = append(b, 0x20, c.lBlk())
-	b = absPtr(b)
-	b = append(b, 0x36, 0x02, blkPtr)
-	b = append(b, 0x20, c.lBlk())
-	b = absLen(b)
-	b = append(b, 0x36, 0x02, blkLen)
-	b = c.stConst(b, blkSeen, 1)
-	b = append(b, 0x0C, 0x01, 0x0B) // br $ok
-	b = absPtr(b)
-	b = c.ld(b, blkPtr)
-	b = append(b, 0x46)
-	b = absLen(b)
-	b = c.ld(b, blkLen)
-	b = append(b, 0x46, 0x71)
+	var resume func([]byte) []byte
 	if checkResume {
-		b = append(b, 0x23)
-		b = utils.AppendULEB128(b, findFromGlobalIdx)
-		b = c.ld(b, blkResume)
-		b = append(b, 0x46, 0x71)
+		resume = func(b []byte) []byte {
+			b = append(b, 0x23)
+			return utils.AppendULEB128(b, findFromGlobalIdx)
+		}
 	}
-	b = append(b, 0x0D, 0x00) // same text: br_if $ok
-	b = c.emitClear(b)
-	b = append(b, 0x20, c.lBlk(), 0x42, 0x00, 0x37, 0x03, blkWasted)
-	b = c.stConst(b, blkFirst, 0)
-	b = c.stConst(b, blkArmed, 0)
-	b = c.stConst(b, blkSeen, 0)
+	b = c.emitTextCheck(b, absPtr, absLen, resume)
 	b = append(b, 0x0C, 0x04, 0x0B) // not ours: walk plain (out of the cap `if`); end $ok
 	b = nConst(b, 1)
 	b = append(b, 0x21, c.lMarked())

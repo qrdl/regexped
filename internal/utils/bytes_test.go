@@ -187,6 +187,36 @@ func TestParseDataSectionBytesNoSection(t *testing.T) {
 	}
 }
 
+// TestCustomSection reads a named custom section out of a module, past other
+// sections, and treats anything malformed as absent.
+func TestCustomSection(t *testing.T) {
+	custom := func(name, payload string) []byte {
+		c := AppendULEB128(nil, uint32(len(name)))
+		c = append(append(c, name...), payload...)
+		return append(append([]byte{0}, AppendULEB128(nil, uint32(len(c)))...), c...)
+	}
+	head := []byte("\x00asm\x01\x00\x00\x00")
+	typeSec := []byte{1, 1, 0} // a non-custom section first
+	mod := append(append(append(append([]byte{}, head...), typeSec...), custom("other", "x")...), custom("want", "payload")...)
+	if got, ok := CustomSection(mod, "want"); !ok || string(got) != "payload" {
+		t.Errorf("CustomSection = %q, %v", got, ok)
+	}
+	for _, c := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"absent", append(append([]byte{}, head...), custom("other", "x")...)},
+		{"not wasm", []byte("mock")},
+		{"section past the end", append(append([]byte{}, head...), 0, 9, 1)},
+		{"bad size", append(append([]byte{}, head...), 0, 0x80)},
+		{"name past the section", append(append([]byte{}, head...), 0, 2, 5, 'w')},
+	} {
+		if got, ok := CustomSection(c.raw, "want"); ok {
+			t.Errorf("%s: CustomSection = %q, true; want absent", c.name, got)
+		}
+	}
+}
+
 func TestParseDataSectionBytesNotWasm(t *testing.T) {
 	_, err := ParseDataSectionBytes([]byte("not a wasm binary"))
 	if err == nil {

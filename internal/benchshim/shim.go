@@ -532,21 +532,24 @@ func BuildSetFind() []byte {
 //
 // bench(ptr i32, len i32, out i32, iters i32, blk i32, notes i32, notes_cap i32,
 //
-//	tbase i32) → void
+//	memo i32, memo_cap i32, tbase i32) → void
 //
-// BuildFind and BuildGroups for a module whose export keeps PER-SEARCH NOTES
+// BuildFind and BuildGroups for a module whose export uses a PER-SEARCH BLOCK
 // (docs/wasm.md, "The search block"): each drive does what a generated stub
 // does — zero the block when the drive starts, hand it over through the
-// imported `regexped:search` global before every call, and once the module has
-// armed the search give it its notes (the region at notes, zeroed here as a
-// stub's allocator would). Without that the shim would time the no-block path,
-// which skips the waste counter a stub's drive pays for.
+// imported `regexped:search` global before every call, give the search its
+// notes once the module has armed it and its Backtracking memo once its budget
+// has tripped (the regions at notes and memo, zeroed here as a stub's
+// allocator would; a cap of 0 gives none). Without that the shim would time
+// the no-block path, which skips the waste counter a stub's drive pays for, or
+// a fresh memo per call. A drive ends at any negative answer and resumes past
+// a match as the stubs do: at its end, or one past its start when it is empty.
 //
 // Like BuildSetFind it imports the regexped module's memory — the block and the
 // notes must live there — declares none of its own, re-exports it for WASI, and
 // keeps its samples at tbase. `out` is the groups slot buffer; find ignores it.
 //
-// Locals: i(8) off(9) rel(10) r32(11) r64(12 i64) t_prev(13 i64).
+// Locals: i(10) off(11) start(12) end(13) r64(14 i64) t_prev(15 i64).
 func BuildFindSearch() []byte { return buildSearchDrive(false) }
 
 // BuildGroupsSearch is BuildFindSearch for a groups export.
@@ -554,8 +557,8 @@ func BuildGroupsSearch() []byte { return buildSearchDrive(true) }
 
 func buildSearchDrive(groups bool) []byte {
 	const (
-		pPtr, pLen, pOut, pIters, pBlk, pNotes, pNotesCap, pTBase = 0, 1, 2, 3, 4, 5, 6, 7
-		lI, lOff, lRel, lR32, lR64, lTPrev                        = 8, 9, 10, 11, 12, 13
+		pPtr, pLen, pOut, pIters, pBlk, pNotes, pNotesCap, pMemo, pMemoCap, pTBase = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+		lI, lOff, lStart, lEnd, lR64, lTPrev                                       = 10, 11, 12, 13, 14, 15
 	)
 	scratch := func(b []byte) []byte { // tbase + TimingsBytes
 		b = append(b, 0x20, pTBase, 0x41)
@@ -575,6 +578,14 @@ func buildSearchDrive(groups bool) []byte {
 		b = append(b, 0x20, pBlk, 0x28, 0x02)
 		return utils.AppendULEB128(b, uint32(off))
 	}
+	// give: the region at ptr (capP bytes) zeroed and recorded in the block.
+	give := func(b []byte, ptr, capP byte, ptrOff, capOff int) []byte {
+		b = append(b, 0x20, ptr, 0x41, 0x00, 0x20, capP, 0xFC, 0x0B, 0x00)
+		b = append(b, 0x20, pBlk, 0x20, ptr, 0x36, 0x02)
+		b = utils.AppendULEB128(b, uint32(ptrOff))
+		b = append(b, 0x20, pBlk, 0x20, capP, 0x36, 0x02)
+		return utils.AppendULEB128(b, uint32(capOff))
+	}
 
 	var b []byte
 	b = append(b, 0x02, 0x04, 0x7F, 0x02, 0x7E) // locals: 4×i32, 2×i64
@@ -592,31 +603,35 @@ func buildSearchDrive(groups bool) []byte {
 	b = append(b, 0xFC, 0x0B, 0x00)
 	b = append(b, 0x41, 0x00, 0x21, lOff)
 
-	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop (inner)
-	b = append(b, 0x20, lOff, 0x20, pLen, 0x4E, 0x0D, 0x01)
-	b = append(b, 0x20, pBlk, 0x24, 0x00) // global.set regexped:search
+	b = append(b, 0x02, 0x40, 0x03, 0x40)                   // block, loop (inner)
+	b = append(b, 0x20, lOff, 0x20, pLen, 0x4A, 0x0D, 0x01) // off > len: exit inner
+	b = append(b, 0x20, pBlk, 0x24, 0x00)                   // global.set regexped:search
 	if groups {
-		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pOut, 0x20, lOff, 0x10, 0x01, 0x22, lR32)
-		b = append(b, 0x41, 0x7F, 0x46, 0x0D, 0x01)             // == -1: exit inner
-		b = append(b, 0x20, lR32, 0x20, lOff, 0x6B, 0x21, lRel) // rel = end - off
+		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pOut, 0x20, lOff, 0x10, 0x01, 0x22, lEnd)
+		b = append(b, 0x41, 0x00, 0x48, 0x0D, 0x01)               // < 0: exit inner
+		b = append(b, 0x20, pOut, 0x28, 0x02, 0x00, 0x21, lStart) // start = out[0]
 	} else {
 		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, lOff, 0x10, 0x01, 0x22, lR64)
-		b = append(b, 0x42, 0x7F, 0x51, 0x0D, 0x01)                   // == -1: exit inner
-		b = append(b, 0x20, lR64, 0xA7, 0x20, lOff, 0x6B, 0x21, lRel) // rel = end - off
+		b = append(b, 0x42, 0x00, 0x53, 0x0D, 0x01)                     // < 0: exit inner
+		b = append(b, 0x20, lR64, 0xA7, 0x21, lEnd)                     // end = low half
+		b = append(b, 0x20, lR64, 0x42, 0x20, 0x88, 0xA7, 0x21, lStart) // start = high half
 	}
-	// Armed with no notes yet: give it the region, zeroed.
+	// Armed with no notes yet: give it the notes region.
 	b = blkField(b, abi.SearchArmedOff)
 	b = append(b, 0x04, 0x40)
 	b = blkField(b, abi.SearchNotesOff)
 	b = append(b, 0x45, 0x04, 0x40)
-	b = append(b, 0x20, pNotes, 0x41, 0x00, 0x20, pNotesCap, 0xFC, 0x0B, 0x00)
-	b = append(b, 0x20, pBlk, 0x20, pNotes, 0x36, 0x02)
-	b = utils.AppendULEB128(b, abi.SearchNotesOff)
-	b = append(b, 0x20, pBlk, 0x20, pNotesCap, 0x36, 0x02)
-	b = utils.AppendULEB128(b, abi.SearchNotesCapOff)
+	b = give(b, pNotes, pNotesCap, abi.SearchNotesOff, abi.SearchNotesCapOff)
 	b = append(b, 0x0B, 0x0B)
-	// off += rel + eqz(rel), as BuildFind advances
-	b = append(b, 0x20, lOff, 0x20, lRel, 0x20, lRel, 0x45, 0x6A, 0x6A, 0x21, lOff)
+	// Tripped with no memo yet: give it the memo region.
+	b = blkField(b, abi.SearchBTStateOff)
+	b = append(b, 0x41, abi.SearchBTTripped, 0x46, 0x04, 0x40)
+	b = blkField(b, abi.SearchBTMemoOff)
+	b = append(b, 0x45, 0x20, pMemoCap, 0x41, 0x00, 0x47, 0x71, 0x04, 0x40) // memo == 0 && cap != 0
+	b = give(b, pMemo, pMemoCap, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff)
+	b = append(b, 0x0B, 0x0B)
+	// off = end + (end == start)
+	b = append(b, 0x20, lEnd, 0x20, lEnd, 0x20, lStart, 0x46, 0x6A, 0x21, lOff)
 	b = append(b, 0x0C, 0x00, 0x0B, 0x0B) // br inner; end loop; end block
 
 	// timings[i] = u32(t_cur - t_prev), at tbase + i*4
@@ -640,7 +655,7 @@ func buildSearchDrive(groups bool) []byte {
 	} else {
 		types = append(types, 0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7E)
 	}
-	types = append(types, 0x60, 0x08, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x00)
+	types = append(types, 0x60, 0x0A, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x00)
 
 	imports := []byte{0x04}
 	imports = append(imports, shimStr("wasi_snapshot_preview1")...)

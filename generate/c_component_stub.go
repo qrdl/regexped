@@ -167,18 +167,20 @@ func genCComponentStubFiles(cfg config.BuildConfig, hBasename string) (hContent,
 			cparts = append(cparts, genCComponentMatch(importModule, re.MatchFunc, names[re.MatchFunc]))
 		}
 		if re.FindFunc != "" {
-			cparts = append(cparts, genCComponentFind(importModule, re.FindFunc, names[re.FindFunc]))
+			cparts = append(cparts, genCComponentFind(importModule, re.FindFunc, names[re.FindFunc]),
+				cNotesPairNoop(re.FindFunc, cIterTypeName(re.FindFunc)))
 		}
 		if re.GroupsFunc != "" {
 			// The group info comes BACK from genCPartsForEntry above: it parsed
 			// this very pattern, so a second parse here could only fail where
 			// that one already had.
 			needAlloc = true
-			cparts = append(cparts, genCComponentGroups(importModule, re.GroupsFunc, names[re.GroupsFunc], groups.num, groups.named))
+			cparts = append(cparts, genCComponentGroups(importModule, re.GroupsFunc, names[re.GroupsFunc], groups.num, groups.named),
+				cNotesPairNoop(re.GroupsFunc, cIterTypeName(re.GroupsFunc)))
 		}
 	}
 	shapes := newSetShapes(cfg)
-	setH, setC := genCComponentSetParts(cfg, sets, setsImportModule, shapes)
+	setH, setC := genCComponentSetParts(cfg, sets, setsImportModule, shapes, sizes)
 	if setH != "" {
 		anyH = true
 		hb.WriteString(setH)

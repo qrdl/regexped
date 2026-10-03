@@ -318,9 +318,10 @@ non-accepting states, the only place an unboundedly long walk can sit without
 accepting — carries two copies of its find:
 
 - the **ordinary copy**, the find described above plus a waste counter in the
-  block: the bytes read past each reported match, and failed reads of more
-  than 32 bytes. Once the waste exceeds `4 × (bytes the search has advanced) +
-  64`, the search is ARMED.
+  block: the bytes read past each reported match, and the part of each failed
+  read of more than 32 bytes that lies below the farthest position an earlier
+  failed read of the search reached — the only part read twice. Once the waste
+  exceeds `4 × (bytes the search has advanced) + 64`, the search is ARMED.
 - the **marked copy**, the same body testing the notes at every byte of a
   cycle state and writing them by walking a wasted tail again. The stub
   allocates the notes (`(len + 1) ×` a few bytes) the first time it sees the
@@ -329,10 +330,14 @@ accepting — carries two copies of its find:
 A pattern with no cycle state gets no notes code at all, byte for byte.
 Measured on this repository's real patterns: no cost on 85 of 151 drives (no
 cycle state), a median of +0.1% on the rest and +5.2% at worst; the bad drives
-above cost 250-380 instructions per byte, linear. A caller that passes no block
-(0) gets each call exactly as described above, and these drives stay
-quadratic for it; bounding the higher-priority branch's repeat
-(`\d{1,10}px|\d`) keeps them linear without a block.
+above cost 130-382 instructions per byte, linear. A caller that passes no block
+(0) to a STANDALONE module gets a default block the module keeps itself, which
+carries over while the caller keeps driving the same text forward (see
+[wasm.md](wasm.md), "Handing the block over"): `a*b|a` over `a`×8 K costs 474
+instructions per byte that way. In a merged build a call with no block runs
+exactly as described above and these drives stay quadratic; bounding the
+higher-priority branch's repeat (`\d{1,10}px|\d`) keeps them linear without a
+block. [complexity.md](complexity.md) gathers every mechanism of this kind.
 
 Sets make the same choice per member, with one difference: see
 [sets.md](sets.md#members-that-are-not-provably-linear).
@@ -603,9 +608,17 @@ doubling of N). With the caller's search block the budget lasts the SEARCH:
 - a capture body (`groups`) keeps only the tripped flag: its windows already
   add up to the input, so it needs no shared memo.
 
+The memo lives in the memory the input lives in. A merged build's fallback
+body keeps its own scratch in the module's memory, so the module carries a
+SECOND copy of the fallback body that reads the memo from the host's memory,
+and a call whose block names a memo runs that one: merged and standalone builds
+keep the memo alike (a merged C drive over 32 KB: 0.6 s, against 24 s with a
+fresh memo per call).
+
 Measured on the adversary rows: `find` of `(?:a|b)*a(?:a|b){12}c|a` over
 `a`×N is linear at 12,808 instructions per byte, its `groups` at 13,390. With
-no block every call works as described in the sections above.
+no block a standalone module uses a default block of its own (12,924 and
+13,506); a merged build works as described in the sections above.
 
 #### Why there is no Pike VM
 
@@ -678,7 +691,7 @@ over a 1.7 MB input is already too much), and the stack must fit beside it, or
 the config's `max_memory` or the host has set a lower limit.
 
 **Knobs.** `CompileOptions.BTWorkBudget` and `CompileSetOptions.BTWorkBudget`,
-neither reachable from YAML: `0` is the default multiplier of 8, a positive
+neither reachable from YAML: `0` is the default multiplier of 1, a positive
 value replaces it, `compile.BTWorkBudgetOff` emits neither counter nor fallback
 — the ordinary body alone, which is how tests drive it by itself; a program
 with a zero-width cycle still gets the fallback alone — and

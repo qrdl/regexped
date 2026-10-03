@@ -315,17 +315,21 @@ before settling for a short match, so a whole scan over `aaaa…` is quadratic.
 Each iterator for a pattern that can do this carries a 128-byte **search block**
 (a private field, so the public API is unchanged) and hands it to the module
 before every call; when the module reports that the scan has started re-reading,
-the iterator allocates its notes — `(len + 1)` bytes per pattern row — and the
+the iterator allocates its notes — `(len + 1) × ⌈R / 8⌉` bytes, one bit per position for each of the R states the pattern notes — and the
 module uses them to stop at ground it has already covered (see
 [wasm.md](wasm.md), "The search block"). A scan that never re-reads never
 allocates. The notes are freed with the iterator. If they cannot be allocated
 (`try_reserve`), the item is `Err(Error::BacktrackOverflow)`: the rest of the
 scan is unknown.
 A Backtracking pattern's iterator uses the same block for its work budget,
-which then lasts the whole scan rather than one call; once it runs out, the
-iterator allocates the fallback's memo — `(len + 1) × ⌈instructions / 8⌉`
-bytes — so a scan whose every call would exhaust the budget pays for it once. The memo is freed, and its allocation fails, the same
-way.
+which then lasts the whole scan rather than one call; once it runs out, every
+later call goes straight to the fallback body, with a memo —
+`(len + 1) × ⌈instructions / 8⌉` bytes — the iterator allocates once and keeps
+for the rest of the scan, so a (state, position) one call ruled out stays ruled
+out. The module carries a second copy of its fallback body that reads the memo
+from this merged build's own memory, which is what lets it keep one; it is
+allocated and fails like the notes. A `wasm_format: component` build keeps the
+memo inside the component.
 
 ## Backtracking stack overflow
 

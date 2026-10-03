@@ -19,9 +19,12 @@ func rustStub(cfg config.BuildConfig, out string) error {
 		return fmt.Errorf("generate Rust stub: %w", err)
 	}
 	setInner := genRustSetInnerSized(cfg, sizes)
-	if singleInner == "" && strings.Contains(setInner, "search_notes(") {
+	if singleInner == "" && strings.Contains(setInner, "SearchBlock") {
 		// The block type and the notes helper ride with the single-pattern
-		// part, which a sets-only config does not have.
+		// part, which a sets-only config does not have. Keyed on the TYPE, not
+		// on a call to the notes helper: a set whose blocks keep only a
+		// Backtracking budget (a merged build gives them no memo) names the
+		// type and calls nothing.
 		setInner = rustSearchPreamble(cfg.ImportModule) + setInner
 	}
 	allInner := singleInner + setInner
@@ -223,19 +226,22 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// notes once a member's search arms: named by the descriptor's
 				// fifth field (abi.FindScratchMagicBlocks). Boxed in a Vec, so
 				// moving the iterator does not move them under the module.
-				gateField += "    scratch: [u32; 5],\n" +
+				gateField += "    scratch: [u32; 6],\n" +
 					"    /// The set's search blocks and, once one arms, its notes.\n" +
-					"    blocks: Vec<SearchBlock>,\n    notes: Vec<Vec<u8>>,\n"
-				gateInit += fmt.Sprintf(" scratch: [0u32; 5], blocks: (0..%[1]d).map(|_| SearchBlock([0; %[2]d])).collect(), notes: vec![Vec::new(); %[1]d],",
+					"    blocks: Vec<SearchBlock>,\n" +
+					"    // Holds the allocations the blocks point at; a set whose blocks\n" +
+					"    // keep no notes never touches it.\n" +
+					"    #[allow(dead_code)]\n    notes: Vec<Vec<u8>>,\n"
+				gateInit += fmt.Sprintf(" scratch: [0u32; 6], blocks: (0..%[1]d).map(|_| SearchBlock([0; %[2]d])).collect(), notes: vec![Vec::new(); %[1]d],",
 					len(blocks), abi.SearchBlockBytes)
 				if blocksBTMemo(blocks) {
-					gateField += "    /// A tripped Backtracking block's memo.\n    btmemos: Vec<Vec<u8>>,\n"
+					gateField += "    /// A tripped Backtracking block's memo.\n    #[allow(dead_code)]\n    btmemos: Vec<Vec<u8>>,\n"
 					gateInit += fmt.Sprintf(" btmemos: vec![Vec::new(); %d],", len(blocks))
 				}
 			}
 			cacheField, cacheInit := "", ""
 			cacheArgs := "0, 0"
-			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache. Without one an overlapping
 				// drive is quadratic — every start position walks to its own
@@ -254,9 +260,9 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// sweep validates the stride it is handed and reports a header
 				// it cannot make sense of.
 				cacheField = "    cache: Vec<u32>,\n"
-				cacheInit = fmt.Sprintf(` cache: {
-            let m = (input.len() + 1) as u64;
-            let row = %[5]d as u64;
+				cacheInit = " cache: {\n            let m = (input.len() + 1) as u64;\n"
+				if sh.Eligible {
+					cacheInit += fmt.Sprintf(`            let row = %[5]d as u64;
             let cell = %[6]d as u64;
             let single = %[3]d + cell + 4 + m * row;
             let k = if single <= %[4]d {
@@ -269,15 +275,41 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
             };
             let nb = m.div_ceil(k);
             let bytes = %[3]d + nb * cell + 4 + k * row;
-            if bytes > %[4]d {
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+						consts.Row, consts.Cell)
+				} else {
+					// No answer cache, only the program sweep's part: the
+					// cache's is its bare header.
+					cacheInit += fmt.Sprintf("            let k: u64 = 1;\n            let bytes: u64 = %d;\n", consts.Hdr)
+				}
+				fits := fmt.Sprintf("bytes > %d", consts.Max)
+				if sh.SweepCells > 0 {
+					cacheInit += fmt.Sprintf("            let fits = bytes <= %d;\n", consts.Max)
+					fits = "!fits"
+					// The program sweep's part, after the cache's, checkpointed
+					// by the same formula over its own geometry.
+					cacheInit += fmt.Sprintf(`            let bytes = {
+                let srow = %[3]d as u64;
+                let scell = %[4]d as u64;
+                let mut sk = m;
+                if %[1]d + scell + 4 + m * srow > %[2]d {
+                    sk = ((m as f64) * (%[5]d as f64) * 4.0 / (srow as f64)).sqrt() as u64;
+                    if sk < 16 { sk = 16; }
+                    if sk > m { sk = m; }
+                }
+                let sb = %[1]d + m.div_ceil(sk) * scell + 4 + sk * srow;
+                if sb <= %[2]d { ((bytes + 7) & !7) + sb } else { bytes }
+            };
+`, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+				}
+				cacheInit += fmt.Sprintf(`            if %[2]s {
                 Vec::new()
             } else {
                 let mut v = vec![0u32; (bytes as usize).div_ceil(4)];
-                v[%[7]d] = k as u32;
+                v[%[1]d] = k as u32;
                 v
             }
-        },`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
-					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
+        },`, config.SetOverlapHdrStrideOff/4, fits)
 				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
 					"(self.cache.len() * 4) as u32"
 			}
@@ -285,19 +317,27 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			gateInit += cacheInit
 			gateArg := "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagic) +
 				"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + "]; self.scratch.as_mut_ptr() }, "
-			afterCall := ""
+			afterCall, failCheck := "", ""
 			if len(blocks) > 0 {
 				gateArg = "{ self.scratch = [" + fmt.Sprint(abi.FindScratchMagicBlocks) +
-					"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + ", self.blocks.as_mut_ptr() as u32]; self.scratch.as_mut_ptr() }, "
+					"u32, self.gates.as_mut_ptr() as u32, " + cacheArgs + ", self.blocks.as_mut_ptr() as u32, " +
+					fmt.Sprint(len(blocks)) + "]; self.scratch.as_mut_ptr() }, "
 				for k, sz := range blocks {
 					if sz.NotesBytes > 0 {
 						afterCall += fmt.Sprintf("            if let Err(e) = search_notes(&mut self.blocks[%d], &mut self.notes[%d], self.input.len(), %d) {\n"+
-							"                self.done = true;\n                return Some(Err(e));\n            }\n", k, k, sz.NotesBytes)
+							"                self.failed.get_or_insert(e);\n            }\n", k, k, sz.NotesBytes)
 					}
 					if sz.BTMemoBytes > 0 {
 						afterCall += fmt.Sprintf("            if let Err(e) = search_btmemo(&mut self.blocks[%d], &mut self.btmemos[%d], self.input.len(), %d) {\n"+
-							"                self.done = true;\n                return Some(Err(e));\n            }\n", k, k, sz.BTMemoBytes)
+							"                self.failed.get_or_insert(e);\n            }\n", k, k, sz.BTMemoBytes)
 					}
+				}
+				if afterCall != "" {
+					// Notes or a memo that could not be had: returned before the
+					// NEXT call, so the matches of the call that asked are delivered.
+					gateField += "    failed: Option<Error>,\n"
+					gateInit += " failed: None,"
+					failCheck = "            if let Some(e) = self.failed.take() { self.done = true; return Some(Err(e)); }\n"
 				}
 			}
 			gateDoc := " and a zeroed gate array"
@@ -325,7 +365,7 @@ impl<'a> Iterator for %s<'a> {
                     end: tuple[2] as usize,
                 }));
             }
-            if self.done { return None; }
+%s            if self.done { return None; }
             let n = unsafe {
                 ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.from,
                     %sself.buf.as_mut_ptr() as *mut i32, %s as i32)
@@ -349,7 +389,7 @@ impl<'a> Iterator for %s<'a> {
     }
 }
 
-`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, s.Find, gateArg, konst,
+`, gateDoc, allocDoc, iterName, gateField, bufField, iterName, failCheck, s.Find, gateArg, konst,
 				btOverflow, malformedCache, outOfOrder, afterCall)
 			fmt.Fprintf(&out, "impl std::iter::FusedIterator for %s<'_> {}\n\n", iterName)
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+

@@ -3,11 +3,23 @@ package compile
 import (
 	"fmt"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
 // --------------------------------------------------------------------------
 // WASM binary encoding helpers
+
+// appendImportModuleSection appends the custom section naming the module's
+// import_module (abi.ImportModuleSection). A custom section may stand anywhere
+// in a module, so appending one leaves the rest of the bytes as they were.
+func appendImportModuleSection(wasm []byte, name string) []byte {
+	var content []byte
+	content = utils.AppendULEB128(content, uint32(len(abi.ImportModuleSection))) //nolint:gosec // a short name
+	content = append(content, abi.ImportModuleSection...)
+	content = append(content, name...)
+	return appendSection(wasm, 0, content)
+}
 
 func appendSection(out []byte, id byte, content []byte) []byte {
 	out = append(out, id)

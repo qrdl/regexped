@@ -78,6 +78,18 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
 			{Name: "bt_groups", Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
 			{Name: "bt_member", Pattern: `a[ab]{11}c[a-z]*X`},
+			// Non-greedy, so not provably linear in an overlapping set's
+			// bodies: split out, with its answers from a PROGRAM SWEEP the
+			// stubs size a second part of the cache region for.
+			{Name: "ng_member", Pattern: `a[a-z]*?z`},
+			{Name: "foo_word", Pattern: `foo\w+`},
+			// A kept member no cache can serve: the sets below that pair it with
+			// ng_member reserve the program sweep's part after a bare header.
+			{Name: "lit_abc", Pattern: `abc`},
+			// A find that keeps BOTH notes and a Backtracking memo (its switch
+			// hands over to the Backtracking find): the C iterator slices one
+			// caller buffer into the two.
+			{Name: "notes_memo", Pattern: `(?:\ba|b\B)*c|a`, FindFunc: "notes_memo_find"},
 		},
 		Sets: []config.SetConfig{{
 			Name:     "split",
@@ -125,7 +137,45 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			Find:        "scan_overlapping_plain",
 			Patterns:    config.PatternSelector{Names: []string{"lower", "alnum", "word"}},
 			Overlapping: true,
+		}, {
+			// A program sweep beside the kept members' cache, both entries.
+			Name:        "sweep",
+			Find:        "scan_sweep",
+			Patterns:    config.PatternSelector{Names: []string{"foo_word", "ng_member"}},
+			Overlapping: true,
+			Hints:       []string{"batch-find"},
+		}, {
+			Name:        "sweep_plain",
+			Find:        "scan_sweep_plain",
+			Patterns:    config.PatternSelector{Names: []string{"foo_word", "ng_member"}},
+			Overlapping: true,
+		}, {
+			Name:        "sweep_only",
+			Find:        "scan_sweep_only",
+			Patterns:    config.PatternSelector{Names: []string{"lit_abc", "ng_member"}},
+			Overlapping: true,
+			Hints:       []string{"batch-find"},
+		}, {
+			Name:        "sweep_only_plain",
+			Find:        "scan_sweep_only_plain",
+			Patterns:    config.PatternSelector{Names: []string{"lit_abc", "ng_member"}},
+			Overlapping: true,
 		}},
+	}
+	if sz, err := compile.SearchSizes(cfg); err != nil || sz["notes_memo_find"].NotesBytes == 0 || sz["notes_memo_find"].BTMemoBytes == 0 {
+		t.Fatalf("notes_memo_find keeps notes and a memo no longer (%+v, %v): its C buffer split goes unchecked", sz["notes_memo_find"], err)
+	}
+	for _, sc := range cfg.Sets[len(cfg.Sets)-4:] {
+		sh, err := compile.SetOverlapCacheShape(sc, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sh.SweepCells == 0 {
+			t.Fatalf("set %s has no program sweep: the stubs' sweep sizing would go unchecked", sc.Name)
+		}
+		if strings.HasPrefix(sc.Name, "sweep_only") == sh.Eligible {
+			t.Fatalf("set %s: cache-eligible = %v, the opposite of what its name promises", sc.Name, sh.Eligible)
+		}
 	}
 
 	// The config must COMPILE, and must give the stubs search blocks: the
@@ -141,13 +191,11 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			t.Fatalf("%s has no search block: this test would check none of that code", f)
 		}
 	}
-	// STANDALONE (no `output:`) as well: only there does a Backtracking
-	// search keep a memo — a merged build's fallback memory is the module's
-	// own — so only there do the stubs carry the memo code.
-	standalone := cfg
-	standalone.Output = ""
-	if ss, err := compile.SearchSizes(standalone); err != nil || ss["bt_find"].BTMemoBytes == 0 {
-		t.Fatalf("the standalone build keeps no Backtracking memo (%v): its stub code would go unchecked", err)
+	// The merged build keeps a tripped Backtracking search's memo in the
+	// host's memory (its second fallback body), so the stubs carry the memo
+	// code here.
+	if sizes["bt_find"].BTMemoBytes == 0 {
+		t.Fatal("the merged build keeps no Backtracking memo: the stubs' memo code would go unchecked")
 	}
 
 	// SETS ONLY: a stub with no single-pattern part carries the block type and
@@ -159,11 +207,28 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		setsOnly.Regexps = append(setsOnly.Regexps, re)
 	}
 	setsOnly.Sets = cfg.Sets[:2]
+	// Sets only, with no block that keeps notes: btsplit's Backtracking
+	// member keeps a budget and a memo, so the stub names the block type and
+	// calls no notes helper — the Rust preamble once went missing exactly
+	// there.
+	setsOnlyBT := setsOnly
+	setsOnlyBT.Sets = cfg.Sets[2:3]
+	// Sets only, and the only region a program sweep's: no set is
+	// cache-eligible, so nothing else would pull in the C header's allocator
+	// machinery and rx_sqrt_, or the Go stub's `math` — both once went missing
+	// exactly there.
+	sweepOnly := setsOnly
+	sweepOnly.Sets = nil
+	for _, sc := range cfg.Sets {
+		if strings.HasPrefix(sc.Name, "sweep_only") {
+			sweepOnly.Sets = append(sweepOnly.Sets, sc)
+		}
+	}
 
 	for _, variant := range []struct {
 		suffix string
 		cfg    config.BuildConfig
-	}{{"", cfg}, {"-standalone", standalone}, {"-sets-only", setsOnly}} {
+	}{{"", cfg}, {"-sets-only", setsOnly}, {"-sets-only-bt", setsOnlyBT}, {"-sweep-only", sweepOnly}} {
 		for _, lang := range []struct {
 			name     string
 			file     string

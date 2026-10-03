@@ -112,6 +112,10 @@ type resourceNotes struct {
 	// tripped is given, 0 for none.
 	bt          bool
 	btMemoBytes int32
+	// heap is the allocator's heap-top global, which the reserve check reads
+	// before the notes or memo are allocated (emitTryReserve); set at
+	// emission (buildPatternAdapterBody).
+	heap uint32
 }
 
 func (n resourceNotes) on() bool { return n.bytesPerPos > 0 || n.bt }
@@ -278,7 +282,8 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 
 // buildPatternAdapterBody dispatches to the body emitter for one resource
 // adapter. The function-shaped kinds are the caller's own business.
-func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal uint32) []byte {
+func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32) []byte {
+	a.notes.heap = heapGlobal
 	switch a.kind {
 	case adapterPatCtor:
 		return buildPatternScannerCtorBody(reallocIdx, a.resNewImport, callListGlobal,
@@ -661,6 +666,67 @@ func callReallocDyn(b []byte, reallocIdx int, align int32, sizeLocal byte) []byt
 	return utils.AppendULEB128(b, uint32(reallocIdx))
 }
 
+// emitTryReserve pushes 1 when cabi_realloc can serve a request of size bytes
+// (the i64 local sizeLocal) without growing memory — growing it here first
+// when it must — and 0 when it cannot: a size the allocator would trap on, or
+// a grow the engine refuses (`max_memory`). A search's OPTIONAL memory — its
+// notes, its Backtracking memo, a set's answer cache — asks first, so a refusal
+// leaves its pointer 0 and the module runs without it, as a module build does;
+// calling the allocator straight would trap the whole call. A fresh carve is a
+// power-of-two size class, at most 2 × (size + 8) bytes above the heap top,
+// which is what is reserved. needLocal is an i64 scratch local.
+func emitTryReserve(b []byte, heapGlobal uint32, sizeLocal, needLocal byte) []byte {
+	b = append(b, 0x20, sizeLocal, 0x42)
+	b = utils.AppendSLEB128_64(b, 0x7FFFFFF0)
+	b = append(b, 0x56, 0x04, 0x7F) // i64.gt_u; if (result i32): a size the allocator traps on
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x05)
+	// need = heap + 2 × (size + 8)
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0xAD, 0x20, sizeLocal, 0x42, 0x08, 0x7C, 0x42, 0x01, 0x86, 0x7C, 0x22, needLocal)
+	b = append(b, 0x3F, 0x00, 0xAD, 0x42, 0x10, 0x86) // memory.size × 64 KiB, in i64
+	b = append(b, 0x58, 0x04, 0x7F)                   // i64.le_u; if (result i32): it fits
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x05) // else: grow by what is missing, rounded up to pages
+	b = append(b, 0x20, needLocal, 0x3F, 0x00, 0xAD, 0x42, 0x10, 0x86, 0x7D)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, 0xFFFF)
+	b = append(b, 0x7C, 0x42, 0x10, 0x88, 0xA7) // + 0xFFFF; >> 16; wrap
+	b = append(b, 0x40, 0x00, 0x41, 0x7F, 0x47) // memory.grow; != -1
+	return append(b, 0x0B, 0x0B)
+}
+
+// emitGiveSearchMemory gives a search block its optional memory: (len + 1) ×
+// nb zeroed bytes, pointed at by the block's (ptrOff, capOff) and DETACHED
+// from the per-call chain (the scanner owns them; its dtor frees them) — or,
+// when emitTryReserve refuses, nothing, leaving the pointer 0 so the module
+// runs that search without it. lenPush pushes the text length (i32); the block
+// is in lBlk. lSz, lP, lChain are i32 locals; lSz64, lNeed i64.
+func emitGiveSearchMemory(b []byte, lenPush func([]byte) []byte, nb int32, ptrOff, capOff, reallocIdx int,
+	heapGlobal, callListGlobal uint32, lBlk, lSz, lP, lChain, lSz64, lNeed byte) []byte {
+	b = lenPush(b)
+	b = append(b, 0xAD, 0x42, 0x01, 0x7C, 0x42) // i64: len + 1
+	b = utils.AppendSLEB128_64(b, int64(nb))
+	b = append(b, 0x7E, 0x21, lSz64) // × nb
+	b = emitTryReserve(b, heapGlobal, lSz64, lNeed)
+	b = append(b, 0x04, 0x40) // if the allocator can serve it
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x21, lChain)
+	b = append(b, 0x20, lSz64, 0xA7, 0x21, lSz)
+	b = callReallocDyn(b, reallocIdx, 1, lSz)
+	b = append(b, 0x22, lP)
+	b = append(b, 0x41, 0x00, 0x20, lSz, 0xFC, 0x0B, 0x00) // memory.fill(p, 0, n)
+	b = append(b, 0x20, lBlk, 0x20, lP)
+	b = storeI32(b, ptrOff)
+	b = append(b, 0x20, lBlk, 0x20, lSz)
+	b = storeI32(b, capOff)
+	b = append(b, 0x20, lChain, 0x24) // detach: the scanner owns them
+	b = utils.AppendULEB128(b, callListGlobal)
+	return append(b, 0x0B)
+}
+
 // callRealloc pushes a cabi_realloc(0, 0, align, size) call.
 func callRealloc(b []byte, reallocIdx int, align, size int32) []byte {
 	b = append(b, 0x41, 0x00) // old_ptr
@@ -986,9 +1052,9 @@ func emitResourceSearch(b []byte, notes resourceNotes, pRep byte, numGroups int)
 // armed it — (len + 1) × bytesPerPos zeroed bytes — DETACHED from the per-call
 // chain like the constructor's blocks, since they outlive this call; the
 // destructor frees them. Emitted after a call that reported a match.
-func emitResourceNotes(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain byte) []byte {
+func emitResourceNotes(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain, lSz64, lNeed byte) []byte {
 	if notes.btMemoBytes > 0 {
-		b = emitResourceBTMemo(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain)
+		b = emitResourceBTMemo(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	}
 	if notes.bytesPerPos == 0 {
 		return b
@@ -1001,23 +1067,11 @@ func emitResourceNotes(b []byte, notes resourceNotes, pRep byte, numGroups, real
 	b = append(b, 0x20, lBlk)
 	b = loadI32(b, abi.SearchNotesOff)
 	b = append(b, 0x45, 0x04, 0x40) // if no notes yet
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, callListGlobal)
-	b = append(b, 0x21, lChain)
-	b = append(b, 0x20, pRep)
-	b = loadI32(b, patRepLen)
-	b = append(b, 0x41, 0x01, 0x6A, 0x41)
-	b = utils.AppendSLEB128(b, notes.bytesPerPos)
-	b = append(b, 0x6C, 0x21, lN) // (len + 1) * bytesPerPos
-	b = callReallocDyn(b, reallocIdx, 1, lN)
-	b = append(b, 0x22, lP)
-	b = append(b, 0x41, 0x00, 0x20, lN, 0xFC, 0x0B, 0x00) // memory.fill(p, 0, n)
-	b = append(b, 0x20, lBlk, 0x20, lP)
-	b = storeI32(b, abi.SearchNotesOff)
-	b = append(b, 0x20, lBlk, 0x20, lN)
-	b = storeI32(b, abi.SearchNotesCapOff)
-	b = append(b, 0x20, lChain, 0x24)
-	b = utils.AppendULEB128(b, callListGlobal)
+	b = emitGiveSearchMemory(b, func(b []byte) []byte {
+		b = append(b, 0x20, pRep)
+		return loadI32(b, patRepLen)
+	}, notes.bytesPerPos, abi.SearchNotesOff, abi.SearchNotesCapOff, reallocIdx,
+		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	return append(b, 0x0B, 0x0B)
 }
 
@@ -1183,9 +1237,10 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, cal
 	lRet := alloc.I32()
 	lR := alloc.I64()
 	lStart, lEnd, lState := alloc.I32(), alloc.I32(), alloc.I32()
-	var lBlk, lN, lP, lChain byte
+	var lBlk, lN, lP, lChain, lSz64, lNeed byte
 	if notes.on() {
 		lBlk, lN, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
+		lSz64, lNeed = alloc.I64(), alloc.I64()
 	}
 	var b []byte
 	b = alloc.EmitDecls(b)
@@ -1250,7 +1305,7 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, cal
 	b = append(b, 0x0B)
 
 	if notes.on() {
-		b = emitResourceNotes(b, notes, pRep, 0, reallocIdx, callListGlobal, lBlk, lN, lP, lChain)
+		b = emitResourceNotes(b, notes, pRep, 0, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	}
 	// start = wrap(r >> 32), end = wrap(r)
 	b = append(b, 0x20, lR, 0x42, 0x20, 0x88, 0xA7, 0x21, lStart)
@@ -1306,9 +1361,10 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 		lEnd   = alloc.I32()
 		lState = alloc.I32()
 	)
-	var lBlk, lN, lP, lChain byte
+	var lBlk, lN, lP, lChain, lSz64, lNeed byte
 	if notes.on() {
 		lBlk, lN, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
+		lSz64, lNeed = alloc.I64(), alloc.I64()
 	}
 	var b []byte
 	b = alloc.EmitDecls(b)
@@ -1382,7 +1438,7 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 	b = append(b, 0x0B)
 
 	if notes.on() {
-		b = emitResourceNotes(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain)
+		b = emitResourceNotes(b, notes, pRep, numGroups, reallocIdx, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	}
 	b = callRealloc(b, reallocIdx, 4, int32(numGroups*groupElemLen))
 	b = append(b, 0x21, lElems)
@@ -1441,31 +1497,19 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 
 // emitResourceBTMemo gives a resource's Backtracking search its memo once it
 // has tripped — (len + 1) × btMemoBytes zeroed bytes, detached like the notes.
-func emitResourceBTMemo(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain byte) []byte {
+func emitResourceBTMemo(b []byte, notes resourceNotes, pRep byte, numGroups, reallocIdx int, callListGlobal uint32, lBlk, lN, lP, lChain, lSz64, lNeed byte) []byte {
 	b = append(b, 0x20, pRep, 0x41)
 	b = utils.AppendSLEB128(b, patRepBlockOff(numGroups))
 	b = append(b, 0x6A, 0x22, lBlk)
 	b = loadI32(b, abi.SearchBTStateOff)
-	b = append(b, 0x41, 0x02, 0x46, 0x04, 0x40) // if tripped
+	b = append(b, 0x41, abi.SearchBTTripped, 0x46, 0x04, 0x40) // if tripped
 	b = append(b, 0x20, lBlk)
 	b = loadI32(b, abi.SearchBTMemoOff)
 	b = append(b, 0x45, 0x04, 0x40) // if no memo yet
-	b = append(b, 0x23)
-	b = utils.AppendULEB128(b, callListGlobal)
-	b = append(b, 0x21, lChain)
-	b = append(b, 0x20, pRep)
-	b = loadI32(b, patRepLen)
-	b = append(b, 0x41, 0x01, 0x6A, 0x41)
-	b = utils.AppendSLEB128(b, notes.btMemoBytes)
-	b = append(b, 0x6C, 0x21, lN) // (len + 1) * btMemoBytes
-	b = callReallocDyn(b, reallocIdx, 1, lN)
-	b = append(b, 0x22, lP)
-	b = append(b, 0x41, 0x00, 0x20, lN, 0xFC, 0x0B, 0x00) // memory.fill(p, 0, n)
-	b = append(b, 0x20, lBlk, 0x20, lP)
-	b = storeI32(b, abi.SearchBTMemoOff)
-	b = append(b, 0x20, lBlk, 0x20, lN)
-	b = storeI32(b, abi.SearchBTMemoCapOff)
-	b = append(b, 0x20, lChain, 0x24)
-	b = utils.AppendULEB128(b, callListGlobal)
+	b = emitGiveSearchMemory(b, func(b []byte) []byte {
+		b = append(b, 0x20, pRep)
+		return loadI32(b, patRepLen)
+	}, notes.btMemoBytes, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, reallocIdx,
+		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	return append(b, 0x0B, 0x0B)
 }

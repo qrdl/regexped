@@ -1540,3 +1540,90 @@ func (e *ckptEmit) emitSeedDeadCell(b []byte) []byte {
 	}
 	return b
 }
+
+// emitCkptSizing computes, inside WASM, the checkpointed answer cache's stride
+// and region for an input of the i32 local lenL bytes: m = len + 1 in the i64
+// local lM, the stride k in lK and the region's bytes in lBytes. It is the
+// arithmetic every stub spells in its own language and MUST agree with
+// config.SetOverlapCheckpointStride / …Bytes, since the sweep validates the
+// stride it is handed: i64 throughout (m × row passes 2^32 on a large input),
+// f64 for the square root. The component's find constructor and a standalone
+// module's default cache (default_search.go) size theirs with it. row is
+// config.SetOverlapBlockRowBytes of the set's pattern count.
+//
+// The single-block budget is config.SetOverlapCacheMaxBytes; emitCkptSizingBudget
+// takes another, for the program sweep's test-only knob.
+func emitCkptSizing(b []byte, lenL, lM, lK, lBytes uint32, cells int, row int64) []byte {
+	return emitCkptSizingBudget(b, lenL, lM, lK, lBytes, cells, row, overlapCacheMaxBytes)
+}
+
+func emitCkptSizingBudget(b []byte, lenL, lM, lK, lBytes uint32, cells int, row int64, budget int64) []byte {
+	cell := int64(cells)*4 + 4
+	// m = len + 1
+	// i64.extend_i32_u: `len` is a u32 byte count, and sign-extending it
+	// made every input above 2 GiB compute a negative span.
+	b = lget(b, lenL)
+	b = append(b, 0xAD, 0x42, 0x01, 0x7C)
+	b = lset(b, lM)
+	// single = HDR + cell + 4 + m*row
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes)+cell+4)
+	b = lget(b, lM)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, row)
+	b = append(b, 0x7E, 0x7C) // i64.mul, i64.add
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, budget)
+	b = append(b, 0x56)       // i64.gt_u -> over budget, checkpoint
+	b = append(b, 0x04, 0x40) // if
+	// k = trunc(sqrt(m * cells*4 / row)), clamped to [16, m].
+	//
+	// Multiply THEN divide, in that order, because that is the order
+	// config.SetOverlapCheckpointStride evaluates and f64 arithmetic is not
+	// associative: folding cells*4/row into one constant at compile time
+	// lands up to an ulp away, and trunc() then turns that into a stride
+	// one apart from every other language's.
+	b = lget(b, lM)
+	b = append(b, 0xB9) // f64.convert_i64_u
+	b = append(b, 0x44)
+	b = appendF64(b, float64(cells)*4)
+	b = append(b, 0xA2) // f64.mul
+	b = append(b, 0x44)
+	b = appendF64(b, float64(row))
+	b = append(b, 0xA3, 0x9F) // f64.div, f64.sqrt
+	b = append(b, 0xB0)       // i64.trunc_f64_u
+	b = lset(b, lK)
+	b = lget(b, lK)
+	b = append(b, 0x42, 0x10, 0x54) // k < 16
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x42, 0x10)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	b = lget(b, lK)
+	b = lget(b, lM)
+	b = append(b, 0x56) // k > m
+	b = append(b, 0x04, 0x40)
+	b = lget(b, lM)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	b = append(b, 0x05) // else: one block, the whole span
+	b = lget(b, lM)
+	b = lset(b, lK)
+	b = append(b, 0x0B)
+	// bytes = HDR + ceil(m/k)*cell + 4 + k*row
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes)+4)
+	b = lget(b, lM)
+	b = lget(b, lK)
+	b = append(b, 0x7C, 0x42, 0x01, 0x7D) // m + k - 1
+	b = lget(b, lK)
+	b = append(b, 0x80) // (m+k-1)/k
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, cell)
+	b = append(b, 0x7E, 0x7C)
+	b = lget(b, lK)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, row)
+	b = append(b, 0x7E, 0x7C)
+	return lset(b, lBytes)
+}

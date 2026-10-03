@@ -128,6 +128,7 @@ type cacheLayout struct {
 	preArmWork  bool  // saturate `work`, so the first call sweeps whatever it costs
 	canaryBelow int32 // bytes of 0xA5 immediately below the region, on a page of their own
 	canaryAbove int32 // bytes of 0xA5 immediately above it
+	sweepBudget int64 // > 0: the program sweep checkpoints past this many bytes
 }
 
 // cacheDrive is one overlapping set compiled, instantiated and laid out for a
@@ -161,8 +162,13 @@ func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *
 		set.Hints = []string{"batch-find"}
 		export = "set_find_batch"
 	}
-	w, err := cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%s", lay.batch, setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+	w, err := cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", lay.batch, lay.sweepBudget, setKey(pats)), func() ([]byte, error) {
+		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}
+		if lay.sweepBudget > 0 {
+			w, _, _, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{}.WithSweepBudget(lay.sweepBudget))
+			return w, err
+		}
+		w, _, err := compile.CompileFile(cfg, "")
 		return w, err
 	})
 	if err != nil {

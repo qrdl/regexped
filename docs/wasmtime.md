@@ -77,7 +77,9 @@ wasmtime run final.wasm
 ```
 
 `wasm-merge` is invoked with `--enable-multimemory --enable-simd`
-`--enable-bulk-memory --enable-bulk-memory-opt`. wasmtime enables SIMD and
+`--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int`
+— the last one for the host: Go 1.26's wasip1 output uses saturating
+float-to-int conversions, which Binaryen otherwise refuses to read. wasmtime enables SIMD and
 multi-memory by default in recent releases — no extra flags are needed at run
 time. See [wasm.md](wasm.md) for the underlying memory layout.
 

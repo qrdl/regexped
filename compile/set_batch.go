@@ -203,6 +203,10 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 
 	var b []byte
 	b = a.EmitDecls(b)
+	// A batching set whose kept members have a set of their own: the merge in
+	// the worker reads its descriptor, and this is `find`, which takes a
+	// position that does not fit whole the transactional way.
+	b = cs.emitKeptCacheEntry(b, pScratch, false)
 	if companion {
 		b = append(b, 0x20, pScratch, 0x21, lDesc)
 	}
@@ -215,12 +219,14 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 	// steps injectScratchPrologue splices into a non-wrapped set's body. The
 	// inner body is left taking a gate, because every one of its callers has
 	// dereferenced.
-	b = cs.emitScratchMagicCheck(b, pScratch, lMagic)
+	if !cs.trustDesc {
+		b = cs.emitScratchMagicCheck(b, pScratch, lMagic)
+	}
 	b = cs.emitWorkerBlocks(b, pScratch)
 
 	cache := overlapCacheCtx{
 		numPat: numPat,
-		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte, setupWork: cs.overlapSweepSetupWork(),
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: lCache, pCacheLen: lCacheLen,
@@ -445,7 +451,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		b = append(b, 0x20, lCache, 0x41, 0x00, 0x47)       // cache != 0
 		b = append(b, 0x20, lReady, 0x45, 0x71)             // && ready == 0
 		b = append(b, 0x04, 0x7F)                           // if (result i32)
-		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte, cs.overlapSweepSetupWork())
 		b = append(b, 0x20, lWork, 0xAD, 0x7D) // - work
 		b = append(b, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07) // MAX
@@ -859,6 +865,11 @@ type batchWalkLocals struct {
 	// itself when the counter trips; lV64 holds that call's answer. 0 when
 	// the set carries no counter.
 	lBudget, lDesc, lV64 byte
+	// sparse: the set carries a sparse counter, whose tripped answer hands
+	// the rest of the call — and of the drive, through block 0 (lBlk0, 0 for
+	// none) — to the split copy's batch entry.
+	sparse bool
+	lBlk0  byte
 }
 
 // emitBatchWalk is the WALK half of the batching entry: call the per-position
@@ -896,31 +907,51 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 
 	// total = worker(ptr, len, pos, gate, out_ptr + (count-k)*12,
 	//                avail + k [, k])
-	b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, x.lPos)
-	b = append(b, 0x20, pGate)
-	b = append(b, 0x20, pOutPtr, 0x20, x.lCount)
-	if !gated {
-		b = append(b, 0x20, x.lK, 0x6B)
+	callWorker := func(b []byte) []byte {
+		b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, x.lPos)
+		b = append(b, 0x20, pGate)
+		b = append(b, 0x20, pOutPtr, 0x20, x.lCount)
+		if !gated {
+			b = append(b, 0x20, x.lK, 0x6B)
+		}
+		b = append(b, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x20, x.lAvail)
+		if !gated {
+			b = append(b, 0x20, x.lK, 0x6A)
+		}
+		if gated {
+			// batch_mode = 1: gate what is DELIVERED rather than only a position
+			// that fitted whole (sharing this worker between both entries made this a runtime argument, so
+			// the exported `find` can share this worker by passing 0).
+			b = append(b, 0x41, 0x01)
+		} else {
+			b = append(b, 0x20, x.lK)
+		}
+		// Seeded with the position this call walks from, immediately before the
+		// call, so the global comes back holding a position at or above it.
+		b = cache.emitSeedWalkEnd(b, x.lPos)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(workerIdx))
+		return append(b, 0x21, x.lTotal)
 	}
-	b = append(b, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
-	b = append(b, 0x20, x.lAvail)
-	if !gated {
-		b = append(b, 0x20, x.lK, 0x6A)
+	b = callWorker(b)
+	if cs.keptCache != nil && cs.keptBatchGlobal >= 0 {
+		// The worker's position does not fit what is left of the buffer
+		// (keptNoFitSentinel): end this call before it when something is
+		// already delivered — the next call starts there with the whole
+		// buffer — and otherwise ask again for it delivered in part.
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, keptNoFitSentinel)
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		// br 3: 0 = this if, 1 = the no-fit if, 2 = loop $L, 3 = block $exit.
+		b = append(b, 0x20, x.lCount, 0x04, 0x40, 0x0C, 0x03, 0x0B)
+		b = append(b, 0x41, keptBatchPartial, 0x24)
+		b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+		b = callWorker(b)
+		b = append(b, 0x41, keptBatchWhole, 0x24)
+		b = utils.AppendULEB128(b, uint32(cs.keptBatchGlobal)) //nolint:gosec // a global index
+		b = append(b, 0x0B)
 	}
-	if gated {
-		// batch_mode = 1: gate what is DELIVERED rather than only a position
-		// that fitted whole (sharing this worker between both entries made this a runtime argument, so
-		// the exported `find` can share this worker by passing 0).
-		b = append(b, 0x41, 0x01)
-	} else {
-		b = append(b, 0x20, x.lK)
-	}
-	// Seeded with the position this call walks from, immediately before the
-	// call, so the global comes back holding a position at or above it.
-	b = cache.emitSeedWalkEnd(b, x.lPos)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(workerIdx))
-	b = append(b, 0x21, x.lTotal)
 
 	if mid {
 		// The counter tripped: this call's walks have cost what the sweep
@@ -960,6 +991,38 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x20, x.lV64)
 		b = append(b, 0x20, x.lCount, 0xAD, 0x7C) // + count, into the count field
 		b = append(b, 0x0F, 0x0B)                 // return; end if
+	}
+
+	if x.sparse {
+		// The sparse counter tripped at this position: the split copy serves
+		// the rest of this call from here, and the drive is marked switched so
+		// every later call goes straight to it. Its answer is returned the way
+		// the mid-sweep path above returns its own call's.
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, sparseHandoverSentinel)
+		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = emitSparseSwitch(b, x.lBlk0)
+		b = append(b, 0x20, pInPtr, 0x20, pInLen)
+		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86) // (i64)pos << 32
+		b = append(b, 0x20, x.lDesc)
+		b = append(b, 0x20, pOutPtr, 0x20, x.lCount, 0x41, abi.SetMatchTupleBytes, 0x6C, 0x6A)
+		b = append(b, 0x20, x.lCap, 0x20, x.lCount, 0x6B)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(cs.companionBatchIdx)) //nolint:gosec // a function index
+		b = append(b, 0x22, x.lV64)
+		// A reserved position word with tuples already delivered: return them
+		// under the ordinary resume cursor, as above (br 3 = block $exit).
+		b = append(b, 0x42, 0x20, 0x88, 0xA7)
+		lowest := uint32(config.SetCursorOutOfOrderPos)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(lowest)) //nolint:gosec // a reserved bit pattern
+		b = append(b, 0x6B, 0x41, 0x03, 0x49)
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A)
+		b = append(b, 0x71, 0x04, 0x40)
+		b = append(b, 0x0C, 0x03, 0x0B)
+		b = append(b, 0x20, x.lV64)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x7C) // + count, into the count field
+		b = append(b, 0x0F, 0x0B)
 	}
 
 	// The worker can return abi.BTStackOverflow instead of a count when a
@@ -1239,6 +1302,19 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	if companion && lDesc == 0 {
 		lDesc = a.I32()
 	}
+	// The sparse counter's: its handover calls the split copy with the
+	// descriptor and returns that call's answer through lV64; lBlk0 is the
+	// drive's state block.
+	var lBlk0 byte
+	if cs.sparseCtr != nil {
+		if lDesc == 0 {
+			lDesc = a.I32()
+		}
+		if lV64 == 0 {
+			lV64 = a.I64()
+		}
+		lBlk0 = a.I32()
+	}
 
 	//
 	// The sweep costs a flat numStates x patterns per input byte. The walk's
@@ -1263,7 +1339,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// descriptor this entry does.
 	cache := overlapCacheCtx{
 		numPat: numPat,
-		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte,
+		dpIdx:  dpIdx, blkIdx: blkIdx, costPerByte: sweepCostPerByte, setupWork: cs.overlapSweepSetupWork(),
 		cellBytes: int32(cs.overlapCells() * 4), rowBytes: rowBytes,
 		pInPtr: pInPtr, pInLen: pInLen,
 		pCache: pScratch, pCacheLen: pScratchLen,
@@ -1291,6 +1367,7 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 	// array into an immediate trap rather than a pointer read out of gate[0].
 	b = cs.emitScratchMagicCheck(b, pGate, lMagic)
 	b = cs.emitWorkerBlocks(b, pGate)
+	b = cs.emitKeptCacheEntry(b, pGate, true)
 	if lDesc != 0 {
 		b = append(b, 0x20, pGate, 0x21, lDesc)
 	}
@@ -1403,18 +1480,34 @@ func emitSetFindBatchBody(cs *compiledSet, workerIdx, selfIdx, dpIdx, blkIdx int
 		b = append(b, 0x20, pScratch, 0x41, 0x00, 0x47)
 		b = append(b, 0x20, lReady, 0x45, 0x71)
 		b = append(b, 0x04, 0x7F)
-		b = emitSweepThreshold(b, pInLen, sweepCostPerByte)
+		b = emitSweepThreshold(b, pInLen, sweepCostPerByte, cs.overlapSweepSetupWork())
 		b = append(b, 0x20, lWork, 0xAD, 0x7D, 0x21, lV64)
 		b = append(b, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x20, lV64)
 		b = append(b, 0x20, lV64, 0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x55, 0x1B, 0xA7)
 		b = append(b, 0x05, 0x41, 0x7F, 0x0B)
 		b = append(b, 0x21, lBudget)
 	}
+	if ctr := cs.sparseCtr; ctr != nil {
+		// The drive's state in block 0: a switched drive's call goes to the
+		// split copy whole; otherwise the counter, read lazily on a charge.
+		if cs.companionBatchIdx < 0 {
+			panic("compile: a batching set's sparse companion has no batch entry")
+		}
+		b = cs.emitScratchBlocks(b, lDesc)
+		b = append(b, 0x21, lBlk0)
+		b = ctr.emitEnter(b, lBlk0,
+			func(b []byte) []byte { return append(b, 0x20, lPos) },
+			func(b []byte) []byte {
+				b = append(b, 0x20, pInPtr, 0x20, pInLen, 0x20, pCursor, 0x20, lDesc, 0x20, pOutPtr, 0x20, pOutCap, 0x10)
+				return utils.AppendULEB128(b, uint32(cs.companionBatchIdx)) //nolint:gosec // a function index
+			})
+	}
 	b = cs.emitBatchWalk(b, cache, batchWalkLocals{
 		lPos: lPos, lK: lK, lCount: lCount, lTotal: lTotal, lStart: lStart,
 		lAvail: lAvail, lDeliver: lDeliver, lDone: lDone, lCap: lCap,
 		lWork: lWork, lWorkIdx: lWorkIdx, lWorkTmp: lWorkTmp, lReady: lReady,
 		lCacheSweepRet: lCacheSweepRet, lBudget: lBudget, lDesc: lDesc, lV64: lV64,
+		sparse: cs.sparseCtr != nil, lBlk0: lBlk0,
 	}, pInPtr, pInLen, pGate, pOutPtr, pScratch, workerIdx, selfIdx, dpIdx, countBits, maxCount, gated)
 
 	// The work counter is drive state, so it goes back to the caller's scratch

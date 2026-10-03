@@ -446,6 +446,20 @@ func (c *setFindCtx) emitCommit(b []byte, btBucket bool) []byte {
 	return b
 }
 
+// emitCommitLate is emitCommit for a COUNTED sparse bucket, whose body can
+// answer sparseHandoverSentinel instead of a count. The sentinel is
+// non-zero, so it is tested for only inside the `count != 0` branch: a
+// candidate that found nothing — most of them — pays no extra test, where
+// emitCommit's Backtracking guard tests every answer up front.
+func (c *setFindCtx) emitCommitLate(b []byte) []byte {
+	b = append(b, 0x22, c.lTmp, 0x04, 0x40) // tee count; if count != 0
+	b = append(b, 0x20, c.lTmp, 0x41, 0x00, 0x48, 0x04, 0x40, 0x20, c.lTmp, 0x0F, 0x0B)
+	b = append(b, 0x20, c.lStart, 0x21, c.lMinStart)
+	b = append(b, 0x20, c.lBase, 0x20, c.lTmp, 0x6A, 0x21, c.lTotal)
+	b = append(b, 0x0B)
+	return b
+}
+
 // emitGateMask folds the gate pre-mask into lValidMask: pattern k stays
 // eligible at match start s only while `2s + 1 >= gate[k]`.
 //
@@ -1163,8 +1177,13 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		if c.mode == capFind {
 			b = c.emitSelectBase(b)
 			b = c.emitSuffixCall(b, bi, litLen, posLocal, g.mask)
-			b = c.emitCommit(b, bi < len(c.cs.buckets) && (c.cs.buckets[bi].btFallback != nil ||
-				c.cs.sparseCtr != nil && c.cs.buckets[bi].sparse && sparseCycle(c.cs.buckets[bi])))
+			counted := bi < len(c.cs.buckets) && c.cs.sparseCtr != nil && c.cs.buckets[bi].sparse && sparseCycle(c.cs.buckets[bi])
+			btb := bi < len(c.cs.buckets) && c.cs.buckets[bi].btFallback != nil
+			if counted && !btb {
+				b = c.emitCommitLate(b)
+			} else {
+				b = c.emitCommit(b, btb || counted)
+			}
 		} else {
 			b = c.emitProbeCall(b, bi, litLen, posLocal, g.mask)
 			b = c.emitRecordProbe(b, bi)

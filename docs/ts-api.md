@@ -247,11 +247,15 @@ A pattern such as `a*b|a` makes each `find` call read to the end of the input
 before settling for a short match, so a whole scan over `aaaa…` is quadratic.
 The generator prevents that with a 128-byte **search block** in its own region:
 it hands the block to the module before every call, and when the module reports
-that the scan has started re-reading (it "arms"), it adds `(len + 1)` notes bytes
-per pattern row from the same arena, which the module uses to stop at ground it
+that the scan has started re-reading (it "arms"), it adds `(len + 1) × ⌈R / 8⌉` notes
+bytes — one bit per position for each of the R states the pattern notes — from
+the same arena, which the module uses to stop at ground it
 has already covered (see [wasm.md](wasm.md), "The search block"). A scan that
-never re-reads never allocates notes. Two generators alive at once each keep
-their own. A pattern that cannot re-read gets neither, and its generator is
+never re-reads never allocates notes — except a BATCHED drive (a pattern or
+set compiled with `hints: [batch-find]`): one batch call runs many finds, so a
+search that arms inside it would re-read for the rest of that call before the
+generator could hand notes over, and the generator allocates them before the
+first call instead. Two generators alive at once each keep their own. A pattern that cannot re-read gets neither, and its generator is
 unchanged. If memory cannot grow for the notes, the generator throws an `Error`
 saying so: the rest of the scan is unknown, as with `-2`.
 A Backtracking pattern's generator uses the same block for its work budget,

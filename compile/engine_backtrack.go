@@ -1179,9 +1179,10 @@ var btFallbackCallPlaceholder = utils.AppendPaddedULEB128(nil, 0, twinCallImmWid
 // exactly the inputs the caller gave. The placeholder's byte offset within b is
 // appended to *callOffs.
 //
-// A body has one such site, the work-budget trip on the pop path. A
-// frame-stack overflow needs none of its own — it arms the budget to trip on
-// the next pop (btArmTrip).
+// A body's sites: the work-budget trip on the pop path and, for a body that
+// keeps its search in the caller's block, the entry's "already tripped" branch
+// (bt_search.go: emitFindEntry, emitCapEntry). A frame-stack overflow needs
+// none of its own — it arms the budget to trip on the next pop (btArmTrip).
 func emitBTFallbackCall(b []byte, nParams int, callOffs *[]int) []byte {
 	for i := 0; i < nParams; i++ {
 		b = append(b, 0x20, byte(i)) // local.get param
@@ -1236,7 +1237,7 @@ func btTailCallBodySearch(nParams int, search *btSearch) (body []byte, callOffs 
 	b = search.blk(b)
 	b = append(b, 0x04, 0x40) // if blk
 	b = search.blk(b)
-	b = append(b, 0x41, 0x02)
+	b = append(b, 0x41, abi.SearchBTTripped)
 	b = search.store32(b, btSearchState)
 	b = append(b, 0x0B)
 	b = emitBTFallbackCall(b, nParams, &callOffs)
@@ -1287,8 +1288,10 @@ func patchBTFallbackCall(body []byte, offs []int, fallbackIdx int) []byte {
 // the i32 length the search ranges over: the window in window mode, the input
 // otherwise. i64 because N·(span+1)·k overflows i32 at 1 MB for N ≥ 256.
 //
-// Set once per CALL. A find body's attempts share it, and it is never saved
-// into a frame: it is a bound on the whole call's work, not per-path state.
+// Set once per CALL — or once per SEARCH, kept in the caller's block between
+// calls, when there is one (bt_search.go). A find body's attempts share it,
+// and it is never saved into a frame: it bounds the call's (or the search's)
+// whole work, not per-path state.
 func emitBTWorkInit(b []byte, workLocal uint32, k, n int, span func([]byte) []byte) []byte {
 	b = span(b)
 	b = append(b, 0xAD)       // i64.extend_i32_u
@@ -2208,14 +2211,24 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		sBlk, sTmp = uint32(a.I32()), uint32(a.I32())
 		if dyn != nil {
 			dyn.memoEnd = uint32(a.I32())
-			if tableMemIdx == 0 {
-				dyn.search, dyn.searchBlk = srch, sBlk
+			switch {
+			case tableMemIdx == 0:
+				dyn.search = srch
+			case fallback.memoInInput:
+				// An embedded build's second fallback: the search's memo, in
+				// the input's memory.
+				dyn.search, dyn.memoMemIdx = srch, 0
 			}
 		}
 	} else {
 		srch = nil
 	}
 	body = a.EmitDecls(body)
+	if dyn != nil && dyn.search == nil && srch != nil && fallback.searchTwin {
+		// An embedded build's per-call fallback: a search with a usable memo
+		// is the next body's.
+		body = srch.emitMemoTwinDispatch(body, sBlk, dyn.rowBytes, &callOffs)
+	}
 
 	locAttemptStart := attemptCursor.Local()
 
@@ -2240,9 +2253,10 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		body = append(body, 0x0F, 0x0B) // return; end
 	}
 
-	// The work budget, once per CALL: every attempt this call makes shares
-	// it. Sized from the whole input rather than len - from — a larger budget
-	// only delays a trip, and the bound stays linear in the input.
+	// The work budget, once per CALL — or once per SEARCH from the caller's
+	// block (emitFindEntry): every attempt shares it. Sized from the whole
+	// input rather than len - from — a larger budget only delays a trip, and
+	// the bound stays linear in the input.
 	if useWork && srch != nil {
 		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, len(prog.Inst), &callOffs)
 	} else if useWork {
@@ -2340,6 +2354,12 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			}
 			b = srch.emitFallbackPlace(b, dyn, sBlk, memoOrigin, btUnknownI64)
 			b = append(b, 0x45, 0x04, 0x40) // not placed: this call's own memo
+			if dyn.memoMemIdx != dyn.memIdx {
+				// An embedded build's memo body is entered only with a usable
+				// memo (emitMemoTwinDispatch tests the same condition), and has
+				// no memory of its own a per-call memo could go in.
+				return append(b, 0x00, 0x0B) // unreachable
+			}
 			b = emitBTScratchInit(b, dyn, memoSpan, btUnknownI64)
 			b = btLocalGet(b, dyn.stackBase)
 			b = append(b, 0x21)

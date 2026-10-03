@@ -14,7 +14,8 @@
 //
 // The first drives one pattern or one set config. The second runs the row
 // table in rows.go: rows expected LINEAR fail the run when their last ratio
-// exceeds maxLinearRatio; rows expected QUADRATIC are known open drives,
+// exceeds maxLinearRatio, or a ratio rises past maxRisingRatio; rows expected
+// QUADRATIC are known open drives,
 // reported with their ratio so a fix shows up as a change in the report;
 // REPORT rows (memory, correctness) are printed only.
 package main
@@ -23,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 )
 
 var (
@@ -325,9 +328,9 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	}
 	if isSet {
 		scratchPtr = scratchTop
-		gatePtr := scratchPtr + 16
+		gatePtr := scratchPtr + abi.FindScratchBytes
 		if len(setBlocks) > 0 {
-			gatePtr = scratchPtr + 24 // the descriptor's fifth field
+			gatePtr = scratchPtr + abi.FindScratchBlocksBytes
 		}
 		outPtr = gatePtr + int64(idSpace*4+16)
 		if len(setBlocks) > 0 {
@@ -337,26 +340,31 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 		}
 		cachePtr = outPtr + int64(capN*12+16)
 		if cacheBytes > 0 {
-			clear(buf[cachePtr : cachePtr+48])
-			putU32(buf, cachePtr+16, uint32(cacheStride))
+			clear(buf[cachePtr : cachePtr+config.SetOverlapCheckpointHeaderBytes])
+			putU32(buf, cachePtr+config.SetOverlapHdrStrideOff, uint32(cacheStride))
 		}
 		scratchTop = cachePtr + int64(cacheBytes) + 16
-		putU32(buf, scratchPtr, 0x52584653)
-		putU32(buf, scratchPtr+4, uint32(gatePtr))
+		// The cache fields name a region only when one is offered: a non-zero
+		// pointer with no region is a cache the sweep refuses, not a drive
+		// with none (which routes to the no-cache companion).
+		offered := int32(0)
 		if cacheBytes > 0 {
-			putU32(buf, scratchPtr+8, uint32(cachePtr))
-			putU32(buf, scratchPtr+12, uint32(cacheBytes))
+			offered = int32(cachePtr)
 		}
+		abi.WriteFindScratch(buf, int32(scratchPtr), int32(gatePtr), offered, int32(cacheBytes))
 		if len(setBlocks) > 0 {
-			putU32(buf, scratchPtr, abi.FindScratchMagicBlocks)
-			putU32(buf, scratchPtr+abi.FindScratchBlocksOff, uint32(blocksPtr))
+			abi.WriteFindScratchBlocks(buf, int32(scratchPtr), int32(gatePtr), offered, int32(cacheBytes),
+				int32(blocksPtr), int32(len(setBlocks)))
 		}
 	} else {
 		outPtr = scratchTop
 		scratchTop += 256*(8+8*int64(max(sp.NGroups, 1))) + 4096
 	}
-	// The per-search block, as a generated stub keeps one per iterator: zeroed
-	// here, handed over before every call, notes allocated when it arms.
+	// The per-search block, as a generated stub keeps one per iterator,
+	// through the shared helper (internal/searchblock): zeroed here, handed
+	// over before every call, notes allocated when it arms and a memo when its
+	// Backtracking budget trips — at the end of memory, with the scratch base
+	// raised above them, as a host that owns everything above the tables must.
 	var blk int64
 	searchG := inst.GetExport(store, abi.SearchExport)
 	var sz compile.SearchSize
@@ -367,10 +375,9 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if useBlock {
 		blk = (scratchTop + abi.SearchBlockAlign - 1) &^ (abi.SearchBlockAlign - 1)
 		scratchTop = blk + abi.SearchBlockBytes
-		clear(buf[blk : blk+abi.SearchBlockBytes])
 	}
 	scratchTop = pageAlign(scratchTop)
-	scratchG := inst.GetExport(store, "regexped:scratch_base")
+	scratchG := inst.GetExport(store, abi.ScratchBaseExport)
 	setScratch := func(v int64) error {
 		if scratchG != nil && scratchG.Global() != nil {
 			return scratchG.Global().Set(store, wasmtime.ValI32(int32(v)))
@@ -380,81 +387,37 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if err := setScratch(scratchTop); err != nil {
 		return r, err
 	}
-	// beforeCall hands the block over; afterCall allocates the notes of a
-	// search that has just armed — at the end of memory, with the scratch base
-	// raised above them, as a host that owns everything above the tables must.
+	grow := func(n int64) (int32, error) {
+		at := pageAlign(int64(mem.DataSize(store)))
+		if _, err := mem.Grow(store, uint64((n+65535)/65536)); err != nil {
+			return 0, fmt.Errorf("grow block region: %w", err)
+		}
+		r.Armed = true
+		return int32(at), setScratch(pageAlign(at + n))
+	}
+	var blocks *searchblock.Blocks
+	switch {
+	case useBlock:
+		blocks = &searchblock.Blocks{At: int32(blk), Sizes: searchblock.Of(sz), Mode: searchblock.Fresh, Alloc: grow}
+	case len(setBlocks) > 0:
+		blocks = &searchblock.Blocks{At: int32(blocksPtr), Sizes: searchblock.Of(compile.SearchSize{Blocks: setBlocks}),
+			Mode: searchblock.Fresh, Alloc: grow}
+	}
+	data := func() []byte { return mem.UnsafeData(store) }
+	begin := blocks.Begin
+	if sp.Fn == "batch" || sp.Fn == "batchgroups" {
+		// A batching iterator's blocks get their notes up front.
+		begin = blocks.BeginBatch
+	}
+	if err := begin(data, len(input)); err != nil {
+		return r, err
+	}
 	beforeCall := func() {
 		if useBlock {
 			_ = searchG.Global().Set(store, wasmtime.ValI32(int32(blk)))
 		}
 	}
-	// give allocates a set block's notes or memo: (len + 1) × nb zeroed bytes
-	// at the end of memory, the field at ptrOff, its size at capOff.
-	give := func(blk int64, ptrOff, capOff int64, nb int) error {
-		n := int64(len(input)+1) * int64(nb)
-		at := pageAlign(int64(mem.DataSize(store)))
-		if _, err := mem.Grow(store, uint64((n+65535)/65536)); err != nil {
-			return fmt.Errorf("grow block region: %w", err)
-		}
-		b := mem.UnsafeData(store)
-		clear(b[at : at+n])
-		putU32(b, blk+ptrOff, uint32(at))
-		putU32(b, blk+capOff, uint32(n))
-		r.Armed = true
-		return setScratch(pageAlign(at + n))
-	}
-	afterCall := func() error {
-		for k, sz := range setBlocks {
-			blk := blocksPtr + int64(k*abi.SearchBlockBytes)
-			b := mem.UnsafeData(store)
-			if sz.NotesBytes > 0 && getU32(b, blk+abi.SearchArmedOff) != 0 && getU32(b, blk+abi.SearchNotesOff) == 0 {
-				if err := give(blk, abi.SearchNotesOff, abi.SearchNotesCapOff, sz.NotesBytes); err != nil {
-					return err
-				}
-			}
-			b = mem.UnsafeData(store)
-			if sz.BTMemoBytes > 0 && getU32(b, blk+abi.SearchBTStateOff) == 2 && getU32(b, blk+abi.SearchBTMemoOff) == 0 {
-				if err := give(blk, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, sz.BTMemoBytes); err != nil {
-					return err
-				}
-			}
-		}
-		if !useBlock {
-			return nil
-		}
-		b := mem.UnsafeData(store)
-		if sz.BTMemoBytes > 0 && getU32(b, blk+abi.SearchBTStateOff) == 2 && getU32(b, blk+abi.SearchBTMemoOff) == 0 {
-			// A Backtracking search whose budget tripped gets its memo.
-			n := int64(len(input)+1) * int64(sz.BTMemoBytes)
-			at := pageAlign(int64(mem.DataSize(store)))
-			if _, err := mem.Grow(store, uint64((n+65535)/65536)); err != nil {
-				return fmt.Errorf("grow memo: %w", err)
-			}
-			b = mem.UnsafeData(store)
-			clear(b[at : at+n])
-			putU32(b, blk+abi.SearchBTMemoOff, uint32(at))
-			putU32(b, blk+abi.SearchBTMemoCapOff, uint32(n))
-			r.Armed = true
-			if err := setScratch(pageAlign(at + n)); err != nil {
-				return err
-			}
-			b = mem.UnsafeData(store)
-		}
-		if sz.NotesBytes == 0 || getU32(b, blk+abi.SearchArmedOff) == 0 || getU32(b, blk+abi.SearchNotesOff) != 0 {
-			return nil
-		}
-		n := int64(len(input)+1) * int64(sz.NotesBytes)
-		at := pageAlign(int64(mem.DataSize(store)))
-		if _, err := mem.Grow(store, uint64((n+65535)/65536)); err != nil {
-			return fmt.Errorf("grow notes: %w", err)
-		}
-		b = mem.UnsafeData(store)
-		clear(b[at : at+n])
-		putU32(b, blk+abi.SearchNotesOff, uint32(at))
-		putU32(b, blk+abi.SearchNotesCapOff, uint32(n))
-		r.Armed = true
-		return setScratch(pageAlign(at + n))
-	}
+	afterCall := func() error { return blocks.After(data) }
 
 	var name string
 	if isSet {
@@ -462,7 +425,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 		case "find":
 			name = sc.Find
 		case "batch":
-			name = sc.Find + "_batch"
+			name = config.SetBatchExportName(sc.Find)
 		case "scan_any":
 			name = sc.ScanAny
 		case "scan_all":
@@ -540,6 +503,10 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			from = advance(s, en)
 		}
 	case !isSet && sp.Fn == "groups":
+		nGroups := 1 // the slots the export writes: group 0 and every capture
+		if re, err := syntax.Parse(sp.Pattern, syntax.Perl); err == nil {
+			nGroups = re.MaxCap() + 1
+		}
 		for from := int32(0); from <= L; {
 			beforeCall()
 			res, e := f.Call(store, ib, L, int32(outPtr), from)
@@ -562,8 +529,9 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			r.Matches++
 			buf = mem.UnsafeData(store)
 			s, en := int32(getU32(buf, outPtr)), int32(getU32(buf, outPtr+4))
-			mix(uint32(s))
-			mix(uint32(en))
+			for k := int64(0); k < 2*int64(nGroups); k++ { // every slot
+				mix(getU32(buf, outPtr+4*k))
+			}
 			if sp.OneCall {
 				break
 			}
@@ -594,10 +562,11 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			}
 			r.Matches += int(v)
 			buf = mem.UnsafeData(store)
+			for k := int64(0); k < int64(v)*recSize; k += 4 { // every record, every slot
+				mix(getU32(buf, outPtr+k))
+			}
 			last := outPtr + int64(v-1)*recSize
 			s, en := int32(getU32(buf, last)), int32(getU32(buf, last+4))
-			mix(uint32(s))
-			mix(uint32(en))
 			pos = advance(s, en)
 		}
 	case isSet && sp.Fn == "find":
@@ -670,6 +639,21 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			cnt := uint32(v) & ((1 << (32 - kBits)) - 1)
 			r.Matches += int(cnt)
 			mix(uint32(v))
+			mix(pos)
+			// Every tuple written, order-independent within the call, as the
+			// find case hashes them.
+			buf = mem.UnsafeData(store)
+			var callSum uint64
+			for i := int64(0); i < int64(cnt) && i < int64(capN); i++ {
+				h := uint64(14695981039346656037)
+				for k := int64(0); k < abi.SetMatchTupleBytes; k++ {
+					h ^= uint64(buf[outPtr+i*abi.SetMatchTupleBytes+k])
+					h *= 1099511628211
+				}
+				callSum += h
+			}
+			mix(uint32(callSum))
+			mix(uint32(callSum >> 32))
 			if pos == 0xFFFFFFFF {
 				break
 			}
@@ -718,7 +702,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	}
 	if cacheBytes > 0 {
 		buf = mem.UnsafeData(store)
-		r.Note = fmt.Sprintf(" cache=%dB ready=%d", cacheBytes, int32(getU32(buf, cachePtr+8)))
+		r.Note = fmt.Sprintf(" cache=%dB ready=%d", cacheBytes, int32(getU32(buf, cachePtr+config.SetOverlapHdrReadyOff)))
 	}
 	return r, nil
 }

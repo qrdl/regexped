@@ -38,16 +38,16 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if output != "-" && strings.EqualFold(WitPathFor(output), output) {
 		return fmt.Errorf("output %q: the component and its sibling .wit would be the same file; give the output another extension, such as .wasm", output)
 	}
-	var rep *compile.Reporter
-	if report != nil {
-		rep = &compile.Reporter{}
-	}
+	// Always a Reporter: it only records, and compile.WarnUnboundedMemory reads
+	// what the compile found. It is rendered only under --verbose.
+	rep := &compile.Reporter{}
 	core, witText, err := Core(cfg, rep)
 	if err != nil {
 		return err
 	}
 	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "sets", len(cfg.Sets), "output", output, "format", "component")
 	rep.Render(report)
+	compile.WarnUnboundedMemory(cfg, rep)
 
 	if output == "-" {
 		// The binary goes to stdout and there is nowhere beside it for the

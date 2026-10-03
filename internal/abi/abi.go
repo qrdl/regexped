@@ -207,7 +207,11 @@ const ScratchBaseExport = "regexped:scratch_base"
 //	+60 … +67             reserved, 0
 //	+68  bt_cap      i32  Backtracking capture body: 2 once a call tripped
 //	+72  bt_memo_cap i32  STUB: bytes allocated at bt_memo_ptr
-//	+76 … +127            reserved, 0
+//	+76  far         i32  one past the farthest position a failed walk of the
+//	                      general find body has read this search: only a walk
+//	                      reaching back below it re-reads, and only that part
+//	                      is waste
+//	+80 … +127            reserved, 0
 //
 // The notes: `(len + 1) × notes_bytes` zeroed bytes, where notes_bytes is a
 // per-pattern constant the stub generator writes into the stub. The module
@@ -246,6 +250,14 @@ const (
 	SearchBTMemoOff    = 56
 	SearchBTCapOff     = 68
 	SearchBTMemoCapOff = 72
+	SearchFarOff       = 76
+)
+
+// bt_state's values; bt_cap uses SearchBTTripped too.
+const (
+	SearchBTNew     = 0 // a new search: no budget set up yet
+	SearchBTLive    = 1 // the search's budget is live in the block
+	SearchBTTripped = 2 // the budget ran out: the fallback serves the rest of the search
 )
 
 // SearchExport is the export through which the host names the current search's
@@ -263,6 +275,15 @@ const (
 // The colon keeps it out of the namespace a config can name, as
 // ScratchBaseExport's does.
 const SearchExport = "regexped:search"
+
+// ImportModuleSection is the custom section in which `regexped compile`
+// records an EMBEDDED module's import_module, the module name its stubs import
+// from. `regexped merge` names each regexp module from it rather than from the
+// one config it is given, so modules built from configs with distinct
+// import_module values merge into one program, and two modules under the SAME
+// name — whose setter exports (SearchExport) the merge would otherwise bind to
+// only one of — are refused. The payload is the name's UTF-8 bytes.
+const ImportModuleSection = "regexped:import_module"
 
 // SearchRuleMult and SearchRuleSlack are the arming rule, shared with the
 // Backtracking per-search budget: a search arms once its waste exceeds
@@ -303,11 +324,13 @@ func WriteFindScratch(buf []byte, off int32, gatePtr, cachePtr, cacheLen int32) 
 
 // WriteFindScratchBlocks fills a descriptor that also names a set's split
 // member search blocks: FindScratchMagicBlocks, then WriteFindScratch's
-// fields, then blocksPtr. buf[off:] must hold FindScratchBlocksBytes.
-func WriteFindScratchBlocks(buf []byte, off int32, gatePtr, cachePtr, cacheLen, blocksPtr int32) {
+// fields, then blocksPtr and the number of blocks there. buf[off:] must hold
+// FindScratchBlocksBytes.
+func WriteFindScratchBlocks(buf []byte, off int32, gatePtr, cachePtr, cacheLen, blocksPtr, blocksN int32) {
 	WriteFindScratch(buf, off, gatePtr, cachePtr, cacheLen)
 	binary.LittleEndian.PutUint32(buf[off+FindScratchMagicOff:], FindScratchMagicBlocks)
 	binary.LittleEndian.PutUint32(buf[off+FindScratchBlocksOff:], uint32(blocksPtr))
+	binary.LittleEndian.PutUint32(buf[off+FindScratchBlocksCountOff:], uint32(blocksN))
 }
 
 // --- a split set member's search block ---------------------------------------
@@ -316,12 +339,18 @@ func WriteFindScratchBlocks(buf []byte, off int32, gatePtr, cachePtr, cacheLen, 
 // per-search block (the single-pattern block above: same size, layout and
 // host protocol), because the member's search spans the set's calls just as a
 // pattern's spans its iterator's. A caller hands the blocks over through the
-// scratch descriptor, in a fifth field that only a descriptor carrying
+// scratch descriptor, in two fields that only a descriptor carrying
 // FindScratchMagicBlocks has:
 //
 //	+16 blocks_ptr  n × SearchBlockBytes, SearchBlockAlign-aligned, zeroed
 //	                when a scan starts; n and each block's notes size are
 //	                the set's generated block list
+//	+20 blocks_n    n, the number of blocks at blocks_ptr
+//
+// The module uses the blocks only when blocks_n is the count its set expects
+// and otherwise runs every member with no block — correct, only slower — so a
+// stub and a module that disagree about the list (a stub generated for another
+// build of the config) cannot make the module write past the caller's array.
 //
 // A second magic rather than a field every descriptor carries, because a
 // caller that knows nothing of blocks writes four fields and whatever follows
@@ -331,8 +360,9 @@ func WriteFindScratchBlocks(buf []byte, off int32, gatePtr, cachePtr, cacheLen, 
 // new magic; any other traps on it as on any wrong word.
 const (
 	// FindScratchMagicBlocks is "RXFB" in little-endian bytes.
-	FindScratchMagicBlocks = 0x52584642
-	FindScratchBlocksOff   = 16
+	FindScratchMagicBlocks    = 0x52584642
+	FindScratchBlocksOff      = 16
+	FindScratchBlocksCountOff = 20
 	// FindScratchBlocksBytes is the size of a descriptor that names blocks.
-	FindScratchBlocksBytes = 20
+	FindScratchBlocksBytes = 24
 )

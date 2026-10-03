@@ -368,7 +368,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			cacheSet := "s->scratch[2] = 0, s->scratch[3] = 0"
 			cacheField, cacheAlloc, cacheFree := "", "", ""
 			cacheAPI := cSetNoCacheAPI(s.Find, scannerType)
-			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, and the ONE place the C stub
 				// allocates.
@@ -396,18 +396,8 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 static size_t rx_%[9]s_cache_plan_(size_t len, unsigned *stride) {
     if (len > 0x7FFFFFFF) return 0;
     unsigned long long m = (unsigned long long)len + 1;
-    unsigned long long row = %[5]dULL;
-    unsigned long long cell = %[6]dULL;
-    unsigned long long k = m;
-    if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
-        k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
-        if (k < 16) k = 16;
-        if (k > m) k = m;
-    }
-    unsigned long long nb = (m + k - 1) / k;
-    unsigned long long bytes = %[3]dULL + nb * cell + 4 + k * row;
-    if (bytes > %[4]dULL) return 0;
-    *stride = (unsigned)k;
+%[10]s    if (bytes > %[4]dULL) return 0;
+%[11]s    *stride = (unsigned)k;
     return (size_t)bytes;
 }
 
@@ -425,7 +415,7 @@ size_t %[9]s_cache_bytes(size_t len) {
     return rx_%[9]s_cache_plan_(len, &k);
 }
 
-int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
+int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
     if (!s) return RX_ERR_NULL_ARG;
     unsigned k;
     size_t need = rx_%[9]s_cache_plan_(s->len, &k);
@@ -442,7 +432,7 @@ int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
 
 `, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
 					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes,
-					config.SetOverlapHdrStrideOff, s.Find, scannerType)
+					config.SetOverlapHdrStrideOff, s.Find, cCachePart(sh, consts), cSweepPart(sh, consts), scannerType)
 				cacheAlloc = fmt.Sprintf(`    /* Writes only: a scanner that owns a cache must be _free'd before it is
        initialised again, so nothing here reads what the struct held. */
     s->cache = 0; s->cache_words = 0; s->cache_own = 0;
@@ -470,11 +460,27 @@ int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
 					"s->scratch[3] = (unsigned)(s->cache_words * 4)"
 			}
 			cb.WriteString(cacheAPI)
+			cb.WriteString(cSetNotesPairDefs(s.Find, scannerType, blocks))
 			gateField += cacheField + cSetBlockFields(blocks)
 			gateInit += cacheAlloc
 			gateArg := "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) +
 				"u, s->scratch[1] = (unsigned)(size_t)s->gates, " + cacheSet + ", s->scratch), "
-			blockNotes := ""
+			blockNotes, pendingCheck := "", ""
+			// What the scanner owns, zeroed FIRST, before any argument check
+			// can return: a later _free of a scanner whose _init failed must
+			// find nothing to free.
+			ownZero := ""
+			if cacheField != "" {
+				ownZero += "    s->cache = 0; s->cache_words = 0; s->cache_own = 0;\n"
+			}
+			if len(blocks) > 0 {
+				ownZero += fmt.Sprintf("    for (size_t k = 0; k < %d; k++) s->notes[k] = 0;\n", len(blocks))
+				if blocksBTMemo(blocks) {
+					ownZero += fmt.Sprintf("    for (size_t k = 0; k < %d; k++) s->btmemos[k] = 0;\n", len(blocks))
+				}
+				ownZero += "    s->given = 0;\n    s->pending = 0;\n"
+				pendingCheck = "    if (s->pending) { int e = s->pending; s->pending = 0; s->done = 1; return e; }\n"
+			}
 			if len(blocks) > 0 {
 				btmemoInit, btmemoFree := "", ""
 				if blocksBTMemo(blocks) {
@@ -486,15 +492,15 @@ int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
 					len(blocks), abi.SearchBlockBytes/8, btmemoInit)
 				gateArg = "(s->scratch[0] = " + fmt.Sprint(abi.FindScratchMagicBlocks) +
 					"u, s->scratch[1] = (unsigned)(size_t)s->gates, " + cacheSet +
-					", s->scratch[4] = (unsigned)(size_t)s->blocks, s->scratch), "
+					fmt.Sprintf(", s->scratch[4] = (unsigned)(size_t)s->blocks, s->scratch[5] = %du, s->scratch), ", len(blocks))
 				for k, sz := range blocks {
 					if sz.NotesBytes > 0 {
-						blockNotes += fmt.Sprintf("    { int nerr = rx_search_notes_(s->blocks[%d], &s->notes[%d], s->len, %d);\n"+
-							"      if (nerr) { s->done = 1; return nerr; } }\n", k, k, sz.NotesBytes)
+						blockNotes += fmt.Sprintf("    { int nerr = rx_search_notes_(s->blocks[%d], &s->notes[%d], s->len, %d, %s);\n"+
+							"      if (nerr && !s->pending) s->pending = nerr; }\n", k, k, sz.NotesBytes, cSetNotesAt(s.Find, blocks, k, false))
 					}
 					if sz.BTMemoBytes > 0 {
-						blockNotes += fmt.Sprintf("    { int nerr = rx_search_btmemo_(s->blocks[%d], &s->btmemos[%d], s->len, %d);\n"+
-							"      if (nerr) { s->done = 1; return nerr; } }\n", k, k, sz.BTMemoBytes)
+						blockNotes += fmt.Sprintf("    { int nerr = rx_search_btmemo_(s->blocks[%d], &s->btmemos[%d], s->len, %d, %s);\n"+
+							"      if (nerr && !s->pending) s->pending = nerr; }\n", k, k, sz.BTMemoBytes, cSetNotesAt(s.Find, blocks, k, true))
 					}
 				}
 				cacheFree += fmt.Sprintf("#if RX_SEARCH_NOTES\n    for (size_t k = 0; k < %d; k++) {\n        if (s->notes[k]) { free(s->notes[k]); s->notes[k] = 0; }%s\n    }\n#endif\n", len(blocks), btmemoFree)
@@ -518,7 +524,8 @@ int %[9]s_set_cache(%[10]s *s, void *buf, size_t bytes) {
 			// exactly — one match per pattern at one start.
 			hb.WriteString(cSetScannerDecls(s.Find, konst, gateField, scannerType))
 			fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
-    if (!s || !input) return RX_ERR_NULL_ARG;
+    if (!s) return RX_ERR_NULL_ARG;
+%[8]s    if (!input) return RX_ERR_NULL_ARG;
     /* The FFI imports are i32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
@@ -532,7 +539,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
        holds %[6]s can never overflow — and the same header serves the component
        format, whose scan cannot re-ask a position. One rule for both. */
     if (cap < (size_t)%[6]s) return RX_ERR_RANGE;
-    if (s->done) return 0;
+%[9]s    if (s->done) return 0;
     int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
     /* Negative is RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or
        RX_ERR_OUT_OF_ORDER, not a count: a Backtracking member exhausted its
@@ -568,7 +575,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 void %[1]s_free(%[2]s *s) {
     if (!s) return;
 %[5]s}
-`, s.Find, scannerType, gateInit, gateArg, cacheFree, konst, blockNotes)
+`, s.Find, scannerType, gateInit, gateArg, cacheFree, konst, blockNotes, ownZero, pendingCheck)
 		}
 	}
 	if hasEmitNameMap(cfg) {
@@ -604,10 +611,13 @@ func genCPartsForEntrySized(re config.RegexEntry, importModule string, sizes map
 		cb.WriteString(genCMatchCPart(importModule, re.MatchFunc))
 	}
 	if re.FindFunc != "" {
+		it := cIterTypeName(re.FindFunc)
 		h, c := cWithSearch(genCFindHPart(re.FindFunc), genCFindCPart(importModule, re.FindFunc),
-			re.FindFunc, cIterTypeName(re.FindFunc), "_ffi_"+re.FindFunc, sizes[re.FindFunc], false)
+			re.FindFunc, it, "_ffi_"+re.FindFunc, sizes[re.FindFunc], false)
 		hb.WriteString(h)
+		hb.WriteString(cNotesPairDecl(re.FindFunc, it, "iterator", re.FindFunc+"_next"))
 		cb.WriteString(c)
+		cb.WriteString(cNotesPairDefs(re.FindFunc, it, sizes[re.FindFunc]))
 	}
 	if re.GroupsFunc != "" {
 		exportName := re.GroupsExportName()
@@ -617,10 +627,13 @@ func genCPartsForEntrySized(re config.RegexEntry, importModule string, sizes map
 		}
 		groups = entryGroups{num: numGroups, named: namedGroups}
 		h, c := genCGroupsStubParts(importModule, re.GroupsFunc, exportName, numGroups, namedGroups)
-		h, c = cWithSearch(h, c, re.GroupsFunc, cIterTypeName(re.GroupsFunc), "_ffi_"+exportName,
+		it := cIterTypeName(re.GroupsFunc)
+		h, c = cWithSearch(h, c, re.GroupsFunc, it, "_ffi_"+exportName,
 			sizes[re.GroupsFunc], true)
 		hb.WriteString(h)
+		hb.WriteString(cNotesPairDecl(re.GroupsFunc, it, "iterator", re.GroupsFunc+"_next"))
 		cb.WriteString(c)
+		cb.WriteString(cNotesPairDefs(re.GroupsFunc, it, sizes[re.GroupsFunc]))
 	}
 	return hb.String(), cb.String(), groups, nil
 }
@@ -1144,6 +1157,7 @@ int %[1]s(%[4]s *s, rx_set_match_t *buf, size_t cap);
 size_t %[1]s_cache_bytes(size_t len);
 int %[1]s_set_cache(%[4]s *s, void *buf, size_t bytes);
 
+%[5]s
 /* Releases whatever the scanner holds. Call it: with RX_SET_CACHE on, an
    overlapping set's scanner OWNS a heap region and abandoning one leaks it.
    Without the cache it is a no-op — the scanner is caller-owned, by value, and
@@ -1162,7 +1176,7 @@ int %[1]s_set_cache(%[4]s *s, void *buf, size_t bytes);
    Safe to call more than once, and on a scanner that finished. */
 void %[1]s_free(%[4]s *s);
 
-`, find, konst, gateField, scannerType)
+`, find, konst, gateField, scannerType, strings.TrimSuffix(cNotesPairDecl(find, scannerType, "scanner", find), "\n"))
 }
 
 // cPatternNameTable is the `emit_name_map: true` helper. Shared with the
@@ -1181,13 +1195,53 @@ func cPatternNameTable(cfg config.BuildConfig) string {
 	return b.String()
 }
 
+// cCachePart is the C cache plan's answer-cache arithmetic: k and bytes for an
+// input of m positions — the bare header when the set has no cache, only a
+// program sweep.
+func cCachePart(sh compile.OverlapCacheShape, consts overlapCacheConsts) string {
+	if !sh.Eligible {
+		return fmt.Sprintf("    unsigned long long k = 1;\n    unsigned long long bytes = %dULL;\n", consts.Hdr)
+	}
+	return fmt.Sprintf(`    unsigned long long row = %[5]dULL;
+    unsigned long long cell = %[6]dULL;
+    unsigned long long k = m;
+    if (%[3]dULL + cell + 4 + m * row > %[4]dULL) {
+        k = (unsigned long long)rx_sqrt_((double)m * %[1]d * 4 / (double)row);
+        if (k < 16) k = 16;
+        if (k > m) k = m;
+    }
+    unsigned long long nb = (m + k - 1) / k;
+    unsigned long long bytes = %[3]dULL + nb * cell + 4 + k * row;
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max, consts.Row, consts.Cell)
+}
+
+// cSweepPart adds a program sweep's part to the C cache plan's bytes: after the
+// cache's, 8-aligned, checkpointed by the same formula over its own geometry,
+// when it fits the budget. "" for a set with none.
+func cSweepPart(sh compile.OverlapCacheShape, consts overlapCacheConsts) string {
+	if sh.SweepCells == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`    {
+        unsigned long long srow = %[3]dULL, scell = %[4]dULL, sk = m;
+        if (%[1]dULL + scell + 4 + m * srow > %[2]dULL) {
+            sk = (unsigned long long)rx_sqrt_((double)m * %[5]d * 4 / (double)srow);
+            if (sk < 16) sk = 16;
+            if (sk > m) sk = m;
+        }
+        unsigned long long sb = %[1]dULL + (m + sk - 1) / sk * scell + 4 + sk * srow;
+        if (sb <= %[2]dULL) bytes = ((bytes + 7) & ~7ULL) + sb;
+    }
+`, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+}
+
 // cSetGateField is the scanner's gate array and descriptor fields, shared by
 // the module and component headers so the two stay identical: the descriptor
 // takes a fifth word when the set's split members keep search blocks.
 func cSetGateField(idKonst string, nblocks int) string {
 	words := 4
 	if nblocks > 0 {
-		words = 5
+		words = 6
 	}
 	return fmt.Sprintf("    unsigned gates[%s];\n    unsigned scratch[%d];\n", idKonst, words)
 }
@@ -1231,6 +1285,9 @@ func cSetBlockFields(blocks []compile.SearchSize) string {
 	}
 	return fmt.Sprintf("    /* The set's search blocks and, once one arms or trips, its notes or\n"+
 		"       memo (docs/wasm.md, \"The search block\"). Opaque; _free releases\n"+
-		"       them, which makes _free REQUIRED for this scanner. */\n"+
-		"    unsigned long long blocks[%d][%d];\n    unsigned char *notes[%d];\n%s", n, abi.SearchBlockBytes/8, n, memos)
+		"       them, which makes _free REQUIRED for this scanner. pending: notes\n"+
+		"       or a memo that could not be had, returned by the NEXT call so the\n"+
+		"       matches of the call that asked for them are delivered. given: the\n"+
+		"       caller's buffer for them (_set_notes), never freed. */\n"+
+		"    unsigned long long blocks[%d][%d];\n    unsigned char *notes[%d];\n%s    unsigned char *given;\n    int pending;\n", n, abi.SearchBlockBytes/8, n, memos)
 }

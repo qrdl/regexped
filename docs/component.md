@@ -299,10 +299,9 @@ reads the host's memory directly. `wac plug` produces a component holding two
 instances with two memories, and every call crosses the canonical ABI and copies
 its input. Same command, different cost model — see [Costs](#costs).
 
-**Several regexp components in one call** works, with one asymmetry against the
-module format. Regexp *modules* may all share an `import_module` name, because
-nothing imports it — it is a label with no consumers. Regexp *components* are
-matched by their interface name, `regexped:<wit_package>/matcher`, which the
+**Several regexp components in one call** works, and needs a distinct name per
+component, as the module format needs a distinct `import_module` per module.
+Regexp *components* are matched by their interface name, `regexped:<wit_package>/matcher`, which the
 socket genuinely imports, so two components built from configs sharing a
 `wit_package` export the same interface and `wac` cannot tell which should
 satisfy the import. **Composing several therefore requires distinct

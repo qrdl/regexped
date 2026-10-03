@@ -485,7 +485,7 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
 	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
-		"searchBlock", "searchNotes", "ffi_regexped_search"},
+		"searchBlock", "searchNotes", "searchBTMemo", "ffi_regexped_search"},
 	"js": {"patternName"},
 	"ts": {"SetMatch", "patternName"},
 	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
@@ -665,16 +665,19 @@ func (p *setShapes) wideAll(i int) bool {
 	return *p.wide[i]
 }
 
-// anyWantsCache reports whether any set in this config gets an overlapping
-// answer cache, which is what decides whether the C header carries the
-// allocator machinery at all, and whether the Go stub imports `math`.
+// anyWantsCache reports whether any set in this config gets a region — an
+// overlapping answer cache, or a program sweep's part after a bare header —
+// which is what decides whether the C header carries the allocator machinery
+// (and rx_sqrt_) at all, and whether the Go stub imports `math`. A sweep-only
+// set sizes its part with the same square root, and testing Eligible alone
+// left both out for a config whose only region was a sweep's.
 //
 // A config with no sets, or none overlapping, must not: the header documents
 // itself as needing no libc, and emitting the feature test would pull
 // <stdlib.h> into builds that rely on that.
 func (p *setShapes) anyWantsCache() bool {
 	for i := range p.cfg.Sets {
-		if p.cacheShape(i).Eligible {
+		if p.cacheShape(i).Offered() {
 			return true
 		}
 	}

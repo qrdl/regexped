@@ -148,6 +148,12 @@ notes-armed: $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --search-block=armed --validate-groups $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --search-block=armed --validate-groups $(CUSTOM)
 	go run . $(RE2TEST_FLAGS) --search-block=armed --high-bytes $(TESTDATA)
+	# Hinted bodies carry notes of their own.
+	go run . $(RE2TEST_FLAGS) --search-block=armed --likelymatch --all-matches $(TESTDATA)
+	# The Backtracking find and capture bodies, tripped from the first call:
+	# the fallback with the search's kept memo answers every call.
+	go run . $(RE2TEST_FLAGS) --search-block=armed --force-backtrack $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) --search-block=armed --force-backtrack --validate-groups $(ADJUSTED)
 	# A set's split members keep notes too, through the blocks the set's
 	# descriptor names: the same comparison for their searches.
 	go run . $(RE2TEST_FLAGS) --search-block=armed --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)

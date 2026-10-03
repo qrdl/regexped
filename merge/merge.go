@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/ownership"
 	"github.com/qrdl/regexped/internal/tools"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // resolveWasmMerge finds wasm-merge: wasm_merge_path, else $PATH. No
@@ -57,16 +59,13 @@ func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []stri
 // plugging "the exports of any number of 'plug' components", so several regexp
 // components compose in one call, with no intermediate files.
 //
-// ONE ASYMMETRY WITH THE MODULE PATH, and it is worth stating because the
-// module path's comment says the opposite (see moduleNameForWasm): every regexp
-// MODULE may safely share one import_module name, because nothing imports it.
 // Components are matched by their WIT INTERFACE name — regexped:<wit_package>/
 // matcher — which the socket genuinely imports, so two regexp components built
 // from configs sharing a wit_package export the same interface and wac cannot
 // tell which should satisfy the import. Multi-plug therefore requires DISTINCT
-// wit_package values, where multi-module merging requires nothing — and
-// checkDistinctPlugExports says so by name, because wac's own message for it is
-// the one a genuine mismatch gives.
+// wit_package values, as multi-module merging requires distinct import_module
+// values (mergeModules) — and checkDistinctPlugExports says so by name, because
+// wac's own message for it is the one a genuine mismatch gives.
 func composeComponents(cfg config.BuildConfig, mainWasm, output string, plugs []string) error {
 	wacCmd, err := resolveWac(cfg)
 	if err != nil {
@@ -175,10 +174,23 @@ func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []
 	// Main module is listed first so it keeps memory index 0 in the merged output
 	// (wasm-merge assigns memory indices in argument order). Regexp modules come after
 	// and get renumbered to higher indices by wasm-merge.
-	mergeArgs := []string{"--enable-multimemory", "--enable-simd", "--enable-bulk-memory", "--enable-bulk-memory-opt"}
+	//
+	// nontrapping-float-to-int is the HOST's feature, not ours: Go 1.26's wasip1
+	// output uses i64.trunc_sat_f64_s (runtime.fastexprand), and without the flag
+	// Binaryen rejects the main module ("all used features should be allowed"),
+	// so every Go host failed to merge.
+	mergeArgs := []string{"--enable-multimemory", "--enable-simd", "--enable-bulk-memory", "--enable-bulk-memory-opt",
+		"--enable-nontrapping-float-to-int"}
 	mergeArgs = append(mergeArgs, mainWasm, "main")
+	// Two modules under one name are an ERROR: wasm-merge would resolve every
+	// import of that name against one of them only.
+	seen := map[string]string{"main": mainWasm}
 	for _, path := range regexWasms {
 		module := moduleNameForWasm(cfg, path)
+		if prev, dup := seen[module]; dup {
+			return fmt.Errorf("merge: %s and %s are both named %q: give each config its own import_module", prev, path, module)
+		}
+		seen[module] = path
 		mergeArgs = append(mergeArgs, path, module)
 	}
 	mergeArgs = append(mergeArgs, "--rename-export-conflicts", "-o", output)
@@ -198,26 +210,24 @@ func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []
 	return nil
 }
 
-// moduleNameForWasm returns the import_module name for a given WASM file.
-// Uses cfg.ImportModule if set; falls back to the basename without extension.
+// moduleNameForWasm returns the module name a regexp WASM file is merged under:
+// the import_module its stubs import from, which `regexped compile` records in
+// the module itself (abi.ImportModuleSection). A module without the record —
+// built before it existed, or not by `regexped compile` — gets the config's
+// import_module, else its file name without the extension.
 //
-// When cfg.ImportModule is set, EVERY regex module is handed the same name.
-// That is deliberate and safe — do not "fix" it by deriving unique per-module
-// names. wasm-merge uses this name only to resolve imports *between* the merged
-// inputs, and a regexped regex module imports exactly one thing:
-// "main"."memory". Nothing imports the regex module's own name, so it is a
-// provider label with no consumers and duplicates cannot be ambiguous. The one
-// name that IS imported ("main", passed for the host module) is unique.
-//
-// Verified empirically against Binaryen 132: two distinct regex modules merged
-// under the same name produce a module whose exports each bind to their own DFA
-// tables and memory, confirmed by executing both under wasmtime including
-// negative cases.
-//
-// This rests on the import invariant above. If regex modules ever gain
-// inter-module imports, revisit: they would then need unique names, while still
-// exposing the host-facing import name the generated stubs expect.
+// The name is the module's own, not the config's, because a merged program is
+// assembled from modules built from several configs: one config's
+// import_module named them all, so modules with distinct names could not be
+// merged at all, and modules sharing one were each handed the same name — and
+// every stub's call to the search setter (abi.SearchExport), which each module
+// exports under one fixed name, then bound to one module only.
 func moduleNameForWasm(cfg config.BuildConfig, path string) string {
+	if raw, err := os.ReadFile(path); err == nil {
+		if name, ok := utils.CustomSection(raw, abi.ImportModuleSection); ok && len(name) > 0 {
+			return string(name)
+		}
+	}
 	if cfg.ImportModule != "" {
 		return cfg.ImportModule
 	}

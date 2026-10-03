@@ -577,9 +577,9 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil)
 
 	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
 		if len(body) == 0 {
@@ -618,12 +618,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -1075,7 +1075,7 @@ func TestFindFromWrapperBodyAllModes(t *testing.T) {
 
 func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
 	{
-		body := buildFindFromWrapperBody(7, mode, minLen)
+		body := buildFindFromWrapperBody(7, mode, minLen, nil)
 		if len(body) == 0 {
 			t.Fatalf("mode %v: emitted nothing", mode)
 		}
@@ -1111,7 +1111,7 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 			t.Errorf("panic message %q does not name the offending mode", msg)
 		}
 	}()
-	buildFindFromWrapperBody(7, findFromMode(0), 0)
+	buildFindFromWrapperBody(7, findFromMode(0), 0, nil)
 }
 
 // TestEmitFindCallFromPos covers the shared call sequence the BATCH wrappers

@@ -287,7 +287,7 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			gateDecl += "\t\titer.scratch[0] = " + fmt.Sprint(abi.FindScratchMagic) + "\n" +
 				"\t\titer.scratch[1] = uint32(uintptr(unsafe.Pointer(&iter.gates[0])))\n"
 			cacheField := ""
-			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, allocated ONCE for the scan.
 				// Without one an overlapping drive is quadratic, and `find`
@@ -300,9 +300,9 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				// this arithmetic MUST match config.SetOverlapCheckpoint* —
 				// the sweep validates what it is handed.
 				cacheField = "\t// The overlapping answer cache; see docs/wasm.md.\n\tcache []uint32\n"
-				gateDecl += fmt.Sprintf(`		if iter.cache == nil {
-			m := uint64(len(iter.input)) + 1
-			row := uint64(%[5]d)
+				gateDecl += "\t\tif iter.cache == nil {\n\t\t\tm := uint64(len(iter.input)) + 1\n"
+				if sh.Eligible {
+					gateDecl += fmt.Sprintf(`			row := uint64(%[5]d)
 			cell := uint64(%[6]d)
 			k := m
 			if %[3]d+cell+4+m*row > %[4]d {
@@ -315,9 +315,38 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 				}
 			}
 			nb := (m + k - 1) / k
-			if n := %[3]d + nb*cell + 4 + k*row; n <= %[4]d {
-				iter.cache = make([]uint32, (n+3)/4)
-				iter.cache[%[7]d] = uint32(k)
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+						consts.Row, consts.Cell)
+				} else {
+					// No answer cache, only the program sweep's part.
+					gateDecl += "\t\t\tk := uint64(1)\n"
+				}
+				cacheN := "%[1]d + nb*cell + 4 + k*row"
+				if !sh.Eligible {
+					cacheN = "uint64(%[1]d)" // the bare header
+				}
+				sweep := ""
+				if sh.SweepCells > 0 {
+					// The program sweep's part, after the cache's, checkpointed
+					// by the same formula over its own geometry.
+					sweep = fmt.Sprintf(`				srow, scell, sk := uint64(%[3]d), uint64(%[4]d), m
+				if %[1]d+scell+4+m*srow > %[2]d {
+					sk = uint64(math.Sqrt(float64(m) * %[5]d * 4 / float64(srow)))
+					if sk < 16 {
+						sk = 16
+					}
+					if sk > m {
+						sk = m
+					}
+				}
+				if sb := %[1]d + (m+sk-1)/sk*scell + 4 + sk*srow; sb <= %[2]d {
+					n = (n+7)&^7 + sb
+				}
+`, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+				}
+				gateDecl += fmt.Sprintf(`			if n := `+cacheN+`; n <= %[2]d {
+`+sweep+`				iter.cache = make([]uint32, (n+3)/4)
+				iter.cache[%[3]d] = uint32(k)
 			} else {
 				iter.cache = []uint32{}
 			}
@@ -328,8 +357,7 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 			iter.scratch[2] = uint32(uintptr(unsafe.Pointer(&iter.cache[0])))
 			iter.scratch[3] = uint32(len(iter.cache) * 4)
 		}
-`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
-					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
+`, consts.Hdr, consts.Max, config.SetOverlapHdrStrideOff/4)
 			} else {
 				gateDecl += "\t\titer.scratch[2], iter.scratch[3] = 0, 0\n"
 			}

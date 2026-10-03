@@ -34,14 +34,13 @@ import (
 // every kebab name here is one the WIT document also contains and nothing can
 // fail. Re-deriving them from the config would add an error branch for a failure
 // witSets has already ruled out.
-func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string, shapes *setShapes) (hPart, cPart string) {
+func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportModule string, shapes *setShapes, sizes map[string]compile.SearchSize) (hPart, cPart string) {
 	if len(wsets) == 0 {
 		return "", ""
 	}
-	// The module header's scanner carries the split members' search blocks;
-	// the identical header here carries them unused (the resource keeps its
-	// own inside the component).
-	sizes := searchSizesFor(cfg)
+	// The module header's scanner carries the split members' search blocks
+	// (sizes, from the caller's one compile); the identical header here
+	// carries them unused (the resource keeps its own inside the component).
 	var hb, cb strings.Builder
 
 	for si, s := range cfg.Sets {
@@ -62,7 +61,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 		// PUBLIC header, and the two formats promise an identical one. Omitting
 		// them made the headers differ for exactly the configs the parity test
 		// did not cover.
-		if sh := shapes.cacheShape(si); s.Overlapping && sh.Eligible && s.Find != "" {
+		if sh := shapes.cacheShape(si); s.Overlapping && sh.Offered() && s.Find != "" {
 			// Byte-for-byte what c_stub.go emits, comments included: the parity
 			// test compares header TEXT, and a field that explains itself
 			// differently in the two formats is a difference. They are simply
@@ -94,6 +93,7 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 				hb.WriteString(cSetScannerDecls(c.Name, konst, gateField, scannerType))
 				cb.WriteString(cComponentSetFindBody(setsImportModule, kebab, c.Name, scannerType, konst))
 				cb.WriteString(cSetNoCacheAPI(c.Name, scannerType))
+				cb.WriteString(cNotesPairNoop(c.Name, scannerType))
 			}
 		}
 	}

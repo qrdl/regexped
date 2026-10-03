@@ -98,11 +98,13 @@ func jsSearchHelpers(ts bool, sizes map[string]compile.SearchSize) string {
 }
 
 // jsNotesHelper is the JS/TS helper that allocates a search's notes once the
-// module has armed it.
+// module has armed it — or, with pre, at once: a BATCHING iterator's one call
+// runs many finds, and notes handed over only between calls would leave a
+// call as large as the input without any (one call, ×4 per doubling).
 func jsNotesHelper(ts bool) string {
-	sig := "function _notes(blk, len, nb, name) {"
+	sig := "function _notes(blk, len, nb, name, pre) {"
 	if ts {
-		sig = "function _notes(blk: number, len: number, nb: number, name: string): void {"
+		sig = "function _notes(blk: number, len: number, nb: number, name: string, pre?: boolean): Error | null {"
 	}
 	mem := "_exp.memory.buffer"
 	if ts {
@@ -113,14 +115,17 @@ func jsNotesHelper(ts bool) string {
     // enough to go quadratic — gets its notes, which the module then reads and
     // writes on every later call of this search (docs/wasm.md, "The search
     // block"). Carved from the bump like a region, so they live as long as
-    // the iterators do.
+    // the iterators do. No memory is RETURNED, not thrown: the match the
+    // caller just got is right, and the iterator delivers it first. A batching
+    // iterator asks up front (pre): the module uses them from the call after
+    // the one that arms, which may be the next find inside the same call.
     const dv = new DataView(%[2]s);
-    if (dv.getUint32(blk + %[3]d, true) === 0 || dv.getUint32(blk + %[4]d, true) !== 0) return;
+    if ((!pre && dv.getUint32(blk + %[3]d, true) === 0) || dv.getUint32(blk + %[4]d, true) !== 0) return null;
     const n = (len + 1) * nb, at = _align(_bump);
     try {
         _grow(at + n);
     } catch (e) {
-        if (e instanceof RangeError) throw new Error("regexped: " + name + ": no memory for this search's notes — the match result is unknown, not negative (see docs/wasm.md)");
+        if (e instanceof RangeError) return new Error("regexped: " + name + ": no memory for this search's notes — the match result is unknown, not negative (see docs/wasm.md)");
         throw e;
     }
     _bump = at + n;
@@ -128,6 +133,7 @@ func jsNotesHelper(ts bool) string {
     const dw = new DataView(%[2]s);
     dw.setUint32(blk + %[4]d, at, true);
     dw.setUint32(blk + %[5]d, n, true);
+    return null;
 }
 
 `, sig, mem, abi.SearchArmedOff, abi.SearchNotesOff, abi.SearchNotesCapOff)
@@ -139,7 +145,7 @@ func jsBTMemoHelper(ts bool) string {
 	sig := "function _btmemo(blk, len, nb, name) {"
 	mem := "_exp.memory.buffer"
 	if ts {
-		sig = "function _btmemo(blk: number, len: number, nb: number, name: string): void {"
+		sig = "function _btmemo(blk: number, len: number, nb: number, name: string): Error | null {"
 		mem = "(_exp.memory as WebAssembly.Memory).buffer"
 	}
 	return fmt.Sprintf(`%[1]s
@@ -147,12 +153,12 @@ func jsBTMemoHelper(ts bool) string {
     // fallback then keeps for the rest of the search, so a (state, position)
     // one call ruled out stays ruled out in the next.
     const dv = new DataView(%[2]s);
-    if (dv.getUint32(blk + %[3]d, true) !== 2 || dv.getUint32(blk + %[4]d, true) !== 0) return;
+    if (dv.getUint32(blk + %[3]d, true) !== %[6]d || dv.getUint32(blk + %[4]d, true) !== 0) return null;
     const n = (len + 1) * nb, at = _align(_bump);
     try {
         _grow(at + n);
     } catch (e) {
-        if (e instanceof RangeError) throw new Error("regexped: " + name + ": no memory for this search's memo — the match result is unknown, not negative (see docs/wasm.md)");
+        if (e instanceof RangeError) return new Error("regexped: " + name + ": no memory for this search's memo — the match result is unknown, not negative (see docs/wasm.md)");
         throw e;
     }
     _bump = at + n;
@@ -160,8 +166,9 @@ func jsBTMemoHelper(ts bool) string {
     const dw = new DataView(%[2]s);
     dw.setUint32(blk + %[4]d, at, true);
     dw.setUint32(blk + %[5]d, n, true);
+    return null;
 }
-`, sig, mem, abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff)
+`, sig, mem, abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, abi.SearchBTTripped)
 }
 
 // jsSearchParts are the lines a JS/TS find or groups generator adds when its
@@ -181,13 +188,20 @@ func jsSearch(funcName string, sz compile.SearchSize, outBytes string, ts bool) 
 	if ts {
 		global = "(_exp['" + abi.SearchExport + "'] as WebAssembly.Global).value"
 	}
+	failDecl := "let _fail = null;"
+	if ts {
+		failDecl = "let _fail: Error | null = null;"
+	}
 	return jsSearchParts{
 		open: fmt.Sprintf(" + %d", abi.SearchBlockBytes),
 		decl: fmt.Sprintf("    // This search's block (docs/wasm.md, \"The search block\"): one per\n"+
 			"    // iterator, in its own region, so two scans in flight never share notes.\n"+
 			"    const _blk = _outBase + (%s);\n"+
-			"    _mem.fill(0, _blk, _blk + %d);\n", outBytes, abi.SearchBlockBytes),
-		before: global + " = _blk;",
+			"    _mem.fill(0, _blk, _blk + %d);\n"+
+			"    // Notes or a memo that could not be had: thrown at the NEXT call, so\n"+
+			"    // the match found by the call that asked for them is delivered.\n"+
+			"    %s\n", outBytes, abi.SearchBlockBytes, failDecl),
+		before: "if (_fail) throw _fail; " + global + " = _blk;",
 		after:  jsAfterCall(funcName, sz),
 	}
 }
@@ -198,10 +212,10 @@ func jsSearch(funcName string, sz compile.SearchSize, outBytes string, ts bool) 
 func jsAfterCall(funcName string, sz compile.SearchSize) string {
 	var parts []string
 	if sz.NotesBytes > 0 {
-		parts = append(parts, fmt.Sprintf("_notes(_blk, len, %d, '%s');", sz.NotesBytes, funcName))
+		parts = append(parts, fmt.Sprintf("_fail = _fail || _notes(_blk, len, %d, '%s');", sz.NotesBytes, funcName))
 	}
 	if sz.BTMemoBytes > 0 {
-		parts = append(parts, fmt.Sprintf("_btmemo(_blk, len, %d, '%s');", sz.BTMemoBytes, funcName))
+		parts = append(parts, fmt.Sprintf("_fail = _fail || _btmemo(_blk, len, %d, '%s');", sz.BTMemoBytes, funcName))
 	}
 	return strings.Join(parts, " ")
 }
@@ -233,6 +247,10 @@ func jsWithSearch(src, funcName string, sz compile.SearchSize, ts, groups bool, 
 			p := jsSearch(funcName, sz, expr, ts)
 			out = append(out, indentOf(ln)+"const [_inBase, _outBase, len] = _open(input, ("+expr+")"+p.open+");")
 			out = append(out, strings.Split(strings.TrimSuffix(p.decl, "\n"), "\n")...)
+			if sz.NotesBytes > 0 {
+				// The batch export runs many finds per call: notes up front.
+				out = append(out, indentOf(ln)+fmt.Sprintf("if (_batched) _fail = _notes(_blk, len, %d, '%s', true);", sz.NotesBytes, funcName))
+			}
 			found["open"] = true
 			continue
 		case strings.HasPrefix(t, "const n = ") && strings.Contains(t, "'"+funcName+"_batch'"):
@@ -281,6 +299,7 @@ func rustSearchPreamble(importModule string) string {
 	return fmt.Sprintf(`#[link(wasm_import_module = %[1]q)]
 unsafe extern "C" {
     #[link_name = %[2]q]
+    #[allow(dead_code)] // a sets-only stub hands its blocks over in the descriptor
     fn ffi_regexped_search(blk: *mut u8);
 }
 
@@ -321,7 +340,7 @@ fn search_notes(blk: &mut SearchBlock, notes: &mut Vec<u8>, len: usize, nb: usiz
 #[allow(dead_code)]
 fn search_btmemo(blk: &mut SearchBlock, memo: &mut Vec<u8>, len: usize, nb: usize) -> Result<()> {
     let field = |b: &SearchBlock, at: usize| u32::from_le_bytes([b.0[at], b.0[at + 1], b.0[at + 2], b.0[at + 3]]);
-    if field(blk, %[7]d) != 2 || field(blk, %[8]d) != 0 {
+    if field(blk, %[7]d) != %[10]d || field(blk, %[8]d) != 0 {
         return Ok(());
     }
     let n = (len + 1) * nb;
@@ -333,7 +352,7 @@ fn search_btmemo(blk: &mut SearchBlock, memo: &mut Vec<u8>, len: usize, nb: usiz
 }
 
 `, importModule, abi.SearchExport, abi.SearchBlockBytes, abi.SearchArmedOff, abi.SearchNotesOff, abi.SearchNotesCapOff,
-		abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff)
+		abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, abi.SearchBTTripped)
 }
 
 // rustWithSearch adds the block to a generated Rust find or groups iterator
@@ -353,29 +372,40 @@ func rustWithSearch(src, funcName, iterName string, sz compile.SearchSize, group
 	rep("    done: bool,\n}\n", "    done: bool,\n"+
 		"    /// This search's block and, once it arms, its notes; once its\n"+
 		"    /// Backtracking budget trips, its memo (docs/wasm.md).\n"+
-		"    search: SearchBlock,\n    notes: Vec<u8>,\n    btmemo: Vec<u8>,\n}\n")
+		"    search: SearchBlock,\n    #[allow(dead_code)]\n    notes: Vec<u8>,\n    #[allow(dead_code)]\n    btmemo: Vec<u8>,\n"+
+		"    /// Notes or a memo that could not be had: returned by the NEXT call,\n"+
+		"    /// so the match of the call that asked for them is delivered.\n"+
+		"    failed: Option<Error>,\n}\n")
 	// The constructor.
 	rep(iterName+" { input, offset, prev_end: None, done: false }",
-		fmt.Sprintf("%s { input, offset, prev_end: None, done: false, search: SearchBlock([0; %d]), notes: Vec::new(), btmemo: Vec::new() }",
+		fmt.Sprintf("%s { input, offset, prev_end: None, done: false, search: SearchBlock([0; %d]), notes: Vec::new(), btmemo: Vec::new(), failed: None }",
 			iterName, abi.SearchBlockBytes))
 	after := func(indent string) string {
 		var out string
 		if sz.NotesBytes > 0 {
 			out += indent + fmt.Sprintf("if let Err(e) = search_notes(&mut self.search, &mut self.notes, self.input.len(), %d) {\n", sz.NotesBytes) +
-				indent + "    self.done = true;\n" + indent + "    return Some(Err(e));\n" + indent + "}\n"
+				indent + "    self.failed.get_or_insert(e);\n" + indent + "}\n"
 		}
 		if sz.BTMemoBytes > 0 {
 			out += indent + fmt.Sprintf("if let Err(e) = search_btmemo(&mut self.search, &mut self.btmemo, self.input.len(), %d) {\n", sz.BTMemoBytes) +
-				indent + "    self.done = true;\n" + indent + "    return Some(Err(e));\n" + indent + "}\n"
+				indent + "    self.failed.get_or_insert(e);\n" + indent + "}\n"
 		}
 		return out
 	}
+	failed := func(indent string) string {
+		return indent + "if let Some(e) = self.failed.take() {\n" + indent + "    self.done = true;\n" +
+			indent + "    return Some(Err(e));\n" + indent + "}\n"
+	}
 	if !groups {
+		rep("        if self.done || self.offset > self.input.len() {\n            return None;\n        }\n",
+			failed("        ")+"        if self.done || self.offset > self.input.len() {\n            return None;\n        }\n")
 		rep("        match unsafe { ffi_"+funcName+"(",
 			"        unsafe { ffi_regexped_search(self.search.0.as_mut_ptr()) };\n        match unsafe { ffi_"+funcName+"(")
 		rep("            n  => {\n", "            n  => {\n"+after("                "))
 		return src
 	}
+	rep("            if self.done || self.offset > self.input.len() {\n                return None;\n            }\n",
+		failed("            ")+"            if self.done || self.offset > self.input.len() {\n                return None;\n            }\n")
 	rep("            let r = unsafe {",
 		"            unsafe { ffi_regexped_search(self.search.0.as_mut_ptr()) };\n            let r = unsafe {")
 	rep("            // Slots are ABSOLUTE: the whole input is passed on every call.\n",
@@ -414,7 +444,7 @@ func searchNotes(blk *searchBlock, notes *[]byte, length, nb int) {
 // (length + 1) × nb zeroed bytes its fallback keeps for the rest of the search.
 func searchBTMemo(blk *searchBlock, memo *[]byte, length, nb int) {
 	w := (*[%[4]d]uint32)(unsafe.Pointer(blk))
-	if w[%[8]d] != 2 || w[%[9]d] != 0 {
+	if w[%[8]d] != %[11]d || w[%[9]d] != 0 {
 		return
 	}
 	*memo = make([]byte, (length+1)*nb)
@@ -424,7 +454,7 @@ func searchBTMemo(blk *searchBlock, memo *[]byte, length, nb int) {
 
 `, importModule, abi.SearchExport, abi.SearchBlockBytes/8, abi.SearchBlockBytes/4,
 		abi.SearchArmedOff/4, abi.SearchNotesOff/4, abi.SearchNotesCapOff/4,
-		abi.SearchBTStateOff/4, abi.SearchBTMemoOff/4, abi.SearchBTMemoCapOff/4)
+		abi.SearchBTStateOff/4, abi.SearchBTMemoOff/4, abi.SearchBTMemoCapOff/4, abi.SearchBTTripped)
 }
 
 // goWithSearch adds the block to a generated Go find or groups iterator
@@ -494,51 +524,77 @@ const cSearchPreamble = `/* A search that re-reads its input gets per-search NOT
 
 // cSearchCPreamble is the .c part: the setter import and the notes helper.
 func cSearchCPreamble(importModule string) string {
-	return fmt.Sprintf(`__attribute__((import_module(%[1]q), import_name(%[2]q)))
+	return fmt.Sprintf(`/* The setter's link symbol is the import module's: two stubs in one program,
+   each importing from a module of its own, would otherwise declare one symbol
+   from two modules, which wasm-ld refuses. */
+#define rx_search_set_ rx_search_set_%[9]s
+__attribute__((import_module(%[1]q), import_name(%[2]q)))
 extern void rx_search_set_(unsigned long long *blk);
 
 /* Gives a search the module has marked ARMED — it read past its matches often
    enough to go quadratic — its notes: (len + 1) × nb zeroed bytes the module
-   reads and writes on every later call of the search. Returns 0, or
-   RX_ERR_BT_OVERFLOW when they cannot be allocated: the answer is then
-   unknown. Without an allocator (RX_SEARCH_NOTES 0) it does nothing. */
-__attribute__((unused)) static int rx_search_notes_(unsigned long long *blk, unsigned char **notes, size_t len, size_t nb) {
-#if RX_SEARCH_NOTES
+   reads and writes on every later call of the search. given is the caller's
+   zeroed buffer for them (<func>_set_notes), used in preference to calloc and
+   never freed; 0 for none. Returns 0, or RX_ERR_BT_OVERFLOW when they cannot
+   be allocated: the answer is then unknown. With neither an allocator
+   (RX_SEARCH_NOTES 0) nor a buffer it does nothing. */
+__attribute__((unused)) static int rx_search_notes_(unsigned long long *blk, unsigned char **notes, size_t len, size_t nb, unsigned char *given) {
     unsigned *w = (unsigned *)blk;
     if (w[%[3]d] == 0 || w[%[4]d] != 0) return 0;
     size_t n = (len + 1) * nb;
-    unsigned char *p = (unsigned char *)calloc(n, 1);
-    if (!p) return RX_ERR_BT_OVERFLOW;
-    *notes = p;
+    unsigned char *p = given;
+#if RX_SEARCH_NOTES
+    if (!p) {
+        p = (unsigned char *)calloc(n, 1);
+        if (!p) return RX_ERR_BT_OVERFLOW;
+        *notes = p;
+    }
+#else
+    (void)notes;
+    if (!p) return 0;
+#endif
     w[%[4]d] = (unsigned)(size_t)p;
     w[%[5]d] = (unsigned)n;
-#else
-    (void)blk; (void)notes; (void)len; (void)nb;
-#endif
     return 0;
 }
 
 /* Gives a Backtracking search whose work budget TRIPPED its memo: (len + 1) ×
-   nb zeroed bytes its fallback keeps for the rest of the search. Returns 0, or
-   RX_ERR_BT_OVERFLOW when it cannot be allocated. */
-__attribute__((unused)) static int rx_search_btmemo_(unsigned long long *blk, unsigned char **memo, size_t len, size_t nb) {
-#if RX_SEARCH_NOTES
+   nb zeroed bytes its fallback keeps for the rest of the search, from given
+   when the caller handed a buffer over. Returns 0, or RX_ERR_BT_OVERFLOW when
+   it cannot be allocated. */
+__attribute__((unused)) static int rx_search_btmemo_(unsigned long long *blk, unsigned char **memo, size_t len, size_t nb, unsigned char *given) {
     unsigned *w = (unsigned *)blk;
-    if (w[%[6]d] != 2 || w[%[7]d] != 0) return 0;
+    if (w[%[6]d] != %[10]d || w[%[7]d] != 0) return 0;
     size_t n = (len + 1) * nb;
-    unsigned char *p = (unsigned char *)calloc(n, 1);
-    if (!p) return RX_ERR_BT_OVERFLOW;
-    *memo = p;
+    unsigned char *p = given;
+#if RX_SEARCH_NOTES
+    if (!p) {
+        p = (unsigned char *)calloc(n, 1);
+        if (!p) return RX_ERR_BT_OVERFLOW;
+        *memo = p;
+    }
+#else
+    (void)memo;
+    if (!p) return 0;
+#endif
     w[%[7]d] = (unsigned)(size_t)p;
     w[%[8]d] = (unsigned)n;
-#else
-    (void)blk; (void)memo; (void)len; (void)nb;
-#endif
     return 0;
 }
 
 `, importModule, abi.SearchExport, abi.SearchArmedOff/4, abi.SearchNotesOff/4, abi.SearchNotesCapOff/4,
-		abi.SearchBTStateOff/4, abi.SearchBTMemoOff/4, abi.SearchBTMemoCapOff/4)
+		abi.SearchBTStateOff/4, abi.SearchBTMemoOff/4, abi.SearchBTMemoCapOff/4, cIdentSafe(importModule), abi.SearchBTTripped)
+}
+
+// cIdentSafe is s with every byte a C identifier cannot hold replaced by `_`.
+func cIdentSafe(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if !(c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			b[i] = '_'
+		}
+	}
+	return string(b)
 }
 
 // cWithSearch adds the block to a generated C find or groups iterator — its
@@ -558,10 +614,18 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 			"    /* This search's block and, once it arms, its notes (docs/wasm.md, \"The\n"+
 			"       search block\"). Opaque; _free releases the notes. */\n"+
 			fmt.Sprintf("    unsigned long long search[%d];\n", abi.SearchBlockBytes/8)+
-			"    unsigned char *notes, *btmemo;\n} "+iterType+";")
-	rep(&c, "    iter->scratch[1] = 0;\n    return 0;\n}",
-		fmt.Sprintf("    iter->scratch[1] = 0;\n    for (int w = 0; w < %d; w++) iter->search[w] = 0;\n    iter->notes = 0;\n    iter->btmemo = 0;\n    return 0;\n}",
-			abi.SearchBlockBytes/8))
+			"    unsigned char *notes, *btmemo, *given;\n"+
+			"    /* Notes or a memo that could not be had: returned by the NEXT call,\n"+
+			"       so the match of the call that asked for them is delivered. */\n"+
+			"    int pending;\n} "+iterType+";")
+	// Zeroed FIRST, before any argument check can return: a later _free of an
+	// iterator whose _init failed must find nothing to free.
+	rep(&c, "    if (!iter || !input) return RX_ERR_NULL_ARG;\n",
+		fmt.Sprintf("    if (!iter) return RX_ERR_NULL_ARG;\n"+
+			"    for (int w = 0; w < %d; w++) iter->search[w] = 0;\n"+
+			"    iter->notes = 0;\n    iter->btmemo = 0;\n    iter->given = 0;\n    iter->pending = 0;\n"+
+			"    if (!input) return RX_ERR_NULL_ARG;\n", abi.SearchBlockBytes/8))
+	pendingCheck := "    if (iter->pending) { int e = iter->pending; iter->pending = 0; iter->done = 1; return e; }\n"
 	rep(&c, "    if (!iter) return;\n    iter->done = 1;\n}",
 		"    if (!iter) return;\n    iter->done = 1;\n#if RX_SEARCH_NOTES\n"+
 			"    /* The notes and memo a search that went bad was given: _free is REQUIRED\n"+
@@ -570,12 +634,17 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 			"    if (iter->btmemo) { free(iter->btmemo); iter->btmemo = 0; }\n#endif\n}")
 	notes := ""
 	if sz.NotesBytes > 0 {
-		notes += fmt.Sprintf("        { int nerr = rx_search_notes_(iter->search, &iter->notes, iter->len, %d);\n"+
-			"          if (nerr) { iter->done = 1; return nerr; } }\n", sz.NotesBytes)
+		notes += fmt.Sprintf("        { int nerr = rx_search_notes_(iter->search, &iter->notes, iter->len, %d, iter->given);\n"+
+			"          if (nerr && !iter->pending) iter->pending = nerr; }\n", sz.NotesBytes)
 	}
 	if sz.BTMemoBytes > 0 {
-		notes += fmt.Sprintf("        { int nerr = rx_search_btmemo_(iter->search, &iter->btmemo, iter->len, %d);\n"+
-			"          if (nerr) { iter->done = 1; return nerr; } }\n", sz.BTMemoBytes)
+		// The memo follows the notes in a caller's buffer (cNotesPair).
+		given := "iter->given"
+		if sz.NotesBytes > 0 {
+			given = fmt.Sprintf("(iter->given ? iter->given + ((((size_t)iter->len + 1) * %d + 7) & ~(size_t)7) : 0)", sz.NotesBytes)
+		}
+		notes += fmt.Sprintf("        { int nerr = rx_search_btmemo_(iter->search, &iter->btmemo, iter->len, %d, %s);\n"+
+			"          if (nerr && !iter->pending) iter->pending = nerr; }\n", sz.BTMemoBytes, given)
 	}
 	if !groups {
 		rep(&h, "   iterator strands the input copy and the scan state inside the regexp\n"+
@@ -586,7 +655,10 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 			"   iterator strands the input copy and the scan state inside the regexp\n"+
 				"   component for the life of the process. Under wasm_format: module it is\n"+
 				"   REQUIRED as well: it frees the notes a scan over input that makes each\n"+
-				"   call read past its match was given (docs/wasm.md).\n")
+				"   call read past its match was given (docs/wasm.md). For the same reason\n"+
+				"   the iterator is NOT COPYABLE once initialised: a copy and two _free\n"+
+				"   calls free the notes twice.\n")
+		rep(&c, "    if (!iter || !out_match) return RX_ERR_NULL_ARG;\n", "    if (!iter || !out_match) return RX_ERR_NULL_ARG;\n"+pendingCheck)
 		rep(&c, "        long long packed = "+ffi+"(", "        rx_search_set_(iter->search);\n        long long packed = "+ffi+"(")
 		rep(&c, "        if (packed < 0) { iter->done = 1; return 0; }\n",
 			"        if (packed < 0) { iter->done = 1; return 0; }\n"+notes)
@@ -597,7 +669,9 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 		"   wasm_format: component it drops the resource handle and is REQUIRED,\n"+
 			"   including before initialising the same iterator again; under\n"+
 			"   wasm_format: module it frees the scan's notes (docs/wasm.md) and is\n"+
-			"   REQUIRED too. */")
+			"   REQUIRED too, and the iterator is NOT COPYABLE once initialised: a\n"+
+			"   copy and two _free calls free the notes twice. */")
+	rep(&c, "    if (!iter || !out_groups) return RX_ERR_NULL_ARG;\n", "    if (!iter || !out_groups) return RX_ERR_NULL_ARG;\n"+pendingCheck)
 	rep(&c, "        int status = "+ffi+"(", "        rx_search_set_(iter->search);\n        int status = "+ffi+"(")
 	rep(&c, "        size_t start = (size_t)slots[0];\n", notes+"        size_t start = (size_t)slots[0];\n")
 	return h, c
@@ -613,9 +687,11 @@ declare function _ffi_regexped_search(blk: usize): void;
  *  often enough to go quadratic — its notes: (len + 1) * nb zeroed bytes the
  *  module reads and writes on every later call of the search (docs/wasm.md,
  *  "The search block"). null when it has not armed or already has them. A
- *  failed allocation traps, as every AssemblyScript allocation does. */
-function _searchNotes(blk: StaticArray<u64>, len: i32, nb: i32): StaticArray<u8> | null {
-  const b = changetype<usize>(blk);
+ *  failed allocation traps, as every AssemblyScript allocation does.
+ *  The block is an ADDRESS, not a managed reference: a set's blocks sit inside
+ *  one array, and a reference to the middle of an object, held across the
+ *  allocation below, is one the collector may treat as an object header. */
+function _searchNotes(b: usize, len: i32, nb: i32): StaticArray<u8> | null {
   if (load<u32>(b + %[3]d) == 0 || load<u32>(b + %[4]d) != 0) return null;
   const notes = new StaticArray<u8>((len + 1) * nb);
   store<u32>(b + %[4]d, u32(changetype<usize>(notes)));
@@ -625,9 +701,8 @@ function _searchNotes(blk: StaticArray<u64>, len: i32, nb: i32): StaticArray<u8>
 
 /** Gives a Backtracking search whose work budget TRIPPED its memo: (len + 1)
  *  * nb zeroed bytes its fallback keeps for the rest of the search. */
-function _searchBTMemo(blk: StaticArray<u64>, len: i32, nb: i32): StaticArray<u8> | null {
-  const b = changetype<usize>(blk);
-  if (load<u32>(b + %[6]d) != 2 || load<u32>(b + %[7]d) != 0) return null;
+function _searchBTMemo(b: usize, len: i32, nb: i32): StaticArray<u8> | null {
+  if (load<u32>(b + %[6]d) != %[9]d || load<u32>(b + %[7]d) != 0) return null;
   const memo = new StaticArray<u8>((len + 1) * nb);
   store<u32>(b + %[7]d, u32(changetype<usize>(memo)));
   store<u32>(b + %[8]d, u32((len + 1) * nb));
@@ -635,7 +710,7 @@ function _searchBTMemo(blk: StaticArray<u64>, len: i32, nb: i32): StaticArray<u8
 }
 
 `, importModule, abi.SearchExport, abi.SearchArmedOff, abi.SearchNotesOff, abi.SearchNotesCapOff,
-		abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff)
+		abi.SearchBTStateOff, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, abi.SearchBTTripped)
 }
 
 // asWithSearch adds the block to a generated AssemblyScript find or groups
@@ -658,10 +733,10 @@ func asWithSearch(src, funcName, ffi string, sz compile.SearchSize, groups bool)
 	set := "      _ffi_regexped_search(changetype<usize>(this.search));\n"
 	notes := ""
 	if sz.NotesBytes > 0 {
-		notes += fmt.Sprintf("      const armed = _searchNotes(this.search, len, %d);\n      if (armed != null) this.notes = armed;\n", sz.NotesBytes)
+		notes += fmt.Sprintf("      const armed = _searchNotes(changetype<usize>(this.search), len, %d);\n      if (armed != null) this.notes = armed;\n", sz.NotesBytes)
 	}
 	if sz.BTMemoBytes > 0 {
-		notes += fmt.Sprintf("      const tripped = _searchBTMemo(this.search, len, %d);\n      if (tripped != null) this.btmemo = tripped;\n", sz.BTMemoBytes)
+		notes += fmt.Sprintf("      const tripped = _searchBTMemo(changetype<usize>(this.search), len, %d);\n      if (tripped != null) this.btmemo = tripped;\n", sz.BTMemoBytes)
 	}
 	if !groups {
 		rep("  private done: bool = false;\n  constructor", "  private done: bool = false;\n"+fields+"  constructor")
@@ -699,13 +774,17 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 		var b strings.Builder
 		for k, sz := range blocks {
 			if sz.NotesBytes > 0 {
-				fmt.Fprintf(&b, "%s_notes(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
+				fmt.Fprintf(&b, "%s_fail = _fail || _notes(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
 			}
 			if sz.BTMemoBytes > 0 {
-				fmt.Fprintf(&b, "%s_btmemo(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.BTMemoBytes, find)
+				fmt.Fprintf(&b, "%s_fail = _fail || _btmemo(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.BTMemoBytes, find)
 			}
 		}
 		return b.String()
+	}
+	failDecl := "let _fail = null;"
+	if ts {
+		failDecl = "let _fail: Error | null = null;"
 	}
 	setup := fmt.Sprintf(`    // The split members' search blocks (docs/wasm.md, "The search block"),
     // one per member and per iterator, named by a second descriptor that
@@ -721,9 +800,12 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
     _mem.fill(0, _sd, _sdEnd);
     {
         const _d = new Uint32Array(%[3]s, scratchBase, 4);
-        new Uint32Array(%[3]s, _sd, 5).set([%[4]d, _d[1], _d[2], _d[3], _sd + %[5]d]);
+        new Uint32Array(%[3]s, _sd, 6).set([%[4]d, _d[1], _d[2], _d[3], _sd + %[5]d, %[6]d]);
     }
-`, setBlocksBytes(blocks), find, mem, abi.FindScratchMagicBlocks, setBlocksAt)
+    // A block's notes or memo that could not be had: thrown at the NEXT call,
+    // so the matches of the call that asked for them are delivered.
+    %[7]s
+`, setBlocksBytes(blocks), find, mem, abi.FindScratchMagicBlocks, setBlocksAt, len(blocks), failDecl)
 	edit := func(fn string, batch bool) {
 		head := "export function* " + fn + "("
 		i := strings.Index(section, head)
@@ -741,21 +823,42 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 			}
 			body = strings.Replace(body, old, new, 1)
 		}
+		// throwBefore puts the pending-failure throw on its own line before
+		// the statement holding marker: the export call, which the rep just
+		// before it has put there exactly once.
+		throwBefore := func(marker string) {
+			at := strings.Index(body, marker)
+			ls := strings.LastIndex(body[:at], "\n") + 1
+			ind := body[ls : ls+len(body[ls:])-len(strings.TrimLeft(body[ls:], " "))]
+			body = body[:ls] + ind + "if (_fail) throw _fail;\n" + body[ls:]
+		}
 		// After the ordinary descriptor is written.
 		k := strings.Index(body, ", scratchBase, 4).set([")
 		if k < 0 {
 			panic("generate: jsSetWithBlocks: no descriptor in " + fn)
 		}
 		e := strings.Index(body[k:], "\n") + k + 1
-		body = body[:e] + setup + body[e:]
+		pre := ""
+		if batch {
+			// The batch entry runs many finds per call: every notes-keeping
+			// block gets its notes up front, not when it arms.
+			for k, sz := range blocks {
+				if sz.NotesBytes > 0 {
+					pre += fmt.Sprintf("    _fail = _fail || _notes(_sd + %d, len, %d, '%s', true);\n", setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
+				}
+			}
+		}
+		body = body[:e] + setup + pre + body[e:]
 		if batch {
 			// The arguments only: JS calls `_exp['…'](`, TypeScript
 			// `(_exp['…'] as Function)(`.
 			rep("(_inBase, len, cursor, scratchBase, ", "(_inBase, len, cursor, _sd, ")
+			throwBefore("(_inBase, len, cursor, _sd, ")
 			rep("        const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;\n",
 				"        const done = (BigInt.asUintN(64, packed) >> 32n) === 0xFFFFFFFFn;\n        if (!done) {\n"+notes("            ")+"        }\n")
 		} else {
 			rep("scratchBase, _outBase, ", "_sd, _outBase, ")
+			throwBefore("_sd, _outBase, ")
 			rep("        if (n <= 0) break;\n", "        if (n <= 0) break;\n"+notes("        "))
 		}
 		section = section[:i] + body + section[i+j:]
@@ -787,7 +890,7 @@ func goSetWithBlocks(body, find string, blocks []compile.SearchSize) string {
 		}
 		src = strings.Replace(src, old, new, 1)
 	}
-	rep("\tscratch [4]uint32\n", "\tscratch [5]uint32\n"+
+	rep("\tscratch [4]uint32\n", "\tscratch [6]uint32\n"+
 		"\t// The set's search blocks (docs/wasm.md, \"The search block\"), named\n"+
 		"\t// by the descriptor's fifth field, their notes once one arms and their\n"+
 		"\t// Backtracking memos once one trips.\n"+
@@ -795,7 +898,8 @@ func goSetWithBlocks(body, find string, blocks []compile.SearchSize) string {
 	rep("\t\titer.scratch[0] = "+fmt.Sprint(abi.FindScratchMagic)+"\n",
 		fmt.Sprintf("\t\tif iter.blocks == nil {\n\t\t\titer.blocks = make([]searchBlock, %[1]d)\n\t\t\titer.notes = make([][]byte, %[1]d)\n\t\t\titer.btmemos = make([][]byte, %[1]d)\n\t\t}\n", len(blocks))+
 			"\t\titer.scratch[0] = "+fmt.Sprint(abi.FindScratchMagicBlocks)+"\n"+
-			"\t\titer.scratch[4] = uint32(uintptr(unsafe.Pointer(&iter.blocks[0])))\n")
+			"\t\titer.scratch[4] = uint32(uintptr(unsafe.Pointer(&iter.blocks[0])))\n"+
+			fmt.Sprintf("\t\titer.scratch[5] = %d\n", len(blocks)))
 	var notes strings.Builder
 	for k, sz := range blocks {
 		if sz.NotesBytes > 0 {
@@ -807,4 +911,173 @@ func goSetWithBlocks(body, find string, blocks []compile.SearchSize) string {
 	}
 	rep("\t\t\titer.pending, iter.consumed = tupleCount, 0\n", notes.String()+"\t\t\titer.pending, iter.consumed = tupleCount, 0\n")
 	return body[:i] + src + body[j:]
+}
+
+// cNotesPairDecl is the header declaration of `<func>_notes_bytes` /
+// `<func>_set_notes`: per-search notes and a Backtracking memo in the
+// CALLER's memory, for a build with no allocator, as `<find>_cache_bytes` /
+// `<find>_set_cache` are for a set's answer cache. Every find and groups
+// iterator — and every set scanner — has the pair, so the same source compiles
+// against any pattern and either output kind; it does nothing where nothing is
+// needed. what names the object ("iterator" or "scanner") and next its call.
+func cNotesPairDecl(funcName, objType, what, next string) string {
+	return fmt.Sprintf(`/* Per-search NOTES and a Backtracking MEMO in YOUR memory: for a build with
+   no allocator (-DRX_SET_CACHE=0), or one that wants to place them itself.
+
+   %[1]s_notes_bytes says how many bytes a scan over an input of len may need
+   for them. 0 means none: the scan keeps neither, or the build is
+   wasm_format: component, whose regexp component keeps its own.
+   %[1]s_set_notes hands a buffer of at least that many bytes to a %[3]s;
+   call it after _init and before the first %[4]s. Without them (and without
+   an allocator) a scan over input that makes each call read past its match,
+   or that exhausts a Backtracking work budget, costs time quadratic in the
+   input; the answers are the same either way.
+
+       size_t need = %[1]s_notes_bytes(len);
+       %[1]s_init(&it, input, len, 0);
+       if (need && need <= sizeof mem) %[1]s_set_notes(&it, mem, sizeof mem);
+
+   0 on success, and when no buffer is needed (buf is then not used).
+   RX_ERR_RANGE when bytes is below what this input needs, RX_ERR_NULL_ARG for
+   a null %[3]s or a null buf that is needed; on an error the %[3]s is
+   unchanged. With an allocator the buffer is used in its place.
+
+   It zeroes the buffer, which must outlive the scan and serve ONE %[3]s at a
+   time; _free never frees it, and _init forgets it, so a restarted scan hands
+   it over again. Any alignment works. */
+size_t %[1]s_notes_bytes(size_t len);
+int %[1]s_set_notes(%[2]s *it, void *buf, size_t bytes);
+
+`, funcName, objType, what, next)
+}
+
+// cNotesPairNoop defines the pair where the scan needs nothing from its
+// caller: an export that keeps neither notes nor a memo, and every export of a
+// component build.
+func cNotesPairNoop(funcName, objType string) string {
+	return fmt.Sprintf(`size_t %[1]s_notes_bytes(size_t len) {
+    (void)len;
+    return 0;
+}
+
+int %[1]s_set_notes(%[2]s *it, void *buf, size_t bytes) {
+    (void)buf; (void)bytes;
+    return it ? 0 : RX_ERR_NULL_ARG;
+}
+
+`, funcName, objType)
+}
+
+// cNotesPairDefs defines the pair for a module build's find or groups
+// iterator: its notes, then — 8-aligned after them — its memo, the layout
+// cWithSearch's _next slices the buffer by.
+func cNotesPairDefs(funcName, iterType string, sz compile.SearchSize) string {
+	if sz.NotesBytes == 0 && sz.BTMemoBytes == 0 {
+		return cNotesPairNoop(funcName, iterType)
+	}
+	return fmt.Sprintf(`size_t %[1]s_notes_bytes(size_t len) {
+    if (len > 0x7FFFFFFF) return 0;
+    unsigned long long m = (unsigned long long)len + 1;
+    unsigned long long n = ((m * %[3]dULL + 7) & ~7ULL) + m * %[4]dULL;
+    return n > (size_t)-1 ? 0 : (size_t)n;
+}
+
+int %[1]s_set_notes(%[2]s *it, void *buf, size_t bytes) {
+    if (!it) return RX_ERR_NULL_ARG;
+    size_t need = %[1]s_notes_bytes(it->len);
+    if (need == 0) return 0;
+    if (!buf) return RX_ERR_NULL_ARG;
+    if (bytes < need) return RX_ERR_RANGE;
+    unsigned char *p = (unsigned char *)buf;
+    for (size_t i = 0; i < need; i++) p[i] = 0;
+    it->given = p;
+    return 0;
+}
+
+`, funcName, iterType, sz.NotesBytes, sz.BTMemoBytes)
+}
+
+// cSetNotesSlices is the sizes, per input position, of the slices a set
+// scanner's caller buffer is cut into: each block's notes, then its memo, in
+// block order, skipping what a block does not keep.
+func cSetNotesSlices(blocks []compile.SearchSize) []int {
+	var out []int
+	for _, sz := range blocks {
+		if sz.NotesBytes > 0 {
+			out = append(out, sz.NotesBytes)
+		}
+		if sz.BTMemoBytes > 0 {
+			out = append(out, sz.BTMemoBytes)
+		}
+	}
+	return out
+}
+
+// cSetNotesSlice is the index among cSetNotesSlices of block k's notes (memo
+// false) or memo (memo true).
+func cSetNotesSlice(blocks []compile.SearchSize, k int, memo bool) int {
+	n := 0
+	for j := 0; j < k; j++ {
+		if blocks[j].NotesBytes > 0 {
+			n++
+		}
+		if blocks[j].BTMemoBytes > 0 {
+			n++
+		}
+	}
+	if memo && blocks[k].NotesBytes > 0 {
+		n++
+	}
+	return n
+}
+
+// cSetNotesPairDefs defines the pair for a module build's set scanner, and the
+// helper its call slices the caller's buffer with (cSetNotesAt): every slice
+// 8-aligned, in cSetNotesSlices order.
+func cSetNotesPairDefs(find, scannerType string, blocks []compile.SearchSize) string {
+	slices := cSetNotesSlices(blocks)
+	if len(slices) == 0 {
+		return cNotesPairNoop(find, scannerType)
+	}
+	var sum, at strings.Builder
+	for i, nb := range slices {
+		if i > 0 {
+			sum.WriteString(" + ")
+		}
+		fmt.Fprintf(&sum, "((m * %dULL + 7) & ~7ULL)", nb)
+		fmt.Fprintf(&at, "    if (slice > %d) at += (m * %d + 7) & ~(size_t)7;\n", i, nb)
+	}
+	return fmt.Sprintf(`size_t %[1]s_notes_bytes(size_t len) {
+    if (len > 0x7FFFFFFF) return 0;
+    unsigned long long m = (unsigned long long)len + 1;
+    unsigned long long n = %[3]s;
+    return n > (size_t)-1 ? 0 : (size_t)n;
+}
+
+int %[1]s_set_notes(%[2]s *it, void *buf, size_t bytes) {
+    if (!it) return RX_ERR_NULL_ARG;
+    size_t need = %[1]s_notes_bytes(it->len);
+    if (need == 0) return 0;
+    if (!buf) return RX_ERR_NULL_ARG;
+    if (bytes < need) return RX_ERR_RANGE;
+    unsigned char *p = (unsigned char *)buf;
+    for (size_t i = 0; i < need; i++) p[i] = 0;
+    it->given = p;
+    return 0;
+}
+
+/* Where slice (cSetNotesSlices order) starts in a caller's buffer. */
+static size_t rx_%[1]s_given_at_(size_t len, int slice) {
+    size_t m = len + 1, at = 0;
+%[4]s    return at;
+}
+
+`, find, scannerType, sum.String(), at.String())
+}
+
+// cSetNotesAt is the expression a set scanner's call hands block k's notes
+// (memo false) or memo (memo true) from: the caller's buffer at that slice, or
+// 0 when the caller handed none.
+func cSetNotesAt(find string, blocks []compile.SearchSize, k int, memo bool) string {
+	return fmt.Sprintf("(s->given ? s->given + rx_%s_given_at_(s->len, %d) : 0)", find, cSetNotesSlice(blocks, k, memo))
 }

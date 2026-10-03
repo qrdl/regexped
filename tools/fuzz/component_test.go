@@ -15,6 +15,7 @@ import (
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/generate"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // The SET adapters of `wasm_format: component`, driven directly.
@@ -1784,4 +1785,108 @@ sets:
 			}
 		}
 	}
+}
+
+// TestComponentDeclinesOptionalMemoryUnderMaxMemory: under a `max_memory` that
+// leaves room for the input but not for a set's answer cache, or for a
+// pattern's per-search notes, the component DECLINES them — the constructor
+// and `next` go on without, as a module build's stub does — where calling the
+// allocator straight trapped the call. The answers are the same either way.
+func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
+	// Two pages past the static data: room for the input and the scanner, not
+	// for a cache of 16 bytes per position of an 8 KB input, nor for 2 bytes of
+	// notes per position of a 32 KB one once the request's power-of-two class
+	// is counted.
+	tight := func(yml string, pages int64) string {
+		t.Helper()
+		var cfg config.BuildConfig
+		if err := yaml.Unmarshal([]byte(yml), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		core, _, err := component.Core(cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		top, err := utils.ParseDataSectionBytes(core)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return yml + fmt.Sprintf("max_memory: %d\n", utils.PageAlign(top)+pages*65536)
+	}
+
+	t.Run("set answer cache", func(t *testing.T) {
+		h := newSetHarness(t, tight(overlapSetCfg, 2))
+		text := strings.Repeat("abcdefgh", 1024)
+		p, n := h.writeInput(text)
+		sc := h.call(h.pkg+"#[constructor]scan-it", p, n, int32(0))
+		if cachePtr := h.u32(sc + 20); cachePtr != 0 {
+			t.Fatalf("a cache was reserved (at %d) under a max_memory it cannot fit", cachePtr)
+		}
+		starts := 0
+		for i := 0; i <= len(text); i++ {
+			ret := h.call(h.pkg+"#[method]scan-it.next", sc)
+			ms, errored := h.matches(ret)
+			if errored {
+				t.Fatal("next reported an error")
+			}
+			if len(ms) == 0 {
+				break
+			}
+			if int(ms[0][1]) != starts {
+				t.Fatalf("position %d reported start %d", starts, ms[0][1])
+			}
+			starts++
+			// The result area is freed by the post-return, as a host's
+			// lifting does; without it the calls would fill the tight memory.
+			h.call("cabi_post_"+h.pkg+"#[method]scan-it.next", ret)
+		}
+		if starts != len(text) {
+			t.Errorf("reported %d positions over %d bytes: an overlapping drive reports every start", starts, len(text))
+		}
+		h.call(h.pkg+"#[dtor]scan-it", sc)
+	})
+
+	t.Run("pattern notes", func(t *testing.T) {
+		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\nregexps:\n  - name: ov\n    pattern: 'a*b|a'\n    find_func: ov_find\n", 2)
+		var cfg config.BuildConfig
+		if err := yaml.Unmarshal([]byte(yml), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		_, _, resources, _, _, err := generate.ComponentArtifactsWithSets(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		core, _, err := component.Core(cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, inst, mem := instantiateCore(t, core)
+		h := &setHarness{t: t, store: store, inst: inst, mem: mem, pkg: "regexped:t/matcher"}
+		names := resources["ov_find"]
+		// 32 KB: its notes, 64 KB, need a 128 KB class — past the room the
+		// input's own 64 KB class leaves.
+		text := strings.Repeat("a", 32000)
+		ptr, length := h.writeInput(text)
+		handle := h.call(names.Constructor, ptr, length, int32(0))
+		got := 0
+		for i := 0; i <= len(text); i++ {
+			ret := h.call(names.Next, handle)
+			start, end, some, errored := h.spans(ret)
+			if errored {
+				t.Fatal("next reported an error")
+			}
+			if !some {
+				break
+			}
+			if int(start) != got || int(end) != got+1 {
+				t.Fatalf("match %d = [%d, %d)", got, start, end)
+			}
+			got++
+			h.call("cabi_post_"+names.Next, ret)
+		}
+		if got != len(text) {
+			t.Errorf("found %d matches over %d bytes", got, len(text))
+		}
+		h.call(names.Dtor, handle)
+	})
 }

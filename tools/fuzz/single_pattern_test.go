@@ -15,6 +15,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 )
 
 // Single-pattern ITERATION coverage.
@@ -111,12 +112,12 @@ var iterSeeds = []struct{ pat, input string }{
 // between what a host iterating our API sees and what Go reports.
 func wasmFindIter(t *testing.T, wasmBytes []byte, input string) ([][2]int, bool) {
 	t.Helper()
-	return wasmFindIterMode(t, wasmBytes, input, blockNone)
+	return wasmFindIterMode(t, wasmBytes, nil, input, searchblock.Off)
 }
 
 // wasmFindIterMode is wasmFindIter with the per-search block handed over the
-// way mode says.
-func wasmFindIterMode(t *testing.T, wasmBytes []byte, input string, mode blockMode) ([][2]int, bool) {
+// way mode says; sizes is what the find export's searches keep.
+func wasmFindIterMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, input string, mode searchblock.Mode) ([][2]int, bool) {
 	t.Helper()
 	engine, wd := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
@@ -137,11 +138,13 @@ func wasmFindIterMode(t *testing.T, wasmBytes []byte, input string, mode blockMo
 		t.Fatal("module missing find export or memory")
 	}
 	copy(mem.UnsafeData(store), input)
-	sr, err := newSearchRegion(store, inst, mem, len(input), mode)
+	sr, err := newSearchRegion(store, inst, mem, len(input), sizes, mode)
 	if err != nil {
 		t.Fatalf("search region: %v", err)
 	}
-	sr.begin(store)
+	if err := sr.begin(store); err != nil {
+		t.Fatalf("search block: %v", err)
+	}
 
 	var out [][2]int
 	pos, prevEnd := 0, -1
@@ -172,7 +175,9 @@ func wasmFindIterMode(t *testing.T, wasmBytes []byte, input string, mode blockMo
 		if v == abi.NoMatch {
 			break
 		}
-		sr.after(store)
+		if err := sr.after(store); err != nil {
+			t.Fatalf("search block: %v", err)
+		}
 		// Absolute already: the wrapper rebases a narrowed result itself.
 		s := int(uint32(v >> 32))
 		e := int(uint32(v))
@@ -316,7 +321,7 @@ func FuzzFindIteration(f *testing.F) {
 		if needsUnicode, uerr := compile.NeedsUnicodeSupport(pat); uerr != nil || needsUnicode {
 			t.Skip()
 		}
-		w, err := compileFind(pat)
+		w, sizes, err := compileFindSized(pat)
 		if err != nil {
 			t.Skip()
 		}
@@ -324,8 +329,8 @@ func FuzzFindIteration(f *testing.F) {
 		// Both copies of a find that keeps per-search notes: the ordinary one a
 		// fresh block runs, and the MARKED one a block armed before the first
 		// call forces — a wrong note is a missed match, silently.
-		for _, mode := range []blockMode{blockNone, blockFresh, blockArmed} {
-			got, ok := wasmFindIterMode(t, w, input, mode)
+		for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
+			got, ok := wasmFindIterMode(t, w, sizes, input, mode)
 			if !ok {
 				t.Skip()
 			}
@@ -650,16 +655,22 @@ var findFromLNM = map[string]bool{
 
 // compileFindShape honours a shape's compilation mode.
 func compileFindShape(name, pat string) ([]byte, error) {
+	w, _, err := compileFindShapeSized(name, pat)
+	return w, err
+}
+
+// compileFindShapeSized is compileFindShape plus what the find export's
+// searches keep.
+func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error) {
 	if findFromLNM[name] {
-		return compileFindLNM(pat)
+		return compileFindOpts("findlnm\x00"+pat, pat, pathsTableBase,
+			compile.CompileOptions{LikelyMode: compile.LikelyNoMatch})
 	}
 	if n, ok := findFromMaxStates[name]; ok {
-		entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+		return compileFindOpts(fmt.Sprintf("findmax%d\x00%s", n, pat), pat, pathsTableBase,
 			compile.CompileOptions{MaxDFAStates: n})
-		return w, err
 	}
-	return compileFind(pat)
+	return compileFindSized(pat)
 }
 
 // endsAt reports, for every start position s in [0, len(input)], the end of the
@@ -711,22 +722,26 @@ func goFirstFrom(ends []int, from int) ([2]int, bool) {
 
 // TestFindFromStartsAtOrAfterFrom drives find at every start position.
 func TestFindFromStartsAtOrAfterFrom(t *testing.T) {
-	for _, mode := range []blockMode{blockNone, blockFresh, blockArmed} {
+	for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
+		n := notesGiven.Load()
 		t.Run(mode.String(), func(t *testing.T) { testFindFromStartsAtOrAfterFrom(t, mode) })
+		if mode == searchblock.Armed && notesGiven.Load() == n {
+			t.Error("the armed run gave no drive notes: the marked copies went unchecked")
+		}
 	}
 }
 
-func testFindFromStartsAtOrAfterFrom(t *testing.T, mode blockMode) {
+func testFindFromStartsAtOrAfterFrom(t *testing.T, mode searchblock.Mode) {
 	for _, c := range findFromShapes {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := regexp.Compile(c.pat); err != nil {
 				t.Skipf("Go rejects %q: %v", c.pat, err)
 			}
-			w, err := compileFindShape(c.name, c.pat)
+			w, sizes, err := compileFindShapeSized(c.name, c.pat)
 			if err != nil {
 				t.Skipf("compile %q: %v", c.pat, err)
 			}
-			call, done, ok := findCallerMode(t, w, c.input, mode, true)
+			call, done, ok := findCallerMode(t, w, sizes, c.input, mode, true)
 			if !ok {
 				t.Skip("module would not instantiate")
 			}
@@ -777,23 +792,23 @@ func testFindFromStartsAtOrAfterFrom(t *testing.T, mode blockMode) {
 // from" into a NON-TERMINATING loop rather than a wrong answer: end - off goes
 // negative and off walks backwards. A step budget stands in for the hang.
 func TestFindFromIterationTerminates(t *testing.T) {
-	for _, mode := range []blockMode{blockNone, blockFresh, blockArmed} {
+	for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
 		t.Run(mode.String(), func(t *testing.T) { testFindFromIterationTerminates(t, mode) })
 	}
 }
 
-func testFindFromIterationTerminates(t *testing.T, mode blockMode) {
+func testFindFromIterationTerminates(t *testing.T, mode searchblock.Mode) {
 	for _, c := range findFromShapes {
 		t.Run(c.name, func(t *testing.T) {
 			re, err := regexp.Compile(c.pat)
 			if err != nil {
 				t.Skipf("Go rejects %q: %v", c.pat, err)
 			}
-			w, err := compileFindShape(c.name, c.pat)
+			w, sizes, err := compileFindShapeSized(c.name, c.pat)
 			if err != nil {
 				t.Skipf("compile %q: %v", c.pat, err)
 			}
-			call, done, ok := findCallerMode(t, w, c.input, mode, false)
+			call, done, ok := findCallerMode(t, w, sizes, c.input, mode, false)
 			if !ok {
 				t.Skip("module would not instantiate")
 			}
@@ -911,14 +926,14 @@ const (
 // make O(len) calls per shape, and re-instantiating per call would dominate.
 func findCaller(t *testing.T, wasmBytes []byte, input string) (func(int) ([2]int, findState), func(), bool) {
 	t.Helper()
-	return findCallerMode(t, wasmBytes, input, blockNone, false)
+	return findCallerMode(t, wasmBytes, nil, input, searchblock.Off, false)
 }
 
 // findCallerMode is findCaller with the per-search block handed over the way
 // mode says. perCall starts a fresh drive — a new block — on every call, for a
 // caller probing positions out of order; otherwise every call continues one
 // drive.
-func findCallerMode(t *testing.T, wasmBytes []byte, input string, mode blockMode, perCall bool) (func(int) ([2]int, findState), func(), bool) {
+func findCallerMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, input string, mode searchblock.Mode, perCall bool) (func(int) ([2]int, findState), func(), bool) {
 	t.Helper()
 	engine, wd := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
@@ -940,15 +955,19 @@ func findCallerMode(t *testing.T, wasmBytes []byte, input string, mode blockMode
 		return nil, nil, false
 	}
 	copy(memExp.Memory().UnsafeData(store), input)
-	sr, err := newSearchRegion(store, inst, memExp.Memory(), len(input), mode)
+	sr, err := newSearchRegion(store, inst, memExp.Memory(), len(input), sizes, mode)
 	if err != nil {
 		t.Fatalf("search region: %v", err)
 	}
-	sr.begin(store)
+	if err := sr.begin(store); err != nil {
+		t.Fatalf("search block: %v", err)
+	}
 
 	call := func(from int) ([2]int, findState) {
 		if perCall {
-			sr.begin(store)
+			if err := sr.begin(store); err != nil {
+				t.Fatalf("search block: %v", err)
+			}
 		}
 		sr.before(store)
 		wd.Arm(store)
@@ -967,7 +986,9 @@ func findCallerMode(t *testing.T, wasmBytes []byte, input string, mode blockMode
 		case abi.NoMatch:
 			return [2]int{}, findNone
 		}
-		sr.after(store)
+		if err := sr.after(store); err != nil {
+			t.Fatalf("search block: %v", err)
+		}
 		return [2]int{int(uint32(v >> 32)), int(uint32(v))}, findMatch
 	}
 	return call, func() { store.Close(); mod.Close() }, true

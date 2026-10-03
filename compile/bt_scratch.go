@@ -65,6 +65,10 @@ type btDyn struct {
 	scratch btScratch
 	// memIdx is the memory the region lives in — the table memory.
 	memIdx int
+	// memoMemIdx is the memory the memo lives in: memIdx, except in an
+	// embedded build's fallback that keeps the search's memo, which the stub
+	// allocated in the input's memory (btScratch.memoInInput).
+	memoMemIdx int
 	// frameSize is this body's frame, in bytes.
 	frameSize int32
 	// rowBytes is one memo row: ceil(N/8).
@@ -89,10 +93,9 @@ type btDyn struct {
 	grow  bool
 	start int32
 
-	// search is set for a single pattern's fallback find that can use the
-	// search's own memo (bt_search.go); searchBlk is its block local.
-	search    *btSearch
-	searchBlk uint32
+	// search is set for a fallback find that can use the search's own memo
+	// (bt_search.go).
+	search *btSearch
 }
 
 // ── The ordinary capture body's frame stack ─────────────────────────────────
@@ -294,10 +297,11 @@ func (d *btDyn) clearLimit() uint32 {
 
 func newBTDyn(scratch btScratch, memIdx int, frameSize int32, numInsts int) *btDyn {
 	return &btDyn{
-		scratch:   scratch,
-		memIdx:    memIdx,
-		frameSize: frameSize,
-		rowBytes:  int32((numInsts + 7) / 8),
+		scratch:    scratch,
+		memIdx:     memIdx,
+		memoMemIdx: memIdx,
+		frameSize:  frameSize,
+		rowBytes:   int32((numInsts + 7) / 8),
 	}
 }
 
@@ -553,7 +557,7 @@ func emitBitStateGuardDyn(b []byte, d *btDyn, p int, byteAddr, memoByte uint32,
 	b = btLocalGet(b, memoByte)
 	b = btLocalGet(b, d.cleared)
 	b = append(b, 0x6B) // i32.sub
-	b = appendTableMemoryFill(b, d.memIdx)
+	b = appendTableMemoryFill(b, d.memoMemIdx)
 	b = btLocalGet(b, memoByte)
 	b = append(b, 0x21)
 	b = utils.AppendULEB128(b, d.cleared)
@@ -567,7 +571,7 @@ func emitBitStateGuardDyn(b []byte, d *btDyn, p int, byteAddr, memoByte uint32,
 
 	mask := int32(1) << (p & 7)
 	b = btLocalGet(b, byteAddr)
-	b = appendTableLoad8u(b, d.memIdx)
+	b = appendTableLoad8u(b, d.memoMemIdx)
 	b = append(b, 0x22)
 	b = utils.AppendULEB128(b, memoByte) // local.tee memoByte
 	b = append(b, 0x41)
@@ -582,7 +586,7 @@ func emitBitStateGuardDyn(b []byte, d *btDyn, p int, byteAddr, memoByte uint32,
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, mask)
 	b = append(b, 0x72) // i32.or
-	return appendTableStore8(b, d.memIdx)
+	return appendTableStore8(b, d.memoMemIdx)
 }
 
 // componentHeapGlobal allocates a component allocator's heap-top global, which
@@ -694,6 +698,9 @@ type btDriveMember struct {
 	// call burns it once.
 	blk     int
 	blocksG uint32
+	// rowBytes is one memo row, ⌈instructions / 8⌉ — what a match's reset
+	// needs to find the candidate's row (emitBTMemberMatched).
+	rowBytes int32
 }
 
 // allocBTDrive allocates a set's call-scoped globals. The epoch starts one
@@ -788,7 +795,7 @@ func emitBTWorkInitMember(b []byte, m *btDriveMember, k, n int, span func([]byte
 		b = appendGlobalSet(b, m.budget)
 		b = append(b, 0x05) // else: a new drive
 		b = appendGlobalGet(b, m.blocksG)
-		b = append(b, 0x41, 0x01, 0x36, 0x02)
+		b = append(b, 0x41, abi.SearchBTLive, 0x36, 0x02)
 		b = utils.AppendULEB128(b, m.blkField(abi.SearchBTStateOff))
 		b = append(b, 0x0B, 0x0B)
 	}
@@ -855,16 +862,42 @@ func emitBTMemberTripped(b []byte, m *btDriveMember) []byte {
 	return append(b, 0x71)    // i32.and
 }
 
-// emitBTMemberMatched resets the member's visited set: its bits are failures
-// only while every attempt that set them failed. end is the i32 local holding
-// the call's answer.
-func emitBTMemberMatched(b []byte, m *btDriveMember, end byte) []byte {
+// emitBTMemberMatched resets the member's visited set after a match: the bits
+// the matching attempt set on its way are not failures. Only the rows from the
+// candidate's start on can hold such bits — positions are absolute, and the
+// attempt read nothing below its start — so the lazy-clear mark moves down to
+// the candidate's row, not to the memo's start: resetting to the start made
+// the next access re-zero every row from the origin up to it, on every match,
+// which in the batch entry was capacity × ⌈N/8⌉ bytes of memory.fill per byte.
+// Rows past the match's end lose their (valid) failure bits too — speed only.
+// end is the i32 local holding the call's answer; winGlobal holds the
+// candidate's start (the window the body was called with).
+func emitBTMemberMatched(b []byte, m *btDriveMember, end byte, winGlobal int32) []byte {
+	candRow := func(b []byte) []byte {
+		b = appendGlobalGet(b, m.memoBase)
+		b = appendGlobalGet(b, uint32(winGlobal)) //nolint:gosec // a global index
+		b = appendGlobalGet(b, m.memoOrigin)
+		b = append(b, 0x6B, 0x41) // i32.sub; i32.const rowBytes
+		b = utils.AppendSLEB128(b, m.rowBytes)
+		return append(b, 0x6C, 0x6A) // i32.mul; i32.add
+	}
 	b = append(b, 0x20, end)
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x4E)       // i32.ge_s
-	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x41, 0x00)                 // i32.const 0
+	b = append(b, 0x4E)                       // i32.ge_s
+	b = append(b, 0x04, 0x40)                 // if
+	b = appendGlobalGet(b, uint32(winGlobal)) //nolint:gosec // a global index
+	b = appendGlobalGet(b, m.memoOrigin)
+	b = append(b, 0x49, 0x04, 0x40) // lt_u; if: a window below the region (none expected)
 	b = appendGlobalGet(b, m.memoBase)
 	b = appendGlobalSet(b, m.cleared)
+	b = append(b, 0x05) // else: cleared = min(cleared, the candidate's row)
+	b = candRow(b)
+	b = appendGlobalGet(b, m.cleared)
+	b = candRow(b)
+	b = appendGlobalGet(b, m.cleared)
+	b = append(b, 0x49, 0x1B) // lt_u; select
+	b = appendGlobalSet(b, m.cleared)
+	b = append(b, 0x0B)    // end if
 	return append(b, 0x0B) // end if
 }
 

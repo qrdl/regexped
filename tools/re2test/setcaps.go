@@ -1306,7 +1306,7 @@ func newSetRunner(
 		outCap: int32(patternCount), bmpLen: bmpLen,
 		wide:        wideAll,
 		droppedFind: droppedFind, droppedAnchored: droppedAnchored,
-		setBlocks:   blocks,
+		setBlocks: blocks,
 	}, nil
 }
 
@@ -1390,14 +1390,14 @@ func runSetProfile(
 		if c.find, e = get(s.find, s.setName+"_find"); e != nil {
 			return e
 		}
-		r.bindBlocks(c.find, s.setName)
+		r.bindBlocks(c.find, s.setName, false)
 		// The batch entry is synthesized from `find`'s name
 		// under the hint, not declared, so its export name is derived the
 		// same way the compiler and the six generators derive it.
 		if c.findBatch, e = get(s.batchFind, config.SetBatchExportName(s.setName+"_find")); e != nil {
 			return e
 		}
-		r.bindBlocks(c.findBatch, s.setName)
+		r.bindBlocks(c.findBatch, s.setName, true)
 		fns = append(fns, c)
 	}
 

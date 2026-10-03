@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/component"
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 )
 
 // TestMain doubles as a mock wasm-merge subprocess. When invoked with
@@ -49,6 +51,66 @@ func TestModuleNameForWasm(t *testing.T) {
 				t.Errorf("moduleNameForWasm: got %q, want %q", got, c.want)
 			}
 		})
+	}
+	// The module's own record wins over the config's import_module.
+	recorded := filepath.Join(t.TempDir(), "rec.wasm")
+	if err := os.WriteFile(recorded, recordedModule("own"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := moduleNameForWasm(config.BuildConfig{ImportModule: "global"}, recorded); got != "own" {
+		t.Errorf("moduleNameForWasm with a record: got %q, want \"own\"", got)
+	}
+}
+
+// recordedModule is an empty module carrying an import_module record.
+func recordedModule(name string) []byte {
+	c := append([]byte{byte(len(abi.ImportModuleSection))}, abi.ImportModuleSection...)
+	c = append(c, name...)
+	return append(append([]byte("\x00asm\x01\x00\x00\x00"), 0, byte(len(c))), c...)
+}
+
+// TestCmdMergeRefusesDuplicateModuleNames: two regexp modules under one name
+// are an error, before wasm-merge runs — it would resolve every import of the
+// name against one of them only. Distinct recorded names merge, each under its
+// own name; and no regexp module may be named "main", the host's name.
+func TestCmdMergeRefusesDuplicateModuleNames(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGEXPED_MOCK_WASM_MERGE", "1")
+	dir := t.TempDir()
+	argv := filepath.Join(dir, "argv")
+	t.Setenv("REGEXPED_MOCK_ARGV", argv)
+	write := func(name string, body []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	mainWasm := write("main.wasm", []byte("mock"))
+	cfg := config.BuildConfig{WasmMergePath: exe, ImportModule: "m"}
+	out := filepath.Join(dir, "out.wasm")
+
+	a, b := write("a.wasm", recordedModule("ma")), write("b.wasm", recordedModule("mb"))
+	if err := CmdMerge(cfg, mainWasm, out, []string{a, b}); err != nil {
+		t.Fatalf("distinct names: %v", err)
+	}
+	if got, err := os.ReadFile(argv); err != nil || !strings.Contains(string(got), a+" ma "+b+" mb") {
+		t.Errorf("wasm-merge argv = %q (%v); want each module under its own name", got, err)
+	}
+	for _, c := range []struct {
+		name  string
+		files []string
+	}{
+		{"same recorded name", []string{write("c.wasm", recordedModule("same")), write("d.wasm", recordedModule("same"))}},
+		{"no record, one config", []string{write("e.wasm", []byte("mock")), write("f.wasm", []byte("mock"))}},
+		{"named main", []string{write("g.wasm", recordedModule("main"))}},
+	} {
+		if err := CmdMerge(cfg, mainWasm, out, c.files); err == nil || !strings.Contains(err.Error(), "both named") {
+			t.Errorf("%s: err = %v; want the duplicate refused", c.name, err)
+		}
 	}
 }
 
@@ -97,6 +159,47 @@ func TestCmdMerge(t *testing.T) {
 			t.Errorf("err = %v; with the key omitted only $PATH is consulted, never $WASM_MERGE", err)
 		}
 	})
+}
+
+// TestCmdMergeAcceptsSaturatingConversions merges, with the REAL wasm-merge, a
+// host that uses i64.trunc_sat_f64_s — what Go 1.26's wasip1 runtime emits.
+// Without --enable-nontrapping-float-to-int Binaryen refused the main module
+// ("all used features should be allowed"), so no Go host could be merged.
+func TestCmdMergeAcceptsSaturatingConversions(t *testing.T) {
+	tool, err := exec.LookPath("wasm-merge")
+	if err != nil {
+		root, _ := filepath.Abs(filepath.Join("..", "wasm-merge"))
+		if st, err := os.Stat(root); err != nil || st.IsDir() {
+			t.Skip("wasm-merge not found: the feature flags are not checked here")
+		}
+		tool = root
+	}
+	dir := t.TempDir()
+	// (module (memory (export "memory") 1)
+	//   (func (export "f") (param f64) (result i64) local.get 0 i64.trunc_sat_f64_s))
+	host := []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		0x01, 0x06, 0x01, 0x60, 0x01, 0x7c, 0x01, 0x7e, // type: (f64) -> i64
+		0x03, 0x02, 0x01, 0x00, // func 0: type 0
+		0x05, 0x03, 0x01, 0x00, 0x01, // memory: min 1
+		0x07, 0x0e, 0x02, 0x01, 'f', 0x00, 0x00, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+		0x0a, 0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0xfc, 0x06, 0x0b, // local.get 0; i64.trunc_sat_f64_s
+	}
+	mainWasm := filepath.Join(dir, "main.wasm")
+	if err := os.WriteFile(mainWasm, host, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BuildConfig{
+		Output: filepath.Join(dir, "out.wasm"), ImportModule: "re", WasmMergePath: tool,
+		Regexps: []config.RegexEntry{{Name: "p", Pattern: `ab+c`, FindFunc: "p_find"}},
+	}
+	regexWasm := filepath.Join(dir, "re.wasm")
+	if err := compile.CmdCompile(cfg, regexWasm); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := CmdMerge(cfg, mainWasm, cfg.Output, []string{regexWasm}); err != nil {
+		t.Fatalf("CmdMerge refused a host using a saturating conversion: %v", err)
+	}
 }
 
 // The world block is read up to its closing brace; text that never closes it, or

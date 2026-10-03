@@ -806,8 +806,8 @@ const maxForwardBulkSkipStates = 4
 // to the find-from global on the reversed, leftmost-longest DFA and returns
 // the lowest position it accepted at (the match start), or -1. It is the
 // literal-anchored find's backward walker without the line-anchor handling —
-// the start-anywhere find serves no pattern with an assertion — and on any
-// table width.
+// a pattern with an assertion gets the CONTEXT passes instead
+// (buildStartAnywhereBackBodyCtx) — and on any table width.
 func buildStartAnywhereBackBody(l *dfaLayout, tableMemIdx int) []byte {
 	const (
 		locPtr     = 0
@@ -1398,7 +1398,7 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 		if p.saBT.mode != p.findFromMode {
 			panic("compile: start-anywhere switch: today's find and the Backtracking handover read `from` differently")
 		}
-		cs = appendWithBTFallback(cs, p.saBT.fast, p.saBT.fallback, p.saBT.callOffs, base+p.slotIndex(slotSABTFallback))
+		cs = appendBTFindParts(cs, p.saBT.fast, *p.saBT, base+p.slotIndex(slotSABT))
 		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT), p.notes.resumeGlobal())
 		cs = utils.AppendULEB128(cs, uint32(len(d)))
 		return append(cs, d...)

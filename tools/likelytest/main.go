@@ -25,7 +25,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +39,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -1697,7 +1697,10 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		re.GroupsFunc = "groups"
 	}
 	opts := compile.CompileOptions{LikelyMode: mode}
-	wasm, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true, opts)
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	if err == nil && tc.mode != modeAnchored {
+		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc+re.GroupsFunc])
+	}
 	return wasm, err
 }
 
@@ -1747,15 +1750,23 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	return wasm, err
 }
 
-// setBlocksOf is, per compiled set module, its split member search blocks
-// (compile.SetDiag.SearchBlocks): the `find` drive hands them over as a
-// generated iterator does.
-var setBlocksOf = map[string][]int{}
+// searchSizesOf is, per compiled module, the search blocks its driven export
+// takes (internal/searchblock): a pattern's find or groups block, or a set's
+// split member blocks (compile.SetDiag.SearchBlocks). Every drive hands them
+// over as a generated stub does.
+var searchSizesOf = map[string][]searchblock.Size{}
 
 func noteSetBlocks(wasm []byte, diags []compile.SetDiag) {
 	for _, d := range diags {
 		if len(d.SearchBlocks) > 0 {
-			setBlocksOf[string(wasm)] = d.SearchBlocks
+			sizes := make([]searchblock.Size, len(d.SearchBlocks))
+			for k, n := range d.SearchBlocks {
+				sizes[k].Notes = n
+				if d.SearchBlocksBTMemo != nil {
+					sizes[k].Memo = d.SearchBlocksBTMemo[k]
+				}
+			}
+			searchSizesOf[string(wasm)] = sizes
 		}
 	}
 }
@@ -1914,7 +1925,7 @@ func benchFuel(wasmBytes []byte, tc testCase, input string, fuelEngine *wasmtime
 	// A single call is a drive's FIRST call: a fresh block, as a stub hands it.
 	var sb *searchBlock
 	if tc.mode != modeAnchored {
-		if sb, err = newSearchBlock(store, inst, mem, len(input)); err != nil {
+		if sb, err = newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)]); err != nil {
 			return 0, err
 		}
 		sb.begin(store)
@@ -2051,7 +2062,7 @@ func benchTimeExhaust(wasmBytes []byte, tc testCase, input string, engine *wasmt
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
-	sb, err := newSearchBlock(store, inst, mem, len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)])
 	if err != nil {
 		return 0, err
 	}
@@ -2121,7 +2132,7 @@ func benchFuelExhaust(wasmBytes []byte, tc testCase, input string, fuelEngine *w
 	copy(buf[inputBase:], []byte(input))
 	runtime.KeepAlive(store)
 	inputLen := int32(len(input))
-	sb, err := newSearchBlock(store, inst, mem, len(input))
+	sb, err := newSearchBlock(store, inst, mem, len(input), searchSizesOf[string(wasmBytes)])
 	if err != nil {
 		return 0, err
 	}
@@ -2602,11 +2613,9 @@ const (
 type setMemPlan struct {
 	inputBase  int32
 	outputBase int32
-	// The set's split member search blocks, their region and each one's
-	// notes room; blocks nil for none.
-	blocks     []int
-	blocksPtr  int32
-	notesBytes int32
+	// The set's split member search blocks and the region for their notes
+	// and memos; nil for none.
+	blocks *searchblock.Blocks
 }
 
 // planSetMem computes input/output offsets that don't overlap with the set's
@@ -2619,15 +2628,8 @@ func planSetMem(wasmBytes []byte, inputLen int) (setMemPlan, error) {
 	}
 	inBase := int32((actualTop + pageSize - 1) / pageSize * pageSize)
 	outBase := inBase + int32(inputLen) + 4096
-	plan := setMemPlan{inputBase: inBase, outputBase: outBase, blocks: setBlocksOf[string(wasmBytes)]}
-	if len(plan.blocks) > 0 {
-		nb := 0
-		for _, n := range plan.blocks {
-			nb = max(nb, n)
-		}
-		plan.blocksPtr = (outBase + setOutCap*16 + 4096 + 7) &^ 7
-		plan.notesBytes = int32((inputLen+1)*nb+7) &^ 7
-	}
+	plan := setMemPlan{inputBase: inBase, outputBase: outBase,
+		blocks: searchblock.Layout(int64(outBase+setOutCap*16+4096), searchSizesOf[string(wasmBytes)], inputLen, searchblock.Fresh)}
 	return plan, nil
 }
 
@@ -2786,8 +2788,8 @@ func benchFuelSet(tc testCase, wasmBytes []byte, input string, fuelEngine *wasmt
 // setMemTop is one past everything a set bench writes: tuples, then the gate
 // array, both above outputBase.
 func setMemTop(plan setMemPlan) int32 {
-	if len(plan.blocks) > 0 {
-		return plan.blocksPtr + int32(len(plan.blocks))*(abi.SearchBlockBytes+plan.notesBytes) + 4096
+	if plan.blocks != nil {
+		return int32(plan.blocks.End()) + 4096
 	}
 	return plan.outputBase + setOutCap*16 + 4096
 }
@@ -2845,10 +2847,11 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		buf[gatePtr+i] = 0
 	}
 	abi.WriteFindScratch(buf, scratchPtr, gatePtr, 0, 0)
-	if len(plan.blocks) > 0 {
-		clear(buf[plan.blocksPtr : plan.blocksPtr+int32(len(plan.blocks)*abi.SearchBlockBytes)])
-		abi.WriteFindScratchBlocks(buf, scratchPtr, gatePtr, 0, 0, plan.blocksPtr)
+	data := func() []byte { return mem.UnsafeData(store) }
+	if err := plan.blocks.Begin(data, int(inputLen)); err != nil {
+		return err
 	}
+	plan.blocks.Describe(buf, scratchPtr)
 	runtime.KeepAlive(store)
 	from := int32(0)
 	for {
@@ -2860,7 +2863,9 @@ func runSetExhaust(store *wasmtime.Store, findFn *wasmtime.Func, mem *wasmtime.M
 		if count <= 0 {
 			return nil
 		}
-		giveSetNotes(mem.UnsafeData(store), plan, inputLen)
+		if err := plan.blocks.After(data); err != nil {
+			return err
+		}
 		buf := mem.UnsafeData(store)
 		base := int(plan.outputBase)
 		s := int32(buf[base+4]) | int32(buf[base+5])<<8 | int32(buf[base+6])<<16 | int32(buf[base+7])<<24
@@ -3099,23 +3104,5 @@ func main() {
 	fmt.Fprintf(os.Stderr, "correctness: %d checks, %d failures\n", totalChecks, totalFailures)
 	if totalFailures > 0 {
 		os.Exit(1)
-	}
-}
-
-// giveSetNotes runs after a set `find` call, as a generated iterator does: a
-// split member whose search armed during it gets its notes.
-func giveSetNotes(buf []byte, plan setMemPlan, inputLen int32) {
-	notesBase := plan.blocksPtr + int32(len(plan.blocks)*abi.SearchBlockBytes)
-	for k, nb := range plan.blocks {
-		blk := plan.blocksPtr + int32(k*abi.SearchBlockBytes)
-		if nb == 0 || binary.LittleEndian.Uint32(buf[blk+abi.SearchArmedOff:]) == 0 ||
-			binary.LittleEndian.Uint32(buf[blk+abi.SearchNotesOff:]) != 0 {
-			continue
-		}
-		n := (inputLen + 1) * int32(nb)
-		notes := notesBase + int32(k)*plan.notesBytes
-		clear(buf[notes : notes+n])
-		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesOff:], uint32(notes))
-		binary.LittleEndian.PutUint32(buf[blk+abi.SearchNotesCapOff:], uint32(n))
 	}
 }

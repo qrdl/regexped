@@ -151,10 +151,12 @@ one per iterator, and the host tells the module which block the next call
 belongs to.
 
 Most searches never pay for notes. The module counts the bytes a search wastes
-(read past its matches, plus failed reads over 32 bytes) and only when that
-passes `4 × progress + 64` does the search **arm**; the host then gives it its
-notes. A pattern whose automaton cannot re-read bytes has no notes at all: its
-export ignores the block, and a stub hands nothing over for it.
+(read past its matches, plus the part of a failed read over 32 bytes that an
+earlier failed read of the same search already covered — block field `far`) and
+only when that passes `4 × progress + 64` does the search **arm**; the host then
+gives it its notes. A pattern whose automaton cannot re-read bytes has no notes
+at all, and unless it is Backtracking (below) its export ignores the block and a
+stub hands nothing over for it.
 
 A **Backtracking** export uses the same block for a different purpose. Its work
 budget — the bound past which it hands a call to its memoised fallback body —
@@ -187,27 +189,56 @@ costs speed, never memory safety. They live until the search ends.
 **The Backtracking memo**: `(len + 1) × bt_memo_bytes` zeroed bytes, where
 `bt_memo_bytes` is ⌈instructions / 8⌉ of the pattern's program (the generators
 get it from `compile.SearchSizes` too). It is checked against `bt_memo_cap` the
-same way; a call it does not cover uses a memo of its own. In an EMBEDDED build
-the fallback's memory is the module's own, not the host's, so it never uses a
-host-provided memo: the budget still lasts the search, and a tripped search
-still goes straight to the fallback, but each fallback call keeps its own memo.
+same way; a call it does not cover uses a memo of its own. An EMBEDDED build
+carries a second copy of the fallback body that reads its memo from the host's
+memory, and a call whose block names a memo runs that copy — so a merged build
+keeps the memo across a search exactly as a standalone one does, and
+`compile.SearchSizes` reports `bt_memo_bytes` for both.
 
 **Handing the block over**, before EVERY call of a `find`, `groups` or batch
-export whose pattern keeps notes, through the export `regexped:search`:
+export whose pattern uses a block — it keeps notes, or a Backtracking work
+budget — through the export `regexped:search`:
 
 - standalone module: a mutable `i32` **global**; write the block's address;
 - embedded module (merged): a **function** `(blk i32) → ()`; call it;
 - component: not exported — the `find` and `groups` resources do it themselves.
 
-The value is read by the call that follows. `0` means "no block": the call then
-runs exactly as it would without this mechanism — correct, and quadratic on the
-inputs above. A module in which no export keeps notes has no `regexped:search`.
+The value is read by the call that follows. A module in which no export uses
+a block has no `regexped:search`. `0` means "no block", and what the call does
+then depends on the output kind:
+
+- **standalone module**: the module uses a **default state** of its own — a
+  block, and the notes, memo and (for a set) answer cache it needs — in memory
+  it grows itself, and puts the global back to 0 after the call. The state
+  carries over to the next call only when that call CONTINUES the previous one:
+  the same text (address and length) and, for a pattern's export, a `from`
+  inside the previous answer's window (`[start, end + 1]` for `find` and
+  `groups`, the next position for a batch call); for a set, the same gate array
+  and a `from` (or batch cursor) that has advanced. Anything else starts a new
+  drive. So a raw caller that drives an export the way a stub does — the same
+  text, `from` moving forward — is linear without handing anything over. One
+  default serves one drive at a time: two drives interleaved over one instance
+  keep resetting each other (correct, but each call starts fresh), and a caller
+  that rewrites its text in place and resumes inside the window reads the old
+  text's state. Regions are grown on first use and reused, grown again to at
+  least twice the size only when a drive needs more, so an instance holds at
+  most about twice its largest drive's state. A caller that hands its own state
+  over pays ~1-9 fuel per call for the check;
+- **embedded module** (merged): no default. The call runs exactly as it would
+  without this mechanism — correct, and quadratic on the inputs above. A merged
+  host that drives the raw exports must hand blocks over itself;
+- **component**: not applicable — the resources keep their own state.
+
+[complexity.md](complexity.md) lists every mechanism of this kind, what each
+costs, and what is still not linear.
 
 **What a host does:**
 
 1. When a search starts, zero a 128-byte block for it.
 2. Before each call of that search, hand the block over (and for a raw export
-   with no notes, hand over 0 or nothing).
+   that uses no block, hand over 0 or nothing). A Backtracking export with no
+   notes still reads it: without one its work budget lasts one call, and a
+   search whose every call exhausts it is quadratic.
 3. After a call that returned a match, if `armed` is set and `notes_ptr` is 0,
    allocate the notes, zeroed, and write `notes_ptr` and `notes_cap`. Likewise,
    for a Backtracking export, if `bt_state` is 2 and `bt_memo_ptr` is 0, allocate
@@ -687,23 +718,27 @@ pattern's spans its iterator's — so it needs a search block of its own (see
 "The search block" above: same size, layout and host protocol, one per member).
 So does a member on a Backtracking bucket, whose work budget lasts the drive,
 and the drive state of a shared-literal bucket's work counter. A set that takes
-blocks accepts a FIFTH field, named by a second magic word:
+blocks accepts two more fields, named by a second magic word (24 bytes in all):
 
 | Offset | Field | Notes |
 |---|---|---|
 | +0 | `magic` | `0x52584642` ("RXFB") |
 | +4 … +15 | as above | |
 | +16 | `blocks_ptr` | `n` blocks of 128 bytes, 8-byte aligned, zeroed when the scan starts |
+| +20 | `blocks_n` | `n` |
 
 `n`, and each block's notes size and Backtracking memo size, come from the set's
 generated block list (`compile.SearchSizes`, field `Blocks`); after each call a
 block that armed gets its notes and one that tripped its memo, exactly as a
 pattern's block does. A block that keeps neither must still be there. The same
-descriptor goes to `find` and to its batch entry. With the first magic the set runs every such search with no block —
-correct, and quadratic on the inputs that make a member re-read. A set that
-takes no blocks traps on the second magic, as on any wrong word: a caller that
-writes four fields leaves whatever follows them to be read as a pointer, so the
-fifth field is opt-in rather than always there.
+descriptor goes to `find` and to its batch entry. The module uses the blocks
+only when `blocks_n` is the count its set expects; otherwise — and with the
+first magic — it runs every such search with no block: correct, and quadratic
+on the inputs that make a member re-read, but never an access past the
+caller's array. A set that takes no blocks traps on the second magic, as on
+any wrong word: a caller that writes four fields leaves whatever follows them
+to be read as a pointer, so the extra fields are opt-in rather than always
+there.
 
 `in_ptr`/`in_len` always describe the **entire** input; `from` bounds only the
 search. Zero-width assertions (`\b`, `\B`, `(?m:^)`, `(?m:$)`) therefore see
@@ -853,6 +888,26 @@ generated with it baked in. `PATTERNS` is the set's member count: a row holds a
 bit per member (an i32 to 32, an i64 to 64, then one i64 word per 64 members,
 little-endian, member k at bit k%64 of word k/64) and then each member's end.
 
+**A set that splits a member** (see [sets.md](sets.md), "Overlap policy")
+sizes its cache from the members it KEEPS — `CELLS` and `PATTERNS` are theirs —
+and, when a split member gets a **program sweep**, adds the sweep's own part
+after it, at the next multiple of 8, by the same formula over the sweep's
+geometry:
+
+    srow   = 4 * SWEPT                 one end per swept member
+    scell  = SWEEP_CELLS * 4 + 4
+    single = 48 + scell + 4 + m * srow
+    if single <= 64 MiB:  sstride = m
+    else:                 sstride = clamp(sqrt(m*SWEEP_CELLS*4/srow), 16, m)
+    sbytes = 48 + ceil(m / sstride) * scell + 4 + sstride * srow
+    if sbytes <= 64 MiB:  bytes = ceil8(bytes) + sbytes
+
+`SWEEP_CELLS` (the swept members' program roots together) and `SWEPT` come from
+the compiler too, and the stubs bake them in. A set with no cache-eligible kept
+members passes the bare 48-byte header as the cache part. The sweep keeps its
+state in the header's words at offsets 0, 4 and 32, which the zeroing already
+covers; its stride is its own business, not a header field.
+
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
 rebuilt, and the drive costs what it did before any of this. Below the 64 MiB
@@ -869,8 +924,13 @@ Measured region sizes, for shapes the sweep accepts:
 
 The rules:
 
-- **It is optional.** `cache_ptr = 0` is legal and is what a caller who does
-  not want to pay for it passes. The drive then walks position by position.
+- **It is optional.** `cache_len = 0` is legal. In an embedded module the
+  drive then walks position by position. A standalone module instead uses a
+  region of its own, grown in its memory on first need and reused by later
+  drives (see "Handing the block over" above): a raw caller gets the linear
+  drive without sizing anything. The module reserves that region when a drive
+  starts, as a generated stub does, so a standalone caller cannot decline the
+  memory by passing no cache.
 - **Zero the 48-byte header** before the first call of a drive, exactly as you
   zero the gate array, then write the stride. The rest of the region needs no
   zeroing: it is written before it is read.
@@ -912,9 +972,10 @@ The rules:
   `from` goes undetected.
 
 The engine may decline even when offered a large enough region: the sweep is
-emitted only where it reproduces the per-position semantics exactly — no
-Backtracking member, no non-greedy member, an automaton within
-`max_fallback_states` — and only where a drive can have arbitrarily many walks
+emitted only where it reproduces the per-position semantics exactly — an
+automaton within `max_fallback_states`, no member whose answers the automaton
+cannot give (a Backtracking or non-greedy member is SPLIT out instead, and gets
+the program sweep) — and only where a drive can have arbitrarily many walks
 alive at once (see [sets.md](sets.md), "Overlap policy"). The member count is no
 limit. Declining is invisible from the caller's side and costs nothing but
 speed.

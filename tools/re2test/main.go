@@ -1078,6 +1078,8 @@ done:
 		// Drives that carried a per-search block: a run where this is 0 has not
 		// exercised either copy of a find with notes.
 		fmt.Printf("  %-38s %d\n", "drives with a search block ("+searchMode+"):", searchDrives)
+		fmt.Printf("  %-38s %d\n", "  of them given notes:", notesDrives)
+		fmt.Printf("  %-38s %d\n", "  of them given a Backtracking memo:", memoDrives)
 	}
 	fmt.Printf("failed:  %d\n", nfail)
 	if nDataErrors > 0 {
@@ -1134,6 +1136,16 @@ done:
 	}
 	if setGateFailures > 0 {
 		return fmt.Errorf("%d set run-level gate(s) failed", setGateFailures)
+	}
+	// An armed run that handed out no notes (no Backtracking memo under
+	// --force-backtrack, where the finds keep none) compared nothing.
+	if searchMode == "armed" {
+		if forceBacktrack && memoDrives == 0 {
+			return fmt.Errorf("--search-block=armed --force-backtrack gave no drive a Backtracking memo")
+		}
+		if !forceBacktrack && notesDrives == 0 {
+			return fmt.Errorf("--search-block=armed gave no drive notes")
+		}
 	}
 	return nil
 }
@@ -1472,7 +1484,7 @@ func callFind(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *wasmt
 		return 0, errBTOverflow
 	}
 	if result.(int64) >= 0 {
-		curSearch.after(store, len(text))
+		curSearch.after(store)
 	}
 	return result.(int64), nil
 }
@@ -1556,7 +1568,7 @@ func callGroupsAt(wd *watchdog, store *wasmtime.Store, fn *wasmtime.Func, mem *w
 	if endPos < 0 {
 		return -1, nil, nil
 	}
-	curSearch.after(store, int(length))
+	curSearch.after(store)
 	buf = mem.UnsafeData(store)
 	slots := make([]int32, numGroups*2)
 	for i := range slots {

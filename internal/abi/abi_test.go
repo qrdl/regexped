@@ -126,7 +126,7 @@ func TestWriteFindScratchLaysTheDocumentedLayout(t *testing.T) {
 	for i := off + FindScratchBlocksBytes; i < len(big); i++ {
 		big[i] = 0xAB
 	}
-	WriteFindScratchBlocks(big, off, 0x1111, 0x2222, 0x3333, 0x5555)
+	WriteFindScratchBlocks(big, off, 0x1111, 0x2222, 0x3333, 0x5555, 7)
 	readB := func(at int) uint32 { return binary.LittleEndian.Uint32(big[off+at:]) }
 	for _, c := range []struct {
 		name string
@@ -138,6 +138,7 @@ func TestWriteFindScratchLaysTheDocumentedLayout(t *testing.T) {
 		{"cache_ptr", FindScratchCacheOff, 0x2222},
 		{"cache_len", FindScratchCacheLenOff, 0x3333},
 		{"blocks_ptr", FindScratchBlocksOff, 0x5555},
+		{"blocks_n", FindScratchBlocksCountOff, 7},
 	} {
 		if got := readB(c.at); got != c.want {
 			t.Errorf("blocks form: %s at +%d = %#x, want %#x", c.name, c.at, got, c.want)
@@ -166,6 +167,7 @@ func TestSearchBlockLayout(t *testing.T) {
 		{"bt_state", SearchBTStateOff, 4}, {"notes_cap", SearchNotesCapOff, 4},
 		{"bt_budget", SearchBTBudgetOff, 8}, {"bt_memo", SearchBTMemoOff, 4},
 		{"bt_cap", SearchBTCapOff, 4}, {"bt_memo_cap", SearchBTMemoCapOff, 4},
+		{"far", SearchFarOff, 4},
 	}
 	used := make([]string, SearchBlockBytes)
 	for _, f := range fields {

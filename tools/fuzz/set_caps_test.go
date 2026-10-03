@@ -18,6 +18,7 @@ import (
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
+	"github.com/qrdl/regexped/internal/searchblock"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -529,6 +530,33 @@ func TestSetMemberWithoutAnOwnDFA(t *testing.T) {
 	}
 }
 
+// TestWideTrailingBoundaryMembers: a 70-member set whose members past index 64
+// END in `\b`, `\B` or `(?m:$)`. Leading assertions never populate the wide
+// word-boundary and newline mid-accept lists — only an accept that depends on
+// the NEXT byte does — so the wide sets elsewhere, whose boundary members all
+// lead, left those lists' bits past 64 unchecked. Every capability, overlapping
+// and gated `find` included, against Go.
+func TestWideTrailingBoundaryMembers(t *testing.T) {
+	pats := wideTrailingBoundaryMembers()
+	w, drops, err := compileCaps(pats, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drops.all) > 0 {
+		t.Fatalf("members dropped: %v", drops.all)
+	}
+	inputs := []string{"", "w9ab", "v9abc0", "q9ab\nq8", "x w8 v7ab_ q6a\n",
+		strings.Repeat("abcdefghij", 3) + "0 w9a v9ab q9\nv8a w7"}
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			r := newCapRunnerFrom(t, w, pats, in)
+			defer r.Close()
+			checkCapsAgainstOracleDropped(t, r, pats, in, drops.anchored)
+			checkGated(t, pats, in)
+		})
+	}
+}
+
 func TestSetCapabilitiesAgainstOracle(t *testing.T) {
 	for _, tc := range capCases {
 		for _, input := range tc.inputs {
@@ -950,6 +978,217 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 }
 
 // gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
+// runGatedFindBlocks is runGatedFind handing the set's search blocks over the
+// way mode says, through the shared helper (internal/searchblock), as a
+// generated iterator does. switched reports whether block 0 — a counted sparse
+// bucket's drive state — recorded the handover to the split companion.
+func runGatedFindBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode) (matches []setMatch, switched bool) {
+	t.Helper()
+	return runGatedDriveBlocks(t, pats, input, mode, 0)
+}
+
+// runGatedDriveBlocks is runGatedFindBlocks for a set that may batch: with
+// batchCap > 0 the set is compiled with `hints: [batch-find]` and the BATCH
+// entry is driven at that capacity, cursor handed back as a stub does; with
+// batchCap < 0 the set batches and its `find` is driven.
+func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32) (matches []setMatch, switched bool) {
+	t.Helper()
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names}}}}
+	if batchCap != 0 {
+		cfg.Sets[0].Hints = []string{"batch-find"}
+	}
+	w, _, diags, err := compile.CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	var sizes []searchblock.Size
+	for _, d := range diags {
+		for k, n := range d.SearchBlocks {
+			sz := searchblock.Size{Notes: n}
+			if d.SearchBlocksBTMemo != nil {
+				sz.Memo = d.SearchBlocksBTMemo[k]
+			}
+			sizes = append(sizes, sz)
+		}
+	}
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	fn := inst.GetFunc(store, "gated_find")
+	const pageSize = 65536
+	dataTop, err := utils.ParseDataSectionBytes(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+	gatePtr := inBase + int32((len(input)+pageSize)/pageSize*pageSize)
+	outPtr := gatePtr + pageSize
+	blocks := searchblock.Layout(int64(outPtr)+pageSize, sizes, len(input), mode)
+	top := int64(outPtr) + 2*pageSize
+	if blocks != nil {
+		top = blocks.End()
+	}
+	if need := uint64((top + pageSize - 1) / pageSize); need > mem.Size(store) {
+		if _, err := mem.Grow(store, need-mem.Size(store)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if g := inst.GetExport(store, abi.ScratchBaseExport); g != nil && g.Global() != nil {
+		_ = g.Global().Set(store, wasmtime.ValI32(int32((top+pageSize-1)/pageSize*pageSize)))
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[inBase:], input)
+	scratchPtr := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
+	data := func() []byte { return mem.UnsafeData(store) }
+	begin := blocks.Begin
+	if batchCap > 0 {
+		begin = blocks.BeginBatch // a batching iterator's notes come up front
+	}
+	if err := begin(data, len(input)); err != nil {
+		t.Fatal(err)
+	}
+	blocks.Describe(mem.UnsafeData(store), scratchPtr)
+	if batchCap > 0 {
+		batch := inst.GetFunc(store, "gated_find_batch")
+		if batch == nil {
+			t.Fatal("module missing gated_find_batch")
+		}
+		countMask := int64(1)<<uint(config.SetCursorCountBits(len(pats))) - 1
+		for cursor, calls := int64(0), 0; ; calls++ {
+			if calls > 8*(len(input)+1)*(len(pats)+1)+16 {
+				t.Fatal("gated_find_batch did not terminate")
+			}
+			res, err := batch.Call(store, inBase, int32(len(input)), cursor, scratchPtr, outPtr, batchCap)
+			if err != nil {
+				t.Fatalf("gated_find_batch: %v", err)
+			}
+			packed := res.(int64)
+			n := int(packed & countMask)
+			buf := mem.UnsafeData(store)
+			for i := 0; i < n; i++ {
+				base := int(outPtr) + i*12
+				matches = append(matches, setMatch{PatternID: int(int32(binary.LittleEndian.Uint32(buf[base:]))),
+					Start: int(int32(binary.LittleEndian.Uint32(buf[base+4:]))),
+					End:   int(int32(binary.LittleEndian.Uint32(buf[base+8:])))})
+			}
+			if uint32(packed>>32) == 0xFFFFFFFF {
+				break
+			}
+			if err := blocks.After(data); err != nil {
+				t.Fatal(err)
+			}
+			cursor = packed
+		}
+		if blocks != nil {
+			switched = binary.LittleEndian.Uint32(mem.UnsafeData(store)[blocks.At+8:]) != 0
+		}
+		return matches, switched
+	}
+	for from := int32(0); ; {
+		res, err := fn.Call(store, inBase, int32(len(input)), from, scratchPtr, outPtr, int32(len(pats)))
+		if err != nil {
+			t.Fatalf("gated_find: %v", err)
+		}
+		n := int(res.(int32))
+		if n <= 0 {
+			break
+		}
+		if err := blocks.After(data); err != nil {
+			t.Fatal(err)
+		}
+		buf := mem.UnsafeData(store)
+		start := 0
+		for i := 0; i < n; i++ {
+			base := int(outPtr) + i*12
+			m := setMatch{PatternID: int(int32(binary.LittleEndian.Uint32(buf[base:]))),
+				Start: int(int32(binary.LittleEndian.Uint32(buf[base+4:]))),
+				End:   int(int32(binary.LittleEndian.Uint32(buf[base+8:])))}
+			start = m.Start
+			matches = append(matches, m)
+		}
+		from = int32(start) + 1
+	}
+	if blocks != nil {
+		switched = binary.LittleEndian.Uint32(mem.UnsafeData(store)[blocks.At+8:]) != 0
+	}
+	return matches, switched
+}
+
+// TestSparseCounterHandoverMatchesGo: a counted sparse bucket — 33 members
+// sharing `foo`, among them `foo\w+`, which reads the literal for ever — over
+// a run of `foo`. Once `foo\w+` has matched and is gated out, every later
+// candidate walks to the end of the run for siblings long dead; the counter
+// trips, the call answers its internal sentinel, and the wrapper hands the call
+// and the rest of the drive to the split companion. The answers must be Go's
+// in every block mode, and with a block the drive must actually have switched,
+// or the companion went unchecked.
+//
+// The same shape is driven where three other wrappers do the handover: beside
+// a member the set splits (the merge wrapper), in a batching set's `find` (the
+// find wrapper in front of the worker) and through its batch entry at a
+// capacity that spans many calls (the entry itself, the switch kept in block 0
+// across calls). And with a member that is reported at EVERY candidate —
+// `foo` beside `foo\w+` — which must not hide the walk from the counter, in a
+// literal bucket and in a literal-less one.
+func TestSparseCounterHandoverMatchesGo(t *testing.T) {
+	digits := func(prefix string) []string {
+		var out []string
+		for k := 1; k <= 32; k++ {
+			out = append(out, fmt.Sprintf(`%s[0-9]{%d}`, prefix, k))
+		}
+		return out
+	}
+	s3 := append([]string{`foo\w+`}, digits("foo")...)
+	p1 := append([]string{`foo`}, s3...)
+	p2 := append([]string{`[a-z]`, `[a-z]+`}, digits("[a-z]")...)
+	split := append(append([]string(nil), p1...), `[a-z]+@(?:[a-z@]*X)?`)
+	fooRuns := []string{
+		strings.Repeat("foo", 300) + " foo123",
+		strings.Repeat(strings.Repeat("foo", 100)+" ", 3) + "foo12 foo1234567",
+	}
+	cases := []struct {
+		name     string
+		pats     []string
+		inputs   []string
+		batchCap int32
+	}{
+		{"S3", s3, fooRuns, 0},
+		{"P1", p1, fooRuns, 0},
+		{"P2", p2, []string{strings.Repeat("a", 900) + " a12 b1234"}, 0},
+		{"split", split, append(fooRuns, strings.Repeat("foo", 200)+" ab@cd "+strings.Repeat("foo", 100)), 0},
+		{"batching find", p1, fooRuns, -1},
+		{"batching cap 64", p1, fooRuns, 64},
+		{"batching cap 1", s3, fooRuns, 1},
+	}
+	for _, c := range cases {
+		for _, in := range c.inputs {
+			want := gatedOracle(c.pats, in)
+			sortMatches(want)
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
+				t.Run(fmt.Sprintf("%s/%s/%d", c.name, mode, len(in)), func(t *testing.T) {
+					got, switched := runGatedDriveBlocks(t, c.pats, in, mode, c.batchCap)
+					sortMatches(got)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("got  %v\nwant %v", got, want)
+					}
+					if mode != searchblock.Off && !switched {
+						t.Fatal("the drive never handed over to the split companion")
+					}
+				})
+			}
+		}
+	}
+}
+
 func gatedOracle(pats []string, input string) []setMatch {
 	var out []setMatch
 	for k, p := range pats {

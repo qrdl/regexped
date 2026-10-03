@@ -3,9 +3,11 @@
 Regexped generates a pair of C stub files (`.h` and `.c`) that declare and implement
 wrapper functions for compiled WASM regexp modules. No libc or sysroot is required;
 the stubs compile cleanly with `--target=wasm32-wasi -nostdlib -DRX_SET_CACHE=0`.
-One optional feature uses an allocator when one is present — see
-[The overlapping answer cache](#the-overlapping-answer-cache) — and that define is
-how a freestanding build declines it.
+Two optional features use an allocator when one is present — an overlapping
+set's answer cache ([The overlapping answer cache](#the-overlapping-answer-cache))
+and the per-search notes and memo ([Linear scans on any input](#linear-scans-on-any-input))
+— and that define is how a freestanding build declines them; it can still hand
+each a buffer of its own.
 
 > **Component format:** `stub_type: c` works under `wasm_format: component` too, and the **API is identical** — the same `rx_match_t`, `rx_group_t`, caller-owned iterators and group-index constants — because the header is produced by the same generator. What differs is the `.c`: canonical-ABI imports with a caller-supplied return area instead of a packed `long long`, plus a `cabi_realloc` when a pattern exports groups (a returned list is allocated in *your* memory). A `wit/` directory is generated beside the stub for `wasm-tools component embed`. See [component.md](component.md).
 
@@ -233,7 +235,7 @@ find_token_free(&iter);
 
 The iterator owns the advance past a zero-length match and Go's `FindAllIndex` rule — an empty match beginning exactly where the previous reported match ended is not reported. Both used to be your job, copied from this document.
 
-**`_free` is a no-op under `wasm_format: module` and MANDATORY under `component`.** There the scan lives inside the regexp component behind a resource handle, and abandoning an iterator strands the input copy and the scan state for the life of the process. Call it on every exit path — each `break`, `return` and `goto` out of the loop, not only the last one. Writing it unconditionally is what lets the same source compile against either format.
+**`_free` is MANDATORY under `component`, and under `wasm_format: module` for any pattern whose iterator keeps search notes** (see "Notes" below); for every other module pattern it is a no-op. Under `component` the scan lives inside the regexp component behind a resource handle, and abandoning an iterator strands the input copy and the scan state for the life of the process; under `module` the notes are `calloc`ed by `_next` and only `_free` releases them. Call it on every exit path — each `break`, `return` and `goto` out of the loop, not only the last one. Writing it unconditionally is what lets the same source compile against either format.
 
 **`_init` only writes the struct, and `_free` needs a struct `_init` has written.** So the contract is the usual one for a C resource: `_init` before `_next` or `_free`, and `_free` before initialising the same iterator again — `_init` does not look at what the struct held, so an iterator initialised again without `_free` leaks under `component`. A second `_free` does nothing; a `_free` on a struct that never went through `_init` is not allowed. The iterator may be an uninitialised local: nothing reads it before `_init` writes it.
 
@@ -286,7 +288,7 @@ if (status == RX_ERR_BT_OVERFLOW) {
 parse_url_free(&iter);
 ```
 
-`_free` carries the same obligations it does for `find`: a no-op for a module, mandatory for a component, and called before initialising the same iterator again.
+`_free` carries the same obligations it does for `find`: mandatory for a component and for a module pattern whose iterator keeps search notes, a no-op otherwise, and called before initialising the same iterator again.
 
 ---
 
@@ -477,9 +479,10 @@ surface.
 - The `#define <FUNC_UPPER>_GROUPS` constant gives the total number of groups
   including group 0 (full match). Use it to size loops or slot arrays.
 - No heap allocation or libc is required. The stubs are self-contained and suitable
-  for embedded WASM environments. The one exception is an `overlapping: true`
-  set's answer cache, which is enabled only when `<stdlib.h>` is available and
-  declined otherwise.
+  for embedded WASM environments. Where `<stdlib.h>` is available they use it
+  for an `overlapping: true` set's answer cache and for search notes and
+  Backtracking memos; without it, `<find>_set_cache` and `<func>_set_notes` take
+  a buffer of yours instead (see "Linear scans on any input").
 - The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for C: it's effective for the JS and TS generators only. Setting it does not change the generated header or its performance.
 
 ---
@@ -491,23 +494,55 @@ before settling for a short match, so a whole scan over `aaaa…` is quadratic.
 The iterator of a pattern that can do this gains two opaque members — a 128-byte
 `search` block and a `notes` pointer — hands the block to the module before
 every call, and, when the module reports that the scan has started re-reading,
-`calloc`s its notes (`(len + 1)` bytes per pattern row), which the module uses to
+`calloc`s its notes (`(len + 1) × ⌈R / 8⌉` bytes, one bit per position for each of the R states the pattern notes), which the module uses to
 stop at ground it has already covered (see [wasm.md](wasm.md), "The search
 block"). **`<func>_free` is then REQUIRED under `wasm_format: module` too**: it
 frees the notes. A failed `calloc` makes `_next` return `RX_ERR_BT_OVERFLOW`.
 A Backtracking pattern's iterator carries the same block and a `btmemo`
 pointer: its work budget then lasts the whole scan rather than one call, and once
-it runs out `_next` `calloc`s the fallback's memo — `(len + 1) × ⌈instructions /
-8⌉` bytes — so a scan whose every call would exhaust the budget pays for it once.
-`_free` frees it, and a failed `calloc` is reported the same way.
+it runs out every later call goes straight to the fallback body, with a memo —
+`(len + 1) × ⌈instructions / 8⌉` bytes — the iterator allocates once and keeps
+for the rest of the scan, so a (state, position) one call ruled out stays ruled
+out. That holds in a merged build too: the module carries a second copy of its
+fallback body that reads the memo from your memory. Under
+`wasm_format: component` the component keeps the memo inside itself, and goes
+without it when it does not fit. Set scanners do the same for every member that
+keeps notes or a memo.
 
 The allocator is detected like the answer cache's: `RX_SEARCH_NOTES` follows
 `RX_SET_CACHE` when that is defined, and `__has_include(<stdlib.h>)` otherwise.
-A `-nostdlib` build that passes `-DRX_SET_CACHE=0` (or `-DRX_SEARCH_NOTES=0`)
-keeps no notes: such a scan stays quadratic, with identical answers. A
-freestanding build that does keep them links `calloc` and `free`, and — like any
+A freestanding build that keeps them links `calloc` and `free`, and — like any
 freestanding C at `-O1` and above — may need a `memset`, which the compiler
 emits for the zeroing loops.
+
+**With no allocator, hand the memory over.** A `-nostdlib` build that passes
+`-DRX_SET_CACHE=0` (or `-DRX_SEARCH_NOTES=0`) cannot `calloc`; every find and
+groups iterator and every set scanner therefore has a pair, the same shape as a
+set's `<find>_cache_bytes` / `<find>_set_cache`:
+
+```c
+size_t <func>_notes_bytes(size_t len);                      /* 0: nothing to hand over */
+int    <func>_set_notes(<iter> *it, void *buf, size_t bytes);
+```
+
+```c
+static unsigned char mem[1 << 16];
+size_t need = url_find_notes_bytes(len);
+url_find_init(&it, input, len, 0);
+if (need && need <= sizeof mem) url_find_set_notes(&it, mem, sizeof mem);
+```
+
+Call `_set_notes` after `_init` and before the first `_next`. It zeroes the
+buffer, which must outlive the scan and serve one iterator at a time; `_free`
+never frees it and `_init` forgets it, so a restarted scan hands it over again.
+It returns 0 (also when nothing is needed), `RX_ERR_RANGE` when the buffer is
+too small for this input, and `RX_ERR_NULL_ARG` for a null iterator or a needed
+null buffer; on an error the iterator is unchanged. With an allocator the
+buffer is used in its place. A `-nostdlib` scan that hands nothing over still
+answers correctly, at quadratic cost on the inputs above. The pair exists in
+every build — a no-op returning 0 where nothing is needed, including every
+`wasm_format: component` build — so the same source compiles against any
+pattern and either format.
 
 ## Backtracking stack overflow
 

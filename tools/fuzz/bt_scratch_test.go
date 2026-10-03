@@ -275,12 +275,20 @@ func TestBTFallbackScratchStandalone(t *testing.T) {
 				}
 
 				var sizes []uint64
-				for i := 0; i < 3; i++ {
+				for i := 0; i < 4; i++ {
 					got, slots := c.call(t, store, inst, mem, c.numSlots())
 					c.check(t, got, slots)
 					sizes = append(sizes, mem.Size(store))
 				}
-				if setGlobal && (sizes[1] != sizes[0] || sizes[2] != sizes[0]) {
+				// No search block is handed over, so the module keeps its own
+				// default state: a `find` search that trips gets the kept memo
+				// once, on the call after it trips (a `groups` search keeps no
+				// memo). From then on nothing may grow.
+				first := sizes[0]
+				if c.entry.FindFunc != "" {
+					first = sizes[1]
+				}
+				if setGlobal && (sizes[1] != first || sizes[2] != first || sizes[3] != first) {
 					t.Errorf("memory kept growing with the host global set: %v pages after each call — the scratch is not being reused", sizes)
 				}
 			})

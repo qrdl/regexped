@@ -5075,6 +5075,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 			tableMemIdx:  tableMemIdx, gated: gated, hasSkip: needSkip,
 			memberGlobal:   memberGlobal,
 			probeWalkEndP1: art.probeWalkEndGlobal + 1,
+			walkEndP1:      art.walkEndGlobal + 1,
 		}
 		if gated {
 			sp.ctr = ctr
@@ -6176,7 +6177,26 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // function index) was removed. To reinstate, change the signature to
 // `([]byte, []int)`, restore the `callSites` plumbing, and update both
 // callers.
-// appendFindCodeEntryTwinned is appendFindCodeEntry plus the NEUTRAL TWIN: when
+
+// findCodeEntry is a pattern's plain find: the body, its neutral twin, and —
+// under per-search notes (search_notes.go) — its marked copy, with the call
+// sites the assembler patches once function indices are known. Every body is
+// size-prefixed; every offset is from the start of its size-prefixed entry.
+type findCodeEntry struct {
+	body      []byte
+	mode      findFromMode
+	twin      []byte // the neutral twin, or nil
+	twinPatch int    // in body: the handoff to the twin, or -1
+	marked    []byte // the marked copy, or nil
+	// markedCall is the handoff to the marked copy in body, and twinMarkedCall
+	// the same in twin; markedBack is the marked copy's handback to body.
+	markedCall, twinMarkedCall, markedBack int
+}
+
+// buildFindCodeEntry builds the plain find for layout l, its neutral twin
+// (below) when it qualifies, and its marked copy when l.notes is set.
+//
+// THE NEUTRAL TWIN (findCodeEntry.twin): when
 // this layout's find body carries a runtime escape that can judge its own hint
 // wrong, a second body is emitted exactly as a neutral compile would emit it,
 // and the returned twin is non-nil.
@@ -6201,28 +6221,6 @@ func emitAcceptBitOnStack(b []byte, stateLocal byte, acceptLimit int32) []byte {
 // An earlier design selected between the two bodies in the wrapper on a
 // verdict global, and that is what the moduleGlobals allocator was built for;
 // the handoff replaced it, and the allocator now has no consumer in this file.
-func appendFindCodeEntryTwinned(cs []byte, l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) ([]byte, findFromMode, []byte, int) {
-	e := buildFindCodeEntry(l, t, mandatoryLit, tableMemIdx)
-	return append(cs, e.body...), e.mode, e.twin, e.twinPatch
-}
-
-// findCodeEntry is a pattern's plain find: the body, its neutral twin, and —
-// under per-search notes (search_notes.go) — its marked copy, with the call
-// sites the assembler patches once function indices are known. Every body is
-// size-prefixed; every offset is from the start of its size-prefixed entry.
-type findCodeEntry struct {
-	body      []byte
-	mode      findFromMode
-	twin      []byte // the neutral twin, or nil
-	twinPatch int    // in body: the handoff to the twin, or -1
-	marked    []byte // the marked copy, or nil
-	// markedCall is the handoff to the marked copy in body, and twinMarkedCall
-	// the same in twin; markedBack is the marked copy's handback to body.
-	markedCall, twinMarkedCall, markedBack int
-}
-
-// buildFindCodeEntry builds the plain find for layout l. See
-// appendFindCodeEntryTwinned for the neutral twin; l.notes adds the marked copy.
 func buildFindCodeEntry(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryLit, tableMemIdx int) findCodeEntry {
 	var hasTwin bool
 	// The twin is worth building only when the hinted body would actually carry

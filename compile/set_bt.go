@@ -136,6 +136,10 @@ func SetAdmitsBacktracking(sc config.SetConfig, cfg config.BuildConfig) bool {
 	if err != nil {
 		return false
 	}
+	if cs.scanComp != nil && (cs.scanComp.hasBTMember() || cs.scanComp.btSplit) {
+		// The scan pair forwards to its split copy, which can.
+		return true
+	}
 	return cs.hasBTMember() || cs.btSplit
 }
 
@@ -221,7 +225,7 @@ func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, 
 	}
 	b = append(b, 0x21, end)
 	if c.member != nil {
-		b = emitBTMemberMatched(b, c.member, end)
+		b = emitBTMemberMatched(b, c.member, end, regions.winGlobal)
 	}
 	return b
 }
@@ -684,7 +688,7 @@ func (cs *compiledSet) emitBTBlocksPrologue(kind setCapKind) []byte {
 		b = append(b, 0x41, 0x00)
 		return appendGlobalSet(b, cs.btBlocksG)
 	}
-	b = emitScratchBlocks(b, 3)
+	b = cs.emitScratchBlocks(b, 3)
 	b = appendGlobalSet(b, cs.btBlocksG)
 	if off := cs.btBlocksBase() * abi.SearchBlockBytes; off > 0 {
 		// Past the blocks before the members', or 0 with none.

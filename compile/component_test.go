@@ -621,8 +621,8 @@ func TestSetAdapterBodyFraming(t *testing.T) {
 		// shapes are checked: the arithmetic is emitted only when the set has a
 		// sweep, and an empty or malformed body would be invisible otherwise.
 		{"constructor (with cache)", buildSetScannerCtorBody(setScannerCtor{reallocIdx: 9, callListGlobal: 1, idSpace: 12, cells: 33, pats: 3})},
-		{"next", buildSetScannerNextBody(9, 3, 12)},
-		{"dtor", buildSetScannerDtorBody(10)},
+		{"next", buildSetScannerNextBodyBlocks(9, 3, 12, nil, 0, 0)},
+		{"dtor", buildSetScannerDtorBodyBlocks(10, nil)},
 	} {
 		if len(c.body) == 0 {
 			t.Errorf("%s: empty body", c.name)
@@ -642,7 +642,7 @@ func TestSetAdapterBodyUnknownKindPanics(t *testing.T) {
 			t.Error("an unknown adapter kind returned silently")
 		}
 	}()
-	buildSetAdapterBody(setAdapter{kind: setAdapterKind(99)}, 1, 2, 3)
+	buildSetAdapterBody(setAdapter{kind: setAdapterKind(99)}, 1, 2, 3, 4)
 }
 
 // TestSetComponentMixedWithPatterns is the case that had NO test and was broken:
@@ -889,7 +889,7 @@ func TestPatternAdapterBodyUnknownKindPanics(t *testing.T) {
 			t.Error("a function-shaped kind reached the resource dispatcher without a panic")
 		}
 	}()
-	buildPatternAdapterBody(componentAdapter{kind: adapterMatch}, 0, 0, 0)
+	buildPatternAdapterBody(componentAdapter{kind: adapterMatch}, 0, 0, 0, 0)
 }
 
 func TestPatRepSize(t *testing.T) {

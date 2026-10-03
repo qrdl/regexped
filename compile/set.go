@@ -731,6 +731,15 @@ type CompileSetOptions struct {
 	// compile has already warned about every pattern the second one drops or
 	// puts on Backtracking, and saying it twice would be noise.
 	quiet bool
+
+	// sweepBudget, when positive, is the program sweep's single-block budget
+	// in place of config.SetOverlapCacheMaxBytes (WithSweepBudget). TEST-ONLY.
+	sweepBudget int64
+
+	// forceWideAll compiles the set's `_all` capabilities in the wide form
+	// whatever its own members would choose: scanSplitOnly's two halves must
+	// agree on the ABI a stub reads off the set once.
+	forceWideAll bool
 }
 
 // SetFrontend is the exported spelling of frontendKind, so an out-of-package
@@ -752,6 +761,14 @@ const (
 // (the zero value) mean "forced to Teddy" for every caller that never asked.
 func (o CompileSetOptions) WithForcedFrontend(fe frontendKind) CompileSetOptions {
 	o.ForceFrontend, o.forceFrontend = fe, true
+	return o
+}
+
+// WithSweepBudget returns a copy of o whose program sweep checkpoints past n
+// bytes instead of config.SetOverlapCacheMaxBytes. TEST-ONLY: the multi-block
+// path otherwise needs a region over 64 MiB.
+func (o CompileSetOptions) WithSweepBudget(n int64) CompileSetOptions {
+	o.sweepBudget = n
 	return o
 }
 

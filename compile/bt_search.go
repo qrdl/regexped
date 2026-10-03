@@ -16,8 +16,10 @@ import (
 // every later call goes straight to the fallback body, whose (pc, position)
 // memo the stub then keeps for the search (bt_memo, sized (len + 1) × ⌈N/8⌉ by
 // SearchSize.BTMemoBytes), so a mark one call made stops the next. Measured on
-// a prototype: the first row 87.5 K fuel/byte flat, 1,500 once the stack
-// overflows first; normal input +0.0% to +0.7%, no trip on any of 34 drives.
+// a prototype at the old multiplier k = 8: the first row 87.5 K fuel/byte flat,
+// 1,500 once the stack overflows first; normal input +0.0% to +0.7%, no trip on
+// any of 34 drives. At k = 1 (defaultBTWorkK) the budgeted burn before a trip
+// is an eighth: `(?:a|b)*a(?:a|b){12}c|a` 88,010 → 12,808 fuel/byte.
 //
 // The memo's marks are failures, so the marks on the path of a REPORTED match
 // are cleared before it is returned — from the matching attempt's start, not
@@ -35,10 +37,11 @@ type btSearch struct {
 }
 
 // btSearchFor is the search context for a Backtracking body compiled under o,
-// nil when the module has no global allocator or the body is a set member's,
-// whose search state lives in the set's drive regions instead.
+// nil when the module has no global allocator (a body compiled without
+// assembling a module). A set's split member gets one too: its search block is
+// the one the set's scratch descriptor names for it.
 func btSearchFor(o *CompileOptions) *btSearch {
-	if o == nil || o.globals == nil || o.btNoSearch {
+	if o == nil || o.globals == nil {
 		return nil
 	}
 	return &btSearch{g: o.globals.Search()}
@@ -67,11 +70,11 @@ func (c *btSearch) store64(b []byte, field uint32) []byte {
 }
 
 const (
-	btSearchState   = abi.SearchBTStateOff   // i32: 0 new, 1 budget live, 2 tripped
+	btSearchState   = abi.SearchBTStateOff   // i32: abi.SearchBTNew / Live / Tripped
 	btSearchWork    = abi.SearchBTBudgetOff  // i64: budget left
 	btSearchMemo    = abi.SearchBTMemoOff    // i32: the memo (STUB), 0 = none yet
 	btSearchMemoCap = abi.SearchBTMemoCapOff // i32: its size (STUB)
-	btSearchCapSt   = abi.SearchBTCapOff     // i32: capture body: 2 once tripped
+	btSearchCapSt   = abi.SearchBTCapOff     // i32: capture body: abi.SearchBTTripped once tripped
 )
 
 // emitFindEntry is the ordinary find body's budget set-up: from the block when
@@ -89,8 +92,8 @@ func (c *btSearch) emitFindEntry(b []byte, blk, tmp, workLocal uint32, k, n int,
 	b = c.load32(b, btSearchState)
 	b = append(b, 0x22)
 	b = utils.AppendULEB128(b, tmp) // local.tee tmp
-	b = append(b, 0x41, 0x02, 0x46) // == 2
-	b = append(b, 0x04, 0x40)       // if tripped
+	b = append(b, 0x41, abi.SearchBTTripped, 0x46)
+	b = append(b, 0x04, 0x40) // if tripped
 	b = emitBTFallbackCall(b, 2, callOffs)
 	b = append(b, 0x0B)
 	b = btLocalGet(b, tmp)
@@ -101,8 +104,14 @@ func (c *btSearch) emitFindEntry(b []byte, blk, tmp, workLocal uint32, k, n int,
 	b = utils.AppendULEB128(b, workLocal)
 	b = append(b, 0x05) // else: a new search
 	b = init(b)
+	// The budget is stored with the state, not only at return: a call that
+	// trapped after this point would otherwise leave state 1 with budget 0,
+	// and the next call's `--work == 0` would start at −1 and never trip.
 	b = btLocalGet(b, blk)
-	b = append(b, 0x41, 0x01)
+	b = btLocalGet(b, workLocal)
+	b = c.store64(b, btSearchWork)
+	b = btLocalGet(b, blk)
+	b = append(b, 0x41, abi.SearchBTLive)
 	b = c.store32(b, btSearchState)
 	b = append(b, 0x0B)
 	b = append(b, 0x05) // else: no block, this call's budget
@@ -125,7 +134,7 @@ func (c *btSearch) emitFindTripped(b []byte, blk uint32) []byte {
 	b = btLocalGet(b, blk)
 	b = append(b, 0x04, 0x40)
 	b = btLocalGet(b, blk)
-	b = append(b, 0x41, 0x02)
+	b = append(b, 0x41, abi.SearchBTTripped)
 	b = c.store32(b, btSearchState)
 	return append(b, 0x0B)
 }
@@ -163,15 +172,57 @@ func (c *btSearch) emitFallbackPlace(b []byte, d *btDyn, blk, origin uint32, unk
 	b = utils.AppendULEB128(b, d.memoEnd)
 	b = append(b, 0x21)
 	b = utils.AppendULEB128(b, d.cleared)
-	// The frame stack: this call's, at the scratch base.
+	// The frame stack: this call's, at the scratch base — but never below the
+	// search's memo. A generated stub raises the scratch base past every
+	// region it allocates; a raw caller that put the memo above the base
+	// without moving it would otherwise have its memo overwritten by frames.
+	alignedMemoEnd := func(b []byte) []byte {
+		b = btLocalGet(b, d.memoEnd)
+		return append(b, 0x41, 0x03, 0x6A, 0x41, 0x7C, 0x71)
+	}
 	b = emitBTScratchBase(b, d, d.stackBase)
 	b = btLocalGet(b, d.stackBase)
 	b = append(b, 0x41, 0x03, 0x6A, 0x41, 0x7C, 0x71)
 	b = append(b, 0x21)
 	b = utils.AppendULEB128(b, d.stackBase)
+	if d.memoMemIdx == d.memIdx {
+		// Only when the memo shares the stack's memory: an embedded build's
+		// memo is in the input's.
+		b = btLocalGet(b, d.stackBase)
+		b = alignedMemoEnd(b)
+		b = btLocalGet(b, d.stackBase)
+		b = alignedMemoEnd(b)
+		b = append(b, 0x4B, 0x1B) // gt_u; select: max(base, memo end)
+		b = append(b, 0x21)
+		b = utils.AppendULEB128(b, d.stackBase)
+	}
 	b = emitBTEnsureStack(b, d, unknown)
 	b = append(b, 0x41, 0x01)
 	return append(b, 0x05, 0x41, 0x00, 0x0B)
+}
+
+// emitMemoTwinDispatch opens an embedded build's per-call fallback find: a
+// call whose search has a memo that covers this text goes to the body right
+// after it (btScratch.memoInInput), which keeps that memo. The condition is
+// emitFallbackPlace's own, so that body never finds its memo unusable. blk is
+// an i32 local; the call's immediate is recorded in callOffs for patching.
+func (c *btSearch) emitMemoTwinDispatch(b []byte, blk uint32, rowBytes int32, callOffs *[]int) []byte {
+	b = c.blk(b)
+	b = append(b, 0x22)
+	b = utils.AppendULEB128(b, blk) // local.tee blk
+	b = append(b, 0x04, 0x40)       // if blk
+	b = btLocalGet(b, blk)
+	b = c.load32(b, btSearchMemo)
+	b = append(b, 0x04, 0x40) // if memo
+	b = btLocalGet(b, blk)
+	b = c.load32(b, btSearchMemoCap)
+	b = append(b, 0xAD, 0x20, localLen, 0xAD, 0x42, 0x01, 0x7C, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(rowBytes))
+	b = append(b, 0x7E, 0x5A) // i64.mul; i64.ge_u
+	b = append(b, 0x04, 0x40) // if it covers the text
+	b = emitBTFallbackCall(b, 2, callOffs)
+	b = append(b, 0x0B, 0x0B)
+	return append(b, 0x0B)
 }
 
 // emitFallbackMatched clears the memo rows [attemptStart, pos] before a match
@@ -213,7 +264,7 @@ func (c *btSearch) emitFallbackMatched(b []byte, d *btDyn, blk, attemptStart, or
 	b = btLocalGet(b, tmp)
 	b = start(b)
 	b = append(b, 0x6B) // size
-	b = appendTableMemoryFill(b, d.memIdx)
+	b = appendTableMemoryFill(b, d.memoMemIdx)
 	b = append(b, 0x0B)
 	return append(b, 0x0B)
 }
@@ -225,7 +276,7 @@ func (c *btSearch) emitCapEntry(b []byte, callOffs *[]int) []byte {
 	b = append(b, 0x04, 0x40)
 	b = c.blk(b)
 	b = c.load32(b, btSearchCapSt)
-	b = append(b, 0x41, 0x02, 0x46)
+	b = append(b, 0x41, abi.SearchBTTripped, 0x46)
 	b = append(b, 0x04, 0x40)
 	b = emitBTFallbackCall(b, 3, callOffs)
 	b = append(b, 0x0B)
@@ -237,7 +288,7 @@ func (c *btSearch) emitCapTripped(b []byte) []byte {
 	b = c.blk(b)
 	b = append(b, 0x04, 0x40)
 	b = c.blk(b)
-	b = append(b, 0x41, 0x02)
+	b = append(b, 0x41, abi.SearchBTTripped)
 	b = c.store32(b, btSearchCapSt)
 	return append(b, 0x0B)
 }

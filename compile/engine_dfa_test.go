@@ -998,7 +998,7 @@ func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 			if isAnchoredFind(table) {
 				t.Fatalf("%q routes to buildAnchoredFindBody, not buildFindBody — case is not testing what it claims", tc.pattern)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1055,7 +1055,7 @@ func TestDFALayoutFindBodyPrefixWalkDivergence(t *testing.T) {
 				t.Fatalf("%q: all four prefix-end states agree (%d) — nothing diverges to emit",
 					tc.pattern, layout.wasmPrefixEnd)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(tc.pattern, false), 0)
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1088,7 +1088,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	if nonMid == 0 {
 		t.Fatalf("%q: expected at least one non-mid dominant state", pattern)
 	}
-	body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, findMandatoryLit(pattern, false), 0)
+	body := buildFindCodeEntry(layout, table, findMandatoryLit(pattern, false), 0).body
 	if len(body) == 0 {
 		t.Fatalf("%q: empty find body", pattern)
 	}
@@ -1128,7 +1128,7 @@ func TestDFALayoutFindBodyMandatoryLit(t *testing.T) {
 			if layout.useCompression != tc.wantCompress {
 				t.Fatalf("%q: useCompression = %v, want %v (numWASM=%d)", tc.pattern, layout.useCompression, tc.wantCompress, layout.numWASM)
 			}
-			body, _, _, _ := appendFindCodeEntryTwinned(nil, layout, table, lit, 0)
+			body := buildFindCodeEntry(layout, table, lit, 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}

@@ -247,14 +247,14 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 					"    // memo (docs/wasm.md, \"The search block\"), kept alive here.\n" +
 					fmt.Sprintf("    blocks: StaticArray<u64> = new StaticArray<u64>(%d);\n", len(blocks)*abi.SearchBlockBytes/8) +
 					"    notes: Array<StaticArray<u8>> = new Array<StaticArray<u8>>();\n"
-				gateInit = strings.Replace(gateInit, "new StaticArray<u32>(4)", "new StaticArray<u32>(5)", 1)
+				gateInit = strings.Replace(gateInit, "new StaticArray<u32>(4)", "new StaticArray<u32>(6)", 1)
 				for k, sz := range blocks {
 					if sz.NotesBytes > 0 {
-						blockNotes += fmt.Sprintf("            {\n                const a = _searchNotes(changetype<StaticArray<u64>>(changetype<usize>(this.blocks) + %d), this.input.byteLength, %d);\n"+
+						blockNotes += fmt.Sprintf("            {\n                const a = _searchNotes(changetype<usize>(this.blocks) + %d, this.input.byteLength, %d);\n"+
 							"                if (a != null) this.notes.push(a);\n            }\n", k*abi.SearchBlockBytes, sz.NotesBytes)
 					}
 					if sz.BTMemoBytes > 0 {
-						blockNotes += fmt.Sprintf("            {\n                const a = _searchBTMemo(changetype<StaticArray<u64>>(changetype<usize>(this.blocks) + %d), this.input.byteLength, %d);\n"+
+						blockNotes += fmt.Sprintf("            {\n                const a = _searchBTMemo(changetype<usize>(this.blocks) + %d, this.input.byteLength, %d);\n"+
 							"                if (a != null) this.notes.push(a);\n            }\n", k*abi.SearchBlockBytes, sz.BTMemoBytes)
 					}
 				}
@@ -267,7 +267,7 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			// Written before EACH call: field 1 is the address of a managed
 			// array, and a descriptor written once could outlive a compaction.
 			cacheSet := "this.scratch[2] = 0, this.scratch[3] = 0"
-			if sh := shapes.cacheShape(setIdx); sh.Eligible {
+			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, allocated once with the
 				// iterator and collected with it — `init`/`free` in a language
@@ -284,9 +284,9 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 				// definite-assignment analysis does not see through the
 				// conditional below and rejects the class outright (TS2564).
 				gateField += "    cache: StaticArray<u32> = new StaticArray<u32>(0);\n"
-				gateInit += fmt.Sprintf(`        {
-            const m: u64 = <u64>input.byteLength + 1;
-            const row: u64 = %[5]d;
+				gateInit += "        {\n            const m: u64 = <u64>input.byteLength + 1;\n"
+				if sh.Eligible {
+					gateInit += fmt.Sprintf(`            const row: u64 = %[5]d;
             const cell: u64 = %[6]d;
             let k: u64 = m;
             if (%[3]d + cell + 4 + m * row > %[4]d) {
@@ -295,14 +295,34 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
                 if (k > m) k = m;
             }
             const nb: u64 = (m + k - 1) / k;
-            const bytes: u64 = %[3]d + nb * cell + 4 + k * row;
-            if (bytes <= %[4]d) {
-                this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
-                this.cache[%[7]d] = <u32>k;
+            let bytes: u64 = %[3]d + nb * cell + 4 + k * row;
+`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
+						consts.Row, consts.Cell)
+				} else {
+					// No answer cache, only the program sweep's part.
+					gateInit += fmt.Sprintf("            const k: u64 = 1;\n            let bytes: u64 = %d;\n", consts.Hdr)
+				}
+				gateInit += fmt.Sprintf("            if (bytes <= %d) {\n", consts.Max)
+				if sh.SweepCells > 0 {
+					// The program sweep's part, after the cache's, checkpointed
+					// by the same formula over its own geometry.
+					gateInit += fmt.Sprintf(`                const srow: u64 = %[3]d;
+                const scell: u64 = %[4]d;
+                let sk: u64 = m;
+                if (%[1]d + scell + 4 + m * srow > %[2]d) {
+                    sk = <u64>Math.sqrt(<f64>m * %[5]d * 4 / <f64>srow);
+                    if (sk < 16) sk = 16;
+                    if (sk > m) sk = m;
+                }
+                const sb: u64 = %[1]d + (m + sk - 1) / sk * scell + 4 + sk * srow;
+                if (sb <= %[2]d) bytes = ((bytes + 7) & ~(<u64>7)) + sb;
+`, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
+				}
+				gateInit += fmt.Sprintf(`                this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
+                this.cache[%[1]d] = <u32>k;
             }
         }
-`, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
-					consts.Row, consts.Cell, config.SetOverlapHdrStrideOff/4)
+`, config.SetOverlapHdrStrideOff/4)
 				cacheSet = "this.scratch[2] = (this.cache.length == 0 ? 0 : changetype<usize>(this.cache) as u32), " +
 					"this.scratch[3] = <u32>(this.cache.length * 4)"
 			}
@@ -312,7 +332,7 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			if len(blocks) > 0 {
 				gateArg = "(this.scratch[0] = " + fmt.Sprint(abi.FindScratchMagicBlocks) +
 					", this.scratch[1] = changetype<usize>(this.gates) as u32, " + cacheSet +
-					", this.scratch[4] = changetype<usize>(this.blocks) as u32, changetype<usize>(this.scratch)), "
+					fmt.Sprintf(", this.scratch[4] = changetype<usize>(this.blocks) as u32, this.scratch[5] = %d, changetype<usize>(this.scratch)), ", len(blocks))
 			}
 			// AssemblyScript has no generators, so `find` is an explicit
 			// iterator object — caller-owned, so two scans can be in flight

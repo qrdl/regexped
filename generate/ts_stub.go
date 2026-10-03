@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
 )
@@ -204,12 +205,12 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 		}
 	}
 
-	sb.WriteString(genTSSetSection(cfg))
+	sb.WriteString(genTSSetSection(cfg, sizes))
 	return sb.String(), nil
 }
 
 // genTSSetSection generates TypeScript set wrappers.
-func genTSSetSection(cfg config.BuildConfig) string {
+func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize) string {
 	if !hasSetExports(cfg) {
 		return ""
 	}
@@ -520,7 +521,6 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 	}
 	// Split members' search blocks (search_stub.go).
 	section := out.String()
-	sizes := searchSizesFor(cfg)
 	for _, s := range cfg.Sets {
 		if s.Find != "" {
 			section = jsSetWithBlocks(section, s.Find, sizes[s.Find].Blocks, true)
