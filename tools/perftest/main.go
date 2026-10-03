@@ -2652,6 +2652,65 @@ func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Eng
 	return before - after
 }
 
+// benchRegexSetFuel is the regex crate side of a set row in fuel: one
+// uncounted call to warm its lazy DFAs, then one metered two-pass scan through
+// regex_set_find, which carries no timing (as measFuelRegex does for a single
+// pattern). 0 when the harness cannot be run.
+func benchRegexSetFuel(sc setTestCase, input string, regexWasmBytes []byte, fuelEngine *wasmtime.Engine) uint64 {
+	mod, err := wasmtime.NewModule(fuelEngine, regexWasmBytes)
+	if err != nil {
+		return 0
+	}
+	linker := wasmtime.NewLinker(fuelEngine)
+	if err := linker.DefineWasi(); err != nil {
+		return 0
+	}
+	store := wasmtime.NewStore(fuelEngine)
+	store.SetWasi(wasmtime.NewWasiConfig())
+	if err := store.SetFuel(fuelBudget); err != nil {
+		return 0
+	}
+	inst, err := linker.Instantiate(store, mod)
+	if err != nil {
+		return 0
+	}
+	var mem *wasmtime.Memory
+	if exp := inst.GetExport(store, "memory"); exp != nil {
+		mem = exp.Memory()
+	}
+	getPatternsPtr := inst.GetFunc(store, "get_set_patterns_ptr")
+	getInputPtr := inst.GetFunc(store, "get_input_ptr")
+	setInit := inst.GetFunc(store, "regex_set_init")
+	findFn := inst.GetFunc(store, "regex_set_find")
+	if mem == nil || getPatternsPtr == nil || getInputPtr == nil || setInit == nil || findFn == nil {
+		return 0
+	}
+	patStr := strings.Join(sc.patterns, "\n")
+	patternsPtr, err := wcall(getPatternsPtr, store)
+	if err != nil {
+		return 0
+	}
+	buf := mem.UnsafeData(store)
+	copy(buf[patternsPtr.(int32):], []byte(patStr))
+	if _, err := wcall(setInit, store, int32(len(patStr))); err != nil {
+		return 0
+	}
+	inputPtr, err := wcall(getInputPtr, store)
+	if err != nil {
+		return 0
+	}
+	copy(buf[inputPtr.(int32):], []byte(input))
+	if _, err := wcall(findFn, store, int32(len(input))); err != nil {
+		return 0
+	}
+	before, _ := store.GetFuel()
+	if _, err := wcall(findFn, store, int32(len(input))); err != nil {
+		return 0
+	}
+	after, _ := store.GetFuel()
+	return before - after
+}
+
 // runSetBenchmarks runs all set composition benchmarks and prints the results.
 func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, fuelEngine *wasmtime.Engine, pct int) {
 	const setFindLabel = "set find (regexped) vs RegexSet+rescan (regex crate)"
@@ -2672,6 +2731,11 @@ func runSetBenchmarks(regexWasmBytes []byte, engine *wasmtime.Engine, fuelEngine
 			if fuelEngine != nil {
 				f := benchRegexpedSetFuel(sc, inp.value, fuelEngine)
 				fmt.Printf("    fuel consumed:  %14s\n", fmtFuel(f))
+				// On its own line: the baseline parser reads the first number
+				// of a "fuel consumed:" line as regexped's.
+				if rx := benchRegexSetFuel(sc, inp.value, regexWasmBytes, fuelEngine); rx > 0 && f > 0 {
+					fmt.Printf("    regex crate fuel: %12s  %8.2fx\n", fmtFuel(rx), float64(rx)/float64(f))
+				}
 			} else {
 				rxp := benchRegexSet(sc, inp.value, regexWasmBytes, engine, pct)
 				rped := benchRegexpedSet(sc, inp.value, engine, pct)

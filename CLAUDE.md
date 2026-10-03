@@ -22,6 +22,7 @@ When `cfg.Sets` is non-empty, `CompileFile` (in `compile/set_emit.go`) replaces 
 
 ```
 regexped/
+├── README.md                  # Project page: features, capabilities, performance, install, usage
 ├── main.go                    # CLI entry point: generate, compile, merge
 ├── config/
 │   ├── config.go              # YAML configuration parsing
@@ -591,6 +592,7 @@ regexped/
 │                              #   wrong local, module validates, from == 0 answers correctly,
 │                              #   `from` ignored for ever after) shipped twice before this
 ├── tools/
+│   ├── README.md              # What each tool checks or measures, and how to run it
 │   ├── advbench/              # Adversarial DRIVES: fuel per input doubling, ×2 linear / ×4
 │   │                          #   quadratic; `make adversary` runs rows.go's table (see Testing)
 │   ├── fuzz/                  # Correctness fuzzer and property tests: compiled WASM against Go regexp
@@ -632,6 +634,7 @@ regexped/
 │                              #   between its per-architecture builds; ci.yml passes a
 │                              #   directory, since it only wants one copy on PATH
 ├── docs/
+│   ├── README.md              # Documentation index: every doc below, grouped
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
 │   ├── go-api.md              # Generated Go API: wasip1 stubs, iter.Seq2, iter.Seq
@@ -1601,7 +1604,7 @@ Implements Laurikari's tagged DFA algorithm — a direct alternative to PikeVM o
 - **github.com/bytecodealliance/wasmtime-go** — wasmtime bindings (`tools/re2test`, `tools/likelytest`, `tools/pattest`, `tools/settest`, `tools/perftest`, `tools/setperf`, `tools/fuzz` only — not a dependency of the compiler itself)
 - **regex-automata** (Rust, `tools/perftest/regex_bench`) — the cross-engine comparison and correctness target for `tools/setperf`
 - **wasm-merge** (external, Binaryen) — `merge` under `wasm_format: module`, and `tools/perftest`
-- **wasm-tools** (external, Bytecode Alliance) — REQUIRED by `wasm_format: component` (`component/` wraps the core module with it, and a component `merge` reads each plug's exports with it); also used by several tests to validate emitted modules, where it is optional and the tests skip without it
+- **wasm-tools** (external, Bytecode Alliance; tested with 1.261.0 and 1.258.0) — REQUIRED by `wasm_format: component` (`component/` wraps the core module with it, and a component `merge` reads each plug's exports with it); also used by several tests to validate emitted modules, where it is optional and the tests skip without it
 - **wac** (external, Bytecode Alliance) — `merge` under `wasm_format: component`
 
 All three ship in the Docker image (`make docker`, fetched by
@@ -1619,9 +1622,9 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-02
+**Last Updated:** 2026-10-03
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
-**Docs:** `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
+**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.

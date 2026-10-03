@@ -99,6 +99,22 @@ pub extern "C" fn regex_bench_set_find(input_len: i32, iters: i32) {
     }
 }
 
+/// One two-pass scan, as regex_bench_set_find times it, without the timing:
+/// the fuel target, so no Instant::now cost is metered. Returns the match count.
+#[no_mangle]
+pub extern "C" fn regex_set_find(input_len: i32) -> i32 {
+    let state = SET_STATE.get().expect("set not initialised — call regex_set_init first");
+    let input = unsafe { std::str::from_utf8_unchecked(&INPUT_BUF[..input_len as usize]) };
+    let mut total: i32 = 0;
+    for pat_idx in state.set.matches(std::hint::black_box(input)).iter() {
+        for m in state.patterns[pat_idx].find_iter(input) {
+            let _ = std::hint::black_box((m.start(), m.end(), pat_idx));
+            total += 1;
+        }
+    }
+    total
+}
+
 fn main() {}
 
 /// Returns the address of the input buffer within WASM linear memory.
