@@ -121,8 +121,8 @@ type btDyn struct {
 // entry — memory is grown only when it does not already have them, so a call
 // that fits never grows after the first — and it DOUBLES when full, by growing
 // memory past its end: the stack is the last thing in memory, so growing copies
-// nothing. When memory cannot grow, the body hands over to the fallback exactly
-// as its old fixed stack did, and the fallback answers abi.BTStackOverflow when
+// nothing. When memory cannot grow, the body hands over to the fallback as any
+// overflowing stack does, and the fallback answers abi.BTStackOverflow when
 // it cannot get memory either — which is how max_memory, declared as the
 // memory's maximum, bounds a call.
 //
@@ -244,8 +244,8 @@ func emitBTGrowStackInit(b []byte, d *btDyn, giveUp func([]byte) []byte) []byte 
 // stack. It is emitBTDynPushCheck with one difference: when memory cannot grow
 // it does not leave the function but runs overflow — the ordinary body's own
 // frame-stack overflow, which hands over to the fallback. overflow is emitted
-// one block deeper than a fixed stack's guard runs it, and its branch depth
-// must count that block.
+// one block deeper than btPushFrame's own nesting, and its branch depth must
+// count that block.
 func emitBTGrowPushCheck(b []byte, d *btDyn, overflow func([]byte) []byte) []byte {
 	minPages := (d.frameSize + 0xFFFF) >> 16
 	if minPages < 1 {
@@ -706,7 +706,13 @@ func appendBTScratchExport(es []byte, sc btScratch) []byte {
 // "A host call" is an epoch: a global every exported set capability bumps on
 // entry (emitBTDrivePrologue), compared against the epoch each member's state
 // was set up in. Component adapters call those same exported functions, so
-// they bump it too.
+// they bump it too. A split set's `find` merge bumps it as well as the kept
+// body it calls, because it calls that body only when the buckets' lower bound
+// is the smallest: a split member run without a bump took the previous call's
+// scratch base, which the host may have written over and raised
+// regexped:scratch_base past since. The second bump in one call is harmless —
+// the merge runs each candidate once, and a split member's stack is dead once
+// its call returns.
 
 // btDrive names a set's call-scoped globals.
 type btDrive struct {

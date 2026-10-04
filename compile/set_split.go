@@ -945,7 +945,7 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 			base := ra.Reserve("split-bt-member", 8)
 			// Its budget lasts the member's search, across the set's calls,
 			// in the member's own block, as a pattern's find keeps it.
-			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget,
+			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget, BTStackStart: opts.BTStackStart,
 				tableMemIdx: opts.TableMemIdx, globals: opts.globals, btDrive: drive}
 			bt, err := buildBTFindParts(p.fullPattern, nil, findMandatoryLit(p.fullPattern, p.byteMode), int64(base), &o)
 			if err != nil {

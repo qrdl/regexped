@@ -343,7 +343,7 @@ func buildSetBTSuffixBody(regions *btSharedRegions,
 	b = append(b, 0x24)
 	b = utils.AppendULEB128(b, uint32(regions.winGlobal+1))
 
-	// end = bt(ptr, len, slotScratch)
+	// end = bt(ptr, len, 0): a member's body is slotless and writes no slots
 	b = call.emitCall(b, regions, btSufPtr, btSufLen, btSufEnd)
 
 	// Frame budget exhausted: the engine abandoned part of the search space and
@@ -499,9 +499,8 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			if cs.btRegions.hasDrive {
 				sc.drive = &cs.btRegions.drive
 			}
-			growth := &btGrowth{scratch: sc, start: btStackStart(0, btNoCaptureFrameSize)}
+			growth := &btGrowth{scratch: sc, start: btStackStart(cs.btStackStart, btNoCaptureFrameSize)}
 			driver, callOffs = appendBacktrackCodeEntry(nil, info.bt,
-				0, 0,
 				btNoCaptureFrameSize,
 				true, // nativeAnchored
 				tableMemIdx, cs.btRegions.winGlobal,
@@ -515,7 +514,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			// driver is patched at once. What the fallback cannot answer — memory
 			// that will not grow — comes back as abi.BTStackOverflow, which the
 			// suffix body already forwards.
-			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
+			fb, _ := appendBacktrackCodeEntry(nil, info.bt,
 				btNoCaptureFrameSize,
 				true, tableMemIdx, cs.btRegions.winGlobal, -1,
 				0, false, &cs.btRegions.scratch, member, true, nil)

@@ -94,7 +94,7 @@ const maxBTFallbackPrefixLen = 64
 // Compile return a module whose memory section was already invalid. Every
 // Backtracking frame stack now grows at call time in the run-time scratch, so
 // only the table base is left to check.
-var ErrBTStackTooLarge = errors.New("compile: backtracking stack reservation exceeds WASM's 4GiB memory limit")
+var ErrBTStackTooLarge = errors.New("compile: backtracking tables would start past WASM's 4GiB memory limit")
 
 // maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
 // section cannot declare more than 65536 pages of 65536 bytes each.
@@ -102,8 +102,9 @@ const maxWasmMemoryBytes = 1 << 32
 
 // checkBTMemoryBudget returns ErrBTStackTooLarge if base+extra bytes would
 // require declaring more linear memory than maxWasmMemoryBytes allows.
-// base is the page-aligned address the reservation starts at (btBase);
-// extra is the reservation's own size (stack, plus memo table when present).
+// base is the page-aligned address a Backtracking capture body's tables start
+// at (btBase); extra is what it reserves there — nothing since its frame stack
+// moved to the run-time scratch, so the only caller passes 0.
 func checkBTMemoryBudget(base int64, extra int64) error {
 	if base+extra > maxWasmMemoryBytes {
 		return ErrBTStackTooLarge
@@ -1131,10 +1132,10 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 			// search's memo in the host's memory (btScratch.memoInInput).
 			memo := scratch
 			memo.memoInInput = true
-			parts.memoFallback, _, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &memo, nil)
+			parts.memoFallback, _, _ = appendBTFindCodeEntry(nil, bt, btScanParams, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &memo, nil)
 			scratch.searchTwin = true
 		}
-		parts.fallback, fallbackMode, parts.memoCallOffs = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch, nil)
+		parts.fallback, fallbackMode, parts.memoCallOffs = appendBTFindCodeEntry(nil, bt, btScanParams, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch, nil)
 		if parts.memoFallback == nil {
 			parts.memoCallOffs = nil
 		}
@@ -1159,7 +1160,7 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 		parts.fast, parts.mode = stub, fallbackMode
 	} else {
 		growth := &btGrowth{scratch: o.btScratch(), start: btStackStart(o.BTStackStart, btNoCaptureFrameSize)}
-		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil, growth)
+		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil, growth)
 		if plan.fallback && mode != fallbackMode {
 			panic("compile: a Backtracking find body and its fallback read `from` differently")
 		}
@@ -1798,11 +1799,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				matchBody, matchFallbackCallOffs = btTailCallBody(2)
 			} else {
 				growth := &btGrowth{scratch: buildOpts.btScratch(), start: btStackStart(buildOpts.BTStackStart, btNoCaptureFrameSize)}
-				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, plan.k, plan.fallback, nil, growth)
+				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, btNoCaptureFrameSize, buildOpts.tableMemIdx, plan.k, plan.fallback, nil, growth)
 			}
 			if plan.fallback {
 				scratch := buildOpts.btScratch()
-				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, 0, false, &scratch, nil)
+				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, btNoCaptureFrameSize, buildOpts.tableMemIdx, 0, false, &scratch, nil)
 			}
 			matchEnd = cur
 		} else {
@@ -2688,7 +2689,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				start:   btStackStart(buildOpts.BTStackStart, int32(frameSize)),
 			}
 			bt.search = btSearchFor(&buildOpts)
-			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, false, growth)
+			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, false, growth)
 			if bt.search != nil {
 				p.btSearch, p.btSearchG = true, bt.search.g
 			}
@@ -2698,7 +2699,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// The same globals and frame layout as the fast body; its own
 			// run-time memory.
 			scratch := buildOpts.btScratch()
-			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, false, nil)
+			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, false, nil)
 		}
 	}
 
@@ -3244,26 +3245,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	if searchSetterIdx >= 0 {
 		cs = appendCodeEntry(cs, searchSetterBody(searchG))
 	}
-	out = appendSection(out, 10, cs)
-
-	// Data section: active segments targeting the correct memory index.
-	if totalSegs > 0 {
-		var ds []byte
-		if !standalone {
-			// Re-encode data segments to target memory[1] (own DFA-table memory).
-			segs := parseDataSegments(rawData)
-			ds = utils.AppendULEB128(ds, uint32(len(segs)))
-			for _, seg := range segs {
-				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
-			}
-		} else {
-			ds = utils.AppendULEB128(ds, uint32(totalSegs))
-			ds = append(ds, rawData...)
-		}
-		out = appendSection(out, 11, ds)
-	}
-
-	return out
+	return appendCodeAndData(out, cs, rawData, totalSegs, standalone)
 }
 
 // Compile compiles multiple regexp patterns to a single WASM module.

@@ -3543,6 +3543,75 @@ func TestSetBTMatchesGo(t *testing.T) {
 	}
 }
 
+// TestSetBTStackGrows: a set member's ordinary frame stack starts at
+// BTStackStart bytes and doubles when full, as a pattern's does. Built with one
+// frame to start and the work budget off — no fallback to hand over to — every
+// answer that needs a second frame comes from a stack that grew: p0 is kept on
+// a Backtracking bucket (up to 30 frames), p1 is split out onto the
+// Backtracking find (one frame per letter before `aX`). Overlapping `find`
+// with every other capability, then gated `find`, each against Go.
+func TestSetBTStackGrows(t *testing.T) {
+	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`, `zz`}
+	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
+		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
+	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {
+		t.Helper()
+		entries := make([]config.RegexEntry, len(pats))
+		names := make([]string, len(pats))
+		for i, p := range pats {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		cfg := config.BuildConfig{MaxFallbackStates: 1, Regexps: entries, Sets: []config.SetConfig{{
+			Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+			ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+			Patterns: config.PatternSelector{Names: names},
+		}}}
+		w, _, diags, err := compile.CompileFileOpts(cfg, "",
+			compile.CompileSetOptions{BTWorkBudget: compile.BTWorkBudgetOff, BTStackStart: start})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, diags
+	}
+	// The option reaches each kind of member: alone beside `zz`, each builds a
+	// different module than with the default start.
+	for _, alone := range [][]string{{pats[0], pats[2]}, {pats[1], pats[2]}} {
+		def, _ := build(t, alone, false, 0)
+		if small, _ := build(t, alone, false, 8); string(small) == string(def) {
+			t.Fatalf("%v: BTStackStart did not reach the member", alone)
+		}
+	}
+	for _, overlapping := range []bool{true, false} {
+		w, diags := build(t, pats, overlapping, 8)
+		bt := 0
+		for _, b := range diags[0].Buckets {
+			if b.Type == "bt-fallback" {
+				bt++
+			}
+		}
+		if bt == 0 || len(diags[0].SplitBacktracking) != 1 || diags[0].SplitBacktracking[0] != 1 {
+			t.Fatalf("overlapping=%v: %d Backtracking buckets, split onto Backtracking %v — the witness no longer has the shape",
+				overlapping, bt, diags[0].SplitBacktracking)
+		}
+		drops := dropsFromSet(diags)
+		for _, in := range inputs {
+			r := newCapRunnerFrom(t, w, pats, in)
+			if overlapping {
+				checkCapsAgainstOracleDropped(t, r, pats, in, drops.anchored)
+			} else {
+				got, want := driveGatedCaps(t, r, in), gatedOracle(pats, in)
+				sortMatches(got)
+				sortMatches(want)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("gated find over %.40q…: got %v, Go says %v", in, got, want)
+				}
+			}
+			r.Close()
+		}
+	}
+}
+
 // TestSetBTManyFallbackPatterns is the permanent regression for the shared-region
 // shared BT region, and it is deliberately a MULTI-pattern all-fallback set:
 // the defect it guards needs a second fallback pattern to exist at all.

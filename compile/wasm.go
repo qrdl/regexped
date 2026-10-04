@@ -2,6 +2,7 @@ package compile
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
@@ -25,6 +26,37 @@ func appendSection(out []byte, id byte, content []byte) []byte {
 	out = append(out, id)
 	out = utils.AppendULEB128(out, uint32(len(content)))
 	return append(out, content...)
+}
+
+// appendCodeAndData closes a module: the code section, then — when there are
+// data segments — the data section, re-encoded to target memory[1] in an
+// embedded build (the module's own table memory). The two are most of a large
+// module's bytes (a 339-set configuration's 69.7 MB), so out grows ONCE to
+// hold both instead of reallocating, and copying everything before it, as
+// each is appended.
+func appendCodeAndData(out, code, rawData []byte, totalSegs int, standalone bool) []byte {
+	var ds []byte
+	if totalSegs > 0 {
+		if !standalone {
+			segs := parseDataSegments(rawData)
+			// Each segment's header grows by its memory index: one byte.
+			ds = make([]byte, 0, 5+len(rawData)+len(segs))
+			ds = utils.AppendULEB128(ds, uint32(len(segs)))
+			for _, seg := range segs {
+				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
+			}
+		} else {
+			ds = make([]byte, 0, 5+len(rawData))
+			ds = utils.AppendULEB128(ds, uint32(totalSegs)) //nolint:gosec // a segment count
+			ds = append(ds, rawData...)
+		}
+	}
+	out = slices.Grow(out, 2*(1+5)+len(code)+len(ds))
+	out = appendSection(out, 10, code)
+	if totalSegs > 0 {
+		out = appendSection(out, 11, ds)
+	}
+	return out
 }
 
 // appendDataSegment appends an active data segment (type 0, memory 0) to out.

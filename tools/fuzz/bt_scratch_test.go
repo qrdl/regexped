@@ -369,6 +369,157 @@ func TestBTFallbackScratchHostWritesAboveTables(t *testing.T) {
 	}
 }
 
+// TestBTSetSplitMemberFollowsTheHostGlobal: inside a set, a Backtracking
+// body's scratch starts where the host call's earlier regions end, and the
+// module learns that a new host call began from an epoch bumped on entry. The
+// merge wrapper a split set exports as `find` did not bump it: only the kept
+// body did, and the merge calls the kept body only when its cached lower bound
+// is the smallest. Once the kept members have no match left, a call runs the
+// split member alone, finds the epoch unchanged, and puts its frame stack where
+// the PREVIOUS call's scratch began — over whatever the host has written there
+// since and declared by raising regexped:scratch_base past it.
+//
+// The host first drives the set once, so the module has grown its own default
+// search area (which raises the scratch floor past it). Then, before every call
+// of a second drive, it writes a canary over the region the module's scratch
+// began at in the previous call and raises the global past it; each call must
+// leave every such region intact.
+func TestBTSetSplitMemberFollowsTheHostGlobal(t *testing.T) {
+	// p0 runs on a Backtracking bucket and is kept (its walks are bounded);
+	// p1 is not provably linear, so it is split out onto the Backtracking find.
+	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`}
+	const input = "baX caX daX eaX faX"
+	want := regexp.MustCompile(pats[1]).FindAllStringIndex(input, -1)
+	// A batching set's `find` is a wrapper over the merged worker; it starts
+	// the host call itself.
+	for _, shape := range []struct{ overlapping, batch bool }{{false, false}, {true, false}, {false, true}} {
+		overlapping := shape.overlapping
+		var hints []string
+		if shape.batch {
+			hints = []string{"batch-find"}
+		}
+		cfg := config.BuildConfig{
+			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
+			Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+			Sets: []config.SetConfig{{Name: "s", Find: "s_find", Overlapping: overlapping, Hints: hints,
+				Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
+		}
+		w, _, diags, err := compile.CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		bt := 0
+		for _, b := range diags[0].Buckets {
+			if b.Type == "bt-fallback" {
+				bt++
+			}
+		}
+		if bt == 0 || len(diags[0].SplitBacktracking) != 1 || diags[0].SplitBacktracking[0] != 1 {
+			t.Fatalf("%+v: %d Backtracking buckets, split onto Backtracking %v — the witness no longer has the shape",
+				shape, bt, diags[0].SplitBacktracking)
+		}
+		engine, _ := sharedEngine()
+		mod, err := wasmtime.NewModule(engine, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := wasmtime.NewStore(engine)
+		store.SetEpochDeadline(1)
+		inst, err := wasmtime.NewInstance(store, mod, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mem := inst.GetExport(store, "memory").Memory()
+		global := inst.GetExport(store, abi.ScratchBaseExport).Global()
+		setGlobal := func(v int32) {
+			if err := global.Set(store, wasmtime.ValI32(v)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		growTo := func(top int32) {
+			if need := uint64((int64(top) + 65535) / 65536); need > mem.Size(store) {
+				if _, err := mem.Grow(store, need-mem.Size(store)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		// The input, then a page holding the gate array, descriptor and out
+		// buffer: above the tables, where the JS/TS stubs write.
+		inBase := int32(mem.Size(store) * 65536)
+		gatePtr := inBase + 65536
+		descPtr := gatePtr + 1024
+		outPtr := gatePtr + 4096
+		growTo(gatePtr + 65536)
+		copy(mem.UnsafeData(store)[inBase:], input)
+		fn := inst.GetFunc(store, "s_find")
+		// drive runs one drive; before call k it calls before(k).
+		drive := func(before func(call int)) [][]int {
+			buf := mem.UnsafeData(store)
+			for i := gatePtr; i < descPtr; i++ {
+				buf[i] = 0
+			}
+			abi.WriteFindScratch(buf, descPtr, gatePtr, 0, 0)
+			var got [][]int
+			from := int32(0)
+			for call := 0; call <= len(want); call++ {
+				before(call)
+				res, err := fn.Call(store, inBase, int32(len(input)), from, descPtr, outPtr, int32(2))
+				if err != nil {
+					t.Fatalf("%+v: find(from=%d): %v", shape, from, err)
+				}
+				if res.(int32) <= 0 {
+					break
+				}
+				buf = mem.UnsafeData(store)
+				start := le32(buf[outPtr+4:])
+				got = append(got, []int{int(start), int(le32(buf[outPtr+8:]))})
+				from = start + 1
+			}
+			return got
+		}
+		setGlobal(gatePtr + 65536)
+		drive(func(int) {})
+		const regionLen = 256 * 1024
+		base0 := int32(mem.Size(store) * 65536)
+		region := func(k int) int32 { return base0 + int32(k)*regionLen }
+		check := func(upTo int) {
+			buf := mem.UnsafeData(store)
+			for k := 0; k < upTo; k++ {
+				for i := region(k); i < region(k+1); i++ {
+					if buf[i] != 0xA5 {
+						t.Fatalf("%+v: a call wrote the host's region %d at %#x, below scratch_base %#x",
+							shape, k, i, region(upTo))
+					}
+				}
+			}
+		}
+		got := drive(func(call int) {
+			check(call - 1) // what the calls so far had canaried
+			if call > 0 {
+				// The host has written the region the previous call's scratch
+				// began at, and declares it in use.
+				growTo(region(call))
+				buf := mem.UnsafeData(store)
+				for i := region(call - 1); i < region(call); i++ {
+					buf[i] = 0xA5
+				}
+			}
+			setGlobal(region(call))
+		})
+		check(len(got))
+		if len(got) != len(want) {
+			t.Fatalf("%+v: matches %v, Go says %v", shape, got, want)
+		}
+		for i := range want {
+			if got[i][0] != want[i][0] || got[i][1] != want[i][1] {
+				t.Fatalf("%+v: matches %v, Go says %v", shape, got, want)
+			}
+		}
+		store.Close()
+		mod.Close()
+	}
+}
+
 // TestBTFallbackScratchEmbedded runs the embedded module shape: input in the
 // host's memory, the fallback's scratch in the module's own.
 func TestBTFallbackScratchEmbedded(t *testing.T) {

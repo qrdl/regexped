@@ -235,9 +235,11 @@ type compiledSet struct {
 	tableMemIdx int
 	btFnBodies  [][]byte
 	btRegions   *btSharedRegions
-	// btWorkBudget is CompileSetOptions.BTWorkBudget, kept for buildBTBodies,
-	// which builds the drivers at assembly time when the options are gone.
+	// btWorkBudget and btStackStart are CompileSetOptions.BTWorkBudget and
+	// BTStackStart, kept for buildBTBodies, which builds the drivers at
+	// assembly time when the options are gone.
 	btWorkBudget int
+	btStackStart int
 
 	// prefixFnBodies[i] is the body for the i-th unique prefix DFA (backward scan).
 	// Signature: (ptr i32, scan_end i32) → i32  (type 0)
@@ -1602,6 +1604,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		mergeState:          -1,
 		btBlocksG:           btBlocksG,
 		btWorkBudget:        opts.BTWorkBudget,
+		btStackStart:        opts.BTStackStart,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
 		prefixFnBodies:      prefixFnBodies,
@@ -2075,7 +2078,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			MaxTDFARegs:               cfg.MaxTDFARegs,
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
-			BTWorkBudget:              over.BTWorkBudget, // test-only override, as below
+			BTWorkBudget:              over.BTWorkBudget, // test-only overrides, as below
+			BTStackStart:              over.BTStackStart,
 			searchSizes:               over.searchSizes,
 			Component:                 comp.Component,
 			ComponentPackage:          comp.ComponentPackage,
@@ -2094,8 +2098,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
 		Report:       rep,
-		// Test-only override (CompileFileOpts); zero everywhere else.
+		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		BTWorkBudget: over.BTWorkBudget,
+		BTStackStart: over.BTStackStart,
 	}
 	if !standalone {
 		opts.tableMemIdx = 1
@@ -3048,7 +3053,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			switch {
 			case c.kind == capFind && cs.mergedCap(c.kind):
-				cs_bytes = append(cs_bytes, cs.withDefault(emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev, false), c.kind)...)
+				body := emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev, false)
+				if cs.btRegions != nil && cs.btRegions.hasDrive {
+					// The merge calls the kept body only when its lower bound
+					// is the smallest (with a kept-members set, never), so a
+					// call can run a split member alone: the merge starts the
+					// host call itself. The scan merge calls the kept body
+					// first on every call and needs no bump of its own.
+					body = injectBTDrivePrologue(body, cs.btRegions.drive, nil)
+				}
+				cs_bytes = append(cs_bytes, cs.withDefault(body, c.kind)...)
 			case cs.mergedCap(c.kind):
 				cs_bytes = append(cs_bytes, emitSplitScanBody(cs, c.kind, keptIdx(c.kind), splitFwd)...)
 			case cs.scanUnionDirect && (c.kind == capScanAny || c.kind == capScanAll):
@@ -3171,25 +3185,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	if searchSetterIdx >= 0 {
 		cs_bytes = appendCodeEntry(cs_bytes, searchSetterBody(searchG))
 	}
-	out = appendSection(out, 10, cs_bytes)
-
-	// Data section.
-	if totalSegs > 0 {
-		var ds []byte
-		if !standalone {
-			segs := parseDataSegments(rawData)
-			ds = utils.AppendULEB128(ds, uint32(len(segs)))
-			for _, seg := range segs {
-				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
-			}
-		} else {
-			ds = utils.AppendULEB128(ds, uint32(totalSegs))
-			ds = append(ds, rawData...)
-		}
-		out = appendSection(out, 11, ds)
-	}
-
-	return out
+	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone)
 }
 
 // rebuildSetMatchBody re-emits the set match function with correct function indices.
@@ -5142,6 +5138,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
 		BTWorkBudget:  over.BTWorkBudget,
+		BTStackStart:  over.BTStackStart,
 		// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
 		ForceFrontend: over.ForceFrontend,
 		forceFrontend: over.forceFrontend,

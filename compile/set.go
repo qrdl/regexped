@@ -708,6 +708,13 @@ type CompileSetOptions struct {
 	// fallback buckets. Same values, same meaning; zero is the default budget.
 	BTWorkBudget int
 
+	// BTStackStart is CompileOptions.BTStackStart for the set's Backtracking
+	// members, bucket and split alike: the bytes an ordinary body's frame stack
+	// starts with. TEST-ONLY, as there: a test shrinks it so a short input
+	// reaches the stack's growth, which the 64 KB default leaves to searches
+	// more than 8,192 frames deep. Zero is the default.
+	BTStackStart int
+
 	// globals is the MODULE's global allocator, shared with every pattern and
 	// every other set in the same compile. A set reaches for it when a bucket
 	// wants module-scoped state — today only the sparse member skip's

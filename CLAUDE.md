@@ -98,7 +98,11 @@ regexped/
 │   │                          #   module any more; it was numAlts × 4,096 frames PER SET, 596 of a
 │   │                          #   339-set WAF module's 643 MB before its first call. Inside a set the
 │   │                          #   stack starts above the member memos placed in the current host call
-│   │                          #   (btScratch.drive), split members' bodies included. A set member's
+│   │                          #   (btScratch.drive), split members' bodies included. A host call is
+│   │                          #   an EPOCH every exported set entry bumps — a split set's `find`
+│   │                          #   merge too, not only the kept body it may never call: a split member
+│   │                          #   run without a bump took the previous call's base, over what the host
+│   │                          #   had written since (4 instructions per call). A set member's
 │   │                          #   body is SLOTLESS: it wrote group 0 to a table address through
 │   │                          #   memory 0 — in an embedded build the HOST's (8 bytes per match)
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
@@ -1081,7 +1085,7 @@ with its memoised FALLBACK body answering every call alone
 (`compile.BTWorkBudgetForceFallback`) and makes any `-2` a failure, sets
 included. That body otherwise answers every call only for a program with a
 zero-width cycle, which gets no ordinary body; for any other program it runs
-only after a work budget trips or a fast body's static stack or memo runs out,
+only after a work budget trips or a fast body's stack cannot grow,
 which the corpus reaches a handful of times. Its memory is sized at call time, so the corpus and benchmark harnesses
 (re2test, perftest, likelytest, pattest, settest, setperf) and `tools/fuzz`'s run
 helpers set a standalone module's exported `regexped:scratch_base` global to the
@@ -1630,7 +1634,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-03
+**Last Updated:** 2026-10-04
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
