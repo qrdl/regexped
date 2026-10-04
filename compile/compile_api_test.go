@@ -1578,7 +1578,9 @@ func TestBTWorkBudgetRejectsUnnamedNegative(t *testing.T) {
 //   - the limit is 127 by default and 0xFF under byte_mode;
 //   - runes above 0xFF are rejected in both modes, since no byte holds one;
 //   - case-fold artifacts of ASCII, and a range whose top endpoint is
-//     U+10FFFF, name no member above the limit and stay legal.
+//     U+10FFFF, name no member above the limit and stay legal — including a
+//     negated class whose tail (?i) cut holes into at those artifacts, and
+//     adjacent artifacts the parser merged into one range.
 func TestUnsupportedRuneRejection(t *testing.T) {
 	cases := []struct {
 		pattern              string
@@ -1613,6 +1615,32 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`a.c`, false, false, "dot is one byte, declared byte semantics"},
 		{`[a-z]+`, false, false, "plain ASCII"},
 		{`\w+`, false, false, "plain ASCII class"},
+
+		// (?i) over a NEGATED class: the parser leaves HOLES at U+017F and
+		// U+212A (the artifacts of s and k), so the class arrives as
+		// [\x7b-\x{17e}] [\x{180}-\x{2129}] [\x{212b}-\x{10ffff}] — no single
+		// range reaches U+10FFFF from below the limit, and none is one rune.
+		// Every one of these was refused, with a message pointing at byte_mode.
+		{`(?i)[^a-z]+`, false, false, "holes at the fold artifacts of s and k"},
+		{`(?i)\W+`, false, false, "\\W is a negated class; the same holes"},
+		{`(?i)[^0-9A-Z_a-z]+`, false, false, "\\W spelled out"},
+		{`(?i:[^k])`, false, false, "one hole, at U+212A"},
+		{`(?i)[^s]x`, false, false, "one hole, at U+017F"},
+		// Under byte_mode, (?i) over Latin-1 adds U+212B (Å, the Angstrom sign,
+		// from å) next to U+212A (from k): the parser MERGES them into one
+		// two-rune range, which the single-rune fold check did not cover.
+		{`(?i)[A-Z_a-z\x7f-\xff]+`, true, false, "adjacent artifacts U+212A..U+212B merged into one range"},
+		{`(?i)[\x7f-\xff]+`, true, false, "the Latin-1 range alone"},
+		{`(?i)[^\xe0-\xfe]`, true, false, "a hole at U+212B, an artifact of å"},
+		// Byte mode leaves out exactly the high bytes: the tail starts at
+		// U+0100, the first rune no byte holds, so nothing above 0xFF is left
+		// out. Refused before the hole rule; the ASCII bytes are what it means.
+		{`[^\x80-\xff]`, true, false, "byte mode: the complement of the high bytes is the ASCII bytes"},
+		// A rune the pattern WROTE stays refused, negated or not: the hole is
+		// only an artifact when every member of its fold orbit is excluded too.
+		{`[^ſ]`, true, true, "hand-written ſ: s and S are still IN the class"},
+		{`[^\x{212A}]`, true, true, "hand-written Kelvin sign: k and K still in the class"},
+		{`(?i)[^a-z\x{100}]`, true, true, "U+0100 has no fold partner below the limit"},
 	}
 
 	compileWith := func(pattern string, byteMode bool) error {
@@ -3151,10 +3179,10 @@ func TestSetSplitPaths(t *testing.T) {
 		// The start-anywhere automaton is over the state limit (2^12 states
 		// from [ab]{11}), so the member is split onto the Backtracking find;
 		// `(?:a|)+` is a cycle that consumes nothing, so that find is the
-		// fallback body alone and reserves no frame stack of its own.
+		// fallback body alone.
 		pat := `(?:a|)+a[ab]{11}c[a-z]*X`
-		if size, ok := btFindStackSize(pat, 0); !ok || size != 0 {
-			t.Fatalf("btFindStackSize = %d, %v; want 0, true (the bare tail call)", size, ok)
+		if !btFindBuildable(pat) {
+			t.Fatal("btFindBuildable = false; want the Backtracking find to take it")
 		}
 		wasm, _, d, err := CompileFileDiag(config.BuildConfig{
 			Regexps: []config.RegexEntry{{Name: "z", Pattern: pat}},

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -816,6 +817,12 @@ func btMemoCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs 
 	if fn == nil {
 		t.Fatalf("module has no %q export", export)
 	}
+	// Input and output lie below the tables, so every call's scratch may start
+	// at them — the protocol every harness follows. Left at 0, each of a batch
+	// export's internal calls would take fresh pages.
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		t.Fatal(err)
+	}
 	buf := mem.UnsafeData(store)
 	if len(input) > int(pathsOutBase-pathsInputBase) {
 		t.Fatalf("input of %d bytes runs into the output window at %d", len(input), pathsOutBase)
@@ -1080,10 +1087,11 @@ func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs .
 // stack grows with the input, so the same blown input must then get the real
 // answer (wantBlown). Both builds are driven.
 //
-// A CAPTURE body has no compile-time ceiling any more: its ordinary stack
-// grows with the search too, and the only ceiling left is memory. So the
-// groups rows put it there, with max_memory (btCaptureCap), and blow it with
-// an input whose stack needs far more.
+// No body has a compile-time ceiling any more: every ordinary stack grows with
+// the search, and the only ceiling left is memory. So every row puts it there,
+// with max_memory — btCaptureCap for the capture rows, capPagesAbove pages
+// above the module's own size for the others — and blows it with an input
+// whose stack needs far more.
 func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	if eng, err := compile.SelectEngine(btCapturePattern, compile.CompileOptions{}); err != nil {
 		t.Fatalf("SelectEngine: %v", err)
@@ -1113,6 +1121,9 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		wantBlown int64  // its answer once the fallback takes the call
 		offOpts   []compile.CompileOptions
 		numCaps   int
+		// capPagesAbove, when > 0, caps the budget-off build at this many
+		// pages above the module's own size.
+		capPagesAbove uint64
 	}{
 		{
 			name:      "groups",
@@ -1138,39 +1149,42 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			offOpts:   []compile.CompileOptions{cappedOff},
 		},
 		{
-			name:      "match",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, MatchFunc: "match"},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "match",
-			ok:        noCapIn(4000),
-			wantOK:    8006,
-			blown:     noCapIn(8192),
-			wantBlown: 16390,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "match",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, MatchFunc: "match"},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "match",
+			ok:            noCapIn(4000),
+			wantOK:        8006,
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     2*btNoCaptureBlown + 6,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 		{
-			name:      "find",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "find",
-			extra:     []int32{0}, // `from` — find is (ptr, len, from)
-			ok:        noCapIn(4000),
-			wantOK:    8006, // packed 0<<32|8006
-			blown:     noCapIn(8192),
-			wantBlown: 16390,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "find",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "find",
+			extra:         []int32{0}, // `from` — find is (ptr, len, from)
+			ok:            noCapIn(4000),
+			wantOK:        8006, // packed 0<<32|8006
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     2*btNoCaptureBlown + 6,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 		{
-			name:      "find_batch",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "find_batch",
-			extra:     []int32{pathsOutBase, 16, 0},
-			ok:        noCapIn(4000),
-			wantOK:    1,
-			blown:     noCapIn(8192),
-			wantBlown: 1,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "find_batch",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "find_batch",
+			extra:         []int32{pathsOutBase, 16, 0},
+			ok:            noCapIn(4000),
+			wantOK:        1,
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     1,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 	}
 
@@ -1179,6 +1193,22 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			w, _, err := compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, tc.offOpts...)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
+			}
+			if tc.capPagesAbove > 0 {
+				store, _, mem, release, ierr := instantiate(w)
+				if ierr != nil {
+					t.Fatalf("instantiate: %v", ierr)
+				}
+				pages := mem.Size(store)
+				release()
+				capped := tc.offOpts[0]
+				capped.MaxMemory, err = config.ParseMemorySize(strconv.FormatUint((pages+tc.capPagesAbove)*65536, 10))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if w, _, err = compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, capped); err != nil {
+					t.Fatalf("compile (capped): %v", err)
+				}
 			}
 
 			// Both inputs genuinely match, so NoMatch is the wrong answer for
@@ -1219,6 +1249,18 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		})
 	}
 }
+
+// btNoCaptureBlown is an iteration count whose btNoCapturePattern search needs
+// far more stack than btNoCaptureCapPages leave: one live 8-byte frame per
+// iteration, 480 KB, against 256 KB — which the stack shares with the default
+// search state a standalone module grows for a caller that hands none over (the
+// batch row needs it: two pages were too few). noCapIn(4000) needs 32 KB and
+// fits the stack's 64 KB start. Its input, 120,006 bytes, stays below
+// pathsOutBase.
+const (
+	btNoCaptureBlown    = 60000
+	btNoCaptureCapPages = 4
+)
 
 // btCaptureBlown is an input length whose btCapturePattern search needs far
 // more stack than btCaptureCap leaves: one live 32-byte frame per byte, 3.2 MB,

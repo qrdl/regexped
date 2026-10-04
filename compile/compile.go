@@ -86,19 +86,14 @@ const maxBTFallbackInstructions = 20000
 // prefix.
 const maxBTFallbackPrefixLen = 64
 
-// ErrBTStackTooLarge is returned whenever the Backtracking engine's stack
-// reservation (btAllocSizes' stackSize, or the capture-tracking path's
-// equivalent inline computation) would push the module's own linear memory
-// requirement past what WASM32 can declare (65536 pages × 64KiB = 4GiB).
-// stackSize scales with bt.numAlts and the capture count, both of which grow
-// with ordinary pattern structure (repeated groups, alternations) rather than
-// anything pathological — an unremarkable-looking
-// bounded-repeat pattern can cross this ceiling well within this project's
-// normal pattern-size range. Without this check, Compile silently returns a
-// WASM module whose memory section is already invalid: it fails at
-// wasmtime.NewModule/instantiation time with a generic "memory size must be
-// at most 0x10000 pages" error instead of failing compilation with a clear,
-// attributable error.
+// ErrBTStackTooLarge is returned when a Backtracking capture body's tables
+// would start past what WASM32 can declare (65536 pages × 64KiB = 4GiB).
+// Backtracking frame stacks used to be RESERVED in the tables — numAlts × 4,096
+// frames, which an unremarkable bounded-repeat pattern could push past the
+// ceiling — and this error attributed that to the pattern instead of letting
+// Compile return a module whose memory section was already invalid. Every
+// Backtracking frame stack now grows at call time in the run-time scratch, so
+// only the table base is left to check.
 var ErrBTStackTooLarge = errors.New("compile: backtracking stack reservation exceeds WASM's 4GiB memory limit")
 
 // maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
@@ -329,7 +324,7 @@ type CompileOptions struct {
 	// existed; BTWorkBudgetForceFallback → the fallback answers every call.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTWorkBudget int
-	// BTStackStart is how many bytes a Backtracking CAPTURE body's frame stack
+	// BTStackStart is how many bytes a Backtracking body's frame stack
 	// is given when a call starts, before it first doubles; 0 means
 	// defaultBTStackStart. The stack lives in the run-time scratch region, not
 	// in the module's tables, so this is claimed per call and only where memory
@@ -363,17 +358,26 @@ type CompileOptions struct {
 	// searchSizes, when non-nil, receives each export's SearchSize: what a
 	// generated stub allocates for its searches (SearchSizes).
 	searchSizes map[string]SearchSize
+
+	// btDrive is the set's call-scoped Backtracking state when this pattern is
+	// a SPLIT member of a set whose bucket members keep fallback regions for
+	// the host call: its bodies' scratch starts above them (btScratch.drive).
+	btDrive *btDrive
 }
 
-// btScratch returns the module's Backtracking fallback-scratch globals. A
-// fallback body reads them on every call that reaches it, so unlike the capture
-// channel it has no global-free form to degrade to: a nil allocator here is a
-// caller that compiles a fallback without assembling a module, which is a bug.
+// btScratch returns the module's Backtracking scratch globals, which every
+// Backtracking body's run-time memory is found through — a fallback's region
+// and an ordinary body's growing frame stack. Read on every call that reaches
+// such a body, so unlike the capture channel it has no global-free form to
+// degrade to: a nil allocator here is a caller that compiles one without
+// assembling a module, which is a bug.
 func (o *CompileOptions) btScratch() btScratch {
 	if o.globals == nil {
-		panic("compile: a Backtracking fallback body needs the module's global allocator")
+		panic("compile: a Backtracking body needs the module's global allocator")
 	}
-	return o.globals.BTScratch()
+	sc := o.globals.BTScratch()
+	sc.drive = o.btDrive
+	return sc
 }
 
 // compiledPattern holds the intermediate compilation result for one RegexEntry.
@@ -1061,10 +1065,10 @@ type btFindParts struct {
 // pattern whose DFA is too large gets, and what a start-anywhere switch hands
 // over to when the start-anywhere find cannot be built. table is the
 // pattern's (large) find DFA when one was built, for its literal prefix; nil
-// otherwise. stack, when non-nil, is the frame stack [base, limit) to use
-// instead of one placed above the tables — how a set's Backtracking members,
-// which never run at the same time, share one (btFindStackSize sizes it).
-func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions, stack *[2]int32) (btFindParts, error) {
+// otherwise. Its frame stack is not laid out here: the ordinary body places a
+// growing one at call time through the scratch globals (btGrowth), and a set's
+// split member hands those globals the set's drive (CompileOptions.btDrive).
+func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions) (btFindParts, error) {
 	var parts btFindParts
 	btProg := compileBTProg(pattern)
 	if len(btProg.Inst) > maxBTFallbackInstructions {
@@ -1114,29 +1118,11 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 		btScanParams.LikelyNoMatch = o.LikelyMode == LikelyNoMatch
 	}
 	parts.data, parts.segs = btScanDataBytes, btScanSegCnt
-	// Allocate BT stack after SIMD tables.
-	btBase := utils.PageAlign(cur + int64(len(btScanDataBytes)))
-	// As on the Backtracking match path: the fallback reserves nothing, and
-	// nor does a fast body that is the bare tail call.
+	// Nothing is reserved above the scan tables: the ordinary body's frame
+	// stack grows at call time, and the fallback's region is sized then too.
+	btBase := cur + int64(len(btScanDataBytes))
 	plan := planBT(bt, o.BTWorkBudget)
 	bt.search = btSearchFor(o)
-	btStackSize := btAllocSizes(bt)
-	if plan.force {
-		btStackSize = 0
-	}
-	if stack != nil {
-		if int(stack[1]-stack[0]) < btStackSize {
-			panic("compile: a shared Backtracking stack smaller than a member's")
-		}
-		btBase, btStackSize = cur+int64(len(btScanDataBytes)), 0
-	} else if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
-		return parts, err
-	}
-	btStackBase := int32(btBase)
-	btStackLimit := btStackBase + int32(btStackSize)
-	if stack != nil {
-		btStackBase, btStackLimit = stack[0], stack[1]
-	}
 	var fallbackMode findFromMode
 	if plan.fallback {
 		scratch := o.btScratch()
@@ -1145,10 +1131,10 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 			// search's memo in the host's memory (btScratch.memoInInput).
 			memo := scratch
 			memo.memoInInput = true
-			parts.memoFallback, _, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &memo)
+			parts.memoFallback, _, _ = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &memo, nil)
 			scratch.searchTwin = true
 		}
-		parts.fallback, fallbackMode, parts.memoCallOffs = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch)
+		parts.fallback, fallbackMode, parts.memoCallOffs = appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, 0, false, &scratch, nil)
 		if parts.memoFallback == nil {
 			parts.memoCallOffs = nil
 		}
@@ -1172,17 +1158,15 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 		stub, parts.callOffs = btTailCallBodySearch(2, stubSearch)
 		parts.fast, parts.mode = stub, fallbackMode
 	} else {
-		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, btStackBase, btStackLimit, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil)
+		growth := &btGrowth{scratch: o.btScratch(), start: btStackStart(o.BTStackStart, btNoCaptureFrameSize)}
+		fast, mode, offs := appendBTFindCodeEntry(nil, bt, btScanParams, 0, 0, btNoCaptureFrameSize, btMandLit, o.tableMemIdx, plan.k, plan.fallback, nil, growth)
 		if plan.fallback && mode != fallbackMode {
 			panic("compile: a Backtracking find body and its fallback read `from` differently")
 		}
 		parts.fast, parts.mode = fast, mode
 		parts.callOffs = offs
 	}
-	parts.end = utils.PageAlign(btBase + int64(btStackSize))
-	if stack != nil {
-		parts.end = btBase
-	}
+	parts.end = btBase
 	if bt.search != nil {
 		parts.search, parts.searchG = true, bt.search.g
 		// Every output kind: an embedded build keeps it through its second
@@ -1216,20 +1200,11 @@ func appendBTFindParts(cs []byte, fast []byte, parts btFindParts, fastIdx int) [
 	return append(cs, parts.memoFallback...)
 }
 
-// btFindStackSize is the frame stack buildBTFindParts gives pattern's find:
-// none when its ordinary body is the bare tail call to the fallback, whose
-// stack is run-time scratch. ok is false when Backtracking cannot take it.
-func btFindStackSize(pattern string, budget int) (size int, ok bool) {
-	prog := compileBTProg(pattern)
-	if len(prog.Inst) > maxBTFallbackInstructions {
-		return 0, false
-	}
-	bt := newBacktrack(prog)
-	bt.numGroups = 0
-	if planBT(bt, budget).force {
-		return 0, true
-	}
-	return btAllocSizes(bt), true
+// btFindBuildable reports whether Backtracking can take pattern's find at all:
+// its program fits maxBTFallbackInstructions. Nothing else is sized at compile
+// time — the find's frame stack grows at call time.
+func btFindBuildable(pattern string) bool {
+	return len(compileBTProg(pattern).Inst) <= maxBTFallbackInstructions
 }
 
 // appendMatchBodies appends matchBody and its fallback, if any; matchFuncIdx is
@@ -1815,30 +1790,21 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
-			// The fallback's memo and stack are sized at call time
-			// (bt_scratch.go), so only the fast body's stack is reserved —
-			// and nothing at all when the fast body is the bare tail call.
+			// Nothing is reserved: the fast body's frame stack grows at call
+			// time (btGrowth) and the fallback's memo and stack are sized then
+			// too (bt_scratch.go), through the same scratch globals.
 			plan := planBT(bt, buildOpts.BTWorkBudget)
-			btBase := utils.PageAlign(cur)
-			btStackSize := btAllocSizes(bt)
-			if plan.force {
-				btStackSize = 0
-			}
-			if err := checkBTMemoryBudget(btBase, int64(btStackSize)); err != nil {
-				return nil, err
-			}
-			btStackBase := int32(btBase)
-			btStackLimit := btStackBase + int32(btStackSize)
 			if plan.force {
 				matchBody, matchFallbackCallOffs = btTailCallBody(2)
 			} else {
-				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, btStackBase, btStackLimit, btNoCaptureFrameSize, buildOpts.tableMemIdx, plan.k, plan.fallback, nil)
+				growth := &btGrowth{scratch: buildOpts.btScratch(), start: btStackStart(buildOpts.BTStackStart, btNoCaptureFrameSize)}
+				matchBody, matchFallbackCallOffs = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, plan.k, plan.fallback, nil, growth)
 			}
 			if plan.fallback {
 				scratch := buildOpts.btScratch()
-				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, 0, false, &scratch)
+				matchFallbackBody, _ = appendBTMatchCodeEntry(nil, bt, 0, 0, btNoCaptureFrameSize, buildOpts.tableMemIdx, 0, false, &scratch, nil)
 			}
-			matchEnd = btBase + int64(btStackSize)
+			matchEnd = cur
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
 				t:                    llTable,
@@ -2076,7 +2042,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if needFindBody {
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
-			parts, err := buildBTFindParts(re.Pattern, table, patMandLit, cur, &buildOpts, nil)
+			parts, err := buildBTFindParts(re.Pattern, table, patMandLit, cur, &buildOpts)
 			if err != nil {
 				return nil, err
 			}
@@ -2722,7 +2688,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				start:   btStackStart(buildOpts.BTStackStart, int32(frameSize)),
 			}
 			bt.search = btSearchFor(&buildOpts)
-			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, growth)
+			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, false, growth)
 			if bt.search != nil {
 				p.btSearch, p.btSearchG = true, bt.search.g
 			}
@@ -2732,7 +2698,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// The same globals and frame layout as the fast body; its own
 			// run-time memory.
 			scratch := buildOpts.btScratch()
-			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, nil)
+			p.captureFallbackBody, _ = appendBacktrackCodeEntry(nil, bt, 0, 0, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), 0, false, &scratch, nil, false, nil)
 		}
 	}
 
@@ -3840,6 +3806,20 @@ const maxUnicodeRune = 0x10ffff
 //     keeping `(?i:[a-z]+)`, since both are an ASCII rune whose fold orbit
 //     leaves the byte range. Declared byte semantics, alongside `.`.
 //
+//   - **The same artifacts as HOLES in a negated class.** Go complements a
+//     class after expanding `(?i)`, so `(?i)[^a-z]` (and `(?i)\W`) arrives as
+//     `[\x7b-\x{17e}]`, `[\x{180}-\x{2129}]`, `[\x{212b}-\x{10ffff}]`: the
+//     tail is cut at exactly the runes the expansion manufactured. A class
+//     reaching U+10FFFF from at or below the limit is therefore still the
+//     open-ended tail when every rune ABOVE the limit it leaves out is an
+//     artifact whose whole fold orbit is left out too (foldArtifactHole). A
+//     hand-written `[^ſ]` leaves ſ out but keeps s and S, and stays refused.
+//
+//   - **Adjacent artifacts merged into one range.** Under byte_mode, `(?i)`
+//     over Latin-1 adds U+212B (Å, the Angstrom sign, from å) beside U+212A
+//     (from k), and the parser merges the two into one range — each rune of a
+//     short range is checked, not only a range of one.
+//
 // What IS rejected is a rune NAMED AS A MEMBER above the mode's limit —
 // `[a-zé]+`, `\pL+`, `[a\x80]+` outside byte mode, `[sſ]` in either — and
 // anything above U+00FF in either mode. "Named as a member" rather than
@@ -3856,6 +3836,12 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 		if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
 			continue
 		}
+		if r, tail := openTailRune(inst, limit); tail {
+			if r >= 0 {
+				return r
+			}
+			continue
+		}
 		for j := 0; j < len(inst.Rune); j += 2 {
 			lo := inst.Rune[j]
 			hi := lo
@@ -3865,10 +3851,7 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 			if hi <= limit {
 				continue
 			}
-			if hi == maxUnicodeRune && lo <= limit {
-				continue // open-ended tail of a negated class
-			}
-			if lo == hi && foldArtifactOf(lo, inst, limit) {
+			if lo > limit && hi-lo < maxFoldArtifactRun && allFoldArtifacts(lo, hi, inst, limit) {
 				continue
 			}
 			if lo > limit {
@@ -3878,6 +3861,71 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 		}
 	}
 	return -1
+}
+
+// maxFoldArtifactRun bounds how many consecutive runes above the limit a class
+// may name, or leave out, as fold artifacts. The real ones come in ones and
+// twos (U+017F; U+212A..U+212B); anything longer was written by the pattern.
+const maxFoldArtifactRun = 8
+
+// openTailRune decides an instruction whose last range reaches U+10FFFF from at
+// or below the limit — a negated class, or its explicit `[a-\x{10ffff}]`
+// spelling. tail is false for any other instruction. For one that is, r is -1
+// when every rune above the limit it LEAVES OUT is a fold-artifact hole, and
+// otherwise the first rune it leaves out that is not.
+func openTailRune(inst *syntax.Inst, limit rune) (r rune, tail bool) {
+	n := len(inst.Rune)
+	if n < 2 || n%2 != 0 || inst.Rune[n-1] != maxUnicodeRune || inst.Rune[0] > limit {
+		return -1, false
+	}
+	next := limit + 1 // the lowest rune above the limit not yet accounted for
+	for j := 0; j < n; j += 2 {
+		lo, hi := inst.Rune[j], inst.Rune[j+1]
+		if hi < next {
+			continue
+		}
+		if lo > next {
+			if lo-next >= maxFoldArtifactRun {
+				return next, true
+			}
+			for g := next; g < lo; g++ {
+				if !foldArtifactHole(g, inst, limit) {
+					return g, true
+				}
+			}
+		}
+		next = hi + 1
+	}
+	return -1, true
+}
+
+// foldArtifactHole reports whether r — a rune above the limit that inst leaves
+// OUT — is a hole `(?i)` cut into a negated class: its fold orbit reaches the
+// limit, and inst leaves out every member of it, as negating an expanded class
+// does. `[^ſ]` leaves ſ out but keeps s and S, so it is not one.
+func foldArtifactHole(r rune, inst *syntax.Inst, limit rune) bool {
+	inRange := false
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if instNamesRune(inst, f) {
+			return false
+		}
+		if f >= 0 && f <= limit {
+			inRange = true
+		}
+	}
+	return inRange
+}
+
+// allFoldArtifacts reports whether every rune in lo..hi is a fold artifact of
+// inst (foldArtifactOf) — a range of more than one when the parser merged
+// adjacent artifacts, as it does with U+212A and U+212B.
+func allFoldArtifacts(lo, hi rune, inst *syntax.Inst, limit rune) bool {
+	for r := lo; r <= hi; r++ {
+		if !foldArtifactOf(r, inst, limit) {
+			return false
+		}
+	}
+	return true
 }
 
 // foldArtifactOf reports whether r — a single rune above the byte limit — was

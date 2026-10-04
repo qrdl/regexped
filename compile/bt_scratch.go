@@ -98,14 +98,21 @@ type btDyn struct {
 	search *btSearch
 }
 
-// ── The ordinary capture body's frame stack ─────────────────────────────────
+// ── The ordinary body's frame stack ─────────────────────────────────────────
 //
-// A Backtracking CAPTURE body's ordinary frame stack used to be reserved in the
+// A Backtracking body's ordinary frame stack used to be reserved in the
 // module's tables: numAlts × 4,096 frames, worked out from the pattern at
 // compile time and claimed when the module loaded, whatever the input — 210 MB
-// for a pattern with 1,602 branches, 10 bytes of input or not. It was only ever
-// a speed cushion, since a search that ran out of it handed over to the
-// fallback.
+// for a capture pattern with 1,602 branches, 10 bytes of input or not, and in a
+// set one stack PER SET: 596 of the 643 MB a 339-set WAF module claimed before
+// its first call. It was only ever a speed cushion, since a search that ran out
+// of it handed over to the fallback. Every ordinary body — capture, match, find
+// and a set member's — now takes it at call time as below.
+//
+// Inside a set, a member's FALLBACK region outlives its call (btDriveMember),
+// so a stack run from the set starts above every region placed in the current
+// host call: the scratch it is handed carries the set's drive
+// (btScratch.drive).
 //
 // So the stack is placed at CALL time through the same scratch arrangement as
 // the fallback's region (emitBTScratchBase), which is what keeps every stub
@@ -125,7 +132,7 @@ type btDyn struct {
 // defaultBTStackStart is CompileOptions.BTStackStart's default: one page.
 const defaultBTStackStart = 64 << 10
 
-// btGrowth asks an ordinary capture body for the growing frame stack above.
+// btGrowth asks an ordinary body for the growing frame stack above.
 type btGrowth struct {
 	scratch btScratch
 	start   int32 // bytes the stack is given at entry
@@ -386,8 +393,37 @@ func emitBTScratchInit(b []byte, d *btDyn, span, unknown func([]byte) []byte) []
 
 // emitBTScratchBase leaves in dst where the scratch may start: the host
 // global; the current end of memory when that is 0; the floor global when it is
-// below the floor.
+// below the floor — or, for a body inside a set whose members keep regions for
+// the host call (btScratch.drive), the top of the last one placed in it.
 func emitBTScratchBase(b []byte, d *btDyn, dst uint32) []byte {
+	if dr := d.scratch.drive; dr != nil {
+		// Inside a set: above every region placed so far in this host call
+		// (scratch.drive). The first body to need scratch in a call finds the
+		// base and RECORDS it, as a member's first fallback does: with a host
+		// global of 0 the base is fresh pages, and a set calls a member once
+		// per candidate — finding it again each time would take fresh pages
+		// per candidate. A stack is dead once its call returns, so the regions
+		// placed after it may start where it did.
+		b = appendGlobalGet(b, dr.scratchEpoch)
+		b = appendGlobalGet(b, dr.epoch)
+		b = append(b, 0x52)       // i64.ne
+		b = append(b, 0x04, 0x40) // if
+		b = emitBTScratchBaseFree(b, d, dst)
+		b = btLocalGet(b, dst)
+		b = appendGlobalSet(b, dr.scratchTop)
+		b = appendGlobalGet(b, dr.epoch)
+		b = appendGlobalSet(b, dr.scratchEpoch)
+		b = append(b, 0x0B) // end if
+		b = appendGlobalGet(b, dr.scratchTop)
+		b = append(b, 0x21)
+		return utils.AppendULEB128(b, dst)
+	}
+	return emitBTScratchBaseFree(b, d, dst)
+}
+
+// emitBTScratchBaseFree is emitBTScratchBase when nothing placed in this host
+// call needs keeping: the host global, raised to the floor, or fresh pages.
+func emitBTScratchBaseFree(b []byte, d *btDyn, dst uint32) []byte {
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, d.scratch.host) // global.get host
 	b = append(b, 0x22)

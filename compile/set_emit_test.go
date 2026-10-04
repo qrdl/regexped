@@ -922,45 +922,21 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 	}
 }
 
-// TestSetEmitPlanBTRegionsMemo covers the BitState memo region.
-//
-// The shared stack is laid out as the MAX over every Backtracking bucket whose
-// ordinary body runs. Two buckets with different stack needs is what
-// distinguishes "took the max" from "took the first".
+// TestSetEmitPlanBTRegions covers what a set's Backtracking buckets share:
+// the window globals — and nothing in the tables, since every frame stack and
+// fallback region is run-time scratch and a member writes no slots.
 func TestSetEmitPlanBTRegions(t *testing.T) {
-	// Nothing to lay out: no BT bucket, no regions.
-	if got := planBTRegions([]*bucket{{isFallback: true}}, 0, &moduleGlobals{}, 0); got != nil {
+	// Nothing to plan: no BT bucket, no regions.
+	if got := planBTRegions([]*bucket{{isFallback: true}}, &moduleGlobals{}); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
-
-	var buckets []*bucket
-	largest := 0
-	for _, pattern := range []string{`(?:a|ab)+c`, `(?:[0-9]|[0-9][0-9]|x|y)+x`} {
-		info := admitBTFallback(parseForBTFallback(t, pattern))
-		if info == nil {
-			t.Fatalf("%q was refused by the Backtracking fallback", pattern)
-		}
-		if info.stackSize > largest {
-			largest = info.stackSize
-		}
-		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
+	info := admitBTFallback(parseForBTFallback(t, `(?:a|ab)+c`))
+	if info == nil {
+		t.Fatal("the witness was refused by the Backtracking fallback")
 	}
-	if buckets[0].btFallback.stackSize == buckets[1].btFallback.stackSize {
-		t.Fatal("both witnesses need the same stack — they cannot tell max from first")
-	}
-	regions := planBTRegions(buckets, 0, &moduleGlobals{}, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, &moduleGlobals{})
 	if regions == nil {
-		t.Fatal("no regions planned for two Backtracking buckets")
-	}
-	if got := int(regions.stackLimit - regions.stackBase); got != largest {
-		t.Errorf("stack region is %d bytes, want the largest bucket's %d", got, largest)
-	}
-	// Everything above the stack must be laid out in order and inside `end`,
-	// or two regions share an address and one silently overwrites the other.
-	// The window pair is no longer among them: it is two module globals, so it
-	// has no address to collide with.
-	if regions.slotScratch < regions.stackLimit || regions.end <= regions.slotScratch {
-		t.Errorf("regions overlap or run backwards: %+v", *regions)
+		t.Fatal("no regions planned for a Backtracking bucket")
 	}
 	if regions.winGlobal < 0 {
 		t.Errorf("no window globals allocated for a BT bucket: %+v", *regions)
@@ -981,7 +957,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{}, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, &moduleGlobals{})
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
@@ -1009,7 +985,7 @@ func TestSetEmitBTProbeBody(t *testing.T) {
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
-	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, 0, &moduleGlobals{}, 0)
+	regions := planBTRegions([]*bucket{{isFallback: true, btFallback: info}}, &moduleGlobals{})
 	body := buildSetBTProbeBody(regions, btBucketCall{driverIdx: 7, fallbackIdx: -1}, 0)
 	if len(body) == 0 {
 		t.Fatal("the Backtracking probe emitted nothing")
@@ -1346,30 +1322,6 @@ func TestSetEmitPrefixCheckPerPatternGuard(t *testing.T) {
 		}},
 	}
 	setEmitCovMustCompile(t, cfg)
-}
-
-// TestSetEmitPlanBTRegionsZeroWidthCycle: a bucket whose program has a
-// zero-width cycle has no ordinary body under any budget — BTWorkBudgetOff
-// included — so it reads no shared stack and none is reserved for it.
-func TestSetEmitPlanBTRegionsZeroWidthCycle(t *testing.T) {
-	var buckets []*bucket
-	for _, pattern := range []string{`(?:a*?)+b`, `(?:.*?)+xyz`} {
-		info := admitBTFallback(parseForBTFallback(t, pattern))
-		if info == nil {
-			t.Fatalf("%q was refused by the Backtracking fallback", pattern)
-		}
-		if !info.bt.zeroWidthCycle {
-			t.Fatalf("%q has no zero-width cycle — witness no longer has the shape", pattern)
-		}
-		buckets = append(buckets, &bucket{isFallback: true, btFallback: info})
-	}
-	for _, budget := range []int{0, BTWorkBudgetOff} {
-		if routed := planBTRegions(buckets, 0, &moduleGlobals{}, budget); routed == nil {
-			t.Fatalf("budget %d: no regions planned for two Backtracking buckets", budget)
-		} else if routed.stackLimit != routed.stackBase {
-			t.Errorf("budget %d: buckets whose ordinary body never runs reserved a stack: %+v", budget, *routed)
-		}
-	}
 }
 
 // TestSetEmitPreflightWithNoPatterns covers the empty-set guard in the

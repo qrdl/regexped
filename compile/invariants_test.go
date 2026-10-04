@@ -1468,11 +1468,11 @@ func TestEmitterGuardsFire(t *testing.T) {
 				appendStartAnywhereBodies(nil, 0)
 		}},
 		{"a set member's Backtracking body in window mode", "window mode", func(*testing.T) {
-			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{}, nil)
+			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{}, true, nil)
 		}},
 		{"Backtracking regions without globals", "global allocator", func(t *testing.T) {
 			infos, _, _ := analyzed(t, `a+b`)
-			planBTRegions([]*bucket{newBTBucket(infos[0])}, 0, nil, 0)
+			planBTRegions([]*bucket{newBTBucket(infos[0])}, nil)
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

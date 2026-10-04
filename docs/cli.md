@@ -240,9 +240,9 @@ the tables and the search's working memory only.
   and answers the same. So does the default state a standalone module keeps
   for a caller that hands it none (see [wasm.md](wasm.md), "Handing the block
   over").
-- A module whose tables — plus the stacks the Backtracking `match_func` and
-  `find_func` paths still reserve at compile time — are already over the cap is
-  a **compile error** naming the cap and the size. A value below 64 KiB rounds
+- A module whose tables are already over the cap is a **compile error** naming
+  the cap and the size. Backtracking reserves nothing there: its frame stacks
+  are claimed when a search runs. A value below 64 KiB rounds
   down to 0 pages and always gets it.
 - A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
   4 GiB, with a compile warning saying so.
@@ -289,7 +289,12 @@ not chosen here because Go's parser rejects `(?-u)` outright.
 - **Case-fold artifacts of ASCII.** Go's parser expands `(?i)` over a class
   eagerly, so `(?i:[a-z])` arrives carrying U+017F (long s) and U+212A (Kelvin
   sign) — runes you did not write, manufactured from the `s` and `k` you did.
-  `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals.
+  `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals,
+  and over NEGATED classes too: `(?i)[^a-z]` and `(?i)\W` arrive with holes at
+  exactly those runes, and match every byte that is not a letter (or word
+  character), `0x80`-`0xFF` included. In byte mode `(?i)` over Latin-1 adds
+  U+212B (from `å`) the same way. A rune you DID write stays refused, negated
+  or not: `[^ſ]` and `[sſ]` both name `ſ`.
   The consequence is that `(?i)k` does not match a Kelvin sign and
   `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
   practice, and folding within `0x00`-`0xFF` in byte mode.

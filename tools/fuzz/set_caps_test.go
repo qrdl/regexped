@@ -2851,6 +2851,90 @@ func TestSetMergedModeAssertions(t *testing.T) {
 	}
 }
 
+// TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone: a set member on
+// Backtracking wrote its match slots — eight bytes of group 0 — to the set's
+// slot scratch, a TABLE-memory address, through memory 0. In an embedded build
+// memory 0 is the HOST's: every member match overwrote eight bytes of the
+// host's memory at that address, or trapped where the address lay past it (a
+// merged Rust WAF app, "out of bounds memory access" on `;cat /etc/passwd`).
+// Standalone builds have one memory and never showed it.
+//
+// The host memory is filled with a canary; after every call, everything
+// outside the input must still be the canary.
+func TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone(t *testing.T) {
+	pats := []string{`(?:a|bc){1,30}?x`, `(?:etc|proc)/(?:passwd|self)\b`}
+	inputs := []string{"zzz bcbcax", ";cat /etc/passwd", "none here", "proc/self ax"}
+	cfg := config.BuildConfig{
+		Output:            "merged.wasm", // embedded: memory 0 is imported
+		MaxFallbackStates: 1,             // every member's suffix DFA is over it: Backtracking
+		Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan",
+			Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
+	}
+	w, _, diags, err := compile.CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt := 0
+	for _, d := range diags {
+		for _, b := range d.Buckets {
+			if b.Type == "bt-fallback" {
+				bt++
+			}
+		}
+	}
+	if bt == 0 {
+		t.Fatal("no member runs on Backtracking — the witness no longer has the shape")
+	}
+	engine, _ := sharedEngine()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mod.Close()
+	for _, in := range inputs {
+		store := wasmtime.NewStore(engine)
+		store.SetEpochDeadline(1)
+		mt, err := wasmtime.NewMemoryType(64, false, 0, false) // 4 MB: past every table address here
+		if err != nil {
+			t.Fatal(err)
+		}
+		hostMem, err := wasmtime.NewMemory(store, mt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host := hostMem.UnsafeData(store)
+		for i := range host {
+			host[i] = 0xA5
+		}
+		inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{hostMem})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const inBase = 4096
+		copy(host[inBase:], in)
+		res, err := inst.GetFunc(store, "s_scan").Call(store, int32(inBase), int32(len(in)), int32(0))
+		if err != nil {
+			t.Fatalf("scan %q: %v", in, err)
+		}
+		want := false
+		for _, p := range pats {
+			want = want || regexp.MustCompile(p).MatchString(in)
+		}
+		if got := res.(int32) >= 0; got != want {
+			t.Errorf("scan %q = %d, Go says match=%v", in, res.(int32), want)
+		}
+		host = hostMem.UnsafeData(store)
+		for i, c := range host {
+			if (i < inBase || i >= inBase+len(in)) && c != 0xA5 {
+				t.Errorf("scan %q wrote the host's memory at %#x (now %#02x)", in, i, c)
+				break
+			}
+		}
+		store.Close()
+	}
+}
+
 // runFindEmbedded drives `find` to exhaustion on an embedded module, with the
 // gate array and out buffer in the imported host memory — what a merged
 // Rust/Go/C stub does.

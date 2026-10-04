@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
@@ -314,6 +316,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// separately, via compileOpts below.
 			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
 			engineType, selErr := compile.SelectEngine(pattern, selOpts)
+			if selErr != nil && gateRefusedASCII(pattern, selErr) {
+				nfail += len(testStrings)
+				fmt.Printf("FAIL  pattern: %q\n      refused by the rune gate though it names nothing above 0x7F: %v\n", pattern, selErr)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
 			if selErr != nil {
 				errStr := selErr.Error()
 				reason := skipParseError
@@ -386,6 +394,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				compileOpts.BTWorkBudget = compile.BTWorkBudgetForceFallback
 			}
 			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
+			if compErr != nil && gateRefusedASCII(pattern, compErr) {
+				nfail += len(testStrings)
+				fmt.Printf("FAIL  pattern: %q\n      refused by the rune gate though it names nothing above 0x7F: %v\n", pattern, compErr)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
 			if compErr != nil {
 				errStr := compErr.Error()
 				reason := skipOther
@@ -1699,6 +1713,89 @@ func preCheck(pattern string) string {
 		return "" // let the compiler report the actual error
 	}
 	return ""
+}
+
+// gateRefusedASCII reports whether err is the compiler's rune gate refusing a
+// pattern that names no code point above 0x7F. That is a compiler defect, not
+// a skip: counted as a skip, `(?i)\W` and `(?i)[^a-z]` were refused without a
+// single failure (custom-tests.txt Category 40). The fold artifacts (?i)
+// manufactures — U+017F, U+212A — are never written, so they never count.
+func gateRefusedASCII(pattern string, err error) bool {
+	if !strings.Contains(err.Error(), "pattern contains the") {
+		return false
+	}
+	parsed, perr := syntax.Parse(pattern, syntax.Perl)
+	if perr != nil {
+		return false
+	}
+	return namedRuneCeiling(pattern, parsed) <= 0x7F
+}
+
+// namedRuneCeiling is the highest code point pattern NAMES: written as a
+// character, as an escape (\xHH, \x{…}, octal), as a \p/\P class
+// (unbounded), or — for a class with no member at or below 0x7F, such as
+// [^\x00-\x7f] — that class's lowest member. -1 when it names nothing above
+// ASCII. tools/fuzz carries the same function for the same reason.
+func namedRuneCeiling(pattern string, parsed *syntax.Regexp) rune {
+	ceil := rune(-1)
+	raise := func(r rune) {
+		if r > 0x7F && r > ceil {
+			ceil = r
+		}
+	}
+	for i := 0; i < len(pattern); {
+		r, w := utf8.DecodeRuneInString(pattern[i:])
+		if r != '\\' {
+			raise(r)
+			i += w
+			continue
+		}
+		if i+1 >= len(pattern) {
+			break
+		}
+		switch c := pattern[i+1]; {
+		case c == 'p' || c == 'P':
+			raise(unicode.MaxRune)
+			i += 2
+		case c == 'x' && i+2 < len(pattern) && pattern[i+2] == '{':
+			end := strings.IndexByte(pattern[i+3:], '}')
+			if end < 0 {
+				return unicode.MaxRune
+			}
+			v, _ := strconv.ParseUint(pattern[i+3:i+3+end], 16, 32)
+			raise(rune(v))
+			i += 4 + end
+		case c == 'x':
+			j := i + 2
+			for j < len(pattern) && j < i+4 && strings.IndexByte("0123456789abcdefABCDEF", pattern[j]) >= 0 {
+				j++
+			}
+			v, _ := strconv.ParseUint(pattern[i+2:j], 16, 32)
+			raise(rune(v))
+			i = j
+		case c >= '0' && c <= '7':
+			j := i + 1
+			for j < len(pattern) && j < i+4 && pattern[j] >= '0' && pattern[j] <= '7' {
+				j++
+			}
+			v, _ := strconv.ParseUint(pattern[i+1:j], 8, 32)
+			raise(rune(v))
+			i = j
+		default:
+			i += 2
+		}
+	}
+	var walk func(re *syntax.Regexp)
+	walk = func(re *syntax.Regexp) {
+		if re.Op == syntax.OpCharClass && len(re.Rune) > 0 && re.Rune[0] > 0x7F {
+			raise(re.Rune[0])
+		}
+		for _, s := range re.Sub {
+			walk(s)
+		}
+	}
+	walk(parsed)
+	return ceil
 }
 
 // hasUnicode reports whether a pattern string requires Unicode support.

@@ -215,6 +215,12 @@ type btScratch struct {
 	// memo to the function right after it; memoInInput marks that body, which
 	// reads and writes the memo in memory 0. Neither is set elsewhere.
 	searchTwin, memoInInput bool
+	// drive is set for a body that runs inside a SET whose Backtracking
+	// members keep their fallback regions for the whole host call
+	// (btDriveMember): such a body's scratch starts above the last region
+	// placed in the current call, never at the base, which would put a frame
+	// stack over a member's live memo. nil everywhere else.
+	drive *btDrive
 }
 
 // BTScratch returns the module's fallback-scratch globals, allocating them on

@@ -252,14 +252,17 @@ cannot have it.
 |---|---|---|
 | notes | `(len + 1) × ⌈R / 8⌉` (R = noted states, usually 1 byte per position) | once a search arms |
 | Backtracking memo | `(len + 1) × ⌈instructions / 8⌉` | once a search trips (per call in the fallback otherwise) |
-| Backtracking capture stack | starts small, doubles by `memory.grow` | as a `groups` search deepens |
+| Backtracking frame stack (every body, set members included) | starts at 64 KB, doubles by `memory.grow`; one scratch for the whole module | as a search deepens |
 | fallback stack and bitset | sized from the input | when the fallback runs |
 | answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | reserved by the stub per drive; filled only if the drive sweeps |
 | program sweep | 4 bytes per position per swept member, checkpointed the same way | after the cache, same region |
 | default state (standalone, raw callers) | what a stub would allocate | grown on first use, reused, regrown to at least twice the size only when a drive needs more |
 
-- **Call-time growth.** The fallback's memory and the capture stack are placed
-  at a scratch base and grown with `memory.grow` when they do not fit. A
+- **Call-time growth.** The fallback's memory and every frame stack are placed
+  at a scratch base and grown with `memory.grow` when they do not fit — nothing
+  is reserved in the module, so memory is the largest any one search needed,
+  not a sum over patterns and sets. Inside a set, a stack starts above the
+  fallback memos the set's members keep for the host call. A
   standalone module learns the free region from the host through the exported
   `regexped:scratch_base` global; a component uses its allocator's heap top.
   Memo rows are cleared lazily as the search reaches them.
@@ -270,7 +273,7 @@ cannot have it.
   Backtracking code and sets no cap. `examples/wasmtime/go/sql-injection`
   shows a cap stopping a hostile value.
 - **Required vs optional.** Memory a call cannot answer without — the
-  fallback's stack and bitset, a capture stack — makes the call answer `-2`
+  fallback's stack and bitset, a frame stack — makes the call answer `-2`
   ("unknown", never "no match") when it cannot be had; a JS/TS input that does
   not fit throws a `RangeError` before any search runs. Memory that only buys
   speed — a set's cache, a component's notes and memo, the default state — is

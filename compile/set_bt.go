@@ -67,10 +67,7 @@ func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
 	// Sets never report captures, so group 0 is all this body will ever
 	// record. This mirrors the single-pattern find fallback in compile.go.
 	bt.numGroups = 0
-	return &btBucketInfo{
-		bt:        bt,
-		stackSize: btAllocSizes(bt),
-	}
+	return &btBucketInfo{bt: bt}
 }
 
 // setPatternInfos resolves one set's selected pattern indices into the
@@ -156,31 +153,26 @@ func hasBTBucketIn(buckets []*bucket) bool {
 	return false
 }
 
-// btSharedRegions is the one stack / memo / scratch allocation a set makes for
-// ALL of its BT buckets, sized to the largest of them.
-//
-// Sharing is safe because the per-candidate driver calls one suffix function
-// at a time via a plain `call` (set_find.go's emitBucketCall) — no nesting, no
-// reentrancy, no threads — so exactly one BT call is ever live, and the stack
-// needs no clearing: BT pushes from stackBase and unwinds within the call, so
-// it starts empty each time. (A FALLBACK body's memo and stack are not in these
-// regions: they are per member and last a host call — see btDriveMember.)
+// btSharedRegions is what a set's BT buckets share. No table bytes at all: an
+// ordinary body's frame stack grows at call time in the run-time scratch
+// (btGrowth), above every region a member keeps for the host call
+// (btScratch.drive); a FALLBACK body's memo and stack are per member and last a
+// host call — see btDriveMember; and a member's body is slotless, so there is
+// no slot buffer either. One BT call is ever live — the per-candidate driver
+// calls one suffix function at a time via a plain `call` (set_find.go's
+// emitBucketCall) — so the window globals are shared safely.
 type btSharedRegions struct {
-	stackBase  int32 // start of the shared BT frame stack
-	stackLimit int32 // one past its end; BT reports overflow on reaching this
 	// winGlobal is the first of TWO consecutive module globals holding
 	// (startOff, endOff) for window mode — the same pair the single-pattern
 	// path carries, and globals for the same reason: an allocator index has no
 	// zero value that is also a writable table address.
-	winGlobal   int32
-	slotScratch int32 // 8-byte group-0 (start, end) buffer the BT body writes
-	end         int32 // one past everything above
-	// scratch is the module's fallback-scratch globals, allocated when some
-	// bucket has a fallback driver. Its memory lies outside every region above.
+	winGlobal int32
+	// scratch is the module's Backtracking scratch globals, which every
+	// bucket's frame stack and fallback region are found through.
 	scratch btScratch
-	// drive and members are the call-scoped globals (btDriveMember), keyed by
-	// bucket index, for every bucket with a fallback driver; hasDrive is false
-	// when there is none.
+	// drive is the set's call-scoped state (btDrive); hasDrive is true for
+	// every set with a BT bucket. members holds a btDriveMember per bucket
+	// with a fallback driver, keyed by bucket index.
 	drive    btDrive
 	hasDrive bool
 	members  map[int]*btDriveMember
@@ -198,14 +190,14 @@ type btBucketCall struct {
 	route bool
 }
 
-// emitCall calls the member's body for (ptr, len, slotScratch) and stores the
-// i32 answer in end, then resets the member's visited set after a match.
+// emitCall calls the member's body for (ptr, len, 0) and stores the i32
+// answer in end, then resets the member's visited set after a match. The body
+// is slotless (buildBacktrackBody): it writes nothing to out_ptr, so 0.
 func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, end byte) []byte {
 	args := func(b []byte) []byte {
 		b = append(b, 0x20, ptr)
 		b = append(b, 0x20, length)
-		b = append(b, 0x41)
-		return utils.AppendSLEB128(b, regions.slotScratch)
+		return append(b, 0x41, 0x00) // out_ptr: unused
 	}
 	call := func(b []byte, idx int) []byte {
 		b = args(b)
@@ -230,32 +222,13 @@ func (c btBucketCall) emitCall(b []byte, regions *btSharedRegions, ptr, length, 
 	return b
 }
 
-// planBTRegions lays the shared regions out above `base` and returns them,
-// or nil when the set has no BT bucket. Sizes are the max over BT buckets whose
-// ordinary body runs: a bucket planned as the bare tail call (planBT's force
-// plan) reads no stack.
-func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget int) *btSharedRegions {
-	maxStack := 0
-	any := false
-	for _, b := range buckets {
-		if b.btFallback == nil {
-			continue
-		}
-		any = true
-		if planBT(b.btFallback.bt, budget).force {
-			continue
-		}
-		if b.btFallback.stackSize > maxStack {
-			maxStack = b.btFallback.stackSize
-		}
-	}
-	if !any {
+// planBTRegions allocates what a set's BT buckets share, or returns nil when
+// the set has no BT bucket.
+func planBTRegions(buckets []*bucket, globals *moduleGlobals) *btSharedRegions {
+	if !hasBTBucketIn(buckets) {
 		return nil
 	}
-	cur := int32(utils.PageAlign(base))
-	r := &btSharedRegions{stackBase: cur}
-	r.stackLimit = r.stackBase + int32(maxStack)
-	cur = r.stackLimit
+	r := &btSharedRegions{}
 	// The window pair is allocated, not reserved: no table bytes here.
 	//
 	// The allocator is guaranteed non-nil by CompileSet, which is the single
@@ -267,9 +240,6 @@ func planBTRegions(buckets []*bucket, base int64, globals *moduleGlobals, budget
 	}
 	r.winGlobal = int32(globals.Alloc())
 	globals.Alloc() // endOff, at winGlobal+1
-	r.slotScratch = cur
-	cur += 8
-	r.end = cur
 	return r
 }
 
@@ -523,15 +493,22 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		if plan.force {
 			driver, callOffs = btTailCallBody(3)
 		} else {
+			// The frame stack grows at call time, above the regions the set's
+			// members keep for the host call.
+			sc := cs.btRegions.scratch
+			if cs.btRegions.hasDrive {
+				sc.drive = &cs.btRegions.drive
+			}
+			growth := &btGrowth{scratch: sc, start: btStackStart(0, btNoCaptureFrameSize)}
 			driver, callOffs = appendBacktrackCodeEntry(nil, info.bt,
-				cs.btRegions.stackBase, cs.btRegions.stackLimit,
+				0, 0,
 				btNoCaptureFrameSize,
 				true, // nativeAnchored
 				tableMemIdx, cs.btRegions.winGlobal,
 				// Set BT buckets are driven directly, not through the groups
 				// wrapper, and use window mode — their slots are already absolute.
 				-1,
-				plan.k, plan.fallback, nil, member, nil)
+				plan.k, plan.fallback, nil, member, true, growth)
 		}
 		if plan.fallback {
 			// Built here like the driver, so its real index is known and the
@@ -541,7 +518,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			fb, _ := appendBacktrackCodeEntry(nil, info.bt, 0, 0,
 				btNoCaptureFrameSize,
 				true, tableMemIdx, cs.btRegions.winGlobal, -1,
-				0, false, &cs.btRegions.scratch, member, nil)
+				0, false, &cs.btRegions.scratch, member, true, nil)
 			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
 			call.member = member
 			call.route = !plan.force && member != nil

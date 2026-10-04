@@ -168,8 +168,8 @@ func btLocalGet(b []byte, idx uint32) []byte {
 // appendBacktrackCodeEntry appends a size-prefixed capture body. callOffs are
 // the byte offsets, within the returned slice, of the fallback calls'
 // placeholder immediates (none when the body makes no such call).
-func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (out []byte, callOffs []int) {
-	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member, growth)
+func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, slotless bool, growth *btGrowth) (out []byte, callOffs []int) {
+	body, offs := buildBacktrackBody(bt, stackBase, stackLimit, frameSize, nativeAnchored, tableMemIdx, winGlobal, capStartGlobal, workK, tripCalls, fallback, member, slotless, growth)
 	sized, offs := btSizePrefix(body, offs)
 	return append(cs, sized...), btShiftOffs(offs, len(cs))
 }
@@ -211,12 +211,20 @@ func appendBacktrackCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, f
 // growth non-nil gives the ORDINARY body its frame stack at call time instead
 // of the fixed region stackBase..stackLimit (see btGrowth): placed through the
 // fallback's scratch arrangement, started at growth.start bytes, doubled when
-// full. The capture path asks for it; a set member does not.
+// full. Every ordinary body asks for it; a set member's gives its scratch the
+// set's drive (btScratch.drive), so the stack starts above the regions other
+// members keep for the host call.
+//
+// slotless makes InstMatch return the end WITHOUT writing slots to out_ptr: a
+// set member, whose caller reads only that end. Its out_ptr used to be the
+// set's slot scratch — a TABLE-memory address, written through memory 0, which
+// in an embedded build is the HOST's: eight bytes of the host's memory
+// overwritten on every member match, or a trap where that address lay past it.
 //
 // Neither body carries a loop guard. The ordinary body runs only programs
 // without a zero-width cycle (planBT), where no guard can fire; the fallback's
 // memo is what terminates it on the others.
-func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, growth *btGrowth) (_ []byte, callOffs []int) {
+func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, nativeAnchored bool, tableMemIdx int, winGlobal int32, capStartGlobal int32, workK int, tripCalls bool, fallback *btScratch, member *btDriveMember, slotless bool, growth *btGrowth) (_ []byte, callOffs []int) {
 	if member != nil && winGlobal < 0 {
 		panic("compile: a set member's Backtracking body runs in window mode")
 	}
@@ -224,9 +232,6 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		workK = 0
 		tripCalls = false
 		growth = nil
-	}
-	if growth != nil && member != nil {
-		panic("compile: a set member's ordinary Backtracking body keeps its fixed stack")
 	}
 
 	prog := bt.prog
@@ -515,7 +520,7 @@ func buildBacktrackBody(bt *backtrack, stackBase, stackLimit, frameSize int32, n
 		inst := prog.Inst[p]
 		brRun := uint32(N - 1 - p)
 
-		body = emitBTInstHandler(body, bt, p, inst, brRun, stackLimit, frameSize, numCapLocals, memoByteAddr, memoMemoByte, false, nativeAnchored, nil, overflow, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal,
+		body = emitBTInstHandler(body, bt, p, inst, brRun, stackLimit, frameSize, numCapLocals, memoByteAddr, memoMemoByte, false, !slotless, nativeAnchored, nil, overflow, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal,
 			memoOrigin, useWindow, dyn)
 	}
 
@@ -566,7 +571,9 @@ func emitAddCapStart(b []byte, capStartGlobal int32) []byte {
 // memoByteAddr and memoMemoByte are a fallback body's memo scratch locals,
 // unused when dyn is nil.
 // noCaptures: when true, InstCapture is treated as NOP and InstMatch calls
-// instMatchFn, whose second argument is brRunNested.
+// instMatchFn, whose second argument is brRunNested. writeSlots false makes a
+// capture body's InstMatch return the end without writing out_ptr (slotless,
+// buildBacktrackBody).
 // overflowFn: emits stack-overflow return code for btPushFrame (nil = i32.const -1; return).
 func emitBTInstHandler(
 	body []byte,
@@ -578,6 +585,7 @@ func emitBTInstHandler(
 	numCapLocals int,
 	memoByteAddr, memoMemoByte uint32,
 	noCaptures bool,
+	writeSlots bool,
 	nativeAnchored bool,
 	instMatchFn func([]byte, uint32) []byte,
 	overflowFn func([]byte, uint32) []byte,
@@ -785,6 +793,12 @@ func emitBTInstHandler(
 		// derivation, and BT's stack always explores the highest-priority
 		// (leftmost-first) derivation first, so the first InstMatch reached is
 		// the correct answer regardless of how much input remains unconsumed.
+
+		if !writeSlots {
+			body = append(body, 0x20, localPos)
+			body = append(body, 0x0F) // return
+			break
+		}
 
 		// Write captures to out_ptr and return pos.
 		// Group 0: start = where this attempt began (0 when the caller
@@ -1614,16 +1628,6 @@ func compileBTProg(pattern string) *syntax.Prog {
 	return prog
 }
 
-// btAllocSizes returns the frame stack size in bytes for a no-capture BT
-// engine's ordinary body: frames are 8 bytes, pos and retryPC.
-func btAllocSizes(bt *backtrack) (stackSize int) {
-	maxFrames := bt.numAlts * 4096
-	if maxFrames < 4096 {
-		maxFrames = 4096
-	}
-	return maxFrames * btNoCaptureFrameSize
-}
-
 // btNoCaptureFrameSize is a no-capture body's frame: pos and retryPC.
 const btNoCaptureFrameSize = 8
 
@@ -1870,6 +1874,7 @@ func buildBTInnerDisp(
 			stackLimit, frameSize, numCapLocals,
 			memoByteAddr, memoMemoByte,
 			true,
+			true,
 			false,
 			instMatchFn,
 			overflowFn,
@@ -1891,8 +1896,8 @@ func buildBTInnerDisp(
 // appendBTMatchCodeEntry appends a size-prefixed no-capture BT match body.
 // Signature: (ptr i32, len i32) → i32
 // Returns match end position (≥ 0) on success, -1 on failure.
-func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch) (out []byte, callOffs []int) {
-	body, offs := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, tableMemIdx, workK, tripCalls, fallback)
+func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch, growth *btGrowth) (out []byte, callOffs []int) {
+	body, offs := buildBTMatchBody(bt, stackBase, stackLimit, frameSize, tableMemIdx, workK, tripCalls, fallback, growth)
 	sized, offs := btSizePrefix(body, offs)
 	return append(cs, sized...), btShiftOffs(offs, len(cs))
 }
@@ -1909,11 +1914,12 @@ func appendBTMatchCodeEntry(cs []byte, bt *backtrack, stackBase, stackLimit, fra
 // constants (localPos=3, localSP=4, localState=5, localScratch=6) so all
 // existing helper functions (btFail, btSetStateAndBr, etc.) can be reused.
 //
-// workK, tripCalls and fallback are buildBacktrackBody's, for this body.
-func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch) (_ []byte, callOffs []int) {
+// workK, tripCalls, fallback and growth are buildBacktrackBody's, for this body.
+func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch, growth *btGrowth) (_ []byte, callOffs []int) {
 	if fallback != nil {
 		workK = 0
 		tripCalls = false
+		growth = nil
 	}
 	prog := bt.prog
 
@@ -1936,11 +1942,16 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize int32, tab
 		dynBase := uint32(2 + totalLocals)
 		dyn.memoBase, dyn.cleared, dyn.stackBase, dyn.stackTop = dynBase, dynBase+1, dynBase+2, dynBase+3
 		totalLocals += 4
+	} else if growth != nil {
+		dyn = newBTGrowDyn(growth, tableMemIdx, frameSize)
+		dynBase := uint32(2 + totalLocals)
+		dyn.stackBase, dyn.stackTop = dynBase, dynBase+1
+		totalLocals += 2
 	}
 
 	// The work counter (btWorkK) is the one i64, in its own group after every
-	// i32, so no existing index moves. A fallback takes the slot for its entry
-	// arithmetic.
+	// i32, so no existing index moves. A fallback, or a growing stack, borrows
+	// the slot for its entry arithmetic before the budget is set.
 	useWork := workK > 0
 	workLocal := uint32(2 + totalLocals) // after the two params and every i32
 	if dyn != nil {
@@ -1971,7 +1982,11 @@ func buildBTMatchBody(bt *backtrack, stackBase, stackLimit, frameSize int32, tab
 	body = utils.AppendSLEB128(body, int32(prog.Start))
 	body = append(body, 0x21, localState)
 
-	if dyn != nil {
+	if dyn != nil && dyn.grow {
+		body = emitBTGrowStackInit(body, dyn, btGiveUp(tripCalls, 2, &callOffs, btWorkTripI32))
+		body = btLocalGet(body, dyn.stackBase)
+		body = append(body, 0x21, localSP)
+	} else if dyn != nil {
 		body = emitBTScratchInit(body, dyn, func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		}, btWorkTripI32)
@@ -2041,8 +2056,8 @@ func emitBTOncePerCall(b []byte, ready uint32, prepare func([]byte) []byte) []by
 // Signature: (ptr i32, len i32) → i64
 // Returns (start << 32 | end) on match, -1 on no match.
 func appendBTFindCodeEntry(cs []byte, bt *backtrack, scanParams prefixScanParams,
-	stackBase, stackLimit, frameSize int32, mandLit *mandatoryLit, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch) (out []byte, mode findFromMode, callOffs []int) {
-	body, mode, offs := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, tableMemIdx, workK, tripCalls, fallback)
+	stackBase, stackLimit, frameSize int32, mandLit *mandatoryLit, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch, growth *btGrowth) (out []byte, mode findFromMode, callOffs []int) {
+	body, mode, offs := buildBTFindBody(bt, scanParams, mandLit, stackBase, stackLimit, frameSize, tableMemIdx, workK, tripCalls, fallback, growth)
 	sized, offs := btSizePrefix(body, offs)
 	return append(cs, sized...), mode, btShiftOffs(offs, len(cs))
 }
@@ -2094,10 +2109,11 @@ func btScanLocalsOnly() prefixScanLocals {
 }
 
 func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandatoryLit,
-	stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch) (_ []byte, _ findFromMode, callOffs []int) {
+	stackBase, stackLimit, frameSize int32, tableMemIdx int, workK int, tripCalls bool, fallback *btScratch, growth *btGrowth) (_ []byte, _ findFromMode, callOffs []int) {
 	if fallback != nil {
 		workK = 0
 		tripCalls = false
+		growth = nil
 	}
 	useMemo := fallback != nil
 	var findFrom findFromMode
@@ -2193,6 +2209,22 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		dyn.memoBase, dyn.cleared = uint32(a.I32()), uint32(a.I32())
 		dyn.stackBase, dyn.stackTop = uint32(a.I32()), uint32(a.I32())
 		dyn.tmp64 = uint32(a.I64())
+	}
+	// The ordinary body's growing frame stack (btGrowth), placed once per call
+	// at its first attempt, as the fallback places its region. Kept apart from
+	// dyn, which everything below reads as "this is the fallback".
+	var grow *btDyn
+	var growReady uint32
+	if growth != nil {
+		grow = newBTGrowDyn(growth, tableMemIdx, frameSize)
+		grow.stackBase, grow.stackTop, growReady = uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
+		grow.tmp64 = uint32(a.I64())
+	}
+	// The body's frame stack: the fallback's region, the growing one, or (nil)
+	// the fixed stackBase..stackLimit.
+	stackDyn := dyn
+	if grow != nil {
+		stackDyn = grow
 	}
 	// The work counter (btWorkK) is allocated LAST, so it is the only local a
 	// budgeted body adds and no index above moves.
@@ -2338,6 +2370,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		return append(bb, 0x6B) // i32.sub
 	}
 	memoPrepare := func(b []byte) []byte {
+		if grow != nil {
+			return emitBTOncePerCall(b, growReady, func(b []byte) []byte {
+				return emitBTGrowStackInit(b, grow, srchTrip(btGiveUp(tripCalls, 2, &callOffs, btUnknownI64)))
+			})
+		}
 		if dyn == nil {
 			return b
 		}
@@ -2474,7 +2511,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// Re-init BT state for this attempt_start.
 		body = memoPrepare(body)
 		body = append(body, 0x20, locAttemptStart, 0x21, localPos)
-		body = emitBTStackBase(body, stackBase, dyn)
+		body = emitBTStackBase(body, stackBase, stackDyn)
 		body = append(body, 0x21, localSP)
 		body = append(body, 0x41)
 		body = utils.AppendSLEB128(body, int32(prog.Start))
@@ -2509,7 +2546,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
 			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
-			dyn)
+			stackDyn)
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
 		body = append(body, 0x0B) // end block $run_exit
@@ -2540,7 +2577,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// Re-init BT state.
 		b = memoPrepare(b)
 		b = append(b, 0x20, locAttemptStart, 0x21, localPos)
-		b = emitBTStackBase(b, stackBase, dyn)
+		b = emitBTStackBase(b, stackBase, stackDyn)
 		b = append(b, 0x21, localSP)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(prog.Start))
@@ -2577,7 +2614,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
 			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
-			dyn)
+			stackDyn)
 
 		b = append(b, 0x00) // unreachable
 		b = append(b, 0x0B) // end loop $run

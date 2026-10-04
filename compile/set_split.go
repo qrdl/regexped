@@ -168,7 +168,7 @@ func budgetSplit(cands []splitCand, pats []*PatternInfo, opts CompileSetOptions,
 	var total int64
 	for _, k := range order {
 		if total+cands[k].saBytes > budget {
-			if _, ok := btFindStackSize(pats[cands[k].idx].fullPattern, opts.BTWorkBudget); ok {
+			if btFindBuildable(pats[cands[k].idx].fullPattern) {
 				cands[k].bt = true
 				continue
 			}
@@ -239,7 +239,7 @@ func sparseSplitCands(spec SetSpec, opts CompileSetOptions, buckets []*bucket, i
 			i := idx[p]
 			if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok {
 				cands = append(cands, splitCand{idx: i, saBytes: sa.end})
-			} else if _, ok := btFindStackSize(p.fullPattern, opts.BTWorkBudget); ok {
+			} else if btFindBuildable(p.fullPattern) {
 				cands = append(cands, splitCand{idx: i, bt: true})
 			}
 		}
@@ -511,7 +511,7 @@ func setSplitCandidates(spec SetSpec, opts CompileSetOptions) []splitCand {
 		}
 		if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok {
 			out = append(out, splitCand{idx: i, saBytes: sa.end})
-		} else if _, ok := btFindStackSize(p.fullPattern, opts.BTWorkBudget); ok {
+		} else if btFindBuildable(p.fullPattern) {
 			out = append(out, splitCand{idx: i, bt: true})
 		}
 	}
@@ -931,28 +931,13 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 	if len(split) == 0 {
 		return
 	}
-	// One frame stack for every Backtracking member: the merge wrappers call
-	// one member at a time, and nothing else runs a member's find.
-	var stack *[2]int32
-	maxStack := 0
-	for _, c := range split {
-		if c.bt {
-			size, _ := btFindStackSize(full.Patterns[c.idx].fullPattern, opts.BTWorkBudget)
-			maxStack = max(maxStack, size)
-			stack = &[2]int32{}
-		}
-	}
-	if stack != nil {
-		base := ra.Reserve("split-bt-stack", 8)
-		ra.Commit(base + int32(maxStack)) //nolint:gosec // a stack size
-		stack[0], stack[1] = base, base+int32(maxStack)
-		if maxStack > 0 {
-			// Declare the stack in the data section, as planBTRegions does:
-			// callers find free memory from the emitted segments, and an
-			// input placed on an undeclared stack is silent corruption.
-			cs.splitData = append(cs.splitData, appendDataSegment(nil, stack[1]-1, []byte{0})...)
-			cs.splitSegs++
-		}
+	// A Backtracking member's frame stack and fallback region are run-time
+	// scratch. When the set's bucket members keep regions for the whole host
+	// call, a split member's scratch starts above them (btScratch.drive): the
+	// merge wrapper calls the buckets and the split members in one call.
+	var drive *btDrive
+	if cs.btRegions != nil && cs.btRegions.hasDrive {
+		drive = &cs.btRegions.drive
 	}
 	for _, c := range split {
 		p := full.Patterns[c.idx]
@@ -961,8 +946,8 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 			// Its budget lasts the member's search, across the set's calls,
 			// in the member's own block, as a pattern's find keeps it.
 			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget,
-				tableMemIdx: opts.TableMemIdx, globals: opts.globals}
-			bt, err := buildBTFindParts(p.fullPattern, nil, findMandatoryLit(p.fullPattern, p.byteMode), int64(base), &o, stack)
+				tableMemIdx: opts.TableMemIdx, globals: opts.globals, btDrive: drive}
+			bt, err := buildBTFindParts(p.fullPattern, nil, findMandatoryLit(p.fullPattern, p.byteMode), int64(base), &o)
 			if err != nil {
 				panic("compile: a split member Backtracking was classified to take refused it: " + err.Error())
 			}

@@ -1490,12 +1490,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	ra := newRegionAlloc(frontier)
 
 	// ── Backtracking fallback buckets ────────────────────
-	// Laid out above every other table this set owns, so the regions cannot
-	// collide with a suffix, prefix, AC or Teddy table. ONE shared allocation
-	// sized to the largest BT bucket: only one BT call is ever live, because
-	// the per-candidate driver calls one suffix function at a time and the
-	// memo re-zeroes itself at the head of every call.
-	btBase := ra.Reserve("bt-fallback", 1)
+	// They lay out nothing: every frame stack and fallback region is run-time
+	// scratch (btGrowth, bt_scratch.go), and a member writes no slots.
+	//
 	// A budgeted bucket — every BT bucket unless the budget is off — also gets a
 	// fallback driver. It reserves no region: its frame stack and memo are
 	// sized from the input at call time and found through the module's
@@ -1508,15 +1505,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		}
 		numBTFallbacks++
 	}
-	btRegions := planBTRegions(buckets, int64(btBase), opts.globals, opts.BTWorkBudget)
+	btRegions := planBTRegions(buckets, opts.globals)
 	var btBlockMembers []*btDriveMember
 	var btBlocksG uint32
-	if btRegions != nil && numBTFallbacks > 0 {
+	if btRegions != nil {
+		// Every BT bucket's ordinary body grows its frame stack through these,
+		// and the call-scoped state lets one host call's candidates share a
+		// member's budget, region and visited set (btDriveMember) — and the
+		// scratch base the call's first body found, so a host global of 0 does
+		// not take fresh pages per candidate (emitBTScratchBase).
 		btRegions.scratch = opts.globals.BTScratch()
-		// The call-scoped state that lets one host call's candidates share a
-		// member's budget, region and visited set (btDriveMember).
 		btRegions.drive = allocBTDrive(opts.globals)
 		btRegions.hasDrive = true
+	}
+	if btRegions != nil && numBTFallbacks > 0 {
 		btRegions.members = map[int]*btDriveMember{}
 		for bi, bkt := range buckets {
 			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
@@ -1558,25 +1560,6 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				spec.Name, bi, n))
 		}
 		numBTFns++
-	}
-	if btRegions == nil {
-		ra.Skip()
-	}
-	if btRegions != nil {
-		ra.Commit(btRegions.end)
-		// DECLARE the reservation in the data section. The regions hold no
-		// initial data — BT zeroes its own memo and its stack starts empty —
-		// but a caller has no other way to learn they exist: both
-		// utils.WasmMemTop and the harnesses derive "where free memory
-		// starts" from the emitted data segments. Without this the input
-		// buffer is placed straight on top of the BT stack, which is silent
-		// corruption rather than a trap: a mixed set lost matches from the
-		// LITERAL bucket too, which is how it was found.
-		//
-		// One zero byte at the top is enough to move that boundary; carrying
-		// the whole region as zeros would add tens of KB to every module.
-		allDataBytes = append(allDataBytes, appendDataSegment(nil, btRegions.end-1, []byte{0})...)
-		totalDataSegs++
 	}
 
 	cs := &compiledSet{

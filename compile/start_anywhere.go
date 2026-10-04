@@ -519,7 +519,7 @@ func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, 
 	if opts.globals == nil {
 		return false
 	}
-	parts, err := buildBTFindParts(re.Pattern, table, mandLit, base, &opts, nil)
+	parts, err := buildBTFindParts(re.Pattern, table, mandLit, base, &opts)
 	if err != nil {
 		return false
 	}

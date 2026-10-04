@@ -32,15 +32,14 @@ const (
 	// search for lack of memory. Where it can arise:
 	//
 	//   - a program compiled with the work budget off
-	//     (compile.BTWorkBudgetOff, a test knob): the backtrack FRAME STACK
-	//     (btPushFrame's guard in compile/engine_backtrack.go), sized from the
-	//     pattern's alternation count by btAllocSizes — compile-time sized while
-	//     the requirement scales with the input;
+	//     (compile.BTWorkBudgetOff, a test knob): the ordinary body's FRAME
+	//     STACK (btPushFrame's guard in compile/engine_backtrack.go), which
+	//     grows at call time, could not grow;
 	//   - every other program only when its FALLBACK body, which sizes its
 	//     frame stack and memo from the input at call time, cannot grow linear
-	//     memory any further (WASM32's 4 GiB, or a lower host limit). The
-	//     ordinary body's static stack no longer produces it: running out hands
-	//     the call to the fallback.
+	//     memory any further (WASM32's 4 GiB, max_memory, or a lower host
+	//     limit). The ordinary body's stack running out hands the call to the
+	//     fallback.
 	//
 	// Whichever fires, the engine has abandoned part of the search space and
 	// cannot say whether a match exists: reporting NoMatch here would be a

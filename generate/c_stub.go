@@ -933,10 +933,9 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	// caller-owned iterator too, so nothing here is static and a second scan
 	// cannot invalidate the first.
 	//
-	// NOTE this does NOT make the C stubs thread-safe: the Backtracking engine
-	// keeps its stack at a fixed stackBase and its BitState memo at a fixed
-	// memoTableBase (compile/engine_backtrack.go). Claim re-entrancy, not
-	// thread-safety.
+	// NOTE this does NOT make the C stubs thread-safe: every Backtracking body
+	// keeps its frame stack and memo in the module's one run-time scratch
+	// region (compile/bt_scratch.go). Claim re-entrancy, not thread-safety.
 	fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
     if (!iter || !input) return RX_ERR_NULL_ARG;
     iter->input = input;
