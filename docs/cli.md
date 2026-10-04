@@ -294,7 +294,9 @@ not chosen here because Go's parser rejects `(?-u)` outright.
   exactly those runes, and match every byte that is not a letter (or word
   character), `0x80`-`0xFF` included. In byte mode `(?i)` over Latin-1 adds
   U+212B (from `å`) the same way. A rune you DID write stays refused, negated
-  or not: `[^ſ]` and `[sſ]` both name `ſ`.
+  or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`, `[^sSſ]` and
+  `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or the octal
+  `\577` — and the byte engine cannot match the `ſ` they ask for.
   The consequence is that `(?i)k` does not match a Kelvin sign and
   `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
   practice, and folding within `0x00`-`0xFF` in byte mode.

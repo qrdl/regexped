@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"regexp/syntax"
+	"strconv"
+	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -1336,7 +1339,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if !buildOpts.Unicode {
 		if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
 			if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil {
-				if bad := unsupportedRune(prog, buildOpts.ByteMode); bad >= 0 {
+				if bad := unsupportedRuneIn(re.Pattern, prog, buildOpts.ByteMode); bad >= 0 {
 					return nil, unsupportedRuneError(bad)
 				}
 			}
@@ -3673,7 +3676,7 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 		return 0, fmt.Errorf("parse error: %w", err)
 	}
 	prog, _ := syntax.Compile(re.Simplify())
-	if bad := unsupportedRune(prog, opts.ByteMode); bad >= 0 && !opts.Unicode {
+	if bad := unsupportedRuneIn(pattern, prog, opts.ByteMode); bad >= 0 && !opts.Unicode {
 		return 0, unsupportedRuneError(bad)
 	}
 	return selectBestEngine(prog, &opts), nil
@@ -3703,7 +3706,7 @@ func compile(pattern string, opts ...CompileOptions) (matcher, error) {
 		options = opts[0]
 	}
 
-	if bad := unsupportedRune(prog, options.ByteMode); bad >= 0 && !options.Unicode {
+	if bad := unsupportedRuneIn(pattern, prog, options.ByteMode); bad >= 0 && !options.Unicode {
 		return nil, unsupportedRuneError(bad)
 	}
 
@@ -3776,7 +3779,9 @@ const maxUnicodeRune = 0x10ffff
 //     the ASCII `s` and `k` in the same instruction. A rune above the limit is
 //     therefore tolerated when the same instruction names its WHOLE fold
 //     orbit, which is what the expansion produces and what a hand-written
-//     `[sſ]` does not — see foldArtifactOf. Without this the gate rejects
+//     `[sſ]` does not — see foldArtifactOf — and when the pattern does not
+//     WRITE it (writtenFoldRunes): `[sSſ]` names the whole orbit too, by
+//     hand, and is refused. Without this the gate rejects
 //     `(?i:[a-z]+)` and `(?i)^\s*SELECT\b` — measured over the four corpora,
 //     that is 8 rows of working, tested patterns, and `(?i)` over a letter
 //     class or `\w` is a common shape rather than an exotic one.
@@ -3795,7 +3800,8 @@ const maxUnicodeRune = 0x10ffff
 //     reaching U+10FFFF from at or below the limit is therefore still the
 //     open-ended tail when every rune ABOVE the limit it leaves out is an
 //     artifact whose whole fold orbit is left out too (foldArtifactHole). A
-//     hand-written `[^ſ]` leaves ſ out but keeps s and S, and stays refused.
+//     hand-written `[^ſ]` leaves ſ out but keeps s and S, and stays refused;
+//     `[^sSſ]` leaves the whole orbit out, but by hand, and is refused too.
 //
 //   - **Adjacent artifacts merged into one range.** Under byte_mode, `(?i)`
 //     over Latin-1 adds U+212B (Å, the Angstrom sign, from å) beside U+212A
@@ -3804,11 +3810,38 @@ const maxUnicodeRune = 0x10ffff
 //
 // What IS rejected is a rune NAMED AS A MEMBER above the mode's limit —
 // `[a-zé]+`, `\pL+`, `[a\x80]+` outside byte mode, `[sſ]` in either — and
-// anything above U+00FF in either mode. "Named as a member" rather than
+// anything above U+00FF in either mode.
+//
+// The program cannot tell an artifact from the same rune WRITTEN by the
+// pattern: `[^sSſ]` and `(?i)[^s]`, or `[kK\x{212A}]` and `(?i)k`, compile to
+// the same instructions. unsupportedRuneIn therefore reads the source text as
+// well, and the tolerance is withdrawn for every rune the pattern writes
+// (writtenFoldRunes) — `(?i)[sſ]` included: the byte engine cannot match the ſ
+// it was asked for, whatever (?i) does with the rest. Anything this refuses is
+// a pattern that names a rune no byte holds, which is what Unicode support will
+// pick up. "Named as a member" rather than
 // "written by the pattern" on purpose: a range endpoint of U+10FFFF is a
 // spelling of "the complement of everything below", not a demand to match that
 // codepoint, and the two are indistinguishable by the time this runs.
 func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
+	return unsupportedRuneWritten(prog, byteMode, nil)
+}
+
+// unsupportedRuneIn is unsupportedRune for a pattern whose source text is at
+// hand: no rune the text writes is tolerated as a fold artifact. Every gate
+// that has the text calls this; the guards that see only a derived program
+// (start_anywhere.go, needsUnicodeSupport) run after one that did.
+func unsupportedRuneIn(pattern string, prog *syntax.Prog, byteMode bool) rune {
+	limit := rune(127)
+	if byteMode {
+		limit = 0xFF
+	}
+	return unsupportedRuneWritten(prog, byteMode, writtenFoldRunes(pattern, limit))
+}
+
+// unsupportedRuneWritten is the gate, with written the runes the pattern's
+// text writes (writtenFoldRunes; nil when unknown or none).
+func unsupportedRuneWritten(prog *syntax.Prog, byteMode bool, written map[rune]bool) rune {
 	limit := rune(127)
 	if byteMode {
 		limit = 0xFF
@@ -3818,7 +3851,7 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 		if inst.Op != syntax.InstRune && inst.Op != syntax.InstRune1 {
 			continue
 		}
-		if r, tail := openTailRune(inst, limit); tail {
+		if r, tail := openTailRune(inst, limit, written); tail {
 			if r >= 0 {
 				return r
 			}
@@ -3833,7 +3866,7 @@ func unsupportedRune(prog *syntax.Prog, byteMode bool) rune {
 			if hi <= limit {
 				continue
 			}
-			if lo > limit && hi-lo < maxFoldArtifactRun && allFoldArtifacts(lo, hi, inst, limit) {
+			if lo > limit && hi-lo < maxFoldArtifactRun && allFoldArtifacts(lo, hi, inst, limit, written) {
 				continue
 			}
 			if lo > limit {
@@ -3855,7 +3888,7 @@ const maxFoldArtifactRun = 8
 // spelling. tail is false for any other instruction. For one that is, r is -1
 // when every rune above the limit it LEAVES OUT is a fold-artifact hole, and
 // otherwise the first rune it leaves out that is not.
-func openTailRune(inst *syntax.Inst, limit rune) (r rune, tail bool) {
+func openTailRune(inst *syntax.Inst, limit rune, written map[rune]bool) (r rune, tail bool) {
 	n := len(inst.Rune)
 	if n < 2 || n%2 != 0 || inst.Rune[n-1] != maxUnicodeRune || inst.Rune[0] > limit {
 		return -1, false
@@ -3871,7 +3904,7 @@ func openTailRune(inst *syntax.Inst, limit rune) (r rune, tail bool) {
 				return next, true
 			}
 			for g := next; g < lo; g++ {
-				if !foldArtifactHole(g, inst, limit) {
+				if written[g] || !foldArtifactHole(g, inst, limit) {
 					return g, true
 				}
 			}
@@ -3901,9 +3934,9 @@ func foldArtifactHole(r rune, inst *syntax.Inst, limit rune) bool {
 // allFoldArtifacts reports whether every rune in lo..hi is a fold artifact of
 // inst (foldArtifactOf) — a range of more than one when the parser merged
 // adjacent artifacts, as it does with U+212A and U+212B.
-func allFoldArtifacts(lo, hi rune, inst *syntax.Inst, limit rune) bool {
+func allFoldArtifacts(lo, hi rune, inst *syntax.Inst, limit rune, written map[rune]bool) bool {
 	for r := lo; r <= hi; r++ {
-		if !foldArtifactOf(r, inst, limit) {
+		if written[r] || !foldArtifactOf(r, inst, limit) {
 			return false
 		}
 	}
@@ -3930,9 +3963,10 @@ func allFoldArtifacts(lo, hi rune, inst *syntax.Inst, limit rune) bool {
 // `(?i)^\s*SELECT\b` and `(?i)Kelvin` on the tolerate side and `[sſ]`,
 // `[s\x{17F}]` and `[a-zſ]` on the reject side.
 //
-// `(?i)[sſ]` tolerates, and that is the right answer rather than a leak: under
-// `(?i)` the class IS the closed orbit, so the artifact and the written rune
-// are the same bytes, and matching `s`/`S` serves what was asked.
+// Orbit completeness alone still admits a hand-written FULL orbit — `[sSſ]`,
+// `(?i)[sſ]` — which compiles to the same instruction as `(?i)s`. Those are
+// told apart by the source text instead (writtenFoldRunes): the ſ the pattern
+// wrote is one the byte engine cannot match, so it is refused.
 //
 // At least one orbit member must be in range, or there is nothing this rune
 // could be an artifact OF.
@@ -3947,6 +3981,90 @@ func foldArtifactOf(r rune, inst *syntax.Inst, limit rune) bool {
 		}
 	}
 	return inRangePartner
+}
+
+// writtenFoldRunes returns the runes above limit that pattern WRITES — as a
+// literal character, a \x{…} escape or an octal escape (`\577` is U+017F) —
+// and that have a fold partner at or below the limit: the only runes the
+// gate's fold-artifact tolerance could otherwise take for something `(?i)`
+// manufactured. nil when there are none, which is every ASCII pattern.
+//
+// A scan rather than a parse, because the parse tree cannot say it either:
+// Go merges single-rune alternatives into one class carrying ONE of their
+// flags, so `[0-9]|(?i)k` arrives as a class naming the Kelvin sign without
+// the FoldCase flag, exactly like a hand-written `[0-9kK\x{212A}]`. \xHH
+// (at most 0xFF) cannot spell such a rune, and \p classes that contain one
+// contain runes the gate refuses anyway.
+func writtenFoldRunes(pattern string, limit rune) map[rune]bool {
+	var out map[rune]bool
+	add := func(r rune) {
+		if r <= limit || !foldsAtOrBelow(r, limit) {
+			return
+		}
+		if out == nil {
+			out = map[rune]bool{}
+		}
+		out[r] = true
+	}
+	for i := 0; i < len(pattern); {
+		if pattern[i] != '\\' || i+1 == len(pattern) {
+			r, n := utf8.DecodeRuneInString(pattern[i:])
+			add(r)
+			i += n
+			continue
+		}
+		switch c := pattern[i+1]; {
+		case c == 'Q':
+			// Literal text up to \E: only characters can write a rune there.
+			end := strings.Index(pattern[i+2:], `\E`)
+			lit := pattern[i+2:]
+			if end >= 0 {
+				lit = lit[:end]
+			}
+			for _, r := range lit {
+				add(r)
+			}
+			i += 2 + len(lit)
+			if end >= 0 {
+				i += 2
+			}
+		case c == 'x' && i+2 < len(pattern) && pattern[i+2] == '{':
+			end := strings.IndexByte(pattern[i+3:], '}')
+			if end < 0 {
+				i += 2
+				continue
+			}
+			if v, err := strconv.ParseUint(pattern[i+3:i+3+end], 16, 32); err == nil {
+				add(rune(v))
+			}
+			i += 3 + end + 1
+		case c >= '0' && c <= '7':
+			// Up to three octal digits, as Go's parser reads them.
+			v, j := rune(0), i+1
+			for ; j < len(pattern) && j < i+4 && pattern[j] >= '0' && pattern[j] <= '7'; j++ {
+				v = v*8 + rune(pattern[j]-'0')
+			}
+			add(v)
+			i = j
+		default:
+			// Any other escape, `\\` included: the escaped character is not
+			// the start of another one.
+			_, n := utf8.DecodeRuneInString(pattern[i+1:])
+			i += 1 + n
+		}
+	}
+	return out
+}
+
+// foldsAtOrBelow reports whether r's simple fold orbit has a member at or
+// below limit.
+func foldsAtOrBelow(r, limit rune) bool {
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f >= 0 && f <= limit {
+			return true
+		}
+	}
+	return false
 }
 
 // instNamesRune reports whether inst's rune ranges cover r.

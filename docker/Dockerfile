@@ -29,7 +29,8 @@
 # without the flag. Passing --user anyway still works and is still supported:
 # the correction sees a non-root uid and does nothing.
 #
-# distroless/cc includes glibc + libstdc++ required by wasm-merge
+# distroless/cc carries the glibc wasm-tools is linked against (wasm-merge and
+# wac ship statically linked)
 FROM gcr.io/distroless/cc-debian13 AS base
 
 FROM scratch

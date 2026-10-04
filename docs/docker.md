@@ -21,7 +21,7 @@ command line.
 make docker
 ```
 
-This builds the `regexped` binary locally and assembles the build context in `docker/` — the binary is built there and `wasm-merge`, `wasm-tools` and `wac` are downloaded there (each one's latest release, if it is not already present — never copied from your `PATH`, which may be linked against a different glibc than the image carries). It then builds the Docker image tagged `regexped` from that directory.
+This builds the `regexped` binary locally and assembles the build context in `docker/` — the binary is built there and `wasm-merge`, `wasm-tools` and `wac` are downloaded there (each one's latest release, if it is not already present — never copied from your `PATH`, which may be linked against a different glibc than the image carries). It then builds the Docker image tagged `regexped` from that directory — so to run a local build, use `regexped` in place of `qrdl/regexped` in the examples below.
 
 Every binary in that directory carries its architecture in its name —
 `regexped-arm64`, `wasm-merge-arm64` and so on — and the `Dockerfile` picks a
@@ -47,7 +47,7 @@ Everything the image needs lives in [`docker/`](../docker): the `Dockerfile`, th
 Mount your project directory to `/work` and pass `regexped` commands as arguments:
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work qrdl/regexped \
   <command> [flags]
 ```
 
@@ -88,7 +88,7 @@ already read.
 ## Generating stubs
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work qrdl/regexped \
   generate --config=regexped.yaml
 ```
 
@@ -99,7 +99,7 @@ Under `wasm_format: component` only three stub types exist: `rust`, `c` and `wit
 To write the stub to stdout:
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work qrdl/regexped \
   generate --config=regexped.yaml --output=-
 ```
 
@@ -108,7 +108,7 @@ docker run --rm -v /path/to/your/project:/work -w /work regexped \
 ## Compiling patterns to WASM
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work qrdl/regexped \
   compile --config=regexped.yaml
 ```
 
@@ -123,7 +123,7 @@ Compiles all regexp patterns in the config to a single WASM file at the path spe
 ## Merging WASM modules
 
 ```bash
-docker run --rm -v /path/to/your/project:/work -w /work regexped \
+docker run --rm -v /path/to/your/project:/work -w /work qrdl/regexped \
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
@@ -147,18 +147,18 @@ An image missing any of them could only do part of the job.
 
 ```bash
 # 1. Generate Rust stubs
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   generate --config=regexped.yaml
 
 # 2. Build your Rust project to WASM (outside the container — needs cargo)
 cargo build --target wasm32-wasip1 --release
 
 # 3. Compile regexp patterns to WASM
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   compile --config=regexped.yaml
 
 # 4. Merge into a single binary
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   merge --config=regexped.yaml --main=target/wasm32-wasip1/release/app.wasm regexps.wasm
 ```
 
@@ -166,18 +166,18 @@ docker run --rm -v $(pwd):/work -w /work regexped \
 
 ```bash
 # 1. Generate Go stubs
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   generate --config=regexped.yaml
 
 # 2. Compile regexp patterns to WASM
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   compile --config=regexped.yaml
 
 # 3. Build your Go project to WASM (outside the container — needs Go)
 GOOS=wasip1 GOARCH=wasm go build -o app.wasm .
 
 # 4. Merge into a single binary
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   merge --config=regexped.yaml --main=app.wasm regexps.wasm
 ```
 
@@ -188,7 +188,7 @@ wasip2 component, and `merge` composes it with the regexp component using `wac`:
 
 ```bash
 # 1. Generate the Rust component stub
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   generate --config=regexped.yaml
 
 # 2. Build your Rust project as a component (outside the container — needs cargo
@@ -196,11 +196,11 @@ docker run --rm -v $(pwd):/work -w /work regexped \
 cargo build --target wasm32-wasip2 --release
 
 # 3. Compile regexp patterns to a component plus its sibling .wit
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   compile --config=regexped.yaml
 
 # 4. Compose the two into one component (wac)
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   merge --config=regexped.yaml --main=target/wasm32-wasip2/release/app.wasm regexps.wasm
 
 # 5. Run it (outside the container)
@@ -214,11 +214,11 @@ Use the file names your config's `wasm_file` and `output` give. See
 
 ```bash
 # 1. Compile regexp patterns to WASM (standalone mode — no output field in config)
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   compile --config=regexped.yaml
 
 # 2. Generate JS/TS stub
-docker run --rm -v $(pwd):/work -w /work regexped \
+docker run --rm -v $(pwd):/work -w /work qrdl/regexped \
   generate --config=regexped.yaml
 ```
 

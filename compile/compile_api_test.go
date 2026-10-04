@@ -1581,6 +1581,45 @@ func TestBTWorkBudgetRejectsUnnamedNegative(t *testing.T) {
 //     U+10FFFF, name no member above the limit and stay legal — including a
 //     negated class whose tail (?i) cut holes into at those artifacts, and
 //     adjacent artifacts the parser merged into one range.
+//
+// TestWrittenFoldRunes pins the scan the rune gate reads a pattern's text
+// with: which spellings write a rune, and which text only looks like one.
+func TestWrittenFoldRunes(t *testing.T) {
+	cases := []struct {
+		pattern string
+		limit   rune
+		want    []rune
+	}{
+		{`abc`, 127, nil},
+		{`ſ`, 127, []rune{0x17F}},
+		{`\x{17f}x\x{212A}`, 127, []rune{0x17F, 0x212A}},
+		{`\577`, 127, []rune{0x17F}},
+		{`\0`, 127, nil},
+		{`\Qſ\x{212A}\E`, 127, []rune{0x17F}},
+		{`\Qa\x{212A}`, 127, nil},
+		{`\\x{17F}\\577`, 127, nil},
+		{`\x{17F`, 127, nil},
+		{`\x{zz}`, 127, nil},
+		{`é`, 127, nil},
+		{`\x{3A9}`, 127, nil},
+		{`\x{212B}`, 127, nil},
+		{`\x{212B}`, 0xFF, []rune{0x212B}},
+		{`a\`, 127, nil},
+	}
+	for _, c := range cases {
+		got := writtenFoldRunes(c.pattern, c.limit)
+		if len(got) != len(c.want) {
+			t.Errorf("writtenFoldRunes(%q, %#x) = %v, want %U", c.pattern, c.limit, got, c.want)
+			continue
+		}
+		for _, r := range c.want {
+			if !got[r] {
+				t.Errorf("writtenFoldRunes(%q, %#x) = %v, want %U", c.pattern, c.limit, got, c.want)
+			}
+		}
+	}
+}
+
 func TestUnsupportedRuneRejection(t *testing.T) {
 	cases := []struct {
 		pattern              string
@@ -1641,6 +1680,23 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`[^ſ]`, true, true, "hand-written ſ: s and S are still IN the class"},
 		{`[^\x{212A}]`, true, true, "hand-written Kelvin sign: k and K still in the class"},
 		{`(?i)[^a-z\x{100}]`, true, true, "U+0100 has no fold partner below the limit"},
+		// A WHOLE orbit written by hand compiles to exactly what (?i)
+		// manufactures, so only the source text tells them apart: Go does not
+		// match the input "ſ" with [^sSſ], and matches it with [sSſ] — a byte
+		// engine can do neither.
+		{`[^sSſ]`, true, true, "the whole orbit left out by hand"},
+		{`[sSſ]`, true, true, "the whole orbit named by hand"},
+		{`[kK\x{212A}]`, true, true, "the Kelvin sign's orbit, by escape"},
+		{`[^kK\x{212A}]`, true, true, "the same, negated"},
+		{`[sS\577]`, true, true, "ſ spelled as an octal escape"},
+		{`(?i)[sſ]`, true, true, "(?i) or not, the byte engine cannot match the ſ written"},
+		{`[åÅ\x{212B}]`, true, true, "byte mode: å's orbit by hand"},
+		// ...while ASCII text that merely LOOKS like such a spelling stays
+		// legal, and so do (?i) artifacts the parser merged into a class
+		// without the FoldCase flag.
+		{`\\x{17F}`, false, false, "an escaped backslash, then plain text"},
+		{`[0-9]|(?i)k`, false, false, "Go merges these into one class without FoldCase"},
+		{`x|(?i:s)`, false, false, "the same, for s"},
 	}
 
 	compileWith := func(pattern string, byteMode bool) error {
