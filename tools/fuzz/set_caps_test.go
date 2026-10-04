@@ -3543,15 +3543,20 @@ func TestSetBTMatchesGo(t *testing.T) {
 	}
 }
 
-// TestSetBTStackGrows: a set member's ordinary frame stack starts at
-// BTStackStart bytes and doubles when full, as a pattern's does. Built with one
-// frame to start and the work budget off — no fallback to hand over to — every
-// answer that needs a second frame comes from a stack that grew: p0 is kept on
-// a Backtracking bucket (up to 30 frames), p1 is split out onto the
-// Backtracking find (one frame per letter before `aX`). Overlapping `find`
-// with every other capability, then gated `find`, each against Go.
+// TestSetBTStackGrows: a set member's ordinary frame stack doubles when full,
+// as a pattern's does. A stack is given every byte of memory above its base,
+// so a small BTStackStart alone does not make it full: the first grow still
+// adds a whole page, 8,192 frames. Each call here therefore starts with the
+// host's scratch base 8 bytes below the end of memory and a one-frame start —
+// the second frame has to grow memory — and the work budget is off, so there
+// is no fallback to hand over to: an answer needing a second frame comes from
+// a stack that grew. p0 is kept on a Backtracking bucket (a frame per greedy
+// iteration, up to 30), p1 split out onto the Backtracking find (a frame per
+// letter before `aX`). Each alone first, where memory must grow during the
+// call; then all three, overlapping `find` with every other capability and
+// gated `find`, each against Go.
 func TestSetBTStackGrows(t *testing.T) {
-	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`, `zz`}
+	pats := []string{`(?:a|bc){1,30}x`, `[a-z]+aX`, `zz`}
 	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
 		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
 	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {
@@ -3574,13 +3579,39 @@ func TestSetBTStackGrows(t *testing.T) {
 		}
 		return w, diags
 	}
-	// The option reaches each kind of member: alone beside `zz`, each builds a
-	// different module than with the default start.
-	for _, alone := range [][]string{{pats[0], pats[2]}, {pats[1], pats[2]}} {
+	// atMemoryEnd is a fresh runner whose host has grown memory by a page and
+	// put the scratch base 8 bytes — one frame — below its end.
+	atMemoryEnd := func(t *testing.T, w []byte, pats []string, in string) (*capRunner, uint64) {
+		t.Helper()
+		r := newCapRunnerFrom(t, w, pats, in)
+		if _, err := r.mem.Grow(r.store, 1); err != nil {
+			t.Fatal(err)
+		}
+		pages := r.mem.Size(r.store)
+		base := wasmtime.ValI32(int32(pages*65536 - 8)) //nolint:gosec // a few pages
+		if err := r.inst.GetExport(r.store, abi.ScratchBaseExport).Global().Set(r.store, base); err != nil {
+			t.Fatal(err)
+		}
+		return r, pages
+	}
+	// Each kind of member alone beside `zz`: BTStackStart reaches it (the
+	// module differs from the default start's), and a search needing a second
+	// frame grows memory.
+	for k, alone := range [][]string{{pats[0], pats[2]}, {pats[1], pats[2]}} {
 		def, _ := build(t, alone, false, 0)
-		if small, _ := build(t, alone, false, 8); string(small) == string(def) {
+		w, _ := build(t, alone, false, 8)
+		if string(w) == string(def) {
 			t.Fatalf("%v: BTStackStart did not reach the member", alone)
 		}
+		in := []string{strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX"}[k]
+		r, pages := atMemoryEnd(t, w, alone, in)
+		if got := r.call(t, "cap_scan_any", r.inBase, int32(len(in)), int32(0)).(int32); got != 0 {
+			t.Errorf("%v: scan_any over %.20q… = %d, want 0", alone, in, got)
+		}
+		if after := r.mem.Size(r.store); after <= pages {
+			t.Errorf("%v: memory stayed at %d pages — the stack never grew", alone, after)
+		}
+		r.Close()
 	}
 	for _, overlapping := range []bool{true, false} {
 		w, diags := build(t, pats, overlapping, 8)
@@ -3596,7 +3627,7 @@ func TestSetBTStackGrows(t *testing.T) {
 		}
 		drops := dropsFromSet(diags)
 		for _, in := range inputs {
-			r := newCapRunnerFrom(t, w, pats, in)
+			r, _ := atMemoryEnd(t, w, pats, in)
 			if overlapping {
 				checkCapsAgainstOracleDropped(t, r, pats, in, drops.anchored)
 			} else {

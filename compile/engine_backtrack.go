@@ -429,15 +429,16 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	body = append(body, 0x0F)       // return
 	body = append(body, 0x0B)       // end if (empty)
 
+	// The exhausted budget's trip (ptr, len, out_ptr), shared with the
+	// overflow of an empty stack below.
+	giveUp := btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32)
+	if member == nil && capSearch != nil {
+		inner := giveUp
+		giveUp = func(b []byte) []byte { return inner(capSearch.emitCapTripped(b)) }
+	}
 	if useWork && member != nil {
-		body = emitBTWorkChargeMember(body, member, workLocal, btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32))
+		body = emitBTWorkChargeMember(body, member, workLocal, giveUp)
 	} else if useWork {
-		// ptr, len, out_ptr
-		giveUp := btGiveUp(tripCalls, 3, &callOffs, btWorkTripI32)
-		if capSearch != nil {
-			inner := giveUp
-			giveUp = func(b []byte) []byte { return inner(capSearch.emitCapTripped(b)) }
-		}
 		body = emitBTWorkCharge(body, workLocal, giveUp)
 	}
 
@@ -493,9 +494,9 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	if dyn.member != nil {
 		memoOrigin = dyn.origin
 	}
-	overflow := btOverflowAction(useWork && tripCalls, workLocal, nil)
+	overflow := btOverflowAction(useWork && tripCalls, workLocal, nil, dyn, giveUp)
 	if useWork && tripCalls && member != nil {
-		overflow = btArmTripMember(member)
+		overflow = btArmTripMember(member, dyn, giveUp)
 	}
 
 	// After each end of block $pc_p, emit the handler for PC p.
@@ -530,10 +531,11 @@ const errBTNoFrameStack = "compile: a Backtracking body needs a frame stack: a f
 
 // btOverflowAction is a body's frame-stack overflow: arm the budget so the next
 // pop calls the fallback (btArmTrip) when the body has one, else unknown — nil
-// meaning the default i32 -2.
-func btOverflowAction(armTrip bool, workLocal uint32, unknown func([]byte, uint32) []byte) func([]byte, uint32) []byte {
+// meaning the default i32 -2. giveUp is the body's exhausted-budget trip, run at
+// once when there is nothing to pop (see btArmTrip).
+func btOverflowAction(armTrip bool, workLocal uint32, unknown func([]byte, uint32) []byte, dyn *btDyn, giveUp func([]byte) []byte) func([]byte, uint32) []byte {
 	if armTrip {
-		return btArmTrip(workLocal)
+		return btArmTrip(workLocal, dyn, giveUp)
 	}
 	return unknown
 }
@@ -1182,10 +1184,12 @@ var btFallbackCallPlaceholder = utils.AppendPaddedULEB128(nil, 0, twinCallImmWid
 // exactly the inputs the caller gave. The placeholder's byte offset within b is
 // appended to *callOffs.
 //
-// A body's sites: the work-budget trip on the pop path and, for a body that
-// keeps its search in the caller's block, the entry's "already tripped" branch
-// (bt_search.go: emitFindEntry, emitCapEntry). A frame-stack overflow needs
-// none of its own — it arms the budget to trip on the next pop (btArmTrip).
+// A body's sites: the work-budget trip on the pop path; for a body that keeps
+// its search in the caller's block, the entry's "already tripped" branch
+// (bt_search.go: emitFindEntry, emitCapEntry); and at every frame push, for an
+// overflow with nothing on the stack (btArmTrip). An overflow with frames on
+// the stack needs no site of its own — it arms the budget to trip on the next
+// pop.
 func emitBTFallbackCall(b []byte, nParams int, callOffs *[]int) []byte {
 	for i := 0; i < nParams; i++ {
 		b = append(b, 0x20, byte(i)) // local.get param
@@ -1198,16 +1202,34 @@ func emitBTFallbackCall(b []byte, nParams int, callOffs *[]int) []byte {
 
 // btArmTrip is a fast body's frame-stack overflow when the budget calls a
 // fallback: set the work counter to 1 and fail. The FAIL handler's pop then
-// finds the budget exhausted and makes the one fallback call the body already
-// has, so the overflow needs no call site — and no patch offset — of its own.
-// The stack is never empty here: a push overflowed it.
-func btArmTrip(workLocal uint32) func([]byte, uint32) []byte {
+// finds the budget exhausted and makes the fallback call the body already has.
+//
+// Unless the stack is EMPTY: then there is no frame to pop, the FAIL handler
+// answers "no match" (or a find moves to its next start) before it charges
+// anything, and the armed budget is never seen. A growing stack overflows
+// empty when memory cannot hold even one frame at call start — max_memory
+// reached — and the search then answered -1 where it knew nothing; giveUp, the
+// body's trip, hands over at once instead, and the fallback answers -2 when it
+// cannot get memory either. (The fixed stacks this was written for could only
+// overflow full.)
+func btArmTrip(workLocal uint32, dyn *btDyn, giveUp func([]byte) []byte) func([]byte, uint32) []byte {
 	return func(b []byte, brDepth uint32) []byte {
+		b = btIfStackEmpty(b, dyn, giveUp)
 		b = append(b, 0x42, 0x01) // i64.const 1
 		b = append(b, 0x21)       // local.set work
 		b = utils.AppendULEB128(b, workLocal)
 		return btFail(b, brDepth)
 	}
+}
+
+// btIfStackEmpty runs then — which must leave the function — when sp is at the
+// frame stack's base.
+func btIfStackEmpty(b []byte, dyn *btDyn, then func([]byte) []byte) []byte {
+	b = append(b, 0x20, localSP)
+	b = emitBTStackBase(b, dyn)
+	b = append(b, 0x4D, 0x04, 0x40) // i32.le_u; if
+	b = then(b)
+	return append(b, 0x0B) // end if
 }
 
 // btTailCallBody is the whole fast body under BTWorkBudgetForceFallback: no
@@ -1981,13 +2003,14 @@ func buildBTMatchBody(bt *backtrack, frameSize int32, tableMemIdx int, workK int
 		return b
 	}
 
+	trip := btWorkTrip(useWork, tripCalls, 2, &callOffs, btWorkTripI32)
 	body = buildBTInnerDisp(body, bt,
 		frameSize,
 		memoByteAddr, memoMemoByte,
-		failEmpty, matchFn, btOverflowAction(useWork && tripCalls, workLocal, nil), tableMemIdx,
+		failEmpty, matchFn, btOverflowAction(useWork && tripCalls, workLocal, nil, dyn, trip), tableMemIdx,
 		// The anchored match body starts at 0 and has no origin to rebase onto.
 		0, false,
-		workLocal, btWorkTrip(useWork, tripCalls, 2, &callOffs, btWorkTripI32),
+		workLocal, trip,
 		dyn)
 
 	body = append(body, 0x00)       // unreachable
@@ -2501,7 +2524,8 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// btOverflowFindReturn's doc for why abandoning just this
 		// attempt_start (what this used to do) cannot produce a truthful
 		// answer.
-		overflowFind := btOverflowAction(useWork && tripCalls, workLocal, btOverflowFindReturn)
+		trip := srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64))
+		overflowFind := btOverflowAction(useWork && tripCalls, workLocal, btOverflowFindReturn, stackDyn, trip)
 		body = append(body, 0x02, 0x40) // block $run_exit
 		body = append(body, 0x03, 0x40) // loop $run
 		body = buildBTInnerDisp(body, bt,
@@ -2509,7 +2533,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
+			workLocal, trip,
 			stackDyn)
 		body = append(body, 0x00) // unreachable
 		body = append(body, 0x0B) // end loop $run
@@ -2571,13 +2595,14 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 		// Stack overflow: report abi.BTStackOverflow and stop — see the
 		// mandLit branch's identical comment above.
-		overflowFind := btOverflowAction(useWork && tripCalls, workLocal, btOverflowFindReturn)
+		trip := srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64))
+		overflowFind := btOverflowAction(useWork && tripCalls, workLocal, btOverflowFindReturn, stackDyn, trip)
 		b = buildBTInnerDisp(b, bt,
 			frameSize,
 			memoByteAddr, memoMemoByte,
 			failEmpty, matchFn, overflowFind, tableMemIdx,
 			memoOrigin, useMemo,
-			workLocal, srchTrip(btWorkTrip(useWork, tripCalls, 2, &callOffs, btUnknownI64)),
+			workLocal, trip,
 			stackDyn)
 
 		b = append(b, 0x00) // unreachable

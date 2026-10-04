@@ -1013,6 +1013,11 @@ func TestNeedsUnicodeSupportExported(t *testing.T) {
 		{`\d{4}`, false},
 		{`\x{263A}`, true},
 		{`\p{Greek}`, true},
+		// Agrees with Compile on a fold-artifact rune the pattern WRITES,
+		// which only the text shows: the program is (?i)s's.
+		{`(?i)[^a-z]`, false},
+		{`[sSſ]`, true},
+		{`[^kK\x{212A}]`, true},
 	} {
 		got, err := NeedsUnicodeSupport(c.pattern)
 		if err != nil {

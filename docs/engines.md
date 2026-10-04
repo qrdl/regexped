@@ -493,8 +493,9 @@ popped as the search goes, so it is never exhausted.
    41-85% cheaper at 1.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
-   frame stack runs out (a compile-time one, or a capture body's growing one
-   when memory cannot grow), which arms the counter to trip on the next pop. It is the same emitter over the same program with a `(pc, pos)` visited
+   frame stack runs out because memory cannot grow, which arms the counter to
+   trip on the next pop — or, when not even the first frame fits and there is
+   nothing to pop, hands over at once. It is the same emitter over the same program with a `(pc, pos)` visited
    bitset at EVERY alternation — Go `regexp`'s bitstate discipline. It restarts
    the call from scratch on the caller's own arguments and globals, and sizes
    its own frame stack and bitset from the input at call time.

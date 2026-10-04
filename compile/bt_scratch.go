@@ -883,9 +883,16 @@ func emitBTWorkChargeMember(b []byte, m *btDriveMember, tmp uint32, trip func([]
 	return append(b, 0x0B) // end if
 }
 
-// btArmTripMember is btArmTrip against the member's budget.
-func btArmTripMember(m *btDriveMember) func([]byte, uint32) []byte {
+// btArmTripMember is btArmTrip against the member's budget. An empty stack
+// trips at once, the budget spent as a charge would leave it, so the host
+// call's later candidates go to the fallback too.
+func btArmTripMember(m *btDriveMember, dyn *btDyn, giveUp func([]byte) []byte) func([]byte, uint32) []byte {
 	return func(b []byte, brDepth uint32) []byte {
+		b = btIfStackEmpty(b, dyn, func(b []byte) []byte {
+			b = append(b, 0x42, 0x00) // i64.const 0
+			b = appendGlobalSet(b, m.budget)
+			return giveUp(b)
+		})
 		b = append(b, 0x42, 0x01) // i64.const 1
 		b = appendGlobalSet(b, m.budget)
 		return btFail(b, brDepth)

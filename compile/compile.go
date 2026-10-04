@@ -3642,7 +3642,9 @@ func NeedsUnicodeSupport(pattern string) (bool, error) {
 		return false, fmt.Errorf("parse error: %w", err)
 	}
 	prog, _ := syntax.Compile(re.Simplify())
-	return needsUnicodeSupport(prog), nil
+	// The text as well as the program: Compile refuses a fold-artifact rune
+	// the pattern writes (`[sSſ]`), which the program alone cannot see.
+	return unsupportedRuneIn(pattern, prog, false) >= 0, nil
 }
 
 // BacktrackHasZeroWidthCycle reports whether pattern's GROUPS program — the
@@ -4034,7 +4036,7 @@ func writtenFoldRunes(pattern string, limit rune) map[rune]bool {
 				i += 2
 				continue
 			}
-			if v, err := strconv.ParseUint(pattern[i+3:i+3+end], 16, 32); err == nil {
+			if v, err := strconv.ParseUint(pattern[i+3:i+3+end], 16, 32); err == nil && v <= unicode.MaxRune {
 				add(rune(v))
 			}
 			i += 3 + end + 1

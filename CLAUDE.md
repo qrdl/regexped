@@ -41,8 +41,10 @@ regexped/
 │   │                          #   the budget runs out or its frame stack overflows — same emitter,
 │   │                          #   a (pc, pos) memo at EVERY Alt. Scoping the budget to empty-body
 │   │                          #   loops (`^(\w*|)*c`) was tried and REFUTED by `^(aa|a)*b`, which
-│   │                          #   hung with no empty-body loop at all. A stack overflow needs no
-│   │                          #   call site of its own: it ARMS the budget to trip on the next pop.
+│   │                          #   hung with no empty-body loop at all. A stack overflow ARMS the
+│   │                          #   budget to trip on the next pop — unless the stack is EMPTY (memory
+│   │                          #   at max_memory at call start), when there is no pop and it tail-
+│   │                          #   calls the fallback at once: it used to answer -1 there (btArmTrip).
 │   │                          #   EXCEPTION: a program with a ZERO-WIDTH CYCLE (progHasZeroWidthCycle)
 │   │                          #   gets no ordinary body under ANY budget, BTWorkBudgetOff included —
 │   │                          #   its first function is the bare tail call. The ordinary body has NO
