@@ -1754,6 +1754,21 @@ func namedRuneCeiling(pattern string, parsed *syntax.Regexp) rune {
 			break
 		}
 		switch c := pattern[i+1]; {
+		case c == 'Q':
+			// Literal text up to \E: only characters name a rune there, and
+			// escape-looking text such as \x{212A} is plain ASCII.
+			lit := pattern[i+2:]
+			end := strings.Index(lit, `\E`)
+			if end >= 0 {
+				lit = lit[:end]
+			}
+			for _, r := range lit {
+				raise(r)
+			}
+			i += 2 + len(lit)
+			if end >= 0 {
+				i += 2
+			}
 		case c == 'p' || c == 'P':
 			raise(unicode.MaxRune)
 			i += 2

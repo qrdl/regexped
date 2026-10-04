@@ -340,6 +340,21 @@ func namedRuneCeiling(pat string, parsed *syntax.Regexp) rune {
 			break
 		}
 		switch c := pat[i+1]; {
+		case c == 'Q':
+			// Literal text up to \E: only characters name a rune there, and
+			// escape-looking text such as \x{212A} is plain ASCII.
+			lit := pat[i+2:]
+			end := strings.Index(lit, `\E`)
+			if end >= 0 {
+				lit = lit[:end]
+			}
+			for _, r := range lit {
+				raise(r)
+			}
+			i += 2 + len(lit)
+			if end >= 0 {
+				i += 2
+			}
 		case c == 'p' || c == 'P':
 			raise(unicode.MaxRune)
 			i += 2
@@ -1402,5 +1417,29 @@ func TestEverySetEmitterIsReached(t *testing.T) {
 	if len(missing) > 0 {
 		t.Errorf("%d of %d set emitters are never reached by the answer-checking tests:\n  %s",
 			len(missing), len(emitters), strings.Join(missing, "\n  "))
+	}
+}
+
+// TestNamedRuneCeilingQuoted: text inside \Q…\E is literal, so escape-looking
+// text there names no rune and a pattern made of it is not skipped.
+func TestNamedRuneCeilingQuoted(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		want    rune
+	}{
+		{`abc`, -1},
+		{`\x{212A}`, 0x212A},
+		{`\Q\x{212A}\E`, -1}, // quoted: plain ASCII text
+		{`\Q\x{212A}`, -1},   // quoted to the end
+		{`\Qſ\E\x{80}`, 0x17F},
+		{`\Q\E\x{212A}`, 0x212A},
+	} {
+		parsed, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("%q: %v", c.pattern, err)
+		}
+		if got := namedRuneCeiling(c.pattern, parsed); got != c.want {
+			t.Errorf("namedRuneCeiling(%q) = %#x, want %#x", c.pattern, got, c.want)
+		}
 	}
 }

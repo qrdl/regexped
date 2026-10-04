@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"regexp/syntax"
+	"testing"
+)
 
 func TestAsciiTwinBasics(t *testing.T) {
 	cases := []struct{ text, pattern string }{
@@ -203,6 +206,30 @@ func TestTwinCandidatesAreNonWordNonSpace(t *testing.T) {
 		}
 		if c >= 0x80 {
 			t.Errorf("candidate %#02x is not ASCII", c)
+		}
+	}
+}
+
+// TestNamedRuneCeilingQuoted: text inside \Q…\E is literal, so a gate refusal
+// of escape-looking quoted text is an ASCII refusal — a failure, not a skip.
+func TestNamedRuneCeilingQuoted(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		want    rune
+	}{
+		{`abc`, -1},
+		{`\x{212A}`, 0x212A},
+		{`\Q\x{212A}\E`, -1}, // quoted: plain ASCII text
+		{`\Q\x{212A}`, -1},   // quoted to the end
+		{`\Qſ\E\x{80}`, 0x17F},
+		{`\Q\E\x{212A}`, 0x212A},
+	} {
+		parsed, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("%q: %v", c.pattern, err)
+		}
+		if got := namedRuneCeiling(c.pattern, parsed); got != c.want {
+			t.Errorf("namedRuneCeiling(%q) = %#x, want %#x", c.pattern, got, c.want)
 		}
 	}
 }
