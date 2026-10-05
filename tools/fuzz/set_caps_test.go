@@ -2851,6 +2851,90 @@ func TestSetMergedModeAssertions(t *testing.T) {
 	}
 }
 
+// TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone: a set member on
+// Backtracking wrote its match slots — eight bytes of group 0 — to the set's
+// slot scratch, a TABLE-memory address, through memory 0. In an embedded build
+// memory 0 is the HOST's: every member match overwrote eight bytes of the
+// host's memory at that address, or trapped where the address lay past it (a
+// merged Rust WAF app, "out of bounds memory access" on `;cat /etc/passwd`).
+// Standalone builds have one memory and never showed it.
+//
+// The host memory is filled with a canary; after every call, everything
+// outside the input must still be the canary.
+func TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone(t *testing.T) {
+	pats := []string{`(?:a|bc){1,30}?x`, `(?:etc|proc)/(?:passwd|self)\b`}
+	inputs := []string{"zzz bcbcax", ";cat /etc/passwd", "none here", "proc/self ax"}
+	cfg := config.BuildConfig{
+		Output:            "merged.wasm", // embedded: memory 0 is imported
+		MaxFallbackStates: 1,             // every member's suffix DFA is over it: Backtracking
+		Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan",
+			Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
+	}
+	w, _, diags, err := compile.CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt := 0
+	for _, d := range diags {
+		for _, b := range d.Buckets {
+			if b.Type == "bt-fallback" {
+				bt++
+			}
+		}
+	}
+	if bt == 0 {
+		t.Fatal("no member runs on Backtracking — the witness no longer has the shape")
+	}
+	engine, _ := sharedEngine()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mod.Close()
+	for _, in := range inputs {
+		store := wasmtime.NewStore(engine)
+		store.SetEpochDeadline(1)
+		mt, err := wasmtime.NewMemoryType(64, false, 0, false) // 4 MB: past every table address here
+		if err != nil {
+			t.Fatal(err)
+		}
+		hostMem, err := wasmtime.NewMemory(store, mt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host := hostMem.UnsafeData(store)
+		for i := range host {
+			host[i] = 0xA5
+		}
+		inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{hostMem})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const inBase = 4096
+		copy(host[inBase:], in)
+		res, err := inst.GetFunc(store, "s_scan").Call(store, int32(inBase), int32(len(in)), int32(0))
+		if err != nil {
+			t.Fatalf("scan %q: %v", in, err)
+		}
+		want := false
+		for _, p := range pats {
+			want = want || regexp.MustCompile(p).MatchString(in)
+		}
+		if got := res.(int32) >= 0; got != want {
+			t.Errorf("scan %q = %d, Go says match=%v", in, res.(int32), want)
+		}
+		host = hostMem.UnsafeData(store)
+		for i, c := range host {
+			if (i < inBase || i >= inBase+len(in)) && c != 0xA5 {
+				t.Errorf("scan %q wrote the host's memory at %#x (now %#02x)", in, i, c)
+				break
+			}
+		}
+		store.Close()
+	}
+}
+
 // runFindEmbedded drives `find` to exhaustion on an embedded module, with the
 // gate array and out buffer in the imported host memory — what a merged
 // Rust/Go/C stub does.
@@ -3456,6 +3540,106 @@ func TestSetBTMatchesGo(t *testing.T) {
 				t.Errorf("BT set find over %q:\n  got  %v\n  want %v", c.input, gotBT, want)
 			}
 		})
+	}
+}
+
+// TestSetBTStackGrows: a set member's ordinary frame stack doubles when full,
+// as a pattern's does. A stack is given every byte of memory above its base,
+// so a small BTStackStart alone does not make it full: the first grow still
+// adds a whole page, 8,192 frames. Each call here therefore starts with the
+// host's scratch base 8 bytes below the end of memory and a one-frame start —
+// the second frame has to grow memory — and the work budget is off, so there
+// is no fallback to hand over to: an answer needing a second frame comes from
+// a stack that grew. p0 is kept on a Backtracking bucket (a frame per greedy
+// iteration, up to 30), p1 split out onto the Backtracking find (a frame per
+// letter before `aX`). Each alone first, where memory must grow during the
+// call; then all three, overlapping `find` with every other capability and
+// gated `find`, each against Go.
+func TestSetBTStackGrows(t *testing.T) {
+	pats := []string{`(?:a|bc){1,30}x`, `[a-z]+aX`, `zz`}
+	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
+		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
+	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {
+		t.Helper()
+		entries := make([]config.RegexEntry, len(pats))
+		names := make([]string, len(pats))
+		for i, p := range pats {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		}
+		cfg := config.BuildConfig{MaxFallbackStates: 1, Regexps: entries, Sets: []config.SetConfig{{
+			Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+			ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+			Patterns: config.PatternSelector{Names: names},
+		}}}
+		w, _, diags, err := compile.CompileFileOpts(cfg, "",
+			compile.CompileSetOptions{BTWorkBudget: compile.BTWorkBudgetOff, BTStackStart: start})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, diags
+	}
+	// atMemoryEnd is a fresh runner whose host has grown memory by a page and
+	// put the scratch base 8 bytes — one frame — below its end.
+	atMemoryEnd := func(t *testing.T, w []byte, pats []string, in string) (*capRunner, uint64) {
+		t.Helper()
+		r := newCapRunnerFrom(t, w, pats, in)
+		if _, err := r.mem.Grow(r.store, 1); err != nil {
+			t.Fatal(err)
+		}
+		pages := r.mem.Size(r.store)
+		base := wasmtime.ValI32(int32(pages*65536 - 8)) //nolint:gosec // a few pages
+		if err := r.inst.GetExport(r.store, abi.ScratchBaseExport).Global().Set(r.store, base); err != nil {
+			t.Fatal(err)
+		}
+		return r, pages
+	}
+	// Each kind of member alone beside `zz`: BTStackStart reaches it (the
+	// module differs from the default start's), and a search needing a second
+	// frame grows memory.
+	for k, alone := range [][]string{{pats[0], pats[2]}, {pats[1], pats[2]}} {
+		def, _ := build(t, alone, false, 0)
+		w, _ := build(t, alone, false, 8)
+		if string(w) == string(def) {
+			t.Fatalf("%v: BTStackStart did not reach the member", alone)
+		}
+		in := []string{strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX"}[k]
+		r, pages := atMemoryEnd(t, w, alone, in)
+		if got := r.call(t, "cap_scan_any", r.inBase, int32(len(in)), int32(0)).(int32); got != 0 {
+			t.Errorf("%v: scan_any over %.20q… = %d, want 0", alone, in, got)
+		}
+		if after := r.mem.Size(r.store); after <= pages {
+			t.Errorf("%v: memory stayed at %d pages — the stack never grew", alone, after)
+		}
+		r.Close()
+	}
+	for _, overlapping := range []bool{true, false} {
+		w, diags := build(t, pats, overlapping, 8)
+		bt := 0
+		for _, b := range diags[0].Buckets {
+			if b.Type == "bt-fallback" {
+				bt++
+			}
+		}
+		if bt == 0 || len(diags[0].SplitBacktracking) != 1 || diags[0].SplitBacktracking[0] != 1 {
+			t.Fatalf("overlapping=%v: %d Backtracking buckets, split onto Backtracking %v — the witness no longer has the shape",
+				overlapping, bt, diags[0].SplitBacktracking)
+		}
+		drops := dropsFromSet(diags)
+		for _, in := range inputs {
+			r, _ := atMemoryEnd(t, w, pats, in)
+			if overlapping {
+				checkCapsAgainstOracleDropped(t, r, pats, in, drops.anchored)
+			} else {
+				got, want := driveGatedCaps(t, r, in), gatedOracle(pats, in)
+				sortMatches(got)
+				sortMatches(want)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("gated find over %.40q…: got %v, Go says %v", in, got, want)
+				}
+			}
+			r.Close()
+		}
 	}
 }
 

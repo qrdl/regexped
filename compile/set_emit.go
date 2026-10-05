@@ -235,9 +235,11 @@ type compiledSet struct {
 	tableMemIdx int
 	btFnBodies  [][]byte
 	btRegions   *btSharedRegions
-	// btWorkBudget is CompileSetOptions.BTWorkBudget, kept for buildBTBodies,
-	// which builds the drivers at assembly time when the options are gone.
+	// btWorkBudget and btStackStart are CompileSetOptions.BTWorkBudget and
+	// BTStackStart, kept for buildBTBodies, which builds the drivers at
+	// assembly time when the options are gone.
 	btWorkBudget int
+	btStackStart int
 
 	// prefixFnBodies[i] is the body for the i-th unique prefix DFA (backward scan).
 	// Signature: (ptr i32, scan_end i32) → i32  (type 0)
@@ -1490,12 +1492,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	ra := newRegionAlloc(frontier)
 
 	// ── Backtracking fallback buckets ────────────────────
-	// Laid out above every other table this set owns, so the regions cannot
-	// collide with a suffix, prefix, AC or Teddy table. ONE shared allocation
-	// sized to the largest BT bucket: only one BT call is ever live, because
-	// the per-candidate driver calls one suffix function at a time and the
-	// memo re-zeroes itself at the head of every call.
-	btBase := ra.Reserve("bt-fallback", 1)
+	// They lay out nothing: every frame stack and fallback region is run-time
+	// scratch (btGrowth, bt_scratch.go), and a member writes no slots.
+	//
 	// A budgeted bucket — every BT bucket unless the budget is off — also gets a
 	// fallback driver. It reserves no region: its frame stack and memo are
 	// sized from the input at call time and found through the module's
@@ -1508,15 +1507,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		}
 		numBTFallbacks++
 	}
-	btRegions := planBTRegions(buckets, int64(btBase), opts.globals, opts.BTWorkBudget)
+	btRegions := planBTRegions(buckets, opts.globals)
 	var btBlockMembers []*btDriveMember
 	var btBlocksG uint32
-	if btRegions != nil && numBTFallbacks > 0 {
+	if btRegions != nil {
+		// Every BT bucket's ordinary body grows its frame stack through these,
+		// and the call-scoped state lets one host call's candidates share a
+		// member's budget, region and visited set (btDriveMember) — and the
+		// scratch base the call's first body found, so a host global of 0 does
+		// not take fresh pages per candidate (emitBTScratchBase).
 		btRegions.scratch = opts.globals.BTScratch()
-		// The call-scoped state that lets one host call's candidates share a
-		// member's budget, region and visited set (btDriveMember).
 		btRegions.drive = allocBTDrive(opts.globals)
 		btRegions.hasDrive = true
+	}
+	if btRegions != nil && numBTFallbacks > 0 {
 		btRegions.members = map[int]*btDriveMember{}
 		for bi, bkt := range buckets {
 			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
@@ -1559,25 +1563,6 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		}
 		numBTFns++
 	}
-	if btRegions == nil {
-		ra.Skip()
-	}
-	if btRegions != nil {
-		ra.Commit(btRegions.end)
-		// DECLARE the reservation in the data section. The regions hold no
-		// initial data — BT zeroes its own memo and its stack starts empty —
-		// but a caller has no other way to learn they exist: both
-		// utils.WasmMemTop and the harnesses derive "where free memory
-		// starts" from the emitted data segments. Without this the input
-		// buffer is placed straight on top of the BT stack, which is silent
-		// corruption rather than a trap: a mixed set lost matches from the
-		// LITERAL bucket too, which is how it was found.
-		//
-		// One zero byte at the top is enough to move that boundary; carrying
-		// the whole region as zeros would add tens of KB to every module.
-		allDataBytes = append(allDataBytes, appendDataSegment(nil, btRegions.end-1, []byte{0})...)
-		totalDataSegs++
-	}
 
 	cs := &compiledSet{
 		btSplit:             anyBTSplit(split),
@@ -1619,6 +1604,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		mergeState:          -1,
 		btBlocksG:           btBlocksG,
 		btWorkBudget:        opts.BTWorkBudget,
+		btStackStart:        opts.BTStackStart,
 		dataBytes:           allDataBytes,
 		dataSegCount:        totalDataSegs,
 		prefixFnBodies:      prefixFnBodies,
@@ -2092,7 +2078,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			MaxTDFARegs:               cfg.MaxTDFARegs,
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
-			BTWorkBudget:              over.BTWorkBudget, // test-only override, as below
+			BTWorkBudget:              over.BTWorkBudget, // test-only overrides, as below
+			BTStackStart:              over.BTStackStart,
 			searchSizes:               over.searchSizes,
 			Component:                 comp.Component,
 			ComponentPackage:          comp.ComponentPackage,
@@ -2111,8 +2098,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		MaxDFAStates: cfg.MaxDFAStates,
 		MaxTDFARegs:  cfg.MaxTDFARegs,
 		Report:       rep,
-		// Test-only override (CompileFileOpts); zero everywhere else.
+		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		BTWorkBudget: over.BTWorkBudget,
+		BTStackStart: over.BTStackStart,
 	}
 	if !standalone {
 		opts.tableMemIdx = 1
@@ -3065,7 +3053,16 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, c := range cs.capFns() {
 			switch {
 			case c.kind == capFind && cs.mergedCap(c.kind):
-				cs_bytes = append(cs_bytes, cs.withDefault(emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev, false), c.kind)...)
+				body := emitSplitFindBody(cs, keptIdx(c.kind), splitFwd, splitRev, false)
+				if cs.btRegions != nil && cs.btRegions.hasDrive {
+					// The merge calls the kept body only when its lower bound
+					// is the smallest (with a kept-members set, never), so a
+					// call can run a split member alone: the merge starts the
+					// host call itself. The scan merge calls the kept body
+					// first on every call and needs no bump of its own.
+					body = injectBTDrivePrologue(body, cs.btRegions.drive, nil)
+				}
+				cs_bytes = append(cs_bytes, cs.withDefault(body, c.kind)...)
 			case cs.mergedCap(c.kind):
 				cs_bytes = append(cs_bytes, emitSplitScanBody(cs, c.kind, keptIdx(c.kind), splitFwd)...)
 			case cs.scanUnionDirect && (c.kind == capScanAny || c.kind == capScanAll):
@@ -3188,25 +3185,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	if searchSetterIdx >= 0 {
 		cs_bytes = appendCodeEntry(cs_bytes, searchSetterBody(searchG))
 	}
-	out = appendSection(out, 10, cs_bytes)
-
-	// Data section.
-	if totalSegs > 0 {
-		var ds []byte
-		if !standalone {
-			segs := parseDataSegments(rawData)
-			ds = utils.AppendULEB128(ds, uint32(len(segs)))
-			for _, seg := range segs {
-				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
-			}
-		} else {
-			ds = utils.AppendULEB128(ds, uint32(totalSegs))
-			ds = append(ds, rawData...)
-		}
-		out = appendSection(out, 11, ds)
-	}
-
-	return out
+	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone)
 }
 
 // rebuildSetMatchBody re-emits the set match function with correct function indices.
@@ -5159,6 +5138,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
 		BTWorkBudget:  over.BTWorkBudget,
+		BTStackStart:  over.BTStackStart,
 		// Test-only frontend pin; see CompileSetOptions.ForceFrontend.
 		ForceFrontend: over.ForceFrontend,
 		forceFrontend: over.forceFrontend,

@@ -105,21 +105,6 @@ func TestBtCheckRune1CaseFold(t *testing.T) {
 	}
 }
 
-func TestBtAllocSizes(t *testing.T) {
-	// Three Alts: a stack of 4096 frames per Alt, each frame pos + retryPC.
-	bt := newBacktrack(compileBTTestProg(t, "ab|cd|ef|gh"))
-	if bt.numAlts != 3 {
-		t.Fatalf("ab|cd|ef|gh has %d Alts, want 3 — witness no longer has the shape", bt.numAlts)
-	}
-	if want := bt.numAlts * 4096 * btNoCaptureFrameSize; btAllocSizes(bt) != want {
-		t.Errorf("btAllocSizes = %d, want %d (numAlts %d)", btAllocSizes(bt), want, bt.numAlts)
-	}
-	// No Alt at all still reserves the 4096-frame floor.
-	if got := btAllocSizes(newBacktrack(compileBTTestProg(t, "(a)(b)(c)"))); got != 4096*btNoCaptureFrameSize {
-		t.Errorf("btAllocSizes(no Alt) = %d, want %d", got, 4096*btNoCaptureFrameSize)
-	}
-}
-
 // TestBTCompileDeterminism guards against a class of bug found and fixed
 // 2026-08-06: the Backtracking bodies emitted per-loop instructions by ranging
 // over a map, and Go randomizes map iteration order per process, so the same
@@ -1713,9 +1698,10 @@ func TestEnginesCovBTStackReservationOverCeiling(t *testing.T) {
 	// A Backtracking stack reserved above WASM32's 4GiB
 	// linear-memory ceiling used to produce a module whose memory section was
 	// already invalid — a failure that only surfaced at instantiation time,
-	// with no attribution to the pattern that caused it. A table base close
-	// to the ceiling reaches the check without needing a pathological
-	// pattern, and both the match and the find fallback carry their own copy.
+	// with no attribution to the pattern that caused it. The match and find
+	// bodies reserve no stack any more (their frame stack grows at call time),
+	// so a table base close to the ceiling no longer trips the check through
+	// them: what they need is not decided at compile time.
 	const nearCeiling = int64(1)<<32 - 4096
 	for _, testCase := range []struct {
 		name  string
@@ -1728,8 +1714,8 @@ func TestEnginesCovBTStackReservationOverCeiling(t *testing.T) {
 			_, _, err := Compile(
 				[]config.RegexEntry{testCase.entry}, nearCeiling, true,
 				CompileOptions{MaxDFAStates: 1})
-			if !errors.Is(err, ErrBTStackTooLarge) {
-				t.Fatalf("Compile: err = %v, want ErrBTStackTooLarge", err)
+			if errors.Is(err, ErrBTStackTooLarge) {
+				t.Fatalf("Compile: err = %v, want no stack reservation to refuse", err)
 			}
 		})
 	}
@@ -2273,6 +2259,73 @@ func TestBTCaptureStackNotReservedAtLoad(t *testing.T) {
 	}
 }
 
+// TestBTStacksNotReservedAtLoad: no Backtracking body claims a frame stack when
+// the module loads. TestBTCaptureStackNotReservedAtLoad pinned it for capture
+// bodies; the match and find bodies and a set's members still reserved
+// numAlts × 4,096 frames of 8 bytes each, per set — 596 of the 643 MB a
+// 339-set WAF module claimed before its first call, against 47 MB of tables.
+func TestBTStacksNotReservedAtLoad(t *testing.T) {
+	pattern := `(?:a|bc){1,60}?x`
+	numAlts := newBacktrack(compileBTTestProg(t, pattern)).numAlts
+	if numAlts < 60 {
+		t.Fatalf("witness has %d Alts, want at least 60", numAlts)
+	}
+	// numAlts × 4,096 × 8 bytes is over 30 pages; the tables are a page or two.
+	const maxPages = 3
+	forceBT := CompileOptions{MaxDFAStates: -1}
+	for _, c := range []struct {
+		name  string
+		entry config.RegexEntry
+	}{
+		{"match", config.RegexEntry{Pattern: pattern, MatchFunc: "m"}},
+		{"find", config.RegexEntry{Pattern: pattern, FindFunc: "f"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w, _, err := Compile([]config.RegexEntry{c.entry}, 0, true, forceBT)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			validateWASM(t, w)
+			if minPages, _, _ := testMemoryLimits(t, w); minPages > maxPages {
+				t.Errorf("module declares %d pages at load for %d Alts, want the tables alone", minPages, numAlts)
+			}
+		})
+	}
+	t.Run("set", func(t *testing.T) {
+		// The same member in three sets reserved three stacks.
+		var sets []config.SetConfig
+		for i := 0; i < 3; i++ {
+			n := "s" + strconv.Itoa(i)
+			sets = append(sets, config.SetConfig{Name: n, ScanAny: n + "_any", Find: n + "_find",
+				Patterns: config.PatternSelector{All: true}})
+		}
+		cfg := config.BuildConfig{
+			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
+			Regexps:           []config.RegexEntry{{Name: "a", Pattern: pattern}, {Name: "b", Pattern: `(?:c|de){1,60}?y`}},
+			Sets:              sets,
+		}
+		w, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatalf("CompileFile: %v", err)
+		}
+		validateWASM(t, w)
+		bt := 0
+		for _, d := range diags {
+			for _, b := range d.Buckets {
+				if b.Type == "bt-fallback" {
+					bt++
+				}
+			}
+		}
+		if bt == 0 {
+			t.Fatal("no set member runs on Backtracking — the witness no longer has the shape")
+		}
+		if minPages, _, _ := testMemoryLimits(t, w); minPages > maxPages {
+			t.Errorf("module declares %d pages at load for %d Backtracking members, want the tables alone", minPages, bt)
+		}
+	})
+}
+
 // TestMaxMemoryDeclaredAsMaximum: max_memory becomes the memory's declared
 // maximum on every assembly path, rounded down to pages; unset declares none,
 // which is the bytes every module had before.
@@ -2327,20 +2380,20 @@ func TestMaxMemoryDeclaredAsMaximum(t *testing.T) {
 
 // TestMaxMemoryBelowStaticSizeIsCompileError: a cap below what the module
 // declares before any call is refused at compile time, naming the cap and the
-// size — including the regions the match and find paths still reserve at
-// compile time, and a component's extra allocator page.
+// size — its tables, and a component's extra allocator page.
 func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
-	// A Backtracking match keeps its compile-time stack: numAlts × 4,096 frames
-	// of 8 bytes, several pages.
-	entries := []config.RegexEntry{{Pattern: `(?:ab|cd|ef|gh|ij|kl|mn|op)*?xyzuvw`, MatchFunc: "m"}}
-	opts := CompileOptions{MaxDFAStates: 2}
+	// A large DFA table is static memory: (a|b)*a(a|b){10} needs 2^11 states,
+	// u16 ids and 256 columns — 1 MB, several pages. (Backtracking reserves
+	// nothing at compile time any more; its frame stacks grow at call time.)
+	entries := []config.RegexEntry{{Pattern: `(a|b)*a(a|b){10}`, MatchFunc: "m"}}
+	opts := CompileOptions{MaxDFAStates: 1 << 13}
 	w, _, err := Compile(entries, 0, true, opts)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	static, _, _ := testMemoryLimits(t, w)
 	if static < 3 {
-		t.Fatalf("witness declares %d pages; want a compile-time region above the tables", static)
+		t.Fatalf("witness declares %d pages; want a table region several pages long", static)
 	}
 	at := func(pages uint64) config.MemorySize {
 		return mustMemorySize(t, itoa(pages*65536+65535)) // rounds down to pages

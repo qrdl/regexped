@@ -1013,6 +1013,11 @@ func TestNeedsUnicodeSupportExported(t *testing.T) {
 		{`\d{4}`, false},
 		{`\x{263A}`, true},
 		{`\p{Greek}`, true},
+		// Agrees with Compile on a fold-artifact rune the pattern WRITES,
+		// which only the text shows: the program is (?i)s's.
+		{`(?i)[^a-z]`, false},
+		{`[sSſ]`, true},
+		{`[^kK\x{212A}]`, true},
 	} {
 		got, err := NeedsUnicodeSupport(c.pattern)
 		if err != nil {
@@ -1468,11 +1473,22 @@ func TestEmitterGuardsFire(t *testing.T) {
 				appendStartAnywhereBodies(nil, 0)
 		}},
 		{"a set member's Backtracking body in window mode", "window mode", func(*testing.T) {
-			buildBacktrackBody(nil, 0, 0, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{}, nil)
+			buildBacktrackBody(nil, 0, false, 0, -1, -1, 0, false, nil, &btDriveMember{}, true, nil)
+		}},
+		// No frame stack is reserved in the module any more: a body built with
+		// neither a fallback scratch nor a growing stack has nowhere to push.
+		{"a Backtracking capture body without a frame stack", "needs a frame stack", func(*testing.T) {
+			buildBacktrackBody(nil, 0, false, 0, -1, -1, 0, false, nil, nil, false, nil)
+		}},
+		{"a Backtracking match body without a frame stack", "needs a frame stack", func(*testing.T) {
+			buildBTMatchBody(nil, 0, 0, 0, false, nil, nil)
+		}},
+		{"a Backtracking find body without a frame stack", "needs a frame stack", func(*testing.T) {
+			buildBTFindBody(nil, prefixScanParams{}, nil, 0, 0, 0, false, nil, nil)
 		}},
 		{"Backtracking regions without globals", "global allocator", func(t *testing.T) {
 			infos, _, _ := analyzed(t, `a+b`)
-			planBTRegions([]*bucket{newBTBucket(infos[0])}, 0, nil, 0)
+			planBTRegions([]*bucket{newBTBucket(infos[0])}, nil)
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

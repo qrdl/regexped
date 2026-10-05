@@ -16,8 +16,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
 )
 
 // Package fuzz is a byte-level correctness
@@ -225,6 +228,12 @@ func FuzzCorrectness(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
 	}
+	// The byte_mode leg: patterns naming code points in 0x80..0xFF, which the
+	// RE2-derived seed corpus never writes. The first is the shape whose
+	// adjacent fold artifacts the rune gate once refused.
+	f.Add(`(?i)[A-Z_a-z\x7f-\xff]+`, "aK_z-")
+	f.Add(`(?i)[^\xe0-\xfe]+`, "abc")
+	f.Add(`[^\x00-\x7f]`, "abc")
 
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if hasUnsupportedUnicode(input) {
@@ -240,19 +249,23 @@ func FuzzCorrectness(f *testing.F) {
 		if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts() {
 			t.Skip() // NFA too large to compile within the fuzz worker's hang deadline — see maxNFAInsts
 		}
-		// Use the compiler's own predicate rather than hasUnsupportedUnicode's
-		// raw-string scan: escapes like \x80 are pure ASCII text but denote a
-		// non-ASCII codepoint once parsed, which the raw scan can't see (see
-		// the \x80 fuzz failure this replaced).
-		if needsUnicode, err := compile.NeedsUnicodeSupport(pat); err != nil || needsUnicode {
-			t.Skip() // requires Unicode support — out of scope (see CLAUDE.md), or doesn't parse
+		// A pattern naming a code point above 0xFF is out of scope; one naming
+		// 0x80..0xFF compiles under byte_mode. Over ASCII input (the only input
+		// judged here) byte_mode and Go agree, so the oracle still holds.
+		ceiling := namedRuneCeiling(pat, parsed)
+		if ceiling > 0xFF {
+			t.Skip() // requires Unicode support — out of scope (see CLAUDE.md)
 		}
 		ref, err := regexp.Compile(pat)
 		if err != nil {
 			t.Skip() // Go stdlib rejects it too — no oracle to compare against
 		}
 
-		wasmBytes, compErr := compileFind(pat)
+		compileIt := compileFind
+		if ceiling > 0x7F {
+			compileIt = compileFindByteMode
+		}
+		wasmBytes, compErr := compileIt(pat)
 		if compErr != nil {
 			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) {
 				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
@@ -296,6 +309,106 @@ func hasUnsupportedUnicode(s string) bool {
 		}
 	}
 	return strings.Contains(s, `\p`) || strings.Contains(s, `\P`)
+}
+
+// namedRuneCeiling is the highest code point pat NAMES: written as a character,
+// as an escape (\xHH, \x{…}, octal), as a \p/\P class (unbounded), or — for a
+// class with no member at or below 0x7F, such as [^\x00-\x7f] — that class's
+// lowest member. -1 when pat names nothing above ASCII.
+//
+// It is deliberately NOT the compiler's rune gate. The harness used to skip
+// whatever compile.NeedsUnicodeSupport refused, which made the gate its own
+// judge: every pure-ASCII pattern it wrongly refused was skipped as "needs
+// Unicode" instead of failing, and `(?i)\W` and `(?i)[^a-z]` stayed refused
+// that way. The runes (?i) expansion manufactures (U+017F, U+212A, U+212B)
+// are never written, so they never count here.
+func namedRuneCeiling(pat string, parsed *syntax.Regexp) rune {
+	ceil := rune(-1)
+	raise := func(r rune) {
+		if r > 0x7F && r > ceil {
+			ceil = r
+		}
+	}
+	for i := 0; i < len(pat); {
+		r, w := utf8.DecodeRuneInString(pat[i:])
+		if r != '\\' {
+			raise(r)
+			i += w
+			continue
+		}
+		if i+1 >= len(pat) {
+			break
+		}
+		switch c := pat[i+1]; {
+		case c == 'Q':
+			// Literal text up to \E: only characters name a rune there, and
+			// escape-looking text such as \x{212A} is plain ASCII.
+			lit := pat[i+2:]
+			end := strings.Index(lit, `\E`)
+			if end >= 0 {
+				lit = lit[:end]
+			}
+			for _, r := range lit {
+				raise(r)
+			}
+			i += 2 + len(lit)
+			if end >= 0 {
+				i += 2
+			}
+		case c == 'p' || c == 'P':
+			raise(unicode.MaxRune)
+			i += 2
+		case c == 'x' && i+2 < len(pat) && pat[i+2] == '{':
+			end := strings.IndexByte(pat[i+3:], '}')
+			if end < 0 {
+				return unicode.MaxRune
+			}
+			v, _ := strconv.ParseUint(pat[i+3:i+3+end], 16, 32)
+			raise(rune(v))
+			i += 4 + end
+		case c == 'x':
+			j := i + 2
+			for j < len(pat) && j < i+4 && strings.IndexByte("0123456789abcdefABCDEF", pat[j]) >= 0 {
+				j++
+			}
+			v, _ := strconv.ParseUint(pat[i+2:j], 16, 32)
+			raise(rune(v))
+			i = j
+		case c >= '0' && c <= '7':
+			j := i + 1
+			for j < len(pat) && j < i+4 && pat[j] >= '0' && pat[j] <= '7' {
+				j++
+			}
+			v, _ := strconv.ParseUint(pat[i+1:j], 8, 32)
+			raise(rune(v))
+			i = j
+		default:
+			i += 2
+		}
+	}
+	var walk func(re *syntax.Regexp)
+	walk = func(re *syntax.Regexp) {
+		if re.Op == syntax.OpCharClass && len(re.Rune) > 0 && re.Rune[0] > 0x7F {
+			raise(re.Rune[0])
+		}
+		for _, s := range re.Sub {
+			walk(s)
+		}
+	}
+	if parsed != nil {
+		walk(parsed)
+	}
+	return ceil
+}
+
+// compileFindByteMode is compileFind under `byte_mode: true`, for a pattern
+// naming code points in 0x80..0xFF — the half of the rune gate the plain
+// targets cannot reach.
+func compileFindByteMode(pat string) ([]byte, error) {
+	return cachedCompile("findbyte\x00"+pat, func() ([]byte, error) {
+		w, _, err := compile.Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "find", ByteMode: true}}, tableBase, true)
+		return w, err
+	})
 }
 
 func fmtGoIndex(m []int) string {
@@ -348,10 +461,10 @@ func skipPattern(pat, input string) string {
 	if prog, err := syntax.Compile(parsed.Simplify()); err == nil && len(prog.Inst) > maxNFAInsts() {
 		return "NFA too large for the fuzz worker's hang deadline (see maxNFAInsts)"
 	}
-	// The compiler's own predicate, not a raw-string scan: escapes like \x80 are
-	// pure ASCII text but denote a non-ASCII codepoint once parsed.
-	if needsUnicode, err := compile.NeedsUnicodeSupport(pat); err != nil || needsUnicode {
-		return "needs Unicode support"
+	// What the pattern NAMES, not what the compiler's rune gate says — see
+	// namedRuneCeiling. The byte_mode half is FuzzCorrectness's.
+	if namedRuneCeiling(pat, parsed) > 0x7F {
+		return "names a code point above 0x7F (byte_mode or Unicode)"
 	}
 	if _, err := regexp.Compile(pat); err != nil {
 		return "Go stdlib rejects it too — no oracle"
@@ -1304,5 +1417,29 @@ func TestEverySetEmitterIsReached(t *testing.T) {
 	if len(missing) > 0 {
 		t.Errorf("%d of %d set emitters are never reached by the answer-checking tests:\n  %s",
 			len(missing), len(emitters), strings.Join(missing, "\n  "))
+	}
+}
+
+// TestNamedRuneCeilingQuoted: text inside \Q…\E is literal, so escape-looking
+// text there names no rune and a pattern made of it is not skipped.
+func TestNamedRuneCeilingQuoted(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		want    rune
+	}{
+		{`abc`, -1},
+		{`\x{212A}`, 0x212A},
+		{`\Q\x{212A}\E`, -1}, // quoted: plain ASCII text
+		{`\Q\x{212A}`, -1},   // quoted to the end
+		{`\Qſ\E\x{80}`, 0x17F},
+		{`\Q\E\x{212A}`, 0x212A},
+	} {
+		parsed, err := syntax.Parse(c.pattern, syntax.Perl)
+		if err != nil {
+			t.Fatalf("%q: %v", c.pattern, err)
+		}
+		if got := namedRuneCeiling(c.pattern, parsed); got != c.want {
+			t.Errorf("namedRuneCeiling(%q) = %#x, want %#x", c.pattern, got, c.want)
+		}
 	}
 }

@@ -708,6 +708,13 @@ type CompileSetOptions struct {
 	// fallback buckets. Same values, same meaning; zero is the default budget.
 	BTWorkBudget int
 
+	// BTStackStart is CompileOptions.BTStackStart for the set's Backtracking
+	// members, bucket and split alike: the bytes an ordinary body's frame stack
+	// starts with. TEST-ONLY, as there: a test shrinks it so a short input
+	// reaches the stack's growth, which the 64 KB default leaves to searches
+	// more than 8,192 frames deep. Zero is the default.
+	BTStackStart int
+
 	// globals is the MODULE's global allocator, shared with every pattern and
 	// every other set in the same compile. A set reaches for it when a bucket
 	// wants module-scoped state — today only the sparse member skip's
@@ -1627,12 +1634,7 @@ type bucket struct {
 // fallback bucket. Built by admitBTFallback at the point the pattern would
 // otherwise have been dropped.
 type btBucketInfo struct {
-	bt *backtrack // the compiled NFA program driver
-	// stackSize is this pattern's own frame-stack requirement. The set
-	// allocates ONE shared stack sized to the max over its BT buckets: only
-	// one BT call is ever live, because the per-candidate driver calls one
-	// suffix function at a time.
-	stackSize int
+	bt *backtrack // the compiled NFA program driver; its frame stack grows at call time
 }
 
 // bucketKey is used in the literal grouping map. "~fallback~" is the sentinel

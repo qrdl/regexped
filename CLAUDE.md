@@ -41,8 +41,10 @@ regexped/
 │   │                          #   the budget runs out or its frame stack overflows — same emitter,
 │   │                          #   a (pc, pos) memo at EVERY Alt. Scoping the budget to empty-body
 │   │                          #   loops (`^(\w*|)*c`) was tried and REFUTED by `^(aa|a)*b`, which
-│   │                          #   hung with no empty-body loop at all. A stack overflow needs no
-│   │                          #   call site of its own: it ARMS the budget to trip on the next pop.
+│   │                          #   hung with no empty-body loop at all. A stack overflow ARMS the
+│   │                          #   budget to trip on the next pop — unless the stack is EMPTY (memory
+│   │                          #   at max_memory at call start), when there is no pop and it tail-
+│   │                          #   calls the fallback at once: it used to answer -1 there (btArmTrip).
 │   │                          #   EXCEPTION: a program with a ZERO-WIDTH CYCLE (progHasZeroWidthCycle)
 │   │                          #   gets no ordinary body under ANY budget, BTWorkBudgetOff included —
 │   │                          #   its first function is the bare tail call. The ordinary body has NO
@@ -92,7 +94,19 @@ regexped/
 │   │                          #   protocol because every byte above the tables is the JS/TS stubs';
 │   │                          #   a second memory would have avoided it and was rejected because
 │   │                          #   Safari has no multi-memory. Memo rows are whole bytes (bit = pc%8,
-│   │                          #   a constant) and cleared LAZILY as the search reaches them
+│   │                          #   a constant) and cleared LAZILY as the search reaches them.
+│   │                          #   EVERY ordinary body's frame stack lives here too (btGrowth: 64 KB
+│   │                          #   at call start, doubled when full) — nothing is reserved in the
+│   │                          #   module any more; it was numAlts × 4,096 frames PER SET, 596 of a
+│   │                          #   339-set WAF module's 643 MB before its first call. Inside a set the
+│   │                          #   stack starts above the member memos placed in the current host call
+│   │                          #   (btScratch.drive), split members' bodies included. A host call is
+│   │                          #   an EPOCH every exported set entry bumps — a split set's `find`
+│   │                          #   merge too, not only the kept body it may never call: a split member
+│   │                          #   run without a bump took the previous call's base, over what the host
+│   │                          #   had written since (4 instructions per call). A set member's
+│   │                          #   body is SLOTLESS: it wrote group 0 to a table address through
+│   │                          #   memory 0 — in an embedded build the HOST's (8 bytes per match)
 │   ├── mandatory_lit.go       # Mandatory literal extraction (FindMandatoryLit)
 │   ├── start_anywhere.go      # WHICH FIND a pattern gets. The START-ANYWHERE find (RE2's
 │   │                          #   method: a forward pass over the leftmost-first DFA of
@@ -750,7 +764,7 @@ regexps:
 
 **`byte_mode:` and the unsupported-rune gate.** regexped is a BYTE engine — `.` consumes one byte, classes are byte classes, `\b` is ASCII — so a rune above U+007F has no byte to be. `compile/compile.go`'s `unsupportedRune` rejects a pattern naming one, with a message that names the rune and points at `byte_mode: true`; runes above U+00FF are rejected in BOTH modes with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
 
-TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` is NOT Unicode support and never was — it is a compile-anyway bypass for tests, not reachable from YAML.
+TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` is NOT Unicode support and never was — it is a compile-anyway bypass for tests, not reachable from YAML.
 
 Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
@@ -1073,7 +1087,7 @@ with its memoised FALLBACK body answering every call alone
 (`compile.BTWorkBudgetForceFallback`) and makes any `-2` a failure, sets
 included. That body otherwise answers every call only for a program with a
 zero-width cycle, which gets no ordinary body; for any other program it runs
-only after a work budget trips or a fast body's static stack or memo runs out,
+only after a work budget trips or a fast body's stack cannot grow,
 which the corpus reaches a handful of times. Its memory is sized at call time, so the corpus and benchmark harnesses
 (re2test, perftest, likelytest, pattest, settest, setperf) and `tools/fuzz`'s run
 helpers set a standalone module's exported `regexped:scratch_base` global to the
@@ -1622,7 +1636,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-03
+**Last Updated:** 2026-10-04
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

@@ -312,17 +312,25 @@ func FuzzFindIteration(f *testing.F) {
 			t.Skip()
 		}
 		// Same guards the other targets use: an oversized NFA blows the fuzz
-		// worker's 10s hang deadline, and Unicode is out of scope.
-		if parsed, perr := syntax.Parse(pat, syntax.Perl); perr == nil {
-			if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil && len(prog.Inst) > maxNFAInsts() {
-				t.Skip()
-			}
+		// worker's 10s hang deadline, and a pattern naming a code point above
+		// 0x7F is out of scope here (see namedRuneCeiling).
+		parsed, perr := syntax.Parse(pat, syntax.Perl)
+		if perr != nil {
+			t.Skip()
 		}
-		if needsUnicode, uerr := compile.NeedsUnicodeSupport(pat); uerr != nil || needsUnicode {
+		if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil && len(prog.Inst) > maxNFAInsts() {
+			t.Skip()
+		}
+		if namedRuneCeiling(pat, parsed) > 0x7F {
 			t.Skip()
 		}
 		w, sizes, err := compileFindSized(pat)
 		if err != nil {
+			// The rune gate refusing a pattern that names nothing above ASCII is
+			// a compiler defect, not a reason to skip.
+			if strings.Contains(err.Error(), "pattern contains the") {
+				t.Fatalf("rune gate refused an ASCII pattern: pat=%q: %v", pat, err)
+			}
 			t.Skip()
 		}
 		want := goFindAll(re, input)
@@ -2251,6 +2259,124 @@ func TestEmptyWidthBoundaryOverHighBytes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// (?i) over a NEGATED class arrives from Go's parser with holes at the fold
+// artifacts of its letters — `(?i)[^a-z]` is [\x7b-\x{17e}] [\x{180}-\x{2129}]
+// [\x{212b}-\x{10ffff}], minus U+017F (from s) and U+212A (from k) — and under
+// byte_mode (?i) over Latin-1 adds U+212B (from å). The rune gate refused all of
+// these; once it accepts them, every emitter has to lower the class to the
+// same BYTE set its unfolded twin would give: the high bytes are not letters,
+// so `(?i)[^a-z]` must take every byte except A-Z and a-z, 0x80..0xFF included.
+//
+// Go cannot be the oracle over high bytes (it decodes UTF-8), so each case
+// carries the byte set it must accept, from the definition of the class over
+// bytes. Every byte goes through find, match, both capture engines, the
+// Backtracking find and a set, since each lowers rune ranges on its own.
+func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
+	isLetter := func(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
+	isWord := func(b byte) bool { return isLetter(b) || (b >= '0' && b <= '9') || b == '_' }
+	cases := []struct {
+		pat      string
+		byteMode bool
+		want     func(b byte) bool
+	}{
+		{`(?i)[^a-z]`, false, func(b byte) bool { return !isLetter(b) }},
+		{`(?i)[^a-z]`, true, func(b byte) bool { return !isLetter(b) }},
+		{`(?i)\W`, false, func(b byte) bool { return !isWord(b) }},
+		{`(?i)[^0-9A-Z_a-z]`, false, func(b byte) bool { return !isWord(b) }},
+		{`(?i:[^k])`, false, func(b byte) bool { return b != 'k' && b != 'K' }},
+		{`(?i)[^s]`, true, func(b byte) bool { return b != 's' && b != 'S' }},
+		{`(?i)[A-Z_a-z\x7f-\xff]`, true, func(b byte) bool { return isLetter(b) || b == '_' || b >= 0x7f }},
+		{`(?i)[\x7f-\xff]`, true, func(b byte) bool { return b >= 0x7f }},
+		{`[^\x80-\xff]`, true, func(b byte) bool { return b < 0x80 }},
+		// Byte-mode folding stays inside the byte range: \xe0-\xfe folds to
+		// \xc0-\xde except × (0xD7) and ÷ (0xF7), which have no partner.
+		{`(?i)[^\xe0-\xfe]`, true, func(b byte) bool {
+			return !((b >= 0xc0 && b <= 0xd6) || (b >= 0xd8 && b <= 0xde) || (b >= 0xe0 && b <= 0xfe))
+		}},
+	}
+	type path struct {
+		name  string
+		build func(pat string, byteMode bool) ([]byte, error)
+		run   func(w []byte, in string) (bool, error)
+	}
+	const selected = compile.EngineType(0) // the engine the selector picks
+	single := func(e config.RegexEntry, base int64, eng compile.EngineType) ([]byte, error) {
+		if eng != selected {
+			w, _, err := compile.CompileForced([]config.RegexEntry{e}, base, true, eng)
+			return w, err
+		}
+		w, _, err := compile.Compile([]config.RegexEntry{e}, base, true, compile.CompileOptions{})
+		return w, err
+	}
+	groupsRun := func(w []byte, in string) (bool, error) {
+		_, ok, _, err := runWasmGroupsPath(w, in, 2)
+		return ok, err
+	}
+	paths := []path{
+		{"find", func(p string, bm bool) ([]byte, error) {
+			return single(config.RegexEntry{Pattern: p, FindFunc: "find", ByteMode: bm}, tableBase, selected)
+		}, func(w []byte, in string) (bool, error) {
+			_, ok, _, err := runWasmFind(w, in)
+			return ok, err
+		}},
+		{"find/backtrack", func(p string, bm bool) ([]byte, error) {
+			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: p, FindFunc: "find", ByteMode: bm}},
+				tableBase, true, compile.CompileOptions{MaxDFAStates: -1})
+			return w, err
+		}, func(w []byte, in string) (bool, error) {
+			_, ok, _, err := runWasmFind(w, in)
+			return ok, err
+		}},
+		{"match", func(p string, bm bool) ([]byte, error) {
+			return single(config.RegexEntry{Pattern: p, MatchFunc: "match", ByteMode: bm}, pathsTableBase, selected)
+		}, func(w []byte, in string) (bool, error) {
+			_, ok, _, err := runWasmMatch(w, in)
+			return ok, err
+		}},
+		{"groups/tdfa", func(p string, bm bool) ([]byte, error) {
+			return single(config.RegexEntry{Pattern: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineTDFA)
+		}, groupsRun},
+		{"groups/backtrack", func(p string, bm bool) ([]byte, error) {
+			return single(config.RegexEntry{Pattern: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineBacktrack)
+		}, groupsRun},
+		{"set", func(p string, bm bool) ([]byte, error) {
+			cfg := config.BuildConfig{
+				Regexps: []config.RegexEntry{{Name: "p0", Pattern: p, ByteMode: bm}},
+				Sets: []config.SetConfig{{Name: "s", Find: "set_find", Overlapping: true,
+					Patterns: config.PatternSelector{Names: []string{"p0"}}}},
+			}
+			w, _, _, err := compile.CompileFileDiag(cfg, "")
+			return w, err
+		}, func(w []byte, in string) (bool, error) {
+			m, _, err := runWasmSetFind(w, in, 1)
+			return len(m) > 0, err
+		}},
+	}
+	for _, c := range cases {
+		for _, p := range paths {
+			t.Run(fmt.Sprintf("%s/byteMode=%v/%s", c.pat, c.byteMode, p.name), func(t *testing.T) {
+				w, err := p.build(c.pat, c.byteMode)
+				if err != nil {
+					t.Fatalf("compile: %v", err)
+				}
+				var wrong []string
+				for b := 0; b < 256; b++ {
+					got, err := p.run(w, string([]byte{byte(b)}))
+					if err != nil {
+						t.Fatalf("byte %#02x: %v", b, err)
+					}
+					if got != c.want(byte(b)) {
+						wrong = append(wrong, fmt.Sprintf("%#02x got %v", b, got))
+					}
+				}
+				if len(wrong) > 0 {
+					t.Errorf("%d of 256 bytes wrong: %v", len(wrong), wrong)
+				}
+			})
+		}
 	}
 }
 

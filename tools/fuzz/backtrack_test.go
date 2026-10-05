@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -816,6 +817,12 @@ func btMemoCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs 
 	if fn == nil {
 		t.Fatalf("module has no %q export", export)
 	}
+	// Input and output lie below the tables, so every call's scratch may start
+	// at them — the protocol every harness follows. Left at 0, each of a batch
+	// export's internal calls would take fresh pages.
+	if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+		t.Fatal(err)
+	}
 	buf := mem.UnsafeData(store)
 	if len(input) > int(pathsOutBase-pathsInputBase) {
 		t.Fatalf("input of %d bytes runs into the output window at %d", len(input), pathsOutBase)
@@ -1080,10 +1087,11 @@ func btRawCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs .
 // stack grows with the input, so the same blown input must then get the real
 // answer (wantBlown). Both builds are driven.
 //
-// A CAPTURE body has no compile-time ceiling any more: its ordinary stack
-// grows with the search too, and the only ceiling left is memory. So the
-// groups rows put it there, with max_memory (btCaptureCap), and blow it with
-// an input whose stack needs far more.
+// No body has a compile-time ceiling any more: every ordinary stack grows with
+// the search, and the only ceiling left is memory. So every row puts it there,
+// with max_memory — btCaptureCap for the capture rows, capPagesAbove pages
+// above the module's own size for the others — and blows it with an input
+// whose stack needs far more.
 func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	if eng, err := compile.SelectEngine(btCapturePattern, compile.CompileOptions{}); err != nil {
 		t.Fatalf("SelectEngine: %v", err)
@@ -1113,6 +1121,9 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		wantBlown int64  // its answer once the fallback takes the call
 		offOpts   []compile.CompileOptions
 		numCaps   int
+		// capPagesAbove, when > 0, caps the budget-off build at this many
+		// pages above the module's own size.
+		capPagesAbove uint64
 	}{
 		{
 			name:      "groups",
@@ -1138,39 +1149,42 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			offOpts:   []compile.CompileOptions{cappedOff},
 		},
 		{
-			name:      "match",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, MatchFunc: "match"},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "match",
-			ok:        noCapIn(4000),
-			wantOK:    8006,
-			blown:     noCapIn(8192),
-			wantBlown: 16390,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "match",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, MatchFunc: "match"},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "match",
+			ok:            noCapIn(4000),
+			wantOK:        8006,
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     2*btNoCaptureBlown + 6,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 		{
-			name:      "find",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "find",
-			extra:     []int32{0}, // `from` — find is (ptr, len, from)
-			ok:        noCapIn(4000),
-			wantOK:    8006, // packed 0<<32|8006
-			blown:     noCapIn(8192),
-			wantBlown: 16390,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "find",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "find",
+			extra:         []int32{0}, // `from` — find is (ptr, len, from)
+			ok:            noCapIn(4000),
+			wantOK:        8006, // packed 0<<32|8006
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     2*btNoCaptureBlown + 6,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 		{
-			name:      "find_batch",
-			entry:     config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
-			opts:      []compile.CompileOptions{squeezed},
-			export:    "find_batch",
-			extra:     []int32{pathsOutBase, 16, 0},
-			ok:        noCapIn(4000),
-			wantOK:    1,
-			blown:     noCapIn(8192),
-			wantBlown: 1,
-			offOpts:   []compile.CompileOptions{squeezedOff},
+			name:          "find_batch",
+			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
+			opts:          []compile.CompileOptions{squeezed},
+			export:        "find_batch",
+			extra:         []int32{pathsOutBase, 16, 0},
+			ok:            noCapIn(4000),
+			wantOK:        1,
+			blown:         noCapIn(btNoCaptureBlown),
+			wantBlown:     1,
+			offOpts:       []compile.CompileOptions{squeezedOff},
+			capPagesAbove: btNoCaptureCapPages,
 		},
 	}
 
@@ -1179,6 +1193,22 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			w, _, err := compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, tc.offOpts...)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
+			}
+			if tc.capPagesAbove > 0 {
+				store, _, mem, release, ierr := instantiate(w)
+				if ierr != nil {
+					t.Fatalf("instantiate: %v", ierr)
+				}
+				pages := mem.Size(store)
+				release()
+				capped := tc.offOpts[0]
+				capped.MaxMemory, err = config.ParseMemorySize(strconv.FormatUint((pages+tc.capPagesAbove)*65536, 10))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if w, _, err = compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, capped); err != nil {
+					t.Fatalf("compile (capped): %v", err)
+				}
 			}
 
 			// Both inputs genuinely match, so NoMatch is the wrong answer for
@@ -1219,6 +1249,18 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		})
 	}
 }
+
+// btNoCaptureBlown is an iteration count whose btNoCapturePattern search needs
+// far more stack than btNoCaptureCapPages leave: one live 8-byte frame per
+// iteration, 480 KB, against 256 KB — which the stack shares with the default
+// search state a standalone module grows for a caller that hands none over (the
+// batch row needs it: two pages were too few). noCapIn(4000) needs 32 KB and
+// fits the stack's 64 KB start. Its input, 120,006 bytes, stays below
+// pathsOutBase.
+const (
+	btNoCaptureBlown    = 60000
+	btNoCaptureCapPages = 4
+)
 
 // btCaptureBlown is an input length whose btCapturePattern search needs far
 // more stack than btCaptureCap leaves: one live 32-byte frame per byte, 3.2 MB,
@@ -1395,6 +1437,123 @@ func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
 			c(in).check(t, got, slots)
 		}
 	})
+}
+
+// TestBTEmptyStackOverflowAnswersUnknown: a growing frame stack can overflow
+// EMPTY — memory cannot hold even one frame at call start, max_memory reached
+// with the scratch base at the end of memory. The overflow arms the budget for
+// the next pop, but with nothing to pop the FAIL handler answered "no match"
+// (a find moved on to its next start) before charging it, so the fallback never
+// ran: `(a|ab)(c|bcd)(d*)` over "abcd" answered -1 where Go matches [0,4). Each
+// body that grows a stack must now hand over at once, and the fallback, which
+// cannot get memory either, answers abi.BTStackOverflow. Each module is capped
+// at exactly its static size; the same module uncapped answers as Go does.
+func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
+	// capped compiles with no cap, then again capped at the static size the
+	// first build instantiates to.
+	capped := func(t *testing.T, build func(compile.CompileOptions) ([]byte, error)) (plain, w []byte) {
+		t.Helper()
+		plain, err := build(compile.CompileOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, _, mem, release, err := instantiate(plain)
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		pages := mem.Size(store)
+		release()
+		memCap, err := config.ParseMemorySize(strconv.FormatUint(pages*65536, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w, err = build(compile.CompileOptions{MaxMemory: memCap}); err != nil {
+			t.Fatal(err)
+		}
+		return plain, w
+	}
+	call := func(t *testing.T, w []byte, input, fn string, args ...interface{}) interface{} {
+		t.Helper()
+		store, inst, mem, release, err := instantiate(w)
+		defer release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(mem.UnsafeData(store)[0:], input) // page 0 is below the tables
+		res, err := inst.GetFunc(store, fn).Call(store, append([]interface{}{int32(0), int32(len(input))}, args...)...)
+		if err != nil {
+			t.Fatalf("%s: %v", fn, err)
+		}
+		return res
+	}
+	single := func(e config.RegexEntry, force bool, maxStates int) func(compile.CompileOptions) ([]byte, error) {
+		return func(o compile.CompileOptions) ([]byte, error) {
+			o.MaxDFAStates = maxStates
+			if force {
+				w, _, err := compile.CompileForced([]config.RegexEntry{e}, 65536, true, compile.EngineBacktrack, o)
+				return w, err
+			}
+			w, _, err := compile.Compile([]config.RegexEntry{e}, 65536, true, o)
+			return w, err
+		}
+	}
+	unknown := int64(abi.BTStackOverflow)
+
+	t.Run("groups", func(t *testing.T) {
+		plain, w := capped(t, single(config.RegexEntry{Pattern: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}, true, 0))
+		if got := call(t, plain, "abcd", "g", int32(1024), int32(0)).(int32); got != 4 {
+			t.Fatalf("uncapped groups = %d, want 4", got)
+		}
+		if got := call(t, w, "abcd", "g", int32(1024), int32(0)).(int32); int64(got) != unknown {
+			t.Errorf("capped groups = %d, want %d (unknown)", got, unknown)
+		}
+	})
+	// Over the state limit, a match or find falls back to Backtracking.
+	const overLimit = `(a|b)*a(a|b){12}`
+	in := "a" + strings.Repeat("b", 12)
+	t.Run("match", func(t *testing.T) {
+		plain, w := capped(t, single(config.RegexEntry{Pattern: overLimit, MatchFunc: "m"}, false, 16))
+		if got := call(t, plain, in, "m").(int32); got != int32(len(in)) {
+			t.Fatalf("uncapped match = %d, want %d", got, len(in))
+		}
+		if got := call(t, w, in, "m").(int32); int64(got) != unknown {
+			t.Errorf("capped match = %d, want %d (unknown)", got, unknown)
+		}
+	})
+	t.Run("find", func(t *testing.T) {
+		plain, w := capped(t, single(config.RegexEntry{Pattern: overLimit, FindFunc: "f"}, false, 16))
+		if got := call(t, plain, in, "f", int32(0)).(int64); got != int64(len(in)) {
+			t.Fatalf("uncapped find = %#x, want [0,%d)", got, len(in))
+		}
+		if got := call(t, w, in, "f", int32(0)).(int64); got != unknown {
+			t.Errorf("capped find = %#x, want %d (unknown)", got, unknown)
+		}
+	})
+	// A set: p0 is kept on a Backtracking bucket, p1 split onto the
+	// Backtracking find.
+	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`}
+	set := func(o compile.CompileOptions) ([]byte, error) {
+		cfg := config.BuildConfig{MaxFallbackStates: 1, MaxMemory: o.MaxMemory,
+			Regexps: []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+			Sets:    []config.SetConfig{{Name: "s", ScanAny: "s_scan", Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}}}
+		w, _, diags, err := compile.CompileFileDiag(cfg, "")
+		if err == nil && len(diags[0].SplitBacktracking) != 1 {
+			t.Fatalf("split onto Backtracking %v — the witness no longer has the shape", diags[0].SplitBacktracking)
+		}
+		return w, err
+	}
+	for i, input := range []string{"zbcbcx", "zbaX"} {
+		t.Run(fmt.Sprintf("set-p%d", i), func(t *testing.T) {
+			plain, w := capped(t, set)
+			if got := call(t, plain, input, "s_scan", int32(0)).(int32); got != int32(i) {
+				t.Fatalf("uncapped scan_any = %d, want %d", got, i)
+			}
+			if got := call(t, w, input, "s_scan", int32(0)).(int32); int64(got) != unknown {
+				t.Errorf("capped scan_any = %d, want %d (unknown)", got, unknown)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

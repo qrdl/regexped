@@ -388,29 +388,21 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps to a handler block. The engine maintains a backtrack stack in WASM linear memory: when an `InstAlt` node is reached, the alternative branch is pushed onto the stack and execution continues with the preferred branch. On failure the stack is popped to try the alternative.
 
-**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. For `match_func` and `find_func` the fast body's stack is reserved at compile time in WASM linear memory immediately after the DFA tables; for `groups_func` it is claimed when a call starts — see [The capture body's stack](#the-capture-bodys-stack).
+**Stack layout:** each frame stores the saved input position, all capture slots, and the retry program counter. Frame size = `4 + numGroups × 2 × 4 + 4` bytes. Every body's stack — `match_func`, `find_func`, `groups_func` and a set's members — is claimed when a call starts, not reserved in the module — see [The frame stack](#the-frame-stack).
 
-**Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, a capture body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
+**Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, the body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
 
-### The capture body's stack
+### The frame stack
 
-A `groups_func` body used to reserve its stack like the others — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input: a pattern with many branches claimed megabytes to match ten bytes. It reserves nothing now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size, growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. When memory cannot grow, the body hands over to the fallback as a full fixed stack does.
+Backtracking bodies used to reserve their stacks in the module — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input, and once per set in a set: a pattern with many branches claimed megabytes to match ten bytes, and a 339-set WAF configuration claimed 596 MB of its 643 MB before its first call. None reserves anything now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size (64 KB), growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. Every body and every set uses the same scratch, so the memory a module ends up with is the largest any one search needed, not the sum over its patterns. When memory cannot grow, the body hands over to the fallback.
+
+Inside a set, the members' fallback memos last a whole host call (see below), so a body run from a set starts its stack above every memo already placed in that call rather than at the base. Every exported entry of a set marks the start of a new call — a split set's `find` included, which can run a split member without calling the buckets at all — so a region placed in an earlier call, which the host may have reused since, is never taken for one of this call's.
 
 ### Frame budget and the `-2` sentinel
 
-For `match_func` and `find_func`, the fast body's backtrack stack is sized **at compile time**:
+The stack a search needs scales with **input length**: a pattern that leaves one live backtrack frame per input byte needs one frame per byte. When the fast body's stack cannot grow, it does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff`, a test knob, stops there.
 
-```
-maxFrames = max(numAlts × 4096, 4096)      # numAlts = InstAlt count in the NFA
-frameSize = 4 + numGroups × 2 × 4 + 4      # pos, capture slots, retry PC
-stackSize = maxFrames × frameSize
-```
-
-The real requirement, however, scales with **input length**: a pattern that leaves one live backtrack frame per input byte exhausts a `numAlts × 4096` budget once the input passes that many bytes. So the ceiling is a function of the input, not just the pattern, and no compile-time check can predict it.
-
-When that stack runs out, the fast body does not give up: it arms its work budget to trip on the next frame pop, and the trip hands the call to the fallback body, whose stack grows with the input (see [Work budget and the fallback body](#work-budget-and-the-fallback-body)). Only a build with `compile.BTWorkBudgetOff`, a test knob, still stops at this ceiling.
-
-The engine gives up only when it cannot get the memory a search needs — the fallback's linear memory cannot grow any further (WASM32's 4 GiB, the config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), or a lower limit the host set), or, with the budget off, the compile-time stack ran out or a capture body's stack could not grow. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
+The engine gives up only when it cannot get the memory a search needs — linear memory cannot grow any further (WASM32's 4 GiB, the config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), or a lower limit the host set), or, with the budget off, a fast body's stack could not grow. It has then abandoned part of the search space and **does not know** whether the input matches, so it returns a distinct sentinel:
 
 | value | meaning |
 |---|---|
@@ -419,7 +411,7 @@ The engine gives up only when it cannot get the memory a search needs — the fa
 
 `-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
 
-**Which patterns fill the compile-time stack.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the ceiling returned `-1`, an input-length-dependent false negative with no diagnostic; today it costs a call the fallback's run, not its answer.
+**Which patterns grow the stack.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the module's then-fixed stack returned `-1`, an input-length-dependent false negative with no diagnostic; today the stack grows instead, and only memory that cannot grow hands the call to the fallback.
 
 **Host behaviour.** Generated stubs must surface `-2` as an error, never as "no match":
 
@@ -501,8 +493,9 @@ popped as the search goes, so it is never exhausted.
    41-85% cheaper at 1.
 2. **The fallback body** has the same signature and contract, and is what the
    fast body TAIL-CALLS when the counter reaches zero — or when the fast body's
-   frame stack runs out (a compile-time one, or a capture body's growing one
-   when memory cannot grow), which arms the counter to trip on the next pop. It is the same emitter over the same program with a `(pc, pos)` visited
+   frame stack runs out because memory cannot grow, which arms the counter to
+   trip on the next pop — or, when not even the first frame fits and there is
+   nothing to pop, hands over at once. It is the same emitter over the same program with a `(pc, pos)` visited
    bitset at EVERY alternation — Go `regexp`'s bitstate discipline. It restarts
    the call from scratch on the caller's own arguments and globals, and sizes
    its own frame stack and bitset from the input at call time.

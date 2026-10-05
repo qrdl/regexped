@@ -73,8 +73,9 @@ not have the global and need nothing.
 **Why it exists.** A standalone module has one memory, and the host has no
 other way to pass data: it writes its input, and the buffers it reads answers
 from, into the module's exported `memory`. A Backtracking call also works in
-that same memory — a `groups_func` search keeps its frame stack there on EVERY
-call, and any search that outgrows its stack continues in a fallback whose
+that same memory — every Backtracking search (`match_func`, `find_func`,
+`groups_func` and a set's Backtracking members) keeps its frame stack there on
+EVERY call, and any search that outgrows its stack continues in a fallback whose
 memory is sized from the input (see [engines.md](engines.md) "Work budget and
 the fallback body") — and it cannot tell which parts of it the host is using. The exported mutable `i32` global
 **`regexped:scratch_base`** is how the host tells it: "everything from this
@@ -102,9 +103,10 @@ last one did.
 
 **If you leave it at 0** (its initial value), answers stay correct, but every
 call that needs this working memory takes new pages at the end of memory, and
-WebAssembly memory never shrinks. A Backtracking `groups_func` call always
-needs it: each one takes at least its frame stack's starting size, so such a
-host's memory grows on every call until it reaches 4 GiB or `max_memory`. Measured with perftest's html-tags pattern
+WebAssembly memory never shrinks. Every Backtracking call needs it — `groups`,
+`match`, `find` and a set's Backtracking members alike: each one takes at least
+its frame stack's starting size, so such a host's memory grows on every call
+until it reaches 4 GiB or `max_memory`. Measured with perftest's html-tags pattern
 (`groups_func`) looping over the tags of a 10 KB HTML page, one call per tag:
 
 | documents processed | memory, global at 0 | memory, global set |

@@ -98,14 +98,21 @@ type btDyn struct {
 	search *btSearch
 }
 
-// ── The ordinary capture body's frame stack ─────────────────────────────────
+// ── The ordinary body's frame stack ─────────────────────────────────────────
 //
-// A Backtracking CAPTURE body's ordinary frame stack used to be reserved in the
+// A Backtracking body's ordinary frame stack used to be reserved in the
 // module's tables: numAlts × 4,096 frames, worked out from the pattern at
 // compile time and claimed when the module loaded, whatever the input — 210 MB
-// for a pattern with 1,602 branches, 10 bytes of input or not. It was only ever
-// a speed cushion, since a search that ran out of it handed over to the
-// fallback.
+// for a capture pattern with 1,602 branches, 10 bytes of input or not, and in a
+// set one stack PER SET: 596 of the 643 MB a 339-set WAF module claimed before
+// its first call. It was only ever a speed cushion, since a search that ran out
+// of it handed over to the fallback. Every ordinary body — capture, match, find
+// and a set member's — now takes it at call time as below.
+//
+// Inside a set, a member's FALLBACK region outlives its call (btDriveMember),
+// so a stack run from the set starts above every region placed in the current
+// host call: the scratch it is handed carries the set's drive
+// (btScratch.drive).
 //
 // So the stack is placed at CALL time through the same scratch arrangement as
 // the fallback's region (emitBTScratchBase), which is what keeps every stub
@@ -114,8 +121,8 @@ type btDyn struct {
 // entry — memory is grown only when it does not already have them, so a call
 // that fits never grows after the first — and it DOUBLES when full, by growing
 // memory past its end: the stack is the last thing in memory, so growing copies
-// nothing. When memory cannot grow, the body hands over to the fallback exactly
-// as its old fixed stack did, and the fallback answers abi.BTStackOverflow when
+// nothing. When memory cannot grow, the body hands over to the fallback as any
+// overflowing stack does, and the fallback answers abi.BTStackOverflow when
 // it cannot get memory either — which is how max_memory, declared as the
 // memory's maximum, bounds a call.
 //
@@ -125,7 +132,7 @@ type btDyn struct {
 // defaultBTStackStart is CompileOptions.BTStackStart's default: one page.
 const defaultBTStackStart = 64 << 10
 
-// btGrowth asks an ordinary capture body for the growing frame stack above.
+// btGrowth asks an ordinary body for the growing frame stack above.
 type btGrowth struct {
 	scratch btScratch
 	start   int32 // bytes the stack is given at entry
@@ -237,8 +244,8 @@ func emitBTGrowStackInit(b []byte, d *btDyn, giveUp func([]byte) []byte) []byte 
 // stack. It is emitBTDynPushCheck with one difference: when memory cannot grow
 // it does not leave the function but runs overflow — the ordinary body's own
 // frame-stack overflow, which hands over to the fallback. overflow is emitted
-// one block deeper than a fixed stack's guard runs it, and its branch depth
-// must count that block.
+// one block deeper than btPushFrame's own nesting, and its branch depth must
+// count that block.
 func emitBTGrowPushCheck(b []byte, d *btDyn, overflow func([]byte) []byte) []byte {
 	minPages := (d.frameSize + 0xFFFF) >> 16
 	if minPages < 1 {
@@ -386,8 +393,37 @@ func emitBTScratchInit(b []byte, d *btDyn, span, unknown func([]byte) []byte) []
 
 // emitBTScratchBase leaves in dst where the scratch may start: the host
 // global; the current end of memory when that is 0; the floor global when it is
-// below the floor.
+// below the floor — or, for a body inside a set whose members keep regions for
+// the host call (btScratch.drive), the top of the last one placed in it.
 func emitBTScratchBase(b []byte, d *btDyn, dst uint32) []byte {
+	if dr := d.scratch.drive; dr != nil {
+		// Inside a set: above every region placed so far in this host call
+		// (scratch.drive). The first body to need scratch in a call finds the
+		// base and RECORDS it, as a member's first fallback does: with a host
+		// global of 0 the base is fresh pages, and a set calls a member once
+		// per candidate — finding it again each time would take fresh pages
+		// per candidate. A stack is dead once its call returns, so the regions
+		// placed after it may start where it did.
+		b = appendGlobalGet(b, dr.scratchEpoch)
+		b = appendGlobalGet(b, dr.epoch)
+		b = append(b, 0x52)       // i64.ne
+		b = append(b, 0x04, 0x40) // if
+		b = emitBTScratchBaseFree(b, d, dst)
+		b = btLocalGet(b, dst)
+		b = appendGlobalSet(b, dr.scratchTop)
+		b = appendGlobalGet(b, dr.epoch)
+		b = appendGlobalSet(b, dr.scratchEpoch)
+		b = append(b, 0x0B) // end if
+		b = appendGlobalGet(b, dr.scratchTop)
+		b = append(b, 0x21)
+		return utils.AppendULEB128(b, dst)
+	}
+	return emitBTScratchBaseFree(b, d, dst)
+}
+
+// emitBTScratchBaseFree is emitBTScratchBase when nothing placed in this host
+// call needs keeping: the host global, raised to the floor, or fresh pages.
+func emitBTScratchBaseFree(b []byte, d *btDyn, dst uint32) []byte {
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, d.scratch.host) // global.get host
 	b = append(b, 0x22)
@@ -670,7 +706,13 @@ func appendBTScratchExport(es []byte, sc btScratch) []byte {
 // "A host call" is an epoch: a global every exported set capability bumps on
 // entry (emitBTDrivePrologue), compared against the epoch each member's state
 // was set up in. Component adapters call those same exported functions, so
-// they bump it too.
+// they bump it too. A split set's `find` merge bumps it as well as the kept
+// body it calls, because it calls that body only when the buckets' lower bound
+// is the smallest: a split member run without a bump took the previous call's
+// scratch base, which the host may have written over and raised
+// regexped:scratch_base past since. The second bump in one call is harmless —
+// the merge runs each candidate once, and a split member's stack is dead once
+// its call returns.
 
 // btDrive names a set's call-scoped globals.
 type btDrive struct {
@@ -841,9 +883,16 @@ func emitBTWorkChargeMember(b []byte, m *btDriveMember, tmp uint32, trip func([]
 	return append(b, 0x0B) // end if
 }
 
-// btArmTripMember is btArmTrip against the member's budget.
-func btArmTripMember(m *btDriveMember) func([]byte, uint32) []byte {
+// btArmTripMember is btArmTrip against the member's budget. An empty stack
+// trips at once, the budget spent as a charge would leave it, so the host
+// call's later candidates go to the fallback too.
+func btArmTripMember(m *btDriveMember, dyn *btDyn, giveUp func([]byte) []byte) func([]byte, uint32) []byte {
 	return func(b []byte, brDepth uint32) []byte {
+		b = btIfStackEmpty(b, dyn, func(b []byte) []byte {
+			b = append(b, 0x42, 0x00) // i64.const 0
+			b = appendGlobalSet(b, m.budget)
+			return giveUp(b)
+		})
 		b = append(b, 0x42, 0x01) // i64.const 1
 		b = appendGlobalSet(b, m.budget)
 		return btFail(b, brDepth)
