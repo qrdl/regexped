@@ -683,6 +683,10 @@ type SetSpec struct {
 	// directly (rather than from a config) get.
 	IDSpaceSize int
 
+	// MaxUnionStates is config.BuildConfig.MaxUnionStates: the union
+	// automaton's construction cap (maxUnionStates); 0 for the default.
+	MaxUnionStates int
+
 	// DeclaredPatternCount is config.SetConfig.PatternCount — the number of
 	// patterns the set SELECTS, before any are dropped for carrying captures
 	// or exceeding the state limit. It sizes the stubs' tuple buffer, and with
@@ -807,7 +811,10 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	if opts.globals == nil {
 		opts.globals = &moduleGlobals{}
 	}
-	diag := &SetDiag{Name: spec.Name}
+	diag := &SetDiag{Name: spec.Name, Mode: "byte"}
+	if len(spec.Patterns) > 0 {
+		diag.Mode = spec.Patterns[0].rp.modeName() // one mode for the whole set
+	}
 	// full is the whole set; spec, from here on, is what the buckets serve.
 	full := spec
 	spec = keptSpec(full, splitIndices(split))
@@ -878,7 +885,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			}
 		}
 	}
-	fe := chooseLiteralFrontend(lits)
+	unicodeSet := len(spec.Patterns) > 0 && spec.Patterns[0].rp.unicode()
+	fe := chooseLiteralFrontend(lits, unicodeSet)
 	// TEST-ONLY measurement override. Placed here, before every
 	// structural refusal below, so a forced frontend is still subject to the
 	// rules that exist for correctness rather than for speed — a fallback
@@ -1361,7 +1369,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// kind only when choosePackedPair succeeded on the same literals.
 	var packedPair *packedPairPlan
 	if fe == frontendPackedPair {
-		packedPair, _ = choosePackedPair(lits)
+		packedPair, _ = choosePackedPair(lits, unicodeSet)
 	}
 
 	// density-heuristic / LikelyNoMatch Shufti for the
@@ -2054,6 +2062,7 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 // options. `comp` is the zero value — meaning MODULE — on every path but
 // CompileFileComponent, which is the arm component/ drives.
 func compileFileComponentReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter, comp asmOpts) ([]byte, int64, []SetDiag, error) {
+	defer rep.startProgress()()
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
@@ -2150,6 +2159,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	var compiledSets []*compiledSet
 	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
+		progressSubject("set %q", sc.Name)
 		// Resolve patterns.
 		var selectedIdx []int
 		if sc.Patterns.All {
@@ -2178,6 +2188,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		fillSetSearchSizes(sc, cs, over.searchSizes)
 		if cs.diag != nil {
 			cs.diag.SearchBlocks, cs.diag.SearchBlocksBTMemo = diagSearchBlocks(cs.searchBlocks())
+			cs.diag.CacheBytesPerByte = overlapShapeOf(cs).bytesPerByte()
 		}
 		if cs.companion != nil {
 			// Its tables sit above the set's own; its functions follow the
@@ -2927,6 +2938,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
+			checkStartRule(p.startRule, p.findFromMode)
 			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen, p.defFind)
 		}
 		if p.hasGroupsFromWrapper() {
@@ -3659,12 +3671,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// evaluated at every position. Skipped entirely under phase1Only, where
 	// they are the union pass's job instead.
 	if !cs.phase1Only {
-		for bi, bkt := range cs.buckets {
-			if !bkt.isFallback {
-				continue
-			}
-			b = c.emitBucketAt(b, bi, 0, lPos)
-		}
+		b = c.emitFallbackBuckets(b, lPos)
 	}
 
 	// The position's first byte is loaded once for the whole bucket chain: an
@@ -4027,12 +4034,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 
 	// Fallback buckets at every position — the union pass's job under phase1Only.
 	if !cs.phase1Only {
-		for bi, bkt := range cs.buckets {
-			if !bkt.isFallback {
-				continue
-			}
-			b = c.emitBucketAt(b, bi, 0, lPos)
-		}
+		b = c.emitFallbackBuckets(b, lPos)
 	}
 
 	// AC transition: only when lPos < pInLen (there is a byte to consume)
@@ -5121,6 +5123,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		DeclaredPatternCount: sc.PatternCount(cfg),
 		Overlapping:          sc.Overlapping,
 		IDSpaceSize:          sc.IDSpaceSize(cfg),
+		MaxUnionStates:       cfg.MaxUnionStates,
 		Patterns:             infos,
 		PatternIDs:           globalIDs,
 	}
@@ -5134,7 +5137,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// built without it, so the default 1024 always won and the drop
 		// warning's own "raise max_dfa_states" hint pointed at a field that
 		// does not feed this budget.
-		MaxFallbackStates: cfg.MaxFallbackStates,
+		MaxFallbackStates: resolveMaxFallbackStates(cfg.MaxFallbackStates, infos),
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
 		BTWorkBudget:  over.BTWorkBudget,

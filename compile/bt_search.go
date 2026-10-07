@@ -328,3 +328,19 @@ func (c *btSearch) emitCapTripped(b []byte) []byte {
 // btMemoBytes is the memo bytes per text position a search of bt keeps once it
 // trips: one row of ⌈N/8⌉ bytes.
 func btMemoBytes(bt *backtrack) int { return (len(bt.prog.Inst) + 7) / 8 }
+
+// reportBTMemo records under --verbose, for a Unicode-mode pattern, the memo
+// its Backtracking body's fallback keeps per input byte: one row per position
+// of ⌈instructions/8⌉ bytes, and a lowered class is hundreds of instructions
+// (`(\pL+)@(\pL+)`: 765 bytes per input byte). A body with no fallback keeps
+// no memo.
+func reportBTMemo(rep *Reporter, unicode bool, body string, bt *backtrack, plan btPlan) {
+	if !unicode || !plan.fallback {
+		return
+	}
+	when := "once its work budget trips"
+	if plan.force {
+		when = "on every call (a zero-width cycle gives it no ordinary body)"
+	}
+	rep.Memory("Backtracking memo ("+body+")", btMemoBytes(bt), when)
+}

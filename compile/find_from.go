@@ -1,6 +1,10 @@
 package compile
 
-import "github.com/qrdl/regexped/internal/utils"
+import (
+	"regexp/syntax"
+
+	"github.com/qrdl/regexped/internal/utils"
+)
 
 // ── The find-from channel ──────────────────────────────
 //
@@ -72,6 +76,12 @@ const (
 	// beginning at position 0 (isAnchoredFind), so the wrapper answers
 	// "no match" for any from != 0 without calling it at all.
 	ffAnchoredZeroOnly
+
+	// ffNativeUTF8 is ffNative for a body that also keeps a Unicode-mode
+	// pattern's matches off positions inside a character (startRule):
+	// obtainable only from emitFindFromSeedRule, which emits the seed and the
+	// rule's rounding of it together.
+	ffNativeUTF8
 )
 
 func (m findFromMode) String() string {
@@ -82,8 +92,283 @@ func (m findFromMode) String() string {
 		return "native"
 	case ffAnchoredZeroOnly:
 		return "anchored-zero-only"
+	case ffNativeUTF8:
+		return "native-utf8"
 	}
 	return "UNSET"
+}
+
+// native reports whether a body in mode m reads the find-from channel and
+// scans the whole buffer from it.
+func (m findFromMode) native() bool { return m == ffNative || m == ffNativeUTF8 }
+
+// ── Unicode start positions ─────────────────────────────────────────────────
+//
+// In Unicode mode no match starts, and no empty match is reported, inside a
+// character: a position is a start position exactly when Go's decoding
+// starts a token there — a valid UTF-8 sequence's first byte, or any byte of
+// invalid input, which Go reads as U+FFFD one byte wide. A continuation byte
+// is skipped only when the lead byte up to 3 bytes back begins a valid
+// sequence that is complete across it.
+//
+// Which bodies need the rule follows from the lowered program: it consumes
+// only whole valid sequences, so a NON-empty match never begins with a
+// continuation byte. Only an empty match can sit inside a character, and of
+// the assertions only `\B` can hold there (both neighbours are non-word
+// bytes; `^ $ \A \z (?m)^ (?m)$` hold only at the input's edges or next to
+// `\n`, `\b` never between two non-word bytes). So:
+//
+//   - a pattern that cannot match empty needs nothing;
+//   - one that can, but not through `\B` alone, needs only `from` rounded up
+//     to a start position: its empty matches are found where they hold, and
+//     they hold only at start positions;
+//   - one that can reach an empty match through `\B` with no position-fixing
+//     assertion on the way also needs every candidate start checked.
+//
+// The rule is applied IN the find bodies (the scan loop and the seed), not at
+// the entry points: measured 2026-10-05 on `\B` and `a?\B` drives over 64 KB,
+// the scan-loop check cost 1-10% less fuel than rounding at the entry points
+// and calling a body again after each match inside a character.
+type startRule uint8
+
+const (
+	// startRuleNone: byte mode, or a pattern that cannot match empty.
+	startRuleNone startRule = iota
+	// startRuleSeed: round `from` up to a start position.
+	startRuleSeed
+	// startRuleScan: startRuleSeed, and skip every candidate start that is
+	// not a start position.
+	startRuleScan
+)
+
+// startRuleFor is the rule pattern's find bodies must keep, from its mode
+// and its program.
+func startRuleFor(pattern resolvedPattern) startRule {
+	rule, _, _ := startEmptyMatches(pattern)
+	return rule
+}
+
+// startEmptyMatches is startRuleFor's rule together with
+// emptyMatchesInsideChar's two answers for the pattern's program, from one
+// parse and one compile: both false when the rule is startRuleNone.
+func startEmptyMatches(pattern resolvedPattern) (rule startRule, anywhere, viaNoWB bool) {
+	if !pattern.unicode() {
+		return startRuleNone, false, false
+	}
+	t, err := pattern.parse()
+	if err != nil {
+		return startRuleNone, false, false
+	}
+	if minLen, _ := t.minMaxLen(); minLen > 0 {
+		return startRuleNone, false, false
+	}
+	// syntax.Compile never fails on a tree syntax.Parse produced.
+	mp, _ := compileProg(t)
+	anywhere, viaNoWB = emptyMatchesInsideChar(mp.orig)
+	if viaNoWB {
+		return startRuleScan, anywhere, viaNoWB
+	}
+	return startRuleSeed, anywhere, viaNoWB
+}
+
+// emptyMatchesInsideChar reports the two ways prog's empty matches can sit
+// inside a character: anywhere, an empty path to Match with no assertion that
+// fixes the position (`\B` allowed), and viaNoWB, such a path through `\B`.
+// Exact: it walks every non-consuming path from the start, carrying the
+// assertions seen.
+func emptyMatchesInsideChar(prog *syntax.Prog) (anywhere, viaNoWB bool) {
+	const fixing = syntax.EmptyBeginLine | syntax.EmptyEndLine | syntax.EmptyBeginText |
+		syntax.EmptyEndText | syntax.EmptyWordBoundary
+	type node struct {
+		pc   uint32
+		seen syntax.EmptyOp
+	}
+	visited := map[node]bool{}
+	stack := []node{{uint32(prog.Start), 0}}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if visited[n] {
+			continue
+		}
+		visited[n] = true
+		in := &prog.Inst[n.pc]
+		switch in.Op {
+		case syntax.InstMatch:
+			if n.seen&fixing == 0 {
+				anywhere = true
+				if n.seen&syntax.EmptyNoWordBoundary != 0 {
+					return true, true
+				}
+			}
+		case syntax.InstAlt, syntax.InstAltMatch:
+			stack = append(stack, node{in.Out, n.seen}, node{in.Arg, n.seen})
+		case syntax.InstCapture, syntax.InstNop:
+			stack = append(stack, node{in.Out, n.seen})
+		case syntax.InstEmptyWidth:
+			stack = append(stack, node{in.Out, n.seen | syntax.EmptyOp(in.Arg)})
+		}
+	}
+	return anywhere, false
+}
+
+// setStartNeeds is what a SET member's position bodies need for the start
+// rule. A set enumerates candidate starts past `from` — after a gate refuses
+// an empty match at one, or at every position when overlapping — so a member
+// whose empty match holds anywhere needs every candidate checked in `find`,
+// not only the seed. The scan pair answers only whether a member matches, and
+// a member whose empty match holds anywhere matches at the next start
+// position as surely as inside a character, so there only `\B` counts.
+func setStartNeeds(pattern resolvedPattern) (find, scan bool) {
+	_, find, scan = startEmptyMatches(pattern)
+	return find, scan
+}
+
+// utf8StartLocals are the locals emitUTF8Start reads and writes: the input
+// (ptr, len), the position it moves, and three i32 scratch locals.
+type utf8StartLocals struct {
+	ptr, len, pos, c, k, n uint32
+}
+
+// emitUTF8Start moves l.pos, when it lies inside a valid UTF-8 sequence of
+// the input, to that sequence's end — the next start position — and then
+// emits onMove at branch depth 0 of its own block (nil: nothing). A position
+// at 0, at or past len, or on a byte that is not a continuation byte is a
+// start position, and so is a continuation byte that continues no valid
+// sequence, as Go reads it.
+//
+// About a dozen instructions when pos holds no continuation byte; the lookback
+// and the sequence check run only at one. Position 0 needs no test of its own:
+// a continuation byte there has no lead before it, and the lookback answers
+// "a start position" for it as for any stray continuation byte.
+func emitUTF8Start(b []byte, l utf8StartLocals, onMove func([]byte) []byte) []byte {
+	get := func(b []byte, x uint32) []byte { return utils.AppendULEB128(append(b, 0x20), x) }
+	set := func(b []byte, op byte, x uint32) []byte { return utils.AppendULEB128(append(b, op), x) }
+	i32c := func(b []byte, v int32) []byte { return utils.AppendSLEB128(append(b, 0x41), v) }
+	// at loads the input byte at pos - k + off (memory 0, the input's).
+	at := func(b []byte, off byte) []byte {
+		b = get(get(b, l.ptr), l.pos)
+		b = append(b, 0x6A)
+		b = get(b, l.k)
+		return append(b, 0x6B, 0x2D, 0x00, off)
+	}
+	isCont := func(b []byte) []byte { // (top & 0xC0) == 0x80
+		b = i32c(b, 0xC0)
+		b = append(b, 0x71)
+		b = i32c(b, 0x80)
+		return append(b, 0x46)
+	}
+	eqC := func(b []byte, v int32) []byte { return append(i32c(get(b, l.c), v), 0x46) }
+
+	b = append(b, 0x02, 0x40) // block $done
+	b = get(get(b, l.pos), l.len)
+	b = append(b, 0x4F, 0x0D, 0x00) // pos >= len → a start position
+	b = get(get(b, l.ptr), l.pos)
+	b = append(b, 0x6A, 0x2D, 0x00, 0x00)
+	b = isCont(b)
+	b = append(b, 0x45, 0x0D, 0x00) // not a continuation byte → a start position
+
+	// The lead byte: the first non-continuation byte up to 3 back.
+	b = set(i32c(b, 1), 0x21, l.k)
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block $found, loop $back
+	b = get(get(b, l.k), l.pos)
+	b = append(b, 0x4B, 0x0D, 0x02) // k > pos: no lead → stray → done
+	b = at(b, 0)
+	b = set(b, 0x22, l.c)
+	b = isCont(b)
+	b = append(b, 0x45, 0x0D, 0x01) // a lead candidate → $found
+	b = get(b, l.k)
+	b = append(b, 0x41, 0x01, 0x6A)
+	b = set(b, 0x22, l.k)
+	b = append(b, 0x41, 0x03, 0x4D, 0x0D, 0x00) // k <= 3 → $back
+	b = append(b, 0x0C, 0x02)                   // four continuations → stray → done
+	b = append(b, 0x0B, 0x0B)                   // end $back, end $found
+
+	// c is the byte at pos - k. A valid lead is 0xC2..0xF4; its sequence is
+	// n = 2, 3 or 4 bytes, and must reach past pos and end within the input.
+	b = i32c(get(b, l.c), 0xC2)
+	b = append(b, 0x49, 0x0D, 0x00) // c < 0xC2 → done
+	b = i32c(get(b, l.c), 0xF5)
+	b = append(b, 0x4F, 0x0D, 0x00) // c >= 0xF5 → done
+	b = i32c(get(i32c(b, 2), l.c), 0xE0)
+	b = append(b, 0x4F, 0x6A)
+	b = i32c(get(b, l.c), 0xF0)
+	b = append(b, 0x4F, 0x6A)
+	b = set(b, 0x21, l.n)
+	b = get(get(b, l.n), l.k)
+	b = append(b, 0x4D, 0x0D, 0x00) // n <= k: the sequence ends before pos → done
+	b = get(get(b, l.pos), l.k)
+	b = append(b, 0x6B)
+	b = get(b, l.n)
+	b = append(b, 0x6A)
+	b = get(b, l.len)
+	b = append(b, 0x4B, 0x0D, 0x00) // cut off by the end of the input → done
+
+	// The second byte's range depends on the lead (no overlong encoding, no
+	// surrogate, nothing past U+10FFFF): (byte - lo) u> (hi - lo) → done.
+	b = at(b, 1)
+	b = i32c(b, 0xA0)
+	b = i32c(b, 0x90)
+	b = i32c(b, 0x80)
+	b = append(eqC(b, 0xF0), 0x1B)
+	b = append(eqC(b, 0xE0), 0x1B, 0x6B) // byte - lo
+	b = i32c(b, 0x1F)
+	b = i32c(b, 0x2F)
+	b = i32c(b, 0x0F)
+	b = i32c(b, 0x3F)
+	b = append(eqC(b, 0xF4), 0x1B)
+	b = append(eqC(b, 0xF0), 0x1B)
+	b = eqC(eqC(b, 0xE0), 0xED)
+	b = append(b, 0x72, 0x1B)       // or, select → hi - lo
+	b = append(b, 0x4B, 0x0D, 0x00) // out of range → done
+	for j := byte(2); j <= 3; j++ {
+		b = i32c(get(b, l.n), int32(j))
+		b = append(b, 0x4B, 0x04, 0x40) // if n > j
+		b = isCont(at(b, j))
+		b = append(b, 0x45, 0x0D, 0x01, 0x0B) // not a continuation → done; end if
+	}
+	b = get(get(b, l.pos), l.k)
+	b = append(b, 0x6B)
+	b = get(b, l.n)
+	b = append(b, 0x6A)
+	b = set(b, 0x21, l.pos) // pos = the sequence's end
+	if onMove != nil {
+		b = onMove(b)
+	}
+	return append(b, 0x0B) // end $done
+}
+
+// emitFindFromSeedRule is emitFindFromSeed for a body that keeps rule, and
+// returns ffNativeUTF8 for any rule but startRuleNone, so a body's mode says
+// which it keeps. Under startRuleSeed the seed is rounded up to a start
+// position here. Under startRuleScan it is not: the caller checks every
+// candidate start, and the seed is the first of them — rounding it as well
+// cost `\B` 10% more fuel over 4 KB of prose, all of it a second check of
+// the same position.
+func emitFindFromSeedRule(b []byte, cur scanCursor, rule startRule, l utf8StartLocals) ([]byte, findFromMode) {
+	b, mode := emitFindFromSeed(b, cur)
+	switch rule {
+	case startRuleNone:
+		return b, mode
+	case startRuleSeed:
+		l.pos = uint32(cur.Local())
+		b = emitUTF8Start(b, l, nil)
+	}
+	return b, ffNativeUTF8
+}
+
+// checkStartRule panics when a pattern's find body does not keep the start
+// rule the pattern needs, or keeps one it does not: a body that matches only
+// at position 0 needs none.
+func checkStartRule(rule startRule, mode findFromMode) {
+	switch {
+	case mode == ffAnchoredZeroOnly:
+	case rule == startRuleNone && mode == ffNativeUTF8:
+		panic("compile: a find body keeps a Unicode start rule its pattern does not need")
+	case rule != startRuleNone && mode != ffNativeUTF8:
+		panic("compile: a Unicode-mode pattern that can match empty has a find body (" + mode.String() +
+			") that does not keep its matches off positions inside a character (see startRule)")
+	}
 }
 
 // emitFindFromSeed appends the two instructions that load the find-from
@@ -332,14 +617,14 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 	var b []byte
 
 	switch {
-	case def != nil && mode == ffNative:
+	case def != nil && mode.native():
 		// Locals 3, 4, 5: i32 area and scratch; 6, 7: i64 sizes; 8: i64 r.
 		b = append(b, 0x02, 0x03, 0x7F, 0x03, 0x7E)
 	case def != nil:
 		panic("compile: a default search state on a " + mode.String() + " find")
 	case mode == ffLegacyNarrow:
 		b = append(b, 0x01, 0x01, 0x7E) // one i64 local: r (local 3)
-	case mode == ffNative, mode == ffAnchoredZeroOnly:
+	case mode.native(), mode == ffAnchoredZeroOnly:
 		b = append(b, 0x00) // no locals
 	default:
 		panic("compile: buildFindFromWrapperBody with " + mode.String() + " mode")
@@ -376,7 +661,7 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 
 	// len - from < minLen: the remainder is shorter than anything this pattern
 	// can match, so there is nothing to scan. Exact at every length —
-	// regexpMinMaxLen is a true lower bound, and already load-bearing for
+	// minMaxLen is a true lower bound, and already load-bearing for
 	// lmBareShuftiEligible, lit-anchor and set analysis.
 	//
 	// Emitted HERE rather than in each find body because this wrapper fronts
@@ -402,7 +687,7 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 		b = append(b, 0x0B)       // end if
 	}
 
-	if mode == ffNative && def != nil {
+	if mode.native() && def != nil {
 		l := defLocals{a: 3, t: 4, s: 5, n: 6, n2: 7}
 		b = def.emitEnter(b, 0, 1, 2, l)
 		b = emitFindFromSet(b, 0x02)          // find_from = from
@@ -413,7 +698,7 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 		b = def.emitFindWindow(b, l, 8)
 		return append(b, 0x0B) // end function
 	}
-	if mode == ffNative {
+	if mode.native() {
 		b = emitFindFromSet(b, 0x02)          // find_from = from
 		b = append(b, 0x20, 0x00, 0x20, 0x01) // ptr, len — the WHOLE buffer
 		b = append(b, 0x10)
@@ -658,10 +943,11 @@ func assertGroupsFromWrapperMode(p *compiledPattern, anchoredOnly bool) {
 		// captureBody IS the export; the channel reaches it directly.
 		mode, what = p.captureFromMode, "capture body"
 	}
-	if mode != ffNative {
+	if !mode.native() {
 		panic("compile: pattern exports groups over a non-native " + what +
 			" (findFromMode " + mode.String() + ") — the groups-from wrapper " +
 			"seeds the find-from channel, which only an ffNative body reads " +
 			"(see find_from.go)")
 	}
+	checkStartRule(p.startRule, mode)
 }

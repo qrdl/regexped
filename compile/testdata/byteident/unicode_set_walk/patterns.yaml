@@ -1,0 +1,13 @@
+# A Unicode-mode set whose fallback bucket holds members that can match empty
+# inside a character: the per-position walk skips candidates there, in `find`
+# and in the scan pair (\B), and the first-byte tables hold lead bytes.
+regexps:
+  - { name: letters, pattern: '[a-zé]+' }
+  - { name: xs, pattern: 'x*' }
+  - { name: nwb, pattern: '\B' }
+sets:
+  - name: uw
+    find: uw_find
+    scan_any: uw_scan_any
+    scan_all: uw_scan_all
+    patterns: all

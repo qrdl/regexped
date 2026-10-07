@@ -39,7 +39,7 @@ regexped compile --config=regexped.yaml
 regexped generate --config=regexped.yaml
 ```
 
-See [`examples/browser/Makefile`](../examples/browser/Makefile) for a complete Makefile that automates these steps.
+See [`examples/browser/validate/Makefile`](../examples/browser/validate/Makefile) for a complete Makefile that automates these steps.
 
 ## Generated JS API
 
@@ -106,6 +106,52 @@ for (const match of parse_url(text)) {
     if (host) console.log('host:', text.slice(host[0], host[1]));
 }
 ```
+
+### Sets, and text beyond ASCII
+
+A set's `find` reports every pattern's matches in one pass, as
+`{patternId, start, end}`, and `emit_name_map: true` adds `patternName(id)`:
+
+```js
+import { init, scan_text, patternName } from './regexp.js';
+await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
+
+for (const m of scan_text('pаypal.com')) {        // the а is Cyrillic
+    console.log(patternName(m.patternId), m.start, m.end);
+}
+// mixed_script 0 11
+// lookalike 1 3
+```
+
+Every position the stub returns is a **byte offset into the input's UTF-8
+encoding**, while a JS string indexes UTF-16 code units, so the
+`text.slice(start, end)` calls above are right only for ASCII text. Above
+ASCII, map offsets to code units first — one pass over the text:
+
+```js
+// at[b] is the code-unit index of the character that byte b belongs to.
+function codeUnitIndex(text) {
+  const at = new Uint32Array(new TextEncoder().encode(text).length + 1);
+  let b = 0, u = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    at.fill(u, b, b + n);
+    b += n;
+    u += ch.length;
+  }
+  at[b] = u;
+  return at;
+}
+
+const at = codeUnitIndex(text);
+for (const m of scan_text(text)) console.log(text.slice(at[m.start], at[m.end]));
+```
+
+[`examples/browser/homoglyph/`](../examples/browser/homoglyph/) is a complete
+page built this way: five Unicode-mode patterns in one `find` set — scripts
+mixed in one token, lookalike letters, invisible and text-direction characters,
+styled letters — highlighted as you type.
 
 ## Embedding in HTML
 

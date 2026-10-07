@@ -1,0 +1,6 @@
+# Unicode mode: a pattern that can match empty, so its find rounds `from` up to
+# a character's first byte (the seed rule).
+regexps:
+  - pattern: 'x*'
+    unicode: true
+    find_func: uni_seed_find

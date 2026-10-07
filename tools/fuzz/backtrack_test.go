@@ -271,7 +271,7 @@ func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 	}
 
 	for _, pat := range shapes {
-		if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err != nil || !cyc {
+		if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, compile.CompileOptions{}); err != nil || !cyc {
 			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — the shape no longer has the cycle this test is about", pat, cyc, err)
 		}
 		re := regexp.MustCompile(pat)
@@ -1853,4 +1853,43 @@ func TestBTKeptMemoFollowsTheText(t *testing.T) {
 	}
 	find(ptrB, b)
 	find(ptrA, "aaxyz")
+}
+
+// TestBTUnicodeModeGroupsMatchGo: in Unicode mode a Backtracking capture body
+// reads the lowered program — each codepoint class a set of UTF-8 byte
+// sequences, each `(?i)` literal its whole fold orbit, so no ASCII ±32 fold is
+// left to apply. Forced onto Backtracking (TDFA could take both shapes), its
+// groups equal Go's over valid UTF-8, through each body: the shipped one, the
+// ordinary body alone and the fallback alone.
+func TestBTUnicodeModeGroupsMatchGo(t *testing.T) {
+	cases := []struct {
+		pat    string
+		inputs []string
+	}{
+		{`(\pL+)@(\pL+)`, []string{"user@host", "é@ж", "日本@語", "x é@ж y", "nope", "a@", "@b",
+			"ÀÉ@ü1", "\U0001D538x@y", "1@2 a@b", "éé@ "}},
+		{`(?i)(straße)`, []string{"straße", "STRAẞE", "Straße", "ſtraße", "strasse", "STRASSE",
+			"xx STRASSE straße", "strAẞe", "STRAßE!"}},
+	}
+	for _, c := range cases {
+		re := regexp.MustCompile(c.pat)
+		numGroups := re.NumSubexp() + 1
+		for _, budget := range []int{0, compile.BTWorkBudgetOff, compile.BTWorkBudgetForceFallback} {
+			w, _, err := compile.CompileForced([]config.RegexEntry{{Pattern: c.pat, GroupsFunc: "groups"}},
+				pathsTableBase, true, compile.EngineBacktrack, compile.CompileOptions{Unicode: true, BTWorkBudget: budget})
+			if err != nil {
+				t.Fatalf("%s budget %d: compile: %v", c.pat, budget, err)
+			}
+			for _, in := range c.inputs {
+				want := re.FindStringSubmatchIndex(in)
+				got, ok, hang, err := runWasmGroupsPath(w, in, numGroups)
+				if err != nil || hang {
+					t.Fatalf("%s budget %d over %q: err=%v hang=%v", c.pat, budget, in, err, hang)
+				}
+				if msg := compareSlots(want, got, ok); msg != "" {
+					t.Errorf("%s budget %d over %q (%s): got %v, want %v", c.pat, budget, in, msg, got, want)
+				}
+			}
+		}
+	}
 }

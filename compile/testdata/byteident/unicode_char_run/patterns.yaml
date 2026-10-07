@@ -1,0 +1,7 @@
+# Unicode mode: a negated class lowered to a cycle through one state per
+# character byte. The find body crosses a run of whole characters 16 bytes at
+# a time — valid UTF-8 with no exit byte — and stops on a character boundary.
+regexps:
+  - pattern: '[^,]+,'
+    find_func: uni_charrun_find
+    unicode: true

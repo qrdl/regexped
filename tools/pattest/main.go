@@ -56,6 +56,27 @@ type cell struct {
 	avgTime time.Duration
 }
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// maxDFAStatesFlag is max_dfa_states for every compile of this run, 0 for the
+// mode's default (1,024 in byte mode, 16,384 in Unicode mode): what raising
+// or lowering it does to a pattern — which engine it gets, its module size,
+// its fuel — is measured here rather than guessed.
+var maxDFAStatesFlag = flag.Int("max-dfa-states", 0, "max_dfa_states for every compile (0 = the mode's default)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	wcallCase = "pattest"
 	// Silence regexped's slog output.
@@ -186,7 +207,7 @@ func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, er
 	case "find":
 		re.FindFunc = "find"
 	}
-	opts := compile.CompileOptions{LikelyMode: likely}
+	opts := withMode(compile.CompileOptions{LikelyMode: likely, MaxDFAStates: *maxDFAStatesFlag})
 	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
 	if err == nil {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc])

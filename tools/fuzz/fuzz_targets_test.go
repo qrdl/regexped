@@ -235,9 +235,14 @@ func FuzzCorrectness(f *testing.F) {
 	f.Add(`(?i)[^\xe0-\xfe]+`, "abc")
 	f.Add(`[^\x00-\x7f]`, "abc")
 
+	unicodeSeeds(f)
+
 	f.Fuzz(func(t *testing.T, pat, input string) {
-		if hasUnsupportedUnicode(input) {
-			t.Skip() // regexped's DFA/find path is byte-oriented; Unicode is out of scope (see CLAUDE.md)
+		if unicodeModeOutOfScope(pat, input) != "" {
+			t.Skip()
+		}
+		if !*unicodeMode && hasUnsupportedUnicode(input) {
+			t.Skip() // byte mode reads bytes, Go reads runes
 		}
 		if len(input) >= inputCap {
 			t.Skip()
@@ -253,8 +258,8 @@ func FuzzCorrectness(f *testing.F) {
 		// 0x80..0xFF compiles under byte_mode. Over ASCII input (the only input
 		// judged here) byte_mode and Go agree, so the oracle still holds.
 		ceiling := namedRuneCeiling(pat, parsed)
-		if ceiling > 0xFF {
-			t.Skip() // requires Unicode support — out of scope (see CLAUDE.md)
+		if ceiling > 0xFF && !*unicodeMode {
+			t.Skip() // byte mode cannot name it; the -unicode run covers it
 		}
 		ref, err := regexp.Compile(pat)
 		if err != nil {
@@ -262,12 +267,12 @@ func FuzzCorrectness(f *testing.F) {
 		}
 
 		compileIt := compileFind
-		if ceiling > 0x7F {
+		if ceiling > 0x7F && !*unicodeMode {
 			compileIt = compileFindByteMode
 		}
 		wasmBytes, compErr := compileIt(pat)
 		if compErr != nil {
-			if errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) {
+			if errors.Is(compErr, errCompileTooSlow) || errors.Is(compErr, compile.ErrBTProgramTooLarge) || errors.Is(compErr, compile.ErrBTStackTooLarge) {
 				t.Skip() // legitimate resource ceiling, no further fallback possible — not a regexped bug
 			}
 			t.Fatalf("compile error on a pattern Go stdlib accepts: pat=%q: %v", pat, compErr)
@@ -299,9 +304,66 @@ func indexEqual(expected []int, span [2]int, ok bool) bool {
 	return ok && expected[0] == span[0] && expected[1] == span[1]
 }
 
-// hasUnsupportedUnicode reports whether s contains anything outside
-// regexped's byte-oriented (ASCII) support: a rune above 127, or a \p/\P
-// Unicode class escape. Mirrors tools/re2test/main.go's hasUnicode.
+// unicodeSeeds, under -unicode, seeds a (pattern, input) target with the
+// start-position shapes — every pattern of unicodeFindShapes, each over
+// multi-byte characters first, last, alone and adjacent, and over invalid
+// UTF-8 — so the fuzzer mutates from where a match can land inside a
+// character. Byte mode adds none.
+func unicodeSeeds(f *testing.F) {
+	if !*unicodeMode {
+		return
+	}
+	for _, c := range unicodeFindShapes {
+		for _, in := range unicodeSeedInputs {
+			f.Add(c.pat, in)
+		}
+	}
+}
+
+// unicodeSeedInputs are the Unicode seeds' inputs: multi-byte characters
+// first, last, alone and adjacent, and invalid UTF-8 — a stray continuation,
+// a cut sequence, a surrogate, an invalid byte between characters.
+var unicodeSeedInputs = []string{"é", "aé", "éa", "a日b", "x😀y", "é b 日", "\x80", "a\xe2\x82b", "\xed\xa0\x80é", "é\xffé"}
+
+// unicodeSetSeeds, under -unicode, seeds a two-pattern set target with
+// neighbouring pairs of the Unicode start-position shapes and the
+// character-run shapes over unicodeSeedInputs, so a set's walk, its union
+// passes and its answer cache meet multi-byte and invalid input from the
+// first run. Byte mode adds none.
+func unicodeSetSeeds(f *testing.F) {
+	if !*unicodeMode {
+		return
+	}
+	var pats []string
+	for _, c := range unicodeFindShapes {
+		pats = append(pats, c.pat)
+	}
+	for _, c := range characterRunShapes {
+		pats = append(pats, c.pat)
+	}
+	for i := 0; i+1 < len(pats); i++ {
+		for _, in := range unicodeSeedInputs {
+			f.Add(pats[i], pats[i+1], in)
+		}
+	}
+}
+
+// unicodeModeOutOfScope is the Unicode-mode scope rule (-unicode): the one
+// case where Go is no oracle — input that is not valid UTF-8 for a pattern
+// that can match U+FFFD, which Go matches there and Unicode mode, by design,
+// does not. Every other input is compared, invalid UTF-8 included: that is
+// what checks the start positions on it. In byte mode it is "".
+func unicodeModeOutOfScope(pat, input string) string {
+	if *unicodeMode && !utf8.ValidString(input) && canMatchReplacement(pat) {
+		return "invalid UTF-8 for a pattern that can match U+FFFD: Go and Unicode mode differ by design"
+	}
+	return ""
+}
+
+// hasUnsupportedUnicode reports whether s holds a rune above 127 or a \p/\P
+// Unicode class escape: text on which byte mode, reading bytes, and Go, reading
+// runes, disagree by design, so a byte-mode run skips it (a -unicode run checks
+// it). Mirrors tools/re2test/main.go's hasUnicode.
 func hasUnsupportedUnicode(s string) bool {
 	for _, r := range s {
 		if r > 127 {
@@ -451,8 +513,11 @@ func fmtSpan(span [2]int, ok bool) string {
 // that exists in one target but not another produces failures that look like
 // engine bugs but are really harness gaps.
 func skipPattern(pat, input string) string {
-	if hasUnsupportedUnicode(input) {
-		return "input has non-ASCII: the byte-oriented engines are out of scope for Unicode (CLAUDE.md)"
+	if reason := unicodeModeOutOfScope(pat, input); reason != "" {
+		return reason
+	}
+	if !*unicodeMode && hasUnsupportedUnicode(input) {
+		return "input has non-ASCII: byte mode reads bytes, Go reads runes"
 	}
 	parsed, err := syntax.Parse(pat, syntax.Perl)
 	if err != nil {
@@ -463,7 +528,7 @@ func skipPattern(pat, input string) string {
 	}
 	// What the pattern NAMES, not what the compiler's rune gate says — see
 	// namedRuneCeiling. The byte_mode half is FuzzCorrectness's.
-	if namedRuneCeiling(pat, parsed) > 0x7F {
+	if !*unicodeMode && namedRuneCeiling(pat, parsed) > 0x7F {
 		return "names a code point above 0x7F (byte_mode or Unicode)"
 	}
 	if _, err := regexp.Compile(pat); err != nil {
@@ -485,7 +550,8 @@ func skipPattern(pat, input string) string {
 // purpose (contrast the Backtracking frame budget, whose *runtime* ceiling was
 // silent until it got its own sentinel).
 func isResourceCeiling(err error) bool {
-	return errors.Is(err, compile.ErrBTProgramTooLarge) ||
+	return errors.Is(err, errCompileTooSlow) ||
+		errors.Is(err, compile.ErrBTProgramTooLarge) ||
 		errors.Is(err, compile.ErrBTStackTooLarge) ||
 		// The SET path's helper-DFA ceiling (maxHelperDFAStates, 2048). Unlike
 		// the two above it has no fallback — the set compile fails — but it is
@@ -535,6 +601,7 @@ func FuzzMatch(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
 	}
+	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
@@ -597,6 +664,7 @@ func FuzzGroups(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
 	}
+	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
@@ -661,6 +729,7 @@ func FuzzGroupsBothBodies(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
 	}
+	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
@@ -697,7 +766,7 @@ func FuzzGroupsBothBodies(f *testing.F) {
 			if leg.budget == compile.BTWorkBudgetOff {
 				// A program with a zero-width cycle has no ordinary body in
 				// any build — under Off it is the fallback leg again.
-				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err == nil && cyc {
+				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, compile.CompileOptions{BTWorkBudget: leg.budget}); err == nil && cyc {
 					t.Skip("zero-width cycle: the ordinary body is never shipped for this program")
 				}
 			}
@@ -744,6 +813,7 @@ func FuzzGroupsBothEngines(f *testing.F) {
 	for _, c := range seedCorpus(seedFile) {
 		f.Add(c.pattern, c.input)
 	}
+	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if len(input) >= pathsInputCap {
 			t.Skip()
@@ -850,8 +920,10 @@ func FuzzSet(f *testing.F) {
 	f.Add(`(?:ab)+Y`, `cX`, "abcXabY") // variable-length prefix, state-dependent
 	f.Add(`xxxFOO`, `FOO`, "yxxxFOOy") // fixed-vs-fixed prefix skew (non-zero drain)
 	f.Add(`a.{3}Z`, `Z`, "qaqqqZ")     // fixed prefix 4 vs trivial
+	unicodeSetSeeds(f)
 
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
+		beginFuzzInput()
 		if len(input) >= pathsInputCap {
 			t.Skip()
 		}
@@ -860,13 +932,6 @@ func FuzzSet(f *testing.F) {
 		// 10s hang deadline — see maxSetOracleInput for the measurements.
 		if len(input) > maxSetOracleInput() {
 			t.Skip("input longer than the per-start-position oracle can price under the worker deadline")
-		}
-		// The whole-input oracle below counts RUNES in its `.{p}` prefix, so
-		// it is only exact on single-byte-rune input.
-		for i := 0; i < len(input); i++ {
-			if input[i] >= 0x80 {
-				t.Skip("non-ASCII input: the rune-counted whole-input oracle would misalign")
-			}
 		}
 		pats := []string{pat1, pat2}
 		refs := make([]*regexp.Regexp, len(pats))
@@ -881,59 +946,68 @@ func FuzzSet(f *testing.F) {
 			refs[i] = re
 		}
 
-		wasmBytes, dropped, compErr := compileSet(pats)
-		if compErr != nil {
-			if isResourceCeiling(compErr) {
-				t.Skip("resource ceiling")
-			}
-			t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, compErr)
-		}
-
-		got, hang, runErr := runWasmSetFind(wasmBytes, input, len(pats))
-		if errors.Is(runErr, errSetOutputTruncated) {
-			t.Fatalf("set find overflowed a patterns_in_set-sized buffer: pats=%q,%q input=%q: %v",
-				pat1, pat2, input, runErr)
-		}
-		if errors.Is(runErr, errBTOverflow) {
-			t.Skip("backtracking frame budget exhausted")
-		}
-		if runErr != nil {
-			t.Fatalf("wasm error: pats=%q,%q input=%q: %v", pat1, pat2, input, runErr)
-		}
-		if hang {
-			t.Fatalf("hang (watchdog %s): pats=%q,%q input=%q", wasmCallTimeout, pat1, pat2, input)
-		}
-
-		byID := map[int][][2]int{}
-		for _, m := range got {
-			byID[m.PatternID] = append(byID[m.PatternID], [2]int{m.Start, m.End})
-		}
-		for i, re := range refs {
-			if dropped[i] {
-				// Not in the set the engine built, so the set reports none of
-				// its matches and the oracle must not expect any.
-				if n := len(byID[i]); n != 0 {
-					t.Fatalf("set pattern[%d]=%q was DROPPED from the set but reported %d matches",
-						i, pats[i], n)
-				}
-				continue
-			}
-			want := allStartPositionMatches(re, input)
-			gotI := byID[i]
-			sortSpans(want)
-			sortSpans(gotI)
-			if len(want) != len(gotI) {
-				t.Fatalf("set pattern[%d]=%q match count: input=%q expected %d %v, got %d %v",
-					i, pats[i], input, len(want), want, len(gotI), gotI)
-			}
-			for k := range want {
-				if want[k][0] != gotI[k][0] || want[k][1] != gotI[k][1] {
-					t.Fatalf("set pattern[%d]=%q match %d: input=%q expected %v, got %v",
-						i, pats[i], k, input, want[k], gotI[k])
-				}
-			}
-		}
+		checkSetFindAllStarts(t, pats, refs, input)
 	})
+}
+
+// checkSetFindAllStarts compiles pats as an `overlapping: true` set and checks
+// its find against allStartPositionMatches, pattern by pattern (refs are the
+// patterns compiled by Go).
+func checkSetFindAllStarts(t *testing.T, pats []string, refs []*regexp.Regexp, input string) {
+	t.Helper()
+	pat1, pat2 := pats[0], pats[len(pats)-1]
+	wasmBytes, dropped, compErr := compileSet(pats)
+	if compErr != nil {
+		if isResourceCeiling(compErr) {
+			t.Skip("resource ceiling")
+		}
+		t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, compErr)
+	}
+
+	got, hang, runErr := runWasmSetFind(wasmBytes, input, len(pats))
+	if errors.Is(runErr, errSetOutputTruncated) {
+		t.Fatalf("set find overflowed a patterns_in_set-sized buffer: pats=%q,%q input=%q: %v",
+			pat1, pat2, input, runErr)
+	}
+	if errors.Is(runErr, errBTOverflow) {
+		t.Skip("backtracking frame budget exhausted")
+	}
+	if runErr != nil {
+		t.Fatalf("wasm error: pats=%q,%q input=%q: %v", pat1, pat2, input, runErr)
+	}
+	if hang {
+		t.Fatalf("hang (watchdog %s): pats=%q,%q input=%q", wasmCallTimeout, pat1, pat2, input)
+	}
+
+	byID := map[int][][2]int{}
+	for _, m := range got {
+		byID[m.PatternID] = append(byID[m.PatternID], [2]int{m.Start, m.End})
+	}
+	for i, re := range refs {
+		if dropped[i] {
+			// Not in the set the engine built, so the set reports none of
+			// its matches and the oracle must not expect any.
+			if n := len(byID[i]); n != 0 {
+				t.Fatalf("set pattern[%d]=%q was DROPPED from the set but reported %d matches",
+					i, pats[i], n)
+			}
+			continue
+		}
+		want := allStartPositionMatches(re, input)
+		gotI := byID[i]
+		sortSpans(want)
+		sortSpans(gotI)
+		if len(want) != len(gotI) {
+			t.Fatalf("set pattern[%d]=%q match count: input=%q expected %d %v, got %d %v",
+				i, pats[i], input, len(want), want, len(gotI), gotI)
+		}
+		for k := range want {
+			if want[k][0] != gotI[k][0] || want[k][1] != gotI[k][1] {
+				t.Fatalf("set pattern[%d]=%q match %d: input=%q expected %v, got %v",
+					i, pats[i], k, input, want[k], gotI[k])
+			}
+		}
+	}
 }
 
 // sortSpans orders spans by (start, end) so two multisets can be compared
@@ -971,7 +1045,9 @@ func sortSpans(v [][2]int) {
 // and forced every context-sensitive pattern to be skipped — which is exactly
 // how the \b and (?m:^) set defects stayed invisible to this target.
 //
-// `.{p}` counts runes, so callers must restrict the corpus to ASCII.
+// The prefix counts Go's tokens — `(?s:.)` reads an invalid byte as a
+// one-byte U+FFFD — so p steps through the positions that start one; inside a
+// character no match starts. Over ASCII that is every byte.
 //
 // The pattern is embedded AS WRITTEN wherever it can be, and re-serialised
 // only when it cannot — see oracleBody (set_caps_test.go) for why that order
@@ -980,8 +1056,14 @@ func sortSpans(v [][2]int) {
 func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
 	body := mustOracleBody(re.String())
 	var out [][2]int
+	starts := goTokenStarts(input)
+	tokens := -1
 	for p := 0; p <= len(input); p++ {
-		anchored, err := regexp.Compile(`\A` + dotPrefix(p) + `(?:` + body + `)`)
+		if !starts[p] {
+			continue
+		}
+		tokens++
+		anchored, err := regexp.Compile(`\A` + dotPrefix(tokens) + `(?:` + body + `)`)
 		if err != nil {
 			// Never return "no matches" here: a broken oracle expression
 			// would read as "the engine over-reported" and blame the
@@ -996,7 +1078,8 @@ func allStartPositionMatches(re *regexp.Regexp, input string) [][2]int {
 	return out
 }
 
-// dotPrefix builds a regexp matching exactly p bytes of anything.
+// dotPrefix builds a regexp matching exactly p tokens of anything: p bytes of
+// ASCII, p characters of valid UTF-8, an invalid byte counting as one.
 //
 // The obvious `(?s:.{p})` hits regexp/syntax's maxRepeat ceiling of 1000 and
 // fails to compile for any longer input — silently, if the caller treats a

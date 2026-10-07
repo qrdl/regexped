@@ -1,0 +1,5 @@
+# Unicode mode: a find over a lowered two-byte class run past 256 states (u16
+# table), so it stays a plain DFA rather than a Compiled DFA.
+regexps:
+  - pattern: '[α-ω0-9]{150}x'
+    find_func: uni_dfa_find

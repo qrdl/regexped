@@ -1,8 +1,6 @@
 package compile
 
 import (
-	"regexp/syntax"
-
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -1263,20 +1261,20 @@ func sparseUnboundedMembers(bkt *bucket) []bool {
 // true, the safe direction.
 func sparseMemberUnbounded(bkt *bucket, p *PatternInfo) bool {
 	ast := patternSuffixAST(p)
-	if ast == nil {
+	if ast.re == nil {
 		return true
 	}
 	if bkt.literal == "" {
 		// Matching only at 0: \A (or a non-multiline ^) leading the pattern.
 		// startAnchor is not set on every path that packs a fallback member,
 		// so it is read off the pattern here.
-		if full := fullPatternAST(p); p.startAnchor || full != nil && topLevelBeginAnchorKind(full) == beginAnchorText {
+		if full := fullPatternAST(p); p.startAnchor || full.re != nil && topLevelBeginAnchorKind(full.re) == beginAnchorText {
 			return false
 		}
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(ast.Simplify())
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	prog, _ := compileProg(ast)
+	d, ok := newDFA(prog, false, maxHelperDFAStates)
 	if !ok {
 		return true
 	}

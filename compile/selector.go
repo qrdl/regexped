@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"regexp/syntax"
+	"sort"
+	"unicode"
 )
 
 // selectBestEngine analyses the compiled regexp pattern and selects the optimal engine type.
@@ -14,8 +16,8 @@ import (
 // When omitted, uses sensible defaults (1000 states, 100KB memory limit).
 //
 // Returns the recommended EngineType for the given pattern.
-func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
-	engine, _ := selectBestEngineWithTDFA(prog, opts)
+func selectBestEngine(mp resolvedProg, opts *CompileOptions) EngineType {
+	engine, _ := selectBestEngineWithTDFA(mp, opts)
 	return engine
 }
 
@@ -36,7 +38,14 @@ func selectBestEngine(prog *syntax.Prog, opts *CompileOptions) EngineType {
 // engine choice (CompileForced) must therefore still handle a nil table.
 //
 
-func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineType, *tdfaTable) {
+func selectBestEngineWithTDFA(mp resolvedProg, opts *CompileOptions) (EngineType, *tdfaTable) {
+	// Every analysis below reads the program as the pattern wrote it; only
+	// the TDFA it may build reads the lowered one (mp). In byte mode the two
+	// are the same program. A lowered class is an alternation of byte
+	// sequences whose lead bytes distinct scripts share, so on it the
+	// alternation, ambiguity and size heuristics would judge the encoding
+	// rather than the pattern.
+	prog := mp.orig
 	// Analyse pattern complexity and DFA viability
 	analysis := analysePattern(prog)
 
@@ -81,8 +90,14 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 	// match 4 chars (leftmost-first), but DFA matches all 6 (longest).
 	hasNestedQuant := hasNestedQuantifiers(prog)
 
-	// Calculate DFA estimates
+	// Calculate DFA estimates. The size is the one estimate that must read the
+	// LOWERED program: a lowered class's states are the automaton's states, and
+	// `\pL{5}x`, six instructions as written, is a 1,452-state table — the
+	// written program had SelectEngine answer Compiled DFA for it.
 	dfaStates := analysis.EstimatedDFAStates
+	if mp.unicode() {
+		dfaStates = estimatedDFAStates(mp.prog)
+	}
 	dfaMem := estimateDFAMemory(dfaStates)
 
 	// Determine complexity label
@@ -123,8 +138,8 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 	// the following separator.
 	if hasCaptureGroups {
 		if !hasNonGreedyQuantifiers(prog) && !hasLineAnchors(prog) &&
-			!hasUnsafeBeginText(prog) && !hasWordBoundary && !hasAmbiguousCaptures(prog) {
-			tt, ok := newTDFA(prog, resolveMaxDFAStates(opts))
+			!hasUnsafeBeginText(prog) && !hasWordBoundary && !hasAmbiguousCaptures(prog, mp.unicode()) {
+			tt, ok := newTDFA(mp, resolveMaxDFAStates(opts, mp.unicode()))
 			if ok && tt.numRegs > resolveMaxTDFARegs(opts) {
 				ok = false
 				slog.Debug("Engine selected", "engine", "Backtrack", "reason", "TDFA register limit exceeded", "numRegs", tt.numRegs)
@@ -137,7 +152,7 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 				// function's doc comment.
 				slog.Debug("Engine selected", "engine", "TDFA", "reason", "capture pattern within state limit")
 				opts.report().Engine(EngineTDFA, "captures present, TDFA eligible and within limits")
-				opts.report().Limit("TDFA states", tt.numStates, resolveMaxDFAStates(opts))
+				opts.report().Limit("TDFA states", tt.numStates, resolveMaxDFAStates(opts, mp.unicode()))
 				opts.report().Limit("TDFA registers", tt.numRegs, resolveMaxTDFARegs(opts))
 				return EngineTDFA, tt
 			}
@@ -176,11 +191,11 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 			opts.LeftmostFirst = true
 		}
 		slog.Debug("Engine selected", "engine", "DFA", "reason", "leftmost-first semantics for alternations/nested quantifiers", "complexity", complexity, "states", dfaStates)
-		return maybeCompiledDFA(EngineDFA, dfaStates, opts), nil
+		return maybeCompiledDFA(EngineDFA, dfaStates, opts, mp.unicode()), nil
 	}
 
 	slog.Debug("Engine selected", "engine", "DFA", "reason", "simple pattern", "complexity", complexity, "states", dfaStates)
-	return maybeCompiledDFA(EngineDFA, dfaStates, opts), nil
+	return maybeCompiledDFA(EngineDFA, dfaStates, opts, mp.unicode()), nil
 }
 
 // maybeCompiledDFA promotes engine from EngineDFA to EngineCompiledDFA when the
@@ -190,13 +205,14 @@ func selectBestEngineWithTDFA(prog *syntax.Prog, opts *CompileOptions) (EngineTy
 // The check is estimatedStates+1 <= threshold because WASM emission always
 // reserves state 0 as the implicit dead state, so a DFA with N logical states
 // occupies N+1 WASM state slots.  As a result the effective maximum number of
-// logical states is threshold-1, not threshold.
-func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptions) EngineType {
+// logical states is threshold-1, not threshold. unicode is the pattern's
+// mode, for the state limit the estimate is reported against.
+func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptions, unicode bool) EngineType {
 	if engine != EngineDFA {
 		return engine
 	}
 	threshold := resolveCompiledDFAThreshold(opts)
-	opts.report().Limit("DFA states", estimatedStates, resolveMaxDFAStates(opts))
+	opts.report().Limit("DFA states", estimatedStates, resolveMaxDFAStates(opts, unicode))
 	if threshold > 0 && estimatedStates+1 <= threshold {
 		opts.report().Engine(EngineCompiledDFA, "no captures; promoted to direct-index dispatch under the CompiledDFA threshold")
 		opts.report().Limit("CompiledDFA threshold", estimatedStates+1, threshold)
@@ -232,11 +248,28 @@ func maybeCompiledDFA(engine EngineType, estimatedStates int, opts *CompileOptio
 // rather than the multi-second-and-climbing cost of a higher ceiling.
 const maxHelperDFAStates = 2048
 
-// resolveMaxDFAStates returns the effective DFA/TDFA state limit from opts.
-// Zero → default (1024). Negative → disabled (0, meaning TDFA is never used).
-func resolveMaxDFAStates(opts *CompileOptions) int {
+// defaultMaxDFAStates and defaultMaxDFAStatesUnicode are max_dfa_states'
+// defaults. A lowered Unicode class costs states per POSITION — about 290 for
+// `\pL` — so at 1,024 a pattern with a few of them fell back to Backtracking,
+// whose lowered program is as large as the class: `\pL{5}x` cost 25,964
+// fuel/byte there against 38.9 as a 1,452-state DFA, with a 2.9 MB module
+// against 746 KB, and `\pL{10}` could not be built at all (measured
+// 2026-10-05). A table over 256 states is (states + 1) × 512 bytes, so the
+// Unicode default allows about 8 MB per DFA.
+const (
+	defaultMaxDFAStates        = 1024
+	defaultMaxDFAStatesUnicode = 16384
+)
+
+// resolveMaxDFAStates returns the effective DFA/TDFA state limit from opts,
+// for a pattern in a Unicode mode when unicode is set. Zero → the mode's
+// default. Negative → disabled (0, meaning TDFA is never used).
+func resolveMaxDFAStates(opts *CompileOptions, unicode bool) int {
 	if opts == nil || opts.MaxDFAStates == 0 {
-		return 1024
+		if unicode {
+			return defaultMaxDFAStatesUnicode
+		}
+		return defaultMaxDFAStates
 	}
 	if opts.MaxDFAStates < 0 {
 		return 0
@@ -420,17 +453,28 @@ func hasUnsafeBeginText(prog *syntax.Prog) bool {
 // exclusion is no longer needed. Genuine user alternations, including one
 // nested inside a loop body (e.g. (?:cat|car)+), are a separate InstAlt
 // instruction and are still checked in full.
-func hasAmbiguousCaptures(prog *syntax.Prog) bool {
+//
+// unicode is true when the program runs LOWERED (Unicode mode); prog is still
+// the program as written. There the inverted-class protection is lifted: a
+// class of any width, `.` and a folded literal have a computable first set
+// (firstRuneRanges). The protection exists because Backtracking checks a wide
+// class with a few inline compares and is cheaper than a TDFA there — in byte
+// mode. Lowered, a wide class is an alternation of byte sequences that
+// Backtracking walks branch by branch on every character it rejects: `\pL` is
+// an 800-way chain, and `(\pL+)\s(\pN+)` over "Straße 42" cost 101,299 fuel
+// on Backtracking against 2,470 on a TDFA. On every capture pattern measured
+// the TDFA was the cheaper engine and its module no larger.
+func hasAmbiguousCaptures(prog *syntax.Prog, unicode bool) bool {
 	for pc, inst := range prog.Inst {
 		switch inst.Op {
 		case syntax.InstAlt:
 			pcU32 := uint32(pc)
 			isQuantifierLoop := inst.Out < pcU32 && inst.Arg >= pcU32
-			if !isAlternationDeterministic(prog, pc, isQuantifierLoop) {
+			if !isAlternationDeterministic(prog, pc, isQuantifierLoop, unicode) {
 				return true
 			}
 		case syntax.InstAltMatch:
-			if !isAlternationDeterministic(prog, pc, false) {
+			if !isAlternationDeterministic(prog, pc, false, unicode) {
 				return true
 			}
 		}
@@ -565,18 +609,30 @@ func analysePattern(prog *syntax.Prog) *patternAnalysis {
 	return analysis
 }
 
-func (a *patternAnalysis) estimateDFAComplexity() {
-	baseStates := a.NumInstructions
-	multiplier := 1.0
-
-	if a.NumAlternations > 0 {
-		multiplier = 1.0 + float64(a.NumAlternations)*0.2
-		if multiplier > 3.0 {
-			multiplier = 3.0
+// estimatedDFAStates is analysePattern's EstimatedDFAStates for prog alone,
+// without the rune-class walk the rest of the analysis needs.
+func estimatedDFAStates(prog *syntax.Prog) int {
+	alternations := 0
+	for pc, inst := range prog.Inst {
+		if inst.Op == syntax.InstAlt && !(inst.Out < uint32(pc) && inst.Arg >= uint32(pc)) {
+			alternations++
 		}
 	}
+	return dfaStatesEstimate(len(prog.Inst), alternations)
+}
 
-	a.EstimatedDFAStates = int(float64(baseStates) * multiplier)
+// dfaStatesEstimate is the state estimate from a program's instruction and
+// (non-loop) alternation counts.
+func dfaStatesEstimate(instructions, alternations int) int {
+	multiplier := 1.0
+	if alternations > 0 {
+		multiplier = min(1.0+float64(alternations)*0.2, 3.0)
+	}
+	return int(float64(instructions) * multiplier)
+}
+
+func (a *patternAnalysis) estimateDFAComplexity() {
+	a.EstimatedDFAStates = dfaStatesEstimate(a.NumInstructions, a.NumAlternations)
 
 	avgTransitionsPerState := 10
 	if a.HasLargeCharClass {
@@ -648,8 +704,9 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 // "Load-bearing engine-selection gates") is still treated as ambiguous; only
 // the disjoint-ness requirement between two otherwise-computable branches is
 // skipped, since TDFA's LeftmostFirst priority resolves that case
-// correctly regardless of overlap.
-func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop bool) bool {
+// correctly regardless of overlap. unicode computes the first sets as
+// codepoint ranges of any width (hasAmbiguousCaptures).
+func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop, unicode bool) bool {
 	if altPC >= len(prog.Inst) {
 		return false
 	}
@@ -671,6 +728,15 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop boo
 		return true // one epsilon, one byte-consuming = always disjoint
 	}
 
+	if unicode {
+		left, okL := firstRuneRanges(prog, int(alt.Out))
+		right, okR := firstRuneRanges(prog, int(alt.Arg))
+		if !okL || !okR || len(left) == 0 || len(right) == 0 {
+			return false
+		}
+		return quantifierLoop || !rangesOverlap(left, right)
+	}
+
 	leftRunes := getFirstRuneSet(prog, int(alt.Out))
 	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
 
@@ -689,6 +755,97 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop boo
 	}
 
 	return true
+}
+
+// firstRuneRanges is getFirstRuneSet as sorted, merged codepoint ranges
+// (lo, hi pairs) with no width limit: a class of any width, `.` and a folded
+// literal (its SimpleFold orbit) all have one. ok is false where the set
+// cannot be known — the branch can reach Match without consuming, or an
+// instruction is malformed. Unicode mode only (hasAmbiguousCaptures).
+func firstRuneRanges(prog *syntax.Prog, pc int) (ranges []rune, ok bool) {
+	visited := make(map[int]bool)
+	var collect func(int) bool
+	collect = func(pc int) bool {
+		if pc >= len(prog.Inst) {
+			return false
+		}
+		if visited[pc] {
+			return true
+		}
+		visited[pc] = true
+		inst := &prog.Inst[pc]
+		switch inst.Op {
+		case syntax.InstRune1:
+			ranges = append(ranges, inst.Rune[0], inst.Rune[0])
+			return true
+		case syntax.InstRune:
+			if len(inst.Rune) == 1 {
+				r := inst.Rune[0]
+				ranges = append(ranges, r, r)
+				if syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+					for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+						ranges = append(ranges, f, f)
+					}
+				}
+				return true
+			}
+			if len(inst.Rune)%2 != 0 || syntax.Flags(inst.Arg)&syntax.FoldCase != 0 {
+				return false
+			}
+			ranges = append(ranges, inst.Rune...)
+			return true
+		case syntax.InstRuneAny:
+			ranges = append(ranges, 0, unicode.MaxRune)
+			return true
+		case syntax.InstRuneAnyNotNL:
+			ranges = append(ranges, 0, '\n'-1, '\n'+1, unicode.MaxRune)
+			return true
+		case syntax.InstCapture, syntax.InstNop, syntax.InstEmptyWidth:
+			return collect(int(inst.Out))
+		case syntax.InstAlt, syntax.InstAltMatch:
+			return collect(int(inst.Out)) && collect(int(inst.Arg))
+		}
+		return false
+	}
+	if !collect(pc) {
+		return nil, false
+	}
+	return mergeRuneRanges(ranges), true
+}
+
+// mergeRuneRanges sorts lo, hi pairs and merges the ones that overlap or
+// touch.
+func mergeRuneRanges(r []rune) []rune {
+	pairs := make([][2]rune, 0, len(r)/2)
+	for i := 0; i+1 < len(r); i += 2 {
+		pairs = append(pairs, [2]rune{r[i], r[i+1]})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i][0] < pairs[j][0] })
+	var out []rune
+	for _, p := range pairs {
+		if n := len(out); n > 0 && p[0] <= out[n-1]+1 {
+			out[n-1] = max(out[n-1], p[1])
+			continue
+		}
+		out = append(out, p[0], p[1])
+	}
+	return out
+}
+
+// rangesOverlap reports whether two sorted, merged range lists share a
+// codepoint.
+func rangesOverlap(a, b []rune) bool {
+	for i, j := 0, 0; i < len(a) && j < len(b); {
+		switch {
+		case a[i+1] < b[j]:
+			i += 2
+		case b[j+1] < a[i]:
+			j += 2
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // getFirstRuneSet returns the set of runes that can start execution at the given PC.

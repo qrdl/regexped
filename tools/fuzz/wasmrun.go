@@ -51,7 +51,7 @@ func compileFind(pat string) ([]byte, error) {
 
 // compileFindSized is compileFind plus what the find export's searches keep.
 func compileFindSized(pat string) ([]byte, []searchblock.Size, error) {
-	return compileFindOpts("find\x00"+pat, pat, tableBase, compile.CompileOptions{})
+	return compileFindOpts("find\x00"+pat, pat, tableBase, withMode(compile.CompileOptions{}))
 }
 
 // compileFindOpts compiles pat's find export under opts, cached under key, with

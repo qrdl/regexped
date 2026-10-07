@@ -2,7 +2,6 @@ package compile
 
 import (
 	"fmt"
-	"regexp/syntax"
 	"slices"
 
 	"github.com/qrdl/regexped/config"
@@ -526,7 +525,7 @@ func planWholeSetSweep(spec SetSpec, buckets []*bucket, patternIDs [][]int, opts
 	if b := buckets[0]; len(buckets) == 1 && b.isFallback && !b.sparse && b.btFallback == nil {
 		return nil // swept directly, over its own tables
 	}
-	var asts []*syntax.Regexp
+	var asts []resolvedTree
 	var ids []int
 	for bi, bkt := range buckets {
 		if bkt.btFallback != nil {
@@ -537,7 +536,7 @@ func planWholeSetSweep(spec SetSpec, buckets []*bucket, patternIDs [][]int, opts
 				return nil
 			}
 			re := fullPatternAST(p)
-			if re == nil {
+			if re.re == nil {
 				return nil
 			}
 			asts = append(asts, re)
@@ -567,7 +566,7 @@ func planWholeSetSweep(spec SetSpec, buckets []*bucket, patternIDs [][]int, opts
 	}
 	if len(asts) > 1 {
 		for _, re := range asts {
-			one, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, opts)
+			one, _, err := mergeSuffixDFA([]resolvedTree{re}, opts)
 			if err != nil || dominanceDecides(one) {
 				return nil
 			}

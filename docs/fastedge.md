@@ -1,6 +1,6 @@
 # Using Regexped in Gcore FastEdge
 
-FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI. Regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host.
+FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI, and HTTP applications built as `wasi:http` components. For the first, regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host — and most of this page covers that route. The last section covers a component application.
 
 ## Configuration
 
@@ -134,3 +134,39 @@ match patterns::scan_url(&url, 0) {
 ```
 
 See [sets.md](sets.md) for the full `sets:` schema and output format.
+
+## Component Model example: an HTTP app in Unicode mode
+
+[`examples/fastedge/lang-detect/`](../examples/fastedge/lang-detect/) is a
+FastEdge HTTP application built the other way: the app is a `wasi:http` guest
+component (`wstd`, `wasm32-wasip2`), the patterns are a regexped component
+(`wasm_format: component`), and `regexped merge` composes the two with `wac`.
+`wasmtime serve` runs the result (`make run`), and so does FastEdge's own local
+runner, `@gcoredev/fastedge-test`, which drives the FastEdge runtime
+`fastedge-run` (`make test`).
+
+It takes text as a POST body and answers a JSON array of the European languages its letters
+allow. Every pattern names a Unicode script class or a letter above U+007F, so
+each compiles in Unicode mode, and a language is one anchored `match_all`
+pattern over its alphabet:
+
+```yaml
+regexps:
+  - name: German
+    pattern: '(?:\P{Latin}|(?i:[a-zäöüß]))*(?i:[äöüß])(?:\P{Latin}|(?i:[a-zäöüß]))*'
+
+sets:
+  - name: latin
+    match_all: latin_languages   # every language whose pattern matches the WHOLE text
+    patterns: [German, French, …]
+```
+
+```rust
+include!("stubs.rs");
+
+let ids: Vec<i32> = langdetect::latin_languages(text)?.collect();
+let names: Vec<&str> = ids.into_iter().map(langdetect::pattern_name).collect();
+```
+
+The calls are the ones a module build makes; see
+[component.md](component.md) for what changes under `wasm_format: component`.

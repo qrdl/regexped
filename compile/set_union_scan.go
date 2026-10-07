@@ -2,7 +2,6 @@ package compile
 
 import (
 	"encoding/binary"
-	"regexp/syntax"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -222,12 +221,26 @@ func detectUnionSkipStates(t *dfaTable, oldToNew []int, midAcceptLimit int) []un
 // See wideAccept for why this is not `maskWords > 1`.
 func (u *unionScanDFA) isWide() bool { return u != nil && u.wideAccept }
 
-// maxUnionScanStates bounds the subset construction. The construction is a
-// `.*`-prefixed union, so it is larger than the plain union it replaces —
-// measured at 1.6x to 4.2x on the shapes that reach it — but it is
-// still a determinisation and can blow up. Over budget, the set keeps the
-// per-position path it has today.
+// maxUnionScanStates is the default bound on the subset construction, which
+// `max_union_states` overrides (SetSpec.maxUnionStates). The construction is
+// a `.*`-prefixed union, so it is larger than the plain union it replaces —
+// measured at 1.6x to 4.2x on the shapes that reach it — but it is still a
+// determinisation and can blow up. Over budget, the set keeps the
+// per-position path it has today. In Unicode mode a letter class costs
+// hundreds of states, so a handful of literal-less members can pass it: an
+// 8-member set of `\pL+\p{Greek}`-like members needed more than 4,096 and
+// fit in 16,384, which took its scan_all from 102 to 23 fuel/byte and its
+// module from 1.39 to 0.94 MB, for 173 s of compile against 55 (measured
+// 2026-10-05).
 const maxUnionScanStates = 4096
+
+// maxUnionStates is the union automaton's construction cap for this set.
+func (s SetSpec) maxUnionStates() int {
+	if s.MaxUnionStates > 0 {
+		return s.MaxUnionStates
+	}
+	return maxUnionScanStates
+}
 
 // maxUnionScanIDs bounds the ID SPACE the one-pass automaton will serve, which
 // is a different budget from maxUnionScanStates: that one bounds the
@@ -311,14 +324,14 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	// threshold everything is emitted as it always was, byte for byte.
 	wide := idSpace > wideBitmapThreshold || len(spec.Patterns) > wideBitmapThreshold
 
-	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
+	progs := make([]resolvedProg, 0, len(spec.Patterns))
 	for _, p := range spec.Patterns {
 		ast := patternFullAST(p)
-		if ast == nil {
+		if ast.re == nil {
 			return nil
 		}
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
-		pr, _ := syntax.Compile(ast.Simplify())
+		pr, _ := compileProg(ast)
 		progs = append(progs, pr)
 	}
 
@@ -337,10 +350,10 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 		// the authority, and the state identity that keeps two differently
 		// accepting states apart is the NFA set itself, not the mask.
 		prog, patternIdx := buildStartAnywhereUnionProgIndexed(progs)
-		d, ok = newDFAWide(prog, false, maxUnionScanStates, patternIdx)
+		d, ok = newDFAWide(prog, false, spec.maxUnionStates(), patternIdx)
 	} else {
 		prog, patternBits := buildStartAnywhereUnionProg(progs, 64)
-		d, ok = newDFA(prog, false, false, maxUnionScanStates, patternBits)
+		d, ok = newDFA(prog, false, spec.maxUnionStates(), patternBits)
 	}
 	if !ok {
 		return nil
@@ -348,7 +361,7 @@ func buildUnionScanDFA(spec SetSpec, tableBase int32, wantAcceptRows bool) *unio
 	if d.hasWordBoundary || d.hasNewlineBoundary {
 		return nil // needs prev-byte context this loop does not carry
 	}
-	if d.numStates > maxUnionScanStates || d.numStates == 0 {
+	if d.numStates > spec.maxUnionStates() || d.numStates == 0 {
 		return nil
 	}
 

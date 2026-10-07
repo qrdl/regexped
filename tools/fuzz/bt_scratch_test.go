@@ -68,7 +68,9 @@ func btScratchCases() []btScratchCase {
 		// A non-greedy loop whose body can match empty: a zero-width cycle, so
 		// the fallback alone, over an input far past any compile-time memo.
 		{"find/static-memo-ceiling", config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"}, squeezed, a(200000) + "xyz"},
-		{"groups/static-memo-ceiling", config.RegexEntry{Pattern: `((?:a?)+?)xyz`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(200000) + "xyz"},
+		// `z+`, not `z`: a capture between plain literals takes its span from
+		// the match and has no capture body at all.
+		{"groups/static-memo-ceiling", config.RegexEntry{Pattern: `((?:a?)+?)xyz+`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(200000) + "xyz"},
 	}
 }
 
@@ -170,7 +172,11 @@ func (c btScratchCase) requireFallbackAnswers(t *testing.T) {
 	if c.entry.GroupsFunc == "" {
 		pat = withoutCaptures(t, pat) // the program match and find compile
 	}
-	if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err != nil {
+	// The options the build below compiles with, the entry's byte_mode
+	// included, as compilePattern adopts it.
+	cycOpts := c.opts
+	cycOpts.ByteMode = cycOpts.ByteMode || c.entry.ByteMode
+	if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, cycOpts); err != nil {
 		t.Fatalf("control: %v", err)
 	} else if cyc {
 		return

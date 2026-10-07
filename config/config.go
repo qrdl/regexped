@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -86,7 +87,7 @@ type BuildConfig struct {
 	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
 	// already isolates every stub.
 	Namespace    string `yaml:"namespace"`
-	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
+	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024; 16384 in Unicode mode)
 	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
 	// MaxMemory caps ALL of the module's memory — its tables, the buffers a
 	// JS/TS stub copies inputs into, and a search's working memory — and is
@@ -103,9 +104,16 @@ type BuildConfig struct {
 	// MaxDFAStates falls back to another engine and still matches; a set
 	// member over this limit is DROPPED from the set and can never match. So
 	// this is the knob that decides whether a set contains what you put in it.
-	MaxFallbackStates int          `yaml:"max_fallback_states"` // 0 = default (1024)
-	Regexps           []RegexEntry `yaml:"regexps"`
-	Sets              []SetConfig  `yaml:"sets"` // optional set composition entries
+	MaxFallbackStates int `yaml:"max_fallback_states"` // 0 = default (1024; 16384 for a Unicode-mode set)
+	// MaxUnionStates caps the construction of a SET's union automata — the
+	// one pass that serves scan_any / scan_all for members with no literal,
+	// and the anchored one serving match_any / match_all. Past it the set
+	// falls back to the per-position walk, or splits members out to searches
+	// of their own, both dearer per byte. A larger cap costs compile time and
+	// compiler memory, not correctness.
+	MaxUnionStates int          `yaml:"max_union_states"` // 0 = default (4096)
+	Regexps        []RegexEntry `yaml:"regexps"`
+	Sets           []SetConfig  `yaml:"sets"` // optional set composition entries
 }
 
 // SetConfig describes one `sets:` entry in the YAML config.
@@ -165,6 +173,11 @@ type SetConfig struct {
 	// "batch-find" is NOT accepted here — it is a
 	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry.
 	Hints []string `yaml:"hints"`
+	// Unicode states the set's mode: true for Unicode mode, false for byte
+	// mode. Unset, the set takes its mode from its members. A set runs in ONE
+	// mode; the rules that combine this key with its members' are in the
+	// compiler, because a member's own choice can come from its pattern text.
+	Unicode *bool `yaml:"unicode"`
 }
 
 // SetCapability is one (yaml key, export name) pair from a set entry.
@@ -709,6 +722,16 @@ type RegexEntry struct {
 	// be stripped from the source before syntax.Parse.
 	ByteMode bool `yaml:"byte_mode"`
 
+	// Unicode states the pattern's mode explicitly: true compiles it in
+	// Unicode mode, where the input is read as UTF-8 and `.` and classes
+	// consume a whole character; false is exactly ByteMode: true, and
+	// LoadConfig sets ByteMode for it. Unset, the pattern picks its own mode:
+	// Unicode when it names a character above U+007F or uses a \p class, byte
+	// mode otherwise. With ByteMode, true is a load error, and so is false
+	// with an explicit `byte_mode: false`. IsByteMode is the one reading of the
+	// pair.
+	Unicode *bool `yaml:"unicode"`
+
 	// Optional function names — only those set are compiled and stubbed.
 	MatchFunc  string `yaml:"match_func"`  // anchored match → the end position, or none
 	FindFunc   string `yaml:"find_func"`   // non-anchored find → an iterator of (start, end)
@@ -740,6 +763,29 @@ func (r RegexEntry) CaptureStubsRequested() bool {
 	return r.GroupsFunc != ""
 }
 
+// NoCaptureGroupProblem is why a groups_func on a pattern with no capture
+// group is refused (GroupsWithoutCaptures). compile returns the same words.
+const NoCaptureGroupProblem = "the pattern has no capture group that can take part in a match, " +
+	"so there are no groups to report; use find_func for the match's span"
+
+// GroupsWithoutCaptures reports whether groups_func is set on a pattern with
+// no capture group that can take part in a match: `a*`, or `(?:(a){0})b`,
+// whose only group simplification removes. Such a pattern compiles to no
+// groups export while every stub would call one, so it is refused —
+// ValidateConfig at load, `compile`, and `generate`. A pattern that does not
+// parse answers false; its own error is reported elsewhere.
+func (r RegexEntry) GroupsWithoutCaptures() bool {
+	if r.GroupsFunc == "" {
+		return false
+	}
+	re, err := syntax.Parse(r.Pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	return err == nil && prog.NumCap <= 2
+}
+
 // GroupsExportName returns the WASM export name for the groups function.
 func (r RegexEntry) GroupsExportName() string {
 	return r.GroupsFunc
@@ -747,6 +793,41 @@ func (r RegexEntry) GroupsExportName() string {
 
 // LoadConfig reads and parses the YAML config at configPath.
 // If configPath is empty it looks for regexped.yaml in the current directory.
+// IsByteMode reports whether the entry is explicitly byte-oriented:
+// `byte_mode: true`, or `unicode: false`, which means the same.
+func (e RegexEntry) IsByteMode() bool {
+	return e.ByteMode || (e.Unicode != nil && !*e.Unicode)
+}
+
+// validateModeKeys rejects the two mode-key conflicts on one entry, which
+// need no parse: `unicode: true` with `byte_mode: true`, and `unicode: false`
+// with an explicit `byte_mode: false`. byteModeSet[i] says whether entry i
+// wrote `byte_mode:` at all, which the decoded bool cannot tell. It then
+// makes `unicode: false` set ByteMode, so every later reader sees one field.
+func validateModeKeys(cfg *BuildConfig, byteModeSet []bool) error {
+	for i := range cfg.Regexps {
+		re := &cfg.Regexps[i]
+		if re.Unicode == nil {
+			continue
+		}
+		label := re.Name
+		if label == "" {
+			label = re.Pattern
+		}
+		explicit := i < len(byteModeSet) && byteModeSet[i]
+		switch {
+		case *re.Unicode && re.ByteMode:
+			return fmt.Errorf("regexp %q: unicode: true and byte_mode: true contradict each other", label)
+		case !*re.Unicode && explicit && !re.ByteMode:
+			return fmt.Errorf("regexp %q: unicode: false and byte_mode: false contradict each other "+
+				"(unicode: false means byte_mode: true)", label)
+		case !*re.Unicode:
+			re.ByteMode = true
+		}
+	}
+	return nil
+}
+
 func LoadConfig(configPath string) (BuildConfig, error) {
 	if configPath == "" {
 		configPath = "regexped.yaml"
@@ -808,6 +889,22 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 	if err := validateHints(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	// Whether each entry WROTE `byte_mode:`, which the decoded bool cannot
+	// say: a second, lenient pass over the same bytes reads only that key.
+	var written struct {
+		Regexps []struct {
+			ByteMode *bool `yaml:"byte_mode"`
+		} `yaml:"regexps"`
+	}
+	// It cannot fail: the strict decode of the same bytes above succeeded.
+	_ = yaml.Unmarshal(raw, &written)
+	byteModeSet := make([]bool, len(written.Regexps))
+	for i, r := range written.Regexps {
+		byteModeSet[i] = r.ByteMode != nil
+	}
+	if err := validateModeKeys(&cfg, byteModeSet); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 	// An unrecognised `stub_type` used to pass the `compile` command silently

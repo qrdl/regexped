@@ -1,0 +1,6 @@
+# Unicode mode: a literal prefix that begins with a non-ASCII character. On a
+# hit for its first byte the prefix scan checks the whole first character —
+# lead and continuation byte — before the rest of the literal.
+regexps:
+  - pattern: 'привет\s+\pL+'
+    find_func: uni_charprobe_find

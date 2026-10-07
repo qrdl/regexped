@@ -483,15 +483,19 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 // through the constructor directly because a set that is refused simply takes
 // the per-position path, leaving nothing in the module to observe.
 func TestSetEmitUnionScanRefusals(t *testing.T) {
-	buildFor := func(t *testing.T, patterns []string) *unionScanDFA {
+	specFor := func(t *testing.T, patterns []string, maxUnion int) SetSpec {
 		t.Helper()
 		infos, globalIDs, _, _ := setEmitCovInfos(t, patterns)
-		spec := SetSpec{
-			Name: "s", ScanAny: "s_scan_any",
+		return SetSpec{
+			Name: "s", ScanAny: "s_scan_any", MatchAny: "s_match_any",
 			Patterns: infos, PatternIDs: globalIDs,
 			DeclaredPatternCount: len(infos), IDSpaceSize: len(infos),
+			MaxUnionStates: maxUnion,
 		}
-		return buildUnionScanDFA(spec, 0, false)
+	}
+	buildFor := func(t *testing.T, patterns []string) *unionScanDFA {
+		t.Helper()
+		return buildUnionScanDFA(specFor(t, patterns, 0), 0, false)
 	}
 
 	// A start-anywhere determinisation is `.*`-prefixed, so it is bigger than
@@ -506,6 +510,38 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	if got := buildFor(t, []string{`a.{13}b`}); got != nil {
 		t.Errorf("a union automaton past the %d-state budget was accepted (%d states); "+
 			"the budget no longer refuses it", maxUnionScanStates, got.numStates)
+	}
+	// max_union_states moves the budget, both ways and for both union
+	// automata: the same shape builds under a larger one, and a set the
+	// default admits is refused under a tiny one.
+	if got := buildUnionScanDFA(specFor(t, []string{`a.{13}b`}, 65536), 0, false); got == nil {
+		t.Error("a.{13}b was refused under max_union_states 65536")
+	}
+	small := []string{`[0-9]{3}`, `[a-z]{2}`}
+	if buildUnionScanDFA(specFor(t, small, 0), 0, false) == nil || buildAnchoredUnionDFA(specFor(t, small, 0), 0, false, false) == nil {
+		t.Fatal("a two-member set was refused at the default budget")
+	}
+	if buildUnionScanDFA(specFor(t, small, 2), 0, false) != nil {
+		t.Error("the scan union was built under max_union_states 2")
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, 2), 0, false, false) != nil {
+		t.Error("the anchored union was built under max_union_states 2")
+	}
+	// From a config: the key reaches the set's union.
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "d", Pattern: `[0-9]{3}`}, {Name: "w", Pattern: `[a-z]{2}`}},
+		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
+			Patterns: config.PatternSelector{All: true}}},
+	}
+	for _, c := range []struct {
+		maxUnion int
+		used     bool
+	}{{0, true}, {2, false}} {
+		cfg.MaxUnionStates = c.maxUnion
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil || len(diags) != 1 || diags[0].UnionScan == nil || diags[0].UnionScan.Used != c.used {
+			t.Errorf("max_union_states %d: diags %+v, err %v; want the union used = %v", c.maxUnion, diags, err, c.used)
+		}
 	}
 
 	// The id-space ceiling. It was 64 — one u64 accept mask — until the
@@ -542,7 +578,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	// PatternInfo is built by analyzePattern, which parses, so an
 	// unparseable fullPattern cannot arrive here from a config — it is set by
 	// hand to reach the guard.
-	broken := &PatternInfo{fullPattern: `(unclosed`, globalID: 0}
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`), globalID: 0}
 	unparseable := SetSpec{
 		Name: "s", ScanAny: "s_scan_any",
 		Patterns: []*PatternInfo{broken}, PatternIDs: []int{0},
@@ -839,7 +875,7 @@ func setEmitCovLocalsOfType(t *testing.T, body []byte, ty byte) int {
 // cannot be built — so they are asserted at the predicate rather than through
 // a compile that would merely lose the pattern either way.
 func TestSetEmitBTAdmissionRefusals(t *testing.T) {
-	if got := admitBTFallback(nil); got != nil {
+	if got := admitBTFallback(byteTree(nil)); got != nil {
 		t.Error("a nil AST was admitted to the Backtracking fallback")
 	}
 
@@ -847,7 +883,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// instructions, which is the cheapest way to build a program of a known
 	// size without tripping the parser's repeat limits.
 	long := parseForBTFallback(t, strings.Repeat("a", maxBTFallbackInstructions+500))
-	if got := admitBTFallback(long); got != nil {
+	if got := admitBTFallback(byteTree(long)); got != nil {
 		t.Errorf("a %d-instruction program was admitted; the NFA size cap no longer refuses it",
 			maxBTFallbackInstructions+500)
 	}
@@ -855,7 +891,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// A pattern the cap does admit, so the refusals above are not passing for
 	// the wrong reason.
 	ok := parseForBTFallback(t, `[0-9]+x`)
-	if got := admitBTFallback(ok); got == nil {
+	if got := admitBTFallback(byteTree(ok)); got == nil {
 		t.Error("an ordinary pattern was refused; the cases above prove nothing")
 	}
 }
@@ -930,7 +966,7 @@ func TestSetEmitPlanBTRegions(t *testing.T) {
 	if got := planBTRegions([]*bucket{{isFallback: true}}, &moduleGlobals{}); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
-	info := admitBTFallback(parseForBTFallback(t, `(?:a|ab)+c`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `(?:a|ab)+c`)))
 	if info == nil {
 		t.Fatal("the witness was refused by the Backtracking fallback")
 	}
@@ -953,7 +989,7 @@ func TestSetEmitPlanBTRegions(t *testing.T) {
 // nobody has checked, and the failure it prevents is a "local index out of
 // bounds" at module validation, which is how it was originally caught.
 func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `[0-9]+x`)))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -981,7 +1017,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 // parameter and its arm are gone, because dead machinery made a documented
 // exclusion look like an oversight.
 func TestSetEmitBTProbeBody(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `[0-9]+x`)))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -1464,7 +1500,7 @@ func TestSetEmitJumpProfitabilityIgnoresUnrecoverablePattern(t *testing.T) {
 		fe: frontendScalar,
 		buckets: []*bucket{{
 			isFallback: true,
-			patterns:   []*PatternInfo{{fullPattern: `(unclosed`, globalID: 0}},
+			patterns:   []*PatternInfo{{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`), globalID: 0}},
 		}},
 	}
 	if unrecoverable.jumpIsProfitable() {
@@ -1634,12 +1670,12 @@ func TestSetCorePatternASTHelpersOnUnparseablePattern(t *testing.T) {
 	// parsed it once already, so a failure here means the string was rewritten
 	// between the two — the helpers answer nil and the packers drop the
 	// pattern with a diagnostic rather than dereferencing.
-	broken := &PatternInfo{fullPattern: `(unclosed`}
-	if got := patternSuffixAST(broken); got != nil {
-		t.Errorf("patternSuffixAST on an unparseable pattern = %v, want nil", got)
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`)}
+	if got := patternSuffixAST(broken); got.re != nil {
+		t.Errorf("patternSuffixAST on an unparseable pattern = %v, want nil", got.re)
 	}
-	if got := patternFullAST(broken); got != nil {
-		t.Errorf("patternFullAST on an unparseable pattern = %v, want nil", got)
+	if got := patternFullAST(broken); got.re != nil {
+		t.Errorf("patternFullAST on an unparseable pattern = %v, want nil", got.re)
 	}
 }
 
@@ -1684,7 +1720,7 @@ func TestSetCoreMergeSuffixDFASparseSetRejects(t *testing.T) {
 	}
 	// maxPatternsPerBucket is the sparse form's own ceiling; the u16 accept
 	// lists cannot address past it.
-	if _, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
+	if _, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
 		t.Error("mergeSuffixDFASparseSet past maxPatternsPerBucket returned no error")
 	}
 
@@ -1692,7 +1728,7 @@ func TestSetCoreMergeSuffixDFASparseSetRejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, _, err := mergeSuffixDFASparseSet(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, _, err := mergeSuffixDFASparseSet(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeSuffixDFASparseSet over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -1708,7 +1744,7 @@ func TestSetCoreMergeAnchoredDFARejects(t *testing.T) {
 	}
 	// The anchored bitmask form is capped by bitmaskWidth exactly as the find
 	// one is: bit k of the returned mask IS bucket-local index k.
-	if _, err := mergeAnchoredDFA(asts, CompileSetOptions{BitmaskWidth: 2}); err == nil {
+	if _, err := mergeAnchoredDFA(byteTrees(asts), CompileSetOptions{BitmaskWidth: 2}); err == nil {
 		t.Error("mergeAnchoredDFA past bitmaskWidth returned no error")
 	}
 
@@ -1716,7 +1752,7 @@ func TestSetCoreMergeAnchoredDFARejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, err := mergeAnchoredDFA(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, err := mergeAnchoredDFA(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeAnchoredDFA over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -1730,7 +1766,7 @@ func TestSetCoreMergeAnchoredDFASparseSetRejects(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `a`)
 	}
-	if _, _, err := mergeAnchoredDFASparseSet(asts, CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
+	if _, _, err := mergeAnchoredDFASparseSet(byteTrees(asts), CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
 		t.Error("mergeAnchoredDFASparseSet past maxPatternsPerBucket returned no error")
 	}
 
@@ -1738,7 +1774,7 @@ func TestSetCoreMergeAnchoredDFASparseSetRejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, _, err := mergeAnchoredDFASparseSet(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, _, err := mergeAnchoredDFASparseSet(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeAnchoredDFASparseSet over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -2220,7 +2256,7 @@ func TestSetCorePromoteSparseBucketsRefusesNewlineBoundary(t *testing.T) {
 	in := []*bucket{setCoreCovBucketOf(infos[0]), setCoreCovBucketOf(infos[1])}
 
 	merged, _, err := mergeSuffixDFASparseSet(
-		[]*syntax.Regexp{patternSuffixAST(infos[0]), patternSuffixAST(infos[1])},
+		[]resolvedTree{patternSuffixAST(infos[0]), patternSuffixAST(infos[1])},
 		CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
@@ -2249,7 +2285,7 @@ func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
 	// failure here means it was rewritten. A bare `continue` would drop the
 	// pattern from the anchored trio while `find` kept it, with nothing in
 	// --diag-json to explain the disagreement.
-	broken := &PatternInfo{fullPattern: `(unclosed`}
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`)}
 
 	buf, restore := captureWarnings(t)
 	defer restore()
@@ -2498,7 +2534,7 @@ func TestSetCoreProbeBodyClampsBucketWidthTo32(t *testing.T) {
 	// eligible pattern seen" mask must be capped at 32 bits however many ids
 	// the bucket carries. binPack caps a bucket at 32 today, so this is
 	// reached by handing genAnchoredWASM a wider id vector directly.
-	table, err := mergeAnchoredDFA([]*syntax.Regexp{mustParse(t, `alpha`), mustParse(t, `beta`)},
+	table, err := mergeAnchoredDFA(byteTrees([]*syntax.Regexp{mustParse(t, `alpha`), mustParse(t, `beta`)}),
 		CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeAnchoredDFA: %v", err)
@@ -2576,18 +2612,18 @@ func TestSetCoreFirstByteSetGivesUpSafely(t *testing.T) {
 	// The table must OVER-approximate: a pattern wrongly cleared is a lost
 	// match. Both give-up paths therefore answer nil ("assume every byte")
 	// rather than an empty or partial set.
-	if got := firstByteSet(`(unclosed`); got != nil {
+	if got := firstByteSet(bytePat(`(unclosed`)); got != nil {
 		t.Error("firstByteSet on an unparseable pattern returned a set; it must give up")
 	}
 	// A non-ASCII first rune is encoded as several bytes and what leads it is
 	// a UTF-8 lead byte, not the rune. Deriving that is out of scope for a
 	// byte-oriented engine, so the whole pattern gives up.
-	if got := firstByteSet("étude"); got != nil {
+	if got := firstByteSet(bytePat("étude")); got != nil {
 		t.Error("firstByteSet on a non-ASCII first rune returned a set; it must give up")
 	}
 	// The positive control: a plain ASCII first byte is derivable, and only
 	// that byte may be set.
-	set := firstByteSet(`keyword`)
+	set := firstByteSet(bytePat(`keyword`))
 	if set == nil {
 		t.Fatal("firstByteSet(keyword) gave up on a derivable ASCII first byte")
 	}
@@ -2609,7 +2645,7 @@ func TestSetCoreBuildStartableTableDeclines(t *testing.T) {
 
 	wide := &bucket{patterns: make([]*PatternInfo, 33)}
 	for i := range wide.patterns {
-		wide.patterns[i] = &PatternInfo{fullPattern: `keyword`}
+		wide.patterns[i] = &PatternInfo{fullPattern: `keyword`, rp: bytePat(`keyword`)}
 	}
 	if got := buildStartableTable(wide); got != nil {
 		t.Error("buildStartableTable on a 33-pattern bucket returned a table; bits past 31 have no home")
@@ -2617,7 +2653,7 @@ func TestSetCoreBuildStartableTableDeclines(t *testing.T) {
 
 	// The positive control, so the two nils above cannot pass for the table
 	// having been switched off entirely.
-	narrow := &bucket{patterns: []*PatternInfo{{fullPattern: `keyword`}, {fullPattern: `[0-9]+`}}}
+	narrow := &bucket{patterns: []*PatternInfo{{fullPattern: `keyword`, rp: bytePat(`keyword`)}, {fullPattern: `[0-9]+`, rp: bytePat(`[0-9]+`)}}}
 	tab := buildStartableTable(narrow)
 	if tab == nil {
 		t.Fatal("buildStartableTable declined a bucket with a derivable first byte")
@@ -2652,7 +2688,7 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `suffix`+string(rune('a'+i%26))+string(rune('a'+i/26)))
 	}
-	table, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	table, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
 	}

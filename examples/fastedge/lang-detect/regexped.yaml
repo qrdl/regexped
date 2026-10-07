@@ -1,0 +1,106 @@
+# A script and European-language detector, by letters alone.
+#
+# Every pattern names a Unicode script class or a character above U+007F, so
+# each compiles in UNICODE mode: a class reads a whole character, and (?i)
+# folds across Unicode — (?i:[äöüß]) also matches Ä, Ö, Ü and ẞ.
+#
+#   1. `scripts` (find): which scripts the text uses, in order of appearance.
+#   2. `latin_languages` / `cyrillic_languages` (match_all, anchored — the
+#      WHOLE text must match): every language whose pattern matches. A
+#      language's pattern is
+#
+#        (?:\P{Script}|(?i:[its alphabet]))*  (?i:[its own letters])  (same)*
+#
+#      so every letter of that script in the text is in the language's
+#      alphabet, and at least one is a letter beyond the script's core (a-z for
+#      Latin; for Cyrillic, the letters Russian, Ukrainian and Bulgarian share).
+#      Other scripts, digits, spaces and punctuation are \P{Script} and pass.
+#   3. The app reports, per script, the matching languages — or the script's
+#      own name when none matches (plain a-z text is "Latin").
+#
+# Pattern names are the display names: emit_name_map gives the app
+# pattern_name(id).
+wasm_format:   component
+import_module: "langdetect"
+wasm_file:     "langdetect.wasm"
+output:        "lang-detect.wasm"
+stub_file:     "stubs.rs"
+
+regexps:
+  - { name: Latin,    pattern: '\p{Latin}+' }
+  - { name: Cyrillic, pattern: '\p{Cyrillic}+' }
+  - { name: Greek,    pattern: '\p{Greek}+' }
+
+  # Latin-script languages: a-z plus each language's own letters.
+  - name: German
+    pattern: '(?:\P{Latin}|(?i:[a-zäöüß]))*(?i:[äöüß])(?:\P{Latin}|(?i:[a-zäöüß]))*'
+  - name: French
+    pattern: '(?:\P{Latin}|(?i:[a-zàâæçéèêëîïôœùûüÿ]))*(?i:[àâæçéèêëîïôœùûüÿ])(?:\P{Latin}|(?i:[a-zàâæçéèêëîïôœùûüÿ]))*'
+  - name: Spanish
+    pattern: '(?:\P{Latin}|(?i:[a-záéíñóúü]))*(?i:[áéíñóúü])(?:\P{Latin}|(?i:[a-záéíñóúü]))*'
+  - name: Portuguese
+    pattern: '(?:\P{Latin}|(?i:[a-záâãàçéêíóôõú]))*(?i:[áâãàçéêíóôõú])(?:\P{Latin}|(?i:[a-záâãàçéêíóôõú]))*'
+  - name: Italian
+    pattern: '(?:\P{Latin}|(?i:[a-zàèéìíîòóùú]))*(?i:[àèéìíîòóùú])(?:\P{Latin}|(?i:[a-zàèéìíîòóùú]))*'
+  - name: Dutch
+    pattern: '(?:\P{Latin}|(?i:[a-záàâéèêëíïóöôúüû]))*(?i:[áàâéèêëíïóöôúüû])(?:\P{Latin}|(?i:[a-záàâéèêëíïóöôúüû]))*'
+  - name: Swedish
+    pattern: '(?:\P{Latin}|(?i:[a-zåäö]))*(?i:[åäö])(?:\P{Latin}|(?i:[a-zåäö]))*'
+  - name: Norwegian
+    pattern: '(?:\P{Latin}|(?i:[a-zæøåé]))*(?i:[æøåé])(?:\P{Latin}|(?i:[a-zæøåé]))*'
+  - name: Danish
+    pattern: '(?:\P{Latin}|(?i:[a-zæøåé]))*(?i:[æøåé])(?:\P{Latin}|(?i:[a-zæøåé]))*'
+  - name: Finnish
+    pattern: '(?:\P{Latin}|(?i:[a-zäöåšž]))*(?i:[äöåšž])(?:\P{Latin}|(?i:[a-zäöåšž]))*'
+  - name: Icelandic
+    pattern: '(?:\P{Latin}|(?i:[a-záðéíóúýþæö]))*(?i:[áðéíóúýþæö])(?:\P{Latin}|(?i:[a-záðéíóúýþæö]))*'
+  - name: Estonian
+    pattern: '(?:\P{Latin}|(?i:[a-zšžõäöü]))*(?i:[šžõäöü])(?:\P{Latin}|(?i:[a-zšžõäöü]))*'
+  - name: Latvian
+    pattern: '(?:\P{Latin}|(?i:[a-zāčēģīķļņšūž]))*(?i:[āčēģīķļņšūž])(?:\P{Latin}|(?i:[a-zāčēģīķļņšūž]))*'
+  - name: Lithuanian
+    pattern: '(?:\P{Latin}|(?i:[a-ząčęėįšųūž]))*(?i:[ąčęėįšųūž])(?:\P{Latin}|(?i:[a-ząčęėįšųūž]))*'
+  - name: Polish
+    pattern: '(?:\P{Latin}|(?i:[a-ząćęłńóśźż]))*(?i:[ąćęłńóśźż])(?:\P{Latin}|(?i:[a-ząćęłńóśźż]))*'
+  - name: Czech
+    pattern: '(?:\P{Latin}|(?i:[a-záčďéěíňóřšťúůýž]))*(?i:[áčďéěíňóřšťúůýž])(?:\P{Latin}|(?i:[a-záčďéěíňóřšťúůýž]))*'
+  - name: Slovak
+    pattern: '(?:\P{Latin}|(?i:[a-záäčďéíĺľňóôŕšťúýž]))*(?i:[áäčďéíĺľňóôŕšťúýž])(?:\P{Latin}|(?i:[a-záäčďéíĺľňóôŕšťúýž]))*'
+  - name: Slovenian
+    pattern: '(?:\P{Latin}|(?i:[a-zčšž]))*(?i:[čšž])(?:\P{Latin}|(?i:[a-zčšž]))*'
+  - name: Croatian
+    pattern: '(?:\P{Latin}|(?i:[a-zčćđšž]))*(?i:[čćđšž])(?:\P{Latin}|(?i:[a-zčćđšž]))*'
+  - name: Hungarian
+    pattern: '(?:\P{Latin}|(?i:[a-záéíóöőúüű]))*(?i:[áéíóöőúüű])(?:\P{Latin}|(?i:[a-záéíóöőúüű]))*'
+  - name: Romanian
+    pattern: '(?:\P{Latin}|(?i:[a-zăâîșşțţ]))*(?i:[ăâîșşțţ])(?:\P{Latin}|(?i:[a-zăâîșşțţ]))*'
+  - name: Albanian
+    pattern: '(?:\P{Latin}|(?i:[a-zçë]))*(?i:[çë])(?:\P{Latin}|(?i:[a-zçë]))*'
+  - name: Maltese
+    pattern: '(?:\P{Latin}|(?i:[a-zċġħżàèìòù]))*(?i:[ċġħżàèìòù])(?:\P{Latin}|(?i:[a-zċġħżàèìòù]))*'
+
+  # Cyrillic-script languages: each language's full alphabet.
+  - name: Russian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]))*(?i:[ёъыэ])(?:\P{Cyrillic}|(?i:[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]))*'
+  - name: Ukrainian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгґдеєжзиіїйклмнопрстуфхцчшщьюя]))*(?i:[ґєії])(?:\P{Cyrillic}|(?i:[абвгґдеєжзиіїйклмнопрстуфхцчшщьюя]))*'
+  - name: Belarusian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгдеёжзійклмнопрстуўфхцчшыьэюя]))*(?i:[ёіўыэ])(?:\P{Cyrillic}|(?i:[абвгдеёжзійклмнопрстуўфхцчшыьэюя]))*'
+  - name: Bulgarian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгдежзийклмнопрстуфхцчшщъьюя]))*(?i:[ъ])(?:\P{Cyrillic}|(?i:[абвгдежзийклмнопрстуфхцчшщъьюя]))*'
+  - name: Serbian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгдђежзијклљмнњопрстћуфхцчџш]))*(?i:[ђјљњћџ])(?:\P{Cyrillic}|(?i:[абвгдђежзијклљмнњопрстћуфхцчџш]))*'
+  - name: Macedonian
+    pattern: '(?:\P{Cyrillic}|(?i:[абвгдѓежзѕијклљмнњопрстќуфхцчџш]))*(?i:[ѓѕјљњќџ])(?:\P{Cyrillic}|(?i:[абвгдѓежзѕијклљмнњопрстќуфхцчџш]))*'
+
+sets:
+  - name: scripts
+    find: find_scripts
+    patterns: [Latin, Cyrillic, Greek]
+    emit_name_map: true
+  - name: latin
+    match_all: latin_languages
+    patterns: [German, French, Spanish, Portuguese, Italian, Dutch, Swedish, Norwegian, Danish, Finnish, Icelandic, Estonian, Latvian, Lithuanian, Polish, Czech, Slovak, Slovenian, Croatian, Hungarian, Romanian, Albanian, Maltese]
+  - name: cyrillic
+    match_all: cyrillic_languages
+    patterns: [Russian, Ukrainian, Belarusian, Bulgarian, Serbian, Macedonian]

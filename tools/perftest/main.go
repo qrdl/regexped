@@ -406,16 +406,15 @@ var tests = []testCase{
 		},
 	},
 
-	// ── Phase 0 new patterns — compatibility baseline coverage ────────────────
+	// ── Compatibility baseline coverage ───────────────────────────────────────
 	// These four patterns extend the baseline corpus to cover engine paths that
-	// the pattern-grouping work touches.
-	// "Phase 0 — Perftest expansion and baseline capture".
+	// pattern grouping touches.
 
 	{
 		// 0.1: word-boundary pattern.
 		// \bERROR\b exercises the doubled DFA state space caused by the
 		// prevWasWord context bit (CLAUDE.md "Word Boundaries in DFA").
-		// The Phase 1 BFS-relabel work touches this state-numbering path.
+		// BFS relabelling of DFA states touches this state-numbering path.
 		name:    "word-boundary",
 		pattern: `\bERROR\b`,
 		mode:    find,
@@ -491,13 +490,13 @@ var tests = []testCase{
 	// These three patterns surface the wins (or absence thereof) of recent
 	// shipping work on a realistic-scale perftest.
 	{
-		// Phase 5 amplifier: mid-accept dominant body with a multi-byte exit
+		// Amplifier for the multi-byte-exit bulk skip: mid-accept dominant body with a multi-byte exit
 		// set. Pattern matches URLs delimited by whitespace, comma, or
 		// semicolon. Body `[^\s,;]+` is mid-accept (every byte while in
 		// it is a valid match end) and has 8-byte exit set
-		// (\t\n\v\f\r space , ;) → triggers Phase 5's Shufti-style nibble-
-		// table SIMD bulk-skip in `emitDominantBulkSkip`. Without Phase 5
-		// the body would scan byte-by-byte at DFA per-byte cost.
+		// (\t\n\v\f\r space , ;) → triggers the Shufti-style nibble-
+		// table SIMD bulk-skip in `emitDominantBulkSkip`. Without it the
+		// body would scan byte-by-byte at DFA per-byte cost.
 		name:    "phase5-url-find-100kb",
 		pattern: `http://[^\s,;]+`,
 		mode:    find,
@@ -583,6 +582,74 @@ var tests = []testCase{
 // secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
 // characters (common prefix chars for JWT, GitHub, AWS patterns) but no secrets.
 // insertAt controls where the secret is spliced in (use -1 for no secret).
+// unicodeTests replace tests under -unicode: patterns a Unicode-mode compile
+// is for — letter classes, scripts, non-ASCII literals, codepoint `.`, folding
+// across Unicode — over mixed-script text, against the regex crate, whose
+// classes are Unicode by default as these are. A byte-mode run cannot compile
+// them, which is why they are a table of their own and not rows of tests.
+var unicodeTests = []testCase{
+	{name: "u-letters", pattern: `\pL+`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, "")},
+		{"no-letter ~10KB", strings.Repeat("0123456789 ,.;:!?-+ ", 512)},
+	}},
+	{name: "u-cyrillic-word", pattern: `\p{Cyrillic}{4,}`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, "")},
+	}},
+	{name: "u-intl-email", pattern: `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}`, mode: find, inputs: []namedInput{
+		{"no-email ~10KB", unicodeText(10<<10, "")},
+		{"with-email ~10KB", unicodeText(10<<10, " пользователь@пример.рф ")},
+	}},
+	{name: "u-literal", pattern: `привет\s+\pL+`, mode: find, inputs: []namedInput{
+		{"absent ~10KB", unicodeText(10<<10, "")},
+		{"present ~10KB", unicodeText(10<<10, " привет мир ")},
+	}},
+	{name: "u-fold", pattern: `(?i)straße|ΣΟΦΙΑ`, mode: find, inputs: []namedInput{
+		{"absent ~10KB", unicodeText(10<<10, "")},
+		{"present ~10KB", unicodeText(10<<10, " STRASSE Straße σοφια ")},
+	}},
+	{name: "u-dot-count", pattern: `x.{3}y`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, " xé日😀y ")},
+	}},
+	{name: "u-greek-anchored", pattern: `\p{Greek}+(?:\s\p{Greek}+)*`, mode: anchored, inputs: []namedInput{
+		{"match", "Ωμέγα αλφα βήτα γάμμα δέλτα"},
+		{"no-match", "Grüße aus Köln"},
+	}},
+	{name: "u-groups", pattern: `(\pL+)\s(\pN+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "Straße 42"},
+		{"no-match", "42 Straße"},
+		{"long match", strings.Repeat("Straße", 50) + " 42"},
+	}},
+	{name: "u-tag-groups", pattern: `<([^>]+)>`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "<" + unicodeText(300, "") + ">"},
+	}},
+	{name: "u-field-groups", pattern: `([^,]+),`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", strings.ReplaceAll(unicodeText(300, ""), ",", ";") + ","},
+	}},
+	{name: "u-email-groups", pattern: `(\pL+)@(\pL+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "пользователь@пример"},
+	}},
+	{name: "u-dot-groups", pattern: `(.+)=(.+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "название=значение"},
+		{"long match", strings.Repeat("ключ", 40) + "=" + strings.Repeat("значение", 20)},
+	}},
+}
+
+// unicodeText is n bytes of mixed-script prose, with needle once in the
+// middle when it is not empty.
+func unicodeText(n int, needle string) string {
+	const block = "Grüße aus Köln, здравствуй мир! 東京タワー abc x 12 Ωμέγα. Gassen und Plätze; " +
+		"съешь же ещё этих мягких французских булок, да выпей чаю. 日本語のテキスト 2024年. "
+	var b strings.Builder
+	for b.Len() < n/2 {
+		b.WriteString(block)
+	}
+	b.WriteString(needle)
+	for b.Len() < n {
+		b.WriteString(block)
+	}
+	return b.String()
+}
+
 func secretBaseInput(secret string) string {
 	// Realistic env file block — high density of 'e', 'g', 'A' characters.
 	const block = `# Application Configuration
@@ -1169,7 +1236,7 @@ func regexpedEngineName(tc testCase) string {
 		// Captures are stripped for anchored/find modes; engine is always DFA.
 		return "DFA"
 	}
-	opts := compile.CompileOptions{MaxDFAStates: 100000}
+	opts := withMode(compile.CompileOptions{MaxDFAStates: 100000})
 	et, err := compile.SelectEngine(tc.pattern, opts)
 	if err != nil {
 		return "?"
@@ -1195,7 +1262,7 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, compile.CompileOptions{})
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped compile(%s): %v\n", tc.name, err)
 		return benchResult{}
@@ -1605,7 +1672,7 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, compile.CompileOptions{})
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  fuel regexped compile(%s): %v\n", tc.name, err)
 		return 0, false
@@ -3029,6 +3096,21 @@ func runCompareSetSize(baselinePath string) bool {
 // --------------------------------------------------------------------------
 // Main
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	// Silence library log output — only the benchmark table goes to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -3047,6 +3129,9 @@ func main() {
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
+	if *unicodeFlag {
+		tests = unicodeTests
+	}
 
 	// PERFTEST_FILTER (debugging env var, mirrors likelytest's LIKELYTEST_FILTER):
 	// comma-separated substrings; only test cases whose name contains one of

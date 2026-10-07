@@ -31,6 +31,7 @@ add a fixture for it.
 | `match_only` | `(?:https?)://(?:[^/]+)/(?:.*)` | `match_func` alone: anchored body, no find sibling | Compiled DFA |
 | `find_only` | `\d{4}-\d{2}-\d{2}` | `find_func` alone | Compiled DFA |
 | `tdfa_groups` | `(?P<scheme>…)://(?P<host>…)/(?P<path>…)` | TDFA capture path with named groups | TDFA |
+| `affix_capture` | `<([^>]*)>` | one capture between fixed literals: the groups export's capture body writes group 1 from the match extent minus the literals' bytes, with no walk (`affixSingleCapture`) — the capture engine the selector names is never built | Backtracking |
 | `bt_groups` | `(a.*?b)(c+)` | Backtracking capture path (the non-greedy quantifier makes it TDFA-ineligible), with the work budget and fallback body every Backtracking program without a zero-width cycle carries. Its find step — the find `groups` locates a match with — carries the find work counter, so it also pins the dispatcher that `groups` reaches the find through | Backtracking |
 | `bt_empty_loop` | `^(\w*\|)*c` | Backtracking capture path over a program with a ZERO-WIDTH CYCLE (the outer `*`'s body can match empty through the `\|` branch). Such a program gets no ordinary body: its fast body is the bare tail call into the FALLBACK body, memoised at every Alt, whose frame stack and memo are sized from the input at call time and found through the module's scratch globals (exported, standalone, as `regexped:scratch_base`). `bt_groups` above pins the other shape — an ordinary body with the WORK BUDGET, an i64 counter charged on every frame pop whose exhaustion tail-calls the same fallback | Backtracking |
 | `case_folded` | `(?i)select\s+.*\s+from` | `(?i)`: literals carry FoldCase and are excluded from literal extraction. Not provably linear, so its find carries the work counter | Compiled DFA |
@@ -42,7 +43,8 @@ add a fixture for it.
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | mixed-prefix: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 | `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
 | `lm_sole_dominant` | `[a-zA-Z]{20,}` + `prefer-match` | the LikelyMatch mid-accept dominant dispatch and its Shufti self-loop bulk skip. `prefer-match` reached NO single-pattern fixture before this one — only the two set fixtures — so every LM-gated emitter in a find body was unpinned | Compiled DFA |
-| `find_start_anywhere` | `\w+@\w+` | the START-ANYWHERE find alone: a forward pass over the leftmost-first DFA of `(?s:.)*?(?:pat)` and a backward pass over the reversed pattern, joined by a glue body — what the find classifier picks for a leading repeat of a word class with no literal to scan for | Compiled DFA |
+| `find_start_anywhere` | `[a-z]+[0-9]{3}` | the START-ANYWHERE find alone: a forward pass over the leftmost-first DFA of `(?s:.)*?(?:pat)` and a backward pass over the reversed pattern, joined by a glue body — what the find classifier picks for a leading repeat of a word class with no literal to scan for | Compiled DFA |
+| `one_byte_lit_anchor` | `\w+@\w+` | a ONE-byte inner literal behind a wide leading repeat: the literal-anchored find with the start-anywhere switch's counter charging every failed candidate | Compiled DFA |
 | `find_switch` | `a*b` | today's general find WITH the work counter at its failed-attempt exits, the start-anywhere find beside it, and the dispatcher every caller of the find reaches. Its automaton has a cycle state, so it also pins the PER-SEARCH NOTES pair (`search_notes.go`): the ordinary copy's waste counter and the marked copy, with the `regexped:search` export | Compiled DFA |
 | `lit_anchor_switch` | `\w+abc\d` | the literal-anchored find with the counter; its backward walker stamps where it stopped, so a FAILED backward walk is charged too | Compiled DFA |
 | `alt_lit_switch` | `x{3}abc\w*z\|y{3}ghi\w*z` | the alternation literal-anchored find with the counter; each branch's backward walker and forward verifier stamp where they stopped | Compiled DFA |
@@ -78,6 +80,36 @@ that reads one table through another's bytes.
 | `set_split_scan_union` | the same split with a union automaton over every member serving the scan pair on its own, so only `find` is merged | packed-pair |
 | `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks, and the scan bodies carry the work counter — charged only for walks that recorded nothing new, checked after the probe is recorded — that hands the call to a union automaton | packed-pair |
 | `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would, and the NO-CACHE COMPANION — the same set split, compiled beside it and never exported — that `find` hands a drive with no usable cache to | scalar |
+
+## Unicode-mode fixtures
+
+Every fixture above is in BYTE mode, which is what proves byte-mode output
+unchanged by Unicode mode (`TestByteIdentFixturesResolveToByteMode` checks
+that they resolve to it). The `unicode_` fixtures pin the Unicode-mode paths —
+lowered programs and the rule that no match or empty match sits inside a
+character — and resolve to Unicode mode instead.
+
+| fixture | pattern(s) | path it pins |
+|---|---|---|
+| `unicode_dfa_find` | `[α-ω0-9]{150}x` | a lowered two-byte class run past 256 states: the plain DFA find over a u16 table |
+| `unicode_compiled_dfa` | `é[0-9]{2}` | a multi-byte literal, match and find, within 256 states |
+| `unicode_tdfa` | `([α-ω]+)-([0-9]+)` | captures around multi-byte classes on TDFA |
+| `unicode_bt` | `(é.*?b)(c+)` | captures on Backtracking over a lowered program |
+| `unicode_lit_anchor` | `\pL+@example\.com` | the literal-anchored find's backward DFA over the reversed, lowered pattern |
+| `unicode_char_probe` | `привет\s+\pL+` | the prefix scan's whole-first-character check for a literal that begins with a non-ASCII character |
+| `unicode_char_run` | `[^,]+,` + `unicode: true` | the bulk skip over whole UTF-8 characters, for a state that loops on every character through one state per byte |
+| `unicode_tdfa_char_run` | `<([^>]+)>(x)` + `unicode: true` | the TDFA capture body's skip over whole UTF-8 characters, run from the tag-op dispatch's arms that enter the loop |
+| `unicode_start_seed` | `x*` + `unicode: true` | a find that rounds `from` up to a character's first byte |
+| `unicode_start_scan` | `a?\B` + `unicode: true` | a find that checks every candidate start (`\B` holds inside a character) |
+| `unicode_set_walk` | `[a-zé]+`, `x*`, `\B` | a set's per-position walk skipping candidates inside a character, in `find` and the scan pair, with lead-byte first-byte tables |
+| `unicode_set_literals` | `привет`, `москва`, `собака`, `город\d+` | multi-byte literals in a literal frontend |
+| `unicode_set_union_scan` | `\pL+\pN`, `\p{Greek}{2,}\pN` | the scan pair's union automaton over lowered members |
+| `unicode_set_overlap_sweep` | `[a-zé]+`, `a*` | the answer cache's sweep writing an empty row inside a character |
+| `unicode_set_split_overlap` | `foo\w+`, `(?:a[^z]*?z)?` + set-level `unicode: true` | a split member's rounded search position and its program sweep |
+
+`TestByteIdenticalPathsAreDistinct` checks the Unicode fixtures reach all four
+engines, and `TestByteIdenticalUnicodeSetFixtures` that each set fixture still
+has the shape it is named for.
 
 `TestByteIdenticalSetShapesAreDistinct` re-derives the frontend, accept kind and
 capability list from the diagnostics on every run, for the same reason the
@@ -115,7 +147,8 @@ answers `from == 0` correctly, and ignores `from` forever after.
 
 That defect shipped twice. `strict_alt`, `lenient_alt`, `lit_chain_prefixed` and `alt_prefixed`
 pin four find bodies that had no fixture at all — the last two were found by
-`compile`'s `TestEveryFindEmitterIsCovered`, which reported that six of the
+an emitter-reach check (today `tools/fuzz`'s `TestEveryEmitterIsReachedBySweeps`,
+run by `make from-coverage`), which reported that six of the
 fourteen find emitters were reached by nothing, and both turned out to be
 missing the find-from floor; `tools/fuzz`'s
 `TestFindFromStartsAtOrAfterFrom` is the behavioural half of the same net and

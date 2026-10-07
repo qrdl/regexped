@@ -39,6 +39,7 @@ tools/perftest/out
 tools/perftest/*.txt
 tools/re2test/re2-exhaustive.txt
 tools/re2test/re2-adjusted.txt
+tools/re2test/re2-unicode.txt
 tools/re2test/re2test
 tools/perftest/perftest
 examples/**/*.wasm
@@ -49,6 +50,9 @@ examples/wasmtime/rust/secrets/secrets.wit
 examples/wasmtime/rust/secret-scanner/component/secrets.wit
 examples/wasmtime/rust/secret-scanner/component/.built
 examples/wasmtime/rust/secrets/.component.stamp
+examples/fastedge/lang-detect/langdetect.wit
+examples/fastedge/lang-detect/.component.stamp
+examples/fastedge/lang-detect/.serve.log
 # The C example's component build puts every artefact in its own directory.
 examples/wasmtime/c/url-parts/component/
 examples/wasmtime/c/url-parts/wasip2/

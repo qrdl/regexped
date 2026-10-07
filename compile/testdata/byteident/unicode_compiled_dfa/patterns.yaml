@@ -1,0 +1,5 @@
+# Unicode mode: a multi-byte literal before a short class, within 256 states.
+regexps:
+  - pattern: 'é[0-9]{2}'
+    find_func: uni_cdfa_find
+    match_func: uni_cdfa_match

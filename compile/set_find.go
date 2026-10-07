@@ -248,6 +248,13 @@ type setFindCtx struct {
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
 	// went with it.
 	aliveMask byte
+	// utf8Start is the Unicode start check's scratch (emitUTF8Skip),
+	// allocated only when some bucket needs the check in this body's mode.
+	utf8Start *utf8StartLocals
+	// utf8Hoisted: the per-position walk is emitting its fallback buckets
+	// behind one start check for all of them (emitFallbackBuckets), so the
+	// per-bucket check is not emitted.
+	utf8Hoisted bool
 }
 
 // minStartSentinel is lMinStart's "nothing found yet" value. It is larger than
@@ -868,7 +875,7 @@ func setPatternIDs(cs *compiledSet) []int {
 //
 // The remaining static test is whether a match can exceed one byte at all: a
 // pattern that cannot never satisfies e > s+1, so the prologue would be dead
-// code. regexpMinMaxLen answers that (maxLen == -1 means unbounded).
+// code. minMaxLen answers that (maxLen == -1 means unbounded).
 //
 // Multi-pattern sets were NOT undecidable-so-assume-yes here; they were
 // measured-negative — but only on a LITERAL-frontend set. That
@@ -884,7 +891,7 @@ func setPatternIDs(cs *compiledSet) []int {
 // The maxLen test is unchanged in intent but now quantifies over the whole
 // set: if NO pattern can match more than one byte, then after reporting (s,
 // s+1) every gate gives p_min = s+1 = from and the jump can never
-// fire, so the prologue would be dead code. regexpMinMaxLen answers that
+// fire, so the prologue would be dead code. minMaxLen answers that
 // (maxLen == -1 means unbounded).
 // The frontend test comes FIRST because patternFullAST re-parses the pattern:
 // a literal-frontend set must reach the same verdict as before the scalar-frontend exception without
@@ -900,10 +907,10 @@ func (cs *compiledSet) jumpIsProfitable() bool {
 	for _, bkt := range cs.buckets {
 		for _, p := range bkt.patterns {
 			ast := patternFullAST(p)
-			if ast == nil {
+			if ast.re == nil {
 				continue
 			}
-			if _, maxLen := regexpMinMaxLen(ast, p.byteMode); maxLen < 0 || maxLen >= 2 {
+			if _, maxLen := ast.minMaxLen(); maxLen < 0 || maxLen >= 2 {
 				return true
 			}
 		}
@@ -1152,6 +1159,7 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		// empty-mask skip, so on the positions it rejects the chain is never
 		// reached at all. On classchain-32's dense corpus that is 75% of them.
 		b = c.emitStartableMask(b, bi, g, posLocal)
+		b = c.emitUTF8Skip(b, bi, litLen, posLocal)
 		// Gate test plus the first empty-mask skip. The skip guards the prefix
 		// DFAs (the expensive part); the second one below guards the
 		// suffix/probe call once those DFAs have had their say. Each is
@@ -1241,6 +1249,56 @@ func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLo
 
 	// Nothing left to look for at this position.
 	b = append(b, 0x20, c.lValidMask, 0x45, 0x0D, 0x00) // eqz; br_if $skip_group
+	return b
+}
+
+// emitUTF8Skip leaves $skip_group when posLocal lies inside a character and
+// bucket bi holds a member whose empty match could otherwise be reported there
+// (bucket.utf8StartCheck). Only a fallback bucket can: a literal bucket's
+// members cannot match empty, and its match starts are where its literal and
+// its fixed prefix put them, on a character's first byte.
+func (c *setFindCtx) emitUTF8Skip(b []byte, bi, litLen int, posLocal byte) []byte {
+	if c.utf8Hoisted || litLen != 0 || bi >= len(c.cs.buckets) || !c.cs.buckets[bi].utf8StartCheck(c.mode) {
+		return b
+	}
+	if c.utf8Start == nil {
+		panic("compile: a set body checks Unicode start positions with no scratch allocated for it")
+	}
+	l := *c.utf8Start
+	b = append(b, 0x20, posLocal, 0x21, byte(l.pos))
+	// Moved to the character's end: posLocal was inside it. The block
+	// emitUTF8Start opens is depth 0, $skip_group depth 1.
+	return emitUTF8Start(b, l, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+}
+
+// emitFallbackBuckets emits every fallback bucket's evaluation at posLocal, in
+// the per-position walk. When a bucket needs the Unicode start check, ONE
+// check runs for all of them, in front: inside a character no member of any
+// bucket can match — a non-empty match never begins with a continuation byte,
+// and the members whose empty match could are what the check is for — so the
+// position is left at once instead of once per bucket that needs it.
+func (c *setFindCtx) emitFallbackBuckets(b []byte, posLocal byte) []byte {
+	hoist := false
+	for _, bkt := range c.cs.buckets {
+		hoist = hoist || (bkt.isFallback && bkt.utf8StartCheck(c.mode))
+	}
+	if hoist {
+		l := *c.utf8Start
+		b = append(b, 0x02, 0x40) // block $fallbacks
+		b = append(b, 0x20, posLocal, 0x21, byte(l.pos))
+		// emitUTF8Start's own block is depth 0, $fallbacks depth 1.
+		b = emitUTF8Start(b, l, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+		c.utf8Hoisted = true
+	}
+	for bi, bkt := range c.cs.buckets {
+		if bkt.isFallback {
+			b = c.emitBucketAt(b, bi, 0, posLocal)
+		}
+	}
+	if hoist {
+		c.utf8Hoisted = false
+		b = append(b, 0x0B) // end $fallbacks
+	}
 	return b
 }
 
@@ -1800,6 +1858,14 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 	c.lTmp = c.locals.I32()
 	c.lValidMask = c.locals.I32()
 	c.lOutBase = c.locals.I32()
+	for _, bkt := range cs.buckets {
+		if bkt.utf8StartCheck(mode) {
+			l := c.locals
+			c.utf8Start = &utf8StartLocals{ptr: uint32(c.pInPtr), len: uint32(c.pInLen),
+				pos: uint32(l.I32()), c: uint32(l.I32()), k: uint32(l.I32()), n: uint32(l.I32())}
+			break
+		}
+	}
 	// lMinStart, lBase and lStart are NOT defaulted here. Every frontend body
 	// allocates them itself, at the point its own frame decides where they go
 	// — after the v128 group in Teddy and packed-pair, after the prefilter's

@@ -114,8 +114,8 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 		Regexps: []RegexEntry{
 			{Name: "p1", Pattern: "a", MatchFunc: "bad name"},
 			{Name: "p2", Pattern: "b", FindFunc: "9lives"},
-			{Name: "p3", Pattern: "c", GroupsFunc: "match"},
-			{Name: "p4", Pattern: "d", GroupsFunc: "fine_name"},
+			{Name: "p3", Pattern: "(c)", GroupsFunc: "match"},
+			{Name: "p4", Pattern: "(d)", GroupsFunc: "fine_name"},
 		},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAll: "loop"},
@@ -137,6 +137,35 @@ func TestValidateConfig_ReportsAllProblems(t *testing.T) {
 	// Every offending field reported in one pass, not just the first.
 	if n := strings.Count(msg, "\n  "); n != 4 {
 		t.Errorf("got %d reported problems, want 4; got:\n%s", n, msg)
+	}
+}
+
+// TestValidateConfig_GroupsWithoutCaptures: a groups_func on a pattern with no
+// capture group that can take part in a match is a load error, since it would
+// compile to no groups export while every stub calls one.
+func TestValidateConfig_GroupsWithoutCaptures(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		refused bool
+	}{
+		{`a*`, true},
+		{`(?:(a){0})b`, true}, // the only group is simplified away
+		{`(?:a|b)+`, true},
+		{`(a)*`, false},
+		{`(?P<x>a)b`, false},
+		{`(`, false}, // does not parse: reported elsewhere
+	} {
+		re := RegexEntry{Pattern: c.pattern, GroupsFunc: "g"}
+		if got := re.GroupsWithoutCaptures(); got != c.refused {
+			t.Errorf("GroupsWithoutCaptures(%q) = %v, want %v", c.pattern, got, c.refused)
+		}
+		err := ValidateConfig(&BuildConfig{Regexps: []RegexEntry{re}})
+		if refused := err != nil && strings.Contains(err.Error(), NoCaptureGroupProblem); refused != c.refused {
+			t.Errorf("ValidateConfig(%q groups_func) = %v, want refused %v", c.pattern, err, c.refused)
+		}
+	}
+	if (RegexEntry{Pattern: `a*`, FindFunc: "f"}).GroupsWithoutCaptures() {
+		t.Error("GroupsWithoutCaptures without groups_func = true")
 	}
 }
 
@@ -939,10 +968,9 @@ func TestWasmFormatValidation(t *testing.T) {
 	}
 }
 
-// A component config carrying sets is refused rather than half-emitted.
-// Sets under `component` LOAD as of phase 3.2: their raw ABI does not cross the
+// A component config carrying sets LOADS: their raw ABI does not cross the
 // boundary (`_all` lifts to a list of ids, `find` becomes a resource), so there
-// is nothing left to refuse about them.
+// is nothing to refuse about them.
 func TestComponentAcceptsSets(t *testing.T) {
 	src := "wasm_format: component\nimport_module: regexps\n" +
 		"regexps:\n  - name: a\n    pattern: 'abc'\n" +

@@ -96,6 +96,21 @@ type sizeResult struct {
 
 func (r sizeResult) fuelPerByte() float64 { return float64(r.Fuel) / float64(max(r.N, 1)) }
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	flag.Parse()
 	if *suite {
@@ -229,7 +244,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if sp.Fn == "batchgroups" {
 			e.Hints = []string{"batch-find"}
 		}
-		opts := compile.CompileOptions{MaxDFAStates: sp.MaxDFA}
+		opts := withMode(compile.CompileOptions{MaxDFAStates: sp.MaxDFA})
 		var force compile.EngineType
 		if sp.BT {
 			force = compile.EngineBacktrack

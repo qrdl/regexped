@@ -2,10 +2,13 @@ package generate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -760,3 +763,146 @@ console.log('OK ' + got);
 		t.Fatalf("node: %v\n%s", err, out)
 	}
 }
+
+// TestJSUnicodeAtRuntime drives Unicode-mode patterns and a Unicode-mode set
+// through the generated JS stub, over strings with 2- to 4-byte characters
+// and one byte array carrying invalid bytes, against Go: the stub encodes a
+// string as UTF-8, every position it yields is a byte offset into that, and no
+// match — empty ones included — starts inside a character. The JS stub is the
+// one layer where Unicode mode changes anything a stub does: every other stub
+// hands the module bytes it already has.
+func TestJSUnicodeAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	yes := true
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{
+			{Name: "letters", Pattern: `\pL+`, FindFunc: "findLetters"},
+			{Name: "lead", Pattern: `é\pL*`, MatchFunc: "matchLead"},
+			{Name: "pairs", Pattern: `(\pL+)-(\d+)`, GroupsFunc: "findPairs"},
+			{Name: "xs", Pattern: `x*`, Unicode: &yes, FindFunc: "findXs"},
+			{Name: "cyr", Pattern: `ж+`},
+		},
+		Sets:     []config.SetConfig{{Name: "u", Find: "findU", Patterns: config.PatternSelector{Names: []string{"xs", "cyr"}}}},
+		StubFile: "stubs.js",
+	}
+	strs := []string{"", "é", "Grüße, мир! 日本-12 x𝄞y é-7 жжx", "éé-3x", "𝄞x𝄞", "жxж", "éжΩ"}
+	raw := []byte("a\xffé-9\x80ж")
+	type sp = [2]int
+	pairs := func(m [][]int) [][]int {
+		if m == nil {
+			return [][]int{}
+		}
+		return m
+	}
+	want := map[string]any{}
+	for i, s := range append(strs, string(raw)) {
+		key := fmt.Sprint(i)
+		w := map[string]any{}
+		w["letters"] = pairs(regexp.MustCompile(`\pL+`).FindAllStringIndex(s, -1))
+		w["xs"] = pairs(regexp.MustCompile(`x*`).FindAllStringIndex(s, -1))
+		// match_func matches the WHOLE input and answers its length.
+		if regexp.MustCompile(`\A(?:é\pL*)\z`).MatchString(s) {
+			w["lead"] = len(s)
+		} else {
+			w["lead"] = nil
+		}
+		var groups [][]*sp
+		for _, m := range regexp.MustCompile(`(\pL+)-(\d+)`).FindAllStringSubmatchIndex(s, -1) {
+			var g []*sp
+			for j := 0; j < len(m); j += 2 {
+				if m[j] < 0 {
+					g = append(g, nil)
+				} else {
+					g = append(g, &sp{m[j], m[j+1]})
+				}
+			}
+			groups = append(groups, g)
+		}
+		if groups == nil {
+			groups = [][]*sp{}
+		}
+		w["pairs"] = groups
+		// A set reports each member's GLOBAL id: its index in Regexps.
+		var set [][3]int
+		for id, p := range map[int]string{3: `x*`, 4: `ж+`} {
+			for _, m := range regexp.MustCompile(p).FindAllStringIndex(s, -1) {
+				set = append(set, [3]int{id, m[0], m[1]})
+			}
+		}
+		sort.Slice(set, func(a, b int) bool {
+			if set[a][1] != set[b][1] {
+				return set[a][1] < set[b][1]
+			}
+			return set[a][0] < set[b][0]
+		})
+		if set == nil {
+			set = [][3]int{}
+		}
+		w["set"] = set
+		want[key] = w
+	}
+	dir := t.TempDir()
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	wantJSON, err := json.Marshal(map[string]any{"strs": strs, "raw": raw, "want": want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"m.wasm": wasm, "stubs.js": []byte(src),
+		"drive.mjs": []byte(unicodeDriver), "want.json": wantJSON} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeESMPackageJSON(t, dir)
+	cmd := exec.Command("node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node reported a disagreement with Go:\n%s", out)
+	}
+	var checks int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "OK %d", &checks); err != nil || checks < 35 {
+		t.Fatalf("driver ran too few checks (%q): a vacuous pass", out)
+	}
+}
+
+// unicodeDriver is TestJSUnicodeAtRuntime's node side.
+const unicodeDriver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const { strs, raw, want } = JSON.parse(await readFile(new URL('./want.json', import.meta.url), 'utf8'));
+let checks = 0;
+function eq(actual, expected, what) {
+    checks++;
+    const a = JSON.stringify(actual), b = JSON.stringify(expected);
+    if (a !== b) {
+        console.error("FAIL " + what + "\n  got  " + a + "\n  want " + b);
+        process.exit(1);
+    }
+}
+const inputs = strs.concat([Uint8Array.from(Buffer.from(raw, 'base64'))]);
+inputs.forEach((input, i) => {
+    const w = want[String(i)];
+    const what = JSON.stringify(typeof input === 'string' ? input : Array.from(input));
+    eq([...stubs.findLetters(input)], w.letters, "findLetters " + what);
+    eq([...stubs.findXs(input)], w.xs, "findXs " + what);
+    eq(stubs.matchLead(input), w.lead, "matchLead " + what);
+    eq([...stubs.findPairs(input)], w.pairs, "findPairs " + what);
+    const set = [...stubs.findU(input)].map(m => [m.patternId, m.start, m.end]);
+    set.sort((a, b) => a[1] - b[1] || a[0] - b[0]);
+    eq(set, w.set, "findU " + what);
+});
+console.log("OK " + checks);
+`

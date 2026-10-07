@@ -3,8 +3,8 @@ package compile
 import (
 	"fmt"
 	"regexp/syntax"
+	"unicode"
 
-	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -102,9 +102,12 @@ func hasEmptyWidthAssertion(re *syntax.Regexp) bool {
 }
 
 // leadingRepeatBytes returns the byte set of re's leading UNBOUNDED repeat
-// (`X*`, `X+`, `X{n,}` over a class, a dot or one literal byte), and whether
-// re starts with one.
-func leadingRepeatBytes(re *syntax.Regexp) (set [256]bool, ok bool) {
+// (`X*`, `X+`, `X{n,}` over a class, a dot or one literal), and whether re
+// starts with one. In Unicode mode the set is the first bytes of the repeated
+// characters' UTF-8 encodings (utf8LeadBytes), not their rune values: `\pL`
+// has none of 0xC0-0xFF as a rune of its own to contribute, and `[α-ω]` has
+// 0xCE and 0xCF.
+func leadingRepeatBytes(re *syntax.Regexp, unicode bool) (set [256]bool, ok bool) {
 	for re.Op == syntax.OpConcat && len(re.Sub) > 0 {
 		re = re.Sub[0]
 	}
@@ -118,6 +121,9 @@ func leadingRepeatBytes(re *syntax.Regexp) (set [256]bool, ok bool) {
 		return set, false
 	}
 	sub := re.Sub[0]
+	if unicode {
+		return utf8LeadBytes(sub)
+	}
 	switch sub.Op {
 	case syntax.OpAnyChar:
 		for i := range set {
@@ -152,6 +158,44 @@ func leadingRepeatBytes(re *syntax.Regexp) (set [256]bool, ok bool) {
 	return set, true
 }
 
+// utf8LeadBytes is leadingRepeatBytes' set in Unicode mode: the bytes the
+// UTF-8 encoding of a character sub matches can begin with — every ASCII byte
+// sub holds, and the lead byte ranges of its multi-byte sequences
+// (appendUTF8Sequences, which leaves surrogates out). A literal stands for its
+// fold orbit when it folds.
+func utf8LeadBytes(sub *syntax.Regexp) (set [256]bool, ok bool) {
+	var ranges []rune
+	switch sub.Op {
+	case syntax.OpAnyChar:
+		ranges = []rune{0, unicode.MaxRune}
+	case syntax.OpAnyCharNotNL:
+		ranges = []rune{0, '\n' - 1, '\n' + 1, unicode.MaxRune}
+	case syntax.OpCharClass:
+		ranges = sub.Rune
+	case syntax.OpLiteral:
+		if len(sub.Rune) != 1 {
+			return set, false
+		}
+		r := sub.Rune[0]
+		ranges = []rune{r, r}
+		if sub.Flags&syntax.FoldCase != 0 {
+			for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+				ranges = append(ranges, f, f)
+			}
+		}
+	default:
+		return set, false
+	}
+	for i := 0; i+1 < len(ranges); i += 2 {
+		for _, s := range appendUTF8Sequences(nil, ranges[i], ranges[i+1]) {
+			for b := int(s[0].lo); b <= int(s[0].hi); b++ {
+				set[b] = true
+			}
+		}
+	}
+	return set, true
+}
+
 // setRaritySum is firstByteSetRaritySum over a byte set.
 func setRaritySum(set [256]bool) int {
 	var bytes []byte
@@ -163,6 +207,58 @@ func setRaritySum(set [256]bool) int {
 	return firstByteSetRaritySum(bytes)
 }
 
+// commonInText reports whether a leading repeat over the bytes of set is
+// common in text: its rarity sum reaches wideClassThreshold, or, in Unicode
+// mode, it holds a character above 0x7F (a lead byte in set). byteRarity
+// grades every such byte rare — the model is English — but a class of Greek or
+// Cyrillic letters is as dense in its own text as `[a-z]` is in English:
+// judged rare, `[α-ω]+@[α-ω]+` kept a find that cost 144 fuel per byte over
+// Greek words against 2.5 for the `@` scan it takes as common, and
+// `[α-ω]+\d` 154 against 35 for the start-anywhere find.
+func commonInText(set [256]bool, unicode bool) bool {
+	if setRaritySum(set) >= wideClassThreshold {
+		return true
+	}
+	if unicode {
+		for b := 0x80; b < 0x100; b++ {
+			if set[b] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// commonForStartAnywhere is commonInText for classifyFind's leading-repeat
+// verdicts, which hand such a pattern to the start-anywhere find: a class
+// common only for its characters above 0x7F qualifies only when it starts on
+// at most maxForwardSkipExits bytes. Rare outside its own script, it leaves
+// the forward pass sitting in its lead state over every other text, and that
+// state is fast only when its bulk skip can stop on each of the class's first
+// bytes: `\p{Han}+x` starts on nine, and its start-anywhere find cost 29 fuel
+// per byte over English text against 2.13 for the switch, while `[α-ω]+\d`
+// (two) cost 2.35 against 4.63 and over Greek 35 against 154.
+func commonForStartAnywhere(set [256]bool, unicode bool) bool {
+	if setRaritySum(set) >= wideClassThreshold {
+		return true
+	}
+	if !commonInText(set, unicode) {
+		return false
+	}
+	n := 0
+	for _, in := range set {
+		if in {
+			n++
+		}
+	}
+	return n <= maxForwardSkipExits
+}
+
+// maxForwardSkipExits is the bulk skip's exit-byte cap (detectDominantSelfLoop's
+// maxExitBytes): the most first bytes a leading class may have for the
+// start-anywhere forward pass to cross the text between them in SIMD strides.
+const maxForwardSkipExits = 8
+
 // wideClassThreshold is the rarity score at and above which a leading class is
 // common in prose — the Shufti/scalar threshold of shuftiBeatsScalar, reused so
 // the compiler has one notion of "common in text".
@@ -170,9 +266,10 @@ const wideClassThreshold = 40
 
 // findClassInput is what classifyFind looks at.
 type findClassInput struct {
-	parsed  *syntax.Regexp // captures stripped
-	table   *dfaTable      // the leftmost-first find DFA
-	l       *dfaLayout     // its layout, with both shape detectors run
+	pattern resolvedPattern // the pattern parsed is parsed from
+	parsed  *syntax.Regexp  // captures stripped
+	table   *dfaTable       // the leftmost-first find DFA
+	l       *dfaLayout      // its layout, with both shape detectors run
 	lm      LikelyMode
 	anchor  bool // today's body can only match at 0
 	lap     *litAnchorPoint
@@ -209,12 +306,15 @@ func classifyFind(in findClassInput) (findStrategy, string) {
 				return findToday, "linear: both shape detectors apply"
 			}
 		case bodyLitAnchor:
-			if in.lap != nil && litAnchorLinear(in.lap) {
+			// A one-byte literal is proved linear here too, but always takes
+			// the counter: candidates of a common byte can be dense, and the
+			// counter is what hands such a search back (emitFindSwitchChargeEvery).
+			if in.lap != nil && !in.lap.oneByte() && litAnchorLinear(in.pattern, in.lap) {
 				return findToday, "linear: the parts around the literal cannot contain it"
 			}
 		}
 	}
-	if set, ok := leadingRepeatBytes(in.parsed); ok && setRaritySum(set) >= wideClassThreshold {
+	if set, ok := leadingRepeatBytes(in.parsed, in.pattern.unicode()); ok && commonForStartAnywhere(set, in.pattern.unicode()) {
 		if set[' '] {
 			if in.lm == LikelyNoMatch {
 				return findNewSearch, "leading repeat crosses words, prefer-no-match"
@@ -254,9 +354,9 @@ func classifyFind(in findClassInput) (findStrategy, string) {
 //     branch literal, so walks from different candidates barely overlap.
 //     `'\s*(?:OR|AND)\s+[0-9]+…|UNION\s+…` needs this one — its `\s*` loops
 //     without accepting, but never across a `'` or a `UNION`.
-func lenientAltLinear(pattern string, opts CompileOptions) bool {
+func lenientAltLinear(pattern resolvedPattern, opts CompileOptions) bool {
 	m, err := compile(pattern, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true,
-		ByteMode: opts.ByteMode, Unicode: opts.Unicode})
+		ByteMode: opts.ByteMode})
 	if err != nil {
 		return false
 	}
@@ -264,7 +364,7 @@ func lenientAltLinear(pattern string, opts CompileOptions) bool {
 	if _, bounded := failedWalkBound(dfaTableFrom(d)); bounded {
 		return true
 	}
-	return lenientAltLiteralFence(pattern, opts.ByteMode)
+	return lenientAltLiteralFence(pattern)
 }
 
 // lenientAltLiteralFence reports whether every branch of an alternation of
@@ -279,11 +379,12 @@ func lenientAltLinear(pattern string, opts CompileOptions) bool {
 // maxLiteral occurrences can start in any one gap. The total is linear in the
 // input, with the longest literal as the constant. The same argument as
 // litAnchorLinear's, over several literals.
-func lenientAltLiteralFence(pattern string, byteMode bool) bool {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+func lenientAltLiteralFence(pattern resolvedPattern) bool {
+	t, err := pattern.parse()
 	if err != nil {
 		return false
 	}
+	re := t.re
 	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		re = re.Sub[0]
 	}
@@ -317,11 +418,11 @@ func lenientAltLiteralFence(pattern string, byteMode bool) bool {
 		branches = append(branches, branch{lit, rest})
 	}
 	for _, b := range branches {
-		if _, maxLen := regexpMinMaxLen(b.rest, byteMode); maxLen >= 0 {
+		if _, maxLen := t.tree(b.rest).minMaxLen(); maxLen >= 0 {
 			continue // a bounded walk, whatever it reads
 		}
 		for _, o := range branches {
-			if regexpCanContain(b.rest, o.lit) {
+			if regexpCanContain(t.tree(b.rest), o.lit) {
 				return false
 			}
 		}
@@ -333,14 +434,15 @@ func lenientAltLiteralFence(pattern string, byteMode bool) bool {
 // every attempt starts at an occurrence of the literal, and when neither the
 // part before it nor the part after it can contain the literal, the backward
 // walk cannot cross the previous occurrence and the forward walk cannot cross
-// the next, so each byte is walked a bounded number of times.
-func litAnchorLinear(lap *litAnchorPoint) bool {
+// the next, so each byte is walked a bounded number of times. pattern is the
+// one lap was found in.
+func litAnchorLinear(pattern resolvedPattern, lap *litAnchorPoint) bool {
 	after := &syntax.Regexp{Op: syntax.OpEmptyMatch}
 	if lap.suffixRe.Op == syntax.OpConcat && len(lap.suffixRe.Sub) > 1 {
 		after = &syntax.Regexp{Op: syntax.OpConcat, Sub: lap.suffixRe.Sub[1:], Flags: lap.suffixRe.Flags}
 	}
 	for _, lit := range lap.litSet {
-		if regexpCanContain(lap.prefixRe, lit) || regexpCanContain(after, lit) {
+		if regexpCanContain(pattern.tree(lap.prefixRe), lit) || regexpCanContain(pattern.tree(after), lit) {
 			return false
 		}
 	}
@@ -350,10 +452,10 @@ func litAnchorLinear(lap *litAnchorPoint) bool {
 // regexpCanContain reports whether a walk of re's automaton can read lit
 // without dying — from any state it can reach. Unsure answers (the automaton
 // cannot be built) are true, the safe direction.
-func regexpCanContain(re *syntax.Regexp, lit []byte) bool {
+func regexpCanContain(re resolvedTree, lit []byte) bool {
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(re.Simplify())
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	prog, _ := compileProg(re)
+	d, ok := newDFA(prog, false, maxHelperDFAStates)
 	if !ok {
 		return true
 	}
@@ -494,8 +596,8 @@ func failedWalkBound(t *dfaTable) (int, bool) {
 // buildStartAnywhereFind fills p with the two passes and reports whether it
 // did. false leaves p untouched, and the caller keeps today's find.
 // nr, when non-nil, asks for per-search notes in the forward pass.
-func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int64, opts CompileOptions, nr *walkNotesReq) bool {
-	sa, ok := buildStartAnywherePasses(re.Pattern, opts, base, utils.PageAlign, nr)
+func (p *compiledPattern) buildStartAnywhereFind(pattern resolvedPattern, base int64, opts CompileOptions, nr *walkNotesReq) bool {
+	sa, ok := buildStartAnywherePasses(pattern, opts, base, utils.PageAlign, nr)
 	if !ok {
 		return false
 	}
@@ -512,14 +614,14 @@ func (p *compiledPattern) buildStartAnywhereFind(re config.RegexEntry, base int6
 // too: its fallback body memoises every (instruction, position) it has tried.
 // False when neither can be built; the Backtracking find's fallback needs the
 // module's global allocator.
-func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, table *dfaTable, mandLit *mandatoryLit, opts CompileOptions, nr *walkNotesReq) bool {
-	if p.buildStartAnywhereFind(re, base, opts, nr) {
+func (p *compiledPattern) buildSwitchHandover(pattern resolvedPattern, base int64, table *dfaTable, mandLit *mandatoryLit, opts CompileOptions, nr *walkNotesReq) bool {
+	if p.buildStartAnywhereFind(pattern, base, opts, nr) {
 		return true
 	}
 	if opts.globals == nil {
 		return false
 	}
-	parts, err := buildBTFindParts(re.Pattern, table, mandLit, base, &opts)
+	parts, err := buildBTFindParts(pattern, table, mandLit, base, &opts)
 	if err != nil {
 		return false
 	}
@@ -531,8 +633,11 @@ func (p *compiledPattern) buildSwitchHandover(re config.RegexEntry, base int64, 
 }
 
 // startAnywhereRefusal names why buildStartAnywherePasses refuses pattern.
-func startAnywhereRefusal(pattern string) string {
-	if parsed, err := syntax.Parse(pattern, syntax.Perl); err == nil && hasEmptyWidthAssertion(parsed) {
+func startAnywhereRefusal(pattern resolvedPattern) string {
+	if startRuleFor(pattern) == startRuleScan {
+		return "an empty match through \\B can fall inside a character, where its byte-wise restart would report it"
+	}
+	if parsed, err := pattern.parse(); err == nil && hasEmptyWidthAssertion(parsed.re) {
 		return "its automaton is over the limits, or cannot represent an assertion exactly"
 	}
 	return "its automaton is over the limits"
@@ -561,22 +666,38 @@ type startAnywherePasses struct {
 // automaton cannot represent the assertion exactly). nr, when non-nil, gives
 // the forward pass per-search notes (search_notes.go), their row tables
 // placed right after its own.
-func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, align func(int64) int64, nr *walkNotesReq) (startAnywherePasses, bool) {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
+func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base int64, align func(int64) int64, nr *walkNotesReq) (startAnywherePasses, bool) {
+	if startRuleFor(pattern) == startRuleScan {
+		// The forward pass restarts at every byte, so it would find an empty
+		// match through `\B` between two bytes of one character, which no
+		// start position allows: such a pattern keeps the per-position find,
+		// and a switch hands it over to the Backtracking find instead.
+		return startAnywherePasses{}, false
+	}
+	parsed, err := pattern.parse()
 	if err != nil {
 		return startAnywherePasses{}, false
 	}
-	stripCaptures(parsed)
-	ctx := hasEmptyWidthAssertion(parsed)
-	maxStates := resolveMaxDFAStates(&opts)
+	stripCaptures(parsed.re)
+	ctx := hasEmptyWidthAssertion(parsed.re)
+	maxStates := resolveMaxDFAStates(&opts, pattern.unicode())
 	memLimit := resolveMaxDFAMemory(&opts)
-	build := func(re *syntax.Regexp, lf bool) *dfaTable {
+	build := func(re resolvedTree, lf bool, lead bool) *dfaTable {
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
-		prog, _ := syntax.Compile(re.Simplify())
-		if unsupportedRune(prog, opts.ByteMode) >= 0 && !opts.Unicode {
+		prog, _ := compileProg(re)
+		if lead {
+			// The forward pass's `(?s:.)*?` restart, added to the LOWERED
+			// program as the set union's is (appendStartAnywherePrefix): one
+			// byte at a time, so the search restarts at every byte. Lowered
+			// as a codepoint `.` it would die at the first invalid byte,
+			// which matches nothing in Unicode mode — `abc` over "\xffabc"
+			// found nothing, where Go finds [1,4).
+			appendStartAnywherePrefix(prog.prog)
+		}
+		if !pattern.unicode() && unsupportedRune(prog.prog, opts.ByteMode) >= 0 {
 			return nil
 		}
-		d, ok := newDFA(prog, opts.Unicode, lf, max(maxHelperDFAStates, maxStates))
+		d, ok := newDFA(prog, lf, max(maxHelperDFAStates, maxStates))
 		if !ok {
 			return nil
 		}
@@ -591,14 +712,19 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 	// the SAME tree the backward pass reverses. It used to re-parse
 	// parsed.String(), and any drift in that round trip would have made the
 	// two passes disagree about a match, which the glue body traps on.
-	// A constant pattern that parses, so the error is always nil.
-	lead, _ := syntax.Parse(`(?s:.)*?`, syntax.Perl)
-	fwdRe := &syntax.Regexp{Op: syntax.OpConcat, Flags: lead.Flags, Sub: []*syntax.Regexp{lead, parsed}}
-	fwdTable := build(fwdRe, true)
+	// A constant pattern that parses, so the error is always nil. In byte
+	// mode the lead is part of the tree, as it always was; in Unicode mode it
+	// is added after lowering (build).
+	fwdRe, byteLead := parsed, pattern.unicode()
+	if !byteLead {
+		lead, _ := syntax.Parse(`(?s:.)*?`, syntax.Perl)
+		fwdRe = parsed.tree(&syntax.Regexp{Op: syntax.OpConcat, Flags: lead.Flags, Sub: []*syntax.Regexp{lead, parsed.re}})
+	}
+	fwdTable := build(fwdRe, true, byteLead)
 	if fwdTable == nil {
 		return startAnywherePasses{}, false
 	}
-	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true})
+	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true, utf8Text: pattern.unicode()})
 	var fwdNotes *notesRows
 	if nr != nil {
 		if fwdNotes = newNotesRows(fwdTable, fwdL); fwdNotes != nil {
@@ -607,7 +733,7 @@ func buildStartAnywherePasses(pattern string, opts CompileOptions, base int64, a
 		}
 	}
 	// Backward pass: the whole pattern reversed, leftmost-longest.
-	revTable := build(reverseRegexp(parsed), false)
+	revTable := build(parsed.reversed(), false, false)
 	if revTable == nil {
 		return startAnywherePasses{}, false
 	}
@@ -1131,7 +1257,7 @@ func buildStartAnywhereBackBodyCtx(l *dfaLayout, tableMemIdx int) []byte {
 //
 // resume, when non-nil, is the search global: the body stores where the host
 // resumes after its match in the search's block (search_notes.go).
-func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int, resume *uint32) ([]byte, findFromMode) {
+func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int, resume *uint32, rule startRule) ([]byte, findFromMode) {
 	const (
 		locPtr = 0
 		locLen = 1
@@ -1144,9 +1270,10 @@ func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int, resume *uint32) (
 	if resume != nil {
 		locBlk = a.I32()
 	}
+	sl := startAnywhereStartLocals(a, rule)
 	var b []byte
 	b = a.EmitDecls(b)
-	b, mode := emitFindFromSeed(b, cur)
+	b, mode := emitStartAnywhereSeed(b, cur, rule, sl)
 	b = append(b, 0x20, locPtr, 0x20, locLen, 0x10)
 	b = utils.AppendULEB128(b, uint32(fwdFuncIdx))
 	b = append(b, 0x22, locEnd, 0x41, 0x00, 0x48, 0x04, 0x40, 0x42, 0x7F, 0x0F, 0x0B) // < 0: return -1
@@ -1164,11 +1291,34 @@ func buildStartAnywhereFindBodyCtx(fwdFuncIdx, revFuncIdx int, resume *uint32) (
 	return b, mode
 }
 
+// startAnywhereStartLocals allocates the Unicode start rule's scratch in a
+// glue body, after its other locals, when rule needs any.
+func startAnywhereStartLocals(a *localAlloc, rule startRule) utf8StartLocals {
+	if rule == startRuleNone {
+		return utf8StartLocals{}
+	}
+	if rule == startRuleScan {
+		panic("compile: the start-anywhere find for a pattern whose empty match can fall inside a character")
+	}
+	return utf8StartLocals{ptr: 0, len: 1, c: uint32(a.I32()), k: uint32(a.I32()), n: uint32(a.I32())}
+}
+
+// emitStartAnywhereSeed is the glue's seed. Rounded to a start position, the
+// seed is also written back to the find-from global, which the passes read:
+// the context forward pass as its start, both backward passes as their floor.
+func emitStartAnywhereSeed(b []byte, cur scanCursor, rule startRule, l utf8StartLocals) ([]byte, findFromMode) {
+	b, mode := emitFindFromSeedRule(b, cur, rule, l)
+	if rule != startRuleNone {
+		b = emitFindFromSet(b, cur.Local())
+	}
+	return b, mode
+}
+
 // buildStartAnywhereFindBody joins the two passes into a find body,
 // (ptr, len) → i64, returning (start << 32 | end) or -1. It is built at
 // assembly time, when both passes' function indices are known. Unsized.
 // resume is buildStartAnywhereFindBodyCtx's.
-func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int, resume *uint32) ([]byte, findFromMode) {
+func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int, resume *uint32, rule startRule) ([]byte, findFromMode) {
 	const (
 		locPtr = 0
 		locLen = 1
@@ -1182,9 +1332,10 @@ func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int, resume *uint32) ([]b
 	if resume != nil {
 		locBlk = a.I32()
 	}
+	sl := startAnywhereStartLocals(a, rule)
 	var b []byte
 	b = a.EmitDecls(b)
-	b, mode := emitFindFromSeed(b, cur)
+	b, mode := emitStartAnywhereSeed(b, cur, rule, sl)
 
 	// end = forward(ptr + from, len - from); negative = no match.
 	b = append(b, 0x20, locPtr, 0x20, locFrom, 0x6A) // ptr + from
@@ -1328,6 +1479,36 @@ func emitFindSwitchCharge(b []byte, w byte, walk func([]byte) []byte, attemptSta
 	return append(b, 0x0B)
 }
 
+// oneByteCandidateCharge is what a literal-anchored find on a ONE-byte literal
+// charges every failed candidate on top of its walk. Such a literal can be
+// common: a failed candidate cost ~300 fuel against the start-anywhere find's
+// ~29 per byte, so past about one failed candidate per 11 bytes the literal
+// scan loses. Under the counter's budget, N × (bytes advanced) + slack with
+// N = 4, a charge of walk + 40 crosses it near that density. Measured on
+// literal-dense, match-poor text (fuel/byte, start-anywhere → guarded find):
+// `[a-z]+-[0-9]+` over "not-a-log-line"×N 29.0 → 29.1 (61.0 unguarded),
+// `[a-z]+=[0-9]+` over "key=value …" 29.0 → 29.3 (39.9 unguarded); 20 tripped
+// too late (43.1) and 80 too early (`\w+ \w+` over mixed text 37.9 against
+// 33.2 before, 16.1 at 40).
+const oneByteCandidateCharge = 40
+
+// emitFindSwitchChargeEvery is emitFindSwitchCharge for a one-byte literal's
+// candidates: EVERY failed candidate is charged, its walk plus
+// oneByteCandidateCharge, with no short-walk exemption — the waste it guards
+// against is many short walks, which the exemption exists to ignore.
+func emitFindSwitchChargeEvery(b []byte, w byte, walk func([]byte) []byte, attemptStartLocal byte, n int32) []byte {
+	b = emitFindSwitchBudget(b, w, attemptStartLocal, n, false)
+	return emitAddWalk(b,
+		func(b []byte) []byte { return append(b, 0x20, w) },
+		func(b []byte) []byte { return append(b, 0x21, w) },
+		func(b []byte) []byte {
+			b = walk(b)
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, oneByteCandidateCharge)
+			return append(b, 0x6A) // i32.add
+		})
+}
+
 // emitAddWalk adds walk, an i32, to an i64 work counter. An i64 because the
 // bytes a find walks pass 4 GiB on a large enough input, and a counter that
 // wrapped would read as small again and keep the check passing on exactly the
@@ -1414,9 +1595,9 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 	if !p.saSwitch {
 		glueResume = p.notes.resumeGlobal()
 	}
-	glue, glueMode := buildStartAnywhereFindBody(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARev), glueResume)
+	glue, glueMode := buildStartAnywhereFindBody(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARev), glueResume, p.startRule)
 	if p.saCtx {
-		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx), glueResume)
+		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx), glueResume, p.startRule)
 	}
 	cs = utils.AppendULEB128(cs, uint32(len(glue)))
 	cs = append(cs, glue...)
@@ -1445,7 +1626,7 @@ func switchNFor(opts CompileOptions) int32 {
 // chooseFindStrategy applies the test overrides, else classifyFind, to a
 // pattern whose today's find body has just been decided (p carries the
 // literal-anchored artifacts when it is one of those).
-func (p *compiledPattern) chooseFindStrategy(re config.RegexEntry, table *dfaTable, l *dfaLayout,
+func (p *compiledPattern) chooseFindStrategy(pattern resolvedPattern, table *dfaTable, l *dfaLayout,
 	lap *litAnchorPoint, mandLit *mandatoryLit, anchored bool, opts CompileOptions,
 ) (findStrategy, string) {
 	switch {
@@ -1456,12 +1637,13 @@ func (p *compiledPattern) chooseFindStrategy(re config.RegexEntry, table *dfaTab
 	case opts.StartAnywhereSwitchN > 0:
 		return findSwitch, "forced"
 	}
-	parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+	parsed, err := syntax.Parse(pattern.src, syntax.Perl)
 	if err != nil {
 		return findToday, "unparseable"
 	}
 	stripCaptures(parsed)
 	in := findClassInput{
+		pattern: pattern,
 		parsed:  parsed,
 		table:   table,
 		l:       l,

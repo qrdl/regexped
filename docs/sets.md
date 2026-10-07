@@ -397,8 +397,11 @@ the rest: one backward pass over the member's own compiled program, one column
 per position, holding for every start the end of the member's leftmost-first
 match there — the per-position answer the overlapping `find` needs, which the
 member's own search can only give by walking from each start. It runs only once
-the member's searches have walked more than `4 × len + 64` bytes in the drive,
-so ordinary text pays for the counter alone; its answers live in the same
+the member's searches have walked more than `4 × len + 64` bytes in the drive
+(in Unicode mode `k × len + 64`, where k is the sweep's estimated cost per
+input byte counted in walked bytes: a lowered class makes the sweep thousands of
+times dearer per byte, and it must not be bought before the walks have spent
+as much), so ordinary text pays for the counter alone; its answers live in the same
 caller's region, after the cache, checkpointed exactly as the cache is. It
 supports every assertion (`\b`, `\B`, `^`, `$`, `(?m)`) and zero-width cycles.
 Measured over `{foo\w+, a[a-z]*?z}` and `a`×N + `z`: 131,456 → 795
@@ -425,9 +428,34 @@ effect.
 
 The empty-match rule follows Go's: after a match ending at `e` the next match
 may start at `e`, except an empty match exactly at `e` is skipped; after an
-empty match at `e` the search resumes past it. We advance by one **byte** where
-Go advances by one rune — the same byte-orientation the single-pattern stub
-iterators document.
+empty match at `e` the search resumes past it. In byte mode we advance by one
+**byte** where Go advances by one rune — the same byte-orientation the
+single-pattern stub iterators document. In Unicode mode the answers are Go's:
+see below.
+
+### Sets in Unicode mode
+
+A set runs in one mode, byte or Unicode, decided by its members and its own
+`unicode:` key — the rule is in [cli.md](cli.md#unicode--codepoint-mode). In
+Unicode mode every capability answers as Go does over valid UTF-8: no match
+starts, and no empty match is reported, inside a character, so `x*` over
+`"é"` reports `[0,0)` and `[2,2)` and never `[1,1)`, and `\B` — the one
+assertion that holds between two bytes of a character — counts only where a
+character starts. An `offset` inside a character is read as the start of the
+next one. This holds for every capability, both `find` policies, the batch
+entry and the answer cache. An invalid byte matches nothing (see
+[engines.md](engines.md#unicode-mode)).
+
+The rule costs nothing for a set whose members cannot match empty, which is
+nearly every set: a match that consumes a byte begins with an ASCII or a lead
+byte, never inside a character. A set with a member that can match empty
+checks, at each candidate position of that member's bucket, whether the
+position is inside a character — one byte load and compare where it is not.
+
+`max_fallback_states` is 16,384 by default for a Unicode-mode set (1,024 in
+byte mode): a lowered Unicode class costs hundreds of states, and a member
+over the limit runs on Backtracking, which measured up to 57 times dearer on
+mixed-script text — see [cli.md](cli.md#unicode--codepoint-mode).
 
 ## The gate array
 
@@ -749,7 +777,7 @@ suffix DFAs within each group:
 | Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
 | Max merged DFA states | 512 | `budget_states` (internal) |
 | Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
-| Max fallback-bucket DFA states | 1024 | `max_fallback_states` (top-level config key) |
+| Max fallback-bucket DFA states | 1024 (16,384 in Unicode mode) | `max_fallback_states` (top-level config key) |
 
 A bucket holding more than 32 patterns switches its accept representation from
 a bitmask to a per-state LIST of pattern indices, which is what lets a group of
@@ -1119,3 +1147,5 @@ bitmask form and none of these checks are emitted.
 - [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find`, secret detection (Go wasip1)
 - [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find` called directly from a native Rust host, gate array and all
 - [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `scan_any`, URL rule matching (FastEdge)
+- [examples/fastedge/lang-detect/](../examples/fastedge/lang-detect/) — `find` and `match_all` over Unicode-mode patterns, language detection by letters (FastEdge HTTP app, component)
+- [examples/browser/homoglyph/](../examples/browser/homoglyph/) — `find` over Unicode-mode patterns, lookalike and hidden characters, with byte offsets turned into JS string positions (browser)

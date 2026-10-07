@@ -86,6 +86,9 @@ ordinary find costs 1-8 on text it can skip, so the compiler picks per pattern:
   the call hands over to the start-anywhere find. A failed walk of 32 bytes or
   fewer is not charged, and the counter is checked before a walk is added, so
   one long failed walk does not trip it. Ordinary text never trips it: 0-6%.
+  A literal-anchored find on a ONE-byte literal is the exception: it always
+  takes the switch, and charges EVERY failed candidate its walk plus 40, since
+  what it guards against is many short failed candidates of a common byte.
 
 Where the start-anywhere automata cannot be built (over `max_dfa_states`, the
 memory bound, or an assertion they cannot represent exactly), the switch hands
@@ -237,7 +240,9 @@ matches.
   Backtracking member re-reads the tail from every start. The program sweep
   is one backward pass over the member's compiled program, one column per
   position: for every start, the end of its leftmost-first match. It runs once
-  the member's searches have walked `4 × len + 64` bytes, lives in the same
+  the member's searches have walked `4 × len + 64` bytes — in Unicode mode
+  `k × len + 64`, k the sweep's estimated cost per byte in walk bytes, since a
+  lowered class makes a column thousands of roots wide — lives in the same
   region after the cache, and is checkpointed the same way. Measured:
   131,456 → 795 instructions per byte (non-greedy), 124,939 → 1,052
   (Backtracking).

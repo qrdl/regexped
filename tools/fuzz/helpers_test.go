@@ -114,6 +114,7 @@ func overlapSizingCfg(pats []string) config.BuildConfig {
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "find", Overlapping: true,
 			Patterns: config.PatternSelector{Names: names},
+			Unicode:  setModeKey(),
 		}},
 	}
 }
@@ -156,6 +157,7 @@ func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *
 	set := config.SetConfig{
 		Name: "s", Find: "set_find",
 		Patterns: config.PatternSelector{All: true}, Overlapping: true,
+		Unicode: setModeKey(),
 	}
 	export := "set_find"
 	if lay.batch {

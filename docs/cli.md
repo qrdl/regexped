@@ -34,13 +34,16 @@ namespace:      "acme"     # optional; prefixes the fixed symbols a stub declare
                            #   <Set>PatternCount). Two stubs in one package or C translation unit need
                            #   distinct set names, and choosing them is yours. No-op for Rust, whose
                            #   `pub mod <rust_module>` already isolates each stub.
-max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
+max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking
+                           #   (default 1024; 16384 for a pattern in Unicode mode, see `unicode:`)
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
                            #   `compile --verbose` prints, per pattern, the engine chosen, why, and
                            #   the DFA/TDFA state and TDFA register counts against these limits
-max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
+max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024; 16384 for a Unicode-mode set)
                            #   A member over it moves to the Backtracking engine, with a warning;
                            #   `compile --verbose` prints each bucket's engine
+max_union_states: 4096     # optional; max states while building a SET's union automata (default 4096)
+                           #   — see "max_union_states:" below
 max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
                            #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
                            #   fractions allowed; a bare number is bytes. See "max_memory:" below
@@ -58,6 +61,7 @@ regexps:
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
     byte_mode: false           # optional; see "byte_mode:" below
+    unicode: false             # optional; see "unicode:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -71,6 +75,7 @@ sets:
     emit_name_map: true        # emit patternName(id) lookup helper in stubs
     patterns: all              # "all" or list of name: values from regexps:
     hints: [batch-find]        # optional; see "hints:" below
+    unicode: false             # optional; the set's mode — see "unicode:" below
 ```
 
 > **Three set keys were retired and are now load errors.**
@@ -172,6 +177,7 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
 | Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
 | Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
+| A `groups_func` pattern must have a capture group that can take part in a match | all | `a*`, or `(?:(a){0})b`, whose only group simplification removes, has no groups to report: it would compile to no groups export while every stub calls one. `compile` and `generate` refuse it too. Use `find_func` for the match's span. |
 
 ### Engine selection
 
@@ -247,19 +253,60 @@ the tables and the search's working memory only.
 - A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
   4 GiB, with a compile warning saying so.
 
+### `max_union_states:` — the budget of a set's union automata
+
+A set whose members have no literal to search for is scanned by ONE automaton
+built over all of them: `scan_any` and `scan_all` read the input once, whatever
+the member count. `match_any` and `match_all` use an anchored automaton of the
+same kind. `max_union_states` (default 4,096) caps their construction. A set
+past the cap still answers correctly, by a slower route: members that are not
+provably linear are split out to searches of their own, and the rest are walked
+position by position. `compile --diag-json` shows which route a set took
+(`union_scan.used`, and `refused: "construction"` when the cap was the reason).
+
+The cap matters most in Unicode mode, where a letter class such as `\pL` costs
+hundreds of states, so a few literal-less members can pass 4,096. Measured on
+an 8-member Unicode-mode set, scanning 64 KB of mixed-script text that no
+member matches:
+
+```yaml
+max_union_states: 16384
+regexps:
+  - { name: m0, pattern: '\pL+\p{Greek}' }
+  - { name: m1, pattern: '\p{Greek}+\p{Cyrillic}' }
+  - { name: m2, pattern: '\p{Cyrillic}+\p{Han}' }
+  - { name: m3, pattern: '\p{Han}+\pN' }
+  - { name: m4, pattern: '\pN+\p{Lu}' }
+  - { name: m5, pattern: '\p{Lu}+\p{Ll}' }
+  - { name: m6, pattern: '\p{Ll}+[^\x00-\x7f]' }
+  - { name: m7, pattern: '[^\x00-\x7f]+\pL' }
+sets:
+  - name: s
+    scan_any: s_any
+    scan_all: s_all
+    patterns: all
+```
+
+| `max_union_states` | union automaton | `scan_all` fuel per byte | module | compile time |
+|---|---|---|---|---|
+| 4096 (default) | refused: needs more states | 102 (members split out) | 1.39 MB | 55 s |
+| 16384 | 2,179 states | 23 | 0.94 MB | 173 s |
+
+A larger cap costs compile time and compiler memory, never correctness; a
+32-member set of the same kind did not fit in 16,384, and at 65,536 its
+construction ran out of 4 GB of compiler memory. In byte mode the cap is
+reached by shapes that must remember many positions at once, such as
+`a.{13}b`.
+
 ### `byte_mode:` — matching raw bytes above 127
 
-Regexped is a **byte** engine. `.` consumes one byte, classes are byte classes,
-and `\b` is ASCII. A rune above U+007F has no byte to be, so a pattern naming
-one is rejected:
-
-```
-pattern contains the non-ASCII rune U+00E9; regexped matches bytes,
-so set byte_mode: true to match it as the single byte 0xE9, or remove it
-```
+A pattern is matched byte by byte unless it asks for Unicode mode: `.` consumes
+one byte, classes are byte classes, and `\b` is ASCII. A pattern naming a rune
+above U+007F asks for Unicode mode (see `unicode:` below), where `é` means the
+character, two bytes of UTF-8.
 
 Setting `byte_mode: true` on a `regexps:` entry declares the pattern
-byte-oriented: runes `0x80`-`0xFF` become legal and mean **exactly that byte**.
+byte-oriented instead: runes `0x80`-`0xFF` mean **exactly that byte**.
 
 ```yaml
 regexps:
@@ -269,12 +316,11 @@ regexps:
     find_func: find_lead
 ```
 
-Runes above `U+00FF` are rejected in **both** modes — no byte holds one — with
-a different message that does not suggest the flag:
+Runes above `U+00FF` are rejected under `byte_mode` — no byte holds one:
 
 ```
-pattern contains the rune U+03B1, above U+00FF; regexped matches bytes
-and has no Unicode support
+pattern contains the rune U+03B1, above U+00FF, which byte mode cannot match;
+without byte mode the pattern compiles in Unicode mode
 ```
 
 The flag is per pattern because it is a statement about that pattern's text,
@@ -282,7 +328,8 @@ and it applies to set members as well as to `_func` patterns. Rust's regex
 crate spells the same distinction `(?-u)` / `regex::bytes`; an inline flag was
 not chosen here because Go's parser rejects `(?-u)` outright.
 
-**What is NOT rejected**, in either mode:
+**What does not ask for Unicode mode**, so a pattern with nothing else stays in
+byte mode:
 
 - **`.` and negated classes.** `[^,]` names every rune there is, and consumes
   one byte. This is documented byte semantics, not an oversight.
@@ -292,14 +339,82 @@ not chosen here because Go's parser rejects `(?-u)` outright.
   `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals,
   and over NEGATED classes too: `(?i)[^a-z]` and `(?i)\W` arrive with holes at
   exactly those runes, and match every byte that is not a letter (or word
-  character), `0x80`-`0xFF` included. In byte mode `(?i)` over Latin-1 adds
-  U+212B (from `å`) the same way. A rune you DID write stays refused, negated
-  or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`, `[^sSſ]` and
-  `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or the octal
-  `\577` — and the byte engine cannot match the `ſ` they ask for.
-  The consequence is that `(?i)k` does not match a Kelvin sign and
-  `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
-  practice, and folding within `0x00`-`0xFF` in byte mode.
+  character), `0x80`-`0xFF` included. Under `byte_mode` `(?i)` over Latin-1
+  adds U+212B (from `å`) the same way. A rune you DID write asks for Unicode
+  mode, negated or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`,
+  `[^sSſ]` and `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or
+  the octal `\577`; under `byte_mode` they are refused, since no byte is `ſ`.
+  The consequence is that in byte mode `(?i)k` does not match a Kelvin sign
+  and `(?i:[a-z]+)` does not match a long s: folding stays within the bytes.
+  `unicode: true` folds across Unicode, as Go does.
+
+### `unicode:` — codepoint mode
+
+What Unicode mode
+changes — `.` and classes reading whole UTF-8 characters, `(?i)` across
+Unicode, no match starting inside a character, invalid bytes matching nothing
+— is in [engines.md](engines.md#unicode-mode).
+
+On a `regexps:` entry:
+
+- **No key** — the pattern picks its own mode: Unicode when it names a
+  character above U+007F or uses a `\p{..}` / `\P{..}` class, byte mode
+  otherwise. `.` and negated classes never pick Unicode by themselves.
+- **`unicode: true`** — Unicode mode even for an ASCII-only pattern, which is
+  how to make `.` match a whole character.
+- **`unicode: false`** — exactly `byte_mode: true`.
+- `unicode: true` with `byte_mode: true`, and `unicode: false` with
+  `byte_mode: false`, on the same entry are load errors.
+
+```yaml
+regexps:
+  - name: word
+    pattern: '\pL+'          # Unicode mode: names a Unicode class
+    find_func: find_word
+  - name: any3
+    pattern: 'a.c'
+    unicode: true            # Unicode mode on request: `.` is one character
+    find_func: find_any3
+  - name: raw
+    pattern: '[\xc0-\xdf]'
+    unicode: false           # the same as byte_mode: true — raw bytes
+    find_func: find_raw
+```
+
+On a `sets:` entry the key sets the set's mode, and a set runs in one mode:
+
+- A member that sets `byte_mode: true` or `unicode: false`, together with a
+  member that asks for Unicode (by its key or by its pattern), is a compile
+  error; so is a set-level `unicode: true` with such a byte member, or a
+  set-level `unicode: false` with a member asking for Unicode.
+- Otherwise one member asking for Unicode puts the whole set in Unicode mode,
+  and members that say nothing follow it; failing that, the set-level key
+  decides, and with neither the set runs in byte mode.
+- A pattern's own `match_func` / `find_func` / `groups_func` follow the
+  pattern's rule above, whichever mode a set it belongs to runs in.
+
+`compile --verbose` and `--diag-json` report the mode each pattern and set
+was compiled in.
+
+**`max_dfa_states` is 16,384 by default for a pattern in Unicode mode**
+(1,024 in byte mode). A Unicode class is decoded byte by byte, so it costs
+DFA states per position — about 290 for `\pL` — and a pattern over the limit
+falls back to Backtracking, whose program grows with the class too: `\pL{5}x`
+needs 1,452 states and measured 39 fuel per byte as a DFA against about
+26,000 on Backtracking. A DFA table over 256 states takes 512 bytes per state,
+so the default allows about 8 MB per automaton. When a pattern needs more and
+its Backtracking program is over that engine's fixed limit of 20,000
+instructions, the compile error says which, and `compile --verbose` prints the
+state count and, for a Unicode-mode pattern, the working memory a search keeps
+per input byte (`memory:` lines). `tools/pattest` takes `-max-dfa-states N`
+to measure what a different limit does to your pattern.
+
+**`max_fallback_states` is 16,384 by default for a set in Unicode mode** too
+(1,024 in byte mode), for the same reason: a member over it runs on
+Backtracking. On a 32-member set over 64 KB of mixed-script text, the one
+member past 1,024 (`\pL{4}\pN`, 1,250 states) on Backtracking took `scan_all`
+to 152,500 fuel per byte; as a DFA, 2,661, in a smaller module (3.7 MB
+against 5.5 MB).
 
 ### `hints:` — LikelyMode and batch-find compile hints
 
@@ -382,7 +497,7 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 | Capture groups (Backtracking engine) | Yes |
 | Backreferences `\1` | No |
 | Lookahead / lookbehind | No |
-| Unicode beyond ASCII | No |
+| Unicode: characters above U+007F, `\p{..}` classes, `(?i)` across Unicode | Yes — [Unicode mode](#unicode--codepoint-mode) |
 
 ---
 
@@ -550,6 +665,17 @@ regexped [--debug] compile [--config=<file>] [--output=<file>|-]
 ```
 
 Compiles each regexp pattern to a single WASM module, or to a Component Model component.
+
+A compile can take minutes — a Unicode-mode set's union automaton, a large
+TDFA — and that is the price of a faster module. Any automaton construction
+that runs past 5 seconds prints a line on stderr, and another every 5 seconds
+after it, so a long compile is visibly working:
+
+```
+regexped: compiling set "s": DFA construction, 12400 of 16384 states so far (38 s)
+```
+
+A compile under 5 seconds prints nothing, and the module is the same either way.
 
 ### Output kinds
 

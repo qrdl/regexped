@@ -27,6 +27,13 @@ type backtrack struct {
 	// search keeps the work budget, the tripped flag and the fallback's memo
 	// per SEARCH through the caller's block (bt_search.go); nil = per call.
 	search *btSearch
+
+	// startRule is the Unicode start rule the find body keeps (find_from.go).
+	startRule startRule
+
+	// unicode: the program was compiled in a Unicode mode, so a literal its
+	// find scans for is UTF-8 text (prefixScanParams.UTF8Text).
+	unicode bool
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -88,8 +95,9 @@ func progHasZeroWidthCycle(prog *syntax.Prog) bool {
 }
 
 // newBacktrack builds the backtrack struct from a compiled NFA program.
-func newBacktrack(prog *syntax.Prog) *backtrack {
-	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2}
+func newBacktrack(mp resolvedProg) *backtrack {
+	prog := mp.prog
+	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2, unicode: mp.unicode()}
 	for _, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
 			bt.numAlts++
@@ -1618,11 +1626,11 @@ func btFoldRune(r rune) rune {
 // pattern string successfully (via compile()/syntax.Parse earlier in
 // compilePattern), so the parse here cannot fail; syntax.Compile never
 // returns a non-nil error (see its stdlib source).
-func compileBTProg(pattern string) *syntax.Prog {
-	re, _ := syntax.Parse(pattern, syntax.Perl)
-	stripCaptures(re)
-	prog, _ := syntax.Compile(re.Simplify())
-	return prog
+func compileBTProg(pattern resolvedPattern) resolvedProg {
+	t, _ := pattern.parse()
+	stripCaptures(t.re)
+	mp, _ := compileProg(t)
+	return mp
 }
 
 // btNoCaptureFrameSize is a no-capture body's frame: pos and retryPC.
@@ -2242,6 +2250,16 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	} else {
 		srch = nil
 	}
+	// The Unicode start rule's scratch, after every index named by arithmetic.
+	var startLocals utf8StartLocals
+	if bt.startRule != startRuleNone {
+		if mandLit != nil {
+			// A mandatory literal means no empty match, so no rule.
+			panic("compile: a Unicode start rule on a mandatory-literal Backtracking find")
+		}
+		startLocals = utf8StartLocals{ptr: 0, len: uint32(localLen), pos: uint32(attemptCursor.Local()),
+			c: uint32(a.I32()), k: uint32(a.I32()), n: uint32(a.I32())}
+	}
 	body = a.EmitDecls(body)
 	if dyn != nil && dyn.search == nil && srch != nil && fallback.searchTwin {
 		// An embedded build's per-call fallback: a search with a usable memo
@@ -2256,7 +2274,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// body already handles a nonzero start — its memo-skip computes
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
 	// was simply never told where to start.
-	body, findFrom = emitFindFromSeed(body, attemptCursor)
+	body, findFrom = emitFindFromSeedRule(body, attemptCursor, bt.startRule, startLocals)
 
 	// A program that can only match at position 0 (every match starts with
 	// \A or a non-multiline ^) answers a search from any later position at
@@ -2429,6 +2447,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// (bounded by loop-PC count + 9 extra locals), so byte-casting is safe.
 		mlScan := prefixScanParams{
 			Prefix:      mandLit.bytes,
+			UTF8Text:    bt.unicode,
 			EngineDepth: 2,
 			// AttemptStart is the mandatory-literal scan's OWN cursor, not
 			// the body's: this scan restarts from scanStartLocal per literal
@@ -2562,6 +2581,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 	scanParams.EngineDepth = 2
 	scanParams.OnMatch = func(b []byte) []byte {
+		if bt.startRule == startRuleScan {
+			// A candidate inside a character is no start position: continue
+			// $outer (depth 1 inside the rule's block) from the next one.
+			b = emitUTF8Start(b, startLocals, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+		}
 		// Re-init BT state.
 		b = memoPrepare(b)
 		b = append(b, 0x20, locAttemptStart, 0x21, localPos)

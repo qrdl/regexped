@@ -18,7 +18,7 @@ func componentCfg() config.BuildConfig {
 		Regexps: []config.RegexEntry{
 			{Pattern: `a`, MatchFunc: "email_match"},
 			{Pattern: `b`, FindFunc: "email_find"},
-			{Pattern: `c`, GroupsFunc: "urlGroups"},
+			{Pattern: `(c)`, GroupsFunc: "urlGroups"},
 		},
 	}
 }
@@ -512,7 +512,7 @@ func TestSetExportNames(t *testing.T) {
 
 // The version follows the INTERFACE name in the sets prefix too. Putting it after
 // the package makes wasm-tools fail with "failed to find export of interface" —
-// the phase 1 bug, which would otherwise be free to recur here.
+// a bug the pattern exports once had, which would otherwise be free to recur here.
 func TestSetExportNamesVersioned(t *testing.T) {
 	cfg := witSetsCfg()
 	cfg.WitVersion = "2.3.0"

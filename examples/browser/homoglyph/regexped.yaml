@@ -1,0 +1,46 @@
+# Homoglyph and hidden-character detection, in UNICODE mode.
+#
+# Every pattern names a Unicode script class or a character above U+007F, so
+# each compiles in Unicode mode: a class reads a whole character, never a byte
+# of one. One `find` set reports every finding with its position; index.html
+# turns the findings into highlights.
+wasm_file:     "regexps.wasm"
+import_module: "homoglyph"
+stub_file:     "regexp.js"
+
+regexps:
+  # A token — letters, digits and . _ @ - , so a domain, an e-mail address or
+  # a user name is one token — mixing Latin letters with Cyrillic or Greek
+  # ones: pаypal.com (Cyrillic а), gοοgle.com (Greek ο), аррӏе.com (all
+  # Cyrillic, .com Latin). The token's first letter picks the branch, and the
+  # branch ends at the first letter of the other kind, so the automaton stays
+  # a small DFA.
+  - name: mixed_script
+    pattern: '[0-9_.@-]*(?:\p{Latin}[\p{Latin}0-9_.@-]*[\p{Cyrillic}\p{Greek}]|[\p{Cyrillic}\p{Greek}][\p{Cyrillic}\p{Greek}0-9_.@-]*\p{Latin})[\p{Latin}\p{Cyrillic}\p{Greek}0-9_.@-]*'
+
+  # One Cyrillic or Greek letter that looks like a Latin one. Ordinary Russian
+  # or Greek text is full of them, so the page shows them only inside a
+  # mixed_script token. index.html's LOOKS_LIKE lists the same letters.
+  - name: lookalike
+    pattern: '[аеорсухѕіјԁһԛԝӏАВЕКМНОРСТХЅІЈҮοναρικυΑΒΕΖΗΙΚΜΝΟΡΤΥΧ]'
+
+  # Characters that take up no space: zero-width space, non-joiner and joiner,
+  # word joiner, byte-order mark, soft hyphen. pay\u200Bpal reads as paypal.
+  - name: invisible
+    pattern: '[\x{00AD}\x{200B}-\x{200D}\x{2060}\x{FEFF}]+'
+
+  # Bidirectional controls, which reorder how text is DISPLAYED without
+  # changing what it is — the "Trojan Source" attack hides code this way.
+  - name: bidi_control
+    pattern: '[\x{061C}\x{200E}\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}]+'
+
+  # Styled letters and digits: fullwidth (ｐａｙｐａｌ), mathematical (𝐩𝐚𝐲𝐩𝐚𝐥, four
+  # UTF-8 bytes each) and circled (ⓟⓐⓨ).
+  - name: styled
+    pattern: '[\x{FF10}-\x{FF19}\x{FF21}-\x{FF3A}\x{FF41}-\x{FF5A}\x{1D400}-\x{1D7FF}\x{24B6}-\x{24E9}]+'
+
+sets:
+  - name: homoglyph
+    find: scan_text
+    patterns: all
+    emit_name_map: true

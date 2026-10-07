@@ -1,0 +1,7 @@
+# A ONE-byte inner literal behind a leading repeat of a class common in prose:
+# the literal-anchored find scans for `@`, walks back over the prefix and
+# forward over the rest, and carries the start-anywhere switch's counter,
+# which charges every failed candidate.
+regexps:
+  - pattern: '\w+@\w+'
+    find_func: onebyte_find

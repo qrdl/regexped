@@ -3,5 +3,5 @@
 # find classifier replaces today's find with a forward start-anywhere pass
 # plus a backward pass (compile/start_anywhere.go).
 regexps:
-  - pattern: '\w+@\w+'
+  - pattern: '[a-z]+[0-9]{3}'
     find_func: sa_find

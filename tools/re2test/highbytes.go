@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------
@@ -377,6 +379,20 @@ func setOracleTwins(pats, strs []string) (twins [][]string, live []bool) {
 		twins[pi] = make([]string, len(strs))
 	}
 	live = make([]bool, len(strs))
+	if *unicodeFlag {
+		// Unicode mode reads a high byte as Go does, so the input is its own
+		// twin — except invalid UTF-8 beside a pattern that can match
+		// U+FFFD, where the two differ by design and nothing states the
+		// answer.
+		fffd := slices.ContainsFunc(pats, canMatchReplacement)
+		for si, s := range strs {
+			for pi := range pats {
+				twins[pi][si] = s
+			}
+			live[si] = !fffd || utf8.ValidString(s)
+		}
+		return twins, live
+	}
 	for si, s := range strs {
 		if !hasHighByte(s) {
 			for pi := range pats {

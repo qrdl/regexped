@@ -109,6 +109,15 @@ provably linear — see
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.
 
+In Unicode mode the shapes above mostly stop applying, because a class with
+multi-byte members is a cycle of several states rather than one self-loop.
+Measured over four Unicode shapes (a `\pL{12,}` run, `key=[^;]+;` over
+Cyrillic, `привет\s+\pL+`, a set over four scripts), no hint lowered fuel:
+of the eight hinted builds, four were the same module as the unhinted one, two
+cost nothing, and two cost more — **+19%** (`prefer-match` on `key=[^;]+;`,
+matching text) and +4% (`prefer-no-match` on `\pL{12,}`, matching text).
+Measure before hinting a Unicode pattern.
+
 ## The optimisations, briefly
 
 - **Counted-chain SIMD verifier** — verifies a fixed-count character class
@@ -137,6 +146,15 @@ won't change anything.
   than a proportional one. Applies to any repeated run, however wide the
   character class, and only to sets large enough to pack into a sparse
   bucket.
+
+  **In Unicode mode it strides over ASCII only.** A repeated class with
+  multi-byte members (`[^;]+`, `\pL+`) is a cycle of several states once
+  decoded byte by byte, and only its ASCII bytes keep the walk in one state.
+  Measured on 40 members of the shape `union[ \t]+kNN[^;]+` over 64 KB with
+  long tails: −93% fuel when the tails are ASCII, but **+78%** when they are
+  Cyrillic, where the stride stops at every character and its bookkeeping
+  costs more than it saves. Measure a Unicode set's real traffic before
+  shipping `prefer-match` on it.
 
 Each of the SIMD skips above turns itself off for the rest of a call once it
 has failed to skip anything several times in a row, so a hint that turns out

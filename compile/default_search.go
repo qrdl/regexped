@@ -114,7 +114,7 @@ func assignDefaults(m *defaultModule, patterns []*compiledPattern, sets []*compi
 		return
 	}
 	for _, p := range patterns {
-		if p.hasFindFunc() && p.findFromMode == ffNative {
+		if p.hasFindFunc() && p.findFromMode.native() {
 			p.defFind = m.forPattern(p, false)
 		}
 		if p.hasGroupsFromWrapper() && (!p.anchored || p.captureFromMode != ffAnchoredZeroOnly) {

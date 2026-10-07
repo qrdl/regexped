@@ -33,7 +33,7 @@ func mustParse(t *testing.T, pattern string) *syntax.Regexp {
 func findPath(t *testing.T, pattern string) ([]splitFrame, bool) {
 	t.Helper()
 	re := mustParse(t, pattern)
-	lit, path := findMandatoryLitRec(re, 0, 0, false)
+	lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 	if lit == nil {
 		return nil, false
 	}
@@ -166,7 +166,7 @@ func TestSplitAtPath_RejectsQuantifier(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			re := mustParse(t, tc.pattern)
-			lit, path := findMandatoryLitRec(re, 0, 0, false)
+			lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 			if lit == nil {
 				t.Skip("no mandatory lit found (pattern not eligible)")
 			}
@@ -182,7 +182,7 @@ func TestSplitAtPath_RejectsAlternate(t *testing.T) {
 	// Construct a path that contains OpAlternate manually (findMandatoryLitRec
 	// never returns a path with OpAlternate, but splitAtPath must reject it).
 	re := mustParse(t, `foo`)
-	lit, path := findMandatoryLitRec(re, 0, 0, false)
+	lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 	if lit == nil {
 		t.Fatal("no mandatory lit found")
 	}
@@ -207,7 +207,7 @@ func buildCanonicalDFA(t *testing.T, pattern string) *dfaTable {
 	if err != nil {
 		t.Fatalf("Compile(%q): %v", pattern, err)
 	}
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	d, ok := newDFA(byteProg(prog), false, maxHelperDFAStates)
 	if !ok {
 		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
 	}
@@ -645,7 +645,7 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 2: fixture loader and tests
+// Fixture loader and tests
 
 type setFixture struct {
 	Patterns []struct {
@@ -710,7 +710,7 @@ func testdataFixture(t *testing.T, name string) setFixture {
 func TestBitmaskPropagation_TwoPatterns(t *testing.T) {
 	// "ab" and "ac": after consuming 'b' only bit 0 accepts; after 'c' only bit 1.
 	asts := []*syntax.Regexp{mustParse(t, `ab`), mustParse(t, `ac`)}
-	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, kind, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -743,7 +743,7 @@ func TestBitmaskPropagation_TwoPatterns(t *testing.T) {
 func TestBitmaskPropagation_EpsilonClosure(t *testing.T) {
 	// "a?" has an epsilon path to accept (can match empty string).
 	asts := []*syntax.Regexp{mustParse(t, `a?`), mustParse(t, `b`)}
-	table, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -786,8 +786,8 @@ func TestBuildUnionProg_SinglePattern(t *testing.T) {
 	// Single pattern: altCount == 0, union.Start = starts[0], no Alt chain.
 	re, _ := syntax.Parse(`ab`, syntax.Perl)
 	prog, _ := syntax.Compile(re.Simplify())
-	union, patternBits := buildUnionProg([]*syntax.Prog{prog}, 64)
-	if union == nil {
+	union, patternBits := buildUnionProg(byteProgs([]*syntax.Prog{prog}), 64)
+	if union.prog == nil {
 		t.Fatal("buildUnionProg: nil result")
 	}
 	// At least the single InstMatch should be assigned bit 0.
@@ -805,7 +805,7 @@ func TestMergeSuffixDFA_TooManyPatterns(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `a`)
 	}
-	_, _, err := mergeSuffixDFA(asts, CompileSetOptions{BitmaskWidth: 64})
+	_, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{BitmaskWidth: 64})
 	if err == nil {
 		t.Error("expected error for 65 patterns with BitmaskWidth=64, got nil")
 	}
@@ -1013,7 +1013,7 @@ func TestChooseLiteralFrontend(t *testing.T) {
 	}{seventeenShort, frontendAC})
 
 	for _, c := range cases {
-		got := chooseLiteralFrontend(c.lits)
+		got := chooseLiteralFrontend(c.lits, false)
 		if got != c.want {
 			t.Errorf("chooseLiteralFrontend(%v) = %v, want %v", c.lits, got, c.want)
 		}
@@ -1115,7 +1115,7 @@ func assertDataSectionConsistent(t *testing.T, wasm []byte) {
 	// No data section present; nothing to check.
 }
 
-// ---- Phase 5.5: AC/Teddy WASM emitter tests ----
+// ---- AC/Teddy WASM emitter tests ----
 
 // TestACBudget covers the Aho-Corasick table budget, which replaced a
 // 32-NODE cap that silently demoted any set past ~17-26
@@ -1531,15 +1531,8 @@ func TestCompileFallback_Merges(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // --------------------------------------------------------------------------
-// Phase 3: bin-packing tests
+// Bin-packing tests
 
 func TestBinPacking_BitmaskCap(t *testing.T) {
 	// 9 patterns all sharing mandatory literal "foo" (variable-length suffix keeps
@@ -2238,7 +2231,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 				t.Fatalf("analyzePattern: %v", err)
 			}
 			info.globalID = i
-			solo, err := mergeAnchoredDFA([]*syntax.Regexp{patternFullAST(info)}, opts)
+			solo, err := mergeAnchoredDFA([]resolvedTree{patternFullAST(info)}, opts)
 			if err != nil {
 				t.Fatalf("mergeAnchoredDFA: %v", err)
 			}
@@ -2291,11 +2284,11 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 	asts, _ := sparseTestASTs(t, 128)
 	opts := CompileSetOptions{}
 
-	if _, _, err := mergeSuffixDFA(asts, opts); err == nil {
+	if _, _, err := mergeSuffixDFA(byteTrees(asts), opts); err == nil {
 		t.Fatal("mergeSuffixDFA accepted 128 patterns; the 32-pattern bitmask cap is the premise of sparse accept")
 	}
 
-	tab, d, err := mergeSuffixDFASparseSet(asts, opts)
+	tab, d, err := mergeSuffixDFASparseSet(byteTrees(asts), opts)
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
 	}
@@ -2322,7 +2315,7 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 // misunderstanding cannot pass.
 func TestSparseSetAcceptListsAreCorrect(t *testing.T) {
 	asts, pats := sparseTestASTs(t, 128)
-	_, d, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	_, d, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("sparse merge: %v", err)
 	}
@@ -2379,7 +2372,7 @@ func TestSparseSetAcceptListsAreCorrect(t *testing.T) {
 // the emitted bytes; this covers the accept maps directly.
 func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 	asts, _ := sparseTestASTs(t, 8)
-	tab, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	tab, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("bitmask merge: %v", err)
 	}
@@ -2387,7 +2380,7 @@ func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, ok := newDFA(prog, false, true, maxHelperDFAStates)
+	d, ok := newDFA(byteProg(prog), true, maxHelperDFAStates)
 	if !ok {
 		t.Fatal("newDFA failed")
 	}
@@ -2412,7 +2405,7 @@ func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 // lists differed. The symptom was a 25-state table where 137 is correct.
 func TestSparseSetTableAcceptListsAreCorrect(t *testing.T) {
 	asts, pats := sparseTestASTs(t, 128)
-	tab, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	tab, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("sparse merge: %v", err)
 	}
@@ -2565,7 +2558,7 @@ func TestCompileSetRejectsBucketWithNoSuffixDFA(t *testing.T) {
 			t.Fatalf("panic = %v, want one naming the missing suffix DFA", r)
 		}
 	}()
-	assertBucketEmittable(3, &bucket{literal: "KEY", patterns: []*PatternInfo{{fullPattern: `KEY[0-9]+`}}})
+	assertBucketEmittable(3, &bucket{literal: "KEY", patterns: []*PatternInfo{{fullPattern: `KEY[0-9]+`, rp: bytePat(`KEY[0-9]+`)}}})
 }
 
 // binPack must not produce a bucket with a nil suffix DFA for any pattern that

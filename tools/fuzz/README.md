@@ -150,8 +150,9 @@ empirically:
 
 `FuzzSet`'s oracle probes each start position `p` against the *whole* input —
 `\A`, then a `p`-character prefix, then the pattern — so `^ $ \A \z \b \B` are
-judged against their real left context. That prefix counts runes, so the target
-skips non-ASCII input. It also skips inputs longer than the probe sweep can
+judged against their real left context. That prefix counts runes, so in byte
+mode, where regexped counts bytes, the target skips non-ASCII input; with
+`-unicode` it checks it. It also skips inputs longer than the probe sweep can
 price under the fuzz worker's deadline, and capture-bearing patterns, which a
 set drops by design.
 
@@ -207,5 +208,10 @@ expands only where it earns its keep:
 - **Layer 3** (differential DFA-vs-Backtracking fuzzing) — not built yet.
 - **CI wiring** — this is a local/overnight tool for now, not part of
   `.github/workflows/ci.yml`.
-- **Unicode** — patterns/inputs with any byte > 127 or a `\p`/`\P` escape
-  are skipped, mirroring `tools/re2test`'s existing Unicode carve-out.
+- **Non-ASCII in byte mode** — a byte-mode run skips input with a byte above
+  127, where regexped reads bytes and Go reads runes. Unicode mode is fuzzed by
+  its own targets, which pass `-unicode` and add multi-byte and invalid-UTF-8
+  seeds: `make seed-unicode` replays the corpora, `make fuzz-unicode`,
+  `fuzz-unicode-groups` and `fuzz-unicode-set` fuzz. Go is the oracle there
+  too, except on input that is not valid UTF-8 for a pattern that can match
+  U+FFFD: Go reads such a byte as U+FFFD, Unicode mode matches nothing on it.

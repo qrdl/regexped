@@ -24,7 +24,9 @@ type Diagnostics struct {
 
 // SetDiag holds diagnostics for one set.
 type SetDiag struct {
-	Name     string `json:"name"`
+	Name string `json:"name"`
+	// Mode is the mode the set runs in, "byte" or "unicode" (resolveSetMode).
+	Mode     string `json:"mode"`
 	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"
 	// Capabilities lists the set's declared capability keys, in the
 	// canonical grid order.
@@ -152,6 +154,11 @@ type SetDiag struct {
 	// when the set's buckets cannot be swept directly: every member's full
 	// pattern merged, beside the buckets the walk keeps.
 	WholeSetSweep *WholeSetSweepDiag `json:"whole_set_sweep,omitempty"`
+	// CacheBytesPerByte is what the region an overlapping `find` is offered —
+	// its answer cache and its split members' program sweep — costs per input
+	// byte, up to the single-block budget (64 MiB), past which it grows with
+	// the square root of the input. 0 when the set keeps no such region.
+	CacheBytesPerByte int `json:"cache_bytes_per_byte,omitempty"`
 }
 
 // WholeSetSweepDiag is the whole-set automaton's size: its states, and the

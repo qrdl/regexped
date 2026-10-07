@@ -1,9 +1,5 @@
 package compile
 
-import (
-	"regexp/syntax"
-)
-
 // First-byte eligibility mask.
 //
 // A fallback bucket has no literal to skip with, so the scalar find body
@@ -44,25 +40,31 @@ import (
 // Built on getFirstRuneSet, whose contract is already "empty result means
 // undetermined" (see its callers in selector.go), so its conservatism is
 // inherited rather than restated.
-func firstByteSet(pat string) []bool {
-	parsed, err := syntax.Parse(pat, syntax.Perl)
+func firstByteSet(pat resolvedPattern) []bool {
+	parsed, err := pat.parse()
 	if err != nil {
 		return nil
 	}
-	stripCaptures(parsed)
+	stripCaptures(parsed.re)
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(parsed.Simplify())
-	runes := getFirstRuneSet(prog, prog.Start)
+	mp, _ := compileProg(parsed)
+	runes := getFirstRuneSet(mp.prog, mp.prog.Start)
 	if len(runes) == 0 {
 		return nil // undetermined — assume every byte
 	}
+	// In a Unicode mode the program is LOWERED: its instructions name bytes,
+	// so every value here is a byte — ASCII or a UTF-8 lead byte, never a
+	// continuation byte, since a lowered program consumes only whole
+	// sequences. In byte mode a value above 0x7F is a rune of several bytes,
+	// and what leads it is a lead byte, not the rune: give up there and let
+	// every byte through.
+	limit := rune(0x7F)
+	if mp.unicode() {
+		limit = 0xFF
+	}
 	out := make([]bool, 256)
 	for r := range runes {
-		if r < 0 || r > 0x7F {
-			// A non-ASCII rune is encoded as several bytes and what leads it
-			// is a UTF-8 lead byte, not the rune. Not worth deriving for a
-			// byte-oriented engine whose Unicode support is out of scope
-			// (CLAUDE.md): give up and let every byte through.
+		if r < 0 || r > limit {
 			return nil
 		}
 		out[r] = true
@@ -96,7 +98,7 @@ func buildStartableTable(bkt *bucket) []uint32 {
 		// No k >= 32 check: the len(bkt.patterns) > 32 guard above already
 		// returned, so it was unreachable.
 		bit := uint32(1) << uint(k)
-		set := firstByteSet(p.fullPattern)
+		set := firstByteSet(p.rp)
 		if set == nil {
 			for b := range tab {
 				tab[b] |= bit

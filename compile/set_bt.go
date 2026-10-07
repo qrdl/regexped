@@ -2,7 +2,6 @@ package compile
 
 import (
 	"fmt"
-	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -54,13 +53,13 @@ import (
 //
 // ast is the pattern's full AST (patternSuffixAST), captures already
 // irrelevant because sets never report them.
-func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
-	if ast == nil {
+func admitBTFallback(ast resolvedTree) *btBucketInfo {
+	if ast.re == nil {
 		return nil
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(ast.Simplify())
-	if len(prog.Inst) > maxBTFallbackInstructions {
+	prog, _ := compileProg(ast)
+	if len(prog.prog.Inst) > maxBTFallbackInstructions {
 		return nil
 	}
 	bt := newBacktrack(prog)
@@ -82,6 +81,10 @@ func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
 func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []int,
 	prefixPool, suffixPool *dfaPool) ([]*PatternInfo, []int, error) {
 
+	mode, err := resolveSetMode(sc, cfg, selectedIdx)
+	if err != nil {
+		return nil, nil, err
+	}
 	var infos []*PatternInfo
 	var globalIDs []int
 	for _, idx := range selectedIdx {
@@ -89,7 +92,7 @@ func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []
 		if re.CaptureStubsRequested() {
 			continue // drop capture-bearing
 		}
-		info, err := analyzePattern(re, prefixPool, suffixPool)
+		info, err := analyzeSetMember(re, mode.member(re.Pattern), prefixPool, suffixPool)
 		if err != nil {
 			patLabel := re.Name
 			if patLabel == "" {

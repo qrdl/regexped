@@ -13,7 +13,6 @@
 - [Usage](#usage)
 - [Examples](#examples)
 - [Documentation](docs/README.md)
-- [Limitations](#limitations)
 - [Dependencies](#dependencies)
 - [License](#license)
 
@@ -21,7 +20,7 @@ Regexped (pronounced reg-exped, short for REGexp EXPEDited) compiles regular exp
 
 Embed high-performance regexp matchers directly into WASM applications — no full regexp engine needed at runtime.
 
-Supports RE2/Perl (leftmost-first) semantics. Unicode not yet supported.
+Supports RE2/Perl (leftmost-first) semantics, over bytes or — in Unicode mode, chosen per pattern and per set — over UTF-8 characters.
 
 ## Features
 
@@ -151,18 +150,15 @@ Examples are available for the following environments: wasmtime, native Rust hos
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-Most build a core WASM module. Three build **Component Model components** 🧩: [`wasmtime/rust/secrets`](examples/wasmtime/rust/secrets) instead of a module, consumed through a generated Rust stub and composed by `regexped merge`; [`wasmtime/rust/secret-scanner`](examples/wasmtime/rust/secret-scanner) and [`wasmtime/c/url-parts`](examples/wasmtime/c/url-parts) alongside a module, from the same source — see [component.md](docs/component.md).
+Most build a core WASM module. Four build **Component Model components** 🧩: [`wasmtime/rust/secrets`](examples/wasmtime/rust/secrets) and the FastEdge HTTP app [`fastedge/lang-detect`](examples/fastedge/lang-detect) instead of a module, consumed through a generated Rust stub and composed by `regexped merge`; [`wasmtime/rust/secret-scanner`](examples/wasmtime/rust/secret-scanner) and [`wasmtime/c/url-parts`](examples/wasmtime/c/url-parts) alongside a module, from the same source — see [component.md](docs/component.md).
+
+Two compile their patterns in **Unicode mode**: [`fastedge/lang-detect`](examples/fastedge/lang-detect), which names European languages by the letters of a text, and [`browser/homoglyph`](examples/browser/homoglyph), which marks lookalike letters and invisible and text-direction characters as you type.
 
 See [`examples/README.md`](examples/README.md) for more details, including which format each example builds.
 
 ## Documentation
 
 See the [documentation index](docs/README.md).
-
-## Limitations
-
-- **No Unicode support** — patterns and input are treated as raw bytes (Latin-1/ASCII). Unicode character classes (`\p{L}`, `\p{N}`, etc.), Unicode case folding, and multi-byte Unicode literals are not supported.
-- **Re-entrant, not thread-safe** — every stub keeps its per-scan state with the caller (a caller-owned scanner in C, inside the iterator in Rust, Go and AssemblyScript, a per-call region in JS and TS), so two scans can be in flight at once on one thread. The module itself is not thread-safe in any language: the Backtracking engine keeps its frame stack at a fixed address in the module's memory and its fallback body's memo in scratch found through module globals, and the find-from position travels to the body through a module-level global. Use one module instance per thread.
 
 ## Dependencies
 

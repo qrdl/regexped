@@ -1,0 +1,8 @@
+# Unicode mode: captures on TDFA around a negated class lowered to a cycle
+# through one state per character byte. The TDFA keeps the class's two ASCII
+# ranges as two states with identical rows; the capture body crosses runs of
+# whole characters 16 bytes at a time from the arms where the walk enters them.
+regexps:
+  - pattern: '<([^>]+)>(x)'
+    groups_func: uni_tdfa_charrun_groups
+    unicode: true

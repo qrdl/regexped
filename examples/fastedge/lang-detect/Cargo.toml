@@ -1,0 +1,18 @@
+[package]
+name = "lang-detect"
+version = "0.1.0"
+edition = "2021"
+
+# A FastEdge HTTP application: a wasi:http GUEST component, built for
+# wasm32-wasip2 and then composed with the regexp component by
+# `regexped merge`. The generated stub needs wit-bindgen: a component consumer
+# cannot declare its imports by hand, because wasm32-wasip2 requires the
+# component-type metadata this macro embeds.
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+anyhow = "1"
+wstd = "0.6"
+wit-bindgen = "0.61"
