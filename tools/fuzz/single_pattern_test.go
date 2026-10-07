@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -1263,6 +1264,42 @@ var characterRunShapes = []struct{ name, pat, body string }{
 	{"forward-pass", `[ab]+[^z]*z`, "find: switch"},
 }
 
+// checkUnicodeCharacterRunMatch drives pat's match body, which crosses its
+// loop with the skip over whole UTF-8 characters too, over every prefix of each
+// input that ends just after an exit byte — where a full match can end — and
+// over the whole input, against Go's full match of oracle.
+func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []string) {
+	t.Helper()
+	w, _, err := compile.Compile([]config.RegexEntry{{Pattern: pat, MatchFunc: "match"}}, pathsTableBase, true, compile.CompileOptions{Unicode: true})
+	if err != nil {
+		t.Fatalf("compile %q: %v", pat, err)
+	}
+	// The validity check's first table, emitted once per skip site.
+	sig := []byte{0xFD, 0x0C, 2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73}
+	if !bytes.Contains(w, sig) {
+		t.Fatalf("%q: the match body takes no skip over whole characters", pat)
+	}
+	full := regexp.MustCompile(`\A(?:` + oracle + `)\z`)
+	for _, in := range inputs {
+		cuts := []int{len(in)}
+		for i := 0; i < len(in); i++ {
+			if strings.IndexByte(",\n\"y>&z", in[i]) >= 0 {
+				cuts = append(cuts, i+1)
+			}
+		}
+		for _, cut := range cuts {
+			s := in[:cut]
+			end, ok, hang, err := runWasmMatch(w, s)
+			if err != nil || hang {
+				t.Fatalf("%q over %q: err %v, hang %v", pat, s, err, hang)
+			}
+			if want := full.MatchString(s); ok != want || ok && end != len(s) {
+				t.Errorf("%q match over %q: got (%d, %v), want %v", pat, s, end, ok, want)
+			}
+		}
+	}
+}
+
 // characterRunGroupsShapes are Unicode-mode captures whose TDFA capture body
 // has such a loop — a group of states with identical rows — and crosses it
 // with the UTF-8 skip from the arms where the walk enters it, or, with no tag
@@ -1361,8 +1398,9 @@ func characterRunInputs() []string {
 
 // TestUnicodeCharacterRunSkip drives every characterRunShapes pattern from
 // every start position, and through a stub's iteration, in all three
-// search-block modes, and every characterRunGroupsShapes pattern through the
-// groups iteration, against Go over the same pattern without U+FFFD.
+// search-block modes, and its match body; and every characterRunGroupsShapes
+// pattern through the groups iteration — all against Go over the same pattern
+// without U+FFFD.
 func TestUnicodeCharacterRunSkip(t *testing.T) {
 	inputs := characterRunInputs()
 	for _, in := range inputs {
@@ -1400,6 +1438,7 @@ func TestUnicodeCharacterRunSkip(t *testing.T) {
 					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
 				}
 			}
+			checkUnicodeCharacterRunMatch(t, c.pat, oracle, inputs)
 		})
 	}
 	for _, pat := range characterRunGroupsShapes {

@@ -1938,6 +1938,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				lmBareShufti:         false,
 				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+				// In Unicode mode a loop over whole characters is a
+				// dominant state too, as it is for the find layout: without
+				// it a match body walked `.+` byte by byte, 24 fuel/byte
+				// against 4.9 with the skip.
+				utf8Text: rp.unicode(),
 			})
 			// Since 2026-07-18: non-mid dominants are default-on for
 			// every LikelyMode again, replacing the LikelyMatch-only

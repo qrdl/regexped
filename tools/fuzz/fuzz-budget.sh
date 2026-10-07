@@ -12,20 +12,31 @@
 # resumes fuzzing with whatever time budget remains.
 #
 # Usage:
-#   ./fuzz-budget.sh [TIME] [MAX_ERRORS] [TARGET]
+#   [UNICODE=1] [PARALLEL=N] ./fuzz-budget.sh [TIME] [MAX_ERRORS] [TARGET]
 #   TIME        total wall-clock budget as a sequence of <number><unit>
 #               chunks (h/m/s), e.g. 10m, 1h30m, 45s. Default: 10m.
 #   MAX_ERRORS  stop after this many distinct crashers. Default: 5.
 #   TARGET      the fuzz function to run, e.g. FuzzSet, FuzzSetCaps or
 #               FuzzFindBatch for sets. Default: FuzzCorrectness.
+#   UNICODE=1   compile every pattern in Unicode mode (the harness's -unicode
+#               flag). Default: byte mode.
+#   PARALLEL=N  run N fuzz workers (go test -parallel). Default: Go's own, one
+#               per CPU. The harness's compile-time guards were calibrated at
+#               4 workers; on a many-core machine prefer several targets at
+#               8 or so each over one target on every core, since contended
+#               workers stretch every call towards Go's 10-second hang limit.
+#
+# Only TARGET runs: -run selects it alone, so neither a relaunch nor the first
+# launch replays the package's other tests and seed corpora first (`make
+# seed-all` does that).
 #
 # Found crashers are moved to found/<TARGET>/<run-timestamp>/<found-time>-<hash>
-# — per target, mirroring testdata/fuzz/<TARGET>/, because the file itself does
-# not record which target produced it — in the same "go test fuzz v1" encoding
-# go test itself writes. To reproduce and debug one, copy it back under the
-# same target:
+# — found/<TARGET>-unicode/… under UNICODE=1 — per target and mode, mirroring
+# testdata/fuzz/<TARGET>/, because the file itself records neither, in the same
+# "go test fuzz v1" encoding go test itself writes. To reproduce and debug one,
+# copy it back under the same target and replay it in the same mode:
 #   cp found/<TARGET>/.../HHMMSS-<hash> testdata/fuzz/<TARGET>/<hash>
-#   go test -run=<TARGET> .
+#   go test -run=<TARGET> .                 # found/<TARGET>-unicode: add -args -unicode
 # Once understood, shrink it and add the minimal repro to
 # tools/re2test/custom-tests.txt (custom-sets.txt for a set target) as a
 # permanent regression test — don't rely on the testdata/fuzz entry alone for
@@ -38,7 +49,7 @@
 # Sort them by TIMING before looking for a wrong answer:
 #
 #   cp found/<TARGET>/.../HHMMSS-<hash> testdata/fuzz/<TARGET>/<hash>
-#   /usr/bin/time go test -run='^<TARGET>$/<hash>$' .
+#   /usr/bin/time go test -run='^<TARGET>$/<hash>$' .   # (-args -unicode for a Unicode one)
 #
 # A file that PASSES on that solo replay and reports no mismatch is a TIMING
 # ARTEFACT, not a defect. Two kinds turn up, and neither is an engine fault:
@@ -68,7 +79,24 @@ TIME="${1:-10m}"
 MAX_ERRORS="${2:-5}"
 TARGET="${3:-FuzzCorrectness}"
 CORPUS_DIR="testdata/fuzz/${TARGET}"
-FOUND_DIR="found/${TARGET}/$(date +%Y%m%d-%H%M%S)"
+MODE_SUFFIX=""
+TEST_ARGS=()
+if [[ "${UNICODE:-}" == "1" ]]; then
+	MODE_SUFFIX="-unicode"
+	TEST_ARGS=(-args -unicode)
+elif [[ -n "${UNICODE:-}" ]]; then
+	echo "UNICODE must be 1 or unset, got: $UNICODE" >&2
+	exit 2
+fi
+PARALLEL_FLAG=()
+if [[ -n "${PARALLEL:-}" ]]; then
+	if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || [[ "$PARALLEL" -eq 0 ]]; then
+		echo "PARALLEL must be a positive integer, got: $PARALLEL" >&2
+		exit 2
+	fi
+	PARALLEL_FLAG=(-parallel="$PARALLEL")
+fi
+FOUND_DIR="found/${TARGET}${MODE_SUFFIX}/$(date +%Y%m%d-%H%M%S)"
 
 if ! [[ "$MAX_ERRORS" =~ ^[0-9]+$ ]] || [[ "$MAX_ERRORS" -eq 0 ]]; then
 	echo "MAX_ERRORS must be a positive integer, got: $MAX_ERRORS" >&2
@@ -130,9 +158,9 @@ while :; do
 	fi
 
 	before=$(ls "$CORPUS_DIR" 2>/dev/null | sort)
-	echo "== fuzzing ${TARGET} for up to ${remaining}s (found ${found}/${MAX_ERRORS} so far) =="
+	echo "== fuzzing ${TARGET}${MODE_SUFFIX:+ (Unicode mode)} for up to ${remaining}s (found ${found}/${MAX_ERRORS} so far) =="
 	log=$(mktemp)
-	if go test -fuzz="^${TARGET}\$" -fuzztime="${remaining}s" . >"$log" 2>&1; then
+	if go test -run="^${TARGET}\$" -fuzz="^${TARGET}\$" -fuzztime="${remaining}s" "${PARALLEL_FLAG[@]}" . "${TEST_ARGS[@]}" >"$log" 2>&1; then
 		rm -f "$log"
 		echo "fuzztime elapsed with no new failure"
 		continue

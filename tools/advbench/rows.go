@@ -153,6 +153,8 @@ var rows = []row{
 		spec: spec{Pattern: `(0*\b|)*0`, Fn: "groups", Gen: "rep:0", Sizes: sz(1024, 2048, 4096, 8192)}},
 	{Name: "bt-budget/set find member (?:aa|a){0,40}b|a", Expect: linear, Why: "a set member's budget lasts one host call",
 		spec: spec{Config: "cfg/setbt4.yaml", Fn: "find", Gen: "rep:a", Sizes: sz(256, 512, 1024, 2048)}},
+	{Name: "bt-budget/set find member (?:ab|cd|ef)*z beside a", Expect: linear, Why: "an alternation's first-byte dispatch enters its only arm without a frame and must charge the budget for the arms it skips: uncharged, the walk from every candidate never trips it (×3.97)",
+		spec: spec{Config: "cfg/setbt5.yaml", Fn: "find", Gen: "rep:ab", Sizes: sz(2048, 4096, 8192)}},
 
 	// ---- Overlapping sets and the answer cache.
 	{Name: "overlap/40 unbounded members", Expect: linear, Why: "the answer cache's rows widen past 32 members",

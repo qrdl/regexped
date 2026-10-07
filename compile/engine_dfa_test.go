@@ -547,6 +547,39 @@ func TestDFALayoutUTF8SelfLoop(t *testing.T) {
 	}
 }
 
+// TestMatchUTF8ErrLocal pins where a match body keeps the UTF-8 skip's error
+// lanes: one v128 after its last local — the chunk at 5, or the hysteresis
+// pair at 6 and 7 once a dominant state does not accept — declared only when a
+// dominant state takes that skip.
+func TestMatchUTF8ErrLocal(t *testing.T) {
+	mid, nonMid := dominantInfo{isMidAccept: true}, dominantInfo{}
+	utf8Mid, utf8NonMid := dominantInfo{isMidAccept: true, utf8: true}, dominantInfo{utf8: true}
+	for _, c := range []struct {
+		name  string
+		infos []dominantInfo
+		want  byte
+	}{
+		{"none", nil, 0},
+		{"byte loops only", []dominantInfo{mid, nonMid}, 0},
+		{"accepting UTF-8 loop", []dominantInfo{utf8Mid}, 0x06},
+		{"accepting UTF-8 loop, hysteresis", []dominantInfo{utf8Mid, nonMid}, 0x08},
+		{"non-accepting UTF-8 loop", []dominantInfo{utf8NonMid}, 0x08},
+	} {
+		if got := matchUTF8ErrLocal(c.infos); got != c.want {
+			t.Errorf("%s: matchUTF8ErrLocal = %d, want %d", c.name, got, c.want)
+		}
+		decl := []byte{0x02, 0x03, 0x7F, 0x01, 0x7B}
+		got := appendMatchUTF8Err(append([]byte(nil), decl...), 0, c.infos)
+		want := decl
+		if c.want != 0 {
+			want = []byte{0x03, 0x03, 0x7F, 0x01, 0x7B, 0x01, 0x7B}
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: appendMatchUTF8Err = % x, want % x", c.name, got, want)
+		}
+	}
+}
+
 // TestDFALayoutTeddyTiers pins how deep the Teddy prefilter is built for
 // shapes the rest of the corpus does not produce: word-boundary patterns
 // (where the filter must union the prev-is-word and prev-is-non-word

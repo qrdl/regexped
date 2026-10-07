@@ -157,6 +157,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 			hystDom = true
 		}
 	}
+	groupsAt := len(b)
 	if l.useCompression {
 		switch {
 		case hystDom:
@@ -176,6 +177,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 			b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
 		}
 	}
+	b = appendMatchUTF8Err(b, groupsAt, l.dominantStates) // the UTF-8 skip's error lanes
 
 	// Literal chain prefix.
 	if len(chain) >= 2 {

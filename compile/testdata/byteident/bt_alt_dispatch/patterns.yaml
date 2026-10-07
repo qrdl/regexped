@@ -1,0 +1,9 @@
+# Backtracking (a word boundary and two groups): the first-byte dispatch at the
+# head of an alternation chain — direct, each case pushing its own arms, for
+# the keywords, and compact, a mask and one shared push sequence, where most
+# bytes start most arms.
+regexps:
+  - pattern: '\b(get|head|post|delete) (\S+)'
+    groups_func: bt_dispatch_keywords
+  - pattern: '\b(\w+a|[a-z]+b|[0-9a-z]+c|x)(\d)'
+    groups_func: bt_dispatch_compact

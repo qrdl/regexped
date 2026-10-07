@@ -439,8 +439,8 @@ func detectTDFAUTF8Skip(tt *tdfaTable) []tdfaUTF8SkipInfo {
 // the top of the main loop instead, the test ran on every byte — `(.+)=(.+)`
 // over text with `=` every 15 bytes, whose walk leaves the loop at the first
 // `=`, cost 5% more fuel for it.
-func emitTDFAUTF8Skip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, localPos, localChunk, localMask, localSkipStart, localCapBase uint32, midAcceptTail func([]byte) []byte) []byte {
-	pos, chunk, mask := byte(localPos), byte(localChunk), byte(localMask)
+func emitTDFAUTF8Skip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, localPos, localChunk, localMask, localSkipStart, localErr, localCapBase uint32, midAcceptTail func([]byte) []byte) []byte {
+	pos, chunk, mask, errLanes := byte(localPos), byte(localChunk), byte(localMask), byte(localErr)
 	b = append(b, 0x20, pos, 0x21, byte(localSkipStart)) // skipStart = pos
 	b = append(b, 0x02, 0x40)                            // block $skip_done
 	b = append(b, 0x03, 0x40)                            // loop $chunks
@@ -459,8 +459,9 @@ func emitTDFAUTF8Skip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, localPo
 	b = append(b, 0x0B)
 	// Invalid UTF-8: stop before the faulty character.
 	b = emitUTF8ErrorLanes(b, chunk)
+	b = append(b, 0x22, errLanes) // local.tee: the stop reads them again
 	b = append(b, 0xFD, 0x53, 0x04, 0x40)
-	b = emitUTF8ErrorStop(b, chunk, mask)
+	b = emitUTF8ErrorStop(b, chunk, mask, errLanes)
 	b = append(b, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x02) // br $skip_done
 	b = append(b, 0x0B)
 	// No exit byte: to the lead byte of a character the chunk cuts, or 16.

@@ -2467,3 +2467,152 @@ func TestMaxMemoryAbove4GiBWarns(t *testing.T) {
 }
 
 func itoa(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// TestBTDispatchPlan pins the first-byte dispatch over an alternation chain
+// (bt_dispatch.go): which arms each byte tries, in priority order; one
+// dispatch per chain, its inner Alts dead; the compact encoding where the
+// direct one would push more than the chain has arms; and the budget charge.
+func TestBTDispatchPlan(t *testing.T) {
+	plan := func(t *testing.T, pat string) *btDispatchPlan {
+		t.Helper()
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return buildBTDispatchPlan(prog)
+	}
+	only := func(t *testing.T, p *btDispatchPlan) *btAltDispatch {
+		t.Helper()
+		if len(p.heads) != 1 {
+			t.Fatalf("%d dispatched chains, want 1", len(p.heads))
+		}
+		for _, d := range p.heads {
+			return d
+		}
+		return nil
+	}
+	expect := func(t *testing.T, d *btAltDispatch, want map[int][]int) {
+		t.Helper()
+		for c, w := range want {
+			got := d.cases[d.caseOf[c]]
+			if len(got) != len(w) {
+				t.Errorf("byte %d: arms %v, want %v", c, got, w)
+				continue
+			}
+			for i := range w {
+				if got[i] != w[i] {
+					t.Errorf("byte %d: arms %v, want %v", c, got, w)
+					break
+				}
+			}
+		}
+	}
+	const eof = 256
+
+	t.Run("keywords", func(t *testing.T) {
+		p := plan(t, `(?:get|head|post|delete)`)
+		d := only(t, p)
+		expect(t, d, map[int][]int{'g': {0}, 'h': {1}, 'p': {2}, 'd': {3}, 'x': {}, eof: {}})
+		if len(p.dead) != 2 || d.compact {
+			t.Errorf("inner Alts %d (want 2), compact %v (want false)", len(p.dead), d.compact)
+		}
+	})
+	t.Run("fold", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?i)(?:get|head|post)`)), map[int][]int{'g': {0}, 'G': {0}, 'P': {2}})
+	})
+	t.Run("overlapping first bytes keep priority", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?:a1|[ab]2|b3)`)), map[int][]int{'a': {0, 1}, 'b': {1, 2}, 'c': {}})
+	})
+	t.Run("an arm that can match empty is in every case", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?:ab|cd|e*)`)), map[int][]int{'a': {0, 2}, 'x': {2}, eof: {2}})
+	})
+	t.Run("a chain every byte starts is left alone", func(t *testing.T) {
+		if p := plan(t, `(?:.a|.b|.c)`); len(p.heads) != 0 {
+			t.Errorf("%d dispatched chains, want 0", len(p.heads))
+		}
+	})
+	t.Run("compact", func(t *testing.T) {
+		d := only(t, plan(t, `(?:\w+a|[a-z]+b|[0-9a-z]+c|x)`))
+		if !d.compact {
+			t.Error("compact = false: the direct encoding would push 6 frames for 4 arms")
+		}
+		expect(t, d, map[int][]int{'a': {0, 1, 2}, 'x': {0, 1, 2, 3}, '5': {0, 2}, '_': {0}, '-': {}})
+	})
+	t.Run("charge", func(t *testing.T) {
+		d := only(t, plan(t, `(?:get|head|post|delete)`))
+		for _, c := range []struct {
+			list []int
+			want int
+		}{{nil, 3}, {[]int{0}, 3}, {[]int{1, 2}, 2}} {
+			if got := btDispatchCharge(d, c.list); got != c.want {
+				t.Errorf("charge for %v = %d, want %d", c.list, got, c.want)
+			}
+		}
+	})
+}
+
+// TestBTFirstSets pins the first-byte supersets the dispatch reads, one per
+// instruction kind, and the budget charge's amount forms.
+func TestBTFirstSets(t *testing.T) {
+	firstOf := func(t *testing.T, pat string) *btFirst {
+		t.Helper()
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return btFirstSets(prog)(uint32(prog.Start))
+	}
+	count := func(f *btFirst) int {
+		n := 0
+		for _, b := range f.bytes {
+			if b {
+				n++
+			}
+		}
+		return n
+	}
+	for _, c := range []struct {
+		pat      string
+		bytes    int
+		has      []byte
+		nullable bool
+	}{
+		{`(?s).x`, 256, []byte{'\n'}, false},
+		{`.x`, 255, []byte{'a'}, false},
+		{`(?i)k`, 2, []byte{'k', 'K'}, false},           // one folded rune
+		{`[a-c\x{100}-\x{200}]`, 3, []byte{'b'}, false}, // a range above the byte space adds nothing
+		{`[^\x00-\x{10FFFF}]`, 0, nil, false},           // Fail
+		{`(a*)*b`, 256, nil, true},                      // a zero-width cycle: anything
+		{`\bfoo`, 1, []byte{'f'}, false},                // an assertion is looked through
+		{`x*`, 1, []byte{'x'}, true},
+	} {
+		f := firstOf(t, c.pat)
+		if got := count(f); got != c.bytes || f.nullable != c.nullable {
+			t.Errorf("%s: %d bytes, nullable %v; want %d, %v", c.pat, got, f.nullable, c.bytes, c.nullable)
+		}
+		for _, b := range c.has {
+			if !f.bytes[b] {
+				t.Errorf("%s: misses %q", c.pat, b)
+			}
+		}
+	}
+	trip := func(b []byte) []byte { return append(b, 0x00) }
+	if !bytes.Equal(emitBTWorkChargeN(nil, 7, 1, trip), emitBTWorkCharge(nil, 7, trip)) {
+		t.Error("emitBTWorkChargeN(1) is not emitBTWorkCharge")
+	}
+	m := &btDriveMember{budget: 3}
+	if !bytes.Equal(emitBTWorkChargeMemberN(nil, m, 7, 1, trip), emitBTWorkChargeMember(nil, m, 7, trip)) {
+		t.Error("emitBTWorkChargeMemberN(1) is not emitBTWorkChargeMember")
+	}
+	if bytes.Equal(emitBTWorkChargeMemberN(nil, m, 7, 2, trip), emitBTWorkChargeMember(nil, m, 7, trip)) {
+		t.Error("emitBTWorkChargeMemberN(2) charges 1")
+	}
+}

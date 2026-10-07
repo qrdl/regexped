@@ -92,12 +92,14 @@ character — and resolve to Unicode mode instead.
 | fixture | pattern(s) | path it pins |
 |---|---|---|
 | `unicode_dfa_find` | `[α-ω0-9]{150}x` | a lowered two-byte class run past 256 states: the plain DFA find over a u16 table |
+| `bt_alt_dispatch` | `\b(get\|head\|post\|delete) (\S+)`, `\b(\w+a\|[a-z]+b\|[0-9a-z]+c\|x)(\d)` | the first-byte dispatch at an alternation chain's head, in both encodings: direct for the keywords, compact where most bytes start most arms | Backtracking |
 | `unicode_compiled_dfa` | `é[0-9]{2}` | a multi-byte literal, match and find, within 256 states |
 | `unicode_tdfa` | `([α-ω]+)-([0-9]+)` | captures around multi-byte classes on TDFA |
 | `unicode_bt` | `(é.*?b)(c+)` | captures on Backtracking over a lowered program |
 | `unicode_lit_anchor` | `\pL+@example\.com` | the literal-anchored find's backward DFA over the reversed, lowered pattern |
 | `unicode_char_probe` | `привет\s+\pL+` | the prefix scan's whole-first-character check for a literal that begins with a non-ASCII character |
 | `unicode_char_run` | `[^,]+,` + `unicode: true` | the bulk skip over whole UTF-8 characters, for a state that loops on every character through one state per byte |
+| `unicode_match_char_run` | `.+`, `[^,]+,`, `\p{Cyrillic}{14}[^,]*,` + `unicode: true` | the match body's skip over whole UTF-8 characters: a Compiled DFA with an accepting and a non-accepting loop, and a plain DFA over 256 states |
 | `unicode_tdfa_char_run` | `<([^>]+)>(x)` + `unicode: true` | the TDFA capture body's skip over whole UTF-8 characters, run from the tag-op dispatch's arms that enter the loop |
 | `unicode_start_seed` | `x*` + `unicode: true` | a find that rounds `from` up to a character's first byte |
 | `unicode_start_scan` | `a?\B` + `unicode: true` | a find that checks every candidate start (`\B` holds inside a character) |

@@ -51,7 +51,10 @@ A backtracker without memoisation is exponential whenever a loop can split the
 same input more than one way. Every Backtracking program is emitted as two
 bodies ([engines.md](engines.md#work-budget-and-the-fallback-body)):
 
-- the **fast body** with a pop counter of `(span + 1) × instructions`;
+- the **fast body** with a pop counter of `(span + 1) × instructions`, which
+  an alternation's first-byte dispatch charges for every arm it skips — the
+  pops the plain chain would have made, without which a loop through a
+  single-arm case pushed nothing, was never charged, and went quadratic;
 - the **fallback body**, which it tail-calls when the counter runs out or its
   frame stack is full: the same program with a `(pc, pos)` visited bitset at
   every alternation, Go's bitstate discipline. Each `(pc, pos)` is entered at

@@ -823,6 +823,16 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int, nr *notesRows,
 		b = []byte{0x01, 4 + 1 + walkNotesLocals, 0x7F}
 		nc = newWalkNotes(nr, l, tableMemIdx, search, locPtr, locLen, locState, locPos, locLast, locByte+1, locByte+2)
 	}
+	// The UTF-8 skip's error lanes (emitUTF8BulkSkip): one more v128, last.
+	var locUTF8Err byte
+	if hasUTF8Dominant(dominant) {
+		b[0]++
+		b = append(b, 0x01, 0x7B)
+		locUTF8Err = locChunk + 1
+		if nr != nil {
+			locUTF8Err += 1 + walkNotesLocals
+		}
+	}
 	if nc != nil {
 		// The walk is handed input[from:], so from is its positions' bias.
 		b = append(b, 0x23)
@@ -891,7 +901,7 @@ func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int, nr *notesRows,
 			b = append(b, 0x20, locState, 0x41)
 			b = utils.AppendSLEB128(b, info.state)
 			b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
-			b = emitDominantBulkSkip(b, info, info.isMidAccept, locPos, locLen, locLast, locPtr, locChunk, locTmp)
+			b = emitDominantBulkSkip(b, info, info.isMidAccept, locPos, locLen, locLast, locPtr, locChunk, locTmp, locUTF8Err)
 			if marked {
 				// The skip strides over the notes: test where it stopped. The
 				// walk sat in this state the whole run, and a noted point's

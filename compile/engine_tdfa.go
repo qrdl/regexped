@@ -1289,7 +1289,8 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	needClassLocal := l.useU8 && l.useCompression
 	// Locals: pos(1) + state(1) + prevState(1) + byte(1) [+ lastAcceptPos(1)
 	// when hasMidAccept] [+ class(1) when needClassLocal] + capture regs
-	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
+	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)]
+	// [+ the UTF-8 skip's error lanes (v128), last, when it has one].
 	extraLocals := 4 + numCapRegs
 	if hasMidAccept {
 		extraLocals++
@@ -1300,9 +1301,12 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
 	needSkipLocals := hasBulkSkip || len(tt.utf8Skip) > 0
 
-	if needSkipLocals {
+	switch {
+	case len(tt.utf8Skip) > 0:
+		b = utils.AppendULEB128(b, uint32(4)) // 3 groups + the UTF-8 skip's error lanes
+	case needSkipLocals:
 		b = utils.AppendULEB128(b, uint32(3)) // 3 local declaration groups
-	} else {
+	default:
 		b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration group
 	}
 	b = utils.AppendULEB128(b, uint32(extraLocals))
@@ -1333,12 +1337,16 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	localChunk := localCapBase + uint32(numCapRegs)
 	localMask := localChunk + 1
 	localSkipStart := localMask + 1
+	localUTF8Err := localSkipStart + 1 // the UTF-8 skip's error lanes, v128
 
 	if needSkipLocals {
 		b = utils.AppendULEB128(b, uint32(1))
 		b = append(b, 0x7B) // v128
 		b = utils.AppendULEB128(b, uint32(2))
 		b = append(b, 0x7F) // i32
+	}
+	if len(tt.utf8Skip) > 0 {
+		b = append(b, 0x01, 0x7B) // 1 × v128: localUTF8Err
 	}
 
 	// midAcceptCheck: if midAccept[state], eagerly write captures for
@@ -1457,7 +1465,7 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 				return b
 			}
 		}
-		b = emitTDFAUTF8Skip(b, info, mainDepth+1, localPos, localChunk, localMask, localSkipStart, localCapBase, midAcceptTail)
+		b = emitTDFAUTF8Skip(b, info, mainDepth+1, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTail)
 		return append(b, 0x0B) // end if
 	}
 	var utf8Hook func([]byte, int, uint32) []byte

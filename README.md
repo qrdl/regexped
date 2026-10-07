@@ -56,38 +56,10 @@ See [sets.md](docs/sets.md) for the details.
 
 ## Performance
 
-**DFA/TDFA matching:** O(n) time, O(1) runtime stack — no worst-case blowup.
-
-**Backtracking:** LeftmostFirst (RE2/Perl) semantics for non-deterministic capture patterns. BitState memoization bounds runtime to O(n × numStates) for patterns with zero-matchable loops; stack overflow guard prevents memory corruption on deeply nested patterns.
-
-**SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
-
-**Comparison vs [regex crate](https://crates.io/crates/regex)** (both compiled to WASM and run in wasmtime by `tools/perftest`; ratio = regex ÷ regexped, so above 1× regexped is ahead):
-
-| Scenario | Capability | Instructions executed | Median time |
-|---|---|---|---|
-| Anchored match (email, URL) | `match_func` | 1.1–2.4× | 1.1–1.7× |
-| Non-anchored find (secrets, URLs, SQL injection, comments; 1–100 KB) | `find_func` | 1.0–26× | 1.3–28× |
-| Multi-pattern alternation find (combined secrets, 10–100 KB) | `find_func` | 5.6–11× | 4.0–13× |
-| TDFA capture groups (URL parse, log fields) | `groups_func` | 0.7–8.2× | 1.3–14× |
-| Backtracking capture groups (CSV, HTML, logs) | `groups_func` | 2.2–10× | 2.0–8.8× |
-| No-match fast reject (9–300 bytes) | `match_func`, `groups_func` | 7.0–33× | 1.8–16× |
-
-**Pattern sets** against the `regex` crate's `RegexSet` plus a per-pattern rescan (the usual way to get positions out of it, `tools/perftest`), or against [regex-automata](https://crates.io/crates/regex-automata), the engine under `regex`, which answers each question directly (`tools/setperf`); same ratio:
-
-| Scenario | Capability | Against | Instructions executed | Median time |
-|---|---|---|---|---|
-| Secret scanning (10 patterns, 100 KB) | `find` | `RegexSet` + rescan | 3.5–4.4× | 3.2–4.1× |
-| Log-level lines (8 patterns, 100 KB, up to 5 matches) | `find` | `RegexSet` + rescan | 7.1–11× | 6.3–9.2× |
-| Log-level lines (8 patterns, 100 KB, 1,545 matches) | `find` | `RegexSet` + rescan | 10× | 11× |
-| Prefixed tokens (20 patterns, 100 KB) | `find` | `RegexSet` + rescan | 17–28× | 18–27× |
-| Is any secret present? (4 patterns, 100 KB) | `scan_any` | regex-automata | 7.1× | 4.7–6.1× |
-| Which secrets are present? (4 patterns, 100 KB) | `scan_all` | regex-automata | 7.1× | 5.6–5.7× |
-| Secret scanning (4 patterns, 100 KB) | `find`, batched | regex-automata | 4.3× | 3.3–3.4× |
-| Which keyword-prefixed tokens appear? (8–32 patterns, 100 KB) | `scan_all` | regex-automata | 5.1–18× | 2.2–17× |
-| Keyword-prefixed tokens with positions (8–32 patterns, 100 KB) | `find`, batched | regex-automata | 18–59× | 11–38× |
-| Which `[a-z]{n}[0-9]{m}` tokens appear? (32 patterns, 100 KB, dense) | `scan_all` | regex-automata | 10× | 4.5× |
-| Is a 100 KB input one of 4–32 formats? (rejected within a few bytes) | `match_any`, `match_all` | regex-automata | 3.6–142× | too short to time |
+Regexped is on average **4–6× faster than Rust's `regex` and `regex-automata`
+crates** (geometric mean of median times over 25 scenarios: single patterns,
+Unicode text, pattern sets), with O(n) matching on every DFA and TDFA path.
+See [docs/performance.md](docs/performance.md) for the tables.
 
 ## Resistance to hostile input
 

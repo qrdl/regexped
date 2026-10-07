@@ -3697,12 +3697,13 @@ func TestSetBTMatchesGo(t *testing.T) {
 // the second frame has to grow memory — and the work budget is off, so there
 // is no fallback to hand over to: an answer needing a second frame comes from
 // a stack that grew. p0 is kept on a Backtracking bucket (a frame per greedy
-// iteration, up to 30), p1 split out onto the Backtracking find (a frame per
-// letter before `aX`). Each alone first, where memory must grow during the
+// iteration, up to 30: the loop's exit, `[bx]`, can start with the same
+// letter, so the first-byte dispatch still pushes it), p1 split out onto the
+// Backtracking find (a frame per letter before `aX`). Each alone first, where memory must grow during the
 // call; then all three, overlapping `find` with every other capability and
 // gated `find`, each against Go.
 func TestSetBTStackGrows(t *testing.T) {
-	pats := []string{`(?:a|bc){1,30}x`, `[a-z]+aX`, `zz`}
+	pats := []string{`(?:a|bc){1,30}[bx]`, `[a-z]+aX`, `zz`}
 	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
 		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
 	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {

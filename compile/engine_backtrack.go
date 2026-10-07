@@ -31,6 +31,10 @@ type backtrack struct {
 	// startRule is the Unicode start rule the find body keeps (find_from.go).
 	startRule startRule
 
+	// dispatch is the first-byte dispatch over the program's alternation
+	// chains (bt_dispatch.go), built on first use by altDispatch.
+	dispatch *btDispatchPlan
+
 	// unicode: the program was compiled in a Unicode mode, so a literal its
 	// find scans for is UTF-8 text (prefixScanParams.UTF8Text).
 	unicode bool
@@ -506,6 +510,14 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	if useWork && tripCalls && member != nil {
 		overflow = btArmTripMember(member, dyn, giveUp)
 	}
+	// The charge the pop path makes, n pops at once, for an alternation's
+	// dispatch.
+	var charge func([]byte, int) []byte
+	if useWork && member != nil {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeMemberN(b, member, workLocal, n, giveUp) }
+	} else if useWork {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeN(b, workLocal, n, giveUp) }
+	}
 
 	// After each end of block $pc_p, emit the handler for PC p.
 	// brRun(p) = N-1-p  (depth from handler top level to restart $run)
@@ -517,7 +529,7 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 		brRun := uint32(N - 1 - p)
 
 		body = emitBTInstHandler(body, bt, p, inst, brRun, frameSize, numCapLocals, memoByteAddr, memoMemoByte, false, !slotless, nativeAnchored, nil, overflow, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal,
-			memoOrigin, useWindow, dyn)
+			memoOrigin, useWindow, dyn, charge)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -598,6 +610,9 @@ func emitBTInstHandler(
 	// The body's run-time frame stack (bt_scratch.go): a FALLBACK body's
 	// region, or an ordinary body's growing stack (dyn.grow).
 	dyn *btDyn,
+	// charge charges the body's work budget n pops; nil when it keeps none.
+	// An alternation's dispatch charges the arms it skips (emitBTAltDispatch).
+	charge func([]byte, int) []byte,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -660,6 +675,14 @@ func emitBTInstHandler(
 		// pos at most once per call.
 		if !dyn.grow {
 			body = emitBitStateGuardDyn(body, dyn, p, memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
+		} else if plan := bt.altDispatch(); plan.dead[p] {
+			// An inner Alt of a dispatched chain: reached only through the
+			// chain's head, which branches past it (bt_dispatch.go).
+			body = append(body, 0x00) // unreachable
+			break
+		} else if d := plan.heads[p]; d != nil {
+			body = emitBTAltDispatch(body, d, brRun, numCapLocals, frameSize, overflowFn, tableMemIdx, dyn, limitLocal, charge)
+			break
 		}
 		body = btPushFrame(body, numCapLocals, inst.Arg, frameSize, brRunNested, overflowFn, tableMemIdx, dyn)
 		body = contOut(body)
@@ -1109,8 +1132,10 @@ const defaultBTWorkK = 1
 //
 // Counting pops bounds time as well, not just backtracks. Every cycle in a
 // syntax.Prog passes through an Alt, and in the ordinary body every Alt pushes a
-// frame, so the stretch between two consecutive push or pop events is acyclic:
-// at most N instructions. A call is therefore at most N·(2·pops + stack depth +
+// frame — or, at an alternation's first-byte dispatch that enters its only arm
+// directly, charges the budget as a pop does (bt_dispatch.go) — so the stretch
+// between two consecutive push, pop or charge events is acyclic: at most N
+// instructions. A call is therefore at most N·(2·pops + stack depth +
 // 1) instructions — linear in the input, since pops are bounded by the budget
 // and depth by N·(span+1): the frames on the stack lie on one path, which
 // without a zero-width cycle (the ordinary body's precondition, planBT) never
@@ -1348,6 +1373,26 @@ func emitBTWorkCharge(b []byte, workLocal uint32, trip func([]byte) []byte) []by
 	b = append(b, 0x22)       // local.tee work
 	b = utils.AppendULEB128(b, workLocal)
 	b = append(b, 0x50)       // i64.eqz
+	b = append(b, 0x04, 0x40) // if void
+	b = trip(b)
+	return append(b, 0x0B) // end if
+}
+
+// emitBTWorkChargeN charges n at once: `work -= n; if work <= 0 trip`. n == 1
+// is emitBTWorkCharge byte for byte. An alternation's first-byte dispatch
+// charges the arms it skips (bt_dispatch.go).
+func emitBTWorkChargeN(b []byte, workLocal uint32, n int, trip func([]byte) []byte) []byte {
+	if n == 1 {
+		return emitBTWorkCharge(b, workLocal, trip)
+	}
+	b = btLocalGet(b, workLocal)
+	b = append(b, 0x42) // i64.const n
+	b = utils.AppendSLEB128_64(b, int64(n))
+	b = append(b, 0x7D) // i64.sub
+	b = append(b, 0x22) // local.tee work
+	b = utils.AppendULEB128(b, workLocal)
+	b = append(b, 0x42, 0x00) // i64.const 0
+	b = append(b, 0x57)       // i64.le_s
 	b = append(b, 0x04, 0x40) // if void
 	b = trip(b)
 	return append(b, 0x0B) // end if
@@ -1830,6 +1875,10 @@ func buildBTInnerDisp(
 	numCapLocals := 0
 	prog := bt.prog
 	N := len(prog.Inst)
+	var charge func([]byte, int) []byte
+	if workTrip != nil {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeN(b, workLocal, n, workTrip) }
+	}
 
 	// ── FAIL handler (state == -1) ──
 	body = append(body, 0x20, localState, 0x41, 0x7F, 0x46, 0x04, 0x40) // state==-1; if void
@@ -1890,6 +1939,7 @@ func buildBTInnerDisp(
 			-1,
 			memoOriginLocal, hasMemoOrigin,
 			dyn,
+			charge,
 		)
 	}
 	return body

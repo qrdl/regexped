@@ -433,6 +433,42 @@ The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps
 
 **Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, the body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
 
+### First-byte dispatch over an alternation
+
+`get|head|post|delete` compiles to a chain of `InstAlt`s, one per arm, and a
+plain walk of it pushes a frame at each, tries the first arm, fails on its
+first byte, pops, and so on down the chain — at every position the body
+visits. Instead the chain's head reads the next byte once and branches
+(`br_table`) to the arms that byte can start, pushing frames only for those,
+in their order, and entering the first; a byte that starts none fails at
+once. An arm skipped this way would have failed on that byte, so no answer
+changes — leftmost-first priority is the order of the arms that can match,
+which is kept. The bytes an arm can start are a superset (an assertion or a
+capture before the first byte is looked through, `(?i)` adds both cases), and
+an arm that can match empty is tried in every case, end of input included.
+Chains of three or more arms, each dispatched once at its widest head; its
+inner `InstAlt`s are then unreachable and emitted as such. Where most bytes
+start most arms, each case only names its arms in a bitmask and one shared
+sequence pushes them, rather than every case repeating the pushes — a frame
+stores every capture slot, and the repetition grew one WAF member's module
+44%. Only in the fast body; the fallback body keeps the plain chain, since it
+memoises every `InstAlt` on `(pc, pos)`.
+
+The dispatch charges the [work budget](#work-budget-and-the-fallback-body)
+one pop per arm it skips — the pops the plain chain would have made, which is
+what the budget is calibrated in. It also keeps the budget's time bound: every
+cycle passes through an `InstAlt`, and a case that enters its only arm pushes
+no frame, so uncharged, `(?:ab|cd|ef)*z` as a set member over `ab`×N walked
+from every candidate without one charge and went quadratic.
+
+Measured (fuel per byte): Unicode `(\pL+?)(\pL*)` over mixed text 967 → 138
+(a lowered class is itself a chain, one arm per lead byte); WAF set members on
+Backtracking, `scan_any` over 16 KB of form / JSON / HTTP-log text: 29-88%
+less (`cij_query_params_02` over form data 400,849 → 46,648, `xss_body_02`
+over JSON 38,925 → 26,611); a non-greedy body re-trying `(from|into|set)` at
+every step 88 → 55; `\b(get|post|…)` captures 5-12% less. Module sizes moved
+−1.6% to +7.3%.
+
 ### The frame stack
 
 Backtracking bodies used to reserve their stacks in the module — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input, and once per set in a set: a pattern with many branches claimed megabytes to match ten bytes, and a 339-set WAF configuration claimed 596 MB of its 643 MB before its first call. None reserves anything now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size (64 KB), growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. Every body and every set uses the same scratch, so the memory a module ends up with is the largest any one search needed, not the sum over its patterns. When memory cannot grow, the body hands over to the fallback.
@@ -452,7 +488,7 @@ The engine gives up only when it cannot get the memory a search needs — linear
 
 `-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
 
-**Which patterns grow the stack.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the module's then-fixed stack returned `-1`, an input-length-dependent false negative with no diagnostic; today the stack grows instead, and only memory that cannot grow hands the call to the fallback.
+**Which patterns grow the stack.** The frame has to survive input being consumed, which means an untried *alternation* branch that the same byte can start, not merely a quantifier: after `ab` matches in `(?:ab|a?cd)*?x`, the frame holding "try `a?cd` here instead" stays live. A branch the byte cannot start is never pushed ([first-byte dispatch](#first-byte-dispatch-over-an-alternation)): `cd` beside `ab` leaves no frame. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the module's then-fixed stack returned `-1`, an input-length-dependent false negative with no diagnostic; today the stack grows instead, and only memory that cannot grow hands the call to the fallback.
 
 **Host behaviour.** Generated stubs must surface `-2` as an error, never as "no match":
 
@@ -522,7 +558,9 @@ popped as the search goes, so it is never exhausted.
 (with one exception, below):
 
 1. **The fast body** is the ordinary body plus one `i64` counter, set to
-   `(span + 1) × numInstructions` and decremented on every frame POP. `span`
+   `(span + 1) × numInstructions` and decremented on every frame POP — and,
+   at an alternation's [first-byte dispatch](#first-byte-dispatch-over-an-alternation),
+   once for every arm it skips. `span`
    is the input length, or the window length when a capture body runs in
    window mode. A `find` whose caller passes a search block (every generated
    stub does) gets the counter once per SEARCH and keeps what is left in the
@@ -881,7 +919,8 @@ leads into it, so a byte outside the loop pays nothing for it.
 
 Measured in fuel per input byte over mostly non-ASCII text: `[^,]+,` find over
 10 KB of mixed-script text with a comma every ~580 bytes 33.2 → 5.2, over
-Cyrillic prose 34.4 → 8.1; `.+` find 32.1 → 4.7; with the single-capture
+Cyrillic prose 34.4 → 8.1; `.+` find 32.1 → 4.7; `[^,]+,` and `.+` match over
+4 KB of Cyrillic, CJK or accented Latin 24.0 → 4.9, of ASCII 24.0 → 2.0; with the single-capture
 shortcut, `([^,]+),` groups over a 487-byte field 154.9 → 5.3; on the TDFA,
 `<([^>]+)>(x)` groups over tags 117.2 → 25.4 and `(\w+)=([^&]+)&` over
 key/value text 31.0 → 10.3. In a find body the cost is the per-byte dispatch

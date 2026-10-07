@@ -1,0 +1,13 @@
+# Unicode mode: match bodies crossing a run of whole characters 16 bytes at a
+# time — a Compiled DFA whose loop accepts (`.+`) and one whose loop does not
+# (`[^,]+,`, with the hysteresis locals), and a plain DFA over 256 states with
+# u16 state ids. Each declares the skip's error-lanes local last.
+regexps:
+  - pattern: '.+'
+    match_func: uni_mrun_dot
+    unicode: true
+  - pattern: '[^,]+,'
+    match_func: uni_mrun_field
+    unicode: true
+  - pattern: '\p{Cyrillic}{14}[^,]*,'
+    match_func: uni_mrun_dfa
