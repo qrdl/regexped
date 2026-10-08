@@ -71,8 +71,7 @@ type dfa struct {
 
 	hasEndAnchor       bool
 	hasWordBoundary    bool
-	hasNewlineBoundary bool // true when pattern contains (?m:^) or (?m:$)
-	needsUnicode       bool
+	hasNewlineBoundary bool           // true when pattern contains (?m:^) or (?m:$)
 	immediateAccepting map[int]uint64 // leftmost-first: accept without scanning further (bitmask)
 
 	// acceptWide/midAcceptWide/immAcceptWide are the >64-pattern accept form
@@ -930,12 +929,12 @@ func nfaStatesKey(states []uint32) string {
 // documented job of bounding compile-time cost, because it was previously
 // only checked on newDFA's *output*, after the unbounded construction had
 // already run to completion (or exhausted memory/CPU trying to).
-func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int, patternBitsArg ...[]uint64) (*dfa, bool) {
+func newDFA(mp resolvedProg, leftmostFirst bool, maxStates int, patternBitsArg ...[]uint64) (*dfa, bool) {
 	var pBits []uint64
 	if len(patternBitsArg) > 0 {
 		pBits = patternBitsArg[0]
 	}
-	return newDFAImpl(prog, needsUnicode, leftmostFirst, maxStates, pBits, nil)
+	return newDFAImpl(mp.prog, leftmostFirst, maxStates, pBits, nil, mp.pg)
 }
 
 // newDFAWide is newDFA for a merged set bucket holding MORE than 64 patterns,
@@ -959,12 +958,12 @@ func newDFA(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates 
 // so that every existing caller keeps the exact construction it has today:
 // with patternIdx nil the shared implementation is bit-identical, which is
 // what keeps `make byteident` honest.
-func newDFAWide(prog *syntax.Prog, leftmostFirst bool, maxStates int, patternIdx []int32) (*dfa, bool) {
-	return newDFAImpl(prog, false, leftmostFirst, maxStates, nil, patternIdx)
+func newDFAWide(mp resolvedProg, leftmostFirst bool, maxStates int, patternIdx []int32) (*dfa, bool) {
+	return newDFAImpl(mp.prog, leftmostFirst, maxStates, nil, patternIdx, mp.pg)
 }
 
-func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxStates int,
-	pBits []uint64, pIdx []int32) (*dfa, bool) {
+func newDFAImpl(prog *syntax.Prog, leftmostFirst bool, maxStates int,
+	pBits []uint64, pIdx []int32, progress *progressSink) (*dfa, bool) {
 	dfa := &dfa{
 		accepting:               make(map[int]uint64),
 		midAccepting:            make(map[int]uint64),
@@ -978,7 +977,6 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 		midAcceptingWOutranked:  make(map[int]uint64),
 		midAcceptingNLOutranked: make(map[int]uint64),
 		unicodeTrans:            make(map[int]map[rune]int),
-		needsUnicode:            needsUnicode,
 		immediateAccepting:      make(map[int]uint64),
 	}
 
@@ -1512,10 +1510,12 @@ func newDFAImpl(prog *syntax.Prog, needsUnicode bool, leftmostFirst bool, maxSta
 	}
 
 	// Process work queue
+	pg := progress.startStep("DFA construction")
 	for len(queue) > 0 {
 		if nextStateID > maxStates {
 			return nil, false
 		}
+		pg.tick(nextStateID, maxStates)
 		item := queue[0]
 		queue = queue[1:]
 
@@ -2656,8 +2656,10 @@ type dfaLayout struct {
 	//
 	// dominantStates lists every DFA state that qualifies for SIMD bulk-skip:
 	//   - ≥ 240/256 byte classes self-loop;
-	//   - exit set has exactly 1 byte (Phase 2 constraint; Phase 5 lifts);
-	//   - state is mid-accepting (Option 1 piggyback requires it).
+	//   - exit set has 1..8 bytes (one splat compare, or a Shufti nibble
+	//     lookup over the exit set);
+	//   - state is mid-accepting (the dispatch reuses the midAccept[state]
+	//     load, which only a mid-accepting state carries).
 	//
 	// Slice order matches the encoded midAccept byte value: the i-th entry
 	// has `midAcceptBytes[entry.state] == byte(2 + i)`. Non-dominant
@@ -2709,6 +2711,14 @@ type dfaLayout struct {
 	// CompileOptions.StartAnywhereSwitchN.
 	switchN int32
 
+	// startRule is the Unicode start rule the find body keeps (find_from.go).
+	startRule startRule
+
+	// utf8Text: the pattern runs in Unicode mode, so a literal prefix is UTF-8
+	// text and the prefix scan may check a whole first character on a hit
+	// (prefixScanParams.UTF8Text).
+	utf8Text bool
+
 	// report carries the verbose Reporter to the emitters the layout reaches,
 	// so each can name the strategy IT chose rather than have the choice
 	// re-derived at a call site. Nil on every path but `compile --verbose`.
@@ -2718,9 +2728,9 @@ type dfaLayout struct {
 // dominantInfo describes one dominant self-loop state recorded by
 // detectDominantSelfLoop.
 //
-// `exitBytes` holds 1..8 bytes (Shufti cap; see Phase 5 below). When
-// len(exitBytes) == 1 the emitter uses the Phase 2 splat+eq fast path;
-// when 2..8 it uses a Shufti-style nibble-table lookup.
+// `exitBytes` holds 1..8 bytes (the Shufti cap). When len(exitBytes) == 1
+// the emitter uses the splat+eq fast path; when 2..8 it uses a Shufti-style
+// nibble-table lookup.
 //
 // An earlier non-mid-accept extension, since removed, added an
 // `isMidAccept bool` field
@@ -2744,6 +2754,11 @@ type dominantInfo struct {
 	// default; a LikelyMatch-gated extension adds a non-mid-accept
 	// channel (see detectShuftiSelfLoop).
 	selfLoopSet []byte
+	// utf8: the state loops on every valid multi-byte UTF-8 character too,
+	// through a state per byte of it, and exitBytes are its ASCII exits
+	// (0..8). Unicode mode only; emitUTF8BulkSkip serves it. See
+	// (*dfaLayout).utf8SelfLoopExits.
+	utf8        bool
 	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
 	isMidAccept bool // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
 }
@@ -2788,6 +2803,10 @@ type dfaLayoutParams struct {
 	// non-find layout. Like forceWordChar, but for (?m:$) before a '\n'.
 	forceNewline bool
 	report       *Reporter
+	// startRule: the Unicode start rule this layout's find body keeps.
+	startRule startRule
+	// utf8Text: the pattern runs in Unicode mode (dfaLayout.utf8Text).
+	utf8Text bool
 }
 
 func buildDFALayout(p dfaLayoutParams) *dfaLayout {
@@ -2806,6 +2825,8 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	wantWordChar := needFind || forceWordChar
 	l := &dfaLayout{}
 	l.report = p.report
+	l.startRule = p.startRule
+	l.utf8Text = p.utf8Text
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
@@ -4018,8 +4039,9 @@ func detectEOFSkipSafe(l *dfaLayout) {
 // `l.midAcceptBytes[state]` as `byte(2 + idx)` so the find-body emitter
 // can dispatch via the already-loaded midAccept value.
 //
-// Phase 2 emission constraints applied at detection time:
-//   - exit set must be exactly 1 byte (Phase 5 will lift to ≤ 16 via nibble);
+// Emission constraints applied at detection time:
+//   - exit set must be 1..8 bytes (maxExitBytes: one splat compare, or a
+//     Shufti nibble lookup);
 //   - state must be mid-accepting (every byte while in it is a valid
 //     match end — required by the bulk-skip's `last_accept = pos + 1`).
 //
@@ -4028,7 +4050,7 @@ func detectEOFSkipSafe(l *dfaLayout) {
 // added to the slice. Detection caps at `maxDominantStates` per DFA.
 func detectDominantSelfLoop(l *dfaLayout) {
 	const threshold = 240
-	const maxExitBytes = 8 // Shufti nibble-lookup cap (Phase 5)
+	const maxExitBytes = 8 // Shufti nibble-lookup cap
 
 	if l.numWASM <= 1 {
 		return
@@ -4085,12 +4107,25 @@ func detectDominantSelfLoop(l *dfaLayout) {
 				}
 			}
 		}
+		utf8 := false
 		if selfBytes < threshold || hitCap {
-			continue
+			// In Unicode mode a class holding every non-ASCII character
+			// leaves its state on every byte above 0x7F and comes back at
+			// the character's end, so it loops on at most 128 bytes; it is
+			// the same run, a character at a time.
+			if !l.utf8Text {
+				continue
+			}
+			ex, ok := l.utf8SelfLoopExits(state, maxExitBytes)
+			if !ok {
+				continue
+			}
+			exitBytes, selfBytes, utf8 = ex, 256-len(ex), true
 		}
-		// Phase 5: 1..8 exit bytes (Shufti cap). The maxExitBytes loop
-		// guard ensures we never reach here with more.
-		if len(exitBytes) < 1 || len(exitBytes) > maxExitBytes {
+		// 1..8 exit bytes (the Shufti cap). The maxExitBytes loop guard
+		// ensures we never reach here with more. A character loop may have
+		// none: `(?s).` leaves only on an invalid byte.
+		if (len(exitBytes) < 1 && !utf8) || len(exitBytes) > maxExitBytes {
 			continue
 		}
 		// Dual-channel detection: accept BOTH mid-accept and non-mid-accept
@@ -4151,6 +4186,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		l.dominantStates = append(l.dominantStates, dominantInfo{
 			state:       state,
 			exitBytes:   exitBytes,
+			utf8:        utf8,
 			isMidAccept: isMidAccept,
 		})
 	}
@@ -4164,7 +4200,7 @@ func detectDominantSelfLoop(l *dfaLayout) {
 	//   254..255  — NON-mid-accept dominant idx (this pass; cap 2)
 	// Non-mid entries are written into the table only by
 	// applyDominantStateEncoding(l, true) — call sites whose emitted body
-	// decodes the `>= 254` sub-range (buildFindBody, emitPhase4Dispatch).
+	// decodes the `>= 254` sub-range (buildFindBody, emitMatchBulkSkipDispatch).
 	// Everywhere else (sets suffix, lit-anchor forward scan, alt-lit
 	// branches) passes false and keeps state-ID-compare dispatch, so their
 	// plain `midAccept[state] != 0 → accept` reads stay correct.
@@ -4189,6 +4225,91 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		out = append(out, info)
 	}
 	l.dominantStates = out
+}
+
+// utf8Sequences lists every valid multi-byte UTF-8 sequence as byte ranges:
+// the lead byte, then each continuation byte. These are exactly the
+// sequences the SIMD validity check in emitDominantBulkSkip accepts — no
+// overlong form, no surrogate, nothing past U+10FFFF.
+var utf8Sequences = [][][2]byte{
+	{{0xC2, 0xDF}, {0x80, 0xBF}},
+	{{0xE0, 0xE0}, {0xA0, 0xBF}, {0x80, 0xBF}},
+	{{0xE1, 0xEC}, {0x80, 0xBF}, {0x80, 0xBF}},
+	{{0xED, 0xED}, {0x80, 0x9F}, {0x80, 0xBF}},
+	{{0xEE, 0xEF}, {0x80, 0xBF}, {0x80, 0xBF}},
+	{{0xF0, 0xF0}, {0x90, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}},
+	{{0xF1, 0xF3}, {0x80, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}},
+	{{0xF4, 0xF4}, {0x80, 0x8F}, {0x80, 0xBF}, {0x80, 0xBF}},
+}
+
+// utf8SelfLoopExits reports whether state loops on every valid multi-byte
+// character, and returns its ASCII exit bytes (at most maxExit) when it does.
+// A character must lead back to state, and every state inside one must be
+// live and record nothing — no accept on any channel — so a run of whole
+// characters changes nothing but the position.
+//
+// A state with a word-boundary accept is refused: whether it accepts depends
+// on the next byte, which a skipped run never tests. A `(?m:$)` accept is
+// handled by the caller, which makes '\n' an exit as for any dominant.
+func (l *dfaLayout) utf8SelfLoopExits(state int32, maxExit int) ([]byte, bool) {
+	for _, ch := range [][]byte{l.midAcceptNWBytes, l.midAcceptWBytes} {
+		if int(state) < len(ch) && ch[state] != 0 {
+			return nil, false
+		}
+	}
+	var exits []byte
+	for b := 0; b < 0x80; b++ {
+		if l.transitionOn(int(state), b) != state {
+			if exits = append(exits, byte(b)); len(exits) > maxExit {
+				return nil, false
+			}
+		}
+	}
+	quiet := func(s int32) bool {
+		if s <= 0 || s == state || int(s) >= l.numWASM {
+			return false
+		}
+		for _, ch := range [][]byte{l.midAcceptBytes, l.midAcceptNLBytes, l.midAcceptNWBytes, l.midAcceptWBytes} {
+			if int(s) < len(ch) && ch[s] != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	for _, seq := range utf8Sequences {
+		cur := map[int32]bool{}
+		for c := int(seq[0][0]); c <= int(seq[0][1]); c++ {
+			cur[l.transitionOn(int(state), c)] = true
+		}
+		for i, r := range seq[1:] {
+			next := map[int32]bool{}
+			for s := range cur {
+				if !quiet(s) {
+					return nil, false
+				}
+				for c := int(r[0]); c <= int(r[1]); c++ {
+					t := l.transitionOn(int(s), c)
+					if i == len(seq)-2 && t != state {
+						return nil, false
+					}
+					next[t] = true
+				}
+			}
+			cur = next
+		}
+	}
+	return exits, true
+}
+
+// countUTF8Dominants counts the dominant states the UTF-8 skip serves.
+func countUTF8Dominants(ds []dominantInfo) int {
+	n := 0
+	for _, d := range ds {
+		if d.utf8 {
+			n++
+		}
+	}
+	return n
 }
 
 // detectShuftiSelfLoop scans the WASM-space
@@ -4375,7 +4496,7 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 }
 
 // minLMBareShuftiLen is the compile-time-guaranteed minimum match length
-// (regexpMinMaxLen) required before lmBareShuftiEligible allows the
+// (minMaxLen) required before lmBareShuftiEligible allows the
 // bare-prefix gate to lift. See detectShuftiSelfLoop's doc comment for the
 // measurements behind this threshold: 8 keeps the confirmed win
 // (`[A-Z]{8,}`, min 8) while excluding the confirmed regression
@@ -4389,12 +4510,12 @@ const minLMBareShuftiLen = 8
 // ineligible (this recomputes syntax.Parse; compilePattern's caller has
 // already validated the pattern earlier in the pipeline, so failure here
 // should not happen in practice).
-func lmBareShuftiEligible(pattern string, byteMode bool) bool {
-	parsed, err := syntax.Parse(pattern, syntax.Perl)
+func lmBareShuftiEligible(pattern resolvedPattern) bool {
+	t, err := pattern.parse()
 	if err != nil {
 		return false
 	}
-	minLen, _ := regexpMinMaxLen(parsed, byteMode)
+	minLen, _ := t.minMaxLen()
 	return minLen >= minLMBareShuftiLen
 }
 
@@ -4412,7 +4533,7 @@ func lmBareShuftiEligible(pattern string, byteMode bool) bool {
 //
 // Pass encodeNonMid=true ONLY when every emitted body that reads this
 // layout's midAcceptBytes decodes the `>= 254` sub-range (buildFindBody,
-// buildMatchBody/buildHybridMatchBody via emitPhase4Dispatch). Sites whose
+// buildMatchBody/buildHybridMatchBody via emitMatchBulkSkipDispatch). Sites whose
 // bodies do a plain `midAccept[state] != 0 → accept` (sets suffix,
 // lit-anchor forward scan, alt-lit branches) MUST pass false — their
 // non-mid dispatch stays on state-ID compares and a 254 value in the
@@ -4451,7 +4572,7 @@ func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
 // be this layout's single mid-accept dominant — i.e. that state's encoding is
 // the ONLY nonzero entry in the table.
 //
-// When it holds, the dispatch in emitFindMidAcceptDispatch / emitPhase4Dispatch
+// When it holds, the dispatch in emitFindMidAcceptDispatch / emitMatchBulkSkipDispatch
 // can skip both the `local.tee val` that caches the loaded byte and the
 // `val == encodedByte` compare that follows it: `val != 0` has already
 // identified the state. The tee is paid on EVERY byte the engine loop consumes,
@@ -4584,7 +4705,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				ds = emitFindSegs(ds, transSegs)
 			}
 		} else {
-			// Non-find path: transitions + (optional) midAccept for Phase 4
+			// Non-find path: transitions + (optional) midAccept for the
 			// match-body bulk-skip dispatch + TDFA accept tables. The non-mid
 			// channel uses state-ID compares (no side table) so no extra
 			// emission is needed here.
@@ -4670,7 +4791,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				ds = emitFindSegs(ds, transSegs)
 			}
 		} else {
-			// Non-find path: transitions + (optional) midAccept for Phase 4
+			// Non-find path: transitions + (optional) midAccept for the
 			// match-body bulk-skip + (optional) nonMidDominantBytes for the
 			// LM-gated non-mid match-body dispatch + TDFA accept tables.
 			// useAcceptSideTable (TDFA-built tables only) also needs midAccept
@@ -5460,6 +5581,13 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	if haveDominants {
 		lLiveState++
 	}
+	// lUTF8Err: the UTF-8 skip's error lanes, a second v128 beside the chunk
+	// when a dominant state takes that skip (emitUTF8BulkSkip); 0 otherwise.
+	var lUTF8Err byte
+	if hasUTF8Dominant(l.dominantStates) {
+		lUTF8Err = lLiveState
+		lLiveState++
+	}
 
 	var b []byte
 	// Local declaration: (7 + n) × i32, 3 × i64, optionally 1 × v128, then
@@ -5475,7 +5603,9 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	b = utils.AppendULEB128(b, uint32(7+n))
 	b = append(b, 0x7F) // i32
 	b = append(b, byte(nI64), 0x7E)
-	if haveDominants {
+	if haveDominants && lUTF8Err != 0 {
+		b = append(b, 0x02, 0x7B) // 2 × v128: chunk, error lanes
+	} else if haveDominants {
 		b = append(b, 0x01, 0x7B) // 1 × v128
 	}
 	if p.futureOff != 0 {
@@ -5806,7 +5936,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 	})
 
 	// Dominant-state SIMD bulk-skip dispatch.
-	// Mirrors emitPhase4Dispatch's mid-accept channel but operates on
+	// Mirrors emitMatchBulkSkipDispatch's mid-accept channel but operates on
 	// per-pattern endPos. The encoded byte in midAcceptBytes[state] is
 	// 2+idx for dominant states (0/1 for non-dominant); we dispatch via
 	// state-compare against each dominant's encoded byte.
@@ -5869,7 +5999,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = emitDominantLivenessGuard(b, info, 3)
 			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
-				lBulkChunk, lByteClass)
+				lBulkChunk, lByteClass, lUTF8Err)
 			// Re-update endPos_k for each pattern in lBitsScratch.
 			for k := range patternIDs {
 				if k >= 32 {
@@ -5908,7 +6038,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 			b = emitDominantLivenessGuard(b, info, 2)
 			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
-				lBulkChunk, lByteClass)
+				lBulkChunk, lByteClass, lUTF8Err)
 			b = append(b, 0x0B) // end if
 		}
 	}
@@ -5983,7 +6113,7 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = append(b, 0x45, 0x0D, 0x00) // eqz -> br $no_skip
 		b = emitDominantBulkSkip(b, info, false,
 			lScanPos, paramLen, 0x00, paramPtr,
-			lBulkChunk, lByteClass)
+			lBulkChunk, lByteClass, lUTF8Err)
 		for k := range patternIDs {
 			if k >= 32 {
 				break
@@ -6348,6 +6478,8 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 			skipSafeOnDead:        l.skipSafeOnDead,
 			eofSkipSafe:           l.eofSkipSafe,
 			switchN:               l.switchN,
+			startRule:             l.startRule,
+			utf8Text:              l.utf8Text,
 		}
 		build = func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int) {
 			bp := fp
@@ -6535,12 +6667,12 @@ func emitU16Transition(b []byte,
 //     exit set — detectDominantSelfLoop's ≤8-exit-byte gate can never
 //     reach this shape). See detectShuftiSelfLoop.
 //
-//   - Single exit byte (Phase 2, info.exitBytes len 1):
+//   - Single exit byte (info.exitBytes len 1):
 //     `i8x16.splat + i8x16.eq + i8x16.bitmask`. Three SIMD ops; the splat
 //     constant is folded by JIT into the loop preamble. Fast path for
 //     patterns like `//[^\n]+`.
 //
-//   - Multi exit byte (Phase 5, info.exitBytes len 2..8): Shufti-style
+//   - Multi exit byte (info.exitBytes len 2..8): Shufti-style
 //     nibble lookup on the EXIT set (the small side in this case).
 //     Build two 16-byte tables T_lo and T_hi where bit i of T_lo[lo]
 //     (resp. T_hi[hi]) is set iff exit byte i has low (resp. high)
@@ -6559,7 +6691,7 @@ func emitU16Transition(b []byte,
 //
 // Contract:
 //   - Caller MUST guard the call so it only runs when state == dominantState.
-//     Option 1 piggybacks on the midAccept[state] lookup; the dominant
+//     The dispatch reuses the midAccept[state] lookup; the dominant
 //     state's `midAcceptBytes` value is encoded uniquely and the caller
 //     branches on the cached value.
 //   - Requires the dominant state to be mid-accepting: every byte while
@@ -6627,7 +6759,7 @@ const nonMidHystStreak = 2
 // the counter with advance < 16 even though nothing was learned about
 // run length; it fires at most once per call, at EOF, and is harmless.
 func emitHystBulkSkip(b []byte, info dominantInfo,
-	posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 	hystCounterLocal, hystPosLocal byte) []byte {
 	// if hystCounter < N (channel still enabled)
 	b = append(b, 0x20, hystCounterLocal)
@@ -6643,7 +6775,7 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 	// re-run on every dominant-state byte that follows.
 	b = emitDominantBulkSkipHooked(b, info, false,
 		posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
-		chunkLocal, tmpLocal, func(b []byte) []byte {
+		chunkLocal, tmpLocal, errLocal, func(b []byte) []byte {
 			b = append(b, 0x41, nonMidHystStreak)
 			b = append(b, 0x21, hystCounterLocal)
 			return b
@@ -6676,12 +6808,12 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 // never reach here, and the load they DO pay was already emitted for the
 // mid-accept last_accept update.
 func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
-	valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 	hystCounterLocal, hystPosLocal byte) []byte {
 	switch len(nonMid) {
 	case 1:
 		b = emitHystBulkSkip(b, nonMid[0],
-			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 			hystCounterLocal, hystPosLocal)
 	case 2:
 		// val is 254 or 255 here; one compare discriminates. The else
@@ -6693,11 +6825,11 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 		b = append(b, 0x46)       // i32.eq
 		b = append(b, 0x04, 0x40) // if (void)
 		b = emitHystBulkSkip(b, nonMid[0],
-			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 			hystCounterLocal, hystPosLocal)
 		b = append(b, 0x05) // else
 		b = emitHystBulkSkip(b, nonMid[1],
-			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 			hystCounterLocal, hystPosLocal)
 		b = append(b, 0x0B) // end if
 	}
@@ -6728,7 +6860,7 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
-	chunkLocal, valLocal, hystCounterLocal, hystPosLocal byte,
+	chunkLocal, valLocal, errLocal, hystCounterLocal, hystPosLocal byte,
 	soleMid bool, nc *notesCtx) []byte {
 
 	var mid, nonMid []dominantInfo
@@ -6761,7 +6893,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 			b = append(b, 0x04, 0x40) // if (void)
 			b = emitDominantBulkSkip(b, info, true,
 				posLocal, lenLocal, lastAcceptLocal, ptrLocal,
-				chunkLocal, valLocal)
+				chunkLocal, valLocal, errLocal)
 			b = append(b, 0x0B) // end if (per-dominant gate)
 		}
 		return b
@@ -6786,7 +6918,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		b = emitAccept(b)
 		b = emitDominantBulkSkip(b, mid[0], true,
 			posLocal, lenLocal, lastAcceptLocal, ptrLocal,
-			chunkLocal, valLocal)
+			chunkLocal, valLocal, errLocal)
 		b = append(b, 0x0B) // end if (val != 0)
 		return b
 	}
@@ -6803,7 +6935,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		if dispatchNonMid {
 			b = append(b, 0x05) // else — val >= 254: non-mid dominant
 			b = emitNonMidValDispatch(b, nonMid,
-				valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, valLocal,
+				valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, valLocal, errLocal,
 				hystCounterLocal, hystPosLocal)
 		}
 		b = append(b, 0x0B) // end if (val < 254)
@@ -6817,7 +6949,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	return b
 }
 
-// emitPhase4Dispatch emits the Phase 4 match-body bulk-skip dispatch.
+// emitMatchBulkSkipDispatch emits the match-body bulk-skip dispatch.
 // One table load feeds both channels:
 //
 //	val = midAcceptBytes[state]
@@ -6840,7 +6972,33 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 // non-mid dominant is present, callers must additionally declare 2 i32
 // locals (hysteresis counter + scratch) and pass their indices; both are
 // ignored when every entry is mid-accept.
-func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
+// matchUTF8ErrLocal is a match body's error-lanes local (emitUTF8BulkSkip):
+// the v128 appendMatchUTF8Err declares after its last local — the chunk at 5,
+// or the hysteresis pair at 6 and 7 when a dominant state does not accept.
+// 0 when no dominant state takes the UTF-8 skip.
+func matchUTF8ErrLocal(dominantStates []dominantInfo) byte {
+	if !hasUTF8Dominant(dominantStates) {
+		return 0
+	}
+	for _, info := range dominantStates {
+		if !info.isMidAccept {
+			return 0x08
+		}
+	}
+	return 0x06
+}
+
+// appendMatchUTF8Err completes a match body's local declarations, whose group
+// count is b[groupsAt], with the error-lanes v128 matchUTF8ErrLocal names.
+func appendMatchUTF8Err(b []byte, groupsAt int, dominantStates []dominantInfo) []byte {
+	if !hasUTF8Dominant(dominantStates) {
+		return b
+	}
+	b[groupsAt]++
+	return append(b, 0x01, 0x7B)
+}
+
+func emitMatchBulkSkipDispatch(b []byte, dominantStates []dominantInfo,
 	midAcceptOff int32, tableMemIdx int, soleMid bool) []byte {
 	if len(dominantStates) == 0 {
 		return b
@@ -6861,6 +7019,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 			nonMid = append(nonMid, info)
 		}
 	}
+	errLocal := matchUTF8ErrLocal(dominantStates)
 	emitMidChain := func(b []byte) []byte {
 		for _, info := range mid {
 			b = append(b, 0x20, tmpLocal)
@@ -6870,7 +7029,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 			b = append(b, 0x04, 0x40) // if (void)
 			b = emitDominantBulkSkip(b, info, false,
 				posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
-				chunkLocal, tmpLocal)
+				chunkLocal, tmpLocal, errLocal)
 			b = append(b, 0x0B) // end if (per-dominant gate)
 		}
 		return b
@@ -6893,7 +7052,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 	if skipValDispatch {
 		b = emitDominantBulkSkip(b, mid[0], false,
 			posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
-			chunkLocal, tmpLocal)
+			chunkLocal, tmpLocal, errLocal)
 		b = append(b, 0x0B) // end if (val != 0)
 		return b
 	}
@@ -6907,7 +7066,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 		b = emitMidChain(b)
 		b = append(b, 0x05) // else — val >= 254: non-mid dominant
 		b = emitNonMidValDispatch(b, nonMid,
-			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 			hystCounterLocal, hystPosLocal)
 		b = append(b, 0x0B) // end if (val < 254)
 	case len(mid) > 0:
@@ -6921,7 +7080,7 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 		b = append(b, 0x4F)       // i32.ge_u
 		b = append(b, 0x04, 0x40) // if (val >= 254)
 		b = emitNonMidValDispatch(b, nonMid,
-			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
 			hystCounterLocal, hystPosLocal)
 		b = append(b, 0x0B) // end if (val >= 254)
 	}
@@ -6929,38 +7088,30 @@ func emitPhase4Dispatch(b []byte, dominantStates []dominantInfo,
 	return b
 }
 
+// errLocal is the v128 local a UTF-8 skip keeps its error lanes in
+// (emitUTF8BulkSkip); a body declares it only when hasUTF8Dominant says one of
+// its dominant states takes that skip, and passes 0 otherwise.
 func emitDominantBulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	posLocal, lenLocal, lastAcceptLocal,
-	ptrLocal, chunkLocal, tmpLocal byte) []byte {
+	ptrLocal, chunkLocal, tmpLocal, errLocal byte) []byte {
 	return emitDominantBulkSkipHooked(b, info, updateLastAccept,
-		posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, nil)
+		posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, nil)
 }
 
-// emitDominantBulkSkipHooked is emitDominantBulkSkip with an optional hook on
-// the BOUNDS EXIT — the `pos + 17 > len` arm, taken when fewer than 17 bytes
-// remain and no chunk can be loaded.
-//
-// That arm is worth a hook because it is MONOTONE: pos never decreases within a
-// call, so once the check fires, no later attempt in the same call can pass it
-// either. A channel that learns this can close itself for the rest of the call
-// instead of paying the same doomed bounds check on every subsequent
-// dominant-state byte. On a short input that is the whole cost of the channel —
-// `<([a-z]+)>` over "<abc>" made two attempts, both of which did nothing but
-// evaluate the bounds check and update a counter.
-//
-// A nil hook emits the original `br_if $bulk_done` byte for byte, so the seven
-// callers that do not want it keep their exact previous bytes.
-func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bool,
-	posLocal, lenLocal, lastAcceptLocal,
-	ptrLocal, chunkLocal, tmpLocal byte,
-	onBoundsExit func([]byte) []byte) []byte {
-	exitBytes := info.exitBytes
+// hasUTF8Dominant reports whether any of infos takes the skip over whole UTF-8
+// characters, whose body needs a second v128 local for its error lanes.
+func hasUTF8Dominant(infos []dominantInfo) bool {
+	for _, info := range infos {
+		if info.utf8 {
+			return true
+		}
+	}
+	return false
+}
 
-	// block $bulk_done
-	b = append(b, 0x02, 0x40)
-	// loop $bulk_outer
-	b = append(b, 0x03, 0x40)
-
+// emitBulkSkipBoundsExit emits a bulk skip's `pos + 17 > len` exit, with the
+// optional hook (emitDominantBulkSkipHooked).
+func emitBulkSkipBoundsExit(b []byte, posLocal, lenLocal byte, onBoundsExit func([]byte) []byte) []byte {
 	// if pos + 17 > len: br $bulk_done (depth 1)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x41, 0x11) // i32.const 17
@@ -6977,8 +7128,11 @@ func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bo
 		b = append(b, 0x0C, 0x02) // br $bulk_done
 		b = append(b, 0x0B)       // end if
 	}
+	return b
+}
 
-	// chunk = v128.load(ptr + pos + 1)
+// emitBulkSkipLoadChunk emits chunk = v128.load(ptr + pos + 1).
+func emitBulkSkipLoadChunk(b []byte, ptrLocal, posLocal, chunkLocal byte) []byte {
 	b = append(b, 0x20, ptrLocal)
 	b = append(b, 0x20, posLocal)
 	b = append(b, 0x6A)
@@ -6986,24 +7140,26 @@ func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bo
 	b = append(b, 0x6A)
 	b = append(b, 0xFD, 0x00, 0x00, 0x00)
 	b = append(b, 0x21, chunkLocal)
+	return b
+}
 
-	if len(info.selfLoopSet) > 0 {
-		// Self-loop set is the small (≤64, Shufti-cap) side, not
-		// the exit side. Ask the shared Shufti primitive for the STOP
-		// polarity directly: bit k set ⇔ lane k is NOT a member, i.e. the
-		// first byte outside the self-loop class, which is exactly what
-		// the ctz/pos-advance logic below needs.
-		b = emitShuftiStopMask(b, info.selfLoopSet, chunkLocal)
-	} else if len(exitBytes) == 1 {
-		// Phase 2 single-byte: m = bitmask(eq(chunk, splat(exit))).
+// emitBulkSkipExitMask pushes the i32 bitmask of the chunk's lanes holding an
+// exit byte.
+func emitBulkSkipExitMask(b []byte, exitBytes []byte, chunkLocal byte) []byte {
+	switch {
+	case len(exitBytes) == 0:
+		// No ASCII exit (a character loop only): no lane stops.
+		b = append(b, 0x41, 0x00) // i32.const 0
+	case len(exitBytes) == 1:
+		// Single exit byte: m = bitmask(eq(chunk, splat(exit))).
 		b = append(b, 0x20, chunkLocal)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(exitBytes[0]))
 		b = append(b, 0xFD, 0x0F) // i8x16.splat
 		b = append(b, 0xFD, 0x23) // i8x16.eq
 		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
-	} else {
-		// Phase 5 multi-byte: Shufti nibble lookup.
+	default:
+		// 2..8 exit bytes: Shufti nibble lookup.
 		// Build T_lo and T_hi: bit i is set in T_lo[lo] iff exitBytes[i] has low nibble lo.
 		var tLo, tHi [16]byte
 		for i, eb := range exitBytes {
@@ -7036,6 +7192,242 @@ func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bo
 		b = append(b, 0xFD, 0x0F) // i8x16.splat
 		b = append(b, 0xFD, 0x24) // i8x16.ne
 		b = append(b, 0xFD, 0x64) // i8x16.bitmask → i32
+	}
+	return b
+}
+
+// emitUTF8BulkSkip is the bulk skip for a state that loops on whole UTF-8
+// characters (dominantInfo.utf8): a Unicode-mode class holding every
+// non-ASCII character, `[^,]`, `.`, lowered to a cycle through one state per
+// character byte. The byte skip cannot serve it — every byte above 0x7F
+// leaves the state — so this one strides 16 bytes at a time over chunks that
+// are valid UTF-8 and hold no exit byte, and stops on a character boundary,
+// where the walk is back in the state:
+//
+//	all-ASCII chunk:  the byte skip's own step (stop at the first exit byte)
+//	otherwise:        invalid UTF-8 anywhere      → stop at the last character
+//	                                                 start before the first
+//	                                                 error (emitUTF8ErrorStop)
+//	                  an exit byte                → stop on it
+//	                  else                        → advance to the lead byte of
+//	                                                 a character the chunk cuts,
+//	                                                 or 16, and go on
+//
+// Validity is the three-table check of Keiser and Lemire ("Validating UTF-8
+// in less than one instruction per byte"), over the chunk with zeros before
+// it: the skip starts on a boundary, so a continuation byte in lane 0 is an
+// error, as it is to Go's decoder. No error means every character that
+// starts in the chunk is valid and every one but the last ends in it; the
+// last is open exactly when a lead byte sits within its length of the end
+// (lane 13 ≥ 0xF0, lane 14 ≥ 0xE0, lane 15 ≥ 0xC0). An ASCII exit byte after
+// an open character's lead would be an error, so the first exit always comes
+// first. An invalid byte is left to the walk, which knows what the pattern
+// does with it.
+//
+// Positions are those of emitDominantBulkSkipHooked: pos is the last byte
+// consumed, the chunk starts at pos + 1, and pos ends on the last byte of the
+// last whole character skipped.
+func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
+	posLocal, lenLocal, lastAcceptLocal,
+	ptrLocal, chunkLocal, tmpLocal, errLocal byte,
+	onBoundsExit func([]byte) []byte) []byte {
+	if errLocal == 0 {
+		panic("compile: a UTF-8 bulk skip in a body that declared no error-lanes local")
+	}
+	b = append(b, 0x02, 0x40) // block $bulk_done
+	b = append(b, 0x03, 0x40) // loop $bulk_outer
+	b = emitBulkSkipBoundsExit(b, posLocal, lenLocal, onBoundsExit)
+	b = emitBulkSkipLoadChunk(b, ptrLocal, posLocal, chunkLocal)
+	b = emitBulkSkipExitMask(b, info.exitBytes, chunkLocal)
+	b = append(b, 0x21, tmpLocal) // tmp = exit lanes
+
+	// An all-ASCII chunk: the byte skip's step.
+	b = append(b, 0x20, chunkLocal, 0xFD, 0x64, 0x45) // i8x16.bitmask; i32.eqz
+	b = append(b, 0x04, 0x40)                         // if
+	b = append(b, 0x20, tmpLocal, 0x45, 0x04, 0x40)   //   if (tmp == 0)
+	b = append(b, 0x20, posLocal, 0x41, 0x10, 0x6A, 0x21, posLocal)
+	b = append(b, 0x0C, 0x02) //     br $bulk_outer
+	b = append(b, 0x0B)       //   end
+	b = append(b, 0x20, tmpLocal, 0x68, 0x20, posLocal, 0x6A, 0x21, posLocal)
+	b = append(b, 0x0C, 0x02) //   br $bulk_done
+	b = append(b, 0x0B)       // end
+
+	b = emitUTF8ErrorLanes(b, chunkLocal)
+	b = append(b, 0x22, errLocal)         // local.tee err: the stop reads it again
+	b = append(b, 0xFD, 0x53, 0x04, 0x40) // v128.any_true; if (invalid)
+	b = emitUTF8ErrorStop(b, chunkLocal, tmpLocal, errLocal)
+	b = append(b, 0x20, posLocal, 0x6A, 0x21, posLocal)
+	b = append(b, 0x0C, 0x02) //   br $bulk_done
+	b = append(b, 0x0B)       // end
+
+	// No exit byte: advance to the open character's lead byte, or by 16.
+	b = append(b, 0x20, tmpLocal, 0x45, 0x04, 0x40) // if (tmp == 0)
+	b = append(b, 0x20, chunkLocal, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64) // i8x16.gt_u; i8x16.bitmask
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68) // i32.or; i32.ctz → 16 when none is open
+	b = append(b, 0x20, posLocal, 0x6A, 0x21, posLocal)
+	b = append(b, 0x0C, 0x01) //   br $bulk_outer
+	b = append(b, 0x0B)       // end
+	b = append(b, 0x20, tmpLocal, 0x68, 0x20, posLocal, 0x6A, 0x21, posLocal)
+
+	b = append(b, 0x0B) // end loop $bulk_outer
+	b = append(b, 0x0B) // end block $bulk_done
+	if updateLastAccept {
+		b = append(b, 0x20, posLocal, 0x41, 0x01, 0x6A, 0x21, lastAcceptLocal)
+	}
+	return b
+}
+
+// emitUTF8ErrorStop pushes where a chunk that is not valid UTF-8 can be left
+// to the walk: the last character start at or before both the lane before
+// the first error and the first exit byte (tmpLocal's mask), or 0.
+//
+// The first error lane j is at or after the start of the first faulty
+// sequence, and no further than the byte that ends it: a truncated sequence
+// shows at the byte that should have continued it, a bad lead or a stray
+// continuation at its own or the next byte. So every character that starts
+// at or before j - 1 and is not the last such is whole and valid — its own
+// fault would have shown before j — and the last character start at or before
+// j - 1 is a safe stop: on an invalid byte itself, a truncated sequence's
+// lead, or, conservatively, the character before a stray continuation.
+// Without it the skip stopped at the chunk start, and the walk tried it again
+// at every character until the invalid byte had passed: Cyrillic text with an
+// invalid byte every 12 bytes cost `.+` 94% more fuel than no skip at all.
+//
+// errLocal holds the chunk's error lanes, which the validity test computed
+// and kept: recomputing them here emitted the ~300-byte check twice per site.
+func emitUTF8ErrorStop(b []byte, chunkLocal, tmpLocal, errLocal byte) []byte {
+	b = append(b, 0x41, 0x1F) // i32.const 31
+	// The character starts: bytes that are not 10xxxxxx.
+	b = append(b, 0x20, chunkLocal, 0xFD, 0x0C)
+	for i := 0; i < 16; i++ {
+		b = append(b, 0xC0)
+	}
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x0C) // v128.and
+	for i := 0; i < 16; i++ {
+		b = append(b, 0x80)
+	}
+	b = append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask
+	// Lanes up to j - 1: (1 << j) - 1, j the first error lane.
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x20, errLocal)
+	b = append(b, 0xFD, 0x0C)
+	b = append(b, make([]byte, 16)...)
+	b = append(b, 0xFD, 0x24, 0xFD, 0x64, 0x68) // i8x16.ne; i8x16.bitmask; i32.ctz
+	b = append(b, 0x74, 0x41, 0x01, 0x6B)       // i32.shl; i32.const 1; i32.sub
+	b = append(b, 0x71)                         // i32.and
+	// Lanes up to the first exit byte: (lowest bit << 1) - 1, all for none.
+	b = append(b, 0x20, tmpLocal, 0x41, 0x00, 0x20, tmpLocal, 0x6B, 0x71) // tmp & -tmp
+	b = append(b, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6B, 0x71)               // << 1; - 1; and
+	// The highest of them, or 0: 31 - clz(mask | 1).
+	b = append(b, 0x41, 0x01, 0x72, 0x67, 0x6B) // i32.const 1; i32.or; i32.clz; i32.sub
+	return b
+}
+
+// utf8OpenTail holds, per lane, the largest byte that cannot open a
+// character running past the chunk's end: lanes 13, 14 and 15 are open from
+// a 4-, 3- and 2-byte lead on.
+var utf8OpenTail = [16]byte{
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xEF, 0xDF, 0xBF,
+}
+
+// emitUTF8ErrorLanes pushes a v128 that is nonzero exactly where the chunk,
+// read from a character boundary, is not valid UTF-8 (Keiser-Lemire): the
+// first two tables classify each (previous byte, byte) pair, and a
+// continuation byte must sit two or three bytes after a 3- or 4-byte lead
+// exactly when the third table's must-be-continuation bit says so.
+func emitUTF8ErrorLanes(b []byte, chunkLocal byte) []byte {
+	prev := func(b []byte, n int) []byte { // the chunk shifted n lanes right, zeros in
+		b = append(b, 0xFD, 0x0C)
+		b = append(b, make([]byte, 16)...)
+		b = append(b, 0x20, chunkLocal, 0xFD, 0x0D)
+		for i := 0; i < 16; i++ {
+			b = append(b, byte(16-n+i))
+		}
+		return b
+	}
+	splat := func(b []byte, v byte) []byte {
+		b = append(b, 0xFD, 0x0C)
+		for i := 0; i < 16; i++ {
+			b = append(b, v)
+		}
+		return b
+	}
+	b = append(b, 0xFD, 0x0C)
+	b = append(b, utf8ErrByte1High[:]...)
+	b = prev(b, 1)
+	b = append(b, 0x41, 0x04, 0xFD, 0x6D, 0xFD, 0x0E) // shr_u 4; swizzle
+	b = append(b, 0xFD, 0x0C)
+	b = append(b, utf8ErrByte1Low[:]...)
+	b = prev(b, 1)
+	b = splat(b, 0x0F)
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x0E) // and; swizzle
+	b = append(b, 0xFD, 0x4E)             // and
+	b = append(b, 0xFD, 0x0C)
+	b = append(b, utf8ErrByte2High[:]...)
+	b = append(b, 0x20, chunkLocal, 0x41, 0x04, 0xFD, 0x6D, 0xFD, 0x0E) // shr_u 4; swizzle
+	b = append(b, 0xFD, 0x4E)                                           // and
+	b = prev(b, 2)
+	b = splat(b, 0x60)
+	b = append(b, 0xFD, 0x73) // i8x16.sub_sat_u: ≥ 0x80 iff a 3- or 4-byte lead
+	b = prev(b, 3)
+	b = splat(b, 0x70)
+	b = append(b, 0xFD, 0x73) // ≥ 0x80 iff a 4-byte lead
+	b = append(b, 0xFD, 0x50) // or
+	b = splat(b, 0x80)
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x51) // and; xor
+	return b
+}
+
+var (
+	utf8ErrByte1High = [16]byte{2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73}
+	utf8ErrByte1Low  = [16]byte{231, 163, 131, 131, 139, 203, 203, 203, 203, 203, 203, 203, 203, 219, 203, 203}
+	utf8ErrByte2High = [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 230, 174, 186, 186, 1, 1, 1, 1}
+)
+
+// emitDominantBulkSkipHooked is emitDominantBulkSkip with an optional hook on
+// the BOUNDS EXIT — the `pos + 17 > len` arm, taken when fewer than 17 bytes
+// remain and no chunk can be loaded.
+//
+// That arm is worth a hook because it is MONOTONE: pos never decreases within a
+// call, so once the check fires, no later attempt in the same call can pass it
+// either. A channel that learns this can close itself for the rest of the call
+// instead of paying the same doomed bounds check on every subsequent
+// dominant-state byte. On a short input that is the whole cost of the channel —
+// `<([a-z]+)>` over "<abc>" made two attempts, both of which did nothing but
+// evaluate the bounds check and update a counter.
+//
+// A nil hook emits the original `br_if $bulk_done` byte for byte, so the seven
+// callers that do not want it keep their exact previous bytes.
+func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bool,
+	posLocal, lenLocal, lastAcceptLocal,
+	ptrLocal, chunkLocal, tmpLocal, errLocal byte,
+	onBoundsExit func([]byte) []byte) []byte {
+	if info.utf8 {
+		return emitUTF8BulkSkip(b, info, updateLastAccept,
+			posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, onBoundsExit)
+	}
+
+	// block $bulk_done
+	b = append(b, 0x02, 0x40)
+	// loop $bulk_outer
+	b = append(b, 0x03, 0x40)
+
+	b = emitBulkSkipBoundsExit(b, posLocal, lenLocal, onBoundsExit)
+	b = emitBulkSkipLoadChunk(b, ptrLocal, posLocal, chunkLocal)
+	if len(info.selfLoopSet) > 0 {
+		// Self-loop set is the small (≤64, Shufti-cap) side, not
+		// the exit side. Ask the shared Shufti primitive for the STOP
+		// polarity directly: bit k set ⇔ lane k is NOT a member, i.e. the
+		// first byte outside the self-loop class, which is exactly what
+		// the ctz/pos-advance logic below needs.
+		b = emitShuftiStopMask(b, info.selfLoopSet, chunkLocal)
+	} else {
+		b = emitBulkSkipExitMask(b, info.exitBytes, chunkLocal)
 	}
 
 	// local.tee tmpLocal (keep mask on stack)
@@ -7499,8 +7891,10 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	// appendMatchLocals appends the locals declaration shared by all three
 	// paths: i32Count i32 locals, then (only with dominants) 1 v128, then
-	// (only with non-mid dominants) the 2 hysteresis i32 locals.
+	// (only with non-mid dominants) the 2 hysteresis i32 locals, then (only
+	// with a UTF-8 dominant) the error-lanes v128.
 	appendMatchLocals := func(b []byte, i32Count byte) []byte {
+		groupsAt := len(b)
 		switch {
 		case hystDom:
 			b = append(b, 0x03, i32Count, 0x7F, 0x01, 0x7B, 0x02, 0x7F)
@@ -7509,7 +7903,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		default:
 			b = append(b, 0x01, i32Count, 0x7F)
 		}
-		return b
+		return appendMatchUTF8Err(b, groupsAt, dominantStates)
 	}
 
 	// startCellInit emits: cell = startStateAccept ? 1 : 0 (packed paths only).
@@ -7519,7 +7913,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	if useU8 && useCompression {
 		// ── u8 compressed path ────────────────────────────────────────────────
-		// Locals: state (2), pos (3), class (4). Phase 4 adds chunk (v128, 5);
+		// Locals: state (2), pos (3), class (4). The bulk skip adds chunk (v128, 5);
 		// non-mid dominants add hystCounter (6) + hystPos (7).
 		b = appendMatchLocals(b, 0x03)
 
@@ -7545,9 +7939,9 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse class),
+		// Bulk-skip dispatch: chunk=local 5, tmp=local 4 (reuse class),
 		// hysteresis counter/scratch = locals 6/7 (only with non-mid).
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
+		b = emitMatchBulkSkipDispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -7563,7 +7957,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 
 	if useU8 {
 		// ── u8 simple path ────────────────────────────────────────────────────
-		// Locals: state (2), pos (3). Phase 4 adds tmp (4, i32) + chunk (5, v128);
+		// Locals: state (2), pos (3). The bulk skip adds tmp (4, i32) + chunk (5, v128);
 		// non-mid dominants add hystCounter (6) + hystPos (7).
 		if emitMidDom {
 			b = appendMatchLocals(b, 0x03)
@@ -7592,8 +7986,8 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 		b = append(b, 0x0F)
 		b = append(b, 0x0B)
 
-		// Phase 4 dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
-		b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
+		// Bulk-skip dispatch: tmp=local 4, chunk=local 5, hyst=6/7.
+		b = emitMatchBulkSkipDispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 		b = append(b, 0x20, 0x03) // pos++
 		b = append(b, 0x41, 0x01)
@@ -7608,7 +8002,7 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	}
 
 	// ── u16 path ─────────────────────────────────────────────────────────────
-	// Locals: state (2), pos (3), byte (4). Phase 4 adds chunk (v128, 5);
+	// Locals: state (2), pos (3), byte (4). The bulk skip adds chunk (v128, 5);
 	// non-mid dominants add hystCounter (6) + hystPos (7).
 	b = appendMatchLocals(b, 0x03)
 
@@ -7640,8 +8034,8 @@ func buildMatchBody(startState uint32, tableOff, classMapOff int32, numClasses i
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	// Phase 4 dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
-	b = emitPhase4Dispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
+	// Bulk-skip dispatch: chunk=local 5, tmp=local 4 (reuse byte), hyst=6/7.
+	b = emitMatchBulkSkipDispatch(b, dominantStates, midAcceptOff, tableMemIdx, soleMid)
 
 	b = append(b, 0x20, 0x03) // pos++
 	b = append(b, 0x41, 0x01)
@@ -8420,10 +8814,13 @@ func buildLitAnchorBackScanBodyStamped(revL *dfaLayout, revTable *dfaTable, tabl
 	}
 
 	// ── DFA transition ────────────────────────────────────────────────────────
-	if revL.useCompression {
+	switch {
+	case !revL.useU8: // past 256 states: Unicode mode only (compile.go)
+		b = emitU16Transition(b, revL.tableOff, revL.useRowDedup, revL.rowMapOff, 0x02, 0x05, tableMemIdx)
+	case revL.useCompression:
 		b = emitCompressedU8Transition(b, revL.tableOff, revL.classMapOff, revL.numClasses,
 			0x02, 0x05, 0, 0, 0x05, tableMemIdx)
-	} else {
+	default:
 		b = emitSimpleU8Transition(b, revL.tableOff, 0x02, 0, 0, 0x05, tableMemIdx)
 	}
 
@@ -8634,6 +9031,12 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		locT1Lo   = 12
 		locT1Hi   = 13
 	)
+	// The UTF-8 skip's error lanes (emitUTF8BulkSkip), allocated last so no
+	// local above moves.
+	var locUTF8Err byte
+	if hasUTF8Dominant(l.dominantStates) {
+		locUTF8Err = a.V128()
+	}
 	b = a.EmitDecls(b)
 
 	// The find-from seed. The literal scan, the backward scan and
@@ -8666,6 +9069,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	if usePrefixScan {
 		simdParams = prefixScanParams{
 			Prefix:      p.litAnchorLitSet[0],
+			UTF8Text:    l.utf8Text,
 			EngineDepth: 2,
 			TableMemIdx: tableMemIdx,
 			Locals: prefixScanLocals{
@@ -8780,9 +9184,15 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	b = append(b, 0x48)       // i32.lt_s
 	b = append(b, 0x04, 0x40) // if (void)
 	if p.switchN > 0 {
-		b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
-			return append(b, 0x20, locCandWalk)
-		}, locAttemptStart, p.switchN, false)
+		if p.litAnchorOneByte() {
+			b = emitFindSwitchChargeEvery(b, locWalked, func(b []byte) []byte {
+				return append(b, 0x20, locCandWalk)
+			}, locAttemptStart, p.switchN)
+		} else {
+			b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
+				return append(b, 0x20, locCandWalk)
+			}, locAttemptStart, p.switchN, false)
+		}
 	}
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41, 0x01)
@@ -8896,10 +9306,18 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 		b = emitNLPreAcceptCheckNotes(b, l.midAcceptNLOff, t.hasNewlineBoundary, locPos, locState, tableMemIdx, mnc)
 
 		// DFA transition.
-		if l.useCompression {
+		switch {
+		case !l.useU8: // past 256 states: Unicode mode only (compile.go)
+			// The u16 emitter takes the byte from a local: the class local is
+			// free here, as the compressed arm's use of it shows.
+			b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A)
+			b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
+			b = append(b, 0x21, locSimdOrClass)
+			b = emitU16Transition(b, l.tableOff, l.useRowDedup, l.rowMapOff, locState, locSimdOrClass, tableMemIdx)
+		case l.useCompression:
 			b = emitCompressedU8Transition(b, l.tableOff, l.classMapOff, l.numClasses,
 				locState, locSimdOrClass, locPtr, locPos, 0xff, tableMemIdx)
-		} else {
+		default:
 			b = emitSimpleU8Transition(b, l.tableOff, locState, locPtr, locPos, 0xff, tableMemIdx)
 		}
 
@@ -8956,7 +9374,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 				b = append(b, 0x04, 0x40) // if (void)
 				b = emitDominantBulkSkip(b, info, true,
 					locPos, locLen, locLastAccept, locPtr,
-					locChunk, locSimdOrClass)
+					locChunk, locSimdOrClass, locUTF8Err)
 				b = append(b, 0x0B) // end if (per-dominant gate)
 			}
 		}
@@ -8973,7 +9391,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 				b = append(b, 0x04, 0x40) // if (void)
 				b = emitDominantBulkSkip(b, info, false,
 					locPos, locLen, locLastAccept, locPtr,
-					locChunk, locSimdOrClass)
+					locChunk, locSimdOrClass, locUTF8Err)
 				if marked {
 					// The skip strides over the notes: test where it stopped
 					// (see buildStartAnywhereForwardBody).
@@ -9037,9 +9455,15 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 	if p.switchN > 0 {
 		// The start-anywhere switch's counter: this candidate walked back
 		// (measured above) and forward from rev_result to pos.
-		b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
-			return append(b, 0x20, locCandWalk, 0x20, locPos, 0x20, locRevResult, 0x6B, 0x6A)
-		}, locAttemptStart, p.switchN, false)
+		if p.litAnchorOneByte() {
+			b = emitFindSwitchChargeEvery(b, locWalked, func(b []byte) []byte {
+				return append(b, 0x20, locCandWalk, 0x20, locPos, 0x20, locRevResult, 0x6B, 0x6A)
+			}, locAttemptStart, p.switchN)
+		} else {
+			b = emitFindSwitchCharge(b, locWalked, func(b []byte) []byte {
+				return append(b, 0x20, locCandWalk, 0x20, locPos, 0x20, locRevResult, 0x6B, 0x6A)
+			}, locAttemptStart, p.switchN, false)
+		}
 	}
 	b = append(b, 0x20, locAttemptStart)
 	b = append(b, 0x41, 0x01)
@@ -9130,6 +9554,7 @@ func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMem
 
 	// ── local declarations ────────────────────────────────────────────────
 	var nc *notesCtx
+	groupsAt := len(b)
 	switch {
 	case vn != nil && needChunk:
 		b = append(b, 0x03, 0x04, 0x7F, 0x01, 0x7B, notesNumLocals, 0x7F)
@@ -9144,6 +9569,16 @@ func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMem
 	default:
 		b = append(b, 0x01)       // 1 local group
 		b = append(b, 0x04, 0x7F) // 4 × i32
+	}
+	// The UTF-8 skip's error lanes (emitUTF8BulkSkip): one more v128, last.
+	var locUTF8Err byte
+	if hasUTF8Dominant(l.dominantStates) {
+		b[groupsAt]++
+		b = append(b, 0x01, 0x7B)
+		locUTF8Err = locChunk + 1
+		if vn != nil {
+			locUTF8Err += notesNumLocals
+		}
 	}
 	walk := func(b []byte, marked bool) []byte {
 		var mnc *notesCtx // the hooks' context: nil emits nothing
@@ -9275,7 +9710,7 @@ func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMem
 				b = append(b, 0x04, 0x40) // if (void)
 				b = emitDominantBulkSkip(b, info, true,
 					locPos, locLen, locLastAccept, locPtr,
-					locChunk, locSimdOrClass)
+					locChunk, locSimdOrClass, locUTF8Err)
 				b = append(b, 0x0B) // end if (per-dominant gate)
 			}
 		}
@@ -9292,7 +9727,7 @@ func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMem
 				b = append(b, 0x04, 0x40) // if (void)
 				b = emitDominantBulkSkip(b, info, false,
 					locPos, locLen, locLastAccept, locPtr,
-					locChunk, locSimdOrClass)
+					locChunk, locSimdOrClass, locUTF8Err)
 				if marked {
 					// The skip strides over the notes: test where it stopped
 					// (see buildStartAnywhereForwardBody).
@@ -9716,6 +10151,10 @@ type findBodyParams struct {
 	skipSafeOnDead bool
 	eofSkipSafe    bool
 	switchN        int32
+	// startRule: the Unicode start rule the body keeps (find_from.go).
+	startRule startRule
+	// utf8Text: the literal prefix is UTF-8 text (dfaLayout.utf8Text).
+	utf8Text bool
 
 	// notes, when non-nil, makes this body one of a pattern's two copies
 	// under per-search notes (search_notes.go): the ORDINARY copy with the
@@ -9943,6 +10382,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		}
 	}
 	var bulkHystCounterLocal, bulkHystPosLocal byte
+	// utf8ErrLocal: the UTF-8 skip's error lanes (emitUTF8BulkSkip), a v128
+	// declared LAST by appendLocalGroups so no other local moves. The
+	// mandatory-literal paths suppress the dominant dispatch, so they need none.
+	needUTF8Err := !useMandatoryLit && hasUTF8Dominant(dominantStates)
+	var utf8ErrLocal byte
 
 	// assignV128Locals assigns sequential indices starting at base to
 	// exactly the v128 locals numV128ForScan implies are live, leaving
@@ -10031,8 +10475,17 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	// going through it. Missing the second of those left three of this task's
 	// acceptance patterns still diverging after the first conversion — all
 	// three have a mandatory literal.
+	// startLocals: the Unicode start rule's scratch is state, pos and
+	// last_accept, i32 on every locals path below and unused until the outer
+	// prologue sets them, after the rule has run.
+	startLocals := utf8StartLocals{ptr: 0, len: 1, pos: uint32(findBodyAttemptStartLocal), c: 2, k: 3, n: 5}
+	if p.startRule != startRuleNone && useMandatoryLit {
+		// A pattern with a mandatory literal cannot match empty, so it needs
+		// no rule; the literal paths' locals were not checked for it.
+		panic("compile: a Unicode start rule on a mandatory-literal find body")
+	}
 	seedFindFrom := func(b []byte) []byte {
-		b, findFrom = emitFindFromSeed(b, attemptCursor)
+		b, findFrom = emitFindFromSeedRule(b, attemptCursor, p.startRule, startLocals)
 		// The adaptive dense switch's probe budget rides along here for the
 		// same reason the find-from offset does: this is the one point every
 		// locals path passes through, after the declarations and before the
@@ -10069,6 +10522,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		if nc != nil {
 			numGroups++
 		}
+		if needUTF8Err {
+			numGroups++
+		}
 		if i32Count <= findBodyAttemptStartLocal-2 {
 			panic("compile: buildFindBody i32 group does not cover attempt_start")
 		}
@@ -10088,6 +10544,16 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			nc.base = 2 + i32Count + byte(numV128ForScan) + trailingI32
 			if p.switchN > 0 {
 				nc.base++
+			}
+		}
+		if needUTF8Err {
+			b = append(b, 0x01, 0x7B)
+			utf8ErrLocal = 2 + i32Count + byte(numV128ForScan) + trailingI32
+			if p.switchN > 0 {
+				utf8ErrLocal++
+			}
+			if nc != nil {
+				utf8ErrLocal += notesNumLocals
 			}
 		}
 		// The find-from seed goes here and only here. This closure is the one
@@ -10162,6 +10628,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
 			Prefix:           prefix,
+			UTF8Text:         p.utf8Text,
 			FirstByteSet:     firstBytes,
 			FirstByteFlags:   firstByteFlags,
 			FirstByteOff:     firstByteOff,
@@ -10207,6 +10674,13 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 				DenseSkipFlag: denseSkipFlagLocal,
 			},
 			OnMatch: func(b []byte) []byte {
+				if p.startRule == startRuleScan {
+					// A candidate inside a character is no start position:
+					// continue $outer from the next one. The scan blocks are
+					// closed here, so $outer is depth 0 outside the rule's
+					// own block.
+					b = emitUTF8Start(b, startLocals, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+				}
 				if len(prefix) >= 1 {
 					// Prefix scan consumed prefix bytes: start DFA from prefixEndState
 					// at pos = attempt_start + len(prefix).
@@ -10767,6 +11241,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x03, 0x40) // loop $lit_outer
 		b, _ = emitPrefixScan(b, prefixScanParams{
 			Prefix:      mandatoryLit.bytes,
+			UTF8Text:    p.utf8Text,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
 			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan
 			// cursor (not attempt_start), so the tightened check would use
@@ -10897,7 +11372,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			midAcceptOff, tableMemIdx,
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
-			chunkLocal /*val+tmp=*/, 0x06,
+			chunkLocal /*val+tmp=*/, 0x06, utf8ErrLocal,
 			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
@@ -10977,7 +11452,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			midAcceptOff, tableMemIdx,
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
-			chunkLocal /*val+tmp=*/, simdMaskLocal,
+			chunkLocal /*val+tmp=*/, simdMaskLocal, utf8ErrLocal,
 			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
@@ -13201,10 +13676,25 @@ func hasOpCapture(re *syntax.Regexp) bool {
 	return false
 }
 
+// asciiRunes reports whether every rune of rs is ASCII, the one range whose
+// byte width does not depend on the mode.
+func asciiRunes(rs []rune) bool {
+	for _, r := range rs {
+		if r > 0x7F {
+			return false
+		}
+	}
+	return true
+}
+
 // extractLitChainCaptures walks a lit-chain parse tree and records each
 // OpCapture's compile-time offset. Returns (captures, maxGroup, ok). Rejects
 // captures inside an OpRepeat body (capture-the-last-occurrence semantics
-// cannot be reconstructed from compile-time offsets).
+// cannot be reconstructed from compile-time offsets), and a literal rune above
+// 0x7F: a rune is one byte wide only in byte mode and two to four in Unicode
+// mode, and the walk has no mode. analyseLitChainBranch, which every caller
+// runs first, refuses those runes already; the walk refuses them itself so
+// that no caller can get a width that is wrong in one of the two modes.
 //
 // `walk` returns the subtree's compile-time width AND whether that subtree
 // *ends* in a variable-length `{N,M}` repeat. The width of such a repeat is
@@ -13255,6 +13745,10 @@ func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 			}
 			return total, varTail
 		case syntax.OpLiteral:
+			if !asciiRunes(node.Rune) {
+				ok = false
+				return 0, false
+			}
 			return len(node.Rune), false
 		case syntax.OpRepeat:
 			if hasOpCapture(node.Sub[0]) {
@@ -13265,6 +13759,10 @@ func extractLitChainCaptures(re *syntax.Regexp) ([]captureGroup, int, bool) {
 			child := node.Sub[0]
 			switch child.Op {
 			case syntax.OpLiteral:
+				if !asciiRunes(child.Rune) {
+					ok = false
+					return 0, false
+				}
 				childW = len(child.Rune)
 			case syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
 				childW = 1
@@ -15519,11 +16017,12 @@ type lenAltPattern struct {
 // hard-coded false (leftmost-longest) for every caller, which silently
 // mismatched RE2/Perl semantics for find-mode callers whenever a branch had
 // its own internal ambiguity.
-func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPattern, bool) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+func analyseLitChainAltLenient(pattern resolvedPattern, leftmostFirst bool) (*lenAltPattern, bool) {
+	t, err := pattern.parse()
 	if err != nil {
 		return nil, false
 	}
+	re := t.re
 	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		re = re.Sub[0]
 	}
@@ -15573,13 +16072,12 @@ func analyseLitChainAltLenient(pattern string, leftmostFirst bool) (*lenAltPatte
 			return nil, false
 		}
 		// Compile the FULL branch (including literal) to an anchored DFA.
-		simplified := cur.Simplify()
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
-		prog, _ := syntax.Compile(simplified)
-		if needsUnicodeSupport(prog) {
+		prog, _ := compileProg(t.tree(cur))
+		if prog.refusedByByteGate() {
 			return nil, false
 		}
-		d, dOk := newDFA(prog, false, leftmostFirst, maxHelperDFAStates)
+		d, dOk := newDFA(prog, leftmostFirst, maxHelperDFAStates)
 		if !dOk {
 			return nil, false
 		}

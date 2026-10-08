@@ -15,7 +15,7 @@ import "regexp/syntax"
 // backward scan can stop at '\n' or pos 0 rather than running to a dead state.
 type litAnchorPoint struct {
 	prefixRe *syntax.Regexp
-	litSet   [][]byte       // 1..8 ASCII literals, each len >= 2
+	litSet   [][]byte       // 1..8 literals of len >= 2, or ONE one-byte literal
 	suffixRe *syntax.Regexp // includes the literal itself
 	anchored bool
 }
@@ -91,35 +91,31 @@ func simpleClassPrefix(re *syntax.Regexp) (tlo [16]byte, count int, ok bool) {
 // extractLitSet returns the literal set encoded by re, or nil when re is not
 // a qualifying literal or alternation of literals.
 //
-// Qualifying: ASCII only, no FoldCase, length >= 2, at most 8 alternatives.
-func extractLitSet(re *syntax.Regexp) [][]byte {
+// Qualifying: no FoldCase, length >= 2 bytes, at most 8 alternatives, and
+// runes the mode takes as bytes (literalBytes: ASCII in byte mode, UTF-8 in
+// Unicode mode).
+func extractLitSet(re *syntax.Regexp, unicode bool) [][]byte {
 	switch re.Op {
 	case syntax.OpLiteral:
 		if re.Flags&syntax.FoldCase != 0 {
 			return nil
 		}
-		var bs []byte
-		for _, r := range re.Rune {
-			if r > 127 {
-				return nil
-			}
-			bs = append(bs, byte(r))
-		}
-		if len(bs) < 2 {
+		bs, ok := literalBytes(re.Rune, unicode)
+		if !ok || len(bs) < 2 {
 			return nil
 		}
 		return [][]byte{bs}
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			return extractLitSet(re.Sub[0])
+			return extractLitSet(re.Sub[0], unicode)
 		}
 		return nil
 
 	case syntax.OpAlternate:
 		var result [][]byte
 		for _, sub := range re.Sub {
-			lits := extractLitSet(sub)
+			lits := extractLitSet(sub, unicode)
 			if lits == nil || len(lits) != 1 {
 				return nil
 			}
@@ -218,10 +214,19 @@ func reverseRegexp(re *syntax.Regexp) *syntax.Regexp {
 	return n
 }
 
+// oneByte reports whether lap anchors on a single one-byte literal.
+func (lap *litAnchorPoint) oneByte() bool {
+	return len(lap.litSet) == 1 && len(lap.litSet[0]) == 1
+}
+
 // findLitAnchorPoint parses pattern and returns the first litAnchorPoint where
-// the top-level concat contains a qualifying literal set.  Returns nil when no
-// qualifying child is found.
-func findLitAnchorPoint(pattern string) *litAnchorPoint {
+// the top-level concat contains a qualifying literal set. Returns nil when no
+// qualifying child is found. Failing a literal of two bytes or more, a pattern
+// that begins with a wide repeat (wideLeadingRepeat) takes a ONE-byte literal
+// at an inner position (oneByteLiteral): `@` in `[\w.]+@[\w.]+`, which no
+// other route scans for. Such a find always carries the start-anywhere switch's
+// counter, charging every failed candidate (litAnchorOneByte).
+func findLitAnchorPoint(pattern string, unicode bool) *litAnchorPoint {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -230,24 +235,64 @@ func findLitAnchorPoint(pattern string) *litAnchorPoint {
 	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		re = re.Sub[0]
 	}
-	return findLitAnchorPointInRegexp(re)
+	return findLitAnchorPointInRegexp(re, unicode, oneByteInnerLiteral(pattern, unicode))
+}
+
+// wideLeadingRepeat reports whether pattern begins with an unbounded repeat of
+// a class common in text that does not contain the space byte
+// (leadingRepeatBytes judged by commonInText) — exactly the patterns
+// classifyFind otherwise sends to the start-anywhere find for want of a literal
+// to scan for, at ~29 fuel/byte. Only those take a one-byte inner literal.
+// Where a pattern's first bytes are selective, scanning for them beats stopping
+// at every occurrence of a common byte — `(\d+)-(\d+)…` over
+// "not-a-log-line"×20 cost 777 fuel scanning for a digit and 5,282 stopping at
+// each `-` (perftest log-fields-10g). A class with the space byte keeps today's
+// find, whose SIMD run skip crosses a long field: `[^,]+,` over 500-byte fields
+// cost 2.1 fuel/byte there and 36.4 with every `,` walked back over its field.
+func wideLeadingRepeat(pattern string, unicode bool) bool {
+	return oneByteInnerLiteral(pattern, unicode) != nil
+}
+
+// oneByteInnerLiteral returns which one-byte inner literals pattern may anchor
+// on, or nil for none: any, behind a wide leading repeat (wideLeadingRepeat)
+// whose ASCII bytes make it common in text; and behind one that is common only
+// for its characters above 0x7F (Unicode mode, commonInText), only a byte not
+// common in text itself (byteRarity below 3). Such a class is dense in its
+// own script's text and rare in any other, and there a common literal is the
+// worse stop: `\p{Han}+x` over English text cost 4.06 fuel per byte anchored on
+// `x` against 2.13 without, while `@`, `=`, `-` and `;` win in every script.
+func oneByteInnerLiteral(pattern string, unicode bool) func(byte) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	stripCaptures(re)
+	set, ok := leadingRepeatBytes(re, unicode)
+	if !ok || set[' '] || !commonInText(set, unicode) {
+		return nil
+	}
+	if setRaritySum(set) >= wideClassThreshold {
+		return func(byte) bool { return true }
+	}
+	return func(b byte) bool { return byteRarity[b] < 3 }
 }
 
 // findLitAnchorPointInRegexp is findLitAnchorPoint's body, operating on an
 // already-parsed, already-capture-stripped node. Split out so the
 // alternation-of-branches detector (findAltLitAnchorPoints) can apply the
 // same single-branch qualification logic to each branch of an OpAlternate
-// without re-parsing or re-stripping captures per branch.
-func findLitAnchorPointInRegexp(re *syntax.Regexp) *litAnchorPoint {
+// without re-parsing or re-stripping captures per branch. oneByteInner, when
+// non-nil, admits the one-byte fallback for the bytes it accepts
+// (oneByteInnerLiteral); the alternation form passes nil.
+//
+// The one-byte literal is taken only when no child carries a longer literal,
+// so every pattern with one keeps the literal it had.
+func findLitAnchorPointInRegexp(re *syntax.Regexp, unicode bool, oneByteInner func(byte) bool) *litAnchorPoint {
 	if re.Op != syntax.OpConcat {
 		return nil
 	}
 	children := re.Sub
-	for i, child := range children {
-		lits := extractLitSet(child)
-		if lits == nil || len(lits) > 8 {
-			continue
-		}
+	at := func(i int, lits [][]byte) *litAnchorPoint {
 		lap := &litAnchorPoint{litSet: lits}
 
 		// prefixRe: children [0, i)
@@ -279,6 +324,35 @@ func findLitAnchorPointInRegexp(re *syntax.Regexp) *litAnchorPoint {
 
 		lap.anchored = prefixStartsWithLineAnchor(lap.prefixRe)
 		return lap
+	}
+	for i, child := range children {
+		lits := extractLitSet(child, unicode)
+		if lits == nil || len(lits) > 8 {
+			continue
+		}
+		return at(i, lits)
+	}
+	if oneByteInner != nil {
+		for i := 1; i < len(children); i++ {
+			if lit := oneByteLiteral(children[i], unicode); lit != nil && oneByteInner(lit[0]) {
+				return at(i, [][]byte{lit})
+			}
+		}
+	}
+	return nil
+}
+
+// oneByteLiteral returns re's literal when it is exactly one byte — one
+// unfolded rune the mode takes as a byte (literalBytes) — or nil.
+func oneByteLiteral(re *syntax.Regexp, unicode bool) []byte {
+	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
+		re = re.Sub[0]
+	}
+	if re.Op != syntax.OpLiteral || re.Flags&syntax.FoldCase != 0 || len(re.Rune) != 1 {
+		return nil
+	}
+	if bs, ok := literalBytes(re.Rune, unicode); ok && len(bs) == 1 {
+		return bs
 	}
 	return nil
 }
@@ -508,11 +582,12 @@ const maxAltLitAnchorBranches = 8
 // Returns (nil, false) on ANY rejection — callers must fall through cleanly
 // to the standard combined-DFA find path, exactly as they already do when
 // findLitAnchorPoint returns nil for the single-pattern case.
-func findAltLitAnchorPoints(pattern string, byteMode bool) ([]altLitAnchorBranch, bool) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+func findAltLitAnchorPoints(pattern resolvedPattern) ([]altLitAnchorBranch, bool) {
+	t, err := pattern.parse()
 	if err != nil {
 		return nil, false
 	}
+	re := t.re
 	for re.Op == syntax.OpCapture && len(re.Sub) == 1 {
 		re = re.Sub[0]
 	}
@@ -527,11 +602,11 @@ func findAltLitAnchorPoints(pattern string, byteMode bool) ([]altLitAnchorBranch
 		for branchRe.Op == syntax.OpCapture && len(branchRe.Sub) == 1 {
 			branchRe = branchRe.Sub[0]
 		}
-		lap := findLitAnchorPointInRegexp(branchRe)
+		lap := findLitAnchorPointInRegexp(branchRe, t.unicode(), nil)
 		if lap == nil {
 			return nil, false
 		}
-		minLen, maxLen := regexpMinMaxLen(lap.prefixRe, byteMode)
+		minLen, maxLen := t.tree(lap.prefixRe).minMaxLen()
 		if minLen != maxLen || maxLen < 0 {
 			return nil, false // not a fixed-length prefix
 		}

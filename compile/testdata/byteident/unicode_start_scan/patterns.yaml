@@ -1,0 +1,7 @@
+# Unicode mode: an empty match through \B, which holds inside a character, so
+# every candidate start is checked (the scan rule) and the start-anywhere find
+# is not used.
+regexps:
+  - pattern: 'a?\B'
+    unicode: true
+    find_func: uni_scan_find

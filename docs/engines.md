@@ -41,13 +41,27 @@ to select Backtracking before this fix, which also corrected a real
 register-copy-ordering bug that this pattern shape had been triggering (see
 [Register minimization and copy ordering](#register-minimization-and-copy-ordering)
 below). The one case that still disqualifies a quantifier loop regardless
-of overlap: either branch's first-byte set is *indeterminate* — e.g. an
-inverted class wider than 256 codepoints (`[^>]`, `.`) — because TDFA can't
-resolve "continue or exit" without knowing what the loop's exit needs.
+of overlap, in byte mode: either branch's first-byte set is *indeterminate* —
+e.g. an inverted class wider than 256 codepoints (`[^>]`, `.`). Such a
+pattern's path is deterministic in practice, and Backtracking checks a wide
+class with a few inline compares, which measured cheaper than a TDFA.
 
 If a pattern has captures but fails the TDFA check (e.g. `<([^>]+)>`,
-`([^,]+),`, `(.*)(foo)` — all disqualified by the indeterminate-branch rule
-above, not by mere overlap), the Backtracking engine is used automatically.
+`([^,]+),`, `(.*)(foo)` in byte mode — all disqualified by the
+indeterminate-branch rule above, not by mere overlap), the Backtracking
+engine is used automatically.
+
+In Unicode mode no first set is indeterminate for its width: a class of any
+width, `.` and a folded literal (its case-fold orbit) are computed as
+codepoint ranges, and only an alternation whose branches really overlap
+(`((\pL)|(a))`, `((?i:é)|(É))`) goes to Backtracking. A lowered wide class is
+a trie over the bytes of its UTF-8 sequences, with one arm per distinct lead
+byte range at the top (`\pL`: 34), which Backtracking still tries arm by arm,
+pushing a frame for each, so there the TDFA is the cheaper engine:
+`(\pL+)\s(\pN+)` over "Straße 42" costs 2,470 fuel on a TDFA against 7,192 on
+Backtracking, `(\pL+)@(\pL+)` over "пользователь@пример" 4,914 against 27,720,
+and `<([^>]+)>` takes a TDFA too. (Lowered to one arm per sequence, `\pL` had
+800 arms, and Backtracking cost 101,301 and 213,949 on those two.)
 
 ---
 
@@ -145,7 +159,7 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 
 | Strategy | Condition |
 |---|---|
-| **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window |
+| **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window. In Unicode mode, a literal that begins with a non-ASCII character is checked a whole character at a time on a first-byte hit: a script's lead byte begins much of its alphabet (0xD0, half of Cyrillic), so `привет` was hit in nearly every chunk of Russian text and cost 27 fuel/byte, and with the second byte checked it costs 6.0 (text in another script, which never hits the lead byte, is unchanged) |
 | **Teddy (1/2/3/4-byte tiers)** | 1–8 first-byte candidates; tier picked by how many leading bytes are jointly selective (nibble-table SIMD lookup per tier) |
 | **Shufti** | 9–16 first-byte candidates (unconditional), or 17–64 (only when a byte-rarity heuristic predicts it beats scalar, or the pattern was compiled with `hints: [prefer-no-match]`, which forces it regardless of the heuristic) — nibble-table SIMD set-membership test over the candidate set itself, not per-candidate comparisons |
 | **Scalar** | 0 first-byte candidates, > 64 candidates, or a 17–64-candidate set the rarity heuristic predicts scalar wins for |
@@ -173,11 +187,36 @@ Both mechanisms use WASM SIMD (simd128).
 
 When a pattern's mandatory literal is at least 2 bytes long (up to 8 byte-alternating variants), the compiler may emit a three-phase find body that is substantially faster than scanning every start position with the full DFA.
 
+A ONE-byte literal anchors the find too, in one case: the pattern begins with an
+unbounded repeat of a class common in text that does not contain the space
+byte, and has no longer literal — `[\w.%+-]+@[\w-]+\.\w{2,}`, which would
+otherwise get the start-anywhere find for want of anything to scan for (29
+fuel/byte against 1.4). Elsewhere a one-byte literal loses: a pattern whose
+first bytes are selective already scans for them (`(\d+)-(\d+)…` over text full
+of `-` and no digit: 777 fuel against 5,282), and a class with the space byte
+keeps the ordinary find's SIMD skip across a long run (`[^,]+,` over 500-byte
+fields: 2.1 fuel/byte against 36.4). Such a find always carries the switch's
+counter (below), charging every failed candidate its walk plus 40, so text
+where the byte is common and matches rare hands the search over (`[a-z]+-[0-9]+`
+over "not-a-log-line"×N: 29.1 fuel/byte, 61.0 unguarded).
+
+In Unicode mode a class holding characters above 0x7F counts as common in text
+too: the byte-frequency model behind "common" is English, which grades every
+such byte rare, yet `[α-ω]` is as dense in Greek text as `[a-z]` is in English.
+Judged rare, `[α-ω]+@[α-ω]+` kept a find that cost 144 fuel per byte over Greek
+words; anchored on `@` it costs 2.5, and 1.4-2.1 over any other text. Such a
+class — common only for those characters — takes a one-byte literal only when
+the byte is not common in text itself (`@`, `=`, `-`, `;`, not `x` or `,`):
+rare outside its own script, it would otherwise stop the scan at every `x` of
+an English text (`\p{Han}+x`: 4.06 fuel/byte against 2.13).
+
 **Conditions for activation:**
 - find mode (`find_func` requested)
-- u8 DFA (≤ 256 states, no word boundaries)
-- a qualifying mandatory literal exists: ASCII, length ≥ 2, at most 8 alternates
-- the reversed-prefix DFA has ≤ 256 states
+- a DFA without word boundaries, and u8 (≤ 256 states) in byte mode; in Unicode
+  mode, where a lowered letter class alone makes tables larger, u16 tables too
+- a qualifying literal exists: length ≥ 2 and at most 8 alternates, or the
+  one-byte case above; ASCII in byte mode, UTF-8 in Unicode mode
+- the reversed-prefix DFA has ≤ 256 states in byte mode
 - for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
 
 **Three-phase runtime execution:**
@@ -256,7 +295,7 @@ a replacement. The compiler picks per pattern, at compile time:
 |---|---|
 | provably linear: a failed attempt walks a bounded number of bytes (no reachable cycle on which it keeps going without accepting and from which it can still end that way — an accept an assertion conditions counts only where its condition can hold); or, without an assertion, both find-body shape detectors apply, or for a literal-anchored find neither the part before the literal nor the part after it can contain it | the ordinary find, unchanged |
 | anchored at 0 | the ordinary find |
-| starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` picks the switch, which keeps the ordinary find |
+| starts with an unbounded repeat of a class common in prose, without the space byte and with no literal to scan for (`\w+@\w+`, `[a-z]+[0-9]{3}`) | the start-anywhere find alone — the ordinary one costs 100+ per byte on such patterns even on ordinary text. `prefer-match` picks the switch, which keeps the ordinary find. In Unicode mode a class common only for its characters above 0x7F (see the literal-anchored find above) qualifies when it starts on at most eight bytes (`[α-ω]+\d`: 154 → 35 fuel/byte over Greek, 4.6 → 2.4 over English); one starting on more (`\p{Han}`: nine) keeps the switch, because the forward pass can skip the text between its first bytes only when they are at most eight |
 | starts with such a repeat that includes the space byte (`[^,]*,`) | the switch (below); `prefer-no-match` picks the start-anywhere find alone |
 | anything else not provably linear, with or without a hint | the **switch** |
 
@@ -366,6 +405,8 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), both TDFA and Backtracking skip re-walking the capture body after the scan — the single group's bounds are just the match's own start/end, so no tag ops or capture-tracking NFA pass are needed at all.
 
+**Literal-affix single-capture shortcut:** the same holds when the only capture group is wrapped in plain literals — a literal before it, after it, or both, and nothing else (`([^,]+),`, `<([^>]*)>`, `key=(\w+)`). The literals have a fixed byte length, so group 1 is the match's start plus the prefix's length to its end minus the suffix's length, and the capture pass is skipped. A case-folded literal does not qualify: under `(?i)` a folded character can be a different number of bytes than the one written. In Unicode mode the lengths are the literals' UTF-8 lengths. This matters most where the find pass is cheap and the capture pass is not: over a 487-byte mostly non-ASCII field, `([^,]+),` costs 16,243 fuel against 75,182 with the capture pass.
+
 #### Register minimization and copy ordering
 
 **Register minimization:** after table construction, a liveness-based graph-coloring pass merges registers whose live ranges do not overlap, reducing WASM local count.
@@ -392,6 +433,42 @@ The NFA is emitted as a WASM `br_table` dispatch loop. Each NFA instruction maps
 
 **Stack overflow guard:** before each frame push, the engine checks that the frame fits. If it does not, the body first grows memory; a body that cannot make room hands the call to its [fallback body](#work-budget-and-the-fallback-body) rather than corrupting memory; with the budget off it returns the `-2` sentinel instead — see the next sections.
 
+### First-byte dispatch over an alternation
+
+`get|head|post|delete` compiles to a chain of `InstAlt`s, one per arm, and a
+plain walk of it pushes a frame at each, tries the first arm, fails on its
+first byte, pops, and so on down the chain — at every position the body
+visits. Instead the chain's head reads the next byte once and branches
+(`br_table`) to the arms that byte can start, pushing frames only for those,
+in their order, and entering the first; a byte that starts none fails at
+once. An arm skipped this way would have failed on that byte, so no answer
+changes — leftmost-first priority is the order of the arms that can match,
+which is kept. The bytes an arm can start are a superset (an assertion or a
+capture before the first byte is looked through, `(?i)` adds both cases), and
+an arm that can match empty is tried in every case, end of input included.
+Chains of three or more arms, each dispatched once at its widest head; its
+inner `InstAlt`s are then unreachable and emitted as such. Where most bytes
+start most arms, each case only names its arms in a bitmask and one shared
+sequence pushes them, rather than every case repeating the pushes — a frame
+stores every capture slot, and the repetition grew one WAF member's module
+44%. Only in the fast body; the fallback body keeps the plain chain, since it
+memoises every `InstAlt` on `(pc, pos)`.
+
+The dispatch charges the [work budget](#work-budget-and-the-fallback-body)
+one pop per arm it skips — the pops the plain chain would have made, which is
+what the budget is calibrated in. It also keeps the budget's time bound: every
+cycle passes through an `InstAlt`, and a case that enters its only arm pushes
+no frame, so uncharged, `(?:ab|cd|ef)*z` as a set member over `ab`×N walked
+from every candidate without one charge and went quadratic.
+
+Measured (fuel per byte): Unicode `(\pL+?)(\pL*)` over mixed text 967 → 138
+(a lowered class is itself a chain, one arm per lead byte); WAF set members on
+Backtracking, `scan_any` over 16 KB of form / JSON / HTTP-log text: 29-88%
+less (`cij_query_params_02` over form data 400,849 → 46,648, `xss_body_02`
+over JSON 38,925 → 26,611); a non-greedy body re-trying `(from|into|set)` at
+every step 88 → 55; `\b(get|post|…)` captures 5-12% less. Module sizes moved
+−1.6% to +7.3%.
+
 ### The frame stack
 
 Backtracking bodies used to reserve their stacks in the module — `numAlts × 4096` frames, worked out from the pattern and claimed when the module loaded, whatever the input, and once per set in a set: a pattern with many branches claimed megabytes to match ten bytes, and a 339-set WAF configuration claimed 596 MB of its 643 MB before its first call. None reserves anything now. When a call starts, the stack is placed at the same scratch base as the fallback's memory (see [Where the fallback's memory comes from](#where-the-fallbacks-memory-comes-from)) and given a small starting size (64 KB), growing memory only if it does not already have that much; when a push does not fit, memory grows by the stack's current size, doubling it. The stack is the last thing in memory, so growing copies nothing, and memory never shrinks, so a call that fits in what an earlier call left never grows. Every body and every set uses the same scratch, so the memory a module ends up with is the largest any one search needed, not the sum over its patterns. When memory cannot grow, the body hands over to the fallback.
@@ -411,7 +488,7 @@ The engine gives up only when it cannot get the memory a search needs — linear
 
 `-2` is returned by every export shape that can host a Backtracking body: `match_func`, `find_func` (as `i64 -2`), `groups_func`, and the `_batch` variants — for the batch exports as a negative count, since a successful call always returns a count ≥ 0. Wrapper functions propagate it instead of folding it into their own "negative means no match" test.
 
-**Which patterns grow the stack.** The frame has to survive input being consumed, which means an untried *alternation* branch, not merely a quantifier: after `ab` matches in `(?:ab|cd)*?x`, the frame holding "try `cd` here instead" stays live. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the module's then-fixed stack returned `-1`, an input-length-dependent false negative with no diagnostic; today the stack grows instead, and only memory that cannot grow hands the call to the fallback.
+**Which patterns grow the stack.** The frame has to survive input being consumed, which means an untried *alternation* branch that the same byte can start, not merely a quantifier: after `ab` matches in `(?:ab|a?cd)*?x`, the frame holding "try `a?cd` here instead" stays live. A branch the byte cannot start is never pushed ([first-byte dispatch](#first-byte-dispatch-over-an-alternation)): `cd` beside `ab` leaves no frame. A non-greedy loop on its own does not accumulate, because its preferred branch fails against the next byte and the frame is popped straight back. The alternation must also survive `regexp/syntax` simplification — `a|b` becomes the char class `[ab]` and `aa|ab` is factored to `a[ab]`, and neither leaves an `InstAlt` to push a frame for. Before this sentinel existed, crossing the module's then-fixed stack returned `-1`, an input-length-dependent false negative with no diagnostic; today the stack grows instead, and only memory that cannot grow hands the call to the fallback.
 
 **Host behaviour.** Generated stubs must surface `-2` as an error, never as "no match":
 
@@ -481,7 +558,9 @@ popped as the search goes, so it is never exhausted.
 (with one exception, below):
 
 1. **The fast body** is the ordinary body plus one `i64` counter, set to
-   `(span + 1) × numInstructions` and decremented on every frame POP. `span`
+   `(span + 1) × numInstructions` and decremented on every frame POP — and,
+   at an alternation's [first-byte dispatch](#first-byte-dispatch-over-an-alternation),
+   once for every arm it skips. `span`
    is the input length, or the window length when a capture body runs in
    window mode. A `find` whose caller passes a search block (every generated
    stub does) gets the counter once per SEARCH and keeps what is left in the
@@ -709,22 +788,25 @@ Regexped implements **RE2 syntax with Perl/RE2 semantics** (leftmost-first match
 
 ### Bytes, not codepoints
 
-Every engine here operates on **bytes**. `.` consumes one byte, a character
-class is a byte class, `\b` is ASCII, and a table row is indexed by a byte
-value. There is no UTF-8 decoding step anywhere in the pipeline.
+In **byte mode** — the mode of every pattern that names nothing above U+007F,
+and the one `byte_mode: true` or `unicode: false` asks for — every engine
+operates on bytes. `.` consumes one byte, a character class is a byte class,
+`\b` is ASCII, and a table row is indexed by a byte value; there is no UTF-8
+decoding step. [Unicode mode](#unicode-mode), below, reads the input as UTF-8
+instead: the engines still run over bytes, and the pattern is lowered to the
+UTF-8 byte sequences of its characters.
 
-This is a deliberate design point rather than a missing feature, and it has two
-visible consequences.
+**What a byte-mode pattern may name.** A pattern naming a rune above U+007F,
+or a Unicode class such as `\pL`, is put in Unicode mode unless its entry says
+otherwise. Under [`byte_mode: true`](cli.md#byte_mode--matching-raw-bytes-above-127)
+— or `unicode: false`, which is the same thing — runes `0x80`-`0xFF` mean those
+bytes, and a rune above `U+00FF`, a Unicode class included, is a compile
+error. Before this gate
+existed, such patterns compiled and the automaton silently truncated the rune
+to a byte — `[a-zé]+` over `"zzé"` returned `[0,2)` where Go returns `[0,4)`.
 
-**A pattern naming a rune above U+007F is a compile error** unless the entry
-sets [`byte_mode: true`](cli.md#byte_mode--matching-raw-bytes-above-127), which
-declares runes `0x80`-`0xFF` to mean those bytes. Runes above `U+00FF` are
-rejected in both modes. Before this gate existed, such patterns compiled and
-the automaton silently truncated the rune to a byte — `[a-zé]+` over `"zzé"`
-returned `[0,2)` where Go returns `[0,4)`.
-
-**Two things are still byte-semantic by declaration**, because no gate can
-separate them from ordinary ASCII patterns:
+**Two things are byte-semantic in byte mode by declaration**, because no gate
+can separate them from ordinary ASCII patterns (Unicode mode changes both):
 
 - `.` and negated classes match one byte, so `a.c` does not match `"aéc"`
   (Go, decoding UTF-8, does).
@@ -733,9 +815,119 @@ separate them from ordinary ASCII patterns:
   manufactures those runes from the ASCII the pattern actually wrote, and
   rejecting them would reject `(?i)` over any letter class.
 
-If your input is UTF-8 and your pattern is ASCII, none of this is visible: an
-ASCII byte never appears inside a multi-byte UTF-8 sequence, so a byte-oriented
-match over UTF-8 text finds exactly what a codepoint-oriented one would.
+If your input is UTF-8 and your pattern names only ASCII characters and ASCII
+classes — no `.` and no negated class — none of this is visible: an ASCII byte
+never appears inside a multi-byte UTF-8 sequence, so a byte-oriented match over
+UTF-8 text finds exactly what a codepoint-oriented one would.
+
+### Unicode mode
+
+**What selects it.** A pattern is compiled in Unicode mode when its entry sets
+[`unicode: true`](cli.md#unicode--codepoint-mode), or when the
+pattern itself asks for codepoints: it names a character above U+007F — `é`,
+`\xe9`, `\x{3b1}`, `[à-ÿ]` — or uses a Unicode class, `\pL`, `\p{Greek}`,
+`\P{N}`. `.` and negated classes do not count (`[^,]` names every character
+there is), nor do the characters Go's parser adds to `(?i)` over ASCII. Setting
+`byte_mode: true` or `unicode: false` keeps a pattern in byte mode: there,
+characters `0x80`-`0xFF` mean raw bytes, and a Unicode class or a character
+above U+00FF stays a compile error. Every other pattern stays in byte mode,
+so no pattern that compiles today changes meaning. Because the trigger is in
+the pattern, `.` means a byte in `a.c` and a character in `a.c\pL`;
+`compile --verbose` and `--diag-json` report each pattern's mode.
+
+**What changes in Unicode mode.** The input is read as UTF-8. (The ASCII
+examples below need `unicode: true` to be in Unicode mode at all.)
+
+- `.`, negated classes and every character class consume one character, one to
+  four bytes: `a.c` matches `"aéc"` as `[0,4)`, as Go does.
+- `(?i)` folds across the whole of Unicode, one character to one: `(?i)k`
+  matches the Kelvin sign, `(?i)s` the long s, `(?i)σ` matches `ς` and `Σ` —
+  and `(?i)ß` does not match `"ss"`, which is a full folding Go does not do
+  either.
+- No match starts, and no empty match is reported, inside a character:
+  `a*` over `"é"` is `[0,0)` `[2,2)`, and a find started from a position inside
+  a character searches from the next one.
+- A byte that belongs to no valid UTF-8 sequence matches nothing — no class,
+  not even `.`. This is RE2's rule and differs from Go's; see
+  [Differences from Go's `regexp`](re2.md#differences-from-gos-regexp). A match
+  can still start right after such a byte, or at it when the match is empty,
+  exactly where Go's would.
+- Positions stay **byte** offsets, so the WASM interface and every generated
+  stub are unchanged.
+
+**What stays ASCII in both modes**, as in Go and RE2:
+
+| Syntax | Matches |
+|---|---|
+| `\w` / `\W` | `[0-9A-Za-z_]` / its complement |
+| `\d` / `\D` | `[0-9]` / its complement |
+| `\s` / `\S` | `[\t\n\f\r ]` / its complement |
+| `\b` / `\B` | a boundary between a `\w` byte and a non-`\w` one, or its absence — `é` counts as non-word |
+| `[[:alpha:]]` and the other POSIX classes | their ASCII members |
+
+**Sets.** A set runs in one mode. A member *asks for Unicode* when its entry
+sets `unicode: true` or its pattern selects it as above; a member is
+*explicitly byte* when its entry sets `byte_mode: true` or `unicode: false`.
+
+- A set holding an explicitly-byte member and a member asking for Unicode is a
+  compile error, and so is a set-level `unicode: true` with an explicitly-byte
+  member, or a set-level `unicode: false` with a member asking for Unicode.
+- Otherwise, one member asking for Unicode puts the whole set in Unicode mode,
+  and the members that say nothing follow it.
+- Otherwise the set-level `unicode:` decides, and with none the set runs in
+  byte mode.
+- A pattern's own exports (`match_func`, `find_func`, `groups_func`) follow
+  the single-pattern rule above whatever set it belongs to: `a.c` with its own
+  `find_func`, in a set running in Unicode mode, reads `.` as a byte in that
+  export and as a character in the set.
+
+Every set capability keeps the rules above — no match, and no empty match,
+inside a character — at every `offset`, for both `find` policies and the
+answer cache; see [sets.md](sets.md#sets-in-unicode-mode).
+
+**Limits.** A pattern in Unicode mode defaults to `max_dfa_states: 16384`
+(byte mode: 1,024): each Unicode class position costs DFA states — about 290
+for `\pL` — and Backtracking, the fallback past the limit, runs a program as
+large as the classes are, at hundreds of times a DFA's cost per byte. A set in
+Unicode mode likewise defaults to `max_fallback_states: 16384`. The other
+limits are unchanged; `compile --verbose` names each one a pattern hits and
+the working memory per input byte its search keeps.
+
+**Fast paths that stay ASCII.** Three analysers that speed up a repeated class
+recognise ASCII classes only: the literal-anchored find's class prefix
+(`[a-z]{3}foo`), the literal chain's counted class (`ab[0-9]{4}`), and the
+SIMD probe over a chain of one byte class (`[a-z]{8,}`). A repetition of a
+non-ASCII class is one to four bytes per character, so its byte count is not
+fixed; such a pattern takes the general DFA find, which is correct and
+linear, without the probe.
+
+**Runs of whole characters.** A class that holds every non-ASCII character —
+`.`, `[^,]`, `[^"\\]`, `(?s).` — is lowered to a cycle through one DFA state
+per byte of a character, so the byte-wise SIMD skip of a looping state (which
+needs the state to loop on almost every byte) cannot serve it. Such a state
+gets a skip of its own: 16 bytes at a time while the chunk is valid UTF-8 and
+holds none of the state's ASCII exit bytes (at most eight), stopping on a
+character boundary — at an exit byte, before a character the chunk cuts, or
+before the first invalid sequence, which the byte walk then handles. The
+validity check is the three-table SIMD check of Keiser and Lemire. It serves
+the DFA and Compiled DFA find and match bodies, the start-anywhere forward
+pass and the TDFA capture body, in Unicode mode only; byte mode is unchanged.
+The TDFA is not minimized, so there the loop is a group of states with
+identical rows — `[^>]`'s two ASCII ranges give two — and the skip runs where
+the walk enters the group, in the tag-op dispatch's arm of each state that
+leads into it, so a byte outside the loop pays nothing for it.
+
+Measured in fuel per input byte over mostly non-ASCII text: `[^,]+,` find over
+10 KB of mixed-script text with a comma every ~580 bytes 33.2 → 5.2, over
+Cyrillic prose 34.4 → 8.1; `.+` find 32.1 → 4.7; `[^,]+,` and `.+` match over
+4 KB of Cyrillic, CJK or accented Latin 24.0 → 4.9, of ASCII 24.0 → 2.0; with the single-capture
+shortcut, `([^,]+),` groups over a 487-byte field 154.9 → 5.3; on the TDFA,
+`<([^>]+)>(x)` groups over tags 117.2 → 25.4 and `(\w+)=([^&]+)&` over
+key/value text 31.0 → 10.3. In a find body the cost is the per-byte dispatch
+any looping state adds to a walk: over text with an invalid byte every 12
+bytes, where every walk dies within the segment and restarts at the next
+position, `[^,]+,` find costs 10% more. A module with such a state grows by
+about 3.5 KB in its find bodies and 1.8 KB in a TDFA capture body.
 
 ---
 
@@ -777,13 +969,7 @@ Skipped cases (exhaustive only):
 
 | Reason | Approximate count |
 |---|---|
-| Unicode support not implemented | ~270K |
+| Needs Unicode mode — checked by the Unicode targets instead | ~270K |
 | Unsupported `\C` syntax | ~511K |
 
-The previously-skipped non-deterministic capture category (~251K) is now covered by the Backtracking engine. The remaining skipped categories (Unicode and `\C`) are architectural limitations unrelated to engine selection.
-
----
-
-## Future
-
-**Unicode support** — expanding character class handling to full Unicode code-point ranges. Currently all engines operate on byte (ASCII) input only.
+The previously-skipped non-deterministic capture category (~251K) is now covered by the Backtracking engine. The rows that name characters above U+007F are skipped by the byte-mode run only: `make -C tools/re2test unicode` compiles them in [Unicode mode](#unicode-mode) and checks them, and the other Unicode targets run the whole corpus that way (see [re2.md](re2.md)). `\C` is the one syntax left out: Go's parser rejects it.

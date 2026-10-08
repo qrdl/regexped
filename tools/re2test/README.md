@@ -41,6 +41,18 @@ Two make targets wrap these: `make sets` (sampled, part of `make test`) and
 `make sets-exhaustive` (every chunk). See
 [docs/re2.md](../../docs/re2.md) for what each capability is checked against.
 
+### Unicode-mode options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-unicode` | false | Compile in Unicode mode. Without it every pattern is compiled in byte mode, and rows naming characters above U+007F are skipped under `requires Unicode support` |
+| `-unicode-all` | false | With `-unicode`, also run the all-ASCII blocks: their answers are byte mode's, their code Unicode mode's |
+| `-unicode-oracle` | false | With `-unicode`: the file's columns are Unicode mode's own answers (`make_adjusted -unicode-variants`), so rows on invalid UTF-8 are judged too |
+
+`make unicode`, `unicode-all`, `unicode-groups`, `custom-unicode`,
+`sets-unicode` and `unicode-ext` wrap these; see
+[docs/re2.md](../../docs/re2.md) for what each runs and its current results.
+
 ### Test files
 
 - `re2-exhaustive.txt` — RE2 C++ exhaustive test suite. Run **without** `--validate-groups`.

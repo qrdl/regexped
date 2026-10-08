@@ -1,0 +1,4 @@
+# Unicode mode: captures around multi-byte classes on the TDFA engine.
+regexps:
+  - pattern: '([α-ω]+)-([0-9]+)'
+    groups_func: uni_tdfa_groups

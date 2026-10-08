@@ -227,7 +227,7 @@ func buildOverlapTestTable(t *testing.T, pats []string) *dfaTable {
 		}
 		asts = append(asts, parsed)
 	}
-	table, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		return nil
 	}
@@ -567,7 +567,7 @@ func TestDFAWalksNest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tb, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+		tb, _, err := mergeSuffixDFA(byteTrees([]*syntax.Regexp{re}), CompileSetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

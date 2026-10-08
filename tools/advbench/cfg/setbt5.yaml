@@ -1,0 +1,10 @@
+import_module: m
+wasm_file: x.wasm
+max_fallback_states: 4
+regexps:
+  - pattern: '(?:ab|cd|ef)*z'
+  - pattern: 'a'
+sets:
+  - name: s
+    find: sfind
+    patterns: all

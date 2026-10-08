@@ -3,7 +3,7 @@ WASMTIME_GO   := wasmtime/go/csv wasmtime/go/sql-injection wasmtime/go/secret-sc
 WASMTIME_C    := wasmtime/c/url-parts
 WASMTIME_AS   := wasmtime/as/find-email wasmtime/as/inject-scanner
 WASMTIME      := $(WASMTIME_RUST) $(WASMTIME_GO) $(WASMTIME_C) $(WASMTIME_AS)
-FASTEDGE      := fastedge/validate fastedge/url-guard
+FASTEDGE      := fastedge/validate fastedge/url-guard fastedge/lang-detect
 # browser is LAST: its `make run` serves the page until you press Ctrl-C, so
 # everything after it in a top-level `make run` would never run.
 OTHER         := node workers browser
@@ -11,7 +11,9 @@ EXAMPLES      := $(WASMTIME) $(FASTEDGE) $(OTHER)
 
 # `make`, `make run` and `make clean` here run the SAME target in every example
 # directory, in the order above: `make` builds every example, `make run` runs
-# every one (workers and fastedge only say why there is nothing to run locally).
+# every one (workers, fastedge/validate and fastedge/url-guard only say why there
+# is nothing to run locally; fastedge/lang-detect serves itself on port 8080 for
+# a few requests).
 # `make <dir>` builds one example.
 #
 # $(FASTEDGE) must be here too: those targets are named after directories that

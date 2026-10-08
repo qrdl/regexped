@@ -50,6 +50,7 @@ func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 		Find:        "cap_find",
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
+		Unicode:     setModeKey(),
 	}}
 	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
 		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
@@ -304,8 +305,25 @@ func probeFor(pat string, p int) *regexp.Regexp {
 	return re
 }
 
+// matchesAt reports whether pat matches starting at byte position p. The
+// probe counts Go's tokens (dotPrefix), so p must start one; inside a
+// character nothing starts, which over ASCII never arises.
 func matchesAt(pat, input string, p int) bool {
-	return probeFor(pat, p).MatchString(input)
+	tok, ok := tokenIndex(input, p)
+	return ok && probeFor(pat, tok).MatchString(input)
+}
+
+// tokenIndex is how many of Go's tokens precede byte position p of input,
+// and whether p starts one (goTokenStarts).
+func tokenIndex(input string, p int) (int, bool) {
+	starts := goTokenStarts(input)
+	n := 0
+	for i := 0; i < p; i++ {
+		if starts[i] {
+			n++
+		}
+	}
+	return n, starts[p]
 }
 
 func startsMatching(pat, input string, from int) []int {
@@ -577,7 +595,11 @@ func anchoredExtent(pat, input string, p int) int {
 	// per pattern per capability, so an uncached compile made the harness's
 	// cost scale with PATTERN LENGTH x positions — the term that pushed large
 	// patterns past the fuzz worker's 10s deadline.
-	m := probeFor(pat, p).FindStringIndex(input)
+	tok, ok := tokenIndex(input, p)
+	if !ok {
+		return -1
+	}
+	m := probeFor(pat, tok).FindStringIndex(input)
 	if m == nil {
 		return -1
 	}
@@ -651,16 +673,14 @@ func FuzzSetCaps(f *testing.F) {
 	f.Add(`a*`, `b`, "bab")
 	f.Add(`a.cX`, `X`, "abcXX")
 
+	unicodeSetSeeds(f)
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
-		// The whole-input oracle counts runes in its `.{p}` prefix, and the
-		// per-`from` sweep below is quadratic, so keep inputs short and ASCII.
+		beginFuzzInput()
+		// The per-`from` sweep below is quadratic, so keep inputs short. The
+		// oracles count Go's tokens, so non-ASCII input is checked in
+		// Unicode mode (skipPattern skips it in byte mode).
 		if len(input) > 64 {
 			t.Skip("input too long for the per-from sweep")
-		}
-		for i := 0; i < len(input); i++ {
-			if input[i] >= 0x80 {
-				t.Skip("non-ASCII input: the rune-counted whole-input oracle would misalign")
-			}
 		}
 		pats := []string{pat1, pat2}
 		for _, p := range pats {
@@ -681,93 +701,205 @@ func FuzzSetCaps(f *testing.F) {
 			}
 		}
 
-		w, dropped, err := compileCaps(pats, true)
-		if err != nil {
-			if isResourceCeiling(err) {
-				t.Skip("resource ceiling")
-			}
-			t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, err)
-		}
-		store, inst, mem, release, err := instantiate(w)
-		defer release()
-		if err != nil {
-			t.Fatalf("instantiate: %v", err)
-		}
-		const pageSize = 65536
-		dataTop, err := utils.ParseDataSectionBytes(w)
-		if err != nil {
-			t.Fatalf("parse data section: %v", err)
-		}
-		inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-		outPtr := inBase + pageSize
-		needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
-		if cur := mem.Size(store); needed > cur {
-			if _, err := mem.Grow(store, needed-cur); err != nil {
-				t.Fatalf("grow: %v", err)
-			}
-		}
-		if len(input) > 0 {
-			copy(mem.UnsafeData(store)[inBase:], input)
-		}
-		r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
-		n := int32(len(input))
-
-		// The anchored oracle gets the ANCHORED scope and the two below get the
-		// global one: a pattern the anchored packer alone refused is gone from
-		// match_any/match_all and still live for scan and find.
-		wantAnchored := oracleAnchored(pats, input, dropped.anchored)
-		gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
-		if len(wantAnchored) == 0 {
-			if gotAny != -1 {
-				t.Fatalf("match_any = %d, want -1: pats=%q,%q input=%q", gotAny, pat1, pat2, input)
-			}
-		} else if !containsInt(wantAnchored, gotAny) {
-			t.Fatalf("match_any = %d, not among %v: pats=%q,%q input=%q", gotAny, wantAnchored, pat1, pat2, input)
-		}
-		gotAll := r.allIDs(t, "cap_match_all", inBase, n)
-		if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
-			t.Fatalf("match_all = %v, want %v: pats=%q,%q input=%q", gotAll, wantAnchored, pat1, pat2, input)
-		}
-
-		for from := 0; from <= len(input); from++ {
-			f32 := int32(from)
-			wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
-
-			wantScanAll := oracleScanAll(pats, input, from, dropped.all)
-
-			// See site 1: a bare id, checked against the anywhere-set.
-			gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
-			if wantPos < 0 {
-				if gotScanAny != -1 {
-					t.Fatalf("scan_any(from=%d) = %d, want -1: pats=%q,%q input=%q", from, gotScanAny, pat1, pat2, input)
-				}
-			} else if !containsInt(wantScanAll, int(gotScanAny)) {
-				t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
-			}
-			gotScanAll := r.allIDs(t, "cap_scan_all", inBase, n, f32)
-			if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
-				t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)
-			}
-		}
-
-		// The DEFAULT `find` configuration, against the union oracle.
-		// The loop above compiled the set with overlapping: true, so this is
-		// the one place the fuzzer reaches the gated body.
-		gotGated := runGatedFind(t, pats, input).matches
-		wantGated := gatedOracle(pats, input)
-		sortMatches(gotGated)
-		sortMatches(wantGated)
-		if len(gotGated) != len(wantGated) {
-			t.Fatalf("gated find: expected %d matches %v, got %d %v: pats=%q,%q input=%q",
-				len(wantGated), wantGated, len(gotGated), gotGated, pat1, pat2, input)
-		}
-		for i := range wantGated {
-			if gotGated[i] != wantGated[i] {
-				t.Fatalf("gated find: match %d expected %+v, got %+v: pats=%q,%q input=%q",
-					i, wantGated[i], gotGated[i], pat1, pat2, input)
-			}
-		}
+		checkSetCapsAllFroms(t, pats, input)
 	})
+}
+
+// checkSetCapsAllFroms compiles pats as an `overlapping: true` set exporting
+// every capability and checks the anchored pair, the scan pair at every
+// `from`, and the gated find's drive against the whole-input oracles.
+func checkSetCapsAllFroms(t *testing.T, pats []string, input string) {
+	t.Helper()
+	pat1, pat2 := pats[0], pats[len(pats)-1]
+	w, dropped, err := compileCaps(pats, true)
+	if err != nil {
+		if isResourceCeiling(err) {
+			t.Skip("resource ceiling")
+		}
+		t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, err)
+	}
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	const pageSize = 65536
+	dataTop, err := utils.ParseDataSectionBytes(w)
+	if err != nil {
+		t.Fatalf("parse data section: %v", err)
+	}
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+	outPtr := inBase + pageSize
+	needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
+	if cur := mem.Size(store); needed > cur {
+		if _, err := mem.Grow(store, needed-cur); err != nil {
+			t.Fatalf("grow: %v", err)
+		}
+	}
+	if len(input) > 0 {
+		copy(mem.UnsafeData(store)[inBase:], input)
+	}
+	r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
+	n := int32(len(input))
+
+	// The anchored oracle gets the ANCHORED scope and the two below get the
+	// global one: a pattern the anchored packer alone refused is gone from
+	// match_any/match_all and still live for scan and find.
+	wantAnchored := oracleAnchored(pats, input, dropped.anchored)
+	gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
+	if len(wantAnchored) == 0 {
+		if gotAny != -1 {
+			t.Fatalf("match_any = %d, want -1: pats=%q,%q input=%q", gotAny, pat1, pat2, input)
+		}
+	} else if !containsInt(wantAnchored, gotAny) {
+		t.Fatalf("match_any = %d, not among %v: pats=%q,%q input=%q", gotAny, wantAnchored, pat1, pat2, input)
+	}
+	gotAll := r.allIDs(t, "cap_match_all", inBase, n)
+	if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
+		t.Fatalf("match_all = %v, want %v: pats=%q,%q input=%q", gotAll, wantAnchored, pat1, pat2, input)
+	}
+
+	for from := 0; from <= len(input); from++ {
+		f32 := int32(from)
+		wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
+
+		wantScanAll := oracleScanAll(pats, input, from, dropped.all)
+
+		// See site 1: a bare id, checked against the anywhere-set.
+		gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
+		if wantPos < 0 {
+			if gotScanAny != -1 {
+				t.Fatalf("scan_any(from=%d) = %d, want -1: pats=%q,%q input=%q", from, gotScanAny, pat1, pat2, input)
+			}
+		} else if !containsInt(wantScanAll, int(gotScanAny)) {
+			t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
+		}
+		gotScanAll := r.allIDs(t, "cap_scan_all", inBase, n, f32)
+		if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
+			t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)
+		}
+	}
+
+	// The DEFAULT `find` configuration, against the union oracle.
+	// The loop above compiled the set with overlapping: true, so this is
+	// the one place the fuzzer reaches the gated body.
+	gotGated := runGatedFind(t, pats, input).matches
+	wantGated := gatedOracle(pats, input)
+	sortMatches(gotGated)
+	sortMatches(wantGated)
+	if len(gotGated) != len(wantGated) {
+		t.Fatalf("gated find: expected %d matches %v, got %d %v: pats=%q,%q input=%q",
+			len(wantGated), wantGated, len(gotGated), gotGated, pat1, pat2, input)
+	}
+	for i := range wantGated {
+		if gotGated[i] != wantGated[i] {
+			t.Fatalf("gated find: match %d expected %+v, got %+v: pats=%q,%q input=%q",
+				i, wantGated[i], gotGated[i], pat1, pat2, input)
+		}
+	}
+}
+
+// TestUnicodeSetStartPositions runs sets in Unicode mode through every
+// capability against Go: no match starts, and no empty match is reported,
+// inside a character. Each pair carries a member whose empty match could
+// otherwise sit inside one — anywhere (`x*`), or only through `\B` — beside
+// a literal member, a split one or one sharing the answer cache, over inputs
+// of one- to four-byte characters, invalid bytes and cut-off sequences. Then
+// the answer cache and the program sweep, forced or triggered, over runs
+// where every character is multi-byte.
+func TestUnicodeSetStartPositions(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	pairs := [][2]string{
+		{`x*`, `é`},
+		{`\B`, `b`},
+		{`a?\B`, `\pL+`},
+		{`(?:é|)`, `ж+`},
+		{`[^x]*`, `日本`},
+		{`(?:a[^z]*?z)?`, `foo\w+`},
+		{`\B(?:a[^z]*?z)?`, `foo\w+`},
+		{`(?:)`, `[a-zé]+`},
+		{`\b`, `x*`},
+	}
+	inputs := []string{"", "é", "aéb", "éé", "aé日b", "日本語 abc", "\xffé\x80", "fooéa..z", "Grüße", "𝄞a𝄞", "\xe6\x97", "a\xe6\x97b"}
+	skipped := 0
+	for _, pr := range pairs {
+		pats := []string{pr[0], pr[1]}
+		refs := []*regexp.Regexp{regexp.MustCompile(pr[0]), regexp.MustCompile(pr[1])}
+		for _, in := range inputs {
+			if unicodeModeOutOfScope(pr[0], in) != "" || unicodeModeOutOfScope(pr[1], in) != "" {
+				skipped++
+				continue
+			}
+			t.Run(fmt.Sprintf("%s|%s|%q", pr[0], pr[1], in), func(t *testing.T) {
+				checkSetFindAllStarts(t, pats, refs, in)
+				checkSetCapsAllFroms(t, pats, in)
+				checkBatch(t, pats, in)
+			})
+		}
+	}
+	if skipped == 0 {
+		t.Error("no input was skipped as invalid UTF-8 for a pattern that can match U+FFFD: the skip rule went unexercised")
+	}
+
+	// The answer cache, swept from the first call, through `find` and the
+	// batch entry, and the walk beside it.
+	for _, pats := range [][]string{{`[a-zé]+`, `a*`}, {`x*`, `[^x]+`}, {`\B`, `[а-я]+`}} {
+		if sh := overlapShapeOf(t, pats); !sh.Eligible {
+			t.Fatalf("%v: the answer cache does not serve this set", pats)
+		}
+		for _, in := range []string{"", "é", "aéb", "жж", strings.Repeat("aé", 40), strings.Repeat("日x", 30)} {
+			want := overlapCacheOracle(pats, in)
+			scratch := cacheFindScratchLen(in, pats)
+			got := canonCache(driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAlways,
+				&cacheDriveOpt{preArmWork: true}))
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%v sweep over %q:\n  got  %v\n  want %v", pats, in, got, want)
+			}
+			walk := canonCache(driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), false, scratch, engageNever, nil))
+			if fmt.Sprint(walk) != fmt.Sprint(want) {
+				t.Fatalf("%v walk over %q:\n  got  %v\n  want %v", pats, in, walk, want)
+			}
+			batch := canonCache(driveOverlapCacheArmed(t, pats, in, 0, 3, true, scratch, engageAlways, nil, true))
+			if fmt.Sprint(batch) != fmt.Sprint(want) {
+				t.Fatalf("%v batch sweep over %q:\n  got  %v\n  want %v", pats, in, batch, want)
+			}
+		}
+	}
+
+	// A split member's program sweep, over a run its own searches re-read
+	// from every start, so the drive must have swept. `\B` holds between two
+	// `a`s, and inside every `é`, where nothing may start.
+	for _, m := range []struct{ pat, trigger string }{
+		{`(?:a[^z]*?z)?`, strings.Repeat("aé", 300) + "z"},
+		{`\B(?:a[^z]*?z)?`, strings.Repeat("aaé", 200) + "z"},
+	} {
+		pats, trigger := []string{`foo\w+`, m.pat}, m.trigger
+		sh, err := cachedOverlapShape(pats)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sh.SweepCells == 0 {
+			t.Fatalf("%v: no program sweep", pats)
+		}
+		for _, in := range []string{"", "aéz", "éaé", trigger} {
+			want := overlapOracleCtx(t, pats, in)
+			scratch, _ := overlapCacheFor(in, pats)
+			opt := &cacheDriveOpt{}
+			got := driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAny, opt)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%v find over %d bytes: got %v\nwant %v", pats, len(in), got, want)
+			}
+			if in == trigger && opt.header[0] != 1 {
+				t.Fatalf("%v: the sweep never ran (header word 0 = %d)", pats, opt.header[0])
+			}
+			for _, cp := range []int32{1, 3} {
+				if got := driveOverlapCache(t, pats, in, cp, true); fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%v batch cap %d over %d bytes: got %v\nwant %v", pats, cp, len(in), got, want)
+				}
+			}
+		}
+	}
 }
 
 // TestSetWideAllBitmap exercises the >64-pattern form of match_all/scan_all,
@@ -875,6 +1007,7 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Name:     "s",
 		Find:     "gated_find",
 		Patterns: config.PatternSelector{Names: names},
+		Unicode:  setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
 		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
@@ -894,6 +1027,9 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	t.Helper()
 	w, err := compileGatedSet(pats)
 	if err != nil {
+		if isResourceCeiling(err) {
+			t.Skip("resource ceiling")
+		}
 		t.Fatalf("compile %v: %v", pats, err)
 	}
 	store, inst, mem, release, err := instantiate(w)
@@ -1552,6 +1688,7 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Hints:       []string{"batch-find"},
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
+		Unicode:     setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
 		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
@@ -1636,7 +1773,14 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 	if err != nil {
 		t.Fatalf("parse data section: %v", err)
 	}
-	cacheLen, cacheStride := overlapCacheFor(input, pats)
+	// A gated set has no answer cache, so nothing to size: the header is the
+	// region every drive declines with. Sizing it would recompile the set as
+	// an OVERLAPPING one (overlapSizingCfg) — seconds for a large Unicode set,
+	// which ran a fuzz input past the worker's deadline.
+	cacheLen, cacheStride := int32(config.SetOverlapCheckpointHeaderBytes), int32(1)
+	if overlapping {
+		cacheLen, cacheStride = overlapCacheFor(input, pats)
+	}
 	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -1871,7 +2015,9 @@ func FuzzFindBatch(f *testing.F) {
 	f.Add(`(?m:^)a`, `a`, "a\nba\nb")
 	f.Add(`(?:)`, `a`, "aa")
 
+	unicodeSetSeeds(f)
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
+		beginFuzzInput()
 		if len(input) > 48 {
 			t.Skip("input too long: the capacity-1 sweep is one WASM call per match")
 		}
@@ -3551,12 +3697,13 @@ func TestSetBTMatchesGo(t *testing.T) {
 // the second frame has to grow memory — and the work budget is off, so there
 // is no fallback to hand over to: an answer needing a second frame comes from
 // a stack that grew. p0 is kept on a Backtracking bucket (a frame per greedy
-// iteration, up to 30), p1 split out onto the Backtracking find (a frame per
-// letter before `aX`). Each alone first, where memory must grow during the
+// iteration, up to 30: the loop's exit, `[bx]`, can start with the same
+// letter, so the first-byte dispatch still pushes it), p1 split out onto the
+// Backtracking find (a frame per letter before `aX`). Each alone first, where memory must grow during the
 // call; then all three, overlapping `find` with every other capability and
 // gated `find`, each against Go.
 func TestSetBTStackGrows(t *testing.T) {
-	pats := []string{`(?:a|bc){1,30}x`, `[a-z]+aX`, `zz`}
+	pats := []string{`(?:a|bc){1,30}[bx]`, `[a-z]+aX`, `zz`}
 	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
 		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
 	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {

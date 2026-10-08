@@ -1,0 +1,5 @@
+# Unicode mode: a non-greedy capture keeps the pattern on Backtracking, whose
+# program is the lowered one.
+regexps:
+  - pattern: '(é.*?b)(c+)'
+    groups_func: uni_bt_groups

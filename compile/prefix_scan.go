@@ -500,7 +500,13 @@ type prefixScanParams struct {
 	//   len(FirstByteSet) 9..16     → multi-eq SIMD
 	//   len(FirstByteSet) == 0 or
 	//   len(FirstByteSet) > 16      → scalar firstByteFlags table lookup
-	Prefix         []byte
+	Prefix []byte
+	// UTF8Text: Prefix is a Unicode-mode pattern's literal text. When it
+	// begins with a whole UTF-8 character (a lead byte and a continuation
+	// byte), the hybrid scan checks that character's second byte on a
+	// first-byte hit before checking the rest (charProbe). Unset, the scan is
+	// byte for byte what it was.
+	UTF8Text       bool
 	FirstByteSet   []byte    // distinct bytes with firstByteFlags[b]==1, pre-computed
 	FirstByteFlags [256]byte // full 256-byte flag table (used for scalar tail)
 	FirstByteOff   int32     // memory offset of FirstByteFlags data segment
@@ -618,6 +624,7 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 			if step < 1 {
 				step = 1
 			}
+			charProbe := p.charProbe()
 
 			b = append(b, 0x02, 0x40) // block $simd_exhausted (void)
 			b = append(b, 0x03, 0x40) // loop $simd_outer (void)
@@ -649,8 +656,44 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 			// if mask != 0: prefix[0] found → Phase B
 			b = append(b, 0x04, 0x40) // if (void): outer if
 
+			// The first character's second byte, checked on a hit only. A
+			// script's lead byte begins much of its alphabet — 0xD0 half of
+			// Cyrillic — so in that script nearly every chunk hits prefix[0],
+			// and the check below of every literal byte then advanced only
+			// 17 − N. With no whole first character in the chunk the scan
+			// advances 15 instead: a start in lanes 0..14 would have shown its
+			// pair here, and lane 15's second byte is the next chunk's lane 0.
+			// A chunk without prefix[0] never reaches this, so text in another
+			// script pays nothing. Measured (fuel/byte, `привет\s+\pL+`, no
+			// match, 10 KB): Russian prose 27.0 → 6.0, mixed scripts 15.7 →
+			// 3.2, Greek prose 1.5 → 1.5.
+			if charProbe {
+				b = append(b, 0x20, l.Chunk)
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(prefix[1]))
+				b = append(b, 0xFD, 0x0F)       // i8x16.splat
+				b = append(b, 0xFD, 0x23)       // i8x16.eq
+				b = append(b, 0xFD, 0x64)       // i8x16.bitmask
+				b = append(b, 0x41, 0x01, 0x76) // >> 1: align with prefix[0] lanes
+				b = append(b, 0x20, l.SimdMask)
+				b = append(b, 0x71)             // i32.and
+				b = append(b, 0x22, l.SimdMask) // local.tee simdMask
+				b = append(b, 0x45)             // i32.eqz
+				b = append(b, 0x04, 0x40)       // if: no whole first character
+				b = append(b, 0x20, l.AttemptStart)
+				b = append(b, 0x41, 0x0F) // i32.const 15
+				b = append(b, 0x6A)
+				b = append(b, 0x21, l.AttemptStart)
+				// 0=this if, 1=outer if, 2=$simd_outer
+				b = append(b, 0x0C, 0x02) // br 2 → restart $simd_outer
+				b = append(b, 0x0B)
+			}
+
 			// Phase B: refine with prefix[1..] from same v128 local.
 			for k := 1; k < len(prefix); k++ {
+				if charProbe && k == 1 {
+					continue // already in the mask
+				}
 				b = append(b, 0x20, l.Chunk)
 				b = append(b, 0x41)
 				b = utils.AppendSLEB128(b, int32(prefix[k]))
@@ -1181,9 +1224,20 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 // this must move with it. The alternative — threading a result out of the
 // emitter — costs a return value on a function called from fifteen sites for
 // output that is off by default.
+// charProbe reports whether the hybrid scan checks the first character's
+// second byte on a hit: a Unicode-mode literal that begins with a UTF-8 lead
+// byte followed by a continuation byte.
+func (p prefixScanParams) charProbe() bool {
+	return p.UTF8Text && len(p.Prefix) >= 2 && p.Prefix[0] >= 0xC2 && p.Prefix[0] <= 0xF4 &&
+		p.Prefix[1] >= 0x80 && p.Prefix[1] <= 0xBF
+}
+
 func (p prefixScanParams) strategyNote() string {
 	if len(p.Prefix) >= 1 {
 		if len(p.Prefix) <= 16 {
+			if p.charProbe() {
+				return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix, first character checked on a hit", len(p.Prefix))
+			}
 			return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix", len(p.Prefix))
 		}
 		return fmt.Sprintf("prefix scan: scalar (prefix %d bytes, over one chunk)", len(p.Prefix))

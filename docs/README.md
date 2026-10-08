@@ -24,6 +24,7 @@
 - [Pattern sets](sets.md) — multi-pattern composition, YAML schema, output format, frontend selection
 
 **Internals**
+- [Performance](performance.md) — regexped against the `regex` crate and `regex-automata`: averages and per-scenario tables
 - [Engines](engines.md) — DFA, TDFA, Backtracking, engine selection
 - [Keeping time and memory linear](complexity.md) — every mechanism against quadratic scans and unbounded memory, what each costs, and what is still not linear
 - [RE2 test coverage](re2.md) — pass/skip counts per engine and skip reasons

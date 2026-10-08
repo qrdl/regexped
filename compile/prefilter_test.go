@@ -331,7 +331,7 @@ func TestPrefixResumeDivergenceArms(t *testing.T) {
 			// Build the DFA exactly as compile.go's LF-DFA find path does; a
 			// different option set here would prove nothing about the code that
 			// actually ships.
-			matcher, err := compile(testCase.pattern, CompileOptions{
+			matcher, err := compile(bytePat(testCase.pattern), CompileOptions{
 				MaxDFAStates:  1024,
 				ForceEngine:   EngineDFA,
 				LeftmostFirst: true,
@@ -413,7 +413,7 @@ func TestPrefixResumeConstantArmStillReached(t *testing.T) {
 	// with a long counted tail (`ghp_[a-zA-Z0-9]{36}`) does not — it routes to
 	// the literal-anchor find body instead and would emit none of this switch.
 	const pattern = `abc`
-	matcher, err := compile(pattern, CompileOptions{
+	matcher, err := compile(bytePat(pattern), CompileOptions{
 		MaxDFAStates:  1024,
 		ForceEngine:   EngineDFA,
 		LeftmostFirst: true,
@@ -639,15 +639,15 @@ func TestShuftiPrefixPlanBands(t *testing.T) {
 // would be wrong — the function gives up instead, and a caller that took a
 // derived answer here would skip positions where a match can begin.
 func TestFirstByteSetGivesUpOnNonASCII(t *testing.T) {
-	if got := firstByteSet(`\x{00e9}cafe`); got != nil {
+	if got := firstByteSet(bytePat(`\x{00e9}cafe`)); got != nil {
 		t.Error("a pattern starting with a non-ASCII rune produced a first-byte set")
 	}
-	if got := firstByteSet(`[`); got != nil {
+	if got := firstByteSet(bytePat(`[`)); got != nil {
 		t.Error("an unparseable pattern produced a first-byte set")
 	}
 	// The positive control: an ordinary ASCII pattern resolves, and only to
 	// the bytes that can actually lead it.
-	got := firstByteSet(`abc`)
+	got := firstByteSet(bytePat(`abc`))
 	if got == nil {
 		t.Fatal("an ASCII literal produced no first-byte set")
 	}
@@ -658,6 +658,25 @@ func TestFirstByteSetGivesUpOnNonASCII(t *testing.T) {
 		if got[b] {
 			t.Errorf("%q is marked startable for /abc/", b)
 		}
+	}
+	// In Unicode mode the program is lowered, so the same non-ASCII start
+	// resolves to its UTF-8 lead byte: `é` is C3 A9, so C3 and nothing else
+	// — not A9, a continuation byte, which no match begins with.
+	uni := firstByteSet(unicodePat(`\x{00e9}cafe`))
+	if uni == nil {
+		t.Fatal("Unicode mode: a pattern starting with é produced no first-byte set")
+	}
+	for b, want := range map[byte]bool{0xC3: true, 0xA9: false, 'c': false, 0xE9: false} {
+		if uni[b] != want {
+			t.Errorf("Unicode mode, /\\x{00e9}cafe/: byte %#x startable = %v, want %v", b, uni[b], want)
+		}
+	}
+	// A class over several scripts gives their lead bytes; `.` stays
+	// undetermined (every lead byte and every ASCII byte but \n is too wide
+	// to bother narrowing — getFirstRuneSet declines it).
+	greek := firstByteSet(unicodePat(`[α-ω]x`))
+	if greek == nil || !greek[0xCE] || !greek[0xCF] || greek['x'] {
+		t.Errorf("Unicode mode, /[α-ω]x/: got %v, want the lead bytes CE and CF", greek)
 	}
 }
 
@@ -810,7 +829,7 @@ func TestFindAbsenceLit(t *testing.T) {
 		{"quest: the body may be skipped", `(?:abc)?`, ""},
 		{"repeat with min 0", `(?:abc){0,3}`, ""},
 		{"case-folded literal needs a case-insensitive search", `(?i)abcd`, ""},
-		{"non-ASCII literal needs UTF-8 encoding", `caf\x{e9}xx`, ""},
+		{"non-ASCII literal: byte mode has no bytes for it", `caf\x{e9}xx`, ""},
 		{"a class is not a literal", `[a-z]+`, ""},
 		{"empty", `(?:)`, ""},
 
@@ -831,15 +850,25 @@ func TestFindAbsenceLit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.pattern, err)
 			}
-			got := string(findAbsenceLit(re.Simplify()))
+			got := string(findAbsenceLit(re.Simplify(), false))
 			if got != tc.want {
 				t.Errorf("findAbsenceLit(%q) = %q, want %q", tc.pattern, got, tc.want)
 			}
 		})
 	}
 	// A nil AST is reachable from the recursive walk over a malformed subtree.
-	if got := findAbsenceLit(nil); got != nil {
+	if got := findAbsenceLit(nil, false); got != nil {
 		t.Errorf("findAbsenceLit(nil) = %q, want nil", got)
+	}
+	// Unicode mode: a non-ASCII literal is its UTF-8 bytes.
+	for pat, want := range map[string]string{`caf\x{e9}xx`: "caféxx", `\pL+привет`: "привет", `(?i)привет`: ""} {
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(findAbsenceLit(re.Simplify(), true)); got != want {
+			t.Errorf("Unicode mode: findAbsenceLit(%q) = %q, want %q", pat, got, want)
+		}
 	}
 }
 
@@ -865,7 +894,7 @@ func TestFindAbsenceLitIsSound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %q: %v", pat, err)
 		}
-		lit := findAbsenceLit(re.Simplify())
+		lit := findAbsenceLit(re.Simplify(), false)
 		if len(lit) == 0 {
 			continue
 		}

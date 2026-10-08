@@ -4,25 +4,33 @@ import (
 	"bytes"
 	"fmt"
 	"regexp/syntax"
+	"slices"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/qrdl/regexped/config"
 )
 
 func TestResolveMaxDFAStates(t *testing.T) {
+	// The default depends on the mode; an explicit value does not.
 	cases := []struct {
-		opts *CompileOptions
-		want int
+		opts    *CompileOptions
+		unicode bool
+		want    int
 	}{
-		{nil, 1024},
-		{&CompileOptions{}, 1024},
-		{&CompileOptions{MaxDFAStates: 512}, 512},
-		{&CompileOptions{MaxDFAStates: -1}, 0},
+		{nil, false, 1024},
+		{&CompileOptions{}, false, 1024},
+		{nil, true, 16384},
+		{&CompileOptions{}, true, 16384},
+		{&CompileOptions{MaxDFAStates: 512}, false, 512},
+		{&CompileOptions{MaxDFAStates: 512}, true, 512},
+		{&CompileOptions{MaxDFAStates: -1}, false, 0},
+		{&CompileOptions{MaxDFAStates: -1}, true, 0},
 	}
 	for _, c := range cases {
-		if got := resolveMaxDFAStates(c.opts); got != c.want {
-			t.Errorf("resolveMaxDFAStates(%v) = %d, want %d", c.opts, got, c.want)
+		if got := resolveMaxDFAStates(c.opts, c.unicode); got != c.want {
+			t.Errorf("resolveMaxDFAStates(%v, unicode=%v) = %d, want %d", c.opts, c.unicode, got, c.want)
 		}
 	}
 }
@@ -78,7 +86,7 @@ func TestMaybeCompiledDFA(t *testing.T) {
 		{EngineDFA, 5, nil, EngineCompiledDFA}, // default threshold=256
 	}
 	for _, c := range cases {
-		if got := maybeCompiledDFA(c.engine, c.states, c.opts); got != c.want {
+		if got := maybeCompiledDFA(c.engine, c.states, c.opts, false); got != c.want {
 			t.Errorf("maybeCompiledDFA(%v, %d) = %v, want %v", c.engine, c.states, got, c.want)
 		}
 	}
@@ -209,15 +217,12 @@ func TestIsAlternationDeterministicPaths(t *testing.T) {
 		// Both branches epsilon-accepting: () and (a?) both reach Match without consuming
 		// a byte → ambiguous → BT.
 		{"(()|(?:a?))", EngineBacktrack, "both epsilon branches", CompileOptions{}},
-		// Large char class >256 chars in left branch → getFirstRuneSet returns empty set
-		// → treated as undetermined → not deterministic → BT.
-		//
-		// Ā is U+0100, so no mode can represent it and byte_mode would not
-		// help — the class has to be >256 codepoints for getFirstRuneSet to
-		// give up, which is the whole point of the case. `Unicode: true` is
-		// the compile-anyway bypass, used here to reach the SELECTOR with a
-		// pattern the gate would otherwise refuse.
-		{"(([\x00-Ā])|(b))", EngineBacktrack, "large char class first rune set",
+		// A class past 256 codepoints in the left branch, which overlaps the
+		// right one. Ā is U+0100, so only Unicode mode compiles it — and
+		// there the first sets are computed as ranges of any width, so this
+		// is Backtracking because [\x00-Ā] contains `b`, not because the
+		// class is wide (TestSelectEngineUnicodeComputesWideFirstSets).
+		{"(([\x00-Ā])|(b))", EngineBacktrack, "wide class overlapping the other branch",
 			CompileOptions{Unicode: true}},
 	}
 	for _, c := range cases {
@@ -428,16 +433,27 @@ func TestSelectEngine_ParseError(t *testing.T) {
 }
 
 func TestSelectEngine_UnicodeWithoutOpt(t *testing.T) {
-	// \p{Greek} compiles to a non-ASCII-only InstRune → needsUnicode=true.
-	_, err := SelectEngine(`\p{Greek}`, CompileOptions{})
-	if err == nil || !strings.Contains(err.Error(), "Unicode") {
-		t.Errorf("SelectEngine(\\p{Greek}): want Unicode error, got %v", err)
+	// \p{Greek} compiles to a non-ASCII-only InstRune: byte mode refuses it,
+	// and left to resolve it asks for Unicode mode.
+	_, err := SelectEngine(`\p{Greek}`, CompileOptions{ForceByteMode: true})
+	if err == nil || !strings.Contains(err.Error(), "U+0370") {
+		t.Errorf("SelectEngine(\\p{Greek}) in byte mode: want the rune named, got %v", err)
+	}
+	if _, err := SelectEngine(`\p{Greek}`, CompileOptions{}); err != nil {
+		t.Errorf("SelectEngine(\\p{Greek}) resolved: %v, want Unicode mode", err)
 	}
 }
 
 func TestSelectEngine_UnicodeWithOpt(t *testing.T) {
 	if _, err := SelectEngine(`\p{Greek}`, CompileOptions{Unicode: true}); err != nil {
 		t.Errorf("SelectEngine(\\p{Greek}, Unicode=true): unexpected error %v", err)
+	}
+	// The size estimate reads the lowered program: `\pL{5}x` is a 1,452-state
+	// table and `é[0-9]{2}` a handful of states, as their compiles find.
+	for pat, want := range map[string]EngineType{`\pL{5}x`: EngineDFA, `é[0-9]{2}`: EngineCompiledDFA} {
+		if got, err := SelectEngine(pat, CompileOptions{}); err != nil || got != want {
+			t.Errorf("SelectEngine(%q) = %v, %v; want %v", pat, got, err, want)
+		}
 	}
 }
 
@@ -472,7 +488,7 @@ func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
 			t.Fatalf("compile %q: %v", c.pattern, err)
 		}
 		opts := CompileOptions{}
-		engine, tt := selectBestEngineWithTDFA(prog, &opts)
+		engine, tt := selectBestEngineWithTDFA(byteProg(prog), &opts)
 		if c.wantTDFA {
 			if engine != EngineTDFA {
 				t.Errorf("%q (%s): engine = %v, want EngineTDFA", c.pattern, c.why, engine)
@@ -510,8 +526,8 @@ func TestSelectBestEngineWithTDFA_MatchesWrapper(t *testing.T) {
 			t.Fatalf("compile %q: %v", pat, err)
 		}
 		o1, o2 := CompileOptions{}, CompileOptions{}
-		want := selectBestEngine(prog, &o1)
-		got, _ := selectBestEngineWithTDFA(prog, &o2)
+		want := selectBestEngine(byteProg(prog), &o1)
+		got, _ := selectBestEngineWithTDFA(byteProg(prog), &o2)
 		if got != want {
 			t.Errorf("%q: wrapper = %v, direct = %v", pat, want, got)
 		}
@@ -562,7 +578,7 @@ func TestSelectorTDFALimitReasons(t *testing.T) {
 		}
 		rep := &Reporter{}
 		rep.Begin(c.label, c.pattern)
-		eng, _ := selectBestEngineWithTDFA(prog, &CompileOptions{
+		eng, _ := selectBestEngineWithTDFA(byteProg(prog), &CompileOptions{
 			Report: rep, MaxDFAStates: c.maxStates, MaxTDFARegs: c.maxRegs})
 		rep.End()
 		if eng != EngineBacktrack {
@@ -612,7 +628,7 @@ func TestDFAStateLimitBailsOutFast(t *testing.T) {
 		if err != nil {
 			t.Fatalf("compile: %v", err)
 		}
-		if _, ok := newDFA(prog, false, true, 1024); ok {
+		if _, ok := newDFA(byteProg(prog), true, 1024); ok {
 			t.Fatalf("newDFA(%q, maxStates=1024): expected state-limit bail-out (ok=false), got ok=true", pattern)
 		}
 	})
@@ -624,7 +640,7 @@ func TestDFAStateLimitBailsOutFast(t *testing.T) {
 	})
 }
 
-func TestRegexpMinMaxLen(t *testing.T) {
+func TestMinMaxLen(t *testing.T) {
 	parse := func(pattern string) *syntax.Regexp {
 		re, err := syntax.Parse(pattern, syntax.Perl)
 		if err != nil {
@@ -667,12 +683,6 @@ func TestRegexpMinMaxLen(t *testing.T) {
 		// Anchors/boundaries → (0,0)
 		{"^", 0, 0},
 		{`\b`, 0, 0},
-		// 2-byte UTF-8 literal (é = U+00E9): OpPlus recurses into Literal → n += 2
-		{"é+", 2, -1},
-		// 3-byte UTF-8 literal (中 = U+4E2D): n += 3
-		{"中+", 3, -1},
-		// 4-byte UTF-8 literal (𐀀 = U+10000): n += 4
-		{"𐀀+", 4, -1},
 		// OpRepeat with unbounded child max → hi = -1
 		{"(?:[a-z]+){2,3}", 2, -1},
 		// OpAlternate with unbounded branch → totMax = -1
@@ -680,9 +690,9 @@ func TestRegexpMinMaxLen(t *testing.T) {
 	}
 	for _, c := range cases {
 		re := parse(c.pattern)
-		gotMin, gotMax := regexpMinMaxLen(re, false)
+		gotMin, gotMax := byteTree(re).minMaxLen()
 		if gotMin != c.wantMin || gotMax != c.wantMax {
-			t.Errorf("regexpMinMaxLen(%q, false) = (%d,%d), want (%d,%d)",
+			t.Errorf("minMaxLen(%q) = (%d,%d), want (%d,%d)",
 				c.pattern, gotMin, gotMax, c.wantMin, c.wantMax)
 		}
 	}
@@ -704,17 +714,17 @@ func TestFindMandatoryLitRecDegenerate(t *testing.T) {
 		{"plus_no_sub", &syntax.Regexp{Op: syntax.OpPlus}},
 	}
 	for _, c := range cases {
-		got, _ := findMandatoryLitRec(c.re, 0, 0, false)
+		got, _ := findMandatoryLitRec(byteTree(c.re), 0, 0)
 		if got != nil {
-			t.Errorf("findMandatoryLitRec(%s, false): got %v, want nil", c.name, got)
+			t.Errorf("findMandatoryLitRec(%s): got %v, want nil", c.name, got)
 		}
 	}
 }
 
-// TestRegexpMinMaxLenDegenerate covers edge cases that the parser never produces
+// TestMinMaxLenDegenerate covers edge cases that the parser never produces
 // (empty Sub slices, OpNoMatch/OpEmptyMatch, unknown Op) by constructing Regexp
 // nodes directly.
-func TestRegexpMinMaxLenDegenerate(t *testing.T) {
+func TestMinMaxLenDegenerate(t *testing.T) {
 	cases := []struct {
 		name    string
 		re      *syntax.Regexp
@@ -731,9 +741,9 @@ func TestRegexpMinMaxLenDegenerate(t *testing.T) {
 		{"unknown_op", &syntax.Regexp{Op: syntax.Op(99)}, 0, -1},
 	}
 	for _, c := range cases {
-		min, max := regexpMinMaxLen(c.re, false)
+		min, max := byteTree(c.re).minMaxLen()
 		if min != c.wantMin || max != c.wantMax {
-			t.Errorf("regexpMinMaxLen(%s, false) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
+			t.Errorf("minMaxLen(%s) = (%d,%d), want (%d,%d)", c.name, min, max, c.wantMin, c.wantMax)
 		}
 	}
 }
@@ -771,25 +781,51 @@ func TestFindMandatoryLit(t *testing.T) {
 		{"[a-z]{0,3}foo", false, "foo", 0},
 	}
 	for _, c := range cases {
-		got := findMandatoryLit(c.pattern, false)
+		got := findMandatoryLit(bytePat(c.pattern))
 		if c.wantNil {
 			if got != nil {
-				t.Errorf("findMandatoryLit(%q, false): got %v, want nil", c.pattern, got)
+				t.Errorf("findMandatoryLit(%q): got %v, want nil", c.pattern, got)
 			}
 			continue
 		}
 		if got == nil {
-			t.Errorf("findMandatoryLit(%q, false): got nil, want lit=%q", c.pattern, c.wantLit)
+			t.Errorf("findMandatoryLit(%q): got nil, want lit=%q", c.pattern, c.wantLit)
 			continue
 		}
 		if string(got.bytes) != c.wantLit {
-			t.Errorf("findMandatoryLit(%q, false): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
+			t.Errorf("findMandatoryLit(%q): lit=%q, want %q", c.pattern, got.bytes, c.wantLit)
 		}
 		if got.minOff != c.wantMin {
-			t.Errorf("findMandatoryLit(%q, false): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
+			t.Errorf("findMandatoryLit(%q): minOff=%d, want %d", c.pattern, got.minOff, c.wantMin)
 		}
 		if got.maxOff < got.minOff {
-			t.Errorf("findMandatoryLit(%q, false): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
+			t.Errorf("findMandatoryLit(%q): maxOff %d < minOff %d", c.pattern, got.maxOff, got.minOff)
+		}
+	}
+	// Unicode mode: a non-ASCII literal is its UTF-8 bytes, and offsets are
+	// bytes too (`\pL{2}` is 2 to 8 bytes before the literal). A surrogate
+	// matches nothing once lowered, so it is not a literal; a folded one is
+	// not one byte sequence.
+	uni := []struct {
+		pattern          string
+		wantLit          string
+		wantMin, wantMax int32
+	}{
+		{"é", "é", 0, 0},
+		{`\pL{2}привет`, "привет", 2, 8},
+		{`x.日本`, "x", 0, 0},
+		{`[α-ω]日本`, "日本", 2, 2},
+	}
+	for _, c := range uni {
+		got := findMandatoryLit(unicodePat(c.pattern))
+		if got == nil || string(got.bytes) != c.wantLit || got.minOff != c.wantMin || got.maxOff != c.wantMax {
+			t.Errorf("Unicode mode, findMandatoryLit(%q) = %+v, want %q at [%d, %d]",
+				c.pattern, got, c.wantLit, c.wantMin, c.wantMax)
+		}
+	}
+	for _, pat := range []string{`\x{D800}`, `(?i)привет`} {
+		if got := findMandatoryLit(unicodePat(pat)); got != nil {
+			t.Errorf("Unicode mode, findMandatoryLit(%q) = %+v, want nil", pat, got)
 		}
 	}
 }
@@ -814,6 +850,15 @@ func TestHasMandatoryLit(t *testing.T) {
 			t.Errorf("HasMandatoryLit(%q, false) = %v, want %v", c.pattern, got, c.want)
 		}
 	}
+	// The pattern is resolved as a compile resolves it: `é.foo` is byte mode
+	// under byte_mode and Unicode mode without, and `foo` is its literal in
+	// both.
+	if !HasMandatoryLit(`é.foo`, true) {
+		t.Errorf("HasMandatoryLit(`é.foo`, true) = false, want true")
+	}
+	if !HasMandatoryLit(`é.foo`) {
+		t.Errorf("HasMandatoryLit(`é.foo`) in Unicode mode = false, want true")
+	}
 }
 
 func chainTable(t *testing.T, pat string) *dfaTable {
@@ -822,7 +867,7 @@ func chainTable(t *testing.T, pat string) *dfaTable {
 	if err != nil {
 		t.Fatalf("pattern=%q parse: %v", pat, err)
 	}
-	table, _, err := mergeSuffixDFA([]*syntax.Regexp{re}, CompileSetOptions{})
+	table, _, err := mergeSuffixDFA(byteTrees([]*syntax.Regexp{re}), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("pattern=%q mergeSuffixDFA: %v", pat, err)
 	}
@@ -890,7 +935,7 @@ func TestIsCountedClassChain_RealPatterns(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, dOk := newDFA(prog, false, true, maxHelperDFAStates)
+		d, dOk := newDFA(byteProg(prog), true, maxHelperDFAStates)
 		if !dOk {
 			t.Fatalf("newDFA: state limit exceeded")
 		}
@@ -924,5 +969,149 @@ func TestCountedChainEmission(t *testing.T) {
 	}
 	if dataSegCount != 0 {
 		t.Errorf("with probes: expected 0 data segments, got %d", dataSegCount)
+	}
+}
+
+// TestSelectEngineAnalysesTheUnloweredProgram: the selector judges a
+// pattern's structure on the program as written, and only builds its TDFA on
+// the lowered one. In byte mode the two are one program, so these byte-mode
+// answers are today's, pinned (CLAUDE.md's load-bearing selector gates); in
+// Unicode mode a pattern of Unicode classes still selects and compiles.
+func TestSelectEngineAnalysesTheUnloweredProgram(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want EngineType
+	}{
+		{`<([^>]+)>`, EngineBacktrack},
+		{`([^,]+),`, EngineBacktrack},
+		{`KEY=([^&]+)&`, EngineBacktrack},
+		{`(a+)(b+)`, EngineTDFA},
+	} {
+		if got, err := SelectEngine(c.pat, CompileOptions{}); err != nil || got != c.want {
+			t.Errorf("SelectEngine(%q) = %v, %v; want %v", c.pat, got, err, c.want)
+		}
+	}
+	for _, pat := range []string{`(\pL+)@(\pL+)`, `([α-ω]+)-(\d+)`} {
+		if _, err := SelectEngine(pat, CompileOptions{Unicode: true}); err != nil {
+			t.Errorf("SelectEngine(%q, Unicode): %v", pat, err)
+		}
+		e := config.RegexEntry{Pattern: pat, GroupsFunc: "g"}
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{Unicode: true}); err != nil {
+			t.Errorf("Compile(%q, Unicode): %v", pat, err)
+		}
+	}
+}
+
+// TestSelectEngineUnicodeComputesWideFirstSets pins the one selection rule
+// that differs by mode: in Unicode mode a class of any width, `.` and a folded
+// literal have a computable first set, so a capture pattern over them is not
+// ambiguous for that reason alone and takes a TDFA — while byte mode keeps the
+// inverted-class protection, and an alternation whose branches really overlap
+// stays on Backtracking in both.
+func TestSelectEngineUnicodeComputesWideFirstSets(t *testing.T) {
+	for _, c := range []struct {
+		pat           string
+		unicode, byte EngineType // byte: 0 = not compilable in byte mode
+	}{
+		{`(\pL+)\s(\pN+)`, EngineTDFA, 0},
+		{`(\pL+)@(\pL+)`, EngineTDFA, 0},
+		{`<([^>]+)>`, EngineTDFA, EngineBacktrack},
+		{`([^,]+),`, EngineTDFA, EngineBacktrack},
+		{`(.+)=(.+)`, EngineTDFA, EngineBacktrack},
+		{`((\pL)|(\pN))`, EngineTDFA, 0},
+		{`((\pL)|(a))`, EngineBacktrack, 0},
+		{`((?i:é)|(É))`, EngineBacktrack, 0},
+		{`((?i:é)|(e))`, EngineTDFA, 0},
+		{`(([\x00-Ā])|(b))`, EngineBacktrack, 0},
+	} {
+		if got, err := SelectEngine(c.pat, CompileOptions{Unicode: true}); err != nil || got != c.unicode {
+			t.Errorf("SelectEngine(%q, Unicode) = %v, %v; want %v", c.pat, got, err, c.unicode)
+		}
+		if c.byte == 0 {
+			continue
+		}
+		if got, err := SelectEngine(c.pat, CompileOptions{ForceByteMode: true}); err != nil || got != c.byte {
+			t.Errorf("SelectEngine(%q, byte) = %v, %v; want %v", c.pat, got, err, c.byte)
+		}
+	}
+}
+
+// TestFirstRuneRanges covers the range form of the first set Unicode mode
+// computes, and its two helpers.
+func TestFirstRuneRanges(t *testing.T) {
+	first := func(pat string) ([]rune, bool) {
+		t.Helper()
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return firstRuneRanges(prog, prog.Start)
+	}
+	for _, c := range []struct {
+		pat  string
+		want []rune
+		ok   bool
+	}{
+		{`a`, []rune{'a', 'a'}, true},
+		{`[a-c]|[b-e]|x`, []rune{'a', 'e', 'x', 'x'}, true},
+		{`[b-c]|a|d`, []rune{'a', 'd'}, true},
+		{`\pN`, nil, true}, // checked for ok only below: the table is long
+		{`.`, []rune{0, '\n' - 1, '\n' + 1, unicode.MaxRune}, true},
+		{`(?s:.)`, []rune{0, unicode.MaxRune}, true},
+		{`(?i:k)`, []rune{'K', 'K', 'k', 'k', 0x212A, 0x212A}, true},
+		{`\bé`, []rune{'é', 'é'}, true},
+		{`a?`, nil, false}, // reaches Match without consuming
+	} {
+		got, ok := first(c.pat)
+		if ok != c.ok || (c.want != nil && !slices.Equal(got, c.want)) {
+			t.Errorf("firstRuneRanges(%q) = %v, %v; want %v, %v", c.pat, got, ok, c.want, c.ok)
+		}
+	}
+	// Malformed and out-of-range instructions are unknowable.
+	bad := &syntax.Prog{Inst: []syntax.Inst{
+		{Op: syntax.InstRune, Rune: []rune{'a', 'b', 'c'}},
+		{Op: syntax.InstRune, Rune: []rune{'a', 'b'}, Arg: uint32(syntax.FoldCase)},
+		{Op: syntax.InstNop, Out: 9},
+	}}
+	for pc := range bad.Inst {
+		if got, ok := firstRuneRanges(bad, pc); ok {
+			t.Errorf("firstRuneRanges(malformed pc %d) = %v, true; want false", pc, got)
+		}
+	}
+	// Hand-built, since the parser merges a class alternation into one class:
+	// two branches reaching one consumer (the second arrival is a revisit),
+	// and two overlapping classes merged into one range.
+	shared := &syntax.Prog{Inst: []syntax.Inst{
+		{Op: syntax.InstAlt, Out: 1, Arg: 1},
+		{Op: syntax.InstRune1, Rune: []rune{'b'}},
+	}}
+	if got, ok := firstRuneRanges(shared, 0); !ok || !slices.Equal(got, []rune{'b', 'b'}) {
+		t.Errorf("firstRuneRanges(two paths to one consumer) = %v, %v; want [b b], true", got, ok)
+	}
+	overlap := &syntax.Prog{Inst: []syntax.Inst{
+		{Op: syntax.InstAlt, Out: 1, Arg: 2},
+		{Op: syntax.InstRune, Rune: []rune{'a', 'c'}},
+		{Op: syntax.InstRune, Rune: []rune{'b', 'e', 'f', 'g'}},
+	}}
+	if got, ok := firstRuneRanges(overlap, 0); !ok || !slices.Equal(got, []rune{'a', 'g'}) {
+		t.Errorf("firstRuneRanges([a-c] | [b-ef-g]) = %v, %v; want [a g], true", got, ok)
+	}
+	if !rangesOverlap([]rune{'a', 'c'}, []rune{'c', 'd'}) || rangesOverlap([]rune{'a', 'b', 'x', 'y'}, []rune{'c', 'w', 'z', 'z'}) {
+		t.Error("rangesOverlap: wrong answer on touching or interleaved ranges")
+	}
+	// An unknowable first set keeps an alternation ambiguous in Unicode mode
+	// too: here one branch is a Fail.
+	alt := &syntax.Prog{Inst: []syntax.Inst{
+		{Op: syntax.InstAlt, Out: 1, Arg: 2},
+		{Op: syntax.InstFail},
+		{Op: syntax.InstRune1, Rune: []rune{'b'}, Out: 3},
+		{Op: syntax.InstMatch},
+	}}
+	if isAlternationDeterministic(alt, 0, true, true) {
+		t.Error("isAlternationDeterministic(Fail | b, unicode) = true, want false")
 	}
 }

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Homoglyph Detector</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 760px;
+      margin: 60px auto;
+      padding: 0 20px;
+      color: #222;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.3em; }
+    p.subtitle { color: #666; font-size: 0.9rem; margin-top: 0; }
+    #loading { color: #888; font-size: 0.9rem; }
+    .examples { margin: 20px 0 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .examples button {
+      font-size: 0.85rem;
+      padding: 4px 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: #f6f6f6;
+      cursor: pointer;
+    }
+    textarea {
+      width: 100%;
+      padding: 8px 10px;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    h2 { font-size: 1rem; margin: 22px 0 6px; }
+    #summary { font-size: 0.95rem; margin-top: 10px; min-height: 1.2em; }
+    #summary.clean   { color: #2a7a2a; }
+    #summary.suspect { color: #b00; }
+    #view {
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 10px;
+      min-height: 1.5em;
+      font-size: 1.1rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .mixed     { background: #fff1a8; }
+    .lookalike { background: #ffb3b3; font-weight: bold; }
+    .styled    { background: #ffd8a8; }
+    .hidden {
+      display: inline-block;
+      background: #b00;
+      color: #fff;
+      font-size: 0.65rem;
+      padding: 1px 3px;
+      margin: 0 1px;
+      border-radius: 3px;
+      vertical-align: middle;
+    }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+    th { color: #666; font-weight: normal; }
+    td.found { font-size: 1rem; white-space: pre-wrap; }
+    .legend { font-size: 0.8rem; color: #666; margin-top: 6px; }
+    .legend span { padding: 0 4px; margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Homoglyph Detector</h1>
+  <p class="subtitle">Finds lookalike letters, invisible characters and text-direction tricks.
+    The patterns are Unicode regexps compiled to WASM — no JS regex engine.</p>
+
+  <div id="loading">Loading WASM…</div>
+
+  <div id="app" style="display:none">
+    <div class="examples" id="examples"></div>
+    <textarea id="text" rows="4" aria-label="Text to check" placeholder="Type or paste text" autocomplete="off" spellcheck="false"></textarea>
+    <div id="summary"></div>
+
+    <h2>What the text really contains</h2>
+    <div id="view"></div>
+    <div class="legend">
+      <span class="mixed">mixed scripts</span>
+      <span class="lookalike">lookalike letter</span>
+      <span class="styled">styled letters</span>
+      <span class="hidden">HIDDEN</span> invisible or text-direction character
+    </div>
+
+    <h2>Findings</h2>
+    <table>
+      <thead><tr><th>Kind</th><th>Found</th><th>Details</th></tr></thead>
+      <tbody id="findings"></tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    // regexp.js and regexps.wasm are generated from regexped.yaml by
+    // `regexped generate` and `regexped compile`. init() takes the WASM bytes.
+    import { init, scan_text, patternName } from './regexp.js';
+
+    await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+
+    // The Latin letter each lookalike imitates: the same letters as the
+    // `lookalike` pattern in regexped.yaml.
+    const LOOKS_LIKE = new Map((
+      'аa еe оo рp сc уy хx ѕs іi јj ԁd һh ԛq ԝw ӏl ' +
+      'АA ВB ЕE КK МM НH ОO РP СC ТT ХX ЅS ІI ЈJ ҮY ' +
+      'οo νv αa ρp ιi κk υu ' +
+      'ΑA ΒB ΕE ΖZ ΗH ΙI ΚK ΜM ΝN ΟO ΡP ΤT ΥY ΧX'
+    ).split(' ').map(pair => [pair[0], pair[1]]));
+
+    // Short names for the characters `invisible` and `bidi_control` match.
+    const CONTROL = new Map([
+      [0x00AD, 'SHY'], [0x200B, 'ZWSP'], [0x200C, 'ZWNJ'], [0x200D, 'ZWJ'],
+      [0x2060, 'WJ'], [0xFEFF, 'BOM'], [0x061C, 'ALM'], [0x200E, 'LRM'],
+      [0x200F, 'RLM'], [0x202A, 'LRE'], [0x202B, 'RLE'], [0x202C, 'PDF'],
+      [0x202D, 'LRO'], [0x202E, 'RLO'], [0x2066, 'LRI'], [0x2067, 'RLI'],
+      [0x2068, 'FSI'], [0x2069, 'PDI'],
+    ]);
+
+    const KIND = {
+      mixed_script: 'Mixed scripts',
+      invisible:    'Invisible',
+      bidi_control: 'Text direction',
+      styled:       'Styled letters',
+    };
+
+    const EXAMPLES = [
+      ['аррӏе.com',        'Log in at аррӏе.com to continue'],
+      ['pаypal.com',       'Your account needs attention: pаypal.com/verify'],
+      ['miсrosoft',        'Contact admin@miсrosoft.com for access'],
+      ['gοοgle.com',       'Search on gοοgle.com'],
+      ['zero-width space', 'Send the payment to pay​pal.com'],
+      ['Trojan Source',    'if (accessLevel != "user‮ ⁦// Check if admin⁩ ⁦") {'],
+      ['styled letters',   'Sign in to 𝐩𝐚𝐲𝐩𝐚𝐥 or ｐａｙｐａｌ.com'],
+      ['clean text',       'Привет, мир! Grüße aus Köln. Καλημέρα κόσμε.'],
+    ];
+
+    const codePoint = ch => 'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+    const script = ch => ch.codePointAt(0) < 0x0400 ? 'Greek' : 'Cyrillic';
+
+    // Positions from the WASM are byte offsets into the input's UTF-8 encoding;
+    // a JS string indexes UTF-16 code units. at[b] is the code-unit index of the
+    // character that byte b belongs to. (A lone surrogate is encoded as U+FFFD,
+    // three bytes, which the cp < 0x10000 arm counts.)
+    function codeUnitIndex(text) {
+      const at = new Uint32Array(new TextEncoder().encode(text).length + 1);
+      let b = 0, u = 0;
+      for (const ch of text) {
+        const cp = ch.codePointAt(0);
+        const n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        at.fill(u, b, b + n);
+        b += n;
+        u += ch.length;
+      }
+      at[b] = u;
+      return at;
+    }
+
+    // Every finding as [start, end) in code units, by pattern name. A lookalike
+    // counts only inside a mixed-script token: Russian and Greek text is full of
+    // letters that look Latin.
+    function scan(text) {
+      const at = codeUnitIndex(text);
+      const found = { mixed_script: [], lookalike: [], invisible: [], bidi_control: [], styled: [] };
+      for (const m of scan_text(text)) {
+        found[patternName(m.patternId)].push([at[m.start], at[m.end]]);
+      }
+      found.lookalike = found.lookalike.filter(
+        ([s]) => found.mixed_script.some(([ts, te]) => s >= ts && s < te));
+      return found;
+    }
+
+    function hiddenBadge(ch) {
+      const badge = document.createElement('span');
+      badge.className = 'hidden';
+      badge.textContent = CONTROL.get(ch.codePointAt(0)) ?? codePoint(ch);
+      badge.title = codePoint(ch);
+      return badge;
+    }
+
+    // `text` with every finding marked. Invisible and text-direction characters
+    // are replaced by badges, so the view shows the characters in their real
+    // order — the text box above displays them the way an attacker intends.
+    function renderView(view, text, found, from = 0, to = text.length) {
+      const marks = new Array(text.length).fill('');
+      const mark = (spans, cls) => {
+        for (const [s, e] of spans) for (let i = s; i < e; i++) marks[i] += ' ' + cls;
+      };
+      mark(found.mixed_script, 'mixed');
+      mark(found.lookalike, 'lookalike');
+      mark(found.styled, 'styled');
+      mark(found.invisible, 'hide');
+      mark(found.bidi_control, 'hide');
+      view.replaceChildren();
+      for (let i = from; i < to; ) {
+        const ch = String.fromCodePoint(text.codePointAt(i));
+        const cls = marks[i].trim();
+        if (cls.includes('hide')) {
+          view.append(hiddenBadge(ch));
+        } else if (cls) {
+          const span = document.createElement('span');
+          span.className = cls;
+          span.textContent = ch;
+          span.title = codePoint(ch) +
+            (LOOKS_LIKE.has(ch) ? ` — ${script(ch)}, looks like Latin ${LOOKS_LIKE.get(ch)}` : '');
+          view.append(span);
+        } else {
+          view.append(ch);
+        }
+        i += ch.length;
+      }
+    }
+
+    function details(kind, piece) {
+      switch (kind) {
+        case 'mixed_script': {
+          const letters = [...piece].filter(ch => LOOKS_LIKE.has(ch));
+          const reads = [...piece].map(ch => LOOKS_LIKE.get(ch) ?? ch).join('');
+          const list = letters.map(ch => `${script(ch)} ${ch} ${codePoint(ch)}`).join(', ');
+          return letters.length ? `reads as “${reads}” · ${list}` : 'Latin letters next to Cyrillic or Greek ones';
+        }
+        case 'invisible':
+          return [...piece].map(codePoint).join(' ') + ' · takes up no space';
+        case 'bidi_control':
+          return [...piece].map(codePoint).join(' ') + ' · changes how the text around it is displayed';
+        case 'styled':
+          return `reads as “${piece.normalize('NFKC')}”`;
+      }
+    }
+
+    const input    = document.getElementById('text');
+    const summary  = document.getElementById('summary');
+    const view     = document.getElementById('view');
+    const findings = document.getElementById('findings');
+
+    function update() {
+      const text = input.value;
+      let found;
+      try {
+        found = scan(text);
+      } catch (e) {
+        summary.textContent = '? cannot decide: ' + e.message;
+        summary.className = '';
+        return;
+      }
+      renderView(view, text, found);
+
+      findings.replaceChildren();
+      const rows = Object.keys(KIND)
+        .flatMap(kind => found[kind].map(([s, e]) => [s, e, kind]))
+        .sort((a, b) => a[0] - b[0]);
+      for (const [s, e, kind] of rows) {
+        const tr = findings.insertRow();
+        tr.insertCell().textContent = KIND[kind];
+        const cell = tr.insertCell();
+        cell.className = 'found';
+        renderView(cell, text, found, s, e);
+        tr.insertCell().textContent = details(kind, text.slice(s, e));
+      }
+
+      if (!text) {
+        summary.textContent = '';
+        summary.className = '';
+      } else if (rows.length === 0) {
+        summary.textContent = '✓ nothing suspicious';
+        summary.className = 'clean';
+      } else {
+        summary.textContent = `✗ ${rows.length} suspicious ${rows.length === 1 ? 'finding' : 'findings'}`;
+        summary.className = 'suspect';
+      }
+    }
+
+    const buttons = document.getElementById('examples');
+    for (const [label, text] of EXAMPLES) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.addEventListener('click', () => { input.value = text; update(); });
+      buttons.append(button);
+    }
+    input.addEventListener('input', update);
+    input.value = EXAMPLES[0][1];
+    update();
+  </script>
+</body>
+</html>

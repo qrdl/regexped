@@ -1,10 +1,12 @@
-.PHONY: notes-armed test exhaustive custom adjusted sets sets-likely sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: notes-armed test exhaustive unicode unicode-all unicode-groups custom-unicode unicode-variants unicode-ext unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely custom adjusted sets sets-likely sets-unicode sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
 CUSTOM       := custom-tests.txt
 CUSTOM_SETS  := custom-sets.txt
+CUSTOM_SETS_UNICODE := custom-sets-unicode.txt
 ADJUSTED     := re2-adjusted.txt
+UNICODE_VARIANTS := re2-unicode.txt
 
 # RE2TEST_FLAGS is appended to every re2test invocation below, so one flag can
 # be applied to the whole suite — e.g. `make test RE2TEST_FLAGS=--bt-fallback-always`
@@ -25,6 +27,101 @@ $(TESTDATA): $(TESTDATA_BZ2)
 # and it costs about 40% more wall time than the bare run.
 exhaustive: $(TESTDATA)
 	go run . $(RE2TEST_FLAGS) --all-matches $(TESTDATA)
+
+# unicode compiles the corpus's six blocks with characters above 0x7F in
+# Unicode mode and judges them against RE2's OWN columns — byte offsets, `.`
+# reading a whole character — an oracle that is not Go. The rows where RE2's
+# \B holds inside a character are skipped, as Go's own exhaustive test skips
+# them; --all-matches still adds Go's every-match column, except where Go and
+# Unicode mode differ by design (input that is not valid UTF-8, for a pattern
+# that can match U+FFFD; this corpus has no such input). Never with
+# --high-bytes, whose ASCII-twin oracle holds for byte mode only.
+unicode: $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) -unicode --all-matches $(TESTDATA)
+
+# unicode-all compiles EVERY block in Unicode mode, the all-ASCII ones too
+# (-unicode-all): their answers are byte mode's — no character above 0x7F to
+# read differently — but each pattern is lowered and its engine chosen as
+# Unicode mode does, which `unicode`, skipping those blocks, never exercises.
+# unicode-groups is the same over the capture-adjusted corpus with
+# --validate-groups: the corpus's capture bodies, TDFA and Backtracking, in
+# Unicode mode. custom-unicode runs custom-tests.txt that way, its rows naming
+# characters above 0x7F — which `custom` skips in byte mode — included.
+unicode-all: $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) -unicode -unicode-all --all-matches $(TESTDATA)
+
+unicode-groups: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) -unicode -unicode-all --validate-groups $(ADJUSTED)
+
+custom-unicode:
+	go run . $(RE2TEST_FLAGS) -unicode -unicode-all --validate-groups $(CUSTOM)
+
+# The byte-mode targets' modes in Unicode mode, over the whole corpus
+# (-unicode -unicode-all): each re-runs its byte-mode counterpart's legs with
+# every pattern compiled — lowered, routed, emitted — as Unicode mode does.
+# Outside `test`; unicode-ext runs them all.
+U := -unicode -unicode-all
+
+unicode-ext: unicode-all unicode-groups custom-unicode unicode-variants unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely
+
+# The adjusted corpus's patterns over Unicode VARIANTS of its strings — a
+# 2-byte character inside each, 3- and 4-byte ones around it, a stray 0xFF and
+# a cut sequence — with every column, every match included, computed by Go
+# over the pattern without U+FFFD: Unicode mode's own answers, invalid input
+# included (-unicode-oracle). The corpus has six blocks of non-ASCII input
+# and no invalid UTF-8; this is the rest of it.
+$(UNICODE_VARIANTS): $(ADJUSTED)
+	go run ./make_adjusted -unicode-variants $(ADJUSTED) $(UNICODE_VARIANTS)
+
+unicode-variants: $(UNICODE_VARIANTS)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups $(UNICODE_VARIANTS)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --search-block=armed $(UNICODE_VARIANTS)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --force-backtrack $(UNICODE_VARIANTS)
+
+unicode-likely: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --likelymatch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --likelymatch --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --likelymatch --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) $(U) --likelynomatch $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --likelynomatch --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --likelynomatch --validate-groups $(CUSTOM)
+
+unicode-force-backtrack: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --force-backtrack $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --force-backtrack --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --force-backtrack --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) $(U) --force-backtrack --likelynomatch --validate-groups $(ADJUSTED)
+
+# Every Backtracking program answered by its memoised fallback alone; a -2 is
+# a failure here.
+unicode-bt-fallback: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --bt-fallback-always --force-backtrack --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --bt-fallback-always --force-backtrack --validate-groups $(CUSTOM)
+
+unicode-notes-armed: $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --search-block=armed --all-matches $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --search-block=armed --validate-groups $(ADJUSTED)
+	go run . $(RE2TEST_FLAGS) $(U) --search-block=armed --validate-groups $(CUSTOM)
+	go run . $(RE2TEST_FLAGS) $(U) --search-block=armed --likelymatch --all-matches $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --search-block=armed --force-backtrack --validate-groups $(ADJUSTED)
+
+# `sets` and `sets-likely` in Unicode mode over the whole corpus — the
+# all-ASCII blocks too, which sets-unicode skips.
+sets-unicode-all: $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=8  --sample=200 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=16 --sample=150 --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=70 --sample=60  --set-shuffle --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=16 --sample=150 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=8 --sample=200 --set-batch --set-profiles=batch $(TESTDATA)
+
+sets-unicode-likely: $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=8  --sample=200 --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=16 --sample=150 --set-shuffle --likelymatch   --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=8  --sample=200 --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=16 --sample=150 --set-shuffle --likelynomatch --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=0  --likelymatch   --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) $(U) --sets --set-chunk=0  --likelynomatch --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
 custom:
 	# Expectation file vs Go, no WASM involved. Was commented out while its
@@ -134,7 +231,7 @@ groupsonly: $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(ADJUSTED)
 	go run . $(RE2TEST_FLAGS) --groups-only --validate-groups $(CUSTOM)
 
-test: exhaustive custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly notes-armed sets sets-likely
+test: exhaustive unicode custom adjusted high-bytes force-backtrack likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly notes-armed sets sets-likely sets-unicode
 
 # Every find that keeps per-search notes has two copies: the ORDINARY one, which
 # every other target drives (a stub's fresh block arms only on a drive that
@@ -198,6 +295,26 @@ sets: $(TESTDATA)
 	go run . $(RE2TEST_FLAGS) --sets --set-chunk=8 --sample=250 --set-bt=1 --set-profiles=$(SET_PROFILES) $(TESTDATA)
 	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0 --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
 
+# Sets in Unicode mode: every capability, both `find` policies and the answer
+# cache legs, against Go read token by token, so no match may start and no
+# empty match may be reported inside a character. Over the corpus's blocks with
+# characters above 0x7F (an all-ASCII block is answered as byte mode answers
+# it, and skipped), custom-sets.txt, and custom-sets-unicode.txt — the shapes
+# whose empty matches could land inside a character, over 2- to 4-byte
+# characters and invalid input — neutral, under both hints, on Backtracking
+# members, and through the batch entry at capacity one.
+sets-unicode: $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=8  --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=16 --set-shuffle --set-subset --set-profiles=$(SET_PROFILES) $(TESTDATA)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=2  --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --set-subset --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --likelymatch   --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --likelynomatch --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --set-bt=1 --set-profiles=$(SET_PROFILES) $(CUSTOM_SETS_UNICODE)
+	go run . $(RE2TEST_FLAGS) -unicode --sets --set-chunk=0  --set-batch --set-profiles=batch $(CUSTOM_SETS_UNICODE)
+
 # The set capabilities under a non-neutral set-level hint.
 #
 # `sets` above runs entirely NEUTRAL, so every hint-gated set emitter had no
@@ -243,4 +360,4 @@ set-batch: $(TESTDATA)
 	go run . $(RE2TEST_FLAGS) --sets --set-chunk=0 --set-batch --set-profiles=batch $(TESTDATA)
 
 clean:
-	rm -f $(TESTDATA) $(ADJUSTED)
+	rm -f $(TESTDATA) $(ADJUSTED) $(UNICODE_VARIANTS)

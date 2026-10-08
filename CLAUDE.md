@@ -32,7 +32,10 @@ regexped/
 ├── compile/
 │   ├── compile.go             # Public API: Compile, CompileForced, SelectEngine, assembleModule, CmdCompile, CmdWriteDiagJSON
 │   ├── selector.go            # Engine selection (TDFA vs Backtrack vs DFA vs CompiledDFA)
-│   ├── engine_dfa.go          # DFA subset construction, table generation, WASM emission
+│   ├── engine_dfa.go          # DFA subset construction, table generation, WASM emission. The
+│   │                          #   looping-state SIMD skips: byte (≤8 exits) and, in Unicode mode,
+│   │                          #   whole UTF-8 characters (utf8SelfLoopExits / emitUTF8BulkSkip:
+│   │                          #   Keiser-Lemire validity, stops before an invalid sequence)
 │   ├── engine_compiled_dfa.go # Compiled DFA: direct-index dispatch, literal-chain prefix
 │   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission.
@@ -59,6 +62,15 @@ regexped/
 │   │                          #   they made Backtracking refuse is now ADMITTED, not dropped).
 │   │                          #   In a SET, a member's budget, fallback region and visited set last
 │   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate
+│   ├── bt_dispatch.go         # FIRST-BYTE DISPATCH at the head of an alternation chain (>= 3 arms,
+│   │                          #   Go's Alt(Alt(a, b), c) flattened): one br_table on the byte to the
+│   │                          #   arms it can start, frames pushed only for those, in order; inner
+│   │                          #   Alts unreachable. Compact encoding (a mask, one shared push run)
+│   │                          #   where per-case pushes would outnumber the arms. Fast body only.
+│   │                          #   Charges the work budget one pop per SKIPPED arm: the budget is
+│   │                          #   calibrated in plain-chain pops, and a single-arm case pushes
+│   │                          #   nothing, so uncharged a loop through it went quadratic
+│   │                          #   (advbench setbt5, ×3.97). WAF members 29-88% less fuel
 │   ├── bt_search.go           # A Backtracking find's work budget per SEARCH, not per call: kept in
 │   │                          #   the caller's per-search block (search_notes.go), so a drive whose
 │   │                          #   every call burns the budget burns it ONCE. A tripped search goes
@@ -193,8 +205,17 @@ regexped/
 │   │                          #   128-member no-cache companion's blocks cost ovl128 +33 KB. ~1-9 fuel per call for a
 │   │                          #   caller that hands its own state over. Embedded builds get none: a
 │   │                          #   second copy of every state-reading body measured +10% to +43% size
-│   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start
-│   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan)
+│   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start.
+│   │                          #   A ONE-byte inner literal only behind a leading repeat of a wide,
+│   │                          #   space-free class — in Unicode mode also one holding a character above
+│   │                          #   0x7F, then only on a literal byte not common in text (commonInText,
+│   │                          #   oneByteInnerLiteral) — (wideLeadingRepeat: the shapes otherwise sent to
+│   │                          #   start-anywhere for want of a literal), and such a find always takes
+│   │                          #   the switch, charging EVERY failed candidate walk + 40
+│   │                          #   (emitFindSwitchChargeEvery). u16 tables in Unicode mode only
+│   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan). A Unicode-mode literal that
+│   │                          #   begins with a non-ASCII character is checked a whole character at a
+│   │                          #   time on a first-byte hit (UTF8Text / charProbe)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
@@ -300,7 +321,9 @@ regexped/
 │   │                          #   Answers live in the caller's cache region AFTER the cache (8-aligned),
 │   │                          #   checkpointed like it (emitCkptSizingBudget); state in the cache
 │   │                          #   header's reserved words 0, 4, 32. Runs once the member's walks pass
-│   │                          #   4 × len + 64. Limits: 4,096 roots per set, 65,536 closure items.
+│   │                          #   4 × len + 64 (Unicode mode: k × len + 64, k = the sweep's estimated
+│   │                          #   fuel per byte in walk bytes, setWorkK). Limits: 4,096 roots per set,
+│   │                          #   65,536 closure items; in Unicode mode 65,536 and 1,048,576.
 │   │                          #   ONE function (emitSweepFnBody): the pass, or block j when its 4th
 │   │                          #   argument is -1 - j — the column step is most of either. Not planned
 │   │                          #   for the NO-CACHE companion, whose drives have no region to keep it in
@@ -499,9 +522,14 @@ regexped/
 │   ├── region.go              # Set table-region allocation: the sequential blocks CompileSet lays out
 │   ├── set_anchored_union.go  # The ANCHORED union automaton serving match_any / match_all
 │   ├── set_bt.go              # Backtracking as the set fallback engine for members over max_fallback_states
-│   ├── tdfa_bulk_skip.go      # TDFA capture-body bulk-skip for dominant self-loop states
+│   ├── tdfa_bulk_skip.go      # TDFA capture-body bulk-skip for dominant self-loop states, and
+│   │                          #   (Unicode mode) for loops over whole UTF-8 characters — a GROUP of
+│   │                          #   states with identical rows, the TDFA not being minimized — run from
+│   │                          #   the tag-op dispatch's arms that enter the loop, so no byte outside
+│   │                          #   it pays: tested on every byte it cost `(.+)=(.+)` 5%
 │   ├── verbose.go             # --verbose compile reporting
-│   ├── whole_capture.go       # Whole-pattern single-capture shortcut: group 1 is group 0
+│   ├── whole_capture.go       # Single-capture shortcuts: group 1 is group 0, or group 0
+│   │                          #   less a plain literal prefix/suffix (`([^,]+),`, `<([^>]*)>`)
 │   └── wasm.go                # WASM binary encoding primitives
 ├── generate/
 │   ├── generate.go            # Stub generation orchestration (ResolveStubType, CmdGenerateStub)
@@ -667,6 +695,7 @@ regexped/
 │   ├── re2.md                 # RE2 test coverage
 │   ├── wasm.md                # WASM interface, memory layout, table formats
 │   ├── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   ├── performance.md         # regexped vs the regex crate and regex-automata: averages + tables (README links)
 │   ├── complexity.md          # Every mechanism against quadratic time and unbounded memory — engines,
 │   │                          #   find switch, notes, Backtracking budget/memo, set split, sparse counter,
 │   │                          #   answer cache, program sweep, default state, memory sizes — and what
@@ -677,14 +706,17 @@ regexped/
 │                              #   YOUR traffic before shipping it
 └── examples/
     ├── Makefile
-    ├── browser/               # Browser demo: email + URL validation via JS + WASM
+    ├── browser/               # Two browser demos, served together by `make run`:
+    │   ├── validate/          #   email + URL validation via JS + WASM
+    │   └── homoglyph/         #   lookalike letters, invisible + bidi characters (Unicode set)
     ├── node/
     │   ├── domain-extract/    # Node.js: domain extraction via TS stub
     │   └── sql-validator/     # Node.js: SQL validator via TS stub
     ├── workers/               # Cloudflare Worker: credential scanner edge API
     ├── fastedge/
     │   ├── validate/          # FastEdge CDN app: email, URL, XSS validation via regexped WASM stubs
-    │   └── url-guard/         # FastEdge: OWASP URL attack detection
+    │   ├── url-guard/         # FastEdge: OWASP URL attack detection
+    │   └── lang-detect/       # FastEdge wasi:http component: European languages by letters (Unicode sets)
     └── wasmtime/
         ├── rust/
         │   ├── url-ipv6/      # DFA anchored match: validate IPv6 URLs (Rust)
@@ -735,7 +767,8 @@ wac_path:      "tools"               # optional; the same rule for wac. The merg
                                      #   for wasm_format: component — `merge` dispatches on the format
 stub_file:     "src/stubs.rs"        # stub output file; extension determines type: .rs, .js, .ts, .go, .h
 stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
-max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024)
+max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024;
+                                     #   16384 in Unicode mode, where one `\pL` costs ~290 states)
 max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
 max_memory:     100MB                # optional; declared as the module memory's MAXIMUM, so the engine
                                      #   refuses every grow past it. Unset = no cap. KB/MB/GB = powers of
@@ -762,11 +795,12 @@ regexps:
     # `<func>_index` / `<func>_names` (an `<func>_indices` object in JS/TS).
 ```
 
-**`byte_mode:` and the unsupported-rune gate.** regexped is a BYTE engine — `.` consumes one byte, classes are byte classes, `\b` is ASCII — so a rune above U+007F has no byte to be. `compile/compile.go`'s `unsupportedRune` rejects a pattern naming one, with a message that names the rune and points at `byte_mode: true`; runes above U+00FF are rejected in BOTH modes with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
+**`byte_mode:` and the unsupported-rune gate.** In BYTE mode — `.` consumes one byte, classes are byte classes, `\b` is ASCII — a rune above U+007F has no byte to be. A pattern naming one asks for UNICODE mode instead (`compile/utf8_lower.go`: `resolvePattern` decides a pattern's mode once and the program is lowered to UTF-8 byte ranges; a SET has one mode for all its members, `resolveSetMode`, and in Unicode mode keeps no match or empty match inside a character at four sites — the per-position walk's candidate skip, the answer cache's sweep, the program sweep's rows and the split merge's search position — all keyed off `setStartNeeds`, since only an EMPTY match can sit inside a character). In byte mode — `byte_mode: true`, `unicode: false`, or a harness's `CompileOptions.ForceByteMode` — `compile/compile.go`'s `unsupportedRune` rejects a rune past the limit, with a message that names it (and points at `byte_mode: true` for one up to U+00FF); a rune above U+00FF is rejected under `byte_mode` too, with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
 
-TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` is NOT Unicode support and never was — it is a compile-anyway bypass for tests, not reachable from YAML.
+TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` and `CompileOptions.ForceByteMode` are how a caller (every harness, and `CompileForced`) states a pattern's mode instead of letting `resolvePattern` decide it.
 
 Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
+A `groups_func` on a pattern with no capture group that can take part in a match (`a*`, `(?:(a){0})b`) is REFUSED — at config load (`config.RegexEntry.GroupsWithoutCaptures`), by `compile` (`compile.ErrNoCaptureGroup`) and by `generate` — because it used to compile to a module with no groups export while every stub called one.
 Setting only `match_func` and/or `find_func` strips captures from the pattern before compilation.
 An entry with no `_func` fields is valid — no WASM file is compiled and no stub is generated for it.
 
@@ -979,7 +1013,7 @@ Test data is unpacked from `$GOROOT/src/regexp/testdata/re2-exhaustive.txt.bz2`.
 
 **Current results (exhaustive, match+find):** ~4.94M passing, 0 failures, ~781K skipped
 - DFA: ~334K, Compiled DFA: ~4.6M
-- Skipped: Unicode (270K), unsupported `\C` syntax (511K)
+- Skipped: rows needing Unicode mode (270K — the Unicode targets below check them), unsupported `\C` syntax (511K)
 
 **Current results (adjusted, with --validate-groups):** ~1.88M passing, 0 failures
 - DFA: ~360K, Compiled DFA: ~1.2M, TDFA: ~41K, Backtracking: ~267K
@@ -1055,6 +1089,36 @@ stride, the widened Shufti band, the counted-chain packer split, the forced-Shuf
 frontend — had **no correctness gate at all**. It compiles genuinely
 different bodies from the ones `setcaps` checks, at 10,435,992 checks over
 its six runs / 0 failures.
+
+**`make setcaps-unicode`** (`tools/re2test`'s `sets-unicode`, in `make test`)
+is the same sweep with every set in UNICODE mode: the oracle's probe counts
+Go's tokens, so no match — empty ones included — may start inside a
+character, over the corpus's non-ASCII blocks, `custom-sets.txt` and
+`custom-sets-unicode.txt` (Go-regenerated blocks of the shapes whose empty
+matches could land inside one, over 2- to 4-byte characters and invalid input):
+34,513,565 checks over its ten runs, 0 failures.
+
+**`make -C tools/re2test unicode-all` / `unicode-groups` / `custom-unicode`**
+(outside `make test`) run Unicode mode over what `unicode` skips: with
+`-unicode-all` every block is compiled in Unicode mode, the all-ASCII ones too —
+their answers are byte mode's, their code (lowered classes, the engine chosen
+for the lowered program) Unicode mode's. 12,364,931 rows; the capture-adjusted
+corpus with `--validate-groups` 3,757,680 (TDFA 179,928, Backtracking 488,376);
+`custom-tests.txt` 8,658 — 0 failures. A row on input that is not valid UTF-8,
+for a pattern that can match U+FFFD, is skipped in Unicode mode (`skipGoFFFD`):
+Go-derived columns are wrong there by design. `make -C tools/fuzz seed-unicode`
+replays the Unicode-seeded fuzz targets' corpora with `-unicode` — the set
+targets seeded with pairs of the same shapes (`unicodeSetSeeds`);
+`fuzz-unicode` / `fuzz-unicode-groups` / `fuzz-unicode-set` fuzz them.
+`make -C tools/re2test unicode-ext` adds every byte-mode MODE in Unicode mode
+(hints, forced Backtracking, fallback-only, armed notes, sets over the whole
+corpus) and `unicode-variants`: the adjusted corpus over Unicode variants of
+its strings (2- to 4-byte characters, a stray 0xFF, a cut sequence), every
+column computed by Go without U+FFFD (`make_adjusted -unicode-variants`, read
+with `-unicode-oracle`): 14,597,031 checks per leg; sets over the whole corpus
+20,362,084, under the hints 11,883,952 — 0 failures throughout. `tools/fuzz`'s
+`TestUnicodeModeOutputKinds` runs one Unicode config as a standalone module, an
+embedded one and a component.
 
 `custom-sets.txt` adds hand-picked blocks whose expectations are REGENERATED
 from Go (`go run ./make_sets custom-sets.txt`) rather than hand-maintained,
@@ -1164,9 +1228,9 @@ It compares ANSWERS rather than global indices, because a wrong renumbering by
 make byteident   # from repo root
 ```
 
-Twenty-eight single-pattern configs, one per code path, plus nineteen SET configs
-spanning four frontends, both accept representations and all five
-capabilities — each checked in with the exact bytes it compiles to and
+Forty-two single-pattern configs, one per code path (the `unicode_` ones in
+Unicode mode), plus twenty-four SET configs spanning four frontends, both
+accept representations, all five capabilities and Unicode mode — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
 supposed to be unaffected by set work, and byte identity is
@@ -1573,6 +1637,28 @@ The same per-byte-cost concern applies to any future plan that moves
 capture-tracking patterns from BT to TDFA on correctness grounds
 alone. Always measure first.
 
+**Unicode mode is the measured exception (2026-10-06).** There the gate is
+lifted: `hasAmbiguousCaptures(prog, unicode)` computes a class of any width,
+`.` and a folded literal's fold orbit as codepoint RANGES
+(`firstRuneRanges`) and checks real overlap, so only a genuinely overlapping
+alternation stays on BT. The premise above — BT checks a wide class with a
+few inline compares — is false once the class is LOWERED: `\pL` was an
+800-way Alt chain that BT walked branch by branch, pushing and popping a
+frame per branch, on every character it rejects. (The lowering is now a
+prefix trie, one arm per distinct lead byte range — 34 for `\pL` — and BT on
+the rows below costs 7,192 and 27,720 rather than 101,299 and 214,332: still
+2.9x and 5.6x the TDFA, so the routing stands.) Measured (perftest
+`-unicode`, fuel; module bytes): `(\pL+)\s(\pN+)` over "Straße 42" 101,299 →
+2,470 (−97.6%), 353 B 189,793 → 46,979; `(\pL+)@(\pL+)` 214,332 → 5,299;
+`(.+)=(.+)` 16,912 → 3,917, 641 B 280,024 → 73,473; `<([^>]+)>` 78,134 →
+75,236; `([^,]+),` 78,288 → 75,182; modules 1.30 MB → 0.76 MB and 2.19 MB →
+1.23 MB (`(\pL+)\s(\pN+)`, `(\pL+)@(\pL+)`). Byte mode is untouched:
+`hasAmbiguousCaptures(prog, false)` is the old code path, and
+`TestSelectEngineUnicodeComputesWideFirstSets` pins both modes. It became
+affordable only after two TDFA-construction fixes that change no output
+(`make byteident`): a memoised whole-walk `epsWalker` and a per-state memo
+of transitions by input-map entry — `^(\pL)(\pL{6})` 2 min 16 s → 1.5 s.
+
 ## Technical Decisions
 
 ### Why DFA?
@@ -1636,9 +1722,9 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-04
+**Last Updated:** 2026-10-06
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
-**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
+**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.
@@ -1647,4 +1733,4 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 **Member self-loop skip** (`compile/set_sparse.go`, sparse bucket bodies, `prefer-match` only). While the walk sits in a state its accept list cannot change, so a run of bytes that all self-loop moves nothing but the position — and `record` may fire ONCE at the end of the run instead of once per byte. Worth **−80%** of the bucket's fuel on a shared-literal family with long self-loop tails, and **+1.6%** on the same family with no runs to stride over, which is why it is hinted rather than default. That +1.6% was +26%, then +9%, and the two reductions attack DIFFERENT costs. The first is a per-state stale flag in the body's scratch, set when an attempt advances nothing and cleared when one advances; it bounds the WASTED ATTEMPT. It has to be per STATE and it has to live in SCRATCH — the body is called once per CANDIDATE, so a local resets before any streak accumulates (a local counter measured +33%, worse than none), and one flag shared across a bucket's dozens of eligible states lets one failing state silence the rest (win collapsed −80% → +5%). The second is that the walk is emitted TWICE, with the member dispatch and without, and chosen between at entry on a per-BUCKET verdict byte: what the stale flags cannot bound is the DISPATCH — a `memberTab[state]` load, a tee and a branch at every byte of every candidate — which on one-byte tails is the entire remaining cost, ~54 fuel per call with not one attempt executing. The no-dispatch copy is byte-for-byte the walk a neutral bucket emits, so a bucket whose skip is not paying costs exactly what not having the feature costs. BOTH escapes RE-PROBE rather than latch, because scratch survives calls and drives: a latch would let one run-free input disable the skip for every later run-heavy one. The per-state flag re-probes on `lPos & 63 == 0`; the per-bucket verdict re-probes on `lPos & 31 == 0`, the CANDIDATE POSITION rather than a call counter, because a counter must be loaded, incremented and stored on the very path the verdict exists to make cheap and measured as two thirds of what was left. The verdict counts states DISPATCHED to, not attempts made — attempts are already suppressed by the stale flags, so counting them reads as "nothing to judge" and clears the verdict every call. Per state, `memberTab[state]` gives a set id and `memberSets[id]` two nibble-table pairs, EXACT — one bit per distinct nibble ROW (see `buildShuftiPairs`), so two pairs cover a set of ANY width and the former 16-byte ceiling is gone; a `[^\n]+` tail is now served, and served exactly. The pair count is fixed because the set is chosen at RUNTIME and the emitted code shape cannot vary per state. The correctness argument rests on `record` stamping the position (last write wins) and its first-timer bookkeeping being idempotent behind `seen`; both are pinned by tests, because breaking either makes every skipped run report the wrong extent silently. A bucket with no eligible state emits no dispatch at all, so it pays nothing. `--diag-json` reports `member_skip_states` / `member_skip_sets` — the skip is otherwise invisible, and an invisible mechanism is one that stops working quietly.
 
-**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup, per-search notes that keep a drive linear for a pattern with a cycle state), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, a pop-counted work budget of one step per instruction per byte that lasts a SEARCH when the caller passes a search block, with a memoised fallback body on every program whose frame stack and memo grow with the input and whose memo the stub keeps for the rest of a search once it trips, the fallback alone for a program with a zero-width cycle, all logic inside WASM). No Pike VM: measured against Backtracking with the per-search budget it never paid on a real config, and was not built
+**Engines implemented:** DFA (anchored + find, LeftmostFirst, word boundaries, SIMD, Hopcroft minimization, anchor-aware find, mandatory literal extraction, u16 row dedup, per-search notes that keep a drive linear for a pattern with a cycle state), Compiled DFA (direct-index table + literal-chain prefix, ≤256 states), TDFA (Laurikari tagged DFA, register ops, tag-op br_table, majority-group optimization, register minimization), Backtracking (hybrid DFA+NFA: DFA determines match extent, NFA fills captures; RE2 leftmost-longest semantics, BitState memoization, first-byte dispatch over alternation chains, a pop-counted work budget of one step per instruction per byte that lasts a SEARCH when the caller passes a search block, with a memoised fallback body on every program whose frame stack and memo grow with the input and whose memo the stub keeps for the rest of a search once it trips, the fallback alone for a program with a zero-width cycle, all logic inside WASM). No Pike VM: measured against Backtracking with the per-search budget it never paid on a real config, and was not built

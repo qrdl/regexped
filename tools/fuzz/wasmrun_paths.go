@@ -3,6 +3,7 @@ package fuzz
 import (
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
@@ -43,13 +44,39 @@ const (
 	maxFuzzGroups = 128
 )
 
+// unicodeMode puts every run-helper compile of this package's tests and fuzz
+// targets in Unicode mode: `go test ./tools/fuzz -args -unicode`. Byte mode
+// is the default. Either way the mode is forced, never resolved from the
+// pattern, so no run is in a mode it did not ask for.
+var unicodeMode = flag.Bool("unicode", false, "compile every run helper's pattern in Unicode mode (default: byte mode)")
+
+// setModeKey is the set-level `unicode:` key the set fuzz targets compile
+// with: the run's mode, stated rather than left to the members to resolve.
+func setModeKey() *bool {
+	v := *unicodeMode
+	return &v
+}
+
+// withMode sets on o the mode the run asks for.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeMode {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
+// runOpts is the run helpers' options: the run's mode and nothing else.
+func runOpts() compile.CompileOptions { return withMode(compile.CompileOptions{}) }
+
 // compileMatch compiles pat into a standalone module exporting a single
 // anchored match function. No captures, so this exercises the DFA /
 // CompiledDFA / lit-chain match bodies.
 func compileMatch(pat string) ([]byte, error) {
 	return cachedCompile("match\x00"+pat, func() ([]byte, error) {
 		entry := config.RegexEntry{Pattern: pat, MatchFunc: "match"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -59,7 +86,7 @@ func compileMatch(pat string) ([]byte, error) {
 func compileGroups(pat string) ([]byte, error) {
 	return cachedCompile("groups\x00"+pat, func() ([]byte, error) {
 		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -71,7 +98,7 @@ func compileGroups(pat string) ([]byte, error) {
 func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), func() ([]byte, error) {
 		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng)
+		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng, runOpts())
 		return w, err
 	})
 }
@@ -83,7 +110,7 @@ func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), func() ([]byte, error) {
 		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
 		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true,
-			compile.EngineBacktrack, compile.CompileOptions{BTWorkBudget: budget})
+			compile.EngineBacktrack, withMode(compile.CompileOptions{BTWorkBudget: budget}))
 		return w, err
 	})
 }
@@ -106,6 +133,7 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 			// allStartPositionMatches models.
 			Overlapping: true,
 			Patterns:    config.PatternSelector{Names: names},
+			Unicode:     setModeKey(),
 		}}
 		// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
 		// tables always start at address 0 and the input CANNOT live at offset 0
@@ -204,15 +232,21 @@ func dropsFromSet(diags []compile.SetDiag) setDrops {
 // inside it and the module's compiled code is what the instance runs.
 func instantiate(wasmBytes []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory, func(), error) {
 	engine, _ := sharedEngine()
-	mod, err := wasmtime.NewModule(engine, wasmBytes)
-	if err != nil {
-		return nil, nil, nil, func() {}, err
+	mod, owned := warmedModule(wasmBytes), false
+	if mod == nil {
+		var err error
+		if mod, err = wasmtime.NewModule(engine, wasmBytes); err != nil {
+			return nil, nil, nil, func() {}, err
+		}
+		owned = true
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
 	release := func() {
 		store.Close()
-		mod.Close()
+		if owned {
+			mod.Close()
+		}
 	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {

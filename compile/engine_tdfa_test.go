@@ -24,7 +24,7 @@ func tdfaStats(pattern string) (numStates, numRegs, totalTagOps int, ok bool) {
 	if err != nil {
 		return
 	}
-	tt, success := newTDFA(prog, 2000)
+	tt, success := newTDFA(byteProg(prog), 2000)
 	if !success {
 		numStates = -1
 		ok = false
@@ -422,7 +422,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 			if prog.NumCap != tc.rawTags {
 				t.Errorf("rawTags: got %d want %d (test case stale?)", prog.NumCap, tc.rawTags)
 			}
-			tt, ok := newTDFA(prog, 2000)
+			tt, ok := newTDFA(byteProg(prog), 2000)
 			if !ok {
 				t.Fatalf("newTDFA failed — pattern ineligible for TDFA")
 			}
@@ -516,7 +516,7 @@ func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
 	if err != nil {
 		t.Fatalf("compile %q: %v", pattern, err)
 	}
-	tt, ok := newTDFA(prog, 2000)
+	tt, ok := newTDFA(byteProg(prog), 2000)
 	if !ok {
 		t.Fatalf("newTDFA rejected pattern %q", pattern)
 	}
@@ -1096,5 +1096,135 @@ func TestTDFARegisterEdgeShapes(t *testing.T) {
 			}
 			validateWASM(t, wasm)
 		})
+	}
+}
+
+// TestTDFAUTF8Skip pins which loops of a Unicode-mode TDFA the UTF-8 skip
+// serves — a group of states with identical rows that every ASCII byte but a
+// few and every character leads back into, firing one batch of set-to-pos
+// ops — where the match body runs it, and the three forms of its state test.
+func TestTDFAUTF8Skip(t *testing.T) {
+	table := func(t *testing.T, pattern string, unicode bool) *tdfaTable {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tt, ok := newTDFA(mp, 16384)
+		if !ok {
+			t.Fatalf("newTDFA(%q) failed", pattern)
+		}
+		return tt
+	}
+	cases := []struct {
+		pattern string
+		exits   []string // each loop's ASCII exits
+		ops     int      // the first loop's batch size
+		hasOps  bool     // the table has tag ops, so the skip sits in the dispatch arms
+	}{
+		{`<([^>]+)>(x)`, []string{">"}, 1, true},
+		{`(.+)=(.+)`, []string{"\n="}, 1, true},
+		{`([^,]+)(,)`, []string{","}, 2, true},
+		{`(\w+)=([^&]+)&`, []string{"&"}, 1, true},
+		{`()[^,]+,`, []string{","}, 0, false},
+		{`(\pL+)\s(\pN+)`, nil, 0, true},
+		{`(.)+y`, nil, 0, true},                 // the group is a copy away: not a set-to-pos batch
+		{`([^\x{80}-\x{7ff}]+),`, nil, 0, true}, // a two-byte lead is dead
+		{`^([^,]+)`, []string{","}, 1, true},    // anchored: the loop's states accept
+	}
+	for _, c := range cases {
+		tt := table(t, c.pattern, true)
+		var exits []string
+		for _, info := range tt.utf8Skip {
+			exits = append(exits, string(info.exitBytes))
+			if len(info.wasmStates) < 2 {
+				t.Errorf("%q: loop %v: want the two states lowered `[^x]`'s ASCII ranges give", c.pattern, info.wasmStates)
+			}
+		}
+		if fmt.Sprint(exits) != fmt.Sprint(c.exits) {
+			t.Errorf("%q: loops' exits = %q, want %q", c.pattern, exits, c.exits)
+			continue
+		}
+		if len(exits) > 0 && len(tt.utf8Skip[0].ops) != c.ops {
+			t.Errorf("%q: batch %v, want %d ops", c.pattern, tt.utf8Skip[0].ops, c.ops)
+		}
+		if tdfaHasTagOps(tt) != c.hasOps {
+			t.Errorf("%q: tdfaHasTagOps = %v, want %v", c.pattern, !c.hasOps, c.hasOps)
+		}
+		// Every case compiles to a valid groups export — the skip in the
+		// dispatch arms, or at the top of the main loop with no dispatch.
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pattern, GroupsFunc: "g"}}, 0, true, CompileOptions{Unicode: true}); err != nil {
+			t.Errorf("%q: compile: %v", c.pattern, err)
+		}
+	}
+	if tt := table(t, `<([^>]+)>(x)`, false); len(tt.utf8Skip) != 0 {
+		t.Errorf("byte mode: loops %+v, want none", tt.utf8Skip)
+	}
+
+	// The skip runs in the arms of states outside the loop that lead into it:
+	// the state after `<` and the states before a character's last byte —
+	// never a state of the loop.
+	tt := table(t, `<([^>]+)>(x)`, true)
+	info := tt.utf8Skip[0]
+	entering := 0
+	for gs := 0; gs < tt.numStates; gs++ {
+		in := false
+		for _, st := range info.wasmStates {
+			in = in || int(st) == gs+1
+		}
+		if in && info.entersFrom(tt, gs) {
+			t.Errorf("state %d of the loop counts as entering it", gs)
+		}
+		if info.entersFrom(tt, gs) {
+			entering++
+		}
+	}
+	if entering < 2 {
+		t.Errorf("%d states enter the loop, want the opener's and the last-byte states'", entering)
+	}
+
+	// A character whose lead byte sets a register the batch does not set
+	// again would leave it at a position inside the run: refused.
+	tt = table(t, `<([^>]+)>(x)`, true)
+	for _, st := range tt.utf8Skip[0].wasmStates {
+		idx := int(st-1)*256 + 0xD0
+		for len(tt.tagOps) <= idx {
+			tt.tagOps = append(tt.tagOps, nil)
+		}
+		tt.tagOps[idx] = []tdfaTagOp{{dst: 99, src: -1}}
+	}
+	if loops := detectTDFAUTF8Skip(tt); len(loops) != 0 {
+		t.Errorf("a lead byte setting a register outside the batch: loops %+v, want none", loops)
+	}
+	// More states with one row than the test on every arm is allowed to name.
+	dead := make([]int, (maxTDFAUTF8SkipLoopStates+1)*256)
+	for i := range dead {
+		dead[i] = -1
+	}
+	wide := &tdfaTable{dfaTable: &dfaTable{numStates: maxTDFAUTF8SkipLoopStates + 1, transitions: dead}}
+	if loops := detectTDFAUTF8Skip(wide); len(loops) != 0 {
+		t.Errorf("%d identical states: loops %+v, want none", wide.numStates, loops)
+	}
+
+	// The state test: one compare, a range for consecutive states, a chain.
+	for _, c := range []struct {
+		states []int32
+		want   []byte
+	}{
+		{[]int32{5}, []byte{0x20, 4, 0x41, 5, 0x46}},
+		{[]int32{3, 4}, []byte{0x20, 4, 0x41, 3, 0x6B, 0x41, 2, 0x49}},
+		{[]int32{2, 5}, []byte{0x20, 4, 0x41, 2, 0x46, 0x20, 4, 0x41, 5, 0x46, 0x72}},
+	} {
+		if got := emitTDFAStateIn(nil, c.states, 4); !bytes.Equal(got, c.want) {
+			t.Errorf("emitTDFAStateIn(%v) = % x, want % x", c.states, got, c.want)
+		}
 	}
 }

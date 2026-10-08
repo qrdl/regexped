@@ -976,6 +976,7 @@ import_module: demo
 max_dfa_states: 2048
 max_tdfa_regs: 48
 max_fallback_states: 512
+max_union_states: 16384
 regexps:
   - name: url
     pattern: '(?P<scheme>https?)://(?P<host>[a-z.]+)'
@@ -1003,7 +1004,7 @@ sets:
 	if len(cfg.Regexps) != 2 || len(cfg.Sets) != 1 {
 		t.Fatalf("loaded %d regexps and %d sets, want 2 and 1", len(cfg.Regexps), len(cfg.Sets))
 	}
-	if cfg.MaxDFAStates != 2048 || cfg.MaxTDFARegs != 48 || cfg.MaxFallbackStates != 512 {
+	if cfg.MaxDFAStates != 2048 || cfg.MaxTDFARegs != 48 || cfg.MaxFallbackStates != 512 || cfg.MaxUnionStates != 16384 {
 		t.Errorf("the numeric limits did not survive loading: %+v", cfg)
 	}
 	if !cfg.Sets[0].Overlapping || !cfg.Sets[0].BatchFind() {
@@ -1512,5 +1513,74 @@ func TestWitWorldNameDefaultFailures(t *testing.T) {
 				t.Errorf("error does not tell the user to set wit_world: %v", err)
 			}
 		})
+	}
+}
+
+// TestLoadConfig_UnicodeKey: `unicode:` loads unset, true or false on an
+// entry and on a set; `unicode: false` is exactly `byte_mode: true`, so it
+// sets ByteMode; and the two contradictions on one entry — `unicode: true`
+// with `byte_mode: true`, `unicode: false` with an explicit
+// `byte_mode: false` — are load errors. An implicit `byte_mode` (unset) with
+// `unicode: false` is not a contradiction.
+func TestLoadConfig_UnicodeKey(t *testing.T) {
+	load := func(t *testing.T, entry string) (BuildConfig, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "regexped.yaml")
+		y := "regexps:\n  - name: p\n    pattern: 'foo'\n    match_func: foo_match\n" + entry +
+			"sets:\n  - name: s\n    match_any: s_any\n    patterns: all\n    unicode: false\n"
+		if err := os.WriteFile(path, []byte(y), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(path)
+	}
+	for _, c := range []struct {
+		entry        string
+		wantErr      bool
+		wantByteMode bool
+		wantUnicode  *bool
+	}{
+		{"", false, false, nil},
+		{"    unicode: true\n", false, false, new(true)},
+		{"    unicode: false\n", false, true, new(false)},
+		{"    unicode: false\n    byte_mode: true\n", false, true, new(false)},
+		{"    unicode: true\n    byte_mode: false\n", false, false, new(true)},
+		{"    unicode: true\n    byte_mode: true\n", true, false, nil},
+		{"    unicode: false\n    byte_mode: false\n", true, false, nil},
+	} {
+		cfg, err := load(t, c.entry)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%q: err = %v, want error %v", c.entry, err, c.wantErr)
+			continue
+		}
+		if err != nil {
+			if !strings.Contains(err.Error(), "contradict") {
+				t.Errorf("%q: err = %v, want a contradiction", c.entry, err)
+			}
+			continue
+		}
+		re := cfg.Regexps[0]
+		if re.ByteMode != c.wantByteMode || re.IsByteMode() != c.wantByteMode {
+			t.Errorf("%q: ByteMode = %v, IsByteMode = %v, want %v", c.entry, re.ByteMode, re.IsByteMode(), c.wantByteMode)
+		}
+		if (re.Unicode == nil) != (c.wantUnicode == nil) || (re.Unicode != nil && *re.Unicode != *c.wantUnicode) {
+			t.Errorf("%q: Unicode = %v, want %v", c.entry, re.Unicode, c.wantUnicode)
+		}
+		if s := cfg.Sets[0].Unicode; s == nil || *s {
+			t.Errorf("%q: set unicode = %v, want false", c.entry, s)
+		}
+	}
+	// An unnamed entry is named by its pattern.
+	path := filepath.Join(t.TempDir(), "regexped.yaml")
+	y := "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n    unicode: true\n    byte_mode: true\n"
+	if err := os.WriteFile(path, []byte(y), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), `regexp "foo"`) {
+		t.Errorf("unnamed entry: err = %v, want it named by its pattern", err)
+	}
+	// Built in code rather than loaded, `unicode: false` still reads as byte
+	// mode through IsByteMode.
+	if !(RegexEntry{Unicode: new(false)}).IsByteMode() {
+		t.Error("IsByteMode ignores unicode: false on an entry built in code")
 	}
 }

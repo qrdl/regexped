@@ -146,7 +146,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	const localPos = uint32(3)
 	const localClass = uint32(4)
 
-	// Phase 4: when mid-accept dominants exist, add v128 chunk local
+	// The bulk skip: when mid-accept dominants exist, add v128 chunk local
 	// (and tmp i32 for the non-compressed path, which lacks a class local).
 	// Non-mid dominants additionally need 2 i32 hysteresis locals
 	// (counter at 6, scratch at 7).
@@ -157,6 +157,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 			hystDom = true
 		}
 	}
+	groupsAt := len(b)
 	if l.useCompression {
 		switch {
 		case hystDom:
@@ -176,6 +177,7 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 			b = append(b, 0x01, 0x02, 0x7F) // 2 i32: state, pos
 		}
 	}
+	b = appendMatchUTF8Err(b, groupsAt, l.dominantStates) // the UTF-8 skip's error lanes
 
 	// Literal chain prefix.
 	if len(chain) >= 2 {
@@ -273,9 +275,9 @@ func buildHybridMatchBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []byte {
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
 
-	// Phase 4 dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
+	// Bulk-skip dispatch: chunk=5 v128, tmp=4 (reuse class on useCompression,
 	// or extra i32 added by the locals declaration above), hyst=6/7.
-	b = emitPhase4Dispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx, soleMidDominant(l))
+	b = emitMatchBulkSkipDispatch(b, l.dominantStates, l.midAcceptOff, tableMemIdx, soleMidDominant(l))
 
 	// pos++
 	b = append(b, 0x20, byte(localPos))
@@ -398,5 +400,7 @@ func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, 
 		skipSafeOnDead:        l.skipSafeOnDead,
 		eofSkipSafe:           l.eofSkipSafe,
 		switchN:               l.switchN,
+		startRule:             l.startRule,
+		utf8Text:              l.utf8Text,
 	})
 }

@@ -35,6 +35,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
@@ -241,10 +242,12 @@ type setCapStats struct {
 	order    []string
 	timeouts int
 	dataErrs int
-	chunks   int
-	skipped  int // chunks skipped by --sample
-	dropped  int // pattern/capability pairs the compiler legitimately excluded
-	printed  int // failure reports emitted so far
+	// asciiBlocks counts the blocks a Unicode-mode run skipped as all-ASCII.
+	asciiBlocks int
+	chunks      int
+	skipped     int // chunks skipped by --sample
+	dropped     int // pattern/capability pairs the compiler legitimately excluded
+	printed     int // failure reports emitted so far
 	// btUnknown counts calls that answered with abi.BTStackOverflow — the
 	// Backtracking engine giving up. Counted rather than folded into "no
 	// match": an engine that wrongly gives up when nothing further matches
@@ -363,10 +366,18 @@ func (s *setCapStats) report() {
 		fmt.Printf("  %-28s pass %10d  fail %6d%s\n", label+":", p, f, flag)
 	}
 	fmt.Printf("  %-28s pass %10d  fail %6d\n", "TOTAL:", total, totalFail)
-	if setHighByteLive > 0 || setHighBytePinned > 0 {
+	if *unicodeFlag && setHighByteLive > 0 {
+		fmt.Printf("  high-byte inputs: %d via the live oracle over the text itself (all capabilities)\n", setHighByteLive)
+	} else if setHighByteLive > 0 || setHighBytePinned > 0 {
 		// Reported so a collapse back to the pinned path cannot hide as "green".
 		fmt.Printf("  high-byte inputs: %d via the live twin oracle (all capabilities), %d via pinned col4 (gated find only)\n",
 			setHighByteLive, setHighBytePinned)
+	}
+	if s.asciiBlocks > 0 {
+		fmt.Printf("  all-ASCII blocks skipped (Unicode mode answers them as byte mode does): %d\n", s.asciiBlocks)
+	}
+	if setUnicodeFFFDSkipped > 0 {
+		fmt.Printf("  invalid UTF-8 inputs skipped (a pattern can match U+FFFD): %d\n", setUnicodeFFFDSkipped)
 	}
 	if s.timeouts > 0 {
 		fmt.Printf("  timeouts (input skipped):    %d\n", s.timeouts)
@@ -493,6 +504,10 @@ type setOracle struct {
 // exactly like "all green" — is visible in the summary.
 var setHighByteLive, setHighBytePinned int
 
+// setUnicodeFFFDSkipped counts the inputs a Unicode-mode run cannot judge:
+// invalid UTF-8 beside a pattern that can match U+FFFD (setOracleTwins).
+var setUnicodeFFFDSkipped int
+
 // buildSetOracle computes the expectations for one chunk.
 //
 // The start-position map uses the whole-input technique: `\A(?s:.{p})(?:pat)`
@@ -501,7 +516,9 @@ var setHighByteLive, setHighBytePinned int
 // replaces (`\A(?:pat)` over input[p:]) judges them against a slice boundary —
 // which is the mistake the two-oracle discipline exists to prevent.
 //
-// `.{p}` counts RUNES, so the caller must have excluded non-ASCII inputs.
+// `.{p}` counts Go's tokens, so p steps through the positions that start one
+// (setTokenStarts); a high-byte input in byte mode is read through its ASCII
+// twin, where every position does.
 func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFindAll bool) (*setOracle, error) {
 	o := &setOracle{}
 	if needAnchored {
@@ -534,9 +551,10 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 		if !hasHighByte(s) {
 			continue
 		}
-		if usable[si] {
+		switch {
+		case usable[si]:
 			setHighByteLive++
-		} else {
+		case !*unicodeFlag:
 			setHighBytePinned++
 		}
 	}
@@ -589,17 +607,26 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 					continue
 				}
 				s := twins[pi][si]
+				// The probe counts Go's tokens: p steps through the byte
+				// positions that start one, and tok counts them. Inside a
+				// character no match starts. Over ASCII (every twin) tok is p.
+				starts := setTokenStarts(s)
+				tok := -1
 				for p := 0; p <= len(s); p++ {
-					if probes[p] == nil {
-						pr, err := regexp.Compile(`\A` + setDotPrefix(p) + `(?:` + body + `)`)
+					if !starts[p] {
+						continue
+					}
+					tok++
+					if probes[tok] == nil {
+						pr, err := regexp.Compile(`\A` + setDotPrefix(tok) + `(?:` + body + `)`)
 						if err != nil {
 							// Never fall through to "no matches": a broken
 							// probe would read as the engine over-reporting.
 							return nil, fmt.Errorf("oracle: position-%d probe for %q: %w", p, pat, err)
 						}
-						probes[p] = pr
+						probes[tok] = pr
 					}
-					if m := probes[p].FindStringIndex(s); m != nil {
+					if m := probes[tok].FindStringIndex(s); m != nil {
 						row[si] = append(row[si], [2]int{p, m[1]})
 					}
 				}
@@ -648,6 +675,20 @@ func normalizeSetOraclePattern(pat string) (string, error) {
 		return "", fmt.Errorf("cannot be embedded in an oracle wrapper: it needs re-serialising (unterminated \\Q) and the re-serialised form re-parses to a different language")
 	}
 	return rt, nil
+}
+
+// setTokenStarts marks the byte positions of s where Go's decoding starts a
+// token — a valid UTF-8 sequence's first byte, or any byte of invalid input,
+// read as a one-byte U+FFFD — and len(s).
+func setTokenStarts(s string) []bool {
+	out := make([]bool, len(s)+1)
+	for i := 0; i < len(s); {
+		out[i] = true
+		_, w := utf8.DecodeRuneInString(s[i:])
+		i += w
+	}
+	out[len(s)] = true
+	return out
 }
 
 // setDotPrefix builds a regexp matching exactly p runes of anything.
@@ -1071,6 +1112,7 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 			Patterns:    sel,
 			Overlapping: s.overlapping,
 			Hints:       hints,
+			Unicode:     setModeKey(),
 		}
 		if s.matchAny {
 			sc.MatchAny = s.setName + "_match_any"
@@ -1402,6 +1444,13 @@ func runSetProfile(
 	}
 
 	for si, text := range strs {
+		if si < len(orc.live) && !orc.live[si] && *unicodeFlag {
+			// Invalid UTF-8 beside a pattern that can match U+FFFD: Go and
+			// Unicode mode differ by design, and the pinned column was written
+			// for byte mode's advance, so nothing states the answer.
+			setUnicodeFFFDSkipped++
+			continue
+		}
 		if si < len(orc.live) && !orc.live[si] {
 			// A high-byte input for which no ASCII twin exists under this
 			// chunk's patterns, so the live oracle cannot state an expectation

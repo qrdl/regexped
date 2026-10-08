@@ -91,6 +91,11 @@ func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over 
 	if err != nil {
 		return OverlapCacheShape{}, err
 	}
+	return overlapShapeOf(cs), nil
+}
+
+// overlapShapeOf is a compiled set's OverlapCacheShape.
+func overlapShapeOf(cs *compiledSet) OverlapCacheShape {
 	var sh OverlapCacheShape
 	if ps := cs.progSweep; ps != nil {
 		sh.SweepCells, sh.SweepRow = ps.cells(), ps.rowBytes()
@@ -101,7 +106,7 @@ func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over 
 	}
 	sw := cs.sweepSrc()
 	if sw == nil {
-		return sh, nil
+		return sh
 	}
 	// Lever C makes the column one cell per PROJECTION rather than per
 	// (state, pattern); overlapCells is the one place that decides which, so a
@@ -111,7 +116,19 @@ func SetOverlapCacheShapeOpts(sc config.SetConfig, cfg config.BuildConfig, over 
 	sh.Patterns = len(sw.ids)
 	sh.CostPerByte = cs.overlapSweepCostPerByte()
 	sh.SetupWork = cs.overlapSweepSetupWork()
-	return sh, nil
+	return sh
+}
+
+// bytesPerByte is what the region sh sizes costs per input byte while it is
+// one block (up to config.SetOverlapCacheMaxBytes): a row per position, the
+// answer cache's and the program sweep's. Past that budget the region grows
+// with the square root of the input instead.
+func (sh OverlapCacheShape) bytesPerByte() int {
+	n := sh.SweepRow
+	if sh.Eligible {
+		n += config.SetOverlapBlockRowBytes(sh.Patterns)
+	}
+	return n
 }
 
 // SetOverlapCacheSizing is the region and stride a caller should reserve for one

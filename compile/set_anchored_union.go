@@ -2,7 +2,6 @@ package compile
 
 import (
 	"encoding/binary"
-	"regexp/syntax"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -114,14 +113,14 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	}
 	wide := idSpace > wideBitmapThreshold || len(spec.Patterns) > wideBitmapThreshold || forceWideAll
 
-	progs := make([]*syntax.Prog, 0, len(spec.Patterns))
+	progs := make([]resolvedProg, 0, len(spec.Patterns))
 	for _, p := range spec.Patterns {
 		ast := patternFullAST(p)
-		if ast == nil {
+		if ast.re == nil {
 			return nil
 		}
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
-		pr, _ := syntax.Compile(ast.Simplify())
+		pr, _ := compileProg(ast)
 		progs = append(progs, pr)
 	}
 
@@ -129,10 +128,10 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	var ok bool
 	if wide {
 		prog, patternIdx := buildUnionProgIndexed(progs)
-		d, ok = newDFAWide(prog, false, maxUnionScanStates, patternIdx)
+		d, ok = newDFAWide(prog, false, spec.maxUnionStates(), patternIdx)
 	} else {
 		prog, patternBits := buildUnionProg(progs, 64)
-		d, ok = newDFA(prog, false, false, maxUnionScanStates, patternBits)
+		d, ok = newDFA(prog, false, spec.maxUnionStates(), patternBits)
 	}
 	if !ok {
 		return nil
@@ -144,7 +143,7 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	if d.hasWordBoundary || d.hasNewlineBoundary {
 		return nil
 	}
-	if d.numStates == 0 || d.numStates >= maxUnionScanStates {
+	if d.numStates == 0 || d.numStates > spec.maxUnionStates() {
 		return nil
 	}
 	// A DOMINANT self-loop state is disqualifying, and this is the one

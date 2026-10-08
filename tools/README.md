@@ -8,8 +8,8 @@ root `Makefile` wraps the ones used as gates.
 
 | Tool | What it checks | Run |
 |---|---|---|
-| [`re2test`](re2test/) | Every engine and every set capability against Go's RE2 exhaustive test corpus, plus the hand-written `custom-tests.txt` and `custom-sets.txt`. Extra runs cover high-byte input, forced Backtracking, the hints, and per-search notes armed from the first call | `make re2test`, `make setcaps` (root) |
-| [`fuzz`](fuzz/) | Mutated `(pattern, input)` pairs against Go's `regexp`, plus property tests: `find` from every offset, iteration, sets, components, memory limits. The seed corpora run as ordinary tests | `go test .` in `tools/fuzz`; `make -C tools/fuzz fuzz` for a fuzzing run |
+| [`re2test`](re2test/) | Every engine and every set capability against Go's RE2 exhaustive test corpus, plus the hand-written `custom-tests.txt` and `custom-sets.txt`. Extra runs cover high-byte input, Unicode mode (the corpus's non-ASCII rows, every block, Unicode variants of every string), forced Backtracking, the hints, and per-search notes armed from the first call | `make re2test`, `make setcaps` (root) |
+| [`fuzz`](fuzz/) | Mutated `(pattern, input)` pairs against Go's `regexp`, in byte and Unicode mode, plus property tests: `find` from every offset, iteration, sets, components, memory limits. The seed corpora run as ordinary tests | `go test .` in `tools/fuzz`; `make -C tools/fuzz fuzz` for a fuzzing run |
 | [`advbench`](advbench/) | Hostile input: drives each entry point at doubling input sizes and fails when the cost grows faster than linear (×2 per doubling is linear, ×4 quadratic) | `make adversary` (root) |
 
 ## Performance

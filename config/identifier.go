@@ -299,6 +299,9 @@ func ValidateConfig(cfg *BuildConfig) error {
 			for _, problem := range captureNameProblems(re.Pattern) {
 				problems = append(problems, fmt.Sprintf("%s: %s", owner, problem))
 			}
+			if re.GroupsWithoutCaptures() {
+				problems = append(problems, fmt.Sprintf("%s: groups_func %q: %s", owner, re.GroupsFunc, NoCaptureGroupProblem))
+			}
 		}
 	}
 

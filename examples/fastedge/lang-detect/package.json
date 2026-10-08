@@ -1,0 +1,12 @@
+{
+  "name": "lang-detect-tests",
+  "private": true,
+  "type": "module",
+  "description": "Runs lang-detect.wasm under the FastEdge runtime locally",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "@gcoredev/fastedge-test": "^0.2.6"
+  }
+}

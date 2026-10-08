@@ -461,8 +461,13 @@ func canonCache(in [][3]int) [][3]int {
 func overlapCacheOracle(pats []string, input string) [][3]int {
 	var out [][3]int
 	for start := 0; start <= len(input); start++ {
+		// The prefix counts Go's tokens; inside a character nothing starts.
+		tok, ok := tokenIndex(input, start)
+		if !ok {
+			continue
+		}
 		for k, p := range pats {
-			re := regexp.MustCompile(fmt.Sprintf(`\A(?s:.{%d})(?:%s)`, start, p))
+			re := regexp.MustCompile(fmt.Sprintf(`\A(?s:.{%d})(?:%s)`, tok, p))
 			if m := re.FindStringIndex(input); m != nil {
 				out = append(out, [3]int{k, start, m[1]})
 			}
@@ -1268,6 +1273,7 @@ func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 	sc := config.SetConfig{
 		Name: "s", Find: "set_find",
 		Patterns: config.PatternSelector{All: true}, Overlapping: true,
+		Unicode: setModeKey(),
 	}
 	sh, err := compile.SetOverlapCacheShape(sc, config.BuildConfig{
 		Regexps: entries, Sets: []config.SetConfig{sc},
@@ -2411,8 +2417,13 @@ func overlapOracleCtx(t *testing.T, pats []string, input string) [][3]int {
 	}
 	var out [][3]int
 	for s := 0; s <= len(input); s++ {
+		// The prefix counts Go's tokens; inside a character nothing starts.
+		tok, ok := tokenIndex(input, s)
+		if !ok {
+			continue
+		}
 		for k, p := range pats {
-			re := regexp.MustCompile(fmt.Sprintf(`\A(?s:.{%d})(?:%s)`, s, p))
+			re := regexp.MustCompile(fmt.Sprintf(`\A(?s:.{%d})(?:%s)`, tok, p))
 			if m := re.FindStringIndex(input); m != nil {
 				out = append(out, [3]int{k, s, m[1]})
 			}

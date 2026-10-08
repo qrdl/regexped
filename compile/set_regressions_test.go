@@ -556,7 +556,7 @@ func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
-	if want := collapseZeroWidthRepeats(pattern); info.fullPattern != want {
+	if want := collapseZeroWidthRepeats(bytePat(pattern)).src; info.fullPattern != want {
 		t.Errorf("fullPattern = %q, want the collapsed %q", info.fullPattern, want)
 	}
 	if ref := patternRefFor(info); ref.Name != pattern {

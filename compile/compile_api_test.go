@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -525,7 +526,7 @@ func TestEngineTypeString(t *testing.T) {
 }
 
 func TestEngineTypeMethod(t *testing.T) {
-	dfaEngine, err := compile("abc", CompileOptions{ForceEngine: EngineDFA})
+	dfaEngine, err := compile(bytePat("abc"), CompileOptions{ForceEngine: EngineDFA})
 	if err != nil {
 		t.Fatalf("compile DFA: %v", err)
 	}
@@ -541,7 +542,7 @@ func TestEngineTypeMethod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile prog: %v", err)
 	}
-	btEngine := newBacktrack(prog)
+	btEngine := newBacktrack(byteProg(prog))
 	if btEngine.Type() != EngineBacktrack {
 		t.Errorf("backtrack.Type() = %v, want Backtracking", btEngine.Type())
 	}
@@ -694,16 +695,18 @@ func TestCompileDFADataSegmentsNewlineBoundary(t *testing.T) {
 
 // TestCompileBTInstHandlerAnyRune exercises InstRuneAny and InstRuneAnyNotNL
 // in emitBTInstHandler. (?s:.+) uses InstRuneAny (DOTALL), .+ uses InstRuneAnyNotNL.
+// The trailing empty group gives groups_func a capture group without making
+// the pattern one whole capture, which a shortcut would serve instead.
 func TestCompileBTInstHandlerAnyRune(t *testing.T) {
 	_, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(?s:.+)", GroupsFunc: "g"}},
+		[]config.RegexEntry{{Pattern: "(?s:.+)()", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
 		t.Fatalf("CompileForced((?s:.+) BT): %v", err)
 	}
 	_, _, err = CompileForced(
-		[]config.RegexEntry{{Pattern: ".+", GroupsFunc: "g"}},
+		[]config.RegexEntry{{Pattern: ".+()", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
@@ -995,7 +998,7 @@ func TestT3Triggered(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			dfa, ok := newDFA(prog, false, true, maxHelperDFAStates)
+			dfa, ok := newDFA(byteProg(prog), true, maxHelperDFAStates)
 			if !ok {
 				t.Fatalf("newDFA: state limit exceeded")
 			}
@@ -1032,13 +1035,13 @@ func TestT3Triggered(t *testing.T) {
 }
 
 func TestCompile_ParseError(t *testing.T) {
-	if _, err := compile("[invalid"); err == nil {
+	if _, err := compile(bytePat("[invalid")); err == nil {
 		t.Error("compile(invalid): expected parse error, got nil")
 	}
 }
 
 func TestCompile_UnicodeWithoutOpt(t *testing.T) {
-	if _, err := compile(`\p{Greek}`); err == nil {
+	if _, err := compile(bytePat(`\p{Greek}`)); err == nil {
 		t.Error("compile(\\p{Greek}): want Unicode error, got nil")
 	}
 }
@@ -1053,7 +1056,7 @@ func TestCompile_RejectsNonDFAEngine(t *testing.T) {
 					t.Errorf("compile(ForceEngine=%v): want a panic", eng)
 				}
 			}()
-			_, _ = compile("abc", CompileOptions{ForceEngine: eng})
+			_, _ = compile(bytePat("abc"), CompileOptions{ForceEngine: eng})
 		}()
 	}
 }
@@ -1356,7 +1359,7 @@ func TestCollapseZeroWidthRepeats(t *testing.T) {
 	inputs := []string{"", "0", "D", "0\n", "\n0\n", "ab", "a b", "xy", "x\ny", "q", "z", "a\x01\n", "\t$", "dd", "a0b\n0"}
 
 	for _, pat := range collapsible {
-		out := collapseZeroWidthRepeats(pat)
+		out := collapseZeroWidthRepeats(bytePat(pat)).src
 		if out == pat {
 			t.Errorf("%q: not rewritten", pat)
 			continue
@@ -1377,7 +1380,7 @@ func TestCollapseZeroWidthRepeats(t *testing.T) {
 		}
 	}
 	for _, pat := range kept {
-		if out := collapseZeroWidthRepeats(pat); out != pat {
+		if out := collapseZeroWidthRepeats(bytePat(pat)).src; out != pat {
 			t.Errorf("%q: rewritten to %q, want it untouched", pat, out)
 		}
 	}
@@ -1626,7 +1629,7 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		rejectDef, rejectByt bool
 		why                  string
 	}{
-		// Written non-ASCII: rejected by default, legal as bytes.
+		// Written non-ASCII: rejected in byte mode, legal as bytes.
 		{`[a-zé]+`, true, false, "é truncated to a byte, [0,2) where Go gives [0,4)"},
 		{`\xe9`, true, false, "matched a raw Latin-1 byte where Go matched nothing"},
 		{`[a\x80]+`, true, false, "mixed byte escape riding along with ASCII"},
@@ -1699,61 +1702,98 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`x|(?i:s)`, false, false, "the same, for s"},
 	}
 
+	// The byte gate's two settings: byte mode as the harnesses force it
+	// (ForceByteMode, runes above 0x7F refused), and byte_mode (0x80-0xFF
+	// are bytes). Left to resolve, every pattern here compiles: one the gate
+	// refuses asks for Unicode mode.
 	compileWith := func(pattern string, byteMode bool) error {
 		e := config.RegexEntry{Pattern: pattern, FindFunc: "find", ByteMode: byteMode}
-		_, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{})
+		_, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode})
 		return err
 	}
 
 	for _, c := range cases {
+		e := config.RegexEntry{Pattern: c.pattern, FindFunc: "find"}
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+			t.Errorf("resolved %q: %v, want it compiled", c.pattern, err)
+		}
 		if err := compileWith(c.pattern, false); (err != nil) != c.rejectDef {
-			t.Errorf("default mode %q: rejected=%v, want %v (%s) [%v]",
+			t.Errorf("byte mode %q: rejected=%v, want %v (%s) [%v]",
 				c.pattern, err != nil, c.rejectDef, c.why, err)
 		}
 		if err := compileWith(c.pattern, true); (err != nil) != c.rejectByt {
-			t.Errorf("byte mode %q: rejected=%v, want %v (%s) [%v]",
+			t.Errorf("byte_mode %q: rejected=%v, want %v (%s) [%v]",
 				c.pattern, err != nil, c.rejectByt, c.why, err)
 		}
 	}
 }
 
-// TestUnsupportedRuneErrorText checks that a rejection tells the reader which
-// of the two situations they are in. The distinction is the whole point: one
-// is a flag away, the other is not supported at all, and a single "contains
-// Unicode features" message (what this replaced) said neither.
+// TestUnsupportedRuneErrorText checks that a byte-mode rejection tells the
+// reader which of the two situations they are in. The distinction is the
+// whole point: one is a flag away, the other is out of the byte range
+// altogether, and a single "contains Unicode features" message (what this
+// replaced) said neither. Left to resolve, both patterns compile, in Unicode
+// mode.
+// TestGroupsWithoutCaptureGroupRefused: a groups_func on a pattern with no
+// capture group that can take part in a match used to compile to a module with
+// no groups export, which every stub calls; it is refused instead, in both
+// modes.
+func TestGroupsWithoutCaptureGroupRefused(t *testing.T) {
+	for _, c := range []struct {
+		pattern string
+		opts    CompileOptions
+	}{
+		{`a*`, CompileOptions{ForceByteMode: true}},
+		{`(?:(a){0})b`, CompileOptions{ForceByteMode: true}},
+		{`\pL+`, CompileOptions{Unicode: true}},
+	} {
+		_, _, err := Compile([]config.RegexEntry{{Pattern: c.pattern, GroupsFunc: "g"}}, 65536, true, c.opts)
+		if !errors.Is(err, ErrNoCaptureGroup) || !strings.Contains(err.Error(), `groups_func "g"`) {
+			t.Errorf("Compile(%q, groups_func) = %v, want ErrNoCaptureGroup naming the export", c.pattern, err)
+		}
+	}
+	if _, _, err := Compile([]config.RegexEntry{{Pattern: `(a)*`, GroupsFunc: "g"}}, 65536, true, CompileOptions{ForceByteMode: true}); err != nil {
+		t.Errorf("Compile((a)*, groups_func): %v", err)
+	}
+}
+
 func TestUnsupportedRuneErrorText(t *testing.T) {
+	byteMode := CompileOptions{ForceByteMode: true}
 	e := config.RegexEntry{Pattern: `[a\x80]+`, FindFunc: "find"}
-	_, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{})
+	_, _, err := Compile([]config.RegexEntry{e}, 65536, true, byteMode)
 	if err == nil {
 		t.Fatal("expected a rejection")
 	}
 	if !strings.Contains(err.Error(), "byte_mode") || !strings.Contains(err.Error(), "U+0080") {
 		t.Errorf("a byte-range rejection must name the rune and the way out, got: %v", err)
 	}
+	if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+		t.Errorf("resolved: %v, want it compiled in Unicode mode", err)
+	}
 
 	e = config.RegexEntry{Pattern: `[α-ω]+`, FindFunc: "find"}
-	_, _, err = Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{})
-	if err == nil {
-		t.Fatal("expected a rejection")
+	_, _, err = Compile([]config.RegexEntry{e}, 65536, true, byteMode)
+	if err == nil || !strings.Contains(err.Error(), "above U+00FF") || strings.Contains(err.Error(), "byte_mode") {
+		t.Errorf("a rune above U+00FF must be named as such and must NOT suggest byte_mode, which cannot help: %v", err)
 	}
-	if strings.Contains(err.Error(), "byte_mode") {
-		t.Errorf("a rune above U+00FF must NOT suggest byte_mode, which cannot help: %v", err)
-	}
-	if !strings.Contains(err.Error(), "above U+00FF") {
-		t.Errorf("expected the above-U+00FF phrasing, got: %v", err)
+	if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+		t.Errorf("resolved: %v, want it compiled in Unicode mode", err)
 	}
 }
 
-// TestUnicodeOptionStillBypasses guards the escape hatch several selector
-// tests depend on. CompileOptions.Unicode does not enable Unicode support —
-// nothing implements it — it suppresses the rejection so a Unicode-bearing
-// pattern can reach the code under test.
-func TestUnicodeOptionStillBypasses(t *testing.T) {
-	if _, err := SelectEngine(`[α-ω]+`, CompileOptions{}); err == nil {
-		t.Error("SelectEngine([α-ω]+) accepted without the bypass, want rejected")
+// TestUnicodeOptionSetsUnicodeMode guards the option several selector tests
+// depend on: CompileOptions.Unicode puts a pattern in Unicode mode without
+// resolving it. Left to resolve, a pattern with a Unicode class reaches the
+// same mode by itself; forced to byte mode it is refused.
+func TestUnicodeOptionSetsUnicodeMode(t *testing.T) {
+	if _, err := SelectEngine(`[α-ω]+`, CompileOptions{ForceByteMode: true}); err == nil {
+		t.Error("SelectEngine([α-ω]+) accepted in byte mode, want rejected")
+	}
+	if _, err := SelectEngine(`[α-ω]+`, CompileOptions{}); err != nil {
+		t.Errorf("SelectEngine([α-ω]+) left to resolve: %v, want Unicode mode", err)
 	}
 	if _, err := SelectEngine(`[α-ω]+`, CompileOptions{Unicode: true}); err != nil {
-		t.Errorf("SelectEngine([α-ω]+) with Unicode bypass: %v", err)
+		t.Errorf("SelectEngine([α-ω]+) in Unicode mode: %v", err)
 	}
 }
 
@@ -1770,8 +1810,11 @@ func TestByteModeGateAppliesBeforeFastPaths(t *testing.T) {
 	// A literal chain (analyseLitChain territory) with a byte escape in it.
 	for _, p := range []string{`caf\xe9[0-9]{8}`, `\xe9[0-9]{8}`, `AKIA[0-9A-Z\xe9]{16}`} {
 		e := config.RegexEntry{Pattern: p, FindFunc: "find"}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err == nil {
-			t.Errorf("default mode %q: accepted, want rejected before the fast path", p)
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: true}); err == nil {
+			t.Errorf("byte mode without byte_mode %q: accepted, want rejected before the fast path", p)
+		}
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+			t.Errorf("resolved %q: %v, want it compiled in Unicode mode", p, err)
 		}
 		e.ByteMode = true
 		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
@@ -1831,10 +1874,11 @@ func TestOpenEndedTailSpellings(t *testing.T) {
 		}
 	}
 
-	// And the endpoint below U+10FFFF is still rejected.
+	// And the endpoint below U+10FFFF is still rejected in byte mode, with
+	// byte_mode or without (ForceByteMode, as a harness compiles).
 	for _, byteMode := range []bool{false, true} {
 		e := config.RegexEntry{Pattern: `[a-\x{ffff}]+`, FindFunc: "find", ByteMode: byteMode}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err == nil {
+		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode}); err == nil {
 			t.Errorf("byteMode=%v: [a-\\x{ffff}] accepted, want rejected", byteMode)
 		}
 	}
@@ -1844,7 +1888,7 @@ func TestOpenEndedTailSpellings(t *testing.T) {
 // state from the start state, as "lo..hi".
 func acceptedByteRange(t *testing.T, pattern string, byteMode bool) string {
 	t.Helper()
-	m, err := compile(pattern, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true, ByteMode: byteMode})
+	m, err := compile(bytePat(pattern), CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true, ByteMode: byteMode})
 	if err != nil {
 		t.Fatalf("compile %q (byteMode=%v): %v", pattern, byteMode, err)
 	}
@@ -1869,19 +1913,21 @@ func acceptedByteRange(t *testing.T, pattern string, byteMode bool) string {
 	return fmt.Sprintf("%02x..%02x", lo, hi)
 }
 
-// regexpMinMaxLen's byteMode parameter decides what a literal rune above
-// U+007F WEIGHS. Under `byte_mode: true` such a rune means exactly that BYTE
-// and consumes one; without it, the rune's UTF-8 encoding is what lands in the
-// input and the width is 2, 3 or 4.
+// minMaxLen's mode decides what a rune WEIGHS. In byte mode it is a byte:
+// under `byte_mode: true` a rune 0x80-0xFF means exactly that byte and
+// consumes one. In Unicode mode it is its UTF-8 encoding, 1 to 4 bytes, and a
+// class or `.` weighs from its narrowest rune's encoding to its widest.
 //
-// Getting it wrong makes the function an OVER-estimate, and every caller reads
-// it as a true bound — the exported find wrapper turns the minimum into an
-// early exit, so an over-estimate refuses an input that matches.
+// Getting it wrong makes the function an OVER-estimate of the minimum or an
+// UNDER-estimate of the maximum, and every caller reads it as a true bound —
+// the exported find wrapper turns the minimum into an early exit, so an
+// over-estimate refuses an input that matches.
 //
 // The end-to-end consequence is pinned in tools/fuzz (TestByteModeLengths-
-// AcrossEmitters); this pins the function, so a caller added later cannot be
-// misled by a value that was wrong before it ever reached them.
-func TestRegexpMinMaxLenByteMode(t *testing.T) {
+// AcrossEmitters, TestUnicodeModeLengthsAcrossEmitters); this pins the
+// function, so a caller added later cannot be misled by a value that was
+// wrong before it ever reached them.
+func TestMinMaxLenByteAndUnicodeMode(t *testing.T) {
 	for _, tc := range []struct {
 		pattern          string
 		byteMin, byteMax int
@@ -1894,22 +1940,40 @@ func TestRegexpMinMaxLenByteMode(t *testing.T) {
 		{`\xe9{2}xy`, 4, 4, 6, 6, "counted repeat multiplies the width"},
 		{`\xe9?ab`, 2, 3, 2, 4, "optional high rune moves only the maximum"},
 		{`(?:\xe9ab|cd)`, 2, 3, 2, 4, "alternation takes min of mins, max of maxes"},
-		// A CLASS is one byte in both modes: the engine consumes a byte per
-		// class regardless, so no arm of this function varies for it.
-		{`[\x80-\xff]ab`, 3, 3, 3, 3, "class arm is mode-independent"},
+		{`é+`, 1, -1, 2, -1, "2-byte literal under a plus"},
+		{`中+`, 1, -1, 3, -1, "3-byte literal"},
+		{`𐀀+`, 1, -1, 4, -1, "4-byte literal"},
+		// A class is one byte in byte mode; in Unicode mode it spans its
+		// lowest rune's width to its highest's.
+		{`[\x80-\xff]ab`, 3, 3, 4, 4, "a class of 2-byte runes only"},
 		{`[a-z]+`, 1, -1, 1, -1, "unbounded stays unbounded"},
+		{`[aé]`, 1, 1, 1, 2, "a class from ASCII to 2-byte"},
+		{`[^a]`, 1, 1, 1, 4, "a negated class reaches U+10FFFF"},
+		{`[\x{800}-\x{FFFF}]`, 1, 1, 3, 3, "a class entirely 3-byte has min 3"},
+		{`\pL`, 1, 1, 1, 4, "a Unicode class"},
+		{`[α-ω]{2}`, 2, 2, 4, 4, "a counted Greek class"},
+		{`[a\x{D800}-\x{DFFF}]`, 1, 1, 1, 1, "a surrogate-only range weighs nothing"},
+		{`[\x{D800}-\x{DFFF}]x`, 2, 2, 1, 1, "a class of surrogates only matches nothing"},
+		{`.`, 1, 1, 1, 4, "dot"},
+		{`(?s).`, 1, 1, 1, 4, "dot with s"},
+		// A (?i) literal weighs its fold orbit's narrowest to widest.
+		{`(?i)k`, 1, 1, 1, 3, "k folds to U+212A KELVIN SIGN"},
+		{`(?i)s`, 1, 1, 1, 2, "s folds to U+017F LONG S"},
+		{`(?i)é`, 1, 1, 2, 2, "é folds to É, both 2 bytes"},
+		{`(?i)ok`, 2, 2, 2, 4, "a folded string sums per rune"},
+		{`(?i)1`, 1, 1, 1, 1, "a rune with no fold"},
 	} {
 		t.Run(tc.pattern, func(t *testing.T) {
 			re, err := syntax.Parse(tc.pattern, syntax.Perl)
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.pattern, err)
 			}
-			if gotMin, gotMax := regexpMinMaxLen(re, true); gotMin != tc.byteMin || gotMax != tc.byteMax {
-				t.Errorf("byteMode=true: got (%d,%d), want (%d,%d) — %s",
+			if gotMin, gotMax := byteTree(re).minMaxLen(); gotMin != tc.byteMin || gotMax != tc.byteMax {
+				t.Errorf("byte mode: got (%d,%d), want (%d,%d) — %s",
 					gotMin, gotMax, tc.byteMin, tc.byteMax, tc.note)
 			}
-			if gotMin, gotMax := regexpMinMaxLen(re, false); gotMin != tc.utf8Min || gotMax != tc.utf8Max {
-				t.Errorf("byteMode=false: got (%d,%d), want (%d,%d) — %s",
+			if gotMin, gotMax := unicodeTree(re).minMaxLen(); gotMin != tc.utf8Min || gotMax != tc.utf8Max {
+				t.Errorf("Unicode mode: got (%d,%d), want (%d,%d) — %s",
 					gotMin, gotMax, tc.utf8Min, tc.utf8Max, tc.note)
 			}
 		})
@@ -2482,7 +2546,9 @@ func TestIsWholePatternSingleCapture_Rejects(t *testing.T) {
 // gets NO capture body, so there is nothing for the exported
 // (ptr, len, out_ptr, from) wrapper to call. Emitting one anyway produced a
 // call to function index -1, which wasm-tools rejects as "function index out
-// of bounds".
+// of bounds". Such a pattern is now refused before any body is built
+// (ErrNoCaptureGroup); the two fixtures assert that, and the wrapper guard
+// stays behind it.
 //
 // Found by `make groupsonly` on the RE2 corpus, at case 3931250 — the only
 // configuration that compiles capture patterns with groups_func alone. Kept
@@ -2504,7 +2570,12 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 	// The two identical entries this loop used to build were a leftover from
 	// `named_groups_func`, now retired — every pattern was
 	// compiled and validated twice with the same config.
-	pats := []string{`(?:(a){0})`, `(a){0}`, `(a)`, `\A(a)(b)`, `\b(?P<x>a)`}
+	for _, pat := range []string{`(?:(a){0})`, `(a){0}`} {
+		if _, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}, 65536, true); !errors.Is(err, ErrNoCaptureGroup) {
+			t.Errorf("%-12q compile: %v, want ErrNoCaptureGroup", pat, err)
+		}
+	}
+	pats := []string{`(a)`, `\A(a)(b)`, `\b(?P<x>a)`}
 	validated := 0
 	for _, pat := range pats {
 		w, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}, 65536, true)
@@ -2547,7 +2618,7 @@ func writeFile(p string, b []byte) error {
 // lnmAction5 set as a prefer-no-match compile would set it.
 func twinLayout(t *testing.T, pattern string, lnm bool) (*dfaLayout, *dfaTable) {
 	t.Helper()
-	m, err := compile(pattern, CompileOptions{
+	m, err := compile(bytePat(pattern), CompileOptions{
 		MaxDFAStates: 4096, ForceEngine: EngineDFA, LeftmostFirst: true,
 	})
 	if err != nil {
@@ -2602,7 +2673,7 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 					"covers the dispatch shape it was written for",
 					l.useHybridDispatch, tc.hybrid)
 			}
-			e := buildFindCodeEntry(l, table, findMandatoryLit(tc.pattern, false), 0)
+			e := buildFindCodeEntry(l, table, findMandatoryLit(bytePat(tc.pattern)), 0)
 			twin, patch := e.twin, e.twinPatch
 			if (twin != nil) != tc.wantTwin {
 				t.Errorf("twin emitted = %v, want %v", twin != nil, tc.wantTwin)
@@ -2644,6 +2715,248 @@ func TestCmdCompileVerboseSets(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	validateWASM(t, data)
+}
+
+// TestVerboseReportsMode: --verbose names each pattern's mode, and a pattern
+// refused for asking for Unicode mode is still reported, with the mode it
+// asked for and why it was refused; --diag-json names each set's mode.
+func TestVerboseReportsMode(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out.wasm")
+	var report bytes.Buffer
+	cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Name: "ascii", Pattern: `a.c`, FindFunc: "f"}}}
+	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
+		t.Fatalf("CmdCompileVerbose: %v", err)
+	}
+	if !strings.Contains(report.String(), "mode:   byte") {
+		t.Errorf("report does not name byte mode:\n%s", report.String())
+	}
+	report.Reset()
+	cfg = config.BuildConfig{Regexps: []config.RegexEntry{{Name: "letters", Pattern: `\pL+`, FindFunc: "f"}}}
+	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
+		t.Fatalf("CmdCompileVerbose(\\pL+): %v", err)
+	}
+	if r := report.String(); !strings.Contains(r, "mode:   unicode") {
+		t.Errorf("report does not name Unicode mode:\n%s", r)
+	}
+	// A pattern refused for its mode is reported with it.
+	report.Reset()
+	yes := true
+	cfg = config.BuildConfig{Regexps: []config.RegexEntry{{Name: "both", Pattern: `a`, FindFunc: "f", Unicode: &yes, ByteMode: true}}}
+	err := CmdCompileVerbose(cfg, out, &report)
+	if err == nil || !strings.Contains(err.Error(), "contradict") || !strings.Contains(report.String(), "refused") {
+		t.Errorf("unicode: true with byte_mode: true: err = %v, report:\n%s", err, report.String())
+	}
+	cfg = config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `foo\w+`}},
+		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
+	}
+	_, _, diags, err := CompileFileDiag(cfg, "")
+	if err != nil || len(diags) != 1 || diags[0].Mode != "byte" {
+		t.Errorf("CompileFileDiag: diags %+v, err %v; want one set in byte mode", diags, err)
+	}
+	// A set's mode, and what its answer cache costs per input byte.
+	report.Reset()
+	cfg = config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `[a-zé]+`}, {Name: "p2", Pattern: `a*`}},
+		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Overlapping: true, Patterns: config.PatternSelector{All: true}}},
+	}
+	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
+		t.Fatalf("CmdCompileVerbose(set): %v", err)
+	}
+	if r := report.String(); !strings.Contains(r, "  mode:       unicode") || !strings.Contains(r, "  memory:     answer cache ") {
+		t.Errorf("set report does not name its mode and cache memory:\n%s", r)
+	}
+}
+
+// TestCompileProgress: a construction that runs long prints a progress line
+// naming the pattern or set, the step and the states against their limit; a
+// short one prints nothing, and a compile with no Progress writer has no sink
+// active. The clock is a fake that moves a second per read.
+func TestCompileProgress(t *testing.T) {
+	var out bytes.Buffer
+	clock := time.Unix(0, 0)
+	rep := func() *Reporter {
+		return &Reporter{Progress: &out, progressAfter: time.Second, progressNow: func() time.Time {
+			clock = clock.Add(time.Second)
+			return clock
+		}}
+	}
+	for _, c := range []struct {
+		pat, groups, want string
+	}{
+		{`\pL{5}x`, "", `regexped: compiling pattern "p": DFA construction, `},
+		// Not `([α-ω]{80})x`: a capture between plain literals takes its
+		// span from the match and builds no TDFA.
+		{`([α-ω]{80})x+`, "g", `regexped: compiling pattern "p": TDFA construction, `},
+	} {
+		out.Reset()
+		re := config.RegexEntry{Name: "p", Pattern: c.pat, FindFunc: "f", GroupsFunc: c.groups}
+		if _, _, err := Compile([]config.RegexEntry{re}, 0, true, CompileOptions{Report: rep()}); err != nil {
+			t.Fatal(err)
+		}
+		if got := out.String(); !strings.Contains(got, c.want) || !strings.Contains(got, " of 16384 states so far (") {
+			t.Errorf("%s: progress output %q, want a line with %q", c.pat, got, c.want)
+		}
+	}
+	// A set: its union automaton, under the set's name.
+	out.Reset()
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "g", Pattern: `[α-ω]{40}\d`}, {Name: "c", Pattern: `[а-я]{40}\d`}},
+		Sets:    []config.SetConfig{{Name: "s", ScanAll: "sl", Patterns: config.PatternSelector{All: true}}},
+	}
+	if _, _, _, err := compileFileDiagReport(cfg, "", CompileSetOptions{}, rep()); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, `regexped: compiling set "s": DFA construction, `) {
+		t.Errorf("set progress output %q", got)
+	}
+	// A short construction never reads the clock often enough to print.
+	out.Reset()
+	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `abc`, FindFunc: "f"}}, 0, true, CompileOptions{Report: rep()}); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("a short compile printed %q", out.String())
+	}
+	// No writer, no sink; and none left behind once a compile with one ends.
+	noWriter := &Reporter{}
+	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `\pL{5}x`, FindFunc: "f"}}, 0, true,
+		CompileOptions{Report: noWriter}); err != nil || noWriter.sink != nil {
+		t.Errorf("err %v, sink %v", err, noWriter.sink)
+	}
+	withWriter := rep()
+	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `abc`, FindFunc: "f"}}, 0, true,
+		CompileOptions{Report: withWriter}); err != nil || withWriter.sink != nil {
+		t.Errorf("err %v, sink left behind %v", err, withWriter.sink)
+	}
+}
+
+// TestCompileProgressConcurrent: compiles in flight at the same time, each
+// with its own Reporter, print only their own lines, and one with no Progress
+// writer prints into neither. The sink used to be one process-global pointer,
+// so a compile that started while another ran took over its output and
+// restored a stale sink when it ended.
+func TestCompileProgressConcurrent(t *testing.T) {
+	newRep := func(out *bytes.Buffer) *Reporter {
+		clock := time.Unix(0, 0)
+		return &Reporter{Progress: out, progressAfter: time.Second, progressNow: func() time.Time {
+			clock = clock.Add(time.Second)
+			return clock
+		}}
+	}
+	var outA, outB bytes.Buffer
+	compileOne := func(wg *sync.WaitGroup, name string, rep *Reporter) {
+		defer wg.Done()
+		re := config.RegexEntry{Name: name, Pattern: `\pL{5}x`, FindFunc: "f"}
+		if _, _, err := Compile([]config.RegexEntry{re}, 0, true, CompileOptions{Report: rep}); err != nil {
+			t.Error(err)
+		}
+	}
+	for range 3 {
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go compileOne(&wg, "a", newRep(&outA))
+		go compileOne(&wg, "b", newRep(&outB))
+		go compileOne(&wg, "c", nil)
+		wg.Wait()
+	}
+	for _, c := range []struct {
+		out        string
+		own, other string
+	}{{outA.String(), "a", "b"}, {outB.String(), "b", "a"}} {
+		if !strings.Contains(c.out, `pattern "`+c.own+`"`) || strings.Contains(c.out, `pattern "`+c.other+`"`) ||
+			strings.Contains(c.out, `pattern "c"`) {
+			t.Errorf("compile %q printed %q, want only its own lines", c.own, c.out)
+		}
+	}
+}
+
+// TestUnicodeModeLimits pins what a Unicode-mode pattern meets at the DFA
+// limits: the 16,384-state default keeps `\pL{5}x` (1,452 states) on its DFA
+// where byte mode's 1,024 would not; a pattern over the limit whose
+// Backtracking program is also too large is an error naming the limit, the key
+// that raises it and Backtracking's fixed ceiling — for each body; --verbose
+// reports the working memory a search keeps per input byte, and a failed
+// compile as failed rather than as a specialised body.
+func TestUnicodeModeLimits(t *testing.T) {
+	compileReport := func(re config.RegexEntry, opts CompileOptions) (string, error) {
+		rep := &Reporter{}
+		opts.Unicode, opts.Report = true, rep
+		_, _, err := Compile([]config.RegexEntry{re}, 0, true, opts)
+		var b bytes.Buffer
+		rep.Render(&b)
+		return b.String(), err
+	}
+
+	r, err := compileReport(config.RegexEntry{Name: "p", Pattern: `\pL{5}x`, FindFunc: "f"}, CompileOptions{})
+	if err != nil || !strings.Contains(r, "engine: DFA") || !strings.Contains(r, "DFA states 1452 of 16384") {
+		t.Errorf("\\pL{5}x at the Unicode default: err %v, report:\n%s", err, r)
+	}
+
+	for _, c := range []struct {
+		name string
+		re   config.RegexEntry
+		want []string
+	}{
+		{"find", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, FindFunc: "f"},
+			[]string{"the find body went to Backtracking", "more than 1024 states (max_dfa_states; raise it", "over the fixed limit of 20000"}},
+		{"match", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, MatchFunc: "m"},
+			[]string{"the match body went to Backtracking", "more than 1024 states (max_dfa_states; raise it", "over the fixed limit of 20000"}},
+	} {
+		r, err := compileReport(c.re, CompileOptions{MaxDFAStates: 1024})
+		if !errors.Is(err, ErrBTProgramTooLarge) {
+			t.Fatalf("%s: err = %v, want ErrBTProgramTooLarge", c.name, err)
+		}
+		for _, w := range c.want {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("%s: error %q lacks %q", c.name, err, w)
+			}
+		}
+		if !strings.Contains(r, "engine: ") || strings.Contains(r, "specialised body") {
+			t.Errorf("%s: report calls a failed compile something else:\n%s", c.name, r)
+		}
+	}
+
+	// The capture body: anchored, so it has no find body, and the non-greedy
+	// `\pL+?` makes the captures TDFA-ineligible (a wide class alone no longer
+	// does in Unicode mode); their Backtracking program is over the ceiling —
+	// fifteen `\pL`s of about 1,550 instructions each.
+	_, err = compileReport(config.RegexEntry{Name: "p", Pattern: `^(\pL+?)(\pL{14})`, GroupsFunc: "g"}, CompileOptions{})
+	if !errors.Is(err, ErrBTProgramTooLarge) || !strings.Contains(err.Error(), "the capture body went to Backtracking because TDFA could not take it") {
+		t.Errorf("capture: err = %v, want the capture body's ErrBTProgramTooLarge", err)
+	}
+
+	// A body that misses only the program size, with no reason to name.
+	if got := (&btTooLarge{body: "find", insts: 20001}).Error(); !strings.Contains(got, "the find body's Backtracking program has 20001 instructions") {
+		t.Errorf("btTooLarge without a reason: %q", got)
+	}
+
+	// Non-greedy, so Backtracking takes the captures.
+	r, err = compileReport(config.RegexEntry{Name: "p", Pattern: `(\pL+?)@(\pL+)`, GroupsFunc: "g"}, CompileOptions{})
+	if err != nil || !strings.Contains(r, "memory: Backtracking memo (capture) 389 B per input byte, once its work budget trips") ||
+		!strings.Contains(r, "memory: per-search notes ") {
+		t.Errorf("(\\pL+?)@(\\pL+): err %v, report lacks its memory lines:\n%s", err, r)
+	}
+	r, err = compileReport(config.RegexEntry{Name: "p", Pattern: `\pL+x`, MatchFunc: "m"}, CompileOptions{MaxDFAStates: 1})
+	if err != nil || !strings.Contains(r, "memory: Backtracking memo (match)") {
+		t.Errorf("forced Backtracking match: err %v, report lacks its memo line:\n%s", err, r)
+	}
+	// Byte mode keeps its report as it was: no memory lines.
+	rep := &Reporter{}
+	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `(\w+)@(\w+)`, GroupsFunc: "g"}}, 0, true,
+		CompileOptions{ForceByteMode: true, Report: rep, ForceEngine: EngineBacktrack}); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Render(&b)
+	if strings.Contains(b.String(), "memory:") {
+		t.Errorf("byte mode reports memory lines:\n%s", b.String())
+	}
+
+	r, _ = compileReport(config.RegexEntry{Name: "p", Pattern: `a{2000}`, FindFunc: "f"}, CompileOptions{})
+	if !strings.Contains(r, "engine: failed — ") {
+		t.Errorf("a pattern that does not parse is not reported as failed:\n%s", r)
+	}
 }
 
 // TestWarnUnboundedMemory: `regexped compile` warns, once, when the module
@@ -2725,9 +3038,13 @@ func TestFindClassifierVerdicts(t *testing.T) {
 	}{
 		{`a*b`, nil, "switch"},
 		{`[^,]*,`, nil, "switch"},
-		{`\w+@\w+`, nil, "start-anywhere"},
+		// A one-byte inner literal behind a wide leading repeat takes the
+		// literal-anchored find, always with the counter; with no literal at
+		// all the leading repeat gets the start-anywhere find.
+		{`\w+@\w+`, nil, "switch"},
 		{`[a-z]+[0-9]{3}`, nil, "start-anywhere"},
-		{`[a-z]+[0-9]+z`, nil, "start-anywhere"},
+		{`[a-z]+[0-9]+z`, nil, "switch"},
+		{`\w+[0-9]+`, nil, "start-anywhere"},
 		{`(?:ab)+c`, nil, "switch"},
 		{`\w+abc\d`, nil, "switch"},
 		{`\w+_x\d`, nil, "switch"},
@@ -2743,7 +3060,8 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		// The hints. A hint never keeps today's find unswitched: prefer-match
 		// keeps today's BODY under the leading word repeat, with the counter.
 		{`\w+@\w+`, []string{"prefer-match"}, "switch"},
-		{`\w+@\w+`, []string{"prefer-no-match"}, "start-anywhere"},
+		{`\w+@\w+`, []string{"prefer-no-match"}, "switch"},
+		{`\w+[0-9]+`, []string{"prefer-no-match"}, "start-anywhere"},
 		{`[^,]*,`, []string{"prefer-no-match"}, "start-anywhere"},
 		{`[^,]*,`, []string{"prefer-match"}, "switch"},
 		{`a*b`, []string{"prefer-match"}, "switch"},
@@ -2769,6 +3087,13 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		// without accepting: its specialised body has no counter, so it takes
 		// the ordinary find and the switch.
 		{`ab?c|x[a-z]*Y`, nil, "switch"},
+		// Unicode mode: a class of characters above 0x7F counts as common in
+		// text (commonInText) — but takes the start-anywhere find alone only
+		// when it starts on at most eight bytes, which the forward pass can
+		// skip between: `[α-ω]` on two, `\p{Han}` on nine.
+		{`[α-ω]+\d`, nil, "start-anywhere"},
+		{`[α-ω]+@[α-ω]+`, nil, "switch"},
+		{`\p{Han}+\d`, nil, "switch"},
 	}
 	for _, c := range cases {
 		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
@@ -2817,7 +3142,7 @@ func TestLenientAltLinear(t *testing.T) {
 		{`(?i)ab[0-9]*c|bc[0-9]*d`, false}, // a folded literal is not a fence
 		{`(ab[0-9]*c|bc[0-9]*d)`, true},    // a capture around the alternation
 	} {
-		if got := lenientAltLinear(c.pat, CompileOptions{}); got != c.linear {
+		if got := lenientAltLinear(bytePat(c.pat), CompileOptions{}); got != c.linear {
 			t.Errorf("%s: linear = %v, want %v", c.pat, got, c.linear)
 		}
 	}
@@ -2832,7 +3157,9 @@ func TestVerboseReportsTheStartAnywhereFind(t *testing.T) {
 		lm  LikelyMode
 	}{
 		{`[^,]*,foo`, LikelyNoMatch},
-		{`\w+@\w+`, LikelyNeutral},
+		// No literal at all: `\w+@\w+` now scans for its `@` (the one-byte
+		// literal-anchored find).
+		{`[a-z]+[0-9]{3}`, LikelyNeutral},
 	} {
 		r := &Reporter{}
 		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 0, true,
@@ -3018,8 +3345,10 @@ func TestOddShapesValidate(t *testing.T) {
 		`[a-z]{0,200}X\w*Y`, `(?:[ab]{9})+X`, `\bab{3}\b|cd{3}`, `ab{3}\b|cd{3}\B`, `\Bab{3}|cd{3}\z`,
 	} {
 		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
+			// groups on `(?:p)()`: most shapes have no capture group of their
+			// own, and groups_func on one is refused (ErrNoCaptureGroup).
 			for _, e := range []config.RegexEntry{
-				{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}, {Pattern: p, GroupsFunc: "g"},
+				{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}, {Pattern: "(?:" + p + ")()", GroupsFunc: "g"},
 			} {
 				w, _, err := Compile([]config.RegexEntry{e}, 0, true, CompileOptions{LikelyMode: lm})
 				if err != nil {
@@ -3048,7 +3377,7 @@ func TestFailedWalkBound(t *testing.T) {
 		{`x[a-z]*y`, false},
 		{`a*b|a`, false}, // the loop is behind the accept of `a`
 	} {
-		m, err := compile(c.pat, CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true})
+		m, err := compile(bytePat(c.pat), CompileOptions{ForceEngine: EngineDFA, LeftmostFirst: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3237,7 +3566,7 @@ func TestSetSplitPaths(t *testing.T) {
 		// `(?:a|)+` is a cycle that consumes nothing, so that find is the
 		// fallback body alone.
 		pat := `(?:a|)+a[ab]{11}c[a-z]*X`
-		if !btFindBuildable(pat) {
+		if !btFindBuildable(bytePat(pat)) {
 			t.Fatal("btFindBuildable = false; want the Backtracking find to take it")
 		}
 		wasm, _, d, err := CompileFileDiag(config.BuildConfig{
@@ -3308,7 +3637,7 @@ func TestModuleGlobalsCloneIsIndependent(t *testing.T) {
 // tables get the start-anywhere find while the total fits, the rest the
 // Backtracking find, and a candidate already on Backtracking stays there.
 func TestSetSplitBudget(t *testing.T) {
-	pats := []*PatternInfo{{fullPattern: `[a-z]+Q1`}, {fullPattern: `[a-z]+Q2`}, {fullPattern: `[a-z]+Q3`}, {fullPattern: `\b[a-z]+X`}}
+	pats := []*PatternInfo{{fullPattern: `[a-z]+Q1`, rp: bytePat(`[a-z]+Q1`)}, {fullPattern: `[a-z]+Q2`, rp: bytePat(`[a-z]+Q2`)}, {fullPattern: `[a-z]+Q3`, rp: bytePat(`[a-z]+Q3`)}, {fullPattern: `\b[a-z]+X`, rp: bytePat(`\b[a-z]+X`)}}
 	cands := []splitCand{{idx: 0, saBytes: 300}, {idx: 1, saBytes: 100}, {idx: 2, saBytes: 200}, {idx: 3, bt: true}}
 	got := budgetSplit(cands, pats, CompileSetOptions{}, 350)
 	want := []bool{true, false, false, true} // 100 + 200 fit; 300 does not

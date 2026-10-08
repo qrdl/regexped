@@ -883,6 +883,27 @@ func emitBTWorkChargeMember(b []byte, m *btDriveMember, tmp uint32, trip func([]
 	return append(b, 0x0B) // end if
 }
 
+// emitBTWorkChargeMemberN charges n at once; n == 1 is emitBTWorkChargeMember
+// byte for byte.
+func emitBTWorkChargeMemberN(b []byte, m *btDriveMember, tmp uint32, n int, trip func([]byte) []byte) []byte {
+	if n == 1 {
+		return emitBTWorkChargeMember(b, m, tmp, trip)
+	}
+	b = appendGlobalGet(b, m.budget)
+	b = append(b, 0x42) // i64.const n
+	b = utils.AppendSLEB128_64(b, int64(n))
+	b = append(b, 0x7D) // i64.sub
+	b = append(b, 0x22) // local.tee tmp
+	b = utils.AppendULEB128(b, tmp)
+	b = appendGlobalSet(b, m.budget)
+	b = btLocalGet(b, tmp)
+	b = append(b, 0x42, 0x01) // i64.const 1
+	b = append(b, 0x53)       // i64.lt_s
+	b = append(b, 0x04, 0x40) // if
+	b = trip(b)
+	return append(b, 0x0B) // end if
+}
+
 // btArmTripMember is btArmTrip against the member's budget. An empty stack
 // trips at once, the budget spent as a charge would leave it, so the host
 // call's later candidates go to the fallback too.

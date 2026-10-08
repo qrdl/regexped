@@ -40,7 +40,7 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	}
 	// Always a Reporter: it only records, and compile.WarnUnboundedMemory reads
 	// what the compile found. It is rendered only under --verbose.
-	rep := &compile.Reporter{}
+	rep := &compile.Reporter{Progress: os.Stderr}
 	core, witText, err := Core(cfg, rep)
 	if err != nil {
 		return err

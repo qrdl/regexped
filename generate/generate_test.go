@@ -824,7 +824,7 @@ func TestWriteStub(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Set stub tests (Phase 5)
+// Set stub tests
 
 // setTestCfg builds a BuildConfig with two named patterns and one set that
 // exercises all three export types: find_all, find_any, and match.
@@ -1068,6 +1068,17 @@ func TestCmdGenerateStub_ResolveError(t *testing.T) {
 	cfg := config.BuildConfig{StubType: "bogus"}
 	if err := CmdGenerateStub(cfg, "-"); err == nil {
 		t.Fatal("CmdGenerateStub(bogus stub_type): expected error, got nil")
+	}
+}
+
+// TestCmdGenerateStub_GroupsWithoutCaptures: the stub of a groups_func on a
+// pattern with no capture group would call an export the module does not have,
+// so generate refuses it, as compile does.
+func TestCmdGenerateStub_GroupsWithoutCaptures(t *testing.T) {
+	cfg := config.BuildConfig{StubType: "js", Regexps: []config.RegexEntry{{Pattern: `a*`, GroupsFunc: "g"}}}
+	err := CmdGenerateStub(cfg, "-")
+	if err == nil || !strings.Contains(err.Error(), config.NoCaptureGroupProblem) {
+		t.Fatalf("CmdGenerateStub(groups_func on a*) = %v, want the no-capture-group refusal", err)
 	}
 }
 
@@ -2453,7 +2464,7 @@ func badPatternCfg(stubType, out string) config.BuildConfig {
 			// A valid entry first, so the failure happens PART WAY through
 			// the loop rather than on its first iteration — the shape that
 			// would otherwise let a generator emit a partial file.
-			{Name: "ok", Pattern: `[a-z]+`, GroupsFunc: "ok_groups"},
+			{Name: "ok", Pattern: `([a-z]+)`, GroupsFunc: "ok_groups"},
 			{Name: "bad", Pattern: `([a-z]+`, GroupsFunc: "bad_groups"},
 		},
 	}

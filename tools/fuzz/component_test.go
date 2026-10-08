@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -923,6 +924,267 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestUnicodeModeOutputKinds drives one Unicode-mode config through each
+// output kind — a standalone module, an EMBEDDED one reading its input from a
+// host's memory, and a component's core module through its find and groups
+// RESOURCES — over input mixing 1- to 4-byte characters and invalid UTF-8
+// (characterRunInputs). The three must answer alike, and the finds and groups
+// as Go does over the patterns without U+FFFD (noReplacement), which makes an
+// invalid byte match nothing, as Unicode mode does. The patterns reach the
+// Unicode-mode paths a kind could treat differently: the character-run skip in
+// a find and in a TDFA capture body, Backtracking over a lowered class, and a
+// one-byte literal behind a class common only for its characters above 0x7F.
+func TestUnicodeModeOutputKinds(t *testing.T) {
+	entries := []config.RegexEntry{
+		{Pattern: `[^,]+,`, FindFunc: "f1"},
+		{Pattern: `\p{Cyrillic}+@\pL+`, FindFunc: "f2"},
+		{Pattern: `<([^>]+)>(x)`, GroupsFunc: "g1"},
+		{Pattern: `(\pL+?)(\pL*)`, GroupsFunc: "g2"},
+		{Pattern: `(.+)=(.+)`, GroupsFunc: "g3"},
+		{Pattern: `\pL+`, MatchFunc: "m"},
+	}
+	opts := compile.CompileOptions{Unicode: true}
+	inputs := characterRunInputs()
+	inputs = append(inputs, "<ключ>x <東京>x <a\xffb>x", "имя@домен, ж@ю\xff@я", "Straße 42, 日本語,\xe2\x82,")
+
+	// The kinds' answers, per input: every find match and every groups record
+	// of each export, and the match export's answer.
+	type answers struct {
+		finds  map[string][][2]int
+		groups map[string][][]int
+		match  int64
+	}
+	newAnswers := func() answers {
+		return answers{finds: map[string][][2]int{}, groups: map[string][][]int{}}
+	}
+
+	// rawDrive answers through the raw exports, as a module stub drives them:
+	// the input at in, the slots at out, both in mem.
+	rawDrive := func(t *testing.T, store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, in, out int32, input string) answers {
+		t.Helper()
+		a := newAnswers()
+		copy(mem.UnsafeData(store)[in:], input)
+		call := func(name string, args ...any) any {
+			t.Helper()
+			r, err := inst.GetFunc(store, name).Call(store, args...)
+			if err != nil {
+				t.Fatalf("%s over %q: %v", name, input, err)
+			}
+			return r
+		}
+		for _, f := range []string{"f1", "f2"} {
+			var got [][2]int
+			pos, prevEnd := 0, -1
+			for pos <= len(input) {
+				r := call(f, in, int32(len(input)), int32(pos)).(int64)
+				if r < 0 {
+					if r != -1 {
+						t.Fatalf("%s over %q from %d: %d", f, input, pos, r)
+					}
+					break
+				}
+				start, end := int(r>>32), int(uint32(r))
+				if !(start == end && start == prevEnd) {
+					got = append(got, [2]int{start, end})
+				}
+				prevEnd = end
+				pos = max(end, pos+1)
+				if end > start {
+					pos = end
+				}
+			}
+			a.finds[f] = got
+		}
+		for g, n := range map[string]int{"g1": 3, "g2": 3, "g3": 3} {
+			var got [][]int
+			pos, prevEnd := 0, -1
+			for pos <= len(input) {
+				r := call(g, in, int32(len(input)), out, int32(pos)).(int32)
+				if r < 0 {
+					if r != -1 {
+						t.Fatalf("%s over %q from %d: %d", g, input, pos, r)
+					}
+					break
+				}
+				buf := mem.UnsafeData(store)
+				m := make([]int, 2*n)
+				for i := range m {
+					m[i] = int(int32(binary.LittleEndian.Uint32(buf[int(out)+4*i:])))
+				}
+				if !(m[0] == m[1] && m[0] == prevEnd) {
+					got = append(got, m)
+				}
+				prevEnd = m[1]
+				if m[1] > m[0] {
+					pos = m[1]
+				} else {
+					pos = m[0] + 1
+				}
+			}
+			a.groups[g] = got
+		}
+		a.match = int64(call("m", in, int32(len(input))).(int32))
+		return a
+	}
+
+	// The standalone module.
+	standalone, _, err := compile.Compile(entries, pathsTableBase, true, opts)
+	if err != nil {
+		t.Fatalf("compile standalone: %v", err)
+	}
+	// The embedded one: its tables in its own memory, its input in the host's.
+	embedded, _, err := compile.Compile(entries, 0, false, opts)
+	if err != nil {
+		t.Fatalf("compile embedded: %v", err)
+	}
+	engine, _ := sharedEngine()
+	embMod, err := wasmtime.NewModule(engine, embedded)
+	if err != nil {
+		t.Fatalf("embedded module: %v", err)
+	}
+	defer embMod.Close()
+	// The component's core module, driven through its resources.
+	core, names, res := componentWasm(t, entries, opts)
+	cStore, cInst, cMem := instantiateCore(t, core)
+	cCall := func(name string, args ...any) uint32 {
+		t.Helper()
+		r, err := cInst.GetFunc(cStore, name).Call(cStore, args...)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return uint32(r.(int32))
+	}
+	drop := func(name string, h int32) { // a destructor returns nothing
+		t.Helper()
+		if _, err := cInst.GetFunc(cStore, name).Call(cStore, h); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	u32 := func(addr uint32) uint32 { return binary.LittleEndian.Uint32(cMem.UnsafeData(cStore)[addr:]) }
+	componentDrive := func(t *testing.T, input string) answers {
+		t.Helper()
+		a := newAnswers()
+		load := func() { copy(cMem.UnsafeData(cStore)[pathsInputBase:], input) }
+		for _, f := range []string{"f1", "f2"} {
+			load()
+			h := int32(cCall(res[f].Constructor, int32(pathsInputBase), int32(len(input)), int32(0)))
+			var got [][2]int
+			prevEnd := -1
+			for {
+				ret := cCall(res[f].Next, h)
+				b := cMem.UnsafeData(cStore)
+				if b[ret] == 1 {
+					t.Fatalf("%s over %q: next answered an error", f, input)
+				}
+				if b[ret+4] != 1 {
+					break
+				}
+				start, end := int(u32(ret+8)), int(u32(ret+12))
+				if !(start == end && start == prevEnd) {
+					got = append(got, [2]int{start, end})
+				}
+				prevEnd = end
+			}
+			drop(res[f].Dtor, h)
+			a.finds[f] = got
+		}
+		for _, g := range []string{"g1", "g2", "g3"} {
+			load()
+			h := int32(cCall(res[g].Constructor, int32(pathsInputBase), int32(len(input)), int32(0)))
+			var got [][]int
+			prevEnd := -1
+			for {
+				ret := cCall(res[g].Next, h)
+				b := cMem.UnsafeData(cStore)
+				if b[ret] == 1 {
+					t.Fatalf("%s over %q: next answered an error", g, input)
+				}
+				ptr, n := u32(ret+4), u32(ret+8)
+				if n == 0 {
+					break
+				}
+				m := make([]int, 2*n)
+				for i := uint32(0); i < n; i++ {
+					e := ptr + 12*i
+					if b[e] == 1 {
+						m[2*i], m[2*i+1] = int(u32(e+4)), int(u32(e+8))
+					} else {
+						m[2*i], m[2*i+1] = -1, -1
+					}
+				}
+				if !(m[0] == m[1] && m[0] == prevEnd) {
+					got = append(got, m)
+				}
+				prevEnd = m[1]
+			}
+			drop(res[g].Dtor, h)
+			a.groups[g] = got
+		}
+		load()
+		ret := cCall(names["m"], int32(pathsInputBase), int32(len(input)))
+		b := cMem.UnsafeData(cStore)
+		a.match = -1
+		if b[ret+4] == 1 {
+			a.match = int64(u32(ret + 8))
+		}
+		return a
+	}
+
+	oracle := map[string]*regexp.Regexp{}
+	for _, e := range entries {
+		oracle[e.FindFunc+e.GroupsFunc] = regexp.MustCompile(noReplacement(t, e.Pattern))
+	}
+	for _, input := range inputs {
+		store, inst, mem, release, err := instantiate(standalone)
+		if err != nil {
+			t.Fatalf("instantiate standalone: %v", err)
+		}
+		if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+			t.Fatal(err)
+		}
+		want := rawDrive(t, store, inst, mem, pathsInputBase, pathsOutBase, input)
+		release()
+
+		eStore := wasmtime.NewStore(engine)
+		eStore.SetEpochDeadline(1 << 40)
+		mt, err := wasmtime.NewMemoryType(4, false, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, err := wasmtime.NewMemory(eStore, mt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		eInst, err := wasmtime.NewInstance(eStore, embMod, []wasmtime.AsExtern{host})
+		if err != nil {
+			t.Fatalf("instantiate embedded: %v", err)
+		}
+		emb := rawDrive(t, eStore, eInst, host, 0, 128*1024, input)
+		eStore.Close()
+		comp := componentDrive(t, input)
+
+		for kind, got := range map[string]answers{"embedded": emb, "component": comp} {
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s over %q answers %v, the standalone module %v", kind, input, got, want)
+			}
+		}
+		for _, f := range []string{"f1", "f2"} {
+			var goAll [][2]int
+			for _, m := range oracle[f].FindAllStringIndex(input, -1) {
+				goAll = append(goAll, [2]int{m[0], m[1]})
+			}
+			if fmt.Sprint(want.finds[f]) != fmt.Sprint(goAll) {
+				t.Errorf("%s over %q: %v, Go without U+FFFD %v", f, input, want.finds[f], goAll)
+			}
+		}
+		for _, g := range []string{"g1", "g2", "g3"} {
+			if fmt.Sprint(want.groups[g]) != fmt.Sprint(oracle[g].FindAllStringSubmatchIndex(input, -1)) {
+				t.Errorf("%s over %q: %v, Go without U+FFFD %v", g, input, want.groups[g], oracle[g].FindAllStringSubmatchIndex(input, -1))
+			}
+		}
+	}
 }
 
 // The -2 sentinel means the answer is UNKNOWN, and must lift to

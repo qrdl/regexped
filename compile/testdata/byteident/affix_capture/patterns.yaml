@@ -1,0 +1,6 @@
+# One capture between fixed literals: group 1 is the match minus the
+# literals' bytes, so the groups export needs no capture body walking the
+# match (affixSingleCapture).
+regexps:
+  - pattern: '<([^>]*)>'
+    groups_func: affix_groups

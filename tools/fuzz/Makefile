@@ -1,7 +1,8 @@
 .PHONY: seed seed-all fuzz fuzz-long clean \
         seed-match seed-groups seed-engines seed-bodies seed-set \
         seed-caps seed-batch seed-iteration \
-        fuzz-match fuzz-groups fuzz-engines fuzz-bodies fuzz-set
+        fuzz-match fuzz-groups fuzz-engines fuzz-bodies fuzz-set \
+        seed-unicode fuzz-unicode fuzz-unicode-groups fuzz-unicode-set
 
 # ---------------------------------------------------------------------------
 # Layer 1: the original no-capture DFA/CompiledDFA find body.
@@ -60,6 +61,26 @@ fuzz-bodies:
 	go test -run=FuzzGroupsBothBodies -fuzz=FuzzGroupsBothBodies -fuzztime=10m .
 fuzz-set:
 	go test -run='FuzzSet$$' -fuzz='FuzzSet$$' -fuzztime=10m .
+
+# ---------------------------------------------------------------------------
+# Unicode mode: the same targets with every pattern compiled in Unicode mode
+# (-unicode), seeded also with the Unicode start-position shapes over
+# multi-byte and invalid input (unicodeSeeds; pairs of them for the set
+# targets, unicodeSetSeeds). Go is the oracle except on
+# input that is not valid UTF-8 for a pattern that can match U+FFFD, which
+# Unicode mode, by design, does not (unicodeModeOutOfScope).
+
+# Replay the seed corpora of every target unicodeSeeds or unicodeSetSeeds
+# feeds, in Unicode mode.
+seed-unicode:
+	go test -run='Fuzz(Correctness|Match|Groups|GroupsBothBodies|GroupsBothEngines|FindIteration|Set|SetCaps|FindBatch)$$' . -args -unicode
+
+fuzz-unicode:
+	go test -run=FuzzCorrectness -fuzz=FuzzCorrectness -fuzztime=10m . -args -unicode
+fuzz-unicode-groups:
+	go test -run='FuzzGroups$$' -fuzz='FuzzGroups$$' -fuzztime=10m . -args -unicode
+fuzz-unicode-set:
+	go test -run='FuzzSetCaps$$' -fuzz='FuzzSetCaps$$' -fuzztime=10m . -args -unicode
 
 clean:
 	rm -rf testdata/fuzz

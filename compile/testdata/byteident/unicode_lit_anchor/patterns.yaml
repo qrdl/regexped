@@ -1,0 +1,5 @@
+# Unicode mode: a variable-length letter run before a literal, found from the
+# literal by a backward DFA over the reversed, lowered pattern.
+regexps:
+  - pattern: '\pL+@example\.com'
+    find_func: uni_litanchor_find

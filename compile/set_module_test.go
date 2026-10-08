@@ -44,7 +44,7 @@ func TestEquivalence_Compat003(t *testing.T) {
 	for i, p := range fix.Patterns {
 		asts[i] = mustParse(t, p.Pattern)
 	}
-	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, kind, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestEquivalence_Compat004(t *testing.T) {
 		}
 	}
 	if len(lits) > 0 {
-		fe := chooseLiteralFrontend(lits)
+		fe := chooseLiteralFrontend(lits, false)
 		if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
 			t.Errorf("compat_004: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
 		}
@@ -110,7 +110,7 @@ func TestEquivalence_Compat005(t *testing.T) {
 			}
 		}
 	}
-	fe := chooseLiteralFrontend(lits)
+	fe := chooseLiteralFrontend(lits, false)
 	if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
 		t.Errorf("compat_005: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
 	}
@@ -505,7 +505,7 @@ func TestDiagnostics_ConflictReasons(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 4.5: anchored match tests
+// Anchored match tests
 
 func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
 	cfg := config.BuildConfig{
@@ -897,7 +897,7 @@ func TestValidateSets_MatchOnly(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 5: fuzzer, mixed_004, diag JSON tests
+// Fuzzer, mixed_004, diag JSON tests
 
 func FuzzSetMatchEquivalence(f *testing.F) {
 	// Seed corpus: simple patterns that exercise different code paths.

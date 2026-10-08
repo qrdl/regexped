@@ -63,6 +63,10 @@ var rows = []row{
 		spec: spec{Pattern: `[a-z]+foo\d`, Fn: "find", Gen: "rep:afoo", Sizes: sz(4096, 8192, 16384)}},
 	{Name: `linear/find [^,]+@[^,]+\.com`, Expect: linear, Why: "the switch on a literal-anchored shape",
 		spec: spec{Pattern: `[^,]+@[^,]+\.com`, Fn: "find", Gen: "rep:a@a", Sizes: sz(4096, 8192, 16384)}},
+	{Name: `linear/find [a-z]+-[0-9]+ one-byte literal`, Expect: linear, Why: "a one-byte literal's every failed candidate is charged, so a dense run hands over",
+		spec: spec{Pattern: `[a-z]+-[0-9]+`, Fn: "find", Gen: "rep:a-", Sizes: sz(4096, 8192, 16384)}},
+	{Name: `linear/find \w+@\w+\.\w{2,} one-byte literal`, Expect: linear, Why: "the same, with the forward walk failing at the next candidate",
+		spec: spec{Pattern: `\w+@\w+\.\w{2,}`, Fn: "find", Gen: "rep:aa@", Sizes: sz(4096, 8192, 16384)}},
 	{Name: "linear/find a*?b no match", Expect: linear, Why: "a non-greedy repeat that never matches",
 		spec: spec{Pattern: `a*?b`, Fn: "find", Gen: "rep:a", Sizes: sz(4096, 8192, 16384)}},
 	{Name: "linear/set find {a*b, a}", Expect: linear, Why: "per-pattern gates retire a pattern below its last end",
@@ -149,6 +153,8 @@ var rows = []row{
 		spec: spec{Pattern: `(0*\b|)*0`, Fn: "groups", Gen: "rep:0", Sizes: sz(1024, 2048, 4096, 8192)}},
 	{Name: "bt-budget/set find member (?:aa|a){0,40}b|a", Expect: linear, Why: "a set member's budget lasts one host call",
 		spec: spec{Config: "cfg/setbt4.yaml", Fn: "find", Gen: "rep:a", Sizes: sz(256, 512, 1024, 2048)}},
+	{Name: "bt-budget/set find member (?:ab|cd|ef)*z beside a", Expect: linear, Why: "an alternation's first-byte dispatch enters its only arm without a frame and must charge the budget for the arms it skips: uncharged, the walk from every candidate never trips it (×3.97)",
+		spec: spec{Config: "cfg/setbt5.yaml", Fn: "find", Gen: "rep:ab", Sizes: sz(2048, 4096, 8192)}},
 
 	// ---- Overlapping sets and the answer cache.
 	{Name: "overlap/40 unbounded members", Expect: linear, Why: "the answer cache's rows widen past 32 members",

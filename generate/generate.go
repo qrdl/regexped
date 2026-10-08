@@ -25,6 +25,13 @@ func ResolveStubType(cfg config.BuildConfig) (string, error) {
 // CmdGenerateStub generates a stub file of the appropriate type for cfg.
 // out is the full output path or "-" for stdout.
 func CmdGenerateStub(cfg config.BuildConfig, out string) error {
+	// Its stub would call a groups export the module does not have; `compile`
+	// refuses the same entry (compile.ErrNoCaptureGroup).
+	for _, re := range cfg.Regexps {
+		if re.GroupsWithoutCaptures() {
+			return fmt.Errorf("regexp %q: groups_func %q: %s", re.Pattern, re.GroupsFunc, config.NoCaptureGroupProblem)
+		}
+	}
 	stubType, err := ResolveStubType(cfg)
 	if err != nil {
 		return err

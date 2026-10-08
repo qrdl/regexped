@@ -224,7 +224,10 @@ generator embeds. The generated stub carries that macro and hides it behind the
 familiar API. Until the merge step runs, the guest has an unsatisfied import and
 will not instantiate.
 
-`examples/wasmtime/rust/secrets` 🧩 is this route end to end.
+`examples/wasmtime/rust/secrets` 🧩 is this route end to end, and
+`examples/fastedge/lang-detect` 🧩 is the same route for a `wasi:http` app: the
+guest is a FastEdge HTTP app built with `wstd`, and the composed component runs
+under `wasmtime serve` and FastEdge's own runtime alike.
 
 ### C guest, with a generated stub
 
@@ -369,6 +372,12 @@ Handing the constructor the **whole** input is not an inefficiency to optimise
 away: `\b`, `\B` and `(?m:^)` are judged against the real preceding byte, so a
 sliced input would silently change the answer at the seam. `start` bounds where
 the first step searches from; it never truncates what the engine sees behind it.
+
+Every position — `start`, and each match's start and end — is a **byte** offset
+into the `list<u8>`, in Unicode mode too. The input crosses as bytes and is not
+validated on the way: invalid UTF-8 reaches a Unicode-mode pattern untouched,
+where an invalid byte matches nothing (see
+[engines.md](engines.md#unicode-mode)), exactly as in a module build.
 
 ### Other languages
 

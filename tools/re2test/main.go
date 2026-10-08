@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,11 +53,22 @@ const (
 	skipNonAnchored = "requires Backtracking (non-greedy find mode)"
 	skipCaptures    = "requires Backtracking (capture groups)"
 	skipUnicode     = "requires Unicode support"
-	skipStateLimit  = "requires larger DFA (state limit exceeded)"
-	skipBadSyntax   = "unsupported RE2 syntax (invalid escape sequence)"
-	skipParseError  = "parse/compile error"
-	skipOther       = "other reasons"
-	skipTimeout     = "timeout (exponential backtracking)"
+	// The three Unicode-mode skips (-unicode). skipASCIIBlock: a block with
+	// no character above 0x7F in its patterns or inputs, which the byte-mode
+	// targets cover (unless -unicode-all runs it). skipREBInsideChar: RE2's \B holds at every byte
+	// position, inside a UTF-8 sequence too, where Go's and Unicode mode's
+	// do not — Go's own exhaustive test skips exactly these rows. skipGoFFFD:
+	// a Go-derived expectation on input that is not valid UTF-8 for a pattern
+	// that can match U+FFFD, which Go matches there and Unicode mode, by
+	// design, does not.
+	skipASCIIBlock    = "ASCII-only block (the byte-mode targets cover it)"
+	skipREBInsideChar = "RE2's \\B inside a character (Go and Unicode mode skip it)"
+	skipGoFFFD        = "Go reads invalid UTF-8 as U+FFFD (Unicode mode matches nothing there)"
+	skipStateLimit    = "requires larger DFA (state limit exceeded)"
+	skipBadSyntax     = "unsupported RE2 syntax (invalid escape sequence)"
+	skipParseError    = "parse/compile error"
+	skipOther         = "other reasons"
+	skipTimeout       = "timeout (exponential backtracking)"
 	// skipBTOverflow is a Backtracking body answering abi.BTStackOverflow:
 	// "the answer is unknown". It is a SKIP rather than a comparison because
 	// -2 is not an answer, and it is counted on its own because the groups
@@ -71,6 +83,9 @@ var skipOrder = []string{
 	skipNonAnchored,
 	skipCaptures,
 	skipUnicode,
+	skipASCIIBlock,
+	skipREBInsideChar,
+	skipGoFFFD,
 	skipStateLimit,
 	skipBadSyntax,
 	skipParseError,
@@ -78,6 +93,43 @@ var skipOrder = []string{
 	skipBTOverflow,
 	"requires " + compile.EngineBacktrack.String(),
 	skipOther,
+}
+
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// unicodeAll, with -unicode, runs the all-ASCII blocks too. Their answers are
+// byte mode's — no character above 0x7F to read differently — but every
+// pattern is compiled as Unicode mode compiles it: classes lowered, `.` a
+// character, folding over the whole of Unicode, the engine chosen for the
+// lowered program. Without it those blocks are skipped (skipASCIIBlock), and
+// the corpus checks the Unicode-mode code only on its six non-ASCII blocks.
+var unicodeAll = flag.Bool("unicode-all", false, "with -unicode, also run the all-ASCII blocks (their answers are byte mode's, their code Unicode mode's)")
+
+// unicodeOracle, with -unicode, declares the file's columns Unicode mode's own
+// answers — make_adjusted -unicode-variants computes them with Go over the
+// pattern without U+FFFD — so the two skips that protect RE2's or Go's
+// columns where Unicode mode differs (skipREBInsideChar, skipGoFFFD) do not
+// apply: every row, invalid input included, is judged.
+var unicodeOracle = flag.Bool("unicode-oracle", false, "with -unicode: the file's columns are Unicode mode's own answers (make_adjusted -unicode-variants); judge invalid-UTF-8 rows too")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
+// setModeKey is the set-level `unicode:` key every set of this run compiles
+// with: the mode -unicode asks for, stated rather than left to the members.
+func setModeKey() *bool {
+	v := *unicodeFlag
+	return &v
 }
 
 func main() {
@@ -105,6 +157,13 @@ func main() {
 	searchBlock := flag.String("search-block", "fresh", "per-search block handed to find and groups (see internal/abi): off = none, the search global left at 0; fresh = a zeroed block per drive and notes allocated when it arms, as a generated stub does; armed = a block ARMED before the first call, so the MARKED copy of every find with notes answers every call — the comparison of the two copies over the corpus")
 	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the alt-prefixed find body, the alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
+	// --high-bytes judges high-byte input against an ASCII twin, which is an
+	// oracle for a BYTE engine only: in Unicode mode the twin's answers are
+	// wrong, and RE2's own columns are the oracle.
+	if *unicodeFlag && *highBytes {
+		fmt.Fprintln(os.Stderr, "-unicode and --high-bytes cannot be combined: the ASCII twin is an oracle for byte mode only")
+		os.Exit(2)
+	}
 	switch *searchBlock {
 	case "off", "fresh", "armed":
 		searchMode = *searchBlock
@@ -307,6 +366,11 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				input = append([]string(nil), testStrings...)
 				continue
 			}
+			if *unicodeFlag && !*unicodeAll && !hasUnicode(pattern) && !slices.ContainsFunc(testStrings, hasUnicode) {
+				skipCount[skipASCIIBlock] += len(testStrings)
+				input = append([]string(nil), testStrings...)
+				continue
+			}
 
 			// Always determine the naturally-selected engine, even under
 			// --force-backtrack: it's still needed to decide whether this
@@ -314,7 +378,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// groupsFn/matchFn dispatch below) and for the passed-test engine
 			// accounting further down. The actual compiled engine is forced
 			// separately, via compileOpts below.
-			selOpts := compile.CompileOptions{MaxDFAStates: maxDFAStates}
+			selOpts := withMode(compile.CompileOptions{MaxDFAStates: maxDFAStates})
 			engineType, selErr := compile.SelectEngine(pattern, selOpts)
 			if selErr != nil && gateRefusedASCII(pattern, selErr) {
 				nfail += len(testStrings)
@@ -346,7 +410,10 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// other patterns retain the usual match+find setup.
 			patternHasCaptures := false
 			if groupsOnly {
-				if parsed, perr := syntax.Parse(pattern, syntax.Perl); perr == nil && parsed.MaxCap() > 0 {
+				// A group simplification removes (`(a){0}`) does not count: a
+				// groups_func on such a pattern is refused (config.NoCaptureGroupProblem).
+				if parsed, perr := syntax.Parse(pattern, syntax.Perl); perr == nil && parsed.MaxCap() > 0 &&
+					!(config.RegexEntry{Pattern: pattern, GroupsFunc: "groups"}).GroupsWithoutCaptures() {
 					patternHasCaptures = true
 				}
 			}
@@ -393,7 +460,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			if btFallbackAlways {
 				compileOpts.BTWorkBudget = compile.BTWorkBudgetForceFallback
 			}
-			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, compileOpts)
+			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, withMode(compileOpts))
 			if compErr != nil && gateRefusedASCII(pattern, compErr) {
 				nfail += len(testStrings)
 				fmt.Printf("FAIL  pattern: %q\n      refused by the rune gate though it names nothing above 0x7F: %v\n", pattern, compErr)
@@ -499,7 +566,24 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// byte engine (see highbytes.go). Without this the whole corpus is
 			// blind to high bytes, which is how a Backtracking bug that lost
 			// every match on such input survived ~9.5M cases.
-			if hasUnicode(text) {
+			// Unicode mode reads such an input as RE2 does, so RE2's own
+			// columns judge it — except where RE2's \B holds inside a
+			// character.
+			if *unicodeFlag && !*unicodeOracle && hasUnicode(text) && strings.Contains(pattern, `\B`) {
+				skipCount[skipREBInsideChar]++
+				continue
+			}
+			// Input that is not valid UTF-8, for a pattern that can match
+			// U+FFFD: Unicode mode matches nothing at such a byte, by design,
+			// where Go reads it as U+FFFD. Only RE2's own columns could judge
+			// the row, and the one file that carries such input is a
+			// Go-validated one (custom-tests.txt, whose columns say what Go and
+			// byte mode answer) — the RE2 corpus has none.
+			if *unicodeFlag && !*unicodeOracle && !utf8.ValidString(text) && canMatchReplacement(pattern) {
+				skipCount[skipGoFFFD]++
+				continue
+			}
+			if hasUnicode(text) && !*unicodeFlag {
 				if !highBytes {
 					skipCount[skipUnicode]++
 					continue
@@ -541,6 +625,8 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// The corpus's own col4 always wins; this only fills in a column
 			// the line does not have. re2-exhaustive.txt has four fields, so
 			// for it that is every row.
+			// Go is the oracle of the two checks below; the rows where Unicode
+			// mode and Go differ by design were skipped above (skipGoFFFD).
 			if allMatches && col4 == "" {
 				if c4, ok := goAllMatchesCol(pattern, text); ok {
 					col4 = c4
@@ -1230,6 +1316,12 @@ func testSetBlock(
 	if len(pats) < 2 {
 		return // not enough patterns to form a set
 	}
+	// Unicode mode answers an all-ASCII block as byte mode does, which the
+	// byte-mode targets already check: the single-pattern rule (skipASCIIBlock).
+	if *unicodeFlag && !*unicodeAll && !slices.ContainsFunc(pats, hasUnicode) && !slices.ContainsFunc(testStrings, hasUnicode) {
+		setStats.asciiBlocks++
+		return
+	}
 
 	var hints []string
 	if likelyMatch {
@@ -1349,7 +1441,9 @@ func crossCheckSPM(chunk setChunk, strs []string, orc *setOracle) {
 			continue
 		}
 		for si, text := range strs {
-			if si >= len(orc.spm[pi]) || si >= len(orc.findAllByStr[pi]) || hasUnicode(text) {
+			// A high-byte input in byte mode is answered for its twin, which
+			// is not text; in Unicode mode both halves read text itself.
+			if si >= len(orc.spm[pi]) || si >= len(orc.findAllByStr[pi]) || (hasUnicode(text) && !*unicodeFlag) {
 				continue
 			}
 			all, spm := orc.findAllByStr[pi][si], orc.spm[pi][si]
@@ -1705,7 +1799,7 @@ func fmtFindResult(v int64) string {
 // preCheck detects patterns that cannot be tested without attempting compilation.
 // Returns a skip reason string, or "" if compilation should be attempted.
 func preCheck(pattern string) string {
-	if hasUnicode(pattern) {
+	if hasUnicode(pattern) && !*unicodeFlag {
 		return skipUnicode
 	}
 	_, err := syntax.Parse(pattern, syntax.Perl)
@@ -1813,7 +1907,33 @@ func namedRuneCeiling(pattern string, parsed *syntax.Regexp) rune {
 	return ceil
 }
 
-// hasUnicode reports whether a pattern string requires Unicode support.
+// canMatchReplacement reports whether pattern has a rune instruction U+FFFD
+// satisfies: the patterns that consume an invalid byte in Go, where Unicode
+// mode matches nothing.
+func canMatchReplacement(pattern string) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return false
+	}
+	for _, in := range prog.Inst {
+		switch in.Op {
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			return true
+		case syntax.InstRune, syntax.InstRune1:
+			if in.MatchRune(utf8.RuneError) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasUnicode reports whether a pattern or input string needs Unicode mode: a
+// rune above 127, or a \p/\P class escape. Byte-mode runs skip such rows.
 func hasUnicode(s string) bool {
 	for _, r := range s {
 		if r > 127 {

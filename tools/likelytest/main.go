@@ -132,6 +132,31 @@ const (
 	setCapScanAll = "scan_all" // one call; returns an i64 id bitmask
 )
 
+// unicodeTests replace tests under -unicode: the shapes whose Unicode-mode
+// lowering changes what a hint can do — a letter-class run (its self-loop is a
+// multi-state cycle over multi-byte characters), a negated class over
+// multi-byte text, a non-ASCII literal and a Unicode set. A byte-mode run
+// cannot compile them, which is why they are a table of their own.
+var unicodeTests = []testCase{
+	{name: "u-letter-run", pattern: `\pL{12,}`, mode: modeFind, exhaustive: true,
+		notes:        "letter run: a multi-state cycle where byte mode has a self-loop",
+		matchInput:   strings.Repeat("Unabhängigkeitserklärungen привет ", 300),
+		nomatchInput: strings.Repeat("Ωμέγα αλφα 12 мир ", 600)},
+	{name: "u-negated-tail", pattern: `key=[^;]+;`, mode: modeFind, exhaustive: true,
+		notes:        "negated class over multi-byte text: the dominant self-loop covers ASCII bytes only",
+		matchInput:   strings.Repeat("key=значение с пробелами и ещё немного текста; ", 200),
+		nomatchInput: strings.Repeat("значение с пробелами и ещё немного текста ", 200)},
+	{name: "u-literal", pattern: `привет\s+\pL+`, mode: modeFind, exhaustive: true,
+		notes:        "a non-ASCII literal prefix: the prefix scan over its UTF-8 bytes",
+		matchInput:   strings.Repeat("Grüße, привет мир! 東京 ", 300),
+		nomatchInput: strings.Repeat("Grüße, мир! 東京タワー abc ", 300)},
+	{name: "u-set-scripts", mode: modeSet, setCap: setCapScanAll,
+		setPatterns:  []string{`\p{Greek}{3,}`, `\p{Cyrillic}{3,}`, `\p{Han}{2,}`, `\p{Latin}{3,}\d`},
+		notes:        "a Unicode set's union scan",
+		matchInput:   strings.Repeat("Grüße aus Köln, привет мир! 東京タワー Ωμέγα x12 ", 300),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ ", 600)},
+}
+
 var tests = []testCase{
 	// ── Shufti prefix-scan targets ───────────────────────
 	// Patterns with no usable literal anchor (no mandatoryLit) and a
@@ -1696,7 +1721,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	case modeGroups:
 		re.GroupsFunc = "groups"
 	}
-	opts := compile.CompileOptions{LikelyMode: mode}
+	opts := withMode(compile.CompileOptions{LikelyMode: mode})
 	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
 	if err == nil && tc.mode != modeAnchored {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc+re.GroupsFunc])
@@ -1715,10 +1740,13 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	for i, p := range tc.setPatterns {
 		entries[i] = config.RegexEntry{Pattern: p}
 	}
+	unicode := *unicodeFlag
 	sc := config.SetConfig{
 		Name:     "bench_set",
 		Patterns: config.PatternSelector{All: true},
 		Hints:    hintsYAML(mode),
+		// The run's mode, stated rather than resolved from the members.
+		Unicode: &unicode,
 	}
 	// Exactly ONE capability per case, on purpose: the compiler emits only the
 	// machinery the declared capabilities need, so a set that also declared
@@ -2981,9 +3009,27 @@ func warmup(engine *wasmtime.Engine) {
 // --------------------------------------------------------------------------
 // Main
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	setsOnly := flag.Bool("sets", false, "run only the set-composition cases (mode == modeSet)")
 	flag.Parse()
+	if *unicodeFlag {
+		tests = unicodeTests
+	}
 
 	// Silence regexped's slog output.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))

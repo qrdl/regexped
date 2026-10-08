@@ -1,0 +1,10 @@
+# A Unicode-mode overlapping set the answer cache serves, with a member that can
+# match empty: the sweep writes an empty row inside a character.
+regexps:
+  - { name: o0, pattern: '[a-zé]+' }
+  - { name: o1, pattern: 'a*' }
+sets:
+  - name: uo
+    find: uo_find
+    overlapping: true
+    patterns: all

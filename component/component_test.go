@@ -178,8 +178,9 @@ func TestCmdCompileSurfacesNameErrors(t *testing.T) {
 
 func TestCmdCompileRejectsUncompilablePattern(t *testing.T) {
 	cfg := findCfg("secrets")
-	// A rune above the byte-mode limit: rejected in both modes.
-	cfg.Regexps = []config.RegexEntry{{Pattern: "\u4e2d", FindFunc: "f"}}
+	// A rune above U+00FF under byte_mode: no byte holds it. (Without
+	// byte_mode it would compile, in Unicode mode.)
+	cfg.Regexps = []config.RegexEntry{{Pattern: "\u4e2d", FindFunc: "f", ByteMode: true}}
 	if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), nil); err == nil ||
 		!strings.Contains(err.Error(), "compile") {
 		t.Errorf("err = %v, want a compile failure", err)
@@ -727,21 +728,27 @@ func TestCoreSurfacesNamingErrors(t *testing.T) {
 // empty component. The set path and the single-pattern path have separate error
 // returns, so both are exercised.
 func TestCoreSurfacesCompileErrors(t *testing.T) {
-	// A rune above 0xFF has no byte to be, and `byte_mode:` cannot help, so this
-	// is refused inside the compiler rather than at config load.
+	// A rune above 0xFF has no byte to be, so under byte_mode this is refused
+	// inside the compiler rather than at config load, on the pattern path and
+	// on the set path; without byte_mode the set resolves to Unicode mode and
+	// compiles.
 	const unsupported = `a€b`
 
 	cfg := coreSetCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported, MatchFunc: "m"}}
+	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported, MatchFunc: "m", ByteMode: true}}
 	cfg.Sets = nil
 	if _, _, err := Core(cfg, nil); err == nil {
 		t.Error("an unsupported rune compiled")
 	}
 
 	cfg = coreSetCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported}}
+	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported, ByteMode: true}}
 	if _, _, err := Core(cfg, nil); err == nil {
 		t.Error("an unsupported rune compiled through the set path")
+	}
+	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported}}
+	if _, _, err := Core(cfg, nil); err != nil {
+		t.Errorf("a Unicode-mode set did not compile: %v", err)
 	}
 }
 

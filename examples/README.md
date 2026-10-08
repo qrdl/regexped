@@ -8,6 +8,16 @@ target. Component examples are marked **🧩**. `url-parts` builds BOTH kinds fr
 one unchanged source — and the component kind by two different routes
 (`make run`, `make component-run`, `make wasip2-run`).
 
+FastEdge runs two kinds of application. A **CDN app** is a proxy-wasm filter on
+traffic passing through the CDN, built as a core module: `fastedge/validate`
+and `fastedge/url-guard`. An **HTTP app** answers requests itself and is a
+`wasi:http` component built for wasip2: `fastedge/lang-detect`.
+
+Two examples have patterns that compile in **Unicode mode** — script classes
+such as `\p{Latin}` and letters such as `ä`, matched a whole character at a
+time and case-folded across Unicode: `fastedge/lang-detect` and
+`browser/homoglyph`.
+
 | Use case | Environment | Language | Patterns | Format (target) | Directory |
 |---|---|---|---|---|---|
 | IPv6 URL validation | wasmtime | Rust | individual | module (wasip1) | [wasmtime/rust/url-ipv6](wasmtime/rust/url-ipv6) |
@@ -17,9 +27,11 @@ one unchanged source — and the component kind by two different routes
 | CSV parsing and validation | wasmtime | Go | individual | module (wasip1) | [wasmtime/go/csv](wasmtime/go/csv) |
 | SQL injection detection | wasmtime | Go | individual | module (wasip1) | [wasmtime/go/sql-injection](wasmtime/go/sql-injection) |
 | Multi-pattern secret scanning | wasmtime | Go | set | module (wasip1) | [wasmtime/go/secret-scanner](wasmtime/go/secret-scanner) |
-| Email, URL, XSS validation | FastEdge | Rust | individual | module (wasip1) | [fastedge/validate](fastedge/validate) |
-| URL guard | FastEdge | Rust | set | module (wasip1) | [fastedge/url-guard](fastedge/url-guard) |
-| Email and URL validation | Browser | JavaScript | individual | module | [browser](browser) |
+| Email, URL, XSS validation | FastEdge CDN app (proxy-wasm) | Rust | individual | module (wasip1) | [fastedge/validate](fastedge/validate) |
+| URL guard | FastEdge CDN app (proxy-wasm) | Rust | set | module (wasip1) | [fastedge/url-guard](fastedge/url-guard) |
+| European language detection by letters | FastEdge HTTP app (wasi:http) | Rust | 3 sets, **Unicode** | **component 🧩** (wasip2) | [fastedge/lang-detect](fastedge/lang-detect) |
+| Email and URL validation | Browser | JavaScript | individual | module | [browser/validate](browser/validate) |
+| Homoglyph and hidden-character detection | Browser | JavaScript | set, **Unicode** | module | [browser/homoglyph](browser/homoglyph) |
 | Domain extraction from URLs | Node.js | TypeScript | individual | module | [node/domain-extract](node/domain-extract) |
 | SQL statement validation | Node.js | TypeScript | set | module | [node/sql-validator](node/sql-validator) |
 | Credential scanner edge API | Cloudflare Workers | JavaScript | individual | module | [workers](workers) |
@@ -28,11 +40,14 @@ one unchanged source — and the component kind by two different routes
 
 In any example directory, `make` builds the example and `make run` builds it if
 needed and runs it. An example with several build routes builds and runs its
-default route that way, and gives the other routes their own targets. `workers`
-and `fastedge/*` have nothing to run locally, so their `make run` only says why.
+default route that way, and gives the other routes their own targets. `workers`,
+`fastedge/validate` and `fastedge/url-guard` have nothing to run locally, so
+their `make run` only says why; `fastedge/lang-detect` is a `wasi:http`
+component, which `wasmtime serve` runs, so its `make run` serves it on port 8080
+for the length of a few requests.
 `make`, `make run` and `make clean` in this directory run the same target in
-every example. `browser` comes last, because its `make run` serves the page
-until you press Ctrl-C.
+every example. `browser` comes last, because its `make run` serves its two
+pages until you press Ctrl-C.
 
 No Makefile installs anything. Each example's README lists, under
 **Prerequisites**, the tools it needs, how to install them, and what each `make`
@@ -59,14 +74,15 @@ tuples — while `make component-run` loads a component and drives a `resource`
 through `bindgen!`-generated bindings, with none of that. `make compare` diffs
 the two. It is also the only example that uses a **set** through a component.
 
-**3. Component Model 🧩** — `wasmtime/rust/secrets`. `wasm_format: component`
+**3. Component Model 🧩** — `wasmtime/rust/secrets`, and the FastEdge HTTP app
+`fastedge/lang-detect`. `wasm_format: component`
 produces a component plus a sibling `.wit`. The consumer is itself a component
 that imports that interface, and `regexped merge` composes the two — the SAME
 command the module format uses, which dispatches on `wasm_format` and shells out
 to `wac` here where it shells out to `wasm-merge` there. No linear-memory
 bookkeeping; each component owns its own.
 
-That example uses a **generated Rust stub**, and its `main.rs` differs from the
+Both use a **generated Rust stub**. `secrets`' `main.rs` differs from the
 module-format version by the module name and one comment: switching
 `wasm_format` does not change calling code. `stub_type: rust` and `wit` are the
 component stub types; see [../docs/component.md](../docs/component.md) for what
