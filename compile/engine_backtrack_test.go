@@ -1214,6 +1214,173 @@ func TestEnginesCovBTEmitSingleRangeClampsAboveByteRange(t *testing.T) {
 	if hi := btEmitSingleRange(nil, 0x80, 0xFF); hi == nil {
 		t.Error("btEmitSingleRange(0x80, 0xFF) emitted nothing, want a range check")
 	}
+	// An empty range matches nothing. The test is one unsigned compare,
+	// scratch - lo <= hi - lo, and lo > hi would wrap hi - lo to a bound every
+	// byte is under.
+	if got := btEmitSingleRange(nil, 'z', 'a'); got != nil {
+		t.Errorf("btEmitSingleRange('z', 'a') emitted % x, want nothing", got)
+	}
+}
+
+// TestBacktrackBodiesHaveNoValueTypedBlocks pins that a Backtracking body's
+// per-instruction checks — the byte-range test and the word-boundary test —
+// produce no value through a block. wasmtime makes every value-typed block a
+// Cranelift variable whose SSA table keeps a slot per block of the function,
+// so one per instruction made its compile memory grow with the square of the
+// body: a Unicode-mode find of `^..(S........(S)+){70}` (2.8 MB) took 3.4 GB to
+// compile. Every shape must have none, the word-boundary one at two sizes.
+func TestBacktrackBodiesHaveNoValueTypedBlocks(t *testing.T) {
+	uni := CompileOptions{Unicode: true}
+	byteMode := CompileOptions{ForceByteMode: true}
+	cases := []struct {
+		name  string
+		entry config.RegexEntry
+		opts  CompileOptions
+	}{
+		{"unicode groups classes", config.RegexEntry{Pattern: `(\pL+)\s(\pN+)`, GroupsFunc: "g"}, uni},
+		{"unicode groups dot", config.RegexEntry{Pattern: `(.+)=(.+)`, GroupsFunc: "g"}, uni},
+		{"unicode groups fold", config.RegexEntry{Pattern: `(?i)(привет)\s+(мир)`, GroupsFunc: "g"}, uni},
+		{"unicode groups word boundary x5", config.RegexEntry{Pattern: `^(?:\b(.)\b ){5}`, GroupsFunc: "g"}, uni},
+		{"unicode groups word boundary x40", config.RegexEntry{Pattern: `^(?:\b(.)\b ){40}`, GroupsFunc: "g"}, uni},
+		{"unicode find x10", config.RegexEntry{Pattern: `^..(S........(S)+){10}`, FindFunc: "f"}, uni},
+		{"byte groups classes and boundaries", config.RegexEntry{Pattern: `([a-z]+)\b(\d+)\B(x)`, GroupsFunc: "g"}, byteMode},
+	}
+	for _, c := range cases {
+		var w []byte
+		var err error
+		if c.entry.GroupsFunc != "" {
+			w, _, err = CompileForced([]config.RegexEntry{c.entry}, 65536, true, EngineBacktrack, c.opts)
+		} else {
+			w, _, err = Compile([]config.RegexEntry{c.entry}, 65536, true, c.opts)
+		}
+		if err != nil {
+			t.Fatalf("%s: compile %q: %v", c.name, c.entry.Pattern, err)
+		}
+		if n := wasmValueTypedBlocks(t, w); n != 0 {
+			t.Errorf("%s: %q has %d value-typed blocks, want none", c.name, c.entry.Pattern, n)
+		}
+	}
+}
+
+// wasmValueTypedBlocks counts, over every function body of a module, the
+// `block` and `loop` instructions whose block type is a value type. It
+// decodes every instruction regexped emits and fails the test unless each
+// body ends exactly where its size says — a decoding slip must not pass for a
+// zero count.
+func wasmValueTypedBlocks(t *testing.T, wasm []byte) int {
+	t.Helper()
+	uleb := func(p *int) uint64 {
+		v, n, err := utils.DecodeULEB128(wasm[*p:])
+		if err != nil {
+			t.Fatalf("bad ULEB128 at %d: %v", *p, err)
+		}
+		*p += n
+		return v
+	}
+	sleb := func(p *int) {
+		_, n, err := utils.DecodeSLEB128(wasm[*p:])
+		if err != nil {
+			t.Fatalf("bad SLEB128 at %d: %v", *p, err)
+		}
+		*p += n
+	}
+	memarg := func(p *int) {
+		if uleb(p)&0x40 != 0 { // multi-memory: a memory index follows
+			uleb(p)
+		}
+		uleb(p)
+	}
+	count := 0
+	for pos := 8; pos < len(wasm); {
+		id := wasm[pos]
+		pos++
+		size := int(uleb(&pos))
+		end := pos + size
+		if id != 10 {
+			pos = end
+			continue
+		}
+		for n := uleb(&pos); n > 0; n-- {
+			bodyEnd := int(uleb(&pos))
+			bodyEnd += pos
+			for groups := uleb(&pos); groups > 0; groups-- {
+				uleb(&pos)
+				pos++
+			}
+			for pos < bodyEnd {
+				op := wasm[pos]
+				pos++
+				switch {
+				case op == 0x02 || op == 0x03 || op == 0x04: // block, loop, if
+					bt := wasm[pos]
+					switch {
+					case bt == 0x40:
+						pos++
+					case bt >= 0x6F: // a value type
+						if op != 0x04 {
+							count++
+						}
+						pos++
+					default: // a type index
+						sleb(&pos)
+						if op != 0x04 {
+							count++
+						}
+					}
+				case op == 0x0C || op == 0x0D || op == 0x10 || op == 0xD2 || (op >= 0x20 && op <= 0x26):
+					uleb(&pos)
+				case op == 0x0E: // br_table
+					for k := uleb(&pos) + 1; k > 0; k-- {
+						uleb(&pos)
+					}
+				case op == 0x11: // call_indirect
+					uleb(&pos)
+					uleb(&pos)
+				case op == 0x1C: // select t*
+					pos += int(uleb(&pos))
+				case op >= 0x28 && op <= 0x3E:
+					memarg(&pos)
+				case op == 0x3F || op == 0x40:
+					uleb(&pos)
+				case op == 0x41 || op == 0x42:
+					sleb(&pos)
+				case op == 0x43:
+					pos += 4
+				case op == 0x44:
+					pos += 8
+				case op == 0xD0:
+					pos++
+				case op == 0xFC:
+					switch sub := uleb(&pos); {
+					case sub == 8 || sub == 10 || sub == 12 || sub == 14:
+						uleb(&pos)
+						uleb(&pos)
+					case sub == 9 || sub == 11 || sub == 13 || (sub >= 15 && sub <= 17):
+						uleb(&pos)
+					}
+				case op == 0xFD:
+					switch sub := uleb(&pos); {
+					case sub <= 11 || sub == 92 || sub == 93:
+						memarg(&pos)
+					case sub == 12 || sub == 13:
+						pos += 16
+					case sub >= 21 && sub <= 34:
+						pos++
+					case sub >= 84 && sub <= 91:
+						memarg(&pos)
+						pos++
+					}
+				}
+			}
+			if pos != bodyEnd {
+				t.Fatalf("function body decoded past its end: at %d, want %d", pos, bodyEnd)
+			}
+		}
+		if pos != end {
+			t.Fatalf("code section decoded to %d, want %d", pos, end)
+		}
+	}
+	return count
 }
 
 // ---------------------------------------------------------------------------

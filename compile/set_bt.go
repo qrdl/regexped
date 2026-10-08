@@ -78,13 +78,17 @@ func admitBTFallback(ast resolvedTree) *btBucketInfo {
 // the emitter chose, so any divergence between the two would be a stub whose
 // signature disagrees with the WASM it calls — a silently wrong return value
 // rather than a build error.
+//
+// progress is the compile's progress sink, nil for a compile that reports
+// none; the members' programs carry it to their constructions.
 func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []int,
-	prefixPool, suffixPool *dfaPool) ([]*PatternInfo, []int, error) {
+	prefixPool, suffixPool *dfaPool, progress *progressSink) ([]*PatternInfo, []int, error) {
 
 	mode, err := resolveSetMode(sc, cfg, selectedIdx)
 	if err != nil {
 		return nil, nil, err
 	}
+	mode.pg = progress
 	var infos []*PatternInfo
 	var globalIDs []int
 	for _, idx := range selectedIdx {

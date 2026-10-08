@@ -143,7 +143,7 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	if d.hasWordBoundary || d.hasNewlineBoundary {
 		return nil
 	}
-	if d.numStates == 0 || d.numStates >= spec.maxUnionStates() {
+	if d.numStates == 0 || d.numStates > spec.maxUnionStates() {
 		return nil
 	}
 	// A DOMINANT self-loop state is disqualifying, and this is the one

@@ -2818,10 +2818,56 @@ func TestCompileProgress(t *testing.T) {
 	if out.Len() != 0 {
 		t.Errorf("a short compile printed %q", out.String())
 	}
-	// No writer, no sink; and none left behind by the compiles above.
+	// No writer, no sink; and none left behind once a compile with one ends.
+	noWriter := &Reporter{}
 	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `\pL{5}x`, FindFunc: "f"}}, 0, true,
-		CompileOptions{Report: &Reporter{}}); err != nil || activeProgress.Load() != nil {
-		t.Errorf("err %v, active sink %v", err, activeProgress.Load())
+		CompileOptions{Report: noWriter}); err != nil || noWriter.sink != nil {
+		t.Errorf("err %v, sink %v", err, noWriter.sink)
+	}
+	withWriter := rep()
+	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `abc`, FindFunc: "f"}}, 0, true,
+		CompileOptions{Report: withWriter}); err != nil || withWriter.sink != nil {
+		t.Errorf("err %v, sink left behind %v", err, withWriter.sink)
+	}
+}
+
+// TestCompileProgressConcurrent: compiles in flight at the same time, each
+// with its own Reporter, print only their own lines, and one with no Progress
+// writer prints into neither. The sink used to be one process-global pointer,
+// so a compile that started while another ran took over its output and
+// restored a stale sink when it ended.
+func TestCompileProgressConcurrent(t *testing.T) {
+	newRep := func(out *bytes.Buffer) *Reporter {
+		clock := time.Unix(0, 0)
+		return &Reporter{Progress: out, progressAfter: time.Second, progressNow: func() time.Time {
+			clock = clock.Add(time.Second)
+			return clock
+		}}
+	}
+	var outA, outB bytes.Buffer
+	compileOne := func(wg *sync.WaitGroup, name string, rep *Reporter) {
+		defer wg.Done()
+		re := config.RegexEntry{Name: name, Pattern: `\pL{5}x`, FindFunc: "f"}
+		if _, _, err := Compile([]config.RegexEntry{re}, 0, true, CompileOptions{Report: rep}); err != nil {
+			t.Error(err)
+		}
+	}
+	for range 3 {
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go compileOne(&wg, "a", newRep(&outA))
+		go compileOne(&wg, "b", newRep(&outB))
+		go compileOne(&wg, "c", nil)
+		wg.Wait()
+	}
+	for _, c := range []struct {
+		out        string
+		own, other string
+	}{{outA.String(), "a", "b"}, {outB.String(), "b", "a"}} {
+		if !strings.Contains(c.out, `pattern "`+c.own+`"`) || strings.Contains(c.out, `pattern "`+c.other+`"`) ||
+			strings.Contains(c.out, `pattern "c"`) {
+			t.Errorf("compile %q printed %q, want only its own lines", c.own, c.out)
+		}
 	}
 }
 

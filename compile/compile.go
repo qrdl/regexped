@@ -3637,7 +3637,7 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// produce a clean-looking diagnostics file describing a set with the
 		// broken pattern quietly missing from it.
 		// Sharing the function is what stops the two answers drifting again.
-		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, nil)
 		if err != nil {
 			return err
 		}

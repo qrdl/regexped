@@ -917,7 +917,7 @@ func newTDFA(mp resolvedProg, limit int) (*tdfaTable, bool) {
 	_, entryOps := getOrAddState(startThreads, false)
 
 	// ---- main BFS ----
-	pg := startProgressStep("TDFA construction")
+	pg := mp.pg.startStep("TDFA construction")
 	for si := 0; si < len(states); si++ {
 		if nextStateID > limit {
 			return nil, false

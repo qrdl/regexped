@@ -88,8 +88,10 @@ const slowCompileDeadline = 4 * time.Second
 
 // fuzzInputCompileBudget is how long ALL the compiles of one fuzz input may
 // take under -unicode, where an input compiles more than once — a set target
-// builds its capability module and its gated one — and two compiles each
-// within slowCompileDeadline still overran the worker's 10s in a loaded run.
+// builds its capability module and its gated one, FuzzGroupsBothBodies one
+// module per leg (three), FuzzGroupsBothEngines one per engine — and two
+// compiles each within slowCompileDeadline still overran the worker's 10s in a
+// loaded run.
 const fuzzInputCompileBudget = 5 * time.Second
 
 var (

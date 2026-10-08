@@ -934,7 +934,7 @@ func newDFA(mp resolvedProg, leftmostFirst bool, maxStates int, patternBitsArg .
 	if len(patternBitsArg) > 0 {
 		pBits = patternBitsArg[0]
 	}
-	return newDFAImpl(mp.prog, leftmostFirst, maxStates, pBits, nil)
+	return newDFAImpl(mp.prog, leftmostFirst, maxStates, pBits, nil, mp.pg)
 }
 
 // newDFAWide is newDFA for a merged set bucket holding MORE than 64 patterns,
@@ -959,11 +959,11 @@ func newDFA(mp resolvedProg, leftmostFirst bool, maxStates int, patternBitsArg .
 // with patternIdx nil the shared implementation is bit-identical, which is
 // what keeps `make byteident` honest.
 func newDFAWide(mp resolvedProg, leftmostFirst bool, maxStates int, patternIdx []int32) (*dfa, bool) {
-	return newDFAImpl(mp.prog, leftmostFirst, maxStates, nil, patternIdx)
+	return newDFAImpl(mp.prog, leftmostFirst, maxStates, nil, patternIdx, mp.pg)
 }
 
 func newDFAImpl(prog *syntax.Prog, leftmostFirst bool, maxStates int,
-	pBits []uint64, pIdx []int32) (*dfa, bool) {
+	pBits []uint64, pIdx []int32, progress *progressSink) (*dfa, bool) {
 	dfa := &dfa{
 		accepting:               make(map[int]uint64),
 		midAccepting:            make(map[int]uint64),
@@ -1510,7 +1510,7 @@ func newDFAImpl(prog *syntax.Prog, leftmostFirst bool, maxStates int,
 	}
 
 	// Process work queue
-	pg := startProgressStep("DFA construction")
+	pg := progress.startStep("DFA construction")
 	for len(queue) > 0 {
 		if nextStateID > maxStates {
 			return nil, false

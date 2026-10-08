@@ -31,10 +31,15 @@ type progressSink struct {
 	subject      atomic.Pointer[string] // what is being compiled: `pattern "x"`, `set "s"`
 }
 
-// activeProgress is the progress sink of the compile in flight, nil when none
-// asked for one. A construction loop cannot be handed it — newDFAImpl and
-// newTDFA are called from dozens of sites — so it is found here.
-var activeProgress atomic.Pointer[progressSink]
+// A compile's sink travels with the program it compiles: resolvePattern
+// takes it from the compile's Reporter, resolvedPattern, resolvedTree,
+// resolvedProg and setMode carry it next to their mode, and every value
+// derived from one keeps it — so newDFA and newTDFA, called from dozens of
+// sites, find it on the program they are handed. Concurrent compiles each
+// report their own constructions, and a compile with no Progress writer
+// reports none, whatever else is running. It used to be one process-global
+// pointer, which a second compile in flight overwrote and restored out of
+// order.
 
 const (
 	progressAfter = 5 * time.Second
@@ -57,13 +62,22 @@ func (r *Reporter) startProgress() (end func()) {
 	}
 	subject := "patterns"
 	s.subject.Store(&subject)
-	prev := activeProgress.Swap(s)
-	return func() { activeProgress.Store(prev) }
+	prev := r.sink
+	r.sink = s
+	return func() { r.sink = prev }
 }
 
-// progressSubject names what the active compile is working on now.
-func progressSubject(format string, args ...any) {
-	if s := activeProgress.Load(); s != nil {
+// progress is r's sink for the compile in flight, nil when there is none.
+func (r *Reporter) progress() *progressSink {
+	if r == nil {
+		return nil
+	}
+	return r.sink
+}
+
+// progressSubject names what r's compile is working on now.
+func (r *Reporter) progressSubject(format string, args ...any) {
+	if s := r.progress(); s != nil {
 		subject := fmt.Sprintf(format, args...)
 		s.subject.Store(&subject)
 	}
@@ -78,10 +92,10 @@ type progressStep struct {
 	calls int
 }
 
-// startProgressStep begins step, or returns nil when no sink is active; every
-// method is nil-safe, so a construction loop calls tick unconditionally.
-func startProgressStep(step string) *progressStep {
-	s := activeProgress.Load()
+// startStep begins step, or returns nil when s is nil (the compile asked for
+// no progress); every method is nil-safe, so a construction loop calls tick
+// unconditionally.
+func (s *progressSink) startStep(step string) *progressStep {
 	if s == nil {
 		return nil
 	}

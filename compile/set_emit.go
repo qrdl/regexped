@@ -2159,7 +2159,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	var compiledSets []*compiledSet
 	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
-		progressSubject("set %q", sc.Name)
+		rep.progressSubject("set %q", sc.Name)
 		// Resolve patterns.
 		var selectedIdx []int
 		if sc.Patterns.All {
@@ -2173,7 +2173,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		}
 
 		// Drop capture-bearing patterns; build PatternInfos.
-		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, rep.progress())
 		if err != nil {
 			return nil, 0, nil, err
 		}
@@ -5186,7 +5186,7 @@ func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over C
 		}
 	}
 	var prefixPool, suffixPool dfaPool
-	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		return nil, err
 	}

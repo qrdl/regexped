@@ -527,6 +527,28 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	if buildAnchoredUnionDFA(specFor(t, small, 2), 0, false, false) != nil {
 		t.Error("the anchored union was built under max_union_states 2")
 	}
+	// The budget is inclusive, as newDFA's and the scan union's are: an
+	// anchored union whose DFA has exactly max_union_states states is built,
+	// and refused one state below. It used to be refused AT the budget. The
+	// count is the DFA's own (dfa.numStates) — the union wrappers' numStates
+	// differ from it by one either way.
+	spec := specFor(t, small, 0)
+	progs := make([]resolvedProg, 0, len(spec.Patterns))
+	for _, p := range spec.Patterns {
+		pr, _ := compileProg(patternFullAST(p))
+		progs = append(progs, pr)
+	}
+	prog, bits := buildUnionProg(progs, 64)
+	d, ok := newDFA(prog, false, 1<<20, bits)
+	if !ok {
+		t.Fatal("the two-member anchored union did not build")
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, d.numStates), 0, false, false) == nil {
+		t.Errorf("the anchored union (%d states) was refused under max_union_states %d", d.numStates, d.numStates)
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, d.numStates-1), 0, false, false) != nil {
+		t.Errorf("the anchored union (%d states) was built under max_union_states %d", d.numStates, d.numStates-1)
+	}
 	// From a config: the key reaches the set's union.
 	cfg := config.BuildConfig{
 		Regexps: []config.RegexEntry{{Name: "d", Pattern: `[0-9]{3}`}, {Name: "w", Pattern: `[a-z]{2}`}},
@@ -3022,7 +3044,7 @@ func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet 
 	for i := range idxs {
 		idxs[i] = i
 	}
-	infos, gids, err := setPatternInfos(sc, cfg, idxs, &prefixPool, &suffixPool)
+	infos, gids, err := setPatternInfos(sc, cfg, idxs, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		t.Fatalf("setPatternInfos: %v", err)
 	}

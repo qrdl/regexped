@@ -123,23 +123,18 @@ func wasmFindIter(t *testing.T, wasmBytes []byte, input string) ([][2]int, bool)
 // way mode says; sizes is what the find export's searches keep.
 func wasmFindIterMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, input string, mode searchblock.Mode) ([][2]int, bool) {
 	t.Helper()
-	engine, wd := sharedEngine()
-	mod, err := wasmtime.NewModule(engine, wasmBytes)
-	if err != nil {
-		t.Fatalf("module: %v", err)
-	}
-	defer mod.Close()
-	store := wasmtime.NewStore(engine)
-	defer store.Close()
-	store.SetEpochDeadline(1)
-	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	_, wd := sharedEngine()
+	// instantiate takes the module a fuzz run under -unicode already built
+	// inside the compile deadline; building it here again cost FuzzFindIteration
+	// a wasmtime build per mode, ≈ 1 s each for a 900 KB module.
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
 	findFn := inst.GetFunc(store, "find")
-	mem := inst.GetExport(store, "memory").Memory()
-	if findFn == nil || mem == nil {
-		t.Fatal("module missing find export or memory")
+	if findFn == nil {
+		t.Fatal("module missing find export")
 	}
 	copy(mem.UnsafeData(store), input)
 	sr, err := newSearchRegion(store, inst, mem, len(input), sizes, mode)

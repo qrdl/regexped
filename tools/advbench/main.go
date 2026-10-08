@@ -97,8 +97,9 @@ type sizeResult struct {
 func (r sizeResult) fuelPerByte() float64 { return float64(r.Fuel) / float64(max(r.N, 1)) }
 
 // unicodeFlag puts every compile of this run in Unicode mode
-// (CompileOptions.Unicode); without it every compile is forced to byte mode
-// (ForceByteMode), so no run is ever in a mode it did not ask for.
+// (CompileOptions.Unicode, and a loaded config's `unicode:` keys); without it
+// every compile is forced to byte mode (ForceByteMode, `unicode: false`), so
+// no run is ever in a mode it did not ask for.
 var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
 
 // withMode sets the mode -unicode asks for on o.
@@ -109,6 +110,18 @@ func withMode(o compile.CompileOptions) compile.CompileOptions {
 		o.ForceByteMode = true
 	}
 	return o
+}
+
+// withConfigMode is withMode for a loaded config, which CompileFile compiles
+// without options: it sets the `unicode:` key of every set and every pattern.
+func withConfigMode(cfg *config.BuildConfig) {
+	u := *unicodeFlag
+	for i := range cfg.Sets {
+		cfg.Sets[i].Unicode = &u
+	}
+	for i := range cfg.Regexps {
+		cfg.Regexps[i].Unicode = &u
+	}
 }
 
 func main() {
@@ -215,6 +228,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("load: %w", err)
 		}
+		withConfigMode(&cfg)
 		found := false
 		for _, s := range cfg.Sets {
 			if sp.Set == "" || s.Name == sp.Set {

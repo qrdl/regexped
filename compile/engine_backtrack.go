@@ -955,7 +955,14 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 
 // btCheckRuneRanges emits a range check for InstRune.
 // Fails (state=-1, br brDepth) if no range matches.
-// Uses: block $matched (result i32) pattern.
+//
+// A void block $ok that each in-range test leaves with br_if, the failure at
+// its end: no 0/1 is produced. wasmtime makes every value-typed block a
+// Cranelift variable whose SSA table keeps a slot per block of the function,
+// so the block (result i32) this used to be — one per InstRune, thousands in a
+// Unicode-mode body, where `.` lowers to several byte-range InstRunes — made
+// wasmtime's compile memory grow with the square of the body: a 2.8 MB module
+// took 3.4 GB to compile, and 0.78 GB this way.
 func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	isFold := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
 
@@ -966,8 +973,7 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
 
-	// Use block $matched (result i32): emit 1 and br if matched, else 0 falls through.
-	b = append(b, 0x02, 0x7F) // block (result i32)
+	b = append(b, 0x02, 0x40) // block $ok
 
 	for i := 0; i < len(inst.Rune); i += 2 {
 		var lo, hi rune
@@ -994,20 +1000,13 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 		b = btEmitRangeMatch(b, lo, hi, isFold)
 	}
 
-	// No range matched: push 0 as block result
-	b = append(b, 0x41, 0x00)
-	b = append(b, 0x0B) // end block $matched — stack has 0 or 1
-
-	// if result == 0 → fail
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if void
+	// No range matched.
 	b = btFail(b, brDepth)
-	b = append(b, 0x0B) // end if
-	return b
+	return append(b, 0x0B) // end block $ok
 }
 
-// btEmitRangeMatch emits code inside a block (result i32) that checks if scratch
-// is in [lo, hi] and br_if 0 (to produce 1 and exit the block) on match.
+// btEmitRangeMatch emits code inside block $ok that leaves it (br_if 0) when
+// scratch is in [lo, hi], or under FoldCase in its other-case range.
 func btEmitRangeMatch(b []byte, lo, hi rune, isFold bool) []byte {
 	b = btEmitSingleRange(b, lo, hi)
 	if isFold {
@@ -1020,34 +1019,33 @@ func btEmitRangeMatch(b []byte, lo, hi rune, isFold bool) []byte {
 	return b
 }
 
-// btEmitSingleRange emits: (scratch >= lo && scratch <= hi); br_if 0 with result 1
+// btEmitSingleRange emits: br_if 0 when scratch is in [lo, hi], tested as one
+// unsigned compare, scratch - lo <= hi - lo.
 func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	// Same saturation as btCheckRuneRanges — see the comment there. scratch is
-	// an i32.load8_u, so it is 0..255 and the ge_u/le_u pair below compares
-	// correctly against a bound anywhere in that space.
+	// an i32.load8_u, so it is 0..255 and the compare below is exact against
+	// bounds anywhere in that space.
 	if lo > 0xFF {
 		return b
 	}
 	if hi > 0xFF {
 		hi = 0xFF
 	}
+	// An empty range matches nothing — and lo > hi would make hi - lo wrap to
+	// a bound every byte is under.
+	if lo > hi {
+		return b
+	}
 	b = append(b, 0x20, localScratch)
+	if lo != 0 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, lo)
+		b = append(b, 0x6B) // i32.sub
+	}
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, lo)
-	b = append(b, 0x4F) // i32.ge_u
-
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, hi)
-	b = append(b, 0x4D) // i32.le_u
-
-	b = append(b, 0x71) // i32.and → 0 or 1
-
-	// if this range matched: push 1 and br out of block
-	b = append(b, 0x04, 0x40) // if void
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x0C, 0x01) // br 1 (out of the result block; depth 0=this if, 1=block $matched)
-	b = append(b, 0x0B)       // end if
+	b = utils.AppendSLEB128(b, hi-lo)
+	b = append(b, 0x4D)       // i32.le_u
+	b = append(b, 0x0D, 0x00) // br_if $ok
 	return b
 }
 
@@ -1506,8 +1504,11 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, frameSize int32, br
 // wantBoundary=true: fail if NOT a word boundary.
 // wantBoundary=false: fail if IS a word boundary.
 //
-// Uses scratch local to hold loaded bytes.
-// Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
+// Computes prevIsWord XOR nextIsWord into locals — state for the previous
+// byte, scratch for the next — and checks it against wantBoundary. state is
+// free here: the instruction sets it again on both exits (contOut, btFail).
+// No value-typed block: wasmtime's compile memory for one grows with the
+// whole function (see btCheckRuneRanges).
 //
 // The captureBody's (ptr,len) are always the caller's true input under
 // window mode (see buildBacktrackBody's winGlobal), so pos==0 / pos==len
@@ -1515,17 +1516,10 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, frameSize int32, br
 // this is what a past defect’s (origPtr,origEnd) scratch used to
 // reconstruct for a narrowed slice.
 func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
-	// Compute prevIsWord (0 or 1) using block (result i32):
-	//   if pos == 0: push 0
-	//   else: load input[pos-1]; isWordChar → push 0 or 1
-	b = append(b, 0x02, 0x7F) // block (result i32) $prevWord
+	// state = input[pos-1] is a word character; 0 at pos == 0.
+	b = append(b, 0x41, 0x00, 0x21, localState)
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if void (pos == 0)
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0C, 0x01) // br 1 → out of $prevWord
-	b = append(b, 0x0B)       // end if
-	// load input[pos-1]
+	b = append(b, 0x04, 0x40) // if pos != 0
 	b = append(b, 0x20, localPtr)
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x41, 0x01)
@@ -1533,120 +1527,64 @@ func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	b = append(b, 0x6A)             // i32.add (ptr + pos - 1)
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
-	b = emitIsWordCharFromScratch(b) // → 0 or 1 on stack
-	b = append(b, 0x0B)              // end block $prevWord → prevIsWord on stack
-
-	// Compute nextIsWord:
-	b = append(b, 0x02, 0x7F) // block (result i32) $nextWord
+	b = emitIsWordCharFromScratch(b)
+	b = append(b, 0x21, localState)
+	b = append(b, 0x0B) // end if
+	// scratch = input[pos] is a word character; 0 at pos >= len.
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x20, localLen)
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x04, 0x40) // if void (pos >= len)
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0C, 0x01) // br 1 → out of $nextWord
-	b = append(b, 0x0B)       // end if
-	// load input[pos]
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if pos < len
 	b = append(b, 0x20, localPtr)
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x6A)
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
-	b = emitIsWordCharFromScratch(b) // → 0 or 1 on stack
-	b = append(b, 0x0B)              // end block $nextWord → nextIsWord on stack
-
+	b = emitIsWordCharFromScratch(b)
+	b = append(b, 0x21, localScratch)
+	b = append(b, 0x05) // else
+	b = append(b, 0x41, 0x00, 0x21, localScratch)
+	b = append(b, 0x0B) // end if
 	// boundary = prevIsWord XOR nextIsWord
+	b = append(b, 0x20, localState, 0x20, localScratch)
 	b = append(b, 0x73) // i32.xor
-
-	// After both result blocks close, we are back at handler top level.
-	// brDepth = brRunNested = brRun+1 (passed from caller as depth to restart $run
-	// from inside one extra block).  Inside the if void here we are inside one extra
-	// block, so depth to $run = brDepth.
 	if wantBoundary {
 		// fail if boundary == 0 (no boundary when we want one)
-		b = append(b, 0x45)       // i32.eqz
-		b = append(b, 0x04, 0x40) // if void
-		b = btFail(b, brDepth)
-		b = append(b, 0x0B) // end if
-	} else {
-		// fail if boundary != 0 (boundary present when we want none)
-		b = append(b, 0x04, 0x40) // if void (nonzero = boundary)
-		b = btFail(b, brDepth)
-		b = append(b, 0x0B) // end if
+		b = append(b, 0x45) // i32.eqz
 	}
+	// else fail if boundary != 0 (boundary present when we want none)
+	b = append(b, 0x04, 0x40) // if void
+	b = btFail(b, brDepth)
+	b = append(b, 0x0B) // end if
 	return b
 }
 
-// emitIsWordCharFromScratch emits code that reads scratch local and pushes
-// 1 if it is a word character [a-zA-Z0-9_], 0 otherwise.
-// Uses block (result i32) pattern with early exits.
+// emitIsWordCharFromScratch pushes 1 if the scratch local holds a word
+// character [a-zA-Z0-9_], 0 otherwise — three unsigned compares OR'd, no
+// branch: scratch|0x20 folds A-Z onto a-z, and no other byte lands there.
 func emitIsWordCharFromScratch(b []byte) []byte {
-	// block $isword (result i32)
-	//   scratch >= 'a' && scratch <= 'z' → 1; br out
-	//   scratch >= 'A' && scratch <= 'Z' → 1; br out
-	//   scratch >= '0' && scratch <= '9' → 1; br out
-	//   scratch == '_' → 1; br out
-	//   0 (fallthrough)
-	// end
-	b = append(b, 0x02, 0x7F) // block (result i32) $isword
-
-	// [a-z]
 	b = append(b, 0x20, localScratch)
+	b = append(b, 0x41, 0x20)
+	b = append(b, 0x72) // i32.or
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('a'))
-	b = append(b, 0x4F) // i32.ge_u
-	b = append(b, 0x20, localScratch)
+	b = append(b, 0x6B) // i32.sub
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('z'))
-	b = append(b, 0x4D)       // i32.le_u
-	b = append(b, 0x71)       // i32.and
-	b = append(b, 0x04, 0x40) // if void
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x0C, 0x01) // br 1 → out of $isword
-	b = append(b, 0x0B)       // end if
-
-	// [A-Z]
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('A'))
-	b = append(b, 0x4F)
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('Z'))
+	b = utils.AppendSLEB128(b, int32('z'-'a'))
 	b = append(b, 0x4D) // i32.le_u
-	b = append(b, 0x71)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// [0-9]
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('0'))
-	b = append(b, 0x4F)
-	b = append(b, 0x20, localScratch)
+	b = append(b, 0x6B)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('9'))
-	b = append(b, 0x4D) // i32.le_u
-	b = append(b, 0x71)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// '_'
+	b = utils.AppendSLEB128(b, int32('9'-'0'))
+	b = append(b, 0x4D)
+	b = append(b, 0x72) // i32.or
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('_'))
 	b = append(b, 0x46) // i32.eq
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// not a word char
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0B)       // end $isword
+	b = append(b, 0x72) // i32.or
 	return b
 }
 

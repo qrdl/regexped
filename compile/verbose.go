@@ -70,6 +70,9 @@ type Reporter struct {
 	// interval) in tests.
 	progressNow   func() time.Time
 	progressAfter time.Duration
+	// sink is the progress sink of the compile in flight (startProgress),
+	// which resolvePattern hands to the programs that compile builds.
+	sink *progressSink
 }
 
 // noteModule records what the assembled module carries that the CLI warns
@@ -107,9 +110,9 @@ func (r *Reporter) Begin(name, pattern string) {
 	r.End()
 	r.cur = &PatternReport{Name: name, Pattern: pattern}
 	if name != "" {
-		progressSubject("pattern %q", name)
+		r.progressSubject("pattern %q", name)
 	} else {
-		progressSubject("pattern %q", truncate(pattern, 40))
+		r.progressSubject("pattern %q", truncate(pattern, 40))
 	}
 }
 

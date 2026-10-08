@@ -731,6 +731,9 @@ func FuzzGroupsBothBodies(f *testing.F) {
 	}
 	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
+		// Three builds per input, one per leg: one budget covers them all
+		// (fuzzInputCompileBudget).
+		beginFuzzInput()
 		if len(input) >= pathsInputCap {
 			t.Skip()
 		}
@@ -815,6 +818,9 @@ func FuzzGroupsBothEngines(f *testing.F) {
 	}
 	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
+		// Two builds per input, Backtracking and TDFA: one budget covers both
+		// (fuzzInputCompileBudget).
+		beginFuzzInput()
 		if len(input) >= pathsInputCap {
 			t.Skip()
 		}

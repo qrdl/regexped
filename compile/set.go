@@ -1071,7 +1071,7 @@ func buildUnionProg(progs []resolvedProg, bitmaskWidth int) (resolvedProg, []uin
 		raw[k] = p.prog
 	}
 	union, patternBits := unionProgs(raw, bitmaskWidth)
-	return resolvedProg{prog: union, orig: union, pm: sameProgMode(progs)}, patternBits
+	return resolvedProg{prog: union, orig: union, pm: sameProgMode(progs), pg: sameProgress(progs)}, patternBits
 }
 
 func unionProgs(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uint64) {

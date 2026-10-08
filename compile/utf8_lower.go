@@ -167,6 +167,7 @@ func (m progMode) reversed() progMode {
 type resolvedPattern struct {
 	src string
 	pm  progMode
+	pg  *progressSink // the compile's progress sink, nil for none
 }
 
 // resolvePattern is the ONE place a single pattern's mode is decided, from its
@@ -187,32 +188,33 @@ func resolvePattern(src string, key *bool, opts *CompileOptions) (resolvedPatter
 	if opts != nil {
 		o = *opts
 	}
+	pg := o.Report.progress() // the compile's progress sink travels with the pattern
 	switch {
 	case o.Unicode && o.ForceByteMode:
 		panic("regexped: CompileOptions.Unicode and ForceByteMode are both set")
 	case o.Unicode && o.ByteMode:
 		panic("regexped: CompileOptions.Unicode and ByteMode are both set")
 	case o.Unicode:
-		return resolvedPattern{src: src, pm: progModeUnicode}, nil
+		return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
 	case o.ForceByteMode:
-		return resolvedPattern{src: src, pm: progModeByte}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
 	}
 	if key != nil {
 		switch {
 		case *key && o.ByteMode:
 			return resolvedPattern{}, fmt.Errorf("unicode: true and byte_mode: true contradict each other")
 		case *key:
-			return resolvedPattern{src: src, pm: progModeUnicode}, nil
+			return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
 		}
-		return resolvedPattern{src: src, pm: progModeByte}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
 	}
 	if o.ByteMode {
-		return resolvedPattern{src: src, pm: progModeByte}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
 	}
 	if detectUnicodeRune(src) < 0 {
-		return resolvedPattern{src: src, pm: progModeByte}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
 	}
-	return resolvedPattern{src: src, pm: progModeUnicode}, nil
+	return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
 }
 
 // detectUnicodeRune returns the rune that makes src ask for Unicode mode, or
@@ -247,12 +249,15 @@ func (p resolvedPattern) modeName() string {
 
 // setMode is a set's resolved mode, which every member's pattern takes
 // (resolveSetMode).
-type setMode struct{ pm progMode }
+type setMode struct {
+	pm progMode
+	pg *progressSink // the compile's progress sink, nil for none
+}
 
 // member gives src, a member pattern of the set, the set's mode.
 func (m setMode) member(src string) resolvedPattern {
 	m.pm.check()
-	return resolvedPattern{src: src, pm: m.pm}
+	return resolvedPattern{src: src, pm: m.pm, pg: m.pg}
 }
 
 // resolveSetMode is the ONE place a set's mode is decided. A member ASKS FOR
@@ -313,33 +318,34 @@ func (p resolvedPattern) parse() (resolvedTree, error) {
 	if err != nil {
 		return resolvedTree{}, err
 	}
-	return resolvedTree{re: re, pm: p.pm}, nil
+	return resolvedTree{re: re, pm: p.pm, pg: p.pg}, nil
 }
 
 // source gives src, the printed form of a tree parsed from p's source and
 // possibly cut down or rewritten since, p's mode.
 func (p resolvedPattern) source(src string) resolvedPattern {
 	p.pm.check()
-	return resolvedPattern{src: src, pm: p.pm}
+	return resolvedPattern{src: src, pm: p.pm, pg: p.pg}
 }
 
 // tree gives re, a tree parsed from p's source and possibly cut down or
 // rewritten since, p's mode.
 func (p resolvedPattern) tree(re *syntax.Regexp) resolvedTree {
 	p.pm.check()
-	return resolvedTree{re: re, pm: p.pm}
+	return resolvedTree{re: re, pm: p.pm, pg: p.pg}
 }
 
 // resolvedTree is a parse tree with the mode of the pattern it came from.
 type resolvedTree struct {
 	re *syntax.Regexp
 	pm progMode
+	pg *progressSink // the compile's progress sink, nil for none
 }
 
 // tree gives re, a tree cut from t or built around it, t's mode.
 func (t resolvedTree) tree(re *syntax.Regexp) resolvedTree {
 	t.pm.check()
-	return resolvedTree{re: re, pm: t.pm}
+	return resolvedTree{re: re, pm: t.pm, pg: t.pg}
 }
 
 // unicode reports whether t is in a Unicode mode.
@@ -353,7 +359,7 @@ func (t resolvedTree) unicode() bool {
 // keep the forward mode.
 func (t resolvedTree) reversed() resolvedTree {
 	t.pm.check()
-	return resolvedTree{re: reverseRegexp(t.re), pm: t.pm.reversed()}
+	return resolvedTree{re: reverseRegexp(t.re), pm: t.pm.reversed(), pg: t.pg}
 }
 
 // resolvedProg is a program with the mode it was compiled in. Every engine
@@ -365,6 +371,7 @@ type resolvedProg struct {
 	prog *syntax.Prog
 	orig *syntax.Prog
 	pm   progMode
+	pg   *progressSink // the compile's progress sink, nil for none
 }
 
 // unicode reports whether p was compiled in a Unicode mode.
@@ -388,12 +395,23 @@ func compileProg(t resolvedTree) (resolvedProg, error) {
 			prog = lowerUTF8Reverse(orig)
 		}
 	}
-	return resolvedProg{prog: prog, orig: orig, pm: t.pm}, err
+	return resolvedProg{prog: prog, orig: orig, pm: t.pm, pg: t.pg}, err
 }
 
 // sameProgMode returns the mode every program in progs was compiled in, for a
 // builder that merges them into one; programs of different modes cannot share
 // one automaton, and merging them panics.
+// sameProgress is the progress sink programs merged into one carry: the first
+// one's, as every program of one compile carries the same.
+func sameProgress(progs []resolvedProg) *progressSink {
+	for _, p := range progs {
+		if p.pg != nil {
+			return p.pg
+		}
+	}
+	return nil
+}
+
 func sameProgMode(progs []resolvedProg) progMode {
 	m := progs[0].pm
 	for _, p := range progs[1:] {
