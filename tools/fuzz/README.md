@@ -153,8 +153,8 @@ empirically:
 judged against their real left context. That prefix counts runes, so in byte
 mode, where regexped counts bytes, the target skips non-ASCII input; with
 `-unicode` it checks it. It also skips inputs longer than the probe sweep can
-price under the fuzz worker's deadline, and capture-bearing patterns, which a
-set drops by design.
+price under the fuzz worker's deadline. A pattern with capture groups is a
+member like any other (a set reports group 0), so it is checked too.
 
 ### `-2` is a skip, not a failure
 

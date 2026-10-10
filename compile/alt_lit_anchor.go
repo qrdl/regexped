@@ -97,7 +97,7 @@ func compileAltLitAnchorBranches(rp resolvedPattern, branches []altLitAnchorBran
 		if revCompErr != nil || revProg.refusedByByteGate() {
 			return nil, false
 		}
-		revDFA, revOk := newDFA(revProg, false, maxHelperDFAStates)
+		revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
 		if !revOk {
 			return nil, false
 		}

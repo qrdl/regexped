@@ -3,6 +3,7 @@ package compile
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -15,6 +16,10 @@ import (
 // The match function body is not stored here — it is built at assemble time
 // (when function-table indices are known) by emitSetMatchFnFinal.
 type compiledSet struct {
+	// err is a member that fits no engine (setFailure): the set does not
+	// compile. Every caller of CompileSet that builds a module checks it.
+	err error
+
 	// midSweepWork / midSweepBudget are the module globals of the
 	// overlapping `find`'s in-call counter, emitted wherever the answer cache
 	// is: once the walk has cost what the sweep would, the body bails out and
@@ -234,6 +239,7 @@ type compiledSet struct {
 	// reached through setFindCtx can address them.
 	tableMemIdx int
 	btFnBodies  [][]byte
+	btFnOwners  []string // the member each btFnBodies entry serves, for messages
 	btRegions   *btSharedRegions
 	// btWorkBudget and btStackStart are CompileSetOptions.BTWorkBudget and
 	// BTStackStart, kept for buildBTBodies, which builds the drivers at
@@ -697,7 +703,7 @@ type SetSpec struct {
 	// which is what the internal harnesses building a SetSpec directly get.
 	DeclaredPatternCount int
 
-	Patterns   []*PatternInfo // resolved, capture-bearing dropped
+	Patterns   []*PatternInfo // resolved, every selected entry
 	PatternIDs []int          // global indices into the regexps list
 }
 
@@ -780,7 +786,19 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if opts.globals == nil {
 		opts.globals = &moduleGlobals{}
 	}
-	return compileSetSplit(spec, prefixPool, suffixPool, opts)
+	opts = opts.resolvedFor(spec)
+	cs := compileSetSplit(spec, prefixPool, suffixPool, opts)
+	cs.err = opts.fail.err
+	return cs
+}
+
+// memorySizeLimit is a config size spelled as the set options spell a limit
+// (exactLimit): unset is 0, "derive it"; a written 0 is negative.
+func memorySizeLimit(m config.MemorySize) int {
+	if !m.IsSet() {
+		return 0
+	}
+	return exactLimit(int(min(m.Bytes(), math.MaxInt32)))
 }
 
 // compileSetWith is CompileSet with the members at the spec.Patterns indices
@@ -789,6 +807,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 // capabilities are split. nonLinear says a member is not provably linear in
 // the set's bodies, which is what the work counters exist for.
 func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, split []splitCand, nonLinear bool) *compiledSet {
+	opts = opts.resolvedFor(spec)
 	// THE nil-allocator fallback for the whole set path. A nil allocator means
 	// this set is being compiled outside a module assembly — CompileSet is
 	// reachable that way from tests that inspect the result rather than run
@@ -2032,12 +2051,12 @@ func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[st
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
-// It exists because a set can legitimately EXCLUDE a pattern the caller asked
-// for: a suffix DFA over max_dfa_states is dropped with a warning and recorded
-// in SetDiag.StateLimitDropped, and a set that does not contain a pattern does
-// not report its matches. Any differential test therefore has to know which
-// patterns actually made it in, or it compares the engine against an oracle
-// for a set the engine was never asked to build.
+// It exists because a set can legitimately leave a pattern out of its
+// anchored pair: a member whose anchored DFA is over max_dfa_states is dropped
+// from match_any / match_all with a warning and recorded in
+// SetDiag.AnchoredStateLimitDropped. Any differential test therefore has to
+// know which patterns those two capabilities hold, or it compares the engine
+// against an oracle for a set the engine was never asked to build.
 //
 // CmdWriteDiagJSON answers the same question by RE-RUNNING the whole set
 // compilation. That is fine for a CLI flag and wrong for a caller in a hot
@@ -2083,7 +2102,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
 		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
-			MaxDFAStates:              cfg.MaxDFAStates,
+			MaxDFAStates:              int(cfg.MaxDFAStates),
+			MaxBTInstructions:         int(cfg.MaxBTInstructions),
 			MaxTDFARegs:               cfg.MaxTDFARegs,
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
@@ -2104,9 +2124,10 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	var compiled []*compiledPattern
 	var lastTableEnd int64
 	opts := CompileOptions{
-		MaxDFAStates: cfg.MaxDFAStates,
-		MaxTDFARegs:  cfg.MaxTDFARegs,
-		Report:       rep,
+		MaxDFAStates:      int(cfg.MaxDFAStates),
+		MaxBTInstructions: int(cfg.MaxBTInstructions),
+		MaxTDFARegs:       cfg.MaxTDFARegs,
+		Report:            rep,
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		BTWorkBudget: over.BTWorkBudget,
 		BTStackStart: over.BTStackStart,
@@ -2172,7 +2193,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			}
 		}
 
-		// Drop capture-bearing patterns; build PatternInfos.
+		// Build PatternInfos, one per selected entry.
 		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, rep.progress())
 		if err != nil {
 			return nil, 0, nil, err
@@ -2184,6 +2205,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		}
 		setOpts.TableBase = int32(setTableBase)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
+		if cs.err != nil {
+			return nil, 0, nil, fmt.Errorf("set %q: %w", sc.Name, cs.err)
+		}
 		compiledSets = append(compiledSets, cs)
 		fillSetSearchSizes(sc, cs, over.searchSizes)
 		if cs.diag != nil {
@@ -2256,7 +2280,12 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// caller trusting it on a set-bearing module wrote its input over the
 	// first set's tables. tools/perftest already worked around this by
 	// re-parsing the data section; nothing else did.
+	var owners codeOwners
+	comp.owners = &owners
 	w := assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals, comp)
+	if err := checkFunctionSizes(w, owners); err != nil {
+		return nil, 0, nil, err
+	}
 	rep.noteModule(globals)
 	return w, dataTop, diags, nil
 }
@@ -2863,6 +2892,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// Defined functions only — `total` counts the imported canon builtins too.
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total-numFuncImports))
 	for i, p := range patterns {
+		opts.owners.mark(len(cs_bytes), p.ownerName())
 		base := baseIdx[i]
 		matchOff, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
@@ -2959,6 +2989,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		tableMemIdx = 1
 	}
 	for si, cs := range sets {
+		opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 		base := setBaseIdx[si]
 		scanProbeBase := base + cs.scanProbeBaseOffset()
 		anchoredProbeBase := base + cs.anchoredProbeBaseOffset()
@@ -3149,9 +3180,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, pb...)
 		}
 		// Backtracking drivers last, matching btFnBaseOffset.
-		for _, bb := range cs.btFnBodies {
+		for bi, bb := range cs.btFnBodies {
+			opts.owners.mark(len(cs_bytes), fmt.Sprintf("member %q of set %q", cs.btFnOwners[bi], cs.name))
 			cs_bytes = append(cs_bytes, bb...)
 		}
+		opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 		// Then a split set's functions, in extraFnTypes' order.
 		for _, c := range cs.keptCaps() {
 			cs_bytes = append(cs_bytes, capBody(c)...)
@@ -3164,7 +3197,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		for i, sm := range cs.split {
 			if sm.bt != nil {
+				opts.owners.mark(len(cs_bytes), fmt.Sprintf("member %q of set %q", sm.name, cs.name))
 				cs_bytes = appendBTFindParts(cs_bytes, sm.bt.fast, *sm.bt, base+cs.splitFwdOffset(i))
+				opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 				continue
 			}
 			cs_bytes = append(cs_bytes, sm.fwdBody...)
@@ -3174,6 +3209,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, cs.emitSweepFnBody(tableMemIdx)...)
 		}
 	}
+	opts.owners.mark(len(cs_bytes), "")
 	if opts.Component {
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
@@ -5131,13 +5167,11 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// Set-level LikelyMode precedence: set hints > neutral.
 		// Used by the set frontend density gate.
 		LikelyMode: resolveHints(sc.Hints),
-		// The knob that decides whether a pattern survives into the set at
-		// all: a fallback bucket over this limit is DROPPED, not demoted to
-		// another engine. It was unreachable before — CompileSetOptions was
-		// built without it, so the default 1024 always won and the drop
-		// warning's own "raise max_dfa_states" hint pointed at a field that
-		// does not feed this budget.
-		MaxFallbackStates: resolveMaxFallbackStates(cfg.MaxFallbackStates, infos),
+		// The state limits (MaxFallbackStates, BudgetStates) are
+		// max_dfa_states, which every member carries (buildLimits):
+		// resolvedFor reads them there. The two sizes are the config's own.
+		BudgetBytes:      memorySizeLimit(cfg.MaxSetBucketSize),
+		SplitTableBudget: int64(memorySizeLimit(cfg.MaxSplitTableSize)),
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
 		BTWorkBudget:  over.BTWorkBudget,
@@ -5191,7 +5225,11 @@ func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over C
 		return nil, err
 	}
 	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, &moduleGlobals{})
-	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
+	cs := CompileSet(spec, &prefixPool, &suffixPool, opts)
+	if cs.err != nil {
+		return nil, fmt.Errorf("set %q: %w", sc.Name, cs.err)
+	}
+	return cs, nil
 }
 
 // wantsWalkExtent reports whether this bucket's tuple-writing body should

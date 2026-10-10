@@ -16,7 +16,6 @@ func (p PatternRef) String() string {
 // Diagnostics is the top-level diagnostic structure produced by CompileFile.
 type Diagnostics struct {
 	PatternsTotal       int       `json:"patterns_total"`
-	CaptureBearing      int       `json:"capture_bearing"`
 	InSet               int       `json:"in_set"`
 	PrefixDedupPoolSize int       `json:"prefix_dedup_pool_size"`
 	Sets                []SetDiag `json:"sets"`
@@ -56,21 +55,15 @@ type SetDiag struct {
 	// emitted today: the union collapse is not built, so
 	// this field exists to make that visible rather than to be guessed at, and
 	// gains a "collapsed" value if the collapse ever lands.
-	BareBodyShape         map[string]string `json:"bare_body_shape,omitempty"`
-	Buckets               []BucketDiag      `json:"buckets"`
-	Conflicts             []ConflictDiag    `json:"conflicts"`
-	CaptureBearingDropped []PatternRef      `json:"capture_bearing_dropped"`
-	StateLimitDropped     []PatternRef      `json:"state_limit_dropped,omitempty"`
+	BareBodyShape map[string]string `json:"bare_body_shape,omitempty"`
+	Buckets       []BucketDiag      `json:"buckets"`
+	Conflicts     []ConflictDiag    `json:"conflicts"`
 	// AnchoredStateLimitDropped lists patterns whose own anchored DFA could not
 	// be built inside the packer's limits, so they left match_any/match_all
-	// while scan_any, scan_all and `find` kept them.
-	//
-	// Separate from StateLimitDropped on purpose. That field is written by the
-	// `find` packers and means the pattern left the set ENTIRELY; this one is
-	// scoped to the anchored capabilities. One field carried both meanings
-	// until 2026-09-20, so nothing downstream could tell a pattern that still
-	// answers from one that does not — a consumer excluded a pattern the scan
-	// pair correctly reported, and read the disagreement as a wrong answer.
+	// while scan_any, scan_all and `find` kept them. It is the only drop: a
+	// member no engine takes for `find` or the scan pair fails the compile,
+	// and the field that once listed such members (state_limit_dropped) is
+	// gone with them.
 	AnchoredStateLimitDropped []PatternRef `json:"anchored_state_limit_dropped,omitempty"`
 	// UnparseableDropped lists patterns the anchored packer could not re-parse
 	// and therefore excluded from match/match_any/match_all while `find` kept

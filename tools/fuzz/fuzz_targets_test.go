@@ -701,7 +701,7 @@ func FuzzGroups(f *testing.F) {
 			t.Fatalf("hang (watchdog timeout after %s): pat=%q input=%q", wasmCallTimeout, pat, input)
 		}
 		if msg := compareSlots(want, got, ok); msg != "" {
-			eng, _ := compile.SelectEngine(pat, compile.CompileOptions{})
+			eng, _ := compile.SelectEngine(pat, withMode(compile.CompileOptions{}))
 			t.Fatalf("groups mismatch (%s): pat=%q input=%q engine=%v\n  expected %v\n  got      %v (ok=%v)",
 				msg, pat, input, eng, want, got, ok)
 		}
@@ -769,7 +769,7 @@ func FuzzGroupsBothBodies(f *testing.F) {
 			if leg.budget == compile.BTWorkBudgetOff {
 				// A program with a zero-width cycle has no ordinary body in
 				// any build — under Off it is the fallback leg again.
-				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, compile.CompileOptions{BTWorkBudget: leg.budget}); err == nil && cyc {
+				if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, withMode(compile.CompileOptions{BTWorkBudget: leg.budget})); err == nil && cyc {
 					t.Skip("zero-width cycle: the ordinary body is never shipped for this program")
 				}
 			}
@@ -853,8 +853,14 @@ func FuzzGroupsBothEngines(f *testing.F) {
 		// then calling the wrong answer a bug is garbage-in: the compiler never
 		// claimed TDFA handles it. So TDFA is only exercised when the selector
 		// itself would pick it; Backtracking is the general fallback and is
-		// always fair game.
-		selected, _ := compile.SelectEngine(pat, compile.CompileOptions{})
+		// always fair game. Selected in the run's mode, as the legs are built:
+		// Unicode mode lifts the ambiguous-capture gate, so `<([^>]+)>` is TDFA
+		// there and Backtracking in byte mode — asked without the mode, a
+		// -unicode run never fuzzed the TDFA those users get.
+		selected, ok := selectEngineWithinBudget(pat)
+		if !ok {
+			t.Skip("engine selection ran past the input's compile budget")
+		}
 		engines := []compile.EngineType{compile.EngineBacktrack}
 		if selected == compile.EngineTDFA {
 			engines = append(engines, compile.EngineTDFA)
@@ -907,10 +913,10 @@ func FuzzGroupsBothEngines(f *testing.F) {
 // per-start-position anchored matching.
 //
 // Comparison is per pattern and by MULTISET, not by sequence: the set ABI
-// leaves the order of the tuples within one call unspecified. Patterns
-// carrying capture groups are skipped: the set pipeline drops capture-bearing
-// patterns (SetDiag.CaptureBearingDropped), so including one would produce an
-// oracle mismatch that is expected behaviour rather than a bug.
+// leaves the order of the tuples within one call unspecified. A pattern with
+// capture groups is a member like any other: a set reports group 0 only.
+// (Such patterns were skipped here on the belief that sets drop them; only an
+// entry with groups_func ever was, and none is any more.)
 func FuzzSet(f *testing.F) {
 	// Seed with pattern pairs drawn from consecutive corpus entries, so the
 	// seeds contain patterns that actually share literals and inputs.
@@ -945,11 +951,7 @@ func FuzzSet(f *testing.F) {
 			if reason := skipPattern(p, input); reason != "" {
 				t.Skip(reason)
 			}
-			re := regexp.MustCompile(p)
-			if re.NumSubexp() > 0 {
-				t.Skip("capture-bearing patterns are dropped from sets by design")
-			}
-			refs[i] = re
+			refs[i] = regexp.MustCompile(p)
 		}
 
 		checkSetFindAllStarts(t, pats, refs, input)

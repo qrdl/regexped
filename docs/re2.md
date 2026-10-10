@@ -233,16 +233,16 @@ chunk-size, subset and profile axes are already covered by the neutral run.
 What is new here is the emission, and one chunk size per hint reaches it
 across the whole corpus.
 
-A pattern the compiler legitimately drops from a set — a fallback bucket's
-suffix DFA over the `max_fallback_states` budget, or one the anchored packer
-alone refused — is excluded from the comparison and counted separately in the
-summary, so a documented exclusion cannot masquerade as either a pass or a
-failure. The exclusion is taken from the compiler's own drop WARNING rather
-than from `--diag-json`, and it is SCOPED by that warning's `where`: an
-"anchored bucket" drop excludes the pattern from `match_any`/`match_all` only,
-while a fallback-bucket drop excludes it from everything non-anchored. Merging
-the two scopes would make the oracle expect matches from a pattern the module
-no longer holds, or drop ones it still reports.
+A pattern the compiler legitimately leaves out of a set's `match_any` /
+`match_all` — its anchored DFA over `max_dfa_states`, the anchored pair having
+no Backtracking path — is excluded from those two capabilities' comparison and
+counted separately in the summary, so a documented exclusion cannot masquerade
+as either a pass or a failure. The exclusion is taken from the compiler's own
+drop WARNING rather than from `--diag-json`, and it is SCOPED by that warning's
+`where`: only an "anchored bucket" drop is an exclusion. Any other drop is a
+FAILURE, since a member no engine takes for `find` or the scan pair must fail
+the compile rather than be left out — `custom-sets-unicode.txt`'s
+`UniMemberOverOldBuildCap` (`.{0,870}` in Unicode mode) is the one that was.
 
 ### Batched sets (`make set-batch`)
 
@@ -274,7 +274,7 @@ the shapes whose empty matches could land inside a character (`x*`, `(?:)`,
 `\B`, `a?\B`, line and text anchors, `.` and negated classes) over 2- to
 4-byte characters, invalid bytes, cut-off, overlong and surrogate sequences,
 plus multi-byte literals and members a set splits out — neutral, under both
-hints, on Backtracking members and through the batch entry. **34,513,565
+hints, on Backtracking members and through the batch entry. **34,516,808
 checks, 0 failures** over its ten runs, the answer cache swept on every
 forced-sweep leg the shape allows.
 

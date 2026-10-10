@@ -85,7 +85,7 @@ var rows = []row{
 		spec: spec{Config: "cfg/batch_notes.yaml", Fn: "batch", Cap: 65536, Gen: "rep:a", Sizes: sz(4096, 8192, 16384)}},
 	{Name: "linear/set find Backtracking member (aa|a)*bx", Expect: linear, Why: "a Backtracking member whose branch dies early",
 		spec: spec{Config: "cfg/setbt2.yaml", Fn: "find", Gen: "rep:a|suf:b", Sizes: sz(4096, 8192, 16384)}},
-	{Name: "linear/set find Backtracking member under max_fallback_states 64", Expect: linear, Why: "the same, forced onto Backtracking",
+	{Name: "linear/set find Backtracking member under max_dfa_states 64", Expect: linear, Why: "the same, forced onto Backtracking",
 		spec: spec{Config: "cfg/setbt3.yaml", Fn: "find", Gen: "rep:a", Sizes: sz(4096, 8192, 16384)}},
 
 	// ---- Overrun: a call reads past the match it reports, the next call

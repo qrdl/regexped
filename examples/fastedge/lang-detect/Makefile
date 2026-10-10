@@ -18,12 +18,10 @@ URL       := http://127.0.0.1:$(PORT)/
 all: compose
 
 # Step 1 – compile the patterns into a component, plus the sibling .wit.
-# Both come from ONE compile, so they hang off a stamp.
-.component.stamp: regexped.yaml $(REGEXPED)
+# Both come from ONE compile: a grouped target (`&:`, GNU make 4.3 or later),
+# so either one missing or out of date reruns it.
+$(COMPONENT) $(WIT) &: regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
-	@touch $@
-
-$(COMPONENT) $(WIT): .component.stamp ;
 
 compile: $(COMPONENT)
 
@@ -75,4 +73,4 @@ test: $(FINAL)
 
 clean:
 	cargo clean
-	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL) .component.stamp .serve.log
+	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL) .serve.log

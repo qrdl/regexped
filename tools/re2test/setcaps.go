@@ -284,13 +284,19 @@ type setCapStats struct {
 	// to a chunk's compile, counted once per compile so it lines up with
 	// `dropped`.
 	eligible int
+	// forcedRefusals counts chunk compiles refused because a member fits no
+	// engine under --set-bt's forced max_dfa_states: the compile is right to
+	// refuse (a member over both limits must not compile), and the chunk is
+	// unchecked in that profile. Without --set-bt the refusal is a FAILURE.
+	forcedRefusals int
 }
 
 // setMaxDropFraction is the share of eligible patterns the compiler may
 // legitimately exclude before the run FAILS.
 //
-// Drops are documented behaviour — a fallback bucket's suffix DFA over
-// max_fallback_states — and are excluded from the comparison, so a regression
+// Drops are documented behaviour — a member's anchored DFA over
+// max_dfa_states, which the anchored pair cannot put on Backtracking — and are
+// excluded from the comparison, so a regression
 // that made the compiler drop EVERYTHING would empty every expectation and
 // exit 0 with a green table. That is the masking direction, so it needs a
 // ceiling rather than a printed number.
@@ -410,6 +416,10 @@ func (s *setCapStats) report() {
 		fmt.Printf("  patterns dropped by compiler (state limit, excluded from comparison): %d of %d eligible\n",
 			s.dropped, s.eligible)
 	}
+	if s.forcedRefusals > 0 {
+		fmt.Printf("  chunk compiles refused under --set-bt's forced limit (a member fits no engine; unchecked): %d\n",
+			s.forcedRefusals)
+	}
 }
 
 // gateProblems returns the run-level failures that are not individual
@@ -419,7 +429,7 @@ func (s *setCapStats) report() {
 func (s *setCapStats) gateProblems(forceBacktrack bool) []string {
 	var out []string
 	// BOTH gates are lifted under --set-bt / --force-backtrack, which cap
-	// max_fallback_states on purpose: mass drops and timeouts are the point of
+	// max_dfa_states on purpose: mass drops and timeouts are the point of
 	// those runs, not a regression in them.
 	if forceBacktrack {
 		return nil
@@ -467,7 +477,7 @@ func (s *setCapStats) totalPass() int {
 // the first, most informative report under megabytes of output.
 var setMaxPrint int
 
-// setBTFallback caps max_fallback_states for set compilation, forcing members
+// setBTFallback caps max_dfa_states for set compilation, forcing members
 // onto the Backtracking fallback engine. 0 = off.
 var setBTFallback int
 
@@ -1030,12 +1040,18 @@ func (r *setRunner) readBitmap() ([]int, error) {
 // ---------------------------------------------------------------------------
 // Dropped patterns.
 //
-// A set can legitimately EXCLUDE a pattern whose suffix DFA exceeds the
-// fallback bucket's state budget: the compiler warns, records it in
-// --diag-json's `state_limit_dropped`, and compiles the rest (docs/sets.md
-// "Fallback buckets can drop patterns"). A dropped pattern
-// reports nothing, so comparing it against an oracle that still expects its
-// matches would manufacture failures out of documented behaviour.
+// A set may leave a member out of match_any / match_all — its ANCHORED pair —
+// when the member's anchored DFA is over max_dfa_states: the compiler warns,
+// records it in --diag-json's `anchored_state_limit_dropped`, and compiles the
+// rest (docs/sets.md). A dropped pattern reports nothing there, so comparing
+// it against an oracle that still expects its matches would manufacture
+// failures out of documented behaviour.
+//
+// It may NOT leave one out of `find` or the scan pair: a member no engine
+// takes is a compile error. A drop there is therefore a FAILURE, not an
+// exclusion — which is how `.{0,870}` in a Unicode-mode set was seen: its
+// DFA was built under a fixed 2,048 states, its Backtracking program was over
+// 20,000 instructions, and the set compiled without it.
 //
 // The drop is captured from the warning itself rather than by re-deriving it:
 // re-running the analysis through CmdWriteDiagJSON would double the compile
@@ -1043,8 +1059,7 @@ func (r *setRunner) readBitmap() ([]int, error) {
 // module is about to be driven — there is no way for the two to disagree.
 //
 // `where` decides the scope: an "anchored bucket" drop removes the pattern
-// from match/match_any/match_all only, while a fallback-bucket drop removes it
-// from everything non-anchored.
+// from match_any/match_all only; any other drop is the failure above.
 
 type dropHandler struct {
 	find     map[int]bool
@@ -1135,14 +1150,15 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 		sets = append(sets, sc)
 	}
 	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	// --set-bt drives Backtracking set members: a low max_fallback_states pushes
+	// --set-bt drives Backtracking set members: a low max_dfa_states pushes
 	// ordinary corpus patterns onto the Backtracking fallback engine in bulk,
 	// the same way --force-backtrack does for single patterns by setting
-	// MaxDFAStates = -1. The naturally-dropped population is tiny (2 patterns
-	// in custom-sets, none in a 40-chunk corpus sample), so forcing the path
-	// is the only way to exercise it at corpus scale.
+	// MaxDFAStates = -1. Forcing the path is the only way to exercise it at
+	// corpus scale. A member whose Backtracking program is over
+	// max_bt_instructions then fits no engine and the chunk's compile is
+	// refused (forcedRefusals): `.{0,870}` in custom-sets-unicode.txt.
 	if setBTFallback > 0 {
-		cfg.MaxFallbackStates = setBTFallback
+		cfg.MaxDFAStates = config.Limit(setBTFallback)
 	}
 	return cfg
 }
@@ -1181,6 +1197,15 @@ func newSetRunner(
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
+	}
+	if len(droppedFind) > 0 {
+		ids := make([]int, 0, len(droppedFind))
+		for id := range droppedFind {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		return nil, fmt.Errorf("the set compiled without member(s) %v in find and the scan pair: "+
+			"a member no engine takes must fail the compile, not be dropped", ids)
 	}
 	// UNIQUE ids, not the sum of the two maps: a pattern dropped from both the
 	// find and the anchored packing is ONE pattern the comparison excludes,
@@ -1393,6 +1418,13 @@ func runSetProfile(
 	verbose bool,
 ) error {
 	r, err := newSetRunner(engine, wd, chunk.pats, strs, prof, hints)
+	if err != nil && setBTFallback > 0 && errors.Is(err, compile.ErrSetMemberFitsNoEngine) {
+		// --set-bt forced max_dfa_states down to push members onto
+		// Backtracking; one whose program is also over max_bt_instructions
+		// fits no engine, and the compile is right to refuse it.
+		setStats.forcedRefusals++
+		return nil
+	}
 	if err != nil {
 		setStats.bad("compile["+prof.name+"]", len(chunk.pats)*len(strs))
 		setFailf("FAIL  set chunk compile error (profile %s, %d patterns): %v\n      first pattern: %q\n",

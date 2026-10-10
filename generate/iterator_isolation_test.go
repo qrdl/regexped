@@ -617,7 +617,7 @@ func TestJSBacktrackingBudgetPerSearchAtRuntime(t *testing.T) {
 		ImportModule: "btsearch",
 		// The member's suffix DFA (82 states) is over this, so it runs on
 		// Backtracking in its bucket.
-		MaxFallbackStates: 16,
+		MaxDFAStates: 16,
 		Regexps: []config.RegexEntry{
 			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
 			{Name: "member", Pattern: `(?:aa|a){0,40}b|a`},

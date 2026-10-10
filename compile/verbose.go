@@ -279,15 +279,9 @@ func (r *Reporter) Render(w io.Writer) {
 				b.ID, truncate(lit, 24), b.AcceptKind, engine, len(b.Patterns), b.SuffixStates, b.TableBytes)
 		}
 		// The drops are the whole reason a user needs this: a set that does not
-		// contain a pattern does not report its matches, and today that is
-		// silent.
-		// Four lines, two scopes, never merged. The first TWO cost the
-		// pattern EVERY capability; the last two cost it match_any/match_all
-		// only, and it still answers on scan_any, scan_all and find. A reader
-		// who cannot tell the scopes apart cannot tell "gone from the set"
-		// from "gone from two of the five exports".
-		reportDrops(w, "dropped (fallback DFA over max_fallback_states)", d.StateLimitDropped)
-		reportDrops(w, "dropped (capture-bearing)", d.CaptureBearingDropped)
+		// report a pattern's matches must say so. Both cost the pattern
+		// match_any/match_all only — it still answers on scan_any, scan_all
+		// and find; a member no engine takes for those fails the compile.
 		reportDrops(w, "dropped from match_any/match_all (anchored DFA over the packer's limits)",
 			d.AnchoredStateLimitDropped)
 		reportDrops(w, "dropped from match_any/match_all (unparseable)", d.UnparseableDropped)

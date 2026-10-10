@@ -914,7 +914,7 @@ func TestSetAdmitsBacktracking(t *testing.T) {
 	}
 	// A budget no fallback DFA can meet: every member lands on BT.
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{sc}, MaxFallbackStates: 1,
+		Regexps: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(sc, cramped) {
 		t.Error("max_fallback_states = 1 must push these members onto Backtracking")

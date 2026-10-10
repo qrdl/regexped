@@ -1269,8 +1269,9 @@ func TestUnicodeSets(t *testing.T) {
 		}
 	}
 
-	// max_fallback_states: 16,384 for a Unicode set unless the key says
-	// otherwise, and byte mode's 1,024 unchanged. `\pL{4}\pN` needs 1,250.
+	// A set member's state limit is max_dfa_states: 16,384 for a Unicode set
+	// unless the key says otherwise, and byte mode's 1,024 unchanged.
+	// `\pL{4}\pN` needs 1,250.
 	btBuckets := func(cfg config.BuildConfig) int {
 		_, _, diags, err := CompileFileOpts(cfg, "", CompileSetOptions{})
 		if err != nil {
@@ -1288,11 +1289,94 @@ func TestUnicodeSets(t *testing.T) {
 	if n := btBuckets(cfg); n != 0 {
 		t.Errorf("Unicode set, no key: %d Backtracking buckets, want 0", n)
 	}
-	cfg.MaxFallbackStates = 1024
+	cfg.MaxDFAStates = 1024
 	if n := btBuckets(cfg); n != 1 {
-		t.Errorf("Unicode set, max_fallback_states 1024: %d Backtracking buckets, want 1", n)
+		t.Errorf("Unicode set, max_dfa_states 1024: %d Backtracking buckets, want 1", n)
 	}
-	if got := resolveMaxFallbackStates(0, []*PatternInfo{{rp: bytePat(`x`)}}); got != 0 {
-		t.Errorf("byte mode, no key: %d, want 0 (the 1,024 default)", got)
+	byteSet := SetSpec{Patterns: []*PatternInfo{{rp: bytePat(`x`)}}}
+	if got := (CompileSetOptions{}).resolvedFor(byteSet).maxFallbackStates(); got != defaultMaxDFAStates {
+		t.Errorf("byte mode, no key: %d, want %d", got, defaultMaxDFAStates)
+	}
+}
+
+// TestSetLimitsTravelWithTheMode pins buildLimits: the configured
+// max_dfa_states and max_bt_instructions travel with a pattern's mode onto
+// every tree and program built from it, and an automaton is built up to the
+// larger of the mode's cap and the limit. A set member's DFA used to stop at a
+// fixed 2,048, so `.{0,870}` in Unicode mode (7,832 states) left its set —
+// its Backtracking program, 21,752 instructions, being over 20,000 too.
+func TestSetLimitsTravelWithTheMode(t *testing.T) {
+	for _, c := range []struct {
+		lim     buildLimits
+		unicode bool
+		cap     int
+		bt      int
+	}{
+		{buildLimits{}, false, maxHelperDFAStates, maxBTFallbackInstructions},
+		{buildLimits{}, true, defaultMaxDFAStatesUnicode, maxBTFallbackInstructions},
+		{buildLimits{dfaStates: 100000, btInsts: 50}, false, 100000, 50},
+		{buildLimits{dfaStates: -1, btInsts: -1}, true, defaultMaxDFAStatesUnicode, 0},
+	} {
+		if got := c.lim.dfaBuildCap(c.unicode); got != c.cap {
+			t.Errorf("%+v unicode=%v: dfaBuildCap %d, want %d", c.lim, c.unicode, got, c.cap)
+		}
+		if got := c.lim.btLimit(); got != c.bt {
+			t.Errorf("%+v: btLimit %d, want %d", c.lim, got, c.bt)
+		}
+	}
+	if off := (buildLimits{btInsts: -1}); !off.btOff() || off.btFits(1) {
+		t.Error("max_bt_instructions: 0 must fit no Backtracking program")
+	}
+	if (buildLimits{}).btFits(maxBTFallbackInstructions+1) || !(buildLimits{}).btFits(maxBTFallbackInstructions) {
+		t.Error("the default Backtracking limit is not inclusive at 20,000")
+	}
+	if limitsOf(nil) != (buildLimits{}) || sameLimits(nil) != (buildLimits{}) {
+		t.Error("no options, no programs: the zero limits")
+	}
+
+	opts := CompileOptions{Unicode: true, MaxDFAStates: 5000, MaxBTInstructions: 7}
+	rp, err := resolvePattern(`a.b`, nil, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, _ := rp.parse()
+	prog, _ := compileProg(tree.reversed())
+	want := buildLimits{dfaStates: 5000, btInsts: 7}
+	if rp.lim != want || tree.lim != want || prog.lim != want || rp.source("x").lim != want {
+		t.Errorf("limits lost on the way: pattern %+v tree %+v reversed prog %+v", rp.lim, tree.lim, prog.lim)
+	}
+	if got := prog.dfaBuildCap(); got != defaultMaxDFAStatesUnicode {
+		t.Errorf("reversed Unicode program's cap = %d, want %d", got, defaultMaxDFAStatesUnicode)
+	}
+	if got := (setMode{pm: progModeByte, lim: want}).member("x").lim; got != want {
+		t.Errorf("a set member takes the set's limits: got %+v", got)
+	}
+
+	// The member that used to be dropped: in a Unicode set it gets its DFA.
+	buf, restore := captureWarnings(t)
+	defer restore()
+	yes := true
+	cfg := config.BuildConfig{
+		Regexps: []config.RegexEntry{{Name: "any", Pattern: `.{0,870}`}, {Name: "zero", Pattern: `0`}},
+		Sets: []config.SetConfig{{Name: "s", Find: "f", Unicode: &yes,
+			Patterns: config.PatternSelector{All: true}}},
+	}
+	_, _, diags, err := CompileFileDiag(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFileDiag: %v", err)
+	}
+	found := false
+	for _, b := range diags[0].Buckets {
+		for _, p := range b.Patterns {
+			if p.Name == "any" {
+				found = true
+				if b.Type == "bt-fallback" || b.SuffixStates != 7832 {
+					t.Errorf("`.{0,870}` in bucket %+v, want a 7,832-state DFA bucket", b)
+				}
+			}
+		}
+	}
+	if !found || strings.Contains(buf.String(), "dropped") {
+		t.Errorf("`.{0,870}` not in any bucket (warnings: %q)", buf.String())
 	}
 }

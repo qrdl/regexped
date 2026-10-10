@@ -462,18 +462,9 @@ type oracleEntry struct {
 // best effort and the sanity check is skipped rather than trusted.
 func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDiag, kind capKind) ([]oracleEntry, bool) {
 	dropped := map[int]bool{}
-	for _, refs := range [][]compile.PatternRef{
-		diag.CaptureBearingDropped, diag.StateLimitDropped,
-	} {
-		for _, r := range refs {
-			dropped[r.ID] = true
-		}
-	}
 	// These two exclude a pattern from the ANCHORED capabilities only; `find`
-	// and the scan pair keep it. AnchoredStateLimitDropped is the anchored
-	// packer's own state-limit drop — separate from StateLimitDropped above,
-	// which the `find` packers write and which means the pattern left the set
-	// entirely.
+	// and the scan pair keep every member (one no engine takes fails the
+	// compile).
 	if kind.anchored() {
 		for _, refs := range [][]compile.PatternRef{
 			diag.UnparseableDropped, diag.AnchoredStateLimitDropped,

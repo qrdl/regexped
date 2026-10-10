@@ -34,15 +34,20 @@ namespace:      "acme"     # optional; prefixes the fixed symbols a stub declare
                            #   <Set>PatternCount). Two stubs in one package or C translation unit need
                            #   distinct set names, and choosing them is yours. No-op for Rust, whose
                            #   `pub mod <rust_module>` already isolates each stub.
-max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking
-                           #   (default 1024; 16384 for a pattern in Unicode mode, see `unicode:`)
+max_dfa_states: 1024       # optional; max states of ANY DFA/TDFA — a single pattern's, a set member's,
+                           #   a set bucket's — before falling back to Backtracking (default 1024;
+                           #   16384 in Unicode mode, see `unicode:`). 0 = always Backtracking.
+                           #   See "Limits" below
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
                            #   `compile --verbose` prints, per pattern, the engine chosen, why, and
                            #   the DFA/TDFA state and TDFA register counts against these limits
-max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024; 16384 for a Unicode-mode set)
-                           #   A member over it moves to the Backtracking engine, with a warning;
-                           #   `compile --verbose` prints each bucket's engine
-max_union_states: 4096     # optional; max states while building a SET's union automata (default 4096)
+max_bt_instructions: 20000 # optional; max Backtracking program size, in instructions (default 20000).
+                           #   0 = never Backtracking: a pattern or set member that needs it fails
+max_set_bucket_size: 2MB   # optional; max table of one SET bucket (default 128 bytes per max_dfa_states
+                           #   state: 128 KB; 2 MB in Unicode mode). A size, spelled like max_memory
+max_split_table_size: 64MB # optional; max TOTAL tables of one SET's split members (default 4 MB;
+                           #   64 MB for a Unicode-mode set). A size, spelled like max_memory
+max_union_states: 4096     # optional; max states while building a SET's union automata (default 4096; 16384 for a Unicode-mode set)
                            #   — see "max_union_states:" below
 max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
                            #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
@@ -97,6 +102,10 @@ sets:
 > line-numbered load error. That catches typos (`mach_func:`) and the retired
 > set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
 > `batch_size` — see [sets.md](sets.md#the-five-capabilities).
+
+> **`max_fallback_states:` was retired and is a load error.** A set member's
+> state limit is `max_dfa_states`, the one key for every automaton; give it
+> there.
 
 > **Three tool keys were retired and are now load errors:** `wasm_merge:`,
 > `wasm_tools:` and `wac:`. Use `wasm_merge_path:`, `wasm_tools_path:` and
@@ -189,6 +198,46 @@ Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture gr
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
 
+### Limits — what each key bounds, and what happens past it
+
+Every limit says the same thing at its edge: a pattern or set member over a
+DFA limit moves to Backtracking; one that no engine takes **does not compile**,
+and the error names the pattern and the key that would let it compile. Nothing
+is ever left out of `find` or the scan pair to make a build succeed.
+
+| Key | Default | Bounds | Past it |
+|---|---|---|---|
+| `max_dfa_states` | 1,024 (16,384 in Unicode mode) | every DFA/TDFA: a single pattern's, a set member's, a set bucket's | Backtracking |
+| `max_bt_instructions` | 20,000 | a Backtracking program | compile error naming `max_bt_instructions` (and `max_dfa_states`, when raising it would keep the pattern on a DFA) |
+| `max_tdfa_regs` | 32 | a TDFA's capture registers | Backtracking |
+| `max_set_bucket_size` | 128 bytes per `max_dfa_states` state | one set bucket's table | the member goes to another bucket (more buckets, a dearer walk) |
+| `max_split_table_size` | 4 MB (64 MB in Unicode mode) | the tables of one set's split members, in total | the rest of them take the Backtracking search |
+| `max_union_states` | 4,096 (16,384 in Unicode mode) | a set's union automata, while being built | a slower scan / probe route |
+| `max_memory` | none | the module's whole memory | a search answers `-2`; tables over it are a compile error |
+
+**`0` means off** for the two count limits: `max_dfa_states: 0` puts every
+pattern and set member on Backtracking, and `max_bt_instructions: 0` forbids
+Backtracking, so a pattern or member that needs it fails the compile. Leaving
+a key out means its default; a negative value is a load error. For the two
+sizes, `0` is a real 0: no two members share a bucket, or no split member gets
+the table-driven search.
+
+**How far an automaton is built.** A DFA is built up to the larger of
+`max_dfa_states` and a construction cap — 2,048 states in byte mode, 16,384 in
+Unicode mode — so a configured limit above the cap always takes effect, and a
+set member is built as far as the same pattern alone. A set member used to stop
+at a fixed 2,048: `.{0,870}` in Unicode mode needs 7,832 states and 21,752
+Backtracking instructions, and the set compiled without it.
+
+**`max_bt_instructions` and WebAssembly's function size.** A Backtracking body
+grows with its program — about 86 bytes per instruction in byte mode and 120
+in Unicode mode — and WebAssembly loads no function over 7,654,321 bytes. Raised
+far enough (past roughly 89,000 instructions in byte mode, 60,000 in Unicode
+mode), the key lets a pattern through whose module no runtime would load; that
+is a compile error saying one generated function is over WebAssembly's cap,
+naming the pattern and the size. Of 894 real patterns measured (WAF rules, the
+examples), none needs more than 20,000 instructions in its own mode.
+
 ### `max_memory:` — a cap on the module's memory
 
 Every pattern and set in a config compiles into ONE module with one memory,
@@ -258,19 +307,39 @@ the tables and the search's working memory only.
 A set whose members have no literal to search for is scanned by ONE automaton
 built over all of them: `scan_any` and `scan_all` read the input once, whatever
 the member count. `match_any` and `match_all` use an anchored automaton of the
-same kind. `max_union_states` (default 4,096) caps their construction. A set
-past the cap still answers correctly, by a slower route: members that are not
-provably linear are split out to searches of their own, and the rest are walked
-position by position. `compile --diag-json` shows which route a set took
-(`union_scan.used`, and `refused: "construction"` when the cap was the reason).
+same kind. `max_union_states` caps their construction: by default 4,096 states
+in byte mode and **16,384 for a set in Unicode mode**. A set past the cap still
+answers correctly, by a slower route: members that are not provably linear are
+split out to searches of their own, and the rest are walked position by
+position (`match_any` / `match_all`: probed bucket by bucket).
+`compile --diag-json` shows which route a set took (`union_scan.used` and
+`anchored_union.used`, with `refused: "construction"` when the cap was the
+reason).
 
-The cap matters most in Unicode mode, where a letter class such as `\pL` costs
-hundreds of states, so a few literal-less members can pass 4,096. Measured on
-an 8-member Unicode-mode set, scanning 64 KB of mixed-script text that no
-member matches:
+The cap counts states WHILE the automaton is being built, before duplicate
+states are merged, so a set can need far more than it finally keeps: the set
+{`\pL{4}\pN`, `\pN{3}\pL{3}`, `\pL{5}x`} passes 8,192 while building and
+keeps 2,740.
+
+The default is larger in Unicode mode because a letter class such as `\pL`
+costs hundreds of states, so a few literal-less members pass 4,096. Measured
+on 4 KB inputs (fuel per byte), 4,096 against 16,384:
+
+| Set | Capability, input | Fuel per byte | Compile time | Compiler memory | Module |
+|---|---|---|---|---|---|
+| the 3-member set above | `scan_any`, English text (no match) | 378 → 20.9 | 1.9 → 8.6 s | 157 → 491 MB | 2.06 → 2.64 MB |
+| `examples/fastedge/lang-detect`'s 23-member `latin` set | `match_all`, English text (no match) | 174 → 29 | 12.1 → 25.7 s | 136 → 449 MB | 1.08 → 2.60 MB |
+| `examples/browser/homoglyph`, lang-detect's `cyrillic` | `scan_*`, `match_all` | unchanged: their automata fit 4,096 | — | — | — |
+
+No input measured slower at 16,384. Set `max_union_states: 4096` on a
+Unicode-mode config to get the byte-mode budget back when compile time or
+compiler memory matters more than scan speed.
+
+An earlier measurement, on an 8-member Unicode-mode set scanning 64 KB of
+mixed-script text that no member matches:
 
 ```yaml
-max_union_states: 16384
+max_union_states: 16384   # the Unicode-mode default
 regexps:
   - { name: m0, pattern: '\pL+\p{Greek}' }
   - { name: m1, pattern: '\p{Greek}+\p{Cyrillic}' }
@@ -289,8 +358,8 @@ sets:
 
 | `max_union_states` | union automaton | `scan_all` fuel per byte | module | compile time |
 |---|---|---|---|---|
-| 4096 (default) | refused: needs more states | 102 (members split out) | 1.39 MB | 55 s |
-| 16384 | 2,179 states | 23 | 0.94 MB | 173 s |
+| 4096 (the byte-mode default) | refused: needs more states | 102 (members split out) | 1.39 MB | 55 s |
+| 16384 (the Unicode-mode default) | 2,179 states | 23 | 0.94 MB | 173 s |
 
 A larger cap costs compile time and compiler memory, never correctness; a
 32-member set of the same kind did not fit in 16,384, and at 65,536 its
@@ -396,25 +465,25 @@ On a `sets:` entry the key sets the set's mode, and a set runs in one mode:
 `compile --verbose` and `--diag-json` report the mode each pattern and set
 was compiled in.
 
-**`max_dfa_states` is 16,384 by default for a pattern in Unicode mode**
-(1,024 in byte mode). A Unicode class is decoded byte by byte, so it costs
-DFA states per position — about 290 for `\pL` — and a pattern over the limit
-falls back to Backtracking, whose program grows with the class too: `\pL{5}x`
-needs 1,452 states and measured 39 fuel per byte as a DFA against about
-26,000 on Backtracking. A DFA table over 256 states takes 512 bytes per state,
-so the default allows about 8 MB per automaton. When a pattern needs more and
-its Backtracking program is over that engine's fixed limit of 20,000
-instructions, the compile error says which, and `compile --verbose` prints the
-state count and, for a Unicode-mode pattern, the working memory a search keeps
-per input byte (`memory:` lines). `tools/pattest` takes `-max-dfa-states N`
-to measure what a different limit does to your pattern.
+**`max_dfa_states` is 16,384 by default in Unicode mode** (1,024 in byte
+mode), for a single pattern and a set alike. A Unicode class is decoded byte by
+byte, so it costs DFA states per position — about 290 for `\pL` — and a
+pattern over the limit falls back to Backtracking, whose program grows with
+the class too: `\pL{5}x` needs 1,452 states and measured 39 fuel per byte as a
+DFA against about 26,000 on Backtracking. A DFA table over 256 states takes 512
+bytes per state, so the default allows about 8 MB per automaton. When a pattern
+needs more and its Backtracking program is over `max_bt_instructions`, the
+compile error says which, and `compile --verbose` prints the state count and,
+for a Unicode-mode pattern, the working memory a search keeps per input byte
+(`memory:` lines). `tools/pattest` takes `-max-dfa-states N` to measure what a
+different limit does to your pattern.
 
-**`max_fallback_states` is 16,384 by default for a set in Unicode mode** too
-(1,024 in byte mode), for the same reason: a member over it runs on
-Backtracking. On a 32-member set over 64 KB of mixed-script text, the one
-member past 1,024 (`\pL{4}\pN`, 1,250 states) on Backtracking took `scan_all`
-to 152,500 fuel per byte; as a DFA, 2,661, in a smaller module (3.7 MB
-against 5.5 MB).
+In a set the same limit decides whether a member keeps its DFA: on a 32-member
+set over 64 KB of mixed-script text, the one member past 1,024 (`\pL{4}\pN`,
+1,250 states) on Backtracking took `scan_all` to 152,500 fuel per byte; as a
+DFA, 2,661, in a smaller module (3.7 MB against 5.5 MB). It also bounds a set
+bucket (with `max_set_bucket_size`), so in Unicode mode several large members
+can share one walk.
 
 ### `hints:` — LikelyMode and batch-find compile hints
 

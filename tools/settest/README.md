@@ -64,9 +64,10 @@ input is "matching" when **any** pattern the set actually contains matches it â€
 anchored over the whole input for `match_any`/`match_all`, unanchored for
 `scan_any`/`scan_all`/`find`.
 
-"Actually contains" is doing work there. A pattern the compiler dropped from
-the set (over `max_fallback_states`, capture-bearing) can never match, so it is
-excluded from the oracle and a warning names it. Otherwise inputs would land in
+"Actually contains" is doing work there. A pattern the compiler left out of
+the set's `match_any`/`match_all` (its anchored DFA over `max_dfa_states`)
+can never match there, so it is excluded from the oracle and a warning names
+it. Otherwise inputs would land in
 the wrong bucket and the sanity check below would fail for a reason that is not
 a bug.
 

@@ -455,7 +455,7 @@ func litAnchorLinear(pattern resolvedPattern, lap *litAnchorPoint) bool {
 func regexpCanContain(re resolvedTree, lit []byte) bool {
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
 	prog, _ := compileProg(re)
-	d, ok := newDFA(prog, false, maxHelperDFAStates)
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
 	if !ok {
 		return true
 	}
@@ -697,7 +697,7 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 		if !pattern.unicode() && unsupportedRune(prog.prog, opts.ByteMode) >= 0 {
 			return nil
 		}
-		d, ok := newDFA(prog, lf, max(maxHelperDFAStates, maxStates))
+		d, ok := newDFA(prog, lf, max(prog.dfaBuildCap(), maxStates))
 		if !ok {
 			return nil
 		}

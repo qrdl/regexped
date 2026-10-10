@@ -171,7 +171,11 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 // `scan_any` correctly reported a pattern this harness had already written off,
 // and the disagreement was read as a wrong answer.
 //
-//   - all: the pattern left the set ENTIRELY. No capability answers for it.
+//   - all: the pattern left the set ENTIRELY. Always empty now: a member no
+//     engine takes for `find` or the scan pair fails the compile, and the
+//     diagnostic that listed such members is gone. Kept so every oracle keeps
+//     one shape — and so a harness that sees it non-empty fails loudly
+//     (set_caps_test's "members dropped").
 //   - anchored: `all`, PLUS the patterns the anchored packer alone refused.
 //     Those keep scan_any, scan_all and `find`, and lose only
 //     match_any/match_all.
@@ -190,12 +194,6 @@ type setDrops struct {
 func dropsFromSet(diags []compile.SetDiag) setDrops {
 	d := setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
 	for _, sd := range diags {
-		for _, ref := range sd.StateLimitDropped {
-			d.all[ref.ID] = true
-		}
-		for _, ref := range sd.CaptureBearingDropped {
-			d.all[ref.ID] = true
-		}
 		for _, ref := range sd.AnchoredStateLimitDropped {
 			d.anchored[ref.ID] = true
 		}

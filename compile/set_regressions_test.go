@@ -422,7 +422,7 @@ func TestWideFormIsConsistentlyRead(t *testing.T) {
 		}},
 		// Small enough that every pattern is BT-admitted, which is what makes
 		// cs.wideAll() true at an id space of 8.
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 	}
 	if _, _, err := CompileFile(cfg, ""); err != nil {
 		t.Fatalf("compile: %v", err)

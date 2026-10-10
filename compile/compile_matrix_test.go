@@ -1091,14 +1091,33 @@ func TestSelectEngineRejection(t *testing.T) {
 	}
 }
 
-// TestMaxFallbackStatesDefault covers the default-value branch of
-// CompileSetOptions.maxFallbackStates.
+// TestMaxFallbackStatesDefault covers the three spellings of
+// CompileSetOptions' limits: 0 is the default (max_dfa_states' byte-mode
+// 1,024, and the buckets' 128 bytes per state), positive is itself, negative
+// an explicit 0 — max_dfa_states: 0, every member on Backtracking.
 func TestMaxFallbackStatesDefault(t *testing.T) {
 	if got := (CompileSetOptions{}).maxFallbackStates(); got != 1024 {
 		t.Errorf("maxFallbackStates default = %d, want 1024", got)
 	}
 	if got := (CompileSetOptions{MaxFallbackStates: 42}).maxFallbackStates(); got != 42 {
 		t.Errorf("maxFallbackStates custom = %d, want 42", got)
+	}
+	off := CompileSetOptions{MaxFallbackStates: -1}
+	if got := off.maxFallbackStates(); got != 0 || !off.dfaOff() || off.dfaStatesOption() != -1 {
+		t.Errorf("maxFallbackStates off = %d (dfaOff %v, option %d), want 0, true, -1",
+			got, off.dfaOff(), off.dfaStatesOption())
+	}
+	if got := (CompileSetOptions{BudgetStates: 100}).budgetBytes(); got != 100*bucketBytesPerState {
+		t.Errorf("budgetBytes from 100 states = %d, want %d", got, 100*bucketBytesPerState)
+	}
+	if got := (CompileSetOptions{BudgetBytes: -1}).budgetStatesPreFilter(); got != 0 {
+		t.Errorf("pre-filter under a zero byte budget = %d, want 0", got)
+	}
+	if got := (CompileSetOptions{SplitTableBudget: -1}).splitTableBudget(); got != 0 {
+		t.Errorf("splitTableBudget explicit 0 = %d, want 0", got)
+	}
+	if got := (CompileSetOptions{}).splitTableBudget(); got != splitTableBudget {
+		t.Errorf("splitTableBudget default = %d, want %d", got, splitTableBudget)
 	}
 }
 
@@ -2053,7 +2072,7 @@ func (c singleCase) build() config.BuildConfig {
 	}
 	return config.BuildConfig{
 		Regexps:      []config.RegexEntry{entry},
-		MaxDFAStates: c.maxDFAStates,
+		MaxDFAStates: config.Limit(c.maxDFAStates),
 		MaxTDFARegs:  c.maxTDFARegs,
 	}
 }
@@ -2417,7 +2436,7 @@ func TestCaptureCrossProductCompiles(t *testing.T) {
 					Regexps: []config.RegexEntry{
 						{Name: "p", Pattern: pat, GroupsFunc: "p_groups"},
 					},
-					MaxDFAStates: b.states,
+					MaxDFAStates: config.Limit(b.states),
 					MaxTDFARegs:  b.regs,
 				}, "")
 				if err != nil {

@@ -405,8 +405,8 @@ func TestBTSetSplitMemberFollowsTheHostGlobal(t *testing.T) {
 			hints = []string{"batch-find"}
 		}
 		cfg := config.BuildConfig{
-			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
-			Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+			MaxDFAStates: 1, // every member's suffix DFA is over it: Backtracking
+			Regexps:      []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
 			Sets: []config.SetConfig{{Name: "s", Find: "s_find", Overlapping: overlapping, Hints: hints,
 				Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
 		}

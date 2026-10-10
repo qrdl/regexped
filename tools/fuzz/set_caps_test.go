@@ -696,9 +696,6 @@ func FuzzSetCaps(f *testing.F) {
 					t.Skip("NFA too large for FuzzSetCaps' eight-body compile (see maxSetCapsNFAInsts)")
 				}
 			}
-			if regexp.MustCompile(p).NumSubexp() > 0 {
-				t.Skip("capture-bearing patterns are dropped from sets by design")
-			}
 		}
 
 		checkSetCapsAllFroms(t, pats, input)
@@ -2026,9 +2023,6 @@ func FuzzFindBatch(f *testing.F) {
 			if reason := skipPattern(p, input); reason != "" {
 				t.Skip(reason)
 			}
-			if regexp.MustCompile(p).NumSubexp() > 0 {
-				t.Skip("capture-bearing patterns are dropped from sets by design")
-			}
 		}
 		checkBatch(t, pats, input)
 	})
@@ -3011,9 +3005,9 @@ func TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone(t *testing.T) {
 	pats := []string{`(?:a|bc){1,30}?x`, `(?:etc|proc)/(?:passwd|self)\b`}
 	inputs := []string{"zzz bcbcax", ";cat /etc/passwd", "none here", "proc/self ax"}
 	cfg := config.BuildConfig{
-		Output:            "merged.wasm", // embedded: memory 0 is imported
-		MaxFallbackStates: 1,             // every member's suffix DFA is over it: Backtracking
-		Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Output:       "merged.wasm", // embedded: memory 0 is imported
+		MaxDFAStates: 1,             // every member's suffix DFA is over it: Backtracking
+		Regexps:      []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
 		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan",
 			Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
 	}
@@ -3595,9 +3589,9 @@ func compileSetBT(pats []string, maxFallback int) ([]byte, map[int]bool, error) 
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	cfg := config.BuildConfig{
-		Regexps:           entries,
-		Sets:              sets,
-		MaxFallbackStates: maxFallback,
+		Regexps:      entries,
+		Sets:         sets,
+		MaxDFAStates: config.Limit(maxFallback),
 	}
 	w, _, diags, err := compile.CompileFileDiag(cfg, "")
 	return w, droppedFromSet(diags), err
@@ -3714,7 +3708,7 @@ func TestSetBTStackGrows(t *testing.T) {
 			names[i] = fmt.Sprintf("p%d", i)
 			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
 		}
-		cfg := config.BuildConfig{MaxFallbackStates: 1, Regexps: entries, Sets: []config.SetConfig{{
+		cfg := config.BuildConfig{MaxDFAStates: 1, Regexps: entries, Sets: []config.SetConfig{{
 			Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 			ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 			Patterns: config.PatternSelector{Names: names},
@@ -3999,7 +3993,7 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 					sc.Name = "g"
 					sc.Patterns = config.PatternSelector{All: true}
 					cfg := config.BuildConfig{
-						Regexps: entries, MaxFallbackStates: mf,
+						Regexps: entries, MaxDFAStates: config.Limit(mf),
 						Sets: []config.SetConfig{sc},
 					}
 					w, _, diags, err := compile.CompileFileDiag(cfg, "")
@@ -4062,8 +4056,8 @@ func compileBTBatchSet(pats []string, maxFallback int) ([]byte, int, error) {
 		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps:           entries,
-		MaxFallbackStates: maxFallback,
+		Regexps:      entries,
+		MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{{
 			Name:        "s",
 			Find:        "set_find",

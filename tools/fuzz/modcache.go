@@ -11,6 +11,7 @@ import (
 	"time"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/internal/searchblock"
 )
 
@@ -89,7 +90,8 @@ const slowCompileDeadline = 4 * time.Second
 // fuzzInputCompileBudget is how long ALL the compiles of one fuzz input may
 // take under -unicode, where an input compiles more than once — a set target
 // builds its capability module and its gated one, FuzzGroupsBothBodies one
-// module per leg (three), FuzzGroupsBothEngines one per engine — and two
+// module per leg (three), FuzzGroupsBothEngines one per engine plus the engine
+// selection that decides whether its TDFA leg runs — and two
 // compiles each within slowCompileDeadline still overran the worker's 10s in a
 // loaded run.
 const fuzzInputCompileBudget = 5 * time.Second
@@ -118,6 +120,24 @@ func beginFuzzInput() {
 func fuzzingUnicode() bool {
 	f := flag.Lookup("test.fuzz")
 	return *unicodeMode && f != nil && f.Value.String() != ""
+}
+
+// selectEngineWithinBudget is compile.SelectEngine in the run's mode, waited
+// for within the fuzz input's compile budget like a compile (runWithDeadline):
+// choosing the engine builds the TDFA, which for `0*(0000{520}000{520}0)` took
+// 5.1 s on its own, before the budget's builds had begun. false when it ran
+// past the budget; outside a fuzz run under -unicode it is waited for.
+func selectEngineWithinBudget(pat string) (compile.EngineType, bool) {
+	opts := withMode(compile.CompileOptions{})
+	if !fuzzingUnicode() {
+		eng, _ := compile.SelectEngine(pat, opts)
+		return eng, true
+	}
+	var eng compile.EngineType
+	if !runWithDeadline(func() { eng, _ = compile.SelectEngine(pat, opts) }) {
+		return 0, false
+	}
+	return eng, true
 }
 
 // cachedCompileSized is cachedCompile for a compile that also reports what its

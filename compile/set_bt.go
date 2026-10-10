@@ -10,9 +10,9 @@ import (
 
 // ── Backtracking as a set fallback engine ────────────────
 //
-// A set member whose fallback-bucket DFA exceeds max_fallback_states used to be
-// DROPPED: warned, recorded in --diag-json's state_limit_dropped, and then
-// absent from every capability of that set at runtime. The same pattern
+// A set member whose fallback-bucket DFA exceeded its state limit used to be
+// DROPPED: warned, recorded in --diag-json, and then absent from every
+// capability of that set at runtime. The same pattern
 // compiled on its own falls back to Backtracking and keeps working, so the set
 // path was strictly weaker than the single-pattern path on identical input.
 //
@@ -41,15 +41,13 @@ import (
 // rather than inheriting confidence from the single-pattern paths.
 //
 // A pattern Backtracking cannot take either — its NFA exceeds
-// maxBTFallbackInstructions, or its suffix AST does not compile — is still
-// dropped and still reported: admitBTFallback returns nil and the caller keeps
-// its existing warn-and-continue. No pattern known to reach that branch
-// remains: a member over the instruction cap fails the whole set compile
-// earlier, in analyzePattern.
+// max_bt_instructions, or its suffix AST does not compile — fits no engine,
+// and the set does not compile (admitFallback). `.{0,870}` in Unicode mode
+// reached it before a member's DFA was built under max_dfa_states: 7,832
+// states over a fixed 2,048, then 21,752 instructions over 20,000.
 
-// admitBTFallback tries to build a Backtracking driver for a pattern that is
-// about to be dropped from a set. Returns nil when BT cannot take it either,
-// in which case the caller drops the pattern exactly as before.
+// admitBTFallback tries to build a Backtracking driver for a pattern no DFA
+// bucket takes. Returns nil when BT cannot take it either.
 //
 // ast is the pattern's full AST (patternSuffixAST), captures already
 // irrelevant because sets never report them.
@@ -59,7 +57,7 @@ func admitBTFallback(ast resolvedTree) *btBucketInfo {
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
 	prog, _ := compileProg(ast)
-	if len(prog.prog.Inst) > maxBTFallbackInstructions {
+	if !prog.lim.btFits(len(prog.prog.Inst)) {
 		return nil
 	}
 	bt := newBacktrack(prog)
@@ -70,8 +68,12 @@ func admitBTFallback(ast resolvedTree) *btBucketInfo {
 }
 
 // setPatternInfos resolves one set's selected pattern indices into the
-// PatternInfos CompileSet works from, dropping capture-bearing entries the way
-// a set always has.
+// PatternInfos CompileSet works from — every one of them. An entry with
+// groups_func is a member too: a set reports group 0 only, and
+// analyzeSetMember strips the capture groups for the set alone, as it does
+// for any member whose pattern has them; the entry's own groups export is
+// unchanged. Such entries used to be dropped from every set that selected
+// them, silently.
 //
 // Extracted so CompileFileDiag and SetAdmitsBacktracking share ONE
 // implementation. They must: the predicate exists to tell `generate` which ABI
@@ -89,13 +91,11 @@ func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []
 		return nil, nil, err
 	}
 	mode.pg = progress
+	mode.lim = limitsOfConfig(cfg)
 	var infos []*PatternInfo
 	var globalIDs []int
 	for _, idx := range selectedIdx {
 		re := cfg.Regexps[idx]
-		if re.CaptureStubsRequested() {
-			continue // drop capture-bearing
-		}
 		info, err := analyzeSetMember(re, mode.member(re.Pattern), prefixPool, suffixPool)
 		if err != nil {
 			patLabel := re.Name
@@ -482,6 +482,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		}
 	}
 	var fallbacks [][]byte
+	var fallbackOwners []string
 	calls := map[int]btBucketCall{}
 	k := 0
 	for bi, bkt := range cs.buckets {
@@ -530,8 +531,10 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			call.route = !plan.force && member != nil
 			driver = patchBTFallbackCall(driver, callOffs, call.fallbackIdx)
 			fallbacks = append(fallbacks, fb)
+			fallbackOwners = append(fallbackOwners, patternRefFor(bkt.patterns[0]).Name)
 		}
 		cs.btFnBodies = append(cs.btFnBodies, driver)
+		cs.btFnOwners = append(cs.btFnOwners, patternRefFor(bkt.patterns[0]).Name)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
 		// things for parameter 7; passing them as one flag made the body read
@@ -544,6 +547,7 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		k++
 	}
 	cs.btFnBodies = append(cs.btFnBodies, fallbacks...)
+	cs.btFnOwners = append(cs.btFnOwners, fallbackOwners...)
 	// Probes, for the scan and anchored capabilities. A bucket that filled
 	// only its suffix slot left these EMPTY — a declared function with no
 	// body, which is a module that will not parse.

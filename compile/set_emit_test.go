@@ -2,7 +2,9 @@ package compile
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp/syntax"
 	"strings"
 	"testing"
@@ -517,6 +519,25 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	if got := buildUnionScanDFA(specFor(t, []string{`a.{13}b`}, 65536), 0, false); got == nil {
 		t.Error("a.{13}b was refused under max_union_states 65536")
 	}
+	// The default follows the set's mode: 16,384 in Unicode mode, where a
+	// letter class costs hundreds of states. `\pL{4}x` needs more than 4,096
+	// states to BUILD and keeps 1,162 once minimized, so the byte-mode default
+	// refused it (with `\pN{3}\pL{3}` and `\pL{5}x` beside it, scan_any went
+	// from 378 fuel/byte to 20.9 at 16,384).
+	uni := []string{`\pL{4}x`}
+	if got := specFor(t, uni, 0).maxUnionStates(); got != maxUnionScanStatesUnicode {
+		t.Errorf("Unicode-mode set: default union bound %d, want %d", got, maxUnionScanStatesUnicode)
+	}
+	if got := specFor(t, []string{`a.{13}b`}, 0).maxUnionStates(); got != maxUnionScanStates {
+		t.Errorf("byte-mode set: default union bound %d, want %d", got, maxUnionScanStates)
+	}
+	if got := buildUnionScanDFA(specFor(t, uni, 0), 0, false); got == nil {
+		t.Errorf("%v was refused under the Unicode-mode default", uni)
+	}
+	if got := buildUnionScanDFA(specFor(t, uni, maxUnionScanStates), 0, false); got != nil {
+		t.Errorf("%v was accepted under max_union_states %d (%d states); "+
+			"the shape no longer reaches the byte-mode bound", uni, maxUnionScanStates, got.numStates)
+	}
 	small := []string{`[0-9]{3}`, `[a-z]{2}`}
 	if buildUnionScanDFA(specFor(t, small, 0), 0, false) == nil || buildAnchoredUnionDFA(specFor(t, small, 0), 0, false, false) == nil {
 		t.Fatal("a two-member set was refused at the default budget")
@@ -949,7 +970,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 		Patterns: config.PatternSelector{Names: []string{"p00", "p01"}},
 	}
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{byName}, MaxFallbackStates: 1,
+		Regexps: entries, Sets: []config.SetConfig{byName}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(byName, cramped) {
 		t.Error("a NAMED selection of members that all land on Backtracking reported none")
@@ -973,7 +994,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 			Name: "s", MatchAll: "s_match_all",
 			Patterns: config.PatternSelector{All: true},
 		}},
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 	}
 	if SetAdmitsBacktracking(unparseable.Sets[0], unparseable) {
 		t.Error("a set whose only member does not parse was predicted to admit Backtracking")
@@ -1974,10 +1995,11 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 
 // TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses is the NEGATIVE half
 // of the test above: when the DFA path cannot serve a member and Backtracking
-// refuses it too — past maxBTFallbackInstructions — the member is dropped, with
-// a warning and a StateLimitDropped entry, never kept in a bucket that cannot
-// answer for it. Both of admitOrDropFallback's reasons: no DFA at all, and a
-// DFA over max_fallback_states.
+// refuses it too — past max_bt_instructions — the set does not compile: the
+// member fits no engine, the error names it and the limits, and it is never
+// kept in a bucket that cannot answer for it, nor dropped. All three of
+// admitFallback's reasons: no DFA at all, a DFA over max_dfa_states, and a DFA
+// that would lose a boundary branch's priority.
 func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 	// 21 × Q{1000} puts the program past 20,000 instructions in an alternative
 	// that dies on its first byte, so the DFA's states stay cheap to build.
@@ -1993,8 +2015,8 @@ func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 	}{
 		// Non-greedy, so isolated; its own merge has 2^12 states.
 		{"own-dfa-unbuildable", `x*?[ab]*a[ab]{11}X|` + manyInsts, CompileSetOptions{}},
-		// A ~1000-state DFA over a 100-state max_fallback_states.
-		{"over-max-fallback-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
+		// A ~1000-state DFA over a 100-state max_dfa_states.
+		{"over-max-dfa-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
 		// Its DFA loses the `\B` branch's priority, so there is no DFA to
 		// fall back to; 20,001 assertions put its program past 20,000
 		// instructions without adding a DFA state.
@@ -2012,15 +2034,24 @@ func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 			buf, restore := captureWarnings(t)
 			defer restore()
 			diag := &SetDiag{Name: tc.name}
-			buckets := compileFallback([]*PatternInfo{info}, tc.opts, diag)
+			opts := tc.opts
+			opts.fail = &setFailure{}
+			buckets := compileFallback([]*PatternInfo{info}, opts, diag)
 			if len(buckets) != 0 {
-				t.Errorf("%d buckets, want the member dropped", len(buckets))
+				t.Errorf("%d buckets, want none: the member fits no engine", len(buckets))
 			}
-			if len(diag.StateLimitDropped) != 1 {
-				t.Errorf("StateLimitDropped = %v, want the member", diag.StateLimitDropped)
+			err := opts.fail.err
+			if !errors.Is(err, ErrSetMemberFitsNoEngine) || !errors.Is(err, ErrBTProgramTooLarge) {
+				t.Fatalf("failure = %v, want ErrSetMemberFitsNoEngine (and ErrBTProgramTooLarge)", err)
 			}
-			if !strings.Contains(buf.String(), "Pattern dropped from set") {
-				t.Errorf("no drop warning; got %q", buf.String())
+			if !strings.Contains(err.Error(), "raise max_bt_instructions to at least") {
+				t.Errorf("the error does not name the limit to raise: %v", err)
+			}
+			if wantDFAKey := tc.name != "boundary-ambiguous"; strings.Contains(err.Error(), "max_dfa_states") != wantDFAKey {
+				t.Errorf("the error names max_dfa_states = %v, want %v: %v", !wantDFAKey, wantDFAKey, err)
+			}
+			if strings.Contains(buf.String(), "Pattern dropped from set") {
+				t.Errorf("a member that fits no engine was dropped (%q), not refused", buf.String())
 			}
 		})
 	}
@@ -2051,9 +2082,6 @@ func TestSetCoreCompileFallbackNewBucketDFAUnbuildable(t *testing.T) {
 
 	if len(buckets) != 1 || buckets[0].btFallback == nil {
 		t.Fatalf("expected one Backtracking bucket, got %d buckets", len(buckets))
-	}
-	if len(diag.StateLimitDropped) != 0 {
-		t.Errorf("an admitted pattern was recorded as dropped: StateLimitDropped = %v", diag.StateLimitDropped)
 	}
 	if out := buf.String(); strings.Contains(out, "Pattern dropped from set") {
 		t.Errorf("a BT-admitted pattern must not warn about being dropped; got %q", out)
@@ -2345,17 +2373,10 @@ func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T)
 	if len(buckets) != 0 || len(members) != 0 {
 		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
 	}
-	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep
-	// it, so it must NOT land in StateLimitDropped, which the find packers use
-	// to mean "gone from the set entirely". A consumer reading one field for
-	// both excluded a pattern scan_any correctly reported.
+	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep it.
 	if len(diag.AnchoredStateLimitDropped) != 1 {
 		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
 			diag.AnchoredStateLimitDropped)
-	}
-	if len(diag.StateLimitDropped) != 0 {
-		t.Errorf("anchored-only drop recorded as a whole-set drop: StateLimitDropped = %v",
-			diag.StateLimitDropped)
 	}
 	// The message used to be "suffix DFA exceeds state limit ...
 	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
@@ -3029,7 +3050,7 @@ func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildCon
 		Patterns: config.PatternSelector{All: true},
 	}
 	return sc, config.BuildConfig{
-		Regexps: entries, MaxFallbackStates: maxFallback,
+		Regexps: entries, MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{sc},
 	}
 }
@@ -3413,5 +3434,147 @@ func TestEmittedFrontendMatchesSelectionWithoutFallback(t *testing.T) {
 					"when no fallback bucket is present", got)
 			}
 		})
+	}
+}
+
+// TestSetNeverDropsAMember pins the set's side of the limits: a member no
+// engine takes fails the compile, naming itself and the limits; written zeros
+// mean what the config says; a groups_func entry is a member; and the two
+// set sizes reach the packers.
+func TestSetNeverDropsAMember(t *testing.T) {
+	cfgOf := func(pats []string, set config.SetConfig) config.BuildConfig {
+		set.Name, set.Patterns = "s", config.PatternSelector{All: true}
+		return config.BuildConfig{Regexps: setEmitCovEntries(pats), Sets: []config.SetConfig{set}}
+	}
+	// 2^13 states, over byte mode's 2,048-state build cap; its Backtracking
+	// program is about 20 instructions (`(?:a|b)` is one class), so a
+	// 5-instruction limit refuses it too.
+	huge := `(?:a|b)*a(?:a|b){12}c`
+	cfg := cfgOf([]string{huge, `foo`}, config.SetConfig{Find: "f"})
+	cfg.MaxBTInstructions = 5
+	_, _, err := CompileFile(cfg, "")
+	if !errors.Is(err, ErrSetMemberFitsNoEngine) || !errors.Is(err, ErrBTProgramTooLarge) {
+		t.Fatalf("a member no engine takes: err = %v, want ErrSetMemberFitsNoEngine", err)
+	}
+	for _, w := range []string{`"p00"`, "max_bt_instructions (5)", "raise max_bt_instructions to at least", "max_dfa_states"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error lacks %q: %v", w, err)
+		}
+	}
+	if err := CmdWriteDiagJSON(cfg, "", filepath.Join(t.TempDir(), "d.json")); !errors.Is(err, ErrSetMemberFitsNoEngine) {
+		t.Errorf("--diag-json on that config: err = %v, want the same refusal", err)
+	}
+	if SetAdmitsBacktracking(cfg.Sets[0], cfg) {
+		t.Error("a set that does not compile was predicted to admit Backtracking")
+	}
+	cfg.MaxBTInstructions = config.LimitOff
+	if _, _, err := CompileFile(cfg, ""); err == nil || !strings.Contains(err.Error(), "Backtracking is off (max_bt_instructions: 0)") {
+		t.Errorf("max_bt_instructions: 0: err = %v, want Backtracking named as off", err)
+	}
+
+	// max_dfa_states: 0 — every member on Backtracking, the literal one
+	// included, and no warning about what the config asked for.
+	buf, restore := captureWarnings(t)
+	off := cfgOf([]string{`foo\d+`, `[a-z]+@x`}, config.SetConfig{Find: "f", ScanAny: "sa"})
+	off.MaxDFAStates = config.LimitOff
+	_, _, diags, err := CompileFileDiag(off, "")
+	restore()
+	if err != nil {
+		t.Fatalf("max_dfa_states: 0: %v", err)
+	}
+	for _, b := range diags[0].Buckets {
+		if b.Type != "bt-fallback" {
+			t.Errorf("max_dfa_states: 0 left bucket %+v off Backtracking", b)
+		}
+	}
+	if strings.Contains(buf.String(), "runs on Backtracking") {
+		t.Errorf("warned about Backtracking the config asked for: %q", buf.String())
+	}
+
+	// A groups_func entry is a member: its captures are stripped for the set.
+	groups := cfgOf(nil, config.SetConfig{Find: "f"})
+	groups.Regexps = []config.RegexEntry{
+		{Name: "url", Pattern: `(https?)://([^/]+)`, GroupsFunc: "url_groups"},
+		{Name: "num", Pattern: `[0-9]+`},
+	}
+	_, _, diags, err = CompileFileDiag(groups, "")
+	if err != nil {
+		t.Fatalf("groups_func member: %v", err)
+	}
+	inBucket := false
+	for _, b := range diags[0].Buckets {
+		for _, p := range b.Patterns {
+			inBucket = inBucket || p.Name == "url"
+		}
+	}
+	if !inBucket {
+		t.Errorf("the groups_func entry is in no bucket: %+v", diags[0].Buckets)
+	}
+
+	// max_set_bucket_size: 0 — no two members share a bucket.
+	shared := cfgOf([]string{`foo[a-z]+`, `foo[0-9]+`}, config.SetConfig{Find: "f"})
+	buckets := func(cfg config.BuildConfig) int {
+		_, _, d, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(d[0].Buckets)
+	}
+	if n := buckets(shared); n != 1 {
+		t.Fatalf("two members behind one literal: %d buckets, want 1", n)
+	}
+	if shared.MaxSetBucketSize, err = config.ParseMemorySize("0"); err != nil {
+		t.Fatal(err)
+	}
+	if n := buckets(shared); n != 2 {
+		t.Errorf("max_set_bucket_size: 0: %d buckets, want 2", n)
+	}
+
+	// max_split_table_size: 0 — every split member takes the Backtracking
+	// search. `[a-z]*@[0-9]+` is split (its walks can cross candidates).
+	split := cfgOf([]string{`\w+@\w+`, `ghp_[0-9a-z]{8}`}, config.SetConfig{Find: "f"})
+	splitBT := func(cfg config.BuildConfig) (members, bt int) {
+		_, _, d, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(d[0].SplitMembers), len(d[0].SplitBacktracking)
+	}
+	if m, bt := splitBT(split); m == 0 || bt != 0 {
+		t.Fatalf("default budget: %d split members, %d on Backtracking; want some, none", m, bt)
+	}
+	if split.MaxSplitTableSize, err = config.ParseMemorySize("0"); err != nil {
+		t.Fatal(err)
+	}
+	if m, bt := splitBT(split); bt != m {
+		t.Errorf("max_split_table_size: 0: %d of %d split members on Backtracking, want all", bt, m)
+	}
+}
+
+// TestBinPackSendsAnUnbuildableLiteralMemberToFallback covers the literal
+// packer's last refusal: a member whose own suffix DFA cannot be built when it
+// opens a bucket goes to the fallback packer WHOLE — a copy, unsplit — where
+// Backtracking takes it; the shared PatternInfo is left as it was.
+func TestBinPackSendsAnUnbuildableLiteralMemberToFallback(t *testing.T) {
+	info := setCoreCovAnalyze(t, `fooab`)
+	if !info.splittable || info.mandLit == nil {
+		t.Fatal("`fooab` should be a literal member")
+	}
+	// A suffix whose automaton needs 2^13 states, past byte mode's cap.
+	re, err := syntax.Parse(`(?:a|b)*a(?:a|b){12}c`, syntax.Perl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.suffixAST = re
+	opts := (CompileSetOptions{}).resolvedFor(SetSpec{Patterns: []*PatternInfo{info}})
+	buckets := binPack([]*PatternInfo{info}, opts, &SetDiag{})
+	if opts.fail.err != nil {
+		t.Fatalf("the member fits Backtracking: %v", opts.fail.err)
+	}
+	if len(buckets) != 1 || buckets[0].btFallback == nil || buckets[0].literal != "" {
+		t.Fatalf("buckets = %+v, want one Backtracking fallback bucket", buckets)
+	}
+	if !info.splittable || info.noOwnDFA {
+		t.Error("the shared PatternInfo was changed; the fallback needs a copy")
 	}
 }

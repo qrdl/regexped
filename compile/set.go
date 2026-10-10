@@ -594,7 +594,7 @@ func analyzeSetMember(re config.RegexEntry, member resolvedPattern, prefixPool, 
 	if !info.trivialPrefix {
 		// syntax.Compile never returns a non-nil error (see its stdlib source).
 		revProg, _ := compileProg(rp.tree(info.prefixAST).reversed())
-		revD, revOk := newDFA(revProg, false, maxHelperDFAStates)
+		revD, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
 		if !revOk {
 			return noOwnDFA()
 		}
@@ -612,7 +612,7 @@ func analyzeSetMember(re config.RegexEntry, member resolvedPattern, prefixPool, 
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
 	prog, _ := compileProg(rp.tree(suffixTarget))
-	d, ok := newDFA(prog, false, maxHelperDFAStates)
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
 	if !ok {
 		return noOwnDFA()
 	}
@@ -664,15 +664,28 @@ const (
 // CompileSetOptions holds tunable parameters for set composition.
 // Zero value uses defaults.
 type CompileSetOptions struct {
-	BitmaskWidth          int   // max patterns per bucket using AcceptBitmask; default 32
-	MaxPatternsPerBucket  int   // hard cap for a sparse (AcceptSparseSet) bucket; default 4096
-	BudgetBytes           int   // max merged DFA table bytes per bucket; default 65536
-	BudgetStates          int   // max DFA states per merged bucket; default 512
-	BudgetStatesPreFilter int   // pre-filter: suffixStates * combinedClassCount; default 65536
-	MaxFallbackStates     int   // max DFA states for a single-pattern fallback bucket; default 1024 (resolveMaxFallbackStates)
-	ACBudgetBytes         int   // max Aho-Corasick table bytes for the whole set; default 524288
-	TableBase             int32 // byte offset where this set's DFA tables start in memory; default 0
-	TableMemIdx           int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+	BitmaskWidth         int // max patterns per bucket using AcceptBitmask; default 32
+	MaxPatternsPerBucket int // hard cap for a sparse (AcceptSparseSet) bucket; default 4096
+	// The bucket and fallback limits below follow the config (resolvedFor):
+	// 0 is "derive it", a negative value is an explicit 0 — the config said
+	// so — and a positive value is itself.
+	BudgetBytes           int // max merged DFA table bytes per bucket: max_set_bucket_size, else bucketBytesPerState × BudgetStates
+	BudgetStates          int // max DFA states per merged bucket: max_dfa_states
+	BudgetStatesPreFilter int // pre-filter: suffixStates * combinedClassCount; follows BudgetBytes
+	MaxFallbackStates     int // max DFA states for a single-pattern fallback bucket: max_dfa_states
+	// SplitTableBudget is max_split_table_size: the most bytes of
+	// start-anywhere tables one set's split members may add, smallest first;
+	// the rest take the Backtracking find. 0 derives it from the set's mode
+	// (splitTableBudget), negative is an explicit 0.
+	SplitTableBudget int64
+	ACBudgetBytes    int   // max Aho-Corasick table bytes for the whole set; default 524288
+	TableBase        int32 // byte offset where this set's DFA tables start in memory; default 0
+	TableMemIdx      int   // 0 = standalone (single memory), 1 = embedded (multi-memory after merge)
+
+	// fail is where a member that fits no engine is recorded (setFailure):
+	// a pointer, so every internal compile of the set — trial, companions —
+	// writes to the one record CompileSet returns.
+	fail *setFailure
 	// AllowSparseAccept permits sparse >32-pattern buckets. Off by default so a
 	// caller that has not thought about probes cannot get one: see CompileSet.
 	AllowSparseAccept bool
@@ -842,46 +855,108 @@ func (o CompileSetOptions) maxPatternsPerBucket() int {
 	return 4096
 }
 
-func (o CompileSetOptions) budgetBytes() int {
-	if o.BudgetBytes > 0 {
-		return o.BudgetBytes
+// bucketBytesPerState is a bucket's default table budget per state of its
+// state limit: 64 KB for 512 states, the ratio the bucket budgets had when
+// they were fixed numbers. A u16 table row is 512 bytes, so the byte budget,
+// not the state count, is what usually closes a bucket; byte classes shrink
+// the rows. Fewer, bigger buckets cost less per input byte — 6 buckets → 3
+// took a 6-member Unicode set's `find` from 836 to 444 fuel/byte.
+const bucketBytesPerState = 128
+
+// exactLimit maps a resolved limit to its option spelling: 0, an explicit
+// zero, becomes negative so it is not read as "derive it".
+func exactLimit(v int) int {
+	if v == 0 {
+		return -1
 	}
-	return 65536
+	return v
+}
+
+// limitValue reads an option spelled as exactLimit spells it: positive is
+// itself, negative is 0, and 0 — never resolved — is def.
+func limitValue(v, def int) int {
+	switch {
+	case v > 0:
+		return v
+	case v < 0:
+		return 0
+	}
+	return def
 }
 
 func (o CompileSetOptions) budgetStates() int {
-	if o.BudgetStates > 0 {
-		return o.BudgetStates
-	}
-	return 512
+	return limitValue(o.BudgetStates, defaultMaxDFAStates)
+}
+
+func (o CompileSetOptions) budgetBytes() int {
+	return limitValue(o.BudgetBytes, bucketBytesPerState*o.budgetStates())
 }
 
 func (o CompileSetOptions) budgetStatesPreFilter() int {
-	if o.BudgetStatesPreFilter > 0 {
-		return o.BudgetStatesPreFilter
-	}
-	return 65536
+	return limitValue(o.BudgetStatesPreFilter, o.budgetBytes())
 }
 
 func (o CompileSetOptions) maxFallbackStates() int {
-	if o.MaxFallbackStates > 0 {
-		return o.MaxFallbackStates
-	}
-	return 1024
+	return limitValue(o.MaxFallbackStates, defaultMaxDFAStates)
 }
 
-// resolveMaxFallbackStates is a set's max_fallback_states: the config's key
-// when set, else 1,024 in byte mode and defaultMaxDFAStatesUnicode in
-// Unicode mode, whose lowered classes need far more states. Measured on a
-// 32-member Unicode set over 64 KB of mixed-script text: `\pL{4}\pN` needs
-// 1,250 states, and on Backtracking it took scan_all to 152,500 fuel/byte and
-// `find` past 10^10 fuel; as a DFA, 2,661 and 4,437 fuel/byte, in a module of
-// 3.7 MB instead of 5.5 MB.
-func resolveMaxFallbackStates(key int, members []*PatternInfo) int {
-	if key == 0 && len(members) > 0 && members[0].rp.unicode() {
-		return defaultMaxDFAStatesUnicode
+// dfaOff reports whether max_dfa_states: 0 put every member on Backtracking.
+func (o CompileSetOptions) dfaOff() bool { return o.MaxFallbackStates < 0 }
+
+// dfaStatesOption is maxFallbackStates spelled as CompileOptions.MaxDFAStates
+// spells it, for a member's own single-pattern builds: an explicit 0 is
+// negative there too, since 0 means the default.
+func (o CompileSetOptions) dfaStatesOption() int { return exactLimit(o.maxFallbackStates()) }
+
+// splitTableBudget is SplitTableBudget, defaulting to the byte-mode figure.
+func (o CompileSetOptions) splitTableBudget() int64 {
+	switch {
+	case o.SplitTableBudget > 0:
+		return o.SplitTableBudget
+	case o.SplitTableBudget < 0:
+		return 0
 	}
-	return key
+	return splitTableBudget
+}
+
+// resolvedFor fills every limit the caller left at 0 from the set itself:
+// the mode its members share and the config limits they carry (buildLimits).
+// Idempotent, so every entry into a set compile calls it. The fallback and
+// bucket state limits are max_dfa_states — the one key for every automaton —
+// and the bucket's byte budget and pre-filter scale with it unless
+// max_set_bucket_size set the bytes (setSpecAndOptions). Measured on Unicode
+// sets (find, fuel/byte over 4 KB): a 3-member set 494 → 308, a 6-member set
+// 836 → 444, against the old fixed 512 states / 64 KB.
+func (o CompileSetOptions) resolvedFor(spec SetSpec) CompileSetOptions {
+	unicode := false
+	var lim buildLimits
+	if len(spec.Patterns) > 0 {
+		unicode = spec.Patterns[0].rp.unicode()
+		lim = spec.Patterns[0].rp.lim
+	}
+	states := lim.dfaStateLimit(unicode)
+	if o.MaxFallbackStates == 0 {
+		o.MaxFallbackStates = exactLimit(states)
+	}
+	if o.BudgetStates == 0 {
+		o.BudgetStates = exactLimit(states)
+	}
+	if o.BudgetBytes == 0 {
+		o.BudgetBytes = exactLimit(bucketBytesPerState * o.budgetStates())
+	}
+	if o.BudgetStatesPreFilter == 0 {
+		o.BudgetStatesPreFilter = exactLimit(o.budgetBytes())
+	}
+	if o.SplitTableBudget == 0 {
+		o.SplitTableBudget = splitTableBudget
+		if unicode {
+			o.SplitTableBudget = splitTableBudgetUnicode
+		}
+	}
+	if o.fail == nil {
+		o.fail = &setFailure{}
+	}
+	return o
 }
 
 // acBudgetBytes is the ceiling on total Aho-Corasick table bytes for a set.
@@ -954,7 +1029,7 @@ func mergeSuffixDFA(asts []resolvedTree, opts CompileSetOptions) (*dfaTable, Acc
 	// contract compile.go's primary DFA construction has with
 	// resolveMaxDFAStates. Only pathological, effectively-unbounded
 	// constructions (beyond maxHelperDFAStates) hit ErrDFAStateLimit.
-	d, ok := newDFA(unionProg, true, maxHelperDFAStates, patternBits)
+	d, ok := newDFA(unionProg, true, unionProg.dfaBuildCap(), patternBits)
 	if !ok {
 		return nil, 0, ErrDFAStateLimit
 	}
@@ -972,7 +1047,7 @@ func mergeSuffixDFAWidth(asts []resolvedTree, bw int) (*dfaTable, error) {
 		return nil, fmt.Errorf("mergeSuffixDFAWidth: %d patterns at width %d", len(asts), bw)
 	}
 	unionProg, patternBits := buildUnionProg(compileSetASTs(asts), bw)
-	d, ok := newDFA(unionProg, true, maxHelperDFAStates, patternBits)
+	d, ok := newDFA(unionProg, true, unionProg.dfaBuildCap(), patternBits)
 	if !ok {
 		return nil, ErrDFAStateLimit
 	}
@@ -1024,7 +1099,7 @@ func mergeSuffixDFASparseSet(asts []resolvedTree, opts CompileSetOptions) (*dfaT
 	}
 	progs := compileSetASTs(asts)
 	unionProg, patternIdx := buildUnionProgIndexed(progs)
-	d, ok := newDFAWide(unionProg, true, maxHelperDFAStates, patternIdx)
+	d, ok := newDFAWide(unionProg, true, unionProg.dfaBuildCap(), patternIdx)
 	if !ok {
 		return nil, nil, ErrDFAStateLimit
 	}
@@ -1071,7 +1146,7 @@ func buildUnionProg(progs []resolvedProg, bitmaskWidth int) (resolvedProg, []uin
 		raw[k] = p.prog
 	}
 	union, patternBits := unionProgs(raw, bitmaskWidth)
-	return resolvedProg{prog: union, orig: union, pm: sameProgMode(progs), pg: sameProgress(progs)}, patternBits
+	return resolvedProg{prog: union, orig: union, pm: sameProgMode(progs), pg: sameProgress(progs), lim: sameLimits(progs)}, patternBits
 }
 
 func unionProgs(progs []*syntax.Prog, bitmaskWidth int) (*syntax.Prog, []uint64) {
@@ -1950,6 +2025,14 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 	stateBudget := opts.budgetStates()
 
 	literalGroups, fallbackPatterns := bucketByLiteral(patterns)
+	if opts.dfaOff() {
+		// max_dfa_states: 0 — every member on Backtracking, which only the
+		// fallback packer gives, and only to a WHOLE pattern.
+		literalGroups, fallbackPatterns = nil, nil
+		for _, p := range patterns {
+			fallbackPatterns = append(fallbackPatterns, asNoOwnDFA(p))
+		}
+	}
 
 	// Deterministic iteration: sort literal keys.
 	litKeys := make([]string, 0, len(literalGroups))
@@ -2096,35 +2179,21 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 					}
 				}
 				if single == nil {
-					// DROP, loudly. Keeping the bucket would make it LIVE with a
-					// nil suffix DFA, and genSuffixWASM emits a body returning 0
-					// for that — so the literal would gate candidates into a
-					// bucket that reports no match at any of them, and the
-					// pattern would silently never match with no warning and no
-					// --diag-json entry.
+					// No literal bucket for it: keeping one would make it LIVE
+					// with a nil suffix DFA, and genSuffixWASM emits a body
+					// returning 0 for that — the literal would gate candidates
+					// into a bucket that reports no match at any of them.
 					//
-					// The fallback packers already refuse this, through
-					// admitOrDropFallback. This site kept the failure instead,
-					// which left one policy written down twice with two
-					// different answers; the drop below is the fallback one.
-					//
-					// Not rescued into a BT bucket the way admitOrDropFallback
-					// does: newBTBucket returns a bucket with an EMPTY literal
-					// and isFallback set, and litBuckets is a shared-literal
-					// group — promoteSharedLiteralBuckets keys on
-					// litBuckets[0].literal and treats an empty one as "this is
-					// the fallback group". Injecting one here would corrupt that
-					// classification for the whole group.
-					// No state count (no DFA was finished), and the limit is
-					// the internal one mergeSuffixDFA builds under, not
-					// max_fallback_states — raising that cannot help.
-					warnPatternDroppedReason(opts, p, "binPack",
-						"its own suffix DFA could not be built",
-						"simplify the pattern or move it out of the set — this limit is not configurable",
-						-1, maxHelperDFAStates)
-					if diag != nil {
-						diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
-					}
+					// Not rescued into a BT bucket HERE: newBTBucket returns a
+					// bucket with an EMPTY literal and isFallback set, and
+					// litBuckets is a shared-literal group —
+					// promoteSharedLiteralBuckets keys on litBuckets[0].literal
+					// and treats an empty one as "this is the fallback group".
+					// The member goes to the fallback packer instead, WHOLE, as
+					// analyzeSetMember sends a member with no automaton of its
+					// own: there it gets Backtracking, or the set does not
+					// compile (admitFallback).
+					fallbackPatterns = append(fallbackPatterns, asNoOwnDFA(p))
 					continue
 				}
 				// Create a new bucket for this pattern.
@@ -2211,44 +2280,39 @@ func binPack(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) []*
 
 // compileFallback applies the same bin-packing algorithm to patterns that have
 // no mandatory literal or whose split path was rejected. These buckets run on
-// admitOrDropFallback turns one pattern's own suffix DFA into a fallback
-// bucket, or — when there is no usable DFA — into a Backtracking bucket, or
-// into a warned drop.
+// admitFallback turns one pattern's own suffix DFA into a fallback bucket,
+// or — when there is no usable DFA — into a Backtracking bucket. A member
+// neither takes is a compile error (memberFitsNoEngine), recorded in
+// opts.fail: a set does not compile without a member it was given, as a
+// single pattern does not compile without its export.
 //
-// The three-step ladder (nil-guard -> newBTBucket -> warnPatternDropped +
-// StateLimitDropped) was written out THREE times in compileFallback, and the
-// nil-guard was once missing from one of them — a real past crash whose fix
-// note is still in the code.
+// The ladder (nil-guard -> newBTBucket -> the error) was once written out
+// three times in compileFallback, and the nil-guard was missing from one of
+// them — a real past crash whose fix note is still in the code.
 //
-// Returns nil when the pattern was dropped; the caller then records nothing
-// further. `where` names the site for the warning, exactly as before.
-func admitOrDropFallback(p *PatternInfo, dfa *dfaTable, where string, opts CompileSetOptions, diag *SetDiag) *bucket {
+// Returns nil when the member fits no engine.
+func admitFallback(p *PatternInfo, dfa *dfaTable, opts CompileSetOptions) *bucket {
 	if dfa == nil {
 		if nb := newBTBucket(p); nb != nil {
-			warnPatternOnBacktracking(opts, p, "its own suffix DFA could not be built",
-				"simplify the pattern to keep it on a DFA", -1, maxHelperDFAStates)
+			if !opts.dfaOff() {
+				warnPatternOnBacktracking(opts, p, "its own suffix DFA could not be built",
+					"raise max_dfa_states to keep it on a DFA", -1, p.rp.lim.dfaBuildCap(p.rp.unicode()))
+			}
 			return nb
 		}
-		// As in binPack: no DFA to count, and the bound is mergeSuffixDFA's
-		// internal maxHelperDFAStates, not max_fallback_states.
-		warnPatternDroppedReason(opts, p, where, "its own suffix DFA could not be built",
-			"simplify the pattern or move it out of the set — this limit is not configurable",
-			-1, maxHelperDFAStates)
-		if diag != nil {
-			diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
-		}
+		opts.fail.add(memberFitsNoEngine(p, fmt.Sprintf("its automaton needs more than %d states",
+			p.rp.lim.dfaBuildCap(p.rp.unicode()))))
 		return nil
 	}
 	if dfa.numStates > opts.maxFallbackStates() {
 		if nb := newBTBucket(p); nb != nil {
-			warnPatternOnBacktracking(opts, p, "suffix DFA exceeds max_fallback_states",
-				"raise max_fallback_states to keep it on a DFA", dfa.numStates, opts.maxFallbackStates())
+			if !opts.dfaOff() {
+				warnPatternOnBacktracking(opts, p, "its suffix DFA exceeds max_dfa_states",
+					"raise max_dfa_states to keep it on a DFA", dfa.numStates, opts.maxFallbackStates())
+			}
 			return nb
 		}
-		warnPatternDropped(opts, p, where, dfa.numStates, opts.maxFallbackStates())
-		if diag != nil {
-			diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
-		}
+		opts.fail.add(memberFitsNoEngine(p, fmt.Sprintf("its automaton needs %d states", dfa.numStates)))
 		return nil
 	}
 	cm, _, nc := computeByteClasses(dfa)
@@ -2262,6 +2326,82 @@ func admitOrDropFallback(p *PatternInfo, dfa *dfaTable, where string, opts Compi
 		isFallback:   true,
 		suffixDFA:    dfa,
 	}
+}
+
+// setFailure is a set compile's first member that fits no engine. Several
+// internal compiles of one set (the split trial, companions, internal sets)
+// meet the same member; the first record is the one reported.
+type setFailure struct{ err error }
+
+func (f *setFailure) add(err error) {
+	if f != nil && f.err == nil {
+		f.err = err
+	}
+}
+
+// ErrSetMemberFitsNoEngine is a set member neither engine can take: its DFA
+// is over max_dfa_states (or cannot keep its branch priorities) and its
+// Backtracking program is over max_bt_instructions. It wraps
+// ErrBTProgramTooLarge too, the last refusal, so a caller that tells a
+// resource ceiling from a defect by that error keeps doing so.
+var ErrSetMemberFitsNoEngine = errors.New("compile: set member fits no engine")
+
+// setMemberUnplaceable is ErrSetMemberFitsNoEngine for one member, naming
+// the limits that would let it compile.
+type setMemberUnplaceable struct {
+	member  string
+	noDFA   string // why no DFA bucket takes it
+	dfaKey  bool   // whether raising max_dfa_states can help
+	insts   int    // its Backtracking program's size
+	btLimit int
+	btOff   bool
+}
+
+func memberFitsNoEngine(p *PatternInfo, noDFA string) error {
+	insts := 0
+	if ast := patternSuffixAST(p); ast.re != nil {
+		prog, _ := compileProg(ast)
+		insts = len(prog.prog.Inst)
+	}
+	return &setMemberUnplaceable{
+		member: patternRefFor(p).Name, noDFA: noDFA, dfaKey: !p.boundaryAmbiguous,
+		insts: insts, btLimit: p.rp.lim.btLimit(), btOff: p.rp.lim.btOff(),
+	}
+}
+
+func (e *setMemberUnplaceable) Error() string {
+	bt := fmt.Sprintf("its Backtracking program has %d instructions, over max_bt_instructions (%d)", e.insts, e.btLimit)
+	raise := fmt.Sprintf("raise max_bt_instructions to at least %d", e.insts)
+	if e.btOff {
+		bt = "Backtracking is off (max_bt_instructions: 0)"
+		raise = fmt.Sprintf("set max_bt_instructions to at least %d", e.insts)
+	}
+	if e.dfaKey {
+		raise += ", or raise max_dfa_states to keep it on a DFA"
+	}
+	return fmt.Sprintf("%v: %q — no DFA takes it (%s) and %s; %s, or move it out of the set",
+		ErrSetMemberFitsNoEngine, e.member, e.noDFA, bt, raise)
+}
+
+func (e *setMemberUnplaceable) Is(target error) bool {
+	return target == ErrSetMemberFitsNoEngine || target == ErrBTProgramTooLarge
+}
+
+// asNoOwnDFA is p as analyzeSetMember leaves a member whose own automaton
+// cannot be built: whole, unsplit, with no automaton, for the fallback packer
+// to give Backtracking. A COPY — p is shared by every compile of the set's
+// spec, and the anchored packing still wants it as it was.
+func asNoOwnDFA(p *PatternInfo) *PatternInfo {
+	q := *p
+	q.splittable = false
+	q.prefixAST, q.suffixAST, q.prefixDFA = nil, nil, nil
+	q.prefixID, q.trivialPrefix, q.prefixMaxLen = -1, true, 0
+	q.startAnchor, q.lineAnchor = false, false
+	if full := fullPatternAST(&q); full.re != nil {
+		q.setTopLevelAnchor(full.re)
+	}
+	q.noOwnDFA = true
+	return &q
 }
 
 // every input position (no literal scan gate).
@@ -2283,27 +2423,24 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 	for _, p := range patterns {
 		// A DFA bucket would answer with the wrong extent (analyzePattern), so
 		// there is no DFA to fall back to: a pattern Backtracking cannot take
-		// either is dropped, as a pattern whose DFA cannot be built is.
+		// either fits no engine, as a pattern whose DFA cannot be built does.
 		if p.boundaryAmbiguous {
 			if nb := newBTBucket(p); nb != nil {
-				warnPatternOnBacktracking(opts, p, "its DFA would lose a word-boundary branch's priority",
-					"rewrite the \\b, \\B or (?m:$) alternative, or move the pattern out of the set", -1, -1)
+				if !opts.dfaOff() {
+					warnPatternOnBacktracking(opts, p, "its DFA would lose a word-boundary branch's priority",
+						"rewrite the \\b, \\B or (?m:$) alternative, or move the pattern out of the set", -1, -1)
+				}
 				buckets = append(buckets, nb)
 				continue
 			}
-			warnPatternDroppedReason(opts, p, "Backtracking fallback bucket",
-				"its DFA loses a word-boundary branch's priority and Backtracking cannot take it",
-				"simplify the pattern or move it out of the set", -1, -1)
-			if diag != nil {
-				diag.StateLimitDropped = append(diag.StateLimitDropped, patternRefFor(p))
-			}
+			opts.fail.add(memberFitsNoEngine(p, "a DFA would lose a word-boundary branch's priority"))
 			continue
 		}
 		// No DFA of its own (analyzePattern): nothing to merge, and every
 		// packing attempt below would rebuild the same automaton and fail
 		// again. Straight to Backtracking, or the warned drop.
 		if p.noOwnDFA {
-			if nb := admitOrDropFallback(p, nil, "fallback bucket", opts, diag); nb != nil {
+			if nb := admitFallback(p, nil, opts); nb != nil {
 				buckets = append(buckets, nb)
 			}
 			continue
@@ -2330,7 +2467,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			// Treated as the drop it already is: an isolated pattern whose own
 			// DFA cannot be built is exactly the case the state-limit branch
 			// below covers, and is reported the same way.
-			if nb := admitOrDropFallback(p, isolatedDFA, "isolated fallback bucket", opts, diag); nb != nil {
+			if nb := admitFallback(p, isolatedDFA, opts); nb != nil {
 				buckets = append(buckets, nb)
 			}
 			continue
@@ -2415,7 +2552,7 @@ func compileFallback(patterns []*PatternInfo, opts CompileSetOptions, diag *SetD
 			// guard, and its comment, for some time; it was simply never added
 			// to this sibling — which is what admitOrDropFallback now makes
 			// impossible.
-			if nb := admitOrDropFallback(p, nbDFA, "new fallback bucket", opts, diag); nb != nil {
+			if nb := admitFallback(p, nbDFA, opts); nb != nil {
 				buckets = append(buckets, nb)
 			}
 		}
@@ -2477,22 +2614,20 @@ func fullPatternAST(p *PatternInfo) resolvedTree {
 }
 
 // warnPatternDropped reports, at warning level, that a pattern has been
-// excluded from its set because its suffix DFA exceeded maxFallbackStates.
+// left out of its set's ANCHORED pair — match_any / match_all — because its
+// anchored DFA exceeded max_dfa_states. It is the only drop left: a member no
+// engine takes for `find` or the scan pair is a compile error (admitFallback),
+// and the anchored pair keeps dropping only until it has a Backtracking path
+// of its own.
 //
 // This must not be nested inside the `if diag != nil` guards that surround the
-// StateLimitDropped bookkeeping: CompileSet creates a SetDiag unconditionally
-// (set_emit.go) so those guards always pass, but the resulting struct is
-// discarded unless the caller asked for --diag-json — its only consumer is
-// CmdWriteDiagJSON. Before this warning existed, a normal build dropped the
-// pattern with exit code 0 and no output at all, and the set silently never
-// matched it.
-//
-// Warn rather than error: erroring would be a behaviour change for configs that
-// build today, and the drop is a resource ceiling rather than a malformed
-// input. Promoting it to a hard failure belongs behind a --strict flag.
+// drop bookkeeping: CompileSet creates a SetDiag unconditionally (set_emit.go)
+// so those guards always pass, but the resulting struct is discarded unless
+// the caller asked for --diag-json. Before this warning existed, a normal
+// build dropped the pattern with exit code 0 and no output at all.
 func warnPatternDropped(opts CompileSetOptions, p *PatternInfo, where string, states, limit int) {
 	warnPatternDroppedReason(opts, p, where, "suffix DFA exceeds state limit",
-		"raise max_fallback_states, simplify the pattern, or move it out of the set",
+		"raise max_dfa_states, simplify the pattern, or move it out of the set",
 		states, limit)
 }
 
@@ -2552,12 +2687,9 @@ func warnPatternOnBacktracking(opts CompileSetOptions, p *PatternInfo, reason, h
 // recordAnchoredStateLimitDrop records a drop that cost the pattern the
 // ANCHORED capabilities only.
 //
-// It is a separate field from StateLimitDropped, which the `find` packers
-// write and which means the pattern left the set entirely. Collapsing the two
-// made a scope-blind consumer exclude a pattern the scan pair and `find` still
-// answer for: a set's scan_any correctly reported a pattern its caller's
-// oracle had already written off. UnparseableDropped is the same
-// anchored-only kind and was already separate; this follows it.
+// The scan pair and `find` still answer for the pattern: a member no engine
+// takes for those fails the compile instead. UnparseableDropped is the same
+// anchored-only kind.
 func recordAnchoredStateLimitDrop(diag *SetDiag, p *PatternInfo) {
 	if diag == nil {
 		return
@@ -2611,7 +2743,7 @@ func mergeAnchoredDFA(asts []resolvedTree, opts CompileSetOptions) (*dfaTable, e
 	}
 	progs := compileSetASTs(asts)
 	unionProg, patternBits := buildUnionProg(progs, bw)
-	d, ok := newDFA(unionProg, false, maxHelperDFAStates, patternBits)
+	d, ok := newDFA(unionProg, false, unionProg.dfaBuildCap(), patternBits)
 	if !ok {
 		return nil, ErrDFAStateLimit
 	}
@@ -2640,7 +2772,7 @@ func mergeAnchoredDFASparseSet(asts []resolvedTree, opts CompileSetOptions) (*df
 	// leftmostFirst=false, matching mergeAnchoredDFA: an anchored answer is
 	// "which patterns match the whole input", and pruning lower-priority
 	// alternatives would drop patterns that do.
-	d, ok := newDFAWide(unionProg, false, maxHelperDFAStates, patternIdx)
+	d, ok := newDFAWide(unionProg, false, unionProg.dfaBuildCap(), patternIdx)
 	if !ok {
 		return nil, nil, ErrDFAStateLimit
 	}
@@ -2700,21 +2832,20 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			continue
 		}
 		solo, err := mergeAnchoredDFA([]resolvedTree{ast}, opts)
-		// Three different things end the pattern's life here and they used to
-		// share one message: "suffix DFA exceeds state limit", with a size and
-		// a max_fallback_states limit. On the err arm solo is nil, so the size
-		// printed was 0 — a number the pattern never reached — and the limit
-		// that actually bound the build is maxHelperDFAStates INSIDE
-		// mergeAnchoredDFA, not max_fallback_states, so the hint sent the
-		// reader after a knob that cannot change the outcome.
+		// Two different things end the pattern's anchored life here: a build
+		// that stopped at the construction cap (solo is nil, so there is no
+		// count to print) and a finished DFA over max_dfa_states. Both are
+		// raised by max_dfa_states — the cap is the larger of the mode's and
+		// it (buildLimits.dfaBuildCap). Until the anchored pair has a
+		// Backtracking path, the member leaves match_any / match_all only.
 		switch {
 		case errors.Is(err, ErrDFAStateLimit):
 			// No state count: construction stopped at the limit, so there is
 			// no finished DFA to count. -1 leaves the attribute out.
 			warnPatternDroppedReason(opts, p, "anchored bucket",
-				"the anchored DFA hit the internal state limit while being built",
-				"simplify the pattern or move it out of the set — this limit is not configurable",
-				-1, maxHelperDFAStates)
+				"the anchored DFA hit the state limit while being built",
+				"raise max_dfa_states, simplify the pattern, or move it out of the set",
+				-1, p.rp.lim.dfaBuildCap(p.rp.unicode()))
 			recordAnchoredStateLimitDrop(diag, p)
 			continue
 		// No other error: one non-nil AST is neither an empty list nor more

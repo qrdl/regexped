@@ -368,7 +368,7 @@ a drive can have arbitrarily many walks alive at once — some input of the form
 `W`×N starts a walk every few bytes that is still going at the end, as `foo\w+`
 over `foo`×N does, where `union[ \t]+[a-z]{3}` can match unboundedly long but
 no match holds the start of another — since otherwise every drive is linear
-already, and within these limits: at most `max_fallback_states` states and a
+already, and within these limits: at most `max_dfa_states` states and a
 projected column of at most 16,383 cells. A member the automaton cannot answer
 for exactly — a Backtracking or non-greedy member — is not a limit on the set:
 it is split out (see "Members that are not provably linear" below), the members
@@ -452,10 +452,14 @@ byte, never inside a character. A set with a member that can match empty
 checks, at each candidate position of that member's bucket, whether the
 position is inside a character — one byte load and compare where it is not.
 
-`max_fallback_states` is 16,384 by default for a Unicode-mode set (1,024 in
-byte mode): a lowered Unicode class costs hundreds of states, and a member
-over the limit runs on Backtracking, which measured up to 57 times dearer on
-mixed-script text — see [cli.md](cli.md#unicode--codepoint-mode).
+`max_dfa_states`, the state limit of every automaton — a set member's and a
+bucket's included — is 16,384 by default in Unicode mode (1,024 in byte
+mode): a lowered Unicode class costs hundreds of states, and a member over the
+limit runs on Backtracking, which measured up to 57 times dearer on
+mixed-script text — see [cli.md](cli.md#unicode--codepoint-mode). A member's
+automaton is BUILT up to the same limit, so a member that fits it gets its DFA:
+`.{0,870}` (7,832 states) used to stop at a fixed 2,048, and with its
+Backtracking program over 20,000 instructions the set compiled without it.
 
 ## The gate array
 
@@ -600,13 +604,17 @@ before. When one is not:
 A split member's search is its **start-anywhere find** — for a member with an
 assertion, the context passes that judge every assertion against the real
 neighbouring bytes — or, where that cannot be built (an automaton over
-`max_fallback_states` or the memory bound, or one that cannot represent an
+`max_dfa_states` or the memory bound, or one that cannot represent an
 assertion exactly), the **Backtracking find**, which memoises every
 (instruction, position) it tries and is linear per call too. A member the set
 had put on a Backtracking bucket is split out the same way: its bucket's
 memory of failed walks lasts one host call, so a drive whose other members
 match often would re-walk them on every call. Start-anywhere members are chosen
-smallest tables first while their tables total at most 4 MB; the rest take the
+smallest tables first while their tables total at most `max_split_table_size`
+(4 MB, 64 MB for a Unicode-mode set, whose tables are larger: 12 members like
+`\pL*\p{Greek}\pN{3}` put 5 on Backtracking at 4 MB, and their `find` cost
+872/904/132 instructions per byte over mixed-script, English and digit text,
+against 310/90/90 with all 12 on the start-anywhere find); the rest take the
 Backtracking find, whose own tables are a few scan bytes and which all share
 one frame stack. There is no limit on how many members are split.
 
@@ -669,8 +677,6 @@ splits reads the kept members' cache through the same worker — a position that
 does not fit what is left of the buffer ends the call, and is split across
 calls only when it does not fit an empty one — and gives its split members the
 program sweep.
-
-**Not split:** a member the compiler dropped from the set stays dropped.
 
 `--diag-json` reports all of it: `split_members` (the ids served outside the
 buckets), `split_backtracking` (those of them on the Backtracking find),
@@ -774,10 +780,19 @@ suffix DFAs within each group:
 |---|---|---|
 | Max patterns per bitmask bucket | 32 | `bitmask_width` (internal) |
 | Max patterns per sparse-set bucket | 4096 | `max_patterns_per_bucket` (internal) |
-| Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
-| Max merged DFA states | 512 | `budget_states` (internal) |
-| Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
-| Max fallback-bucket DFA states | 1024 (16,384 in Unicode mode) | `max_fallback_states` (top-level config key) |
+| Max merged DFA states | 1,024 (16,384 in Unicode mode) | `max_dfa_states` |
+| Max merged DFA table bytes | 128 bytes per state of that limit: 128 KB (2 MB in Unicode mode) | `max_set_bucket_size` |
+| Pre-filter (states × combined classes) | the table bytes' number | follows `max_set_bucket_size` (internal) |
+| Max fallback-bucket DFA states | 1,024 (16,384 in Unicode mode) | `max_dfa_states` |
+| Split members' start-anywhere tables, total | 4 MB (64 MB in Unicode mode) | `max_split_table_size` |
+
+Fewer, bigger buckets cost less per input byte, since each bucket is a walk of
+its own: on Unicode-mode sets, raising these limits from a fixed 512 states /
+64 KB to `max_dfa_states` took a 3-member set's `find` from 494 to 308
+instructions per byte (3 buckets → 2) and a 6-member set's from 836 to 444
+(6 → 3), with smaller modules and faster compiles. `max_set_bucket_size` and
+`max_split_table_size` are sizes, written like `max_memory` (`2MB`, `64MiB`);
+a written 0 is a real 0 — no merges, or no member on the start-anywhere find.
 
 A bucket holding more than 32 patterns switches its accept representation from
 a bitmask to a per-state LIST of pattern indices, which is what lets a group of
@@ -806,36 +821,32 @@ optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged
 into the same bucket, even if they'd otherwise fit — recorded as conflict
 reason `lm_counted_chain_split` in diagnostics.
 
-**Over `max_fallback_states`, a pattern changes engine.** A fallback bucket's
-own merged DFA is still subject to the `max_fallback_states` budget above; a
-pattern that would push it over that limit is not merged but moved onto the
-Backtracking engine, in a bucket of its own — see [When a set member falls back
-to Backtracking](#when-a-set-member-falls-back-to-backtracking). It still
-matches, at Backtracking's cost, and it switches the set's `match_all` and
-`scan_all` to the `out_ptr` form. Check `--diag-json` for `"bt-fallback"`
-buckets, and raise `max_fallback_states` to keep such a pattern on a DFA.
+**Over `max_dfa_states`, a pattern changes engine.** A fallback bucket's own
+merged DFA is still subject to `max_dfa_states`; a pattern that would push it
+over that limit is not merged but moved onto the Backtracking engine, in a
+bucket of its own — see [When a set member falls back to
+Backtracking](#when-a-set-member-falls-back-to-backtracking). It still matches,
+at Backtracking's cost, and it switches the set's `match_all` and `scan_all` to
+the `out_ptr` form. Check `--diag-json` for `"bt-fallback"` buckets, and raise
+`max_dfa_states` to keep such a pattern on a DFA.
 
-A member the FIND-path packers could not place at all would be absent from
-those capabilities and recorded in `state_limit_dropped`; the build still
-succeeds, so a pipeline that only checks the exit code would ship a set that
-under-reports — read the warning, or `state_limit_dropped`.
+**A set never compiles without a member it selected.** A member no engine
+takes — its DFA over `max_dfa_states` and its Backtracking program over
+`max_bt_instructions` — fails the compile, and the error names the member and
+both limits, with the value that would let it compile. It used to be left out
+of `find` and the scan pair with a warning, and the build succeeded: `.{0,870}`
+in a Unicode-mode set (7,832 states, 21,752 Backtracking instructions) was
+dropped that way while the same pattern compiled on its own, and listed in
+`--diag-json`'s `state_limit_dropped`, which is gone with the drops.
 
-**Which capabilities a drop removes it from.** A pattern the FIND-path packers
-drop is gone from `find` and the scan pair; the anchored pair is packed
-separately, from the unfiltered pattern list, so `match_any` and `match_all`
-still answer for it. The reverse also happens and is worth stating plainly:
-
-**Backtracking members and the anchored pair.** A pattern whose suffix DFA
-exceeds `max_fallback_states` can be rescued onto the Backtracking engine for
-`find` and the scan pair. The ANCHORED packing admits no Backtracking member —
-it has no BT bucket path at all — so such a pattern is silently absent from
-`match_any` and `match_all`. `--diag-json` shows it in both places: in a
-`bt-fallback` bucket, and in `anchored_state_limit_dropped` for the anchored
-packing. That is a SEPARATE array from `state_limit_dropped`, which means the
-pattern left the set entirely — here it is still answered by `find` and the
-scan pair.
-If your set needs the anchored pair to answer for every member, raise
-`max_fallback_states` until nothing is BT-rescued.
+**The anchored pair is the one exception, for now.** `match_any` and
+`match_all` are packed separately, and that packing has no Backtracking path
+yet: a member whose anchored DFA is over `max_dfa_states` — and so every member
+on Backtracking — is left out of `match_any` and `match_all` only, with a
+warning, while `find` and the scan pair still answer for it. `--diag-json`
+shows it in `anchored_state_limit_dropped` (and a Backtracking member in a
+`bt-fallback` bucket too). If your set needs the anchored pair to answer for
+every member, raise `max_dfa_states` until nothing is on Backtracking.
 
 ## Diagnostics
 
@@ -846,21 +857,23 @@ describing how patterns were placed:
 regexped compile --config=regexped.yaml --diag-json=diag.json
 ```
 
-The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
-`in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
-and per-set `frontend`
+The JSON contains `patterns_total`, `in_set` (patterns actually placed into a
+set), `prefix_dedup_pool_size`, and per-set `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
-`conflicts`, `capture_bearing_dropped`, `state_limit_dropped` (patterns
-dropped for exceeding a fallback bucket's state budget — see
-[Bin-packing](#bin-packing-and-merge-constraints) above) and
-`anchored_state_limit_dropped` arrays.
+`conflicts` and `anchored_state_limit_dropped` arrays.
 
-The last two are not the same thing and a consumer must not merge them.
-`state_limit_dropped` means the pattern left the set ENTIRELY: no capability
-answers for it. `anchored_state_limit_dropped` means only the ANCHORED packing
-refused it, so `match_any` and `match_all` no longer see it while `scan_any`,
-`scan_all` and `find` still do. `unparseable_dropped` has the anchored-only
-scope too.
+`anchored_state_limit_dropped` means only the ANCHORED packing refused the
+pattern, so `match_any` and `match_all` no longer see it while `scan_any`,
+`scan_all` and `find` still do. `unparseable_dropped` has the same scope.
+Nothing leaves a set ENTIRELY any more — a member no engine takes fails the
+compile — so the `state_limit_dropped` array that listed such members is
+gone.
+
+An entry with `groups_func` is a set member like any other: a set reports the
+whole match only, so its capture groups are stripped for the set, and its own
+`groups_func` export is unchanged. (Such entries used to be left out of every
+set that selected them, silently, and `--diag-json` listed them as
+`capture_bearing_dropped`.)
 
 If a set's frontend was **downgraded** from the one its literals selected, the
 per-set `frontend_demotion` object says so, with `from`, `to`, a machine-
@@ -1040,7 +1053,7 @@ disqualifies.
 
 ## When a set member falls back to Backtracking
 
-A set member whose fallback-bucket DFA exceeds `max_fallback_states` is not
+A set member whose fallback-bucket DFA exceeds `max_dfa_states` is not
 dropped: it is compiled on the **Backtracking engine** instead, so the member
 behaves like the same pattern compiled on its own. Backtracking is the only
 engine here not bound by a compiled table size — it walks the NFA with an
@@ -1056,25 +1069,28 @@ route, this switches the set's `match_all` and `scan_all` to the `out_ptr` form.
 Unlike it, the member stays in `match_any` and `match_all`, whose whole-input
 answer does not depend on which branch wins.
 
-A member whose own DFA cannot be built at all goes to Backtracking too, as the
-same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a` needs 2^13
-states, past the internal limit of 2,048 on one member's set automaton, and
-`max_fallback_states` cannot raise that limit. Such a member used to fail the
-whole set's compile. Like the `max_fallback_states` route, it is absent from
-`match_any` and `match_all` (`anchored_state_limit_dropped`, with its own
-warning) and switches `match_all` and `scan_all` to the `out_ptr` form.
+A member whose own DFA cannot be built within the limit goes to Backtracking
+too, as the same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a`
+needs 2^13 states. A member's automaton is built up to the larger of
+`max_dfa_states` and a construction cap (2,048 states in byte mode, 16,384 in
+Unicode mode), so raising `max_dfa_states` lets it finish. Like the other
+route, the member is absent from `match_any` and `match_all`
+(`anchored_state_limit_dropped`, with its own warning) and switches `match_all`
+and `scan_all` to the `out_ptr` form.
 
-A member Backtracking cannot take either is still excluded, still warned
-about, and still recorded in `--diag-json`'s `state_limit_dropped` — for either
-reason above, since a DFA bucket would give the second kind wrong extents. No
-pattern is known to reach that any more: the main refusal left is the engine's
-instruction cap, and a member that large fails the whole set compile earlier.
-Buckets that were admitted appear in `--diag-json` as `"bt-fallback"`, with
+A member Backtracking cannot take either — its program over
+`max_bt_instructions`, or Backtracking turned off with `max_bt_instructions: 0`
+— fits no engine, for either reason above (a DFA bucket would give the second
+kind wrong extents), and the set does not compile: the error names the member,
+why no DFA takes it, its program's size, and the limit to raise. With
+`max_dfa_states: 0` every member is put on Backtracking. Buckets that were
+admitted appear in `--diag-json` as `"bt-fallback"`, with
 `suffix_states` and `table_bytes` of 0 — they have no table — and `compile
 --verbose` prints their engine as `Backtracking`. Every compile also WARNS,
 once per such member and for every route onto Backtracking: "Set member runs
-on Backtracking: <reason>", with a hint for keeping it on a DFA. It is a
-warning, not a drop — the member still matches.
+on Backtracking: <reason>", with a hint for keeping it on a DFA — except under
+`max_dfa_states: 0`, which asked for it. It is a warning, not a drop — the
+member still matches.
 
 **What one costs.** Measured on a set of 15 ordinary patterns (credentials,
 log fields) plus ONE member routed here for word-boundary ambiguity,

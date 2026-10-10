@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -86,32 +87,43 @@ type BuildConfig struct {
 	// equivalent, and the shared Span and error type widen the
 	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
 	// already isolates every stub.
-	Namespace    string `yaml:"namespace"`
-	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024; 16384 in Unicode mode)
-	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
+	Namespace string `yaml:"namespace"`
+	// MaxDFAStates is the largest DFA or TDFA, in states, any automaton may
+	// be: a single pattern's, and a set's per-member and per-bucket automata
+	// alike. Over it a pattern or member runs on Backtracking. Unset is the
+	// mode's default (1,024; 16,384 in Unicode mode); 0 means always
+	// Backtracking. See Limit for how the YAML value decodes.
+	MaxDFAStates Limit `yaml:"max_dfa_states"`
+	MaxTDFARegs  int   `yaml:"max_tdfa_regs"` // 0 = default (32)
+	// MaxBTInstructions caps a Backtracking program, in instructions — the
+	// size its emitted body grows with. Unset is 20,000; 0 means never
+	// Backtracking, so a pattern or set member that needs it does not compile.
+	MaxBTInstructions Limit `yaml:"max_bt_instructions"`
 	// MaxMemory caps ALL of the module's memory — its tables, the buffers a
 	// JS/TS stub copies inputs into, and a search's working memory — and is
 	// declared as the WASM memory's maximum, so the engine refuses every grow
 	// past it. Unset means no cap. See MemorySize for the spelling.
 	MaxMemory MemorySize `yaml:"max_memory"`
-	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback
-	// bucket in a SET. It is a different budget from MaxDFAStates: that one
-	// bounds a whole single-pattern automaton, this one bounds one bucket of
-	// many inside a set, which is why they are separate keys despite sharing
-	// a default.
-	//
-	// It is load-bearing in a way the other two are not. A single pattern over
-	// MaxDFAStates falls back to another engine and still matches; a set
-	// member over this limit is DROPPED from the set and can never match. So
-	// this is the knob that decides whether a set contains what you put in it.
-	MaxFallbackStates int `yaml:"max_fallback_states"` // 0 = default (1024; 16384 for a Unicode-mode set)
+	// MaxSetBucketSize caps one set BUCKET's table — the automaton several
+	// members share, so the input is walked once for all of them. A member
+	// that would push a bucket past it goes to another bucket, or one of its
+	// own; fewer, bigger buckets are cheaper per input byte. Unset is 128
+	// bytes per max_dfa_states state (128 KB; 2 MB in Unicode mode).
+	MaxSetBucketSize MemorySize `yaml:"max_set_bucket_size"`
+	// MaxSplitTableSize caps the TOTAL tables of one set's split members —
+	// members served by a search of their own, outside the buckets. Members
+	// get the table-driven search smallest first while the total fits; the
+	// rest get the Backtracking search, which needs no table and is slower.
+	// Unset is 4 MB (64 MB for a Unicode-mode set).
+	MaxSplitTableSize MemorySize `yaml:"max_split_table_size"`
 	// MaxUnionStates caps the construction of a SET's union automata — the
 	// one pass that serves scan_any / scan_all for members with no literal,
 	// and the anchored one serving match_any / match_all. Past it the set
 	// falls back to the per-position walk, or splits members out to searches
 	// of their own, both dearer per byte. A larger cap costs compile time and
-	// compiler memory, not correctness.
-	MaxUnionStates int          `yaml:"max_union_states"` // 0 = default (4096)
+	// compiler memory, not correctness. The default follows the set's mode:
+	// 16,384 in Unicode mode, where a letter class costs hundreds of states.
+	MaxUnionStates int          `yaml:"max_union_states"` // 0 = default (4096; 16384 for a Unicode-mode set)
 	Regexps        []RegexEntry `yaml:"regexps"`
 	Sets           []SetConfig  `yaml:"sets"` // optional set composition entries
 }
@@ -299,8 +311,8 @@ func (s SetConfig) PatternCount(cfg BuildConfig) int {
 // This is deliberately an UPPER BOUND computed from the config alone, and it
 // is THE definition for both sides: the compiler calls it (through
 // SetSpec.IDSpaceSize) and so does every stub generator, so the two cannot
-// drift. Patterns dropped later — capture-bearing ones, or ones over the DFA
-// state limit — only lower the ids actually emitted, never raise them, so an
+// drift. A member left out of the anchored pair (over the DFA state limit)
+// only lowers the ids actually emitted there, never raises them, so an
 // upper bound stays safe. Deriving it instead from what survived compilation
 // would be tighter but unavailable to the generators, which never see the
 // compiled module.
@@ -1019,7 +1031,52 @@ const MaxWasmMemoryPages = 1 << 16
 // pages, because a memory's maximum is declared in pages.
 const wasmPageBytes = 64 << 10
 
-// MemorySize is a `max_memory:` value: a number, fractions allowed, optionally
+// Limit is a count limit in the config — `max_dfa_states:` and
+// `max_bt_instructions:` — whose three cases are not three numbers:
+//
+//   - UNSET (the key absent, or null) is the zero value, and means the
+//     limit's default;
+//   - 0, written, means the thing it bounds is OFF: no DFA at all for
+//     max_dfa_states (always Backtracking), no Backtracking at all for
+//     max_bt_instructions. It decodes to -1, which is how CompileOptions
+//     spells "off", so a written 0 cannot be mistaken for "unset" anywhere
+//     downstream;
+//   - a positive number is that limit.
+//
+// A negative value, a fraction or anything that is not a number is a
+// line-numbered load error.
+type Limit int
+
+// LimitOff is the value a written 0 decodes to.
+const LimitOff Limit = -1
+
+// UnmarshalYAML implements yaml.NodeUnmarshaler; see MemorySize.UnmarshalYAML
+// for why it takes the node.
+func (l *Limit) UnmarshalYAML(node ast.Node) error {
+	n, ok := node.(*ast.IntegerNode)
+	if !ok {
+		return &yaml.SyntaxError{
+			Message: "want a whole number, 0 or more, got " + node.Type().String(),
+			Token:   node.GetToken(),
+		}
+	}
+	v, err := strconv.ParseInt(n.GetToken().Value, 0, 64)
+	if err != nil || v < 0 || v > math.MaxInt32 {
+		return &yaml.SyntaxError{
+			Message: fmt.Sprintf("want a whole number from 0 to %d, got %s", math.MaxInt32, n.GetToken().Value),
+			Token:   node.GetToken(),
+		}
+	}
+	if v == 0 {
+		*l = LimitOff
+		return nil
+	}
+	*l = Limit(v)
+	return nil
+}
+
+// MemorySize is a size in the config — `max_memory:`, `max_set_bucket_size:`,
+// `max_split_table_size:` — a number, fractions allowed, optionally
 // followed by a unit — KB, MB, GB (powers of 1,000) or KiB, MiB, GiB (powers
 // of 1,024), in any letter case, with or without a space before it. A bare
 // number is bytes. Anything else is a load error.
@@ -1090,13 +1147,13 @@ func (m *MemorySize) UnmarshalYAML(node ast.Node) error {
 	case *ast.StringNode, *ast.IntegerNode, *ast.FloatNode:
 	default:
 		return &yaml.SyntaxError{
-			Message: "max_memory: want a size such as 100MB, got " + node.Type().String(),
+			Message: "want a size such as 100MB, got " + node.Type().String(),
 			Token:   node.GetToken(),
 		}
 	}
 	v, err := ParseMemorySize(node.GetToken().Value)
 	if err != nil {
-		return &yaml.SyntaxError{Message: "max_memory: " + err.Error(), Token: node.GetToken()}
+		return &yaml.SyntaxError{Message: err.Error(), Token: node.GetToken()}
 	}
 	*m = v
 	return nil

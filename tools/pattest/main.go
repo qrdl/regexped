@@ -14,6 +14,8 @@
 // stdlib regexp package (RE2 semantics, matching this project's own
 // leftmost-first semantics) as ground truth: -mode match checks for a match
 // anchored at the start of the input; -mode find checks for a match anywhere.
+// Go reads runes, so in byte mode (the default) an input with a byte above
+// 0x7F is left out, with a warning; -unicode measures it.
 package main
 
 import (
@@ -67,6 +69,16 @@ var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileO
 // its fuel — is measured here rather than guessed.
 var maxDFAStatesFlag = flag.Int("max-dfa-states", 0, "max_dfa_states for every compile (0 = the mode's default)")
 
+// isASCII reports whether s has no byte above 0x7F.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
 // withMode sets the mode -unicode asks for on o.
 func withMode(o compile.CompileOptions) compile.CompileOptions {
 	if *unicodeFlag {
@@ -105,6 +117,29 @@ func main() {
 	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "error: no inputs found in file")
 		os.Exit(1)
+	}
+	// Byte mode reads bytes and the Go oracle reads runes, so on an input with
+	// a byte above 0x7F the two disagree about what matches — `.{2}` matches
+	// the two bytes of `é` in byte mode, and Go puts it in the non-matching
+	// bucket — and every number reported for that bucket is about the wrong
+	// inputs. Such inputs are left out, as tools/fuzz leaves them out, and the
+	// run says how many; -unicode compiles in the mode the oracle reads.
+	if !*unicodeFlag {
+		ascii := inputs[:0:0]
+		for _, in := range inputs {
+			if isASCII(in) {
+				ascii = append(ascii, in)
+			}
+		}
+		if n := len(inputs) - len(ascii); n > 0 {
+			fmt.Fprintf(os.Stderr, "warning: %d input(s) with bytes above 0x7F left out: byte mode reads bytes, "+
+				"the Go oracle reads runes, so it cannot bucket them; use -unicode to measure them\n", n)
+		}
+		if len(ascii) == 0 {
+			fmt.Fprintln(os.Stderr, "error: no ASCII inputs left to measure in byte mode; use -unicode")
+			os.Exit(1)
+		}
+		inputs = ascii
 	}
 
 	classifyRe, err := classifierRegexp(*patternFlag, *modeFlag)

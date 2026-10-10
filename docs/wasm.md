@@ -568,9 +568,11 @@ empty-mask group skip are not emitted for such a bucket at all, because an
 
 Promotion is refused when the merged DFA misses the state or byte budget, in
 which case the packer would have split it again anyway. In practice the byte
-budget binds first: past 256 states a table switches to u16 cells, and 64 KB of
-those is 128 states — so a merge over ~255 states is declined and the group
-keeps its split packing.
+budget binds first: past 256 states a table switches to u16 cells, 512 bytes a
+state before byte-class compression, so at the default budget —
+`max_set_bucket_size`, 128 bytes per `max_dfa_states` state: 128 KB in byte
+mode, 2 MB in Unicode mode — a merge past about 256 states (byte mode) or
+4,096 (Unicode mode) is declined and the group keeps its split packing.
 
 Three further refusals are about what a sparse body CANNOT see, and each exists
 because ignoring it produced wrong answers rather than slow ones:
@@ -977,7 +979,7 @@ The rules:
 
 The engine may decline even when offered a large enough region: the sweep is
 emitted only where it reproduces the per-position semantics exactly — an
-automaton within `max_fallback_states`, no member whose answers the automaton
+automaton within `max_dfa_states`, no member whose answers the automaton
 cannot give (a Backtracking or non-greedy member is SPLIT out instead, and gets
 the program sweep) — and only where a drive can have arbitrarily many walks
 alive at once (see [sets.md](sets.md), "Overlap policy"). The member count is no

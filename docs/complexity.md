@@ -305,7 +305,7 @@ cannot have it.
   serves one drive at a time; two drives alternating calls keep resetting it.
   The answers are right; each call starts fresh.
 - **Overlapping sets past the sweeps' limits**: kept members whose automaton
-  is over `max_fallback_states` or whose projected column is over 16,383 cells,
+  is over `max_dfa_states` or whose projected column is over 16,383 cells,
   and split members whose programs exceed the program sweep's 4,096 roots or
   65,536 closure items, keep their walks.
 - **A `from` that goes backwards** within a drive is unsupported: notes and

@@ -2073,9 +2073,9 @@ func (c setMatrixCase) build() config.BuildConfig {
 		set.Hints = append(append([]string(nil), set.Hints...), "batch-find")
 	}
 	return config.BuildConfig{
-		Regexps:           entries,
-		Sets:              []config.SetConfig{set},
-		MaxFallbackStates: c.maxFallbackStates,
+		Regexps:      entries,
+		Sets:         []config.SetConfig{set},
+		MaxDFAStates: config.Limit(c.maxFallbackStates),
 	}
 }
 

@@ -1274,7 +1274,7 @@ func sparseMemberUnbounded(bkt *bucket, p *PatternInfo) bool {
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
 	prog, _ := compileProg(ast)
-	d, ok := newDFA(prog, false, maxHelperDFAStates)
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
 	if !ok {
 		return true
 	}

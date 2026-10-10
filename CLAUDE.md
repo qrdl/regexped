@@ -162,6 +162,15 @@ regexped/
 │   │                          #   emitter that never claimed one is a BUILD failure.
 │   │                          #   emitFindFromSeed takes a scanCursor, NOT a local index —
 │   │                          #   see locals.go for why that distinction is load-bearing
+│   ├── limits.go              # buildLimits: max_dfa_states and max_bt_instructions, carried with
+│   │                          #   the pattern's MODE on resolvedPattern/Tree/Prog, so every
+│   │                          #   automaton is built under them wherever it is built
+│   │                          #   (dfaBuildCap = max(mode cap 2,048 / 16,384, the limit)). A
+│   │                          #   flat 2,048 in the set path dropped `.{0,870}` (7,832 states)
+│   ├── funcsize.go            # WebAssembly's 7,654,321-byte function cap: a module with a body
+│   │                          #   over it is a compile error naming its pattern/set (codeOwners,
+│   │                          #   filled by both assemblers). Only Backtracking bodies near it:
+│   │                          #   86 B/instruction byte mode, 121-127 Unicode — ~89k / ~60k
 │   ├── locals.go              # Binding for internal/wlocals: the WASM local allocator and
 │   │                          #   the SEALED scan cursor. Emitters no longer write local
 │   │                          #   indices by hand; the declaration vector is generated from
@@ -352,11 +361,11 @@ regexped/
 │   │                          #   has no effect but the position, and these bodies report no
 │   │                          #   position. It probes the EXIT set, never the self-loop set —
 │   │                          #   one nibble-table pair per 8 members makes a 230-byte
-│   │                          #   self-loop 29 pairs against the exit set's 4. The automaton
-│   │                          #   is NOT minimized, so the detector must treat a move to an
-│   │                          #   INDISTINGUISHABLE state as staying put (same rows AND same
-│   │                          #   accepts); without that the exit set is \w rather than [a-z]
-│   │                          #   and the win halves.
+│   │                          #   self-loop 29 pairs against the exit set's 4. The detector
+│   │                          #   treats a move to an INDISTINGUISHABLE state as staying put
+│   │                          #   (same rows AND same accepts): before the automaton was
+│   │                          #   minimized (dfaTableFrom), without that the exit set was \w
+│   │                          #   rather than [a-z] and the win halved.
 │   │                          #   Serves scan_any/scan_all on literal-less sets, and PHASE 2 of the
 │   │                          #   two-phase split on MIXED sets. Table layout is
 │   │                          #   u8 state ids <=256 states, byte-class compressed over 32 KB.
@@ -365,6 +374,9 @@ regexped/
 │   │                          #   carries a representative id (scan_any's whole answer) plus a
 │   │                          #   bitmap row OR'd into the caller's `_all` bitmap. Past
 │   │                          #   256 ids the set keeps the per-position walk, ~7x dearer.
+│   │                          #   Its construction is bounded by max_union_states: 4,096 states,
+│   │                          #   16,384 in Unicode mode, where 4,096 refused a 3-member `\pL`
+│   │                          #   set and left scan_any 18x dearer (378 vs 20.9 fuel/byte).
 │   │                          #   Both preflight predicates REQUIRE the narrow form — the preflight
 │   │                          #   emitters read u64 accept tables a wide automaton does not emit.
 │   │                          #   States are renumbered MID-ACCEPT-FIRST, so the per-byte "can a
@@ -397,7 +409,7 @@ regexped/
 │   │                          #   calling the worker. A split member's search is its
 │   │                          #   start-anywhere find (CONTEXT passes for an assertion
 │   │                          #   member) or, where that cannot be built, and for members
-│   │                          #   past the 4 MB start-anywhere tables' budget (smallest
+│   │                          #   past max_split_table_size (4 MB; 64 MB in Unicode mode; smallest
 │   │                          #   tables first) or on a Backtracking bucket, the
 │   │                          #   BACKTRACKING find — through the merge wrapper, NOT a
 │   │                          #   per-candidate bucket: a bucket's visited set lasts one
@@ -521,7 +533,7 @@ regexped/
 │   │                          #   it cost overlap-shape-3 +10.5%, on a state change +3.8%
 │   ├── region.go              # Set table-region allocation: the sequential blocks CompileSet lays out
 │   ├── set_anchored_union.go  # The ANCHORED union automaton serving match_any / match_all
-│   ├── set_bt.go              # Backtracking as the set fallback engine for members over max_fallback_states
+│   ├── set_bt.go              # Backtracking as the set fallback engine for members over max_dfa_states
 │   ├── tdfa_bulk_skip.go      # TDFA capture-body bulk-skip for dominant self-loop states, and
 │   │                          #   (Unicode mode) for loops over whole UTF-8 characters — a GROUP of
 │   │                          #   states with identical rows, the TDFA not being minimized — run from
@@ -767,9 +779,24 @@ wac_path:      "tools"               # optional; the same rule for wac. The merg
                                      #   for wasm_format: component — `merge` dispatches on the format
 stub_file:     "src/stubs.rs"        # stub output file; extension determines type: .rs, .js, .ts, .go, .h
 stub_type:     "rust"                # optional; overrides extension inference: rust, js, ts, go, c, as
-max_dfa_states: 1024                 # optional; max DFA/TDFA states before falling back (default 1024;
-                                     #   16384 in Unicode mode, where one `\pL` costs ~290 states)
+max_dfa_states: 1024                 # optional; max states of ANY DFA/TDFA — a single pattern's, a set
+                                     #   member's, a set bucket's — before falling back to Backtracking
+                                     #   (default 1024; 16384 in Unicode mode, where one `\pL` costs ~290
+                                     #   states). A written 0 = always Backtracking (config.Limit decodes it
+                                     #   to -1); unset = default; negative = load error. Every automaton is
+                                     #   BUILT up to max(mode cap 2,048 / 16,384, it) — the limits travel with
+                                     #   the pattern (compile/limits.go). `max_fallback_states:` is RETIRED
 max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
+max_bt_instructions: 20000           # optional; max Backtracking program, in instructions. 0 = never
+                                     #   Backtracking (a pattern or member that needs it fails to compile)
+max_set_bucket_size: 2MB             # optional; one set bucket's table (default 128 B per max_dfa_states
+                                     #   state); the bucket pre-filter follows it
+max_split_table_size: 64MB           # optional; TOTAL start-anywhere tables of one set's split members
+                                     #   (default 4 MB; 64 MB for a Unicode-mode set)
+max_union_states: 4096               # optional; max states while BUILDING a set's union automata (scan pair
+                                     #   and anchored pair), counted before minimization (default 4096;
+                                     #   16384 for a Unicode-mode set, SetSpec.maxUnionStates). Past it the
+                                     #   set takes a slower route, never a wrong answer
 max_memory:     100MB                # optional; declared as the module memory's MAXIMUM, so the engine
                                      #   refuses every grow past it. Unset = no cap. KB/MB/GB = powers of
                                      #   1,000, KiB/MiB/GiB = 1,024, any case, fractions ok; bare = bytes;
@@ -1096,7 +1123,7 @@ Go's tokens, so no match — empty ones included — may start inside a
 character, over the corpus's non-ASCII blocks, `custom-sets.txt` and
 `custom-sets-unicode.txt` (Go-regenerated blocks of the shapes whose empty
 matches could land inside one, over 2- to 4-byte characters and invalid input):
-34,513,565 checks over its ten runs, 0 failures.
+34,516,808 checks over its ten runs, 0 failures (its `--set-bt=1` run counts 8 chunk compiles refused under the forced limit, a member fitting no engine).
 
 **`make -C tools/re2test unicode-all` / `unicode-groups` / `custom-unicode`**
 (outside `make test`) run Unicode mode over what `unicode` skips: with
@@ -1132,14 +1159,19 @@ so every multi-match position splits and the corpus becomes a check of the
 resume path (delivered-tuple gating when gated, the `skip` parameter when
 overlapping).
 
-A pattern the compiler legitimately drops from a set (a fallback suffix DFA
-over `max_fallback_states`, or one the anchored packer alone refused) is
-excluded from the comparison and counted separately, so a documented exclusion
-cannot pass for either a pass or a failure. The exclusion comes from the drop
-WARNING, not from `--diag-json`, and is SCOPED by its `where`: an "anchored
-bucket" drop costs the pattern `match_any`/`match_all` only, and every other
-drop costs it the non-anchored capabilities. `--diag-json` keeps the same two
-scopes apart as `anchored_state_limit_dropped` and `state_limit_dropped`.
+A set NEVER compiles without a member it selected for `find` and the scan
+pair: a member no engine takes (DFA over `max_dfa_states` AND Backtracking
+program over `max_bt_instructions`) is a compile error,
+`compile.ErrSetMemberFitsNoEngine`, naming both limits. The only drop left is
+from `match_any`/`match_all` — the anchored packing has no Backtracking path
+yet — and re2test excludes such a member from those two only,
+taking the exclusion from the drop WARNING (`where` "anchored bucket"), not
+from `--diag-json`. Any other drop warning FAILS the chunk;
+`custom-sets-unicode.txt`'s `UniMemberOverOldBuildCap` (`.{0,870}`: 7,832
+states, 21,752 instructions, built under a fixed 2,048 and dropped) is the
+regression. An entry with `groups_func` is a member too (captures stripped for
+the set); `--diag-json`'s `capture_bearing*` fields and `state_limit_dropped`
+are gone (nothing writes them any more).
 
 **Backtracking `-2` and the fallback body.** A Backtracking call answering
 `-2` ("the engine gave up, answer unknown") is its own skip category,
@@ -1400,7 +1432,7 @@ measured), what it changed (a per-mode `SetDiag` row — frontend, scan body, an
 body, buckets — since a body selection is invisible everywhere else and is usually the
 whole story), and whether it paid (fuel and p50 per bucket). Inputs are bucketed
 matching/non-matching by a Go stdlib oracle built from the patterns the set ACTUALLY
-contains — a compiler-dropped pattern is excluded and warned about — and the driven
+contains — a pattern left out of the anchored pair is excluded there — and the driven
 export is checked against that oracle before anything is measured, since a mis-driven
 ABI measures the wrong work entirely.
 
@@ -1722,7 +1754,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-06
+**Last Updated:** 2026-10-09
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

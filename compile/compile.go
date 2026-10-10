@@ -59,24 +59,36 @@ var ErrDFAStateLimit = errors.New("compile: DFA state limit exceeded during cons
 var ErrBTProgramTooLarge = errors.New("compile: backtracking fallback program exceeds size limit")
 
 // btTooLarge is ErrBTProgramTooLarge for one body, saying what a user can do
-// about it: the program's size against the fixed limit, and why the body went
-// to Backtracking at all — with the key that would keep it on its automaton,
-// when one would. A Unicode-mode program is far larger than its byte-mode
-// counterpart (a lowered `\pL` is hundreds of instructions), so this is
-// where a pattern over max_dfa_states usually lands.
+// about it: the program's size against max_bt_instructions, and why the body
+// went to Backtracking at all — with the key that would keep it on its
+// automaton, when one would. A Unicode-mode program is far larger than its
+// byte-mode counterpart (a lowered `\pL` is hundreds of instructions), so this
+// is where a pattern over max_dfa_states usually lands.
 type btTooLarge struct {
 	body  string // "find", "match" or "capture"
 	insts int
 	why   string // why the body is on Backtracking; "" when unknown
+	limit int    // max_bt_instructions in force
+	off   bool   // max_bt_instructions: 0 — Backtracking is off
+}
+
+// newBTTooLarge is btTooLarge under lim.
+func newBTTooLarge(body string, insts int, why string, lim buildLimits) *btTooLarge {
+	return &btTooLarge{body: body, insts: insts, why: why, limit: lim.btLimit(), off: lim.btOff()}
 }
 
 func (e *btTooLarge) Error() string {
-	if e.why == "" {
-		return fmt.Sprintf("%v: the %s body's Backtracking program has %d instructions, over the fixed limit of %d",
-			ErrBTProgramTooLarge, e.body, e.insts, maxBTFallbackInstructions)
+	why := ""
+	if e.why != "" {
+		why = " because " + e.why
 	}
-	return fmt.Sprintf("%v: the %s body went to Backtracking because %s, but its program there has %d instructions, "+
-		"over the fixed limit of %d", ErrBTProgramTooLarge, e.body, e.why, e.insts, maxBTFallbackInstructions)
+	if e.off {
+		return fmt.Sprintf("%v: the %s body needs Backtracking%s, and max_bt_instructions: 0 turns Backtracking off; "+
+			"set max_bt_instructions to at least %d", ErrBTProgramTooLarge, e.body, why, e.insts)
+	}
+	return fmt.Sprintf("%v: the %s body went to Backtracking%s, but its program there has %d instructions, "+
+		"over max_bt_instructions (%d); raise max_bt_instructions to at least %d",
+		ErrBTProgramTooLarge, e.body, why, e.insts, e.limit, e.insts)
 }
 
 func (e *btTooLarge) Is(target error) bool { return target == ErrBTProgramTooLarge }
@@ -90,7 +102,8 @@ func dfaLimitWhy(what string, states, maxStates int, tooMany bool) string {
 	return fmt.Sprintf("its %s needs %d states, over %d (max_dfa_states; raise it to keep the DFA)", what, states, maxStates)
 }
 
-// maxBTFallbackInstructions caps the NFA program size (len(prog.Inst)) any
+// maxBTFallbackInstructions is max_bt_instructions' DEFAULT: the NFA program
+// size (len(prog.Inst)) any
 // Backtracking engine construction site — no-capture find/match fallback,
 // capture-tracking fallback when TDFA is ineligible, and the general
 // engine-executor path — is willing to turn into WASM.
@@ -326,6 +339,13 @@ type CompileOptions struct {
 	// Exposed as max_tdfa_regs in the YAML config.
 	MaxTDFARegs  int
 	MaxDFAMemory int // Maximum DFA table bytes, checked beside MaxDFAStates; 0 = no limit (not a config key)
+	// MaxBTInstructions caps a Backtracking program, in instructions — the
+	// size its emitted body grows with (buildLimits.btLimit). 0 means the
+	// default (maxBTFallbackInstructions, 20,000); negative means no
+	// Backtracking at all, so a pattern that needs it does not compile.
+	// Exposed as max_bt_instructions in the YAML config, whose written 0
+	// arrives here as -1.
+	MaxBTInstructions int
 	// The three mode fields answer three DIFFERENT questions; none stands in
 	// for another (resolvePattern reads them):
 	//
@@ -450,6 +470,9 @@ type compiledPattern struct {
 	findBody    []byte // (i32,i32)→i64; nil if not needed. Set via setFind, never directly.
 	captureBody []byte // (i32,i32,i32)→i32; nil if no groups; always internal
 
+	// label is the pattern's name, or its source when it has none: who owns
+	// its function bodies, for messages (codeOwners).
+	label        string
 	matchExport  string // empty = not exported
 	findExport   string // empty = internal-only (for wrapper use)
 	groupsExport string
@@ -1138,8 +1161,8 @@ type btFindParts struct {
 func buildBTFindParts(pattern resolvedPattern, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions) (btFindParts, error) {
 	var parts btFindParts
 	btProg := compileBTProg(pattern)
-	if len(btProg.prog.Inst) > maxBTFallbackInstructions {
-		return parts, &btTooLarge{body: "find", insts: len(btProg.prog.Inst)}
+	if !btProg.lim.btFits(len(btProg.prog.Inst)) {
+		return parts, newBTTooLarge("find", len(btProg.prog.Inst), "", btProg.lim)
 	}
 	bt := newBacktrack(btProg)
 	bt.numGroups = 0
@@ -1271,10 +1294,11 @@ func appendBTFindParts(cs []byte, fast []byte, parts btFindParts, fastIdx int) [
 }
 
 // btFindBuildable reports whether Backtracking can take pattern's find at all:
-// its program fits maxBTFallbackInstructions. Nothing else is sized at compile
+// its program fits max_bt_instructions. Nothing else is sized at compile
 // time — the find's frame stack grows at call time.
 func btFindBuildable(pattern resolvedPattern) bool {
-	return len(compileBTProg(pattern).prog.Inst) <= maxBTFallbackInstructions
+	p := compileBTProg(pattern)
+	return p.lim.btFits(len(p.prog.Inst))
 }
 
 // appendMatchBodies appends matchBody and its fallback, if any; matchFuncIdx is
@@ -1395,6 +1419,10 @@ func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine Eng
 	}
 	if err != nil || p == nil {
 		return p, err
+	}
+	p.label = re.Name
+	if p.label == "" {
+		p.label = re.Pattern
 	}
 	p.startRule = startRuleFor(rp)
 	// What a search of a Unicode-mode pattern keeps per input byte, so the
@@ -1898,7 +1926,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if llErr != nil || llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
 			btProg := compileBTProg(rp)
-			if len(btProg.prog.Inst) > maxBTFallbackInstructions {
+			if !btProg.lim.btFits(len(btProg.prog.Inst)) {
 				why := fmt.Sprintf("its match DFA table is over the memory bound (%d bytes)", memLimit)
 				if llErr != nil || llTable.numStates > maxStates {
 					n := 0
@@ -1907,7 +1935,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					}
 					why = dfaLimitWhy("match DFA", n, maxStates, llErr != nil)
 				}
-				return nil, &btTooLarge{body: "match", insts: len(btProg.prog.Inst), why: why}
+				return nil, newBTTooLarge("match", len(btProg.prog.Inst), why, btProg.lim)
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
@@ -2246,7 +2274,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				// Compile the reversed prefix DFA for the backward scan.
 				revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
 				if revCompErr == nil && !revProg.refusedByByteGate() {
-					revDFA, revOk := newDFA(revProg, false, maxHelperDFAStates)
+					revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
 					var revTable *dfaTable
 					if revOk {
 						revTable = dfaTableFrom(revDFA)
@@ -2776,9 +2804,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	if groupsEngine == EngineBacktrack {
-		if len(prog.Inst) > maxBTFallbackInstructions {
-			return nil, &btTooLarge{body: "capture", insts: len(prog.Inst),
-				why: "TDFA could not take it (--verbose says why; a TDFA over max_dfa_states is one reason)"}
+		if !mp.lim.btFits(len(prog.Inst)) {
+			return nil, newBTTooLarge("capture", len(prog.Inst),
+				"TDFA could not take it (--verbose says why; a TDFA over max_dfa_states is one reason)", mp.lim)
 		}
 		bt := newBacktrack(mp)
 
@@ -3284,6 +3312,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(total-numFuncImports))
 	for i, p := range patterns {
+		opts.owners.mark(len(cs), p.ownerName())
 		base := baseIdx[i]
 		matchOff, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
@@ -3383,6 +3412,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly, p.defGroups)
 		}
 	}
+	opts.owners.mark(len(cs), "")
 	if opts.Component {
 		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
 		cs = appendCodeEntry(cs, buildComponentFreeBody(classHeadsBase))
@@ -3404,6 +3434,11 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 		cs = appendCodeEntry(cs, searchSetterBody(searchG))
 	}
 	return appendCodeAndData(out, cs, rawData, totalSegs, standalone)
+}
+
+// ownerName is how a message about one of p's function bodies names p.
+func (p *compiledPattern) ownerName() string {
+	return fmt.Sprintf("pattern %q", p.label)
 }
 
 // Compile compiles multiple regexp patterns to a single WASM module.
@@ -3510,7 +3545,12 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		return nil, 0, err
 	}
 	asm.MaxPages = maxPages
+	var owners codeOwners
+	asm.owners = &owners
 	w := assembleModule(compiled, memPages, standalone, globals, asm)
+	if err := checkFunctionSizes(w, owners); err != nil {
+		return nil, 0, err
+	}
 	opts.Report.noteModule(globals)
 	return w, lastTableEnd, nil
 }
@@ -3554,10 +3594,11 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		rep.Sets = diags
 	} else {
 		compOpts := CompileOptions{
-			MaxDFAStates: cfg.MaxDFAStates,
-			MaxTDFARegs:  cfg.MaxTDFARegs,
-			MaxMemory:    cfg.MaxMemory,
-			Report:       rep,
+			MaxDFAStates:      int(cfg.MaxDFAStates),
+			MaxBTInstructions: int(cfg.MaxBTInstructions),
+			MaxTDFARegs:       cfg.MaxTDFARegs,
+			MaxMemory:         cfg.MaxMemory,
+			Report:            rep,
 		}
 		standalone := cfg.Output == ""
 		var err error
@@ -3623,14 +3664,6 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 				}
 			}
 		}
-		var droppedRefs []PatternRef
-		for _, idx := range selectedIdx {
-			re := cfg.Regexps[idx]
-			if re.CaptureStubsRequested() {
-				diag.CaptureBearing++
-				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
-			}
-		}
 		// setPatternInfos, not a second copy of its loop. This used to
 		// `continue` past an analyzePattern error where CompileFile treats the
 		// same error as FATAL, so a config that cannot build could still
@@ -3650,8 +3683,10 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// and this file is the only window onto those.
 		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
+		if cs.err != nil {
+			return fmt.Errorf("set %q: %w", sc.Name, cs.err)
+		}
 		if cs.diag != nil {
-			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)
 		}
 		diag.InSet += len(infos)
@@ -3894,16 +3929,16 @@ func compile(pattern resolvedPattern, opts ...CompileOptions) (matcher, error) {
 		panic(fmt.Sprintf("compile: builds a DFA only, asked for engine %v", options.ForceEngine))
 	}
 
-	// max(maxHelperDFAStates, resolveMaxDFAStates(&options)): callers
-	// (compile.go's match/find construction) deliberately set
-	// MaxDFAStates arbitrarily low to force a BT fallback while still
-	// expecting a real (if oversized) table back for prefix-extraction
-	// optimisations — see maxHelperDFAStates' doc comment. But a caller
-	// that configures a MaxDFAStates ABOVE maxHelperDFAStates (e.g.
-	// re2test's 100000) must have construction actually reach that
-	// budget, or the 2048 ceiling silently downgrades DFA-eligible
-	// patterns to Backtracking regardless of the configured threshold.
-	ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options, pattern.unicode()))
+	// The larger of the mode's construction cap and the state limit
+	// (buildLimits.dfaBuildCap): callers (compile.go's match/find
+	// construction) deliberately set MaxDFAStates arbitrarily low to force a
+	// BT fallback while still expecting a real (if oversized) table back for
+	// prefix-extraction optimisations — see maxHelperDFAStates' doc comment.
+	// But a caller that configures a MaxDFAStates ABOVE the cap (e.g.
+	// re2test's 100000) must have construction actually reach that budget,
+	// or the cap silently downgrades DFA-eligible patterns to Backtracking
+	// regardless of the configured threshold.
+	ceiling := buildLimits{dfaStates: options.MaxDFAStates}.dfaBuildCap(pattern.unicode())
 	d, ok := newDFA(prog, options.LeftmostFirst, ceiling)
 	if !ok {
 		return nil, ErrDFAStateLimit

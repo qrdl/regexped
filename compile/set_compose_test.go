@@ -2657,7 +2657,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 		opts                  CompileSetOptions
 	}{
 		{"word-boundary", `(?:\B|a|)a`, "lose a word-boundary branch's priority", CompileSetOptions{}},
-		{"over-max-fallback-states", btNullableChainPattern, "exceeds max_fallback_states", CompileSetOptions{MaxFallbackStates: 8}},
+		{"over-max-dfa-states", btNullableChainPattern, "exceeds max_dfa_states", CompileSetOptions{MaxFallbackStates: 8}},
 		{"own-dfa-unbuildable", setCoreCovNullableUnbuildable, "could not be built", CompileSetOptions{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2734,23 +2734,22 @@ func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	}
 }
 
-// TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch.
+// TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch: a set
+// member's state limit is the config's max_dfa_states.
 //
 // Driving compileFallback through CompileSetOptions proves the branch works but
-// says nothing about whether a user can reach it. They could not:
-// CompileSetOptions was constructed in two places and NEITHER set
-// MaxFallbackStates, so the hardcoded default of 1024 always won — and the
-// drop warning's own hint said "raise max_dfa_states", a field that feeds a
-// different budget entirely.
+// says nothing about whether a user can reach it. Once they could not:
+// CompileSetOptions was constructed in two places and neither set the limit,
+// so the hardcoded default of 1024 always won.
 //
 // This drives the real entry point, CompileFileDiag, so a future refactor that
-// rebuilds CompileSetOptions without the field fails here rather than silently
-// restoring the unreachable knob. The budget's observable effect is the bucket
+// rebuilds the options without the limit fails here rather than silently
+// restoring the unreachable knob. The limit's observable effect is the bucket
 // the member lands in: over it, a Backtracking bucket; under it, a DFA one.
 func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	cfg := func(limit int) config.BuildConfig {
 		return config.BuildConfig{
-			MaxFallbackStates: limit,
+			MaxDFAStates: config.Limit(limit),
 			Regexps: []config.RegexEntry{
 				// No usable literal, so it lands in a fallback bucket, and
 				// enough states to clear a small limit and not a large one.
@@ -2773,7 +2772,7 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	} {
 		_, _, diags, err := CompileFileDiag(cfg(tc.limit), "")
 		if err != nil {
-			t.Fatalf("max_fallback_states=%d: CompileFileDiag: %v", tc.limit, err)
+			t.Fatalf("max_dfa_states=%d: CompileFileDiag: %v", tc.limit, err)
 		}
 		gotBT := false
 		for _, d := range diags {
@@ -2878,8 +2877,9 @@ func TestWideSetShapesCompile(t *testing.T) {
 // but named by no bucket, so the emitted mask arithmetic has to restrict the
 // answer to the patterns that can actually be reported.
 //
-// A low MaxFallbackStates is what forces the drop; nothing else in the suite
-// compiles a set that loses a member this way.
+// A low max_dfa_states is what forces the drop — from match_any / match_all,
+// the anchored pair, which has no Backtracking path; nothing else in the
+// suite compiles a set that loses a member this way.
 func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 	fams := [][]string{
 		{`[a-z]{0,60}x`, `abc`, `def`},
@@ -2900,7 +2900,7 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 					MatchAny: "ma", MatchAll: "mall", ScanAny: "sa", ScanAll: "sall", Find: "fi",
 					Patterns: config.PatternSelector{Names: names}}
 				if _, _, err := CompileFile(config.BuildConfig{
-					Regexps: entries, Sets: []config.SetConfig{sc}, MaxFallbackStates: lim}, ""); err != nil {
+					Regexps: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: config.Limit(lim)}, ""); err != nil {
 					t.Fatalf("CompileFile(%v, limit=%d): %v", f, lim, err)
 				}
 			}

@@ -1,9 +1,12 @@
 # conflict_003: budget_overflow_bytes
 # Patterns with same literal "baz". After merging pattern 1, pattern 2's merged
 # DFA exceeds the table-bytes budget.
+# The pre-filter follows the byte budget unless set, so it is set here: the
+# fixture isolates the byte budget.
 options:
   bitmask_width: 64
   budget_bytes: 1
+  budget_states_prefilter: 65536
 patterns:
   - pattern: 'baz[a-z]+'
   - pattern: 'baz[0-9]+'

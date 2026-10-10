@@ -20,13 +20,12 @@ all: compose
 # $(REGEXPED) is a prerequisite because the component depends on the COMPILER as
 # much as on the config.
 #
-# Both come from ONE compile, so they hang off a stamp: a rule naming two targets
-# runs its recipe once per target, and twice at once under -j.
-.component.stamp: regexped.yaml $(REGEXPED)
+# Both come from ONE compile: a grouped target (`&:`, GNU make 4.3 or later)
+# runs its recipe once for both, under -j too, and either one missing or out
+# of date reruns it. A plain rule naming two targets would run it once per
+# target, and twice at once under -j.
+$(COMPONENT) $(WIT) &: regexped.yaml $(REGEXPED)
 	$(REGEXPED) compile --config=regexped.yaml
-	@touch $@
-
-$(COMPONENT) $(WIT): .component.stamp ;
 
 compile: $(COMPONENT)
 
@@ -71,4 +70,4 @@ run: $(FINAL)
 
 clean:
 	cargo clean
-	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL) .component.stamp
+	rm -f $(COMPONENT) $(WIT) $(STUB) $(FINAL)

@@ -247,6 +247,56 @@ func TestLoadConfigMaxMemory(t *testing.T) {
 	}
 }
 
+// TestLoadConfigLimits pins max_dfa_states' and max_bt_instructions' three
+// cases: absent is the default (0), a written 0 is OFF (LimitOff), a positive
+// number is itself; a negative or non-integer value is a line-numbered refusal.
+// max_fallback_states is retired: a load error, not an ignored key.
+func TestLoadConfigLimits(t *testing.T) {
+	load := func(t *testing.T, extra string) (BuildConfig, error) {
+		t.Helper()
+		return LoadConfig(writeConfig(t, "wasm_file: out.wasm\n"+extra+"regexps:\n  - pattern: 'a'\n    match_func: m\n"))
+	}
+	for _, c := range []struct {
+		yaml    string
+		dfa, bt Limit
+	}{
+		{"", 0, 0},
+		{"max_dfa_states: 0\nmax_bt_instructions: 0\n", LimitOff, LimitOff},
+		{"max_dfa_states: 4096\nmax_bt_instructions: 50000\n", 4096, 50000},
+	} {
+		cfg, err := load(t, c.yaml)
+		if err != nil {
+			t.Fatalf("%q: %v", c.yaml, err)
+		}
+		if cfg.MaxDFAStates != c.dfa || cfg.MaxBTInstructions != c.bt {
+			t.Errorf("%q: max_dfa_states %d, max_bt_instructions %d; want %d, %d",
+				c.yaml, cfg.MaxDFAStates, cfg.MaxBTInstructions, c.dfa, c.bt)
+		}
+	}
+	for _, line := range []string{"max_dfa_states: -1\n", "max_bt_instructions: -5\n", "max_dfa_states: 1.5\n",
+		"max_bt_instructions: lots\n", "max_dfa_states: [1]\n", "max_dfa_states: 9999999999\n"} {
+		_, err := load(t, line)
+		if err == nil {
+			t.Errorf("%q: loaded, want a refusal", line)
+			continue
+		}
+		if !strings.Contains(err.Error(), "[2:") {
+			t.Errorf("%q: not a line-numbered error: %v", line, err)
+		}
+	}
+	if _, err := load(t, "max_fallback_states: 512\n"); err == nil {
+		t.Error("max_fallback_states (retired, now max_dfa_states) loaded, want a load error")
+	}
+	for _, line := range []string{"max_set_bucket_size: 2MB\n", "max_split_table_size: 0\n"} {
+		if _, err := load(t, line); err != nil {
+			t.Errorf("%q: %v", line, err)
+		}
+	}
+	if _, err := load(t, "max_split_table_size: -1MB\n"); err == nil {
+		t.Error("max_split_table_size: -1MB loaded, want a refusal")
+	}
+}
+
 func TestPatternSelector_UnmarshalYAML_All(t *testing.T) {
 	var s struct {
 		P PatternSelector `yaml:"patterns"`
@@ -975,7 +1025,9 @@ stub_file: stubs.rs
 import_module: demo
 max_dfa_states: 2048
 max_tdfa_regs: 48
-max_fallback_states: 512
+max_bt_instructions: 30000
+max_set_bucket_size: 1MiB
+max_split_table_size: 8MB
 max_union_states: 16384
 regexps:
   - name: url
@@ -1004,7 +1056,8 @@ sets:
 	if len(cfg.Regexps) != 2 || len(cfg.Sets) != 1 {
 		t.Fatalf("loaded %d regexps and %d sets, want 2 and 1", len(cfg.Regexps), len(cfg.Sets))
 	}
-	if cfg.MaxDFAStates != 2048 || cfg.MaxTDFARegs != 48 || cfg.MaxFallbackStates != 512 || cfg.MaxUnionStates != 16384 {
+	if cfg.MaxDFAStates != 2048 || cfg.MaxTDFARegs != 48 || cfg.MaxBTInstructions != 30000 || cfg.MaxUnionStates != 16384 ||
+		cfg.MaxSetBucketSize.Bytes() != 1<<20 || cfg.MaxSplitTableSize.Bytes() != 8_000_000 {
 		t.Errorf("the numeric limits did not survive loading: %+v", cfg)
 	}
 	if !cfg.Sets[0].Overlapping || !cfg.Sets[0].BatchFind() {

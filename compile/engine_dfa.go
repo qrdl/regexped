@@ -2451,8 +2451,9 @@ func minimizeDFA(t *dfaTable) {
 // the caller's column-collapsing then makes one byte silently inherit the
 // other's transitions. Harmless while compression was u8-coupled (<=256
 // states); reachable the moment a >255-state table is compressed, which every
-// u16 union automaton is (maxUnionScanStates is 4096, and u16 ⇒ >256 states ⇒
-// always over the 32 KB budget). Compile-time cost only.
+// u16 union automaton is (its default bound is 4,096 states, 16,384 in Unicode
+// mode, and u16 ⇒ >256 states ⇒ always over the 32 KB budget). Compile-time
+// cost only.
 func computeByteClasses(t *dfaTable) (classMap [256]byte, classRep []int, numClasses int) {
 	sigToClass := map[string]int{}
 	sig := make([]byte, 2*t.numStates)
@@ -16077,7 +16078,7 @@ func analyseLitChainAltLenient(pattern resolvedPattern, leftmostFirst bool) (*le
 		if prog.refusedByByteGate() {
 			return nil, false
 		}
-		d, dOk := newDFA(prog, leftmostFirst, maxHelperDFAStates)
+		d, dOk := newDFA(prog, leftmostFirst, prog.dfaBuildCap())
 		if !dOk {
 			return nil, false
 		}

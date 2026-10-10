@@ -525,7 +525,7 @@ Note the contrast with the **compile-time** ceilings (`ErrBTStackTooLarge`, `Err
 
 The Backtracking engine's WASM emission is `br_table`-based with one case per NFA instruction, so emitted module size scales roughly linearly with the NFA program's instruction count (`len(prog.Inst)` after `regexp/syntax` compilation) — a confirmed pathological pattern (a large literal byte run repeated under an unbounded quantifier) produced a 123,695-instruction program and a 7,966,121-byte module, exceeding wasmtime's own ~7,654,321-byte function-body-size limit and failing to load at runtime.
 
-Every construction site that can route to Backtracking — the no-capture find/match fallback (taken when the primary DFA is rejected as too large), the capture-tracking fallback (taken when a capture pattern is not TDFA-eligible), and the general engine-executor path (`Compile`/`CompileForced`/`SelectEngine` callers, including explicit `ForceEngine: EngineBacktrack`) — checks `len(prog.Inst)` against `maxBTFallbackInstructions` (20,000) before emitting any WASM. Exceeding the cap fails compilation with a clear error (`errBTProgramTooLarge`) instead of silently producing an oversized module that only fails once a WASM runtime tries to load it. The 20,000 threshold assumes a 3x-worse bytes/instruction ratio than the confirmed repro, targeting a worst-case module size comfortably under wasmtime's limit — real-world patterns are nowhere near it; hand-written patterns typically compile to tens or low hundreds of NFA instructions, so the cap only rejects pathological inputs (e.g. fuzzer-generated giant literal runs), not practical usage.
+Every construction site that can route to Backtracking — the no-capture find/match fallback (taken when the primary DFA is rejected as too large), the capture-tracking fallback (taken when a capture pattern is not TDFA-eligible), and the general engine-executor path (`Compile`/`CompileForced`/`SelectEngine` callers, including explicit `ForceEngine: EngineBacktrack`) — and a set member's Backtracking bucket or split search — checks `len(prog.Inst)` against `max_bt_instructions` (default 20,000) before emitting any WASM. Exceeding it fails compilation with an error (`ErrBTProgramTooLarge`; for a set member, `ErrSetMemberFitsNoEngine`) that names the key, the size the program needs, and `max_dfa_states` where raising that would keep the pattern on a DFA; `max_bt_instructions: 0` forbids Backtracking altogether. The default assumes a 3x-worse bytes/instruction ratio than the confirmed repro, targeting a worst-case module size comfortably under wasmtime's limit — real-world patterns are nowhere near it: of 894 measured (WAF rules, the examples), none needs 20,000 in its own mode. Raised far enough (past roughly 89,000 instructions in byte mode, 60,000 in Unicode mode, at 86 and 121-127 bytes per instruction), the key lets through a body over WebAssembly's 7,654,321-byte function cap; the compiler checks every function of the finished module and refuses that too (`ErrFunctionTooLarge`), naming the pattern and the size, rather than produce a module no runtime will load.
 
 ### BitState memoization
 
@@ -889,8 +889,11 @@ answer cache; see [sets.md](sets.md#sets-in-unicode-mode).
 (byte mode: 1,024): each Unicode class position costs DFA states — about 290
 for `\pL` — and Backtracking, the fallback past the limit, runs a program as
 large as the classes are, at hundreds of times a DFA's cost per byte. A set in
-Unicode mode likewise defaults to `max_fallback_states: 16384`. The other
-limits are unchanged; `compile --verbose` names each one a pattern hits and
+Unicode mode takes the same `max_dfa_states` for its members and buckets, and
+defaults to `max_union_states: 16384` for the automata that scan or match all
+its members in one pass (byte mode: 4,096) and to `max_split_table_size: 64MB`
+for its split members' tables (byte mode: 4 MB). The other limits are
+unchanged; `compile --verbose` names each one a pattern hits and
 the working memory per input byte its search keeps.
 
 **Fast paths that stay ASCII.** Three analysers that speed up a repeated class

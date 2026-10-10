@@ -168,6 +168,7 @@ type resolvedPattern struct {
 	src string
 	pm  progMode
 	pg  *progressSink // the compile's progress sink, nil for none
+	lim buildLimits   // the configured size limits (limits.go)
 }
 
 // resolvePattern is the ONE place a single pattern's mode is decided, from its
@@ -189,32 +190,33 @@ func resolvePattern(src string, key *bool, opts *CompileOptions) (resolvedPatter
 		o = *opts
 	}
 	pg := o.Report.progress() // the compile's progress sink travels with the pattern
+	lim := limitsOf(&o)       // and so do the limits
 	switch {
 	case o.Unicode && o.ForceByteMode:
 		panic("regexped: CompileOptions.Unicode and ForceByteMode are both set")
 	case o.Unicode && o.ByteMode:
 		panic("regexped: CompileOptions.Unicode and ByteMode are both set")
 	case o.Unicode:
-		return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
+		return resolvedPattern{src: src, pm: progModeUnicode, pg: pg, lim: lim}, nil
 	case o.ForceByteMode:
-		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg, lim: lim}, nil
 	}
 	if key != nil {
 		switch {
 		case *key && o.ByteMode:
 			return resolvedPattern{}, fmt.Errorf("unicode: true and byte_mode: true contradict each other")
 		case *key:
-			return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
+			return resolvedPattern{src: src, pm: progModeUnicode, pg: pg, lim: lim}, nil
 		}
-		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg, lim: lim}, nil
 	}
 	if o.ByteMode {
-		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg, lim: lim}, nil
 	}
 	if detectUnicodeRune(src) < 0 {
-		return resolvedPattern{src: src, pm: progModeByte, pg: pg}, nil
+		return resolvedPattern{src: src, pm: progModeByte, pg: pg, lim: lim}, nil
 	}
-	return resolvedPattern{src: src, pm: progModeUnicode, pg: pg}, nil
+	return resolvedPattern{src: src, pm: progModeUnicode, pg: pg, lim: lim}, nil
 }
 
 // detectUnicodeRune returns the rune that makes src ask for Unicode mode, or
@@ -250,14 +252,15 @@ func (p resolvedPattern) modeName() string {
 // setMode is a set's resolved mode, which every member's pattern takes
 // (resolveSetMode).
 type setMode struct {
-	pm progMode
-	pg *progressSink // the compile's progress sink, nil for none
+	pm  progMode
+	pg  *progressSink // the compile's progress sink, nil for none
+	lim buildLimits   // the config's size limits, every member's
 }
 
 // member gives src, a member pattern of the set, the set's mode.
 func (m setMode) member(src string) resolvedPattern {
 	m.pm.check()
-	return resolvedPattern{src: src, pm: m.pm, pg: m.pg}
+	return resolvedPattern{src: src, pm: m.pm, pg: m.pg, lim: m.lim}
 }
 
 // resolveSetMode is the ONE place a set's mode is decided. A member ASKS FOR
@@ -279,9 +282,6 @@ func resolveSetMode(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []i
 	var byteMember, unicodeMember string
 	for _, idx := range selectedIdx {
 		re := cfg.Regexps[idx]
-		if re.CaptureStubsRequested() {
-			continue // dropped from the set (setPatternInfos), so no say in its mode
-		}
 		switch {
 		case re.IsByteMode():
 			if byteMember == "" {
@@ -318,34 +318,35 @@ func (p resolvedPattern) parse() (resolvedTree, error) {
 	if err != nil {
 		return resolvedTree{}, err
 	}
-	return resolvedTree{re: re, pm: p.pm, pg: p.pg}, nil
+	return resolvedTree{re: re, pm: p.pm, pg: p.pg, lim: p.lim}, nil
 }
 
 // source gives src, the printed form of a tree parsed from p's source and
 // possibly cut down or rewritten since, p's mode.
 func (p resolvedPattern) source(src string) resolvedPattern {
 	p.pm.check()
-	return resolvedPattern{src: src, pm: p.pm, pg: p.pg}
+	return resolvedPattern{src: src, pm: p.pm, pg: p.pg, lim: p.lim}
 }
 
 // tree gives re, a tree parsed from p's source and possibly cut down or
 // rewritten since, p's mode.
 func (p resolvedPattern) tree(re *syntax.Regexp) resolvedTree {
 	p.pm.check()
-	return resolvedTree{re: re, pm: p.pm, pg: p.pg}
+	return resolvedTree{re: re, pm: p.pm, pg: p.pg, lim: p.lim}
 }
 
 // resolvedTree is a parse tree with the mode of the pattern it came from.
 type resolvedTree struct {
-	re *syntax.Regexp
-	pm progMode
-	pg *progressSink // the compile's progress sink, nil for none
+	re  *syntax.Regexp
+	pm  progMode
+	pg  *progressSink // the compile's progress sink, nil for none
+	lim buildLimits   // the configured size limits (limits.go)
 }
 
 // tree gives re, a tree cut from t or built around it, t's mode.
 func (t resolvedTree) tree(re *syntax.Regexp) resolvedTree {
 	t.pm.check()
-	return resolvedTree{re: re, pm: t.pm, pg: t.pg}
+	return resolvedTree{re: re, pm: t.pm, pg: t.pg, lim: t.lim}
 }
 
 // unicode reports whether t is in a Unicode mode.
@@ -359,7 +360,7 @@ func (t resolvedTree) unicode() bool {
 // keep the forward mode.
 func (t resolvedTree) reversed() resolvedTree {
 	t.pm.check()
-	return resolvedTree{re: reverseRegexp(t.re), pm: t.pm.reversed(), pg: t.pg}
+	return resolvedTree{re: reverseRegexp(t.re), pm: t.pm.reversed(), pg: t.pg, lim: t.lim}
 }
 
 // resolvedProg is a program with the mode it was compiled in. Every engine
@@ -372,6 +373,7 @@ type resolvedProg struct {
 	orig *syntax.Prog
 	pm   progMode
 	pg   *progressSink // the compile's progress sink, nil for none
+	lim  buildLimits   // the configured size limits (limits.go)
 }
 
 // unicode reports whether p was compiled in a Unicode mode.
@@ -395,7 +397,7 @@ func compileProg(t resolvedTree) (resolvedProg, error) {
 			prog = lowerUTF8Reverse(orig)
 		}
 	}
-	return resolvedProg{prog: prog, orig: orig, pm: t.pm, pg: t.pg}, err
+	return resolvedProg{prog: prog, orig: orig, pm: t.pm, pg: t.pg, lim: t.lim}, err
 }
 
 // sameProgMode returns the mode every program in progs was compiled in, for a

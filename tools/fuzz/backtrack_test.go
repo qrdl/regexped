@@ -145,7 +145,7 @@ func TestSetBTMemoIsLinearInInputLength(t *testing.T) {
 			Name: "s", Find: "set_find",
 			Patterns: config.PatternSelector{Names: []string{"p0"}},
 		}},
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 	}
 	w, _, diags, err := compile.CompileFileDiag(cfg, "")
 	if err != nil {
@@ -271,7 +271,7 @@ func TestBTZeroWidthCycleProgramsMatchGo(t *testing.T) {
 	}
 
 	for _, pat := range shapes {
-		if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, compile.CompileOptions{}); err != nil || !cyc {
+		if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, withMode(compile.CompileOptions{})); err != nil || !cyc {
 			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — the shape no longer has the cycle this test is about", pat, cyc, err)
 		}
 		re := regexp.MustCompile(pat)
@@ -417,8 +417,8 @@ func TestSetBTMemberRegionReplacedBelowOrigin(t *testing.T) {
 	pats := []string{`[a-z]{63}key`, `(aa|a)*b`}
 	names := []string{"p0", "p1"}
 	cfg := config.BuildConfig{
-		MaxFallbackStates: 1,
-		Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		MaxDFAStates: 1,
+		Regexps:      []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 			Patterns: config.PatternSelector{Names: names},
@@ -556,7 +556,7 @@ func TestSetBTMemberRegionReplacedBelowOrigin(t *testing.T) {
 func TestSetBTHostCallIsLinear(t *testing.T) {
 	names := []string{"p0", "p1", "p2"}
 	cfg := config.BuildConfig{
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 		Regexps: []config.RegexEntry{
 			{Name: "p0", Pattern: `(\w*|)*c`},
 			{Name: "p1", Pattern: `bar[0-9]+`},
@@ -687,7 +687,7 @@ func TestSetBTHostCallIsLinear(t *testing.T) {
 func TestSetScanAllStopsProbingMatchedPatterns(t *testing.T) {
 	names := []string{"p0", "p1", "p2"}
 	cfg := config.BuildConfig{
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 		Regexps: []config.RegexEntry{
 			{Name: "p0", Pattern: `(\w*|)*c`},
 			{Name: "p1", Pattern: `bar[0-9]+`},
@@ -1539,7 +1539,7 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 	// Backtracking find.
 	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`}
 	set := func(o compile.CompileOptions) ([]byte, error) {
-		cfg := config.BuildConfig{MaxFallbackStates: 1, MaxMemory: o.MaxMemory,
+		cfg := config.BuildConfig{MaxDFAStates: 1, MaxMemory: o.MaxMemory,
 			Regexps: []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
 			Sets:    []config.SetConfig{{Name: "s", ScanAny: "s_scan", Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}}}
 		w, _, diags, err := compile.CompileFileDiag(cfg, "")

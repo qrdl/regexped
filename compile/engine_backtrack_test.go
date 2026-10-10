@@ -2465,9 +2465,9 @@ func TestBTStacksNotReservedAtLoad(t *testing.T) {
 				Patterns: config.PatternSelector{All: true}})
 		}
 		cfg := config.BuildConfig{
-			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
-			Regexps:           []config.RegexEntry{{Name: "a", Pattern: pattern}, {Name: "b", Pattern: `(?:c|de){1,60}?y`}},
-			Sets:              sets,
+			MaxDFAStates: 1, // every member's suffix DFA is over it: Backtracking
+			Regexps:      []config.RegexEntry{{Name: "a", Pattern: pattern}, {Name: "b", Pattern: `(?:c|de){1,60}?y`}},
+			Sets:         sets,
 		}
 		w, _, diags, err := CompileFileDiag(cfg, "")
 		if err != nil {
@@ -2782,4 +2782,55 @@ func TestBTFirstSets(t *testing.T) {
 	if bytes.Equal(emitBTWorkChargeMemberN(nil, m, 7, 2, trip), emitBTWorkChargeMember(nil, m, 7, trip)) {
 		t.Error("emitBTWorkChargeMemberN(2) charges 1")
 	}
+}
+
+// TestFunctionSizeCap pins the one limit no key raises: WebAssembly loads no
+// function body over 7,654,321 bytes, and a Backtracking body grows with its
+// program (about 64 bytes per literal instruction). max_bt_instructions raised
+// far enough lets such a body through, and the compile refuses it there,
+// naming the pattern — not the runtime, at load.
+func TestFunctionSizeCap(t *testing.T) {
+	pattern := strings.Repeat("abcdefghij", 15000) // 150,000 instructions
+	_, _, err := Compile([]config.RegexEntry{{Name: "long", Pattern: pattern, MatchFunc: "m"}}, 0, true,
+		CompileOptions{MaxDFAStates: 1, MaxBTInstructions: 200000})
+	if !errors.Is(err, ErrFunctionTooLarge) {
+		t.Fatalf("err = %v, want ErrFunctionTooLarge", err)
+	}
+	for _, w := range []string{`pattern "long"`, "over WebAssembly's cap of 7654321 bytes", "lower max_bt_instructions"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error lacks %q: %v", w, err)
+		}
+	}
+
+	// The scan itself: owners by offset, a glue body, malformed input.
+	body := func(n int) []byte { return append(utils.AppendULEB128(nil, uint32(n)), make([]byte, n)...) }
+	code := utils.AppendULEB128(nil, 2)
+	small := len(code)
+	code = append(code, body(3)...)
+	big := len(code)
+	code = append(code, body(maxWasmFunctionBytes+1)...)
+	module := append([]byte("\x00asm\x01\x00\x00\x00"), 10)
+	module = append(utils.AppendULEB128(module, uint32(len(code))), code...)
+	owners := codeOwners{{at: small, name: `pattern "a"`}, {at: big, name: `member "b" of set "s"`}}
+	if err := checkFunctionSizes(module, owners); err == nil || !strings.Contains(err.Error(), `member "b" of set "s"`) {
+		t.Errorf("oversized body: err = %v, want it named by its owner", err)
+	}
+	if err := checkFunctionSizes(module, codeOwners{{at: big + 1, name: "later"}}); err == nil ||
+		!strings.Contains(err.Error(), "the module's own glue") {
+		t.Errorf("a body before every owner mark: err = %v, want the glue named", err)
+	}
+	hdr := "\x00asm\x01\x00\x00\x00"
+	for _, bad := range [][]byte{nil, []byte(hdr), module[:20], append([]byte(hdr), 10, 0xff),
+		append([]byte(hdr), 10, 1, 0xff),      // a code section whose count does not decode
+		append([]byte(hdr), 10, 2, 1, 0xff)} { // one body, whose size does not decode
+		if err := checkFunctionSizes(bad, nil); err != nil {
+			t.Errorf("no readable code section (%d bytes): err = %v, want nil", len(bad), err)
+		}
+	}
+	fits := append([]byte(hdr), 10, 4, 1, 2, 0, 0x0b) // one 2-byte body
+	if err := checkFunctionSizes(fits, nil); err != nil {
+		t.Errorf("a module whose bodies fit: err = %v", err)
+	}
+	var none *codeOwners
+	none.mark(1, "ignored") // nil-safe: an assembly nobody checks records nothing
 }

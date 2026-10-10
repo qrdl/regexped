@@ -1,6 +1,6 @@
 import_module: m
 wasm_file: x.wasm
-max_fallback_states: 64
+max_dfa_states: 64
 regexps:
   - pattern: '(?:a|b)*a(?:a|b){8}c'
   - pattern: 'a'

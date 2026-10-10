@@ -1180,8 +1180,10 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 		if !bytes.Contains(data, []byte(`"patterns_total"`)) {
 			t.Errorf("diag JSON missing expected key, got: %s", data)
 		}
-		if !bytes.Contains(data, []byte(`"capture_bearing"`)) {
-			t.Errorf("diag JSON missing capture_bearing key: %s", data)
+		// A member with groups_func is a set member like any other now, so
+		// the report has no field counting such entries left out.
+		if bytes.Contains(data, []byte(`"capture_bearing`)) {
+			t.Errorf("diag JSON still carries a capture_bearing field: %s", data)
 		}
 	})
 
@@ -2357,14 +2359,10 @@ func TestReporterRenderSets(t *testing.T) {
 					Patterns: []PatternRef{{ID: 2, Name: "ambig"}},
 				},
 			},
-			StateLimitDropped:     []PatternRef{{ID: 7, Name: "huge"}},
-			CaptureBearingDropped: []PatternRef{{ID: 8}}, // unnamed → "#8"
-			// The two anchored-only scopes. Both are here so the render is
-			// checked to keep them APART from the two global ones above: a
-			// reader who cannot tell the four lines apart cannot tell "gone
-			// from the set" from "gone from two of the five exports".
+			// The two anchored-only scopes, the only drops a set makes. Both
+			// are here so the render is checked to keep them apart.
 			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
-			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}},
+			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}, {ID: 8}}, // unnamed → "#8"
 			FrontendDemotion:          &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
 			// Members served outside the buckets and the work counters: each
 			// changes the set's cost by large factors and shows nowhere else.
@@ -2398,10 +2396,8 @@ func TestReporterRenderSets(t *testing.T) {
 		"#0   AKIA                     bitmask  DFA",
 		"#1   (fallback — no lite…     bitmask  DFA",
 		"#2   (fallback — no lite…     bitmask  Backtracking",
-		"dropped (fallback DFA over max_fallback_states): huge",
-		"dropped (capture-bearing): #8", // the unnamed spelling
 		"dropped from match_any/match_all (anchored DFA over the packer's limits): anch",
-		"dropped from match_any/match_all (unparseable): bad",
+		"dropped from match_any/match_all (unparseable): bad, #8", // #8: the unnamed spelling
 		"id space:   9",
 		"DOWNGRADED frontend:",
 		"split out (not provably linear; own linear search): #3, #4 (Backtracking)",
@@ -2899,9 +2895,11 @@ func TestUnicodeModeLimits(t *testing.T) {
 		want []string
 	}{
 		{"find", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, FindFunc: "f"},
-			[]string{"the find body went to Backtracking", "more than 1024 states (max_dfa_states; raise it", "over the fixed limit of 20000"}},
+			[]string{"the find body went to Backtracking", "needs 5801 states, over 1024 (max_dfa_states; raise it",
+				"over max_bt_instructions (20000); raise max_bt_instructions to at least 30982"}},
 		{"match", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, MatchFunc: "m"},
-			[]string{"the match body went to Backtracking", "more than 1024 states (max_dfa_states; raise it", "over the fixed limit of 20000"}},
+			[]string{"the match body went to Backtracking", "needs 5801 states, over 1024 (max_dfa_states; raise it",
+				"over max_bt_instructions (20000); raise max_bt_instructions to at least 30982"}},
 	} {
 		r, err := compileReport(c.re, CompileOptions{MaxDFAStates: 1024})
 		if !errors.Is(err, ErrBTProgramTooLarge) {
@@ -2926,9 +2924,15 @@ func TestUnicodeModeLimits(t *testing.T) {
 		t.Errorf("capture: err = %v, want the capture body's ErrBTProgramTooLarge", err)
 	}
 
-	// A body that misses only the program size, with no reason to name.
-	if got := (&btTooLarge{body: "find", insts: 20001}).Error(); !strings.Contains(got, "the find body's Backtracking program has 20001 instructions") {
+	// A body that misses only the program size, with no reason to name; and
+	// one under max_bt_instructions: 0, which names the key and the size.
+	if got := newBTTooLarge("find", 20001, "", buildLimits{}).Error(); !strings.Contains(got,
+		"the find body went to Backtracking, but its program there has 20001 instructions, over max_bt_instructions (20000)") {
 		t.Errorf("btTooLarge without a reason: %q", got)
+	}
+	if got := newBTTooLarge("find", 77, "", buildLimits{btInsts: -1}).Error(); !strings.Contains(got,
+		"max_bt_instructions: 0 turns Backtracking off; set max_bt_instructions to at least 77") {
+		t.Errorf("btTooLarge with Backtracking off: %q", got)
 	}
 
 	// Non-greedy, so Backtracking takes the captures.

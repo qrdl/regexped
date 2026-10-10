@@ -1089,8 +1089,9 @@ func TestWideSweepSinglePattern(t *testing.T) {
 					Name: "p", Pattern: pat,
 					GroupsFunc: "g", FindFunc: "f", MatchFunc: "m",
 				}},
-				MaxDFAStates: o.dfa, MaxTDFARegs: o.tdfa,
-				MaxFallbackStates: o.fallback,
+				// The set fallback limit is max_dfa_states now: a fallback
+				// of 1 is max_dfa_states 1.
+				MaxDFAStates: config.Limit(max(o.dfa, o.fallback)), MaxTDFARegs: o.tdfa,
 			}, "")
 			if err != nil {
 				continue

@@ -976,8 +976,8 @@ func TestComponentResourcesWithSearchBlocks(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "t", WitPackage: "t",
-				MaxFallbackStates: c.mfs,
-				Sets:              []config.SetConfig{{Name: "s", Patterns: config.PatternSelector{All: true}, Find: "scan_it"}}}
+				MaxDFAStates: config.Limit(c.mfs),
+				Sets:         []config.SetConfig{{Name: "s", Patterns: config.PatternSelector{All: true}, Find: "scan_it"}}}
 			for i, p := range c.pats {
 				cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Name: "p" + strconv.Itoa(i), Pattern: p})
 			}

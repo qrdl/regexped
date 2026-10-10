@@ -1507,3 +1507,30 @@ regexps
 -;0-9;-;-;0-9
 -;6-10;-;-;6-10
 -;0-62;-;-;0-62
+# ============================================================
+# A member over the old fixed limits. In Unicode mode `.{0,870}` needs 7,832
+# DFA states and 21,752 Backtracking instructions: a set built its DFA under a
+# fixed 2,048 states, found its Backtracking program over 20,000
+# instructions, and compiled WITHOUT it. A set member's DFA is built under
+# max_dfa_states (16,384 in Unicode mode), as a single pattern's is.
+# ============================================================
+UniMemberOverOldBuildCap
+strings
+""
+"0"
+"é0"
+"x0y"
+"日本0"
+regexps
+".{0,870}"
+-;0-0;-;-;0-0
+-;0-1;-;-;0-1
+-;0-3;-;-;0-3
+-;0-3;-;-;0-3
+-;0-7;-;-;0-7
+"0"
+-;-;-;-;-
+-;0-1;-;-;0-1
+-;2-3;-;-;2-3
+-;1-2;-;-;1-2
+-;6-7;-;-;6-7

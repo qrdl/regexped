@@ -3314,7 +3314,7 @@ func checkTDFAGroups(t *testing.T, cases []tdfaCase) {
 			name = c.pattern
 		}
 		t.Run(name, func(t *testing.T) {
-			eng, err := compile.SelectEngine(c.pattern, compile.CompileOptions{})
+			eng, err := compile.SelectEngine(c.pattern, withMode(compile.CompileOptions{}))
 			if err != nil {
 				t.Fatalf("SelectEngine(%q): %v", c.pattern, err)
 			}

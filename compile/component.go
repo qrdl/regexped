@@ -58,6 +58,10 @@ type asmOpts struct {
 	// SetNames is the same thing for `sets:`, keyed by set name. Empty for a
 	// config with no sets.
 	SetNames map[string]ComponentSetNames
+	// owners, when non-nil, receives who owns each run of function bodies the
+	// assembler appends (codeOwners), for the caller's check of WebAssembly's
+	// function size cap. A pointer: asmOpts is passed by value.
+	owners *codeOwners
 }
 
 // validate rejects the states the struct itself allows. A component with no

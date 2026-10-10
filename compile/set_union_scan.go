@@ -221,23 +221,44 @@ func detectUnionSkipStates(t *dfaTable, oldToNew []int, midAcceptLimit int) []un
 // See wideAccept for why this is not `maskWords > 1`.
 func (u *unionScanDFA) isWide() bool { return u != nil && u.wideAccept }
 
-// maxUnionScanStates is the default bound on the subset construction, which
-// `max_union_states` overrides (SetSpec.maxUnionStates). The construction is
-// a `.*`-prefixed union, so it is larger than the plain union it replaces —
-// measured at 1.6x to 4.2x on the shapes that reach it — but it is still a
-// determinisation and can blow up. Over budget, the set keeps the
-// per-position path it has today. In Unicode mode a letter class costs
-// hundreds of states, so a handful of literal-less members can pass it: an
-// 8-member set of `\pL+\p{Greek}`-like members needed more than 4,096 and
-// fit in 16,384, which took its scan_all from 102 to 23 fuel/byte and its
-// module from 1.39 to 0.94 MB, for 173 s of compile against 55 (measured
-// 2026-10-05).
-const maxUnionScanStates = 4096
+// maxUnionScanStates and maxUnionScanStatesUnicode are the default bounds on
+// the union automata's subset construction — the scan pair's and the anchored
+// pair's — which `max_union_states` overrides (SetSpec.maxUnionStates). The
+// scan construction is a `.*`-prefixed union, so it is larger than the plain
+// union it replaces — measured at 1.6x to 4.2x on the shapes that reach it —
+// but it is still a determinisation and can blow up. Over budget, the set keeps
+// the per-position path (scan pair) or the per-bucket probes (anchored pair).
+//
+// The bound counts states WHILE BUILDING, before minimizeDFA merges the
+// duplicates, so a set can be refused at 4,096 for an automaton that finishes
+// far smaller: {`\pL{4}\pN`, `\pN{3}\pL{3}`, `\pL{5}x`} needs more than 8,192
+// to build and keeps 2,740.
+//
+// In Unicode mode a letter class costs hundreds of states, so a handful of
+// members pass 4,096; the Unicode default is 16,384, like max_dfa_states'.
+// Measured 2026-10-09 (fuel/byte over 4 KB, compile time, compiler memory,
+// module): that 3-member set's scan_any on English text 378 → 20.9, 1.9 →
+// 8.6 s, 157 → 491 MB, 2.06 → 2.64 MB; examples/fastedge/lang-detect's
+// 23-member `latin` set's match_all on non-matching text 174 → 29, 12.1 →
+// 25.7 s, 136 → 449 MB, 1.08 → 2.60 MB. No input measured slower; sets whose
+// automata fit 4,096 (homoglyph, lang-detect `cyrillic`, three more) compiled
+// to the same module. Earlier (2026-10-05): an 8-member set of
+// `\pL+\p{Greek}`-like members took its scan_all from 102 to 23 fuel/byte, its
+// module from 1.39 to 0.94 MB, its compile from 55 s to 173 s.
+const (
+	maxUnionScanStates        = 4096
+	maxUnionScanStatesUnicode = 16384
+)
 
-// maxUnionStates is the union automaton's construction cap for this set.
+// maxUnionStates is the union automaton's construction cap for this set: the
+// configured value, else the default for the set's mode (one mode for all its
+// members, resolveSetMode).
 func (s SetSpec) maxUnionStates() int {
 	if s.MaxUnionStates > 0 {
 		return s.MaxUnionStates
+	}
+	if len(s.Patterns) > 0 && s.Patterns[0].rp.unicode() {
+		return maxUnionScanStatesUnicode
 	}
 	return maxUnionScanStates
 }
