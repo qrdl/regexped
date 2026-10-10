@@ -248,13 +248,13 @@ type setFindCtx struct {
 	// per-position walk left to narrow. `aliveReady` and `emitAliveNarrow`
 	// went with it.
 	aliveMask byte
-	// utf8Start is the Unicode start check's scratch (emitUTF8Skip),
-	// allocated only when some bucket needs the check in this body's mode.
+	// utf8Start is the Unicode start check's scratch (emitFallbackBuckets,
+	// emitStepStart), allocated only when some bucket needs the check in this
+	// body's mode.
 	utf8Start *utf8StartLocals
-	// utf8Hoisted: the per-position walk is emitting its fallback buckets
-	// behind one start check for all of them (emitFallbackBuckets), so the
-	// per-bucket check is not emitted.
-	utf8Hoisted bool
+	// utf8Step: the scalar walk visits start positions only (emitStepStart,
+	// emitAdvance).
+	utf8Step bool
 }
 
 // minStartSentinel is lMinStart's "nothing found yet" value. It is larger than
@@ -1159,7 +1159,6 @@ func (c *setFindCtx) emitBucketAt(b []byte, bi, litLen int, posLocal byte) []byt
 		// empty-mask skip, so on the positions it rejects the chain is never
 		// reached at all. On classchain-32's dense corpus that is 75% of them.
 		b = c.emitStartableMask(b, bi, g, posLocal)
-		b = c.emitUTF8Skip(b, bi, litLen, posLocal)
 		// Gate test plus the first empty-mask skip. The skip guards the prefix
 		// DFAs (the expensive part); the second one below guards the
 		// suffix/probe call once those DFAs have had their say. Each is
@@ -1252,23 +1251,54 @@ func (c *setFindCtx) emitStartableMask(b []byte, bi int, g prefixLenGroup, posLo
 	return b
 }
 
-// emitUTF8Skip leaves $skip_group when posLocal lies inside a character and
-// bucket bi holds a member whose empty match could otherwise be reported there
-// (bucket.utf8StartCheck). Only a fallback bucket can: a literal bucket's
-// members cannot match empty, and its match starts are where its literal and
-// its fixed prefix put them, on a character's first byte.
-func (c *setFindCtx) emitUTF8Skip(b []byte, bi, litLen int, posLocal byte) []byte {
-	if c.utf8Hoisted || litLen != 0 || bi >= len(c.cs.buckets) || !c.cs.buckets[bi].utf8StartCheck(c.mode) {
-		return b
+// fallbackStartCheck reports whether the per-position walk's fallback buckets
+// need the Unicode start check: one of them holds a member whose empty match
+// could otherwise be reported inside a character.
+func (c *setFindCtx) fallbackStartCheck() bool {
+	for _, bkt := range c.cs.buckets {
+		if bkt.isFallback && bkt.utf8StartCheck(c.mode) {
+			return true
+		}
 	}
-	if c.utf8Start == nil {
-		panic("compile: a set body checks Unicode start positions with no scratch allocated for it")
+	return false
+}
+
+// emitStepStart, in the scalar walk's prologue, makes the walk visit START
+// positions only: it rounds posLocal up to one here and emitAdvance steps from
+// one to the next, a character at a time. Inside a character no member of any
+// bucket can match — a non-empty match never begins with a continuation byte,
+// and a literal starts with an ASCII or a lead byte — so nothing is lost, and
+// no position needs the check inside the loop. Checked at every byte instead,
+// the lookback from each character's second byte cost set {`\p{Han}*`, `foo`}
+// 219 fuel/byte over CJK against 128 for {`\p{Han}+`, `foo`}, the same calls
+// and matches.
+func (c *setFindCtx) emitStepStart(b []byte, posLocal byte) []byte {
+	if !c.fallbackStartCheck() {
+		return b
 	}
 	l := *c.utf8Start
 	b = append(b, 0x20, posLocal, 0x21, byte(l.pos))
-	// Moved to the character's end: posLocal was inside it. The block
-	// emitUTF8Start opens is depth 0, $skip_group depth 1.
-	return emitUTF8Start(b, l, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+	b = emitUTF8Start(b, l, nil)
+	b = utils.AppendULEB128(append(b, 0x20), l.pos)
+	b = append(b, 0x21, posLocal)
+	c.utf8Step = true
+	return b
+}
+
+// emitAdvance moves the per-position walk's posLocal to the next position it
+// visits: the next start position when emitStepStart armed the walk, else the
+// next byte.
+func (c *setFindCtx) emitAdvance(b []byte, posLocal byte) []byte {
+	if !c.utf8Step {
+		return append(b, 0x20, posLocal, 0x41, 0x01, 0x6A, 0x21, posLocal)
+	}
+	// The walk leaves at the next position whenever it would leave at
+	// posLocal + 1, the nearest one: tested first, a call that returns after
+	// one position pays nothing for the step.
+	b = c.emitDrainCheckAhead(b, posLocal, 0x01)
+	l := *c.utf8Start
+	l.pos = uint32(posLocal)
+	return emitUTF8NextStart(b, l)
 }
 
 // emitFallbackBuckets emits every fallback bucket's evaluation at posLocal, in
@@ -1276,27 +1306,57 @@ func (c *setFindCtx) emitUTF8Skip(b []byte, bi, litLen int, posLocal byte) []byt
 // check runs for all of them, in front: inside a character no member of any
 // bucket can match — a non-empty match never begins with a continuation byte,
 // and the members whose empty match could are what the check is for — so the
-// position is left at once instead of once per bucket that needs it.
+// position is left at once instead of once per bucket that needs it. A walk
+// emitStepStart armed visits start positions only and needs no check here.
+//
+// The Aho-Corasick walk must feed every byte to its automaton, so it cannot
+// step over a character; it skips the check instead while posLocal is below
+// the end of the character the last check found it inside, which the check's
+// scratch still holds (0, a local's initial value, before any check; the walk
+// only moves forward), so a character pays the lookback once, not at each of
+// its continuation bytes.
 func (c *setFindCtx) emitFallbackBuckets(b []byte, posLocal byte) []byte {
-	hoist := false
-	for _, bkt := range c.cs.buckets {
-		hoist = hoist || (bkt.isFallback && bkt.utf8StartCheck(c.mode))
-	}
-	if hoist {
+	hoist := c.fallbackStartCheck()
+	check := hoist && !c.utf8Step
+	if check {
 		l := *c.utf8Start
+		u := utf8Emit{l}
 		b = append(b, 0x02, 0x40) // block $fallbacks
+		b = append(b, 0x02, 0x40) // block $start
+		b = u.get(append(b, 0x20, posLocal), l.len)
+		b = append(b, 0x4F, 0x0D, 0x00) // pos >= len → a start position
+		b = append(u.get(b, l.ptr), 0x20, posLocal, 0x6A, 0x2D, 0x00, 0x00)
+		b = u.isCont(b)
+		b = append(b, 0x45, 0x0D, 0x00)                 // not a continuation byte → a start position
+		b = append(b, 0x02, 0x40)                       // block $seq: c, k and l.pos set
+		b = append(b, 0x02, 0x40)                       // block $lead1
+		b = append(b, 0x20, posLocal, 0x45, 0x0D, 0x02) // pos == 0: no lead → $start
+		b = append(u.get(b, l.ptr), 0x20, posLocal, 0x6A, 0x41, 0x01, 0x6B, 0x2D, 0x00, 0x00)
+		b = u.set(b, 0x22, l.c)
+		b = u.isCont(b)
+		b = append(b, 0x45, 0x0D, 0x00) // the byte before leads → $lead1
+		// A third or fourth byte, or a stray: inside the character the check
+		// last found posLocal inside when l.pos, its end, is still ahead —
+		// the second byte paid the lookback, the rest of the character skips
+		// it.
+		b = u.get(append(b, 0x20, posLocal), l.pos)
+		b = append(b, 0x49, 0x0D, 0x03) // pos < end → $fallbacks
 		b = append(b, 0x20, posLocal, 0x21, byte(l.pos))
-		// emitUTF8Start's own block is depth 0, $fallbacks depth 1.
-		b = emitUTF8Start(b, l, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
-		c.utf8Hoisted = true
+		b = u.lookbackFrom(b, 2, 2)
+		b = append(b, 0x0C, 0x01, 0x0B) // br $seq; end $lead1
+		b = u.set(u.i32c(b, 1), 0x21, l.k)
+		b = append(b, 0x20, posLocal, 0x21, byte(l.pos))
+		b = append(b, 0x0B) // end $seq
+		b = u.seqEnd(b, 0, false)
+		b = append(b, 0x0C, 0x01) // inside a character → $fallbacks
+		b = append(b, 0x0B)       // end $start
 	}
 	for bi, bkt := range c.cs.buckets {
 		if bkt.isFallback {
 			b = c.emitBucketAt(b, bi, 0, posLocal)
 		}
 	}
-	if hoist {
-		c.utf8Hoisted = false
+	if check {
 		b = append(b, 0x0B) // end $fallbacks
 	}
 	return b
@@ -1634,6 +1694,15 @@ func (c *setFindCtx) emitEpilogue(b []byte) []byte {
 // no remaining candidate can produce a start at or before lMinStart, the scan
 // is finished.
 func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
+	return c.emitDrainCheckAt(b, lPos, depth, false)
+}
+
+// emitDrainCheckAhead is emitDrainCheck at lPos + 1.
+func (c *setFindCtx) emitDrainCheckAhead(b []byte, lPos byte, depth byte) []byte {
+	return c.emitDrainCheckAt(b, lPos, depth, true)
+}
+
+func (c *setFindCtx) emitDrainCheckAt(b []byte, lPos byte, depth byte, ahead bool) []byte {
 	switch c.mode {
 	case capScanAny:
 		// Settled by the first hit for the same reason, now that no start is
@@ -1665,6 +1734,10 @@ func (c *setFindCtx) emitDrainCheck(b []byte, lPos byte, depth byte) []byte {
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(bound))
 		b = append(b, 0x6B)
+	}
+	if ahead {
+		// lPos + 1 - M > lMinStart, an integer comparison: lPos - M >= lMinStart.
+		return append(b, 0x20, c.lMinStart, 0x4E, 0x0D, depth)
 	}
 	b = append(b, 0x20, c.lMinStart, 0x4A, 0x0D, depth) // lPos - M > lMinStart
 	return b

@@ -1626,25 +1626,21 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 	n := tt.numStates
 
 	// Precompute per-state entries (bytes with non-empty ops).
-	type byteOps struct {
-		bv  int
-		ops []tdfaTagOp
-	}
 	type stateInfo struct {
-		entries          []byteOps
+		entries          []tdfaByteOps
 		allSame          bool
 		sameOps          []tdfaTagOp
-		majorityOps      []tdfaTagOp // majority-group ops (non-nil iff !allSame && majority exists)
-		minorityBytewise []byteOps   // minority entries (bytes whose ops ≠ majorityOps)
+		majorityOps      []tdfaTagOp   // majority-group ops (non-nil iff !allSame && majority exists)
+		minorityBytewise []tdfaByteOps // minority entries (bytes whose ops ≠ majorityOps)
 	}
 	infos := make([]stateInfo, n)
 	anyHasOps := false
 	for gs := 0; gs < n; gs++ {
-		var entries []byteOps
+		var entries []tdfaByteOps
 		for bv := 0; bv < 256; bv++ {
 			idx := gs*256 + bv
 			if idx < len(tt.tagOps) && len(tt.tagOps[idx]) > 0 {
-				entries = append(entries, byteOps{bv, tt.tagOps[idx]})
+				entries = append(entries, tdfaByteOps{bv, tt.tagOps[idx]})
 			}
 		}
 		if len(entries) == 0 {
@@ -1669,7 +1665,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 				}
 				transIdx := gs*256 + bv
 				if transIdx < len(tt.transitions) && tt.transitions[transIdx] >= 0 {
-					entries = append(entries, byteOps{bv, nil}) // nil = no ops
+					entries = append(entries, tdfaByteOps{bv, nil}) // nil = no ops
 				}
 			}
 		}
@@ -1694,20 +1690,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 			count int
 		}
 		var groups []opsGroup
-		// strconv.AppendInt, not fmt.Appendf — same reasoning as keyString's doc
-		// comment, and this runs once per transition entry,
-		// i.e. up to 256 times per state. Byte-identical to "%d:%d," including
-		// negative dst/src (-1 = assign-from-pos, -2 = scratchRegSentinel).
-		keyFor := func(ops []tdfaTagOp) string {
-			s := make([]byte, 0, len(ops)*8)
-			for _, op := range ops {
-				s = strconv.AppendInt(s, int64(op.dst), 10)
-				s = append(s, ':')
-				s = strconv.AppendInt(s, int64(op.src), 10)
-				s = append(s, ',')
-			}
-			return string(s)
-		}
+		keyFor := tdfaOpsKey
 		groupIdx := make(map[string]int)
 		for _, e := range entries {
 			k := keyFor(e.ops)
@@ -1727,7 +1710,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 		}
 		majorityOps := groups[majIdx].ops
 		majKey := keyFor(majorityOps)
-		var minority []byteOps
+		var minority []tdfaByteOps
 		for _, e := range entries {
 			if keyFor(e.ops) != majKey {
 				minority = append(minority, e)
@@ -1811,21 +1794,25 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 				// "br $maj_done+1" from inside the `if` block: the if block is
 				// at depth 0, $maj_done is at depth 1, so we need br 1.
 				b = append(b, 0x02, 0x40) // block $maj_done
-				for _, e := range info.minorityBytewise {
-					b = append(b, 0x20, byte(localByte))
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, int32(e.bv))
-					b = append(b, 0x46)       // i32.eq
-					b = append(b, 0x04, 0x40) // if
-					for _, op := range e.ops {
+				if len(info.minorityBytewise) > 1 {
+					b = emitTDFAMinorityTable(b, info.minorityBytewise, info.majorityOps, localByte, localPos, localCapBase)
+				} else {
+					for _, e := range info.minorityBytewise {
+						b = append(b, 0x20, byte(localByte))
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(e.bv))
+						b = append(b, 0x46)       // i32.eq
+						b = append(b, 0x04, 0x40) // if
+						for _, op := range e.ops {
+							b = emitTDFATagOp(op, b, localPos, localCapBase)
+						}
+						b = append(b, 0x0C, 0x01) // br 1 → exit $maj_done (skip majority)
+						b = append(b, 0x0B)       // end if
+					}
+					// majority ops (fire when no minority byte matched)
+					for _, op := range info.majorityOps {
 						b = emitTDFATagOp(op, b, localPos, localCapBase)
 					}
-					b = append(b, 0x0C, 0x01) // br 1 → exit $maj_done (skip majority)
-					b = append(b, 0x0B)       // end if
-				}
-				// majority ops (fire when no minority byte matched)
-				for _, op := range info.majorityOps {
-					b = emitTDFATagOp(op, b, localPos, localCapBase)
 				}
 				b = append(b, 0x0B) // end $maj_done
 			}
@@ -1842,6 +1829,91 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 	}
 
 	b = append(b, 0x0B) // end $exit
+	return b
+}
+
+// tdfaByteOps is a transition byte and its tag ops.
+type tdfaByteOps struct {
+	bv  int
+	ops []tdfaTagOp
+}
+
+// tdfaOpsKey is ops serialised, for grouping equal op lists: strconv, not
+// fmt.Appendf — it runs once per transition entry, up to 256 times per state.
+// Byte-identical to "%d:%d," including negative dst/src (-1 = assign-from-pos,
+// -2 = scratchRegSentinel).
+func tdfaOpsKey(ops []tdfaTagOp) string {
+	s := make([]byte, 0, len(ops)*8)
+	for _, op := range ops {
+		s = strconv.AppendInt(s, int64(op.dst), 10)
+		s = append(s, ':')
+		s = strconv.AppendInt(s, int64(op.src), 10)
+		s = append(s, ',')
+	}
+	return string(s)
+}
+
+// emitTDFAMinorityTable emits, inside block $maj_done, a state's tag ops for
+// a byte that has MORE than one minority byte: one br_table on the byte to the
+// handler of its minority ops group (the bytes grouped by equal ops) or, for
+// a majority byte, past them to the majority ops.
+//
+//	block $default
+//	  block g[G-1] … block g[0]
+//	    local.get byte; br_table [256: group index, G for the majority] G
+//	  end g[0]: ops of group 0; br G → $maj_done
+//	  …
+//	  end g[G-1]: ops of group G-1; br 1 → $maj_done
+//	end $default: majority ops
+//
+// A compare per minority byte cost a lowered loop state (`(\pL+)\s`, ~50 lead
+// bytes and ~52 letters on its two sides) ~50 compares on every byte its
+// losing side reads: `(\pL+)\s(\pL+)` 146.75 → 116.67 fuel/byte over Russian,
+// 159.30 → 115.58 over CJK, and the byte-mode `(\w+)\s(\w+)` 123.01 → 117.05.
+// One minority byte keeps its compare, cheaper than a table.
+func emitTDFAMinorityTable(b []byte, minority []tdfaByteOps, majority []tdfaTagOp, localByte, localPos, localCapBase uint32) []byte {
+	group := [256]int{}
+	var groups [][]tdfaTagOp
+	keys := map[string]int{}
+	for _, e := range minority {
+		k := tdfaOpsKey(e.ops)
+		g, ok := keys[k]
+		if !ok {
+			g = len(groups)
+			keys[k] = g
+			groups = append(groups, e.ops)
+		}
+		group[e.bv] = g + 1 // 0: a majority byte
+	}
+	G := len(groups)
+	b = append(b, 0x02, 0x40) // block $default
+	for range G {
+		b = append(b, 0x02, 0x40) // block g[i], innermost g[0]
+	}
+	b = append(b, 0x20, byte(localByte))
+	b = append(b, 0x0E) // br_table
+	b = utils.AppendULEB128(b, 256)
+	for c := range 256 {
+		t := G // the majority, past every handler
+		if group[c] > 0 {
+			t = group[c] - 1
+		}
+		b = utils.AppendULEB128(b, uint32(t)) //nolint:gosec // at most 256 groups
+	}
+	b = utils.AppendULEB128(b, uint32(G)) //nolint:gosec // default: the majority
+	for i, ops := range groups {
+		b = append(b, 0x0B) // end g[i]
+		for _, op := range ops {
+			b = emitTDFATagOp(op, b, localPos, localCapBase)
+		}
+		// br → $maj_done, past g[i+1..G-1] and $default.
+		b = append(b, 0x0C)
+		b = utils.AppendULEB128(b, uint32(G-i)) //nolint:gosec // at most 256 groups
+	}
+	b = append(b, 0x0B) // end $default: a majority byte
+	for _, op := range majority {
+		b = emitTDFATagOp(op, b, localPos, localCapBase)
+	}
 	return b
 }
 

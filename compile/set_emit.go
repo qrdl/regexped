@@ -1552,7 +1552,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		for bi, bkt := range buckets {
 			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
 				m := allocBTDriveMember(opts.globals, btRegions.drive)
-				m.rowBytes = int32((len(bkt.btFallback.bt.prog.Inst) + 7) / 8) //nolint:gosec // a program size
+				m.rowBytes = int32(bkt.btFallback.bt.memoRowBytes()) //nolint:gosec // a program's Alts / 8
 				btRegions.members[bi] = m
 				// A member with an ordinary body keeps its budget per
 				// `find` drive in a search block (emitBTWorkInitMember).
@@ -3689,6 +3689,10 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// no-match `find` — which is exactly what the preflight exists to avoid.
 	b = c.emitGateLocalsPrologue(b)
 	b = c.emitFindPrologue(b, lPos)
+	// Not under phase1Only, where the fallback buckets are the union pass's.
+	if !cs.phase1Only {
+		b = c.emitStepStart(b, lPos)
+	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
@@ -3715,7 +3719,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// one of them opened by reading the same byte again.
 	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = c.emitAdvance(b, lPos)
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop $scan
 	b = append(b, 0x0B) // end block $done

@@ -880,6 +880,54 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 	}
 }
 
+// TestSetEmitUnicodeStartCheckOncePerCharacter pins where a Unicode set's
+// `find` checks start positions when a fallback member can match empty. The
+// scalar walk rounds its first position once and then steps from one start
+// position to the next (emitUTF8NextStart, whose continuation probe is a
+// 16-bit load), so the loop holds no per-position check. The Aho-Corasick
+// walk, which must feed every byte to its automaton, keeps ONE check per
+// position for every fallback bucket. A byte-mode set has neither.
+func TestSetEmitUnicodeStartCheckOncePerCharacter(t *testing.T) {
+	probe := []byte{0x2F, 0x00, 0x01, 0x41, 0xC0, 0x81, 0x03, 0x71} // i32.load16_u offset=1; i32.const 0xC0C0; i32.and
+	lead := []byte{0x41, 0xC2, 0x01, 0x49, 0x0D, 0x00}              // i32.const 0xC2; i32.lt_u; br_if 0: a lead's check
+	body := func(t *testing.T, patterns []string, wantFE frontendKind) []byte {
+		t.Helper()
+		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}
+		cfg := config.BuildConfig{Regexps: setEmitCovEntries(patterns), Sets: []config.SetConfig{sc}}
+		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fe := emittedFrontend(cs); fe != wantFE {
+			t.Fatalf("%q: frontend %v, want %v", patterns, fe, wantFE)
+		}
+		base := cs.funcCount()
+		return emitSetMatchFnFinal(cs, base, base, 0, capFind, base)
+	}
+	kws := make([]string, 17)
+	for i := range kws {
+		kws[i] = fmt.Sprintf("kw%02dzz", i)
+	}
+	for _, c := range []struct {
+		name            string
+		patterns        []string
+		fe              frontendKind
+		probes, checked int
+	}{
+		{"scalar", []string{`\p{Han}*`, `foo`}, frontendScalar, 1, 2},
+		{"aho-corasick", append([]string{`\p{Han}*`}, kws...), frontendAC, 0, 1},
+		{"byte mode", []string{`[a-z]*`, `foo`}, frontendScalar, 0, 0},
+	} {
+		b := body(t, c.patterns, c.fe)
+		if got := bytes.Count(b, probe); got != c.probes {
+			t.Errorf("%s: %d steps to the next start position, want %d", c.name, got, c.probes)
+		}
+		if got := bytes.Count(b, lead); got != c.checked {
+			t.Errorf("%s: %d sequence checks, want %d", c.name, got, c.checked)
+		}
+	}
+}
+
 // setEmitCovLocalsOfType counts the locals of one value type declared by a
 // size-prefixed WASM function body. It sums across groups on purpose: the
 // allocator coalesces adjacent same-type runs, so which GROUP a local lands in

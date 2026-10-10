@@ -327,7 +327,7 @@ func (c *btSearch) emitCapTripped(b []byte) []byte {
 
 // btMemoBytes is the memo bytes per text position a search of bt keeps once it
 // trips: one row of ⌈N/8⌉ bytes.
-func btMemoBytes(bt *backtrack) int { return (len(bt.prog.Inst) + 7) / 8 }
+func btMemoBytes(bt *backtrack) int { return bt.memoRowBytes() }
 
 // reportBTMemo records under --verbose, for a Unicode-mode pattern, the memo
 // its Backtracking body's fallback keeps per input byte: one row per position

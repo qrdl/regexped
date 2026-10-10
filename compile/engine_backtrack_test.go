@@ -2268,6 +2268,145 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 	}
 }
 
+// TestBTMemoIndexedByAlt pins the fallback memo's row: a bit per Alt, in pc
+// order — the only instructions whose (pc, pos) the fallback marks — less, in
+// Unicode mode, the inner Alts of a dispatched chain, never reached; every
+// other pc has none. The row a stub is told to allocate per position
+// (SearchSizes) is that many bits.
+func TestBTMemoIndexedByAlt(t *testing.T) {
+	bt := newBacktrack(byteProg(compileBTTestProg(t, `(?:ab|cd|ef)+x`)))
+	alts := 0
+	for pc, in := range bt.prog.Inst {
+		want := -1
+		if in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch {
+			want = alts
+			alts++
+		}
+		if got := bt.memoIndex()[pc]; got != want {
+			t.Errorf("byte mode: pc %d (%v) has memo bit %d, want %d", pc, in.Op, got, want)
+		}
+	}
+	if alts < 3 || bt.memoRowBytes() != (alts+7)/8 {
+		t.Errorf("byte mode: %d Alts, row %d bytes, want ⌈Alts/8⌉", alts, bt.memoRowBytes())
+	}
+
+	rp, err := resolvePattern(`\pL+?@\pL+`, nil, &CompileOptions{Unicode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := rp.parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, err := compileProg(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := newBacktrack(mp)
+	plan := u.altDispatch()
+	guarded := 0
+	for pc, in := range u.prog.Inst {
+		isAlt := in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch
+		switch got := u.memoIndex()[pc]; {
+		case isAlt && !plan.dead[pc]:
+			if got != guarded {
+				t.Errorf("unicode: guarded Alt at pc %d has memo bit %d, want %d", pc, got, guarded)
+			}
+			guarded++
+		case got != -1:
+			t.Errorf("unicode: pc %d (%v, dead %v) has memo bit %d, want none", pc, in.Op, plan.dead[pc], got)
+		}
+	}
+	if u.memoRowBytes() != (guarded+7)/8 || guarded >= u.numAlts {
+		t.Errorf("unicode: %d of %d Alts guarded, row %d bytes", guarded, u.numAlts, u.memoRowBytes())
+	}
+
+	// A Backtracking find keeps the memo for the rest of its search once it
+	// trips (a groups body keeps only the tripped flag).
+	sz, err := SearchSizes(config.BuildConfig{MaxDFAStates: 1, Regexps: []config.RegexEntry{
+		{Name: "f", Pattern: `\pL+?@\pL+`, FindFunc: "f"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sz["f"].BTMemoBytes; got != u.memoRowBytes() {
+		t.Errorf("SearchSizes: memo %d bytes per position, want the row's %d", got, u.memoRowBytes())
+	}
+}
+
+// TestBTWorkBudgetFromCodepointProgram pins the work budget's N: the
+// instruction count of the program before lowering, in Unicode mode as in byte
+// mode (where it is the program itself). Lowering puts a class's byte
+// sequences in the program, so its count let an exponential search run
+// hundreds of times more pops than its byte twin before the fallback took
+// over.
+func TestBTWorkBudgetFromCodepointProgram(t *testing.T) {
+	budget := func(n int) []byte { // emitBTWorkInit's k × N, after (span + 1)
+		return utils.AppendSLEB128_64([]byte{0xAD, 0x42, 0x01, 0x7C, 0x42}, int64(defaultBTWorkK)*int64(n))
+	}
+	for _, c := range []struct {
+		pat     string
+		unicode bool
+	}{{`\pL+x`, true}, {`\w+x`, false}} {
+		rp, err := resolvePattern(c.pat, nil, &CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := newBacktrack(mp).budgetN, len(mp.orig.Inst); got != want {
+			t.Errorf("%s: budget N %d, want the codepoint program's %d", c.pat, got, want)
+		}
+		wasm, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 65536, true,
+			CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode, MaxDFAStates: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(wasm, budget(len(mp.orig.Inst))) {
+			t.Errorf("%s: no work budget of k × %d in the module", c.pat, len(mp.orig.Inst))
+		}
+		if c.unicode && bytes.Contains(wasm, budget(len(mp.prog.Inst))) {
+			t.Errorf("%s: a work budget sized from the lowered program (%d)", c.pat, len(mp.prog.Inst))
+		}
+	}
+}
+
+// TestBTFallbackDispatchesInUnicodeMode pins the first-byte dispatch in the
+// memoised FALLBACK body, which is the only body of a program with a
+// zero-width cycle: in Unicode mode its lowered classes are dispatched on the
+// byte (a 257-entry br_table, the byte or the end of input), in byte mode its
+// chains stay plain.
+func TestBTFallbackDispatchesInUnicodeMode(t *testing.T) {
+	brTable257 := []byte{0x0E, 0x81, 0x02} // br_table, 257 targets
+	for _, c := range []struct {
+		pat     string
+		unicode bool
+		want    bool
+	}{
+		{`(\pL*)*x`, true, true},
+		{`((?:the|and|for|you)|[a-z]*)*x`, true, true},
+		{`((?:the|and|for|you)|[a-z]*)*x`, false, false},
+	} {
+		if cyc, err := BacktrackHasZeroWidthCycle(c.pat, CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode}); err != nil || !cyc {
+			t.Fatalf("%s: no zero-width cycle (%v), so the fallback is not its only body", c.pat, err)
+		}
+		wasm, _, err := CompileForced([]config.RegexEntry{{Pattern: c.pat, GroupsFunc: "g"}}, 65536, true,
+			EngineBacktrack, CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, wasm)
+		if got := bytes.Contains(wasm, brTable257); got != c.want {
+			t.Errorf("%s (unicode %v): first-byte dispatch in the fallback body %v, want %v", c.pat, c.unicode, got, c.want)
+		}
+	}
+}
+
 // TestBTWorkBudgetOffAcyclicDropsTheFallback is the other half: a program with
 // no zero-width cycle keeps its ordinary body under BTWorkBudgetOff, with no
 // work counter and no fallback body behind it — so the module is smaller than
@@ -2650,7 +2789,7 @@ func TestBTDispatchPlan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return buildBTDispatchPlan(prog)
+		return buildBTDispatchPlan(prog, false)
 	}
 	only := func(t *testing.T, p *btDispatchPlan) *btAltDispatch {
 		t.Helper()
@@ -2708,6 +2847,39 @@ func TestBTDispatchPlan(t *testing.T) {
 			t.Error("compact = false: the direct encoding would push 6 frames for 4 arms")
 		}
 		expect(t, d, map[int][]int{'a': {0, 1, 2}, 'x': {0, 1, 2, 3}, '5': {0, 2}, '_': {0}, '-': {}})
+	})
+	t.Run("pairs", func(t *testing.T) {
+		// Two arms no byte starts both of: dispatched in Unicode mode only.
+		if p := plan(t, `(?:ab|cd)`); len(p.heads) != 0 {
+			t.Errorf("byte mode: %d dispatched pairs, want 0", len(p.heads))
+		}
+		pairs := func(t *testing.T, pat string) *btDispatchPlan {
+			t.Helper()
+			re, err := syntax.Parse(pat, syntax.Perl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prog, err := syntax.Compile(re.Simplify())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return buildBTDispatchPlan(prog, true)
+		}
+		expect(t, only(t, pairs(t, `(?:ab|cd)`)), map[int][]int{'a': {0}, 'c': {1}, 'x': {}, eof: {}})
+		if p := pairs(t, `(?:a1|a2)`); len(p.heads) != 0 {
+			t.Errorf("a pair one byte starts both arms of: %d dispatched, want 0 — it needs the frame", len(p.heads))
+		}
+		// Every Alt of a lowered class is a dispatch head or reached only
+		// through one, so Backtracking pushes no frame inside it.
+		for _, pat := range []string{`(?i)k`, `\p{Han}`, `\pL`} {
+			_, low := lowerTestProgs(t, pat, false)
+			p := buildBTDispatchPlan(low, true)
+			for pc, in := range low.Inst {
+				if in.Op == syntax.InstAlt && p.heads[pc] == nil && !p.dead[pc] {
+					t.Errorf("%s: the Alt at pc %d is walked arm by arm", pat, pc)
+				}
+			}
+		}
 	})
 	t.Run("charge", func(t *testing.T) {
 		d := only(t, plan(t, `(?:get|head|post|delete)`))

@@ -38,6 +38,53 @@ type backtrack struct {
 	// unicode: the program was compiled in a Unicode mode, so a literal its
 	// find scans for is UTF-8 text (prefixScanParams.UTF8Text).
 	unicode bool
+
+	// memoIdx is the fallback memo's bit for each pc (memoIndex), built on
+	// first use.
+	memoIdx []int
+
+	// budgetN is the work budget's N, pops per byte per unit of k: the
+	// instruction count of the program BEFORE lowering (resolvedProg.orig;
+	// prog itself in byte mode). Lowering puts a class's byte sequences in
+	// the program, `\pL+` 1,552 instructions against 4, while the first-byte
+	// dispatch walks one in a few steps — so the lowered count let an
+	// exponential search run hundreds of times more pops than its byte twin
+	// before the memoised fallback took over.
+	budgetN int
+}
+
+// memoIndex maps each pc the fallback body guards to its bit in a memo row,
+// in pc order, and every other pc to -1. The guarded pcs are the Alts — the
+// only instructions whose (pc, pos) the fallback marks — less, in Unicode
+// mode, the inner Alts of a dispatched chain, which are never reached. A row
+// over every instruction was mostly bits never set: `\pL+` 194 bytes per
+// input position where its Alts need 41.
+func (bt *backtrack) memoIndex() []int {
+	if bt.memoIdx == nil {
+		plan := bt.altDispatch()
+		bt.memoIdx = make([]int, len(bt.prog.Inst))
+		n := 0
+		for pc, in := range bt.prog.Inst {
+			bt.memoIdx[pc] = -1
+			if (in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch) && !(bt.unicode && plan.dead[pc]) {
+				bt.memoIdx[pc] = n
+				n++
+			}
+		}
+	}
+	return bt.memoIdx
+}
+
+// memoRowBytes is one fallback memo row: a bit per guarded pc (memoIndex),
+// at least one byte.
+func (bt *backtrack) memoRowBytes() int {
+	n := 0
+	for _, i := range bt.memoIndex() {
+		if i >= 0 {
+			n++
+		}
+	}
+	return max((n+7)/8, 1)
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -101,7 +148,10 @@ func progHasZeroWidthCycle(prog *syntax.Prog) bool {
 // newBacktrack builds the backtrack struct from a compiled NFA program.
 func newBacktrack(mp resolvedProg) *backtrack {
 	prog := mp.prog
-	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2, unicode: mp.unicode()}
+	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2, unicode: mp.unicode(), budgetN: len(prog.Inst)}
+	if mp.orig != nil {
+		bt.budgetN = len(mp.orig.Inst)
+	}
 	for _, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
 			bt.numAlts++
@@ -284,7 +334,7 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	totalLocals := 4 + numCapLocals + memoLocalsCount + winLocalsCount
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, N)
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dynBase := uint32(3 + totalLocals)
 		dyn.memoBase, dyn.cleared, dyn.stackBase, dyn.stackTop = dynBase, dynBase+1, dynBase+2, dynBase+3
 		totalLocals += 4
@@ -393,9 +443,9 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	}
 	if useWork && member != nil {
 		// A set member's budget lasts the host call (btDriveMember).
-		body = emitBTWorkInitMember(body, member, workK, N, workSpan)
+		body = emitBTWorkInitMember(body, member, workK, bt.budgetN, workSpan)
 	} else if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, N, workSpan)
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, workSpan)
 	}
 
 	// ── Part 3: Memo table lazy clear ──────────────────────────────────────
@@ -673,8 +723,26 @@ func emitBTInstHandler(
 		// first visit would already have returned. Every cycle in a
 		// syntax.Prog passes through an Alt, and an Alt is entered at a given
 		// pos at most once per call.
+		//
+		// In Unicode mode the fallback dispatches a chain too, behind the memo
+		// guard at its HEAD: the chain's inner Alts are reached only through
+		// the head, so a second arrival at one of them is a second arrival at
+		// (head, pos), which the guard cuts, and the dispatch only chooses
+		// which arms to push. Walked arm by arm with a guard at every Alt, a
+		// lowered class cost a guard, a push and a pop per arm on every
+		// character: `(\pL*)*x` 1,206 → 266 fuel/byte over Russian words,
+		// 1,662 → 259 over CJK. Byte mode keeps the plain chain.
 		if !dyn.grow {
-			body = emitBitStateGuardDyn(body, dyn, p, memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
+			plan := bt.altDispatch()
+			if bt.unicode && plan.dead[p] {
+				body = append(body, 0x00) // unreachable
+				break
+			}
+			body = emitBitStateGuardDyn(body, dyn, bt.memoIndex()[p], memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
+			if d := plan.heads[p]; bt.unicode && d != nil {
+				body = emitBTAltDispatch(body, d, brRun, numCapLocals, frameSize, overflowFn, tableMemIdx, dyn, limitLocal, charge)
+				break
+			}
 		} else if plan := bt.altDispatch(); plan.dead[p] {
 			// An inner Alt of a dispatched chain: reached only through the
 			// chain's head, which branches past it (bt_dispatch.go).
@@ -1933,7 +2001,7 @@ func buildBTMatchBody(bt *backtrack, frameSize int32, tableMemIdx int, workK int
 	totalLocals := 4 + memoLocalsCount + 1
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, len(prog.Inst))
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dynBase := uint32(2 + totalLocals)
 		dyn.memoBase, dyn.cleared, dyn.stackBase, dyn.stackTop = dynBase, dynBase+1, dynBase+2, dynBase+3
 		totalLocals += 4
@@ -1976,7 +2044,7 @@ func buildBTMatchBody(bt *backtrack, frameSize int32, tableMemIdx int, workK int
 	}
 
 	if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
 	}
@@ -2189,7 +2257,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// arithmetic.
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, len(prog.Inst))
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dyn.memoBase, dyn.cleared = uint32(a.I32()), uint32(a.I32())
 		dyn.stackBase, dyn.stackTop = uint32(a.I32()), uint32(a.I32())
 		dyn.tmp64 = uint32(a.I64())
@@ -2283,9 +2351,9 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// input rather than len - from — a larger budget only delays a trip, and
 	// the bound stays linear in the input.
 	if useWork && srch != nil {
-		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, len(prog.Inst), &callOffs)
+		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, bt.budgetN, &callOffs)
 	} else if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
 	}

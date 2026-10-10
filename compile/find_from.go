@@ -242,100 +242,210 @@ type utf8StartLocals struct {
 // a continuation byte there has no lead before it, and the lookback answers
 // "a start position" for it as for any stray continuation byte.
 func emitUTF8Start(b []byte, l utf8StartLocals, onMove func([]byte) []byte) []byte {
-	get := func(b []byte, x uint32) []byte { return utils.AppendULEB128(append(b, 0x20), x) }
-	set := func(b []byte, op byte, x uint32) []byte { return utils.AppendULEB128(append(b, op), x) }
-	i32c := func(b []byte, v int32) []byte { return utils.AppendSLEB128(append(b, 0x41), v) }
-	// at loads the input byte at pos - k + off (memory 0, the input's).
-	at := func(b []byte, off byte) []byte {
-		b = get(get(b, l.ptr), l.pos)
-		b = append(b, 0x6A)
-		b = get(b, l.k)
-		return append(b, 0x6B, 0x2D, 0x00, off)
-	}
-	isCont := func(b []byte) []byte { // (top & 0xC0) == 0x80
-		b = i32c(b, 0xC0)
-		b = append(b, 0x71)
-		b = i32c(b, 0x80)
-		return append(b, 0x46)
-	}
-	eqC := func(b []byte, v int32) []byte { return append(i32c(get(b, l.c), v), 0x46) }
-
+	u := utf8Emit{l}
 	b = append(b, 0x02, 0x40) // block $done
-	b = get(get(b, l.pos), l.len)
+	b = u.get(u.get(b, l.pos), l.len)
 	b = append(b, 0x4F, 0x0D, 0x00) // pos >= len → a start position
-	b = get(get(b, l.ptr), l.pos)
+	b = u.get(u.get(b, l.ptr), l.pos)
 	b = append(b, 0x6A, 0x2D, 0x00, 0x00)
-	b = isCont(b)
+	b = u.isCont(b)
 	b = append(b, 0x45, 0x0D, 0x00) // not a continuation byte → a start position
-
-	// The lead byte: the first non-continuation byte up to 3 back.
-	b = set(i32c(b, 1), 0x21, l.k)
-	b = append(b, 0x02, 0x40, 0x03, 0x40) // block $found, loop $back
-	b = get(get(b, l.k), l.pos)
-	b = append(b, 0x4B, 0x0D, 0x02) // k > pos: no lead → stray → done
-	b = at(b, 0)
-	b = set(b, 0x22, l.c)
-	b = isCont(b)
-	b = append(b, 0x45, 0x0D, 0x01) // a lead candidate → $found
-	b = get(b, l.k)
-	b = append(b, 0x41, 0x01, 0x6A)
-	b = set(b, 0x22, l.k)
-	b = append(b, 0x41, 0x03, 0x4D, 0x0D, 0x00) // k <= 3 → $back
-	b = append(b, 0x0C, 0x02)                   // four continuations → stray → done
-	b = append(b, 0x0B, 0x0B)                   // end $back, end $found
-
-	// c is the byte at pos - k. A valid lead is 0xC2..0xF4; its sequence is
-	// n = 2, 3 or 4 bytes, and must reach past pos and end within the input.
-	b = i32c(get(b, l.c), 0xC2)
-	b = append(b, 0x49, 0x0D, 0x00) // c < 0xC2 → done
-	b = i32c(get(b, l.c), 0xF5)
-	b = append(b, 0x4F, 0x0D, 0x00) // c >= 0xF5 → done
-	b = i32c(get(i32c(b, 2), l.c), 0xE0)
-	b = append(b, 0x4F, 0x6A)
-	b = i32c(get(b, l.c), 0xF0)
-	b = append(b, 0x4F, 0x6A)
-	b = set(b, 0x21, l.n)
-	b = get(get(b, l.n), l.k)
-	b = append(b, 0x4D, 0x0D, 0x00) // n <= k: the sequence ends before pos → done
-	b = get(get(b, l.pos), l.k)
-	b = append(b, 0x6B)
-	b = get(b, l.n)
-	b = append(b, 0x6A)
-	b = get(b, l.len)
-	b = append(b, 0x4B, 0x0D, 0x00) // cut off by the end of the input → done
-
-	// The second byte's range depends on the lead (no overlong encoding, no
-	// surrogate, nothing past U+10FFFF): (byte - lo) u> (hi - lo) → done.
-	b = at(b, 1)
-	b = i32c(b, 0xA0)
-	b = i32c(b, 0x90)
-	b = i32c(b, 0x80)
-	b = append(eqC(b, 0xF0), 0x1B)
-	b = append(eqC(b, 0xE0), 0x1B, 0x6B) // byte - lo
-	b = i32c(b, 0x1F)
-	b = i32c(b, 0x2F)
-	b = i32c(b, 0x0F)
-	b = i32c(b, 0x3F)
-	b = append(eqC(b, 0xF4), 0x1B)
-	b = append(eqC(b, 0xF0), 0x1B)
-	b = eqC(eqC(b, 0xE0), 0xED)
-	b = append(b, 0x72, 0x1B)       // or, select → hi - lo
-	b = append(b, 0x4B, 0x0D, 0x00) // out of range → done
-	for j := byte(2); j <= 3; j++ {
-		b = i32c(get(b, l.n), int32(j))
-		b = append(b, 0x4B, 0x04, 0x40) // if n > j
-		b = isCont(at(b, j))
-		b = append(b, 0x45, 0x0D, 0x01, 0x0B) // not a continuation → done; end if
-	}
-	b = get(get(b, l.pos), l.k)
-	b = append(b, 0x6B)
-	b = get(b, l.n)
-	b = append(b, 0x6A)
-	b = set(b, 0x21, l.pos) // pos = the sequence's end
+	b = u.lookback(b, 0)
+	b = u.seqEnd(b, 0, false)
 	if onMove != nil {
 		b = onMove(b)
 	}
 	return append(b, 0x0B) // end $done
+}
+
+// emitUTF8NextStart moves l.pos, a START position of the input, to the next
+// one: past the whole character it begins when that is a valid sequence of 2–4
+// bytes, else one byte on (ASCII, a stray continuation byte or an invalid
+// sequence, each a start of its own, and the end of the input).
+//
+// A walk over start positions only needs emitUTF8Start once, to round where it
+// begins; stepping with this, it never visits a byte inside a character. One
+// that called emitUTF8Start at every position paid its lookback at the second
+// byte of every character instead.
+func emitUTF8NextStart(b []byte, l utf8StartLocals) []byte {
+	u := utf8Emit{l}
+	b = append(b, 0x02, 0x40) // block $next
+	b = append(b, 0x02, 0x40) // block $plus1
+	b = u.get(u.get(b, l.pos), l.len)
+	b = append(b, 0x4F, 0x0D, 0x00) // pos >= len → $plus1
+	b = u.get(u.get(b, l.ptr), l.pos)
+	b = append(b, 0x6A, 0x2D, 0x00, 0x00)
+	b = u.set(b, 0x22, l.c)
+	b = u.i32c(b, 0xC0)
+	b = append(b, 0x49, 0x0D, 0x00) // ASCII or a continuation byte → $plus1
+	// c leads. Every 2-byte lead (C2..DF) and every 3-byte one but E0 and
+	// ED takes any continuation byte second, so for those — every alphabet
+	// and all of CJK — the check is the continuation bytes alone: about 30
+	// instructions, where the full check, with its lead-dependent range for
+	// the second byte, is 100.
+	b = append(b, 0x02, 0x40) // block $full
+	b = u.i32c(u.get(b, l.c), 0xE0)
+	b = append(b, 0x49, 0x04, 0x40) // if c < 0xE0: two bytes, or C0/C1
+	b = u.i32c(u.get(b, l.c), 0xC2)
+	b = append(b, 0x49, 0x0D, 0x02) // C0, C1 → $plus1
+	b = u.i32c(u.get(b, l.pos), 2)
+	b = append(b, 0x6A)
+	b = u.get(b, l.len)
+	b = append(b, 0x4B, 0x0D, 0x02) // cut off → $plus1
+	b = u.isCont(u.at(b, 1, true))
+	b = append(b, 0x45, 0x0D, 0x02) // no continuation → $plus1
+	b = u.i32c(u.get(b, l.pos), 2)
+	b = append(b, 0x6A)
+	b = u.set(b, 0x21, l.pos)
+	b = append(b, 0x0C, 0x03, 0x0B) // br $next; end if
+	b = u.i32c(u.get(b, l.c), 0xF0)
+	b = append(b, 0x49)
+	b = u.i32c(u.get(b, l.c), 0xE0)
+	b = append(b, 0x47)
+	b = u.i32c(u.get(b, l.c), 0xED)
+	b = append(b, 0x47, 0x71, 0x71, 0x45, 0x0D, 0x00) // not E1..EC, EE, EF → $full
+	b = u.i32c(u.get(b, l.pos), 3)
+	b = append(b, 0x6A)
+	b = u.get(b, l.len)
+	b = append(b, 0x4B, 0x0D, 0x01) // cut off → $plus1
+	b = u.get(u.get(b, l.ptr), l.pos)
+	b = append(b, 0x6A, 0x2F, 0x00, 0x01) // i32.load16_u offset=1: bytes 1 and 2
+	b = u.i32c(b, 0xC0C0)
+	b = append(b, 0x71)
+	b = u.i32c(b, 0x8080)
+	b = append(b, 0x47, 0x0D, 0x01) // not both continuations → $plus1
+	b = u.i32c(u.get(b, l.pos), 3)
+	b = append(b, 0x6A)
+	b = u.set(b, 0x21, l.pos)
+	b = append(b, 0x0C, 0x02) // br $next
+	b = append(b, 0x0B)       // end $full
+	b = u.seqEnd(b, 0, true)
+	b = append(b, 0x0C, 0x01) // br $next
+	b = append(b, 0x0B)       // end $plus1
+	b = u.get(b, l.pos)
+	b = append(b, 0x41, 0x01, 0x6A)
+	b = u.set(b, 0x21, l.pos)
+	return append(b, 0x0B) // end $next
+}
+
+// utf8Emit holds the emitters emitUTF8Start and emitUTF8NextStart share over
+// one set of locals.
+type utf8Emit struct{ l utf8StartLocals }
+
+func (u utf8Emit) get(b []byte, x uint32) []byte { return utils.AppendULEB128(append(b, 0x20), x) }
+func (u utf8Emit) set(b []byte, op byte, x uint32) []byte {
+	return utils.AppendULEB128(append(b, op), x)
+}
+func (u utf8Emit) i32c(b []byte, v int32) []byte { return utils.AppendSLEB128(append(b, 0x41), v) }
+
+// at loads the input byte at pos - k + off (memory 0, the input's); fwd: k is
+// known to be 0 and is not read.
+func (u utf8Emit) at(b []byte, off byte, fwd bool) []byte {
+	b = u.get(u.get(b, u.l.ptr), u.l.pos)
+	b = append(b, 0x6A)
+	if !fwd {
+		b = u.get(b, u.l.k)
+		b = append(b, 0x6B)
+	}
+	return append(b, 0x2D, 0x00, off)
+}
+
+// isCont tests the byte on the stack: (top & 0xC0) == 0x80.
+func (u utf8Emit) isCont(b []byte) []byte {
+	b = u.i32c(b, 0xC0)
+	b = append(b, 0x71)
+	b = u.i32c(b, 0x80)
+	return append(b, 0x46)
+}
+
+func (u utf8Emit) eqC(b []byte, v int32) []byte { return append(u.i32c(u.get(b, u.l.c), v), 0x46) }
+
+// lookback finds the lead of the character pos may lie inside — the first
+// non-continuation byte up to 3 back — leaving it in c and its distance in k;
+// with none (a stray continuation byte) it leaves the block at depth d.
+func (u utf8Emit) lookback(b []byte, d byte) []byte { return u.lookbackFrom(b, d, 1) }
+
+// lookbackFrom is lookback starting k at k0, the bytes nearer pos already
+// known to be continuation bytes.
+func (u utf8Emit) lookbackFrom(b []byte, d byte, k0 int32) []byte {
+	l := u.l
+	b = u.set(u.i32c(b, k0), 0x21, l.k)
+	b = append(b, 0x02, 0x40, 0x03, 0x40) // block $found, loop $back
+	b = u.get(u.get(b, l.k), l.pos)
+	b = append(b, 0x4B, 0x0D, d+2) // k > pos: no lead → stray → done
+	b = u.at(b, 0, false)
+	b = u.set(b, 0x22, l.c)
+	b = u.isCont(b)
+	b = append(b, 0x45, 0x0D, 0x01) // a lead candidate → $found
+	b = u.get(b, l.k)
+	b = append(b, 0x41, 0x01, 0x6A)
+	b = u.set(b, 0x22, l.k)
+	b = append(b, 0x41, 0x03, 0x4D, 0x0D, 0x00) // k <= 3 → $back
+	b = append(b, 0x0C, d+2)                    // four continuations → stray → done
+	return append(b, 0x0B, 0x0B)                // end $back, end $found
+}
+
+// seqEnd moves pos to the end of the sequence c leads at pos - k when that is
+// a valid sequence reaching past pos and ending within the input, and leaves
+// the block at depth d otherwise. fwd: k is 0, the sequence starts at pos.
+func (u utf8Emit) seqEnd(b []byte, d byte, fwd bool) []byte {
+	l := u.l
+	// c is the byte at pos - k. A valid lead is 0xC2..0xF4; its sequence is
+	// n = 2, 3 or 4 bytes, and must reach past pos and end within the input.
+	b = u.i32c(u.get(b, l.c), 0xC2)
+	b = append(b, 0x49, 0x0D, d) // c < 0xC2 → done
+	b = u.i32c(u.get(b, l.c), 0xF5)
+	b = append(b, 0x4F, 0x0D, d) // c >= 0xF5 → done
+	b = u.i32c(u.get(u.i32c(b, 2), l.c), 0xE0)
+	b = append(b, 0x4F, 0x6A)
+	b = u.i32c(u.get(b, l.c), 0xF0)
+	b = append(b, 0x4F, 0x6A)
+	b = u.set(b, 0x21, l.n)
+	if !fwd {
+		b = u.get(u.get(b, l.n), l.k)
+		b = append(b, 0x4D, 0x0D, d) // n <= k: the sequence ends before pos → done
+	}
+	b = u.get(b, l.pos)
+	if !fwd {
+		b = u.get(b, l.k)
+		b = append(b, 0x6B)
+	}
+	b = u.get(b, l.n)
+	b = append(b, 0x6A)
+	b = u.get(b, l.len)
+	b = append(b, 0x4B, 0x0D, d) // cut off by the end of the input → done
+
+	// The second byte's range depends on the lead (no overlong encoding, no
+	// surrogate, nothing past U+10FFFF): (byte - lo) u> (hi - lo) → done.
+	b = u.at(b, 1, fwd)
+	b = u.i32c(b, 0xA0)
+	b = u.i32c(b, 0x90)
+	b = u.i32c(b, 0x80)
+	b = append(u.eqC(b, 0xF0), 0x1B)
+	b = append(u.eqC(b, 0xE0), 0x1B, 0x6B) // byte - lo
+	b = u.i32c(b, 0x1F)
+	b = u.i32c(b, 0x2F)
+	b = u.i32c(b, 0x0F)
+	b = u.i32c(b, 0x3F)
+	b = append(u.eqC(b, 0xF4), 0x1B)
+	b = append(u.eqC(b, 0xF0), 0x1B)
+	b = u.eqC(u.eqC(b, 0xE0), 0xED)
+	b = append(b, 0x72, 0x1B)    // or, select → hi - lo
+	b = append(b, 0x4B, 0x0D, d) // out of range → done
+	for j := byte(2); j <= 3; j++ {
+		b = u.i32c(u.get(b, l.n), int32(j))
+		b = append(b, 0x4B, 0x04, 0x40) // if n > j
+		b = u.isCont(u.at(b, j, fwd))
+		b = append(b, 0x45, 0x0D, d+1, 0x0B) // not a continuation → done; end if
+	}
+	b = u.get(b, l.pos)
+	if !fwd {
+		b = u.get(b, l.k)
+		b = append(b, 0x6B)
+	}
+	b = u.get(b, l.n)
+	b = append(b, 0x6A)
+	return u.set(b, 0x21, l.pos) // pos = the sequence's end
 }
 
 // emitFindFromSeedRule is emitFindFromSeed for a body that keeps rule, and

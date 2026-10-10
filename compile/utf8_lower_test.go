@@ -396,7 +396,8 @@ func lowerClassBattery(t *testing.T, pat string, reverse bool) {
 // TestLowerUTF8LeadArms pins how many arms a lowered class's entry has: one
 // per distinct lead byte range, plus the ASCII arm — not one per UTF-8
 // sequence, which is what Backtracking used to push a frame for on every
-// character a class rejects (`\pL`: 800).
+// character a class rejects (`\pL`: 800). Below the leads, a node's intervals
+// that continue alike are one multi-range arm.
 func TestLowerUTF8LeadArms(t *testing.T) {
 	for _, c := range []struct {
 		pat  string
@@ -409,6 +410,26 @@ func TestLowerUTF8LeadArms(t *testing.T) {
 		}
 		if arms != c.arms {
 			t.Errorf("%s: the lowered class's entry has %d arms, want %d", c.pat, arms, c.arms)
+		}
+	}
+	// Below the leads, no two arms of a node continue to the same
+	// instruction: those are one multi-range arm. (The entry chain's lead
+	// arms may: it is dispatched on the byte.)
+	for _, pat := range []string{`\pL`, `\pN`, `\p{Han}`, `[^,]`, `(?i)k`} {
+		_, low := lowerTestProgs(t, pat, false)
+		entry := map[int]bool{}
+		for pc := low.Start; low.Inst[pc].Op == syntax.InstAlt; pc = int(low.Inst[pc].Arg) {
+			entry[pc] = true
+		}
+		for pc, in := range low.Inst {
+			if in.Op != syntax.InstAlt || entry[pc] {
+				continue
+			}
+			a, b := low.Inst[in.Out], low.Inst[in.Arg]
+			consumes := func(i syntax.Inst) bool { return i.Op == syntax.InstRune || i.Op == syntax.InstRune1 }
+			if consumes(a) && consumes(b) && a.Out == b.Out {
+				t.Errorf("%s: the Alt at pc %d has two arms continuing to pc %d", pat, pc, a.Out)
+			}
 		}
 	}
 }

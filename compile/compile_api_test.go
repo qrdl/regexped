@@ -2894,12 +2894,12 @@ func TestUnicodeModeLimits(t *testing.T) {
 		re   config.RegexEntry
 		want []string
 	}{
-		{"find", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, FindFunc: "f"},
-			[]string{"the find body went to Backtracking", "needs 5801 states, over 1024 (max_dfa_states; raise it",
-				"over max_bt_instructions (20000); raise max_bt_instructions to at least 30982"}},
-		{"match", config.RegexEntry{Name: "p", Pattern: `\pL{20}`, MatchFunc: "m"},
-			[]string{"the match body went to Backtracking", "needs 5801 states, over 1024 (max_dfa_states; raise it",
-				"over max_bt_instructions (20000); raise max_bt_instructions to at least 30982"}},
+		{"find", config.RegexEntry{Name: "p", Pattern: `\pL{25}`, FindFunc: "f"},
+			[]string{"the find body went to Backtracking", "needs 7251 states, over 1024 (max_dfa_states; raise it",
+				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23302"}},
+		{"match", config.RegexEntry{Name: "p", Pattern: `\pL{25}`, MatchFunc: "m"},
+			[]string{"the match body went to Backtracking", "needs 7251 states, over 1024 (max_dfa_states; raise it",
+				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23302"}},
 	} {
 		r, err := compileReport(c.re, CompileOptions{MaxDFAStates: 1024})
 		if !errors.Is(err, ErrBTProgramTooLarge) {
@@ -2918,8 +2918,8 @@ func TestUnicodeModeLimits(t *testing.T) {
 	// The capture body: anchored, so it has no find body, and the non-greedy
 	// `\pL+?` makes the captures TDFA-ineligible (a wide class alone no longer
 	// does in Unicode mode); their Backtracking program is over the ceiling —
-	// fifteen `\pL`s of about 1,550 instructions each.
-	_, err = compileReport(config.RegexEntry{Name: "p", Pattern: `^(\pL+?)(\pL{14})`, GroupsFunc: "g"}, CompileOptions{})
+	// twenty-five `\pL`s of about 930 instructions each.
+	_, err = compileReport(config.RegexEntry{Name: "p", Pattern: `^(\pL+?)(\pL{24})`, GroupsFunc: "g"}, CompileOptions{})
 	if !errors.Is(err, ErrBTProgramTooLarge) || !strings.Contains(err.Error(), "the capture body went to Backtracking because TDFA could not take it") {
 		t.Errorf("capture: err = %v, want the capture body's ErrBTProgramTooLarge", err)
 	}
@@ -2937,7 +2937,7 @@ func TestUnicodeModeLimits(t *testing.T) {
 
 	// Non-greedy, so Backtracking takes the captures.
 	r, err = compileReport(config.RegexEntry{Name: "p", Pattern: `(\pL+?)@(\pL+)`, GroupsFunc: "g"}, CompileOptions{})
-	if err != nil || !strings.Contains(r, "memory: Backtracking memo (capture) 389 B per input byte, once its work budget trips") ||
+	if err != nil || !strings.Contains(r, "memory: Backtracking memo (capture) 7 B per input byte, once its work budget trips") ||
 		!strings.Contains(r, "memory: per-search notes ") {
 		t.Errorf("(\\pL+?)@(\\pL+): err %v, report lacks its memory lines:\n%s", err, r)
 	}

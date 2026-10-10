@@ -3087,7 +3087,9 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	}
 
 	// Find-mode fast-skip: literal prefix or firstByteFlags + Teddy tables.
-	l.prefix = computePrefix(t)
+	// Capped before anything reads it, so the scan, the resume states walked
+	// from it below and --verbose all see the same prefix.
+	l.prefix = scanPrefixCap(computePrefix(t), l.utf8Text)
 	if needFind && len(l.prefix) == 0 {
 		l.firstByteOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize + wbAcceptSize + nlAcceptSize
 		wbAcceptNWMid := t.hasWordBoundary && t.midAcceptNWStates[t.midStartState] != 0
@@ -7237,7 +7239,14 @@ func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	}
 	b = append(b, 0x02, 0x40) // block $bulk_done
 	b = append(b, 0x03, 0x40) // loop $bulk_outer
-	b = emitBulkSkipBoundsExit(b, posLocal, lenLocal, onBoundsExit)
+	// pos + 17 > len: the hook, then the last chunk, overlapping (depth 2 is
+	// $bulk_done from inside this if).
+	b = append(b, 0x20, posLocal, 0x41, 0x11, 0x6A, 0x20, lenLocal, 0x4B, 0x04, 0x40)
+	if onBoundsExit != nil {
+		b = onBoundsExit(b)
+	}
+	b = emitUTF8SkipTail(b, info.exitBytes, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, true, 2)
+	b = append(b, 0x0B) // end if
 	b = emitBulkSkipLoadChunk(b, ptrLocal, posLocal, chunkLocal)
 	b = emitBulkSkipExitMask(b, info.exitBytes, chunkLocal)
 	b = append(b, 0x21, tmpLocal) // tmp = exit lanes
@@ -7325,6 +7334,116 @@ func emitUTF8ErrorStop(b []byte, chunkLocal, tmpLocal, errLocal byte) []byte {
 	b = append(b, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6B, 0x71)               // << 1; - 1; and
 	// The highest of them, or 0: 31 - clz(mask | 1).
 	b = append(b, 0x41, 0x01, 0x72, 0x67, 0x6B) // i32.const 1; i32.or; i32.clz; i32.sub
+	return b
+}
+
+// emitUTF8SkipTail is the UTF-8 skip's last, OVERLAPPING chunk, emitted where
+// the skip finds fewer than 16 bytes left: the chunk loads at len - 16 and its
+// lanes below the skip's start — d of them, already walked — are cut from
+// every mask, the exit lanes, the error lanes, the character starts and the
+// open tail, so the skip ends at len - 16 + a lane at or past d, never
+// backwards. Without it the skip never served the last 15 bytes of its
+// window, and a groups call, whose window is the match, walked most of a
+// short match byte by byte: `<([^>]+)>(\d)` over 20-40-byte Cyrillic tags
+// 42.80 → 30.36 fuel/byte with it, `[^,]+,` finding nothing over Russian
+// prose 48.12 → 14.63.
+//
+// The validity lanes past d are judged against their real previous bytes
+// (the chunk holds them), so they are right; an error there stops at the last
+// character start at or past d before it — d itself at worst, pos unchanged.
+// The open tail is the input's end: a character a lead opens there is cut,
+// and the walk is left to judge it. before: pos is the byte before the skip's
+// start (the DFA skip's convention: the chunk starts at pos + 1, and pos ends
+// on the byte before the lane it stops at); otherwise pos is the start and
+// ends on the lane. ptr and len are the input's locals. Every way out — at
+// once when nothing is left or len < 16, or with pos moved — branches to the
+// block out levels up from where the code starts.
+func emitUTF8SkipTail(b []byte, exitBytes []byte, pos, lenL, ptrL, chunk, mask, errLanes byte, before bool, out byte) []byte {
+	start := func(b []byte) []byte { // the position the chunk starts from: pos, or pos + 1
+		b = append(b, 0x20, pos)
+		if before {
+			b = append(b, 0x41, 0x01, 0x6A)
+		}
+		return b
+	}
+	// hi: the lanes at or past d, -1 << (start - len + 16).
+	hi := func(b []byte) []byte {
+		b = append(b, 0x41, 0x7F)
+		b = start(b)
+		return append(b, 0x20, lenL, 0x6B, 0x41, 0x10, 0x6A, 0x74)
+	}
+	// set pos = len - 16 + (the lane on the stack), less one for the DFA skip.
+	setPos := func(b []byte) []byte {
+		b = append(b, 0x20, lenL, 0x6A, 0x41, 0x10, 0x6B)
+		if before {
+			b = append(b, 0x41, 0x01, 0x6B)
+		}
+		return append(b, 0x21, pos)
+	}
+	// Nothing left — the common way here, at the end of the input — first.
+	b = start(b)
+	b = append(b, 0x20, lenL, 0x4F, 0x0D, out)             // nothing left: leave
+	b = append(b, 0x20, lenL, 0x41, 0x10, 0x49, 0x0D, out) // len < 16: leave
+	// chunk = v128.load(ptr + len - 16)
+	b = append(b, 0x20, ptrL, 0x20, lenL, 0x6A, 0x41, 0x10, 0x6B, 0xFD, 0x00, 0x00, 0x00, 0x21, chunk)
+	b = emitBulkSkipExitMask(b, exitBytes, chunk)
+	b = append(hi(b), 0x71, 0x21, mask) // mask = exit lanes past d
+	// No byte above 0x7F past d: stop at the first exit byte, or take it all.
+	b = append(b, 0x20, chunk, 0xFD, 0x64)
+	b = append(hi(b), 0x71, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, mask, 0x41, 0x80, 0x80, 0x04, 0x72, 0x68) // ctz(mask | 0x10000): 16 for none
+	b = append(setPos(b), 0x0C, out+1, 0x0B)
+	// Invalid UTF-8 past d: stop before the faulty character, at d at worst.
+	b = emitUTF8ErrorLanes(b, chunk)
+	b = append(b, 0x22, errLanes, 0xFD, 0x0C)
+	b = append(b, make([]byte, 16)...)
+	b = append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask
+	b = append(hi(b), 0x71, 0x04, 0x40)
+	b = emitUTF8ErrorStopFrom(b, chunk, mask, errLanes, hi)
+	b = append(setPos(b), 0x0C, out+1, 0x0B)
+	// No exit byte: to the lead byte of a character cut at the end, or len.
+	b = append(b, 0x20, mask, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, chunk, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64)
+	b = append(hi(b), 0x71, 0x41)
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68)
+	b = append(setPos(b), 0x0C, out+1, 0x0B)
+	b = append(b, 0x20, mask, 0x68) // on the exit byte
+	return append(setPos(b), 0x0C, out)
+}
+
+// emitUTF8ErrorStopFrom is emitUTF8ErrorStop over the lanes hi keeps: the
+// error and the character starts below them are cut, and with no start left
+// it answers hi's lowest lane rather than 0.
+func emitUTF8ErrorStopFrom(b []byte, chunkLocal, tmpLocal, errLocal byte, hi func([]byte) []byte) []byte {
+	b = append(b, 0x41, 0x1F) // i32.const 31
+	b = append(b, 0x20, chunkLocal, 0xFD, 0x0C)
+	for i := 0; i < 16; i++ {
+		b = append(b, 0xC0)
+	}
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x0C) // v128.and
+	for i := 0; i < 16; i++ {
+		b = append(b, 0x80)
+	}
+	b = append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask: the starts
+	b = append(hi(b), 0x71)               // past d
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x20, errLocal)
+	b = append(b, 0xFD, 0x0C)
+	b = append(b, make([]byte, 16)...)
+	b = append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask
+	b = append(hi(b), 0x71, 0x68)         // past d; i32.ctz: j
+	b = append(b, 0x74, 0x41, 0x01, 0x6B) // i32.shl; i32.const 1; i32.sub
+	b = append(b, 0x71)                   // i32.and
+	b = append(b, 0x20, tmpLocal, 0x41, 0x00, 0x20, tmpLocal, 0x6B, 0x71)
+	b = append(b, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6B, 0x71)
+	// The highest of them, or d: 31 - clz(mask | (hi & -hi)).
+	b = hi(b)
+	b = append(b, 0x41, 0x00)
+	b = hi(b)
+	b = append(b, 0x6B, 0x71, 0x72, 0x67, 0x6B) // i32.sub; i32.and; i32.or; i32.clz; i32.sub
 	return b
 }
 
@@ -8191,6 +8310,55 @@ func computePrefixWalk(t *dfaTable, start int) (prefix []byte, ok bool) {
 		visited[state] = true
 	}
 	return prefix, true
+}
+
+// scanPrefixCap returns the part of a literal prefix the SIMD scan looks for.
+// Byte mode scans the whole literal. In Unicode mode a character is 2–4 bytes,
+// and the hybrid scan advances 17 − N bytes per 16-byte chunk (a literal over
+// 16 bytes is scanned a byte at a time), so its cost grows with the literal's
+// BYTE length: over Russian text with no match, `здравствуйте\s+\pL+` (24 B)
+// cost 19.7 fuel/byte scanned whole, against 2.78 for a 4-byte literal. The
+// automaton verifies what the scan does not, so only the first TWO characters
+// are scanned: one character lost 21–29% once it was common in the text (a
+// CJK character starting half the words), a third cost a byte of advance per
+// chunk for nothing. An all-ASCII literal keeps 8 bytes — no character check
+// applies to it and the advance is its only cost. A cut is always at the end
+// of a character, so the scan's resume state lies between two characters; a
+// prefix no longer than the cap is returned as it is.
+func scanPrefixCap(prefix []byte, utf8Text bool) []byte {
+	if !utf8Text {
+		return prefix
+	}
+	ascii := true
+	for _, c := range prefix {
+		if c >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return prefix[:min(len(prefix), 8)]
+	}
+	end := 0
+	for n := 0; n < 2 && end < len(prefix); n++ {
+		end += utf8LeadLen(prefix[end])
+	}
+	return prefix[:min(end, len(prefix))]
+}
+
+// utf8LeadLen is the byte length of the UTF-8 sequence a byte begins: 2 for a
+// lead 0xC2–0xDF, 3 for 0xE0–0xEF, 4 for 0xF0–0xF4, and 1 otherwise (ASCII, or
+// a byte no valid sequence begins with, which stands alone).
+func utf8LeadLen(c byte) int {
+	switch {
+	case c >= 0xC2 && c <= 0xDF:
+		return 2
+	case c >= 0xE0 && c <= 0xEF:
+		return 3
+	case c >= 0xF0 && c <= 0xF4:
+		return 4
+	}
+	return 1
 }
 
 // dfaHasOutrankedState reports whether t has any state
@@ -11241,7 +11409,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		b = append(b, 0x21, scanStartLocal)
 		b = append(b, 0x03, 0x40) // loop $lit_outer
 		b, _ = emitPrefixScan(b, prefixScanParams{
-			Prefix:      mandatoryLit.bytes,
+			// Only the scan is capped: a hit is where the literal STARTS, so
+			// minOff/maxOff, which locate that start, stay the whole
+			// literal's, and the automaton verifies the rest.
+			Prefix:      scanPrefixCap(mandatoryLit.bytes, p.utf8Text),
 			UTF8Text:    p.utf8Text,
 			EngineDepth: 2, // loop $lit_outer + block $no_match
 			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan

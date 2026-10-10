@@ -1018,6 +1018,37 @@ func TestChooseLiteralFrontend(t *testing.T) {
 			t.Errorf("chooseLiteralFrontend(%v) = %v, want %v", c.lits, got, c.want)
 		}
 	}
+
+	// Unicode mode counts first CHARACTERS: twenty Cyrillic keywords start on
+	// two lead bytes (D0, D1) but twenty letters, and take Teddy, whose
+	// two-byte probe holds the whole letter; the same bytes in byte mode keep
+	// AC. Twenty keywords sharing two first letters keep AC in both, and a Han
+	// set under one lead byte is judged by its characters too.
+	cyr := []rune("абвгдежзийклмнопрст") // 19 letters under D0 …
+	cyr = append(cyr, 'ф')               // … and one under D1
+	var distinct, shared, han [][]byte
+	for i, r := range cyr {
+		distinct = append(distinct, []byte(string(r)+"ова"))
+		shared = append(shared, []byte(string([]rune("пр")[i%2])+string(r)+"ова"))
+	}
+	for i := 0; i < 20; i++ {
+		han = append(han, []byte(string(rune(0x4E00+i%5))+string(rune(0x4E10+i))))
+	}
+	for _, c := range []struct {
+		name    string
+		lits    [][]byte
+		unicode bool
+		want    frontendKind
+	}{
+		{"cyrillic, distinct letters", distinct, true, frontendTeddy},
+		{"cyrillic as bytes", distinct, false, frontendAC},
+		{"cyrillic, two first letters", shared, true, frontendAC},
+		{"han, five first characters under E4", han, true, frontendTeddy},
+	} {
+		if got := chooseLiteralFrontend(c.lits, c.unicode); got != c.want {
+			t.Errorf("%s: chooseLiteralFrontend = %v, want %v", c.name, got, c.want)
+		}
+	}
 }
 
 func TestAC_Construction(t *testing.T) {

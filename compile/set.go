@@ -1646,6 +1646,7 @@ func chooseLiteralFrontend(literals [][]byte, unicode bool) frontendKind {
 	}
 	minLen := 1 << 30
 	var firstBytes [256]bool
+	firstChars := map[string]bool{}
 	distinctFirst := 0
 	for _, lit := range literals {
 		if len(lit) == 0 {
@@ -1653,6 +1654,20 @@ func chooseLiteralFrontend(literals [][]byte, unicode bool) frontendKind {
 		}
 		if len(lit) < minLen {
 			minLen = len(lit)
+		}
+		if unicode {
+			// First CHARACTERS: a script puts a whole alphabet under one to
+			// six lead bytes (Cyrillic D0-D3, Han E4-E9), so its keywords
+			// start on fewer than four distinct BYTES and took AC, whose root
+			// skip keys on a byte that begins half the script's characters
+			// and never skips. 32 Cyrillic keywords over Russian text: AC
+			// 2,032,992 fuel on `scan_any`, Teddy — whose two-byte probe holds
+			// the whole first character — 641,187.
+			if c := string(lit[:min(len(lit), utf8LeadLen(lit[0]))]); !firstChars[c] {
+				firstChars[c] = true
+				distinctFirst++
+			}
+			continue
 		}
 		if !firstBytes[lit[0]] {
 			firstBytes[lit[0]] = true

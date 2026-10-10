@@ -1099,6 +1099,70 @@ func TestTDFARegisterEdgeShapes(t *testing.T) {
 	}
 }
 
+// TestTDFAMinorityTable pins the tag-op dispatch of a state with more than
+// one minority byte: one br_table on the byte to a handler per group of equal
+// ops, the majority by default, each handler leaving past the rest; a state
+// with ONE minority byte keeps its compare.
+func TestTDFAMinorityTable(t *testing.T) {
+	setPos := func(dst int) []tdfaTagOp { return []tdfaTagOp{{dst: dst, src: -1}} }
+	got := emitTDFAMinorityTable(nil, []tdfaByteOps{{'a', setPos(0)}, {'b', setPos(1)}, {'c', setPos(0)}},
+		setPos(2), 5, 6, 10)
+	want := []byte{0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x20, 5, 0x0E, 0x80, 0x02}
+	for c := range 256 {
+		switch c {
+		case 'a', 'c':
+			want = append(want, 0)
+		case 'b':
+			want = append(want, 1)
+		default:
+			want = append(want, 2)
+		}
+	}
+	want = append(want, 2,
+		0x0B, 0x20, 6, 0x21, 10, 0x0C, 2, // group 0 ('a', 'c'): reg 0 = pos; br $maj_done
+		0x0B, 0x20, 6, 0x21, 11, 0x0C, 1, // group 1 ('b'): reg 1 = pos
+		0x0B, 0x20, 6, 0x21, 12) // the majority: reg 2 = pos
+	if !bytes.Equal(got, want) {
+		t.Errorf("emitTDFAMinorityTable:\n got %x\nwant %x", got, want)
+	}
+
+	tdfaOf := func(t *testing.T, pattern string, unicode bool) *tdfaTable {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tt, ok := newTDFA(mp, 16384)
+		if !ok {
+			t.Fatalf("newTDFA(%q) failed", pattern)
+		}
+		return tt
+	}
+	brTable256 := []byte{0x0E, 0x80, 0x02}
+	for _, c := range []struct {
+		pattern string
+		unicode bool
+		table   bool
+	}{
+		{`(\pL+)\s(\pL+)`, true, true}, // lead bytes and letters split a loop state
+		{`(\w+)\s(\w+)`, false, true},
+		{`(a+)b`, false, false}, // one minority byte: its compare
+	} {
+		b := emitTDFATagOps(tdfaOf(t, c.pattern, c.unicode), nil, 1, 2, 3, 4, nil)
+		if got := bytes.Contains(b, brTable256); got != c.table {
+			t.Errorf("%q: a 256-entry br_table %v, want %v", c.pattern, got, c.table)
+		}
+	}
+}
+
 // TestTDFAUTF8Skip pins which loops of a Unicode-mode TDFA the UTF-8 skip
 // serves — a group of states with identical rows that every ASCII byte but a
 // few and every character leads back into, firing one batch of set-to-pos
@@ -1167,6 +1231,22 @@ func TestTDFAUTF8Skip(t *testing.T) {
 	}
 	if tt := table(t, `<([^>]+)>(x)`, false); len(tt.utf8Skip) != 0 {
 		t.Errorf("byte mode: loops %+v, want none", tt.utf8Skip)
+	}
+	// Its last chunk overlaps what it walked: the lanes below the skip's
+	// start are cut by -1 << (start - len + 16).
+	cut := []byte{0x6B, 0x41, 0x10, 0x6A, 0x74} // i32.sub; i32.const 16; i32.add; i32.shl
+	for _, c := range []struct {
+		unicode bool
+		want    bool
+	}{{true, true}, {false, false}} {
+		w, _, err := Compile([]config.RegexEntry{{Pattern: `<([^>]+)>(x)`, GroupsFunc: "g"}}, 0, true,
+			CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Contains(w, cut); got != c.want {
+			t.Errorf("unicode %v: the last chunk's lane cut %v, want %v", c.unicode, got, c.want)
+		}
 	}
 
 	// The skip runs in the arms of states outside the loop that lead into it:

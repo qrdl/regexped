@@ -977,6 +977,14 @@ var unicodeStartInputs = []string{
 	"прив", "12привет", "ab\xffпривет", "приве\xd0", "東京タワー東京", "東京タワ", "x東京タワーy",
 	// One-byte literals among multi-byte text.
 	"пользователь@пример.рф", "é@ж.日本 @@ a@b.cd", "x@@y.zz", "@\xffж@ю.яя", "日本@語.テキ",
+	// A literal longer than the two characters its scan looks for: cut at
+	// and past that boundary, once, twice adjacent, after sixteen characters
+	// sharing its first character, after runs of its first two, cut inside a
+	// character, after an invalid byte.
+	"зд", "здр", "x зд", "здравствуй", "здравствуйте мир", "12здравствуйте",
+	"здравствуйтездравствуйте мир", "1здравствуйте2здравствуйте3",
+	"зззззззззззззззздравствуйте мир", "здздздздздздздздздравствуйте7", "аздравствуйте1",
+	"здравствуй\xd1", "\xffздравствуйте ж",
 }
 
 // unicodeFindShapes are Unicode-mode finds that can match empty, each with
@@ -1034,6 +1042,12 @@ var unicodeFindShapes = []struct {
 	{"char-probe-mandatory", `\d{0,3}привет`, 0, false, "mandatory literal extracted"},
 	{"char-probe-lit-anchor", `[a-z]+привет`, 0, false, "literal-anchored find"},
 	{"char-probe-bt", `привет\s*\pL+`, 1, false, "Backtracking"},
+	// A literal over two characters: the scan looks for the first two and
+	// the automaton verifies the rest, in the prefix scan and the
+	// mandatory-literal scan.
+	{"scan-cap-prefix", `здравствуйте\s+\pL+`, 0, false, "prefix scan: hybrid SIMD, 4-byte prefix"},
+	{"scan-cap-mandatory", `\d{0,3}здравствуйте`, 0, false, "mandatory literal extracted"},
+	{"scan-cap-lit-anchor", `\pL+здравствуйте\d`, 0, false, "literal-anchored find"},
 	// A one-byte inner literal behind a wide leading repeat, on tables past
 	// 256 states (u16 ids).
 	{"lit-anchor-u16-email", `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}`, 0, false, "literal-anchored find"},
@@ -1301,6 +1315,7 @@ func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []st
 // ops at all (`()[^,]+,`), from the top of its main loop.
 var characterRunGroupsShapes = []string{
 	`<([^>]+)>(x)`, `(.+)=(.+)`, `([^,]+)(,)`, `(\w+)=([^&]+)&`, `()[^,]+,`, `^([^,]+)`, `x([^y]*)y`, `"([^"\\]*)"`,
+	`<([^>]+)>(\d)`, `([^,]+),(\d*)`,
 }
 
 // noReplacement returns pat with U+FFFD taken out of every class and of `.`:
@@ -1387,6 +1402,14 @@ func characterRunInputs() []string {
 			unit := strings.Repeat("a", 20) + strings.Repeat(run, 100) + bad
 			out = append(out, strings.Repeat(unit, 4)+"b"+strings.Repeat("東", 30)+"z"+strings.Repeat("ω", 20))
 		}
+	}
+	// Short windows, whose last chunk overlaps what the skip already walked:
+	// matches of 15-31 bytes, valid, after an invalid byte the last chunk
+	// holds below where the skip resumes, and ending in a character cut short.
+	for k := 6; k <= 14; k++ {
+		run := strings.Repeat("ж", k)
+		out = append(out, "<"+run+">5", "ab\xff<"+run+">7 ", run+",12", "\x80"+run+"=x"+run,
+			"<"+strings.Repeat("東", k/2+1)+"a>9", "q"+run+"\xe6\x97", "\xc2"+run+"y")
 	}
 	return out
 }

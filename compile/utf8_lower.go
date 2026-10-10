@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp/syntax"
 	"slices"
+	"strconv"
 	"unicode"
 	"unicode/utf8"
 
@@ -36,17 +37,18 @@ import (
 // Surrogates U+D800-U+DFFF are cut out before anything else: they have no
 // valid encoding, and utf8.EncodeRune would silently write U+FFFD for them.
 //
-// # Suffix sharing
+// # Prefix trie, suffix sharing
 //
-// A lowered byte range is keyed by (range, next node), so sequences that end
-// alike share their tails and the class becomes an in-tree converging on the
+// The sequences are laid out as a PREFIX trie (lowerRuneInst): each node
+// splits the bytes its sequences continue with into disjoint intervals, one
+// arm per lead interval at the top and, below it, ONE arm, a multi-range
+// instruction, for all the intervals that continue to the same next node. A
+// lowered arm is keyed by (ranges, next node), so sequences that end alike
+// share their tails and the class becomes an in-tree converging on the
 // instruction's Out: `[80-BF]`→Out is one instruction however many sequences
-// end in it. Leading bytes are not merged, so the alternation keeps one arm,
-// one Alt and one lead instruction per sequence, and what sharing saves is
-// only the tails in common. `\pL` has 800 multi-byte sequences, most of them
-// narrow and ending in a range of their own: its program lowers to 3,055
-// instructions, 800 of them Alts, where the same layout without sharing
-// would have 3,500.
+// end in it. `\pL` has 800 multi-byte sequences: its program lowers to 934
+// instructions, 321 of them Alts — 3,055 and 800 one arm per sequence, 1,551
+// and 791 one arm per interval.
 //
 // Sharing adds no meeting point the original program lacked. Inside one
 // class, every byte a thread reads after its first is a continuation byte
@@ -435,8 +437,8 @@ const fragExit = ^uint32(0)
 // (InstRune, InstRune1, InstRuneAny, InstRuneAnyNotNL) whose codepoints reach
 // past 0x7F is replaced by the UTF-8 byte sequences that encode them, as a
 // trie of byte-range InstRune/InstRune1 instructions under InstAlt chains —
-// one arm per distinct byte range at each level, equal suffixes shared
-// (lowerRuneInst). An instruction
+// one arm per lead interval, then one per distinct next node, its byte
+// intervals in one instruction, equal suffixes shared (lowerRuneInst). An instruction
 // carrying syntax.FoldCase is first given its whole fold set and loses the
 // flag, so the copy has no FoldCase anywhere. An unfolded instruction whose
 // codepoints are all ASCII is copied as it is — a rune ≤ 0x7F is its own
@@ -555,22 +557,35 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 	}
 
 	// Build a PREFIX trie of the sequences: each node splits the byte range
-	// its sequences continue with into disjoint intervals, one arm per
-	// interval — the lead ranges at the top, so Backtracking pushes a frame
-	// per distinct lead range rather than per sequence (`\pL`: 33 against
-	// 800). Arms are byte-range instructions interned by (range, successor),
-	// so equal suffixes still share instructions, and nodes by their arms, so
-	// equal subtrees share nodes. All sequences in a node continue by the same
+	// its sequences continue with into disjoint intervals, and below the top
+	// the intervals continuing to the same next node are one arm — the lead
+	// ranges at the top, one arm each, so Backtracking dispatches on a lead
+	// rather than pushing a frame per sequence (`\pL`: 33 against 800). Arms are
+	// byte-range instructions interned by (ranges, successor), so equal
+	// suffixes still share instructions, and nodes by their arms, so equal
+	// subtrees share nodes. All sequences in a node continue by the same
 	// number of bytes forward (a lead byte fixes the length) and none ends
 	// where another continues in either direction (a sequence ends on its
 	// lead or last byte, never on a byte that another continues past).
+	// An arm carries every interval of its node that continues to the same
+	// next node: two intervals apart (lead C3's [80-96] and [98-B6], both to
+	// the class's exit) are one multi-range instruction, which Backtracking
+	// checks with no frame, where two arms under an Alt cost a push and a pop
+	// per character.
 	type arm struct {
-		r    utf8Range
+		rs   []utf8Range
 		next uint32 // node index, or fragExit
 	}
 	var arms []arm
 	var armHeight []int
-	armIDs := make(map[arm]uint32)
+	armIDs := make(map[string]uint32)
+	armKey := func(a arm) string {
+		k := make([]byte, 0, 2*len(a.rs)+5)
+		for _, r := range a.rs {
+			k = append(k, r.lo, r.hi)
+		}
+		return string(k) + "|" + strconv.Itoa(int(a.next))
+	}
 	type node struct {
 		arms   []uint32
 		height int
@@ -578,7 +593,8 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 	var nodes []node
 	nodeIDs := make(map[string]uint32)
 	internArm := func(a arm) uint32 {
-		if id, ok := armIDs[a]; ok {
+		key := armKey(a)
+		if id, ok := armIDs[key]; ok {
 			return id
 		}
 		h := 1
@@ -588,12 +604,12 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 		id := uint32(len(arms))
 		arms = append(arms, a)
 		armHeight = append(armHeight, h)
-		armIDs[a] = id
+		armIDs[key] = id
 		return id
 	}
-	var build func(tails [][]utf8Range) []uint32
+	var build func(tails [][]utf8Range, top bool) []uint32
 	internNode := func(tails [][]utf8Range) uint32 {
-		ids := build(tails)
+		ids := build(tails, false)
 		key := fmt.Sprint(ids)
 		if id, ok := nodeIDs[key]; ok {
 			return id
@@ -607,22 +623,39 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 		nodeIDs[key] = id
 		return id
 	}
-	// build returns the arms of the node whose sequences are tails.
-	build = func(tails [][]utf8Range) []uint32 {
+	// build returns the arms of the node whose sequences are tails. The top
+	// node, the lead bytes, keeps one arm per interval: its chain is always
+	// dispatched on the byte, and lead ranges sharing a next node in one arm
+	// would be checked one by one after the dispatch had already chosen it —
+	// `(\pL+?)(\pL*)` over Russian +2.4% fuel, D0 being the arm's second
+	// range.
+	build = func(tails [][]utf8Range, top bool) []uint32 {
 		bounds := make([]int, 0, 2*len(tails))
 		for _, t := range tails {
 			bounds = append(bounds, int(t[0].lo), int(t[0].hi)+1)
 		}
 		slices.Sort(bounds)
 		bounds = slices.Compact(bounds)
-		var out []uint32
-		var cur arm
-		have := false
-		flush := func() {
-			if have {
-				out = append(out, internArm(cur))
+		// The node's arms, one per next node, in the order of their first
+		// interval; adjacent intervals to the same next node merge.
+		var group []arm
+		byNext := map[uint32]int{}
+		add := func(lo, hi int, next uint32) {
+			g, ok := byNext[next]
+			if top && ok && int(group[g].rs[len(group[g].rs)-1].hi)+1 != lo {
+				ok = false // a lead interval of its own
 			}
-			have = false
+			if !ok {
+				byNext[next] = len(group)
+				group = append(group, arm{next: next})
+				g = len(group) - 1
+			}
+			rs := group[g].rs
+			if n := len(rs); n > 0 && int(rs[n-1].hi)+1 == lo {
+				rs[n-1].hi = byte(hi)
+				return
+			}
+			group[g].rs = append(rs, utf8Range{byte(lo), byte(hi)})
 		}
 		for i := 0; i+1 < len(bounds); i++ {
 			lo, hi := bounds[i], bounds[i+1]-1
@@ -639,7 +672,6 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 				}
 			}
 			if !covered {
-				flush()
 				continue
 			}
 			if ended && len(rest) > 0 {
@@ -649,19 +681,17 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 			if len(rest) > 0 {
 				next = internNode(rest)
 			}
-			if have && cur.next == next && int(cur.r.hi)+1 == lo {
-				cur.r.hi = byte(hi)
-				continue
-			}
-			flush()
-			cur, have = arm{utf8Range{byte(lo), byte(hi)}, next}, true
+			add(lo, hi, next)
 		}
-		flush()
+		out := make([]uint32, len(group))
+		for i, a := range group {
+			out[i] = internArm(a)
+		}
 		return out
 	}
 	var top []uint32
 	if len(multi) > 0 {
-		top = build(multi)
+		top = build(multi, true)
 	}
 
 	entryArms := len(top)
@@ -751,7 +781,11 @@ func lowerRuneInst(inst *syntax.Inst, reverse bool) ([]syntax.Inst, uint32) {
 		if a.next != fragExit {
 			next = entryAt[a.next]
 		}
-		frag[pos[id]] = runeRangeInst([]rune{rune(a.r.lo), rune(a.r.hi)}, next)
+		rs := make([]rune, 0, 2*len(a.rs))
+		for _, r := range a.rs {
+			rs = append(rs, rune(r.lo), rune(r.hi))
+		}
+		frag[pos[id]] = runeRangeInst(rs, next)
 	}
 	if nAlt > 0 {
 		return frag, 0

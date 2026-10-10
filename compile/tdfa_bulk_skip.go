@@ -444,8 +444,10 @@ func emitTDFAUTF8Skip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, localPo
 	b = append(b, 0x20, pos, 0x21, byte(localSkipStart)) // skipStart = pos
 	b = append(b, 0x02, 0x40)                            // block $skip_done
 	b = append(b, 0x03, 0x40)                            // loop $chunks
-	// pos + 16 > len: br $skip_done
-	b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x20, 0x01, 0x4B, 0x0D, 0x01)
+	// pos + 16 > len: the last chunk, overlapping, then $skip_done.
+	b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x20, 0x01, 0x4B, 0x04, 0x40)
+	b = emitUTF8SkipTail(b, info.exitBytes, pos, 0x01, 0x00, chunk, mask, errLanes, false, 2)
+	b = append(b, 0x0B)
 	// chunk = v128.load(ptr + pos)
 	b = append(b, 0x20, 0x00, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, chunk)
 	b = emitBulkSkipExitMask(b, info.exitBytes, chunk)

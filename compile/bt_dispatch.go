@@ -2,6 +2,7 @@ package compile
 
 import (
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ const btCompactMaxArms = 32
 // altDispatch is bt's dispatch plan, built on first use.
 func (bt *backtrack) altDispatch() *btDispatchPlan {
 	if bt.dispatch == nil {
-		bt.dispatch = buildBTDispatchPlan(bt.prog)
+		bt.dispatch = buildBTDispatchPlan(bt.prog, bt.unicode)
 	}
 	return bt.dispatch
 }
@@ -155,7 +156,13 @@ func btFirstSets(prog *syntax.Prog) func(uint32) *btFirst {
 // and builds each one's dispatch, at its WIDEST head: candidates are taken
 // widest first, and a candidate head that an accepted chain already flattened
 // is dropped, so each chain is dispatched once.
-func buildBTDispatchPlan(prog *syntax.Prog) *btDispatchPlan {
+//
+// pairs (Unicode mode) also dispatches a chain of TWO arms that no byte can
+// start both of: a frame is then never needed, the byte picks the one arm or
+// fails. A lowered `(?i)k` is one ([Kk] or E2 84 AA), and the plain pair
+// pushed and popped a frame for its second arm on every byte the first
+// rejects. Byte mode keeps its pairs as they are.
+func buildBTDispatchPlan(prog *syntax.Prog, pairs bool) *btDispatchPlan {
 	plan := &btDispatchPlan{heads: map[int]*btAltDispatch{}, dead: map[int]bool{}}
 	indeg := make([]int, len(prog.Inst))
 	indeg[prog.Start]++
@@ -196,7 +203,7 @@ func buildBTDispatchPlan(prog *syntax.Prog) *btDispatchPlan {
 		}
 		flatten(in.Out)
 		flatten(in.Arg)
-		if len(arms) < 3 {
+		if len(arms) < 2 || len(arms) == 2 && !pairs {
 			continue
 		}
 		firsts := make([]*btFirst, len(arms))
@@ -225,6 +232,9 @@ func buildBTDispatchPlan(prog *syntax.Prog) *btDispatchPlan {
 		}
 		if len(d.cases) == 1 && len(d.cases[0]) == len(arms) {
 			continue // every byte starts every arm: nothing to skip
+		}
+		if len(arms) == 2 && slices.ContainsFunc(d.cases, func(l []int) bool { return len(l) == 2 }) {
+			continue // a byte that starts both arms still needs the frame
 		}
 		if len(arms) <= btCompactMaxArms {
 			pushes := 0

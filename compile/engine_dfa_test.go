@@ -178,6 +178,89 @@ func TestComputePrefix(t *testing.T) {
 	}
 }
 
+// TestDFALayoutScanPrefixCap pins the literal prefix a Unicode-mode find scans
+// for: its first two characters, cut at a character's end, 8 bytes of an
+// all-ASCII literal, and the resume state walked over exactly those bytes.
+// Byte mode scans the whole literal.
+func TestDFALayoutScanPrefixCap(t *testing.T) {
+	for _, c := range []struct {
+		prefix string
+		utf8   bool
+		want   string
+	}{
+		{"здравствуйте", true, "зд"},
+		{"日本語", true, "日本"},
+		{"😀😁😂", true, "😀😁"},
+		{"aé日", true, "aé"},
+		{"é", true, "é"},
+		{"\xd0", true, "\xd0"}, // shorter than its character: kept as it is
+		{"abcdefghijkl", true, "abcdefgh"},
+		{"abc", true, "abc"},
+		{"здравствуйте", false, "здравствуйте"},
+		{"abcdefghijkl", false, "abcdefghijkl"},
+	} {
+		if got := string(scanPrefixCap([]byte(c.prefix), c.utf8)); got != c.want {
+			t.Errorf("scanPrefixCap(%q, %v) = %q, want %q", c.prefix, c.utf8, got, c.want)
+		}
+	}
+
+	layout := func(t *testing.T, pattern string, unicode bool) (*dfaTable, *dfaLayout) {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := newDFA(mp, true, 16384)
+		if !ok {
+			t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+		}
+		p := dfaLayoutCovFindParams()
+		p.t = dfaTableFrom(d)
+		p.utf8Text = unicode
+		return p.t, buildDFALayout(p)
+	}
+	for _, c := range []struct {
+		pattern string
+		unicode bool
+		want    string
+	}{
+		{`здравствуйте\s+\pL+`, true, "зд"},
+		{`日本語\s+x`, true, "日本"},
+		{`abcdefghijklmnopqrstuvwx\s+\w+`, false, "abcdefghijklmnopqrstuvwx"},
+	} {
+		tab, l := layout(t, c.pattern, c.unicode)
+		if string(l.prefix) != c.want {
+			t.Errorf("%q: layout prefix %q, want %q", c.pattern, l.prefix, c.want)
+		}
+		end := tab.midStartState
+		for _, ch := range l.prefix {
+			end = tab.transitions[end*256+int(ch)]
+		}
+		if l.wasmPrefixEnd != uint32(end+1) {
+			t.Errorf("%q: resume state %d, want the state after %q, %d", c.pattern, l.wasmPrefixEnd, l.prefix, end+1)
+		}
+	}
+
+	rep := &Reporter{}
+	re := config.RegexEntry{Pattern: `здравствуйте\s+\pL+`, FindFunc: "f"}
+	if _, _, err := Compile([]config.RegexEntry{re}, 65536, true, CompileOptions{Report: rep}); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Render(&b)
+	if !strings.Contains(b.String(), "prefix scan: hybrid SIMD, 4-byte prefix") {
+		t.Errorf("--verbose does not name the 4-byte scanned prefix:\n%s", b.String())
+	}
+}
+
 // TestDFAU16RowDedup exercises the u16 transition-table row-dedup path
 // (buildDFALayout's rowMap, emitU16Transition, dfaDataSegments).
 // [a-z]{300} produces 301 states (> 256 -> u16 table); the uniform class-run

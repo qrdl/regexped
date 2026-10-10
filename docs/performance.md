@@ -4,6 +4,9 @@ Regexped against Rust's [`regex`](https://crates.io/crates/regex) crate and
 [`regex-automata`](https://crates.io/crates/regex-automata), the engine under
 it — all three compiled to WASM and run in wasmtime. Every ratio below is the
 other engine's figure divided by regexped's, so above 1× regexped is ahead.
+Only matching is measured: the time `regex` and `regex-automata` spend
+compiling a pattern at run time is not counted — see
+[How these are measured](#how-these-are-measured).
 
 **On average** — the geometric mean, the right average for ratios, of the
 median-time column below, a range counting as the geometric mean of its two
@@ -67,3 +70,30 @@ WASM instructions executed (fuel); `tools/setperf` does the same for pattern
 sets against `regex-automata`. Instructions executed are exact and repeatable;
 time depends on the machine, which is why both are given. See
 [tools/README.md](../tools/README.md) for running them.
+
+**Only matching is compared — compiling a pattern is not counted on either
+side.**
+
+- **`regex` and `regex-automata` compile their patterns at run time**
+  (`Regex::new`, `RegexSet::new`, `regex_automata::meta::Regex`'s builder).
+  The harness does that once per pattern, in an init call made before any
+  timing or instruction counting starts, so the figures above leave out what
+  a program using those crates pays to compile its patterns.
+- **regexped compiles its patterns ahead of time**, with `regexped compile`,
+  before the module exists; nothing of it happens at run time.
+- **Loading the WASM modules** — wasmtime compiling each one to machine code
+  and instantiating it — is not counted for either engine.
+- **Instructions executed** come from one call per input. On the Rust side that
+  call follows an uncounted warm-up call on the same input, because `regex`'s
+  lazy DFA builds its states the first time it needs them: the counted call is
+  its steady state, what a long-running program pays per search. regexped has
+  no lazy state — its automata are complete in the module — so its first call
+  is already its steady state.
+- **Time** is taken inside WASM on both sides, each iteration timed on its own,
+  so no host-call overhead is included; the median of those iterations is
+  reported.
+
+So these numbers compare the cost of searching with a pattern that is already
+compiled. A program that compiles a pattern and searches only a few times pays
+the `regex` crate's compile time on top, which regexped pays at build time
+instead.
