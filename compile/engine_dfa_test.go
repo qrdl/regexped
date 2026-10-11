@@ -30,6 +30,29 @@ func compileTestDFA(t *testing.T, pattern string, leftmostFirst bool) *dfaTable 
 	return dfaTableFrom(d)
 }
 
+// compileTestDFAMode is compileTestDFA in a stated mode: the pattern resolved,
+// lowered when unicode is set, and built leftmost-first.
+func compileTestDFAMode(t *testing.T, pattern string, unicode bool) *dfaTable {
+	t.Helper()
+	rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := rp.parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, err := compileProg(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := newDFA(mp, true, 16384)
+	if !ok {
+		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+	}
+	return dfaTableFrom(d)
+}
+
 // dfaStateCount returns the number of LF DFA states for the given pattern
 // after stripping capture groups. Used for diagnostics in tests.
 func dfaStateCount(pattern string) (int, error) {
@@ -521,6 +544,24 @@ func dfaLayoutCovFindParams() dfaLayoutParams {
 // serves: a state that loops on every valid multi-byte character, through
 // states that record nothing, with at most eight ASCII exits. In byte mode the
 // same patterns keep their byte dominants and get none.
+// TestSuffixBodyUTF8Skip: a set bucket's suffix body takes the skip over whole
+// characters exactly when the set is in Unicode mode (genSuffixWASMWalkEndCtr's
+// utf8Text). The skip is recognised by its open-tail table, which only the
+// character skip emits.
+func TestSuffixBodyUTF8Skip(t *testing.T) {
+	tbl := compileTestDFAMode(t, `[^&]+&`, true)
+	body := func(utf8Text bool) []byte {
+		art, _, _, _ := genSuffixWASMWalkEndCtr(nil, -1, tbl, 0, 0, []int{0}, []int{0}, LikelyNeutral, utf8Text, false, true, nil)
+		return art.fnBody
+	}
+	if !bytes.Contains(body(true), utf8OpenTail[:]) {
+		t.Error("a Unicode-mode set's suffix body has no character skip")
+	}
+	if bytes.Contains(body(false), utf8OpenTail[:]) {
+		t.Error("a byte-mode suffix body carries the character skip")
+	}
+}
+
 func TestDFALayoutUTF8SelfLoop(t *testing.T) {
 	layout := func(t *testing.T, pattern string, unicode bool) *dfaLayout {
 		t.Helper()

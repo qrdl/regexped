@@ -2630,7 +2630,7 @@ func TestSetCoreProbeBodyClampsBucketWidthTo32(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mergeAnchoredDFA: %v", err)
 	}
-	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40))
+	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40), false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM emitted no body for a 40-id bucket")
 	}
@@ -2643,7 +2643,7 @@ func TestSetCoreGenAnchoredWASMEmptyTable(t *testing.T) {
 	// An empty bucket DFA still needs a callable probe: the anchored capability
 	// bodies call every bucket in turn with no nil check, so the degenerate
 	// case has to be a function returning 0, not a missing one.
-	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2))
+	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2), false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM(nil) emitted no body")
 	}
@@ -2655,6 +2655,43 @@ func TestSetCoreGenAnchoredWASMEmptyTable(t *testing.T) {
 	}
 	if sparse != nil {
 		t.Error("an empty table must not report sparse anchored info")
+	}
+}
+
+// TestSetProbeRunSkips: a scan probe takes a run skip for every state its
+// table loops over whole characters in — past the two non-accepting dominants a
+// layout keeps — and leaves out a state with a zero-width newline or word
+// accept, whose per-byte check reads the bytes a skip would jump.
+func TestSetProbeRunSkips(t *testing.T) {
+	probe := func(t *testing.T, pattern string, unicode, newline bool) ([]byte, *dfaLayout) {
+		t.Helper()
+		tbl := compileTestDFAMode(t, pattern, unicode)
+		l := buildDFALayout(dfaLayoutParams{t: tbl, utf8Text: unicode, forceNewline: newline})
+		p := setSuffixParams{
+			l: l, patternIDs: []int{0},
+			wasmStart: uint32(tbl.startState + 1), wasmMidStart: uint32(tbl.midStartState + 1),
+			hasNewlineBoundary: newline,
+		}
+		return buildSetProbeBodyExit(p, false, probeExitMaskComplete), l
+	}
+	// Three value loops: the layout keeps two, the probe skips all three
+	// (each skip emits the open-tail table twice, in its loop and its tail).
+	body, l := probe(t, `a[^&,]+&|b[^,;]+;|c[^<>]+<`, true, false)
+	if len(l.dominantStates) != 2 {
+		t.Fatalf("the layout kept %d dominants, want the two its encoding allows", len(l.dominantStates))
+	}
+	if got := bytes.Count(body, utf8OpenTail[:]); got != 6 {
+		t.Errorf("the scan probe carries %d open-tail tables, want 6 (three character skips)", got)
+	}
+	// A loop whose state may accept before a newline, `(?m)$`: no skip at all.
+	// (A word-boundary accept never reaches here: the word/non-word split
+	// halves every self-loop below the dominant threshold.)
+	body, l = probe(t, `(?m)x[^&,]*$`, false, true)
+	if len(l.dominantStates) == 0 {
+		t.Fatal("the precondition failed: no dominant state to leave out")
+	}
+	if bytes.Contains(body, []byte{0xFD, 0x00, 0x00, 0x00}) {
+		t.Error("the scan probe skips over a state with a newline accept")
 	}
 }
 

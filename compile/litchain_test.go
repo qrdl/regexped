@@ -965,6 +965,27 @@ func TestLenAltMatchBodyCompiles(t *testing.T) {
 	}
 }
 
+// TestLenAltMatchBodyGatedCompressed: the gated branch walk over a branch table
+// big enough to be class-compressed, which still has a run to skip.
+func TestLenAltMatchBodyGatedCompressed(t *testing.T) {
+	const pattern = `ERROR[0-9]{3}|x[^,]*,[a-z]{1,140};`
+	altp, ok := analyseLitChainAltLenient(bytePat(pattern), false)
+	if !ok {
+		t.Fatalf("%s is not a lenient alternation", pattern)
+	}
+	planLenAltLayout(altp, 0, false)
+	found := false
+	for _, br := range altp.branches {
+		if !br.isLitChain && br.dfaLayout.useCompression && len(br.dfaLayout.dominantStates) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no compressed DFA branch with a run skip: the shape no longer reaches the gated walk's compressed step")
+	}
+	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+}
+
 // Regression tests for the lit-chain anchored/find body defects.
 //
 // Every fix in that wave is a *gate*: the emitter it protects cannot express

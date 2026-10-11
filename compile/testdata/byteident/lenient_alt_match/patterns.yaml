@@ -1,0 +1,6 @@
+# The lenient alternation's anchored match alone: its DFA branch walks a byte
+# run with the run skip, gated per 128-byte stretch, and a short input takes the
+# plain walk.
+regexps:
+  - pattern: 'ERROR[0-9]{3}|x[^,]*,'
+    match_func: lenient_match

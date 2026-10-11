@@ -1,4 +1,4 @@
-.PHONY: notes-armed test exhaustive unicode unicode-all unicode-groups custom-unicode unicode-variants unicode-ext unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely custom adjusted sets sets-likely sets-unicode sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
+.PHONY: notes-armed test exhaustive unicode unicode-all unicode-groups custom-unicode custom-tests-unicode unicode-variants unicode-ext unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely custom adjusted sets sets-likely sets-unicode sets-exhaustive set-batch likelymatch likelynomatch force-backtrack-likelynomatch matchonly findonly groupsonly clean
 
 TESTDATA     := re2-exhaustive.txt
 TESTDATA_BZ2 := $(shell go env GOROOT)/src/regexp/testdata/re2-exhaustive.txt.bz2
@@ -7,6 +7,7 @@ CUSTOM_SETS  := custom-sets.txt
 CUSTOM_SETS_UNICODE := custom-sets-unicode.txt
 ADJUSTED     := re2-adjusted.txt
 UNICODE_VARIANTS := re2-unicode.txt
+CUSTOM_UNICODE := custom-tests-unicode.txt
 
 # RE2TEST_FLAGS is appended to every re2test invocation below, so one flag can
 # be applied to the whole suite — e.g. `make test RE2TEST_FLAGS=--bt-fallback-always`
@@ -30,9 +31,10 @@ exhaustive: $(TESTDATA)
 
 # unicode compiles the corpus's six blocks with characters above 0x7F in
 # Unicode mode and judges them against RE2's OWN columns — byte offsets, `.`
-# reading a whole character — an oracle that is not Go. The rows where RE2's
-# \B holds inside a character are skipped, as Go's own exhaustive test skips
-# them; --all-matches still adds Go's every-match column, except where Go and
+# reading a whole character — an oracle that is not Go. A \B row over such
+# input is judged where RE2's columns equal Go's and skipped where RE2's \B
+# holds inside a character (337 rows; Go's own exhaustive test skips every \B
+# row over such input); --all-matches still adds Go's every-match column, except where Go and
 # Unicode mode differ by design (input that is not valid UTF-8, for a pattern
 # that can match U+FFFD; this corpus has no such input). Never with
 # --high-bytes, whose ASCII-twin oracle holds for byte mode only.
@@ -62,7 +64,28 @@ custom-unicode:
 # Outside `test`; unicode-ext runs them all.
 U := -unicode -unicode-all
 
-unicode-ext: unicode-all unicode-groups custom-unicode unicode-variants unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely
+unicode-ext: unicode-all unicode-groups custom-unicode custom-tests-unicode unicode-variants unicode-likely unicode-force-backtrack unicode-bt-fallback unicode-notes-armed sets-unicode-all sets-unicode-likely
+
+# custom-tests-unicode.txt: single patterns written for Unicode mode — \p{..},
+# non-ASCII literals and ranges, (?i) over whole fold orbits, `.` and negated
+# classes, empty matches and \b/\B/(?m) beside multi-byte characters, captures,
+# runs long enough for the character skips, invalid input — over every mode the
+# byte-mode targets run. Its rows are Go's answers without U+FFFD, regenerated
+# with `go run ./make_adjusted -unicode-regen custom-tests-unicode.txt`.
+custom-tests-unicode:
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --search-block=armed $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --search-block=off $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --likelymatch $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --likelynomatch $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --search-block=armed --likelymatch $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --force-backtrack $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --force-backtrack --likelynomatch $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --force-backtrack --search-block=armed $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --force-backtrack --bt-fallback-always $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --match-only $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --find-only $(CUSTOM_UNICODE)
+	go run . $(RE2TEST_FLAGS) $(U) -unicode-oracle --validate-groups --groups-only $(CUSTOM_UNICODE)
 
 # The adjusted corpus's patterns over Unicode VARIANTS of its strings — a
 # 2-byte character inside each, 3- and 4-byte ones around it, a stray 0xFF and

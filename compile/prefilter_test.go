@@ -801,6 +801,37 @@ func TestDominantWalkStatesEdges(t *testing.T) {
 	}
 }
 
+// TestUTF8LoopState pins the never-dying test's second half: a state that
+// loops over whole UTF-8 characters. A lowered class holding every non-ASCII
+// character self-loops on ASCII bytes only, so dominantWalkStates cannot see
+// it, and a set built on such a member lost its overlapping preflight.
+func TestUTF8LoopState(t *testing.T) {
+	for _, c := range []struct {
+		pattern     string
+		unicode     bool
+		loop, never bool
+	}{
+		{`[^,]+;`, true, true, true},   // every character but ASCII ','
+		{`.+`, true, true, true},       // `.` stops only at '\n'
+		{`[^,]+;`, false, false, true}, // byte mode: a byte self-loop, dominantWalkStates' case
+		{`\p{Cyrillic}+!`, true, false, false},
+		{`[a-zé]+`, true, false, false},
+		{`[^,é]+;`, true, false, false},  // one character leads out
+		{`[^a-z]+;`, true, false, false}, // 26 ASCII exits, past dominantMaxExceptions
+	} {
+		tbl := compileTestDFAMode(t, c.pattern, c.unicode)
+		if got := utf8LoopState(tbl); got != c.loop {
+			t.Errorf("utf8LoopState(%q, unicode=%v) = %v, want %v", c.pattern, c.unicode, got, c.loop)
+		}
+		if got := hasNeverDyingState(tbl); got != c.never {
+			t.Errorf("hasNeverDyingState(%q, unicode=%v) = %v, want %v", c.pattern, c.unicode, got, c.never)
+		}
+	}
+	if utf8LoopState(nil) || utf8LoopState(&dfaTable{}) {
+		t.Error("utf8LoopState reported a loop in an empty table")
+	}
+}
+
 // ── The absence-literal prefilter's AST walk ───────────────────────────────
 //
 // findAbsenceLit answers "does every match of this pattern contain this exact

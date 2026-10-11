@@ -4245,6 +4245,38 @@ var utf8Sequences = [][][2]byte{
 	{{0xF4, 0xF4}, {0x80, 0x8F}, {0x80, 0xBF}, {0x80, 0xBF}},
 }
 
+// loopsOverUTF8 reports whether every valid multi-byte character read from
+// state, a byte at a time through step, leads back to state, every state it
+// passes inside a character being one inside admits. Shared by the character
+// skip (utf8SelfLoopExits, over a layout) and the never-dying test
+// (utf8LoopState, over a table), which differ only in what they require of the
+// states inside a character.
+func loopsOverUTF8(state int, step func(s, c int) int, inside func(s int) bool) bool {
+	for _, seq := range utf8Sequences {
+		cur := map[int]bool{}
+		for c := int(seq[0][0]); c <= int(seq[0][1]); c++ {
+			cur[step(state, c)] = true
+		}
+		for i, r := range seq[1:] {
+			next := map[int]bool{}
+			for s := range cur {
+				if !inside(s) {
+					return false
+				}
+				for c := int(r[0]); c <= int(r[1]); c++ {
+					t := step(s, c)
+					if i == len(seq)-2 && t != state {
+						return false
+					}
+					next[t] = true
+				}
+			}
+			cur = next
+		}
+	}
+	return true
+}
+
 // utf8SelfLoopExits reports whether state loops on every valid multi-byte
 // character, and returns its ASCII exit bytes (at most maxExit) when it does.
 // A character must lead back to state, and every state inside one must be
@@ -4268,38 +4300,20 @@ func (l *dfaLayout) utf8SelfLoopExits(state int32, maxExit int) ([]byte, bool) {
 			}
 		}
 	}
-	quiet := func(s int32) bool {
-		if s <= 0 || s == state || int(s) >= l.numWASM {
+	quiet := func(s int) bool {
+		if s <= 0 || s == int(state) || s >= l.numWASM {
 			return false
 		}
 		for _, ch := range [][]byte{l.midAcceptBytes, l.midAcceptNLBytes, l.midAcceptNWBytes, l.midAcceptWBytes} {
-			if int(s) < len(ch) && ch[s] != 0 {
+			if s < len(ch) && ch[s] != 0 {
 				return false
 			}
 		}
 		return true
 	}
-	for _, seq := range utf8Sequences {
-		cur := map[int32]bool{}
-		for c := int(seq[0][0]); c <= int(seq[0][1]); c++ {
-			cur[l.transitionOn(int(state), c)] = true
-		}
-		for i, r := range seq[1:] {
-			next := map[int32]bool{}
-			for s := range cur {
-				if !quiet(s) {
-					return nil, false
-				}
-				for c := int(r[0]); c <= int(r[1]); c++ {
-					t := l.transitionOn(int(s), c)
-					if i == len(seq)-2 && t != state {
-						return nil, false
-					}
-					next[t] = true
-				}
-			}
-			cur = next
-		}
+	step := func(s, c int) int { return int(l.transitionOn(s, c)) }
+	if !loopsOverUTF8(int(state), step, quiet) {
+		return nil, false
 	}
 	return exits, true
 }
@@ -4888,12 +4902,16 @@ func genSuffixWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, pr
 // set swept over its whole-set automaton has every bucket stamp the same
 // global, since the trigger reads one.
 func genSuffixWASMWalkEnd(walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
-	return genSuffixWASMWalkEndCtr(nil, walkEnd, t, tableBase, tableMemIdx, patternIDs, prefixFixedLens, lm, needProbes, gated, globals, probeFlags...)
+	return genSuffixWASMWalkEndCtr(nil, walkEnd, t, tableBase, tableMemIdx, patternIDs, prefixFixedLens, lm, false, needProbes, gated, globals, probeFlags...)
 }
 
 // genSuffixWASMWalkEndCtr is genSuffixWASMWalkEnd with, for a sparse bucket,
-// the sparse work counter (set_sparse.go); nil for none.
-func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
+// the sparse work counter (set_sparse.go); nil for none. utf8Text says the set
+// is in Unicode mode: a state looping over whole characters then takes the
+// character skip (utf8SelfLoopExits), as a single pattern's does — without it a
+// member like `&ключ=[^&]+&` walked a Russian value byte by byte, 63.50 fuel/byte
+// against 19.02.
+func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tableBase int64, tableMemIdx int, patternIDs, prefixFixedLens []int, lm LikelyMode, utf8Text, needProbes, gated bool, globals *moduleGlobals, probeFlags ...bool) (art suffixArtifacts, dataBytes []byte, dataSegCount int, nextTableOffset int32) {
 	// probeFlags[0]: also build the first-hit variant (set wants both rules).
 	// probeFlags[1]: the SOLE probe is first-hit (no scan_all declared), so
 	// scanProbe itself gets the cheap exit and no second body is emitted.
@@ -5006,6 +5024,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		lmNonMidShufti:       lmShufti,
 		lmWideShufti:         lmShufti,
 		forceWordChar:        t.hasWordBoundary,
+		utf8Text:             utf8Text,
 	})
 
 	// Both mid-accept and non-mid-accept dominants are
@@ -14452,6 +14471,19 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 	// match body — which is the kind of mistake the allocator makes hard to
 	// repeat, since each name now comes from its own allocation.
 	locScalarByte := a.I32()
+	// locErr: the character skip's error lanes (inlineVerifySkip), allocated
+	// only when a DFA branch takes that skip.
+	// locCheck, locBound: the gate's (emitInlineAnchoredDFAVerifyGated),
+	// allocated only when a DFA branch has a run skip.
+	var locErr, locCheck, locBound byte
+	for _, br := range altp.branches {
+		if !br.isLitChain && len(br.dfaLayout.dominantStates) > 0 && locCheck == 0 {
+			locCheck, locBound = a.I32(), a.I32()
+		}
+		if !br.isLitChain && hasUTF8Dominant(br.dfaLayout.dominantStates) && locErr == 0 {
+			locErr = a.V128()
+		}
+	}
 
 	b = a.EmitDecls(b)
 
@@ -14600,9 +14632,25 @@ func buildLenAltMatchBody(altp *lenAltPattern, l lenAltLayout, tableMemIdx int) 
 			// pos = 0; run inline anchored DFA verify (on no-accept br to depth 0).
 			b = append(b, 0x41, 0x00)
 			b = append(b, 0x21, locPos)
-			b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
-				locPtr, locLen, locState, locPos, locClass, locOutEnd,
-				tableMemIdx, 0, true)
+			if len(br.dfaLayout.dominantStates) > 0 {
+				// A run skip pays from a stretch on; a shorter input takes
+				// the plain walk.
+				b = append(b, 0x20, locLen, 0x41)
+				b = utils.AppendSLEB128(b, probeSkipStretch)
+				b = append(b, 0x4F, 0x04, 0x40) // if len >= stretch
+				b = emitInlineAnchoredDFAVerifyGated(b, br.dfaLayout,
+					locPtr, locLen, locState, locPos, locClass, locOutEnd,
+					tableMemIdx, 1, inlineVerifySkip{chunk: locChunk, err: locErr, check: locCheck, bound: locBound})
+				b = append(b, 0x05) // else
+				b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
+					locPtr, locLen, locState, locPos, locClass, locOutEnd,
+					tableMemIdx, 1, true)
+				b = append(b, 0x0B) // end if
+			} else {
+				b = emitInlineAnchoredDFAVerify(b, br.dfaLayout,
+					locPtr, locLen, locState, locPos, locClass, locOutEnd,
+					tableMemIdx, 0, true)
+			}
 
 			// Anchored match: require last_accept == len for full input consumption.
 			b = append(b, 0x20, locOutEnd)
@@ -16169,6 +16217,9 @@ type lenAltBranch struct {
 // would already have matched and lenient should not engage.
 type lenAltPattern struct {
 	branches []lenAltBranch
+	// unicode: the pattern is in Unicode mode, so the anchored match's
+	// branch walks take the skip over whole characters too.
+	unicode bool
 }
 
 // analyseLitChainAltLenient detects an OpAlternate whose every branch begins
@@ -16292,7 +16343,7 @@ func analyseLitChainAltLenient(pattern resolvedPattern, leftmostFirst bool) (*le
 		// All branches lit-chain — let the strict path handle it.
 		return nil, false
 	}
-	return &lenAltPattern{branches: branches}, true
+	return &lenAltPattern{branches: branches, unicode: pattern.unicode()}, true
 }
 
 // planLenAltLayout computes data-segment offsets for a lenient alternation:
@@ -16348,6 +16399,9 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool) lenAltLay
 			lmWideShufti:         false,
 			forceWordChar:        br.dfaTable.hasWordBoundary,
 			forceNewline:         find && br.dfaTable.hasNewlineBoundary,
+			// The anchored match walks a branch with its run skips
+			// (inlineVerifySkip); over whole characters in Unicode mode.
+			utf8Text: !find && altp.unicode,
 		})
 		// dfaDataSegments returns size-prefixed bytes; strip the count for our use.
 		// forceMidAccept=true: emitInlineAnchoredDFAVerify reads dl.midAcceptOff
@@ -16402,6 +16456,106 @@ func buildLenAltDataSegments(altp *lenAltPattern, l lenAltLayout) ([]byte, int) 
 		segCount += br.dfaSegCount
 	}
 	return segs, segCount
+}
+
+// inlineVerifySkip holds the locals emitInlineAnchoredDFAVerifyGated needs:
+// chunk, a v128 scratch; err, a second v128 for the character skip's error
+// lanes (0 when no dominant takes it); check and bound, the gate's i32s.
+type inlineVerifySkip struct {
+	chunk, err, check, bound byte
+}
+
+// emitInlineAnchoredDFAVerifyGated is emitInlineAnchoredDFAVerify for a
+// FULL-CONSUMPTION caller (no pre-transition accept checks — see there), with
+// the layout's run skips: a state looping on a run of bytes, or of whole
+// characters in Unicode mode, crosses it 16 bytes at a time, and a
+// mid-accepting one records its accept at the run's end (last_accept = run
+// end + 1), as the per-byte update would have. The skips are tested once per
+// stretch of probeSkipStretch bytes rather than on every byte — where a long
+// run in a state no skip covers, or a short input, would pay for the test
+// throughout — and the per-byte walk is bounded by min(next stretch point, len),
+// so its step costs what it did. The caller emits this only for an input at
+// least a stretch long and the plain walk otherwise: on 6- and 8-byte inputs
+// a test on every byte cost +25% and +35% fuel.
+func emitInlineAnchoredDFAVerifyGated(b []byte, dl *dfaLayout,
+	locPtr, locLen, locState, locPos, locClass, locOutEnd byte,
+	tableMemIdx int, nextBranchDepth byte, sk inlineVerifySkip) []byte {
+	if dl.midAcceptNLBytes != nil {
+		panic("emitInlineAnchoredDFAVerifyGated: newline pre-accept table built for a full-consumption caller")
+	}
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(dl.wasmStart))
+	b = append(b, 0x21, locState)
+	b = append(b, 0x41, 0x7F, 0x21, locOutEnd)  // last_accept = -1
+	b = append(b, 0x20, locPos, 0x21, sk.check) // a stretch point at once
+
+	b = append(b, 0x02, 0x40) // block $dfa_done
+	b = append(b, 0x03, 0x40) // loop $outer
+	// End of input: the EOF accept, then out.
+	b = append(b, 0x20, locPos, 0x20, locLen, 0x4F, 0x04, 0x40)
+	b = emitAcceptBitOnStack(b, locState, dl.acceptLimit)
+	b = append(b, 0x04, 0x40, 0x20, locPos, 0x21, locOutEnd, 0x0B)
+	b = append(b, 0x0C, 0x02) // br $dfa_done
+	b = append(b, 0x0B)
+	// The stretch point. The skips take the position of the LAST byte read,
+	// pos - 1. A character skip's state holds only between characters, so a
+	// point that falls inside one — `x` before two-byte letters puts every
+	// point on a letter's second byte — moves on a byte instead (at most
+	// three), else the skip never fired.
+	b = append(b, 0x20, locPos, 0x20, sk.check, 0x4F, 0x04, 0x40)
+	if hasUTF8Dominant(dl.dominantStates) {
+		b = append(b, 0x20, locPtr, 0x20, locPos, 0x6A, 0x2D, 0x00, 0x00) // input[pos]
+		b = append(b, 0x41, 0xC0, 0x01, 0x71, 0x41, 0x80, 0x01, 0x46)     // & 0xC0 == 0x80
+		b = append(b, 0x04, 0x40)                                         // if inside a character
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, sk.check)
+		b = append(b, 0x05) // else
+	}
+	for _, info := range dl.dominantStates {
+		b = append(b, 0x20, locState, 0x41)
+		b = utils.AppendSLEB128(b, info.state)
+		b = append(b, 0x46, 0x04, 0x40) // if state == info.state
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6B, 0x21, locPos)
+		b = emitDominantBulkSkip(b, info, info.isMidAccept,
+			locPos, locLen, locOutEnd, locPtr, sk.chunk, locClass, sk.err)
+		b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos)
+		b = append(b, 0x0B) // end if
+	}
+	b = append(b, 0x20, locPos, 0x41)
+	b = utils.AppendSLEB128(b, probeSkipStretch)
+	b = append(b, 0x6A, 0x21, sk.check)
+	if hasUTF8Dominant(dl.dominantStates) {
+		b = append(b, 0x0B) // end if inside a character
+	}
+	b = append(b, 0x0B) // end if
+	// bound = min(check, len)
+	b = append(b, 0x20, sk.check, 0x20, locLen, 0x20, sk.check, 0x20, locLen, 0x49, 0x1B, 0x21, sk.bound)
+	b = append(b, 0x02, 0x40)                                     // block $stretch
+	b = append(b, 0x03, 0x40)                                     // loop $inner
+	b = append(b, 0x20, locPos, 0x20, sk.bound, 0x4F, 0x0D, 0x01) // pos >= bound → $stretch
+	if dl.useCompression {
+		b = emitCompressedU8Transition(b, dl.tableOff, dl.classMapOff, dl.numClasses,
+			locState, locClass, locPtr, locPos, 0xff, tableMemIdx)
+	} else {
+		b = emitSimpleU8Transition(b, dl.tableOff,
+			locState, locPtr, locPos, 0xff, tableMemIdx)
+	}
+	b = append(b, 0x20, locState, 0x45, 0x0D, 0x03) // dead → $dfa_done
+	// if midAccept[state]: last_accept = pos + 1
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, dl.midAcceptOff)
+	b = append(b, 0x20, locState, 0x6A)
+	b = appendTableLoad8u(b, tableMemIdx)
+	b = append(b, 0x04, 0x40, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locOutEnd, 0x0B)
+	b = append(b, 0x20, locPos, 0x41, 0x01, 0x6A, 0x21, locPos)
+	b = append(b, 0x0C, 0x00) // br $inner
+	b = append(b, 0x0B)       // end loop $inner
+	b = append(b, 0x0B)       // end block $stretch
+	b = append(b, 0x0C, 0x00) // br $outer
+	b = append(b, 0x0B)       // end loop $outer
+	b = append(b, 0x0B)       // end block $dfa_done
+	// last_accept < 0: the branch failed.
+	b = append(b, 0x20, locOutEnd, 0x41, 0x00, 0x48, 0x0D, nextBranchDepth)
+	return b
 }
 
 // emitInlineAnchoredDFAVerify emits the WASM bytes for an inline anchored DFA

@@ -1,0 +1,6 @@
+# Unicode mode: the lenient alternation's anchored match, its branch walk taking
+# the skip over whole characters at a stretch point aligned to a character.
+regexps:
+  - pattern: 'ERROR[0-9]{3}|x[^,]*,'
+    match_func: uni_lenient_match
+    unicode: true

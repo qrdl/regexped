@@ -90,18 +90,105 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	if anchored && l.useU8 && !l.useCompression && p.dominantSkip != nil {
 		dom = p.dominantSkip
 	}
+	unrollAnchored := anchored && l.useU8 && !l.useCompression
 
+	// Run skips over the layout's dominant states (dominantInfo): a run of
+	// bytes a state loops on, or — in a Unicode-mode set — of whole
+	// characters, crossed 16 bytes at a time by emitDominantBulkSkip, the
+	// skip the bucket's find body takes. Sound for both flavours by the
+	// self-loop property: the run changes nothing but the position, the
+	// anchored probe records nothing mid-walk, and the scan probe's bits for
+	// the state were ORed in when the walk entered it. A state with a
+	// zero-width word-boundary or newline accept is left out of the scan
+	// probe, whose per-byte check of those channels reads the very bytes a
+	// skip jumps. The unrolled anchored loop keeps its own byte-run skip (dom
+	// above) and takes only the character skip from here, at its top
+	// (unrolledSkips); every other walk takes them after its transition
+	// (walkSkips). Measured over records with 40-letter Russian values: the
+	// scan pair 44.1 fuel/byte without them.
+	var walkSkips, unrolledSkips []dominantInfo
+	for _, info := range l.dominantStates {
+		st := int(info.state)
+		if !anchored && ((st < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[st] != 0) ||
+			(st < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[st] != 0) ||
+			(st < len(l.midAcceptWBytes) && l.midAcceptWBytes[st] != 0)) {
+			continue
+		}
+		switch {
+		case !unrollAnchored:
+			walkSkips = append(walkSkips, info)
+		case info.utf8:
+			unrolledSkips = append(unrolledSkips, info)
+		}
+	}
+	// The layout keeps at most two non-accepting dominants (their encoded
+	// byte values, 254 and 255, are the find body's); a probe compares state
+	// ids instead, so it takes every character loop the layout can prove.
+	if l.utf8Text {
+		seen := map[int32]bool{}
+		for _, info := range l.dominantStates {
+			seen[info.state] = true
+		}
+		for st := int32(1); st < int32(l.numWASM); st++ {
+			if seen[st] {
+				continue
+			}
+			if !anchored && ((int(st) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[st] != 0) ||
+				(int(st) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[st] != 0) ||
+				(int(st) < len(l.midAcceptWBytes) && l.midAcceptWBytes[st] != 0)) {
+				continue
+			}
+			ex, ok := l.utf8SelfLoopExits(st, 8)
+			if !ok {
+				continue
+			}
+			info := dominantInfo{state: st, exitBytes: ex, utf8: true}
+			if unrollAnchored {
+				unrolledSkips = append(unrolledSkips, info)
+			} else {
+				walkSkips = append(walkSkips, info)
+			}
+		}
+	}
+	needErr := hasUTF8Dominant(walkSkips) || hasUTF8Dominant(unrolledSkips)
+
+	// The character skips' GATE in the unrolled anchored walk: tested once
+	// per stretch of input (a stretch POINT) rather than on every four-byte
+	// step, where a long run in a state no skip covers paid for the test
+	// throughout (+11.3% fuel). lCheck is the next stretch point, lBound the
+	// inner walk's bound, min(lCheck, len).
+	gateAnchored := len(unrolledSkips) > 0
 	var b []byte
-	if len(dom) > 0 {
-		// 4 i32 + 1 i32 skip mask, then 1 v128 chunk.
-		b = append(b, 0x02, 0x05, 0x7F, 0x01, 0x7B)
-	} else {
+	nV128 := byte(0)
+	switch {
+	case needErr:
+		nV128 = 2 // the chunk and the UTF-8 error lanes
+	case len(dom) > 0 || len(walkSkips) > 0:
+		nV128 = 1 // the chunk
+	}
+	nGate := byte(0)
+	if gateAnchored {
+		nGate = 2 // lCheck, lBound
+	}
+	switch {
+	case nV128 > 0 && nGate > 0:
+		b = append(b, 0x03, 0x05, 0x7F, nV128, 0x7B, nGate, 0x7F)
+	case nV128 > 0:
+		// 4 i32 + 1 i32 skip mask, then the v128s.
+		b = append(b, 0x02, 0x05, 0x7F, nV128, 0x7B)
+	default:
 		b = append(b, 0x01, 0x04, 0x7F) // 4 x i32 locals
 	}
 	const (
 		lSkipMask = byte(8)
 		lChunk    = byte(9)
 	)
+	var lErr byte
+	if needErr {
+		lErr = 10
+	}
+	lCheck := 9 + nV128
+	lBound := lCheck + 1
 
 	// Entry state, keyed on paramStart — shared with buildSetSuffixBody, which
 	// is where the rule (and the reason it keys on paramStart rather than the
@@ -157,122 +244,205 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	// route the input byte through a class map or a scaled index, so their
 	// loads cannot take the offset immediate this depends on. They keep the
 	// per-byte loop unchanged.
-	unrollAnchored := anchored && l.useU8 && !l.useCompression
 	if unrollAnchored {
 		const unroll = 4
-		b = append(b, 0x02, 0x40) // block $tail
-		b = append(b, 0x03, 0x40) // loop $main4
-
-		// Dominant-state bulk skip.
-		//
-		// Placed at the TOP OF THE WALK, not at function entry: lState only
-		// becomes a dominant state after some bytes have been consumed, so an
-		// entry-time check never fires (measured: +11 fuel and no skips).
-		//
-		// Sound by the self-loop property alone. Every byte other than one of
-		// this state's exceptions maps the state to itself, so a chunk with no
-		// exception leaves the state unchanged and nothing observable is
-		// skipped — the anchored probe records NOTHING mid-walk, since every
-		// orTableBits call in this function is !anchored-guarded. On a hit the
-		// walk resumes AT the first exception byte, whose transition then runs
-		// normally.
-		//
-		// lState is a WASM id (0 = dead, table index + 1) and
-		// dominantWalkState.WASMState is in the same space: reorderAcceptFirst
-		// has already relabelled the table, and the u8 direct-index path
-		// applies no further permutation.
-		//
-		// Progress is guaranteed: the no-exception arm advances a full chunk,
-		// and the exception arm advances by ctz and leaves, after which the
-		// unrolled body consumes that byte and changes the state.
-		for _, d := range dom {
-			b = append(b, 0x20, lState, 0x41)
-			b = utils.AppendSLEB128(b, int32(d.WASMState))
-			b = append(b, 0x46, 0x04, 0x40) // if lState == d.WASMState   (E)
-			b = append(b, 0x02, 0x40)       // block $skip_done            (F)
-			b = append(b, 0x03, 0x40)       // loop  $skip                 (G)
-			// Whole chunk must be in range, else leave the skip to the walk.
-			b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
-			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
-			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
-			b = append(b, 0x21, lChunk)
-			// Both flavours build ONE mask with the same compare chain; only
-			// what the mask means, and therefore the test against it, differs.
-			probe := d.Exceptions
-			if d.Members != nil {
-				probe = d.Members
+		// emitUnrolled emits the four-byte walk; gated, inside the stretch
+		// loops (the skips' gate), else as it always was. extra is the
+		// nesting it is emitted under.
+		emitUnrolled := func(b []byte, gated bool, extra byte) []byte {
+			// deadDepth is $done's depth from inside $main4.
+			deadDepth := 2 + extra
+			if gated {
+				deadDepth = 4 + extra
 			}
-			b = append(b, 0x41, 0x00) // mask accumulator
-			for _, e := range probe {
-				b = append(b, 0x20, lChunk)
+			b = append(b, 0x02, 0x40) // block $tail
+			if gated {
+				b = append(b, 0x03, 0x40) // loop $outer
+				// The stretch point: the character skips, then the next point.
+				// `lScanPos + unroll > lCheck` rather than `>=`: a byte-run skip
+				// inside the stretch may leave lScanPos short of lCheck by less
+				// than a block, and the inner loop exits there too.
+				b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, lCheck, 0x4B, 0x04, 0x40)
+				// A character skip's state holds only between characters, and
+				// the walk's four-byte steps put a point inside one as often as
+				// not (an odd-length prefix before two-byte letters: always),
+				// so the point first reads on a byte at a time to the next
+				// character boundary — at most three.
+				b = append(b, 0x02, 0x40) // block $aligned
+				b = append(b, 0x03, 0x40) // loop $align
+				b = append(b, 0x20, lScanPos, 0x20, paramLen, 0x4F, 0x0D, 0x01)
+				b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00)
+				b = append(b, 0x41, 0xC0, 0x01, 0x71, 0x41, 0x80, 0x01, 0x47, 0x0D, 0x01) // not a continuation byte
 				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(e))
-				b = append(b, 0xFD, 0x0F) // i8x16.splat
-				b = append(b, 0xFD, 0x23) // i8x16.eq
-				b = append(b, 0xFD, 0x64) // i8x16.bitmask
-				b = append(b, 0x72)       // i32.or
+				b = utils.AppendSLEB128(b, l.tableOff)
+				b = append(b, 0x20, lState, 0x41, 0x08, 0x74, 0x6A)
+				b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A, 0x2D, 0x00, 0x00, 0x6A)
+				b = appendTableLoad8u(b, tableMemIdx)
+				b = append(b, 0x22, lState, 0x45, 0x0D, 5+extra) // dead → $done
+				b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, lScanPos)
+				b = append(b, 0x0C, 0x00) // br $align
+				b = append(b, 0x0B)       // end loop $align
+				b = append(b, 0x0B)       // end block $aligned
+				// The character skip. emitDominantBulkSkip takes the position of
+				// the LAST byte read, which here is lScanPos - 1.
+				for _, info := range unrolledSkips {
+					b = append(b, 0x20, lState, 0x41)
+					b = utils.AppendSLEB128(b, info.state)
+					b = append(b, 0x46, 0x04, 0x40) // if lState == info.state
+					b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6B, 0x21, lScanPos)
+					b = emitDominantBulkSkip(b, info, false, lScanPos, paramLen, 0, paramPtr, lChunk, lByteClass, lErr)
+					b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, lScanPos)
+					b = append(b, 0x0B) // end if
+				}
+				b = append(b, 0x20, lScanPos, 0x41)
+				b = utils.AppendSLEB128(b, probeSkipStretch)
+				b = append(b, 0x6A, 0x21, lCheck)
+				b = append(b, 0x0B) // end if
+				// lBound = min(lCheck, len)
+				b = append(b, 0x20, lCheck, 0x20, paramLen, 0x20, lCheck, 0x20, paramLen, 0x49, 0x1B, 0x21, lBound)
+				b = append(b, 0x02, 0x40) // block $stretch
 			}
-			b = append(b, 0x22, lSkipMask)
-			if d.Members != nil {
-				// Member mode: the mask marks bytes that STAY. The whole chunk
-				// self-loops iff every lane is set.
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, 0xFFFF)
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if mask == 0xFFFF            (H)
-			} else {
-				b = append(b, 0x45, 0x04, 0x40) // if mask == 0           (H)
-			}
-			b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x21, lScanPos)
-			b = append(b, 0x0C, 0x01) // br 1 → restart $skip (G)
-			b = append(b, 0x0B)       // end if (H)
-			// A byte that leaves the state is in this chunk: resume AT it and
-			// leave the skip. Exception mode's mask already marks it; member
-			// mode's marks the complement, so invert within the 16 lanes
-			// first. ctz is in [0,15] on both paths because the all-stay case
-			// was consumed by the branch above — and a ctz of 0 still makes
-			// progress, since the walk below then consumes that byte and
-			// changes the state.
-			if d.Members != nil {
-				b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x41)
-				b = utils.AppendSLEB128(b, 0xFFFF)
-				b = append(b, 0x73)                       // i32.xor
-				b = append(b, 0x68, 0x6A, 0x21, lScanPos) // ctz; add; set
-			} else {
-				b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lScanPos)
-			}
-			b = append(b, 0x0C, 0x01) // br 1 → $skip_done (F)
-			b = append(b, 0x0B)       // end loop $skip (G)
-			b = append(b, 0x0B)       // end block $skip_done (F)
-			b = append(b, 0x0B)       // end if lState == d (E)
-		}
+			b = append(b, 0x03, 0x40) // loop $main4
 
-		// Need all `unroll` bytes in range: lScanPos + unroll > paramLen → tail.
-		b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
-		for k := 0; k < unroll; k++ {
-			// table[state*256 + input[lScanPos + k]] — the +k rides in the
-			// load's offset immediate, which is why lScanPos is untouched
-			// until the block completes.
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, l.tableOff)
-			b = append(b, 0x20, lState, 0x41, 0x08, 0x74, 0x6A)
-			b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
-			b = append(b, 0x2D, 0x00)
-			b = utils.AppendULEB128(b, uint32(k)) // input load offset immediate
-			b = append(b, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx)
-			b = append(b, 0x21, lState)
-			// Dead state → $done. lScanPos is left at the block start, which
-			// is < paramLen, and that is all the anchored answer needs: the
-			// EOF check below is `lScanPos == paramLen`, so any early exit
-			// correctly reports "did not consume the whole input". The exact
-			// position is never read on this path.
-			b = append(b, 0x20, lState, 0x45, 0x0D, 0x02)
+			// Dominant-state bulk skip.
+			//
+			// Placed at the TOP OF THE WALK, not at function entry: lState only
+			// becomes a dominant state after some bytes have been consumed, so an
+			// entry-time check never fires (measured: +11 fuel and no skips).
+			//
+			// Sound by the self-loop property alone. Every byte other than one of
+			// this state's exceptions maps the state to itself, so a chunk with no
+			// exception leaves the state unchanged and nothing observable is
+			// skipped — the anchored probe records NOTHING mid-walk, since every
+			// orTableBits call in this function is !anchored-guarded. On a hit the
+			// walk resumes AT the first exception byte, whose transition then runs
+			// normally.
+			//
+			// lState is a WASM id (0 = dead, table index + 1) and
+			// dominantWalkState.WASMState is in the same space: reorderAcceptFirst
+			// has already relabelled the table, and the u8 direct-index path
+			// applies no further permutation.
+			//
+			// Progress is guaranteed: the no-exception arm advances a full chunk,
+			// and the exception arm advances by ctz and leaves, after which the
+			// unrolled body consumes that byte and changes the state.
+			for _, d := range dom {
+				b = append(b, 0x20, lState, 0x41)
+				b = utils.AppendSLEB128(b, int32(d.WASMState))
+				b = append(b, 0x46, 0x04, 0x40) // if lState == d.WASMState   (E)
+				b = append(b, 0x02, 0x40)       // block $skip_done            (F)
+				b = append(b, 0x03, 0x40)       // loop  $skip                 (G)
+				// Whole chunk must be in range, else leave the skip to the walk.
+				b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
+				b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+				b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+				b = append(b, 0x21, lChunk)
+				// Both flavours build ONE mask with the same compare chain; only
+				// what the mask means, and therefore the test against it, differs.
+				probe := d.Exceptions
+				if d.Members != nil {
+					probe = d.Members
+				}
+				b = append(b, 0x41, 0x00) // mask accumulator
+				for _, e := range probe {
+					b = append(b, 0x20, lChunk)
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, int32(e))
+					b = append(b, 0xFD, 0x0F) // i8x16.splat
+					b = append(b, 0xFD, 0x23) // i8x16.eq
+					b = append(b, 0xFD, 0x64) // i8x16.bitmask
+					b = append(b, 0x72)       // i32.or
+				}
+				b = append(b, 0x22, lSkipMask)
+				if d.Members != nil {
+					// Member mode: the mask marks bytes that STAY. The whole chunk
+					// self-loops iff every lane is set.
+					b = append(b, 0x41)
+					b = utils.AppendSLEB128(b, 0xFFFF)
+					b = append(b, 0x46)       // i32.eq
+					b = append(b, 0x04, 0x40) // if mask == 0xFFFF            (H)
+				} else {
+					b = append(b, 0x45, 0x04, 0x40) // if mask == 0           (H)
+				}
+				b = append(b, 0x20, lScanPos, 0x41, 0x10, 0x6A, 0x21, lScanPos)
+				b = append(b, 0x0C, 0x01) // br 1 → restart $skip (G)
+				b = append(b, 0x0B)       // end if (H)
+				// A byte that leaves the state is in this chunk: resume AT it and
+				// leave the skip. Exception mode's mask already marks it; member
+				// mode's marks the complement, so invert within the 16 lanes
+				// first. ctz is in [0,15] on both paths because the all-stay case
+				// was consumed by the branch above — and a ctz of 0 still makes
+				// progress, since the walk below then consumes that byte and
+				// changes the state.
+				if d.Members != nil {
+					b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x41)
+					b = utils.AppendSLEB128(b, 0xFFFF)
+					b = append(b, 0x73)                       // i32.xor
+					b = append(b, 0x68, 0x6A, 0x21, lScanPos) // ctz; add; set
+				} else {
+					b = append(b, 0x20, lScanPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lScanPos)
+				}
+				b = append(b, 0x0C, 0x01) // br 1 → $skip_done (F)
+				b = append(b, 0x0B)       // end loop $skip (G)
+				b = append(b, 0x0B)       // end block $skip_done (F)
+				b = append(b, 0x0B)       // end if lState == d (E)
+			}
+			// Need all `unroll` bytes in range: lScanPos + unroll > paramLen → tail;
+			// under the gate, past the stretch's bound → the stretch point.
+			bound := paramLen
+			if gated {
+				bound = lBound
+			}
+			b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, bound, 0x4B, 0x0D, 0x01)
+			for k := 0; k < unroll; k++ {
+				// table[state*256 + input[lScanPos + k]] — the +k rides in the
+				// load's offset immediate, which is why lScanPos is untouched
+				// until the block completes.
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, l.tableOff)
+				b = append(b, 0x20, lState, 0x41, 0x08, 0x74, 0x6A)
+				b = append(b, 0x20, paramPtr, 0x20, lScanPos, 0x6A)
+				b = append(b, 0x2D, 0x00)
+				b = utils.AppendULEB128(b, uint32(k)) // input load offset immediate
+				b = append(b, 0x6A)
+				b = appendTableLoad8u(b, tableMemIdx)
+				b = append(b, 0x21, lState)
+				// Dead state → $done. lScanPos is left at the block start, which
+				// is < paramLen, and that is all the anchored answer needs: the
+				// EOF check below is `lScanPos == paramLen`, so any early exit
+				// correctly reports "did not consume the whole input". The exact
+				// position is never read on this path.
+				b = append(b, 0x20, lState, 0x45, 0x0D, deadDepth)
+			}
+			b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x21, lScanPos)
+			b = append(b, 0x0C, 0x00) // br 0 → restart $main4
+			b = append(b, 0x0B)       // end loop $main4
+			if gated {
+				b = append(b, 0x0B) // end block $stretch
+				// Out of the stretch: the tail when fewer than a block is left,
+				// else the next stretch point.
+				b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x20, paramLen, 0x4B, 0x0D, 0x01)
+				b = append(b, 0x0C, 0x00) // br $outer
+				b = append(b, 0x0B)       // end loop $outer
+			}
+			b = append(b, 0x0B) // end block $tail
+			return b
 		}
-		b = append(b, 0x20, lScanPos, 0x41, unroll, 0x6A, 0x21, lScanPos)
-		b = append(b, 0x0C, 0x00) // br 0 → restart $main4
-		b = append(b, 0x0B)       // end loop $main4
-		b = append(b, 0x0B)       // end block $tail
+		if gateAnchored {
+			// An input shorter than one stretch takes the plain walk: it would
+			// never reach a stretch point, and the gate's set-up alone measured
+			// +6.4% on a 21-byte call.
+			b = append(b, 0x20, paramLen, 0x20, lScanPos, 0x6B, 0x41)
+			b = utils.AppendSLEB128(b, probeSkipStretch)
+			b = append(b, 0x4F, 0x04, 0x40)             // if len - start >= stretch
+			b = append(b, 0x20, lScanPos, 0x21, lCheck) // a stretch point at once
+			b = emitUnrolled(b, true, 1)
+			b = append(b, 0x05) // else
+			b = emitUnrolled(b, false, 1)
+			b = append(b, 0x0B) // end if
+		} else {
+			b = emitUnrolled(b, false, 0)
+		}
 	}
 
 	b = append(b, 0x03, 0x40) // loop $main
@@ -340,6 +510,33 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 	}
 
 	b = append(b, 0x20, lState, 0x45, 0x0D, 0x01) // dead state: br $done
+	// The run skips (walkSkips above), on the byte just read. A scan probe
+	// first takes the exits the loop top would take next — the bits it
+	// already holds settle the answer, or no wanted pattern can accept from
+	// this state — rather than cross a run it has no use for. Depth 2 from
+	// inside the `if` is $done.
+	for _, info := range walkSkips {
+		b = append(b, 0x20, lState, 0x41)
+		b = utils.AppendSLEB128(b, info.state)
+		b = append(b, 0x46, 0x04, 0x40) // if lState == info.state
+		if !anchored {
+			const doneDepth = 2
+			if exit == probeExitFirstHit {
+				b = append(b, 0x20, lBits, 0x0D, doneDepth)
+			} else {
+				b = append(b, 0x20, lBits, 0x20, paramValidMask, 0x46, 0x0D, doneDepth)
+			}
+			if p.futureOff != 0 && int(info.state) < len(p.future) {
+				b = append(b, 0x20, paramValidMask, 0x41)
+				b = utils.AppendSLEB128(b, int32(uint32(p.future[info.state])))
+				b = append(b, 0x71)                                // & future[state]
+				b = append(b, 0x20, lBits, 0x41, 0x7F, 0x73, 0x71) // &^ lBits
+				b = append(b, 0x45, 0x0D, doneDepth)               // eqz -> $done
+			}
+		}
+		b = emitDominantBulkSkip(b, info, false, lScanPos, paramLen, 0, paramPtr, lChunk, lByteClass, lErr)
+		b = append(b, 0x0B) // end if
+	}
 	b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, lScanPos)
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop
@@ -467,7 +664,7 @@ func buildCountedChainProbeBody(class []byte, n int, anchored bool) []byte {
 // bitmask. Nothing else — the anchored probe reads no mid-accept, immediate-
 // accept or zero-width side table, because "did the run reach `len` in an
 // accepting state" is answered entirely at the end.
-func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32, sparse *sparseAnchoredInfo) {
+func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int, utf8Text bool) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32, sparse *sparseAnchoredInfo) {
 	numPatterns := len(patternIDs)
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
@@ -481,6 +678,9 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		tableBase:     tableBase,
 		needFind:      false,
 		leftmostFirst: false,
+		// A Unicode-mode set's state looping over whole characters takes the
+		// character skip (buildSetProbeBodyExit's run skips).
+		utf8Text: utf8Text,
 	})
 
 	// Sparse accept: an anchored bucket whose accept is a per-state LIST takes the sparse
@@ -558,3 +758,9 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 	body = append(body, raw...)
 	return
 }
+
+// probeSkipStretch is the anchored character skips' stretch (the gate in
+// buildSetProbeBodyExit): measured, a long run in a loop no skip covers beside
+// skippable members cost +3.4% at 64 and +1.7% at 128, a long run skipped 5.48
+// against 5.55 fuel/byte, and a run shorter than a stretch is never skipped.
+const probeSkipStretch = 128

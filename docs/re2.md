@@ -47,7 +47,33 @@ match U+FFFD, is skipped in Unicode mode: its columns are Go's, and Unicode mode
 differs from Go there by design ("Invalid UTF-8 in the input", below) — 55 rows
 of `custom-tests.txt`; the RE2 corpus has no such input.
 
-`unicode-ext` runs those three and the rest of the byte-mode modes in Unicode
+Every pattern in those corpora is ASCII but five, so none of them reaches what
+only a pattern NAMING Unicode content does. `custom-tests-unicode` does:
+`custom-tests-unicode.txt` holds single patterns written for Unicode mode —
+`\p{..}` and `\P{..}` by category and script, non-ASCII literals and literals
+mixing ASCII with them, written ranges with ends at the 2/3- and 3/4-byte
+boundaries, `(?i)` over whole fold orbits (`k` against U+212A, `σ`/`ς`/`Σ`,
+3- and 4-byte orbits), `.` and negated classes in counted repeats, empty
+matches and `\b`/`\B`/`(?m)^`/`(?m)$` beside 2- to 4-byte characters,
+captures through TDFA, Backtracking and the shortcuts, runs of characters
+long enough for the 16-byte skips at every length around a chunk boundary
+with invalid bytes in every lane, and the byte-mode fast paths' shapes over
+multi-byte text — over valid input and every kind of invalid sequence (stray
+continuation, cut-off, overlong, surrogate, past U+10FFFF). Its blocks,
+strings and patterns are written by hand; its rows are Go's answers over each
+pattern without U+FFFD, rewritten in place by `go run ./make_adjusted
+-unicode-regen custom-tests-unicode.txt`, so every row — invalid input
+included — is judged (`-unicode-oracle`). Thirteen legs: neutral, both hints,
+armed notes, no search block, forced Backtracking (plain, hinted, armed,
+fallback alone) and match-, find- and groups-only: 536 patterns, 43,022 rows,
+1,290,387 checks, 0 failures. Each code path only Unicode mode reaches was
+also broken on purpose — the start rule at each of its seven call sites, the
+character skips' open tail, error stop and tail chunk, the TDFA skip's tag
+ops, the first-character check of the prefix scan, the literal-anchored find's
+two-byte backward table, the Backtracking fallback's dispatch — and a leg of
+this target or `sets-unicode` failed every time.
+
+`unicode-ext` runs those four and the rest of the byte-mode modes in Unicode
 mode over the whole corpus: `unicode-likely` (both hints),
 `unicode-force-backtrack`, `unicode-bt-fallback` (every Backtracking program
 answered by its memoised fallback alone), `unicode-notes-armed`,
@@ -273,10 +299,14 @@ differ by design). Runs the corpus's blocks with characters above 0x7F,
 the shapes whose empty matches could land inside a character (`x*`, `(?:)`,
 `\B`, `a?\B`, line and text anchors, `.` and negated classes) over 2- to
 4-byte characters, invalid bytes, cut-off, overlong and surrogate sequences,
-plus multi-byte literals and members a set splits out — neutral, under both
-hints, on Backtracking members and through the batch entry. **34,516,808
-checks, 0 failures** over its ten runs, the answer cache swept on every
-forced-sweep leg the shape allows.
+plus multi-byte literals and members a set splits out, `(?i)` over whole fold
+orbits, written non-ASCII ranges, `\p{..}` members (a union automaton past 64
+ids among them), keyword sets for each literal frontend (packed pair, Teddy,
+Aho-Corasick, and Shufti once 600 keywords put Aho-Corasick over its budget),
+runs of characters after a literal, and a sparse bucket with and without
+assertions — neutral, under both hints, on Backtracking members and through
+the batch entry. **40,329,659 checks, 0 failures** over its ten runs, the
+answer cache swept on every forced-sweep leg the shape allows.
 
 ---
 
@@ -291,11 +321,13 @@ targets skip them, under `requires Unicode support`.
 `make unicode` (from `tools/re2test/`) checks them: the six blocks that hold
 such characters are compiled in Unicode mode and judged against RE2's own
 columns — byte offsets, `.` reading a whole character — an oracle that is not
-Go, plus Go's every-match column. 698,220 checks pass, 0 fail. Two kinds of
-row are left out, each counted under its own reason: 2,696 where RE2's `\B`
-holds between two bytes of one character — Go and Unicode mode keep no match
-inside a character, and Go's own exhaustive test skips these rows too — and,
-for Go's column only, input that is not valid UTF-8 for a pattern that can
+Go, plus Go's every-match column. 702,938 checks pass, 0 fail. Two kinds of
+row are left out, each counted under its own reason: 337 where RE2's `\B`
+holds between two bytes of one character (`\B` over `"a\u0080b"`: RE2 2-2,
+Go and Unicode mode no match — they keep no match inside a character); the
+other 2,359 `\B` rows over such input, where RE2's columns equal Go's, are
+judged, although Go's own exhaustive test skips every one of them. And, for
+Go's column only, input that is not valid UTF-8 for a pattern that can
 match U+FFFD (see "Invalid UTF-8 in the input" below; this corpus has none).
 `--high-bytes` cannot be combined with Unicode mode: its ASCII-twin oracle is
 sound for byte mode only.

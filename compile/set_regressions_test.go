@@ -501,6 +501,37 @@ func TestOverlapPreflightPredicatesAgree(t *testing.T) {
 	}
 }
 
+// TestUnicodeOverlapPreflight: an overlapping set whose members loop over
+// whole characters gets the preflight that retires a member matching nowhere,
+// as its byte-mode twin does. Without it {`[^,]+;`, `\p{Cyrillic}+!`} swept
+// Russian text holding no `;` or `!` at 1,509 fuel/byte, against 53.
+func TestUnicodeOverlapPreflight(t *testing.T) {
+	uni := true
+	for _, pats := range [][]string{
+		{`[^,]+;`, `\p{Cyrillic}+!`},
+		{`[^,]+;`, `[a-z]+!`},
+	} {
+		pp, sp := &dfaPool{}, &dfaPool{}
+		spec := SetSpec{Name: "s", Find: "cap_find", Overlapping: true}
+		for i, pat := range pats {
+			info, err := analyzePattern(config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: pat, Unicode: &uni}, pp, sp)
+			if err != nil {
+				t.Fatalf("analyzePattern(%q): %v", pat, err)
+			}
+			if !info.rp.unicode() {
+				t.Fatalf("%q compiled in byte mode", pat)
+			}
+			info.globalID = i
+			spec.Patterns = append(spec.Patterns, info)
+			spec.PatternIDs = append(spec.PatternIDs, i)
+		}
+		cs := CompileSet(spec, pp, sp, CompileSetOptions{})
+		if !cs.usesOverlappingFindPreflight() {
+			t.Errorf("%q: the Unicode overlapping set has no preflight", pats)
+		}
+	}
+}
+
 // sparseishGroup is n patterns behind one shared literal, the shape that
 // promotes to a sparse bucket.
 func sparseishGroup(n int) []string {

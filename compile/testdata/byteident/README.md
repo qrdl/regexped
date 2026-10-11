@@ -39,6 +39,7 @@ add a fixture for it.
 | `counted_chain` | `x[a-f]{3,10}y` | bounded counted repeat `{N,M}` | Compiled DFA |
 | `strict_alt` | `AKIA[A-Z0-9]{16}\|ghp_[A-Za-z0-9]{20}` | strict alternation of lit-chain branches — `buildLitChainAltFindBody` | Compiled DFA |
 | `lenient_alt` | `ERROR[0-9]{3}\|WARNING[0-9]{3}` | lenient alternation find — `buildLitChainAltLenientFindBody`, the one find body whose scan cursor is NOT `locAttemptStart` | Compiled DFA |
+| `lenient_alt_match` | `ERROR[0-9]{3}\|x[^,]*,`, match only | the lenient alternation's anchored match: its DFA branch walk with the byte-run skip, gated per 128-byte stretch, and the plain walk for a short input |
 | `lit_chain_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}` | lit chain with a fixed-length prefix — `buildLitChainPrefixedFindBody`; reports `attempt_start - M`, so it needs a find-from floor | Compiled DFA |
 | `alt_prefixed` | `[a-z]{3}AKIA[A-Z0-9]{24}\|[0-9]{3}ghp_[A-Za-z0-9]{24}` | mixed-prefix: strict alternation of prefixed branches — `buildLitChainAltPrefixedFindBody` | Compiled DFA |
 | `byte_mode` | `caf\xe9[0-9]{4}` + `byte_mode: true` | a pattern naming raw bytes above 127, which every other fixture's mode rejects outright | Compiled DFA |
@@ -78,6 +79,7 @@ that reads one table through another's bytes.
 | `set_split` | members that are not provably linear in a set's bodies SPLIT OUT to their own start-anywhere find: the merge wrapper `find` becomes, the member passes, the position global the bucket body stamps, and — the `\b` member refusing a union automaton — the merged scan wrappers | scalar |
 | `set_split_batch` | the split in a BATCHING set: the merge sits in the shared per-position worker both entries call, and follows the batch resume rule (gate every match delivered) | packed-pair |
 | `set_split_scan_union` | the same split with a union automaton over every member serving the scan pair on its own, so only `find` is merged | packed-pair |
+| `set_probe_run_skip` | `&key=[^&,]+&`, `,fld=[^,;]*;` | the scan and anchored probes' run skips over byte runs | packed-pair |
 | `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks, and the scan bodies carry the work counter — charged only for walks that recorded nothing new, checked after the probe is recorded — that hands the call to a union automaton | packed-pair |
 | `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would, and the NO-CACHE COMPANION — the same set split, compiled beside it and never exported — that `find` hands a drive with no usable cache to | scalar |
 
@@ -101,12 +103,17 @@ character — and resolve to Unicode mode instead.
 | `unicode_char_run` | `[^,]+,` + `unicode: true` | the bulk skip over whole UTF-8 characters, for a state that loops on every character through one state per byte |
 | `unicode_match_char_run` | `.+`, `[^,]+,`, `\p{Cyrillic}{14}[^,]*,` + `unicode: true` | the match body's skip over whole UTF-8 characters: a Compiled DFA with an accepting and a non-accepting loop, and a plain DFA over 256 states |
 | `unicode_tdfa_char_run` | `<([^>]+)>(x)` + `unicode: true` | the TDFA capture body's skip over whole UTF-8 characters, run from the tag-op dispatch's arms that enter the loop |
+| `unicode_alt_lit_char_run` | `x{3}abc[^,]*z\|y{3}ghi[^,]*z` + `unicode: true` | the alternation literal-anchored find's forward verify crossing whole characters with the character skip |
+| `unicode_lenient_alt_match` | `ERROR[0-9]{3}\|x[^,]*,` + `unicode: true`, match only | the lenient alternation's anchored match taking the character skip in its branch walk, gated per stretch |
 | `unicode_start_seed` | `x*` + `unicode: true` | a find that rounds `from` up to a character's first byte |
 | `unicode_start_scan` | `a?\B` + `unicode: true` | a find that checks every candidate start (`\B` holds inside a character) |
 | `unicode_set_walk` | `[a-zé]+`, `x*`, `\B` | a set's per-position walk skipping candidates inside a character, in `find` and the scan pair, with lead-byte first-byte tables |
 | `unicode_set_literals` | `привет`, `москва`, `собака`, `город\d+` | multi-byte literals in a literal frontend |
 | `unicode_set_union_scan` | `\pL+\pN`, `\p{Greek}{2,}\pN` | the scan pair's union automaton over lowered members |
 | `unicode_set_overlap_sweep` | `[a-zé]+`, `a*` | the answer cache's sweep writing an empty row inside a character |
+| `unicode_set_overlap_preflight` | `[^,]+;`, `\p{Cyrillic}+!` | the overlapping preflight over a member whose never-dying state loops over whole characters (`utf8LoopState`) |
+| `unicode_set_suffix_char_run` | `&ключ=[^&]+&`, `,поле=[^,]*,`, `<тег>[^<]+<` | bucket suffix bodies crossing a run of whole characters with the character skip |
+| `unicode_set_anchored_char_run` | `&ключ=[^&,]+&`, `,поле=[^,;]*;`, `<тег>[^<>]+<` | the anchored probe's character skips at 128-byte stretch points aligned to a character boundary, and the scan probes' skips |
 | `unicode_set_split_overlap` | `foo\w+`, `(?:a[^z]*?z)?` + set-level `unicode: true` | a split member's rounded search position and its program sweep |
 
 `TestByteIdenticalPathsAreDistinct` checks the Unicode fixtures reach all four

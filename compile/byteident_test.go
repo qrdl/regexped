@@ -194,6 +194,9 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 		{name: "unicode_set_literals", literal: true},
 		{name: "unicode_set_union_scan", union: true},
 		{name: "unicode_set_overlap_sweep", cache: true},
+		{name: "unicode_set_overlap_preflight", cache: true},
+		{name: "unicode_set_suffix_char_run", literal: true},
+		{name: "unicode_set_anchored_char_run", literal: true},
 		{name: "unicode_set_split_overlap", split: true, cache: true, literal: true},
 	} {
 		_, _, diags, err := CompileFileDiag(loadByteIdentConfig(t, c.name), "")

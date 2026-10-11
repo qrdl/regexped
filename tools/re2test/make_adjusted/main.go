@@ -13,6 +13,16 @@
 // The harness reads such a file with -unicode -unicode-oracle.
 //
 // Usage: go run ./make_adjusted -unicode-variants re2-adjusted.txt re2-unicode.txt
+//
+// With -unicode-regen it rewrites a hand-written Unicode-mode corpus IN PLACE
+// (custom-tests-unicode.txt): its blocks, strings, patterns and comments are
+// kept, and every pattern's expectation rows are replaced by Go's answers over
+// the pattern without U+FFFD — col0, col1 and col4 as -unicode-variants writes
+// them, plus col5 (the first match with captures) and col6 (every match with
+// captures) for a pattern tested through the groups export. A pattern either
+// oracle cannot take is an error, and the file is then left untouched.
+//
+// Usage: go run ./make_adjusted -unicode-regen custom-tests-unicode.txt
 package main
 
 import (
@@ -144,7 +154,19 @@ func parseSections(path string) ([]section, error) {
 
 func main() {
 	variants := flag.Bool("unicode-variants", false, "read re2-adjusted.txt and write its Unicode-mode variant corpus")
+	regen := flag.Bool("unicode-regen", false, "rewrite a Unicode-mode corpus's expectation rows in place, from Go")
 	flag.Parse()
+	if *regen {
+		if flag.NArg() != 1 {
+			fmt.Fprintf(os.Stderr, "usage: make_adjusted -unicode-regen <corpus>\n")
+			os.Exit(1)
+		}
+		if err := regenUnicode(flag.Arg(0)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if flag.NArg() != 2 {
 		fmt.Fprintf(os.Stderr, "usage: make_adjusted [-unicode-variants] <input> <output>\n")
 		os.Exit(1)
@@ -378,32 +400,11 @@ func writeUnicodeVariants(sections []section, path string) error {
 		if len(strs) == 0 {
 			continue
 		}
-		type pat struct {
-			src             string
-			re, full        *regexp.Regexp
-			testedViaGroups bool
-		}
-		var pats []pat
+		var pats []unicodeOracle
 		for _, rp := range sec.regexps {
-			oracle, ok := noReplacement(rp.pattern)
-			if !ok {
-				continue
+			if p, ok := newUnicodeOracle(rp.pattern); ok {
+				pats = append(pats, p)
 			}
-			re, err := regexp.Compile(oracle)
-			if err != nil {
-				continue
-			}
-			eng, selErr := compile.SelectEngine(rp.pattern, compile.CompileOptions{MaxDFAStates: maxDFAStates, Unicode: true})
-			if selErr != nil {
-				continue
-			}
-			p := pat{src: rp.pattern, re: re, testedViaGroups: eng == compile.EngineBacktrack || eng == compile.EngineTDFA}
-			if !p.testedViaGroups {
-				if p.full, err = regexp.Compile(`\A(?:` + oracle + `)\z`); err != nil {
-					continue
-				}
-			}
-			pats = append(pats, p)
 		}
 		if len(pats) == 0 {
 			continue
@@ -417,35 +418,7 @@ func writeUnicodeVariants(sections []section, path string) error {
 			fmt.Fprintf(w, "%s\n", strconv.Quote(p.src))
 			nPatterns++
 			for _, s := range strs {
-				col1 := "-"
-				if m := p.re.FindStringIndex(s); m != nil {
-					col1 = fmt.Sprintf("%d-%d", m[0], m[1])
-				}
-				col0 := "-"
-				if p.testedViaGroups {
-					if m := p.re.FindStringSubmatchIndex(s); m != nil && m[0] == 0 {
-						var slots []string
-						for k := 0; k+1 < len(m); k += 2 {
-							if m[k] < 0 {
-								slots = append(slots, "-")
-							} else {
-								slots = append(slots, fmt.Sprintf("%d-%d", m[k], m[k+1]))
-							}
-						}
-						col0 = strings.Join(slots, " ")
-					}
-				} else if m := p.full.FindStringIndex(s); m != nil {
-					col0 = fmt.Sprintf("0-%d", m[1])
-				}
-				col4 := "-"
-				if all := p.re.FindAllStringIndex(s, -1); len(all) > 0 {
-					parts := make([]string, len(all))
-					for i, m := range all {
-						parts[i] = fmt.Sprintf("%d-%d", m[0], m[1])
-					}
-					col4 = strings.Join(parts, ",")
-				}
-				fmt.Fprintf(w, "%s;%s;-;-;%s\n", col0, col1, col4)
+				fmt.Fprintf(w, "%s\n", p.row(s, false))
 				nRows++
 			}
 		}
@@ -454,5 +427,170 @@ func writeUnicodeVariants(sections []section, path string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "wrote %d patterns, %d rows\n", nPatterns, nRows)
+	return nil
+}
+
+// unicodeOracle is one pattern's Unicode-mode answers, computed by Go over
+// the pattern without U+FFFD (noReplacement).
+type unicodeOracle struct {
+	src  string
+	re   *regexp.Regexp
+	full *regexp.Regexp // \A(?:pat)\z, for a pattern tested through the match export
+	// testedViaGroups mirrors which export tools/re2test/main.go judges col0
+	// with: the groups export when the engine Unicode mode selects is
+	// Backtracking or TDFA, the match export otherwise.
+	testedViaGroups bool
+}
+
+func newUnicodeOracle(pattern string) (unicodeOracle, bool) {
+	oracle, ok := noReplacement(pattern)
+	if !ok {
+		return unicodeOracle{}, false
+	}
+	re, err := regexp.Compile(oracle)
+	if err != nil {
+		return unicodeOracle{}, false
+	}
+	eng, err := compile.SelectEngine(pattern, compile.CompileOptions{MaxDFAStates: maxDFAStates, Unicode: true})
+	if err != nil {
+		return unicodeOracle{}, false
+	}
+	o := unicodeOracle{src: pattern, re: re, testedViaGroups: eng == compile.EngineBacktrack || eng == compile.EngineTDFA}
+	if !o.testedViaGroups {
+		if o.full, err = regexp.Compile(`\A(?:` + oracle + `)\z`); err != nil {
+			return unicodeOracle{}, false
+		}
+	}
+	return o, true
+}
+
+// fmtSubmatch formats one match's slots as the harness's col0/col5 read them:
+// "s-e" per group, "-" for a group that took no part.
+func fmtSubmatch(m []int) string {
+	var slots []string
+	for k := 0; k+1 < len(m); k += 2 {
+		if m[k] < 0 {
+			slots = append(slots, "-")
+		} else {
+			slots = append(slots, fmt.Sprintf("%d-%d", m[k], m[k+1]))
+		}
+	}
+	return strings.Join(slots, " ")
+}
+
+// row is the expectation row for input s: "col0;col1;-;-;col4", and with
+// groups set, for a pattern tested through the groups export, ";col5;col6"
+// after it.
+func (o unicodeOracle) row(s string, groups bool) string {
+	col1 := "-"
+	if m := o.re.FindStringIndex(s); m != nil {
+		col1 = fmt.Sprintf("%d-%d", m[0], m[1])
+	}
+	col0 := "-"
+	if o.testedViaGroups {
+		if m := o.re.FindStringSubmatchIndex(s); m != nil && m[0] == 0 {
+			col0 = fmtSubmatch(m)
+		}
+	} else if m := o.full.FindStringIndex(s); m != nil {
+		col0 = fmt.Sprintf("0-%d", m[1])
+	}
+	col4 := "-"
+	if all := o.re.FindAllStringIndex(s, -1); len(all) > 0 {
+		parts := make([]string, len(all))
+		for i, m := range all {
+			parts[i] = fmt.Sprintf("%d-%d", m[0], m[1])
+		}
+		col4 = strings.Join(parts, ",")
+	}
+	r := fmt.Sprintf("%s;%s;-;-;%s", col0, col1, col4)
+	if !groups || !o.testedViaGroups {
+		return r
+	}
+	col5 := "-"
+	if m := o.re.FindStringSubmatchIndex(s); m != nil {
+		col5 = fmtSubmatch(m)
+	}
+	col6 := "-"
+	if all := o.re.FindAllStringSubmatchIndex(s, -1); len(all) > 0 {
+		parts := make([]string, len(all))
+		for i, m := range all {
+			parts[i] = fmtSubmatch(m)
+		}
+		col6 = strings.Join(parts, "|")
+	}
+	return r + ";" + col5 + ";" + col6
+}
+
+// regenUnicode rewrites path's expectation rows from Go (see the file
+// comment). Comments, block names, strings and patterns pass through; the
+// rows after each pattern, whatever they were, are replaced by one row per
+// string of its block. Nothing is written unless every pattern was taken.
+func regenUnicode(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var out, strs []string
+	section := ""
+	nPatterns, nRows := 0, 0
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		switch {
+		case line == "":
+			return fmt.Errorf("%s: blank line (the harness refuses them); not rewritten", path)
+		case strings.HasPrefix(line, "#"):
+			out = append(out, line)
+			continue
+		case line == "strings":
+			section, strs = "strings", strs[:0]
+			out = append(out, line)
+			continue
+		case line == "regexps":
+			section = "regexps"
+			out = append(out, line)
+			continue
+		case section == "strings":
+			s, err := strconv.Unquote(line)
+			if err != nil {
+				return fmt.Errorf("%s: string %s: %v; not rewritten", path, line, err)
+			}
+			strs = append(strs, s)
+			out = append(out, line)
+			continue
+		case section == "regexps" && strings.HasPrefix(line, `"`):
+			pat, err := strconv.Unquote(line)
+			if err != nil {
+				return fmt.Errorf("%s: pattern %s: %v; not rewritten", path, line, err)
+			}
+			o, ok := newUnicodeOracle(pat)
+			if !ok {
+				return fmt.Errorf("%s: pattern %q: no Unicode-mode oracle (Go cannot compile it, or Unicode mode refuses it); not rewritten", path, pat)
+			}
+			out = append(out, line)
+			for _, s := range strs {
+				if strings.Contains(s, "�") {
+					return fmt.Errorf("%s: input %q holds a real U+FFFD, which the oracle cannot judge; not rewritten", path, s)
+				}
+				out = append(out, o.row(s, true))
+				nRows++
+			}
+			nPatterns++
+			continue
+		case section == "regexps" && (line[0] == '-' || ('0' <= line[0] && line[0] <= '9')):
+			continue // an old row: replaced above
+		case isSectionName(line) && 'A' <= line[0] && line[0] <= 'Z':
+			section = ""
+			out = append(out, line)
+			continue
+		}
+		return fmt.Errorf("%s: unexpected line %q; not rewritten", path, line)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(out, "\n")+"\n"), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "%s: %d patterns, %d rows\n", path, nPatterns, nRows)
 	return nil
 }

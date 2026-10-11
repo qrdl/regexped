@@ -1124,7 +1124,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		if bkt.sparse && sparseCycle(bkt) {
 			ctr = sparseCtr
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, unicodeSet, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
 			bucketLivenessExit(bkt))
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
@@ -1777,7 +1777,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 					ids[j] = globalIDOf[ap]
 				}
 				cs.anchoredIDs[bi] = ids
-				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
+				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids, unicodeSet)
 				if sp != nil {
 					ab.sparseScratch = sp.scratch
 					ab.sparseIDMapOff = sp.idMapOff

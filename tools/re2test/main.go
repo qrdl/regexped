@@ -57,12 +57,13 @@ const (
 	// no character above 0x7F in its patterns or inputs, which the byte-mode
 	// targets cover (unless -unicode-all runs it). skipREBInsideChar: RE2's \B holds at every byte
 	// position, inside a UTF-8 sequence too, where Go's and Unicode mode's
-	// do not — Go's own exhaustive test skips exactly these rows. skipGoFFFD:
+	// do not — Go's own exhaustive test skips every \B row over such input;
+	// this one skips only the rows whose columns differ from Go's. skipGoFFFD:
 	// a Go-derived expectation on input that is not valid UTF-8 for a pattern
 	// that can match U+FFFD, which Go matches there and Unicode mode, by
 	// design, does not.
 	skipASCIIBlock    = "ASCII-only block (the byte-mode targets cover it)"
-	skipREBInsideChar = "RE2's \\B inside a character (Go and Unicode mode skip it)"
+	skipREBInsideChar = "RE2's \\B inside a character (RE2's columns differ from Go's)"
 	skipGoFFFD        = "Go reads invalid UTF-8 as U+FFFD (Unicode mode matches nothing there)"
 	skipStateLimit    = "requires larger DFA (state limit exceeded)"
 	skipBadSyntax     = "unsupported RE2 syntax (invalid escape sequence)"
@@ -568,8 +569,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			// every match on such input survived ~9.5M cases.
 			// Unicode mode reads such an input as RE2 does, so RE2's own
 			// columns judge it — except where RE2's \B holds inside a
-			// character.
-			if *unicodeFlag && !*unicodeOracle && hasUnicode(text) && strings.Contains(pattern, `\B`) {
+			// character. Unicode mode answers \B as Go does, so a \B row is
+			// judged whenever RE2's columns equal Go's (2,359 of the corpus's
+			// 2,696) and skipped only where they differ (`\B` over "a\u0080b":
+			// RE2 2-2, between the two bytes of U+0080; Go no match).
+			if *unicodeFlag && !*unicodeOracle && hasUnicode(text) && strings.Contains(pattern, `\B`) &&
+				!corpusAgreesWithGo(pattern, text, col0, col1, col4, col5, col6) {
 				skipCount[skipREBInsideChar]++
 				continue
 			}
@@ -2102,6 +2107,44 @@ func expectedGroupsAllGo(re *regexp.Regexp, text string) [][]int32 {
 }
 
 // slotsEqualGo compares Go FindStringSubmatchIndex against expected slot pairs.
+// corpusAgreesWithGo reports whether every column of a row that this harness
+// judges says what Go's regexp says: col0 under the contract of the export
+// that judges it (groups, anchored at 0, for a pattern with captures; the
+// full-consumption match otherwise), col1 the first match, and col4, col5 and
+// col6 when the row carries them. A pattern Go cannot compile never agrees.
+func corpusAgreesWithGo(pattern, text, col0, col1, col4, col5, col6 string) bool {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return false
+	}
+	n := re.NumSubexp() + 1
+	anchor := `\A(?:` + pattern + `)`
+	if re.NumSubexp() == 0 {
+		anchor += `\z`
+	}
+	reAnchored, err := regexp.Compile(anchor)
+	if err != nil || !slotsEqualGo(reAnchored.FindStringSubmatchIndex(text), parseCaptures(col0, n)) {
+		return false
+	}
+	var goFind int64 = -1
+	if m := re.FindStringIndex(text); m != nil {
+		goFind = int64(m[0])<<32 | int64(m[1])
+	}
+	if goFind != parseCol1(col1) {
+		return false
+	}
+	if col4 != "" && col4 != "-" && !col4Equal(re.FindAllStringIndex(text, -1), parseCol4(col4)) {
+		return false
+	}
+	if col5 != "" && col5 != "-" && !slotsEqualGo(re.FindStringSubmatchIndex(text), parseCaptures(col5, n)) {
+		return false
+	}
+	if col6 != "" && col6 != "-" && !col6Equal(expectedGroupsAllGo(re, text), parseCol6(col6, n)) {
+		return false
+	}
+	return true
+}
+
 func slotsEqualGo(goSub []int, exp []int32) bool {
 	if len(goSub) == 0 && exp == nil {
 		return true

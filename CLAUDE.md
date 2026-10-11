@@ -36,6 +36,11 @@ regexped/
 │   │                          #   looping-state SIMD skips: byte (≤8 exits) and, in Unicode mode,
 │   │                          #   whole UTF-8 characters (utf8SelfLoopExits / emitUTF8BulkSkip:
 │   │                          #   Keiser-Lemire validity, stops before an invalid sequence)
+│   │                          #   — a Unicode set's bucket bodies take them too (the set's mode is
+│   │                          #   passed to genSuffixWASMWalkEndCtr), and a lenient alternation's
+│   │                          #   anchored match walks a branch with them, tested once per 128-byte
+│   │                          #   stretch (emitInlineAnchoredDFAVerifyGated; a shorter input takes
+│   │                          #   the plain walk)
 │   ├── engine_compiled_dfa.go # Compiled DFA: direct-index dispatch, literal-chain prefix
 │   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission.
@@ -383,7 +388,14 @@ regexped/
 │   │                          #   match end here" test is `state < midAcceptLimit` — a compare
 │   │                          #   against a constant — and the accept entry is loaded only inside
 │   │                          #   the branch. Shared by both scan bodies AND emitUnionAliveMask.
-│   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM
+│   ├── set_probe.go           # Bitmask-only bucket probes (scan + anchored flavours), genAnchoredWASM.
+│   │                          #   Both take the layout's RUN SKIPS (byte runs; whole characters in a
+│   │                          #   Unicode-mode set, every character loop, not the layout's two): the
+│   │                          #   anchored one tests its character skips once per 128-byte stretch
+│   │                          #   (probeSkipStretch) at a point read on to a character boundary, and an
+│   │                          #   input under a stretch takes the plain walk — tested every step, a run
+│   │                          #   in a loop no skip covers paid +11.3%. The scan probe tests every byte
+│   │                          #   (+2.2% on byte-mode two-letter values, accepted: a gate measured worse)
 │   ├── set_caps.go            # ANCHORED bodies only (match_any/match_all) + the shared bit-recording
 │   │                          #   emitters and id-space helpers. The scan pair is NOT here — see set_emit.go.
 │   ├── set_split.go           # Set members that are NOT PROVABLY LINEAR in a set's bodies.
@@ -520,7 +532,10 @@ regexped/
 │   ├── byte_rarity.go         # Byte-rarity classes: route a 17..64-byte first-byte set to Shufti or scalar
 │   ├── class_chain_prefix.go  # Chain-start SIMD verify for `[class]{N,}` patterns
 │   ├── counted_chain.go       # Counted linear class-chain detection
-│   ├── dominant_walk.go       # Dominant-walk-state detection for the anchored set probe
+│   ├── dominant_walk.go       # Dominant-walk-state detection for the anchored set probe, and
+│   │                          #   hasNeverDyingState — a byte self-loop OR a loop over whole UTF-8
+│   │                          #   characters (utf8LoopState): without the second, a Unicode overlapping
+│   │                          #   set never got its "matches nowhere" preflight (1,509 vs 53 fuel/byte)
 │   ├── liveness.go            # Per-state liveness for set probes: which patterns can still accept.
 │   │                          #   Also the LITERAL bucket's exit (livenessCanFire): members
 │   │                          #   sharing a literal walk one merged DFA, and `foo\w+` keeps it
@@ -1123,7 +1138,7 @@ Go's tokens, so no match — empty ones included — may start inside a
 character, over the corpus's non-ASCII blocks, `custom-sets.txt` and
 `custom-sets-unicode.txt` (Go-regenerated blocks of the shapes whose empty
 matches could land inside one, over 2- to 4-byte characters and invalid input):
-34,516,808 checks over its ten runs, 0 failures (its `--set-bt=1` run counts 8 chunk compiles refused under the forced limit, a member fitting no engine).
+40,329,659 checks over its ten runs, 0 failures (its `--set-bt=1` run counts 8 chunk compiles refused under the forced limit, a member fitting no engine).
 
 **`make -C tools/re2test unicode-all` / `unicode-groups` / `custom-unicode`**
 (outside `make test`) run Unicode mode over what `unicode` skips: with
@@ -1137,6 +1152,19 @@ Go-derived columns are wrong there by design. `make -C tools/fuzz seed-unicode`
 replays the Unicode-seeded fuzz targets' corpora with `-unicode` — the set
 targets seeded with pairs of the same shapes (`unicodeSetSeeds`);
 `fuzz-unicode` / `fuzz-unicode-groups` / `fuzz-unicode-set` fuzz them.
+**`make -C tools/re2test custom-tests-unicode`** (outside `make test`, in
+`unicode-ext`) is the single-pattern counterpart for what the ASCII corpora
+cannot reach: `custom-tests-unicode.txt`, patterns written for Unicode mode
+(`\p{..}`, non-ASCII literals and ranges, `(?i)` orbits, counted `.`, empty
+matches and assertions beside multi-byte characters, captures, long runs for
+the character skips, every kind of invalid sequence) whose rows are Go's
+answers without U+FFFD, REWRITTEN by `go run ./make_adjusted -unicode-regen
+custom-tests-unicode.txt` and judged with `-unicode-oracle` over thirteen
+legs (every byte-mode mode): 1,290,387 checks, 0 failures. Each Unicode-only
+runtime path was broken on purpose once and a leg of it or `sets-unicode`
+failed every time. `make unicode` judges a `\B` row over non-ASCII input
+wherever RE2's columns equal Go's (2,359 of 2,696) and skips only the 337
+where RE2's `\B` holds between two bytes of one character.
 `make -C tools/re2test unicode-ext` adds every byte-mode MODE in Unicode mode
 (hints, forced Backtracking, fallback-only, armed notes, sets over the whole
 corpus) and `unicode-variants`: the adjusted corpus over Unicode variants of
@@ -1261,7 +1289,7 @@ make byteident   # from repo root
 ```
 
 Forty-two single-pattern configs, one per code path (the `unicode_` ones in
-Unicode mode), plus twenty-four SET configs spanning four frontends, both
+Unicode mode), plus twenty-five SET configs spanning four frontends, both
 accept representations, all five capabilities and Unicode mode — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is

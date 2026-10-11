@@ -932,6 +932,30 @@ bytes, where every walk dies within the segment and restarts at the next
 position, `[^,]+,` find costs 10% more. A module with such a state grows by
 about 3.5 KB in its find bodies and 1.8 KB in a TDFA capture body.
 
+The same skip serves a Unicode-mode SET's bucket bodies, and the
+alternation literal-anchored find's branch verify: a member like
+`&ключ=[^&]+&` over records with 40-letter Russian values went 63.50 → 19.02
+fuel/byte, `x{3}abc[^,]*z|y{3}ghi[^,]*z` 32.97 → 12.74.
+
+**Run skips in the set probes and the lenient match.** A set's scan probes
+(`scan_any`, `scan_all`), its anchored probes (`match_any`, `match_all`) and a
+lenient alternation's anchored match (a literal-chain branch beside DFA
+branches) walked every run byte by byte; they take the run skip too — over a
+run of bytes a state loops on, and in Unicode mode over whole characters.
+Measured (fuel/byte over 10 KB): the scan pair over never-closed 40-letter
+values 44.1 → 14.3 (Unicode) and 44.8 → 13.3 (byte mode), and +2.2% in byte
+mode over two-letter values — the cost of testing every walked byte for a
+skippable state, which no gate removed and which was accepted; the anchored
+pair over one long record 17.76 → 5.55; `ERROR[0-9]{3}|x[^,]*,` match 29.00 →
+5.02 (Unicode) and → 1.98 (byte mode). The anchored probe and the lenient
+match test for a skippable state once per 128-byte STRETCH instead of on every
+step, the walk between points bounded by the next point so its step costs
+what it did, and a point that falls inside a character first reads on to the
+next character boundary; an input shorter than one stretch takes the plain
+walk. Ungated, a long run in a state no skip covers paid +11.3% and a 6-byte
+lenient match +25%; gated, those are +1.7% and +1.8%, and a 21-byte anchored
+call +1.4%.
+
 ---
 
 ## RE2 Test Coverage

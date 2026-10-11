@@ -86,6 +86,10 @@ func compileAltLitAnchorBranches(rp resolvedPattern, branches []altLitAnchorBran
 			lmBareShufti:         false,
 			lmNonMidShufti:       false,
 			lmWideShufti:         false,
+			// A branch's forward verify over whole characters takes the
+			// character skip, as a single pattern's find does: 32.97 →
+			// 12.74 fuel/byte over 40-letter Russian values.
+			utf8Text: rp.unicode(),
 		})
 		if !l.useU8 {
 			return nil, false
