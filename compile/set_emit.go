@@ -220,6 +220,14 @@ type compiledSet struct {
 	// anchoredIDs then holds the whole set's ids as a single group because the
 	// automaton reports for every pattern.
 	anchoredUnion *anchoredUnion
+	// anchoredBT are the anchored pair's Backtracking buckets — a member whose
+	// own anchored DFA cannot be built inside the limits — one pattern each,
+	// anchoredBTIDs their global ids. Their probes (anchoredBTProbeBodies,
+	// filled by buildBTBodies) sit after the anchored DFA probes and are
+	// called after the DFA part, by the bucket body and the union body alike.
+	anchoredBT            []*bucket
+	anchoredBTIDs         []int
+	anchoredBTProbeBodies [][]byte
 
 	// btFnBodies[i] is the Backtracking driver for the i-th BT fallback bucket
 	//: (ptr, len, out_ptr) -> i32, the same shape a
@@ -490,12 +498,18 @@ func (cs *compiledSet) capFnOffset(kind setCapKind) int {
 func (cs *compiledSet) funcCount() int {
 	return len(cs.capFns()) + cs.hiddenFnCount() + cs.numSuffixFns + len(cs.prefixFnBodies) +
 		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies) +
-		cs.numBTFns + cs.extraFnCount()
+		len(cs.anchoredBTProbeBodies) + cs.numBTFns + cs.extraFnCount()
 }
 
 // btFnBaseOffset returns the index of the first Backtracking driver, which sit
 // last so that adding them moved no existing sub-index.
 func (cs *compiledSet) btFnBaseOffset() int {
+	return cs.anchoredBTProbeBaseOffset() + len(cs.anchoredBTProbeBodies)
+}
+
+// anchoredBTProbeBaseOffset returns the index of the first anchored-pair
+// Backtracking probe, right after the anchored DFA probes.
+func (cs *compiledSet) anchoredBTProbeBaseOffset() int {
 	return cs.anchoredProbeBaseOffset() + len(cs.anchoredProbeBodies)
 }
 
@@ -1726,13 +1740,25 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
 		// Its result is discarded when the union wins, which costs compile time
 		// only (CLAUDE.md: runtime over compile time).
-		abuckets, amembers := compileAnchoredBuckets(full.Patterns, opts, diag)
+		abuckets, amembers, abt := compileAnchoredBuckets(full.Patterns, opts, diag)
+		if len(abt) > 0 {
+			// Counted before anything asks hasBTMember(): the set's `_all`
+			// pair goes to the out_ptr form, where -2 is unambiguous.
+			var fns int
+			cs.btRegions, fns = allocAnchoredBTRegions(cs.btRegions, abt, opts.BTWorkBudget, opts.globals)
+			cs.numBTFns += fns
+			cs.anchoredBT = abt
+			cs.anchoredBTProbeBodies = make([][]byte, len(abt))
+			for _, b := range abt {
+				cs.anchoredBTIDs = append(cs.anchoredBTIDs, globalIDOf[b.patterns[0]])
+			}
+		}
 		// The union must answer for exactly the patterns the PACKER kept.
 		//
-		// It is built from a spec, and the packer drops a pattern whose solo
-		// anchored DFA exceeds max_fallback_states (and admits no Backtracking
-		// member — see docs/sets.md "Backtracking members and the anchored
-		// pair"). Building the union from the unfiltered spec made the two
+		// It is built from a spec, and the packer leaves out a pattern whose
+		// solo anchored DFA exceeds the limits — that one runs on its own
+		// Backtracking probe after the union. Building the union from the
+		// unfiltered spec made the two
 		// halves of one capability disagree: with the union, match_any and
 		// match_all reported patterns that with buckets they do not, and the
 		// --set-bt corpus leg found exactly that.
@@ -2078,12 +2104,9 @@ func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[st
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
-// It exists because a set can legitimately leave a pattern out of its
-// anchored pair: a member whose anchored DFA is over max_dfa_states is dropped
-// from match_any / match_all with a warning and recorded in
-// SetDiag.AnchoredStateLimitDropped. Any differential test therefore has to
-// know which patterns those two capabilities hold, or it compares the engine
-// against an oracle for a set the engine was never asked to build.
+// It exists so a differential test can see how the set was built — which
+// frontend, which members split, which members' anchored pair runs on
+// Backtracking (SetDiag.AnchoredBacktracking) — without compiling it twice.
 //
 // CmdWriteDiagJSON answers the same question by RE-RUNNING the whole set
 // compilation. That is fine for a CLI flag and wrong for a caller in a hot
@@ -2693,6 +2716,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for range cs.anchoredProbeBodies {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
+		for range cs.anchoredBTProbeBodies {
+			fs = append(fs, byte(setTypeI32x4ToI32))
+		}
 		for i := 0; i < cs.numBTFns; i++ {
 			// (ptr, len, out_ptr) -> i32, the capture-body shape.
 			fs = append(fs, byte(setTypeI32x3ToI32))
@@ -3062,7 +3088,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					out = append(out,
-						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx)...)
+						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx,
+							base+cs.anchoredBTProbeBaseOffset(), cs.anchoredBTIDs)...)
 					break
 				}
 				out = append(out, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
@@ -3092,9 +3119,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				out = append(out, body...)
 			}
 			// Every exported capability that can reach a Backtracking member
-			// starts a new host call for it. The anchored pair cannot: no BT
-			// bucket is admitted there.
-			if cs.btRegions != nil && cs.btRegions.hasDrive && c.kind != capMatchAny && c.kind != capMatchAll {
+			// starts a new host call for it — the anchored pair when it has
+			// Backtracking probes of its own.
+			anchoredCap := c.kind == capMatchAny || c.kind == capMatchAll
+			if cs.btRegions != nil && cs.btRegions.hasDrive && (!anchoredCap || len(cs.anchoredBT) > 0) {
 				out = injectBTDrivePrologue(out, cs.btRegions.drive, cs.emitBTBlocksPrologue(c.kind))
 			}
 			return out
@@ -3204,6 +3232,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, pb...)
 		}
 		for _, pb := range cs.anchoredProbeBodies {
+			cs_bytes = append(cs_bytes, pb...)
+		}
+		for _, pb := range cs.anchoredBTProbeBodies {
 			cs_bytes = append(cs_bytes, pb...)
 		}
 		// Backtracking drivers last, matching btFnBaseOffset.

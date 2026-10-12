@@ -278,13 +278,10 @@ func (r *Reporter) Render(w io.Writer) {
 			fmt.Fprintf(w, "    #%-3d %-24s %-8s %-12s %2d pattern(s)  %d states  %d bytes\n",
 				b.ID, truncate(lit, 24), b.AcceptKind, engine, len(b.Patterns), b.SuffixStates, b.TableBytes)
 		}
-		// The drops are the whole reason a user needs this: a set that does not
-		// report a pattern's matches must say so. Both cost the pattern
-		// match_any/match_all only — it still answers on scan_any, scan_all
-		// and find; a member no engine takes for those fails the compile.
-		reportDrops(w, "dropped from match_any/match_all (anchored DFA over the packer's limits)",
-			d.AnchoredStateLimitDropped)
-		reportDrops(w, "dropped from match_any/match_all (unparseable)", d.UnparseableDropped)
+		// A member whose anchored pair runs on Backtracking costs every
+		// match_any / match_all call a probe after the DFA part.
+		reportDrops(w, "match_any/match_all on Backtracking (anchored DFA over the limits)",
+			d.AnchoredBacktracking)
 		if d.IDSpaceSize != len(d.Buckets) && d.IDSpaceSize > 0 {
 			fmt.Fprintf(w, "  id space:   %d\n", d.IDSpaceSize)
 		}

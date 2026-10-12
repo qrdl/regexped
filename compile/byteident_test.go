@@ -196,6 +196,7 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 		{name: "unicode_set_walk"},
 		{name: "unicode_set_literals", literal: true},
 		{name: "unicode_set_ac_probe", literal: true, acProbe: true},
+		{name: "unicode_set_anchored_bt"},
 		{name: "unicode_set_union_scan", union: true},
 		{name: "unicode_set_overlap_sweep", cache: true},
 		{name: "unicode_set_overlap_preflight", cache: true},

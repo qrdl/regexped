@@ -58,19 +58,14 @@ type SetDiag struct {
 	BareBodyShape map[string]string `json:"bare_body_shape,omitempty"`
 	Buckets       []BucketDiag      `json:"buckets"`
 	Conflicts     []ConflictDiag    `json:"conflicts"`
-	// AnchoredStateLimitDropped lists patterns whose own anchored DFA could not
-	// be built inside the packer's limits, so they left match_any/match_all
-	// while scan_any, scan_all and `find` kept them. It is the only drop: a
-	// member no engine takes for `find` or the scan pair fails the compile,
-	// and the field that once listed such members (state_limit_dropped) is
-	// gone with them.
-	AnchoredStateLimitDropped []PatternRef `json:"anchored_state_limit_dropped,omitempty"`
-	// UnparseableDropped lists patterns the anchored packer could not re-parse
-	// and therefore excluded from match/match_any/match_all while `find` kept
-	// them. Defensive — analyzePattern already parsed these once — but a
-	// silent `continue` there would leave the capabilities disagreeing with no
-	// diagnostic trail at all.
-	UnparseableDropped []PatternRef `json:"unparseable_dropped,omitempty"`
+	// AnchoredBacktracking lists members whose own anchored DFA cannot be
+	// built inside the limits, so match_any / match_all answer for them
+	// through a Backtracking probe over the whole input, run after the DFA
+	// part. No member is ever left out of a capability: one that Backtracking
+	// cannot take either fails the compile. (The fields that once listed
+	// members DROPPED from the anchored pair — anchored_state_limit_dropped,
+	// unparseable_dropped — are gone with the drops.)
+	AnchoredBacktracking []PatternRef `json:"anchored_backtracking,omitempty"`
 	// FrontendDemotion records that the frontend chooseLiteralFrontend picked
 	// was NOT the one emitted, and why. Nil when the chosen frontend shipped.
 	//

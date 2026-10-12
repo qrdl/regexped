@@ -16019,7 +16019,8 @@ regexps
 -;0-296;-;-;0-296
 # ============================================================
 # A member over the state limit (`[аб]*а[аб]{14}`, about 2^15 states) runs on
-# Backtracking: the `_all` form goes wide, and the anchored pair is the union of the others.
+# Backtracking: the `_all` form goes wide, and the anchored pair probes it on
+# Backtracking after the union of the others.
 # ============================================================
 UniSetWideAnchored
 strings

@@ -3,6 +3,7 @@ package compile
 import (
 	"encoding/binary"
 
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -345,7 +346,13 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 // lands on state 0, whose accept entry is empty, so "died at byte 3" and "ran
 // to the end matching nothing" leave the same answer and need no separate
 // path.
-func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tableMemIdx int) []byte {
+//
+// btBase / btIDs are the set's anchored Backtracking probes (the members the
+// union cannot hold), called after the walk: match_any returns the union's
+// answer when it has one and otherwise the first probe that matches;
+// match_all ORs each matching probe's bit into the bitmap. A probe that gave
+// up returns -2 from the capability. None: the body is unchanged.
+func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tableMemIdx int, btBase int, btIDs []int) []byte {
 	const (
 		pInPtr = 0
 		pInLen = 1
@@ -368,14 +375,29 @@ func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tabl
 	lOld64 := base + 6 // i64, wide `_all`
 	lNew64 := base + 7 // i64, wide `_all`
 
+	// With Backtracking probes, two more i32 locals after the shape's own:
+	// the probe's answer, and the id a wide match_all records.
+	bt := len(btIDs) > 0
+	var lRes, lID byte
 	var b []byte
 	switch {
+	case wideAllABI && bt:
+		b = append(b, 0x03, 0x06, 0x7F, 0x02, 0x7E, 0x02, 0x7F) // 6 i32, 2 i64, 2 i32
+		lRes, lID = base+8, base+9
 	case wideAllABI:
 		b = append(b, 0x02, 0x06, 0x7F, 0x02, 0x7E) // 6 i32, 2 i64
+	case kind == capMatchAny && !u.isWide() && bt:
+		b = append(b, 0x03, 0x02, 0x7F, 0x01, 0x7E, 0x01, 0x7F) // 2 i32, 1 i64, 1 i32
+		lRes = base + 3
 	case kind == capMatchAny && !u.isWide():
 		b = append(b, 0x02, 0x02, 0x7F, 0x01, 0x7E) // 2 i32, 1 i64
+	case kind == capMatchAny && bt:
+		b = append(b, 0x01, 0x04, 0x7F) // 4 i32
+		lRes = base + 3
 	case kind == capMatchAny:
 		b = append(b, 0x01, 0x03, 0x7F) // 3 i32
+	case bt:
+		panic("compile: an anchored Backtracking probe in a narrow match_all")
 	default:
 		b = append(b, 0x01, 0x02, 0x7F) // 2 i32
 	}
@@ -424,10 +446,51 @@ func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tabl
 	default:
 		b = emitAnchoredEOFMask(b, u, lState, tableMemIdx)
 	}
+	if bt {
+		b = emitUnionBTProbes(b, kind, btBase, btIDs, pInPtr, pInLen, pOut, lRes, lID, lScratch)
+	}
 	b = append(b, 0x0B) // end function
 
 	body := utils.AppendULEB128(nil, uint32(len(b)))
 	return append(body, b...)
+}
+
+// emitUnionBTProbes runs the set's anchored Backtracking probes after the
+// union walk, whose answer is on the stack: match_any's id (or -1), or wide
+// match_all's count (also in lCount). Leaves the capability's answer on the
+// stack.
+func emitUnionBTProbes(b []byte, kind setCapKind, btBase int, btIDs []int, pInPtr, pInLen, pOut, lRes, lID, lCount byte) []byte {
+	call := func(b []byte, k int) []byte {
+		b = append(b, 0x20, pInPtr, 0x41, 0x00, 0x20, pInLen, 0x41, 0x01, 0x10)
+		b = utils.AppendULEB128(b, uint32(btBase+k)) //nolint:gosec // a function index
+		b = append(b, 0x21, lRes)
+		b = append(b, 0x20, lRes, 0x41, 0x00, 0x48, 0x04, 0x40) // gave up: if (res < 0)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
+		return append(b, 0x0F, 0x0B) // return -2; end
+	}
+	if kind == capMatchAny {
+		// The union's id when it has one: a definite answer needs no probe.
+		b = append(b, 0x22, lRes, 0x41, 0x00, 0x4E, 0x04, 0x40) // tee; if (id >= 0)
+		b = append(b, 0x20, lRes, 0x0F, 0x0B)                   // return id; end
+		for k, id := range btIDs {
+			b = call(b, k)
+			b = append(b, 0x20, lRes, 0x04, 0x40, 0x41) // if (matched)
+			b = utils.AppendSLEB128(b, int32(id))
+			b = append(b, 0x0F, 0x0B) // return id; end
+		}
+		return append(b, 0x41, 0x7F) // -1
+	}
+	b = append(b, 0x1A) // drop: the count is in lCount
+	for k, id := range btIDs {
+		b = call(b, k)
+		b = append(b, 0x20, lRes, 0x04, 0x40, 0x41) // if (matched)
+		b = utils.AppendSLEB128(b, int32(id))
+		b = append(b, 0x21, lID)
+		b = emitWideBitmapSet(b, pOut, lID, lCount)
+		b = append(b, 0x0B)
+	}
+	return append(b, 0x20, lCount)
 }
 
 // emitAnchoredEOFMask pushes the u64 accept mask of lState — global ids

@@ -294,12 +294,12 @@ type setCapStats struct {
 // setMaxDropFraction is the share of eligible patterns the compiler may
 // legitimately exclude before the run FAILS.
 //
-// Drops are documented behaviour — a member's anchored DFA over
-// max_dfa_states, which the anchored pair cannot put on Backtracking — and are
-// excluded from the comparison, so a regression
-// that made the compiler drop EVERYTHING would empty every expectation and
-// exit 0 with a green table. That is the masking direction, so it needs a
-// ceiling rather than a printed number.
+// No drop is documented behaviour any more (a member no engine takes fails
+// the compile; one whose anchored DFA is over the limits answers the anchored
+// pair through Backtracking), and every drop already fails its chunk. The
+// ceiling stays as a second guard in the masking direction: a regression that
+// made the compiler drop EVERYTHING would otherwise empty every expectation
+// and exit 0 with a green table.
 const setMaxDropFraction = 0.01
 
 // setMaxTimeoutFraction is the same idea for the watchdog: a timed-out call is
@@ -1040,26 +1040,21 @@ func (r *setRunner) readBitmap() ([]int, error) {
 // ---------------------------------------------------------------------------
 // Dropped patterns.
 //
-// A set may leave a member out of match_any / match_all — its ANCHORED pair —
-// when the member's anchored DFA is over max_dfa_states: the compiler warns,
-// records it in --diag-json's `anchored_state_limit_dropped`, and compiles the
-// rest (docs/sets.md). A dropped pattern reports nothing there, so comparing
-// it against an oracle that still expects its matches would manufacture
-// failures out of documented behaviour.
-//
-// It may NOT leave one out of `find` or the scan pair: a member no engine
-// takes is a compile error. A drop there is therefore a FAILURE, not an
-// exclusion — which is how `.{0,870}` in a Unicode-mode set was seen: its
-// DFA was built under a fixed 2,048 states, its Backtracking program was over
-// 20,000 instructions, and the set compiled without it.
+// A set never leaves a member out of any capability: a member no engine takes
+// is a compile error, and one whose anchored DFA is over max_dfa_states
+// answers match_any / match_all through Backtracking. A drop is therefore a
+// FAILURE, never an exclusion — which is how `.{0,870}` in a Unicode-mode set
+// was seen: its DFA was built under a fixed 2,048 states, its Backtracking
+// program was over 20,000 instructions, and the set compiled without it.
+// Until 2026-10-12 an anchored-only drop was the one exclusion this harness
+// made; there are none left.
 //
 // The drop is captured from the warning itself rather than by re-deriving it:
 // re-running the analysis through CmdWriteDiagJSON would double the compile
 // cost of every chunk, and the warning is emitted by the very compile whose
 // module is about to be driven — there is no way for the two to disagree.
 //
-// `where` decides the scope: an "anchored bucket" drop removes the pattern
-// from match_any/match_all only; any other drop is the failure above.
+// Every drop is recorded as the failure above.
 
 type dropHandler struct {
 	find     map[int]bool
@@ -1074,24 +1069,17 @@ func (h *dropHandler) Handle(_ context.Context, r slog.Record) error {
 	if !strings.HasPrefix(r.Message, "Pattern dropped from set") {
 		return nil
 	}
-	id, where := -1, ""
+	id := -1
 	r.Attrs(func(a slog.Attr) bool {
-		switch a.Key {
-		case "id":
+		if a.Key == "id" {
 			id = int(a.Value.Int64())
-		case "where":
-			where = a.Value.String()
 		}
 		return true
 	})
 	if id < 0 {
 		return nil
 	}
-	if strings.HasPrefix(where, "anchored bucket") {
-		h.anchored[id] = true
-	} else {
-		h.find[id] = true
-	}
+	h.find[id] = true
 	return nil
 }
 
@@ -1300,8 +1288,9 @@ func newSetRunner(
 				wideAll = true
 			}
 		}
-		// A member split out onto the Backtracking find forces it too.
-		if len(d.SplitBacktracking) > 0 {
+		// A member split out onto the Backtracking find forces it too, and so
+		// does an anchored pair's Backtracking probe.
+		if len(d.SplitBacktracking) > 0 || len(d.AnchoredBacktracking) > 0 {
 			wideAll = true
 		}
 	}

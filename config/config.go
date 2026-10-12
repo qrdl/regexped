@@ -311,9 +311,8 @@ func (s SetConfig) PatternCount(cfg BuildConfig) int {
 // This is deliberately an UPPER BOUND computed from the config alone, and it
 // is THE definition for both sides: the compiler calls it (through
 // SetSpec.IDSpaceSize) and so does every stub generator, so the two cannot
-// drift. A member left out of the anchored pair (over the DFA state limit)
-// only lowers the ids actually emitted there, never raises them, so an
-// upper bound stays safe. Deriving it instead from what survived compilation
+// drift. The ids a set actually emits never exceed it, so an upper bound
+// stays safe. Deriving it instead from what survived compilation
 // would be tighter but unavailable to the generators, which never see the
 // compiled module.
 func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {

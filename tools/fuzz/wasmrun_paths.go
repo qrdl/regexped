@@ -150,15 +150,14 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 }
 
 // droppedFromSet returns the indices of the patterns the compiler EXCLUDED
-// from the set it just built.
+// from the set it just built — always none now: a member no engine takes
+// fails the compile instead (see CLAUDE.md).
 //
-// A set is allowed to drop a pattern: a suffix DFA over max_dfa_states is
-// warned about and recorded rather than failing the compile (see CLAUDE.md,
-// and compile/set.go's warnPatternDropped). Such a pattern is not in the set,
-// so the set reports none of its matches — and a differential test that keeps
-// it in the oracle reports the engine as wrong for obeying its own contract.
-// That was a real harness defect, whose threshold was exactly one DFA state
-// wide: 1024 states passed, 1025 was dropped and "failed".
+// A set used to drop such a pattern with a warning, and a differential test
+// that kept it in the oracle then reported the engine as wrong for obeying
+// its own contract. That was a real harness defect, whose threshold was
+// exactly one DFA state wide: 1024 states passed, 1025 was dropped and
+// "failed".
 //
 // The ids here are the set's global pattern ids, which compileSet assigns as
 // the index into pats — so they index the caller's slice directly.
@@ -177,8 +176,8 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 //     one shape — and so a harness that sees it non-empty fails loudly
 //     (set_caps_test's "members dropped").
 //   - anchored: `all`, PLUS the patterns the anchored packer alone refused.
-//     Those keep scan_any, scan_all and `find`, and lose only
-//     match_any/match_all.
+//     Always empty too since 2026-10-12: such a member's anchored pair runs
+//     on Backtracking, and one no engine takes fails the compile.
 //
 // So an anchored oracle uses `anchored` and every other oracle uses `all`.
 type setDrops struct {
@@ -186,25 +185,14 @@ type setDrops struct {
 	anchored map[int]bool
 }
 
-// dropsFromSet reads both scopes out of the compiler's own diagnostics.
-//
-// The scope is the compiler's to state, not this harness's to guess: see
-// compile.SetDiag's AnchoredStateLimitDropped, which exists because one field
-// used to carry both meanings.
+// dropsFromSet reads both scopes out of the compiler's own diagnostics —
+// both empty since 2026-10-12: the anchored packing no longer drops a member
+// (a member its DFA cannot take runs on Backtracking there, and one no
+// engine takes fails the compile), so every oracle answers for every member.
+// Kept as the one place a future scope would be read from.
 func dropsFromSet(diags []compile.SetDiag) setDrops {
-	d := setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
-	for _, sd := range diags {
-		for _, ref := range sd.AnchoredStateLimitDropped {
-			d.anchored[ref.ID] = true
-		}
-		for _, ref := range sd.UnparseableDropped {
-			d.anchored[ref.ID] = true
-		}
-	}
-	for id := range d.all {
-		d.anchored[id] = true
-	}
-	return d
+	_ = diags
+	return setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
 }
 
 // instantiate builds and instantiates a module, returning the store, instance,

@@ -2378,102 +2378,88 @@ func TestSetCorePromoteSparseBucketsRefusesNewlineBoundary(t *testing.T) {
 // --------------------------------------------------------------------------
 // compileAnchoredBuckets
 
-func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
-	// Defensive, but not silent: analyzePattern parsed the string once, so a
-	// failure here means it was rewritten. A bare `continue` would drop the
-	// pattern from the anchored trio while `find` kept it, with nothing in
-	// --diag-json to explain the disagreement.
+func TestSetCoreCompileAnchoredBucketsUnparseableIsAnError(t *testing.T) {
+	// Defensive, but not silent: the member was parsed once, so a failure
+	// here means it was rewritten — and leaving it out of the anchored pair
+	// while `find` kept it would be a silent drop. It fails the compile.
 	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`)}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-unparseable"}
-	buckets, members := compileAnchoredBuckets([]*PatternInfo{broken}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 || len(members) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+	opts := CompileSetOptions{fail: &setFailure{}}
+	buckets, members, bt := compileAnchoredBuckets([]*PatternInfo{broken}, opts, &SetDiag{Name: "anchored-unparseable"})
+	if len(buckets) != 0 || len(members) != 0 || len(bt) != 0 {
+		t.Fatalf("got %d buckets / %d member lists / %d Backtracking buckets, want none", len(buckets), len(members), len(bt))
 	}
-	if len(diag.UnparseableDropped) != 1 {
-		t.Errorf("drop not recorded in --diag-json: UnparseableDropped = %v", diag.UnparseableDropped)
-	}
-	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("silent drop: slog output was %q", out)
+	if !errors.Is(opts.fail.err, ErrSetMemberFitsNoEngine) {
+		t.Fatalf("error %v, want ErrSetMemberFitsNoEngine", opts.fail.err)
 	}
 }
 
 // setCoreCovAnchoredUnbuildable is a FuzzSetCaps crasher's own member.
 // Its solo anchored DFA hits maxHelperDFAStates INSIDE mergeAnchoredDFA, so
 // that call returns an error rather than an oversized table — the arm where
-// there is no state count to report and max_fallback_states is not the limit
-// that bound anything.
+// there is no state count to report.
 var setCoreCovAnchoredUnbuildable = "|0..+0.........\".\x00\x10$"
 
-func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T) {
-	info := setCoreCovAnalyze(t, setCoreCovAnchoredUnbuildable)
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-unbuildable"}
-	buckets, members := compileAnchoredBuckets([]*PatternInfo{info}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 || len(members) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+// A member whose anchored DFA cannot be built — construction stops at the
+// cap, or the finished DFA is over max_dfa_states — answers match_any /
+// match_all through a Backtracking bucket over its WHOLE pattern, with a
+// warning naming the limit that bound it and --diag-json listing it. With
+// Backtracking off it fails the compile, naming both limits.
+func TestSetCoreCompileAnchoredBucketsOverLimitRunsOnBacktracking(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		pattern string
+		opts    CompileSetOptions
+		states  string
+		limit   string
+	}{
+		{"construction cap", setCoreCovAnchoredUnbuildable, CompileSetOptions{}, "", fmt.Sprintf("limit=%d", maxHelperDFAStates)},
+		{"over max_dfa_states", `[a-z]{40}`, CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, "states=", "limit=4"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			info := setCoreCovAnalyze(t, c.pattern)
+			buf, restore := captureWarnings(t)
+			defer restore()
+			diag := &SetDiag{Name: "anchored-bt"}
+			opts := c.opts
+			opts.fail = &setFailure{}
+			buckets, _, bt := compileAnchoredBuckets([]*PatternInfo{info}, opts, diag)
+			if opts.fail.err != nil {
+				t.Fatal(opts.fail.err)
+			}
+			if len(buckets) != 0 || len(bt) != 1 || bt[0].btFallback == nil || bt[0].patterns[0] != info {
+				t.Fatalf("got %d DFA buckets / %d Backtracking buckets, want 0 / 1 holding the member", len(buckets), len(bt))
+			}
+			// The WHOLE pattern, not the post-literal suffix find runs on.
+			whole, _ := compileProg(patternFullAST(info))
+			if got, want := len(bt[0].btFallback.bt.prog.Inst), len(whole.prog.Inst); got != want {
+				t.Errorf("Backtracking program has %d instructions, the whole pattern's has %d", got, want)
+			}
+			if len(diag.AnchoredBacktracking) != 1 {
+				t.Errorf("--diag-json AnchoredBacktracking = %v, want the member", diag.AnchoredBacktracking)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "Set member runs on Backtracking: its anchored DFA") || strings.Contains(out, "Pattern dropped from set") {
+				t.Errorf("warning %q", out)
+			}
+			if !strings.Contains(out, c.limit) || (c.states != "" && !strings.Contains(out, c.states)) {
+				t.Errorf("warning should name %q %q: %q", c.states, c.limit, out)
+			}
+		})
 	}
-	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep it.
-	if len(diag.AnchoredStateLimitDropped) != 1 {
-		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
-			diag.AnchoredStateLimitDropped)
-	}
-	// The message used to be "suffix DFA exceeds state limit ...
-	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
-	// pattern never reached and a knob that cannot change the outcome, since
-	// what bound the build is the hard-coded maxHelperDFAStates.
-	out := buf.String()
-	if !strings.Contains(out, "Pattern dropped from set") {
-		t.Fatalf("silent drop: slog output was %q", out)
-	}
-	if strings.Contains(out, "max_fallback_states") {
-		t.Errorf("warning still points at max_fallback_states, which cannot change this outcome: %q", out)
-	}
-	if !strings.Contains(out, fmt.Sprintf("limit=%d", maxHelperDFAStates)) {
-		t.Errorf("warning should name the limit that actually bound the build (%d): %q",
-			maxHelperDFAStates, out)
-	}
-}
-
-func TestSetCoreCompileAnchoredBucketsOverFallbackLimitKeepsItsMessage(t *testing.T) {
-	// The other arm of the same switch, and the reason the message is a split
-	// rather than a rewrite: here the DFA BUILDS and is genuinely over
-	// max_fallback_states, so the size and the knob in the message are both
-	// true and the wording must not change.
-	info := setCoreCovAnalyze(t, `[a-z]{40}`)
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-over-limit"}
-	buckets, _ := compileAnchoredBuckets([]*PatternInfo{info},
-		CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, diag)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets", len(buckets))
-	}
-	if len(diag.AnchoredStateLimitDropped) != 1 {
-		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
-			diag.AnchoredStateLimitDropped)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "exceeds state limit") {
-		t.Errorf("the over-limit arm should still say so: %q", out)
-	}
-	if !strings.Contains(out, "limit=4") {
-		t.Errorf("warning should name max_fallback_states as given: %q", out)
-	}
-	if strings.Contains(out, "states=0") {
-		t.Errorf("this arm has a real state count and must report it: %q", out)
-	}
+	t.Run("Backtracking off", func(t *testing.T) {
+		info := setCoreCovAnalyze(t, `[a-z]{40}`)
+		info.rp.lim.btInsts = -1
+		opts := CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20, fail: &setFailure{}}
+		buckets, _, bt := compileAnchoredBuckets([]*PatternInfo{info}, opts, &SetDiag{})
+		if len(buckets) != 0 || len(bt) != 0 {
+			t.Fatalf("got %d / %d buckets, want none", len(buckets), len(bt))
+		}
+		err := opts.fail.err
+		if !errors.Is(err, ErrSetMemberFitsNoEngine) || !strings.Contains(err.Error(), "match_any / match_all") ||
+			!strings.Contains(err.Error(), "max_bt_instructions") {
+			t.Fatalf("error %v, want ErrSetMemberFitsNoEngine for match_any / match_all naming max_bt_instructions", err)
+		}
+	})
 }
 
 func TestSetCoreCompileAnchoredBucketsMergeRefusalStartsNewBucket(t *testing.T) {
@@ -2482,7 +2468,7 @@ func TestSetCoreCompileAnchoredBucketsMergeRefusalStartsNewBucket(t *testing.T) 
 	// merge has to open a new bucket rather than reorder anything.
 	infos := setCoreCovAnalyzeAll(t, setCoreCovOversizedPair...)
 	opts := CompileSetOptions{MaxFallbackStates: 2048, BudgetStates: 2048, BudgetBytes: 1 << 20}
-	buckets, members := compileAnchoredBuckets(infos, opts, nil)
+	buckets, members, _ := compileAnchoredBuckets(infos, opts, nil)
 
 	if len(buckets) != 2 {
 		t.Fatalf("expected the anchored merge refused (2 buckets), got %d", len(buckets))
@@ -3123,7 +3109,8 @@ func TestSetAssemblerFindTwinHandoff(t *testing.T) {
 }
 
 // btABISet builds a one-set config declaring the capabilities the `_all` ABI
-// switch touches. maxFallback = 1 forces its fallback members onto BT.
+// switch touches. maxFallback = 1 forces its fallback members onto BT — and,
+// with the anchored pair declared, every member's anchored probe too.
 func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildConfig) {
 	entries := make([]config.RegexEntry, len(pats))
 	for i, p := range pats {
@@ -3141,10 +3128,16 @@ func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildCon
 }
 
 // compileBTABISet compiles the set and hands back the artefact, so a test can
-// ask what the emitter actually decided rather than infer it.
-func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet {
+// ask what the emitter actually decided rather than infer it. anchored = false
+// leaves the anchored pair out, so its Backtracking probes cannot be what
+// selects the wide `_all` form.
+func compileBTABISet(t *testing.T, pats []string, maxFallback int, anchored bool) *compiledSet {
 	t.Helper()
 	sc, cfg := btABISet(pats, maxFallback)
+	if !anchored {
+		sc.MatchAll = ""
+		cfg.Sets[0].MatchAll = ""
+	}
 	var prefixPool, suffixPool dfaPool
 	idxs := make([]int, len(cfg.Regexps))
 	for i := range idxs {
@@ -3180,7 +3173,7 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	// see the end of this test).
 	pats := []string{`(?:ab|cd)+`, `hello`}
 
-	plain := compileBTABISet(t, pats, 0)
+	plain := compileBTABISet(t, pats, 0, true)
 	if plain.hasBTMember() {
 		t.Fatal("no BT member expected at the default limit; the rest of this test is meaningless")
 	}
@@ -3188,12 +3181,15 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 		t.Error("a set with no BT member and a 2-id space must keep the narrow i64 _all form")
 	}
 
-	bt := compileBTABISet(t, pats, 1)
-	if !bt.hasBTMember() {
+	// Without the anchored pair, so the find side's Backtracking bucket is the
+	// only Backtracking in the set (TestAnchoredBacktrackingForcesWideAll
+	// covers the anchored probes).
+	bt := compileBTABISet(t, pats, 1, false)
+	if !bt.hasBTMember() || len(bt.anchoredBT) != 0 {
 		// Failing to build the required fixture is a failure, not a skip:
 		// without a BT member there is no wide-_all arm left to assert, and a
 		// skip would make this ABI regression test silently vacuous.
-		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
+		t.Fatal("max_fallback_states=1 admitted no find-side BT member; the forced-BT " +
 			"fixture no longer builds and the wide-_all arm is untested")
 	}
 	if !bt.wideAll() {
@@ -3203,7 +3199,9 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	// A member that is not linear leaves its Backtracking bucket for a split
 	// member on the Backtracking find, and the form must STAY wide: the stub
 	// generator decides it from the unsplit packing (SetAdmitsBacktracking).
-	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1)
+	// Without the anchored pair, whose probes would select the wide form
+	// whatever the split does.
+	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1, false)
 	if split.hasBTMember() || len(split.split) == 0 || split.split[0].bt == nil {
 		t.Fatal("`(?:ab|cd)+xyz` under max_fallback_states=1 should be a Backtracking split member")
 	}
@@ -3222,7 +3220,7 @@ func TestSetBTDisablesTwoPhaseSplit(t *testing.T) {
 	// A literal-bearing pattern and a literal-less one: the mixed shape the
 	// split exists for.
 	pats := []string{`hello[0-9]{3}`, `(?:ab|cd)+`}
-	bt := compileBTABISet(t, pats, 1)
+	bt := compileBTABISet(t, pats, 1, false)
 	if !bt.hasBTMember() {
 		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
 			"fixture no longer builds and the split-suppression arm is untested")

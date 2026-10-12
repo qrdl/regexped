@@ -1189,14 +1189,15 @@ so every multi-match position splits and the corpus becomes a check of the
 resume path (delivered-tuple gating when gated, the `skip` parameter when
 overlapping).
 
-A set NEVER compiles without a member it selected for `find` and the scan
-pair: a member no engine takes (DFA over `max_dfa_states` AND Backtracking
-program over `max_bt_instructions`) is a compile error,
-`compile.ErrSetMemberFitsNoEngine`, naming both limits. The only drop left is
-from `match_any`/`match_all` — the anchored packing has no Backtracking path
-yet — and re2test excludes such a member from those two only,
-taking the exclusion from the drop WARNING (`where` "anchored bucket"), not
-from `--diag-json`. Any other drop warning FAILS the chunk;
+A set NEVER compiles without a member it selected, in any capability: a member
+no engine takes (DFA over `max_dfa_states` AND Backtracking program over
+`max_bt_instructions`) is a compile error, `compile.ErrSetMemberFitsNoEngine`,
+naming both limits — for the anchored pair too, whose packing gives a member
+whose anchored DFA is over the limits a Backtracking probe over the whole
+input (whole-input acceptance, run after the DFA part; `--diag-json`'s
+`anchored_backtracking`), which moves the set's `_all` pair to the out_ptr
+form. Until 2026-10-12 that member was dropped from `match_any`/`match_all`
+with a warning and re2test excluded it. Any drop warning now FAILS the chunk;
 `custom-sets-unicode.txt`'s `UniMemberOverOldBuildCap` (`.{0,870}`: 7,832
 states, 21,752 instructions, built under a fixed 2,048 and dropped) is the
 regression. An entry with `groups_func` is a member too (captures stripped for
@@ -1461,8 +1462,8 @@ the hint changed the module at all (a byte-identical build is a definitive no an
 measured), what it changed (a per-mode `SetDiag` row — frontend, scan body, anchored
 body, buckets — since a body selection is invisible everywhere else and is usually the
 whole story), and whether it paid (fuel and p50 per bucket). Inputs are bucketed
-matching/non-matching by a Go stdlib oracle built from the patterns the set ACTUALLY
-contains — a pattern left out of the anchored pair is excluded there — and the driven
+matching/non-matching by a Go stdlib oracle built from the patterns the set
+contains — every member, in every capability — and the driven
 export is checked against that oracle before anything is measured, since a mis-driven
 ABI measures the wrong work entirely.
 

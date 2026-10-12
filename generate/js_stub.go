@@ -106,9 +106,8 @@ export function %s(input) {
     const bitmapBase = %s;
     new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3).fill(0);
     const n = _exp['%s'](%s);
-    // -2 is UNKNOWN, not "nothing matched". The anchored path never probes a
-    // Backtracking member today, so this cannot fire; it is here so that a
-    // future one cannot fail silently.
+    // -2 is UNKNOWN, not "nothing matched": a member's Backtracking probe
+    // gave up.
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3);
     const out = [];

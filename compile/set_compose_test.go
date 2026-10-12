@@ -2984,9 +2984,9 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 		}
 	})
 
-	t.Run("nil_diag_drop_record", func(t *testing.T) {
+	t.Run("nil_diag_anchored_bt_record", func(t *testing.T) {
 		spec, _, _ := build(t, []string{`abc`})
-		recordAnchoredStateLimitDrop(nil, spec.Patterns[0]) // must not panic
+		recordAnchoredBacktracking(nil, spec.Patterns[0]) // must not panic
 	})
 }
 
@@ -3293,4 +3293,37 @@ func TestACProbeWideColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	validateWASM(t, w)
+}
+
+// TestAnchoredBacktrackingForcesWideAll: a member whose anchored DFA cannot be
+// built gives the anchored pair a Backtracking probe, which can answer -2 —
+// so the set's `_all` pair takes the out_ptr form even when `find` and the
+// scan pair need no Backtracking, and SetAdmitsBacktracking (what `generate`
+// reads to pick the stubs' form) says so. Without the member the set keeps
+// the i64 mask.
+func TestAnchoredBacktrackingForcesWideAll(t *testing.T) {
+	inspect := func(t *testing.T, pats ...string) (*compiledSet, bool) {
+		t.Helper()
+		entries := make([]config.RegexEntry, len(pats))
+		for i, p := range pats {
+			entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		}
+		sc := config.SetConfig{Name: "s", MatchAny: "ma", MatchAll: "mall", Patterns: config.PatternSelector{All: true}}
+		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cs, SetAdmitsBacktracking(sc, cfg)
+	}
+	cs, admits := inspect(t, `abc`, `[a-c]+`, `(?:a|b)*a(?:a|b){12}c`)
+	if len(cs.anchoredBT) != 1 || cs.anchoredBTIDs[0] != 2 {
+		t.Fatalf("anchored Backtracking buckets %d (ids %v), want the third member", len(cs.anchoredBT), cs.anchoredBTIDs)
+	}
+	if !cs.wideAll() || !admits {
+		t.Fatalf("wideAll %v, SetAdmitsBacktracking %v; want both true", cs.wideAll(), admits)
+	}
+	if cs, admits := inspect(t, `abc`, `[a-c]+`); cs.wideAll() || admits || len(cs.anchoredBT) != 0 {
+		t.Fatalf("without the member: wideAll %v, admits %v, %d anchored Backtracking buckets", cs.wideAll(), admits, len(cs.anchoredBT))
+	}
 }

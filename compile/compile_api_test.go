@@ -2359,11 +2359,9 @@ func TestReporterRenderSets(t *testing.T) {
 					Patterns: []PatternRef{{ID: 2, Name: "ambig"}},
 				},
 			},
-			// The two anchored-only scopes, the only drops a set makes. Both
-			// are here so the render is checked to keep them apart.
-			AnchoredStateLimitDropped: []PatternRef{{ID: 10, Name: "anch"}},
-			UnparseableDropped:        []PatternRef{{ID: 9, Name: "bad"}, {ID: 8}}, // unnamed → "#8"
-			FrontendDemotion:          &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
+			// Members whose anchored pair runs on Backtracking.
+			AnchoredBacktracking: []PatternRef{{ID: 10, Name: "anch"}, {ID: 8}}, // unnamed → "#8"
+			FrontendDemotion:     &FrontendDemotionDiag{From: "ac", To: "shufti", Reason: "budget"},
 			// Members served outside the buckets and the work counters: each
 			// changes the set's cost by large factors and shows nowhere else.
 			SplitMembers:             []int{3, 4},
@@ -2396,8 +2394,7 @@ func TestReporterRenderSets(t *testing.T) {
 		"#0   AKIA                     bitmask  DFA",
 		"#1   (fallback — no lite…     bitmask  DFA",
 		"#2   (fallback — no lite…     bitmask  Backtracking",
-		"dropped from match_any/match_all (anchored DFA over the packer's limits): anch",
-		"dropped from match_any/match_all (unparseable): bad, #8", // #8: the unnamed spelling
+		"match_any/match_all on Backtracking (anchored DFA over the limits): anch, #8", // #8: the unnamed spelling
 		"id space:   9",
 		"DOWNGRADED frontend:",
 		"split out (not provably linear; own linear search): #3, #4 (Backtracking)",

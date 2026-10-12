@@ -80,6 +80,7 @@ that reads one table through another's bytes.
 | `set_split_batch` | the split in a BATCHING set: the merge sits in the shared per-position worker both entries call, and follows the batch resume rule (gate every match delivered) | packed-pair |
 | `set_split_scan_union` | the same split with a union automaton over every member serving the scan pair on its own, so only `find` is merged | packed-pair |
 | `set_probe_run_skip` | `&key=[^&,]+&`, `,fld=[^,;]*;` | the scan and anchored probes' run skips over byte runs | packed-pair |
+| `set_anchored_bt` | the anchored pair with two members whose anchored DFA is past the construction cap: Backtracking probes (whole-input acceptance) after the anchored union, `_all` in its out_ptr form | — |
 | `set_scan_counter` | a literal frontend's scan pair with a member that is not provably linear and nothing split: the probes stamp their walks, and the scan bodies carry the work counter — charged only for walks that recorded nothing new, checked after the probe is recorded — that hands the call to a union automaton | packed-pair |
 | `set_overlap_counter` | an overlapping `find` the answer cache serves, over a member that is not provably linear: the walk's IN-CALL counter, which sweeps as soon as the call's walks cost what the sweep would, and the NO-CACHE COMPANION — the same set split, compiled beside it and never exported — that `find` hands a drive with no usable cache to | scalar |
 
@@ -115,6 +116,7 @@ character — and resolve to Unicode mode instead.
 | `unicode_set_overlap_preflight` | `[^,]+;`, `\p{Cyrillic}+!` | the overlapping preflight over a member whose never-dying state loops over whole characters (`utf8LoopState`) |
 | `unicode_set_suffix_char_run` | `&ключ=[^&]+&`, `,поле=[^,]*,`, `<тег>[^<]+<` | bucket suffix bodies crossing a run of whole characters with the character skip |
 | `unicode_set_anchored_char_run` | `&ключ=[^&,]+&`, `,поле=[^,;]*;`, `<тег>[^<>]+<` | the anchored probe's character skips at 128-byte stretch points aligned to a character boundary, and the scan probes' skips |
+| `unicode_set_anchored_bt` | `[аб]*а[аб]{14}` | an anchored pair whose only member's anchored DFA is past 16,384 states: no union, the bucket body runs its Backtracking probe alone |
 | `unicode_set_split_overlap` | `foo\w+`, `(?:a[^z]*?z)?` + set-level `unicode: true` | a split member's rounded search position and its program sweep |
 
 `TestByteIdenticalPathsAreDistinct` checks the Unicode fixtures reach all four

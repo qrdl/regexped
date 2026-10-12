@@ -2373,8 +2373,18 @@ type setMemberUnplaceable struct {
 }
 
 func memberFitsNoEngine(p *PatternInfo, noDFA string) error {
+	return fitsNoEngine(p, patternSuffixAST(p), noDFA)
+}
+
+// anchoredMemberFitsNoEngine is memberFitsNoEngine for the anchored pair,
+// whose Backtracking program is the WHOLE pattern's.
+func anchoredMemberFitsNoEngine(p *PatternInfo, noDFA string) error {
+	return fitsNoEngine(p, patternFullAST(p), noDFA+" for match_any / match_all")
+}
+
+func fitsNoEngine(p *PatternInfo, ast resolvedTree, noDFA string) error {
 	insts := 0
-	if ast := patternSuffixAST(p); ast.re != nil {
+	if ast.re != nil {
 		prog, _ := compileProg(ast)
 		insts = len(prog.prog.Inst)
 	}
@@ -2628,48 +2638,6 @@ func fullPatternAST(p *PatternInfo) resolvedTree {
 	return t
 }
 
-// warnPatternDropped reports, at warning level, that a pattern has been
-// left out of its set's ANCHORED pair — match_any / match_all — because its
-// anchored DFA exceeded max_dfa_states. It is the only drop left: a member no
-// engine takes for `find` or the scan pair is a compile error (admitFallback),
-// and the anchored pair keeps dropping only until it has a Backtracking path
-// of its own.
-//
-// This must not be nested inside the `if diag != nil` guards that surround the
-// drop bookkeeping: CompileSet creates a SetDiag unconditionally (set_emit.go)
-// so those guards always pass, but the resulting struct is discarded unless
-// the caller asked for --diag-json. Before this warning existed, a normal
-// build dropped the pattern with exit code 0 and no output at all.
-func warnPatternDropped(opts CompileSetOptions, p *PatternInfo, where string, states, limit int) {
-	warnPatternDroppedReason(opts, p, where, "suffix DFA exceeds state limit",
-		"raise max_dfa_states, simplify the pattern, or move it out of the set",
-		states, limit)
-}
-
-// warnPatternDroppedReason is warnPatternDropped with the REASON spelled out.
-//
-// The one-message form said "suffix DFA exceeds state limit" — with a
-// max_fallback_states hint — for the unparseable-anchored drop too, where
-// neither half is true and the hint sends the reader after the wrong knob.
-// states or limit below 0 is left out of the message: a drop that happened
-// before a DFA was finished has no state count, and one with no size limit
-// behind it has no limit — printing 0 names a number the pattern never reached.
-func warnPatternDroppedReason(opts CompileSetOptions, p *PatternInfo, where, reason, hint string, states, limit int) {
-	if opts.quiet {
-		return
-	}
-	ref := patternRefFor(p)
-	args := []any{"pattern", ref.Name, "id", ref.ID, "where", where}
-	if states >= 0 {
-		args = append(args, "states", states)
-	}
-	if limit >= 0 {
-		args = append(args, "limit", limit)
-	}
-	args = append(args, "hint", hint)
-	slog.Warn("Pattern dropped from set: "+reason, args...)
-}
-
 // warnPatternOnBacktracking reports a set member admitted on the Backtracking
 // engine instead of a DFA bucket. The member still matches — this is not a
 // drop — but the switch is not free and used to be silent: one such member
@@ -2677,11 +2645,28 @@ func warnPatternDroppedReason(opts CompileSetOptions, p *PatternInfo, where, rea
 // find, and it moves the set's match_all / scan_all to the out_ptr form. Every
 // route onto Backtracking warns, not only the word-boundary one.
 //
-// The message must NOT begin "Pattern dropped from set": tools/re2test counts
-// drops by that prefix, and a member that is kept must not be excluded from
-// its comparison. states or limit below 0 is left out, as in
-// warnPatternDroppedReason.
+// The message must NOT begin "Pattern dropped from set": tools/re2test fails
+// a chunk on that prefix, and a member that is kept is no failure. states or
+// limit below 0 is left out of the message: a build that stopped before a DFA
+// was finished has no state count, and printing 0 names a number the pattern
+// never reached.
 func warnPatternOnBacktracking(opts CompileSetOptions, p *PatternInfo, reason, hint string, states, limit int) {
+	warnOnBacktracking(opts, p, reason, hint,
+		"scan_any, scan_all and find cost more (up to ~2x measured); match_all and scan_all switch to the out_ptr form",
+		states, limit)
+}
+
+// warnAnchoredOnBacktracking is warnPatternOnBacktracking for the anchored
+// pair: the member's anchored automaton cannot be built, so match_any and
+// match_all answer for it through a Backtracking probe over the whole input.
+func warnAnchoredOnBacktracking(opts CompileSetOptions, p *PatternInfo, reason string, states, limit int) {
+	warnOnBacktracking(opts, p, "its anchored DFA "+reason,
+		"raise max_dfa_states to keep its anchored pair on a DFA",
+		"match_any and match_all run a Backtracking probe for it after the DFA part; match_all and scan_all switch to the out_ptr form",
+		states, limit)
+}
+
+func warnOnBacktracking(opts CompileSetOptions, p *PatternInfo, reason, hint, effect string, states, limit int) {
 	if opts.quiet {
 		return
 	}
@@ -2693,23 +2678,17 @@ func warnPatternOnBacktracking(opts CompileSetOptions, p *PatternInfo, reason, h
 	if limit >= 0 {
 		args = append(args, "limit", limit)
 	}
-	args = append(args,
-		"effect", "scan_any, scan_all and find cost more (up to ~2x measured); match_all and scan_all switch to the out_ptr form",
-		"hint", hint)
+	args = append(args, "effect", effect, "hint", hint)
 	slog.Warn("Set member runs on Backtracking: "+reason, args...)
 }
 
-// recordAnchoredStateLimitDrop records a drop that cost the pattern the
-// ANCHORED capabilities only.
-//
-// The scan pair and `find` still answer for the pattern: a member no engine
-// takes for those fails the compile instead. UnparseableDropped is the same
-// anchored-only kind.
-func recordAnchoredStateLimitDrop(diag *SetDiag, p *PatternInfo) {
+// recordAnchoredBacktracking records a member whose anchored pair runs on
+// Backtracking (compileAnchoredBuckets).
+func recordAnchoredBacktracking(diag *SetDiag, p *PatternInfo) {
 	if diag == nil {
 		return
 	}
-	diag.AnchoredStateLimitDropped = append(diag.AnchoredStateLimitDropped, patternRefFor(p))
+	diag.AnchoredBacktracking = append(diag.AnchoredBacktracking, patternRefFor(p))
 }
 
 // patternRefFor builds a PatternRef from a PatternInfo.
@@ -2797,26 +2776,27 @@ func mergeAnchoredDFASparseSet(asts []resolvedTree, opts CompileSetOptions) (*df
 // compileAnchoredBuckets packs every pattern of the set into buckets whose
 // merged, non-leftmost-first DFA fits the state and byte budgets. Patterns are
 // taken in declaration order so a bucket's bit k maps to a stable global id.
-func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) ([]*bucket, [][]*PatternInfo) {
+//
+// A pattern whose own anchored DFA cannot be built within the limits gets a
+// Backtracking bucket instead (btBuckets, one pattern each): a probe over the
+// WHOLE pattern that accepts only when the whole input is consumed. One that
+// Backtracking cannot take either fails the compile through opts.fail, naming
+// the limits to raise — no member is ever silently left out of the anchored
+// pair. Until 2026-10-12 such a member was dropped from match_any / match_all
+// with a warning, which a caller checking only the exit code shipped.
+func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, diag *SetDiag) (buckets []*bucket, members [][]*PatternInfo, btBuckets []*bucket) {
 	bw := opts.bitmaskWidth()
 	byteBudget := opts.budgetBytes()
 	stateBudget := opts.budgetStates()
 
-	var buckets []*bucket
-	var members [][]*PatternInfo
-
 	for _, p := range patterns {
 		ast := patternFullAST(p)
 		if ast.re == nil {
-			// Defensive — analyzePattern parsed this once already — but a bare
-			// `continue` would drop the pattern from the anchored trio while
-			// `find` kept it, with nothing in --diag-json to explain the
-			// disagreement.
-			warnPatternDroppedReason(opts, p, "anchored bucket", "the pattern could not be parsed for the anchored packing",
-				"simplify the pattern or move it out of the set", -1, -1)
-			if diag != nil {
-				diag.UnparseableDropped = append(diag.UnparseableDropped, patternRefFor(p))
-			}
+			// Defensive — the member was parsed once already — but a bare
+			// `continue` would drop the pattern from the anchored pair while
+			// `find` kept it.
+			opts.fail.add(fmt.Errorf("%w: %q could not be parsed for match_any / match_all",
+				ErrSetMemberFitsNoEngine, patternRefFor(p).Name))
 			continue
 		}
 		placed := false
@@ -2847,27 +2827,31 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 			continue
 		}
 		solo, err := mergeAnchoredDFA([]resolvedTree{ast}, opts)
-		// Two different things end the pattern's anchored life here: a build
+		// Two different things end the pattern's anchored DFA here: a build
 		// that stopped at the construction cap (solo is nil, so there is no
 		// count to print) and a finished DFA over max_dfa_states. Both are
 		// raised by max_dfa_states — the cap is the larger of the mode's and
-		// it (buildLimits.dfaBuildCap). Until the anchored pair has a
-		// Backtracking path, the member leaves match_any / match_all only.
+		// it (buildLimits.dfaBuildCap). Either way the anchored pair answers
+		// for the member through Backtracking, or the compile fails.
+		noDFA, states, limit := "", -1, -1
 		switch {
 		case errors.Is(err, ErrDFAStateLimit):
-			// No state count: construction stopped at the limit, so there is
-			// no finished DFA to count. -1 leaves the attribute out.
-			warnPatternDroppedReason(opts, p, "anchored bucket",
-				"the anchored DFA hit the state limit while being built",
-				"raise max_dfa_states, simplify the pattern, or move it out of the set",
-				-1, p.rp.lim.dfaBuildCap(p.rp.unicode()))
-			recordAnchoredStateLimitDrop(diag, p)
-			continue
+			noDFA = fmt.Sprintf("its anchored automaton needs more than %d states", p.rp.lim.dfaBuildCap(p.rp.unicode()))
+			limit = p.rp.lim.dfaBuildCap(p.rp.unicode())
 		// No other error: one non-nil AST is neither an empty list nor more
 		// than bitmaskWidth (at least 1), and compileSetASTs cannot fail.
 		case solo.numStates > opts.maxFallbackStates():
-			warnPatternDropped(opts, p, "anchored bucket", solo.numStates, opts.maxFallbackStates())
-			recordAnchoredStateLimitDrop(diag, p)
+			noDFA = fmt.Sprintf("its anchored automaton needs %d states", solo.numStates)
+			states, limit = solo.numStates, opts.maxFallbackStates()
+		}
+		if noDFA != "" {
+			if bt := newAnchoredBTBucket(p); bt != nil {
+				warnAnchoredOnBacktracking(opts, p, "is over the state limit", states, limit)
+				recordAnchoredBacktracking(diag, p)
+				btBuckets = append(btBuckets, bt)
+			} else {
+				opts.fail.add(anchoredMemberFitsNoEngine(p, noDFA))
+			}
 			continue
 		}
 		buckets = append(buckets, &bucket{
@@ -2891,7 +2875,7 @@ func compileAnchoredBuckets(patterns []*PatternInfo, opts CompileSetOptions, dia
 	for _, b := range buckets {
 		members = append(members, b.patterns)
 	}
-	return buckets, members
+	return buckets, members, btBuckets
 }
 
 // regexpHasWordBoundary reports whether re contains a \b or \B assertion

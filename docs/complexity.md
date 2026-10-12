@@ -202,6 +202,12 @@ split out as for `find`.
 call — their walks are bounded, so that suffices; a Backtracking member that
 is split keeps the full per-search budget and memo.
 
+**The anchored pair's Backtracking probes** — a member whose anchored DFA is
+over the limits answers `match_any` / `match_all` through one probe over the
+whole input — are one call each, with the same budget and memoised fallback:
+linear in the input (`(?:a|b)*a(?:a|b){12}c` over `ab`×N + `x`: 282 fuel per
+byte at 4, 8 and 16 KB).
+
 ### Overlapping sets
 
 `overlapping: true` reports every member's match at every start, so a member

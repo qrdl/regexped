@@ -113,9 +113,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
     let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
-    // The wide form returns a COUNT, so -2 can only be the sentinel: the
-    // bitmap is then unknown, not empty. The anchored path never calls a
-    // Backtracking probe today, so this cannot fire yet.
+    // The wide form returns a COUNT, so -2 can only be the sentinel: a
+    // member's Backtracking probe gave up, and the bitmap is unknown, not empty.
     if n == %d { return Err(Error::BacktrackOverflow); }
     Ok((0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0))
 }

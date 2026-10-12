@@ -839,14 +839,14 @@ in a Unicode-mode set (7,832 states, 21,752 Backtracking instructions) was
 dropped that way while the same pattern compiled on its own, and listed in
 `--diag-json`'s `state_limit_dropped`, which is gone with the drops.
 
-**The anchored pair is the one exception, for now.** `match_any` and
-`match_all` are packed separately, and that packing has no Backtracking path
-yet: a member whose anchored DFA is over `max_dfa_states` — and so every member
-on Backtracking — is left out of `match_any` and `match_all` only, with a
-warning, while `find` and the scan pair still answer for it. `--diag-json`
-shows it in `anchored_state_limit_dropped` (and a Backtracking member in a
-`bt-fallback` bucket too). If your set needs the anchored pair to answer for
-every member, raise `max_dfa_states` until nothing is on Backtracking.
+**The anchored pair follows the same rule.** `match_any` and `match_all` are
+packed separately (see "The anchored capabilities use their own automata"),
+and a member whose anchored DFA is over `max_dfa_states` answers there through
+a Backtracking probe over the whole input, run after the DFA part — with a
+warning, and listed in `--diag-json`'s `anchored_backtracking`. One that
+Backtracking cannot take either fails the compile, naming the limits. Until
+2026-10-12 such a member was left out of `match_any` and `match_all` with a
+warning, and the build succeeded.
 
 ## Diagnostics
 
@@ -860,14 +860,14 @@ regexped compile --config=regexped.yaml --diag-json=diag.json
 The JSON contains `patterns_total`, `in_set` (patterns actually placed into a
 set), `prefix_dedup_pool_size`, and per-set `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
-`conflicts` and `anchored_state_limit_dropped` arrays.
+`conflicts` and `anchored_backtracking` arrays.
 
-`anchored_state_limit_dropped` means only the ANCHORED packing refused the
-pattern, so `match_any` and `match_all` no longer see it while `scan_any`,
-`scan_all` and `find` still do. `unparseable_dropped` has the same scope.
-Nothing leaves a set ENTIRELY any more — a member no engine takes fails the
-compile — so the `state_limit_dropped` array that listed such members is
-gone.
+`anchored_backtracking` lists the members whose anchored DFA could not be
+built, so `match_any` and `match_all` answer for them through Backtracking.
+Nothing leaves a set or a capability any more — a member no engine takes
+fails the compile — so the arrays that listed dropped members
+(`state_limit_dropped`, `anchored_state_limit_dropped`, `unparseable_dropped`)
+are gone.
 
 An entry with `groups_func` is a set member like any other: a set reports the
 whole match only, so its capture groups are stripped for the set, and its own
@@ -1092,9 +1092,21 @@ too, as the same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a`
 needs 2^13 states. A member's automaton is built up to the larger of
 `max_dfa_states` and a construction cap (2,048 states in byte mode, 16,384 in
 Unicode mode), so raising `max_dfa_states` lets it finish. Like the other
-route, the member is absent from `match_any` and `match_all`
-(`anchored_state_limit_dropped`, with its own warning) and switches `match_all`
-and `scan_all` to the `out_ptr` form.
+route, it switches `match_all` and `scan_all` to the `out_ptr` form.
+
+A member's ANCHORED automaton can be over the limit too — it is the whole
+pattern, without leftmost-first pruning, so it is often larger than the find
+path's — and then `match_any` and `match_all` answer for it through a
+Backtracking probe over the whole input: whole-input acceptance, so a
+derivation that stops short of the end backtracks into the next (`(?:x|xy)…`
+over `xy…` answers through its second branch). The probe runs after the
+anchored DFA part, so `match_any` returns a DFA member's hit without it; it
+costs what the same pattern costs as a Backtracking `match` on its own
+(`(?:a|b)*a(?:a|b){12}c` over `ab`×N + `x`: 279 fuel per byte alone, 282 in a
+set), linear in the input. Such a member, too, switches `match_all` and
+`scan_all` to the `out_ptr` form, whether or not `find` needs Backtracking.
+`--diag-json` lists it in `anchored_backtracking`, and the compile warns "Set
+member runs on Backtracking: its anchored DFA is over the state limit".
 
 A member Backtracking cannot take either — its program over
 `max_bt_instructions`, or Backtracking turned off with `max_bt_instructions: 0`
@@ -1127,7 +1139,7 @@ would turn giving up into a confident wrong answer, so it gets its own channel:
 
 | capability | how "unknown" arrives |
 |---|---|
-| `scan_any` | the return is `-2`, distinct from `-1` for "no match" |
+| `scan_any`, `match_any` | the return is `-2`, distinct from `-1` for "no match" |
 | `match_all`, `scan_all` | these use the `out_ptr` form for this set at any id space, so the return is a count — and `-2` there is the sentinel |
 | `find` | the return is `-2` instead of a match count |
 | `find`'s batch entry | the cursor's resume-position word is `0xFFFFFFFE`, beside `0xFFFFFFFF` for "done", with a zero count |

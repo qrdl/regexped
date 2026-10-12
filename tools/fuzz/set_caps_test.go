@@ -529,20 +529,19 @@ func checkCapsAgainstOracleDropped(t *testing.T, r *capRunner, pats []string, in
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's
-// compile. Every non-anchored capability answers as Go does, gated `find`
-// included; match_any and match_all drop such a member, with a warning, as
-// they drop any member over the anchored state limit.
+// compile. Every capability answers as Go does, gated `find` included;
+// match_any and match_all answer for such a member through a Backtracking
+// probe, as for any member over the anchored state limit.
 func TestSetMemberWithoutAnOwnDFA(t *testing.T) {
 	pats := []string{`(?:a|b)*a(?:a|b){12}c|a`, `zz`, `x[ab]*a[ab]{11}c`}
 	inputs := []string{"", "b", "zz", "a", strings.Repeat("a", 13) + "c",
 		"bbbb" + strings.Repeat("a", 13) + "c zz", "x" + strings.Repeat("a", 12) + "c",
 		"xb" + strings.Repeat("ab", 6) + "c bab"}
-	anchoredDropped := map[int]bool{0: true, 2: true}
 	for _, in := range inputs {
 		t.Run("caps/"+in, func(t *testing.T) {
 			r := newCapRunner(t, pats, in, true)
 			defer r.Close()
-			checkCapsAgainstOracleDropped(t, r, pats, in, anchoredDropped)
+			checkCapsAgainstOracle(t, r, pats, in)
 		})
 		t.Run("gated/"+in, func(t *testing.T) { checkGated(t, pats, in) })
 	}
@@ -1215,6 +1214,177 @@ func TestByteModeHighByteLiteralSets(t *testing.T) {
 					defer r2.Close()
 					checkCapsAgainstOracle(t, r2, twinPats, twin(in))
 				})
+			}
+		})
+	}
+}
+
+// anchoredBTSets are sets with a member whose anchored automaton cannot be
+// built inside the default limits, so match_any / match_all answer for it
+// through a Backtracking probe over the whole input: in byte mode
+// `(?:a|b)*a(?:a|b){12}c` (2^13 states, past max_dfa_states and the 2,048
+// construction cap) and the same behind `(?:x|xy)`, which needs the probe to
+// backtrack out of the higher-priority branch that stops short of the end;
+// in Unicode mode `[аб]*а[аб]{14}` (2^15 states, past 16,384). Each sits
+// beside DFA members, so the DFA part runs first and the probe after it.
+//
+// maxUnion 2 refuses the anchored union automaton, so the set answers through
+// its anchored DFA buckets and then the probes — the other anchored body; a
+// set with no DFA member at all has no union to build and takes it too.
+var anchoredBTSets = []struct {
+	name     string
+	unicode  bool
+	maxUnion int
+	pats     []string
+	inputs   []string
+}{
+	{"byte", false, 0,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`, `[a-c]+`, `abc`},
+		[]string{"", "abc", "aaaa", "bbba" + strings.Repeat("ab", 6) + "c", "a" + strings.Repeat("b", 12) + "c",
+			"a" + strings.Repeat("b", 11) + "c", "xa" + strings.Repeat("b", 12) + "c", "xya" + strings.Repeat("b", 12) + "c",
+			"xyz", "xy" + strings.Repeat("ab", 7) + "c", strings.Repeat("ab", 20) + "c", strings.Repeat("ab", 20) + "x"}},
+	{"unicode", true, 0,
+		[]string{`[аб]*а[аб]{14}`, `привет`, `[а-я]+!`, `\p{Greek}+`},
+		[]string{"", "привет", "абв!", "αβγ", "ббба" + strings.Repeat("б", 14), "а" + strings.Repeat("б", 13),
+			strings.Repeat("а", 15), strings.Repeat("аб", 12) + "!", "\xff", "а\xd0" + strings.Repeat("б", 14)}},
+	{"byte-buckets", false, 2,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `[a-c]+`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`, `abc`},
+		[]string{"", "abc", "aaaa", "bbba" + strings.Repeat("ab", 6) + "c", "a" + strings.Repeat("b", 11) + "c",
+			"xya" + strings.Repeat("b", 12) + "c", strings.Repeat("ab", 20) + "x"}},
+	{"unicode-buckets", true, 2,
+		[]string{`привет`, `[аб]*а[аб]{14}`, `[а-я]+!`},
+		[]string{"", "привет", "абв!", "ббба" + strings.Repeat("б", 14), strings.Repeat("а", 15), "а" + strings.Repeat("б", 13)}},
+	{"byte-only-bt", false, 0,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`},
+		[]string{"", "abc", "bbba" + strings.Repeat("ab", 6) + "c", "xya" + strings.Repeat("b", 12) + "c", "xy" + strings.Repeat("ab", 7) + "c"}},
+}
+
+func compileAnchoredBTSet(t *testing.T, pats []string, unicode, overlapping bool, maxMemory config.MemorySize, maxUnion int) ([]byte, compile.SetDiag) {
+	t.Helper()
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	mode := unicode
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Regexps: entries, Sets: []config.SetConfig{{
+		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+		Patterns: config.PatternSelector{Names: names}, Unicode: &mode,
+	}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, diags[0]
+}
+
+// TestAnchoredPairBacktrackingMembers: such a member is in match_any /
+// match_all — --diag-json lists it as running there on Backtracking — the
+// `_all` pair is in its out_ptr form, and every capability answers against Go
+// (the overlapping set from every start, the gated drive against
+// FindAllIndex). Until 2026-10-12 the member was dropped from the anchored
+// pair with a warning.
+func TestAnchoredPairBacktrackingMembers(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	for _, c := range anchoredBTSets {
+		t.Run(c.name, func(t *testing.T) {
+			*unicodeMode = c.unicode
+			ovl, d := compileAnchoredBTSet(t, c.pats, c.unicode, true, config.MemorySize{}, c.maxUnion)
+			if len(d.AnchoredBacktracking) == 0 {
+				t.Fatalf("--diag-json anchored_backtracking is empty: no member's anchored pair is on Backtracking")
+			}
+			if union := d.AnchoredUnion != nil && d.AnchoredUnion.Used; union != (c.maxUnion == 0 && len(c.pats) > len(d.AnchoredBacktracking)) {
+				t.Fatalf("anchored union used %v: not the body this case is for", union)
+			}
+			gated, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, config.MemorySize{}, c.maxUnion)
+			for _, in := range c.inputs {
+				if unicodeModeOutOfScope(c.pats[0], in) != "" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%.24q", in), func(t *testing.T) {
+					r := newCapRunnerFrom(t, ovl, c.pats, in)
+					defer r.Close()
+					if f := r.inst.GetFunc(r.store, "cap_match_all"); len(f.Type(r.store).Params()) != 3 {
+						t.Fatalf("match_all takes %d params: not the out_ptr form a Backtracking member needs", len(f.Type(r.store).Params()))
+					}
+					checkCapsAgainstOracle(t, r, c.pats, in)
+					g := newCapRunnerFrom(t, gated, c.pats, in)
+					defer g.Close()
+					got, want := driveGatedCaps(t, g, in), gatedOracle(c.pats, in)
+					sortMatches(got)
+					sortMatches(want)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("gated find:\n  got  %v\n  want %v", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestAnchoredPairBacktrackingGivesUp: a probe that cannot finish — the
+// module capped by max_memory, so its frame stack and memo cannot grow over a
+// long input — makes match_any and match_all answer -2, "unknown", never -1
+// or a count; and a short input still answers.
+func TestAnchoredPairBacktrackingGivesUp(t *testing.T) {
+	for _, c := range anchoredBTSets {
+		t.Run(c.name, func(t *testing.T) {
+			long := strings.Repeat("ab", 1<<17) + "x"
+			if c.unicode {
+				long = strings.Repeat("аб", 1<<16) + "x"
+			}
+			plain, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, config.MemorySize{}, c.maxUnion)
+			store, _, mem, release, err := instantiate(plain)
+			if err != nil {
+				release()
+				t.Fatal(err)
+			}
+			pages := mem.Size(store)
+			release()
+			// Room for the input and three pages of working memory: enough for
+			// a short search's frame stack, far short of the long one's memo.
+			inPages := uint64(len(long)+8+65535) / 65536
+			memCap, err := config.ParseMemorySize(fmt.Sprintf("%dKiB", (pages+inPages+3)*64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, memCap, c.maxUnion)
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := int32(mem.Size(store) * 65536)
+			if _, err := mem.Grow(store, inPages); err != nil {
+				t.Fatalf("grow for the input: %v", err)
+			}
+			// What a stub does: the search's working memory starts above what
+			// the host wrote, so a call reuses it instead of taking fresh pages.
+			if err := setScratchBase(store, inst, base+int32(inPages*65536)); err != nil {
+				t.Fatal(err)
+			}
+			call := func(fn, in string) int32 {
+				copy(mem.UnsafeData(store)[base:], in)
+				args := []interface{}{base, int32(len(in))}
+				if fn == "cap_match_all" {
+					args = append(args, base+int32(len(in))) // bitmap after the input
+					clear(mem.UnsafeData(store)[base+int32(len(in)) : base+int32(len(in))+8])
+				}
+				res, err := inst.GetFunc(store, fn).Call(store, args...)
+				if err != nil {
+					t.Fatalf("%s: %v", fn, err)
+				}
+				return res.(int32)
+			}
+			for _, fn := range []string{"cap_match_any", "cap_match_all"} {
+				if got := call(fn, long); got != -2 {
+					t.Errorf("%s over %d bytes under max_memory = %d, want -2 (unknown)", fn, len(long), got)
+				}
+			}
+			// A short input still answers definitely after a give-up.
+			if got := call("cap_match_any", c.inputs[3]); got < 0 {
+				t.Errorf("match_any(%q) = %d after a give-up", c.inputs[3], got)
 			}
 		})
 	}
@@ -4330,6 +4500,8 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 						}
 						// Split out onto the Backtracking find: Backtracking too.
 						nBT += len(d.SplitBacktracking)
+						// And an anchored pair's Backtracking probes.
+						nBT += len(d.AnchoredBacktracking)
 					}
 					// The stub side must agree with what was emitted, since a
 					// disagreement there is a wrong signature rather than a

@@ -461,19 +461,10 @@ type oracleEntry struct {
 // selected pattern could not be compiled by Go — the bucketing is then a
 // best effort and the sanity check is skipped rather than trusted.
 func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDiag, kind capKind) ([]oracleEntry, bool) {
+	// Every capability answers for every member: a member no engine takes
+	// fails the compile, and one whose anchored DFA cannot be built answers
+	// match_any / match_all through Backtracking.
 	dropped := map[int]bool{}
-	// These two exclude a pattern from the ANCHORED capabilities only; `find`
-	// and the scan pair keep every member (one no engine takes fails the
-	// compile).
-	if kind.anchored() {
-		for _, refs := range [][]compile.PatternRef{
-			diag.UnparseableDropped, diag.AnchoredStateLimitDropped,
-		} {
-			for _, r := range refs {
-				dropped[r.ID] = true
-			}
-		}
-	}
 
 	selected := map[string]bool{}
 	for _, n := range sc.Patterns.Names {
