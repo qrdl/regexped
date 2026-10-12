@@ -109,6 +109,7 @@ character — and resolve to Unicode mode instead.
 | `unicode_start_scan` | `a?\B` + `unicode: true` | a find that checks every candidate start (`\B` holds inside a character) |
 | `unicode_set_walk` | `[a-zé]+`, `x*`, `\B` | a set's per-position walk skipping candidates inside a character, in `find` and the scan pair, with lead-byte first-byte tables |
 | `unicode_set_literals` | `привет`, `москва`, `собака`, `город\d+` | multi-byte literals in a literal frontend |
+| `unicode_set_ac_probe` | 22 keywords on `п`, `р`, `м` (`пример`, `при`, `рим`, …) | Aho-Corasick over literals that all begin with a lead byte: the two-column root probe and the per-candidate verify, with literals that may jump to their node and literals that may not |
 | `unicode_set_union_scan` | `\pL+\pN`, `\p{Greek}{2,}\pN` | the scan pair's union automaton over lowered members |
 | `unicode_set_overlap_sweep` | `[a-zé]+`, `a*` | the answer cache's sweep writing an empty row inside a character |
 | `unicode_set_overlap_preflight` | `[^,]+;`, `\p{Cyrillic}+!` | the overlapping preflight over a member whose never-dying state loops over whole characters (`utf8LoopState`) |

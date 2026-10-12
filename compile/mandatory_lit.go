@@ -77,8 +77,14 @@ func findMandatoryLit(pattern resolvedPattern) *mandatoryLit {
 // bytes the lowered program consumes for it, beginning at a character's first
 // byte, so an offset counted in them is a byte offset. A surrogate is refused:
 // lowering cuts it out (it matches nothing), and its encoding would be
-// U+FFFD's, which a literal scan would then find. Byte mode refuses every rune
-// above 0x7F.
+// U+FFFD's, which a literal scan would then find. In byte mode a rune
+// 0x80-0xFF IS that byte: only `byte_mode: true` admits one (the mode gate
+// refuses it otherwise, and the ASCII fold artifacts it tolerates lie above
+// 0xFF), and the program consumes it as that byte. Refusing it — as every
+// literal extractor did until 2026-10-12 — cost a `byte_mode` keyword set its
+// literal frontend (20 Latin-1 keywords 217.5 → 10.3 fuel/byte with keywords
+// present) and a single pattern its literal-anchored find (`\w+caf\xe9\d`
+// 29.0 → 2.0). A rune above 0xFF is refused.
 func literalBytes(rs []rune, unicode bool) ([]byte, bool) {
 	bs := make([]byte, 0, len(rs))
 	for _, r := range rs {
@@ -87,6 +93,8 @@ func literalBytes(rs []rune, unicode bool) ([]byte, bool) {
 			bs = append(bs, byte(r))
 		case unicode && utf8.ValidRune(r):
 			bs = utf8.AppendRune(bs, r)
+		case !unicode && r <= 0xFF:
+			bs = append(bs, byte(r))
 		default:
 			return nil, false
 		}

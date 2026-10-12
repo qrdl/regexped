@@ -860,7 +860,8 @@ func TestFindAbsenceLit(t *testing.T) {
 		{"quest: the body may be skipped", `(?:abc)?`, ""},
 		{"repeat with min 0", `(?:abc){0,3}`, ""},
 		{"case-folded literal needs a case-insensitive search", `(?i)abcd`, ""},
-		{"non-ASCII literal: byte mode has no bytes for it", `caf\x{e9}xx`, ""},
+		{"a rune 0x80-0xFF is that byte in byte mode", `caf\x{e9}xx`, "caf\xe9xx"},
+		{"a rune above 0xFF: byte mode has no byte for it", `caf\x{3b1}xx`, ""},
 		{"a class is not a literal", `[a-z]+`, ""},
 		{"empty", `(?:)`, ""},
 

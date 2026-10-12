@@ -224,6 +224,15 @@ type ACTableDiag struct {
 	// ByteClasses and Stride are meaningful only when Compressed.
 	ByteClasses int `json:"byte_classes,omitempty"`
 	Stride      int `json:"stride,omitempty"`
+	// ProbeColumns are the two byte offsets the root-state prefilter tests
+	// in place of the first byte — a Unicode-mode set whose literals all
+	// begin with a non-ASCII character (chooseACProbe); omitted when the
+	// prefilter tests the first byte. A body with a fallback bucket has no
+	// prefilter at all and walks every position, whatever this says.
+	ProbeColumns []int `json:"probe_columns,omitempty"`
+	// VerifyColumn is the column a probe hit dispatches on before the trie
+	// walk (planACVerify); omitted without the verify.
+	VerifyColumn *int `json:"verify_column,omitempty"`
 }
 
 // FrontendDemotionDiag explains why a literal frontend was downgraded.

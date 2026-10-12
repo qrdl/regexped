@@ -375,7 +375,10 @@ above U+007F asks for Unicode mode (see `unicode:` below), where `é` means the
 character, two bytes of UTF-8.
 
 Setting `byte_mode: true` on a `regexps:` entry declares the pattern
-byte-oriented instead: runes `0x80`-`0xFF` mean **exactly that byte**.
+byte-oriented instead: runes `0x80`-`0xFF` mean **exactly that byte**. A
+literal carrying such bytes is a literal like any other: a set's literal
+frontends, the literal-anchored find and the prefilters search for it —
+UTF-8 keywords written as bytes (`\xd0\xbf\xd1\x80…`) included.
 
 ```yaml
 regexps:

@@ -3056,3 +3056,241 @@ func TestSparseCounterModulesBuild(t *testing.T) {
 		})
 	}
 }
+
+// acProbeKeywords is twenty Russian keywords that all begin with `п`
+// (D0 BF), with varied second letters: under the first-characters rule
+// (fewer than 4 distinct) they keep the Aho-Corasick frontend.
+var acProbeKeywords = []string{
+	"пример", "привет", "правда", "письмо", "птица", "пожар", "пустота", "печать", "поле", "пирог",
+	"палец", "песок", "плита", "почта", "пенал", "пчела", "пакет", "повар", "пруд", "парус",
+}
+
+func asBytes(ss ...string) [][]byte {
+	out := make([][]byte, len(ss))
+	for i, s := range ss {
+		out[i] = []byte(s)
+	}
+	return out
+}
+
+// TestChooseACProbe pins which two columns the Aho-Corasick root probe tests:
+// only for literals that all begin with a UTF-8 lead byte, the pair with the
+// fewest distinct bytes, ties toward the earlier columns, never two lead-only
+// columns.
+func TestChooseACProbe(t *testing.T) {
+	type want struct {
+		off1, off2     int
+		bytes1, bytes2 []byte
+	}
+	prefixed := func(prefix string, n int) []string {
+		var out []string
+		for i := 0; i < n; i++ {
+			out = append(out, prefix+acProbeKeywords[i][len("п"):])
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name string
+		lits [][]byte
+		want *want
+	}{
+		{"п… keywords", asBytes(acProbeKeywords...), &want{0, 1, []byte{0xD0}, []byte{0xBF}}},
+		{"an ASCII literal beside them", asBytes(append(append([]string{}, acProbeKeywords...), "abc")...), nil},
+		{"a one-byte literal", append(asBytes(acProbeKeywords...), []byte{0xD0}), nil},
+		{"Han 日… keywords", asBytes("日本", "日記", "日曜日", "日光", "日中"), &want{0, 1, []byte{0xE6}, []byte{0x97}}},
+		// Columns {D0}, {BF}, {D1}, {80}: every allowed pair counts two
+		// bytes, and the earliest wins.
+		{"пр… keywords", asBytes(prefixed("пр", 20)...), &want{0, 1, []byte{0xD0}, []byte{0xBF}}},
+		// ѿ is D1 BF: columns {D0, D1}, {BF}, {D1}, {80} — (1, 2) is the
+		// earliest pair at two bytes with a column that is not lead-only.
+		{"пр… beside ѿр…", asBytes(append(prefixed("пр", 10), prefixed("ѿр", 10)...)...), &want{1, 2, []byte{0xBF}, []byte{0xD1}}},
+		// р is D1 80, so column 1 holds two bytes too; with varied second
+		// letters column 3 holds many, and (0, 1) stays the cheapest.
+		{"п… beside р…", asBytes(append(append([]string{}, acProbeKeywords[:10]...), "рука", "река", "роза", "рыба", "рама", "рост", "ручей", "рожь", "рябь", "рис")...), &want{0, 1, []byte{0xD0, 0xD1}, []byte{0x80, 0xBF}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := chooseACProbe(c.lits)
+			if c.want == nil {
+				if got != nil {
+					t.Fatalf("probe %+v, want none", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("no probe")
+			}
+			if got.Off1 != c.want.off1 || got.Off2 != c.want.off2 ||
+				!bytes.Equal(got.Bytes1, c.want.bytes1) || !bytes.Equal(got.Bytes2, c.want.bytes2) {
+				t.Fatalf("probe (%d, %d) % x / % x, want (%d, %d) % x / % x", got.Off1, got.Off2, got.Bytes1, got.Bytes2,
+					c.want.off1, c.want.off2, c.want.bytes1, c.want.bytes2)
+			}
+		})
+	}
+}
+
+// TestPlanACVerify pins the per-candidate verify's plan: its dispatch column,
+// which literals may jump straight to their node, and that node.
+func TestPlanACVerify(t *testing.T) {
+	plan := func(t *testing.T, ss ...string) (*acVerifyPlan, *acLayout, [][]byte) {
+		t.Helper()
+		lits := asBytes(ss...)
+		ac := buildAC(lits)
+		l := buildACLayoutMode(ac, 0, false)
+		return planACVerify(ac, l, lits), l, lits
+	}
+	// The dispatch column: the most distinct bytes inside the shortest
+	// literal, ties toward the earlier column.
+	pl, _, lits := plan(t, acProbeKeywords...)
+	minLen := 1 << 30
+	for _, l := range lits {
+		minLen = min(minLen, len(l))
+	}
+	best, bestN := -1, 0
+	for o := 0; o < minLen; o++ {
+		seen := map[byte]bool{}
+		for _, l := range lits {
+			seen[l[o]] = true
+		}
+		if len(seen) > bestN {
+			best, bestN = o, len(seen)
+		}
+	}
+	if pl.Col != best {
+		t.Fatalf("dispatch column %d, want %d", pl.Col, best)
+	}
+	if len(pl.Vals) != bestN || len(pl.Cases) != bestN {
+		t.Fatalf("%d cases over %d values, want %d", len(pl.Cases), len(pl.Vals), bestN)
+	}
+
+	for _, c := range []struct {
+		lits     []string
+		eligible []bool
+	}{
+		// рим occurs inside пример and ends before its end: the walk reports
+		// рим first, so пример may not jump.
+		{[]string{"пример", "рим"}, []bool{false, true}},
+		// мер ends where пример ends: jumping to пример's node reports both.
+		{[]string{"пример", "мер"}, []bool{true, true}},
+		// A prefix pair: при ends inside пример.
+		{[]string{"при", "пример"}, []bool{true, false}},
+	} {
+		pl, l, lits := plan(t, c.lits...)
+		for i := range lits {
+			if pl.Eligible[i] != c.eligible[i] {
+				t.Errorf("%q: %q eligible = %v, want %v", c.lits, lits[i], pl.Eligible[i], c.eligible[i])
+			}
+			// The node a jump sets: walking the EMITTED goto table from the
+			// root over the literal must arrive there.
+			state := 0
+			for _, b := range lits[i] {
+				state = int(binary.LittleEndian.Uint16(l.gotoBytes[(state*l.stride+int(b))*2:]))
+			}
+			if pl.Node[i] != state {
+				t.Errorf("%q: %q node %d, the emitted table reaches %d", c.lits, lits[i], pl.Node[i], state)
+			}
+			if !bytes.Equal(pl.Lits[i], lits[i]) {
+				t.Errorf("%q: literal %d is %q in the plan", c.lits, i, pl.Lits[i])
+			}
+		}
+	}
+}
+
+// TestACProbeByMode: a set of keywords that all begin with a byte 0xC2-0xF4
+// gets the two-column probe and the verify, and --diag-json says so — in
+// Unicode mode from non-ASCII first characters, in byte mode from `byte_mode`
+// literals written as UTF-8 bytes (`\xd0\xbf…`, extracted since such bytes
+// count as literal bytes there). An ASCII keyword set keeps the first-byte
+// probe in byte mode — the body byteident pins.
+func TestACProbeByMode(t *testing.T) {
+	inspect := func(t *testing.T, patterns []string, byteMode bool) *compiledSet {
+		t.Helper()
+		entries := make([]config.RegexEntry, len(patterns))
+		for i, p := range patterns {
+			entries[i] = config.RegexEntry{Name: fmt.Sprintf("k%02d", i), Pattern: p, ByteMode: byteMode}
+		}
+		mode := !byteMode
+		sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{All: true}, Unicode: &mode}
+		cs, err := compileSetForInspection(sc, config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cs
+	}
+	escaped := make([]string, len(acProbeKeywords))
+	ascii := make([]string, len(acProbeKeywords))
+	for i, kw := range acProbeKeywords {
+		var sb strings.Builder
+		for _, b := range []byte(kw) {
+			fmt.Fprintf(&sb, `\x%02x`, b)
+		}
+		escaped[i] = sb.String()
+		ascii[i] = fmt.Sprintf("kw%02dzz", i)
+	}
+	for _, c := range []struct {
+		name     string
+		patterns []string
+		byteMode bool
+		probe    bool
+	}{
+		{"unicode", acProbeKeywords, false, true},
+		{"byte mode, UTF-8 bytes", escaped, true, true},
+		{"byte mode, ASCII", ascii, true, false},
+	} {
+		cs := inspect(t, c.patterns, c.byteMode)
+		if emittedFrontend(cs) != frontendAC {
+			t.Fatalf("%s: frontend %v, want AC", c.name, emittedFrontend(cs))
+		}
+		if got := cs.acProbe != nil && cs.acVerify != nil; got != c.probe {
+			t.Fatalf("%s: probe %+v, verify %v; want both %v", c.name, cs.acProbe, cs.acVerify != nil, c.probe)
+		}
+		d := cs.diag.ACTable
+		if !c.probe {
+			if d.ProbeColumns != nil || d.VerifyColumn != nil {
+				t.Fatalf("%s: diag %+v reports a probe", c.name, d)
+			}
+			continue
+		}
+		if fmt.Sprint(d.ProbeColumns) != "[0 1]" || d.VerifyColumn == nil || *d.VerifyColumn != cs.acVerify.Col {
+			t.Fatalf("%s: diag probe columns %v, verify column %v; want [0 1] and %d", c.name, d.ProbeColumns, d.VerifyColumn, cs.acVerify.Col)
+		}
+	}
+}
+
+// acWideColumnKeywords begin with five different letters under one lead byte
+// (а..д, D0 B0..D0 B4) and vary in their second letter: the chooser keeps
+// columns (0, 1), and column 1 holds five bytes — past the three a compare
+// chain serves, so the probe tests it with nibble tables. Five first
+// characters select Teddy on their own; the frontend is forced to AC.
+var acWideColumnKeywords = []string{
+	"арбуз", "банан", "вишня", "груша", "дыня", "азбука", "буря", "весна", "гроза", "дождь",
+	"аист", "белка", "волк", "гусь", "дятел", "акула", "бобр", "ворон", "голубь", "дельфин",
+}
+
+// TestACProbeWideColumn: a probe column of more than three bytes takes the
+// nibble-table membership test, and the module validates.
+func TestACProbeWideColumn(t *testing.T) {
+	p := chooseACProbe(asBytes(acWideColumnKeywords...))
+	if p == nil || p.Off1 != 0 || p.Off2 != 1 || len(p.Bytes2) != 5 {
+		t.Fatalf("probe %+v, want columns (0, 1) with five bytes in column 1", p)
+	}
+	entries := make([]config.RegexEntry, len(acWideColumnKeywords))
+	for i, kw := range acWideColumnKeywords {
+		entries[i] = config.RegexEntry{Name: fmt.Sprintf("k%02d", i), Pattern: kw}
+	}
+	on := true
+	sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", ScanAny: "y", Patterns: config.PatternSelector{All: true}, Unicode: &on}
+	cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	opts := CompileSetOptions{}.WithForcedFrontend(frontendAC)
+	cs, err := compileSetForInspection(sc, cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emittedFrontend(cs) != frontendAC || cs.acProbe == nil || len(cs.acProbe.Bytes2) != 5 || cs.acVerify == nil {
+		t.Fatalf("frontend %v, probe %+v, verify %v", emittedFrontend(cs), cs.acProbe, cs.acVerify != nil)
+	}
+	w, _, _, err := CompileFileOpts(cfg, "", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+}

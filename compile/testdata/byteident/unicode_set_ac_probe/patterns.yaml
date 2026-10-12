@@ -1,0 +1,31 @@
+# A Unicode-mode set of 22 keywords on three first characters, every one
+# beginning with a UTF-8 lead byte: Aho-Corasick with the two-column root
+# probe and the per-candidate verify (eligible and ineligible literals).
+regexps:
+  - { name: k00, pattern: 'пример' }
+  - { name: k01, pattern: 'при' }
+  - { name: k02, pattern: 'рим' }
+  - { name: k03, pattern: 'мер' }
+  - { name: k04, pattern: 'пром' }
+  - { name: k05, pattern: 'промокашка' }
+  - { name: k06, pattern: 'мок' }
+  - { name: k07, pattern: 'пирог' }
+  - { name: k08, pattern: 'рог' }
+  - { name: k09, pattern: 'почтальон' }
+  - { name: k10, pattern: 'почтамт' }
+  - { name: k11, pattern: 'пирамида' }
+  - { name: k12, pattern: 'рам' }
+  - { name: k13, pattern: 'правда' }
+  - { name: k14, pattern: 'письмо' }
+  - { name: k15, pattern: 'птица' }
+  - { name: k16, pattern: 'пустота' }
+  - { name: k17, pattern: 'печать' }
+  - { name: k18, pattern: 'поле' }
+  - { name: k19, pattern: 'палец' }
+  - { name: k20, pattern: 'песок' }
+  - { name: k21, pattern: 'плита' }
+sets:
+  - name: ac
+    find: ac_find
+    scan_all: ac_scan_all
+    patterns: all

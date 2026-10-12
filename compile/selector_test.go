@@ -748,6 +748,33 @@ func TestMinMaxLenDegenerate(t *testing.T) {
 	}
 }
 
+// TestLiteralBytes pins the bytes a literal's runes stand for: ASCII in
+// either mode; in byte mode a rune 0x80-0xFF is that byte and anything above
+// has none; in Unicode mode a rune is its UTF-8 encoding, a surrogate none.
+func TestLiteralBytes(t *testing.T) {
+	for _, c := range []struct {
+		runes   []rune
+		unicode bool
+		want    string
+		ok      bool
+	}{
+		{[]rune("ab"), false, "ab", true},
+		{[]rune{'c', 0xE9}, false, "c\xe9", true},
+		{[]rune{0xD0, 0xBF}, false, "\xd0\xbf", true},
+		{[]rune{0xFF}, false, "\xff", true},
+		{[]rune{0x100}, false, "", false},
+		{[]rune{'a', 0x3B1}, false, "", false},
+		{[]rune{0xE9}, true, "\xc3\xa9", true},
+		{[]rune("п"), true, "\xd0\xbf", true},
+		{[]rune{0xD800}, true, "", false},
+	} {
+		got, ok := literalBytes(c.runes, c.unicode)
+		if ok != c.ok || string(got) != c.want {
+			t.Errorf("literalBytes(%U, unicode %v) = %q, %v; want %q, %v", c.runes, c.unicode, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 func TestFindMandatoryLit(t *testing.T) {
 	cases := []struct {
 		pattern string
@@ -775,8 +802,11 @@ func TestFindMandatoryLit(t *testing.T) {
 		{"", true, "", 0},
 		// URL-like: mandatory literal ://, minOff=2 (minimum 2 chars before it).
 		{`[a-zA-Z]{2,8}://[^\s]+`, false, "://", 2},
-		// Non-ASCII literal: r > 127 → returns nil.
-		{"é", true, "", 0},
+		// A rune 0x80-0xFF in byte mode is that byte (only `byte_mode` admits
+		// one): the literal is the single byte 0xE9.
+		{"é", false, "\xe9", 0},
+		// A rune above 0xFF has no byte: nil.
+		{"α", true, "", 0},
 		// OpRepeat with Min=0: not mandatory → skipped; foo found after.
 		{"[a-z]{0,3}foo", false, "foo", 0},
 	}

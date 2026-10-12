@@ -2269,25 +2269,31 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 }
 
 // TestBTMemoIndexedByAlt pins the fallback memo's row: a bit per Alt, in pc
-// order — the only instructions whose (pc, pos) the fallback marks — less, in
-// Unicode mode, the inner Alts of a dispatched chain, never reached; every
-// other pc has none. The row a stub is told to allocate per position
-// (SearchSizes) is that many bits.
+// order — the only instructions whose (pc, pos) the fallback marks — less the
+// inner Alts of a dispatched chain, never reached, in either mode; every other
+// pc has none. The row a stub is told to allocate per position (SearchSizes)
+// is that many bits.
 func TestBTMemoIndexedByAlt(t *testing.T) {
 	bt := newBacktrack(byteProg(compileBTTestProg(t, `(?:ab|cd|ef)+x`)))
-	alts := 0
+	bplan := bt.altDispatch()
+	alts, guardedB := 0, 0
 	for pc, in := range bt.prog.Inst {
-		want := -1
-		if in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch {
-			want = alts
+		isAlt := in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch
+		if isAlt {
 			alts++
 		}
+		want := -1
+		if isAlt && !bplan.dead[pc] {
+			want = guardedB
+			guardedB++
+		}
 		if got := bt.memoIndex()[pc]; got != want {
-			t.Errorf("byte mode: pc %d (%v) has memo bit %d, want %d", pc, in.Op, got, want)
+			t.Errorf("byte mode: pc %d (%v, dead %v) has memo bit %d, want %d", pc, in.Op, bplan.dead[pc], got, want)
 		}
 	}
-	if alts < 3 || bt.memoRowBytes() != (alts+7)/8 {
-		t.Errorf("byte mode: %d Alts, row %d bytes, want ⌈Alts/8⌉", alts, bt.memoRowBytes())
+	// The three-arm chain is dispatched, so one of its Alts is never reached.
+	if alts < 3 || guardedB >= alts || bt.memoRowBytes() != (guardedB+7)/8 {
+		t.Errorf("byte mode: %d of %d Alts guarded, row %d bytes", guardedB, alts, bt.memoRowBytes())
 	}
 
 	rp, err := resolvePattern(`\pL+?@\pL+`, nil, &CompileOptions{Unicode: true})
@@ -2376,12 +2382,12 @@ func TestBTWorkBudgetFromCodepointProgram(t *testing.T) {
 	}
 }
 
-// TestBTFallbackDispatchesInUnicodeMode pins the first-byte dispatch in the
-// memoised FALLBACK body, which is the only body of a program with a
-// zero-width cycle: in Unicode mode its lowered classes are dispatched on the
-// byte (a 257-entry br_table, the byte or the end of input), in byte mode its
-// chains stay plain.
-func TestBTFallbackDispatchesInUnicodeMode(t *testing.T) {
+// TestBTFallbackDispatches pins the first-byte dispatch in the memoised
+// FALLBACK body, which is the only body of a program with a zero-width cycle:
+// its alternation chains — a lowered class in Unicode mode, a keyword chain in
+// either mode — are dispatched on the byte (a 257-entry br_table, the byte or
+// the end of input).
+func TestBTFallbackDispatches(t *testing.T) {
 	brTable257 := []byte{0x0E, 0x81, 0x02} // br_table, 257 targets
 	for _, c := range []struct {
 		pat     string
@@ -2390,7 +2396,7 @@ func TestBTFallbackDispatchesInUnicodeMode(t *testing.T) {
 	}{
 		{`(\pL*)*x`, true, true},
 		{`((?:the|and|for|you)|[a-z]*)*x`, true, true},
-		{`((?:the|and|for|you)|[a-z]*)*x`, false, false},
+		{`((?:the|and|for|you)|[a-z]*)*x`, false, true},
 	} {
 		if cyc, err := BacktrackHasZeroWidthCycle(c.pat, CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode}); err != nil || !cyc {
 			t.Fatalf("%s: no zero-width cycle (%v), so the fallback is not its only body", c.pat, err)

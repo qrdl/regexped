@@ -955,6 +955,24 @@ each in turn; with **4 or more** it uses the same nibble-table membership test
 as Shufti below, whose cost depends on the size of the first-byte *set* rather
 than growing with every literal added.
 
+In Unicode mode, when every literal begins with a non-ASCII character, the
+first byte is a UTF-8 lead byte that begins a large share of its script's
+characters (D0/D1 begin half of all Russian letters), so a first-byte probe
+would stop every byte or two. Such a set's root prefilter tests **two byte
+columns** instead — the pair with the fewest distinct bytes among the
+literals' first four, at least one not a lead byte; for a two-byte script,
+the whole first character — and each hit is **verified** before the trie
+walk: one `br_table` on the literals' most varied byte selects the literals
+that can start there, a compare chain tests them, and a match jumps straight
+to the literal's trie node unless another literal ends inside it first. No
+match skips the position. Over 40 KB of text with no match this is 3.5 fuel
+per byte against 28 for the first-byte probe when the text is in the
+keywords' script, and 7% less than the first-byte probe when it is not.
+`--diag-json`'s `ac_table` reports the two columns as `probe_columns` and the
+verify's as `verify_column`. In byte mode the same holds for `byte_mode`
+literals whose first byte is 0xC2–0xF4 — UTF-8 keywords written as bytes; an
+ASCII keyword set keeps the first-byte probe.
+
 ### Shufti — SIMD first-byte prefilter for the scalar case
 
 When the frontend would otherwise be scalar (no mandatory literal, or AC

@@ -2700,6 +2700,10 @@ func TestByteModeLengthsAcrossEmitters(t *testing.T) {
 		{"counted", `\xe9{2}xy`},
 		{"two-high-bytes", `\xe9\xe9ab`},
 		{"high-byte-class", `[\x80-\xff]ab`},
+		// A high byte inside the literal a literal-anchored find scans for:
+		// extracted as a literal byte since `byte_mode` bytes count as such.
+		{"lit-anchor-high-literal", `[a-y]+\xe9t\xe9`},
+		{"lit-anchor-high-mid", `[a-y]+caf\xe9\d`},
 	}
 
 	// The shortest input for each shape is the one that matters: the early
@@ -2711,6 +2715,8 @@ func TestByteModeLengthsAcrossEmitters(t *testing.T) {
 		"m\xe9zzzz", "a\xe9b", "\xe9\xe9xy", "\xe9\xe9ab",
 		strings.Repeat("z", 40) + "\xe9ab",
 		strings.Repeat("z", 9) + "a\xe9foo",
+		"a\xe9t\xe9", "xa\xe9t\xe9y", "\xe9t\xe9", "abc\xe9t", "acaf\xe95", "zzcaf\xe9x caf\xe97",
+		strings.Repeat("b", 30) + "\xe9t\xe9", strings.Repeat("q", 20) + "caf\xe90",
 	}
 
 	for _, sh := range shapes {

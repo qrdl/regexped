@@ -165,6 +165,7 @@ type acLayout struct {
 	strideShift int // log2(stride*2) — the shift that turns a node id into a row offset
 
 	numNodes int
+	oldToNew []int // node i's EMITTED id, for a jump straight to a literal's node (acVerifyPlan)
 	// outLimit is the highest node id that carries OUTPUT. Nodes are
 	// renumbered so that the root is 0 (it can never carry output — every
 	// literal is non-empty) and every output-bearing node falls in
@@ -270,7 +271,7 @@ func buildACLayoutMode(ac *acAutomaton, tableBase int32, compress bool) *acLayou
 			next++
 		}
 	}
-	l := &acLayout{numNodes: n, stride: 256, outLimit: outLimit}
+	l := &acLayout{numNodes: n, stride: 256, outLimit: outLimit, oldToNew: oldToNew}
 	for b := 0; b < 256; b++ {
 		l.classMap[b] = byte(b) // identity, unused unless compressed
 	}

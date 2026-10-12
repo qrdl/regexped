@@ -339,6 +339,15 @@ type compiledSet struct {
 	acDataSegCount      int
 	acFirstByteSet      []byte // distinct first bytes for SIMD prefilter
 	acFirstByteFlagsOff int32  // data offset of firstByteFlags[256] table
+	// acProbe, when set, replaces the root-state prefilter's first-byte test
+	// with a two-column one: a position is a candidate iff input[p+Off1] is
+	// in Bytes1 AND input[p+Off2] is in Bytes2 (chooseACProbe says when).
+	acProbe *packedPairPlan
+	// acVerify: at a probe hit, dispatch on input[p+Col] and compare the
+	// literals carrying that byte there; a matching ELIGIBLE literal jumps
+	// straight to its trie node, no literal at all skips the position
+	// (planACVerify, emitACVerify).
+	acVerify *acVerifyPlan
 
 	// Teddy frontend (fe == frontendTeddy): SIMD nibble tables.
 	teddyTabs         *teddyTables
@@ -1257,6 +1266,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	var acDataBytes []byte
 	acDataSegCount := 0
 	var acFirstByteSet []byte
+	var acProbe *packedPairPlan
+	var acVerify *acVerifyPlan
 	var acFirstByteFlagsOff int32
 	if fe == frontendAC {
 		ac := buildAC(lits)
@@ -1348,6 +1359,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			acFirstByteFlagsOff = acL.tableEnd
 			acDataBytes = append(acDataBytes, appendDataSegment(nil, acFirstByteFlagsOff, fbFlags)...)
 			acDataSegCount++ // one more segment for firstByteFlags
+			// Both modes: chooseACProbe declines unless every literal begins
+			// with a byte 0xC2-0xF4, which in byte mode only a `byte_mode`
+			// literal can — UTF-8 keywords written as bytes, whose first byte
+			// stalls the first-byte probe exactly as in Unicode mode (20
+			// Russian keywords as bytes, no match: 42.5 → 2.7 fuel/byte).
+			acProbe = chooseACProbe(lits)
+			if acProbe != nil {
+				acVerify = planACVerify(ac, acL, lits)
+				diag.ACTable.ProbeColumns = []int{acProbe.Off1, acProbe.Off2}
+				if acVerify != nil {
+					col := acVerify.Col
+					diag.ACTable.VerifyColumn = &col
+				}
+			}
 		} else {
 			fe = frontendScalar
 			diag.FrontendDemotion = &FrontendDemotionDiag{
@@ -1649,6 +1674,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		acDataBytes:         acDataBytes,
 		acDataSegCount:      acDataSegCount,
 		acFirstByteSet:      acFirstByteSet,
+		acProbe:             acProbe,
+		acVerify:            acVerify,
 		acFirstByteFlagsOff: acFirstByteFlagsOff,
 		teddyTabs:           teddyTabs,
 		teddyDataOffset:     teddyDataOffset,
@@ -3538,6 +3565,274 @@ func emitSetTailProbe(b []byte, p setTailProbeParams) []byte {
 // on a 17-byte call) and at two it is already ahead.
 const acTailProbeMinLeft = 2
 
+// chooseACProbe picks a two-column probe for the Aho-Corasick root-state
+// prefilter, or nil to keep the first-byte probe.
+//
+// Taken only when every literal begins with a UTF-8 lead byte (0xC2-0xF4) —
+// in Unicode mode a non-ASCII first character, in byte mode a `byte_mode`
+// literal whose first byte is in that range (UTF-8 keywords written as
+// bytes). Such a byte begins a large share of its own script's characters —
+// D0/D1 half of all Russian letters — so on text in that script the
+// first-byte probe stops every byte or two and the trie walks nearly every
+// byte: 27-35 fuel per byte with no match, against 5-7 with this probe.
+// packed-pair's column chooser refuses a lead-only column for the same reason.
+//
+// Columns lie in 0..min(minLen,4)-1; the pair with the fewest distinct bytes
+// wins, ties toward the earlier columns, and at least one of its columns must
+// not be lead bytes only. For a 2-byte script that is the whole first
+// character. The probe is a SUPERSET filter: every literal has its own bytes
+// at both columns, so every real start passes, and the trie resolves the rest.
+func chooseACProbe(literals [][]byte) *packedPairPlan {
+	minLen := 1 << 30
+	for _, lit := range literals {
+		if len(lit) < minLen {
+			minLen = len(lit)
+		}
+	}
+	window := minLen
+	if window > 4 {
+		window = 4
+	}
+	if window < 2 {
+		return nil
+	}
+	cols := make([][]byte, window)
+	for o := 0; o < window; o++ {
+		var seen [256]bool
+		for _, lit := range literals {
+			seen[lit[o]] = true
+		}
+		for i := 0; i < 256; i++ {
+			if seen[i] {
+				cols[o] = append(cols[o], byte(i))
+			}
+		}
+	}
+	leadsOnly := func(col []byte) bool {
+		for _, c := range col {
+			if c < 0xC2 || c > 0xF4 {
+				return false
+			}
+		}
+		return true
+	}
+	if !leadsOnly(cols[0]) {
+		return nil
+	}
+	var best *packedPairPlan
+	bestN := 1 << 30
+	for o1 := 0; o1 < window; o1++ {
+		for o2 := o1 + 1; o2 < window; o2++ {
+			if leadsOnly(cols[o1]) && leadsOnly(cols[o2]) {
+				continue
+			}
+			if n := len(cols[o1]) + len(cols[o2]); n < bestN {
+				bestN = n
+				best = &packedPairPlan{Off1: o1, Off2: o2, Bytes1: cols[o1], Bytes2: cols[o2], MinLen: minLen}
+			}
+		}
+	}
+	return best
+}
+
+// acVerifyPlan is the per-candidate verify in front of the Aho-Corasick trie
+// walk, taken at every probe hit.
+//
+// A br_table on input[p+Col] — Col the column, inside the shortest literal,
+// with the most distinct bytes — selects the literals carrying that byte
+// there, and a compare chain tests just those. Two exits beside "walk the trie
+// as before":
+//
+//   - an ELIGIBLE literal that matches sets the trie state to the literal's
+//     node and the position to its last byte, and the walk's transition for
+//     that byte is skipped: exactly where Aho-Corasick from the root at p
+//     arrives after consuming the literal, so its output list (the literal
+//     and its suffix literals) is processed as before. A literal is
+//     INELIGIBLE when another literal occurs inside it ending before its end:
+//     the walk would report that one first, a jump would not. An ineligible
+//     literal stays in the chain and, when it matches, falls through to the
+//     trie walk unchanged.
+//   - no literal of the chain matching (or fitting) means no literal starts
+//     at p, and the scan resumes at p+1: the root-state walk from p finds
+//     only literals starting at or after p, and the prefilter finds the later
+//     ones itself.
+//
+// Cases are tried in literal order, and the order cannot matter: two
+// literals matching at p are a prefix pair, the longer is ineligible (the
+// shorter ends inside it), and jumping to the shorter's node walks on into
+// the longer.
+type acVerifyPlan struct {
+	Col      int      // dispatch column: input[p+Col] selects the case
+	Cases    [][]int  // literal ids per distinct byte value at Col, in Vals order
+	Vals     []byte   // the distinct byte values at Col
+	Eligible []bool   // per literal: no other literal ends INSIDE it before its end
+	Node     []int    // per literal: the emitted id of its trie node
+	Lits     [][]byte // the literals, by literal id (cs.litToBuckets' ids)
+	MinLen   int
+}
+
+func planACVerify(ac *acAutomaton, acL *acLayout, lits [][]byte) *acVerifyPlan {
+	minLen := 1 << 30
+	for _, lit := range lits {
+		if len(lit) < minLen {
+			minLen = len(lit)
+		}
+	}
+	if minLen < 1 {
+		return nil
+	}
+	// The column with the most distinct bytes; ties toward the earlier one.
+	bestCol, bestN := -1, 0
+	for o := 0; o < minLen; o++ {
+		var seen [256]bool
+		n := 0
+		for _, lit := range lits {
+			if !seen[lit[o]] {
+				seen[lit[o]] = true
+				n++
+			}
+		}
+		if n > bestN {
+			bestN, bestCol = n, o
+		}
+	}
+	pl := &acVerifyPlan{Col: bestCol, MinLen: minLen, Lits: lits}
+	var byVal [256][]int
+	for i, lit := range lits {
+		byVal[lit[bestCol]] = append(byVal[lit[bestCol]], i)
+	}
+	for v := 0; v < 256; v++ {
+		if len(byVal[v]) > 0 {
+			pl.Vals = append(pl.Vals, byte(v))
+			pl.Cases = append(pl.Cases, byVal[v])
+		}
+	}
+	pl.Eligible = make([]bool, len(lits))
+	pl.Node = make([]int, len(lits))
+	for i, lit := range lits {
+		pl.Eligible[i] = true
+		for j, m := range lits {
+			if j == i {
+				continue
+			}
+			// m occurring in lit and ending before lit's end: AC would report
+			// it first, a direct jump to lit's node would not.
+			for off := 0; off+len(m) < len(lit); off++ {
+				if string(lit[off:off+len(m)]) == string(m) {
+					pl.Eligible[i] = false
+				}
+			}
+		}
+		cur := 0
+		for _, c := range lit {
+			cur = ac.nodes[cur].gotoTable[c]
+		}
+		pl.Node[i] = acL.oldToNew[cur]
+	}
+	return pl
+}
+
+// emitACVerify emits the verify at a probe hit (lACState == 0, lPos the
+// candidate or pInLen). Leaves lPos/lACState/lVerified set for a direct
+// report, lPos unchanged for a literal the trie must walk, or restarts the
+// scan at lPos+1 when no literal starts at lPos.
+func emitACVerify(b []byte, cs *compiledSet, st *blockStack, lPos, pInPtr, pInLen, lACState, lVerified byte) []byte {
+	pl := cs.acVerify
+	pp := cs.acProbe
+	b = append(b, 0x02, 0x40) // block $vdone
+	st.Push("vdone")
+	// lPos + Col >= pInLen: cannot dispatch; the trie walk handles it.
+	b = append(b, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, int32(pl.Col))
+	b = append(b, 0x6A, 0x20, pInLen, 0x4F, 0x0D, st.Depth("vdone"))
+
+	n := len(pl.Vals)
+	b = append(b, 0x02, 0x40) // block $vdefault
+	st.Push("vdefault")
+	for i := 0; i < n; i++ {
+		b = append(b, 0x02, 0x40)
+		st.Push(fmt.Sprintf("vcase%d", i))
+	}
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00)
+	b = utils.AppendULEB128(b, uint32(pl.Col))
+	b = append(b, 0x0E) // br_table
+	b = utils.AppendULEB128(b, 256)
+	caseOf := map[byte]int{}
+	for i, v := range pl.Vals {
+		caseOf[v] = i
+	}
+	for v := 0; v < 256; v++ {
+		if i, ok := caseOf[byte(v)]; ok {
+			b = utils.AppendULEB128(b, uint32(i))
+		} else {
+			b = utils.AppendULEB128(b, uint32(n)) // default
+		}
+	}
+	b = utils.AppendULEB128(b, uint32(n))
+	for i := 0; i < n; i++ {
+		b = append(b, 0x0B) // end $vcase_i
+		st.Pop()
+		for _, li := range pl.Cases[i] {
+			lit := pl.Lits[li]
+			b = append(b, 0x02, 0x40) // block $no
+			st.Push("vno")
+			b = append(b, 0x20, lPos, 0x41)
+			b = utils.AppendSLEB128(b, int32(len(lit)))
+			b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, st.Depth("vno")) // does not fit
+			for j, c := range lit {
+				if j == pl.Col || (j == pp.Off1 && len(pp.Bytes1) == 1) || (j == pp.Off2 && len(pp.Bytes2) == 1) {
+					continue
+				}
+				b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00)
+				b = utils.AppendULEB128(b, uint32(j))
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(c))
+				b = append(b, 0x47, 0x0D, st.Depth("vno")) // ne → $no
+			}
+			if pl.Eligible[li] {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(pl.Node[li]))
+				b = append(b, 0x21, lACState)
+				b = append(b, 0x20, lPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(len(lit)-1))
+				b = append(b, 0x6A, 0x21, lPos)
+				b = append(b, 0x41, 0x01, 0x21, lVerified)
+			}
+			b = append(b, 0x0C, st.Depth("vdone"))
+			b = append(b, 0x0B) // end $no
+			st.Pop()
+		}
+		// No literal of this case starts here.
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+		b = append(b, 0x0C, st.Depth("scan"))
+	}
+	b = append(b, 0x0B) // end $vdefault
+	st.Pop()
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, st.Depth("scan"))
+	b = append(b, 0x0B) // end $vdone
+	st.Pop()
+	return b
+}
+
+// emitACColumnMask leaves on the stack the 16-bit mask of lanes of the chunk
+// in chunkLocal whose byte is in set: a compare chain up to 3 bytes, Shufti
+// above (the AC first-byte probe's own crossover).
+func emitACColumnMask(b []byte, set []byte, chunkLocal byte) []byte {
+	if len(set) > 3 {
+		return emitShuftiPrefixCheck(b, set, chunkLocal)
+	}
+	for i, c := range set {
+		b = append(b, 0x20, chunkLocal, 0x41)
+		b = utils.AppendSLEB128(b, int32(c))
+		b = append(b, 0xFD, 0x0F, 0xFD, 0x23) // i8x16.splat; i8x16.eq
+		if i > 0 {
+			b = append(b, 0xFD, 0x50) // v128.or
+		}
+	}
+	return append(b, 0xFD, 0x64) // i8x16.bitmask
+}
+
 // hasSetFallbackBucketsIn is the same question about a raw bucket list, for
 // use during compilation before a compiledSet exists.
 func hasSetFallbackBucketsIn(buckets []*bucket) bool {
@@ -4037,7 +4332,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 
 	// Prefilter locals: the skip mask, the backward tail probe's four, and a
 	// v128 chunk.
-	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk byte
+	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk, lChunk2, lCol1 byte
 	if usePrefilter {
 		lSkipMask = a.I32()
 		lTailBase = a.I32()
@@ -4045,6 +4340,21 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		lTailProbed = a.I32()
 		lTailSkip = a.I32()
 		lChunk = a.V128()
+		if cs.acProbe != nil {
+			lCol1 = a.I32()
+			lChunk2 = a.V128()
+		}
+	}
+	var lVerified byte
+	useVerify := usePrefilter && cs.acVerify != nil
+	if useVerify {
+		lVerified = a.I32()
+	}
+	// probeOff2 is how many bytes past a chunk's last lane the two-column
+	// probe reads: its second column. 0 for the one-column probe.
+	probeOff2 := int32(0)
+	if usePrefilter && cs.acProbe != nil {
+		probeOff2 = int32(cs.acProbe.Off2)
 	}
 
 	c.lMinStart = a.I32()
@@ -4104,7 +4414,35 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		// candidate bitmask — the positions whose byte can begin some literal —
 		// on the stack. A closure because the backward tail probe below runs
 		// exactly this at a different position.
+		// loadAt loads the 16-byte chunk at posLocal+off into dst.
+		loadAt := func(b []byte, posLocal byte, off int, dst byte) []byte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
+			if off > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(off))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+			return append(b, 0x21, dst)
+		}
 		emitCandMask := func(b []byte, posLocal byte) []byte {
+			if pp := cs.acProbe; pp != nil {
+				// Two-column probe: each column's membership mask, AND-ed.
+				// The second column is loaded and tested only when the first
+				// has a hit in the chunk. This mask-on-the-stack form serves
+				// the tail probe, once per call; the SIMD path below tests
+				// the same two columns with its own branch structure, and
+				// TestACProbeTailAndChunkMasksAgree pins that they agree.
+				b = loadAt(b, posLocal, pp.Off1, lChunk)
+				b = emitACColumnMask(b, pp.Bytes1, lChunk)
+				b = append(b, 0x22, lCol1) // local.tee lCol1
+				b = append(b, 0x04, 0x7F)  // if (result i32)
+				b = loadAt(b, posLocal, pp.Off2, lChunk2)
+				b = emitACColumnMask(b, pp.Bytes2, lChunk2)
+				b = append(b, 0x20, lCol1, 0x71) // i32.and
+				b = append(b, 0x05, 0x41, 0x00)  // else: i32.const 0
+				return append(b, 0x0B)           // end if
+			}
 			// Load 16-byte chunk from memory[0] (input)
 			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
 			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
@@ -4153,21 +4491,48 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 			return b
 		}
 
-		// SIMD path: if lPos + 15 < pInLen
-		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-		b = append(b, 0x04, 0x40)                                     // if (void) — SIMD path
+		// SIMD path: if lPos + 15 (+ the probe's second column) < pInLen
+		b = append(b, 0x20, lPos, 0x41)
+		b = utils.AppendSLEB128(b, 15+probeOff2)
+		b = append(b, 0x6A, 0x20, pInLen, 0x49) // lt_u
+		b = append(b, 0x04, 0x40)               // if (void) — SIMD path
 		st.Push("simd_if")
 
-		b = emitCandMask(b, lPos)
-		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+		if pp := cs.acProbe; pp != nil {
+			// The first column's mask is tested ONCE; only a chunk with a
+			// first-column hit loads and tests the second. Chaining the two
+			// tests into one mask cost text where the literals' lead byte is
+			// rare 3.5% over the first-byte probe; tested this way it costs
+			// 6.9% less (67,601 against 72,583 fuel over 40 KB of English
+			// for Russian keywords).
+			b = loadAt(b, lPos, pp.Off1, lChunk)
+			b = emitACColumnMask(b, pp.Bytes1, lChunk)
+			b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+			b = append(b, 0x04, 0x40)      // if (void) — first column hit
+			st.Push("col1_if")
+			b = loadAt(b, lPos, pp.Off2, lChunk2)
+			b = emitACColumnMask(b, pp.Bytes2, lChunk2)
+			b = append(b, 0x20, lSkipMask, 0x71, 0x22, lSkipMask) // i32.and; local.tee
+			b = append(b, 0x04, 0x40)                             // if (void) — mask non-zero
+			st.Push("mask_if")
+			b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
+			b = append(b, 0x0C, st.Depth("skip_done"))
+			b = append(b, 0x0B) // end if mask
+			st.Pop()
+			b = append(b, 0x0B) // end if first column
+			st.Pop()
+		} else {
+			b = emitCandMask(b, lPos)
+			b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
-		// if mask != 0: candidate found at lPos + ctz(mask)
-		b = append(b, 0x04, 0x40) // if (void) — mask non-zero
-		st.Push("mask_if")
-		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
-		b = append(b, 0x0C, st.Depth("skip_done"))
-		b = append(b, 0x0B) // end if mask
-		st.Pop()
+			// if mask != 0: candidate found at lPos + ctz(mask)
+			b = append(b, 0x04, 0x40) // if (void) — mask non-zero
+			st.Push("mask_if")
+			b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
+			b = append(b, 0x0C, st.Depth("skip_done"))
+			b = append(b, 0x0B) // end if mask
+			st.Pop()
+		}
 
 		// No candidate: advance 16 and restart
 		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos) // lPos += 16
@@ -4194,7 +4559,8 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 			lTailBase: lTailBase, lTailMask: lTailMask,
 			lTailProbed: lTailProbed, lTailSkip: lTailSkip,
 			survivor:       lSkipMask,
-			window:         16,
+			window:         16 + probeOff2,
+			wideShift:      probeOff2 > 0,
 			minLeft:        acTailProbeMinLeft,
 			exitsPrefilter: true,
 			// One deeper than the block this emitter is about to open.
@@ -4222,6 +4588,10 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x0B) // end block $skip_done
 		st.Pop()
 
+		if useVerify {
+			b = emitACVerify(b, cs, st, lPos, pInPtr, pInLen, lACState, lVerified)
+		}
+
 		b = append(b, 0x0B) // end if lACState == 0
 		st.Pop()
 
@@ -4232,6 +4602,14 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	// lACState = goto_table[lACState * stride*2 + col(input[lPos]) * 2] as u16,
 	// where col is the byte itself, or its equivalence class when the table is
 	// byte-class compressed (one extra table load per input byte).
+	if useVerify {
+		// A verified literal has already set lACState and lPos to what this
+		// transition would reach at its last byte: skip it, once.
+		b = append(b, 0x20, lVerified, 0x04, 0x40) // if lVerified
+		b = append(b, 0x41, 0x00, 0x21, lVerified)
+		b = append(b, 0x05) // else
+		st.Push("verified_if")
+	}
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, acL.gotoOff)
 	b = append(b, 0x20, lACState, 0x41, byte(acL.strideShift), 0x74, 0x6A) // + lACState * stride*2
@@ -4249,6 +4627,10 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x41, 0x01, 0x74, 0x6A) // * 2; add
 	b = appendTableLoad16u(b, tableMemIdx)
 	b = append(b, 0x21, lACState)
+	if useVerify {
+		b = append(b, 0x0B) // end if lVerified
+		st.Pop()
+	}
 
 	// Does this node report anything? ONE unsigned compare against a
 	// constant, and the two u16 loads below happen only when it does.

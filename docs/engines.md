@@ -215,7 +215,8 @@ an English text (`\p{Han}+x`: 4.06 fuel/byte against 2.13).
 - a DFA without word boundaries, and u8 (≤ 256 states) in byte mode; in Unicode
   mode, where a lowered letter class alone makes tables larger, u16 tables too
 - a qualifying literal exists: length ≥ 2 and at most 8 alternates, or the
-  one-byte case above; ASCII in byte mode, UTF-8 in Unicode mode
+  one-byte case above; bytes in byte mode (0x80–0xFF under `byte_mode: true`),
+  UTF-8 in Unicode mode
 - the reversed-prefix DFA has ≤ 256 states in byte mode
 - for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
 
@@ -451,8 +452,13 @@ inner `InstAlt`s are then unreachable and emitted as such. Where most bytes
 start most arms, each case only names its arms in a bitmask and one shared
 sequence pushes them, rather than every case repeating the pushes — a frame
 stores every capture slot, and the repetition grew one WAF member's module
-44%. Only in the fast body; the fallback body keeps the plain chain, since it
-memoises every `InstAlt` on `(pc, pos)`.
+44%. The fallback body dispatches too: it memoises the chain's head on
+`(pc, pos)` and dispatches from there, and since the inner `InstAlt`s are
+reached only through the head, a second arrival at one of them is a second
+arrival at the head, which the memo cuts. A program with a zero-width cycle
+has the fallback as its only body: `((?:the|and|for|you)|[a-z]*)*x` over
+words each ending in `x` 404.55 → 230.49 fuel per byte, `(\pL*)*x` over
+Russian words 1,206 → 266.
 
 The dispatch charges the [work budget](#work-budget-and-the-fallback-body)
 one pop per arm it skips — the pops the plain chain would have made, which is

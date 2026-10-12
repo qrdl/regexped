@@ -92,8 +92,8 @@ func simpleClassPrefix(re *syntax.Regexp) (tlo [16]byte, count int, ok bool) {
 // a qualifying literal or alternation of literals.
 //
 // Qualifying: no FoldCase, length >= 2 bytes, at most 8 alternatives, and
-// runes the mode takes as bytes (literalBytes: ASCII in byte mode, UTF-8 in
-// Unicode mode).
+// runes the mode takes as bytes (literalBytes: in byte mode up to 0xFF, which
+// only `byte_mode` admits above 0x7F; UTF-8 in Unicode mode).
 func extractLitSet(re *syntax.Regexp, unicode bool) [][]byte {
 	switch re.Op {
 	case syntax.OpLiteral:

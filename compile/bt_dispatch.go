@@ -33,8 +33,12 @@ import (
 // can reach Match without consuming is tried in every case, end of input
 // included.
 //
-// Only in an ORDINARY body. The fallback body memoises every Alt on (pc, pos),
-// which is what terminates it on a zero-width cycle; it keeps the plain chain.
+// In the ordinary body and in the FALLBACK body. The fallback memoises the
+// Alts on (pc, pos), which is what terminates it on a zero-width cycle; it
+// guards the chain's HEAD and dispatches from there, and since the inner Alts
+// are reached only through the head, a second arrival at one of them is a
+// second arrival at (head, pos), which the guard cuts — the bound "every
+// (pc, pos) at most once" holds unchanged.
 //
 // Measured (fuel/byte): Unicode `(\pL+?)(\pL*)` 967 → 133, WAF Backtracking
 // members' `scan_any` 48-77% less (`cij_body_04` 732 → 166 over an HTTP log),

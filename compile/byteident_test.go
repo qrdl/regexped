@@ -189,9 +189,13 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 		name                string
 		union, split, cache bool
 		literal             bool
+		// acProbe: Aho-Corasick with the two-column root probe and the
+		// per-candidate verify.
+		acProbe bool
 	}{
 		{name: "unicode_set_walk"},
 		{name: "unicode_set_literals", literal: true},
+		{name: "unicode_set_ac_probe", literal: true, acProbe: true},
 		{name: "unicode_set_union_scan", union: true},
 		{name: "unicode_set_overlap_sweep", cache: true},
 		{name: "unicode_set_overlap_preflight", cache: true},
@@ -209,6 +213,9 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 			(d.CacheBytesPerByte > 0) != c.cache || (d.Frontend != "scalar") != c.literal {
 			t.Errorf("%s: mode %s, union scan %v, split %v, cache %d B/byte, frontend %s — not the shape it is named for",
 				c.name, d.Mode, union, d.SplitMembers, d.CacheBytesPerByte, d.Frontend)
+		}
+		if probe := d.Frontend == "ac" && d.ACTable != nil && len(d.ACTable.ProbeColumns) == 2 && d.ACTable.VerifyColumn != nil; probe != c.acProbe {
+			t.Errorf("%s: two-column AC probe %v, want %v (frontend %s, AC table %+v)", c.name, probe, c.acProbe, d.Frontend, d.ACTable)
 		}
 	}
 }

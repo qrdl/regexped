@@ -55,8 +55,8 @@ type backtrack struct {
 
 // memoIndex maps each pc the fallback body guards to its bit in a memo row,
 // in pc order, and every other pc to -1. The guarded pcs are the Alts — the
-// only instructions whose (pc, pos) the fallback marks — less, in Unicode
-// mode, the inner Alts of a dispatched chain, which are never reached. A row
+// only instructions whose (pc, pos) the fallback marks — less the inner Alts
+// of a dispatched chain, which are never reached. A row
 // over every instruction was mostly bits never set: `\pL+` 194 bytes per
 // input position where its Alts need 41.
 func (bt *backtrack) memoIndex() []int {
@@ -66,7 +66,7 @@ func (bt *backtrack) memoIndex() []int {
 		n := 0
 		for pc, in := range bt.prog.Inst {
 			bt.memoIdx[pc] = -1
-			if (in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch) && !(bt.unicode && plan.dead[pc]) {
+			if (in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch) && !plan.dead[pc] {
 				bt.memoIdx[pc] = n
 				n++
 			}
@@ -724,22 +724,25 @@ func emitBTInstHandler(
 		// syntax.Prog passes through an Alt, and an Alt is entered at a given
 		// pos at most once per call.
 		//
-		// In Unicode mode the fallback dispatches a chain too, behind the memo
-		// guard at its HEAD: the chain's inner Alts are reached only through
-		// the head, so a second arrival at one of them is a second arrival at
-		// (head, pos), which the guard cuts, and the dispatch only chooses
-		// which arms to push. Walked arm by arm with a guard at every Alt, a
-		// lowered class cost a guard, a push and a pop per arm on every
-		// character: `(\pL*)*x` 1,206 → 266 fuel/byte over Russian words,
-		// 1,662 → 259 over CJK. Byte mode keeps the plain chain.
+		// The fallback dispatches a chain too, behind the memo guard at its
+		// HEAD: the chain's inner Alts are reached only through the head, so
+		// a second arrival at one of them is a second arrival at (head, pos),
+		// which the guard cuts, and the dispatch only chooses which arms to
+		// push. Walked arm by arm with a guard at every Alt, a chain cost a
+		// guard, a push and a pop per arm at every position: a lowered class
+		// is such a chain on every character, `(\pL*)*x` 1,206 → 266
+		// fuel/byte over Russian words and 1,662 → 259 over CJK; in byte mode
+		// `((?:the|and|for|you)|[a-z]*)*x`, whose zero-width cycle makes the
+		// fallback its only body, 404.55 → 230.49 over words each ending in
+		// `x`.
 		if !dyn.grow {
 			plan := bt.altDispatch()
-			if bt.unicode && plan.dead[p] {
+			if plan.dead[p] {
 				body = append(body, 0x00) // unreachable
 				break
 			}
 			body = emitBitStateGuardDyn(body, dyn, bt.memoIndex()[p], memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
-			if d := plan.heads[p]; bt.unicode && d != nil {
+			if d := plan.heads[p]; d != nil {
 				body = emitBTAltDispatch(body, d, brRun, numCapLocals, frameSize, overflowFn, tableMemIdx, dyn, limitLocal, charge)
 				break
 			}

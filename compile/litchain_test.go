@@ -1341,12 +1341,16 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 		}
 	})
 
-	// Non-ASCII rune in literal → nil in byte mode; its UTF-8 bytes in
-	// Unicode mode, a surrogate excepted (it matches nothing once lowered).
+	// Non-ASCII rune in literal: in byte mode 0x80-0xFF is that byte and a
+	// rune above has none; its UTF-8 bytes in Unicode mode, a surrogate
+	// excepted (it matches nothing once lowered).
 	t.Run("non_ascii_literal", func(t *testing.T) {
 		re := parse(`café`)
-		if got := extractLitSet(re, false); got != nil {
-			t.Errorf("extractLitSet(non-ASCII) = %v, want nil", got)
+		if got := extractLitSet(re, false); len(got) != 1 || string(got[0]) != "caf\xe9" {
+			t.Errorf("byte mode: extractLitSet(café) = %q, want [caf\\xe9]", got)
+		}
+		if got := extractLitSet(parse(`cafα`), false); got != nil {
+			t.Errorf("byte mode: extractLitSet(cafα) = %q, want nil", got)
 		}
 		if got := extractLitSet(re, true); len(got) != 1 || string(got[0]) != "café" {
 			t.Errorf("Unicode mode: extractLitSet(café) = %q, want [café]", got)
@@ -1454,8 +1458,9 @@ func TestFindLitAnchorPointOneByte(t *testing.T) {
 		{`\w+@\w+`, false, "@"},
 		{`[a-z]+-[0-9]+`, false, "-"},
 		{`(\w+)=(\w+)`, false, "="},
-		{`\w+(@)\w+`, false, "@"}, // the literal under a capture
-		{`\w+\xe9\w+`, false, ""}, // above 0x7F: not a byte-mode literal
+		{`\w+(@)\w+`, false, "@"},     // the literal under a capture
+		{`\w+\xe9\w+`, false, "\xe9"}, // 0x80-0xFF is that byte in byte mode
+		{`\w+\x{3b1}\w+`, false, ""},  // above 0xFF: no byte for it
 		{`\pL+@\pL+`, true, "@"},
 		{`\w+_x\d`, false, "_x"}, // a longer literal wins
 		{`\d+-\d+`, false, ""},   // digits: selective first bytes

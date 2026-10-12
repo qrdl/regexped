@@ -899,6 +899,327 @@ func TestUnicodeSetStartPositions(t *testing.T) {
 	}
 }
 
+// acProbeSet is a Unicode-mode keyword set that keeps Aho-Corasick (fewer
+// than four distinct first characters) and whose literals all begin with a
+// lead byte, so the root prefilter tests two byte columns and every probe hit
+// runs the per-candidate verify. It carries every case the verify's jump
+// rule distinguishes: prefix pairs, the longer listed first (пример / при,
+// so its own case is tried before the shorter one's) and the shorter first
+// (пром / промокашка); a literal occurring inside another and ending before
+// its end with no prefix partner (рам in пирамида), and beside one (рим in
+// пример, мок in промокашка); a suffix literal (рог of пирог, мер of
+// пример); and two literals that differ only past the dispatch column
+// (почтальон / почтамт).
+var acProbeSet = []string{
+	"пример", "при", "рим", "мер", "пром", "промокашка", "мок", "пирог", "рог", "почтальон",
+	"почтамт", "пирамида", "рам", "правда", "письмо", "птица", "пустота", "печать", "поле", "палец",
+	"песок", "плита",
+}
+
+// acProbeDiag compiles acProbeSet in Unicode mode and returns its AC table
+// report, failing unless the two-column probe and the verify shipped.
+func acProbeDiag(t *testing.T, pats []string) *compile.ACTableDiag {
+	t.Helper()
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	on := true
+	sets := []config.SetConfig{{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{Names: names}, Unicode: &on}}
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := diags[0]
+	if d.Frontend != "ac" || d.ACTable == nil || len(d.ACTable.ProbeColumns) != 2 || d.ACTable.VerifyColumn == nil {
+		t.Fatalf("frontend %q, AC table %+v: the two-column probe and the verify did not ship", d.Frontend, d.ACTable)
+	}
+	return d.ACTable
+}
+
+// TestUnicodeACRootProbe drives every capability of acProbeSet against Go:
+// match_any/match_all, scan_any/scan_all from every position (scan_all's
+// answer must hold every id, so a jump that skipped a literal's suffix
+// literals shows there), the gated find to exhaustion (Go's per-pattern
+// non-overlapping rule) and the overlapping find from every start. The
+// inputs: a long text with keywords planted, adjacent and at the very end;
+// inputs shorter than the probe's window; inputs ending 0, 1 and Col bytes
+// after the last candidate (the verify's "no room to dispatch" arm and its
+// fit check); and texts whose only candidates are words no keyword matches
+// (the "no literal starts here" exit).
+func TestUnicodeACRootProbe(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	d := acProbeDiag(t, acProbeSet)
+	col := *d.VerifyColumn
+	refs := make([]*regexp.Regexp, len(acProbeSet))
+	for i, p := range acProbeSet {
+		refs[i] = regexp.MustCompile(p)
+	}
+	words := []string{"мама", "пёс", "дом", "привычка", "приют", "пустяк", "рама", "море", "почта", "прима", "пирожок", "пирамида", "Grüße", "x"}
+	var long strings.Builder
+	for i := 0; long.Len() < 1024; i++ {
+		long.WriteString(words[i%len(words)])
+		long.WriteByte(' ')
+		if i%5 == 2 {
+			long.WriteString(acProbeSet[(i*7)%len(acProbeSet)])
+			long.WriteByte(' ')
+		}
+		if i%11 == 4 {
+			long.WriteString("примерпирогрог промокашкамок")
+		}
+	}
+	long.WriteString("пример")
+	tail := string([]byte("пирог")[:col])
+
+	// The long text: the gated find's drive against Go, and the scan pair
+	// from a spread of starts. Every start of a 1 KB input costs minutes.
+	t.Run("long", func(t *testing.T) {
+		in := long.String()
+		checkGated(t, acProbeSet, in)
+		r := newCapRunner(t, acProbeSet, in, false)
+		defer r.Close()
+		n := int32(len(in))
+		for _, from := range []int{0, 1, 2, 17, 100, 511, len(in) - 12, len(in) - 6, len(in)} {
+			want := oracleScanAll(acProbeSet, in, from, nil)
+			got := r.allIDs(t, "cap_scan_all", r.inBase, n, int32(from))
+			if !eqIDs(append([]int(nil), want...), got) {
+				t.Fatalf("scan_all(from=%d) = %v, want %v", from, got, want)
+			}
+			anyID := int(r.call(t, "cap_scan_any", r.inBase, n, int32(from)).(int32))
+			if len(want) == 0 && anyID != -1 || len(want) > 0 && !containsInt(want, anyID) {
+				t.Fatalf("scan_any(from=%d) = %d, want one of %v", from, anyID, want)
+			}
+		}
+	})
+	inputs := []string{
+		"", "п", "пр", "при", "пример", "примерпри", "пирамида", "пирамидарам", "рог", "\xd0", "при\xd0", "xпримерx", "почтальонпочтамт",
+		"пёс пёс пёс " + "пирог",
+		"пёс пёс пёс " + "пирог" + "x",
+		"пёс пёс пёс " + "пирог" + strings.Repeat("y", col),
+		"пёс пёс пёс " + tail,
+		"пёс пёс пёс п" + "\xbf",
+		"это пустяк, приют и прима — привычка",
+		strings.Repeat("пёс ", 20),
+	}
+	for _, in := range inputs {
+		in := in
+		t.Run(fmt.Sprintf("%d:%.24q", len(in), in), func(t *testing.T) {
+			checkSetFindAllStarts(t, acProbeSet, refs, in)
+			checkSetCapsAllFroms(t, acProbeSet, in)
+		})
+	}
+}
+
+// TestACProbeTailAndChunkMasksAgree: the probe's two columns are tested by
+// the SIMD path one way (the second column only inside the first's hit
+// branch) and by the backward tail probe another (both masks on the stack),
+// once per call. An input of 16 + Off2 to 32 + Off2 bytes leaves its last
+// candidates to the tail probe alone; both shapes must find them, and miss
+// the non-keyword candidates around them.
+func TestACProbeTailAndChunkMasksAgree(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	d := acProbeDiag(t, acProbeSet)
+	off2 := d.ProbeColumns[1]
+	refs := make([]*regexp.Regexp, len(acProbeSet))
+	for i, p := range acProbeSet {
+		refs[i] = regexp.MustCompile(p)
+	}
+	checked := 0
+	for _, kw := range []string{"при", "рим", "пример", "мок"} {
+		for pad := 16; pad < 32; pad++ {
+			for _, lead := range []string{"", "пёс"} {
+				in := lead + strings.Repeat("x", pad-len(lead)) + kw
+				if len(in) < 16+off2 || len(in) >= 32+off2 || strings.Index(in, kw) < 16 {
+					continue
+				}
+				checked++
+				t.Run(fmt.Sprintf("%s+%d+%s", lead, pad, kw), func(t *testing.T) {
+					checkSetFindAllStarts(t, acProbeSet, refs, in)
+					checkSetCapsAllFroms(t, acProbeSet, in)
+				})
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no input put its candidate where only the tail probe sees it")
+	}
+}
+
+// TestACProbeWideColumnAgainstOracle: Aho-Corasick forced on keywords whose
+// probe column holds five bytes (а..д under one lead byte), so the root probe
+// tests that column with nibble tables rather than a compare chain; every
+// capability against Go. `find` is the overlapping one, the contract
+// checkCapsAgainstOracle checks from every start with one gate array; the
+// gated body shares the probe and runs in TestUnicodeACRootProbe.
+func TestACProbeWideColumnAgainstOracle(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	pats := []string{
+		"арбуз", "банан", "вишня", "груша", "дыня", "азбука", "буря", "весна", "гроза", "дождь",
+		"аист", "белка", "волк", "гусь", "дятел", "акула", "бобр", "ворон", "голубь", "дельфин",
+	}
+	entries := make([]config.RegexEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+	}
+	on := true
+	sets := []config.SetConfig{{
+		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true, Patterns: config.PatternSelector{Names: names}, Unicode: &on,
+	}}
+	w, _, diags, err := compile.CompileFileOpts(config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendAC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := diags[0]; d.Frontend != "ac" || d.ACTable == nil || fmt.Sprint(d.ACTable.ProbeColumns) != "[0 1]" {
+		t.Fatalf("frontend %q, AC table %+v: not the two-column probe this test is for", d.Frontend, d.ACTable)
+	}
+	for _, in := range []string{"", "арбуз", "вишнягруша", "на опушке белка и волк", "дятел\xd0", "абвгд еёжз", "x дельфин"} {
+		t.Run(fmt.Sprintf("%q", in), func(t *testing.T) {
+			r := newCapRunnerFrom(t, w, pats, in)
+			defer r.Close()
+			checkCapsAgainstOracle(t, r, pats, in)
+		})
+	}
+}
+
+// byteModeTwin maps every byte above 0x7F in texts to an ASCII stand-in that
+// appears in none of them, one stand-in per byte: under a byte engine a high
+// byte behaves exactly like any other byte the pattern names literally, so
+// the mapped pattern over the mapped input asks Go the same question — an
+// isomorphism, the oracle TestByteModeLengthsAcrossEmitters uses for one byte.
+func byteModeTwin(t *testing.T, texts ...string) func(string) string {
+	t.Helper()
+	used := map[byte]bool{}
+	var high []byte
+	for _, s := range texts {
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c < 0x80 {
+				used[c] = true
+			} else if !used[c] {
+				used[c] = true
+				high = append(high, c)
+			}
+		}
+	}
+	m := map[byte]byte{}
+	pool := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for _, c := range high {
+		for len(pool) > 0 && used[pool[0]] {
+			pool = pool[1:]
+		}
+		if len(pool) == 0 {
+			t.Fatalf("no ASCII stand-in left for byte %#x", c)
+		}
+		m[c] = pool[0]
+		used[pool[0]] = true
+		pool = pool[1:]
+	}
+	return func(s string) string {
+		b := []byte(s)
+		for i, c := range b {
+			if r, ok := m[c]; ok {
+				b[i] = r
+			}
+		}
+		return string(b)
+	}
+}
+
+// TestByteModeHighByteLiteralSets: `byte_mode` keyword sets whose literals
+// carry bytes above 0x7F — UTF-8 Russian written as bytes (every first byte
+// D0/D1, so Aho-Corasick with the two-column probe and the verify) and
+// Latin-1 words — against Go through byteModeTwin: the gated find's drive
+// against FindAllIndex per member, every capability of the overlapping set
+// from every start. Until such bytes counted as literal bytes the sets walked
+// a fallback bucket, which answered right but at 200-320 fuel per byte.
+func TestByteModeHighByteLiteralSets(t *testing.T) {
+	ru := []string{"пример", "при", "рим", "мер", "пром", "промокашка", "мок", "пирог", "рог", "почтальон",
+		"почтамт", "пирамида", "рам", "правда", "письмо", "птица", "пустота", "печать", "поле", "палец"}
+	lat := []string{"caf\xe9", "na\xefve", "r\xe9sum\xe9", "fa\xe7ade", "se\xf1or", "\xfcber", "gr\xf6\xdfe",
+		"\xe9t\xe9", "cr\xe8me", "d\xe9j\xe0", "ma\xf1ana", "pi\xf1ata", "S\xe3o", "Ni\xf1o", "fran\xe7ais",
+		"Z\xfcrich", "M\xfcnchen", "K\xf6ln", "\xe0 la", "a\xf1o"}
+	for _, c := range []struct {
+		name   string
+		kws    []string
+		probe  bool
+		inputs []string
+	}{
+		{"utf8-bytes", ru, true, []string{"", "пример", "примерпри", "пирамидарам", "это пёс и пирог", "почтальонпочтамт",
+			"мама мыла раму и пирог пирамида при", "пёс\xd0", strings.Repeat("пёс ", 12) + "палец"}},
+		{"latin1", lat, false, []string{"", "caf\xe9", "a caf\xe9 au lait", "\xe9t\xe9 r\xe9sum\xe9", "M\xfcnchenK\xf6ln",
+			"the fran\xe7ais se\xf1or", "na\xefve", strings.Repeat("the ", 10) + "d\xe9j\xe0"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pats := make([]string, len(c.kws))
+			raw := make([]string, len(c.kws))
+			for i, kw := range c.kws {
+				raw[i] = kw
+				var sb strings.Builder
+				for _, b := range []byte(kw) {
+					fmt.Fprintf(&sb, `\x%02x`, b)
+				}
+				pats[i] = sb.String()
+			}
+			twin := byteModeTwin(t, append(append([]string{}, raw...), c.inputs...)...)
+			twinPats := make([]string, len(raw))
+			for i, kw := range raw {
+				twinPats[i] = regexp.QuoteMeta(twin(kw))
+			}
+			compileSet := func(overlapping bool) []byte {
+				entries := make([]config.RegexEntry, len(pats))
+				names := make([]string, len(pats))
+				for i, p := range pats {
+					names[i] = fmt.Sprintf("p%d", i)
+					entries[i] = config.RegexEntry{Name: names[i], Pattern: p, ByteMode: true}
+				}
+				off := false
+				w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+					Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+					ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+					Patterns: config.PatternSelector{Names: names}, Unicode: &off,
+				}}}, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				d := diags[0]
+				if d.Frontend == "scalar" {
+					t.Fatalf("frontend scalar: the high-byte literals were not extracted")
+				}
+				if probe := d.ACTable != nil && len(d.ACTable.ProbeColumns) == 2; probe != c.probe {
+					t.Fatalf("frontend %q, AC table %+v: two-column probe %v, want %v", d.Frontend, d.ACTable, probe, c.probe)
+				}
+				return w
+			}
+			gated, ovl := compileSet(false), compileSet(true)
+			for _, in := range c.inputs {
+				t.Run(fmt.Sprintf("%.20q", in), func(t *testing.T) {
+					r := newCapRunnerFrom(t, gated, pats, in)
+					defer r.Close()
+					got := driveGatedCaps(t, r, in)
+					want := gatedOracle(twinPats, twin(in))
+					sortMatches(got)
+					sortMatches(want)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("gated find over %q:\n  got  %v\n  want %v", in, got, want)
+					}
+					r2 := newCapRunnerFrom(t, ovl, pats, in)
+					defer r2.Close()
+					checkCapsAgainstOracle(t, r2, twinPats, twin(in))
+				})
+			}
+		})
+	}
+}
+
 // TestSetWideAllBitmap exercises the >64-pattern form of match_all/scan_all,
 // which switches from an i64 bitmask return to a caller-provided bitmap.
 // The bit-per-pattern packing is easy to get wrong at
