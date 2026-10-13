@@ -170,13 +170,13 @@ func cTypesPreambleCache(wantCache bool) string {
 
 // genCStubFiles generates the content for both the .h and .c stub files.
 // hBasename is the bare filename of the header (e.g. "stub.h") used in the #include directive.
-func genCStubFiles(entries []config.RegexEntry, importModule, hBasename string, wantCache bool) (hContent, cContent string, err error) {
+func genCStubFiles(entries []config.PatternEntry, importModule, hBasename string, wantCache bool) (hContent, cContent string, err error) {
 	return genCStubFilesSized(entries, importModule, hBasename, wantCache, nil)
 }
 
 // genCStubFilesSized is genCStubFiles with each export's search block
 // (search_stub.go); nil sizes means none.
-func genCStubFilesSized(entries []config.RegexEntry, importModule, hBasename string, wantCache bool, sizes map[string]compile.SearchSize) (hContent, cContent string, err error) {
+func genCStubFilesSized(entries []config.PatternEntry, importModule, hBasename string, wantCache bool, sizes map[string]compile.SearchSize) (hContent, cContent string, err error) {
 	type entryParts struct{ h, c string }
 	var parts []entryParts
 	for _, re := range entries {
@@ -211,7 +211,7 @@ func genCStubFilesSized(entries []config.RegexEntry, importModule, hBasename str
 // cStubWithSets updates genCStubFiles to also handle sets.
 func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, cContent string, err error) {
 	hasIndividual := false
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
 			hasIndividual = true
 			break
@@ -222,7 +222,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 	}
 	shapes := newSetShapes(cfg)
 	sizes := searchSizesFor(cfg)
-	hContent, cContent, err = genCStubFilesSized(cfg.Regexps, cfg.ImportModule, hBasename, shapes.anyWantsCache(), sizes)
+	hContent, cContent, err = genCStubFilesSized(cfg.Patterns, cfg.ImportModule, hBasename, shapes.anyWantsCache(), sizes)
 	if err != nil {
 		return
 	}
@@ -578,10 +578,8 @@ void %[1]s_free(%[2]s *s) {
 `, s.Find, scannerType, gateInit, gateArg, cacheFree, konst, blockNotes, ownZero, pendingCheck)
 		}
 	}
-	if hasEmitNameMap(cfg) {
-		hb.WriteString("const char *pattern_name(int id);\n\n")
-		cb.WriteString(cPatternNameTable(cfg))
-	}
+	hb.WriteString(cPatternNameDecls(cfg))
+	cb.WriteString(cPatternNameFns(cfg))
 	hContent = hb.String()
 	cContent = cb.String()
 	return
@@ -603,7 +601,7 @@ type entryGroups struct {
 // numbers for its own .c bodies, and parsing the pattern a second time there
 // gave that call an error branch no config could reach — this function has
 // already failed on exactly the same pattern by then.
-func genCPartsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (hPart, cPart string, groups entryGroups, err error) {
+func genCPartsForEntrySized(re config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (hPart, cPart string, groups entryGroups, err error) {
 	var hb, cb strings.Builder
 
 	if re.MatchFunc != "" {
@@ -621,7 +619,7 @@ func genCPartsForEntrySized(re config.RegexEntry, importModule string, sizes map
 	}
 	if re.GroupsFunc != "" {
 		exportName := re.GroupsExportName()
-		numGroups, namedGroups, e := extractGroupInfo(re.Pattern)
+		numGroups, namedGroups, e := extractGroupInfo(re.Regexp)
 		if e != nil {
 			return "", "", entryGroups{}, e
 		}
@@ -1043,7 +1041,7 @@ func cABIRet(r abiRet) string {
 func cSetConstDecls(setName, konst, idKonst string, n, idN int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "/* Number of patterns in set %q. Sizes the match buffer: the scanner can\n   receive at most this many matches at one position. */\n#define %s %d\n\n", setName, konst, n)
-	fmt.Fprintf(&b, "/* One past the largest pattern id set %q can report. Pattern ids are global\n   indices into regexps:, so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id — the gate\n   array and the _all bitmap — is sized from this. The out_ids array you\n   pass to the _all calls is NOT: it is a LIST of ids, not an id-indexed array,\n   and at most PATTERN_COUNT ids can ever be written to it — which is what\n   the prototypes' `static` sizes say. */\n#define %s %d\n\n", setName, idKonst, idN)
+	fmt.Fprintf(&b, "/* One past the largest pattern id set %q can report. Pattern ids index\n   patterns: (then the set's own regexps:), so a set holding a few late-declared patterns has a\n   small count and a large id space. Everything indexed BY an id — the gate\n   array and the _all bitmap — is sized from this. The out_ids array you\n   pass to the _all calls is NOT: it is a LIST of ids, not an id-indexed array,\n   and at most PATTERN_COUNT ids can ever be written to it — which is what\n   the prototypes' `static` sizes say. */\n#define %s %d\n\n", setName, idKonst, idN)
 	return b.String()
 }
 
@@ -1178,19 +1176,35 @@ void %[1]s_free(%[4]s *s);
 `, find, konst, gateField, scannerType, strings.TrimSuffix(cNotesPairDecl(find, scannerType, "scanner", find), "\n"))
 }
 
-// cPatternNameTable is the `emit_name_map: true` helper. Shared with the
-// component stub: it maps ids to names and has nothing to do with the output
-// kind.
-func cPatternNameTable(cfg config.BuildConfig) string {
+// cPatternNameDecls declares every `emit_name_map: true` lookup, one per set.
+// Shared with the component stub, as is cPatternNameFns: they map ids to names
+// and have nothing to do with the output kind.
+func cPatternNameDecls(cfg config.BuildConfig) string {
 	var b strings.Builder
-	b.WriteString("static const char *rx_pattern_names[] = {")
-	for i, re := range cfg.Regexps {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(&b, "%q", re.Name)
+	for _, s := range nameMapSets(cfg) {
+		fn := config.SetPatternNameFunc(s.Name, "c")
+		fmt.Fprintf(&b, "/* %s %s */\nconst char *%s(int id);\n\n", fn, nameMapDoc(s), fn)
 	}
-	b.WriteString("};\nconst char *pattern_name(int id) { int n=sizeof(rx_pattern_names)/sizeof(*rx_pattern_names); return (id>=0&&id<n)?rx_pattern_names[id]:\"\"; }\n")
+	return b.String()
+}
+
+// cPatternNameFns defines the lookups cPatternNameDecls declares.
+func cPatternNameFns(cfg config.BuildConfig) string {
+	var b strings.Builder
+	for _, s := range nameMapSets(cfg) {
+		fmt.Fprintf(&b, "const char *%s(int id) {\n", config.SetPatternNameFunc(s.Name, "c"))
+		named := namedMembers(s, cfg)
+		if len(named) == 0 {
+			b.WriteString("    (void)id;\n")
+		} else {
+			b.WriteString("    switch (id) {\n")
+			for _, m := range named {
+				fmt.Fprintf(&b, "    case %d: return %q;\n", m.ID, m.Entry.Name)
+			}
+			b.WriteString("    }\n")
+		}
+		b.WriteString("    return \"\";\n}\n")
+	}
 	return b.String()
 }
 

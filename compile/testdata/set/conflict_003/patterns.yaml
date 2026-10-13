@@ -8,8 +8,8 @@ options:
   budget_bytes: 1
   budget_states_prefilter: 65536
 patterns:
-  - pattern: 'baz[a-z]+'
-  - pattern: 'baz[0-9]+'
+  - regexp: 'baz[a-z]+'
+  - regexp: 'baz[0-9]+'
 expect:
   bucket_count: 2
   conflict_reasons:

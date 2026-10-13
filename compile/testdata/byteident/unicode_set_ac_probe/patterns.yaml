@@ -1,29 +1,29 @@
 # A Unicode-mode set of 22 keywords on three first characters, every one
 # beginning with a UTF-8 lead byte: Aho-Corasick with the two-column root
 # probe and the per-candidate verify (eligible and ineligible literals).
-regexps:
-  - { name: k00, pattern: 'пример' }
-  - { name: k01, pattern: 'при' }
-  - { name: k02, pattern: 'рим' }
-  - { name: k03, pattern: 'мер' }
-  - { name: k04, pattern: 'пром' }
-  - { name: k05, pattern: 'промокашка' }
-  - { name: k06, pattern: 'мок' }
-  - { name: k07, pattern: 'пирог' }
-  - { name: k08, pattern: 'рог' }
-  - { name: k09, pattern: 'почтальон' }
-  - { name: k10, pattern: 'почтамт' }
-  - { name: k11, pattern: 'пирамида' }
-  - { name: k12, pattern: 'рам' }
-  - { name: k13, pattern: 'правда' }
-  - { name: k14, pattern: 'письмо' }
-  - { name: k15, pattern: 'птица' }
-  - { name: k16, pattern: 'пустота' }
-  - { name: k17, pattern: 'печать' }
-  - { name: k18, pattern: 'поле' }
-  - { name: k19, pattern: 'палец' }
-  - { name: k20, pattern: 'песок' }
-  - { name: k21, pattern: 'плита' }
+patterns:
+  - { name: k00, regexp: 'пример' }
+  - { name: k01, regexp: 'при' }
+  - { name: k02, regexp: 'рим' }
+  - { name: k03, regexp: 'мер' }
+  - { name: k04, regexp: 'пром' }
+  - { name: k05, regexp: 'промокашка' }
+  - { name: k06, regexp: 'мок' }
+  - { name: k07, regexp: 'пирог' }
+  - { name: k08, regexp: 'рог' }
+  - { name: k09, regexp: 'почтальон' }
+  - { name: k10, regexp: 'почтамт' }
+  - { name: k11, regexp: 'пирамида' }
+  - { name: k12, regexp: 'рам' }
+  - { name: k13, regexp: 'правда' }
+  - { name: k14, regexp: 'письмо' }
+  - { name: k15, regexp: 'птица' }
+  - { name: k16, regexp: 'пустота' }
+  - { name: k17, regexp: 'печать' }
+  - { name: k18, regexp: 'поле' }
+  - { name: k19, regexp: 'палец' }
+  - { name: k20, regexp: 'песок' }
+  - { name: k21, regexp: 'плита' }
 sets:
   - name: ac
     find: ac_find

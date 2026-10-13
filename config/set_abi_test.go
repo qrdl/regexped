@@ -24,11 +24,11 @@ func setWithNames(names ...string) SetConfig {
 }
 
 func cfgWithPatterns(names ...string) BuildConfig {
-	entries := make([]RegexEntry, len(names))
+	entries := make([]PatternEntry, len(names))
 	for i, n := range names {
-		entries[i] = RegexEntry{Name: n, Pattern: "x"}
+		entries[i] = PatternEntry{Name: n, Regexp: "x"}
 	}
-	return BuildConfig{Regexps: entries}
+	return BuildConfig{Patterns: entries}
 }
 
 // TestPatternCountAndIDSpaceSizeDiffer is the id-space hazard stated as a test.

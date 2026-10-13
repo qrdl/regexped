@@ -14,7 +14,7 @@ import (
 // here mint their own, because compile/ must not import generate/ (generate/
 // already imports compile/), and because what compile/ actually depends on is
 // only that a name EXISTS for a func — not how it was spelled.
-func canonicalNames(entries []config.RegexEntry) map[string]string {
+func canonicalNames(entries []config.PatternEntry) map[string]string {
 	const prefix = "regexped:test/matcher"
 	names := map[string]string{}
 	for _, e := range entries {
@@ -27,7 +27,7 @@ func canonicalNames(entries []config.RegexEntry) map[string]string {
 	return names
 }
 
-func componentOpts(entries []config.RegexEntry) CompileOptions {
+func componentOpts(entries []config.PatternEntry) CompileOptions {
 	return CompileOptions{
 		Component:            true,
 		ComponentPackage:     "regexped:test/matcher",
@@ -62,7 +62,7 @@ func TestAsmOptsRejectsComponentWithoutPackage(t *testing.T) {
 }
 
 func TestCompileRejectsComponentWithoutStandalone(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: `abc`, FindFunc: "f"}}
+	entries := []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}
 	_, _, err := Compile(entries, 0, false, componentOpts(entries))
 	if !errors.Is(err, errComponentNeedsStandalone) {
 		t.Errorf("err = %v, want errComponentNeedsStandalone", err)
@@ -70,7 +70,7 @@ func TestCompileRejectsComponentWithoutStandalone(t *testing.T) {
 }
 
 func TestCompileRejectsComponentWithoutPackage(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: `abc`, FindFunc: "f"}}
+	entries := []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}
 	opts := componentOpts(entries)
 	opts.ComponentPackage = ""
 	if _, _, err := Compile(entries, 0, true, opts); !errors.Is(err, errComponentNoPackage) {
@@ -82,9 +82,9 @@ func TestPatternBaseIndices(t *testing.T) {
 	if idx, total := patternBaseIndices(nil); total != 0 || len(idx) != 0 {
 		t.Errorf("empty: idx=%v total=%d", idx, total)
 	}
-	entries := []config.RegexEntry{
-		{Pattern: `abc`, MatchFunc: "m"},
-		{Pattern: `def`, FindFunc: "f"},
+	entries := []config.PatternEntry{
+		{Regexp: `abc`, MatchFunc: "m"},
+		{Regexp: `def`, FindFunc: "f"},
 	}
 	// Compile once so the patterns carry real function layouts, then check the
 	// bases are cumulative and the total is their sum.
@@ -107,14 +107,14 @@ func TestPatternBaseIndices(t *testing.T) {
 
 // compileForTest compiles entries and returns the internal patterns, so the
 // adapter list can be checked against real function layouts.
-func compileForTest(t *testing.T, entries []config.RegexEntry) []*compiledPattern {
+func compileForTest(t *testing.T, entries []config.PatternEntry) []*compiledPattern {
 	t.Helper()
 	var out []*compiledPattern
 	cur := int64(0)
 	for _, e := range entries {
 		p, err := compilePattern(e, cur, 0, CompileOptions{globals: &moduleGlobals{}})
 		if err != nil {
-			t.Fatalf("compile %q: %v", e.Pattern, err)
+			t.Fatalf("compile %q: %v", e.Regexp, err)
 		}
 		if p == nil {
 			continue
@@ -129,11 +129,11 @@ func compileForTest(t *testing.T, entries []config.RegexEntry) []*compiledPatter
 // and NONE for a func whose canonical name the caller did not supply — the
 // assembler must never invent a name.
 func TestComponentAdaptersSelection(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `abc`, MatchFunc: "m"},
-		{Pattern: `def`, FindFunc: "f"},
-		{Pattern: `(?P<g>x)y`, GroupsFunc: "g"},
-		{Pattern: `zzz`}, // no _func: contributes nothing
+	entries := []config.PatternEntry{
+		{Regexp: `abc`, MatchFunc: "m"},
+		{Regexp: `def`, FindFunc: "f"},
+		{Regexp: `(?P<g>x)y`, GroupsFunc: "g"},
+		{Regexp: `zzz`}, // no _func: contributes nothing
 	}
 	compiled := compileForTest(t, entries)
 	names := canonicalNames(entries)
@@ -170,10 +170,10 @@ func TestComponentAdaptersSelection(t *testing.T) {
 // assembling and validating the whole module checks. Driving all three adapter
 // kinds at once also covers the shared allocator and post-return.
 func TestComponentModuleAssemblesAndValidates(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Pattern: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
+	entries := []config.PatternEntry{
+		{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+		{Regexp: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
 	}
 	wasm, _, err := Compile(entries, 0, true, componentOpts(entries))
 	if err != nil {
@@ -204,7 +204,7 @@ func TestGroupsAdapterHandlesOffsetsPastOneByte(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		sb.WriteString("(a)")
 	}
-	entries := []config.RegexEntry{{Pattern: sb.String(), GroupsFunc: "many_groups"}}
+	entries := []config.PatternEntry{{Regexp: sb.String(), GroupsFunc: "many_groups"}}
 	wasm, _, err := Compile(entries, 0, true, componentOpts(entries))
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +216,7 @@ func TestGroupsAdapterHandlesOffsetsPastOneByte(t *testing.T) {
 // (i32,i32,i32,i32) type cabi_realloc needs — it is shared with the groups-from
 // wrapper, which is absent here.
 func TestComponentWithoutGroupsStillTypesRealloc(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: `abc`, MatchFunc: "m"}}
+	entries := []config.PatternEntry{{Regexp: `abc`, MatchFunc: "m"}}
 	wasm, _, err := Compile(entries, 0, true, componentOpts(entries))
 	if err != nil {
 		t.Fatal(err)
@@ -348,8 +348,8 @@ func setComponentCfg(n int) config.BuildConfig {
 		}},
 	}
 	for i := 0; i < n; i++ {
-		cfg.Regexps = append(cfg.Regexps, config.RegexEntry{
-			Pattern: "kw" + string(rune('a'+i%26)) + string(rune('a'+i/26)) + "[0-9]{2}",
+		cfg.Patterns = append(cfg.Patterns, config.PatternEntry{
+			Regexp: "kw" + string(rune('a'+i%26)) + string(rune('a'+i/26)) + "[0-9]{2}",
 		})
 	}
 	return cfg
@@ -484,7 +484,7 @@ func TestSetComponentIgnoresOutputForMemoryMode(t *testing.T) {
 
 	// The control: an EMBEDDED module imports its memory, and the walk must say
 	// so, or the assertion above would pass on a parser that finds nothing.
-	embedded, _, err := Compile([]config.RegexEntry{{Pattern: `a+`, MatchFunc: "m"}}, 0, false, CompileOptions{})
+	embedded, _, err := Compile([]config.PatternEntry{{Regexp: `a+`, MatchFunc: "m"}}, 0, false, CompileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,14 +580,14 @@ func TestSetComponentNoSetsDelegates(t *testing.T) {
 		WasmFormat:   "component",
 		ImportModule: "t",
 		WitPackage:   "t",
-		Regexps:      []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}},
+		Patterns:     []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}},
 	}
 	names := map[string]string{"m": "regexped:t/matcher#m"}
 	viaSets, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	direct, _, err := Compile(cfg.Regexps, 0, true, CompileOptions{
+	direct, _, err := Compile(cfg.Patterns, 0, true, CompileOptions{
 		Component:            true,
 		ComponentPackage:     "regexped:t/matcher",
 		ComponentExportNames: names,
@@ -656,10 +656,10 @@ func TestSetAdapterBodyUnknownKindPanics(t *testing.T) {
 // the adapter and says nothing about the cause.
 func TestSetComponentMixedWithPatterns(t *testing.T) {
 	cfg := setComponentCfg(3)
-	cfg.Regexps[0].MatchFunc = "token_match"
-	cfg.Regexps[1].FindFunc = "token_find"
+	cfg.Patterns[0].MatchFunc = "token_match"
+	cfg.Patterns[1].FindFunc = "token_find"
 	// Not a set member: a groups_func entry is dropped from every set.
-	cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Pattern: `(\w+)=(\d+)`, GroupsFunc: "token_groups"})
+	cfg.Patterns = append(cfg.Patterns, config.PatternEntry{Regexp: `(\w+)=(\d+)`, GroupsFunc: "token_groups"})
 	names := map[string]string{
 		"token_match":  "regexped:t/matcher#token-match",
 		"token_find":   "regexped:t/matcher#token-find",
@@ -692,7 +692,7 @@ func TestSetComponentMixedWithPatterns(t *testing.T) {
 // offset happened to be zero, this is the one that would still pass.
 func TestSetComponentMixedWithoutResource(t *testing.T) {
 	cfg := setComponentCfg(3)
-	cfg.Regexps[0].MatchFunc = "token_match"
+	cfg.Patterns[0].MatchFunc = "token_match"
 	cfg.Sets[0].Find = ""
 	names := map[string]string{"token_match": "regexped:t/matcher#token-match"}
 	core, _, err := CompileFileComponent(cfg, "regexped:t/matcher", names, nil, setComponentNames("s"), nil)
@@ -738,7 +738,7 @@ func TestSetComponentSkipsMissingCapabilityName(t *testing.T) {
 // patternResourceNames builds the resource name table for every find and groups
 // export in entries, in the canonical form generate/ derives, so these tests do
 // not need generate/ (which imports this package).
-func patternResourceNames(entries []config.RegexEntry) map[string]ComponentPatternResource {
+func patternResourceNames(entries []config.PatternEntry) map[string]ComponentPatternResource {
 	const prefix = "regexped:test/matcher"
 	out := map[string]ComponentPatternResource{}
 	add := func(name string, groups bool) {
@@ -764,7 +764,7 @@ func patternResourceNames(entries []config.RegexEntry) map[string]ComponentPatte
 
 // matchOnlyNames keeps the plain function names for the MATCH exports only:
 // find and groups travel in the resource table.
-func matchOnlyNames(entries []config.RegexEntry) map[string]string {
+func matchOnlyNames(entries []config.PatternEntry) map[string]string {
 	names := map[string]string{}
 	for _, e := range entries {
 		if e.MatchFunc != "" {
@@ -779,10 +779,10 @@ func matchOnlyNames(entries []config.RegexEntry) map[string]string {
 // result is VALID WASM — the check that catches an import that shifted one call
 // target but not another — and carries exactly the exports the WIT expects.
 func TestComponentPatternResourcesAssembleAndValidate(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Pattern: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
+	entries := []config.PatternEntry{
+		{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+		{Regexp: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
 	}
 	wasm, _, err := Compile(entries, 0, true, CompileOptions{
 		Component:                 true,
@@ -838,8 +838,8 @@ func TestComponentPatternResourcesAssembleAndValidate(t *testing.T) {
 // calls the wrong import. The Reporter is non-nil so the set diagnostics reach it.
 func TestSetComponentMixedWithPatternResources(t *testing.T) {
 	cfg := setComponentCfg(3)
-	cfg.Regexps[1].FindFunc = "token_find"
-	resources := patternResourceNames(cfg.Regexps)
+	cfg.Patterns[1].FindFunc = "token_find"
+	resources := patternResourceNames(cfg.Patterns)
 	rep := &Reporter{}
 	core, _, err := CompileFileComponent(cfg, "regexped:test/matcher", nil, resources, setComponentNames("s"), rep)
 	if err != nil {
@@ -905,9 +905,9 @@ func TestPatRepSize(t *testing.T) {
 // entry, and a name whose Groups flag contradicts the export it is attached to
 // — each emits no resource rather than a mis-shaped one.
 func TestOrderedPatternResources(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
+	entries := []config.PatternEntry{
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
 	}
 	compiled := compileForTest(t, entries)
 	if got := orderedPatternResources(compiled, nil, 0); got != nil {
@@ -941,11 +941,11 @@ func TestOrderedPatternResources(t *testing.T) {
 // memo and free them in the dtor are reached only here inside this package;
 // tools/fuzz drives them at run time.
 func TestComponentResourcesWithSearchBlocks(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `a*b|a`, FindFunc: "overrun_find"},
-		{Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
-		{Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
-		{Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
+	entries := []config.PatternEntry{
+		{Regexp: `a*b|a`, FindFunc: "overrun_find"},
+		{Regexp: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+		{Regexp: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+		{Regexp: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
 	}
 	wasm, _, err := Compile(entries, 0, true, CompileOptions{
 		Component:                 true,
@@ -979,7 +979,7 @@ func TestComponentResourcesWithSearchBlocks(t *testing.T) {
 				MaxDFAStates: config.Limit(c.mfs),
 				Sets:         []config.SetConfig{{Name: "s", Patterns: config.PatternSelector{All: true}, Find: "scan_it"}}}
 			for i, p := range c.pats {
-				cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Name: "p" + strconv.Itoa(i), Pattern: p})
+				cfg.Patterns = append(cfg.Patterns, config.PatternEntry{Name: "p" + strconv.Itoa(i), Regexp: p})
 			}
 			sz, err := SearchSizes(cfg)
 			if err != nil {

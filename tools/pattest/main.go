@@ -235,7 +235,7 @@ func classifierRegexp(pattern, mode string) (*regexp.Regexp, error) {
 // compilePattern compiles pattern as a standalone WASM module exporting
 // match_func or find_func (named after the mode) under the given LikelyMode.
 func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, error) {
-	re := config.RegexEntry{Pattern: pattern}
+	re := config.PatternEntry{Regexp: pattern}
 	switch mode {
 	case "match":
 		re.MatchFunc = "match"
@@ -243,7 +243,7 @@ func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, er
 		re.FindFunc = "find"
 	}
 	opts := withMode(compile.CompileOptions{LikelyMode: likely, MaxDFAStates: *maxDFAStatesFlag})
-	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, opts)
 	if err == nil {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc])
 	}

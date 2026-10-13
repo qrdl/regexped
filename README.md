@@ -122,9 +122,9 @@ Examples are available for the following environments: wasmtime, native Rust hos
 
 Languages: Rust, Go, C, JavaScript, TypeScript, AssemblyScript.
 
-Most build a core WASM module. Four build **Component Model components** 🧩: [`wasmtime/rust/secrets`](examples/wasmtime/rust/secrets) and the FastEdge HTTP app [`fastedge/lang-detect`](examples/fastedge/lang-detect) instead of a module, consumed through a generated Rust stub and composed by `regexped merge`; [`wasmtime/rust/secret-scanner`](examples/wasmtime/rust/secret-scanner) and [`wasmtime/c/url-parts`](examples/wasmtime/c/url-parts) alongside a module, from the same source — see [component.md](docs/component.md).
+Most build a core WASM module. Four build **Component Model components** 🧩: [`wasmtime/rust/secrets`](examples/wasmtime/rust/secrets) and the FastEdge HTTP app [`fastedge/script-detect`](examples/fastedge/script-detect) instead of a module, consumed through a generated Rust stub and composed by `regexped merge`; [`wasmtime/rust/secret-scanner`](examples/wasmtime/rust/secret-scanner) and [`wasmtime/c/url-parts`](examples/wasmtime/c/url-parts) alongside a module, from the same source — see [component.md](docs/component.md).
 
-Two compile their patterns in **Unicode mode**: [`fastedge/lang-detect`](examples/fastedge/lang-detect), which names European languages by the letters of a text, and [`browser/homoglyph`](examples/browser/homoglyph), which marks lookalike letters and invisible and text-direction characters as you type.
+Two compile their patterns in **Unicode mode**: [`fastedge/script-detect`](examples/fastedge/script-detect), which names the scripts of a text by its letters, narrowed to the European alphabets they fit, and [`browser/homoglyph`](examples/browser/homoglyph), which marks lookalike letters and invisible and text-direction characters as you type.
 
 See [`examples/README.md`](examples/README.md) for more details, including which format each example builds.
 

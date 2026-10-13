@@ -4,23 +4,23 @@ import_module: "threats"
 stub_file:     "stub.ts"
 stub_type:     "as"
 
-regexps:
+patterns:
   - name: "union_select"
-    pattern: 'UNION\s+SELECT'
+    regexp: 'UNION\s+SELECT'
   - name: "drop_table"
-    pattern: 'DROP\s+TABLE'
+    regexp: 'DROP\s+TABLE'
   - name: "or_tautology"
-    pattern: 'OR\s+1\s*=\s*1'
+    regexp: 'OR\s+1\s*=\s*1'
   - name: "sleep_inject"
-    pattern: 'SLEEP\s*\('
+    regexp: 'SLEEP\s*\('
   - name: "script_tag"
-    pattern: '<script'
+    regexp: '<script'
   - name: "js_protocol"
-    pattern: 'javascript:'
+    regexp: 'javascript:'
   - name: "event_handler"
-    pattern: 'onerror\s*='
+    regexp: 'onerror\s*='
   - name: "alert_call"
-    pattern: 'alert\s*\('
+    regexp: 'alert\s*\('
 
 sets:
   - name: "sqli"
@@ -30,4 +30,5 @@ sets:
 
   - name: "xss"
     scan_any: "scan_xss"
+    emit_name_map: true
     patterns: ["script_tag", "js_protocol", "event_handler", "alert_call"]

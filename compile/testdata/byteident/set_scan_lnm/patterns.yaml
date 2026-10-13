@@ -9,15 +9,15 @@
 # state has a 26-byte exit set and a 230-byte self-loop — the stride's target.
 # Several patterns with DIFFERENT counts keep them distinct without giving any
 # of them a mandatory literal.
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]{4}[0-9]{1}'
+    regexp: '[a-z]{4}[0-9]{1}'
   - name: p1
-    pattern: '[a-z]{4}[0-9]{2}'
+    regexp: '[a-z]{4}[0-9]{2}'
   - name: p2
-    pattern: '[a-z]{5}[0-9]{1}'
+    regexp: '[a-z]{5}[0-9]{1}'
   - name: p3
-    pattern: '[a-z]{6}[0-9]{3}'
+    regexp: '[a-z]{6}[0-9]{3}'
 sets:
   - name: s
     scan_any: s_scan_any

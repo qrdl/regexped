@@ -75,8 +75,8 @@ func runOpts() compile.CompileOptions { return withMode(compile.CompileOptions{}
 // CompiledDFA / lit-chain match bodies.
 func compileMatch(pat string) ([]byte, error) {
 	return cachedCompile("match\x00"+pat, func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, MatchFunc: "match"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, runOpts())
+		entry := config.PatternEntry{Regexp: pat, MatchFunc: "match"}
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -85,8 +85,8 @@ func compileMatch(pat string) ([]byte, error) {
 // the engine (TDFA when eligible, Backtracking otherwise).
 func compileGroups(pat string) ([]byte, error) {
 	return cachedCompile("groups\x00"+pat, func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, runOpts())
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -97,8 +97,8 @@ func compileGroups(pat string) ([]byte, error) {
 // sees for a given pattern shape, and the other backend stays dark.
 func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng, runOpts())
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true, eng, runOpts())
 		return w, err
 	})
 }
@@ -108,8 +108,8 @@ func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 // body and its fallback can each be run alone.
 func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true,
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true,
 			compile.EngineBacktrack, withMode(compile.CompileOptions{BTWorkBudget: budget}))
 		return w, err
 	})
@@ -120,11 +120,11 @@ func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
 	w, drops, err := cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, setDrops, error) {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
 		sets := []config.SetConfig{{
 			Name: "s",
@@ -140,7 +140,7 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 		// the way it does for the single-pattern paths. cfg.Output == "" selects
 		// standalone. runWasmSetFindAll therefore derives its layout from the
 		// emitted data section rather than using pathsInputBase.
-		cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+		cfg := config.BuildConfig{Patterns: entries, Sets: sets}
 		w, _, diags, err := compile.CompileFileDiag(cfg, "")
 		return w, dropsFromSet(diags), err
 	})

@@ -35,11 +35,11 @@ import (
 // serve every oracle: conflating them made this harness exclude a pattern the
 // scan pair still answers for, and read the disagreement as a wrong answer.
 func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -53,7 +53,7 @@ func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 		Unicode:     setModeKey(),
 	}}
 	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, dropsFromSet(diags), err
 	})
 }
@@ -526,6 +526,62 @@ func checkCapsAgainstOracleDropped(t *testing.T, r *capRunner, pats []string, in
 	}
 }
 
+// TestSetInlineRegexps drives a set whose members are partly its own
+// `regexps:` beside a second set with regexps of its own, in one module. An
+// inline regexp's id follows every top-level pattern and is numbered per set,
+// so set "a"'s inline ids are 2 and 3 while set "b"'s first is 2 as well; a
+// top-level pattern "a" does not select (id 0) must never be reported.
+func TestSetInlineRegexps(t *testing.T) {
+	cfg := config.BuildConfig{
+		Patterns: []config.PatternEntry{
+			{Name: "foo", Regexp: `foo`},
+			{Name: "bar", Regexp: `bar[0-9]+`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "a", MatchAny: "cap_match_any", MatchAll: "cap_match_all",
+			ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find",
+			// The oracle asks `find` from every position, which only the
+			// overlapping body answers without a drive's gates.
+			Overlapping: true,
+			Patterns:    config.PatternSelector{Names: []string{"bar"}},
+			Regexps:     []string{`baz`, `qu+x`},
+		}, {
+			Name: "b", ScanAll: "b_scan_all",
+			Regexps: []string{`zip`, `foo`},
+		}},
+	}
+	if err := config.ValidateSets(&cfg); err != nil {
+		t.Fatalf("ValidateSets: %v", err)
+	}
+	w, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	// Indexed by set "a"'s ids; id 0 is not a member, so it gets a regexp that
+	// matches nothing and the oracle expects no report of it.
+	never := `[^\x00-\x{10FFFF}]`
+	pats := []string{never, `bar[0-9]+`, `baz`, `qu+x`}
+	for _, input := range []string{"foo bar12 baz quux zip", "quux", "bar7", "baz", "zip foo", ""} {
+		r := newCapRunnerFrom(t, w, pats, input)
+		checkCapsAgainstOracle(t, r, pats, input)
+		// Set "b": `zip` is id 2 and `foo` id 3 — its own numbering, not
+		// after set "a"'s regexps — and top-level `foo` (id 0) is not its member.
+		var want []int
+		for id, re := range map[int]string{2: `zip`, 3: `foo`} {
+			if strings.Contains(input, re) {
+				want = append(want, id)
+			}
+		}
+		sort.Ints(want)
+		r.npat = 4
+		got := r.allIDs(t, "b_scan_all", r.inBase, int32(len(input)), int32(0))
+		if !eqIDs(want, got) {
+			t.Errorf("%q: set b scan_all = %v, want %v", input, got, want)
+		}
+		r.Close()
+	}
+}
+
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's
@@ -919,15 +975,15 @@ var acProbeSet = []string{
 // report, failing unless the two-column probe and the verify shipped.
 func acProbeDiag(t *testing.T, pats []string) *compile.ACTableDiag {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	on := true
 	sets := []config.SetConfig{{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{Names: names}, Unicode: &on}}
-	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1061,18 +1117,18 @@ func TestACProbeWideColumnAgainstOracle(t *testing.T) {
 		"арбуз", "банан", "вишня", "груша", "дыня", "азбука", "буря", "весна", "гроза", "дождь",
 		"аист", "белка", "волк", "гусь", "дятел", "акула", "бобр", "ворон", "голубь", "дельфин",
 	}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	on := true
 	sets := []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true, Patterns: config.PatternSelector{Names: names}, Unicode: &on,
 	}}
-	w, _, diags, err := compile.CompileFileOpts(config.BuildConfig{Regexps: entries, Sets: sets}, "",
+	w, _, diags, err := compile.CompileFileOpts(config.BuildConfig{Patterns: entries, Sets: sets}, "",
 		compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendAC))
 	if err != nil {
 		t.Fatal(err)
@@ -1174,14 +1230,14 @@ func TestByteModeHighByteLiteralSets(t *testing.T) {
 				twinPats[i] = regexp.QuoteMeta(twin(kw))
 			}
 			compileSet := func(overlapping bool) []byte {
-				entries := make([]config.RegexEntry, len(pats))
+				entries := make([]config.PatternEntry, len(pats))
 				names := make([]string, len(pats))
 				for i, p := range pats {
 					names[i] = fmt.Sprintf("p%d", i)
-					entries[i] = config.RegexEntry{Name: names[i], Pattern: p, ByteMode: true}
+					entries[i] = config.PatternEntry{Name: names[i], Regexp: p, ByteMode: true}
 				}
 				off := false
-				w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+				w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 					Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 					ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 					Patterns: config.PatternSelector{Names: names}, Unicode: &off,
@@ -1261,14 +1317,14 @@ var anchoredBTSets = []struct {
 
 func compileAnchoredBTSet(t *testing.T, pats []string, unicode, overlapping bool, maxMemory config.MemorySize, maxUnion int) ([]byte, compile.SetDiag) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	mode := unicode
-	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Regexps: entries, Sets: []config.SetConfig{{
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 		Patterns: config.PatternSelector{Names: names}, Unicode: &mode,
@@ -1399,18 +1455,18 @@ func TestSetWideAllBitmap(t *testing.T) {
 	const n = 70
 	pats := make([]string, n)
 	names := make([]string, n)
-	entries := make([]config.RegexEntry, n)
+	entries := make([]config.PatternEntry, n)
 	for i := range pats {
 		pats[i] = fmt.Sprintf("kw%02dX", i)
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: pats[i]}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: pats[i]}
 	}
 	sets := []config.SetConfig{{
 		Name: "s", MatchAll: "cap_match_all", ScanAll: "cap_scan_all",
 		Find: "cap_find", Overlapping: true,
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -1485,11 +1541,11 @@ func TestSetWideAllBitmap(t *testing.T) {
 // compileGatedSet compiles pats into a standalone module whose `find` is the
 // default gated body (no `overlapping:` key).
 func compileGatedSet(pats []string) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:     "s",
@@ -1498,7 +1554,7 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Unicode:  setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, err
 	})
 }
@@ -1617,13 +1673,13 @@ func runGatedFindBlocks(t *testing.T, pats []string, input string, mode searchbl
 // batchCap < 0 the set batches and its `find` is driven.
 func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32) (matches []setMatch, switched bool) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
-	cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+	cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names}}}}
 	if batchCap != 0 {
 		cfg.Sets[0].Hints = []string{"batch-find"}
@@ -2164,11 +2220,11 @@ func TestGatedLadderFuel(t *testing.T) {
 // bodies over shared suffix functions, which is also what makes declaring both
 // worth testing: the shared functions must serve either caller.
 func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -2179,7 +2235,7 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Unicode:     setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, err
 	})
 }
@@ -2637,15 +2693,15 @@ func TestFindBatchZeroCap(t *testing.T) {
 // gating — but they reach the sentinel through different arms.
 func TestBatchZeroCapTerminates(t *testing.T) {
 	pats := []string{`ab`, `b`}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	for _, overlapping := range []bool{false, true} {
 		t.Run(fmt.Sprintf("overlapping=%v", overlapping), func(t *testing.T) {
-			cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 				Overlapping: overlapping,
 				Patterns:    config.PatternSelector{Names: names},
@@ -2758,18 +2814,18 @@ func sparsePats(gen func(int) string, n int) []string {
 // never firing, so every case below asserts the packing it meant to exercise.
 func bucketTypes(t *testing.T, pats []string) (find []string) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all",
 		ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find",
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -2986,14 +3042,14 @@ func TestSparseSetABIMatrixValidates(t *testing.T) {
 			pats := sparsePats(gen, n)
 			for _, c := range caps {
 				t.Run(fmt.Sprintf("%s/n=%d/%s", shapeName, n, c.name), func(t *testing.T) {
-					entries := make([]config.RegexEntry, len(pats))
+					entries := make([]config.PatternEntry, len(pats))
 					for i, p := range pats {
-						entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+						entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 					}
 					sc := c.set
 					sc.Name = "g"
 					sc.Patterns = config.PatternSelector{All: true}
-					cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+					cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 					w, _, diags, err := compile.CompileFileDiag(cfg, "")
 					if err != nil {
 						t.Fatalf("compile: %v", err)
@@ -3108,13 +3164,13 @@ func TestSparseGatedBatchDeliversEveryPattern(t *testing.T) {
 				// so any loss shows up directly as a count.
 				pats[i] = fmt.Sprintf(`(?:(?:)|a%d)*`, i)
 			}
-			entries := make([]config.RegexEntry, n)
+			entries := make([]config.PatternEntry, n)
 			names := make([]string, n)
 			for i, p := range pats {
 				names[i] = fmt.Sprintf("p%d", i)
-				entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+				entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 			}
-			cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 				Patterns: config.PatternSelector{Names: names},
 			}}}
@@ -3356,9 +3412,9 @@ func compileSetBothModes(t *testing.T, pat string, caps func(*config.SetConfig))
 		}
 		caps(&sc)
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "p0", Pattern: pat}},
-			Sets:    []config.SetConfig{sc},
-			Output:  output,
+			Patterns: []config.PatternEntry{{Name: "p0", Regexp: pat}},
+			Sets:     []config.SetConfig{sc},
+			Output:   output,
 		}
 		w, _, err := compile.CompileFile(cfg, "")
 		if err != nil {
@@ -3498,7 +3554,7 @@ func TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm", // embedded: memory 0 is imported
 		MaxDFAStates: 1,             // every member's suffix DFA is over it: Backtracking
-		Regexps:      []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Patterns:     []config.PatternEntry{{Name: "p0", Regexp: pats[0]}, {Name: "p1", Regexp: pats[1]}},
 		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan",
 			Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
 	}
@@ -3813,11 +3869,11 @@ func shuftiPatterns(n int) []string {
 // compileCapsShufti is compileCaps with AC forced out of budget.
 func compileCapsShufti(t *testing.T, pats []string, overlapping bool) []byte {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -3830,7 +3886,7 @@ func compileCapsShufti(t *testing.T, pats []string, overlapping bool) []byte {
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	w, _, diags, err := compile.CompileFileOpts(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		config.BuildConfig{Patterns: entries, Sets: sets}, "",
 		compile.CompileSetOptions{ACBudgetBytes: 1})
 	if err != nil {
 		t.Fatalf("compile shufti set: %v", err)
@@ -3904,11 +3960,11 @@ func wideUnionPatterns(n int) []string {
 // LikelyNoMatch, and only since the selection ceiling was raised.
 func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -3922,7 +3978,7 @@ func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte 
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	w, _, diags, err := compile.CompileFileOpts(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		config.BuildConfig{Patterns: entries, Sets: sets}, "",
 		compile.CompileSetOptions{ACBudgetBytes: 1})
 	if err != nil {
 		t.Fatalf("compile wide-union set: %v", err)
@@ -4067,11 +4123,11 @@ func itoa2(n int) string {
 // naturally-dropped population is tiny, so forcing the path is the only way to
 // get real coverage of it.
 func compileSetBT(pats []string, maxFallback int) ([]byte, map[int]bool, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -4080,7 +4136,7 @@ func compileSetBT(pats []string, maxFallback int) ([]byte, map[int]bool, error) 
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	cfg := config.BuildConfig{
-		Regexps:      entries,
+		Patterns:     entries,
 		Sets:         sets,
 		MaxDFAStates: config.Limit(maxFallback),
 	}
@@ -4193,13 +4249,13 @@ func TestSetBTStackGrows(t *testing.T) {
 		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
 	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {
 		t.Helper()
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
-		cfg := config.BuildConfig{MaxDFAStates: 1, Regexps: entries, Sets: []config.SetConfig{{
+		cfg := config.BuildConfig{MaxDFAStates: 1, Patterns: entries, Sets: []config.SetConfig{{
 			Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 			ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 			Patterns: config.PatternSelector{Names: names},
@@ -4476,15 +4532,15 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 			for _, mf := range []int{0, 1} {
 				name := fmt.Sprintf("%s/%s/mf=%d", shapeName, c.name, mf)
 				t.Run(name, func(t *testing.T) {
-					entries := make([]config.RegexEntry, len(pats))
+					entries := make([]config.PatternEntry, len(pats))
 					for i, p := range pats {
-						entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+						entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 					}
 					sc := c.set
 					sc.Name = "g"
 					sc.Patterns = config.PatternSelector{All: true}
 					cfg := config.BuildConfig{
-						Regexps: entries, MaxDFAStates: config.Limit(mf),
+						Patterns: entries, MaxDFAStates: config.Limit(mf),
 						Sets: []config.SetConfig{sc},
 					}
 					w, _, diags, err := compile.CompileFileDiag(cfg, "")
@@ -4542,14 +4598,14 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 // Backtracking engine. Returns the module and how many BT buckets it holds, so
 // a test cannot silently pass by exercising the DFA path instead.
 func compileBTBatchSet(pats []string, maxFallback int) ([]byte, int, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps:      entries,
+		Patterns:     entries,
 		MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{{
 			Name:        "s",
@@ -4732,8 +4788,8 @@ func TestAnchoredBatchDoesNotRepeat(t *testing.T) {
 		{`\A`, "abc"},
 		{`\Aab*`, "abbabb"},
 	} {
-		w, _, err := compile.Compile([]config.RegexEntry{{
-			Pattern: c.pat, FindFunc: "find", Hints: []string{"batch-find"},
+		w, _, err := compile.Compile([]config.PatternEntry{{
+			Regexp: c.pat, FindFunc: "find", Hints: []string{"batch-find"},
 		}}, pathsTableBase, true)
 		if err != nil {
 			t.Fatalf("%q compile: %v", c.pat, err)
@@ -4923,13 +4979,13 @@ var splitInputs = []string{
 // splitDiag compiles pats as a gated set and returns its split member ids.
 func splitDiag(t *testing.T, pats []string) []int {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
-	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names},
 	}}}, "")
 	if err != nil {
@@ -4991,13 +5047,13 @@ func TestSetSplitMembersAgainstOracle(t *testing.T) {
 	// member) — by the merge wrappers.
 	direct, merged := 0, 0
 	for _, pats := range splitCases {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
-		_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+		_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 			Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl", Patterns: config.PatternSelector{Names: names},
 		}}}, "")
 		if err != nil {
@@ -5060,11 +5116,11 @@ func TestSetSplitMembersAgainstOracle(t *testing.T) {
 func TestSetSplitBatchAgainstOracle(t *testing.T) {
 	for _, pats := range splitCases {
 		for _, ov := range []bool{false, true} {
-			entries := make([]config.RegexEntry, len(pats))
+			entries := make([]config.PatternEntry, len(pats))
 			for i, p := range pats {
-				entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+				entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 			}
-			_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "f", Overlapping: ov, Hints: []string{"batch-find"}, Patterns: config.PatternSelector{All: true},
 			}}}, "")
 			if err != nil {
@@ -5214,12 +5270,12 @@ func TestSetCountersLinear(t *testing.T) {
 	cfg.SetWasmSIMD(true)
 	engine := wasmtime.NewEngineWithConfig(cfg)
 	build := func(pats []string, set config.SetConfig) ([]byte, compile.SetDiag) {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		for i, p := range pats {
-			entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 		}
 		set.Name, set.Patterns = "s", config.PatternSelector{All: true}
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}, "")
 		if err != nil {
 			t.Fatal(err)
 		}

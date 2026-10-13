@@ -1,8 +1,8 @@
 import_module: m
 wasm_file: x.wasm
 max_dfa_states: 16
-regexps:
-  - pattern: '(?:aa|a){0,40}b|a'
+patterns:
+  - regexp: '(?:aa|a){0,40}b|a'
 sets:
   - name: s
     find: sfind

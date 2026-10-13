@@ -468,7 +468,7 @@ func namedRuneCeiling(pat string, parsed *syntax.Regexp) rune {
 // targets cannot reach.
 func compileFindByteMode(pat string) ([]byte, error) {
 	return cachedCompile("findbyte\x00"+pat, func() ([]byte, error) {
-		w, _, err := compile.Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "find", ByteMode: true}}, tableBase, true)
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, FindFunc: "find", ByteMode: true}}, tableBase, true)
 		return w, err
 	})
 }

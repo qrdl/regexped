@@ -162,7 +162,7 @@ func witFuncs(cfg config.BuildConfig) ([]witFunc, error) {
 	// form, so the message can name both originals.
 	claimed := map[string]witFunc{}
 
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		for _, c := range []struct {
 			field, name, doc, sig string
 			kind                  witKind

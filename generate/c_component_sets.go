@@ -97,10 +97,8 @@ func genCComponentSetParts(cfg config.BuildConfig, wsets []witSet, setsImportMod
 			}
 		}
 	}
-	if hasEmitNameMap(cfg) {
-		hb.WriteString("const char *pattern_name(int id);\n\n")
-		cb.WriteString(cPatternNameTable(cfg))
-	}
+	hb.WriteString(cPatternNameDecls(cfg))
+	cb.WriteString(cPatternNameFns(cfg))
 	return hb.String(), cb.String()
 }
 

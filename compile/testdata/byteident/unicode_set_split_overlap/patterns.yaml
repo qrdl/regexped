@@ -2,9 +2,9 @@
 # merge rounds its search position up to a character's first byte, and its
 # program sweep answers -1 inside a character. Its members are ASCII, so the
 # set-level key is what puts it in Unicode mode.
-regexps:
-  - { name: s0, pattern: 'foo\w+' }
-  - { name: s1, pattern: '(?:a[^z]*?z)?' }
+patterns:
+  - { name: s0, regexp: 'foo\w+' }
+  - { name: s1, regexp: '(?:a[^z]*?z)?' }
 sets:
   - name: us
     find: us_find

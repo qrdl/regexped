@@ -11,14 +11,14 @@ wasm_file:     "regexps.wasm"  # compiled regexp WASM (intermediate)
 import_module: "regexps"       # Rust module name in generated stubs
 stub_file:     "stubs.rs"      # generated Rust FFI stubs
 
-regexps:
-  - pattern:    '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
+patterns:
+  - regexp:    '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
     match_func: "match_email"
 
-  - pattern:    '^https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?$'
+  - regexp:    '^https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?$'
     match_func: "url_match"
 
-  - pattern:    '(?i)(?:<\s*(?:script|iframe|...)\b[^>]*>|\bon\w+=|javascript\s*:)'
+  - regexp:    '(?i)(?:<\s*(?:script|iframe|...)\b[^>]*>|\bon\w+=|javascript\s*:)'
     find_func:  "find_xss"
 ```
 
@@ -96,7 +96,7 @@ See [`examples/fastedge/validate/`](../examples/fastedge/validate/) for the comp
 sets:
   - name: "attacks"
     scan_any: "scan_url"    # non-anchored: ONE matching pattern id, no position
-    emit_name_map: true      # so pattern_name(id) can name the attack type
+    emit_name_map: true      # so attacks_pattern_name(id) can name the attack type
     patterns: all
 ```
 
@@ -108,7 +108,7 @@ sets:
 // Backtracking engine's memory.
 match patterns::scan_url(&url, 0) {
     Ok(Some(pattern_id)) => {
-        let attack = patterns::pattern_name(pattern_id);
+        let attack = patterns::attacks_pattern_name(pattern_id);
         self.send_http_response(
             403,
             vec![("Content-Type", "text/plain")],
@@ -137,7 +137,7 @@ See [sets.md](sets.md) for the full `sets:` schema and output format.
 
 ## Component Model example: an HTTP app in Unicode mode
 
-[`examples/fastedge/lang-detect/`](../examples/fastedge/lang-detect/) is a
+[`examples/fastedge/script-detect/`](../examples/fastedge/script-detect/) is a
 FastEdge HTTP application built the other way: the app is a `wasi:http` guest
 component (`wstd`, `wasm32-wasip2`), the patterns are a regexped component
 (`wasm_format: component`), and `regexped merge` composes the two with `wac`.
@@ -145,27 +145,28 @@ component (`wstd`, `wasm32-wasip2`), the patterns are a regexped component
 runner, `@gcoredev/fastedge-test`, which drives the FastEdge runtime
 `fastedge-run` (`make test`).
 
-It takes text as a POST body and answers a JSON array of the European languages its letters
-allow. Every pattern names a Unicode script class or a letter above U+007F, so
+It takes text as a POST body and answers a JSON array of the scripts its letters
+use, each narrowed to the European alphabets its letters fit. Every pattern names a Unicode script class or a letter above U+007F, so
 each compiles in Unicode mode, and a language is one anchored `match_all`
 pattern over its alphabet:
 
 ```yaml
-regexps:
+patterns:
   - name: German
-    pattern: '(?:\P{Latin}|(?i:[a-zäöüß]))*(?i:[äöüß])(?:\P{Latin}|(?i:[a-zäöüß]))*'
+    regexp: '(?:\P{Latin}|(?i:[a-zäöüß]))*(?i:[äöüß])(?:\P{Latin}|(?i:[a-zäöüß]))*'
 
 sets:
   - name: latin
     match_all: latin_languages   # every language whose pattern matches the WHOLE text
+    emit_name_map: true          # latin_pattern_name(id) names a language
     patterns: [German, French, …]
 ```
 
 ```rust
 include!("stubs.rs");
 
-let ids: Vec<i32> = langdetect::latin_languages(text)?.collect();
-let names: Vec<&str> = ids.into_iter().map(langdetect::pattern_name).collect();
+let ids: Vec<i32> = scriptdetect::latin_languages(text)?.collect();
+let names: Vec<&str> = ids.into_iter().map(scriptdetect::latin_pattern_name).collect();
 ```
 
 The calls are the ones a module build makes; see

@@ -273,8 +273,8 @@ func TestDFALayoutScanPrefixCap(t *testing.T) {
 	}
 
 	rep := &Reporter{}
-	re := config.RegexEntry{Pattern: `здравствуйте\s+\pL+`, FindFunc: "f"}
-	if _, _, err := Compile([]config.RegexEntry{re}, 65536, true, CompileOptions{Report: rep}); err != nil {
+	re := config.PatternEntry{Regexp: `здравствуйте\s+\pL+`, FindFunc: "f"}
+	if _, _, err := Compile([]config.PatternEntry{re}, 65536, true, CompileOptions{Report: rep}); err != nil {
 		t.Fatal(err)
 	}
 	var b bytes.Buffer
@@ -291,11 +291,11 @@ func TestDFALayoutScanPrefixCap(t *testing.T) {
 // useRowDedup triggers.
 func TestDFAU16RowDedup(t *testing.T) {
 	t.Run("match", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{300}", MatchFunc: "m"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{300}", MatchFunc: "m"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 	t.Run("find", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{300}", FindFunc: "f"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{300}", FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 }
@@ -308,12 +308,12 @@ func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 	t.Run("newline_boundary_u8_compressed", func(t *testing.T) {
 		// (?m)^[a-z]{150}FOOBAR$: >128 states, u8-compressed table, mandatory
 		// literal "FOOBAR" with no fixed prefix, newline-boundary anchors.
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m)^[a-z]{150}FOOBAR$`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m)^[a-z]{150}FOOBAR$`, FindFunc: "f"}})
 	})
 	t.Run("word_boundary_u16", func(t *testing.T) {
 		// \b[a-z]{300}FOOBAR\b: > 256 states forces u16, mandatory literal +
 		// word-boundary variant.
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\b[a-z]{300}FOOBAR\b`, FindFunc: "f"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `\b[a-z]{300}FOOBAR\b`, FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 }
@@ -331,7 +331,7 @@ func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 // nil for it (no fixed prefix on either side), so this reaches the general
 // (non-mandatory-lit) dispatch branch rather than T2's mandatory-lit path.
 func TestDFANonMidDominantU16Sentinel(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[^,]{300,}XYZ", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[^,]{300,}XYZ", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 100000})
 }
 
@@ -341,7 +341,7 @@ func TestDFANonMidDominantU16Sentinel(t *testing.T) {
 // literal prefix, reaches the general DFA find path (not the lit-chain-alt
 // frontend) and has few enough distinct first bytes for Teddy.
 func TestDFATeddyThreeFourBytePrefix(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:cat|dog|bird|frog)[0-9]+`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:cat|dog|bird|frog)[0-9]+`, FindFunc: "f"}})
 }
 
 // TestDFACaseFoldUnicodeOrbit exercises the full-Unicode SimpleFold orbit
@@ -349,7 +349,7 @@ func TestDFATeddyThreeFourBytePrefix(t *testing.T) {
 // (InstRune1). (?i)k folds across a 3-way orbit: Kelvin sign
 // U+212A <-> 'K' <-> 'k' — not just ASCII upper/lower.
 func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?i)k`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?i)k`, MatchFunc: "m"}})
 }
 
 // TestDFAImmAcceptMidStartSinglePattern exercises the bits==0 -> bits=1
@@ -358,10 +358,10 @@ func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
 // nfaAcceptBits is always 0.
 func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 	t.Run("word_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:x)?\b`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:x)?\b`, FindFunc: "f"}})
 	})
 	t.Run("newline_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m)(?:x)?$`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m)(?:x)?$`, FindFunc: "f"}})
 	})
 }
 
@@ -373,7 +373,7 @@ func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 // and findLitAnchorPoint/l.useU8 both qualify (numWASM=5) so the pattern
 // reaches the lit-anchor path rather than the general find dispatch.
 func TestDFALitAnchorNonMidDominant(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*bar`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `.*bar`, FindFunc: "f"}})
 }
 
 // TestDFAAltLitAnchorNoSIMDFallback exercises the default (scalar-scan, no
@@ -392,7 +392,7 @@ func TestDFAAltLitAnchorNoSIMDFallback(t *testing.T) {
 		}
 		pattern += string(c) + `[a-z]+end`
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "f"}})
 }
 
 // TestDFAMixedMidNonMidDominant exercises the mixed mid-accept +
@@ -404,7 +404,7 @@ func TestDFAAltLitAnchorNoSIMDFallback(t *testing.T) {
 // self-loop), while the leading [^,]* run before the mandatory "bar" cannot
 // (non-mid-accept).
 func TestDFAMixedMidNonMidDominant(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `[^,]*bar[^\n]*`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `[^,]*bar[^\n]*`, MatchFunc: "m"}})
 }
 
 // TestDFALenAltAnchorSkipPartialLane exercises the lenAlt (length-
@@ -413,7 +413,7 @@ func TestDFAMixedMidNonMidDominant(t *testing.T) {
 // buildLenAltMatchBody. Branches have mixed \b anchors and
 // non-16-multiple literal lengths.
 func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo[0-9]{3}|bar[0-9]{5}`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `\bfoo[0-9]{3}|bar[0-9]{5}`, MatchFunc: "m"}})
 }
 
 // TestDFASetsEmptyFallbackStrictPrefix exercises the constant "no match"
@@ -422,9 +422,9 @@ func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
 // the same bucket).
 func TestDFASetsEmptyFallbackStrictPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p_cat", Pattern: "cat"},
-			{Name: "p_catalog", Pattern: "catalog"},
+		Patterns: []config.PatternEntry{
+			{Name: "p_cat", Regexp: "cat"},
+			{Name: "p_catalog", Regexp: "catalog"},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}},
@@ -651,7 +651,7 @@ func TestDFALayoutUTF8SelfLoop(t *testing.T) {
 	// none, one and two bytes, a mid-accepting state — and named by --verbose.
 	for _, pat := range []string{`[^,]+,`, `.+`, `(?s).+`, `"[^"\\]*"`} {
 		rep := &Reporter{}
-		if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: pat, FindFunc: "f"}}, 0, true, CompileOptions{Unicode: true, Report: rep}); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "f"}}, 0, true, CompileOptions{Unicode: true, Report: rep}); err != nil {
 			t.Fatalf("%q: %v", pat, err)
 		}
 		var b strings.Builder
@@ -1864,7 +1864,7 @@ func TestDFATailBoundaryOutranked(t *testing.T) {
 	}
 	// It still has to COMPILE — the routing sends it to Backtracking rather
 	// than rejecting it.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "outranked_find"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "outranked_find"}})
 }
 
 // TestDFATailAmbiguousBoundaryTarget covers the sibling analysis
@@ -1917,8 +1917,8 @@ func TestDFATailAnchorShapes(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "anchor_match", FindFunc: "anchor_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "anchor_match", FindFunc: "anchor_find"},
 			})
 		})
 	}
@@ -1938,8 +1938,8 @@ func TestDFATailLitChainAltGroups(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, GroupsFunc: "chain_groups"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, GroupsFunc: "chain_groups"},
 			})
 		})
 	}
@@ -2033,8 +2033,8 @@ func TestDFATailShouldTryLitChainAltUnbounded(t *testing.T) {
 func TestDFATailLeadingEndTextAnchor(t *testing.T) {
 	for _, pattern := range []string{`\zabc[a-z]{20}`, `\zabc[a-z]{20,24}`} {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "endtext_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "endtext_match"},
 			})
 		})
 	}
@@ -2057,8 +2057,8 @@ func TestDFATailEOFSkipSafe(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, FindFunc: "eofskip_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, FindFunc: "eofskip_find"},
 			})
 		})
 	}
@@ -2070,8 +2070,8 @@ func TestDFATailEOFSkipSafe(t *testing.T) {
 func TestDFATailEmptyPatternFind(t *testing.T) {
 	for _, pattern := range []string{``, `(?:)`, `a*`} {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "empty_match", FindFunc: "empty_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "empty_match", FindFunc: "empty_find"},
 			})
 		})
 	}
@@ -2221,8 +2221,8 @@ func TestDFATailAltBranchAnchorsResolvedAtCompileTime(t *testing.T) {
 	}
 	for _, testCase := range patterns {
 		t.Run(testCase.pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: testCase.pattern, MatchFunc: "altanchor_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: testCase.pattern, MatchFunc: "altanchor_match"},
 			})
 		})
 	}
@@ -2244,8 +2244,8 @@ func TestDFATailAltBranchAnchorsWithCaptures(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, GroupsFunc: "altanchor_groups"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, GroupsFunc: "altanchor_groups"},
 			})
 		})
 	}
@@ -2263,11 +2263,11 @@ func TestDFATailAltBranchRangeCounts(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			e := config.RegexEntry{Pattern: pattern, MatchFunc: "altrange_match", GroupsFunc: "altrange_groups"}
+			e := config.PatternEntry{Regexp: pattern, MatchFunc: "altrange_match", GroupsFunc: "altrange_groups"}
 			if e.GroupsWithoutCaptures() {
 				e.GroupsFunc = "" // refused without a capture group (ErrNoCaptureGroup)
 			}
-			mustCompileEntries(t, []config.RegexEntry{e})
+			mustCompileEntries(t, []config.PatternEntry{e})
 		})
 	}
 }
@@ -2290,8 +2290,8 @@ func TestDFATailSingleBranchAnchorsResolvedAtCompileTime(t *testing.T) {
 	}
 	for _, testCase := range patterns {
 		t.Run(testCase.pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: testCase.pattern, MatchFunc: "chainanchor_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: testCase.pattern, MatchFunc: "chainanchor_match"},
 			})
 		})
 	}
@@ -2583,7 +2583,7 @@ func TestCountedClassChainShortTail(t *testing.T) {
 	for _, p := range []string{`[a-z]{5,}`, `[a-f]{8,}`, `\w{12,}x`, `[0-9]{3,}-[0-9]{4,}`} {
 		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
 			t.Run(fmt.Sprintf("%s/%v", p, lm), func(t *testing.T) {
-				if _, _, err := Compile([]config.RegexEntry{{Pattern: p, FindFunc: "f"}},
+				if _, _, err := Compile([]config.PatternEntry{{Regexp: p, FindFunc: "f"}},
 					65536, true, CompileOptions{LikelyMode: lm}); err != nil {
 					t.Fatalf("Compile(%q): %v", p, err)
 				}
@@ -2743,11 +2743,11 @@ func TestEmitterCornerPatterns(t *testing.T) {
 		t.Run(pat, func(t *testing.T) {
 			// groups on `(?:pat)()`: a pattern with no capture group of its
 			// own is refused for groups_func (ErrNoCaptureGroup).
-			for _, e := range []config.RegexEntry{
-				{Pattern: pat, MatchFunc: "m", FindFunc: "f"},
-				{Pattern: "(?:" + pat + ")()", GroupsFunc: "g"},
+			for _, e := range []config.PatternEntry{
+				{Regexp: pat, MatchFunc: "m", FindFunc: "f"},
+				{Regexp: "(?:" + pat + ")()", GroupsFunc: "g"},
 			} {
-				wasm, _, err := Compile([]config.RegexEntry{e}, 65536, true)
+				wasm, _, err := Compile([]config.PatternEntry{e}, 65536, true)
 				if err != nil {
 					t.Fatalf("Compile(%+v): %v", e, err)
 				}

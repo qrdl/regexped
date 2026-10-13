@@ -1,5 +1,5 @@
 # (?m:^) / (?m:$): the newline-boundary machinery, midStartNewline and the
 # midAcceptNL side table.
-regexps:
-  - pattern: '(?m:^)ERROR:.*(?m:$)'
+patterns:
+  - regexp: '(?m:^)ERROR:.*(?m:$)'
     find_func: line_find

@@ -1110,8 +1110,8 @@ func TestResolvePatternModeFields(t *testing.T) {
 	}
 	// ForceByteMode leaves the byte gate to refuse `é` with its own message,
 	// never the resolver's.
-	e := config.RegexEntry{Pattern: `é`, FindFunc: "find"}
-	_, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: true})
+	e := config.PatternEntry{Regexp: `é`, FindFunc: "find"}
+	_, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{ForceByteMode: true})
 	if err == nil || strings.Contains(err.Error(), "Unicode mode") || !strings.Contains(err.Error(), "byte_mode") {
 		t.Errorf("ForceByteMode: want the byte gate's message, got %v", err)
 	}
@@ -1172,15 +1172,15 @@ func TestResolvePatternDetection(t *testing.T) {
 // puts the set in Unicode mode.
 func TestResolveSetMode(t *testing.T) {
 	yes, no := true, false
-	regexps := []config.RegexEntry{
-		{Name: "ascii", Pattern: `foo\d+`},
-		{Name: "letters", Pattern: `\pL+`},
-		{Name: "raw", Pattern: `[\x80-\xff]`, ByteMode: true},
-		{Name: "unikey", Pattern: `bar`, Unicode: &yes},
-		{Name: "bytekey", Pattern: `baz`, Unicode: &no},
-		{Pattern: `\p{Greek}`},
+	regexps := []config.PatternEntry{
+		{Name: "ascii", Regexp: `foo\d+`},
+		{Name: "letters", Regexp: `\pL+`},
+		{Name: "raw", Regexp: `[\x80-\xff]`, ByteMode: true},
+		{Name: "unikey", Regexp: `bar`, Unicode: &yes},
+		{Name: "bytekey", Regexp: `baz`, Unicode: &no},
+		{Regexp: `\p{Greek}`},
 	}
-	cfg := config.BuildConfig{Regexps: regexps}
+	cfg := config.BuildConfig{Patterns: regexps}
 	for _, c := range []struct {
 		members []int
 		key     *bool
@@ -1199,7 +1199,11 @@ func TestResolveSetMode(t *testing.T) {
 		{[]int{0, 5}, nil, "unicode"},
 	} {
 		sc := config.SetConfig{Name: "s", Unicode: c.key}
-		m, err := resolveSetMode(sc, cfg, c.members)
+		var members []config.SetMember
+		for _, i := range c.members {
+			members = append(members, config.SetMember{Entry: cfg.Patterns[i], ID: i})
+		}
+		m, err := resolveSetMode(sc, members)
 		switch {
 		case c.want == "" || c.want == "unicode":
 			if err != nil || m.member("x").unicode() != (c.want == "unicode") {
@@ -1220,12 +1224,12 @@ func TestResolveSetMode(t *testing.T) {
 func TestUnicodeSets(t *testing.T) {
 	yes := true
 	cfgFor := func(pats []string, sc config.SetConfig) config.BuildConfig {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		for i, p := range pats {
-			entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 		}
 		sc.Name, sc.Unicode, sc.Patterns = "s", &yes, config.PatternSelector{All: true}
-		return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+		return config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 	}
 	everything := config.SetConfig{Find: "f", ScanAny: "sa", ScanAll: "sl", MatchAny: "ma", MatchAll: "ml"}
 	for _, c := range []struct {
@@ -1378,7 +1382,7 @@ func TestSetLimitsTravelWithTheMode(t *testing.T) {
 	defer restore()
 	yes := true
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "any", Pattern: `.{0,870}`}, {Name: "zero", Pattern: `0`}},
+		Patterns: []config.PatternEntry{{Name: "any", Regexp: `.{0,870}`}, {Name: "zero", Regexp: `0`}},
 		Sets: []config.SetConfig{{Name: "s", Find: "f", Unicode: &yes,
 			Patterns: config.PatternSelector{All: true}}},
 	}

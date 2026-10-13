@@ -40,9 +40,9 @@ func TestJSBacktrackFallbackGrowsMemoryAtRuntime(t *testing.T) {
 	}
 	const btPattern = `^(\w*|)*c`
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "words", Pattern: `[a-z]+`, FindFunc: "findWords"},
-			{Name: "bt", Pattern: btPattern, GroupsFunc: "btGroups"},
+		Patterns: []config.PatternEntry{
+			{Name: "words", Regexp: `[a-z]+`, FindFunc: "findWords"},
+			{Name: "bt", Regexp: btPattern, GroupsFunc: "btGroups"},
 		},
 		StubFile: "stubs.js",
 	}

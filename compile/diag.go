@@ -45,9 +45,11 @@ type SetDiag struct {
 	// promised -1 for that case; setMaxLookback cannot return it.
 	MaxLookback int `json:"max_lookback"`
 	// IDSpaceSize is one past the largest pattern id this set can report.
-	// For `patterns: all` it equals the pattern count;
-	// for a named subset it is the largest selected pattern's global index
-	// plus one, and it — not the pattern count — is the size of the gate array
+	// For `patterns: all` with no inline regexps it equals the pattern count;
+	// for a named subset it is the largest selected pattern's index plus one,
+	// and for a set with regexps of its own it is the number of top-level
+	// patterns plus its own regexps (config.SetConfig.IDSpaceSize). It — not
+	// the pattern count — is the size of the gate array
 	// and the `_all` bitmap, and what decides the narrow-vs-wide `_all` ABI.
 	IDSpaceSize int `json:"id_space_size"`
 	// BareBodyShape records which body shape each declared bare capability

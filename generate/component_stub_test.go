@@ -20,10 +20,10 @@ func rustComponentCfg() config.BuildConfig {
 		WasmFormat:   "component",
 		ImportModule: "secrets",
 		WasmFile:     "/somewhere/secrets.wasm",
-		Regexps: []config.RegexEntry{
-			{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "find_github_token"},
-			{Pattern: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mail_groups"},
-			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
+		Patterns: []config.PatternEntry{
+			{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "find_github_token"},
+			{Regexp: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mail_groups"},
+			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 		},
 		// A SET too, so the parity check covers every capability and the find
 		// resource — the one place the component stub's mechanism differs most
@@ -57,7 +57,7 @@ func TestRustComponentStubHasIdenticalPublicAPI(t *testing.T) {
 	// Compose the module stub exactly as rustStub does — the preamble carries
 	// Error, Result and Span, and comparing against the inner text alone would
 	// make the component side look like it had invented them.
-	moduleInner, err := genRustStubsInner(module.Regexps, module.ImportModule)
+	moduleInner, err := genRustStubsInner(module.Patterns, module.ImportModule)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,11 +81,11 @@ func rustParityCfg() config.BuildConfig {
 		WasmFormat:   "component",
 		ImportModule: "parity",
 		WasmFile:     "parity.wasm",
-		Regexps: []config.RegexEntry{
-			{Name: "tok", Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "findAwsKey", MatchFunc: "matchToken"},
-			{Name: "mail", Pattern: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mailGroups"},
-			{Name: "lower", Pattern: `[a-z]+`, MatchFunc: "lower_match"},
-			{Name: "digits", Pattern: `[0-9]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "tok", Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "findAwsKey", MatchFunc: "matchToken"},
+			{Name: "mail", Regexp: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mailGroups"},
+			{Name: "lower", Regexp: `[a-z]+`, MatchFunc: "lower_match"},
+			{Name: "digits", Regexp: `[0-9]+`},
 		},
 		Sets: []config.SetConfig{
 			{
@@ -258,7 +258,7 @@ func TestRustComponentStubHonoursRustModule(t *testing.T) {
 // Naming errors surface from the generator, not from rustc later.
 func TestRustComponentStubNameErrors(t *testing.T) {
 	cfg := rustComponentCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: "a", FindFunc: "_bad"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "a", FindFunc: "_bad"}}
 	if _, err := genRustComponentStubFile(cfg); err == nil ||
 		!strings.Contains(err.Error(), "find_func") {
 		t.Errorf("err = %v", err)
@@ -269,7 +269,7 @@ func TestRustComponentStubNameErrors(t *testing.T) {
 // entries produces no file at all — the same rule the module stubs follow.
 func TestRustComponentStubEmpty(t *testing.T) {
 	cfg := rustComponentCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: "abc"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "abc"}}
 	cfg.Sets = nil // a set declaring a capability IS an export
 	text, err := genRustComponentStubFile(cfg)
 	if err != nil {
@@ -360,7 +360,7 @@ func TestRustComponentStubWriteFailure(t *testing.T) {
 func TestRustComponentStubBindsCamelCaseNames(t *testing.T) {
 	cfg := config.BuildConfig{
 		WasmFormat: "component", ImportModule: "t",
-		Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "matchIt"}},
+		Patterns: []config.PatternEntry{{Regexp: "abc", MatchFunc: "matchIt"}},
 	}
 	text, err := genRustComponentStubFile(cfg)
 	if err != nil {
@@ -397,13 +397,13 @@ func cComponentCfg() config.BuildConfig {
 		WasmFormat:   "component",
 		ImportModule: "urlparts",
 		WasmFile:     "/somewhere/urlparts.wasm",
-		Regexps: []config.RegexEntry{
-			{Pattern: `(?P<scheme>https?)://(?P<host>[^/:?#\s]+)`, GroupsFunc: "parse_url"},
-			{Pattern: `AKIA[A-Z0-9]{16}`, FindFunc: "find_aws_key"},
-			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "digits", Pattern: `[0-9]+`},
-			{Name: "upper", Pattern: `[A-Z]+`},
+		Patterns: []config.PatternEntry{
+			{Regexp: `(?P<scheme>https?)://(?P<host>[^/:?#\s]+)`, GroupsFunc: "parse_url"},
+			{Regexp: `AKIA[A-Z0-9]{16}`, FindFunc: "find_aws_key"},
+			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "digits", Regexp: `[0-9]+`},
+			{Name: "upper", Regexp: `[A-Z]+`},
 		},
 		// A SET too, so the header-parity check covers every capability and the
 		// find scanner — the one place the component mechanism differs most
@@ -556,7 +556,7 @@ func TestCComponentAllocatorOnlyWhenAListIsReturned(t *testing.T) {
 	}
 
 	cfg := cComponentCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: `abc`, FindFunc: "f"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}
 	cfg.Sets = nil // a set's `_all` and `find` return lists too
 	_, noGroups, err := genCComponentStubFiles(cfg, "stub.h")
 	if err != nil {
@@ -572,7 +572,7 @@ func TestCComponentAllocatorOnlyWhenAListIsReturned(t *testing.T) {
 	// fails late, at `component new`, with "module does not export a function
 	// named cabi_realloc".
 	setOnly := cComponentCfg()
-	setOnly.Regexps = []config.RegexEntry{{Pattern: `abc`}, {Pattern: `def`}}
+	setOnly.Patterns = []config.PatternEntry{{Regexp: `abc`}, {Regexp: `def`}}
 	_, setC, err := genCComponentStubFiles(setOnly, "stub.h")
 	if err != nil {
 		t.Fatal(err)
@@ -692,7 +692,7 @@ func TestCComponentDispatchAndEmpty(t *testing.T) {
 	}
 
 	// A config with no exports writes nothing at all.
-	cfg.Regexps = []config.RegexEntry{{Pattern: "abc"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "abc"}}
 	cfg.Sets = nil // a set declaring a capability IS an export
 	empty := filepath.Join(t.TempDir(), "stub.h")
 	if err := cComponentStub(cfg, empty); err != nil {
@@ -730,7 +730,7 @@ func TestCComponentStubToStdout(t *testing.T) {
 
 func TestCComponentNameErrors(t *testing.T) {
 	cfg := cComponentCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: "a", FindFunc: "_bad"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "a", FindFunc: "_bad"}}
 	if _, _, err := genCComponentStubFiles(cfg, "stub.h"); err == nil {
 		t.Error("an unrepresentable func name must be rejected")
 	}
@@ -875,9 +875,9 @@ func TestCComponentInitReadsNoPriorState(t *testing.T) {
 func TestCComponentAllocatorIsOneUnit(t *testing.T) {
 	cfg := config.BuildConfig{
 		WasmFormat: "component", ImportModule: "unit", WitPackage: "unit",
-		Regexps: []config.RegexEntry{
-			{Name: "g", Pattern: `(a+)(b*)`, GroupsFunc: "g_groups"},
-			{Name: "d", Pattern: `[0-9]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "g", Regexp: `(a+)(b*)`, GroupsFunc: "g_groups"},
+			{Name: "d", Regexp: `[0-9]+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{All: true},
@@ -922,7 +922,7 @@ func TestTwoCComponentStubsLinkInOneGuest(t *testing.T) {
 	mk := func(ns, pkg, set string) config.BuildConfig {
 		return config.BuildConfig{
 			WasmFormat: "component", ImportModule: pkg, WitPackage: pkg, Namespace: ns,
-			Regexps: []config.RegexEntry{{Name: "a", Pattern: `[a-z]+`}, {Name: "d", Pattern: `[0-9]+`}},
+			Patterns: []config.PatternEntry{{Name: "a", Regexp: `[a-z]+`}, {Name: "d", Regexp: `[0-9]+`}},
 			Sets: []config.SetConfig{{
 				Name: set, Patterns: config.PatternSelector{All: true},
 				ScanAll: set + "_hits", Find: "scan_" + set,
@@ -978,7 +978,7 @@ func TestCComponentCapabilityNamedLikeTheResourceImport(t *testing.T) {
 	}
 	cfg := config.BuildConfig{
 		WasmFormat: "component", ImportModule: "t", WitPackage: "t",
-		Regexps: []config.RegexEntry{{Name: "a", Pattern: `[a-z]+`}, {Name: "d", Pattern: `[0-9]+`}},
+		Patterns: []config.PatternEntry{{Name: "a", Regexp: `[a-z]+`}, {Name: "d", Regexp: `[0-9]+`}},
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{All: true},
 			ScanAll: "scan_it_next", Find: "scan_it",
@@ -1004,9 +1004,9 @@ func setStubCfg() config.BuildConfig {
 		ImportModule: "t",
 		WitPackage:   "t",
 		WasmFile:     "t.wasm",
-		Regexps: []config.RegexEntry{
-			{Pattern: `ghp_[A-Za-z0-9]{4}`, MatchFunc: "token_match"},
-			{Pattern: `AKIA[A-Z0-9]{6}`},
+		Patterns: []config.PatternEntry{
+			{Regexp: `ghp_[A-Za-z0-9]{4}`, MatchFunc: "token_match"},
+			{Regexp: `AKIA[A-Z0-9]{6}`},
 		},
 		Sets: []config.SetConfig{{
 			Name:        "s",
@@ -1050,7 +1050,7 @@ func TestRustComponentSetInner(t *testing.T) {
 		"inner: Option<sets::ScanIt>,",
 		"sets::ScanIt::new(input, offset)",
 		"impl std::iter::FusedIterator for ScanItIter<'_> {}",
-		"pub fn pattern_name(id: i32) -> &'static str {",
+		"pub fn s_pattern_name(id: i32) -> &'static str {",
 		// The error arm must come BEFORE the finished test, or an engine that
 		// gave up ends the iteration and reports success.
 		"Err(e) => {",
@@ -1138,7 +1138,7 @@ func TestCComponentSetParts(t *testing.T) {
 		"#define S_ID_SPACE 2",
 		"int which_matches(const char *input, size_t len);",
 		"void scan_it_free(rx_s_scanner_t *s);",
-		"const char *pattern_name(int id);",
+		"const char *rx_s_pattern_name(int id);",
 	} {
 		if !strings.Contains(h, want) {
 			t.Errorf("C set header is missing %q", want)
@@ -1163,7 +1163,7 @@ func TestCComponentSetParts(t *testing.T) {
 		// needs a handle and clears it.
 		"if (!s || s->scratch[0] == 0) return;",
 		"s->scratch[0] = 0;",
-		"rx_pattern_names[] = {",
+		"const char *rx_s_pattern_name(int id) {",
 	} {
 		if !strings.Contains(c, want) {
 			t.Errorf("C set body is missing %q", want)
@@ -1238,7 +1238,7 @@ func TestCComponentSetWitDirAndAllocator(t *testing.T) {
 // unresolvable world in C.
 func TestComponentStubsSetsOnlyImports(t *testing.T) {
 	cfg := setStubCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: `abc`}, {Pattern: `def`}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: `abc`}, {Regexp: `def`}}
 
 	rs, err := genRustComponentStubFile(cfg)
 	if err != nil {
@@ -1445,14 +1445,14 @@ import_module: e2e
 wasm_file: e2e.wasm
 output: composed.wasm
 stub_file: stub.h
-regexps:
+patterns:
   - name: word
-    pattern: '[a-z]+'
+    regexp: '[a-z]+'
     match_func: word_match
   - name: digits
-    pattern: '[0-9]+'
+    regexp: '[0-9]+'
   - name: upper
-    pattern: '[A-Z]+'
+    regexp: '[A-Z]+'
 sets:
   - name: runs
     patterns: all
@@ -1656,10 +1656,10 @@ import_module: notes
 wasm_file: notes.wasm
 output: composed.wasm
 stub_file: stub.h
-regexps:
-  - pattern: 'a*b|a'
+patterns:
+  - regexp: 'a*b|a'
     find_func: overrun
-  - pattern: '(x)(?:[a-z]*y)?'
+  - regexp: '(x)(?:[a-z]*y)?'
     groups_func: greedy
 `)
 	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")

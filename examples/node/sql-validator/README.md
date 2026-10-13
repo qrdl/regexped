@@ -60,7 +60,7 @@ node dist/main.js   →  run
 Four patterns (`select`, `insert`, `update`, `delete`) are compiled into a set
 with `match_any: validate_sql` and `emit_name_map: true`. The generated stub
 exports `validate_sql(input)`, which returns the id of a pattern matching the
-whole input or `null`, and `patternName(id)`, which maps that id to its name. One WASM call per
+whole input or `null`, and `sqlPatternName(id)`, the set's own lookup from that id to its name. One WASM call per
 statement validates syntax and identifies the statement type.
 
 Patterns check required structural keywords (FROM for SELECT, INTO+VALUES for

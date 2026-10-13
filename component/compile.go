@@ -45,7 +45,7 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "sets", len(cfg.Sets), "output", output, "format", "component")
+	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "sets", len(cfg.Sets), "output", output, "format", "component")
 	rep.Render(report)
 	compile.WarnUnboundedMemory(cfg, rep)
 

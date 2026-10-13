@@ -41,7 +41,7 @@ impl HttpContext for Guard {
         // and says so, rather than reporting "unknown" as either verdict.
         match patterns::scan_url(&url, 0) {
             Ok(Some(pattern_id)) => {
-                let attack = patterns::pattern_name(pattern_id);
+                let attack = patterns::attacks_pattern_name(pattern_id);
                 self.send_http_response(
                     403,
                     vec![("Content-Type", "text/plain")],

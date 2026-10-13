@@ -3,8 +3,8 @@
 # findMandatoryLitRec's maxOff check causes it to return nil (maxOff > 256).
 # These route to compileFallback.
 patterns:
-  - pattern: '[^\n]{257}foo\d+'
-  - pattern: '[^\n]{300}bar\w+'
+  - regexp: '[^\n]{257}foo\d+'
+  - regexp: '[^\n]{300}bar\w+'
 expect:
   bucket_count: 2
   fallback_count: 2

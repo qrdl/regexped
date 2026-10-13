@@ -103,14 +103,14 @@ func overlapCacheForK(input string, pats []string, k int32) int32 {
 // overlapSizingCfg is the set overlapCacheFor and overlapCacheForK size a region
 // for: an overlapping find over pats, by the pattern names the drives use.
 func overlapSizingCfg(pats []string) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	return config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "find", Overlapping: true,
 			Patterns: config.PatternSelector{Names: names},
@@ -150,9 +150,9 @@ func (d *cacheDrive) buf() []byte { return d.mem.UnsafeData(d.store) }
 
 func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *cacheDrive {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	set := config.SetConfig{
 		Name: "s", Find: "set_find",
@@ -165,7 +165,7 @@ func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *
 		export = "set_find_batch"
 	}
 	w, err := cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", lay.batch, lay.sweepBudget, setKey(pats)), func() ([]byte, error) {
-		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}
+		cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}
 		if lay.sweepBudget > 0 {
 			w, _, _, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{}.WithSweepBudget(lay.sweepBudget))
 			return w, err

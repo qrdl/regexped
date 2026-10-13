@@ -366,8 +366,8 @@ void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache _init alloc
 size_t <find>_cache_bytes(size_t len);
 int <find>_set_cache(rx_<set>_scanner_t *s, void *buf, size_t bytes);
 
-/* only if any set in the config sets emit_name_map: true */
-const char *pattern_name(int id);
+/* per set, only if it sets emit_name_map: true */
+const char *rx_<set>_pattern_name(int id);
 ```
 
 ```c
@@ -445,14 +445,17 @@ address inside the module, and its fallback body's memo and stack in scratch
 found through module globals, so BT-compiled patterns stay non-reentrant at the
 WASM level.
 
-The two constants differ for a named subset: `<SET>_PATTERN_COUNT` counts the
-set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past
+The two constants differ for a named subset and for a set with regexps of its
+own: `<SET>_PATTERN_COUNT` counts the set's patterns and sizes the tuple buffer, while `<SET>_ID_SPACE` is one past
 the largest id the set can report and sizes everything indexed *by* an id — the
 `gates` array and the `_all` bitmap. A set holding two late-declared
 patterns has a count of 2 and a much larger id space.
 
-`pattern_name` is a single shared lookup across every set in the config
-that requested `emit_name_map: true`, not one per set.
+`rx_<set>_pattern_name` — `rx_secrets_pattern_name` for a set named `secrets` —
+is emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ---
 

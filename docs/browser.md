@@ -19,11 +19,11 @@ wasm_file:     "regexps.wasm"   # compiled standalone WASM output
 stub_file:     "regexp.js"       # generated JS module
 import_module: "regexps"        # module name used in generated stubs
 
-regexps:
-  - pattern:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+patterns:
+  - regexp:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
     match_func: "email_match"
 
-  - pattern:    'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
+  - regexp:    'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
     match_func: "url_match"
 ```
 
@@ -110,14 +110,15 @@ for (const match of parse_url(text)) {
 ### Sets, and text beyond ASCII
 
 A set's `find` reports every pattern's matches in one pass, as
-`{patternId, start, end}`, and `emit_name_map: true` adds `patternName(id)`:
+`{patternId, start, end}`, and `emit_name_map: true` adds the set's own name
+lookup, here `homoglyphPatternName(id)` for the set `homoglyph`:
 
 ```js
-import { init, scan_text, patternName } from './regexp.js';
+import { init, scan_text, homoglyphPatternName } from './regexp.js';
 await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
 for (const m of scan_text('pаypal.com')) {        // the а is Cyrillic
-    console.log(patternName(m.patternId), m.start, m.end);
+    console.log(homoglyphPatternName(m.patternId), m.start, m.end);
 }
 // mixed_script 0 11
 // lookalike 1 3

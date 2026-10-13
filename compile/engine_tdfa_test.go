@@ -364,19 +364,19 @@ func TestTDFAEpsCapOps(t *testing.T) {
 func TestTDFACompileDeterminism(t *testing.T) {
 	// url-parse is a 6-group TDFA pattern with non-trivial register operations.
 	// It was observed to produce different WASM sizes across runs before the fix.
-	re := config.RegexEntry{
-		Pattern: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
+	re := config.PatternEntry{
+		Regexp: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
 			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
 			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
 		GroupsFunc: "groups",
 	}
-	first, _, err := Compile([]config.RegexEntry{re}, 0, true)
+	first, _, err := Compile([]config.PatternEntry{re}, 0, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	const iterations = 20
 	for i := 0; i < iterations; i++ {
-		got, _, err := Compile([]config.RegexEntry{re}, 0, true)
+		got, _, err := Compile([]config.PatternEntry{re}, 0, true)
 		if err != nil {
 			t.Fatalf("iteration %d: Compile: %v", i+1, err)
 		}
@@ -442,7 +442,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 // group, resolved entirely via entry ops before the first byte-consuming
 // transition (anyHasOps=false).
 func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "()a", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "()a", GroupsFunc: "g"}})
 }
 
 // TestTDFAMinimizeRegistersApplyColoring exercises the block in
@@ -461,7 +461,7 @@ func TestTDFAMinimizeRegistersApplyColoring(t *testing.T) {
 		t.Fatalf("tdfaStats(%q): pattern ineligible for TDFA", pattern)
 	}
 	t.Logf("numStates=%d numRegs=%d", numStates, numRegs)
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 }
 
 // TestTDFAU16TableAddressing exercises the useU8=false (2-byte state ID)
@@ -479,7 +479,7 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 	if numStates <= 256 {
 		t.Fatalf("tdfaStats(%q): numStates = %d, want > 256 (u16 table)", pattern, numStates)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 }
 
 // TestTDFAEpsWalkAltFallthrough exercises the "try inst.Arg after inst.Out
@@ -490,7 +490,7 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 // so the whole-pattern-single-capture shortcut never applies
 // regardless of MaxCap — confirmed live.
 func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:(a)|(b))`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:(a)|(b))`, GroupsFunc: "g"}})
 }
 
 // TestTDFAStartThreadOffMainEntry exercises startThreads[i]'s capture-op
@@ -503,7 +503,7 @@ func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 // InstMatch is still reachable via pure epsilon from Start, preserving the
 // mechanism) while MaxCap()==2 keeps clear of the shortcut.
 func TestTDFAStartThreadOffMainEntry(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a*)(b*)", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a*)(b*)", GroupsFunc: "g"}})
 }
 
 func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
@@ -857,7 +857,7 @@ func TestTDFABulkSkipMidAcceptModuleValid(t *testing.T) {
 			if detectTDFABulkSkip(tt) == nil {
 				t.Fatalf("pattern %q no longer has a bulk-skip state — this test would compile nothing relevant", pattern)
 			}
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 		})
 	}
 }
@@ -1090,7 +1090,7 @@ func TestTDFARegisterEdgeShapes(t *testing.T) {
 			if eng != EngineTDFA {
 				t.Fatalf("engine = %v, want TDFA — the shape no longer reaches TDFA construction", eng)
 			}
-			wasm, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "g"}}, 65536, true)
+			wasm, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "g"}}, 65536, true)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
@@ -1225,7 +1225,7 @@ func TestTDFAUTF8Skip(t *testing.T) {
 		}
 		// Every case compiles to a valid groups export — the skip in the
 		// dispatch arms, or at the top of the main loop with no dispatch.
-		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pattern, GroupsFunc: "g"}}, 0, true, CompileOptions{Unicode: true}); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{{Regexp: c.pattern, GroupsFunc: "g"}}, 0, true, CompileOptions{Unicode: true}); err != nil {
 			t.Errorf("%q: compile: %v", c.pattern, err)
 		}
 	}
@@ -1239,7 +1239,7 @@ func TestTDFAUTF8Skip(t *testing.T) {
 		unicode bool
 		want    bool
 	}{{true, true}, {false, false}} {
-		w, _, err := Compile([]config.RegexEntry{{Pattern: `<([^>]+)>(x)`, GroupsFunc: "g"}}, 0, true,
+		w, _, err := Compile([]config.PatternEntry{{Regexp: `<([^>]+)>(x)`, GroupsFunc: "g"}}, 0, true,
 			CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
 		if err != nil {
 			t.Fatal(err)

@@ -99,7 +99,7 @@ The calling code is minimal — the generated `stubs.rs` hides all WASM FFI deta
 ```rust
 match patterns::scan_url(url.as_bytes(), 0) {
     Ok(Some(pattern_id)) => {
-        let attack = patterns::pattern_name(pattern_id);
+        let attack = patterns::attacks_pattern_name(pattern_id);
         // block with 403
     }
     Ok(None) => {}          // nothing matched: continue to the origin

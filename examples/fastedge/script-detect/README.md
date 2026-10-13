@@ -1,9 +1,9 @@
-# fastedge/lang-detect — script and European-language detection
+# fastedge/script-detect — script detection by letters
 
 A FastEdge HTTP application that takes text as a POST body and returns a JSON
-array of the European languages its letters allow. It looks at **letters only,
-never words**: the point is to show Unicode regexps, not to be a full
-language identifier.
+array of the scripts its letters use, each narrowed, where the letters allow,
+to the European alphabets they fit. It looks at **letters only, never words**:
+the point is to show Unicode regexps, not to be a language identifier.
 
 ```sh
 $ curl --data-binary 'Zażółć gęślą jaźń' http://127.0.0.1:8080/
@@ -12,7 +12,7 @@ $ curl --data-binary 'Zażółć gęślą jaźń' http://127.0.0.1:8080/
 
 It is a **Component Model** application in Rust: the app is a `wasi:http` guest
 component, the patterns are a regexped component (`wasm_format: component`),
-and `regexped merge` composes the two into `lang-detect.wasm`.
+and `regexped merge` composes the two into `script-detect.wasm`.
 
 ## What it answers
 
@@ -27,7 +27,7 @@ languages matches, the script's name is returned instead.
 |---|---|
 | `Hello world` | `["Latin"]` — no letter beyond `a`–`z` |
 | `Grüße aus Köln` | `["German"]` |
-| `Un café, por favor` | `["French","Spanish","Portuguese","Italian","Dutch","Norwegian","Danish","Icelandic","Czech","Slovak","Hungarian"]` — every alphabet with `é` |
+| `Un café, por favor` | `["French","Spanish","Portuguese","Italian","Dutch","Norwegian/Danish","Icelandic","Czech","Slovak","Hungarian"]` — every alphabet with `é` |
 | `Zażółć gęślą jaźń` | `["Polish"]` |
 | `Příliš žluťoučký kůň` | `["Czech"]` |
 | `Привет` | `["Cyrillic"]` — only shared letters |
@@ -38,12 +38,15 @@ languages matches, the script's name is returned instead.
 | `Привет, Grüße` | `["Cyrillic","German"]` — scripts in order of appearance |
 
 Languages: English, German, French, Spanish, Portuguese, Italian, Dutch,
-Swedish, Norwegian, Danish, Finnish, Icelandic, Estonian, Latvian, Lithuanian,
+Swedish, Norwegian/Danish, Finnish, Icelandic, Estonian, Latvian, Lithuanian,
 Polish, Czech, Slovak, Slovenian, Croatian, Hungarian, Romanian, Albanian and
 Maltese in Latin script; Russian, Ukrainian, Belarusian, Bulgarian, Serbian and
 Macedonian in Cyrillic; Greek. English has no letters of its own, so English
 text answers `["Latin"]`, and Greek is the only language of its script, so it
-is reported by the script's name.
+is reported by the script's name. Norwegian and Danish write the same
+alphabet, so letters cannot tell them apart: they are one pattern,
+`Norwegian/Danish`, since two members compiling to the same program are a
+load error.
 
 A body that is not UTF-8 is refused with 400, and a method other than POST
 with 405.
@@ -66,14 +69,14 @@ What each target needs:
 
 | Target | What it does | Needs |
 |---|---|---|
-| `make` | builds `lang-detect.wasm` — the steps below | `regexped`, `wasm-tools`, Rust, `wac` |
-| `make compile` | compiles the patterns to the component `langdetect.wasm` and its `langdetect.wit` | `regexped`, `wasm-tools` |
+| `make` | builds `script-detect.wasm` — the steps below | `regexped`, `wasm-tools`, Rust, `wac` |
+| `make compile` | compiles the patterns to the component `scriptdetect.wasm` and its `scriptdetect.wit` | `regexped`, `wasm-tools` |
 | `make generate` | generates the Rust stub `stubs.rs` | `regexped` |
 | `make build` | generates the stub if needed, then `cargo build --target wasm32-wasip2` | `regexped`, Rust |
-| `make compose` | composes the two into `lang-detect.wasm` — the same as `make` | `regexped`, `wasm-tools`, Rust, `wac` |
+| `make compose` | composes the two into `script-detect.wasm` — the same as `make` | `regexped`, `wasm-tools`, Rust, `wac` |
 | `make run` | serves the app on `127.0.0.1:8080` in the background, POSTs the sample texts above, stops the server | the above, `wasmtime`, `curl` |
 | `make serve` | serves the app until Ctrl-C, for your own `curl` | the above, `wasmtime` |
-| `make test` | runs `lang-detect.wasm` under the FastEdge runtime itself (`fastedge-run`, through `@gcoredev/fastedge-test`) and checks every sample's answer, the empty body and the 405 — [`test.mjs`](test.mjs) | the `make` tools, Node.js, `npm install` |
+| `make test` | runs `script-detect.wasm` under the FastEdge runtime itself (`fastedge-run`, through `@gcoredev/fastedge-test`) and checks every sample's answer, the empty body and the 405 — [`test.mjs`](test.mjs) | the `make` tools, Node.js, `npm install` |
 | `make clean` | removes the build outputs | — |
 
 `make run` and `make serve` use `wasmtime serve`, which runs any `wasi:http`
@@ -106,14 +109,15 @@ a byte, and `(?i)` folds across Unicode — `(?i:[äöüß])` also matches `Ä`,
    own letters. Cyrillic patterns spell out each language's whole alphabet the
    same way.
 3. [`lib.rs`](lib.rs) asks the language set of each script found and turns the
-   ids into names with `pattern_name` (`emit_name_map: true`): the pattern
-   names in the config ARE the display names.
+   ids into names with each set's own lookup, `scripts_pattern_name`,
+   `latin_pattern_name` and `cyrillic_pattern_name` (`emit_name_map: true` on
+   each set): the pattern names in the config ARE the display names.
 
 The three sets compile to one 490 KB component. All matching is in it; `lib.rs`
 only chooses which set to ask.
 
 ## Deploying
 
-`lang-detect.wasm` is a complete FastEdge HTTP application: upload it as a
+`script-detect.wasm` is a complete FastEdge HTTP application: upload it as a
 binary and create an application from it. See
 [docs/fastedge.md](../../../docs/fastedge.md) and the FastEdge documentation.

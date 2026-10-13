@@ -414,12 +414,12 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 				// A group simplification removes (`(a){0}`) does not count: a
 				// groups_func on such a pattern is refused (config.NoCaptureGroupProblem).
 				if parsed, perr := syntax.Parse(pattern, syntax.Perl); perr == nil && parsed.MaxCap() > 0 &&
-					!(config.RegexEntry{Pattern: pattern, GroupsFunc: "groups"}).GroupsWithoutCaptures() {
+					!(config.PatternEntry{Regexp: pattern, GroupsFunc: "groups"}).GroupsWithoutCaptures() {
 					patternHasCaptures = true
 				}
 			}
-			re := config.RegexEntry{
-				Pattern: pattern,
+			re := config.PatternEntry{
+				Regexp: pattern,
 			}
 			if !patternHasCaptures {
 				if !findOnly {
@@ -461,7 +461,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 			if btFallbackAlways {
 				compileOpts.BTWorkBudget = compile.BTWorkBudgetForceFallback
 			}
-			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, forceGroupsEngine, withMode(compileOpts))
+			wasmBytes, _, searchSizes, compErr := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, forceGroupsEngine, withMode(compileOpts))
 			if compErr != nil && gateRefusedASCII(pattern, compErr) {
 				nfail += len(testStrings)
 				fmt.Printf("FAIL  pattern: %q\n      refused by the rune gate though it names nothing above 0x7F: %v\n", pattern, compErr)

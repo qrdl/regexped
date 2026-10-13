@@ -583,7 +583,7 @@ func TestDFAWalksNest(t *testing.T) {
 // sweep's own answers are checked against Go by tools/fuzz; this pins that the
 // shapes still take the path, and emits every arm of its column advance.
 func TestWholeSetSweepShapes(t *testing.T) {
-	load := func(path, set string) []config.RegexEntry {
+	load := func(path, set string) []config.PatternEntry {
 		bc, err := config.LoadConfig(path)
 		if err != nil {
 			t.Fatal(err)
@@ -596,10 +596,10 @@ func TestWholeSetSweepShapes(t *testing.T) {
 			for _, n := range sc.Patterns.Names {
 				want[n] = true
 			}
-			var out []config.RegexEntry
-			for _, r := range bc.Regexps {
-				if r.Pattern != "" && (sc.Patterns.All || want[r.Name]) {
-					out = append(out, config.RegexEntry{Name: r.Name, Pattern: r.Pattern})
+			var out []config.PatternEntry
+			for _, r := range bc.Patterns {
+				if r.Regexp != "" && (sc.Patterns.All || want[r.Name]) {
+					out = append(out, config.PatternEntry{Name: r.Name, Regexp: r.Regexp})
 				}
 			}
 			return out
@@ -607,16 +607,16 @@ func TestWholeSetSweepShapes(t *testing.T) {
 		t.Fatalf("no set %q in %s", set, path)
 		return nil
 	}
-	named := func(pats ...string) []config.RegexEntry {
-		out := make([]config.RegexEntry, len(pats))
+	named := func(pats ...string) []config.PatternEntry {
+		out := make([]config.PatternEntry, len(pats))
 		for i, p := range pats {
-			out[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			out[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 		}
 		return out
 	}
 	for _, c := range []struct {
 		name    string
-		regexps []config.RegexEntry
+		regexps []config.PatternEntry
 	}{
 		{"word-boundary", named(`\bfoo\w*`, `bar\b`, `\Bx\w+`)},
 		{"line-anchors", named(`(?m:^)ab+`, `ab+(?m:$)`, `c+`)},
@@ -638,7 +638,7 @@ func TestWholeSetSweepShapes(t *testing.T) {
 				if batch {
 					sc.Hints = []string{"batch-find"}
 				}
-				cfg := config.BuildConfig{Regexps: c.regexps, Sets: []config.SetConfig{sc}}
+				cfg := config.BuildConfig{Patterns: c.regexps, Sets: []config.SetConfig{sc}}
 				w, _, diags, err := CompileFileDiag(cfg, "")
 				if err != nil {
 					t.Fatal(err)
@@ -680,7 +680,7 @@ func fmtPatterns(n int, format string, from ...int) []string {
 func TestOverlapSweepBoundaryChannels(t *testing.T) {
 	for _, p := range []string{`a+\b`, `\Ba+`, `[a-z]+\b`, `\W+\b`, `a\b|a\w+`, `a\b|a\B\w*`} {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "p", Pattern: p}},
+			Patterns: []config.PatternEntry{{Name: "p", Regexp: p}},
 			Sets: []config.SetConfig{{Name: "s", Find: "f", Overlapping: true,
 				Patterns: config.PatternSelector{All: true}}},
 		}
@@ -827,7 +827,7 @@ func TestBuildOverlapProjPanicsOnGeometryMismatch(t *testing.T) {
 // one fallback bucket, literal-less members so no frontend claims them.
 func overlapShapeCfg() (config.SetConfig, config.BuildConfig) {
 	patterns := []string{`[0-9][a-c][0-9]`, `[a-c][0-9][a-c]`}
-	cfg := config.BuildConfig{Regexps: setEmitCovEntries(patterns)}
+	cfg := config.BuildConfig{Patterns: setEmitCovEntries(patterns)}
 	sc := config.SetConfig{
 		Name:        "s",
 		Find:        "s_find",
@@ -891,7 +891,7 @@ func TestSetOverlapCacheShapeEligible(t *testing.T) {
 // descriptor's shape identical on both paths so a stub has one code path.
 func TestSetOverlapCacheShapeIneligible(t *testing.T) {
 	// Not overlapping: gated `find` gets no sweep.
-	cfg := config.BuildConfig{Regexps: setEmitCovEntries([]string{`[0-9][a-c][0-9]`})}
+	cfg := config.BuildConfig{Patterns: setEmitCovEntries([]string{`[0-9][a-c][0-9]`})}
 	sc := config.SetConfig{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true}}
 	cfg.Sets = []config.SetConfig{sc}
 
@@ -921,7 +921,7 @@ func TestSetOverlapCacheShapeIneligible(t *testing.T) {
 // read as "no cache needed".
 func TestSetOverlapCacheShapeCompileError(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "bad", Pattern: `(?P<x>`}},
+		Patterns: []config.PatternEntry{{Name: "bad", Regexp: `(?P<x>`}},
 	}
 	sc := config.SetConfig{
 		Name: "s", Find: "s_find", Overlapping: true,
@@ -943,7 +943,7 @@ func TestSetOverlapCacheShapeCompileError(t *testing.T) {
 // memory-safety fault rather than a wrong answer.
 func TestSetOverlapCacheShapeNamedSubset(t *testing.T) {
 	patterns := []string{`[0-9][a-c][0-9]`, `[a-c][0-9][a-c]`, `[0-9][0-9][a-c]`}
-	cfg := config.BuildConfig{Regexps: setEmitCovEntries(patterns)}
+	cfg := config.BuildConfig{Patterns: setEmitCovEntries(patterns)}
 	// The LAST two, so the ids the set reports are 1 and 2 while it holds two
 	// patterns.
 	sc := config.SetConfig{
@@ -979,7 +979,7 @@ func TestSetOverlapCacheShapeNamedSubset(t *testing.T) {
 // costs two cells' worth.
 func TestSetOverlapCacheShapeHandComputed(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p0", Pattern: `a+`}, {Name: "p1", Pattern: `[^\n]*ERROR`}},
+		Patterns: []config.PatternEntry{{Name: "p0", Regexp: `a+`}, {Name: "p1", Regexp: `[^\n]*ERROR`}},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Patterns: config.PatternSelector{All: true},
@@ -1070,8 +1070,8 @@ func TestWideSweepSinglePattern(t *testing.T) {
 			continue
 		}
 		for _, standalone := range []bool{true, false} {
-			e := config.RegexEntry{Name: "p", Pattern: pat, MatchFunc: "m", FindFunc: "f"}
-			w, _, err := Compile([]config.RegexEntry{e}, 65536, standalone)
+			e := config.PatternEntry{Name: "p", Regexp: pat, MatchFunc: "m", FindFunc: "f"}
+			w, _, err := Compile([]config.PatternEntry{e}, 65536, standalone)
 			if err != nil {
 				continue // a declined shape, not a failure
 			}
@@ -1085,8 +1085,8 @@ func TestWideSweepSinglePattern(t *testing.T) {
 		}
 		for _, o := range opts {
 			w, _, err := CompileFile(config.BuildConfig{
-				Regexps: []config.RegexEntry{{
-					Name: "p", Pattern: pat,
+				Patterns: []config.PatternEntry{{
+					Name: "p", Regexp: pat,
 					GroupsFunc: "g", FindFunc: "f", MatchFunc: "m",
 				}},
 				// The set fallback limit is max_dfa_states now: a fallback
@@ -1103,7 +1103,7 @@ func TestWideSweepSinglePattern(t *testing.T) {
 		// is honoured.
 		for _, forced := range []EngineType{EngineTDFA, EngineBacktrack} {
 			w, _, err := CompileForced(
-				[]config.RegexEntry{{Name: "p", Pattern: pat, GroupsFunc: "g", FindFunc: "f"}},
+				[]config.PatternEntry{{Name: "p", Regexp: pat, GroupsFunc: "g", FindFunc: "f"}},
 				65536, true, forced)
 			if err != nil {
 				continue
@@ -1200,18 +1200,18 @@ func assertWasm(t *testing.T, w []byte, what string) {
 // capabilities, compiled under the given hint.
 func unionScanSet(t *testing.T, n int, hints []string) ([]byte, []SetDiag) {
 	t.Helper()
-	entries := make([]config.RegexEntry, n)
+	entries := make([]config.PatternEntry, n)
 	for i := range entries {
 		// Literal-less by construction: a class chain with no fixed substring
 		// long enough to anchor on, and a per-pattern digit span so the
 		// patterns stay distinguishable.
-		entries[i] = config.RegexEntry{
-			Name:    fmt.Sprintf("p%d", i),
-			Pattern: fmt.Sprintf(`[a-z]{%d}[0-9]{%d}`, 3+i%4, 1+i%3),
+		entries[i] = config.PatternEntry{
+			Name:   fmt.Sprintf("p%d", i),
+			Regexp: fmt.Sprintf(`[a-z]{%d}[0-9]{%d}`, 3+i%4, 1+i%3),
 		}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name:     "s",
 			ScanAny:  "s_scan_any",
@@ -1294,19 +1294,19 @@ func bytesContains(h, n []byte) bool {
 func TestWideAcceptSparseBucket(t *testing.T) {
 	for _, n := range []int{40, 65, 90} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			entries := make([]config.RegexEntry, n)
+			entries := make([]config.PatternEntry, n)
 			for i := range entries {
 				// The literal must be SHARED, not merely similar: distinct
 				// literals pack into distinct buckets and no bucket ever
 				// crosses the width the wide form exists for. The varying
 				// part therefore goes AFTER a run that breaks the literal.
-				entries[i] = config.RegexEntry{
-					Name:    fmt.Sprintf("p%d", i),
-					Pattern: fmt.Sprintf(`shared[ \t]+k%03d[a-z]+`, i),
+				entries[i] = config.PatternEntry{
+					Name:   fmt.Sprintf("p%d", i),
+					Regexp: fmt.Sprintf(`shared[ \t]+k%03d[a-z]+`, i),
 				}
 			}
 			cfg := config.BuildConfig{
-				Regexps: entries,
+				Patterns: entries,
 				Sets: []config.SetConfig{{
 					Name:     "s",
 					Find:     "s_find",
@@ -1360,18 +1360,18 @@ func TestWideAcceptSparseBucket(t *testing.T) {
 func TestOverlapDPRefusals(t *testing.T) {
 	cases := []struct {
 		name    string
-		build   func() []config.RegexEntry
+		build   func() []config.PatternEntry
 		wantSet bool
 	}{
 		{
 			// Past the sparse promotion threshold on one shared literal.
 			name: "sparse bucket",
-			build: func() []config.RegexEntry {
-				out := make([]config.RegexEntry, 50)
+			build: func() []config.PatternEntry {
+				out := make([]config.PatternEntry, 50)
 				for i := range out {
-					out[i] = config.RegexEntry{
-						Name:    fmt.Sprintf("p%d", i),
-						Pattern: fmt.Sprintf(`shared[ \t]+k%03d[a-z]+`, i),
+					out[i] = config.PatternEntry{
+						Name:   fmt.Sprintf("p%d", i),
+						Regexp: fmt.Sprintf(`shared[ \t]+k%03d[a-z]+`, i),
 					}
 				}
 				return out
@@ -1381,23 +1381,23 @@ func TestOverlapDPRefusals(t *testing.T) {
 			// A capture-bearing member routes to Backtracking, which has no
 			// DFA for the sweep to read.
 			name: "backtracking member",
-			build: func() []config.RegexEntry {
-				return []config.RegexEntry{
-					{Name: "a", Pattern: `alpha[0-9]{3}`},
-					{Name: "b", Pattern: `bravo[0-9]{3}`},
-					{Name: "c", Pattern: `charlie(a.*?b)(c+)`},
+			build: func() []config.PatternEntry {
+				return []config.PatternEntry{
+					{Name: "a", Regexp: `alpha[0-9]{3}`},
+					{Name: "b", Regexp: `bravo[0-9]{3}`},
+					{Name: "c", Regexp: `charlie(a.*?b)(c+)`},
 				}
 			},
 		},
 		{
 			// More patterns than an i64 mask can hold.
 			name: "past the mask width",
-			build: func() []config.RegexEntry {
-				out := make([]config.RegexEntry, 80)
+			build: func() []config.PatternEntry {
+				out := make([]config.PatternEntry, 80)
 				for i := range out {
-					out[i] = config.RegexEntry{
-						Name:    fmt.Sprintf("p%d", i),
-						Pattern: fmt.Sprintf(`lit%03dx[a-z]+`, i),
+					out[i] = config.PatternEntry{
+						Name:   fmt.Sprintf("p%d", i),
+						Regexp: fmt.Sprintf(`lit%03dx[a-z]+`, i),
 					}
 				}
 				return out
@@ -1407,10 +1407,10 @@ func TestOverlapDPRefusals(t *testing.T) {
 			// A word boundary changes which start state a position gets, which
 			// the sweep would have to reproduce.
 			name: "word boundary member",
-			build: func() []config.RegexEntry {
-				return []config.RegexEntry{
-					{Name: "a", Pattern: `alpha[0-9]{3}`},
-					{Name: "b", Pattern: `\bbravo\b[0-9]{3}`},
+			build: func() []config.PatternEntry {
+				return []config.PatternEntry{
+					{Name: "a", Regexp: `alpha[0-9]{3}`},
+					{Name: "b", Regexp: `\bbravo\b[0-9]{3}`},
 				}
 			},
 		},
@@ -1418,7 +1418,7 @@ func TestOverlapDPRefusals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.BuildConfig{
-				Regexps: tc.build(),
+				Patterns: tc.build(),
 				Sets: []config.SetConfig{{
 					Name:        "s",
 					Find:        "s_find",
@@ -1457,16 +1457,16 @@ func TestFindPreflightPredicatesOnWideSets(t *testing.T) {
 		for _, n := range []int{8, 90} {
 			name := fmt.Sprintf("n=%d/overlapping=%v", n, overlapping)
 			t.Run(name, func(t *testing.T) {
-				entries := make([]config.RegexEntry, n)
+				entries := make([]config.PatternEntry, n)
 				for i := range entries {
 					// Literal-less, so a union automaton is built at all.
-					entries[i] = config.RegexEntry{
-						Name:    fmt.Sprintf("p%d", i),
-						Pattern: fmt.Sprintf(`[a-z]{%d}[0-9]{%d}x`, 2+i%3, 1+i%2),
+					entries[i] = config.PatternEntry{
+						Name:   fmt.Sprintf("p%d", i),
+						Regexp: fmt.Sprintf(`[a-z]{%d}[0-9]{%d}x`, 2+i%3, 1+i%2),
 					}
 				}
 				cfg := config.BuildConfig{
-					Regexps: entries,
+					Patterns: entries,
 					Sets: []config.SetConfig{{
 						Name:        "s",
 						Find:        "s_find",
@@ -1678,8 +1678,8 @@ func TestProgramSweepModulesBuild(t *testing.T) {
 			set.Hints = []string{"batch-find"}
 		}
 		return config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "k", Pattern: kept}, {Name: "m", Pattern: member}},
-			Sets:    []config.SetConfig{set},
+			Patterns: []config.PatternEntry{{Name: "k", Regexp: kept}, {Name: "m", Regexp: member}},
+			Sets:     []config.SetConfig{set},
 		}
 	}
 	for _, m := range members {
@@ -1714,7 +1714,7 @@ func TestProgramSweepModulesBuild(t *testing.T) {
 	if sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg); err != nil || sh.SweepCells != 0 {
 		t.Errorf("%s alone: a sweep past the root limit (%+v, %v)", huge, sh, err)
 	}
-	cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Name: "m2", Pattern: members[0]})
+	cfg.Patterns = append(cfg.Patterns, config.PatternEntry{Name: "m2", Regexp: members[0]})
 	sh, err := SetOverlapCacheShape(cfg.Sets[0], cfg)
 	if err != nil || sh.SweepCells == 0 || sh.SweepRow != 4 {
 		t.Errorf("%s beside %s: want one swept member (%+v, %v)", huge, members[0], sh, err)

@@ -40,10 +40,10 @@ func genStubsForIsolation(t *testing.T, ext string, batch bool) string {
 		sc.Hints = []string{"batch-find"}
 	}
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "w", Pattern: `[a-z]+`, FindFunc: "findWords"},
-			{Name: "n", Pattern: `[0-9]+`, MatchFunc: "matchNums"},
-			{Name: "g", Pattern: `(?P<a>[a-z])(?P<b>[0-9])`, GroupsFunc: "grp"},
+		Patterns: []config.PatternEntry{
+			{Name: "w", Regexp: `[a-z]+`, FindFunc: "findWords"},
+			{Name: "n", Regexp: `[0-9]+`, MatchFunc: "matchNums"},
+			{Name: "g", Regexp: `(?P<a>[a-z])(?P<b>[0-9])`, GroupsFunc: "grp"},
 		},
 		Sets:     []config.SetConfig{sc},
 		StubFile: "out." + ext,
@@ -200,10 +200,10 @@ func isolationConfig(batch bool) config.BuildConfig {
 		set.Hints = []string{"batch-find"}
 	}
 	return config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "words", Pattern: `[a-z]+`, FindFunc: "findWords"},
-			{Name: "nums", Pattern: `[0-9]+`, FindFunc: "findNums"},
-			{Name: "pairs", Pattern: `(?P<letter>[a-z])(?P<digit>[0-9])`, GroupsFunc: "findPairs"},
+		Patterns: []config.PatternEntry{
+			{Name: "words", Regexp: `[a-z]+`, FindFunc: "findWords"},
+			{Name: "nums", Regexp: `[0-9]+`, FindFunc: "findNums"},
+			{Name: "pairs", Regexp: `(?P<letter>[a-z])(?P<digit>[0-9])`, GroupsFunc: "findPairs"},
 		},
 		Sets:     []config.SetConfig{set},
 		StubFile: "stubs.js",
@@ -383,9 +383,9 @@ func TestJSSearchNotesAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.BuildConfig{
 		ImportModule: "notes",
-		Regexps: []config.RegexEntry{
-			{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun"},
-			{Name: "greedy", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "greedy"},
+		Patterns: []config.PatternEntry{
+			{Name: "overrun", Regexp: `a*b|a`, FindFunc: "overrun"},
+			{Name: "greedy", Regexp: `(x)(?:[a-z]*y)?`, GroupsFunc: "greedy"},
 		},
 		StubFile: "stubs.js",
 	}
@@ -461,9 +461,9 @@ func TestJSSetSearchBlocksAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.BuildConfig{
 		ImportModule: "notes",
-		Regexps: []config.RegexEntry{
-			{Name: "member", Pattern: `foo\w+bar|foo`},
-			{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
+		Patterns: []config.PatternEntry{
+			{Name: "member", Regexp: `foo\w+bar|foo`},
+			{Name: "aws", Regexp: `AKIA[A-Z0-9]{16}`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "scan", Patterns: config.PatternSelector{Names: []string{"member", "aws"}},
@@ -534,10 +534,10 @@ func TestJSBatchNotesUpFrontAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.BuildConfig{
 		ImportModule: "batchnotes",
-		Regexps: []config.RegexEntry{
-			{Name: "member", Pattern: `a*b|a`},
-			{Name: "lit", Pattern: `zzz`},
-			{Name: "own", Pattern: `a*b|a`, FindFunc: "own", Hints: []string{"batch-find"}},
+		Patterns: []config.PatternEntry{
+			{Name: "member", Regexp: `a*b|a`},
+			{Name: "lit", Regexp: `zzz`},
+			{Name: "own", Regexp: `a*b|a`, FindFunc: "own", Hints: []string{"batch-find"}},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "scan", Hints: []string{"batch-find"},
@@ -618,9 +618,9 @@ func TestJSBacktrackingBudgetPerSearchAtRuntime(t *testing.T) {
 		// The member's suffix DFA (82 states) is over this, so it runs on
 		// Backtracking in its bucket.
 		MaxDFAStates: 16,
-		Regexps: []config.RegexEntry{
-			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
-			{Name: "member", Pattern: `(?:aa|a){0,40}b|a`},
+		Patterns: []config.PatternEntry{
+			{Name: "bt", Regexp: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+			{Name: "member", Regexp: `(?:aa|a){0,40}b|a`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "scan", Patterns: config.PatternSelector{Names: []string{"member"}},
@@ -699,7 +699,7 @@ func TestJSNotesFailureDeliversTheMatch(t *testing.T) {
 	load := func(maxMemory string) config.BuildConfig {
 		t.Helper()
 		yml := "import_module: m\nstub_file: stubs.js\n" + maxMemory +
-			"regexps:\n  - name: ov\n    pattern: 'a*b|a'\n    find_func: ov_find\n"
+			"patterns:\n  - name: ov\n    regexp: 'a*b|a'\n    find_func: ov_find\n"
 		p := filepath.Join(dir, "regexped.yaml")
 		if err := os.WriteFile(p, []byte(yml), 0o644); err != nil {
 			t.Fatal(err)
@@ -780,12 +780,12 @@ func TestJSUnicodeAtRuntime(t *testing.T) {
 	}
 	yes := true
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "letters", Pattern: `\pL+`, FindFunc: "findLetters"},
-			{Name: "lead", Pattern: `é\pL*`, MatchFunc: "matchLead"},
-			{Name: "pairs", Pattern: `(\pL+)-(\d+)`, GroupsFunc: "findPairs"},
-			{Name: "xs", Pattern: `x*`, Unicode: &yes, FindFunc: "findXs"},
-			{Name: "cyr", Pattern: `ж+`},
+		Patterns: []config.PatternEntry{
+			{Name: "letters", Regexp: `\pL+`, FindFunc: "findLetters"},
+			{Name: "lead", Regexp: `é\pL*`, MatchFunc: "matchLead"},
+			{Name: "pairs", Regexp: `(\pL+)-(\d+)`, GroupsFunc: "findPairs"},
+			{Name: "xs", Regexp: `x*`, Unicode: &yes, FindFunc: "findXs"},
+			{Name: "cyr", Regexp: `ж+`},
 		},
 		Sets:     []config.SetConfig{{Name: "u", Find: "findU", Patterns: config.PatternSelector{Names: []string{"xs", "cyr"}}}},
 		StubFile: "stubs.js",
@@ -827,7 +827,7 @@ func TestJSUnicodeAtRuntime(t *testing.T) {
 			groups = [][]*sp{}
 		}
 		w["pairs"] = groups
-		// A set reports each member's GLOBAL id: its index in Regexps.
+		// A set reports each member's GLOBAL id: its index in Patterns.
 		var set [][3]int
 		for id, p := range map[int]string{3: `x*`, 4: `ж+`} {
 			for _, m := range regexp.MustCompile(p).FindAllStringIndex(s, -1) {

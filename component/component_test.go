@@ -51,10 +51,10 @@ func findCfg(name string) config.BuildConfig {
 	return config.BuildConfig{
 		WasmFormat:   "component",
 		ImportModule: name,
-		Regexps: []config.RegexEntry{
-			{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-			{Pattern: `[a-z]+`, MatchFunc: "lower_match"},
-			{Pattern: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
+		Patterns: []config.PatternEntry{
+			{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
+			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
+			{Regexp: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
 		},
 	}
 }
@@ -144,7 +144,7 @@ func TestCmdCompileRejectsConfigWithNoExports(t *testing.T) {
 		ImportModule: "secrets",
 		// A pattern with no _func fields compiles to nothing, so there is no
 		// interface to build a component around.
-		Regexps: []config.RegexEntry{{Pattern: `abc`}},
+		Patterns: []config.PatternEntry{{Regexp: `abc`}},
 	}
 	err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), nil)
 	if err == nil || !strings.Contains(err.Error(), "no exports") {
@@ -156,7 +156,7 @@ func TestCmdCompileSurfacesNameErrors(t *testing.T) {
 	// A func name that cannot be a WIT identifier: caught while building the
 	// WIT, before anything is compiled.
 	cfg := findCfg("secrets")
-	cfg.Regexps = []config.RegexEntry{{Pattern: "a", FindFunc: "_bad"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "a", FindFunc: "_bad"}}
 	if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), nil); err == nil ||
 		!strings.Contains(err.Error(), "find_func") {
 		t.Errorf("bad func name: err = %v", err)
@@ -180,7 +180,7 @@ func TestCmdCompileRejectsUncompilablePattern(t *testing.T) {
 	cfg := findCfg("secrets")
 	// A rune above U+00FF under byte_mode: no byte holds it. (Without
 	// byte_mode it would compile, in Unicode mode.)
-	cfg.Regexps = []config.RegexEntry{{Pattern: "\u4e2d", FindFunc: "f", ByteMode: true}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "\u4e2d", FindFunc: "f", ByteMode: true}}
 	if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), nil); err == nil ||
 		!strings.Contains(err.Error(), "compile") {
 		t.Errorf("err = %v, want a compile failure", err)
@@ -538,9 +538,9 @@ func TestCmdCompileWritesSetComponent(t *testing.T) {
 	out := filepath.Join(dir, "runs.wasm")
 	cfg := config.BuildConfig{
 		WasmFormat: "component", ImportModule: "runs", WitPackage: "runs",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "digits", Pattern: `[0-9]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "digits", Regexp: `[0-9]+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "runs", Patterns: config.PatternSelector{All: true},
@@ -581,9 +581,9 @@ func TestCmdCompileVerboseReportsSets(t *testing.T) {
 	var report bytes.Buffer
 	cfg := config.BuildConfig{
 		WasmFormat: "component", ImportModule: "runs", WitPackage: "runs",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "digits", Pattern: `[0-9]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "digits", Regexp: `[0-9]+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "runs", Patterns: config.PatternSelector{All: true},
@@ -613,9 +613,9 @@ func coreSetCfg() config.BuildConfig {
 		ImportModule: "t",
 		WitPackage:   "t",
 		WasmFile:     "t.wasm",
-		Regexps: []config.RegexEntry{
-			{Pattern: `ghp_[A-Za-z0-9]{4}`},
-			{Pattern: `AKIA[A-Z0-9]{6}`},
+		Patterns: []config.PatternEntry{
+			{Regexp: `ghp_[A-Za-z0-9]{4}`},
+			{Regexp: `AKIA[A-Z0-9]{6}`},
 		},
 		Sets: []config.SetConfig{{
 			Name:     "s",
@@ -658,7 +658,7 @@ func TestCoreBuildsSetComponent(t *testing.T) {
 // the resource's import offsets them all.
 func TestCoreBuildsMixedComponent(t *testing.T) {
 	cfg := coreSetCfg()
-	cfg.Regexps[0].MatchFunc = "token_match"
+	cfg.Patterns[0].MatchFunc = "token_match"
 	core, witText, err := Core(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -735,18 +735,18 @@ func TestCoreSurfacesCompileErrors(t *testing.T) {
 	const unsupported = `a€b`
 
 	cfg := coreSetCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported, MatchFunc: "m", ByteMode: true}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: unsupported, MatchFunc: "m", ByteMode: true}}
 	cfg.Sets = nil
 	if _, _, err := Core(cfg, nil); err == nil {
 		t.Error("an unsupported rune compiled")
 	}
 
 	cfg = coreSetCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported, ByteMode: true}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: unsupported, ByteMode: true}}
 	if _, _, err := Core(cfg, nil); err == nil {
 		t.Error("an unsupported rune compiled through the set path")
 	}
-	cfg.Regexps = []config.RegexEntry{{Pattern: unsupported}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: unsupported}}
 	if _, _, err := Core(cfg, nil); err != nil {
 		t.Errorf("a Unicode-mode set did not compile: %v", err)
 	}
@@ -845,7 +845,7 @@ func realCore(t *testing.T, cfg config.BuildConfig) ([]byte, string) {
 	// The RESOURCES matter as much as the plain names: find and groups are
 	// resources, so a core built without them exports no constructor and
 	// `component new` refuses the WIT beside it.
-	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{
+	core, _, err := compile.Compile(cfg.Patterns, 0, true, compile.CompileOptions{
 		Component:                 true,
 		ComponentPackage:          prefix,
 		ComponentExportNames:      names,
@@ -861,7 +861,7 @@ func realCore(t *testing.T, cfg config.BuildConfig) ([]byte, string) {
 // `component new` has nothing to lift from.
 func plainCore(t *testing.T, cfg config.BuildConfig) []byte {
 	t.Helper()
-	core, _, err := compile.Compile(cfg.Regexps, 0, true, compile.CompileOptions{})
+	core, _, err := compile.Compile(cfg.Patterns, 0, true, compile.CompileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

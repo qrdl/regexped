@@ -11,8 +11,8 @@ wasm_format:   component
 import_module: "secrets"
 wasm_file:     "secrets.wasm"
 
-regexps:
-  - pattern:   'ghp_[A-Za-z0-9]{36}'
+patterns:
+  - regexp:   'ghp_[A-Za-z0-9]{36}'
     find_func: "find_github_token"
 ```
 
@@ -225,7 +225,7 @@ familiar API. Until the merge step runs, the guest has an unsatisfied import and
 will not instantiate.
 
 `examples/wasmtime/rust/secrets` 🧩 is this route end to end, and
-`examples/fastedge/lang-detect` 🧩 is the same route for a `wasi:http` app: the
+`examples/fastedge/script-detect` 🧩 is the same route for a `wasi:http` app: the
 guest is a FastEdge HTTP app built with `wstd`, and the composed component runs
 under `wasmtime serve` and FastEdge's own runtime alike.
 
@@ -517,7 +517,7 @@ Neither of these is a gap waiting to be filled.
 
 | | Status |
 |---|---|
-| Batch exports (`hints: [batch-find]`, on a set or a `regexps:` entry) | Refused at load, by design. Batching exists for one reason — to save host↔WASM crossings — and only the JS and TS stubs ever generate it, because every other stub is itself compiled to WASM and calls the body directly, with no crossing to save. JS and TS are not component targets, so under `component` there is no host batching could help. It is refused rather than ignored because the user asked for a second entry point. |
+| Batch exports (`hints: [batch-find]`, on a set or a `patterns:` entry) | Refused at load, by design. Batching exists for one reason — to save host↔WASM crossings — and only the JS and TS stubs ever generate it, because every other stub is itself compiled to WASM and calls the body directly, with no crossing to save. JS and TS are not component targets, so under `component` there is no host batching could help. It is refused rather than ignored because the user asked for a second entry point. |
 | `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
 
 ## How it is built

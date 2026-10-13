@@ -44,8 +44,8 @@ wasm_file:     "regexps.wasm"    # intermediate regexp WASM
 import_module: "regexps"         # module name used by the generated stubs
 stub_file:     "stubs.rs"        # .rs / .go / .h / .ts → language inferred from extension
 
-regexps:
-  - pattern:    '^https?://\[[0-9a-fA-F:]+\](?::\d+)?(?:/[^\s]*)?$'
+patterns:
+  - regexp:    '^https?://\[[0-9a-fA-F:]+\](?::\d+)?(?:/[^\s]*)?$'
     match_func: "url_ipv6_match"
 ```
 

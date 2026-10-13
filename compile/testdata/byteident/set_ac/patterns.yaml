@@ -1,42 +1,42 @@
 # Set frontend: AHO-CORASICK — >16 literals with LOW first-byte diversity
 # (every literal starts 'k'), inside the 512 KB table budget. compile/aho_corasick.go.
-regexps:
+patterns:
   - name: p0
-    pattern: 'kw00'
+    regexp: 'kw00'
   - name: p1
-    pattern: 'kw01'
+    regexp: 'kw01'
   - name: p2
-    pattern: 'kw02'
+    regexp: 'kw02'
   - name: p3
-    pattern: 'kw03'
+    regexp: 'kw03'
   - name: p4
-    pattern: 'kw04'
+    regexp: 'kw04'
   - name: p5
-    pattern: 'kw05'
+    regexp: 'kw05'
   - name: p6
-    pattern: 'kw06'
+    regexp: 'kw06'
   - name: p7
-    pattern: 'kw07'
+    regexp: 'kw07'
   - name: p8
-    pattern: 'kw08'
+    regexp: 'kw08'
   - name: p9
-    pattern: 'kw09'
+    regexp: 'kw09'
   - name: p10
-    pattern: 'kw10'
+    regexp: 'kw10'
   - name: p11
-    pattern: 'kw11'
+    regexp: 'kw11'
   - name: p12
-    pattern: 'kw12'
+    regexp: 'kw12'
   - name: p13
-    pattern: 'kw13'
+    regexp: 'kw13'
   - name: p14
-    pattern: 'kw14'
+    regexp: 'kw14'
   - name: p15
-    pattern: 'kw15'
+    regexp: 'kw15'
   - name: p16
-    pattern: 'kw16'
+    regexp: 'kw16'
   - name: p17
-    pattern: 'kw17'
+    regexp: 'kw17'
 sets:
   - name: s
     find: s_find

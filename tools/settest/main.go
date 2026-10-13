@@ -466,21 +466,14 @@ func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDi
 	// match_any / match_all through Backtracking.
 	dropped := map[int]bool{}
 
-	selected := map[string]bool{}
-	for _, n := range sc.Patterns.Names {
-		selected[n] = true
-	}
-
 	exact := true
 	var out []oracleEntry
-	for id, re := range cfg.Regexps {
-		if !sc.Patterns.All && !selected[re.Name] {
-			continue
-		}
+	for _, m := range sc.Members(cfg) {
+		id, re := m.ID, m.Entry
 		if dropped[id] {
 			continue
 		}
-		src := re.Pattern
+		src := re.Regexp
 		if kind.anchored() {
 			// "Anchored" here is full consumption, 0..len — the same rule
 			// docs/sets.md gives for match_any/match_all.
@@ -488,7 +481,7 @@ func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDi
 		}
 		c, err := regexp.Compile(src)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: pattern %d (%q) rejected by Go's regexp: %v\n", id, re.Pattern, err)
+			fmt.Fprintf(os.Stderr, "warning: pattern %d (%q) rejected by Go's regexp: %v\n", id, re.Regexp, err)
 			exact = false
 			continue
 		}

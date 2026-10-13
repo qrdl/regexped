@@ -5,11 +5,11 @@
 # wasi:http guest component, compose the two. The last step is `regexped
 # merge`, which dispatches on wasm_format and calls `wac` for a component.
 REGEXPED  := ../../../regexped
-COMPONENT := langdetect.wasm
-WIT       := langdetect.wit
+COMPONENT := scriptdetect.wasm
+WIT       := scriptdetect.wit
 STUB      := stubs.rs
-GUEST     := target/wasm32-wasip2/release/lang_detect.wasm
-FINAL     := lang-detect.wasm
+GUEST     := target/wasm32-wasip2/release/script_detect.wasm
+FINAL     := script-detect.wasm
 PORT      ?= 8080
 URL       := http://127.0.0.1:$(PORT)/
 
@@ -63,7 +63,7 @@ run: $(FINAL)
 	  printf '%s → ' "$$text"; curl -s --data-binary "$$text" $(URL); echo; \
 	done
 
-# Run lang-detect.wasm under the FastEdge runtime itself — fastedge-run, through
+# Run script-detect.wasm under the FastEdge runtime itself — fastedge-run, through
 # @gcoredev/fastedge-test — and assert every sample's answer (test.mjs). Run
 # `npm install` once first; this Makefile installs nothing.
 test: $(FINAL)

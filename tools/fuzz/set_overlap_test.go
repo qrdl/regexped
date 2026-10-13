@@ -219,10 +219,10 @@ func wholeSetSweepSets(t *testing.T) []struct {
 		}
 		byName := map[string]string{}
 		var all []string
-		for _, r := range bc.Regexps {
-			if r.Pattern != "" {
-				byName[r.Name] = r.Pattern
-				all = append(all, r.Pattern)
+		for _, r := range bc.Patterns {
+			if r.Regexp != "" {
+				byName[r.Name] = r.Regexp
+				all = append(all, r.Regexp)
 			}
 		}
 		for _, sc := range bc.Sets {
@@ -1266,9 +1266,9 @@ func TestOverlapCacheRefusesWrappedLayout(t *testing.T) {
 // column's width and the bucket's pattern count.
 func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name: "s", Find: "set_find",
@@ -1276,7 +1276,7 @@ func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 		Unicode: setModeKey(),
 	}
 	sh, err := compile.SetOverlapCacheShape(sc, config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{sc},
+		Patterns: entries, Sets: []config.SetConfig{sc},
 	})
 	if err != nil {
 		t.Fatalf("shape: %v", err)
@@ -2255,10 +2255,10 @@ func overlapOracleFrom(t *testing.T, pats []string, input string, from int) [][3
 // nothing about the bytes; only a validator does.
 func TestOverlapDPModuleValidates(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "a", Pattern: `a+`},
-			{Name: "e", Pattern: `[^\n]*ERROR`},
-			{Name: "x", Pattern: `x?y`},
+		Patterns: []config.PatternEntry{
+			{Name: "a", Regexp: `a+`},
+			{Name: "e", Regexp: `[^\n]*ERROR`},
+			{Name: "x", Regexp: `x?y`},
 		},
 		Sets: []config.SetConfig{{
 			Name:        "s",

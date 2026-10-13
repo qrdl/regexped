@@ -97,7 +97,7 @@
   <script type="module">
     // regexp.js and regexps.wasm are generated from regexped.yaml by
     // `regexped generate` and `regexped compile`. init() takes the WASM bytes.
-    import { init, scan_text, patternName } from './regexp.js';
+    import { init, scan_text, homoglyphPatternName } from './regexp.js';
 
     await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
     document.getElementById('loading').style.display = 'none';
@@ -167,7 +167,7 @@
       const at = codeUnitIndex(text);
       const found = { mixed_script: [], lookalike: [], invisible: [], bidi_control: [], styled: [] };
       for (const m of scan_text(text)) {
-        found[patternName(m.patternId)].push([at[m.start], at[m.end]]);
+        found[homoglyphPatternName(m.patternId)].push([at[m.start], at[m.end]]);
       }
       found.lookalike = found.lookalike.filter(
         ([s]) => found.mixed_script.some(([ts, te]) => s >= ts && s < te));

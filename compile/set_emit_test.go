@@ -52,7 +52,7 @@ func setEmitCovInfos(t *testing.T, patterns []string) ([]*PatternInfo, []int, *d
 	infos := make([]*PatternInfo, 0, len(patterns))
 	globalIDs := make([]int, 0, len(patterns))
 	for i, pattern := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -81,10 +81,10 @@ func setEmitCovCompileSet(t *testing.T, spec SetSpec, patterns []string, opts Co
 
 // setEmitCovEntries turns patterns into named config entries p00, p01, ... so
 // a set can select them by name.
-func setEmitCovEntries(patterns []string) []config.RegexEntry {
-	entries := make([]config.RegexEntry, len(patterns))
+func setEmitCovEntries(patterns []string) []config.PatternEntry {
+	entries := make([]config.PatternEntry, len(patterns))
 	for i, pattern := range patterns {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pattern}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pattern}
 	}
 	return entries
 }
@@ -134,11 +134,11 @@ var litLessNeverDying = []string{`[^\n]*[0-2]`, `[^\n]*[3-5]`}
 // reads the HOST's memory as if it were the table — silently wrong answers
 // rather than a validation error.
 func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		// A literal-anchored find: emits a backward-scan body plus a find body
 		// built around it, the pair that carries the lit-anchor table index.
 		{
-			Name: "lit_anchor", Pattern: `[a-z]+@example\.com`,
+			Name: "lit_anchor", Regexp: `[a-z]+@example\.com`,
 			FindFunc: "lit_anchor_find",
 		},
 		// Captures the selector routes to BACKTRACKING, not TDFA: an inverted
@@ -147,7 +147,7 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		// the composed wrapper has to pass the BT window scratch offset rather
 		// than -1. Non-anchored, so the wrapper composes find + capture.
 		{
-			Name: "bt_groups", Pattern: `<([^>]+)>`,
+			Name: "bt_groups", Regexp: `<([^>]+)>`,
 			GroupsFunc: "bt_groups_groups", FindFunc: "bt_groups_find",
 			Hints: []string{"batch-find"},
 		},
@@ -155,19 +155,19 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		// body is ANCHORED, which selects the other batch-groups wrapper —
 		// the native lit-chain one, with no find body to compose.
 		{
-			Name: "lit_chain", Pattern: `ghp_(?P<id>[A-Za-z0-9]{36})`,
+			Name: "lit_chain", Regexp: `ghp_(?P<id>[A-Za-z0-9]{36})`,
 			GroupsFunc: "lit_chain_groups",
 			Hints:      []string{"batch-find"},
 		},
 		// A plain member so the set has something left after the
 		// capture-bearing entries are dropped from it.
-		{Name: "plain", Pattern: `plain[0-9]+`},
+		{Name: "plain", Regexp: `plain[0-9]+`},
 	}
 	cfg := config.BuildConfig{
 		// The only thing that selects the embedded arm. CompileFile's second
 		// argument is an output PATH and does not affect it.
-		Output:  "merged.wasm",
-		Regexps: entries,
+		Output:   "merged.wasm",
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", MatchAny: "s_match_any",
 			Patterns: config.PatternSelector{All: true},
@@ -212,7 +212,7 @@ func TestSetEmitFindPreflightTakesUnionWalk(t *testing.T) {
 	// preflight dormant on purpose (set_emit.go's "byte-identical" note). So
 	// scan_any is declared alongside.
 	gated := config.BuildConfig{
-		Regexps: setEmitCovEntries(litLessNeverDying),
+		Patterns: setEmitCovEntries(litLessNeverDying),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAny: "s_scan_any",
 			Patterns: config.PatternSelector{All: true},
@@ -226,7 +226,7 @@ func TestSetEmitFindPreflightTakesUnionWalk(t *testing.T) {
 	// pattern from validMask with — which is the difference between one
 	// overlapping call and a quadratic one.
 	overlapping := config.BuildConfig{
-		Regexps: setEmitCovEntries(litLessNeverDying),
+		Patterns: setEmitCovEntries(litLessNeverDying),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Patterns: config.PatternSelector{All: true},
@@ -258,11 +258,11 @@ func TestSetEmitOverlapPreflightIDSpaceExceedsMembers(t *testing.T) {
 	entries := setEmitCovEntries(litLessNeverDying)
 	// Declared last, dropped from the set, and its index is what IDSpaceSize
 	// is computed from.
-	entries = append(entries, config.RegexEntry{
-		Name: "dropped", Pattern: `(?P<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
+	entries = append(entries, config.PatternEntry{
+		Name: "dropped", Regexp: `(?P<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
 	})
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Patterns: config.PatternSelector{All: true},
@@ -309,7 +309,7 @@ func TestSetEmitACFrontendWithFallbackBucket(t *testing.T) {
 	patterns = append(patterns, `[0-9]{4,}`)
 
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAll: "s_scan_all", MatchAll: "s_match_all",
 			Patterns: config.PatternSelector{All: true},
@@ -359,7 +359,7 @@ func TestSetEmitACFrontendSingleByteLiteral(t *testing.T) {
 	patterns = append(patterns, `k[0-9]{3}`)
 
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAll: "s_scan_all",
 			Patterns: config.PatternSelector{All: true},
@@ -467,7 +467,7 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 	// And the whole config compiles: the sweep body is emitted at assembly
 	// time, so the predicate agreeing is only half the check.
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries([]string{wideButU8}),
+		Patterns: setEmitCovEntries([]string{wideButU8}),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Hints:    []string{"batch-find"},
@@ -572,7 +572,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	}
 	// From a config: the key reaches the set's union.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "d", Pattern: `[0-9]{3}`}, {Name: "w", Pattern: `[a-z]{2}`}},
+		Patterns: []config.PatternEntry{{Name: "d", Regexp: `[0-9]{3}`}, {Name: "w", Regexp: `[a-z]{2}`}},
 		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
 			Patterns: config.PatternSelector{All: true}}},
 	}
@@ -647,7 +647,7 @@ func TestSetEmitUnionScanWideSetCompiles(t *testing.T) {
 		patterns[i] = fmt.Sprintf(`[0-9]{%d}[a-c]`, i+1)
 	}
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
 			Patterns: config.PatternSelector{All: true},
@@ -893,7 +893,7 @@ func TestSetEmitUnicodeStartCheckOncePerCharacter(t *testing.T) {
 	body := func(t *testing.T, patterns []string, wantFE frontendKind) []byte {
 		t.Helper()
 		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}
-		cfg := config.BuildConfig{Regexps: setEmitCovEntries(patterns), Sets: []config.SetConfig{sc}}
+		cfg := config.BuildConfig{Patterns: setEmitCovEntries(patterns), Sets: []config.SetConfig{sc}}
 		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -1018,7 +1018,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 		Patterns: config.PatternSelector{Names: []string{"p00", "p01"}},
 	}
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{byName}, MaxDFAStates: 1,
+		Patterns: entries, Sets: []config.SetConfig{byName}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(byName, cramped) {
 		t.Error("a NAMED selection of members that all land on Backtracking reported none")
@@ -1037,7 +1037,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 	// UNNAMED so the error path labels it by its pattern text instead — the
 	// only branch where the label falls back that way.
 	unparseable := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Pattern: `(unclosed`}},
+		Patterns: []config.PatternEntry{{Regexp: `(unclosed`}},
 		Sets: []config.SetConfig{{
 			Name: "s", MatchAll: "s_match_all",
 			Patterns: config.PatternSelector{All: true},
@@ -1274,7 +1274,7 @@ func TestSetEmitUnionScanTableLayouts(t *testing.T) {
 			// And the module built from it: the emitter runs at assembly time,
 			// so the geometry agreeing is only half the check.
 			cfg := config.BuildConfig{
-				Regexps: setEmitCovEntries(testCase.patterns),
+				Patterns: setEmitCovEntries(testCase.patterns),
 				Sets: []config.SetConfig{{
 					Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
 					Find:     "s_find",
@@ -1442,7 +1442,7 @@ func TestSetEmitPrefixCheckPerPatternGuard(t *testing.T) {
 
 	// And the module: the emitter runs at assembly time.
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find",
 			Patterns: config.PatternSelector{All: true},
@@ -1620,7 +1620,7 @@ func TestSetEmitJumpProfitabilityIgnoresUnrecoverablePattern(t *testing.T) {
 func setCoreCovAnalyze(t *testing.T, pattern string) *PatternInfo {
 	t.Helper()
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern(%q): %v", pattern, err)
 	}
@@ -1634,7 +1634,7 @@ func setCoreCovAnalyzeAll(t *testing.T, patterns ...string) []*PatternInfo {
 	var prefixPool, suffixPool dfaPool
 	infos := make([]*PatternInfo, len(patterns))
 	for i, pattern := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -1919,7 +1919,7 @@ func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
 	// handling (noOwnDFA) rather than carrying its own.
 	for _, pat := range []string{`[a-z]{1000}[0-9]{1000}[a-z]{1000}`, `x[ab]*a[ab]{11}c`} {
 		var prefixPool, suffixPool dfaPool
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("%s: analyzePattern failed instead of routing to Backtracking: %v", pat, err)
 		}
@@ -1935,9 +1935,9 @@ func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
 
 	// In a set it lands on a Backtracking bucket, not in an error.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "chain", Pattern: `[a-z]{1000}[0-9]{1000}[a-z]{1000}`},
-			{Name: "zz", Pattern: `zz`},
+		Patterns: []config.PatternEntry{
+			{Name: "chain", Regexp: `[a-z]{1000}[0-9]{1000}[a-z]{1000}`},
+			{Name: "zz", Regexp: `zz`},
 		},
 		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sa", Patterns: config.PatternSelector{All: true}}},
 	}
@@ -2878,14 +2878,14 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 
 // setPlusPatternsConfig is a BuildConfig with BOTH a set and standalone
 // patterns chosen to select the specialised emitters.
-func setPlusPatternsConfig(extra []config.RegexEntry, hints []string) config.BuildConfig {
-	base := []config.RegexEntry{
-		{Name: "s0", Pattern: `alpha[0-9]{3}`},
-		{Name: "s1", Pattern: `bravo[0-9]{3}`},
-		{Name: "s2", Pattern: `charlie[0-9]{3}`},
+func setPlusPatternsConfig(extra []config.PatternEntry, hints []string) config.BuildConfig {
+	base := []config.PatternEntry{
+		{Name: "s0", Regexp: `alpha[0-9]{3}`},
+		{Name: "s1", Regexp: `bravo[0-9]{3}`},
+		{Name: "s2", Regexp: `charlie[0-9]{3}`},
 	}
 	return config.BuildConfig{
-		Regexps: append(base, extra...),
+		Patterns: append(base, extra...),
 		Sets: []config.SetConfig{{
 			Name:     "s",
 			Find:     "s_find",
@@ -2898,7 +2898,7 @@ func setPlusPatternsConfig(extra []config.RegexEntry, hints []string) config.Bui
 func TestSetAssemblerPerPatternBodies(t *testing.T) {
 	cases := []struct {
 		name    string
-		entries []config.RegexEntry
+		entries []config.PatternEntry
 		exports []string
 	}{
 		{
@@ -2906,14 +2906,14 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// plus ONE dispatcher built at assembly time from indices that do
 			// not exist before then.
 			name: "alt lit anchor dispatcher",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name: "alt",
 				// The branches need an UNBOUNDED suffix. A bounded one is
 				// caught earlier by analyseLitChainAltPrefixed and never
 				// reaches the alt-lit-anchor block at all — see
 				// TestCompileAltLitAnchorDispatch, which learned the same
 				// thing the same way.
-				Pattern:  `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`,
+				Regexp:   `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`,
 				FindFunc: "alt_find",
 			}},
 			exports: []string{"alt_find", "s_find"},
@@ -2922,9 +2922,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// Lit-anchor: a backward DFA recovers the match start, and the
 			// forward half is generated at assembly time too.
 			name: "lit anchor pair",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "mail",
-				Pattern:  `[a-z]+@example\.com`,
+				Regexp:   `[a-z]+@example\.com`,
 				FindFunc: "mail_find",
 			}},
 			exports: []string{"mail_find", "s_find"},
@@ -2933,9 +2933,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// A capture body beside a set: the groups wrapper composes a find
 			// and a capture function, both indexed by the set assembler.
 			name: "groups wrapper",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:       "grp",
-				Pattern:    `<([a-z]+)>`,
+				Regexp:     `<([a-z]+)>`,
 				GroupsFunc: "grp_groups",
 			}},
 			exports: []string{"grp_groups", "s_find"},
@@ -2944,9 +2944,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// An anchored match body, which takes the assembler's matchBody
 			// arm rather than any find arm.
 			name: "match only",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:      "m",
-				Pattern:   `[0-9]{4}-[0-9]{2}`,
+				Regexp:    `[0-9]{4}-[0-9]{2}`,
 				MatchFunc: "m_match",
 			}},
 			exports: []string{"m_match", "s_find"},
@@ -2963,9 +2963,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// mandatory literal, or there is no dense switch to escape and no
 			// twin to emit (TestFindNeutralTwinEmission pins that predicate).
 			name: "prefer-no-match find twin",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "tw",
-				Pattern:  `[a-zA-Z]{20,}`,
+				Regexp:   `[a-zA-Z]{20,}`,
 				FindFunc: "tw_find",
 				Hints:    []string{"prefer-no-match"},
 			}},
@@ -2975,9 +2975,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// Batch wrappers beside a set: a second entry point over the same
 			// body, whose index the assembler also has to resolve.
 			name: "batch find",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "b",
-				Pattern:  `[a-z]+@example\.com`,
+				Regexp:   `[a-z]+@example\.com`,
 				FindFunc: "b_find",
 				Hints:    []string{"batch-find"},
 			}},
@@ -3012,8 +3012,8 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 // which is the set half of the reporting path: SetDiag records rendered beside
 // per-pattern ones.
 func TestSetAssemblerWithReporter(t *testing.T) {
-	cfg := setPlusPatternsConfig([]config.RegexEntry{{
-		Name: "mail", Pattern: `[a-z]+@example\.com`, FindFunc: "mail_find",
+	cfg := setPlusPatternsConfig([]config.PatternEntry{{
+		Name: "mail", Regexp: `[a-z]+@example\.com`, FindFunc: "mail_find",
 	}}, nil)
 	rep := &Reporter{}
 	if _, _, diags, err := CompileFileDiag(cfg, ""); err != nil {
@@ -3045,13 +3045,13 @@ func TestSetAssemblerWithReporter(t *testing.T) {
 // the bytes the shared emitter produces at the pattern's real function index
 // catches both, without a WASM parser.
 func TestSetAssemblerFindTwinHandoff(t *testing.T) {
-	entry := config.RegexEntry{
+	entry := config.PatternEntry{
 		Name:     "tw",
-		Pattern:  `[a-zA-Z]{20,}`,
+		Regexp:   `[a-zA-Z]{20,}`,
 		FindFunc: "tw_find",
 		Hints:    []string{"prefer-no-match"},
 	}
-	cfg := setPlusPatternsConfig([]config.RegexEntry{entry}, nil)
+	cfg := setPlusPatternsConfig([]config.PatternEntry{entry}, nil)
 	w, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -3072,7 +3072,7 @@ func TestSetAssemblerFindTwinHandoff(t *testing.T) {
 	// they compile to nothing here and the twin is the module's first — and
 	// only — standalone pattern.
 	base := 0
-	for _, e := range cfg.Regexps[:len(cfg.Regexps)-1] {
+	for _, e := range cfg.Patterns[:len(cfg.Patterns)-1] {
 		q, cErr := compilePattern(e, 0, 0, CompileOptions{})
 		if cErr != nil {
 			t.Fatalf("compilePattern(%s): %v", e.Name, cErr)
@@ -3112,9 +3112,9 @@ func TestSetAssemblerFindTwinHandoff(t *testing.T) {
 // switch touches. maxFallback = 1 forces its fallback members onto BT — and,
 // with the anchored pair declared, every member's anchored probe too.
 func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildConfig) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name: "s", MatchAll: "s_match_all", ScanAll: "s_scan_all",
@@ -3122,7 +3122,7 @@ func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildCon
 		Patterns: config.PatternSelector{All: true},
 	}
 	return sc, config.BuildConfig{
-		Regexps: entries, MaxDFAStates: config.Limit(maxFallback),
+		Patterns: entries, MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{sc},
 	}
 }
@@ -3139,18 +3139,18 @@ func compileBTABISet(t *testing.T, pats []string, maxFallback int, anchored bool
 		cfg.Sets[0].MatchAll = ""
 	}
 	var prefixPool, suffixPool dfaPool
-	idxs := make([]int, len(cfg.Regexps))
-	for i := range idxs {
-		idxs[i] = i
+	members := make([]config.SetMember, len(cfg.Patterns))
+	for i, e := range cfg.Patterns {
+		members[i] = config.SetMember{Entry: e, ID: i}
 	}
-	infos, gids, err := setPatternInfos(sc, cfg, idxs, &prefixPool, &suffixPool, nil)
+	infos, gids, err := setPatternInfos(sc, members, cfg, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		t.Fatalf("setPatternInfos: %v", err)
 	}
 	spec := SetSpec{
 		Name: sc.Name, MatchAll: sc.MatchAll, ScanAll: sc.ScanAll,
 		ScanAny: sc.ScanAny, Find: sc.Find,
-		DeclaredPatternCount: len(cfg.Regexps), IDSpaceSize: len(cfg.Regexps),
+		DeclaredPatternCount: len(cfg.Patterns), IDSpaceSize: len(cfg.Patterns),
 		Patterns: infos, PatternIDs: gids,
 	}
 	return CompileSet(spec, &prefixPool, &suffixPool,
@@ -3250,11 +3250,11 @@ func TestSetBTDisablesTwoPhaseSplit(t *testing.T) {
 func TestMemberSkipIsVisibleAndHintGated(t *testing.T) {
 	// 40 patterns behind one shared literal, each with a one-byte self-loop
 	// tail — the shape that packs into a single sparse bucket.
-	eligible := make([]config.RegexEntry, 40)
+	eligible := make([]config.PatternEntry, 40)
 	for i := range eligible {
-		eligible[i] = config.RegexEntry{
-			Name:    fmt.Sprintf("p%d", i),
-			Pattern: fmt.Sprintf(`union[ \t]+k%02da+`, i),
+		eligible[i] = config.PatternEntry{
+			Name:   fmt.Sprintf("p%d", i),
+			Regexp: fmt.Sprintf(`union[ \t]+k%02da+`, i),
 		}
 	}
 	// Same shape, but the tail self-loop is \w — 63 bytes. Under the old
@@ -3262,17 +3262,17 @@ func TestMemberSkipIsVisibleAndHintGated(t *testing.T) {
 	// oversized and only the shared `[ \t]+` run stayed eligible. The
 	// rectangle cover spends a bit per nibble ROW instead, so \w is one pair
 	// like every other class and those forty states are now served too.
-	wide := make([]config.RegexEntry, 40)
+	wide := make([]config.PatternEntry, 40)
 	for i := range wide {
-		wide[i] = config.RegexEntry{
-			Name:    fmt.Sprintf("p%d", i),
-			Pattern: fmt.Sprintf(`union[ \t]+k%02d\w+`, i),
+		wide[i] = config.PatternEntry{
+			Name:   fmt.Sprintf("p%d", i),
+			Regexp: fmt.Sprintf(`union[ \t]+k%02d\w+`, i),
 		}
 	}
 
-	count := func(entries []config.RegexEntry, hints []string) int {
+	count := func(entries []config.PatternEntry, hints []string) int {
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{{
 				Name:     "s",
 				Find:     "s_find",
@@ -3445,10 +3445,10 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 // disagree. These tests pin BOTH directions: the downgrade is reported, and a
 // set with no fallback bucket still reports its real literal frontend.
 
-func diagFrontendEntries(pats []string) []config.RegexEntry {
-	out := make([]config.RegexEntry, len(pats))
+func diagFrontendEntries(pats []string) []config.PatternEntry {
+	out := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		out[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: p}
+		out[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: p}
 	}
 	return out
 }
@@ -3456,7 +3456,7 @@ func diagFrontendEntries(pats []string) []config.RegexEntry {
 func diagFrontendFor(t *testing.T, pats []string) string {
 	t.Helper()
 	cfg := config.BuildConfig{
-		Regexps: diagFrontendEntries(pats),
+		Patterns: diagFrontendEntries(pats),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find",
 			Patterns: config.PatternSelector{All: true},
@@ -3527,7 +3527,7 @@ func TestEmittedFrontendMatchesSelectionWithoutFallback(t *testing.T) {
 func TestSetNeverDropsAMember(t *testing.T) {
 	cfgOf := func(pats []string, set config.SetConfig) config.BuildConfig {
 		set.Name, set.Patterns = "s", config.PatternSelector{All: true}
-		return config.BuildConfig{Regexps: setEmitCovEntries(pats), Sets: []config.SetConfig{set}}
+		return config.BuildConfig{Patterns: setEmitCovEntries(pats), Sets: []config.SetConfig{set}}
 	}
 	// 2^13 states, over byte mode's 2,048-state build cap; its Backtracking
 	// program is about 20 instructions (`(?:a|b)` is one class), so a
@@ -3576,9 +3576,9 @@ func TestSetNeverDropsAMember(t *testing.T) {
 
 	// A groups_func entry is a member: its captures are stripped for the set.
 	groups := cfgOf(nil, config.SetConfig{Find: "f"})
-	groups.Regexps = []config.RegexEntry{
-		{Name: "url", Pattern: `(https?)://([^/]+)`, GroupsFunc: "url_groups"},
-		{Name: "num", Pattern: `[0-9]+`},
+	groups.Patterns = []config.PatternEntry{
+		{Name: "url", Regexp: `(https?)://([^/]+)`, GroupsFunc: "url_groups"},
+		{Name: "num", Regexp: `[0-9]+`},
 	}
 	_, _, diags, err = CompileFileDiag(groups, "")
 	if err != nil {

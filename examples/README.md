@@ -11,11 +11,11 @@ one unchanged source — and the component kind by two different routes
 FastEdge runs two kinds of application. A **CDN app** is a proxy-wasm filter on
 traffic passing through the CDN, built as a core module: `fastedge/validate`
 and `fastedge/url-guard`. An **HTTP app** answers requests itself and is a
-`wasi:http` component built for wasip2: `fastedge/lang-detect`.
+`wasi:http` component built for wasip2: `fastedge/script-detect`.
 
 Two examples have patterns that compile in **Unicode mode** — script classes
 such as `\p{Latin}` and letters such as `ä`, matched a whole character at a
-time and case-folded across Unicode: `fastedge/lang-detect` and
+time and case-folded across Unicode: `fastedge/script-detect` and
 `browser/homoglyph`.
 
 | Use case | Environment | Language | Patterns | Format (target) | Directory |
@@ -29,7 +29,7 @@ time and case-folded across Unicode: `fastedge/lang-detect` and
 | Multi-pattern secret scanning | wasmtime | Go | set | module (wasip1) | [wasmtime/go/secret-scanner](wasmtime/go/secret-scanner) |
 | Email, URL, XSS validation | FastEdge CDN app (proxy-wasm) | Rust | individual | module (wasip1) | [fastedge/validate](fastedge/validate) |
 | URL guard | FastEdge CDN app (proxy-wasm) | Rust | set | module (wasip1) | [fastedge/url-guard](fastedge/url-guard) |
-| European language detection by letters | FastEdge HTTP app (wasi:http) | Rust | 3 sets, **Unicode** | **component 🧩** (wasip2) | [fastedge/lang-detect](fastedge/lang-detect) |
+| Script detection by letters, narrowed to the alphabets that fit | FastEdge HTTP app (wasi:http) | Rust | 3 sets, **Unicode** | **component 🧩** (wasip2) | [fastedge/script-detect](fastedge/script-detect) |
 | Email and URL validation | Browser | JavaScript | individual | module | [browser/validate](browser/validate) |
 | Homoglyph and hidden-character detection | Browser | JavaScript | set, **Unicode** | module | [browser/homoglyph](browser/homoglyph) |
 | Domain extraction from URLs | Node.js | TypeScript | individual | module | [node/domain-extract](node/domain-extract) |
@@ -42,7 +42,7 @@ In any example directory, `make` builds the example and `make run` builds it if
 needed and runs it. An example with several build routes builds and runs its
 default route that way, and gives the other routes their own targets. `workers`,
 `fastedge/validate` and `fastedge/url-guard` have nothing to run locally, so
-their `make run` only says why; `fastedge/lang-detect` is a `wasi:http`
+their `make run` only says why; `fastedge/script-detect` is a `wasi:http`
 component, which `wasmtime serve` runs, so its `make run` serves it on port 8080
 for the length of a few requests.
 `make`, `make run` and `make clean` in this directory run the same target in
@@ -75,7 +75,7 @@ through `bindgen!`-generated bindings, with none of that. `make compare` diffs
 the two. It is also the only example that uses a **set** through a component.
 
 **3. Component Model 🧩** — `wasmtime/rust/secrets`, and the FastEdge HTTP app
-`fastedge/lang-detect`. `wasm_format: component`
+`fastedge/script-detect`. `wasm_format: component`
 produces a component plus a sibling `.wit`. The consumer is itself a component
 that imports that interface, and `regexped merge` composes the two — the SAME
 command the module format uses, which dispatches on `wasm_format` and shells out

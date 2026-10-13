@@ -1,9 +1,9 @@
 # A Unicode-mode overlapping set whose member loops over whole characters
 # (`[^,]` lowered): its never-dying state is a character loop, which is what
 # gives the set the preflight retiring a member that matches nowhere.
-regexps:
-  - { name: p0, pattern: '[^,]+;' }
-  - { name: p1, pattern: '\p{Cyrillic}+!' }
+patterns:
+  - { name: p0, regexp: '[^,]+;' }
+  - { name: p1, regexp: '\p{Cyrillic}+!' }
 sets:
   - name: up
     find: up_find

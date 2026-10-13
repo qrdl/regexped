@@ -1,9 +1,9 @@
 import_module: m
 wasm_file: x.wasm
 max_dfa_states: 4
-regexps:
-  - pattern: '(?:ab|cd|ef)*z'
-  - pattern: 'a'
+patterns:
+  - regexp: '(?:ab|cd|ef)*z'
+  - regexp: 'a'
 sets:
   - name: s
     find: sfind

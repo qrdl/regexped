@@ -58,8 +58,8 @@ func compileFindSized(pat string) ([]byte, []searchblock.Size, error) {
 // what its searches keep.
 func compileFindOpts(key, pat string, base int64, opts compile.CompileOptions) ([]byte, []searchblock.Size, error) {
 	return cachedCompileSized(key, func() ([]byte, []searchblock.Size, error) {
-		entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-		w, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{entry}, base, true, 0, opts)
+		entry := config.PatternEntry{Regexp: pat, FindFunc: "find"}
+		w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{entry}, base, true, 0, opts)
 		return w, searchblock.Of(sizes["find"]), err
 	})
 }

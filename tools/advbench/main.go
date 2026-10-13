@@ -119,8 +119,8 @@ func withConfigMode(cfg *config.BuildConfig) {
 	for i := range cfg.Sets {
 		cfg.Sets[i].Unicode = &u
 	}
-	for i := range cfg.Regexps {
-		cfg.Regexps[i].Unicode = &u
+	for i := range cfg.Patterns {
+		cfg.Patterns[i].Unicode = &u
 	}
 }
 
@@ -244,7 +244,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 			sizes, err = compile.SearchSizes(cfg)
 		}
 	} else {
-		e := config.RegexEntry{Pattern: sp.Pattern, ByteMode: sp.ByteMode}
+		e := config.PatternEntry{Regexp: sp.Pattern, ByteMode: sp.ByteMode}
 		switch sp.Fn {
 		case "find":
 			e.FindFunc = "find"
@@ -263,7 +263,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if sp.BT {
 			force = compile.EngineBacktrack
 		}
-		wasmBytes, top, sizes, err = compile.CompileWithSearchSizes([]config.RegexEntry{e}, tableBase, true, force, opts)
+		wasmBytes, top, sizes, err = compile.CompileWithSearchSizes([]config.PatternEntry{e}, tableBase, true, force, opts)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("compile: %w", err)
@@ -323,7 +323,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if isSet {
 		inBase = pageAlign(top)
 	}
-	idSpace := len(cfg.Regexps)
+	idSpace := len(cfg.Patterns)
 	capN := sp.Cap
 	if capN == 0 {
 		capN = idSpace

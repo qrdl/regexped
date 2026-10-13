@@ -38,10 +38,10 @@ func TestPlainFindReservesTheAnswerCache(t *testing.T) {
 	eligible := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "alnum", Regexp: `[a-z0-9]+x?`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -50,9 +50,9 @@ func TestPlainFindReservesTheAnswerCache(t *testing.T) {
 	}
 	// The same set with literals: not eligible, so no cache anywhere.
 	ineligible := eligible
-	ineligible.Regexps = []config.RegexEntry{
-		{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
-		{Name: "gh", Pattern: `ghp_[0-9a-zA-Z]{36}`},
+	ineligible.Patterns = []config.PatternEntry{
+		{Name: "aws", Regexp: `AKIA[A-Z0-9]{16}`},
+		{Name: "gh", Regexp: `ghp_[0-9a-zA-Z]{36}`},
 	}
 
 	for _, lang := range []struct {
@@ -94,9 +94,9 @@ func TestBatchFindKeepsTheAnswerCache(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -140,10 +140,10 @@ func TestGeneratedJSSizingMatchesConfig(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "alnum", Regexp: `[a-z0-9]+x?`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -251,9 +251,9 @@ func TestMalformedCacheReachesTheCaller(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -321,9 +321,9 @@ func TestGoStubDeclaresMalformedCacheError(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -391,9 +391,9 @@ func TestOutOfOrderReachesTheCaller(t *testing.T) {
 			cfg := config.BuildConfig{
 				Output:       "merged.wasm",
 				ImportModule: "demo",
-				Regexps: []config.RegexEntry{
-					{Name: "lower", Pattern: `[a-z]+`},
-					{Name: "word", Pattern: `\w+`},
+				Patterns: []config.PatternEntry{
+					{Name: "lower", Regexp: `[a-z]+`},
+					{Name: "word", Regexp: `\w+`},
 				},
 				Sets: []config.SetConfig{set},
 			}
@@ -457,9 +457,9 @@ func TestOutOfOrderIsDeclaredInEveryStub(t *testing.T) {
 		}
 		return config.BuildConfig{
 			Output: "merged.wasm", ImportModule: "demo",
-			Regexps: []config.RegexEntry{
-				{Name: "lower", Pattern: `[a-z]+`},
-				{Name: "word", Pattern: `\w+`},
+			Patterns: []config.PatternEntry{
+				{Name: "lower", Regexp: `[a-z]+`},
+				{Name: "word", Regexp: `\w+`},
 			},
 			Sets: []config.SetConfig{set},
 		}
@@ -514,10 +514,10 @@ func ovSizingCfg() config.BuildConfig {
 	return config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
-			{Name: "word", Pattern: `\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "alnum", Regexp: `[a-z0-9]+x?`},
+			{Name: "word", Regexp: `\w+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "ov", Find: "scan_ov",
@@ -779,9 +779,9 @@ func sweepSizingMatchesConfig(t *testing.T, keptPat string, eligible bool) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "kept", Pattern: keptPat},
-			{Name: "ng", Pattern: `a[a-z]*?z`},
+		Patterns: []config.PatternEntry{
+			{Name: "kept", Regexp: keptPat},
+			{Name: "ng", Regexp: `a[a-z]*?z`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "sw", Find: "scan_sw",
@@ -959,8 +959,8 @@ func sweepSizingMatchesConfig(t *testing.T, keptPat string, eligible bool) {
 func overlapOracle(t *testing.T, cfg config.BuildConfig, input string) int {
 	t.Helper()
 	var res []*regexp.Regexp
-	for _, r := range cfg.Regexps {
-		res = append(res, regexp.MustCompile(`^(?:`+r.Pattern+`)`))
+	for _, r := range cfg.Patterns {
+		res = append(res, regexp.MustCompile(`^(?:`+r.Regexp+`)`))
 	}
 	n := 0
 	for s := 0; s <= len(input); s++ {
@@ -1173,13 +1173,13 @@ wasm_file: re.wasm
 output: merged.wasm
 stub_file: stubs.h
 wasm_merge_path: '`+merge+`'
-regexps:
+patterns:
   - name: lower
-    pattern: '[a-z]+'
+    regexp: '[a-z]+'
   - name: alnum
-    pattern: '[a-z0-9]+x?'
+    regexp: '[a-z0-9]+x?'
   - name: word
-    pattern: '\w+'
+    regexp: '\w+'
 sets:
   - name: ov
     patterns: all
@@ -1275,7 +1275,7 @@ func TestCStubsMergeTwoModulesWithNotes(t *testing.T) {
 	}
 	cfg := func(name, mod, pattern, fn string) string {
 		return "import_module: " + mod + "\nwasm_file: " + name + ".wasm\noutput: merged.wasm\nstub_file: " + name + ".h\n" +
-			"wasm_merge_path: '" + merge + "'\nregexps:\n  - name: p\n    pattern: '" + pattern + "'\n    find_func: " + fn + "\n"
+			"wasm_merge_path: '" + merge + "'\npatterns:\n  - name: p\n    regexp: '" + pattern + "'\n    find_func: " + fn + "\n"
 	}
 	write("a.yaml", cfg("a", "ma", "a*b|a", "ova_find"))
 	write("b.yaml", cfg("b", "mb", "x*y|x", "ovb_find"))
@@ -1348,7 +1348,7 @@ func TestCStubMergedBacktrackingKeepsMemo(t *testing.T) {
 		}
 	}
 	write("bt.yaml", "import_module: mbt\nwasm_file: bt.wasm\noutput: merged.wasm\nstub_file: bt.h\n"+
-		"wasm_merge_path: '"+merge+"'\nregexps:\n  - name: p\n    pattern: '(?:a|b)*a(?:a|b){12}c|a'\n    find_func: bt_find\n")
+		"wasm_merge_path: '"+merge+"'\npatterns:\n  - name: p\n    regexp: '(?:a|b)*a(?:a|b){12}c|a'\n    find_func: bt_find\n")
 	write("inc/stdlib.h", "#pragma once\n#include <stddef.h>\nvoid *malloc(size_t);\nvoid *calloc(size_t, size_t);\nvoid free(void *);\n")
 	write("guest.c", cBTMemoGuest)
 	run(t, dir, nil, bin, "compile", "--config=bt.yaml")
@@ -1439,17 +1439,17 @@ wasm_file: re.wasm
 output: merged.wasm
 stub_file: stubs.h
 wasm_merge_path: '`+merge+`'
-regexps:
+patterns:
   - name: overrun
-    pattern: 'a*b|a'
+    regexp: 'a*b|a'
     find_func: ov_find
   - name: bt
-    pattern: '(?:a|b)*a(?:a|b){12}c|a'
+    regexp: '(?:a|b)*a(?:a|b){12}c|a'
     find_func: bt_find
   - name: member
-    pattern: 'foo\w+bar|foo'
+    regexp: 'foo\w+bar|foo'
   - name: aws
-    pattern: 'AKIA[A-Z0-9]{16}'
+    regexp: 'AKIA[A-Z0-9]{16}'
 sets:
   - name: s
     patterns: [member, aws]

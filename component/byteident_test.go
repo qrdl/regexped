@@ -96,7 +96,7 @@ func TestComponentKeepsModuleExportsAtTheSameIndices(t *testing.T) {
 
 	moduleCfg := cfg
 	moduleCfg.WasmFormat = ""
-	plain, _, err := compile.Compile(moduleCfg.Regexps, 0, true, compile.CompileOptions{})
+	plain, _, err := compile.Compile(moduleCfg.Patterns, 0, true, compile.CompileOptions{})
 	if err != nil {
 		t.Fatalf("module compile: %v", err)
 	}

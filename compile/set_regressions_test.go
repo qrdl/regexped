@@ -25,9 +25,9 @@ import (
 // functions than it emitted.
 func TestAltLitAnchorInSetModule(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "alt", Pattern: `abc[0-9]+|xyz[0-9]+`, FindFunc: "alt_find"},
-			{Name: "other", Pattern: `kw[0-9]{3}`},
+		Patterns: []config.PatternEntry{
+			{Name: "alt", Regexp: `abc[0-9]+|xyz[0-9]+`, FindFunc: "alt_find"},
+			{Name: "other", Regexp: `kw[0-9]{3}`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{All: true},
@@ -65,7 +65,7 @@ func TestNarrowUnionWithWideAllABI(t *testing.T) {
 	}
 	pp, sp := &dfaPool{}, &dfaPool{}
 	for i, pat := range []string{`alpha`, `bravo`, `charlie`, `delta`, `echo`, `foxtrot`} {
-		info, err := analyzePattern(config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: pat}, pp, sp)
+		info, err := analyzePattern(config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: pat}, pp, sp)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -113,21 +113,21 @@ func TestTwoSparseBucketsKeepTheirIDs(t *testing.T) {
 	// its own literal and its own bucket and nothing is shared; and 40 per
 	// group is over the bitmask width, so each group splits and then promotes
 	// to ONE sparse bucket.
-	var entries []config.RegexEntry
+	var entries []config.PatternEntry
 	for i := 0; i < 40; i++ {
-		entries = append(entries, config.RegexEntry{
-			Name:    fmt.Sprintf("foo%02d", i),
-			Pattern: fmt.Sprintf(`foolit[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/8, 1+i%8),
+		entries = append(entries, config.PatternEntry{
+			Name:   fmt.Sprintf("foo%02d", i),
+			Regexp: fmt.Sprintf(`foolit[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/8, 1+i%8),
 		})
 	}
 	for i := 0; i < 40; i++ {
-		entries = append(entries, config.RegexEntry{
-			Name:    fmt.Sprintf("bar%02d", i),
-			Pattern: fmt.Sprintf(`barlit[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/8, 1+i%8),
+		entries = append(entries, config.PatternEntry{
+			Name:   fmt.Sprintf("bar%02d", i),
+			Regexp: fmt.Sprintf(`barlit[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/8, 1+i%8),
 		})
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{All: true}, Find: "cap_find",
 		}},
@@ -160,10 +160,10 @@ func compileSetForTest(t *testing.T, cfg config.BuildConfig) *compiledSet {
 	t.Helper()
 	pp, sp := &dfaPool{}, &dfaPool{}
 	spec := SetSpec{Name: cfg.Sets[0].Name, Find: cfg.Sets[0].Find}
-	for i, re := range cfg.Regexps {
+	for i, re := range cfg.Patterns {
 		info, err := analyzePattern(re, pp, sp)
 		if err != nil {
-			t.Fatalf("analyzePattern(%q): %v", re.Pattern, err)
+			t.Fatalf("analyzePattern(%q): %v", re.Regexp, err)
 		}
 		info.globalID = i
 		spec.Patterns = append(spec.Patterns, info)
@@ -186,7 +186,7 @@ func TestAbsenceLiteralsPastThirtyTwo(t *testing.T) {
 	const n = 40
 	for i := 0; i < n; i++ {
 		pat := fmt.Sprintf(`LIT%02d[0-9]+`, i)
-		info, err := analyzePattern(config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}, pp, sp)
+		info, err := analyzePattern(config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pat}, pp, sp)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -288,10 +288,10 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	cfg := config.BuildConfig{
 		// `output:` set → embedded: tables become memory 1.
 		Output: "merged.wasm",
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: `a+`},
-			{Name: "p1", Pattern: `[^\n]*ERROR`},
-			{Name: "p2", Pattern: `x?y`},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: `a+`},
+			{Name: "p1", Regexp: `[^\n]*ERROR`},
+			{Name: "p2", Regexp: `x?y`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{All: true},
@@ -300,10 +300,10 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	}
 	pp, sp := &dfaPool{}, &dfaPool{}
 	spec := SetSpec{Name: "s", Find: "cap_find", Overlapping: true, BatchFind: true}
-	for i, re := range cfg.Regexps {
+	for i, re := range cfg.Patterns {
 		info, err := analyzePattern(re, pp, sp)
 		if err != nil {
-			t.Fatalf("analyzePattern(%q): %v", re.Pattern, err)
+			t.Fatalf("analyzePattern(%q): %v", re.Regexp, err)
 		}
 		info.globalID = i
 		spec.Patterns = append(spec.Patterns, info)
@@ -406,14 +406,14 @@ func TestWideFormIsConsistentlyRead(t *testing.T) {
 		`(?:c|(?:b|c))`, `^(?:(?:c|(?:b|c)))$`, `^(?:(?:c|(?:b|c)))`, `(?:(?:c|(?:b|c)))$`,
 		`(?:c(?:b.))`, `^(?:(?:c(?:b.)))$`, `^(?:(?:c(?:b.)))`, `(?:(?:c(?:b.)))$`,
 	}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Patterns: config.PatternSelector{Names: names},
 			MatchAny: "s_match_any", MatchAll: "s_match_all",
@@ -433,7 +433,7 @@ func TestWideFormIsConsistentlyRead(t *testing.T) {
 	pp, sp := &dfaPool{}, &dfaPool{}
 	spec := SetSpec{Name: "s", MatchAny: "s_match_any", MatchAll: "s_match_all"}
 	for i, pat := range pats {
-		info, err := analyzePattern(config.RegexEntry{Name: names[i], Pattern: pat}, pp, sp)
+		info, err := analyzePattern(config.PatternEntry{Name: names[i], Regexp: pat}, pp, sp)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -484,7 +484,7 @@ func TestOverlapPreflightPredicatesAgree(t *testing.T) {
 			pp, sp := &dfaPool{}, &dfaPool{}
 			spec := SetSpec{Name: "s", Find: "cap_find", Overlapping: true}
 			for i, pat := range pats {
-				info, err := analyzePattern(config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}, pp, sp)
+				info, err := analyzePattern(config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pat}, pp, sp)
 				if err != nil {
 					t.Skipf("analyzePattern(%q): %v", pat, err)
 				}
@@ -514,7 +514,7 @@ func TestUnicodeOverlapPreflight(t *testing.T) {
 		pp, sp := &dfaPool{}, &dfaPool{}
 		spec := SetSpec{Name: "s", Find: "cap_find", Overlapping: true}
 		for i, pat := range pats {
-			info, err := analyzePattern(config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: pat, Unicode: &uni}, pp, sp)
+			info, err := analyzePattern(config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: pat, Unicode: &uni}, pp, sp)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -555,7 +555,7 @@ func TestZCaretIsNotExcluded(t *testing.T) {
 	for _, pat := range []string{`\z^`, `$^`, `\z^a`} {
 		t.Run(pat, func(t *testing.T) {
 			pp, sp := &dfaPool{}, &dfaPool{}
-			info, err := analyzePattern(config.RegexEntry{Name: "p", Pattern: pat}, pp, sp)
+			info, err := analyzePattern(config.PatternEntry{Name: "p", Regexp: pat}, pp, sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -583,7 +583,7 @@ func TestZCaretIsNotExcluded(t *testing.T) {
 func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
 	const pattern = `(?m:$*$*$*$*$*$*$*$*$*$*$*)*0$`
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -595,7 +595,7 @@ func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
 	}
 
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "chain", Pattern: pattern}, {Name: "lit", Pattern: `abc`}},
+		Patterns: []config.PatternEntry{{Name: "chain", Regexp: pattern}, {Name: "lit", Regexp: `abc`}},
 		Sets: []config.SetConfig{{
 			Name: "s", MatchAny: "ma", ScanAll: "sall", Find: "f",
 			Patterns: config.PatternSelector{Names: []string{"chain", "lit"}},
@@ -621,21 +621,21 @@ func TestSetMemberZeroWidthRepeatsCollapsed(t *testing.T) {
 //   - a member that matches empty (`\d?`) makes every state accept
 //     mid-string, so the wide body needs no accept-range compare.
 func TestUnionScanShapes(t *testing.T) {
-	digits := func(n int, suffix string) []config.RegexEntry {
-		var out []config.RegexEntry
+	digits := func(n int, suffix string) []config.PatternEntry {
+		var out []config.PatternEntry
 		for k := 1; k <= n; k++ {
-			out = append(out, config.RegexEntry{Name: fmt.Sprintf("d%03d", k), Pattern: fmt.Sprintf(`\d{%d}%s`, k, suffix)})
+			out = append(out, config.PatternEntry{Name: fmt.Sprintf("d%03d", k), Regexp: fmt.Sprintf(`\d{%d}%s`, k, suffix)})
 		}
 		return out
 	}
-	dummies := func(n int) []config.RegexEntry {
-		var out []config.RegexEntry
+	dummies := func(n int) []config.PatternEntry {
+		var out []config.PatternEntry
 		for k := 0; k < n; k++ {
-			out = append(out, config.RegexEntry{Name: fmt.Sprintf("z%03d", k), Pattern: fmt.Sprintf("lit%03d", k)})
+			out = append(out, config.PatternEntry{Name: fmt.Sprintf("z%03d", k), Regexp: fmt.Sprintf("lit%03d", k)})
 		}
 		return out
 	}
-	names := func(es []config.RegexEntry) []string {
+	names := func(es []config.PatternEntry) []string {
 		var out []string
 		for _, e := range es {
 			out = append(out, e.Name)
@@ -652,23 +652,23 @@ func TestUnionScanShapes(t *testing.T) {
 	}{
 		{"three_word_rows", func() config.BuildConfig {
 			d := digits(150, "")
-			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+			return config.BuildConfig{Patterns: d, Sets: []config.SetConfig{set(names(d))}}
 		}()},
 		{"empty_first_mask_word", func() config.BuildConfig {
 			z, d := dummies(64), digits(100, "")
-			return config.BuildConfig{Regexps: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
+			return config.BuildConfig{Patterns: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
 		}()},
 		{"no_mid_string_accept", func() config.BuildConfig {
 			d := digits(150, "$")
-			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+			return config.BuildConfig{Patterns: d, Sets: []config.SetConfig{set(names(d))}}
 		}()},
 		{"ids_past_256", func() config.BuildConfig {
 			z, d := dummies(300), digits(2, "")
-			return config.BuildConfig{Regexps: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
+			return config.BuildConfig{Patterns: append(z, d...), Sets: []config.SetConfig{set(names(d))}}
 		}()},
 		{"every_state_accepts_mid_string", func() config.BuildConfig {
-			d := append(digits(150, ""), config.RegexEntry{Name: "empty", Pattern: `\d?`})
-			return config.BuildConfig{Regexps: d, Sets: []config.SetConfig{set(names(d))}}
+			d := append(digits(150, ""), config.PatternEntry{Name: "empty", Regexp: `\d?`})
+			return config.BuildConfig{Patterns: d, Sets: []config.SetConfig{set(names(d))}}
 		}()},
 	}
 	for _, c := range cases {
@@ -696,7 +696,7 @@ func TestSetMemberCornerShapes(t *testing.T) {
 	for _, pat := range []string{`$^\W`, `[^0](?m:^)0[^0]\s`, `(?:(?:\w|\B|\d))*`, `(?m:^) (?:(?:[01])+){0,2}`} {
 		t.Run(pat, func(t *testing.T) {
 			cfg := config.BuildConfig{
-				Regexps: []config.RegexEntry{{Name: "p", Pattern: pat}},
+				Patterns: []config.PatternEntry{{Name: "p", Regexp: pat}},
 				Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl",
 					MatchAny: "ma", MatchAll: "ml", Patterns: config.PatternSelector{All: true}}},
 			}

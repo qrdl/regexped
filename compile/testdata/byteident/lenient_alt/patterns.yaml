@@ -6,6 +6,6 @@
 # emitter whose scan start is NOT locAttemptStart — attempt_start is derived
 # from the window base — and seeding the wrong one of the two made the exported
 # find ignore its `from` argument entirely while still passing at from == 0.
-regexps:
-  - pattern: 'ERROR[0-9]{3}|WARNING[0-9]{3}'
+patterns:
+  - regexp: 'ERROR[0-9]{3}|WARNING[0-9]{3}'
     find_func: lenientalt_find

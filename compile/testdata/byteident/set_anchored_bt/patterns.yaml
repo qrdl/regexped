@@ -2,11 +2,11 @@
 # is past the construction cap (2^13 states) answer match_any / match_all
 # through Backtracking probes run after the anchored union automaton, which
 # holds the DFA members; the `_all` pair is in its out_ptr form.
-regexps:
-  - { name: bt0, pattern: '(?:a|b)*a(?:a|b){12}c' }
-  - { name: bt1, pattern: '(?:x|xy)(?:a|b)*a(?:a|b){12}c' }
-  - { name: cls, pattern: '[a-c]+' }
-  - { name: lit, pattern: 'abc' }
+patterns:
+  - { name: bt0, regexp: '(?:a|b)*a(?:a|b){12}c' }
+  - { name: bt1, regexp: '(?:x|xy)(?:a|b)*a(?:a|b){12}c' }
+  - { name: cls, regexp: '[a-c]+' }
+  - { name: lit, regexp: 'abc' }
 sets:
   - name: anch
     match_any: anch_any

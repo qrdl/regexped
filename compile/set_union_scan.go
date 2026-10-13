@@ -238,10 +238,10 @@ func (u *unionScanDFA) isWide() bool { return u != nil && u.wideAccept }
 // members pass 4,096; the Unicode default is 16,384, like max_dfa_states'.
 // Measured 2026-10-09 (fuel/byte over 4 KB, compile time, compiler memory,
 // module): that 3-member set's scan_any on English text 378 → 20.9, 1.9 →
-// 8.6 s, 157 → 491 MB, 2.06 → 2.64 MB; examples/fastedge/lang-detect's
-// 23-member `latin` set's match_all on non-matching text 174 → 29, 12.1 →
+// 8.6 s, 157 → 491 MB, 2.06 → 2.64 MB; examples/fastedge/script-detect's
+// `latin` set (23 members then) match_all on non-matching text 174 → 29, 12.1 →
 // 25.7 s, 136 → 449 MB, 1.08 → 2.60 MB. No input measured slower; sets whose
-// automata fit 4,096 (homoglyph, lang-detect `cyrillic`, three more) compiled
+// automata fit 4,096 (homoglyph, script-detect `cyrillic`, three more) compiled
 // to the same module. Earlier (2026-10-05): an 8-member set of
 // `\pL+\p{Greek}`-like members took its scan_all from 102 to 23 fuel/byte, its
 // module from 1.39 to 0.94 MB, its compile from 55 s to 173 s.

@@ -226,20 +226,24 @@ for patternID := range kindSeq {
 
 The iterator owns one reusable tuple buffer sized from `<set>_pattern_count`
 and a zeroed gate array sized from `<set>_id_space` — the gate array is indexed by
-global pattern id, so the two lengths differ for a named subset. Both overlap
+pattern id, so the two lengths differ for a named subset and for a set with
+regexps of its own. Both overlap
 policies take the array; see [sets.md](sets.md) for what the overlapping body
 keeps in it. Each WASM call returns every match at one position before
 the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 
-`PatternName(id)` is emitted once per config when any set sets
-`emit_name_map: true`.
+`<Set>PatternName(id int) string` — `SecretsPatternName` for a set named
+`secrets` — is emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ## Notes
 
 - The `unsafe` FFI call is hidden inside the generated stub; your application code only sees safe Go functions.
 - The WASM module must be loaded before calling any stub function. In `wasip1` targets, all imports are resolved at link time by the runtime (e.g. wasmtime).
 - The stub file imports `"iter"` and `"unsafe"` automatically; do not add them manually.
-- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Go, on a `regexps:` entry and on a `sets:` entry alike: batching amortises host-boundary crossings, and a Go stub is compiled to wasm and merged, so its call into the module is a direct call inside one module with no boundary to amortise. Setting it does not change the generated Go stub or its performance.
+- The `batch-find` hint ([`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)) is a no-op for Go, on a `patterns:` entry and on a `sets:` entry alike: batching amortises host-boundary crossings, and a Go stub is compiled to wasm and merged, so its call into the module is a direct call inside one module with no boundary to amortise. Setting it does not change the generated Go stub or its performance.
 
 ---
 

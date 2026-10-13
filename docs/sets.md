@@ -18,7 +18,7 @@ their positions and pattern IDs.
 ## Pipeline overview
 
 ```
-regexps: [p1, p2, ..., pN]
+patterns: [p1, p2, ..., pN]
             │
             ▼
     analyzePattern()       ← split each pattern at its mandatory literal
@@ -52,11 +52,11 @@ the machinery those questions require. The **key** names the capability; the
 **value** is the WASM export / generated-function name you choose.
 
 ```yaml
-regexps:
-  - name: aws_key          # name: required for sets.patterns list references
-    pattern: 'AKIA[0-9A-Z]{16}'
+patterns:
+  - name: aws_key          # name: required to select it by name from a set
+    regexp: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
-    pattern: 'ghp_[0-9a-zA-Z]{36}'
+    regexp: 'ghp_[0-9a-zA-Z]{36}'
 
 sets:
   - name: secret_scanner
@@ -76,6 +76,46 @@ sets:
 The grid: `match_*` is anchored, `scan_*` is not; `_any` is one arbitrary
 matching pattern, `_all` is every matching pattern. `find` is the only
 capability that reports positions and extents.
+
+### Members: top-level patterns and the set's own regexps
+
+A set's members come from two keys, and it needs at least one member from the
+two together:
+
+- **`patterns:`** selects entries of the top-level `patterns:` list: `all`
+  (every top-level pattern, named or not), or a list of their `name:` values.
+  An entry there is a PATTERN — a regexp plus optional metadata (a name, its
+  own exports, mode keys, hints).
+- **`regexps:`** lists bare regexps that belong to this set alone. Nothing
+  outside the set sees them: `patterns: all` in another set never includes
+  them. They take the set's own `unicode:` and `hints:`.
+
+```yaml
+patterns:
+  - name: aws_key
+    regexp: 'AKIA[0-9A-Z]{16}'
+
+sets:
+  - name: secrets
+    find: scan_secrets
+    patterns: [aws_key]
+    regexps: ['xox[baprs]-[0-9A-Za-z-]{10,48}']
+  - name: log_levels             # no top-level patterns needed at all
+    match_any: level_of
+    regexps: ['ERROR', 'WARN', 'INFO']
+```
+
+A config whose every regexp is inline needs no top-level `patterns:`; a config
+with no regexp anywhere is a load error.
+
+**Equivalent members are a load error.** Two members of one set that compile
+to the same program — selected by name, through `all`, or inline — are refused
+with a message naming both: `set "levels": regexp 'ERROR' and regexp
+'(?:ERROR)' are equivalent`. Capture groups do not count, since a set reports
+group 0 only. Identical programs give identical answers on every input, so the
+check never refuses two regexps a set could tell apart; it does not catch every
+pair that matches alike (`a+` and `aa*` compile differently). Top-level
+patterns are not checked against each other outside a set.
 
 At least one capability must be declared. Every capability value must be a
 valid identifier in all six stub languages (see
@@ -118,7 +158,8 @@ See [component.md](component.md#sets).
 
 A set's `name:` is yours, and so are the symbols derived from it —
 `<SET>_PATTERN_COUNT`, `<SET>_ID_SPACE`, `rx_<set>_scanner_t`,
-`<Set>PatternCount` — which `namespace:` does not prefix. Two stubs generated
+`<Set>PatternCount`, and the `emit_name_map` lookup `<set>_pattern_name` —
+which `namespace:` does not prefix. Two stubs generated
 into one package, or included in one C translation unit, therefore need distinct
 set names. Choosing them is up to you, as it is for func and capability names.
 
@@ -690,7 +731,7 @@ is the counter's switch target) and `in_call_counter`.
 
 | offset | field | type |
 |---|---|---|
-| 0 | `pattern_id` | i32 — index into `regexps:` in YAML order |
+| 0 | `pattern_id` | i32 — the member's pattern id (see [Pattern ids](#pattern-ids-and-the-two-emitted-constants)) |
 | 4 | `start` | i32 — absolute, same for every tuple in one call |
 | 8 | `end` | i32 — absolute (an END, not a length) |
 
@@ -718,9 +759,14 @@ the responsible buckets as `"bt-fallback"`.
 
 ### Pattern ids and the two emitted constants
 
-A `pattern_id` is the pattern's **global** index into `regexps:`, so a set that
-selects a subset does not renumber: a set holding the last two of seventy
-patterns reports ids 68 and 69. Two constants therefore accompany every set,
+A top-level pattern's `pattern_id` is its index into the top-level `patterns:`
+list, in YAML order, so a set that selects a subset does not renumber: a set
+holding the last two of seventy patterns reports ids 68 and 69. A set's own
+`regexps:` come after every top-level pattern and are numbered **per set**: with
+seventy top-level patterns, each set's first inline regexp is id 70, whatever
+the set selects, and editing one set's `regexps:` never renumbers another set.
+An id therefore means one pattern within its set, and the same inline id can
+mean different regexps in different sets. Two constants accompany every set,
 and they are not interchangeable:
 
 | constant | value | sizes |
@@ -728,8 +774,10 @@ and they are not interchangeable:
 | `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the batch cursor's `k` field |
 | `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array and the `_all` bitmask/bitmap. Which `_all` ABI is exported depends on it AND on whether the set has a Backtracking member — see above |
 
-For `patterns: all` — the common case — the two are equal. They diverge only
-for a named subset, and using the wrong one there is a memory-safety bug: the
+For `patterns: all` with no inline regexps — the common case — the two are
+equal. They diverge for a named subset and for a set with inline regexps that
+does not select every top-level pattern, and using the wrong one there is a
+memory-safety bug: the
 gate array is indexed by pattern id, so sizing it at the pattern count lets the
 module write past the caller's array. Both constants are emitted in all six
 stub languages, and every generated declaration is written in terms of the
@@ -752,8 +800,13 @@ splitting into several sets if its scan capabilities are hot. `--diag-json`
 reports which body a set got under `union_scan`; there is no other way to see
 it.
 
-`emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
-pattern id back to its `name:` string.
+`emit_name_map: true` additionally emits the SET's own name lookup, named from
+the set like its constants — for a set `secrets`, `secrets_pattern_name` in
+Rust, `rx_secrets_pattern_name` in C, `SecretsPatternName` in Go and
+`secretsPatternName` in JS, TypeScript and AssemblyScript. It maps one of the
+set's pattern ids to that member's `name:`, and answers `""` for an unnamed
+pattern, an inline regexp, or an id the set does not hold. Each set gets its own
+because inline ids are numbered per set.
 
 ### `--diag-json` reports what the compiler chose
 
@@ -1193,5 +1246,5 @@ bitmask form and none of these checks are emitted.
 - [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find`, secret detection (Go wasip1)
 - [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find` called directly from a native Rust host, gate array and all
 - [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `scan_any`, URL rule matching (FastEdge)
-- [examples/fastedge/lang-detect/](../examples/fastedge/lang-detect/) — `find` and `match_all` over Unicode-mode patterns, language detection by letters (FastEdge HTTP app, component)
+- [examples/fastedge/script-detect/](../examples/fastedge/script-detect/) — `find` and `match_all` over Unicode-mode patterns, script detection by letters (FastEdge HTTP app, component)
 - [examples/browser/homoglyph/](../examples/browser/homoglyph/) — `find` over Unicode-mode patterns, lookalike and hidden characters, with byte offsets turned into JS string positions (browser)

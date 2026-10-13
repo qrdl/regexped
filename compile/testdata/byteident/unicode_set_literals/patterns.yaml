@@ -1,10 +1,10 @@
 # A Unicode-mode set of multi-byte literals: their UTF-8 bytes reach the
 # literal frontend.
-regexps:
-  - { name: k0, pattern: 'привет' }
-  - { name: k1, pattern: 'москва' }
-  - { name: k2, pattern: 'собака' }
-  - { name: k3, pattern: 'город\d+' }
+patterns:
+  - { name: k0, regexp: 'привет' }
+  - { name: k1, regexp: 'москва' }
+  - { name: k2, regexp: 'собака' }
+  - { name: k3, regexp: 'город\d+' }
 sets:
   - name: ul
     find: ul_find

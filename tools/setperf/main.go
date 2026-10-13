@@ -855,11 +855,11 @@ func sampleNeedles(pats []string, k int) []string {
 // compileCase compiles one set exporting every capability. `overlapping`
 // selects which find body is emitted; the other six are unaffected.
 func compileCase(c setCase, overlapping bool) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(c.patterns))
+	entries := make([]config.PatternEntry, len(c.patterns))
 	names := make([]string, len(c.patterns))
 	for i, p := range c.patterns {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	hints := []string{"batch-find"}
 	if setHints != "" {
@@ -876,7 +876,7 @@ func compileCase(c setCase, overlapping bool) ([]byte, error) {
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
 	}}
-	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	cfg := config.BuildConfig{Patterns: entries, Sets: sets}
 	w, _, diags, err := compile.CompileFileOpts(cfg, "", compileSetOptions())
 	if err == nil {
 		for _, d := range diags {
@@ -2852,11 +2852,11 @@ func overlapSizingFor(c setCase) (bytes, stride int, err error) {
 // column width falls out of the DFA construction and nothing in the case's
 // pattern list implies it.
 func overlapSetConfigFor(c setCase) (config.SetConfig, config.BuildConfig) {
-	entries := make([]config.RegexEntry, len(c.patterns))
+	entries := make([]config.PatternEntry, len(c.patterns))
 	pnames := make([]string, len(c.patterns))
 	for i, p := range c.patterns {
 		pnames[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: pnames[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: pnames[i], Regexp: p}
 	}
 	// The set MUST be declared exactly as compileCase declares it — every
 	// capability and the batch hint — and inspected under compileSetOptions,
@@ -2872,7 +2872,7 @@ func overlapSetConfigFor(c setCase) (config.SetConfig, config.BuildConfig) {
 		hints = append(hints, setHints)
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name:        "s",
 			MatchAny:    "cap_match_any",

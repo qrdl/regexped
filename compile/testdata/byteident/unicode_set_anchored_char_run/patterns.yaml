@@ -1,10 +1,10 @@
 # A Unicode-mode set's anchored pair over members whose value runs over whole
 # characters: the anchored probe's character skips, tested at a 128-byte
 # stretch point aligned to a character boundary, and the scan probes' skips.
-regexps:
-  - { name: k, pattern: '&ключ=[^&,]+&' }
-  - { name: p, pattern: ',поле=[^,;]*;' }
-  - { name: t, pattern: '<тег>[^<>]+<' }
+patterns:
+  - { name: k, regexp: '&ключ=[^&,]+&' }
+  - { name: p, regexp: ',поле=[^,;]*;' }
+  - { name: t, regexp: '<тег>[^<>]+<' }
 sets:
   - name: ua
     match_any: ua_match_any

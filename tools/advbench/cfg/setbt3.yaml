@@ -1,9 +1,9 @@
 import_module: m
 wasm_file: x.wasm
 max_dfa_states: 64
-regexps:
-  - pattern: '(?:a|b)*a(?:a|b){8}c'
-  - pattern: 'a'
+patterns:
+  - regexp: '(?:a|b)*a(?:a|b){8}c'
+  - regexp: 'a'
 sets:
   - name: s
     find: sfind

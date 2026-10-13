@@ -727,7 +727,7 @@ type SetSpec struct {
 	DeclaredPatternCount int
 
 	Patterns   []*PatternInfo // resolved, every selected entry
-	PatternIDs []int          // global indices into the regexps list
+	PatternIDs []int          // pattern ids: top-level indices, then the set's own regexps (config.SetMember)
 }
 
 // patternCount is the count the batch cursor and the stubs' buffer are sized
@@ -2151,7 +2151,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// that logic here is bug-prone — earlier versions produced under-sized
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
-		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
+		w, top, err := Compile(cfg.Patterns, 0, standalone, CompileOptions{
 			MaxDFAStates:              int(cfg.MaxDFAStates),
 			MaxBTInstructions:         int(cfg.MaxBTInstructions),
 			MaxTDFARegs:               cfg.MaxTDFARegs,
@@ -2189,7 +2189,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// below and by every set — the same rule compileAll follows.
 	globals := &moduleGlobals{}
 	opts.globals = globals
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
 			return nil, 0, nil, err
@@ -2218,33 +2218,13 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	fillSearchSizes(compiled, over.searchSizes)
 
 	// Resolve and compile sets.
-	// Build name→index map.
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
-		}
-	}
-
 	var prefixPool, suffixPool dfaPool
 	var compiledSets []*compiledSet
 	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
 		rep.progressSubject("set %q", sc.Name)
-		// Resolve patterns.
-		var selectedIdx []int
-		if sc.Patterns.All {
-			for i := range cfg.Regexps {
-				selectedIdx = append(selectedIdx, i)
-			}
-		} else {
-			for _, name := range sc.Patterns.Names {
-				selectedIdx = append(selectedIdx, nameIdx[name])
-			}
-		}
-
-		// Build PatternInfos, one per selected entry.
-		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, rep.progress())
+		// Build PatternInfos, one per member: selected and inline.
+		infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, rep.progress())
 		if err != nil {
 			return nil, 0, nil, err
 		}
@@ -5616,28 +5596,19 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 // table address; the automaton is identical either way. `over` carries the same
 // overrides CompileFileOpts takes, and is the zero value on every real build.
 func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over CompileSetOptions) (*compiledSet, error) {
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
+	if !sc.Patterns.All {
+		idx := make(map[string]bool, len(cfg.Patterns))
+		for _, re := range cfg.Patterns {
+			idx[re.Name] = re.Name != ""
 		}
-	}
-	var selectedIdx []int
-	if sc.Patterns.All {
-		for i := range cfg.Regexps {
-			selectedIdx = append(selectedIdx, i)
-		}
-	} else {
 		for _, name := range sc.Patterns.Names {
-			idx, ok := nameIdx[name]
-			if !ok {
+			if !idx[name] {
 				return nil, fmt.Errorf("set %q: unknown pattern %q", sc.Name, name)
 			}
-			selectedIdx = append(selectedIdx, idx)
 		}
 	}
 	var prefixPool, suffixPool dfaPool
-	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool, nil)
+	infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		return nil, err
 	}

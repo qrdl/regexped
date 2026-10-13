@@ -25,8 +25,8 @@ They're mutually exclusive — a pattern can't set both.
 ## Setting the hint
 
 ```yaml
-regexps:
-  - pattern: 'AKIA[A-Z0-9]{16}'
+patterns:
+  - regexp: 'AKIA[A-Z0-9]{16}'
     match_func: aws_key_match
     hints: [prefer-match]
 
@@ -37,7 +37,7 @@ sets:
     hints: [prefer-no-match]
 ```
 
-A `regexps:` entry's hint governs that pattern's own compiled body
+A `patterns:` entry's hint governs that pattern's own compiled body
 (`match_func`/`find_func`/`groups_func`). A `sets:`
 entry's hint governs that set's own frontend and suffix-body choices — it is
 not inherited by member patterns' own directly-exported bodies. There's no

@@ -159,7 +159,7 @@ func validateWASM(t *testing.T, wasm []byte) {
 
 // mustCompileEntries calls Compile with standalone=true, fails on error, and
 // validates the emitted module.
-func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...CompileOptions) {
+func mustCompileEntries(t *testing.T, entries []config.PatternEntry, opts ...CompileOptions) {
 	t.Helper()
 	wasm, _, err := Compile(entries, 0, true, opts...)
 	if err != nil {
@@ -173,57 +173,57 @@ func mustCompileEntries(t *testing.T, entries []config.RegexEntry, opts ...Compi
 
 func TestCompileIntegrationDFA(t *testing.T) {
 	t.Run("match_only", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}})
 	})
 	t.Run("find_only", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", FindFunc: "f"}})
 	})
 	t.Run("match_and_find", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m", FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", MatchFunc: "m", FindFunc: "f"}})
 	})
 	t.Run("find_word_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo\b`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `\bfoo\b`, FindFunc: "f"}})
 	})
 	t.Run("find_lit_anchor", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*foo.*`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `.*foo.*`, FindFunc: "f"}})
 	})
 	// Alternation with 2 first bytes and selective tails → T1/T2/T3 Teddy tables.
 	t.Run("find_teddy_t3", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(http|ftp)://[^\s]+`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(http|ftp)://[^\s]+`, FindFunc: "f"}})
 	})
 	t.Run("no_func_entry", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc"}})
 	})
 	t.Run("multiple_entries", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{
-			{Pattern: "abc", MatchFunc: "m1"},
-			{Pattern: "def", FindFunc: "f2"},
+		mustCompileEntries(t, []config.PatternEntry{
+			{Regexp: "abc", MatchFunc: "m1"},
+			{Regexp: "def", FindFunc: "f2"},
 		})
 	})
 }
 
 func TestCompileIntegrationTDFA(t *testing.T) {
 	t.Run("groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a)(b)", GroupsFunc: "g"}})
 	})
 	t.Run("named_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}})
 	})
 	t.Run("find_and_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a+)(b+)", FindFunc: "f", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a+)(b+)", FindFunc: "f", GroupsFunc: "g"}})
 	})
 	t.Run("match_and_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a)(b)", MatchFunc: "m", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a)(b)", MatchFunc: "m", GroupsFunc: "g"}})
 	})
 	t.Run("anchored_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "^(a)(b)$", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "^(a)(b)$", GroupsFunc: "g"}})
 	})
 }
 
 func TestCompileIntegrationBacktrack(t *testing.T) {
 	t.Run("groups_forced", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: "(a)(b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -232,7 +232,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -240,18 +240,18 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 		}
 	})
 	t.Run("natural_bt_nongreedy", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a+?)(b)", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a+?)(b)", GroupsFunc: "g"}})
 	})
 	t.Run("match_dfa_overflow", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}, CompileOptions{MaxDFAStates: 1})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}, CompileOptions{MaxDFAStates: 1})
 	})
 	t.Run("find_dfa_overflow", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
 	})
 	// btCheckRuneRanges: char-class range in backtracking engine.
 	t.Run("bt_char_range", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "([a-z]+)", GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: "([a-z]+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -261,7 +261,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	// btWordBoundary: word-boundary assertion in backtracking engine.
 	t.Run("bt_word_boundary", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: `(\bfoo\b)`, GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: `(\bfoo\b)`, GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -271,7 +271,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	// btFoldRune: case-insensitive single-character match in backtracking engine.
 	t.Run("bt_case_fold_char", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "((?i:a)+)", GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: "((?i:a)+)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -280,12 +280,12 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	// buildBTScanTables: BT find mode (no-capture find path).
 	t.Run("bt_find_mode", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]+", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]+", FindFunc: "f"}}, CompileOptions{MaxDFAStates: 1})
 	})
 	// A non-greedy loop with a zero-matchable body is a zero-width cycle: the
 	// memoised fallback body alone.
 	t.Run("bt_memo_nongreedy_loop", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a*?)+)", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "((?:a*?)+)", GroupsFunc: "g"}})
 	})
 }
 
@@ -406,9 +406,9 @@ func TestReverseRegexp(t *testing.T) {
 }
 
 func TestCompileEmbeddedMode(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: "abc", MatchFunc: "m"},
-		{Pattern: "(x)(y)", GroupsFunc: "g"},
+	entries := []config.PatternEntry{
+		{Regexp: "abc", MatchFunc: "m"},
+		{Regexp: "(x)(y)", GroupsFunc: "g"},
 	}
 	wasm, _, err := Compile(entries, 0, false)
 	if err != nil {
@@ -441,7 +441,7 @@ func TestCompileInvalidPattern(t *testing.T) {
 		"(?Pfoo)",   // malformed named group
 	}
 	for _, pat := range cases {
-		_, _, err := Compile([]config.RegexEntry{{Pattern: pat, MatchFunc: "m"}}, 0, true)
+		_, _, err := Compile([]config.PatternEntry{{Regexp: pat, MatchFunc: "m"}}, 0, true)
 		if err == nil {
 			t.Errorf("Compile(%q): expected error, got nil", pat)
 		}
@@ -451,27 +451,27 @@ func TestCompileInvalidPattern(t *testing.T) {
 func TestCompileIntegrationNonHybridDFA(t *testing.T) {
 	// buildMatchBody: non-hybrid match path (u8 simple).
 	t.Run("match_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}, noHybridOpts())
 	})
 	// buildAnchoredFindBody: non-hybrid anchored find (^ pattern).
 	t.Run("find_anchored_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "^abc", FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "^abc", FindFunc: "f"}}, noHybridOpts())
 	})
 	// buildFindBody: non-hybrid non-anchored find.
 	t.Run("find_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", FindFunc: "f"}}, noHybridOpts())
 	})
 	// Non-hybrid match+find combined.
 	t.Run("match_and_find_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "abc", MatchFunc: "m", FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "abc", MatchFunc: "m", FindFunc: "f"}}, noHybridOpts())
 	})
 	// buildAnchoredFindBody with word boundary.
 	t.Run("find_anchored_word_boundary_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `^\bfoo`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `^\bfoo`, FindFunc: "f"}}, noHybridOpts())
 	})
 	// buildLitAnchorFindBody / buildLitAnchorBackScanBody: literal-anchor find path.
 	t.Run("find_lit_anchor_non_hybrid", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*foo.*`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `.*foo.*`, FindFunc: "f"}}, noHybridOpts())
 	})
 }
 
@@ -549,12 +549,12 @@ func TestEngineTypeMethod(t *testing.T) {
 }
 
 func TestCmdCompile(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}
+	entries := []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}
 
 	t.Run("file output standalone", func(t *testing.T) {
 		dir := t.TempDir()
 		out := filepath.Join(dir, "out.wasm")
-		cfg := config.BuildConfig{Regexps: entries} // no Output field → standalone
+		cfg := config.BuildConfig{Patterns: entries} // no Output field → standalone
 		if err := CmdCompile(cfg, out); err != nil {
 			t.Fatalf("CmdCompile: %v", err)
 		}
@@ -570,7 +570,7 @@ func TestCmdCompile(t *testing.T) {
 	t.Run("file output embedded", func(t *testing.T) {
 		dir := t.TempDir()
 		out := filepath.Join(dir, "out.wasm")
-		cfg := config.BuildConfig{Regexps: entries, Output: "final.wasm", ImportModule: "rx"} // Output set → embedded
+		cfg := config.BuildConfig{Patterns: entries, Output: "final.wasm", ImportModule: "rx"} // Output set → embedded
 		if err := CmdCompile(cfg, out); err != nil {
 			t.Fatalf("CmdCompile: %v", err)
 		}
@@ -591,7 +591,7 @@ func TestCmdCompile(t *testing.T) {
 
 	t.Run("standalone carries no import_module record", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out.wasm")
-		if err := CmdCompile(config.BuildConfig{Regexps: entries, ImportModule: "rx"}, out); err != nil {
+		if err := CmdCompile(config.BuildConfig{Patterns: entries, ImportModule: "rx"}, out); err != nil {
 			t.Fatal(err)
 		}
 		data, err := os.ReadFile(out)
@@ -611,7 +611,7 @@ func TestCmdCompile(t *testing.T) {
 		orig := os.Stdout
 		os.Stdout = w
 
-		cfg := config.BuildConfig{Regexps: entries}
+		cfg := config.BuildConfig{Patterns: entries}
 		compErr := CmdCompile(cfg, "-")
 
 		w.Close()
@@ -635,14 +635,14 @@ func TestCmdCompile(t *testing.T) {
 // ^[a-z]+ has no interior literal anchor so findLitAnchorPoint returns nil,
 // falling through to appendFindCodeEntry which picks buildHybridAnchoredFindBody.
 func TestCompileHybridAnchoredFind(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]+`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `^[a-z]+`, FindFunc: "f"}})
 }
 
 // TestCompileU16DFA exercises the u16 DFA table path (appendTableLoad16u) by
 // compiling a pattern whose DFA has > 256 states.
 func TestCompileU16DFA(t *testing.T) {
 	// a{512} produces a linear DFA with 514 states (> 256 → u16 table).
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a{512}", MatchFunc: "m"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "a{512}", MatchFunc: "m"}},
 		CompileOptions{MaxDFAStates: 100000})
 }
 
@@ -653,14 +653,14 @@ func TestCompileU16DFA(t *testing.T) {
 // (?:a?)+? part from collapsing to a single state), while the (?:a?)+?
 // prefix supplies the cycle. MaxDFAStates=1 forces BT fallback.
 func TestCompileBTMatchMemo(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?:a?)+?b", MatchFunc: "m"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?:a?)+?b", MatchFunc: "m"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
 // TestCompileBTFindMemo is TestCompileBTMatchMemo for the find path: the LF DFA
 // forced too large and a zero-width cycle, so the memoised fallback find body.
 func TestCompileBTFindMemo(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?:a?)+?", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?:a?)+?", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
@@ -668,7 +668,7 @@ func TestCompileBTFindMemo(t *testing.T) {
 // a{130} produces ~132 DFA states: 132*256 = 33792 > 32KB → useCompression=true.
 // noHybridOpts forces the non-hybrid (non-compiled-DFA) match body path.
 func TestCompileMatchBodyCompressed(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a{130}", MatchFunc: "m"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "a{130}", MatchFunc: "m"}},
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
@@ -683,14 +683,14 @@ func TestCompileMatchBodyCompressed(t *testing.T) {
 // 2026-08-18. Kept as a compile smoke test
 // for the empty-match-at-start shape.
 func TestCompileMatchBodyImmediateAccept(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "a*", MatchFunc: "m"}},
 		CompileOptions{CompiledDFAThreshold: -1})
 }
 
 // TestCompileDFADataSegmentsNewlineBoundary exercises the midAcceptNLBytes path
 // in dfaDataSegments. (?m:foo$) has hasNewlineBoundary=true.
 func TestCompileDFADataSegmentsNewlineBoundary(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:foo$)`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m:foo$)`, FindFunc: "f"}})
 }
 
 // TestCompileBTInstHandlerAnyRune exercises InstRuneAny and InstRuneAnyNotNL
@@ -699,14 +699,14 @@ func TestCompileDFADataSegmentsNewlineBoundary(t *testing.T) {
 // the pattern one whole capture, which a shortcut would serve instead.
 func TestCompileBTInstHandlerAnyRune(t *testing.T) {
 	_, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(?s:.+)()", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: "(?s:.+)()", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
 		t.Fatalf("CompileForced((?s:.+) BT): %v", err)
 	}
 	_, _, err = CompileForced(
-		[]config.RegexEntry{{Pattern: ".+()", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: ".+()", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
@@ -718,7 +718,7 @@ func TestCompileBTInstHandlerAnyRune(t *testing.T) {
 // (btPushFrame) in emitBTInstHandler. (a|b) has an Alt that is not a loop.
 func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
 	_, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(a|b)", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: "(a|b)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
@@ -731,19 +731,19 @@ func TestCompileBTInstHandlerNonLoopAlt(t *testing.T) {
 // (?m:$) sets hasNewlineBoundary=true; [a-z] has no fixed literal so
 // findLitAnchorPoint returns nil and appendFindCodeEntry reaches buildAnchoredFindBody.
 func TestCompileAnchoredFindBodyNLBoundary(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]+(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `^[a-z]+(?m:$)`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileAnchoredFindBodyCompressedNL exercises the useU8&&useCompression path in
 // buildAnchoredFindBody. ^[a-z]{130}(?m:$): ~132 DFA states → table >32KB → useCompression=true.
 func TestCompileAnchoredFindBodyCompressedNL(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]{130}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `^[a-z]{130}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileAnchoredFindBodyU16NL exercises the u16 path in buildAnchoredFindBody.
 // ^[a-z]{512}(?m:$): ~513 DFA states > 256 → useU8=false → u16 table path.
 func TestCompileAnchoredFindBodyU16NL(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `^[a-z]{512}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `^[a-z]{512}(?m:$)`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileFindBodyFlags exercises flag-dependent branches in buildFindBody
@@ -751,19 +751,19 @@ func TestCompileAnchoredFindBodyU16NL(t *testing.T) {
 func TestCompileFindBodyFlags(t *testing.T) {
 	// hasImmAccept: a* accepts the empty string → immediateAccept at start state.
 	t.Run("imm_accept", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "a*", FindFunc: "f"}}, noHybridOpts())
 	})
 	// hasWordBoundary: non-anchored find with \b emits word-char table and midAcceptW/NW.
 	t.Run("word_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo\b`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `\bfoo\b`, FindFunc: "f"}}, noHybridOpts())
 	})
 	// hasNewlineBoundary: (?m:$) emits midAcceptNL table.
 	t.Run("newline_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:foo$)`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m:foo$)`, FindFunc: "f"}}, noHybridOpts())
 	})
 	// useMandatoryLit: pattern has a mandatory interior literal ("://") with no fixed prefix.
 	t.Run("mandatory_lit", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `[a-z]+://\S+`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `[a-z]+://\S+`, FindFunc: "f"}}, noHybridOpts())
 	})
 }
 
@@ -772,12 +772,12 @@ func TestCompileFindBodyFlags(t *testing.T) {
 func TestCompileAnchoredFindBodyFlags(t *testing.T) {
 	// hasImmAccept: ^a* is anchored and has immediateAccept at the start state.
 	t.Run("imm_accept", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "^a*", FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "^a*", FindFunc: "f"}}, noHybridOpts())
 	})
 	// hasNewlineBoundary: \A anchors the find; (?m:$) adds EmptyEndLine → midAcceptNL.
 	// midStartNewline is dead because \A requires ecBeginText which ecBeginLine cannot satisfy.
 	t.Run("newline_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\Afoo(?m:$)`, FindFunc: "f"}}, noHybridOpts())
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `\Afoo(?m:$)`, FindFunc: "f"}}, noHybridOpts())
 	})
 }
 
@@ -785,19 +785,19 @@ func TestCompileAnchoredFindBodyFlags(t *testing.T) {
 // a{130} produces ~132 states: 132×256 = 33 792 > 32 KB → useCompression=true;
 // 133 states ≤ default threshold 256 → useHybridDispatch=true.
 func TestCompileHybridMatchBodyCompressed(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a{130}", MatchFunc: "m"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "a{130}", MatchFunc: "m"}},
 		CompileOptions{MaxDFAStates: 100000})
 }
 
 // TestCompileHybridMatchBodyImmAccept exercises the hasImmAccept branch in buildHybridMatchBody.
 // a* accepts the empty string → immediateAccept at start state → hybrid match with hasImmAccept=true.
 func TestCompileHybridMatchBodyImmAccept(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "a*", MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "a*", MatchFunc: "m"}})
 }
 
 // TestCompileEmbeddedFindPaths exercises tableMemIdx=1 branches in the DFA find WASM emitter.
 func TestCompileEmbeddedFindPaths(t *testing.T) {
-	embed := func(t *testing.T, entries []config.RegexEntry, opts ...CompileOptions) {
+	embed := func(t *testing.T, entries []config.PatternEntry, opts ...CompileOptions) {
 		t.Helper()
 		var o CompileOptions
 		if len(opts) > 0 {
@@ -813,22 +813,22 @@ func TestCompileEmbeddedFindPaths(t *testing.T) {
 	}
 	// appendTableLoad16u tableMemIdx=1: u16 find (>256 states) in embedded mode.
 	t.Run("u16_find", func(t *testing.T) {
-		embed(t, []config.RegexEntry{{Pattern: "a{512}", FindFunc: "f"}},
+		embed(t, []config.PatternEntry{{Regexp: "a{512}", FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 	// appendTableVLoad tableMemIdx=1: Teddy find in embedded mode.
 	// (foo|bar)[0-9]+ has 2 first bytes (f/b), no mandatory interior literal →
 	// useMandatoryLit=false → emitOuterPrologue → Teddy VLoad with tableMemIdx=1.
 	t.Run("teddy_find", func(t *testing.T) {
-		embed(t, []config.RegexEntry{{Pattern: `(foo|bar)[0-9]+`, FindFunc: "f"}})
+		embed(t, []config.PatternEntry{{Regexp: `(foo|bar)[0-9]+`, FindFunc: "f"}})
 	})
 	// word char table with tableMemIdx=1: word boundary find in embedded mode.
 	t.Run("word_boundary_find", func(t *testing.T) {
-		embed(t, []config.RegexEntry{{Pattern: `\bfoo\b`, FindFunc: "f"}})
+		embed(t, []config.PatternEntry{{Regexp: `\bfoo\b`, FindFunc: "f"}})
 	})
 	// appendTableStore32/Store8 tableMemIdx=1: BT find fallback in embedded mode.
 	t.Run("bt_find", func(t *testing.T) {
-		embed(t, []config.RegexEntry{{Pattern: "(?:a?)+?", FindFunc: "f"}},
+		embed(t, []config.PatternEntry{{Regexp: "(?:a?)+?", FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 1})
 	})
 }
@@ -837,7 +837,7 @@ func TestCompileEmbeddedFindPaths(t *testing.T) {
 // in the BT match (groups) path when compiled in embedded mode.
 func TestCompileEmbeddedBTMatch(t *testing.T) {
 	wasm, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: "(a)(b)", GroupsFunc: "g"}},
 		0, false, EngineBacktrack,
 	)
 	if err != nil {
@@ -868,15 +868,15 @@ func TestEngineTypeStringUnknown(t *testing.T) {
 func TestCompileBTInstHandlerEmptyWidth(t *testing.T) {
 	// EmptyBeginLine: (?m:^) routes captures to BT via hasLineAnchors.
 	t.Run("begin_line", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `((?m:^)a)`, GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `((?m:^)a)`, GroupsFunc: "g"}})
 	})
 	// EmptyEndLine: (?m:$) routes captures to BT via hasLineAnchors.
 	t.Run("end_line", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a(?m:$))`, GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(a(?m:$))`, GroupsFunc: "g"}})
 	})
 	// EmptyNoWordBoundary: \B routes captures to BT via hasWordBoundary.
 	t.Run("no_word_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a\Bb)`, GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(a\Bb)`, GroupsFunc: "g"}})
 	})
 }
 
@@ -885,7 +885,7 @@ func TestCompileBTInstHandlerEmptyWidth(t *testing.T) {
 // empty computePrefix (char class has many first bytes), so the OnMatch callback takes
 // the "check previous byte" branch rather than the fixed-prefix branch.
 func TestCompileFindBodyWBNoPrefix(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `\b[a-z]`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `\b[a-z]`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileFindBodyMandLitWBNL exercises the mandatory-literal DFA prologue
@@ -893,14 +893,14 @@ func TestCompileFindBodyWBNoPrefix(t *testing.T) {
 // (?m:\b[a-z]{1,5}foo$) finds "foo" as mandatory literal (minOff=1, maxOff=5),
 // has an empty prefix (char class first bytes), and sets both flag bits.
 func TestCompileFindBodyMandLitWBNL(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:\b[a-z]{1,5}foo$)`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m:\b[a-z]{1,5}foo$)`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileFindBodyCompressed exercises the u8-compressed non-anchored find path in
 // buildFindBody. [a-z]{130} produces 131 DFA states: 131×256 = 33 536 B > 32 KB →
 // useCompression=true, useU8=true. No fixed literal or prefix → non-mandatory-lit path.
 func TestCompileFindBodyCompressed(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{130}", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{130}", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
@@ -908,7 +908,7 @@ func TestCompileFindBodyCompressed(t *testing.T) {
 // [a-i]+ has exactly 9 distinct first bytes, which puts it in the 9–16 range
 // that uses multi-eq rather than Teddy tables.
 func TestCompileMultiEqSIMD(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-i]+", FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-i]+", FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileLitAnchorFindCompressed exercises the useCompression branch in
@@ -916,14 +916,14 @@ func TestCompileMultiEqSIMD(t *testing.T) {
 // forward DFA with ~134 states (131 for [a-z]{130} + a few for foo), making the
 // forward-scan table exceed 32 KB → useCompression=true in the forward layout.
 func TestCompileLitAnchorFindCompressed(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*[a-z]{130}foo.*`, FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `.*[a-z]{130}foo.*`, FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
 // TestCompileFindBodyU16 exercises the u16 (>256 states) non-anchored find path in
 // buildFindBody. [a-z]{512} produces ~513 DFA states → useU8=false → u16 table path.
 func TestCompileFindBodyU16(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{512}", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{512}", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 100000, CompiledDFAThreshold: -1})
 }
 
@@ -932,7 +932,7 @@ func TestCompileFindBodyU16(t *testing.T) {
 // and (?m:$) (EmptyEndLine), causing both emitWBPreAcceptCheck and emitNLPreAcceptCheck
 // to emit code in the same find loop body.
 func TestCompileFindBodyWBAndNL(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m:\bfoo$)`, FindFunc: "f"}}, noHybridOpts())
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m:\bfoo$)`, FindFunc: "f"}}, noHybridOpts())
 }
 
 // TestCompileBTCaptureWithMemo exercises the memo locals of the capture path's
@@ -940,28 +940,28 @@ func TestCompileFindBodyWBAndNL(t *testing.T) {
 // cycle (non-greedy loop with zero-matchable body a?), so the memoised fallback
 // is the only body it gets.
 func TestCompileBTCaptureWithMemo(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a?)+?)", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "((?:a?)+?)", GroupsFunc: "g"}})
 }
 
 // TestCompileNFAFirstBytesFold exercises the fold-case alternative byte path
 // in nfaFirstBytes. (?i:abc) has first byte 'a' with fold alternative 'A'.
 func TestCompileNFAFirstBytesFold(t *testing.T) {
 	// FindFunc + MaxDFAStates=1 forces BT find fallback, which calls nfaFirstBytes.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(?i:abc)", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?i:abc)", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
 // TestCompileBTScanTablesTeddy exercises Teddy nibble-table generation in
 // buildBTScanTables. (a|b|c) has 3 first bytes (≤8) → 1-byte Teddy tables.
 func TestCompileBTScanTablesTeddy(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a|b|c)x", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a|b|c)x", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
 // TestCompileBTFindBodyMandatoryLit exercises the mandatory-literal path in
 // buildBTFindBody. [a-z]+://[^\s]+ has mandatory literal "://" with minOff=2.
 func TestCompileBTFindBodyMandatoryLit(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `[a-z]+://[^\s]+`, FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `[a-z]+://[^\s]+`, FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
@@ -1122,7 +1122,7 @@ func TestCmdCompile_WithSets(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.wasm")
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\w+`}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `foo\w+`}},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1141,11 +1141,11 @@ func TestCmdCompile_WithSets(t *testing.T) {
 
 func TestCmdWriteDiagJSON(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\w+`},
-			{Name: "p2", Pattern: `bar\d+`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\w+`},
+			{Name: "p2", Regexp: `bar\d+`},
 			// Capture-bearing pattern, must be dropped from sets.
-			{Name: "p3", Pattern: `(quux)`, GroupsFunc: "qg"},
+			{Name: "p3", Regexp: `(quux)`, GroupsFunc: "qg"},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s1", Find: "s1_all", Patterns: config.PatternSelector{All: true}},
@@ -1157,7 +1157,7 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 		// It used to return nil: `--diag-json=out.json` on a set-less config
 		// wrote no file and said nothing, leaving the user with a missing
 		// file and no explanation.
-		empty := config.BuildConfig{Regexps: cfg.Regexps}
+		empty := config.BuildConfig{Patterns: cfg.Patterns}
 		err := CmdWriteDiagJSON(empty, "", "")
 		if err == nil {
 			t.Fatal("expected an error for a config with no sets")
@@ -1232,7 +1232,7 @@ func TestCompileLenientAltFindBody(t *testing.T) {
 	if !shouldTryLitChainAlt(pattern) {
 		t.Fatalf("shouldTryLitChainAlt(%q) = false, want true (test pattern no longer trips the lit-chain-alt gate)", pattern)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "sql_inject_find"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "sql_inject_find"}})
 }
 
 // TestCompileTDFARegLimitExceededForced exercises the
@@ -1244,7 +1244,7 @@ func TestCompileLenientAltFindBody(t *testing.T) {
 // register-starved MaxTDFARegs).
 func TestCompileTDFARegLimitExceededForced(t *testing.T) {
 	_, err := compilePattern(
-		config.RegexEntry{Pattern: "(a)(b)(c)(d)(e)(f)", GroupsFunc: "g"},
+		config.PatternEntry{Regexp: "(a)(b)(c)(d)(e)(f)", GroupsFunc: "g"},
 		// The allocator: the pattern falls back to Backtracking, whose fallback
 		// body reads the module's scratch globals.
 		0, EngineTDFA, CompileOptions{MaxTDFARegs: 1, globals: &moduleGlobals{}},
@@ -1269,21 +1269,21 @@ func TestCompileBTManyLoopsCompile(t *testing.T) {
 	chain := `(?m:` + strings.Repeat(`(?:$|a)*`, 16) + `0$)`
 	for _, c := range []struct {
 		name  string
-		entry config.RegexEntry
+		entry config.PatternEntry
 		opts  []CompileOptions
 	}{
-		{"find/114", config.RegexEntry{Pattern: loops(114), FindFunc: "f"}, nil},
-		{"find/256", config.RegexEntry{Pattern: loops(256), FindFunc: "f"}, nil},
-		{"match/114", config.RegexEntry{Pattern: loops(114), MatchFunc: "m"}, nil},
-		{"groups/114", config.RegexEntry{Pattern: loops(114) + `(x)y`, GroupsFunc: "g"}, nil},
-		{"groups/nullable-40", config.RegexEntry{Pattern: strings.Repeat(`(?:(?:$|a)*a)`, 40) + `(x)y`, GroupsFunc: "g"}, nil},
-		{"find/chain-16", config.RegexEntry{Pattern: chain, FindFunc: "f"}, nil},
-		{"match/chain-16", config.RegexEntry{Pattern: chain, MatchFunc: "m"}, []CompileOptions{{MaxDFAStates: 1}}},
-		{"groups/chain-16", config.RegexEntry{Pattern: chain + `(x)y`, GroupsFunc: "g"}, nil},
-		{"find/lazy-70", config.RegexEntry{Pattern: strings.Repeat(`(?:[a-z]+?)`, 70) + `0`, FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
+		{"find/114", config.PatternEntry{Regexp: loops(114), FindFunc: "f"}, nil},
+		{"find/256", config.PatternEntry{Regexp: loops(256), FindFunc: "f"}, nil},
+		{"match/114", config.PatternEntry{Regexp: loops(114), MatchFunc: "m"}, nil},
+		{"groups/114", config.PatternEntry{Regexp: loops(114) + `(x)y`, GroupsFunc: "g"}, nil},
+		{"groups/nullable-40", config.PatternEntry{Regexp: strings.Repeat(`(?:(?:$|a)*a)`, 40) + `(x)y`, GroupsFunc: "g"}, nil},
+		{"find/chain-16", config.PatternEntry{Regexp: chain, FindFunc: "f"}, nil},
+		{"match/chain-16", config.PatternEntry{Regexp: chain, MatchFunc: "m"}, []CompileOptions{{MaxDFAStates: 1}}},
+		{"groups/chain-16", config.PatternEntry{Regexp: chain + `(x)y`, GroupsFunc: "g"}, nil},
+		{"find/lazy-70", config.PatternEntry{Regexp: strings.Repeat(`(?:[a-z]+?)`, 70) + `0`, FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			w, _, err := Compile([]config.RegexEntry{c.entry}, 65536, true, c.opts...)
+			w, _, err := Compile([]config.PatternEntry{c.entry}, 65536, true, c.opts...)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
@@ -1309,7 +1309,7 @@ func TestCompileBTManyLoopsCompile(t *testing.T) {
 // the fix, and the find call it produces costs 48 fuel on the repro's input.
 func TestCompileFuzzRepro143548(t *testing.T) {
 	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)`
-	if _, _, err := Compile([]config.RegexEntry{{Pattern: pattern, FindFunc: "find"}}, 65536, true); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{{Regexp: pattern, FindFunc: "find"}}, 65536, true); err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 }
@@ -1325,7 +1325,7 @@ func TestCompileFuzzRepro143548(t *testing.T) {
 // `(?:$|l)*` because the repro's own `$*` is now collapsed before any engine
 // sees it (collapseZeroWidthRepeats).
 func TestCompileFuzzRepro092700(t *testing.T) {
-	if _, _, err := Compile([]config.RegexEntry{{Pattern: `(?:(?:$|l)*llllllll0){200}`, FindFunc: "find"}}, 65536, true); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{{Regexp: `(?:(?:$|l)*llllllll0){200}`, FindFunc: "find"}}, 65536, true); err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 }
@@ -1396,11 +1396,11 @@ func TestCollapseZeroWidthRepeats(t *testing.T) {
 // Backtracking's loop guards at all.
 func TestCompileNestedEmptyBodyLoopChain(t *testing.T) {
 	pattern := `(?m:$*$*$*$*$*$*$*$*$*$*$*)*0$`
-	for _, entry := range []config.RegexEntry{
-		{Pattern: pattern, FindFunc: "f"},
-		{Pattern: pattern, MatchFunc: "m"},
+	for _, entry := range []config.PatternEntry{
+		{Regexp: pattern, FindFunc: "f"},
+		{Regexp: pattern, MatchFunc: "m"},
 	} {
-		if _, _, err := Compile([]config.RegexEntry{entry}, 65536, true); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{entry}, 65536, true); err != nil {
 			t.Errorf("Compile(%+v): %v", entry, err)
 		}
 	}
@@ -1417,7 +1417,7 @@ func TestCompileNestedEmptyBodyLoopChain(t *testing.T) {
 // groups, so the shortcut's MaxCap()==1 requirement fails and the pattern
 // reaches Backtracking's memoised fallback body as originally intended.
 func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((?:a?)+?)(b)", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "((?:a?)+?)(b)", GroupsFunc: "g"}})
 }
 
 // TestCompileEmbeddedLitAnchorTableMemIdx exercises the tableMemIdx = 1
@@ -1427,9 +1427,9 @@ func TestCompileBTCaptureWithMemoTwoGroups(t *testing.T) {
 // standalone=true; this compiles the same pattern shapes with
 // standalone=false.
 func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
-	wasm, _, err := Compile([]config.RegexEntry{
-		{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f1"},
-		{Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`, FindFunc: "f2"},
+	wasm, _, err := Compile([]config.PatternEntry{
+		{Regexp: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f1"},
+		{Regexp: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`, FindFunc: "f2"},
 	}, 0, false)
 	if err != nil {
 		t.Fatalf("Compile(embedded lit-anchor): %v", err)
@@ -1444,7 +1444,7 @@ func TestCompileEmbeddedLitAnchorTableMemIdx(t *testing.T) {
 func TestCmdCompile_ErrorPaths(t *testing.T) {
 	t.Run("compile_file_error_with_sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "bad", Pattern: `[`}},
+			Patterns: []config.PatternEntry{{Name: "bad", Regexp: `[`}},
 			Sets: []config.SetConfig{
 				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 			},
@@ -1455,7 +1455,7 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 	})
 	t.Run("compile_error_no_sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Pattern: "[", MatchFunc: "m"}},
+			Patterns: []config.PatternEntry{{Regexp: "[", MatchFunc: "m"}},
 		}
 		if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "out.wasm")); err == nil {
 			t.Fatal("expected Compile error, got nil")
@@ -1470,7 +1470,7 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 		w.Close() // both ends closed before use — write to w now fails safely, no SIGPIPE
 		orig := os.Stdout
 		os.Stdout = w
-		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}}
 		compErr := CmdCompile(cfg, "-")
 		os.Stdout = orig
 		if compErr == nil {
@@ -1478,7 +1478,7 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 		}
 	})
 	t.Run("write_file_failure", func(t *testing.T) {
-		cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "abc", MatchFunc: "m"}}}
+		cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}}
 		badPath := filepath.Join(t.TempDir(), "nonexistent-dir", "out.wasm")
 		if err := CmdCompile(cfg, badPath); err == nil {
 			t.Fatal("expected os.WriteFile error, got nil")
@@ -1501,9 +1501,9 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 	// same message, because both go through setPatternInfos.
 	t.Run("unbuildable pattern fails BOTH", func(t *testing.T) {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{
-				{Name: "bad", Pattern: `[`},
-				{Name: "good", Pattern: `foo`},
+			Patterns: []config.PatternEntry{
+				{Name: "bad", Regexp: `[`},
+				{Name: "good", Regexp: `foo`},
 			},
 			Sets: []config.SetConfig{
 				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -1530,9 +1530,9 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 	// excluded by design — must still produce a diagnostics file, and say so.
 	t.Run("capture-bearing pattern is dropped, not fatal", func(t *testing.T) {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{
-				{Name: "caps", Pattern: `(foo)(bar)`, GroupsFunc: "g"},
-				{Name: "good", Pattern: `foo`},
+			Patterns: []config.PatternEntry{
+				{Name: "caps", Regexp: `(foo)(bar)`, GroupsFunc: "g"},
+				{Name: "good", Regexp: `foo`},
 			},
 			Sets: []config.SetConfig{
 				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -1558,14 +1558,14 @@ func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
 // reads every negative value as "no counter", so without the check a stale
 // constant compiles a module with no work budget and no fallback, silently.
 func TestBTWorkBudgetRejectsUnnamedNegative(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: `^(aa|a)*b`, GroupsFunc: "groups"}}
+	entries := []config.PatternEntry{{Regexp: `^(aa|a)*b`, GroupsFunc: "groups"}}
 	for _, budget := range []int{0, 8, BTWorkBudgetOff, BTWorkBudgetForceFallback, -3} {
 		wantErr := budget == -3
 		_, _, err := Compile(entries, 0, true, CompileOptions{BTWorkBudget: budget})
 		if got := errors.Is(err, errBTWorkBudget); got != wantErr || (!wantErr && err != nil) {
 			t.Errorf("Compile, BTWorkBudget %d: err = %v, want error %v", budget, err, wantErr)
 		}
-		_, _, _, err = CompileFileOpts(config.BuildConfig{Regexps: entries}, "", CompileSetOptions{BTWorkBudget: budget})
+		_, _, _, err = CompileFileOpts(config.BuildConfig{Patterns: entries}, "", CompileSetOptions{BTWorkBudget: budget})
 		if got := errors.Is(err, errBTWorkBudget); got != wantErr || (!wantErr && err != nil) {
 			t.Errorf("CompileFileOpts, BTWorkBudget %d: err = %v, want error %v", budget, err, wantErr)
 		}
@@ -1709,14 +1709,14 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 	// are bytes). Left to resolve, every pattern here compiles: one the gate
 	// refuses asks for Unicode mode.
 	compileWith := func(pattern string, byteMode bool) error {
-		e := config.RegexEntry{Pattern: pattern, FindFunc: "find", ByteMode: byteMode}
-		_, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode})
+		e := config.PatternEntry{Regexp: pattern, FindFunc: "find", ByteMode: byteMode}
+		_, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode})
 		return err
 	}
 
 	for _, c := range cases {
-		e := config.RegexEntry{Pattern: c.pattern, FindFunc: "find"}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+		e := config.PatternEntry{Regexp: c.pattern, FindFunc: "find"}
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 			t.Errorf("resolved %q: %v, want it compiled", c.pattern, err)
 		}
 		if err := compileWith(c.pattern, false); (err != nil) != c.rejectDef {
@@ -1749,36 +1749,36 @@ func TestGroupsWithoutCaptureGroupRefused(t *testing.T) {
 		{`(?:(a){0})b`, CompileOptions{ForceByteMode: true}},
 		{`\pL+`, CompileOptions{Unicode: true}},
 	} {
-		_, _, err := Compile([]config.RegexEntry{{Pattern: c.pattern, GroupsFunc: "g"}}, 65536, true, c.opts)
+		_, _, err := Compile([]config.PatternEntry{{Regexp: c.pattern, GroupsFunc: "g"}}, 65536, true, c.opts)
 		if !errors.Is(err, ErrNoCaptureGroup) || !strings.Contains(err.Error(), `groups_func "g"`) {
 			t.Errorf("Compile(%q, groups_func) = %v, want ErrNoCaptureGroup naming the export", c.pattern, err)
 		}
 	}
-	if _, _, err := Compile([]config.RegexEntry{{Pattern: `(a)*`, GroupsFunc: "g"}}, 65536, true, CompileOptions{ForceByteMode: true}); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{{Regexp: `(a)*`, GroupsFunc: "g"}}, 65536, true, CompileOptions{ForceByteMode: true}); err != nil {
 		t.Errorf("Compile((a)*, groups_func): %v", err)
 	}
 }
 
 func TestUnsupportedRuneErrorText(t *testing.T) {
 	byteMode := CompileOptions{ForceByteMode: true}
-	e := config.RegexEntry{Pattern: `[a\x80]+`, FindFunc: "find"}
-	_, _, err := Compile([]config.RegexEntry{e}, 65536, true, byteMode)
+	e := config.PatternEntry{Regexp: `[a\x80]+`, FindFunc: "find"}
+	_, _, err := Compile([]config.PatternEntry{e}, 65536, true, byteMode)
 	if err == nil {
 		t.Fatal("expected a rejection")
 	}
 	if !strings.Contains(err.Error(), "byte_mode") || !strings.Contains(err.Error(), "U+0080") {
 		t.Errorf("a byte-range rejection must name the rune and the way out, got: %v", err)
 	}
-	if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 		t.Errorf("resolved: %v, want it compiled in Unicode mode", err)
 	}
 
-	e = config.RegexEntry{Pattern: `[α-ω]+`, FindFunc: "find"}
-	_, _, err = Compile([]config.RegexEntry{e}, 65536, true, byteMode)
+	e = config.PatternEntry{Regexp: `[α-ω]+`, FindFunc: "find"}
+	_, _, err = Compile([]config.PatternEntry{e}, 65536, true, byteMode)
 	if err == nil || !strings.Contains(err.Error(), "above U+00FF") || strings.Contains(err.Error(), "byte_mode") {
 		t.Errorf("a rune above U+00FF must be named as such and must NOT suggest byte_mode, which cannot help: %v", err)
 	}
-	if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 		t.Errorf("resolved: %v, want it compiled in Unicode mode", err)
 	}
 }
@@ -1811,15 +1811,15 @@ func TestUnicodeOptionSetsUnicodeMode(t *testing.T) {
 func TestByteModeGateAppliesBeforeFastPaths(t *testing.T) {
 	// A literal chain (analyseLitChain territory) with a byte escape in it.
 	for _, p := range []string{`caf\xe9[0-9]{8}`, `\xe9[0-9]{8}`, `AKIA[0-9A-Z\xe9]{16}`} {
-		e := config.RegexEntry{Pattern: p, FindFunc: "find"}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: true}); err == nil {
+		e := config.PatternEntry{Regexp: p, FindFunc: "find"}
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{ForceByteMode: true}); err == nil {
 			t.Errorf("byte mode without byte_mode %q: accepted, want rejected before the fast path", p)
 		}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 			t.Errorf("resolved %q: %v, want it compiled in Unicode mode", p, err)
 		}
 		e.ByteMode = true
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{}); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 			t.Errorf("byte mode %q: %v", p, err)
 		}
 	}
@@ -1879,8 +1879,8 @@ func TestOpenEndedTailSpellings(t *testing.T) {
 	// And the endpoint below U+10FFFF is still rejected in byte mode, with
 	// byte_mode or without (ForceByteMode, as a harness compiles).
 	for _, byteMode := range []bool{false, true} {
-		e := config.RegexEntry{Pattern: `[a-\x{ffff}]+`, FindFunc: "find", ByteMode: byteMode}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode}); err == nil {
+		e := config.PatternEntry{Regexp: `[a-\x{ffff}]+`, FindFunc: "find", ByteMode: byteMode}
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{ForceByteMode: !byteMode}); err == nil {
 			t.Errorf("byteMode=%v: [a-\\x{ffff}] accepted, want rejected", byteMode)
 		}
 	}
@@ -2014,8 +2014,8 @@ func TestCompilePatternAttachesMinLen(t *testing.T) {
 	}
 }
 
-func configRegexEntryForMinLen(pattern string, byteMode bool) config.RegexEntry {
-	return config.RegexEntry{Pattern: pattern, FindFunc: "find", ByteMode: byteMode}
+func configRegexEntryForMinLen(pattern string, byteMode bool) config.PatternEntry {
+	return config.PatternEntry{Regexp: pattern, FindFunc: "find", ByteMode: byteMode}
 }
 
 // TestParseHints covers parseHints directly (40% covered without this — only
@@ -2083,7 +2083,7 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 
 	// Caller says neutral, but the pattern's own hint says no-match — the
 	// hint must win and take the SIMD-verify shortcut.
-	entry := config.RegexEntry{Pattern: pattern, FindFunc: "f", Hints: []string{"prefer-no-match"}}
+	entry := config.PatternEntry{Regexp: pattern, FindFunc: "f", Hints: []string{"prefer-no-match"}}
 	p, err := compilePattern(entry, 0, 0, CompileOptions{LikelyMode: LikelyNeutral})
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
@@ -2094,7 +2094,7 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 
 	// The reverse: caller says no-match, but the pattern's own hint says
 	// neutral — the hint must still win, so the shortcut must NOT fire.
-	entryNeutralHint := config.RegexEntry{Pattern: pattern, FindFunc: "f", Hints: []string{}}
+	entryNeutralHint := config.PatternEntry{Regexp: pattern, FindFunc: "f", Hints: []string{}}
 	pNeutral, err := compilePattern(entryNeutralHint, 0, 0, CompileOptions{LikelyMode: LikelyNoMatch})
 	if err != nil {
 		t.Fatalf("compilePattern (caller no-match, no pattern hint): %v", err)
@@ -2107,7 +2107,7 @@ func TestPatternHintsOverridesCallerLikelyMode(t *testing.T) {
 		t.Fatal("expected both compiles to produce a lit-anchor backscan body")
 	}
 
-	entryOverride := config.RegexEntry{Pattern: pattern, FindFunc: "f", Hints: []string{"prefer-match"}}
+	entryOverride := config.PatternEntry{Regexp: pattern, FindFunc: "f", Hints: []string{"prefer-match"}}
 	pOverride, err := compilePattern(entryOverride, 0, 0, CompileOptions{LikelyMode: LikelyNoMatch})
 	if err != nil {
 		t.Fatalf("compilePattern (caller no-match, pattern hint=match): %v", err)
@@ -2159,7 +2159,7 @@ func TestSetHintsSelectsShuftiFrontend(t *testing.T) {
 		var patternIDs []int
 		for i := 0; i < n; i++ {
 			pat := fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i%len(alphabet)], i)
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -2469,7 +2469,7 @@ func TestTruncate(t *testing.T) {
 func TestVerboseDFAConstructionLimit(t *testing.T) {
 	// Exponential subset construction: `.*a.{14}b` needs a state per
 	// 15-byte window, far past newDFA's internal ceiling.
-	re := config.RegexEntry{Name: "blowup", Pattern: `(?s).*a.{14}b`, FindFunc: "find"}
+	re := config.PatternEntry{Name: "blowup", Regexp: `(?s).*a.{14}b`, FindFunc: "find"}
 	rep := &Reporter{}
 	if _, err := compilePattern(re, 0, 0, CompileOptions{Report: rep, MaxDFAStates: 64, globals: &moduleGlobals{}}); err != nil {
 		t.Fatalf("compilePattern: %v", err)
@@ -2564,14 +2564,14 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 	// `named_groups_func`, now retired — every pattern was
 	// compiled and validated twice with the same config.
 	for _, pat := range []string{`(?:(a){0})`, `(a){0}`} {
-		if _, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}, 65536, true); !errors.Is(err, ErrNoCaptureGroup) {
+		if _, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, 65536, true); !errors.Is(err, ErrNoCaptureGroup) {
 			t.Errorf("%-12q compile: %v, want ErrNoCaptureGroup", pat, err)
 		}
 	}
 	pats := []string{`(a)`, `\A(a)(b)`, `\b(?P<x>a)`}
 	validated := 0
 	for _, pat := range pats {
-		w, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}, 65536, true)
+		w, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, 65536, true)
 		if err != nil {
 			// A FAILURE, not a logged note. These are fixtures the compiler is
 			// expected to handle; treating a compile error as "skip this one"
@@ -2692,8 +2692,8 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 // a report writer: the per-set diagnostics must reach the rendered report.
 func TestCmdCompileVerboseSets(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `foo\w+`}, {Name: "p2", Pattern: `bar\d+`}},
-		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p1", Regexp: `foo\w+`}, {Name: "p2", Regexp: `bar\d+`}},
+		Sets:     []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
 	}
 	var report bytes.Buffer
 	out := filepath.Join(t.TempDir(), "out.wasm")
@@ -2716,7 +2716,7 @@ func TestCmdCompileVerboseSets(t *testing.T) {
 func TestVerboseReportsMode(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out.wasm")
 	var report bytes.Buffer
-	cfg := config.BuildConfig{Regexps: []config.RegexEntry{{Name: "ascii", Pattern: `a.c`, FindFunc: "f"}}}
+	cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Name: "ascii", Regexp: `a.c`, FindFunc: "f"}}}
 	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
 		t.Fatalf("CmdCompileVerbose: %v", err)
 	}
@@ -2724,7 +2724,7 @@ func TestVerboseReportsMode(t *testing.T) {
 		t.Errorf("report does not name byte mode:\n%s", report.String())
 	}
 	report.Reset()
-	cfg = config.BuildConfig{Regexps: []config.RegexEntry{{Name: "letters", Pattern: `\pL+`, FindFunc: "f"}}}
+	cfg = config.BuildConfig{Patterns: []config.PatternEntry{{Name: "letters", Regexp: `\pL+`, FindFunc: "f"}}}
 	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
 		t.Fatalf("CmdCompileVerbose(\\pL+): %v", err)
 	}
@@ -2734,14 +2734,14 @@ func TestVerboseReportsMode(t *testing.T) {
 	// A pattern refused for its mode is reported with it.
 	report.Reset()
 	yes := true
-	cfg = config.BuildConfig{Regexps: []config.RegexEntry{{Name: "both", Pattern: `a`, FindFunc: "f", Unicode: &yes, ByteMode: true}}}
+	cfg = config.BuildConfig{Patterns: []config.PatternEntry{{Name: "both", Regexp: `a`, FindFunc: "f", Unicode: &yes, ByteMode: true}}}
 	err := CmdCompileVerbose(cfg, out, &report)
 	if err == nil || !strings.Contains(err.Error(), "contradict") || !strings.Contains(report.String(), "refused") {
 		t.Errorf("unicode: true with byte_mode: true: err = %v, report:\n%s", err, report.String())
 	}
 	cfg = config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `foo\w+`}},
-		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p1", Regexp: `foo\w+`}},
+		Sets:     []config.SetConfig{{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}}},
 	}
 	_, _, diags, err := CompileFileDiag(cfg, "")
 	if err != nil || len(diags) != 1 || diags[0].Mode != "byte" {
@@ -2750,8 +2750,8 @@ func TestVerboseReportsMode(t *testing.T) {
 	// A set's mode, and what its answer cache costs per input byte.
 	report.Reset()
 	cfg = config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p1", Pattern: `[a-zé]+`}, {Name: "p2", Pattern: `a*`}},
-		Sets:    []config.SetConfig{{Name: "s1", Find: "s1_find", Overlapping: true, Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p1", Regexp: `[a-zé]+`}, {Name: "p2", Regexp: `a*`}},
+		Sets:     []config.SetConfig{{Name: "s1", Find: "s1_find", Overlapping: true, Patterns: config.PatternSelector{All: true}}},
 	}
 	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
 		t.Fatalf("CmdCompileVerbose(set): %v", err)
@@ -2783,8 +2783,8 @@ func TestCompileProgress(t *testing.T) {
 		{`([α-ω]{80})x+`, "g", `regexped: compiling pattern "p": TDFA construction, `},
 	} {
 		out.Reset()
-		re := config.RegexEntry{Name: "p", Pattern: c.pat, FindFunc: "f", GroupsFunc: c.groups}
-		if _, _, err := Compile([]config.RegexEntry{re}, 0, true, CompileOptions{Report: rep()}); err != nil {
+		re := config.PatternEntry{Name: "p", Regexp: c.pat, FindFunc: "f", GroupsFunc: c.groups}
+		if _, _, err := Compile([]config.PatternEntry{re}, 0, true, CompileOptions{Report: rep()}); err != nil {
 			t.Fatal(err)
 		}
 		if got := out.String(); !strings.Contains(got, c.want) || !strings.Contains(got, " of 16384 states so far (") {
@@ -2794,8 +2794,8 @@ func TestCompileProgress(t *testing.T) {
 	// A set: its union automaton, under the set's name.
 	out.Reset()
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "g", Pattern: `[α-ω]{40}\d`}, {Name: "c", Pattern: `[а-я]{40}\d`}},
-		Sets:    []config.SetConfig{{Name: "s", ScanAll: "sl", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "g", Regexp: `[α-ω]{40}\d`}, {Name: "c", Regexp: `[а-я]{40}\d`}},
+		Sets:     []config.SetConfig{{Name: "s", ScanAll: "sl", Patterns: config.PatternSelector{All: true}}},
 	}
 	if _, _, _, err := compileFileDiagReport(cfg, "", CompileSetOptions{}, rep()); err != nil {
 		t.Fatal(err)
@@ -2805,7 +2805,7 @@ func TestCompileProgress(t *testing.T) {
 	}
 	// A short construction never reads the clock often enough to print.
 	out.Reset()
-	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `abc`, FindFunc: "f"}}, 0, true, CompileOptions{Report: rep()}); err != nil {
+	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `abc`, FindFunc: "f"}}, 0, true, CompileOptions{Report: rep()}); err != nil {
 		t.Fatal(err)
 	}
 	if out.Len() != 0 {
@@ -2813,12 +2813,12 @@ func TestCompileProgress(t *testing.T) {
 	}
 	// No writer, no sink; and none left behind once a compile with one ends.
 	noWriter := &Reporter{}
-	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `\pL{5}x`, FindFunc: "f"}}, 0, true,
+	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `\pL{5}x`, FindFunc: "f"}}, 0, true,
 		CompileOptions{Report: noWriter}); err != nil || noWriter.sink != nil {
 		t.Errorf("err %v, sink %v", err, noWriter.sink)
 	}
 	withWriter := rep()
-	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `abc`, FindFunc: "f"}}, 0, true,
+	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `abc`, FindFunc: "f"}}, 0, true,
 		CompileOptions{Report: withWriter}); err != nil || withWriter.sink != nil {
 		t.Errorf("err %v, sink left behind %v", err, withWriter.sink)
 	}
@@ -2840,8 +2840,8 @@ func TestCompileProgressConcurrent(t *testing.T) {
 	var outA, outB bytes.Buffer
 	compileOne := func(wg *sync.WaitGroup, name string, rep *Reporter) {
 		defer wg.Done()
-		re := config.RegexEntry{Name: name, Pattern: `\pL{5}x`, FindFunc: "f"}
-		if _, _, err := Compile([]config.RegexEntry{re}, 0, true, CompileOptions{Report: rep}); err != nil {
+		re := config.PatternEntry{Name: name, Regexp: `\pL{5}x`, FindFunc: "f"}
+		if _, _, err := Compile([]config.PatternEntry{re}, 0, true, CompileOptions{Report: rep}); err != nil {
 			t.Error(err)
 		}
 	}
@@ -2872,29 +2872,29 @@ func TestCompileProgressConcurrent(t *testing.T) {
 // reports the working memory a search keeps per input byte, and a failed
 // compile as failed rather than as a specialised body.
 func TestUnicodeModeLimits(t *testing.T) {
-	compileReport := func(re config.RegexEntry, opts CompileOptions) (string, error) {
+	compileReport := func(re config.PatternEntry, opts CompileOptions) (string, error) {
 		rep := &Reporter{}
 		opts.Unicode, opts.Report = true, rep
-		_, _, err := Compile([]config.RegexEntry{re}, 0, true, opts)
+		_, _, err := Compile([]config.PatternEntry{re}, 0, true, opts)
 		var b bytes.Buffer
 		rep.Render(&b)
 		return b.String(), err
 	}
 
-	r, err := compileReport(config.RegexEntry{Name: "p", Pattern: `\pL{5}x`, FindFunc: "f"}, CompileOptions{})
+	r, err := compileReport(config.PatternEntry{Name: "p", Regexp: `\pL{5}x`, FindFunc: "f"}, CompileOptions{})
 	if err != nil || !strings.Contains(r, "engine: DFA") || !strings.Contains(r, "DFA states 1452 of 16384") {
 		t.Errorf("\\pL{5}x at the Unicode default: err %v, report:\n%s", err, r)
 	}
 
 	for _, c := range []struct {
 		name string
-		re   config.RegexEntry
+		re   config.PatternEntry
 		want []string
 	}{
-		{"find", config.RegexEntry{Name: "p", Pattern: `\pL{25}`, FindFunc: "f"},
+		{"find", config.PatternEntry{Name: "p", Regexp: `\pL{25}`, FindFunc: "f"},
 			[]string{"the find body went to Backtracking", "needs 7251 states, over 1024 (max_dfa_states; raise it",
 				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23302"}},
-		{"match", config.RegexEntry{Name: "p", Pattern: `\pL{25}`, MatchFunc: "m"},
+		{"match", config.PatternEntry{Name: "p", Regexp: `\pL{25}`, MatchFunc: "m"},
 			[]string{"the match body went to Backtracking", "needs 7251 states, over 1024 (max_dfa_states; raise it",
 				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23302"}},
 	} {
@@ -2916,7 +2916,7 @@ func TestUnicodeModeLimits(t *testing.T) {
 	// `\pL+?` makes the captures TDFA-ineligible (a wide class alone no longer
 	// does in Unicode mode); their Backtracking program is over the ceiling —
 	// twenty-five `\pL`s of about 930 instructions each.
-	_, err = compileReport(config.RegexEntry{Name: "p", Pattern: `^(\pL+?)(\pL{24})`, GroupsFunc: "g"}, CompileOptions{})
+	_, err = compileReport(config.PatternEntry{Name: "p", Regexp: `^(\pL+?)(\pL{24})`, GroupsFunc: "g"}, CompileOptions{})
 	if !errors.Is(err, ErrBTProgramTooLarge) || !strings.Contains(err.Error(), "the capture body went to Backtracking because TDFA could not take it") {
 		t.Errorf("capture: err = %v, want the capture body's ErrBTProgramTooLarge", err)
 	}
@@ -2933,18 +2933,18 @@ func TestUnicodeModeLimits(t *testing.T) {
 	}
 
 	// Non-greedy, so Backtracking takes the captures.
-	r, err = compileReport(config.RegexEntry{Name: "p", Pattern: `(\pL+?)@(\pL+)`, GroupsFunc: "g"}, CompileOptions{})
+	r, err = compileReport(config.PatternEntry{Name: "p", Regexp: `(\pL+?)@(\pL+)`, GroupsFunc: "g"}, CompileOptions{})
 	if err != nil || !strings.Contains(r, "memory: Backtracking memo (capture) 7 B per input byte, once its work budget trips") ||
 		!strings.Contains(r, "memory: per-search notes ") {
 		t.Errorf("(\\pL+?)@(\\pL+): err %v, report lacks its memory lines:\n%s", err, r)
 	}
-	r, err = compileReport(config.RegexEntry{Name: "p", Pattern: `\pL+x`, MatchFunc: "m"}, CompileOptions{MaxDFAStates: 1})
+	r, err = compileReport(config.PatternEntry{Name: "p", Regexp: `\pL+x`, MatchFunc: "m"}, CompileOptions{MaxDFAStates: 1})
 	if err != nil || !strings.Contains(r, "memory: Backtracking memo (match)") {
 		t.Errorf("forced Backtracking match: err %v, report lacks its memo line:\n%s", err, r)
 	}
 	// Byte mode keeps its report as it was: no memory lines.
 	rep := &Reporter{}
-	if _, _, err := Compile([]config.RegexEntry{{Name: "p", Pattern: `(\w+)@(\w+)`, GroupsFunc: "g"}}, 0, true,
+	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `(\w+)@(\w+)`, GroupsFunc: "g"}}, 0, true,
 		CompileOptions{ForceByteMode: true, Report: rep, ForceEngine: EngineBacktrack}); err != nil {
 		t.Fatal(err)
 	}
@@ -2954,7 +2954,7 @@ func TestUnicodeModeLimits(t *testing.T) {
 		t.Errorf("byte mode reports memory lines:\n%s", b.String())
 	}
 
-	r, _ = compileReport(config.RegexEntry{Name: "p", Pattern: `a{2000}`, FindFunc: "f"}, CompileOptions{})
+	r, _ = compileReport(config.PatternEntry{Name: "p", Regexp: `a{2000}`, FindFunc: "f"}, CompileOptions{})
 	if !strings.Contains(r, "engine: failed — ") {
 		t.Errorf("a pattern that does not parse is not reported as failed:\n%s", r)
 	}
@@ -2971,19 +2971,19 @@ func TestWarnUnboundedMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bt := config.RegexEntry{Name: "bt", Pattern: `^(aa|a)*b`, GroupsFunc: "bt_groups"}
-	dfa := config.RegexEntry{Name: "dfa", Pattern: `abc`, FindFunc: "dfa_find"}
+	bt := config.PatternEntry{Name: "bt", Regexp: `^(aa|a)*b`, GroupsFunc: "bt_groups"}
+	dfa := config.PatternEntry{Name: "dfa", Regexp: `abc`, FindFunc: "dfa_find"}
 	set := []config.SetConfig{{Name: "s", Find: "s_find", Patterns: config.PatternSelector{Names: []string{"dfa"}}}}
 	cases := []struct {
 		name string
 		cfg  config.BuildConfig
 		want int
 	}{
-		{"backtracking, no cap", config.BuildConfig{Regexps: []config.RegexEntry{bt}}, 1},
-		{"backtracking, capped", config.BuildConfig{Regexps: []config.RegexEntry{bt}, MaxMemory: capped}, 0},
-		{"no backtracking", config.BuildConfig{Regexps: []config.RegexEntry{dfa}}, 0},
-		{"backtracking beside a set, no cap", config.BuildConfig{Regexps: []config.RegexEntry{bt, dfa}, Sets: set}, 1},
-		{"a set, no backtracking", config.BuildConfig{Regexps: []config.RegexEntry{dfa}, Sets: set}, 0},
+		{"backtracking, no cap", config.BuildConfig{Patterns: []config.PatternEntry{bt}}, 1},
+		{"backtracking, capped", config.BuildConfig{Patterns: []config.PatternEntry{bt}, MaxMemory: capped}, 0},
+		{"no backtracking", config.BuildConfig{Patterns: []config.PatternEntry{dfa}}, 0},
+		{"backtracking beside a set, no cap", config.BuildConfig{Patterns: []config.PatternEntry{bt, dfa}, Sets: set}, 1},
+		{"a set, no backtracking", config.BuildConfig{Patterns: []config.PatternEntry{dfa}, Sets: set}, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -3018,7 +3018,7 @@ func TestVerboseReporterNotes(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			o := c.opts
 			o.Report = &Reporter{}
-			if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 65536, true, o); err != nil {
+			if _, _, err := Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "f"}}, 65536, true, o); err != nil {
 				t.Fatalf("Compile(%q): %v", c.pat, err)
 			}
 		})
@@ -3097,9 +3097,9 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		{`\p{Han}+\d`, nil, "switch"},
 	}
 	for _, c := range cases {
-		entry := config.RegexEntry{Pattern: c.pat, FindFunc: "f", Hints: c.hints}
+		entry := config.PatternEntry{Regexp: c.pat, FindFunc: "f", Hints: c.hints}
 		r := &Reporter{}
-		w, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{Report: r})
+		w, _, err := Compile([]config.PatternEntry{entry}, 0, true, CompileOptions{Report: r})
 		if err != nil {
 			t.Fatalf("%s %v: %v", c.pat, c.hints, err)
 		}
@@ -3114,7 +3114,7 @@ func TestFindClassifierVerdicts(t *testing.T) {
 			t.Errorf("%s %v: find %q, want %q (notes %v)", c.pat, c.hints, got, c.want, r.Patterns[0].Notes)
 		}
 		if c.want == "today" {
-			today, _, err := Compile([]config.RegexEntry{entry}, 0, true, CompileOptions{TodayFind: true})
+			today, _, err := Compile([]config.PatternEntry{entry}, 0, true, CompileOptions{TodayFind: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3163,7 +3163,7 @@ func TestVerboseReportsTheStartAnywhereFind(t *testing.T) {
 		{`[a-z]+[0-9]{3}`, LikelyNeutral},
 	} {
 		r := &Reporter{}
-		if _, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "f"}}, 0, true,
+		if _, _, err := Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "f"}}, 0, true,
 			CompileOptions{LikelyMode: c.lm, Report: r}); err != nil {
 			t.Fatal(err)
 		}
@@ -3280,7 +3280,7 @@ func TestFindStrategyOverrides(t *testing.T) {
 		r := &Reporter{}
 		o := c.opts
 		o.Report = r
-		if _, _, err := Compile([]config.RegexEntry{{Pattern: `[a-z]+@example\.com`, FindFunc: "f"}}, 0, true, o); err != nil {
+		if _, _, err := Compile([]config.PatternEntry{{Regexp: `[a-z]+@example\.com`, FindFunc: "f"}}, 0, true, o); err != nil {
 			t.Fatal(err)
 		}
 		r.End()
@@ -3315,7 +3315,7 @@ func TestFindStrategiesValidate(t *testing.T) {
 			for _, st := range strategies {
 				o := st
 				o.LikelyMode = lm
-				w, _, err := Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "f"}}, 0, true, o)
+				w, _, err := Compile([]config.PatternEntry{{Regexp: pat, FindFunc: "f"}}, 0, true, o)
 				if err != nil {
 					t.Fatalf("%s %v %+v: %v", pat, lm, st, err)
 				}
@@ -3348,10 +3348,10 @@ func TestOddShapesValidate(t *testing.T) {
 		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
 			// groups on `(?:p)()`: most shapes have no capture group of their
 			// own, and groups_func on one is refused (ErrNoCaptureGroup).
-			for _, e := range []config.RegexEntry{
-				{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}, {Pattern: "(?:" + p + ")()", GroupsFunc: "g"},
+			for _, e := range []config.PatternEntry{
+				{Regexp: p, MatchFunc: "m"}, {Regexp: p, FindFunc: "f"}, {Regexp: "(?:" + p + ")()", GroupsFunc: "g"},
 			} {
-				w, _, err := Compile([]config.RegexEntry{e}, 0, true, CompileOptions{LikelyMode: lm})
+				w, _, err := Compile([]config.PatternEntry{e}, 0, true, CompileOptions{LikelyMode: lm})
 				if err != nil {
 					t.Fatalf("%s %v: %v", p, lm, err)
 				}
@@ -3397,10 +3397,10 @@ func TestScanSplitOnlyAgreesOnAllForm(t *testing.T) {
 	sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "sa", Overlapping: true,
 		Patterns: config.PatternSelector{All: true}}
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "a", Pattern: `foo\w+`},
-			{Name: "b", Pattern: `a[ab]{12}c[a-z]*z`},
-			{Name: "c", Pattern: `\bbar\b`},
+		Patterns: []config.PatternEntry{
+			{Name: "a", Regexp: `foo\w+`},
+			{Name: "b", Regexp: `a[ab]{12}c[a-z]*z`},
+			{Name: "c", Regexp: `\bbar\b`},
 		},
 		Sets: []config.SetConfig{sc},
 	}
@@ -3457,8 +3457,8 @@ func TestSetSplitRule(t *testing.T) {
 		{`a[ab]{11}c[a-z]*X`, true},
 	} {
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "p", Pattern: c.pat}},
-			Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+			Patterns: []config.PatternEntry{{Name: "p", Regexp: c.pat}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
 		}
 		_, _, diags, err := CompileFileDiag(cfg, "")
 		if err != nil {
@@ -3477,11 +3477,11 @@ func TestSetSplitRule(t *testing.T) {
 	// a set with more members than one byte of local indices addresses splits
 	// every one of them.
 	for _, n := range []int{24, 40} {
-		var regexps []config.RegexEntry
+		var regexps []config.PatternEntry
 		for i := 0; i < n; i++ {
-			regexps = append(regexps, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`[a-z]+Q%d`, i)})
+			regexps = append(regexps, config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: fmt.Sprintf(`[a-z]+Q%d`, i)})
 		}
-		cfg := config.BuildConfig{Regexps: regexps,
+		cfg := config.BuildConfig{Patterns: regexps,
 			Sets: []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}}}
 		_, _, diags, err := CompileFileDiag(cfg, "")
 		if err != nil {
@@ -3499,9 +3499,9 @@ func TestSetSplitRule(t *testing.T) {
 // Backtracking, a second set compiled after a first allocated i64 globals, and
 // a spec built without its id space.
 func TestSetSplitPaths(t *testing.T) {
-	compileDiag := func(t *testing.T, regexps []config.RegexEntry, sets []config.SetConfig) []SetDiag {
+	compileDiag := func(t *testing.T, regexps []config.PatternEntry, sets []config.SetConfig) []SetDiag {
 		t.Helper()
-		_, _, diags, err := CompileFileDiag(config.BuildConfig{Regexps: regexps, Sets: sets}, "")
+		_, _, diags, err := CompileFileDiag(config.BuildConfig{Patterns: regexps, Sets: sets}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3510,7 +3510,7 @@ func TestSetSplitPaths(t *testing.T) {
 	all := config.PatternSelector{All: true}
 
 	t.Run("scan pair with an assertion member", func(t *testing.T) {
-		d := compileDiag(t, []config.RegexEntry{{Name: "p", Pattern: `\b[a-z]+X`}},
+		d := compileDiag(t, []config.PatternEntry{{Name: "p", Regexp: `\b[a-z]+X`}},
 			[]config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl", Patterns: all}})
 		if len(d[0].SplitMembers) != 1 {
 			t.Errorf("split members %v, want the one member", d[0].SplitMembers)
@@ -3518,7 +3518,7 @@ func TestSetSplitPaths(t *testing.T) {
 	})
 
 	t.Run("no-cache companion on Backtracking", func(t *testing.T) {
-		d := compileDiag(t, []config.RegexEntry{{Name: "a", Pattern: `a+`}, {Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}},
+		d := compileDiag(t, []config.PatternEntry{{Name: "a", Regexp: `a+`}, {Name: "b", Regexp: `a[ab]{11}c[a-z]*X`}},
 			[]config.SetConfig{{Name: "s", Find: "f", Overlapping: true, Patterns: all}})
 		if len(d[0].NoCacheSplitBacktracking) != 1 {
 			t.Errorf("companion Backtracking members %v, want member 1", d[0].NoCacheSplitBacktracking)
@@ -3527,7 +3527,7 @@ func TestSetSplitPaths(t *testing.T) {
 
 	t.Run("a second set after i64 globals", func(t *testing.T) {
 		d := compileDiag(t,
-			[]config.RegexEntry{{Name: "b", Pattern: `a[ab]{11}c[a-z]*X`}, {Name: "c", Pattern: `[a-z]+Q`}},
+			[]config.PatternEntry{{Name: "b", Regexp: `a[ab]{11}c[a-z]*X`}, {Name: "c", Regexp: `[a-z]+Q`}},
 			[]config.SetConfig{
 				{Name: "s1", Find: "f1", Patterns: config.PatternSelector{Names: []string{"b"}}},
 				{Name: "s2", Find: "f2", Patterns: config.PatternSelector{Names: []string{"c"}}},
@@ -3544,12 +3544,12 @@ func TestSetSplitPaths(t *testing.T) {
 		prev := splitMergeLocalMembers
 		splitMergeLocalMembers = 0
 		defer func() { splitMergeLocalMembers = prev }()
-		regexps := []config.RegexEntry{
-			{Name: "a", Pattern: `[a-z]+Q`}, {Name: "b", Pattern: `foo\w+bar|foo`},
-			{Name: "c", Pattern: `a[ab]{11}c[a-z]*X`}, {Name: "d", Pattern: `AKIA[A-Z0-9]{16}`},
+		regexps := []config.PatternEntry{
+			{Name: "a", Regexp: `[a-z]+Q`}, {Name: "b", Regexp: `foo\w+bar|foo`},
+			{Name: "c", Regexp: `a[ab]{11}c[a-z]*X`}, {Name: "d", Regexp: `AKIA[A-Z0-9]{16}`},
 		}
 		for _, output := range []string{"", "merged.wasm"} {
-			wasm, _, d, err := CompileFileDiag(config.BuildConfig{Output: output, Regexps: regexps,
+			wasm, _, d, err := CompileFileDiag(config.BuildConfig{Output: output, Patterns: regexps,
 				Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sl", Patterns: all}}}, "")
 			if err != nil {
 				t.Fatal(err)
@@ -3571,8 +3571,8 @@ func TestSetSplitPaths(t *testing.T) {
 			t.Fatal("btFindBuildable = false; want the Backtracking find to take it")
 		}
 		wasm, _, d, err := CompileFileDiag(config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "z", Pattern: pat}},
-			Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: all}},
+			Patterns: []config.PatternEntry{{Name: "z", Regexp: pat}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "f", Patterns: all}},
 		}, "")
 		if err != nil {
 			t.Fatal(err)
@@ -3603,7 +3603,7 @@ func TestSetSplitPaths(t *testing.T) {
 
 	t.Run("a spec without its id space", func(t *testing.T) {
 		var prefixPool, suffixPool dfaPool
-		info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z]+X`}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: `[a-z]+X`}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3656,19 +3656,19 @@ func TestSetSplitBudget(t *testing.T) {
 // not a merged one); nothing for an export that keeps no block; and one block
 // per split member for a set, under `find` and its batch entry's names alike.
 func TestSearchSizes(t *testing.T) {
-	regexps := []config.RegexEntry{
-		{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun_find"},
-		{Name: "overrun_groups", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
-		{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
-		{Name: "plain", Pattern: `abc`, FindFunc: "plain_find"},
-		{Name: "split_member", Pattern: `foo\w+bar|foo`},
-		{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
+	regexps := []config.PatternEntry{
+		{Name: "overrun", Regexp: `a*b|a`, FindFunc: "overrun_find"},
+		{Name: "overrun_groups", Regexp: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+		{Name: "bt", Regexp: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+		{Name: "plain", Regexp: `abc`, FindFunc: "plain_find"},
+		{Name: "split_member", Regexp: `foo\w+bar|foo`},
+		{Name: "aws", Regexp: `AKIA[A-Z0-9]{16}`},
 	}
 	sets := []config.SetConfig{{Name: "split", Find: "scan_split",
 		Patterns: config.PatternSelector{Names: []string{"split_member", "aws"}}},
 		{Name: "plain", Find: "scan_plain", Patterns: config.PatternSelector{Names: []string{"aws"}}}}
 	for _, merged := range []bool{false, true} {
-		cfg := config.BuildConfig{ImportModule: "m", Regexps: regexps, Sets: sets}
+		cfg := config.BuildConfig{ImportModule: "m", Patterns: regexps, Sets: sets}
 		if merged {
 			cfg.Output = "merged.wasm"
 		}
@@ -3699,7 +3699,7 @@ func TestSearchSizes(t *testing.T) {
 		}
 	}
 	if _, err := SearchSizes(config.BuildConfig{ImportModule: "m",
-		Regexps: []config.RegexEntry{{Name: "x", Pattern: `(`, FindFunc: "f"}}}); err == nil {
+		Patterns: []config.PatternEntry{{Name: "x", Regexp: `(`, FindFunc: "f"}}}); err == nil {
 		t.Error("a config that does not compile gave sizes rather than an error")
 	}
 

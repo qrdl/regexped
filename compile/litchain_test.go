@@ -427,7 +427,7 @@ func TestLitChainRangeMatchBodyCompiles(t *testing.T) {
 		t.Run(pattern, func(t *testing.T) {
 			// Match-only: the find half of this path deliberately rejects
 			// anchored ranges and falls back to the DFA.
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 		})
 	}
 }
@@ -701,7 +701,7 @@ func TestLitChainRangeGroupsCompiles(t *testing.T) {
 				t.Fatalf("analyseLitChainGroupsRange(%q) rejected the shape, so the "+
 					"range groups body is not the path under test", pattern)
 			}
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 		})
 	}
 }
@@ -735,7 +735,7 @@ func TestLitChainAltLayoutOneByteLiteral(t *testing.T) {
 			t.Errorf("%q: second-byte tables placed at %d/%d without 2-byte Teddy",
 				tc.pattern, l.teddyT1LoOff, l.teddyT1HiOff)
 		}
-		wasm, _, err := Compile([]config.RegexEntry{{Pattern: tc.pattern, MatchFunc: "m", FindFunc: "f"}}, 0, true)
+		wasm, _, err := Compile([]config.PatternEntry{{Regexp: tc.pattern, MatchFunc: "m", FindFunc: "f"}}, 0, true)
 		if err != nil {
 			t.Fatalf("%q: %v", tc.pattern, err)
 		}
@@ -960,7 +960,7 @@ func TestLenAltMatchBodyCompiles(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 		})
 	}
 }
@@ -983,7 +983,7 @@ func TestLenAltMatchBodyGatedCompressed(t *testing.T) {
 	if !found {
 		t.Fatal("no compressed DFA branch with a run skip: the shape no longer reaches the gated walk's compressed step")
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 }
 
 // Regression tests for the lit-chain anchored/find body defects.
@@ -1687,7 +1687,7 @@ func TestBuildSimplePrefixCheckBody(t *testing.T) {
 // reaches this path — see the alt-lit-anchor dispatch test for the analogous
 // alternation case.
 func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
-	entry := config.RegexEntry{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f"}
+	entry := config.PatternEntry{Regexp: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f"}
 
 	p, err := compilePattern(entry, 0, 0, CompileOptions{LikelyMode: LikelyNoMatch})
 	if err != nil {
@@ -1696,7 +1696,7 @@ func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
 	if p.litAnchorBackScanBody == nil {
 		t.Fatal("compilePattern did not take the lit-anchor path")
 	}
-	re, _ := syntax.Parse(entry.Pattern, syntax.Perl)
+	re, _ := syntax.Parse(entry.Regexp, syntax.Perl)
 	lap := findLitAnchorPointInRegexp(re, false, nil)
 	if lap == nil {
 		t.Fatal("findLitAnchorPointInRegexp returned nil")
@@ -1720,7 +1720,7 @@ func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
 		t.Error("LikelyNeutral unexpectedly took the buildSimplePrefixCheckBody shortcut")
 	}
 
-	mustCompileEntries(t, []config.RegexEntry{entry}, CompileOptions{LikelyMode: LikelyNoMatch})
+	mustCompileEntries(t, []config.PatternEntry{entry}, CompileOptions{LikelyMode: LikelyNoMatch})
 }
 
 func TestFindAltLitAnchorPoints(t *testing.T) {
@@ -1807,7 +1807,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 // shape, so it falls through to this path instead.
 func TestCompileAltLitAnchorDispatch(t *testing.T) {
 	pattern := `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`
-	entry := config.RegexEntry{Pattern: pattern, FindFunc: "f"}
+	entry := config.PatternEntry{Regexp: pattern, FindFunc: "f"}
 
 	p, err := compilePattern(entry, 0, 0, CompileOptions{})
 	if err != nil {
@@ -1828,7 +1828,7 @@ func TestCompileAltLitAnchorDispatch(t *testing.T) {
 		}
 	}
 
-	mustCompileEntries(t, []config.RegexEntry{entry})
+	mustCompileEntries(t, []config.PatternEntry{entry})
 }
 
 // ccpLayout builds a find-mode layout the way appendFindCodeEntry's callers do,

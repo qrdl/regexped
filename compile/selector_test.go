@@ -636,7 +636,7 @@ func TestDFAStateLimitBailsOutFast(t *testing.T) {
 		// End-to-end: MaxDFAStates left at its default (1024) — the pattern
 		// must compile successfully (falling back to Backtracking), not
 		// hang and not hard-error.
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "f"}})
 	})
 }
 
@@ -1025,8 +1025,8 @@ func TestSelectEngineAnalysesTheUnloweredProgram(t *testing.T) {
 		if _, err := SelectEngine(pat, CompileOptions{Unicode: true}); err != nil {
 			t.Errorf("SelectEngine(%q, Unicode): %v", pat, err)
 		}
-		e := config.RegexEntry{Pattern: pat, GroupsFunc: "g"}
-		if _, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{Unicode: true}); err != nil {
+		e := config.PatternEntry{Regexp: pat, GroupsFunc: "g"}
+		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{Unicode: true}); err != nil {
 			t.Errorf("Compile(%q, Unicode): %v", pat, err)
 		}
 	}

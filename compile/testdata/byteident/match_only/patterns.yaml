@@ -1,4 +1,4 @@
 # match_func alone: captures are stripped and only the anchored body is emitted.
-regexps:
-  - pattern: '(?:https?)://(?:[^/]+)/(?:.*)'
+patterns:
+  - regexp: '(?:https?)://(?:[^/]+)/(?:.*)'
     match_func: only_match

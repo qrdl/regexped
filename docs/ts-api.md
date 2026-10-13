@@ -204,8 +204,11 @@ an early `break`. Until 2026-08-25 this was not true: one shared staging address
 meant an interleaved call left a suspended generator scanning another string's
 bytes, silently.
 
-`patternName(id)` is emitted once per config when any set sets
-`emit_name_map: true`.
+`<set>PatternName(id: number): string` — `secretsPatternName` for a set named
+`secrets` — is emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ### `batchSize` — the same matches, a bufferful per call
 

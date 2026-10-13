@@ -443,9 +443,9 @@ func TestSetComponentCacheGeometry(t *testing.T) {
 		WasmFormat:   "component",
 		ImportModule: "t",
 		WitPackage:   "t",
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: `[^\n]*[0-2]`},
-			{Name: "p1", Pattern: `[^\n]*[3-5]`},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: `[^\n]*[0-2]`},
+			{Name: "p1", Regexp: `[^\n]*[3-5]`},
 		},
 		Sets: []config.SetConfig{{
 			Name:        "s",
@@ -749,7 +749,7 @@ func shuftiCompiledSetOpts(t *testing.T, over func(*CompileSetOptions)) *compile
 	var ids []int
 	for i := 0; i < teddyMaxLiterals+1; i++ {
 		pat := fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i%len(alphabet)], i)
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -860,7 +860,7 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 	var patterns []*PatternInfo
 	var ids []int
 	for i, pat := range []string{`a+`, `[^\n]*ERROR`, `x?y`} {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -898,9 +898,9 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 // actually did.
 func TestSetAdmitsBacktracking(t *testing.T) {
 	pats := []string{`a+`, `[^\n]*ERROR`}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name: "s", MatchAll: "m_all", Find: "f",
@@ -908,13 +908,13 @@ func TestSetAdmitsBacktracking(t *testing.T) {
 	}
 
 	// A generous fallback budget: every member gets a DFA, so no BT.
-	roomy := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	roomy := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 	if SetAdmitsBacktracking(sc, roomy) {
 		t.Error("a set whose members all fit their DFA budget must not admit Backtracking")
 	}
 	// A budget no fallback DFA can meet: every member lands on BT.
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: 1,
+		Patterns: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(sc, cramped) {
 		t.Error("max_fallback_states = 1 must push these members onto Backtracking")
@@ -1058,8 +1058,8 @@ func TestNeedsUnicodeSupportExported(t *testing.T) {
 // Backtracking and compare — which is only meaningful if the override is
 // actually honoured, and nothing here checked that it was.
 func TestCompileForcedSelectsTheNamedEngine(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Name: "p", Pattern: `(a+)(b+)`, GroupsFunc: "p_groups"},
+	entries := []config.PatternEntry{
+		{Name: "p", Regexp: `(a+)(b+)`, GroupsFunc: "p_groups"},
 	}
 	for _, forced := range []EngineType{EngineTDFA, EngineBacktrack} {
 		wasm, _, err := CompileForced(entries, 65536, true, forced)
@@ -1213,11 +1213,11 @@ func TestUnicodeFindBodiesKeepTheStartRule(t *testing.T) {
 		if c.fallback {
 			o.BTWorkBudget = BTWorkBudgetForceFallback
 		}
-		w, _, err := Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, 0, true, o)
+		w, _, err := Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, 0, true, o)
 		if err != nil || len(w) == 0 {
 			t.Fatalf("%q: compile: %v", c.pat, err)
 		}
-		p, err := compilePattern(config.RegexEntry{Pattern: c.pat, FindFunc: "find"}, 0, 0,
+		p, err := compilePattern(config.PatternEntry{Regexp: c.pat, FindFunc: "find"}, 0, 0,
 			CompileOptions{Unicode: true, MaxDFAStates: c.maxStates, BTWorkBudget: o.BTWorkBudget, globals: &moduleGlobals{}})
 		if err != nil {
 			t.Fatalf("%q: compilePattern: %v", c.pat, err)
@@ -1520,7 +1520,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 		var prefixPool, suffixPool dfaPool
 		var out []*PatternInfo
 		for _, p := range pats {
-			info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1655,25 +1655,25 @@ func TestPrefixScanCharProbe(t *testing.T) {
 	// Through a compile: a Unicode literal gets the check, the same bytes as
 	// a byte_mode literal do not.
 	for _, c := range []struct {
-		re   config.RegexEntry
+		re   config.PatternEntry
 		opts CompileOptions
 		want bool
 	}{
-		{config.RegexEntry{Pattern: `привет\s+\pL+`, FindFunc: "f"}, CompileOptions{}, true},
-		{config.RegexEntry{Pattern: `\xd0\xbf\xd1\x80[0-9a-f]{300}`, FindFunc: "f", ByteMode: true}, CompileOptions{}, false},
+		{config.PatternEntry{Regexp: `привет\s+\pL+`, FindFunc: "f"}, CompileOptions{}, true},
+		{config.PatternEntry{Regexp: `\xd0\xbf\xd1\x80[0-9a-f]{300}`, FindFunc: "f", ByteMode: true}, CompileOptions{}, false},
 	} {
 		rep := &Reporter{}
 		c.opts.Report = rep
-		if _, _, err := Compile([]config.RegexEntry{c.re}, 65536, true, c.opts); err != nil {
-			t.Fatalf("Compile(%q): %v", c.re.Pattern, err)
+		if _, _, err := Compile([]config.PatternEntry{c.re}, 65536, true, c.opts); err != nil {
+			t.Fatalf("Compile(%q): %v", c.re.Regexp, err)
 		}
 		var b bytes.Buffer
 		rep.Render(&b)
 		if !strings.Contains(b.String(), "prefix scan: hybrid SIMD") {
-			t.Fatalf("Compile(%q): no hybrid prefix scan, so the check is not exercised:\n%s", c.re.Pattern, b.String())
+			t.Fatalf("Compile(%q): no hybrid prefix scan, so the check is not exercised:\n%s", c.re.Regexp, b.String())
 		}
 		if got := strings.Contains(b.String(), "first character checked on a hit"); got != c.want {
-			t.Errorf("Compile(%q): first-character check reported %v, want %v:\n%s", c.re.Pattern, got, c.want, b.String())
+			t.Errorf("Compile(%q): first-character check reported %v, want %v:\n%s", c.re.Regexp, got, c.want, b.String())
 		}
 	}
 }

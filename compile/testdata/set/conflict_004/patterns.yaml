@@ -9,8 +9,8 @@ options:
   budget_bytes: 1048576
   budget_states_prefilter: 65536
 patterns:
-  - pattern: 'qux[a-z]+'
-  - pattern: 'qux[0-9]+'
+  - regexp: 'qux[a-z]+'
+  - regexp: 'qux[0-9]+'
 expect:
   bucket_count: 2
   conflict_reasons:

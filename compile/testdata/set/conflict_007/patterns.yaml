@@ -5,8 +5,8 @@
 options:
   budget_states: 1
 patterns:
-  - pattern: '(?:error|warn|fatal)'
-  - pattern: '(?:foo|bar|baz)\d+'
+  - regexp: '(?:error|warn|fatal)'
+  - regexp: '(?:foo|bar|baz)\d+'
 expect:
   bucket_count: 2
   fallback_count: 2

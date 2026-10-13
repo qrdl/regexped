@@ -394,8 +394,8 @@ func TestPrefixResumeDivergenceArms(t *testing.T) {
 
 			// Emit for real: this is what executes the arm's bytecode-building
 			// statements and validates that what it built is a legal module.
-			mustCompileEntries(t, []config.RegexEntry{{
-				Pattern:  testCase.pattern,
+			mustCompileEntries(t, []config.PatternEntry{{
+				Regexp:   testCase.pattern,
 				FindFunc: "diverge_find",
 			}})
 		})
@@ -440,7 +440,7 @@ func TestPrefixResumeConstantArmStillReached(t *testing.T) {
 		t.Errorf("an unanchored literal-prefix pattern selects the %q arm, want %q",
 			arm, armConstant)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "constant_find"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "constant_find"}})
 }
 
 // Unit coverage for the small routers and pure helpers that decide what the

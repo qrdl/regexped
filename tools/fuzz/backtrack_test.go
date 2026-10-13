@@ -56,9 +56,9 @@ func TestBTFindMemoIsLinearInInputLength(t *testing.T) {
 	// zero-width cycle, so the memoised fallback answers), a DFA squeezed past
 	// its limit (so the pattern reaches Backtracking for find at all), and a
 	// no-match input (so every start position is attempted).
-	entry := config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"}
+	entry := config.PatternEntry{Regexp: `(?:a?)+?xyz`, FindFunc: "find"}
 	opts := compile.CompileOptions{MaxDFAStates: 1}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, opts)
+	w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, opts)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestSetBTMemoIsLinearInInputLength(t *testing.T) {
 	// leading byte so most positions are candidates that FAIL fast, and a
 	// match at the very end so the drive scans the whole input.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p0", Pattern: `q(?:a?)+?z`}},
+		Patterns: []config.PatternEntry{{Name: "p0", Regexp: `q(?:a?)+?z`}},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "set_find",
 			Patterns: config.PatternSelector{Names: []string{"p0"}},
@@ -418,7 +418,7 @@ func TestSetBTMemberRegionReplacedBelowOrigin(t *testing.T) {
 	names := []string{"p0", "p1"}
 	cfg := config.BuildConfig{
 		MaxDFAStates: 1,
-		Regexps:      []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Patterns:     []config.PatternEntry{{Name: "p0", Regexp: pats[0]}, {Name: "p1", Regexp: pats[1]}},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 			Patterns: config.PatternSelector{Names: names},
@@ -557,10 +557,10 @@ func TestSetBTHostCallIsLinear(t *testing.T) {
 	names := []string{"p0", "p1", "p2"}
 	cfg := config.BuildConfig{
 		MaxDFAStates: 1,
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: `(\w*|)*c`},
-			{Name: "p1", Pattern: `bar[0-9]+`},
-			{Name: "p2", Pattern: `(aa|a)*b`},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: `(\w*|)*c`},
+			{Name: "p1", Regexp: `bar[0-9]+`},
+			{Name: "p2", Regexp: `(aa|a)*b`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "set_find", ScanAll: "set_scan_all",
@@ -688,10 +688,10 @@ func TestSetScanAllStopsProbingMatchedPatterns(t *testing.T) {
 	names := []string{"p0", "p1", "p2"}
 	cfg := config.BuildConfig{
 		MaxDFAStates: 1,
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: `(\w*|)*c`},
-			{Name: "p1", Pattern: `bar[0-9]+`},
-			{Name: "p2", Pattern: `(aa|a)*b`},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: `(\w*|)*c`},
+			{Name: "p1", Regexp: `bar[0-9]+`},
+			{Name: "p2", Regexp: `(aa|a)*b`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", ScanAll: "set_scan_all",
@@ -865,7 +865,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		entry  config.RegexEntry
+		entry  config.PatternEntry
 		opts   []compile.CompileOptions
 		export string
 		extra  []int32
@@ -878,7 +878,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 		{
 			// buildBacktrackBody — the capture body, shared with set BT buckets.
 			name:   "groups/html-tags",
-			entry:  config.RegexEntry{Pattern: htmlTagsPattern, GroupsFunc: "groups"},
+			entry:  config.PatternEntry{Regexp: htmlTagsPattern, GroupsFunc: "groups"},
 			export: "groups", extra: []int32{pathsOutBase, 0},
 			wrap:   func(a string) string { return "<" + a + ">" },
 			answer: func(_ string, loc []int) int64 { return int64(loc[1]) },
@@ -886,7 +886,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 		{
 			// buildBTMatchBody.
 			name:   "match",
-			entry:  config.RegexEntry{Pattern: `(?:a?)+?b`, MatchFunc: "match"},
+			entry:  config.PatternEntry{Regexp: `(?:a?)+?b`, MatchFunc: "match"},
 			opts:   []compile.CompileOptions{squeezed},
 			export: "match",
 			wrap:   func(a string) string { return a + "b" },
@@ -895,7 +895,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 		{
 			// buildBTFindBody, general-scan branch.
 			name:   "find/general-scan",
-			entry:  config.RegexEntry{Pattern: `(?:a?)+?`, FindFunc: "find"},
+			entry:  config.PatternEntry{Regexp: `(?:a?)+?`, FindFunc: "find"},
 			opts:   []compile.CompileOptions{squeezed},
 			export: "find", extra: []int32{0},
 			wrap:   func(a string) string { return a },
@@ -905,7 +905,7 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 			// buildBTFindBody, mandatory-literal branch — a separate emission
 			// site with its own copy of the fill.
 			name:   "find/mandatory-literal",
-			entry:  config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"},
+			entry:  config.PatternEntry{Regexp: `(?:a?)+?xyz`, FindFunc: "find"},
 			opts:   []compile.CompileOptions{squeezed},
 			export: "find", extra: []int32{0},
 			wrap:   func(a string) string { return a + "xyz" },
@@ -918,11 +918,11 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w, _, err := compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, tc.opts...)
+			w, _, err := compile.Compile([]config.PatternEntry{tc.entry}, pathsTableBase, true, tc.opts...)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			re := regexp.MustCompile(tc.entry.Pattern)
+			re := regexp.MustCompile(tc.entry.Regexp)
 
 			for _, n := range lengths {
 				in := tc.wrap(strings.Repeat("a", n))
@@ -961,13 +961,13 @@ func TestBTMemoOverflowIsGuarded(t *testing.T) {
 func TestBTFallbackFindAnswersLongInputs(t *testing.T) {
 	const pattern = `Z(?:a?)+?xyz`
 	const length = 60000
-	entry := config.RegexEntry{Pattern: pattern, FindFunc: "find"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+	entry := config.PatternEntry{Regexp: pattern, FindFunc: "find"}
+	w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true,
 		compile.CompileOptions{MaxDFAStates: 1})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	off, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+	off, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true,
 		compile.CompileOptions{MaxDFAStates: 1, BTWorkBudget: compile.BTWorkBudgetOff})
 	if err != nil {
 		t.Fatalf("compile (budget off): %v", err)
@@ -1116,7 +1116,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		entry     config.RegexEntry
+		entry     config.PatternEntry
 		opts      []compile.CompileOptions
 		export    string
 		extra     []int32
@@ -1132,7 +1132,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 	}{
 		{
 			name:      "groups",
-			entry:     config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups"},
+			entry:     config.PatternEntry{Regexp: btCapturePattern, GroupsFunc: "groups"},
 			export:    "groups",
 			extra:     []int32{pathsOutBase, 0}, // out_ptr, from
 			ok:        capIn(8191),
@@ -1144,7 +1144,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		},
 		{
 			name:      "groups_batch",
-			entry:     config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups", Hints: []string{"batch-find"}},
+			entry:     config.PatternEntry{Regexp: btCapturePattern, GroupsFunc: "groups", Hints: []string{"batch-find"}},
 			export:    "groups_batch",
 			extra:     []int32{pathsOutBase, 16, 0},
 			ok:        capIn(8191),
@@ -1155,7 +1155,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		},
 		{
 			name:          "match",
-			entry:         config.RegexEntry{Pattern: btNoCapturePattern, MatchFunc: "match"},
+			entry:         config.PatternEntry{Regexp: btNoCapturePattern, MatchFunc: "match"},
 			opts:          []compile.CompileOptions{squeezed},
 			export:        "match",
 			ok:            noCapIn(4000),
@@ -1167,7 +1167,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		},
 		{
 			name:          "find",
-			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find"},
+			entry:         config.PatternEntry{Regexp: btNoCapturePattern, FindFunc: "find"},
 			opts:          []compile.CompileOptions{squeezed},
 			export:        "find",
 			extra:         []int32{0}, // `from` — find is (ptr, len, from)
@@ -1180,7 +1180,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 		},
 		{
 			name:          "find_batch",
-			entry:         config.RegexEntry{Pattern: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
+			entry:         config.PatternEntry{Regexp: btNoCapturePattern, FindFunc: "find", Hints: []string{"batch-find"}},
 			opts:          []compile.CompileOptions{squeezed},
 			export:        "find_batch",
 			extra:         []int32{pathsOutBase, 16, 0},
@@ -1195,7 +1195,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w, _, err := compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, tc.offOpts...)
+			w, _, err := compile.Compile([]config.PatternEntry{tc.entry}, pathsTableBase, true, tc.offOpts...)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -1211,7 +1211,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if w, _, err = compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, capped); err != nil {
+				if w, _, err = compile.Compile([]config.PatternEntry{tc.entry}, pathsTableBase, true, capped); err != nil {
 					t.Fatalf("compile (capped): %v", err)
 				}
 			}
@@ -1219,11 +1219,11 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			// Both inputs genuinely match, so NoMatch is the wrong answer for
 			// either one — which is what made the old behaviour a false
 			// negative rather than a merely imprecise one.
-			re := regexp.MustCompile(tc.entry.Pattern)
+			re := regexp.MustCompile(tc.entry.Regexp)
 			for _, in := range []string{tc.ok, tc.blown} {
 				if !re.MatchString(in) {
 					t.Fatalf("test input of %d bytes does not match %s — fixture is wrong",
-						len(in), tc.entry.Pattern)
+						len(in), tc.entry.Regexp)
 				}
 			}
 
@@ -1243,7 +1243,7 @@ func TestBTStackOverflowIsDistinguishable(t *testing.T) {
 			}
 
 			// Shipped: the overflow hands the call to the fallback.
-			w, _, err = compile.Compile([]config.RegexEntry{tc.entry}, pathsTableBase, true, tc.opts...)
+			w, _, err = compile.Compile([]config.PatternEntry{tc.entry}, pathsTableBase, true, tc.opts...)
 			if err != nil {
 				t.Fatalf("compile (budget on): %v", err)
 			}
@@ -1342,7 +1342,7 @@ func TestBTCaptureStackGrows(t *testing.T) {
 	small, big := strings.Repeat("a", 100)+"c", strings.Repeat("a", btCaptureBlown)+"c"
 	for _, start := range []int{64 << 10, 256 << 10} {
 		t.Run(fmt.Sprintf("start-%dKiB", start>>10), func(t *testing.T) {
-			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: btCapturePattern, GroupsFunc: "groups"}},
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: btCapturePattern, GroupsFunc: "groups"}},
 				pathsTableBase, true, compile.CompileOptions{BTWorkBudget: compile.BTWorkBudgetOff, BTStackStart: start})
 			if err != nil {
 				t.Fatalf("compile: %v", err)
@@ -1381,10 +1381,10 @@ func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
 	memCap := btCaptureCap(t)
 	capPages, _ := memCap.Pages()
 	small, big := strings.Repeat("a", 100)+"c", strings.Repeat("a", btCaptureBlown)+"c"
-	entry := config.RegexEntry{Pattern: btCapturePattern, GroupsFunc: "groups"}
+	entry := config.PatternEntry{Regexp: btCapturePattern, GroupsFunc: "groups"}
 
 	t.Run("standalone", func(t *testing.T) {
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true, compile.CompileOptions{MaxMemory: memCap})
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, compile.CompileOptions{MaxMemory: memCap})
 		if err != nil {
 			t.Fatalf("compile: %v", err)
 		}
@@ -1405,7 +1405,7 @@ func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
 	})
 
 	t.Run("embedded", func(t *testing.T) {
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, 0, false, compile.CompileOptions{MaxMemory: memCap})
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, 0, false, compile.CompileOptions{MaxMemory: memCap})
 		if err != nil {
 			t.Fatalf("compile: %v", err)
 		}
@@ -1492,21 +1492,21 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 		}
 		return res
 	}
-	single := func(e config.RegexEntry, force bool, maxStates int) func(compile.CompileOptions) ([]byte, error) {
+	single := func(e config.PatternEntry, force bool, maxStates int) func(compile.CompileOptions) ([]byte, error) {
 		return func(o compile.CompileOptions) ([]byte, error) {
 			o.MaxDFAStates = maxStates
 			if force {
-				w, _, err := compile.CompileForced([]config.RegexEntry{e}, 65536, true, compile.EngineBacktrack, o)
+				w, _, err := compile.CompileForced([]config.PatternEntry{e}, 65536, true, compile.EngineBacktrack, o)
 				return w, err
 			}
-			w, _, err := compile.Compile([]config.RegexEntry{e}, 65536, true, o)
+			w, _, err := compile.Compile([]config.PatternEntry{e}, 65536, true, o)
 			return w, err
 		}
 	}
 	unknown := int64(abi.BTStackOverflow)
 
 	t.Run("groups", func(t *testing.T) {
-		plain, w := capped(t, single(config.RegexEntry{Pattern: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}, true, 0))
+		plain, w := capped(t, single(config.PatternEntry{Regexp: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}, true, 0))
 		if got := call(t, plain, "abcd", "g", int32(1024), int32(0)).(int32); got != 4 {
 			t.Fatalf("uncapped groups = %d, want 4", got)
 		}
@@ -1518,7 +1518,7 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 	const overLimit = `(a|b)*a(a|b){12}`
 	in := "a" + strings.Repeat("b", 12)
 	t.Run("match", func(t *testing.T) {
-		plain, w := capped(t, single(config.RegexEntry{Pattern: overLimit, MatchFunc: "m"}, false, 16))
+		plain, w := capped(t, single(config.PatternEntry{Regexp: overLimit, MatchFunc: "m"}, false, 16))
 		if got := call(t, plain, in, "m").(int32); got != int32(len(in)) {
 			t.Fatalf("uncapped match = %d, want %d", got, len(in))
 		}
@@ -1527,7 +1527,7 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 		}
 	})
 	t.Run("find", func(t *testing.T) {
-		plain, w := capped(t, single(config.RegexEntry{Pattern: overLimit, FindFunc: "f"}, false, 16))
+		plain, w := capped(t, single(config.PatternEntry{Regexp: overLimit, FindFunc: "f"}, false, 16))
 		if got := call(t, plain, in, "f", int32(0)).(int64); got != int64(len(in)) {
 			t.Fatalf("uncapped find = %#x, want [0,%d)", got, len(in))
 		}
@@ -1540,8 +1540,8 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 	pats := []string{`(?:a|bc){1,30}?x`, `[a-z]+aX`}
 	set := func(o compile.CompileOptions) ([]byte, error) {
 		cfg := config.BuildConfig{MaxDFAStates: 1, MaxMemory: o.MaxMemory,
-			Regexps: []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
-			Sets:    []config.SetConfig{{Name: "s", ScanAny: "s_scan", Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}}}
+			Patterns: []config.PatternEntry{{Name: "p0", Regexp: pats[0]}, {Name: "p1", Regexp: pats[1]}},
+			Sets:     []config.SetConfig{{Name: "s", ScanAny: "s_scan", Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}}}
 		w, _, diags, err := compile.CompileFileDiag(cfg, "")
 		if err == nil && len(diags[0].SplitBacktracking) != 1 {
 			t.Fatalf("split onto Backtracking %v — the witness no longer has the shape", diags[0].SplitBacktracking)
@@ -1631,8 +1631,8 @@ func TestBTHighByteInRanges(t *testing.T) {
 			if serr != nil {
 				t.Fatalf("select: %v", serr)
 			}
-			entry := config.RegexEntry{Pattern: sh.pat, GroupsFunc: "groups"}
-			w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+			entry := config.PatternEntry{Regexp: sh.pat, GroupsFunc: "groups"}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -1691,10 +1691,10 @@ func TestBTHighByteByteMode(t *testing.T) {
 	}
 	for _, sh := range shapes {
 		t.Run(sh.name, func(t *testing.T) {
-			entry := config.RegexEntry{Pattern: sh.pat, GroupsFunc: "groups", ByteMode: true}
+			entry := config.PatternEntry{Regexp: sh.pat, GroupsFunc: "groups", ByteMode: true}
 			// Forced, because auto-selection sends these to TDFA today. The
 			// clamp is Backtracking's, so Backtracking is what must be asked.
-			w, _, err := compile.CompileForced([]config.RegexEntry{entry},
+			w, _, err := compile.CompileForced([]config.PatternEntry{entry},
 				pathsTableBase, true, compile.EngineBacktrack)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
@@ -1725,7 +1725,7 @@ func TestBTHighByteByteMode(t *testing.T) {
 // appendBTFindCodeEntry's find path, so without this the BT find emitter has
 // no iteration coverage at all.
 func compileFindBT(pat string) ([]byte, error) {
-	w, _, err := compile.Compile([]config.RegexEntry{{Pattern: pat, FindFunc: "find"}},
+	w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, FindFunc: "find"}},
 		tableBase, true, compile.CompileOptions{MaxDFAStates: -1})
 	return w, err
 }
@@ -1785,8 +1785,8 @@ func TestBTFindIterationMatchesGo(t *testing.T) {
 // address at the same length, C a shorter text at A's address.
 func TestBTKeptMemoFollowsTheText(t *testing.T) {
 	const pat = `(?:a?)+?xyz` // a zero-width cycle: the fallback answers every call
-	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-	w, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{entry}, pathsTableBase, true, 0,
+	entry := config.PatternEntry{Regexp: pat, FindFunc: "find"}
+	w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{entry}, pathsTableBase, true, 0,
 		compile.CompileOptions{MaxDFAStates: 1})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -1880,7 +1880,7 @@ func TestBTUnicodeModeGroupsMatchGo(t *testing.T) {
 		re := regexp.MustCompile(c.pat)
 		numGroups := re.NumSubexp() + 1
 		for _, budget := range []int{0, compile.BTWorkBudgetOff, compile.BTWorkBudgetForceFallback} {
-			w, _, err := compile.CompileForced([]config.RegexEntry{{Pattern: c.pat, GroupsFunc: "groups"}},
+			w, _, err := compile.CompileForced([]config.PatternEntry{{Regexp: c.pat, GroupsFunc: "groups"}},
 				pathsTableBase, true, compile.EngineBacktrack, compile.CompileOptions{Unicode: true, BTWorkBudget: budget})
 			if err != nil {
 				t.Fatalf("%s budget %d: compile: %v", c.pat, budget, err)

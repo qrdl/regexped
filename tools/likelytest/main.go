@@ -80,7 +80,7 @@ func (m matchMode) String() string {
 type testCase struct {
 	name         string
 	pattern      string   // unset when mode == modeSet
-	setPatterns  []string // only set when mode == modeSet; passed as separate RegexEntry per pattern
+	setPatterns  []string // only set when mode == modeSet; passed as separate PatternEntry per pattern
 	mode         matchMode
 	notes        string // one-line description of which optimisation it targets
 	matchInput   string
@@ -1712,7 +1712,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	if tc.mode == modeSet {
 		return compileSetMode(tc, mode)
 	}
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	switch tc.mode {
 	case modeAnchored:
 		re.MatchFunc = "match"
@@ -1722,7 +1722,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		re.GroupsFunc = "groups"
 	}
 	opts := withMode(compile.CompileOptions{LikelyMode: mode})
-	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, opts)
 	if err == nil && tc.mode != modeAnchored {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc+re.GroupsFunc])
 	}
@@ -1736,9 +1736,9 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 // these entries carry their own _func fields, so there is no per-pattern
 // fallback to plumb.
 func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(tc.setPatterns))
+	entries := make([]config.PatternEntry, len(tc.setPatterns))
 	for i, p := range tc.setPatterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
 	unicode := *unicodeFlag
 	sc := config.SetConfig{
@@ -1761,8 +1761,8 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		sc.Find = "set_find"
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets:    []config.SetConfig{sc},
+		Patterns: entries,
+		Sets:     []config.SetConfig{sc},
 	}
 	// Output empty → standalone.
 	if tc.forceScalarFrontend {

@@ -1249,7 +1249,7 @@ func regexpedEngineName(tc testCase) string {
 // imports the regexped function and loops benchIters times internally — only
 // one CGo crossing for the entire measurement.
 func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) benchResult {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	var fnExport string
 	switch tc.mode {
 	case anchored:
@@ -1262,7 +1262,7 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped compile(%s): %v\n", tc.name, err)
 		return benchResult{}
@@ -1659,7 +1659,7 @@ type fuelInputResult struct {
 // measFuelRegexped compiles tc.pattern, instantiates the module with a fuel-enabled
 // store, then measures fuel consumed by a single exported function call.
 func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, bool) {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	var fnExport string
 	switch tc.mode {
 	case anchored:
@@ -1672,7 +1672,7 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  fuel regexped compile(%s): %v\n", tc.name, err)
 		return 0, false
@@ -1859,7 +1859,7 @@ func tcModeStr(tc testCase) string {
 }
 
 func compileTestWasm(tc testCase) ([]byte, error) {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	switch tc.mode {
 	case anchored:
 		re.MatchFunc = "match"
@@ -1868,7 +1868,7 @@ func compileTestWasm(tc testCase) ([]byte, error) {
 	case anchoredGroups:
 		re.GroupsFunc = "groups"
 	}
-	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true)
+	wasmBytes, _, err := compile.Compile([]config.PatternEntry{re}, tableBase, true)
 	return wasmBytes, err
 }
 
@@ -2455,12 +2455,12 @@ func benchRegexSet(sc setTestCase, input string, regexWasmBytes []byte, engine *
 // against a regex crate that crosses once per pass. Rows measured before
 // 2026-09-26 are not comparable with rows after it.
 func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct int) benchResult {
-	entries := make([]config.RegexEntry, len(sc.patterns))
+	entries := make([]config.PatternEntry, len(sc.patterns))
 	for i, p := range sc.patterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2645,12 +2645,12 @@ func exhaustSetFindBlocks(store *wasmtime.Store, mem *wasmtime.Memory, findFn *w
 // benchRegexpedSetFuel measures WASM fuel consumed by one complete `find` exhaustion
 // pass over the input using a fuel-enabled wasmtime engine.
 func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Engine) uint64 {
-	entries := make([]config.RegexEntry, len(sc.patterns))
+	entries := make([]config.PatternEntry, len(sc.patterns))
 	for i, p := range sc.patterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2959,12 +2959,12 @@ func parseSetSizeBaseline(path string) (map[string]int, error) {
 // runSizeOnlySets prints WASM module sizes for all set test cases and exits.
 func runSizeOnlySets() {
 	for _, sc := range setTests {
-		entries := make([]config.RegexEntry, len(sc.patterns))
+		entries := make([]config.PatternEntry, len(sc.patterns))
 		for i, p := range sc.patterns {
-			entries[i] = config.RegexEntry{Pattern: p}
+			entries[i] = config.PatternEntry{Regexp: p}
 		}
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},
@@ -3064,12 +3064,12 @@ func runCompareSetSize(baselinePath string) bool {
 			fmt.Fprintf(os.Stderr, "  compare-sets-size: no baseline for %q\n", sc.name)
 			continue
 		}
-		entries := make([]config.RegexEntry, len(sc.patterns))
+		entries := make([]config.PatternEntry, len(sc.patterns))
 		for i, p := range sc.patterns {
-			entries[i] = config.RegexEntry{Pattern: p}
+			entries[i] = config.PatternEntry{Regexp: p}
 		}
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},

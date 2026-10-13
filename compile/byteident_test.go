@@ -119,28 +119,15 @@ func TestByteIdentFixturesResolveToByteMode(t *testing.T) {
 	for _, name := range byteIdentFixtures(t) {
 		cfg := loadByteIdentConfig(t, name)
 		want := strings.HasPrefix(name, "unicode_")
-		for _, re := range cfg.Regexps {
-			rp, err := resolvePattern(re.Pattern, re.Unicode, &CompileOptions{ByteMode: re.IsByteMode()})
+		for _, re := range cfg.Patterns {
+			rp, err := resolvePattern(re.Regexp, re.Unicode, &CompileOptions{ByteMode: re.IsByteMode()})
 			// A Unicode set's ASCII members resolve to byte mode on their own.
 			if err != nil || (rp.unicode() && !want) || (want && len(cfg.Sets) == 0 && !rp.unicode()) {
-				t.Errorf("%s: pattern %q resolved to (%s, %v), want Unicode mode %v", name, re.Pattern, rp.modeName(), err, want)
+				t.Errorf("%s: pattern %q resolved to (%s, %v), want Unicode mode %v", name, re.Regexp, rp.modeName(), err, want)
 			}
-		}
-		nameIdx := map[string]int{}
-		for i, re := range cfg.Regexps {
-			nameIdx[re.Name] = i
 		}
 		for _, sc := range cfg.Sets {
-			var idx []int
-			for i := range cfg.Regexps {
-				if sc.Patterns.All {
-					idx = append(idx, i)
-				}
-			}
-			for _, n := range sc.Patterns.Names {
-				idx = append(idx, nameIdx[n])
-			}
-			m, err := resolveSetMode(sc, cfg, idx)
+			m, err := resolveSetMode(sc, sc.Members(cfg))
 			if err != nil || m.member("x").unicode() != want {
 				t.Errorf("%s: set %q resolved to (%v, %v), want Unicode mode %v", name, sc.Name, m.pm, err, want)
 			}
@@ -155,11 +142,11 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 	seen, seenUnicode := map[EngineType]int{}, map[EngineType]int{}
 	for _, name := range byteIdentFixtures(t) {
 		cfg := loadByteIdentConfig(t, name)
-		for _, re := range cfg.Regexps {
+		for _, re := range cfg.Patterns {
 			// The entry's own mode has to be passed: a byte_mode fixture names
 			// runes the default mode rejects, so asking the selector about it
 			// neutrally is asking about a pattern that does not compile.
-			eng, err := SelectEngine(re.Pattern, CompileOptions{ByteMode: re.ByteMode, Unicode: re.Unicode != nil && *re.Unicode})
+			eng, err := SelectEngine(re.Regexp, CompileOptions{ByteMode: re.ByteMode, Unicode: re.Unicode != nil && *re.Unicode})
 			if err != nil {
 				t.Fatalf("%s: SelectEngine: %v", name, err)
 			}
@@ -168,7 +155,7 @@ func TestByteIdenticalPathsAreDistinct(t *testing.T) {
 			} else {
 				seen[eng]++
 			}
-			t.Logf("%-16s %-24s %v", name, re.Pattern, eng)
+			t.Logf("%-16s %-24s %v", name, re.Regexp, eng)
 		}
 	}
 	for _, want := range []EngineType{EngineDFA, EngineCompiledDFA, EngineTDFA, EngineBacktrack} {
@@ -354,7 +341,7 @@ func TestByteIdenticalFindStrategyFixtures(t *testing.T) {
 	for name, notes := range want {
 		cfg := loadByteIdentConfig(t, name)
 		r := &Reporter{}
-		if _, _, err := Compile(cfg.Regexps, 0, true, CompileOptions{Report: r}); err != nil {
+		if _, _, err := Compile(cfg.Patterns, 0, true, CompileOptions{Report: r}); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		r.End()

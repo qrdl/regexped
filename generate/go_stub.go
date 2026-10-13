@@ -23,14 +23,14 @@ func goStub(cfg config.BuildConfig, out string) error {
 		pkgName = "main"
 	}
 	needsSpan := false
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.GroupsFunc != "" {
 			needsSpan = true
 			break
 		}
 	}
 	sizes := searchSizesFor(cfg)
-	singleBody, needsIter, err := genGoStubsBodySized(cfg.Regexps, cfg.ImportModule, sizes)
+	singleBody, needsIter, err := genGoStubsBodySized(cfg.Patterns, cfg.ImportModule, sizes)
 	if err != nil {
 		return fmt.Errorf("generate Go stub: %w", err)
 	}
@@ -104,7 +104,7 @@ func genGoSetBody(cfg config.BuildConfig, shapes *setShapes) (string, bool) {
 		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "// %s is the number of patterns in set %q. It sizes the match buffer:\n// Find can report at most this many matches at one position.\nconst %s = %d\n\n", konst, s.Name, konst, n)
-		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// are global indices into regexps:, so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "// %s is one past the largest pattern id set %q can report. Pattern ids\n// index patterns: (then the set's own regexps:), so a set holding a few late-declared\n// patterns has a small count and a large id space. Everything indexed BY an\n// id \u2014 the gate array, the _all bitmask \u2014 is sized from this.\nconst %s = %d\n\n", idKonst, s.Name, idKonst, idN)
 
 		imp := func(name, sig string) {
 			fmt.Fprintf(&out, "//go:wasmimport %s %s\n//go:noescape\nfunc ffi_%s%s\n\n", cfg.ImportModule, name, name, sig)
@@ -463,15 +463,18 @@ func (iter *%[1]sIter) Matches() iter.Seq[SetMatch] {
 				malformedCache, outOfOrder)
 		}
 	}
-	if hasEmitNameMap(cfg) {
-		out.WriteString("// PatternName returns the name of the pattern with the given ID.\n")
-		out.WriteString("func PatternName(id int) string {\n\tswitch id {\n")
-		for i, re := range cfg.Regexps {
-			if re.Name != "" {
-				fmt.Fprintf(&out, "\tcase %d: return %q\n", i, re.Name)
+	for _, s := range nameMapSets(cfg) {
+		fn := config.SetPatternNameFunc(s.Name, "go")
+		fmt.Fprintf(&out, "// %s %s\n", fn, nameMapDoc(s))
+		fmt.Fprintf(&out, "func %s(id int) string {\n", fn)
+		if named := namedMembers(s, cfg); len(named) > 0 {
+			out.WriteString("\tswitch id {\n")
+			for _, m := range named {
+				fmt.Fprintf(&out, "\tcase %d:\n\t\treturn %q\n", m.ID, m.Entry.Name)
 			}
+			out.WriteString("\t}\n")
 		}
-		out.WriteString("\t}\n\treturn \"\"\n}\n\n")
+		out.WriteString("\treturn \"\"\n}\n\n")
 	}
 	return out.String(), needsIter
 }
@@ -740,13 +743,13 @@ func (iter *%[1]sIter) Matches() iter.Seq[[]Span] {
 
 // genGoStubsBody returns the body (no header, no imports) for single-pattern stubs.
 // Returns (body string, needsIter bool).
-func genGoStubsBody(entries []config.RegexEntry, importModule string) (string, bool, error) {
+func genGoStubsBody(entries []config.PatternEntry, importModule string) (string, bool, error) {
 	return genGoStubsBodySized(entries, importModule, nil)
 }
 
 // genGoStubsBodySized is genGoStubsBody with each export's search block
 // (search_stub.go); nil sizes means none.
-func genGoStubsBodySized(entries []config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, bool, error) {
+func genGoStubsBodySized(entries []config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (string, bool, error) {
 	var parts []string
 	needsIter := false
 	if anySearchBlock(sizes) {
@@ -769,7 +772,7 @@ func genGoStubsBodySized(entries []config.RegexEntry, importModule string, sizes
 
 // genGoStubFile generates the full Go stub file for a slice of entries (no sets).
 // Kept for backward compatibility with tests.
-func genGoStubFile(entries []config.RegexEntry, importModule, pkgName string) (string, error) {
+func genGoStubFile(entries []config.PatternEntry, importModule, pkgName string) (string, error) {
 	body, needsIter, err := genGoStubsBody(entries, importModule)
 	if err != nil || body == "" {
 		return "", err
@@ -789,7 +792,7 @@ func genGoStubFile(entries []config.RegexEntry, importModule, pkgName string) (s
 
 // genGoStubsForEntrySized generates the Go stub content for a single regexp
 // entry, with each export's search block; nil sizes means none.
-func genGoStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
+func genGoStubsForEntrySized(re config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -803,7 +806,7 @@ func genGoStubsForEntrySized(re config.RegexEntry, importModule string, sizes ma
 		written = true
 	}
 	if re.GroupsFunc != "" {
-		numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+		numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 		if err != nil {
 			return "", err
 		}
@@ -1001,7 +1004,7 @@ func warnUnexportedGoNames(cfg config.BuildConfig, pkgName string) {
 		}
 		hidden = append(hidden, name)
 	}
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		note(re.MatchFunc)
 		note(re.FindFunc)
 		note(re.GroupsFunc)

@@ -1,8 +1,8 @@
 # A Unicode-mode set with no literal: one union automaton over the lowered
 # members serves the scan pair.
-regexps:
-  - { name: u0, pattern: '\pL+\pN' }
-  - { name: u1, pattern: '\p{Greek}{2,}\pN' }
+patterns:
+  - { name: u0, regexp: '\pL+\pN' }
+  - { name: u1, regexp: '\p{Greek}{2,}\pN' }
 sets:
   - name: uu
     scan_any: uu_scan_any

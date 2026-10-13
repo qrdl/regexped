@@ -2,6 +2,6 @@
 # the literal-anchored find scans for `@`, walks back over the prefix and
 # forward over the rest, and carries the start-anywhere switch's counter,
 # which charges every failed candidate.
-regexps:
-  - pattern: '\w+@\w+'
+patterns:
+  - regexp: '\w+@\w+'
     find_func: onebyte_find

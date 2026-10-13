@@ -1,4 +1,4 @@
-// Runs lang-detect.wasm under the FastEdge runtime (fastedge-run, through
+// Runs script-detect.wasm under the FastEdge runtime (fastedge-run, through
 // @gcoredev/fastedge-test) and checks every sample text's answer.
 //
 //   npm install && npm test        (or `make test`, after `make`)
@@ -12,13 +12,13 @@ const samples = [
   ['Hello world', ['Latin']],
   ['Grüße aus Köln', ['German']],
   ['Un café, por favor', ['French', 'Spanish', 'Portuguese', 'Italian', 'Dutch',
-    'Norwegian', 'Danish', 'Icelandic', 'Czech', 'Slovak', 'Hungarian']],
+    'Norwegian/Danish', 'Icelandic', 'Czech', 'Slovak', 'Hungarian']],
   ['Zażółć gęślą jaźń', ['Polish']],
   ['Příliš žluťoučký kůň', ['Czech']],
   ['Árvíztűrő tükörfúrógép', ['Hungarian']],
   ['ŠČ', ['Latvian', 'Lithuanian', 'Czech', 'Slovak', 'Slovenian', 'Croatian']],
   ['Rīga ir Latvijas galvaspilsēta', ['Latvian']],
-  ['Rødgrød med fløde', ['Norwegian', 'Danish']],
+  ['Rødgrød med fløde', ['Norwegian/Danish']],
   ['Привет', ['Cyrillic']],
   ['Привіт', ['Ukrainian']],
   ['Съешь', ['Russian', 'Bulgarian']],
@@ -45,7 +45,7 @@ const post = (text, expected) => ({
 });
 
 await runAndExit(defineTestSuite({
-  wasmPath: './lang-detect.wasm',
+  wasmPath: './script-detect.wasm',
   tests: [
     ...samples.map(([text, expected]) => post(text, expected)),
     {

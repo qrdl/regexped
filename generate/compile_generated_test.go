@@ -43,53 +43,53 @@ func TestGeneratedStubsCompile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
+		Patterns: []config.PatternEntry{
 			{
 				Name:       "url",
-				Pattern:    `(?P<scheme>https?)://(?P<host>[a-z.]+)/([a-z/]*)`,
+				Regexp:     `(?P<scheme>https?)://(?P<host>[a-z.]+)/([a-z/]*)`,
 				MatchFunc:  "url_match",
 				FindFunc:   "url_find",
 				GroupsFunc: "url_groups",
 			},
-			{Name: "aws", Pattern: `AKIA[A-Z0-9]{16}`},
-			{Name: "gh", Pattern: `ghp_[0-9a-zA-Z]{36}`},
+			{Name: "aws", Regexp: `AKIA[A-Z0-9]{16}`},
+			{Name: "gh", Regexp: `ghp_[0-9a-zA-Z]{36}`},
 			// LITERAL-LESS, and that is the point: the overlapping answer
 			// cache is emitted only for a set that reaches the fallback
 			// bucket, so a set of literals — which is what this config held —
 			// generates no cache code at all and compiles nothing of it.
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "alnum", Pattern: `[a-z0-9]+x?`},
-			{Name: "word", Pattern: `\w+`},
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "alnum", Regexp: `[a-z0-9]+x?`},
+			{Name: "word", Regexp: `\w+`},
 			// Finds that keep PER-SEARCH NOTES (docs/wasm.md, "The search
 			// block"): their iterators carry a block, hand it over before
 			// every call and allocate notes once a search arms — code no other
 			// entry here generates.
-			{Name: "overrun", Pattern: `a*b|a`, FindFunc: "overrun_find"},
-			{Name: "overrun_groups", Pattern: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
+			{Name: "overrun", Regexp: `a*b|a`, FindFunc: "overrun_find"},
+			{Name: "overrun_groups", Regexp: `(x)(?:[a-z]*y)?`, GroupsFunc: "overrun_groups"},
 			// A set member split out of its set whose own search keeps notes:
 			// the set iterator hands it a search block through the second
 			// form of the scratch descriptor (abi.FindScratchMagicBlocks).
-			{Name: "split_member", Pattern: `foo\w+bar|foo`},
+			{Name: "split_member", Regexp: `foo\w+bar|foo`},
 			// Backtracking finds whose work budget lasts the search: the
 			// iterator hands over a block and gives a tripped search its memo;
 			// the set's member is split onto the Backtracking find (its
 			// start-anywhere automaton is over the state limit), so the set
 			// iterator gives a block a memo too.
-			{Name: "bt", Pattern: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
-			{Name: "bt_groups", Pattern: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
-			{Name: "bt_member", Pattern: `a[ab]{11}c[a-z]*X`},
+			{Name: "bt", Regexp: `(?:a|b)*a(?:a|b){12}c|a`, FindFunc: "bt_find"},
+			{Name: "bt_groups", Regexp: `((?:a|b)*a(?:a|b){12}c)|(a)`, GroupsFunc: "bt_groups"},
+			{Name: "bt_member", Regexp: `a[ab]{11}c[a-z]*X`},
 			// Non-greedy, so not provably linear in an overlapping set's
 			// bodies: split out, with its answers from a PROGRAM SWEEP the
 			// stubs size a second part of the cache region for.
-			{Name: "ng_member", Pattern: `a[a-z]*?z`},
-			{Name: "foo_word", Pattern: `foo\w+`},
+			{Name: "ng_member", Regexp: `a[a-z]*?z`},
+			{Name: "foo_word", Regexp: `foo\w+`},
 			// A kept member no cache can serve: the sets below that pair it with
 			// ng_member reserve the program sweep's part after a bare header.
-			{Name: "lit_abc", Pattern: `abc`},
+			{Name: "lit_abc", Regexp: `abc`},
 			// A find that keeps BOTH notes and a Backtracking memo (its switch
 			// hands over to the Backtracking find): the C iterator slices one
 			// caller buffer into the two.
-			{Name: "notes_memo", Pattern: `(?:\ba|b\B)*c|a`, FindFunc: "notes_memo_find"},
+			{Name: "notes_memo", Regexp: `(?:\ba|b\B)*c|a`, FindFunc: "notes_memo_find"},
 		},
 		Sets: []config.SetConfig{{
 			Name:     "split",
@@ -111,6 +111,8 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			// automaton a set cannot build: it goes to Backtracking. Its
 			// failing the set's compile once left every stub here without a
 			// search block (searchSizesFor), which the check below catches.
+			// Plus an inline regexp of its own, so each language's name
+			// lookup has an id past the top-level patterns to answer "" for.
 			Name:        "sec",
 			MatchAny:    "which_secret",
 			MatchAll:    "all_kinds",
@@ -118,6 +120,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			ScanAll:     "kinds",
 			Find:        "scan_secrets",
 			Patterns:    config.PatternSelector{All: true},
+			Regexps:     []string{`xox[bp]-[0-9]+`},
 			EmitNameMap: true,
 		}, {
 			// The OTHER `find` shape, and CACHE-ELIGIBLE: the stub reserves an
@@ -201,10 +204,10 @@ func TestGeneratedStubsCompile(t *testing.T) {
 	// SETS ONLY: a stub with no single-pattern part carries the block type and
 	// the notes helper itself, which the single-pattern part otherwise brings.
 	setsOnly := cfg
-	setsOnly.Regexps = nil
-	for _, re := range cfg.Regexps {
+	setsOnly.Patterns = nil
+	for _, re := range cfg.Patterns {
 		re.MatchFunc, re.FindFunc, re.GroupsFunc = "", "", ""
-		setsOnly.Regexps = append(setsOnly.Regexps, re)
+		setsOnly.Patterns = append(setsOnly.Patterns, re)
 	}
 	setsOnly.Sets = cfg.Sets[:2]
 	// Sets only, with no block that keeps notes: btsplit's Backtracking
@@ -504,10 +507,10 @@ func freestandingCfg() config.BuildConfig {
 	return config.BuildConfig{
 		Output:       "merged.wasm",
 		ImportModule: "demo",
-		Regexps: []config.RegexEntry{
-			{Name: "lower", Pattern: `[a-z]+`},
-			{Name: "digits", Pattern: `[0-9]+`},
-			{Name: "upper", Pattern: `[A-Z]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "lower", Regexp: `[a-z]+`},
+			{Name: "digits", Regexp: `[0-9]+`},
+			{Name: "upper", Regexp: `[A-Z]+`},
 		},
 		Sets: []config.SetConfig{{
 			Name: "runs", Find: "scan_runs",

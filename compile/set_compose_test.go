@@ -261,7 +261,7 @@ func TestAnalyzePattern_Trivial(t *testing.T) {
 	// ^foo: the mandatory literal "foo" has a zero-byte prefix (BeginText anchor)
 	// which is treated as trivial.
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `^foo`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `^foo`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestAnalyzePattern_Trivial(t *testing.T) {
 func TestAnalyzePattern_FullSplit(t *testing.T) {
 	// \d{3}foo\w+ has a bounded prefix (\d{3}) and a suffix (\w+) around "foo".
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `\d{3}foo\w+`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `\d{3}foo\w+`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestAnalyzePattern_FullSplit(t *testing.T) {
 
 func TestAnalyzePattern_ParseError(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
-	_, err := analyzePattern(config.RegexEntry{Pattern: `[invalid`}, &prefixPool, &suffixPool)
+	_, err := analyzePattern(config.PatternEntry{Regexp: `[invalid`}, &prefixPool, &suffixPool)
 	if err == nil {
 		t.Error("expected error for invalid pattern, got nil")
 	}
@@ -630,7 +630,7 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	var firstSuffixID int
 	for i, p := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("pattern %q: %v", p, err)
 		}
@@ -649,8 +649,8 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 
 type setFixture struct {
 	Patterns []struct {
-		Name    string `yaml:"name"`
-		Pattern string `yaml:"pattern"`
+		Name   string `yaml:"name"`
+		Regexp string `yaml:"regexp"`
 	} `yaml:"patterns"`
 	Options struct {
 		BitmaskWidth          int `yaml:"bitmask_width"`
@@ -684,9 +684,9 @@ func (f setFixture) patternInfos(t *testing.T) []*PatternInfo {
 	var prefixPool, suffixPool dfaPool
 	infos := make([]*PatternInfo, len(f.Patterns))
 	for i, p := range f.Patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: p.Pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p.Regexp}, &prefixPool, &suffixPool)
 		if err != nil {
-			t.Fatalf("analyzePattern(%q): %v", p.Pattern, err)
+			t.Fatalf("analyzePattern(%q): %v", p.Regexp, err)
 		}
 		infos[i] = info
 	}
@@ -1177,7 +1177,7 @@ func TestACBudget(t *testing.T) {
 				fb := "abcdefghijklmnopqrstuvwxyz0123456789"[i%36]
 				pat = fmt.Sprintf("%cQ%03d[0-9a-z]{3}", fb, i)
 			}
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -1259,7 +1259,7 @@ func TestACOutputOverflow(t *testing.T) {
 		var ids []int
 		for i := 0; i < n; i++ {
 			pat := strings.Repeat("a", i+1) + "[0-9]"
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -1524,7 +1524,7 @@ func TestCompileFallback_BudgetCap(t *testing.T) {
 	pats := []string{`\w+`, `[a-z]+`, `[0-9]+`}
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1548,7 +1548,7 @@ func TestCompileFallback_Merges(t *testing.T) {
 	pats := []string{`\d+`, `[0-9]+`} // both have no mandatory lit, simple DFAs
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1576,7 +1576,7 @@ func TestBinPacking_BitmaskCap(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1598,7 +1598,7 @@ func TestBinPacking_BudgetCap(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	patterns := make([]*PatternInfo, 3)
 	for i, pat := range []string{`baz[a-z]+`, `baz[0-9]+`, `baz\w+`} {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1619,7 +1619,7 @@ func TestBinPacking_FirstFitDecreasing(t *testing.T) {
 	pats := []string{`foo\w+`, `fooa+`, `foob+`}
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1754,7 +1754,7 @@ func TestTopLevelBeginAnchorKind(t *testing.T) {
 
 func TestAnalyzePattern_NonGreedyFallback(t *testing.T) {
 	// Non-greedy pattern: should go to isolated fallback (no error).
-	re := config.RegexEntry{Pattern: `(?:a+?)b`}
+	re := config.PatternEntry{Regexp: `(?:a+?)b`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1770,7 +1770,7 @@ func TestAnalyzePattern_NonGreedyFallback(t *testing.T) {
 
 func TestAnalyzePattern_ZeroLengthFallback(t *testing.T) {
 	// Pattern with minLen=0: routes to fallback.
-	re := config.RegexEntry{Pattern: `(?:aa)*`}
+	re := config.PatternEntry{Regexp: `(?:aa)*`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1783,7 +1783,7 @@ func TestAnalyzePattern_ZeroLengthFallback(t *testing.T) {
 
 func TestAnalyzePattern_ZeroLengthBeginAnchor(t *testing.T) {
 	// Pattern with minLen=0 and begin-anchor at top level: startAnchor=true.
-	re := config.RegexEntry{Pattern: `^(?:aa)*`}
+	re := config.PatternEntry{Regexp: `^(?:aa)*`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1800,7 +1800,7 @@ func TestAnalyzePattern_ZeroLengthBeginAnchor(t *testing.T) {
 func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
 	// Pattern where the prefix is a non-begin zero-length assertion ($a):
 	// should route to fallback (splittable=false).
-	re := config.RegexEntry{Pattern: `(?:$)a`}
+	re := config.PatternEntry{Regexp: `(?:$)a`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1813,7 +1813,7 @@ func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
 
 func TestAnalyzePattern_BeginSuffixFallback(t *testing.T) {
 	// Pattern whose suffix contains a begin-anchor (a^): routes to fallback.
-	re := config.RegexEntry{Pattern: `a^`}
+	re := config.PatternEntry{Regexp: `a^`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1851,11 +1851,11 @@ var setCapNames = map[string]string{
 
 // setConfigWith builds a config declaring exactly the named capabilities.
 func setConfigWith(patterns []string, overlapping bool, caps ...string) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(patterns))
+	entries := make([]config.PatternEntry, len(patterns))
 	names := make([]string, len(patterns))
 	for i, p := range patterns {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name:        "s",
@@ -1878,15 +1878,15 @@ func setConfigWith(patterns []string, overlapping bool, caps ...string) config.B
 			panic("unknown capability " + c)
 		}
 	}
-	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	return config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 }
 
 // setConfigSubset builds a config whose set selects `pick` (indices into
 // patterns) by name, leaving the rest of the regexps out of the set.
 func setConfigSubset(patterns []string, pick []int, caps ...string) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(patterns))
+	entries := make([]config.PatternEntry, len(patterns))
 	for i, p := range patterns {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	var names []string
 	for _, i := range pick {
@@ -1907,7 +1907,7 @@ func setConfigSubset(patterns []string, pick []int, caps ...string) config.Build
 			panic("unknown capability " + c)
 		}
 	}
-	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	return config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 }
 
 // exportTypeIndex returns the type-section index of the function exported
@@ -2105,7 +2105,7 @@ func sparseGroup(t *testing.T, n int, opts CompileSetOptions) []*bucket {
 	infos := make([]*PatternInfo, 0, n)
 	for i := 0; i < n; i++ {
 		p := fmt.Sprintf(`union[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern %q: %v", p, err)
 		}
@@ -2174,7 +2174,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 	var infos []*PatternInfo
 	for i := 0; i < 128; i++ {
 		p := fmt.Sprintf(`union[ \t]+\b[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			continue
 		}
@@ -2199,7 +2199,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		var pp, sp dfaPool
 		var in []*bucket
 		for i := 0; i < bucketMaskBits; i++ {
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9]`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`kw%03d[0-9]`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2225,7 +2225,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		for i := 0; i < bucketMaskBits+1; i++ {
 			// A counted class chain: literal + [0-9a-z]{N}, N large enough for
 			// isCountedClassChain.
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9a-z]{6}`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`kw%03d[0-9a-z]{6}`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2257,7 +2257,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		var pp, sp dfaPool
 		var in []*bucket
 		for i := 0; i < bucketMaskBits+8; i++ {
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`^kw%03d[0-9]+$`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`^kw%03d[0-9]+$`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2607,7 +2607,7 @@ func TestBinPackLiteralSingletonAlwaysHasSuffixDFA(t *testing.T) {
 	for _, pat := range pats {
 		t.Run(pat, func(t *testing.T) {
 			var prefixPool, suffixPool dfaPool
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Skipf("analyzePattern refused %q: %v", pat, err)
 			}
@@ -2648,7 +2648,7 @@ func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	// No literal anywhere, so this lands in the fallback bucket rather than a
 	// literal bucket. ~200 suffix DFA states, comfortably over the limit below.
-	info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2693,7 +2693,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var prefixPool, suffixPool dfaPool
-			info, err := analyzePattern(config.RegexEntry{Pattern: tc.pattern}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: tc.pattern}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2714,7 +2714,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 	}
 	// And the control: a member that stays on a DFA warns about nothing.
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `(?:\B|a)a`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `(?:\B|a)a`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2732,7 +2732,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 func TestAdmitBTFallback_AdmitsNullableChain(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	for _, pattern := range []string{btNullableChainPattern, `[a-z0-9]{200}`} {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -2747,7 +2747,7 @@ func TestAdmitBTFallback_AdmitsNullableChain(t *testing.T) {
 // unconditionally would still pass the test above.
 func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2781,10 +2781,10 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	cfg := func(limit int) config.BuildConfig {
 		return config.BuildConfig{
 			MaxDFAStates: config.Limit(limit),
-			Regexps: []config.RegexEntry{
+			Patterns: []config.PatternEntry{
 				// No usable literal, so it lands in a fallback bucket, and
 				// enough states to clear a small limit and not a large one.
-				{Name: "big", Pattern: btNullableChainPattern},
+				{Name: "big", Regexp: btNullableChainPattern},
 			},
 			Sets: []config.SetConfig{{
 				Name:     "s",
@@ -2834,7 +2834,7 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 func TestCompileFallback_NilSuffixDFANoPanic(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	info, err := analyzePattern(
-		config.RegexEntry{Pattern: strings.Repeat(`(?:[a-z]*[0-9]*)`, 3000)},
+		config.PatternEntry{Regexp: strings.Repeat(`(?:[a-z]*[0-9]*)`, 3000)},
 		&prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
@@ -2878,11 +2878,11 @@ func TestWideSetShapesCompile(t *testing.T) {
 				for _, hints := range [][]string{nil, {"prefer-no-match"}, {"prefer-match"}} {
 					name := fmt.Sprintf("%s/ov=%v/all=%v/%v", f.name, ov, all, hints)
 					t.Run(name, func(t *testing.T) {
-						entries := make([]config.RegexEntry, len(f.pats))
+						entries := make([]config.PatternEntry, len(f.pats))
 						names := make([]string, len(f.pats))
 						for i, p := range f.pats {
 							names[i] = fmt.Sprintf("p%d", i)
-							entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+							entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 						}
 						sc := config.SetConfig{
 							Name: "s", Overlapping: ov, Hints: hints,
@@ -2893,7 +2893,7 @@ func TestWideSetShapesCompile(t *testing.T) {
 							sc.MatchAll, sc.ScanAll = "mall", "sall"
 						}
 						if _, _, err := CompileFile(
-							config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
+							config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
 							t.Fatalf("CompileFile: %v", err)
 						}
 					})
@@ -2919,11 +2919,11 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 		{`\w{0,50}!`, `foo`, `bar`, `baz`},
 	}
 	for _, f := range fams {
-		entries := make([]config.RegexEntry, len(f))
+		entries := make([]config.PatternEntry, len(f))
 		names := make([]string, len(f))
 		for i, p := range f {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
 		for _, lim := range []int{2, 4, 8, 16, 32} {
 			for _, ov := range []bool{false, true} {
@@ -2931,7 +2931,7 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 					MatchAny: "ma", MatchAll: "mall", ScanAny: "sa", ScanAll: "sall", Find: "fi",
 					Patterns: config.PatternSelector{Names: names}}
 				if _, _, err := CompileFile(config.BuildConfig{
-					Regexps: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: config.Limit(lim)}, ""); err != nil {
+					Patterns: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: config.Limit(lim)}, ""); err != nil {
 					t.Fatalf("CompileFile(%v, limit=%d): %v", f, lim, err)
 				}
 			}
@@ -2950,7 +2950,7 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 		var infos []*PatternInfo
 		var ids []int
 		for i, pat := range pats {
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -2997,9 +2997,9 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 func TestCompileFileEmbeddedSet(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output: "merged.wasm",
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\d+`}, {Name: "p2", Pattern: `(?:bar|baz)[a-z]+`},
-			{Name: "alt", Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+`, FindFunc: "alt_find"},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\d+`}, {Name: "p2", Regexp: `(?:bar|baz)[a-z]+`},
+			{Name: "alt", Regexp: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+`, FindFunc: "alt_find"},
 		},
 		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", MatchAll: "ml",
 			Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}}},
@@ -3036,10 +3036,10 @@ func TestSparseCounterModulesBuild(t *testing.T) {
 		{"splitting off", "", false, CompileSetOptions{NoSplit: true}},
 	} {
 		t.Run(v.name, func(t *testing.T) {
-			var res []config.RegexEntry
+			var res []config.PatternEntry
 			for i, p := range append(append([]string(nil), members...), v.extra) {
 				if p != "" {
-					res = append(res, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p})
+					res = append(res, config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p})
 				}
 			}
 			set := config.SetConfig{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true}}
@@ -3047,7 +3047,7 @@ func TestSparseCounterModulesBuild(t *testing.T) {
 				set.Hints = []string{"batch-find"}
 			}
 			for _, out := range []string{"", "merged.wasm"} {
-				w, _, _, err := CompileFileOpts(config.BuildConfig{Output: out, Regexps: res, Sets: []config.SetConfig{set}}, "", v.opts)
+				w, _, _, err := CompileFileOpts(config.BuildConfig{Output: out, Patterns: res, Sets: []config.SetConfig{set}}, "", v.opts)
 				if err != nil {
 					t.Fatalf("output=%q: %v", out, err)
 				}
@@ -3204,13 +3204,13 @@ func TestPlanACVerify(t *testing.T) {
 func TestACProbeByMode(t *testing.T) {
 	inspect := func(t *testing.T, patterns []string, byteMode bool) *compiledSet {
 		t.Helper()
-		entries := make([]config.RegexEntry, len(patterns))
+		entries := make([]config.PatternEntry, len(patterns))
 		for i, p := range patterns {
-			entries[i] = config.RegexEntry{Name: fmt.Sprintf("k%02d", i), Pattern: p, ByteMode: byteMode}
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("k%02d", i), Regexp: p, ByteMode: byteMode}
 		}
 		mode := !byteMode
 		sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{All: true}, Unicode: &mode}
-		cs, err := compileSetForInspection(sc, config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, CompileSetOptions{})
+		cs, err := compileSetForInspection(sc, config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, CompileSetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3273,13 +3273,13 @@ func TestACProbeWideColumn(t *testing.T) {
 	if p == nil || p.Off1 != 0 || p.Off2 != 1 || len(p.Bytes2) != 5 {
 		t.Fatalf("probe %+v, want columns (0, 1) with five bytes in column 1", p)
 	}
-	entries := make([]config.RegexEntry, len(acWideColumnKeywords))
+	entries := make([]config.PatternEntry, len(acWideColumnKeywords))
 	for i, kw := range acWideColumnKeywords {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("k%02d", i), Pattern: kw}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("k%02d", i), Regexp: kw}
 	}
 	on := true
 	sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", ScanAny: "y", Patterns: config.PatternSelector{All: true}, Unicode: &on}
-	cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 	opts := CompileSetOptions{}.WithForcedFrontend(frontendAC)
 	cs, err := compileSetForInspection(sc, cfg, opts)
 	if err != nil {
@@ -3304,12 +3304,12 @@ func TestACProbeWideColumn(t *testing.T) {
 func TestAnchoredBacktrackingForcesWideAll(t *testing.T) {
 	inspect := func(t *testing.T, pats ...string) (*compiledSet, bool) {
 		t.Helper()
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		for i, p := range pats {
-			entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 		}
 		sc := config.SetConfig{Name: "s", MatchAny: "ma", MatchAll: "mall", Patterns: config.PatternSelector{All: true}}
-		cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+		cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
 		if err != nil {
 			t.Fatal(err)

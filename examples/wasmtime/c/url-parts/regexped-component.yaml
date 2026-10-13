@@ -21,6 +21,6 @@ output:        "component/composed.wasm"
 import_module: "url_parts"
 stub_file:     "component/stub.h"
 
-regexps:
-  - pattern:          '(?P<scheme>https?)://(?P<host>[^/:?#\s]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#\s]*)?(?:\?(?P<query>[^#\s]*))?(?:#(?P<fragment>[^\s]*))?'
+patterns:
+  - regexp:          '(?P<scheme>https?)://(?P<host>[^/:?#\s]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#\s]*)?(?:\?(?P<query>[^#\s]*))?(?:#(?P<fragment>[^\s]*))?'
     groups_func: "parse_url"

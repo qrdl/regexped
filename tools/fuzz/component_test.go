@@ -206,10 +206,10 @@ const narrowSetCfg = `
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: 'ghp_[A-Za-z0-9]{4}'
-  - pattern: 'AKIA[A-Z0-9]{6}'
-  - pattern: '[0-9]{3}-[0-9]{2}'
+patterns:
+  - regexp: 'ghp_[A-Za-z0-9]{4}'
+  - regexp: 'AKIA[A-Z0-9]{6}'
+  - regexp: '[0-9]{3}-[0-9]{2}'
 sets:
   - name: s
     patterns: all
@@ -346,9 +346,9 @@ func TestComponentSetScannerReclaimsItsState(t *testing.T) {
 // reused memory and the body only ORs, so a stale bitmap reports ids from an
 // earlier call. The loop below alternates answers for exactly that reason.
 func TestComponentSetWideAll(t *testing.T) {
-	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n"
+	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n"
 	for i := 0; i < 70; i++ {
-		cfg += fmt.Sprintf("  - pattern: 'kw%03d[a-z]{2}'\n", i)
+		cfg += fmt.Sprintf("  - regexp: 'kw%03d[a-z]{2}'\n", i)
 	}
 	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n    find: scan_it\n"
 	h := newSetHarness(t, cfg)
@@ -395,9 +395,9 @@ func TestComponentSetWideAll(t *testing.T) {
 // return the sentinel at all, and the adapter used to turn this mask into
 // err(backtrack-overflow).
 func TestComponentNarrowAllReportsBit63(t *testing.T) {
-	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n  - pattern: 'zzz'\n"
+	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n  - regexp: 'zzz'\n"
 	for i := 1; i < 64; i++ {
-		cfg += fmt.Sprintf("  - pattern: 'a{1,%d}'\n", i)
+		cfg += fmt.Sprintf("  - regexp: 'a{1,%d}'\n", i)
 	}
 	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n"
 	h := newSetHarness(t, cfg)
@@ -423,8 +423,8 @@ func TestComponentNarrowAllReportsBit63(t *testing.T) {
 	}
 
 	// And the ordinary case beside it: one pattern of two matching, mask 2.
-	h2 := newSetHarness(t, "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n"+
-		"  - pattern: 'zzz'\n  - pattern: 'a'\nsets:\n  - name: s\n    patterns: all\n"+
+	h2 := newSetHarness(t, "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n"+
+		"  - regexp: 'zzz'\n  - regexp: 'a'\nsets:\n  - name: s\n    patterns: all\n"+
 		"    match_all: all_matches\n    scan_all: all_hits\n")
 	p2, n2 := h2.writeInput("a")
 	if got, errored := h2.list(h2.call(h2.pkg+"#all-matches", p2, n2)); errored || fmt.Sprint(got) != "[1]" {
@@ -467,7 +467,7 @@ type allocHarness struct {
 
 func newAllocHarness(t *testing.T) *allocHarness {
 	t.Helper()
-	entries := []config.RegexEntry{{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"}}
+	entries := []config.PatternEntry{{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"}}
 	core, _, err := compile.Compile(entries, 0, true, compile.CompileOptions{
 		Component:            true,
 		ComponentPackage:     "regexped:t/matcher",
@@ -694,9 +694,9 @@ func TestCabiReallocTrapsWhenTheCarveWrapsTheAddressSpace(t *testing.T) {
 
 // componentWasm compiles entries as a component core module and returns the
 // bytes plus the canonical export name for each configured func name.
-func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string, map[string]generate.PatternResourceNames) {
+func componentWasm(t *testing.T, entries []config.PatternEntry, opts compile.CompileOptions) ([]byte, map[string]string, map[string]generate.PatternResourceNames) {
 	t.Helper()
-	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Regexps: entries}
+	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Patterns: entries}
 	_, names, resources, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatalf("component artifacts: %v", err)
@@ -731,10 +731,10 @@ type adapterResult struct {
 }
 
 func TestComponentAdaptersOverTheRealABI(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `[a-z]+`, MatchFunc: "m"},
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
-		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
+	entries := []config.PatternEntry{
+		{Regexp: `[a-z]+`, MatchFunc: "m"},
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
 	}
 	w, names, res := componentWasm(t, entries, compile.CompileOptions{})
 	// instantiateCore, not instantiate: every find and groups resource imports a
@@ -937,13 +937,13 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 // a find and in a TDFA capture body, Backtracking over a lowered class, and a
 // one-byte literal behind a class common only for its characters above 0x7F.
 func TestUnicodeModeOutputKinds(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `[^,]+,`, FindFunc: "f1"},
-		{Pattern: `\p{Cyrillic}+@\pL+`, FindFunc: "f2"},
-		{Pattern: `<([^>]+)>(x)`, GroupsFunc: "g1"},
-		{Pattern: `(\pL+?)(\pL*)`, GroupsFunc: "g2"},
-		{Pattern: `(.+)=(.+)`, GroupsFunc: "g3"},
-		{Pattern: `\pL+`, MatchFunc: "m"},
+	entries := []config.PatternEntry{
+		{Regexp: `[^,]+,`, FindFunc: "f1"},
+		{Regexp: `\p{Cyrillic}+@\pL+`, FindFunc: "f2"},
+		{Regexp: `<([^>]+)>(x)`, GroupsFunc: "g1"},
+		{Regexp: `(\pL+?)(\pL*)`, GroupsFunc: "g2"},
+		{Regexp: `(.+)=(.+)`, GroupsFunc: "g3"},
+		{Regexp: `\pL+`, MatchFunc: "m"},
 	}
 	opts := compile.CompileOptions{Unicode: true}
 	inputs := characterRunInputs()
@@ -1134,7 +1134,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 
 	oracle := map[string]*regexp.Regexp{}
 	for _, e := range entries {
-		oracle[e.FindFunc+e.GroupsFunc] = regexp.MustCompile(noReplacement(t, e.Pattern))
+		oracle[e.FindFunc+e.GroupsFunc] = regexp.MustCompile(noReplacement(t, e.Regexp))
 	}
 	for _, input := range inputs {
 		store, inst, mem, release, err := instantiate(standalone)
@@ -1194,7 +1194,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 // pattern must have no zero-width cycle — such a program has no ordinary body
 // in any build, and only the ordinary body has a static ceiling to hit.
 func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: btNoCapturePattern, FindFunc: "f"}}
+	entries := []config.PatternEntry{{Regexp: btNoCapturePattern, FindFunc: "f"}}
 	// BTWorkBudgetOff: with the budget on, a body past its static stack hands
 	// the call to its fallback, which sizes its memory from the input and
 	// answers — so -2 would need memory that cannot grow. Off, the body keeps
@@ -1410,10 +1410,10 @@ const overlapSetCfg = `
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: '[a-z]+'
-  - pattern: '[0-9]+'
-  - pattern: '[A-Z]+'
+patterns:
+  - regexp: '[a-z]+'
+  - regexp: '[0-9]+'
+  - regexp: '[A-Z]+'
 sets:
   - name: s
     patterns: all
@@ -1681,11 +1681,11 @@ func TestComponentScannerReportsOutOfOrder(t *testing.T) {
 const geometrySetCfg = `wasm_format: component
 import_module: t
 wit_package: t
-regexps:
+patterns:
   - name: p0
-    pattern: '[^\n]*[0-2]'
+    regexp: '[^\n]*[0-2]'
   - name: p1
-    pattern: '[^\n]*[3-5]'
+    regexp: '[^\n]*[3-5]'
 sets:
   - name: s
     patterns: all
@@ -1735,9 +1735,9 @@ func TestComponentWideOverlapCache(t *testing.T) {
 	for _, n := range []int{40, 70} {
 		pats := letterRuns(n)
 		var b strings.Builder
-		b.WriteString("wasm_format: component\nimport_module: t\nwit_package: t\nregexps:\n")
+		b.WriteString("wasm_format: component\nimport_module: t\nwit_package: t\npatterns:\n")
 		for i, p := range pats {
-			fmt.Fprintf(&b, "  - name: p%d\n    pattern: '%s'\n", i, p)
+			fmt.Fprintf(&b, "  - name: p%d\n    regexp: '%s'\n", i, p)
 		}
 		b.WriteString("sets:\n  - name: s\n    patterns: all\n    overlapping: true\n    find: scan_it\n")
 		var cfg config.BuildConfig
@@ -1811,10 +1811,10 @@ func TestComponentWideOverlapCache(t *testing.T) {
 // `[resource-new]` builtin stubbed by instantiateCore's identity function.
 
 // patternResourceHarness is setHarness pointed at the `matcher` interface.
-func newPatternResourceHarness(t *testing.T, entries []config.RegexEntry) (*setHarness, map[string]generate.PatternResourceNames) {
+func newPatternResourceHarness(t *testing.T, entries []config.PatternEntry) (*setHarness, map[string]generate.PatternResourceNames) {
 	t.Helper()
 	cfg := config.BuildConfig{
-		WasmFormat: "component", ImportModule: "t", WitPackage: "t", Regexps: entries,
+		WasmFormat: "component", ImportModule: "t", WitPackage: "t", Patterns: entries,
 	}
 	_, _, resources, _, _, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
@@ -1844,9 +1844,9 @@ func (h *setHarness) spans(ret int32) (start, end uint32, some, errored bool) {
 // checks the positions AND the advance rule: every match is reported once, in
 // order, and a scan over an empty-matchable pattern terminates.
 func TestComponentPatternFindResource(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
-		{Pattern: `a*`, FindFunc: "empties"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Regexp: `a*`, FindFunc: "empties"},
 	})
 
 	drive := func(funcName, input string) [][2]uint32 {
@@ -1903,8 +1903,8 @@ func TestComponentPatternFindResource(t *testing.T) {
 // UNSET group — the element path a happy-path test never reaches — and the
 // empty list that means the scan is finished.
 func TestComponentPatternGroupsResource(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
 	})
 	n := res["g"]
 	if !n.Groups {
@@ -1965,8 +1965,8 @@ func TestComponentPatternGroupsResource(t *testing.T) {
 // pattern, interleaved, must not share a position — the property the resource
 // exists to provide and the one a module-level global would break.
 func TestComponentPatternScannersAreIndependent(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `[0-9]+`, FindFunc: "nums"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `[0-9]+`, FindFunc: "nums"},
 	})
 	n := res["nums"]
 	pa, la := h.writeInput("1 22 333")
@@ -2006,10 +2006,10 @@ func TestComponentSplitSet(t *testing.T) {
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: '[a-z]+X'
-  - pattern: 'foo'
-  - pattern: '\bbar'
+patterns:
+  - regexp: '[a-z]+X'
+  - regexp: 'foo'
+  - regexp: '\bbar'
 sets:
   - name: s
     patterns: all
@@ -2109,7 +2109,7 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 	})
 
 	t.Run("pattern notes", func(t *testing.T) {
-		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\nregexps:\n  - name: ov\n    pattern: 'a*b|a'\n    find_func: ov_find\n", 2)
+		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\npatterns:\n  - name: ov\n    regexp: 'a*b|a'\n    find_func: ov_find\n", 2)
 		var cfg config.BuildConfig
 		if err := yaml.Unmarshal([]byte(yml), &cfg); err != nil {
 			t.Fatal(err)

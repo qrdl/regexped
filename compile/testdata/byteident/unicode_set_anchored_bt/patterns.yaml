@@ -1,8 +1,8 @@
 # A Unicode-mode anchored pair whose only member has an anchored DFA past
 # 16,384 states: no union to build, so the bucket body runs its Backtracking
 # probe alone.
-regexps:
-  - { name: bt0, pattern: '[аб]*а[аб]{14}' }
+patterns:
+  - { name: bt0, regexp: '[аб]*а[аб]{14}' }
 sets:
   - name: anch
     match_any: anch_any

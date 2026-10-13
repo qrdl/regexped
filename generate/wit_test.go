@@ -15,10 +15,10 @@ func componentCfg() config.BuildConfig {
 	return config.BuildConfig{
 		WasmFormat:   "component",
 		ImportModule: "url_ipv6",
-		Regexps: []config.RegexEntry{
-			{Pattern: `a`, MatchFunc: "email_match"},
-			{Pattern: `b`, FindFunc: "email_find"},
-			{Pattern: `(c)`, GroupsFunc: "urlGroups"},
+		Patterns: []config.PatternEntry{
+			{Regexp: `a`, MatchFunc: "email_match"},
+			{Regexp: `b`, FindFunc: "email_find"},
+			{Regexp: `(c)`, GroupsFunc: "urlGroups"},
 		},
 	}
 }
@@ -165,15 +165,15 @@ func TestWitWorldOverride(t *testing.T) {
 // export a caller reaches.
 func TestWitNameErrors(t *testing.T) {
 	cfg := componentCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: "a", MatchFunc: "_bad"}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "_bad"}}
 	if _, err := WitText(cfg); err == nil || !strings.Contains(err.Error(), "match_func") {
 		t.Errorf("err = %v, want one naming match_func", err)
 	}
 
 	// Two config names that kebab to the same identifier: an error naming both.
-	cfg.Regexps = []config.RegexEntry{
-		{Pattern: "a", MatchFunc: "url_match"},
-		{Pattern: "b", FindFunc: "urlMatch"},
+	cfg.Patterns = []config.PatternEntry{
+		{Regexp: "a", MatchFunc: "url_match"},
+		{Regexp: "b", FindFunc: "urlMatch"},
 	}
 	_, err := WitText(cfg)
 	if err == nil {
@@ -190,7 +190,7 @@ func TestWitNameErrors(t *testing.T) {
 // nothing.
 func TestWitSkipsEntriesWithoutFuncs(t *testing.T) {
 	cfg := componentCfg()
-	cfg.Regexps = append(cfg.Regexps, config.RegexEntry{Pattern: "z"})
+	cfg.Patterns = append(cfg.Patterns, config.PatternEntry{Regexp: "z"})
 	got, err := WitText(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +263,7 @@ func TestEveryWitEntryPointEnforcesTheSameRules(t *testing.T) {
 			return c
 		},
 		"match_func": func(c config.BuildConfig) config.BuildConfig {
-			c.Regexps = []config.RegexEntry{{Pattern: "a", MatchFunc: "_bad"}}
+			c.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "_bad"}}
 			return c
 		},
 	}
@@ -408,9 +408,9 @@ func witSetsCfg() config.BuildConfig {
 		ImportModule: "t",
 		WitPackage:   "t",
 		WasmFile:     "t.wasm",
-		Regexps: []config.RegexEntry{
-			{Pattern: `ghp_[A-Za-z0-9]{4}`, MatchFunc: "token_match"},
-			{Pattern: `AKIA[A-Z0-9]{6}`},
+		Patterns: []config.PatternEntry{
+			{Regexp: `ghp_[A-Za-z0-9]{4}`, MatchFunc: "token_match"},
+			{Regexp: `AKIA[A-Z0-9]{6}`},
 		},
 		Sets: []config.SetConfig{{
 			Name:     "s",
@@ -462,7 +462,7 @@ func TestWitSetsInterface(t *testing.T) {
 // legal WIT and pointless, and a world exporting one makes a consumer bind it.
 func TestWitSetsOnlyOmitsMatcher(t *testing.T) {
 	cfg := witSetsCfg()
-	cfg.Regexps = []config.RegexEntry{{Pattern: `abc`}, {Pattern: `def`}}
+	cfg.Patterns = []config.PatternEntry{{Regexp: `abc`}, {Regexp: `def`}}
 	text, err := WitText(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -553,7 +553,7 @@ func TestWitSetsRejectsUnrepresentableName(t *testing.T) {
 // every generated stub would declare the symbol twice.
 func TestWitSetsRejectsCollisionWithMatcher(t *testing.T) {
 	cfg := witSetsCfg()
-	cfg.Regexps[0].MatchFunc = "any_hit"
+	cfg.Patterns[0].MatchFunc = "any_hit"
 	_, err := WitText(cfg)
 	if err == nil {
 		t.Fatal("a name colliding across interfaces was accepted")

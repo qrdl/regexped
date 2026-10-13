@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,13 +12,13 @@ import (
 
 func TestCaptureStubsRequested(t *testing.T) {
 	cases := []struct {
-		entry RegexEntry
+		entry PatternEntry
 		want  bool
 	}{
-		{RegexEntry{}, false},
-		{RegexEntry{MatchFunc: "m"}, false},
-		{RegexEntry{FindFunc: "f"}, false},
-		{RegexEntry{GroupsFunc: "g"}, true},
+		{PatternEntry{}, false},
+		{PatternEntry{MatchFunc: "m"}, false},
+		{PatternEntry{FindFunc: "f"}, false},
+		{PatternEntry{GroupsFunc: "g"}, true},
 	}
 	for _, c := range cases {
 		if got := c.entry.CaptureStubsRequested(); got != c.want {
@@ -28,11 +29,11 @@ func TestCaptureStubsRequested(t *testing.T) {
 
 func TestGroupsExportName(t *testing.T) {
 	cases := []struct {
-		entry RegexEntry
+		entry PatternEntry
 		want  string
 	}{
-		{RegexEntry{GroupsFunc: "grp"}, "grp"},
-		{RegexEntry{}, ""},
+		{PatternEntry{GroupsFunc: "grp"}, "grp"},
+		{PatternEntry{}, ""},
 	}
 	for _, c := range cases {
 		if got := c.entry.GroupsExportName(); got != c.want {
@@ -42,7 +43,7 @@ func TestGroupsExportName(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	yaml := "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	yaml := "patterns:\n  - regexp: 'foo'\n    match_func: foo_match\n"
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
@@ -52,11 +53,11 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if len(cfg.Regexps) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(cfg.Regexps))
+	if len(cfg.Patterns) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(cfg.Patterns))
 	}
-	if cfg.Regexps[0].MatchFunc != "foo_match" {
-		t.Errorf("MatchFunc = %q, want foo_match", cfg.Regexps[0].MatchFunc)
+	if cfg.Patterns[0].MatchFunc != "foo_match" {
+		t.Errorf("MatchFunc = %q, want foo_match", cfg.Patterns[0].MatchFunc)
 	}
 }
 
@@ -80,12 +81,12 @@ func TestLoadConfigNoRegexes(t *testing.T) {
 	}
 	_, err := LoadConfig(path)
 	if err == nil {
-		t.Fatal("expected error for config with no regexps, got nil")
+		t.Fatal("expected error for config with no patterns, got nil")
 	}
 }
 func TestLoadConfigPathResolution(t *testing.T) {
 	dir := t.TempDir()
-	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+	yaml := "wasm_file: regexps.wasm\nstub_file: src/stub.rs\noutput: final.wasm\npatterns:\n  - regexp: 'foo'\n    match_func: foo_match\n"
 	path := filepath.Join(dir, "regexped.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
 		t.Fatal(err)
@@ -189,7 +190,7 @@ func TestMemorySizeAbove4GiB(t *testing.T) {
 func TestLoadConfigMaxMemory(t *testing.T) {
 	load := func(t *testing.T, line string) (BuildConfig, error) {
 		t.Helper()
-		body := "wasm_file: x.wasm\n" + line + "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+		body := "wasm_file: x.wasm\n" + line + "patterns:\n  - regexp: 'foo'\n    match_func: foo_match\n"
 		path := filepath.Join(t.TempDir(), "regexped.yaml")
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
@@ -254,7 +255,7 @@ func TestLoadConfigMaxMemory(t *testing.T) {
 func TestLoadConfigLimits(t *testing.T) {
 	load := func(t *testing.T, extra string) (BuildConfig, error) {
 		t.Helper()
-		return LoadConfig(writeConfig(t, "wasm_file: out.wasm\n"+extra+"regexps:\n  - pattern: 'a'\n    match_func: m\n"))
+		return LoadConfig(writeConfig(t, "wasm_file: out.wasm\n"+extra+"patterns:\n  - regexp: 'a'\n    match_func: m\n"))
 	}
 	for _, c := range []struct {
 		yaml    string
@@ -338,7 +339,7 @@ func TestPatternSelector_UnmarshalYAML_Invalid(t *testing.T) {
 
 func TestValidateSets_Valid(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}, {Name: "p2", Pattern: "bar"}},
+		Patterns: []PatternEntry{{Name: "p1", Regexp: "foo"}, {Name: "p2", Regexp: "bar"}},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{All: true}},
 			{Name: "s2", ScanAll: "s2_all", Patterns: PatternSelector{Names: []string{"p1"}}},
@@ -351,8 +352,8 @@ func TestValidateSets_Valid(t *testing.T) {
 
 func TestValidateSets_DuplicateRegexName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "dup", Pattern: "foo"}, {Name: "dup", Pattern: "bar"}},
-		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{All: true}}},
+		Patterns: []PatternEntry{{Name: "dup", Regexp: "foo"}, {Name: "dup", Regexp: "bar"}},
+		Sets:     []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for duplicate regexp name, got nil")
@@ -361,7 +362,7 @@ func TestValidateSets_DuplicateRegexName(t *testing.T) {
 
 func TestValidateSets_DuplicateSetName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Patterns: []PatternEntry{{Name: "p", Regexp: "foo"}},
 		Sets: []SetConfig{
 			{Name: "same", ScanAny: "a", Patterns: PatternSelector{All: true}},
 			{Name: "same", ScanAll: "b", Patterns: PatternSelector{All: true}},
@@ -374,8 +375,8 @@ func TestValidateSets_DuplicateSetName(t *testing.T) {
 
 func TestValidateSets_UnknownPatternRef(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "known", Pattern: "foo"}},
-		Sets:    []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
+		Patterns: []PatternEntry{{Name: "known", Regexp: "foo"}},
+		Sets:     []SetConfig{{Name: "s", ScanAny: "ma", Patterns: PatternSelector{Names: []string{"unknown"}}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for unknown pattern reference, got nil")
@@ -384,8 +385,8 @@ func TestValidateSets_UnknownPatternRef(t *testing.T) {
 
 func TestValidateSets_NoExportField(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []SetConfig{{Name: "s", Patterns: PatternSelector{All: true}}},
+		Patterns: []PatternEntry{{Name: "p", Regexp: "foo"}},
+		Sets:     []SetConfig{{Name: "s", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for set with no export field, got nil")
@@ -394,8 +395,8 @@ func TestValidateSets_NoExportField(t *testing.T) {
 
 func TestValidateSets_MissingSetName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []SetConfig{{ScanAny: "ma", Patterns: PatternSelector{All: true}}},
+		Patterns: []PatternEntry{{Name: "p", Regexp: "foo"}},
+		Sets:     []SetConfig{{ScanAny: "ma", Patterns: PatternSelector{All: true}}},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected error for set with missing name, got nil")
@@ -404,7 +405,7 @@ func TestValidateSets_MissingSetName(t *testing.T) {
 
 func TestValidateSets_EmptySets(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p", Pattern: "foo"}},
+		Patterns: []PatternEntry{{Name: "p", Regexp: "foo"}},
 	}
 	if err := ValidateSets(cfg); err != nil {
 		t.Errorf("ValidateSets empty sets: %v", err)
@@ -479,19 +480,19 @@ func TestPatternSelector_UnmarshalYAML_NonStringListItem(t *testing.T) {
 
 func TestValidateSets_DuplicateRegexExportName(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{
-			{Name: "p1", Pattern: "foo", MatchFunc: "dup"},
-			{Name: "p2", Pattern: "bar", FindFunc: "dup"},
+		Patterns: []PatternEntry{
+			{Name: "p1", Regexp: "foo", MatchFunc: "dup"},
+			{Name: "p2", Regexp: "bar", FindFunc: "dup"},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
-		t.Error("expected duplicate WASM export name error among regexps, got nil")
+		t.Error("expected duplicate WASM export name error among patterns, got nil")
 	}
 }
 
 func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo", MatchFunc: "shared"}},
+		Patterns: []PatternEntry{{Name: "p1", Regexp: "foo", MatchFunc: "shared"}},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAll: "shared", Patterns: PatternSelector{All: true}},
 		},
@@ -503,7 +504,7 @@ func TestValidateSets_RegexSetExportCollision(t *testing.T) {
 
 func TestValidateSets_MissingPatternsField(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Patterns: []PatternEntry{{Name: "p1", Regexp: "foo"}},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAny: "s1_any"}, // patterns omitted entirely
 		},
@@ -515,13 +516,166 @@ func TestValidateSets_MissingPatternsField(t *testing.T) {
 
 func TestValidateSets_DuplicatePatternInSet(t *testing.T) {
 	cfg := &BuildConfig{
-		Regexps: []RegexEntry{{Name: "p1", Pattern: "foo"}},
+		Patterns: []PatternEntry{{Name: "p1", Regexp: "foo"}},
 		Sets: []SetConfig{
 			{Name: "s1", ScanAny: "s1_any", Patterns: PatternSelector{Names: []string{"p1", "p1"}}},
 		},
 	}
 	if err := ValidateSets(cfg); err == nil {
 		t.Error("expected duplicate-pattern error, got nil")
+	}
+}
+
+// TestSetMembersInlineRegexps pins how a set's own `regexps:` join its
+// members: after the selected top-level patterns, with ids numbered PER SET
+// right after every top-level pattern, so one set's inline regexps never
+// renumber another set's. `all` selects every top-level entry, named or not,
+// and never another set's regexps.
+func TestSetMembersInlineRegexps(t *testing.T) {
+	cfg := BuildConfig{
+		Patterns: []PatternEntry{
+			{Name: "a", Regexp: "aa"},
+			{Regexp: "bb"}, // unnamed: reachable only through all
+			{Name: "c", Regexp: "cc"},
+		},
+		Sets: []SetConfig{
+			{Name: "everything", ScanAll: "e", Patterns: PatternSelector{All: true}},
+			{Name: "mixed", Find: "m", Patterns: PatternSelector{Names: []string{"c"}}, Regexps: []string{"x+", "y+"}},
+			{Name: "inline", MatchAny: "i", Regexps: []string{"z"}},
+			{Name: "both", ScanAny: "b", Patterns: PatternSelector{All: true}, Regexps: []string{"w"}},
+		},
+	}
+	type want struct {
+		ids         []int
+		count, idSp int
+	}
+	for i, w := range []want{
+		{[]int{0, 1, 2}, 3, 3},
+		{[]int{2, 3, 4}, 3, 5},
+		{[]int{3}, 1, 4},
+		{[]int{0, 1, 2, 3}, 4, 4},
+	} {
+		sc := cfg.Sets[i]
+		var ids []int
+		for _, m := range sc.Members(cfg) {
+			ids = append(ids, m.ID)
+			if m.Inline != (m.ID >= len(cfg.Patterns)) {
+				t.Errorf("%s: member %d Inline = %v", sc.Name, m.ID, m.Inline)
+			}
+		}
+		if !reflect.DeepEqual(ids, w.ids) {
+			t.Errorf("%s: member ids %v, want %v", sc.Name, ids, w.ids)
+		}
+		if got := sc.PatternCount(cfg); got != w.count {
+			t.Errorf("%s: PatternCount = %d, want %d", sc.Name, got, w.count)
+		}
+		if got := sc.IDSpaceSize(cfg); got != w.idSp {
+			t.Errorf("%s: IDSpaceSize = %d, want %d", sc.Name, got, w.idSp)
+		}
+	}
+	// An inline member carries only its regexp.
+	if m := cfg.Sets[1].Members(cfg)[1]; !reflect.DeepEqual(m.Entry, PatternEntry{Regexp: "x+"}) {
+		t.Errorf("inline member entry = %+v, want only Regexp", m.Entry)
+	}
+	if err := ValidateSets(&cfg); err != nil {
+		t.Errorf("ValidateSets: %v", err)
+	}
+	// Members skips an undeclared name (ValidateSets reports it), and the
+	// first of two equal names wins.
+	dup := BuildConfig{Patterns: []PatternEntry{{Name: "p", Regexp: "a"}, {Name: "p", Regexp: "b"}}}
+	got := SetConfig{Patterns: PatternSelector{Names: []string{"p", "nope"}}}.Members(dup)
+	if len(got) != 1 || got[0].ID != 0 {
+		t.Errorf("Members over a duplicate and an unknown name = %+v, want only id 0", got)
+	}
+}
+
+// TestValidateSets_InlineRegexps covers the load errors inline regexps add: a
+// set with no members, an empty regexp (ValidateSets), and two equivalent
+// members of one set (validateSetMembers, at load only).
+func TestValidateSets_InlineRegexps(t *testing.T) {
+	top := []PatternEntry{
+		{Name: "err_find", Regexp: "ERROR", FindFunc: "find_error"},
+		{Name: "err_match", Regexp: "(?:ERROR)", MatchFunc: "match_error"},
+		{Regexp: "(WARN)"},
+	}
+	for _, c := range []struct {
+		name string
+		pats []PatternEntry
+		set  SetConfig
+		want string // "" = valid
+	}{
+		{"inline only", nil, SetConfig{Regexps: []string{"a", "b"}}, ""},
+		{"no members", nil, SetConfig{Patterns: PatternSelector{All: true}}, "has no members"},
+		{"empty list", top, SetConfig{Patterns: PatternSelector{Names: []string{}}}, "has no members"},
+		{"empty regexp", nil, SetConfig{Regexps: []string{"a", ""}}, "regexps item 1 is empty"},
+		{"inline twins", nil, SetConfig{Regexps: []string{"ERROR", "WARN", "(?:ERROR)"}},
+			`regexp 'ERROR' and regexp '(?:ERROR)' are equivalent`},
+		{"captures do not count", nil, SetConfig{Regexps: []string{"(a)b", "ab"}},
+			`regexp '(a)b' and regexp 'ab' are equivalent`},
+		{"simplified twins", nil, SetConfig{Regexps: []string{"a{2}", "aa"}}, "are equivalent"},
+		{"same language, different answers", nil, SetConfig{Regexps: []string{"a|ab", "ab|a"}}, ""},
+		{"through all", top, SetConfig{Patterns: PatternSelector{All: true}},
+			`pattern "err_find" and pattern "err_match" are equivalent`},
+		{"named and inline", top, SetConfig{Patterns: PatternSelector{Names: []string{"err_find"}}, Regexps: []string{"(ERROR)"}},
+			`pattern "err_find" and regexp '(ERROR)' are equivalent`},
+		{"unnamed and inline", top[2:], SetConfig{Patterns: PatternSelector{All: true}, Regexps: []string{"WARN"}},
+			`pattern '(WARN)' and regexp 'WARN' are equivalent`},
+		{"one per set", top[:1], SetConfig{Patterns: PatternSelector{Names: []string{"err_find"}}}, ""},
+		{"unparseable is compile's to report", nil, SetConfig{Regexps: []string{"(", "("}}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.set.Name, c.set.Find = "s", "s_find"
+			cfg := &BuildConfig{Patterns: c.pats, Sets: []SetConfig{c.set}}
+			err := ValidateSets(cfg)
+			if err == nil {
+				err = validateSetMembers(cfg)
+			}
+			switch {
+			case c.want == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+				t.Errorf("err = %v, want it to contain %q", err, c.want)
+			}
+		})
+	}
+	// Top-level entries are not checked against each other outside a set.
+	cfg := &BuildConfig{Patterns: top}
+	if err := validateSetMembers(cfg); err != nil {
+		t.Errorf("equivalent top-level entries outside any set: %v", err)
+	}
+	// A config built in code is not refused by ValidateSets — CompileFile's
+	// check — so the corpus harnesses keep compiling equivalent members.
+	cfg = &BuildConfig{Patterns: top, Sets: []SetConfig{{Name: "s", Find: "f", Patterns: PatternSelector{All: true}}}}
+	if err := ValidateSets(cfg); err != nil {
+		t.Errorf("ValidateSets refused equivalent members: %v", err)
+	}
+}
+
+// TestLoadConfig_InlineRegexps loads the new keys from YAML: a config whose
+// every regexp is inline needs no top-level patterns:, a config with no
+// regexp anywhere is refused, and the retired keys are unknown fields.
+func TestLoadConfig_InlineRegexps(t *testing.T) {
+	cfg, err := LoadConfig(writeCfg(t, "sets:\n  - name: levels\n    match_any: level_of\n"+
+		"    regexps: ['ERROR', 'WARN', 'INFO']\n"))
+	if err != nil {
+		t.Fatalf("inline-only config: %v", err)
+	}
+	if got := cfg.Sets[0].Regexps; !reflect.DeepEqual(got, []string{"ERROR", "WARN", "INFO"}) {
+		t.Errorf("regexps = %q", got)
+	}
+	for _, c := range []struct{ name, yaml, want string }{
+		{"nothing to build", "sets:\n  - name: s\n    find: f\n    patterns: all\n", "has no patterns"},
+		{"empty file", "wasm_file: x.wasm\n", "has no patterns"},
+		{"old top-level key", "regexps:\n  - regexp: 'a'\n    match_func: m\n", "regexps"},
+		{"old entry key", "patterns:\n  - pattern: 'a'\n    match_func: m\n", "pattern"},
+		{"equivalent members", "patterns:\n  - name: a\n    regexp: 'x'\nsets:\n  - name: s\n    find: f\n" +
+			"    patterns: [a]\n    regexps: ['(?:x)']\n", `set "s": pattern "a" and regexp '(?:x)' are equivalent`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if err := loadYAML(t, c.yaml); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("err = %v, want it to contain %q", err, c.want)
+			}
+		})
 	}
 }
 
@@ -560,7 +714,7 @@ func TestBatchFindOnSets(t *testing.T) {
 	if err := validateHintList([]string{"batch-find"}); err != nil {
 		t.Errorf("validateHintList(batch-find) = %v, want nil", err)
 	}
-	withFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+	withFind := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n" +
 		"  - name: s\n    find: sf\n    hints: [batch-find]\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, withFind))
 	if err != nil {
@@ -569,7 +723,7 @@ func TestBatchFindOnSets(t *testing.T) {
 	if !cfg.Sets[0].BatchFind() {
 		t.Error("BatchFind() = false on a set with find: and hints: [batch-find]")
 	}
-	noFind := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+	noFind := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n" +
 		"  - name: s\n    scan_any: sa\n    hints: [batch-find]\n    patterns: all\n"
 	if _, err := LoadConfig(writeCfg(t, noFind)); err == nil {
 		t.Error("batch-find without find: expected an error")
@@ -581,8 +735,8 @@ func TestBatchFindOnSets(t *testing.T) {
 func TestLoadConfig_HintsMutuallyExclusive(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - regexp: 'foo'\n" +
 		"    match_func: foo_match\n" +
 		"    hints: [prefer-match, prefer-no-match]\n"
 	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
@@ -596,8 +750,8 @@ func TestLoadConfig_HintsMutuallyExclusive(t *testing.T) {
 func TestLoadConfig_HintsUnknownValue(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - regexp: 'foo'\n" +
 		"    match_func: foo_match\n" +
 		"    hints: [bogus]\n"
 	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
@@ -611,8 +765,8 @@ func TestLoadConfig_HintsUnknownValue(t *testing.T) {
 func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - name: p1\n    pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - name: p1\n    regexp: 'foo'\n" +
 		"sets:\n" +
 		"  - name: s1\n" +
 		"    find_any: any1\n" +
@@ -632,8 +786,8 @@ func TestLoadConfig_SetHintsMutuallyExclusive(t *testing.T) {
 func TestLoadConfig_BatchFindInvalidForSets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - name: p1\n    pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - name: p1\n    regexp: 'foo'\n" +
 		"sets:\n" +
 		"  - name: s1\n" +
 		"    find_any: any1\n" +
@@ -648,12 +802,12 @@ func TestLoadConfig_BatchFindInvalidForSets(t *testing.T) {
 }
 
 // TestLoadConfig_BatchFindValidForRegexps verifies "batch-find" loads cleanly
-// on a regexps: entry, alone or combined with prefer-match/prefer-no-match.
+// on a patterns: entry, alone or combined with prefer-match/prefer-no-match.
 func TestLoadConfig_BatchFindValidForRegexps(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - regexp: 'foo'\n" +
 		"    find_func: foo_find\n" +
 		"    hints: [batch-find, prefer-match]\n"
 	if err := os.WriteFile(path, []byte(yamlData), 0600); err != nil {
@@ -667,8 +821,8 @@ func TestLoadConfig_BatchFindValidForRegexps(t *testing.T) {
 func TestLoadConfig_ValidateSetsError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "regexped.yaml")
-	yamlData := "regexps:\n" +
-		"  - name: p1\n    pattern: 'foo'\n" +
+	yamlData := "patterns:\n" +
+		"  - name: p1\n    regexp: 'foo'\n" +
 		"sets:\n" +
 		"  - name: s1\n" +
 		"    find_any: any1\n" +
@@ -703,23 +857,23 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 	cases := []struct {
 		name, key, yaml string
 	}{
-		{"find_all", "find_all", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
-		{"find_any", "find_any", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
-		{"batch_size", "batch_size", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
+		{"find_all", "find_all", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    find_all: sf\n    patterns: all\n"},
+		{"find_any", "find_any", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    find_any: sf\n    patterns: all\n"},
+		{"batch_size", "batch_size", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    find: sf\n    batch_size: 128\n    patterns: all\n"},
 		// Retired keys: `match:` and `scan:` and
 		// `find_batch:` (decision (11)). Dropping the KEYS rather than
 		// repurposing them is the point — a surviving `match:` with match_any
 		// semantics would leave every existing config compiling while its
 		// callers silently switched from reading 0/1 to reading an id.
-		{"match", "match", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
-		{"scan", "scan", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
-		{"find_batch", "find_batch", "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
+		{"match", "match", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    match: sm\n    patterns: all\n"},
+		{"scan", "scan", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    scan: ss\n    patterns: all\n"},
+		{"find_batch", "find_batch", "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n"},
 		// Retired. It was never a separate capability — both
 		// stubs called the SAME WASM export — so `groups_func` plus the
 		// generated name→index constants replaces it, and C and AS gain named
 		// access they never had.
-		{"named_groups_func", "named_groups_func", "regexps:\n  - pattern: '(?P<a>x)'\n    named_groups_func: ng\n"},
-		{"typo", "mach_func", "regexps:\n  - pattern: 'foo'\n    mach_func: m\n"},
+		{"named_groups_func", "named_groups_func", "patterns:\n  - regexp: '(?P<a>x)'\n    named_groups_func: ng\n"},
+		{"typo", "mach_func", "patterns:\n  - regexp: 'foo'\n    mach_func: m\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -735,7 +889,7 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 }
 
 func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
-	base := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    find: sf\n    patterns: all\n"
+	base := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    find: sf\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, base))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -764,7 +918,7 @@ func TestLoadConfig_OverlappingRoundTrips(t *testing.T) {
 // there is no body to select, so the key has no effect and is accepted rather
 // than rejected — a harmless key should not be a build failure.
 func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    scan_any: sc\n    overlapping: true\n    patterns: all\n"
+	yaml := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    scan_any: sc\n    overlapping: true\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, yaml))
 	if err != nil {
 		t.Fatalf("overlapping without find must be ignored, got error: %v", err)
@@ -782,7 +936,7 @@ func TestLoadConfig_OverlappingWithoutFindIsIgnored(t *testing.T) {
 // set — legal until then — no longer exists, and asking for batching adds
 // nothing to Capabilities().
 func TestLoadConfig_BatchFindIsNotACapability(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+	yaml := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n" +
 		"  - name: s\n    find: fb\n    hints: [batch-find]\n    patterns: all\n"
 	cfg, err := LoadConfig(writeCfg(t, yaml))
 	if err != nil {
@@ -804,17 +958,17 @@ func TestLoadConfig_BatchFindIsNotACapability(t *testing.T) {
 // otherwise adding the hint to a working config would turn a valid export into
 // a duplicate.
 func TestLoadConfig_BatchNameCollision(t *testing.T) {
-	ending := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n" +
+	ending := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n" +
 		"  - name: s\n    find: my_batch\n    patterns: all\n"
 	if _, err := LoadConfig(writeCfg(t, ending)); err == nil {
 		t.Fatal("a set capability ending in _batch must be rejected")
 	}
-	collide := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+	collide := "patterns:\n  - name: p\n    regexp: 'foo'\n    find_func: ff\nsets:\n" +
 		"  - name: s\n    scan_any: ff_batch\n    patterns: all\n"
 	if _, err := LoadConfig(writeCfg(t, collide)); err == nil {
 		t.Fatal("a set capability claiming a pattern's synthesized batch name must be rejected")
 	}
-	ok := "regexps:\n  - name: p\n    pattern: 'foo'\n    find_func: ff\nsets:\n" +
+	ok := "patterns:\n  - name: p\n    regexp: 'foo'\n    find_func: ff\nsets:\n" +
 		"  - name: s\n    find: set_find\n    hints: [batch-find]\n    patterns: all\n"
 	if _, err := LoadConfig(writeCfg(t, ok)); err != nil {
 		t.Fatalf("a non-colliding batching set must be accepted, got: %v", err)
@@ -847,7 +1001,7 @@ func TestValidateSets_AllCapabilityNamesValidated(t *testing.T) {
 	for _, key := range []string{"match_any", "match_all", "scan_any", "scan_all", "find"} {
 		t.Run(key, func(t *testing.T) {
 			// A Go stub, so `struct` is reserved in the generated language.
-			yaml := "stub_file: x.go\nregexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
+			yaml := "stub_file: x.go\npatterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    " + key + ": struct\n    patterns: all\n"
 			_, err := LoadConfig(writeCfg(t, yaml))
 			if err == nil {
 				t.Fatalf("%s: a reserved word must be rejected as an export name", key)
@@ -857,7 +1011,7 @@ func TestValidateSets_AllCapabilityNamesValidated(t *testing.T) {
 }
 
 func TestValidateSets_NoCapabilityIsError(t *testing.T) {
-	yaml := "regexps:\n  - name: p\n    pattern: 'foo'\nsets:\n  - name: s\n    patterns: all\n"
+	yaml := "patterns:\n  - name: p\n    regexp: 'foo'\nsets:\n  - name: s\n    patterns: all\n"
 	_, err := LoadConfig(writeCfg(t, yaml))
 	if err == nil {
 		t.Fatal("a set declaring no capability must be rejected")
@@ -868,7 +1022,7 @@ func TestValidateSets_NoCapabilityIsError(t *testing.T) {
 // retired. Strict YAML makes each a line-numbered unknown-field error naming it.
 func TestLoadConfigRetiredToolKeys(t *testing.T) {
 	for _, key := range []string{"wasm_merge", "wasm_tools", "wac"} {
-		_, err := LoadConfig(writeCfg(t, key+": x\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"))
+		_, err := LoadConfig(writeCfg(t, key+": x\npatterns:\n  - regexp: 'foo'\n    match_func: foo_match\n"))
 		if err == nil || !strings.Contains(err.Error(), key) {
 			t.Errorf("%s: err = %v, want an unknown-field error naming it", key, err)
 		}
@@ -897,7 +1051,7 @@ func TestLoadConfigToolPathKeys(t *testing.T) {
 			{"~bob/bin", filepath.Join(dir, "~bob/bin")},
 		} {
 			path := filepath.Join(dir, "regexped.yaml")
-			yaml := key + ": '" + c.value + "'\nregexps:\n  - pattern: 'foo'\n    match_func: foo_match\n"
+			yaml := key + ": '" + c.value + "'\npatterns:\n  - regexp: 'foo'\n    match_func: foo_match\n"
 			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -946,49 +1100,49 @@ func TestLoadConfigRejects(t *testing.T) {
 	}{
 		{
 			"unparseable YAML",
-			"regexps: [oh dear\n",
+			"patterns: [oh dear\n",
 			"",
 		},
 		{
 			"a reserved word as a function name",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\n    match_func: match\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\n    match_func: match\n",
 			"",
 		},
 		{
 			"a function name that is not an identifier",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\n    match_func: 'my func'\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\n    match_func: 'my func'\n",
 			"",
 		},
 		{
 			"a set naming a pattern that does not exist",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\nsets:\n  - name: s\n    find: f\n    patterns: [nope]\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\nsets:\n  - name: s\n    find: f\n    patterns: [nope]\n",
 			"",
 		},
 		{
 			"a set with no patterns key",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\nsets:\n  - name: s\n    find: f\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\nsets:\n  - name: s\n    find: f\n",
 			"patterns",
 		},
 		{
 			"an unknown hint",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\n    match_func: m\n    hints: [go-faster]\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\n    match_func: m\n    hints: [go-faster]\n",
 			"",
 		},
 		{
 			"two sets exporting the same name",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\nsets:\n" +
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\nsets:\n" +
 				"  - name: s1\n    find: dup\n    patterns: all\n" +
 				"  - name: s2\n    find: dup\n    patterns: all\n",
 			"",
 		},
 		{
 			"a retired key: named_groups_func",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: '(a)'\n    named_groups_func: g\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: '(a)'\n    named_groups_func: g\n",
 			"",
 		},
 		{
 			"a retired key: find_batch",
-			"stub_file: s.rs\nregexps:\n  - name: p\n    pattern: 'a'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n",
+			"stub_file: s.rs\npatterns:\n  - name: p\n    regexp: 'a'\nsets:\n  - name: s\n    find_batch: fb\n    patterns: all\n",
 			"",
 		},
 	}
@@ -1029,15 +1183,15 @@ max_bt_instructions: 30000
 max_set_bucket_size: 1MiB
 max_split_table_size: 8MB
 max_union_states: 16384
-regexps:
+patterns:
   - name: url
-    pattern: '(?P<scheme>https?)://(?P<host>[a-z.]+)'
+    regexp: '(?P<scheme>https?)://(?P<host>[a-z.]+)'
     match_func: url_match
     find_func: url_find
     groups_func: url_groups
     hints: [prefer-match]
   - name: num
-    pattern: '[0-9]+'
+    regexp: '[0-9]+'
 sets:
   - name: secrets
     match_any: which_secret
@@ -1053,8 +1207,8 @@ sets:
 	if err != nil {
 		t.Fatalf("a valid config was refused: %v", err)
 	}
-	if len(cfg.Regexps) != 2 || len(cfg.Sets) != 1 {
-		t.Fatalf("loaded %d regexps and %d sets, want 2 and 1", len(cfg.Regexps), len(cfg.Sets))
+	if len(cfg.Patterns) != 2 || len(cfg.Sets) != 1 {
+		t.Fatalf("loaded %d patterns and %d sets, want 2 and 1", len(cfg.Patterns), len(cfg.Sets))
 	}
 	if cfg.MaxDFAStates != 2048 || cfg.MaxTDFARegs != 48 || cfg.MaxBTInstructions != 30000 || cfg.MaxUnionStates != 16384 ||
 		cfg.MaxSetBucketSize.Bytes() != 1<<20 || cfg.MaxSplitTableSize.Bytes() != 8_000_000 {
@@ -1074,11 +1228,11 @@ sets:
 func TestPatternSelectorForms(t *testing.T) {
 	cfg, err := LoadConfig(writeConfig(t, `
 stub_file: s.rs
-regexps:
+patterns:
   - name: a
-    pattern: 'a'
+    regexp: 'a'
   - name: b
-    pattern: 'b'
+    regexp: 'b'
 sets:
   - name: s1
     find: f1
@@ -1103,20 +1257,20 @@ sets:
 // write in a config file, and the assertion is that loading it fails with a
 // message naming the problem rather than reaching the generators.
 
-// TestLoadConfigRejectsEmptyPattern covers the empty-`pattern:` guard
+// TestLoadConfigRejectsEmptyPattern covers the empty-`regexp:` guard
 // . An empty pattern used to compile to something matching
 // the empty string everywhere — almost always a YAML slip.
 func TestLoadConfigRejectsEmptyPattern(t *testing.T) {
 	for _, c := range []struct{ name, yaml, want string }{
 		{
 			name: "named entry",
-			yaml: "regexps:\n  - name: broken\n    pattern: \"\"\n    match_func: m\n",
-			want: `regexp broken has an empty pattern`,
+			yaml: "patterns:\n  - name: broken\n    regexp: \"\"\n    match_func: m\n",
+			want: `pattern broken has an empty regexp`,
 		},
 		{
 			name: "unnamed entry falls back to its index",
-			yaml: "regexps:\n  - pattern: \"\"\n    match_func: m\n",
-			want: `regexp #0 has an empty pattern`,
+			yaml: "patterns:\n  - regexp: \"\"\n    match_func: m\n",
+			want: `pattern #0 has an empty regexp`,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1131,7 +1285,7 @@ func TestLoadConfigRejectsEmptyPattern(t *testing.T) {
 // TestLoadConfigRejectsUnknownStubType covers surfacing ResolveStubType's error
 // at load rather than only at `generate`.
 func TestLoadConfigRejectsUnknownStubType(t *testing.T) {
-	err := loadYAML(t, "stub_type: pascal\nregexps:\n  - pattern: 'a'\n    match_func: m\n")
+	err := loadYAML(t, "stub_type: pascal\npatterns:\n  - regexp: 'a'\n    match_func: m\n")
 	if err == nil || !strings.Contains(err.Error(), "pascal") {
 		t.Errorf("want an error naming the unknown stub_type, got %v", err)
 	}
@@ -1161,7 +1315,7 @@ func TestLoadConfigReadErrors(t *testing.T) {
 		}
 	})
 	t.Run("malformed YAML", func(t *testing.T) {
-		if err := loadYAML(t, "regexps: [unclosed\n"); err == nil {
+		if err := loadYAML(t, "patterns: [unclosed\n"); err == nil {
 			t.Error("want a parse error for malformed YAML")
 		}
 	})
@@ -1172,8 +1326,8 @@ func TestLoadConfigReadErrors(t *testing.T) {
 // the per-set one already existed.
 func TestValidateHintsRejectsPointlessBatchFind(t *testing.T) {
 	t.Run("regexp with neither find_func nor groups_func", func(t *testing.T) {
-		cfg := &BuildConfig{Regexps: []RegexEntry{
-			{Name: "p", Pattern: "a", MatchFunc: "m", Hints: []string{"batch-find"}},
+		cfg := &BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "a", MatchFunc: "m", Hints: []string{"batch-find"}},
 		}}
 		err := validateHints(cfg)
 		if err == nil || !strings.Contains(err.Error(), "batch-find") {
@@ -1181,16 +1335,16 @@ func TestValidateHintsRejectsPointlessBatchFind(t *testing.T) {
 		}
 	})
 	t.Run("regexp with groups_func is accepted", func(t *testing.T) {
-		cfg := &BuildConfig{Regexps: []RegexEntry{
-			{Name: "p", Pattern: "(a)", GroupsFunc: "g", Hints: []string{"batch-find"}},
+		cfg := &BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "(a)", GroupsFunc: "g", Hints: []string{"batch-find"}},
 		}}
 		if err := validateHints(cfg); err != nil {
 			t.Errorf("groups_func alone should accept batch-find: %v", err)
 		}
 	})
 	t.Run("unknown hint on a regexp", func(t *testing.T) {
-		cfg := &BuildConfig{Regexps: []RegexEntry{
-			{Name: "p", Pattern: "a", MatchFunc: "m", Hints: []string{"prefer-nothing"}},
+		cfg := &BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "a", MatchFunc: "m", Hints: []string{"prefer-nothing"}},
 		}}
 		if err := validateHints(cfg); err == nil {
 			t.Error("want an error for an unknown hint")
@@ -1198,7 +1352,7 @@ func TestValidateHintsRejectsPointlessBatchFind(t *testing.T) {
 	})
 	t.Run("unknown hint on a set", func(t *testing.T) {
 		cfg := &BuildConfig{
-			Regexps: []RegexEntry{{Name: "p", Pattern: "a"}},
+			Patterns: []PatternEntry{{Name: "p", Regexp: "a"}},
 			Sets: []SetConfig{{
 				Name: "s", Find: "f", Patterns: PatternSelector{All: true},
 				Hints: []string{"prefer-nothing"},
@@ -1216,7 +1370,7 @@ func TestSetBatchPatternCount(t *testing.T) {
 	batching := SetConfig{Name: "s", Find: "f", Hints: []string{"batch-find"}}
 	t.Run("no batch hint is always ok", func(t *testing.T) {
 		s := SetConfig{Name: "s", Find: "f", Patterns: PatternSelector{All: true}}
-		cfg := &BuildConfig{Regexps: make([]RegexEntry, SetCursorMaxPatterns+1)}
+		cfg := &BuildConfig{Patterns: make([]PatternEntry, SetCursorMaxPatterns+1)}
 		if _, ok := setBatchPatternCount(s, cfg); !ok {
 			t.Error("a set with no batch-find hint has no cursor and no limit")
 		}
@@ -1228,10 +1382,10 @@ func TestSetBatchPatternCount(t *testing.T) {
 			t.Errorf("got (%d, %v), want (2, true)", n, ok)
 		}
 	})
-	t.Run("patterns: all counts the regexps", func(t *testing.T) {
+	t.Run("patterns: all counts the top-level patterns", func(t *testing.T) {
 		s := batching
 		s.Patterns = PatternSelector{All: true}
-		cfg := &BuildConfig{Regexps: make([]RegexEntry, 3)}
+		cfg := &BuildConfig{Patterns: make([]PatternEntry, 3)}
 		if n, ok := setBatchPatternCount(s, cfg); n != 3 || !ok {
 			t.Errorf("got (%d, %v), want (3, true)", n, ok)
 		}
@@ -1239,7 +1393,7 @@ func TestSetBatchPatternCount(t *testing.T) {
 	t.Run("over the cursor limit", func(t *testing.T) {
 		s := batching
 		s.Patterns = PatternSelector{All: true}
-		cfg := &BuildConfig{Regexps: make([]RegexEntry, SetCursorMaxPatterns+1)}
+		cfg := &BuildConfig{Patterns: make([]PatternEntry, SetCursorMaxPatterns+1)}
 		if n, ok := setBatchPatternCount(s, cfg); ok {
 			t.Errorf("got (%d, true), want ok=false past %d", n, SetCursorMaxPatterns)
 		}
@@ -1264,8 +1418,8 @@ func TestSetBatchExportName(t *testing.T) {
 func TestValidateSetsRejectsBatchSuffixAndStemCollisions(t *testing.T) {
 	t.Run("regexp export ending in _batch", func(t *testing.T) {
 		cfg := &BuildConfig{
-			Regexps: []RegexEntry{{Name: "p", Pattern: "a", FindFunc: "scan_batch"}},
-			Sets:    []SetConfig{{Name: "s", Find: "f", Patterns: PatternSelector{All: true}}},
+			Patterns: []PatternEntry{{Name: "p", Regexp: "a", FindFunc: "scan_batch"}},
+			Sets:     []SetConfig{{Name: "s", Find: "f", Patterns: PatternSelector{All: true}}},
 		}
 		err := ValidateSets(cfg)
 		if err == nil || !strings.Contains(err.Error(), "_batch") {
@@ -1274,7 +1428,7 @@ func TestValidateSetsRejectsBatchSuffixAndStemCollisions(t *testing.T) {
 	})
 	t.Run("two set names collapsing to one stem", func(t *testing.T) {
 		cfg := &BuildConfig{
-			Regexps: []RegexEntry{{Name: "p", Pattern: "a"}},
+			Patterns: []PatternEntry{{Name: "p", Regexp: "a"}},
 			Sets: []SetConfig{
 				{Name: "url-guard", Find: "f1", Patterns: PatternSelector{All: true}},
 				{Name: "url_guard", Find: "f2", Patterns: PatternSelector{All: true}},
@@ -1306,7 +1460,7 @@ func TestValidateConfigChecksPatternNamesForNameMap(t *testing.T) {
 	withNameMap := func(name string) *BuildConfig {
 		return &BuildConfig{
 			StubType: "c", ImportModule: "m",
-			Regexps: []RegexEntry{{Name: name, Pattern: "a", MatchFunc: "m1"}},
+			Patterns: []PatternEntry{{Name: name, Regexp: "a", MatchFunc: "m1"}},
 			Sets: []SetConfig{{
 				Name: "s", Find: "f", Patterns: PatternSelector{All: true},
 				EmitNameMap: true,
@@ -1327,6 +1481,33 @@ func TestValidateConfigChecksPatternNamesForNameMap(t *testing.T) {
 	if err := ValidateConfig(cfg); err != nil {
 		t.Errorf("without emit_name_map the name is unconstrained: %v", err)
 	}
+	// Only the members of a set that emits a lookup are checked, and a name
+	// two such sets share is reported once.
+	cfg = withNameMap("café")
+	cfg.Patterns = append(cfg.Patterns, PatternEntry{Name: "fine", Regexp: "b"})
+	cfg.Sets[0].Patterns = PatternSelector{Names: []string{"fine"}}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("a non-member's name reached the check: %v", err)
+	}
+	cfg = withNameMap("café")
+	cfg.Sets = append(cfg.Sets, SetConfig{Name: "t", ScanAny: "g", Patterns: PatternSelector{All: true}, EmitNameMap: true})
+	if err := ValidateConfig(cfg); err == nil || strings.Count(err.Error(), "café") != 1 {
+		t.Errorf("a name shared by two sets: err = %v, want it reported once", err)
+	}
+}
+
+// TestSetPatternNameFunc pins the per-language name of a set's lookup; a stub
+// type with no lookup gets none.
+func TestSetPatternNameFunc(t *testing.T) {
+	for lang, want := range map[string]string{
+		"rust": "secret_scanner_pattern_name", "c": "rx_secret_scanner_pattern_name",
+		"go": "SecretScannerPatternName", "js": "secretScannerPatternName",
+		"ts": "secretScannerPatternName", "as": "secretScannerPatternName", "wit": "",
+	} {
+		if got := SetPatternNameFunc("secret_scanner", lang); got != want {
+			t.Errorf("%s: %q, want %q", lang, got, want)
+		}
+	}
 }
 
 // TestASIteratorTypeCollision covers the AssemblyScript arm of the
@@ -1335,9 +1516,9 @@ func TestValidateConfigChecksPatternNamesForNameMap(t *testing.T) {
 func TestASIteratorTypeCollision(t *testing.T) {
 	cfg := &BuildConfig{
 		StubType: "as", ImportModule: "m",
-		Regexps: []RegexEntry{
-			{Name: "a", Pattern: "a", FindFunc: "url_find"},
-			{Name: "b", Pattern: "b", MatchFunc: "UrlFindIter"},
+		Patterns: []PatternEntry{
+			{Name: "a", Regexp: "a", FindFunc: "url_find"},
+			{Name: "b", Regexp: "b", MatchFunc: "UrlFindIter"},
 		},
 	}
 	if err := ValidateConfig(cfg); err == nil {
@@ -1449,7 +1630,7 @@ func TestValidateIdentShapeRejects(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := &BuildConfig{
 				StubType: "rust", ImportModule: c.mod,
-				Regexps: []RegexEntry{{Name: "p", Pattern: "a", MatchFunc: "m"}},
+				Patterns: []PatternEntry{{Name: "p", Regexp: "a", MatchFunc: "m"}},
 			}
 			if err := ValidateConfig(cfg); err == nil {
 				t.Errorf("import_module %q: want an error", c.mod)
@@ -1498,8 +1679,8 @@ func TestValidateSetsRejectsOverCursorLimit(t *testing.T) {
 // the value never becomes a Go value at all, so the switch below never runs.
 func TestPatternSelectorDecodeError(t *testing.T) {
 	err := loadYAML(t, `
-regexps:
-  - pattern: 'a'
+patterns:
+  - regexp: 'a'
     name: a
 sets:
   - name: s
@@ -1579,7 +1760,7 @@ func TestLoadConfig_UnicodeKey(t *testing.T) {
 	load := func(t *testing.T, entry string) (BuildConfig, error) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "regexped.yaml")
-		y := "regexps:\n  - name: p\n    pattern: 'foo'\n    match_func: foo_match\n" + entry +
+		y := "patterns:\n  - name: p\n    regexp: 'foo'\n    match_func: foo_match\n" + entry +
 			"sets:\n  - name: s\n    match_any: s_any\n    patterns: all\n    unicode: false\n"
 		if err := os.WriteFile(path, []byte(y), 0600); err != nil {
 			t.Fatal(err)
@@ -1611,7 +1792,7 @@ func TestLoadConfig_UnicodeKey(t *testing.T) {
 			}
 			continue
 		}
-		re := cfg.Regexps[0]
+		re := cfg.Patterns[0]
 		if re.ByteMode != c.wantByteMode || re.IsByteMode() != c.wantByteMode {
 			t.Errorf("%q: ByteMode = %v, IsByteMode = %v, want %v", c.entry, re.ByteMode, re.IsByteMode(), c.wantByteMode)
 		}
@@ -1622,18 +1803,18 @@ func TestLoadConfig_UnicodeKey(t *testing.T) {
 			t.Errorf("%q: set unicode = %v, want false", c.entry, s)
 		}
 	}
-	// An unnamed entry is named by its pattern.
+	// An unnamed entry is named by its regexp.
 	path := filepath.Join(t.TempDir(), "regexped.yaml")
-	y := "regexps:\n  - pattern: 'foo'\n    match_func: foo_match\n    unicode: true\n    byte_mode: true\n"
+	y := "patterns:\n  - regexp: 'foo'\n    match_func: foo_match\n    unicode: true\n    byte_mode: true\n"
 	if err := os.WriteFile(path, []byte(y), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), `regexp "foo"`) {
-		t.Errorf("unnamed entry: err = %v, want it named by its pattern", err)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), `pattern "foo"`) {
+		t.Errorf("unnamed entry: err = %v, want it named by its regexp", err)
 	}
 	// Built in code rather than loaded, `unicode: false` still reads as byte
 	// mode through IsByteMode.
-	if !(RegexEntry{Unicode: new(false)}).IsByteMode() {
+	if !(PatternEntry{Unicode: new(false)}).IsByteMode() {
 		t.Error("IsByteMode ignores unicode: false on an entry built in code")
 	}
 }

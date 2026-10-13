@@ -27,11 +27,11 @@ wit_version: "1.2.0"       # optional; component only. UNSET MEANS NO VERSION �
 stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h, .wit
 stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as, wit
 namespace:      "acme"     # optional; prefixes the fixed symbols a stub declares — Span, SetMatch,
-                           #   the error type, the pattern-name helper, C's rx_match_t, rx_group_t and
-                           #   rx_set_match_t — so two stubs can share one package. It does NOT prefix
-                           #   names you choose: func and capability names, or what a set's NAME
-                           #   derives (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, rx_<set>_scanner_t,
-                           #   <Set>PatternCount). Two stubs in one package or C translation unit need
+                           #   the error type, C's rx_match_t, rx_group_t and rx_set_match_t — so
+                           #   two stubs can share one package. It does NOT prefix names you choose:
+                           #   func and capability names, or what a set's NAME derives
+                           #   (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, rx_<set>_scanner_t,
+                           #   <Set>PatternCount, <set>_pattern_name). Two stubs in one package or C translation unit need
                            #   distinct set names, and choosing them is yours. No-op for Rust, whose
                            #   `pub mod <rust_module>` already isolates each stub.
 max_dfa_states: 1024       # optional; max states of ANY DFA/TDFA — a single pattern's, a set member's,
@@ -53,13 +53,14 @@ max_memory: 100MB          # optional; the most memory the module may ever use (
                            #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
                            #   fractions allowed; a bare number is bytes. See "max_memory:" below
 
-regexps:
-  - pattern: 'https?://...' # RE2 regexp pattern
-    name: "my_pattern"      # required when referenced by sets: patterns list
+# A REGEXP is a bare expression; a PATTERN is a regexp plus optional metadata.
+patterns:                  # optional when every regexp lives inside sets (their regexps: key)
+  - regexp: 'https?://...' # required: the RE2 regexp itself
+    name: "my_pattern"      # optional; required to select it by name from a set's patterns: list
 
     # One or more func fields — only those set are compiled and stubbed.
     # The func name becomes both the WASM export name and the generated function name.
-    # An entry with only 'pattern' is valid; no code is generated for it.
+    # An entry with only 'regexp' is valid; no code is generated for it.
     match_func:        "url_match"         # anchored match
     find_func:         "url_find"          # non-anchored find
     groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
@@ -77,8 +78,9 @@ sets:
     scan_all:   "all_kinds"    # non-anchored: every pattern matching somewhere
     find:       "locate"       # non-anchored: positions and extents
     overlapping: false         # optional; default false = per-pattern non-overlapping
-    emit_name_map: true        # emit patternName(id) lookup helper in stubs
-    patterns: all              # "all" or list of name: values from regexps:
+    emit_name_map: true        # emit this set's own name lookup, <set>_pattern_name(id), in stubs
+    patterns: all              # "all" (every top-level pattern) or a list of their name: values
+    regexps: ['xox[bp]-\d+']   # optional; bare regexps private to this set (needs this or patterns:)
     hints: [batch-find]        # optional; see "hints:" below
     unicode: false             # optional; the set's mode — see "unicode:" below
 ```
@@ -150,14 +152,14 @@ runs. A violation is a hard error: nothing is written and the exit status is non
 - Contextual keywords that are legal identifiers in their own language — TypeScript's
   `type`, `from`, `of`, `get`, `set`, `string`, `number`, or Go's predeclared `len`/`cap` —
   are **not** rejected.
-- **Not** covered: `regexps[].name` and `sets[].name`. Those are selection keys only, and
+- **Not** covered: `patterns[].name` and `sets[].name`. Those are selection keys only, and
   reach generated code as quoted string literals rather than identifiers, so reserved
   words and punctuation are fine there.
 
 All offending names are reported in a single pass rather than one per run.
 
 Suffix `_batch` is separately reserved for the compiler-synthesized batch export (see
-`hints: [batch-find]` below), and export names must be unique across all `regexps:` and
+`hints: [batch-find]` below), and export names must be unique across all `patterns:` and
 `sets:` entries.
 
 #### Rules that depend on `stub_type`
@@ -174,10 +176,11 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
 | `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
-| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_patternNames`, `patternName`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
-| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
-| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `rx_pattern_names`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
-| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
+| Export names must not collide with a generator helper (`SetMatch`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not collide with a symbol DERIVED from a set's name: its pattern-count, id-space and batch-size constants and its name lookup — for a set `scanner`, `SCANNER_PATTERN_COUNT` / `scanner_pattern_name` in Rust, `SCANNER_PATTERN_COUNT` / `rx_scanner_pattern_name` in C, `ScannerPatternCount` / `ScannerPatternName` in Go, `scannerPatternCount` / `scannerPatternName` in JS and TS, `SCANNER_PATTERN_COUNT` / `scannerPatternName` in AssemblyScript | all | The generator declares them beside the set's exports. All are reserved whether or not the set asks for batching or `emit_name_map`, so turning either on never breaks a working config. |
 | Export names must not start with `ffi_` | `rust`, `go`, `c` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
 | An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
@@ -328,8 +331,8 @@ on 4 KB inputs (fuel per byte), 4,096 against 16,384:
 | Set | Capability, input | Fuel per byte | Compile time | Compiler memory | Module |
 |---|---|---|---|---|---|
 | the 3-member set above | `scan_any`, English text (no match) | 378 → 20.9 | 1.9 → 8.6 s | 157 → 491 MB | 2.06 → 2.64 MB |
-| `examples/fastedge/lang-detect`'s 23-member `latin` set | `match_all`, English text (no match) | 174 → 29 | 12.1 → 25.7 s | 136 → 449 MB | 1.08 → 2.60 MB |
-| `examples/browser/homoglyph`, lang-detect's `cyrillic` | `scan_*`, `match_all` | unchanged: their automata fit 4,096 | — | — | — |
+| `examples/fastedge/script-detect`'s `latin` set, 23 members when measured | `match_all`, English text (no match) | 174 → 29 | 12.1 → 25.7 s | 136 → 449 MB | 1.08 → 2.60 MB |
+| `examples/browser/homoglyph`, script-detect's `cyrillic` | `scan_*`, `match_all` | unchanged: their automata fit 4,096 | — | — | — |
 
 No input measured slower at 16,384. Set `max_union_states: 4096` on a
 Unicode-mode config to get the byte-mode budget back when compile time or
@@ -340,15 +343,15 @@ mixed-script text that no member matches:
 
 ```yaml
 max_union_states: 16384   # the Unicode-mode default
-regexps:
-  - { name: m0, pattern: '\pL+\p{Greek}' }
-  - { name: m1, pattern: '\p{Greek}+\p{Cyrillic}' }
-  - { name: m2, pattern: '\p{Cyrillic}+\p{Han}' }
-  - { name: m3, pattern: '\p{Han}+\pN' }
-  - { name: m4, pattern: '\pN+\p{Lu}' }
-  - { name: m5, pattern: '\p{Lu}+\p{Ll}' }
-  - { name: m6, pattern: '\p{Ll}+[^\x00-\x7f]' }
-  - { name: m7, pattern: '[^\x00-\x7f]+\pL' }
+patterns:
+  - { name: m0, regexp: '\pL+\p{Greek}' }
+  - { name: m1, regexp: '\p{Greek}+\p{Cyrillic}' }
+  - { name: m2, regexp: '\p{Cyrillic}+\p{Han}' }
+  - { name: m3, regexp: '\p{Han}+\pN' }
+  - { name: m4, regexp: '\pN+\p{Lu}' }
+  - { name: m5, regexp: '\p{Lu}+\p{Ll}' }
+  - { name: m6, regexp: '\p{Ll}+[^\x00-\x7f]' }
+  - { name: m7, regexp: '[^\x00-\x7f]+\pL' }
 sets:
   - name: s
     scan_any: s_any
@@ -374,16 +377,16 @@ one byte, classes are byte classes, and `\b` is ASCII. A pattern naming a rune
 above U+007F asks for Unicode mode (see `unicode:` below), where `é` means the
 character, two bytes of UTF-8.
 
-Setting `byte_mode: true` on a `regexps:` entry declares the pattern
+Setting `byte_mode: true` on a `patterns:` entry declares the pattern
 byte-oriented instead: runes `0x80`-`0xFF` mean **exactly that byte**. A
 literal carrying such bytes is a literal like any other: a set's literal
 frontends, the literal-anchored find and the prefilters search for it —
 UTF-8 keywords written as bytes (`\xd0\xbf\xd1\x80…`) included.
 
 ```yaml
-regexps:
+patterns:
   - name: utf8_lead
-    pattern: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
+    regexp: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
     byte_mode: true
     find_func: find_lead
 ```
@@ -427,7 +430,7 @@ changes — `.` and classes reading whole UTF-8 characters, `(?i)` across
 Unicode, no match starting inside a character, invalid bytes matching nothing
 — is in [engines.md](engines.md#unicode-mode).
 
-On a `regexps:` entry:
+On a `patterns:` entry:
 
 - **No key** — the pattern picks its own mode: Unicode when it names a
   character above U+007F or uses a `\p{..}` / `\P{..}` class, byte mode
@@ -439,16 +442,16 @@ On a `regexps:` entry:
   `byte_mode: false`, on the same entry are load errors.
 
 ```yaml
-regexps:
+patterns:
   - name: word
-    pattern: '\pL+'          # Unicode mode: names a Unicode class
+    regexp: '\pL+'          # Unicode mode: names a Unicode class
     find_func: find_word
   - name: any3
-    pattern: 'a.c'
+    regexp: 'a.c'
     unicode: true            # Unicode mode on request: `.` is one character
     find_func: find_any3
   - name: raw
-    pattern: '[\xc0-\xdf]'
+    regexp: '[\xc0-\xdf]'
     unicode: false           # the same as byte_mode: true — raw bytes
     find_func: find_raw
 ```
@@ -490,7 +493,7 @@ can share one walk.
 
 ### `hints:` — LikelyMode and batch-find compile hints
 
-Both `regexps:` entries and `sets:` entries accept an optional `hints:` list.
+Both `patterns:` entries and `sets:` entries accept an optional `hints:` list.
 Three values are recognised; `batch-find` is independent of the other two and
 may be combined with either (or neither) — the "mutually exclusive" rule only
 ever applies between `prefer-match` and `prefer-no-match`:
@@ -498,7 +501,7 @@ ever applies between `prefer-match` and `prefer-no-match`:
 - **`prefer-match`** — biases the compiler's code-shape choice for fast-accept.
 - **`prefer-no-match`** — biases for fast-reject. Mutually exclusive with
   `prefer-match`.
-- **`batch-find`** — requests batching. On a `regexps:` entry it emits a
+- **`batch-find`** — requests batching. On a `patterns:` entry it emits a
   `<func>_batch` WASM export for that pattern's `find_func` and/or
   `groups_func` (see below). On a `sets:` entry it emits one alongside the
   set's `find` and gives the generated `find` an optional `batchSize`
@@ -512,7 +515,7 @@ export). The `prefer-match`/`prefer-no-match` choice never affects match
 correctness — only which optimisation path is emitted.
 
 `prefer-match`/`prefer-no-match` resolve **per entry, with no fallback chain
-between the two levels**. A `regexps:` entry's hint governs only that
+between the two levels**. A `patterns:` entry's hint governs only that
 pattern's own exported bodies (`match_func`/`find_func`/`groups_func`); a
 `sets:` entry's hint governs only that set's own frontend and bucket suffix
 bodies. A set's hint is not inherited by a member's own exported bodies, and a
@@ -521,7 +524,7 @@ suffix DFA for several patterns, so there is no per-pattern choice for it to
 honour. An entry with no `hints:` is neutral regardless of what encloses it.
 
 `batch-find` has no fallback to resolve either: it is read on the entry (or
-set) that carries it, and each one decides for itself. On a `regexps:` entry
+set) that carries it, and each one decides for itself. On a `patterns:` entry
 it requires `find_func` or `groups_func`, and on a `sets:` entry it requires
 `find` — there is otherwise nothing to batch, and accepting the hint anyway
 would leave the caller believing they had asked for something.
@@ -532,7 +535,7 @@ measure the effect on your own patterns with `tools/pattest`.
 
 #### `batch-find` — batched multi-match export (JS/TS only)
 
-Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
+Setting `hints: [batch-find]` on a `patterns:` entry adds a `<func>_batch` WASM
 export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
 multiple matches per host call instead of one, for `find_func` and
 `groups_func`. One capability means one batch export and one name; the rule
@@ -770,7 +773,7 @@ target — so there is no host under `component` it could help.
 | Config | Error |
 |---|---|
 | a set with `hints: [batch-find]` | "…is not supported for wasm_format: component — the component interface exposes one position per call through the find resource" |
-| a `regexps:` entry with `hints: [batch-find]` | "…is not supported for wasm_format: component — the batch groups export it adds has no WIT form" |
+| a `patterns:` entry with `hints: [batch-find]` | "…is not supported for wasm_format: component — the batch groups export it adds has no WIT form" |
 | no `import_module` and no `wit_package` | "…is required for wasm_format: component: it names the WIT package, the world, and every export" |
 
 `sets:` IS supported. Their raw ABI does not cross the boundary: `match_all` and
@@ -802,7 +805,7 @@ That makes adding, removing or changing it a **breaking change** for anyone who 
 | Field | Notes |
 |---|---|
 | `wasm_file` | Required unless `--output` is given |
-| `regexps` | One or more patterns to compile |
+| `patterns` | One or more patterns to compile — unless every regexp lives in a set's `regexps:`, in which case it may be left out. A file with no regexp anywhere is a load error |
 
 Entries with no `_func` fields produce no individual exports. If such an
 entry is also not referenced by any `sets:` block, it is silently skipped;
@@ -813,11 +816,11 @@ otherwise it participates only as a member of the set(s) that select it.
 When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces one exported WASM function per declared capability, plus a batch entry when it asks for one.
 
 ```yaml
-regexps:
-  - name: aws_key      # name is required for sets: pattern references
-    pattern: 'AKIA[0-9A-Z]{16}'
+patterns:
+  - name: aws_key      # name is required to select it from a set's patterns: list
+    regexp: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
-    pattern: 'ghp_[0-9a-zA-Z]{36}'
+    regexp: 'ghp_[0-9a-zA-Z]{36}'
 
 sets:
   - name: secret_scanner
@@ -825,11 +828,17 @@ sets:
     scan_any: which_secret   # non-anchored: one pattern id, or -1 (optional)
     match_any: validate      # anchored (whole input): one pattern id (optional)
     hints: [batch-find]      # optional: work several positions ahead per call
-    emit_name_map: true      # emit pattern_name(id) helper in stubs
+    emit_name_map: true      # emit secret_scanner_pattern_name(id) in stubs
     patterns:
-      - aws_key              # list of regexps.name values
+      - aws_key              # names of top-level patterns
       - github_pat
-      # or: patterns: "all" to include every entry in regexps:
+      # or: patterns: "all" to include every top-level pattern
+    regexps:                 # optional: bare regexps of this set's own
+      - 'xox[baprs]-[0-9A-Za-z-]{10,48}'
+
+  - name: log_levels         # a set may hold ONLY regexps of its own
+    match_any: level_of
+    regexps: ['ERROR', 'WARN', 'INFO']
 ```
 
 | `sets:` field | Required | Description |
@@ -841,14 +850,31 @@ sets:
 | `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
 | `find` | At least one | Non-anchored: every match at the next matching position — the only capability reporting positions and extents |
 | `overlapping` | No | `false` (default) = per-pattern non-overlapping; `true` = every start position. Affects `find` only, and is silently ignored on a set without it |
-| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
-| `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
+| `patterns` | One of these two | Top-level patterns this set holds: `"all"` (every top-level pattern, named or not) or a list of their `name:` values |
+| `regexps` | One of these two | Bare regexps of this set's own. Private to it: `patterns: all` in another set never includes them |
+| `emit_name_map` | No | Emit this set's own name lookup in generated stubs (`<set>_pattern_name(id)` in each language's spelling): a member's `name:`, or `""` for an unnamed pattern, an inline regexp or an id the set does not hold |
 | `hints` | No | `[prefer-match]` or `[prefer-no-match]` (per-set LikelyMode default), and/or `[batch-find]`, which requires `find` — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 
 `match:`, `scan:` and `find_batch:` are **retired keys** and are load errors;
 see the note under the schema above.
 
-The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+The `name:` field on `patterns:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+
+**Pattern ids.** A top-level pattern a set holds reports its index in the
+top-level `patterns:` list. A set's own `regexps:` come after every top-level
+pattern and are numbered per set: with 4 top-level patterns, each set's first
+inline regexp is id 4, so editing one set's `regexps:` never renumbers
+another set.
+
+**Equivalent members are a load error.** Two members of one set — selected by
+name, through `all`, or inline — that compile to the same program are
+refused, with a message naming both, for example
+`set "levels": regexp 'ERROR' and regexp '(?:ERROR)' are equivalent`. Capture
+groups do not count (a set reports group 0 only), and the check compares Go's
+compiled program, so it never refuses two regexps a set could tell apart; it
+does not catch every pair that matches alike (`a+` and `aa*` compile
+differently). Top-level patterns are not checked against each other outside a
+set.
 
 See [sets.md](sets.md) for full pipeline details and output tuple formats.
 

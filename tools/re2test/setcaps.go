@@ -98,9 +98,10 @@ var (
 	//
 	// This is the only configuration in which <SET>_PATTERN_COUNT and
 	// <SET>_ID_SPACE differ, and confusing them is a memory-safety bug rather
-	// than a wrong answer: pattern_id is the GLOBAL index into `regexps:`, so
-	// the gate array and the `_all` bitmap are sized from the id space while
-	// the tuple buffer is sized from the pattern count. Sizing the gate array
+	// than a wrong answer: a selected member's pattern_id is its index into
+	// the top-level `patterns:`, so the gate array and the `_all` bitmap are
+	// sized from the id space while the tuple buffer is sized from the
+	// pattern count. Sizing the gate array
 	// from the count let the module write past the caller's array, and
 	// `patterns: all` makes the two equal, so no run that used it
 	// could ever have caught that.
@@ -1096,9 +1097,9 @@ func captureDrops(fn func()) (find, anchored map[int]bool) {
 
 // buildSetProfileConfig turns a profile into a BuildConfig over pats.
 func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selected []int) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sel := config.PatternSelector{All: true}
 	if selected != nil {
@@ -1137,7 +1138,7 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 		}
 		sets = append(sets, sc)
 	}
-	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+	cfg := config.BuildConfig{Patterns: entries, Sets: sets}
 	// --set-bt drives Backtracking set members: a low max_dfa_states pushes
 	// ordinary corpus patterns onto the Backtracking fallback engine in bulk,
 	// the same way --force-backtrack does for single patterns by setting

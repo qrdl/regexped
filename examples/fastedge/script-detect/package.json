@@ -1,8 +1,8 @@
 {
-  "name": "lang-detect-tests",
+  "name": "script-detect-tests",
   "private": true,
   "type": "module",
-  "description": "Runs lang-detect.wasm under the FastEdge runtime locally",
+  "description": "Runs script-detect.wasm under the FastEdge runtime locally",
   "scripts": {
     "test": "node test.mjs"
   },

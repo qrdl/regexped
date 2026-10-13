@@ -1,4 +1,5 @@
-//! A script and European-language detector: POST text, get back a JSON array.
+//! A script detector: POST text, get back a JSON array of the scripts its
+//! letters use, each narrowed to the European alphabets its letters fit.
 //!
 //!     $ curl --data 'Grüße aus Köln' http://localhost:8080/
 //!     ["German"]
@@ -12,7 +13,10 @@ use wstd::http::{Method, Request, Response, StatusCode};
 
 include!("stubs.rs");
 
-use langdetect::{cyrillic_languages, find_scripts, latin_languages, pattern_name};
+use scriptdetect::{
+    cyrillic_languages, cyrillic_pattern_name, find_scripts, latin_languages, latin_pattern_name,
+    scripts_pattern_name,
+};
 
 #[wstd::http_server]
 async fn main(mut request: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -34,7 +38,7 @@ async fn main(mut request: Request<Body>) -> anyhow::Result<Response<Body>> {
 /// scripts first appear. A script none of whose languages match — plain a-z
 /// text, Cyrillic using only the letters its languages share, any Greek — is
 /// reported by its own name.
-fn detect(text: &[u8]) -> langdetect::Result<Vec<&'static str>> {
+fn detect(text: &[u8]) -> scriptdetect::Result<Vec<&'static str>> {
     let mut scripts: Vec<i32> = Vec::new();
     for m in find_scripts(text, 0) {
         let id = m?.pattern_id;
@@ -44,15 +48,17 @@ fn detect(text: &[u8]) -> langdetect::Result<Vec<&'static str>> {
     }
     let mut found = Vec::new();
     for script in scripts {
-        let languages: Vec<i32> = match pattern_name(script) {
-            "Latin" => latin_languages(text)?.collect(),
-            "Cyrillic" => cyrillic_languages(text)?.collect(),
+        // Each set names its own ids: a set's lookup knows only its members.
+        let name = scripts_pattern_name(script);
+        let languages: Vec<&'static str> = match name {
+            "Latin" => latin_languages(text)?.map(latin_pattern_name).collect(),
+            "Cyrillic" => cyrillic_languages(text)?.map(cyrillic_pattern_name).collect(),
             _ => Vec::new(),
         };
         if languages.is_empty() {
-            found.push(pattern_name(script));
+            found.push(name);
         } else {
-            found.extend(languages.into_iter().map(pattern_name));
+            found.extend(languages);
         }
     }
     Ok(found)

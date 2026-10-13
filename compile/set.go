@@ -24,12 +24,12 @@ type PatternInfo struct {
 	// rp is fullPattern with the member's resolved mode: every tree and
 	// program built for the member comes from it (resolvePattern).
 	rp resolvedPattern
-	// byteMode is the member's config.RegexEntry.IsByteMode, kept for the
+	// byteMode is the member's config.PatternEntry.IsByteMode, kept for the
 	// CompileOptions a set-level consumer builds for the member (ByteMode:
 	// runes 0x80-0xFF are legal and mean those bytes). Lengths come from rp.
 	byteMode   bool
 	name       string         // YAML name: field; empty when not set
-	globalID   int            // index into cfg.Regexps
+	globalID   int            // index into cfg.Patterns (an inline member: past them, per set)
 	prefixAST  *syntax.Regexp // AST before the mandatory literal; nil when trivial
 	suffixAST  *syntax.Regexp // AST after the mandatory literal; nil when trivial
 	mandLit    *mandatoryLit  // from findMandatoryLitRec
@@ -337,15 +337,15 @@ func (info *PatternInfo) setTopLevelAnchor(parsed *syntax.Regexp) {
 	}
 }
 
-// analyzePattern parses re.Pattern, finds the mandatory literal, splits the
+// analyzePattern parses re.Regexp, finds the mandatory literal, splits the
 // AST around it, and builds canonical prefix and suffix DFAs — deduplicating
 // them through the supplied pools.
 //
 // Patterns where no mandatory literal is found, or where splitAtPath rejects
 // the path (quantifier in path), have trivialPrefix=true and splittable=false;
 // they go to the fallback bucket when the set is packed.
-func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*PatternInfo, error) {
-	rp, err := resolvePattern(re.Pattern, re.Unicode, &CompileOptions{ByteMode: re.IsByteMode()})
+func analyzePattern(re config.PatternEntry, prefixPool, suffixPool *dfaPool) (*PatternInfo, error) {
+	rp, err := resolvePattern(re.Regexp, re.Unicode, &CompileOptions{ByteMode: re.IsByteMode()})
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +354,7 @@ func analyzePattern(re config.RegexEntry, prefixPool, suffixPool *dfaPool) (*Pat
 
 // analyzeSetMember is analyzePattern for a member whose pattern already has
 // its set's mode (resolveSetMode): a member does not resolve its own.
-func analyzeSetMember(re config.RegexEntry, member resolvedPattern, prefixPool, suffixPool *dfaPool) (*PatternInfo, error) {
+func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool, suffixPool *dfaPool) (*PatternInfo, error) {
 	// The set path's copy of compilePatternBody's rewrite: members are parsed
 	// here, never through that function, and every later consumer re-parses
 	// fullPattern, so the rewritten string is stored there once. Errors and
@@ -363,14 +363,14 @@ func analyzeSetMember(re config.RegexEntry, member resolvedPattern, prefixPool, 
 	pattern := rp.src
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
-		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Pattern, err)
+		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Regexp, err)
 	}
 	stripCaptures(parsed)
 
 	info := &PatternInfo{
 		fullPattern:    pattern,
 		rp:             rp,
-		displayPattern: re.Pattern,
+		displayPattern: re.Regexp,
 		byteMode:       re.IsByteMode(),
 		prefixID:       -1,
 		suffixID:       -1,

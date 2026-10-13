@@ -3,23 +3,23 @@
 # resumed through an opaque i64 cursor. Both entries are driven by ONE shared
 # per-position worker, so this pins that the batching set carries one set of
 # bucket code rather than two.
-regexps:
+patterns:
   - name: p0
-    pattern: 'Aqr00'
+    regexp: 'Aqr00'
   - name: p1
-    pattern: 'Bqr01'
+    regexp: 'Bqr01'
   - name: p2
-    pattern: 'Cqr02'
+    regexp: 'Cqr02'
   - name: p3
-    pattern: 'Dqr03'
+    regexp: 'Dqr03'
   - name: p4
-    pattern: 'Eqr04'
+    regexp: 'Eqr04'
   - name: p5
-    pattern: 'Fqr05'
+    regexp: 'Fqr05'
   - name: p6
-    pattern: 'Gqr06'
+    regexp: 'Gqr06'
   - name: p7
-    pattern: 'Hqr07'
+    regexp: 'Hqr07'
 sets:
   - name: s
     find: s_find

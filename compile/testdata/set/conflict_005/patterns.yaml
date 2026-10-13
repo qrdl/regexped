@@ -4,8 +4,8 @@
 options:
   budget_states: 1
 patterns:
-  - pattern: '\w+'
-  - pattern: '[a-z]*[0-9]+'
+  - regexp: '\w+'
+  - regexp: '[a-z]*[0-9]+'
 expect:
   bucket_count: 2
   fallback_count: 2

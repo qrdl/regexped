@@ -78,7 +78,7 @@ func genJSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
 		args := func(kind string) string { return spellJSArgs(capByKind(caps, kind), spell) }
 
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s = %d;\n\n", s.Name, konst, n)
-		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s = %d;\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids index\n// patterns: (then the set's own regexps:), so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s = %d;\n\n", s.Name, idKonst, idN)
 
 		if s.BatchFind() {
 			fmt.Fprintf(&out, "// Largest batchSize %s accepts for set %q. It is the cursor layout's\n// limit, not a policy: one i64 carries the resume position in its top 32\n// bits and splits the low 32 between the intra-position index and the count.\n// It never binds in practice — this many tuples is a multi-megabyte buffer.\nexport const %s = %d;\n\n",
@@ -354,16 +354,7 @@ export function %s(input, from = 0) {
 		}
 		out.WriteString("\n")
 	}
-	if hasEmitNameMap(cfg) {
-		out.WriteString("const _patternNames = [")
-		for i, re := range cfg.Regexps {
-			if i > 0 {
-				out.WriteString(", ")
-			}
-			fmt.Fprintf(&out, "%q", re.Name)
-		}
-		out.WriteString("];\nexport function patternName(id) { return _patternNames[id] ?? ''; }\n")
-	}
+	out.WriteString(jsPatternNameFns(cfg, "js", "id", ""))
 	// Split members' search blocks (search_stub.go).
 	section := out.String()
 	for _, s := range cfg.Sets {
@@ -372,6 +363,27 @@ export function %s(input, from = 0) {
 		}
 	}
 	return section
+}
+
+// jsPatternNameFns is every `emit_name_map: true` lookup, one per set, in the
+// JS family's shared syntax: lang picks the name, param and ret the types
+// (none for JS, number / i32 and string for TS / AssemblyScript).
+func jsPatternNameFns(cfg config.BuildConfig, lang, param, ret string) string {
+	var out strings.Builder
+	for _, s := range nameMapSets(cfg) {
+		fn := config.SetPatternNameFunc(s.Name, lang)
+		fmt.Fprintf(&out, "/** `%s` %s */\n", fn, nameMapDoc(s))
+		fmt.Fprintf(&out, "export function %s(%s)%s {\n", fn, param, ret)
+		if named := namedMembers(s, cfg); len(named) > 0 {
+			out.WriteString("  switch (id) {\n")
+			for _, m := range named {
+				fmt.Fprintf(&out, "    case %d: return %q;\n", m.ID, m.Entry.Name)
+			}
+			out.WriteString("  }\n")
+		}
+		out.WriteString("  return '';\n}\n")
+	}
+	return out.String()
 }
 
 // genJSStubFile generates the content of an ES module JS stub that exports
@@ -520,7 +532,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	if hasSuspendableExports(cfg) && anySearchBlock(sizes) {
 		sb.WriteString(jsSearchHelpers(false, sizes))
 	}
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" {
 			sb.WriteString(genJSMatchFunc(re.MatchFunc))
 		}
@@ -528,9 +540,9 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 			sb.WriteString(jsWithSearch(genJSFindFunc(re.FindFunc), re.FindFunc, sizes[re.FindFunc], false, false, 0))
 		}
 		if re.GroupsFunc != "" {
-			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+			numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 			if err != nil {
-				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
+				return "", fmt.Errorf("pattern %q: %w", re.Regexp, err)
 			}
 			sb.WriteString(jsWithSearch(genJSGroupsFunc(re.GroupsFunc, numGroups), re.GroupsFunc,
 				sizes[re.GroupsFunc], false, true, numGroups*2*4))

@@ -187,7 +187,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	if hasSuspendableExports(cfg) && anySearchBlock(sizes) {
 		sb.WriteString(jsSearchHelpers(true, sizes))
 	}
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" {
 			sb.WriteString(genTSMatchFunc(re.MatchFunc))
 		}
@@ -195,9 +195,9 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 			sb.WriteString(jsWithSearch(genTSFindFunc(re.FindFunc), re.FindFunc, sizes[re.FindFunc], true, false, 0))
 		}
 		if re.GroupsFunc != "" {
-			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+			numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 			if err != nil {
-				return "", fmt.Errorf("pattern %q: %w", re.Pattern, err)
+				return "", fmt.Errorf("pattern %q: %w", re.Regexp, err)
 			}
 			sb.WriteString(jsWithSearch(genTSGroupsFunc(re.GroupsFunc, numGroups), re.GroupsFunc,
 				sizes[re.GroupsFunc], true, true, numGroups*2*4))
@@ -252,7 +252,7 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
 		args := func(kind string) string { return spellJSArgs(capByKind(caps, kind), spell) }
 
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the find generator\n// can receive at most this many matches at one position.\nexport const %s: number = %d;\n\n", s.Name, konst, n)
-		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: number = %d;\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids index\n// patterns: (then the set's own regexps:), so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: number = %d;\n\n", s.Name, idKonst, idN)
 
 		if s.BatchFind() {
 			fmt.Fprintf(&out, "// Largest batchSize %s accepts for set %q. It is the cursor layout's\n// limit, not a policy: one i64 carries the resume position in its top 32\n// bits and splits the low 32 between the intra-position index and the count.\n// It never binds in practice — this many tuples is a multi-megabyte buffer.\nexport const %s: number = %d;\n\n",
@@ -509,16 +509,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 		}
 		out.WriteString("\n")
 	}
-	if hasEmitNameMap(cfg) {
-		out.WriteString("const _patternNames: string[] = [")
-		for i, re := range cfg.Regexps {
-			if i > 0 {
-				out.WriteString(", ")
-			}
-			fmt.Fprintf(&out, "%q", re.Name)
-		}
-		out.WriteString("];\nexport function patternName(id: number): string { return _patternNames[id] ?? ''; }\n")
-	}
+	out.WriteString(jsPatternNameFns(cfg, "ts", "id: number", ": string"))
 	// Split members' search blocks (search_stub.go).
 	section := out.String()
 	for _, s := range cfg.Sets {

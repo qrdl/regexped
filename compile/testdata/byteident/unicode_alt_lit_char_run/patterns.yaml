@@ -1,6 +1,6 @@
 # Unicode mode: the alternation literal-anchored find whose branches' forward
 # verify runs over whole characters (`[^,]*` lowered) and takes the character skip.
-regexps:
-  - pattern: 'x{3}abc[^,]*z|y{3}ghi[^,]*z'
+patterns:
+  - regexp: 'x{3}abc[^,]*z|y{3}ghi[^,]*z'
     find_func: uni_altlit_charrun_find
     unicode: true

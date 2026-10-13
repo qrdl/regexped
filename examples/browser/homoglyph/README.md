@@ -57,11 +57,11 @@ make run
 ## Usage in your own page
 
 ```js
-import { init, scan_text, patternName } from './regexp.js';
+import { init, scan_text, homoglyphPatternName } from './regexp.js';
 await init(await fetch('./regexps.wasm').then(r => r.arrayBuffer()));
 
 for (const m of scan_text('pаypal.com')) {
-  console.log(patternName(m.patternId), m.start, m.end);   // byte offsets
+  console.log(homoglyphPatternName(m.patternId), m.start, m.end);   // byte offsets
 }
 // mixed_script 0 11
 // lookalike 1 3

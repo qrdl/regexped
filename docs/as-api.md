@@ -180,8 +180,8 @@ export function <scan_all>(input: ArrayBuffer, offset: u32): Array<i32> | null
 export function <find>(input: ArrayBuffer, offset: u32): <Find>Iter
 class <Find>Iter { next(): SetMatch | null }
 
-// only if any set in the config sets emit_name_map: true
-export function patternName(id: i32): string
+// per set, only if it sets emit_name_map: true
+export function <set>PatternName(id: i32): string
 ```
 
 The iterator is caller-owned: two scans can be in flight at once, and creating
@@ -191,8 +191,11 @@ both overlap policies take one — so neither ever appears here.
 `<match_all>`/`<scan_all>` return an `Array<i32>` of pattern ids, **not** a
 boolean. `<scan_any>` decomposes the engine's packed `i64` for you.
 
-`patternName` is a single shared lookup across every set in the config that
-requested `emit_name_map: true`.
+`<set>PatternName` — `secretsPatternName` for a set named `secrets` — is
+emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ---
 

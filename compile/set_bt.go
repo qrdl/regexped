@@ -67,8 +67,10 @@ func admitBTFallback(ast resolvedTree) *btBucketInfo {
 	return &btBucketInfo{bt: bt}
 }
 
-// setPatternInfos resolves one set's selected pattern indices into the
-// PatternInfos CompileSet works from — every one of them. An entry with
+// setPatternInfos resolves one set's members (config.SetConfig.Members: the
+// selected top-level patterns, then the set's own regexps) into the
+// PatternInfos CompileSet works from — every one of them — and the pattern id
+// each is reported under. An entry with
 // groups_func is a member too: a set reports group 0 only, and
 // analyzeSetMember strips the capture groups for the set alone, as it does
 // for any member whose pattern has them; the entry's own groups export is
@@ -83,10 +85,10 @@ func admitBTFallback(ast resolvedTree) *btBucketInfo {
 //
 // progress is the compile's progress sink, nil for a compile that reports
 // none; the members' programs carry it to their constructions.
-func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []int,
+func setPatternInfos(sc config.SetConfig, members []config.SetMember, cfg config.BuildConfig,
 	prefixPool, suffixPool *dfaPool, progress *progressSink) ([]*PatternInfo, []int, error) {
 
-	mode, err := resolveSetMode(sc, cfg, selectedIdx)
+	mode, err := resolveSetMode(sc, members)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,20 +96,23 @@ func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []
 	mode.lim = limitsOfConfig(cfg)
 	var infos []*PatternInfo
 	var globalIDs []int
-	for _, idx := range selectedIdx {
-		re := cfg.Regexps[idx]
-		info, err := analyzeSetMember(re, mode.member(re.Pattern), prefixPool, suffixPool)
+	for _, m := range members {
+		re := m.Entry
+		info, err := analyzeSetMember(re, mode.member(re.Regexp), prefixPool, suffixPool)
 		if err != nil {
-			patLabel := re.Name
+			kind, patLabel := "pattern", re.Name
 			if patLabel == "" {
-				patLabel = re.Pattern
+				patLabel = re.Regexp
 			}
-			return nil, nil, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
+			if m.Inline {
+				kind = "regexp"
+			}
+			return nil, nil, fmt.Errorf("set %q: %s %q: %w", sc.Name, kind, patLabel, err)
 		}
-		info.globalID = idx
+		info.globalID = m.ID
 		info.name = re.Name
 		infos = append(infos, info)
-		globalIDs = append(globalIDs, idx)
+		globalIDs = append(globalIDs, m.ID)
 	}
 	return infos, globalIDs, nil
 }
