@@ -19,7 +19,11 @@ import (
 // bitmask has 32 usable bits, a list has as many entries as the state needs.
 //
 // WHAT IT DELIBERATELY DOES NOT DO, and why the driver needs no changes:
-// `validMask` is ignored. Every mask on the per-candidate path — the group
+// it does not filter by a validMask. Its `validMask` slot carries the
+// member-skip verdict instead (the mask the walk choice reads, or 0 for a
+// bucket with no member skip): the driver pushes the verdict global there for
+// one instruction where computing the mask cost three, −2 fuel per candidate
+// on every sparse bucket. Every mask on the per-candidate path — the group
 // mask, the gate pre-mask, the first-byte mask — is an i32 and cannot
 // express more than 32 patterns, and widening all of them to i64 was rejected
 // as bigger and riskier than this format, for half the benefit. So the
@@ -483,19 +487,22 @@ type sparseSuffixParams struct {
 // sparse-set bucket. Signature is identical to the bitmask body's, so the
 // driver calls it the same way:
 //
-//	ungated (type 3): (ptr, start, len, lPos, out_ptr, out_cap, validMask) -> i32
-//	gated   (type 9): ... , gate_ptr                                       -> i32
+//	ungated (type 3): (ptr, start, len, lPos, out_ptr, out_cap, verdict) -> i32
+//	gated   (type 9): ... , gate_ptr                                     -> i32
+//
+// verdict is the member-skip verdict mask in the bitmask body's validMask
+// slot (see the file header), 0 for a bucket with no member skip.
 func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	const (
-		pPtr    = byte(0)
-		pStart  = byte(1)
-		pLen    = byte(2)
-		pLPos   = byte(3)
-		pOutPtr = byte(4)
-		pOutCap = byte(5)
-		_       = byte(6) // validMask: see the file header for why it is unused
-		pGate   = byte(7)
-		pSkip   = byte(7)
+		pPtr     = byte(0)
+		pStart   = byte(1)
+		pLen     = byte(2)
+		pLPos    = byte(3)
+		pOutPtr  = byte(4)
+		pOutCap  = byte(5)
+		pVerdict = byte(6) // the validMask slot: see the file header
+		pGate    = byte(7)
+		pSkip    = byte(7)
 	)
 	// The parameter count varies: a gated or skip-taking body has one more.
 	// The declared locals then follow it, and `nLocals` used to be a separate
@@ -749,9 +756,11 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		//	stale_mask & lPos == 0  ⇔  dispatch (either not stale, or on the tick)
 		//
 		// A zero mask ANDs to zero at every position, so "not stale" needs no
-		// separate test at all — which is the whole saving, five instructions
+		// separate test at all — which is the whole saving, four instructions
 		// per candidate against eight, on every candidate of every sparse
-		// bucket that carries a skip.
+		// bucket that carries a skip. The mask arrives as the pVerdict
+		// parameter: the driver reads the global into the call's otherwise
+		// unused validMask slot, so the test here is a local read.
 		//
 		// The arms are the opposite way round from the boolean form: a NON-zero
 		// result now means "stale and not on the tick", i.e. take the plain
@@ -759,8 +768,7 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		// the tick when it should always dispatch, which costs the skip's whole
 		// win and no correctness — exactly the kind of silent loss the
 		// `sparse-member-skip` win-half row exists to catch.
-		b = append(b, 0x23) // global.get: the verdict mask
-		b = utils.AppendULEB128(b, uint32(p.memberGlobal))
+		b = append(b, 0x20, pVerdict) // the verdict mask (the driver's global.get)
 		b = append(b, 0x20, pLPos)
 		b = append(b, 0x71)       // i32.and — mask & candidate position
 		b = append(b, 0x04, 0x40) // if (void): stale AND off the tick

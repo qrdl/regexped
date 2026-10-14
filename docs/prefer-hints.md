@@ -72,6 +72,12 @@ set a hint or not.
   SIMD-driven scan that pays off when most of the input isn't in that byte
   class, with a runtime fallback if the input turns out to be dense in it
   anyway (so it doesn't cost much even when your intuition is wrong).
+  It does not cost nothing, though: on no-match text dense in those bytes
+  the hinted build still spends more fuel per `find` call than the unhinted
+  one — 6 more when the text starts with one of those bytes, 37 more when
+  it starts with another (`[a-zA-Z]{20,}` over lines beginning `; `). The
+  cost is per call, not per byte: in the worse case 0.25% of a 64-byte
+  line and 0.003% of a 5 KB one.
 - A fixed-count single-class literal-anchor prefix, count ≤ 16 — e.g.
   `[0-9]{16}INFO:[^\n]+`. Gets a SIMD chunk-verify instead of a scalar
   reverse walk on the anchor.
@@ -124,11 +130,18 @@ Measure before hinting a Unicode pattern.
   run (`{N}`/`{N,M}`) in SIMD chunks instead of a scalar loop.
 - **Dominant-self-loop bulk-skip** — for patterns dominated by one
   "consume anything except a delimiter" state, skips through the run in SIMD
-  chunks instead of one byte at a time.
+  chunks instead of one byte at a time. Under `prefer-match` it also serves a
+  run that is NOT itself a match yet (`<([a-z]+)>`, whose `[a-z]+` needs the
+  `>` after it), and that is a trade: measured on short tag-and-text lines,
+  lines under 17 bytes cost +8..9% fuel against the unhinted build, 20–64
+  byte lines −16..−21%, long runs −84%. A call that cannot use the skip pays
+  ~13 fuel the first time it enters the state and 1 per byte walked after.
 - **Shufti / SIMD prefix scan** — a nibble-table SIMD technique for
   detecting "any byte in this set" over a first-byte set too big for a
   handful of direct SIMD compares but too small to be worth a scalar
-  byte-class table lookup.
+  byte-class table lookup. A set of one or two contiguous byte ranges
+  (`[a-z]`, `[A-Z]`, `[a-zA-Z]`) is tested with two SIMD range compares per
+  range instead: same answer, half the instructions.
 - **Lit-anchor class-prefix SIMD verify** — same SIMD-chunk idea applied to
   the backward verification step of a literal-anchored find.
 - **Union-scan run skip** — for a set with no literal to filter on, strides

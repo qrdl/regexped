@@ -161,7 +161,7 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 |---|---|
 | **Hybrid prefix** | literal prefix ≥ 1 byte — SIMD check for full prefix within a 16-byte window. In Unicode mode, a literal that begins with a non-ASCII character is checked a whole character at a time on a first-byte hit: a script's lead byte begins much of its alphabet (0xD0, half of Cyrillic), so `привет` was hit in nearly every chunk of Russian text and cost 27 fuel/byte, and with the second byte checked it costs 6.0 (text in another script, which never hits the lead byte, is unchanged) |
 | **Teddy (1/2/3/4-byte tiers)** | 1–8 first-byte candidates; tier picked by how many leading bytes are jointly selective (nibble-table SIMD lookup per tier) |
-| **Shufti** | 9–16 first-byte candidates (unconditional), or 17–64 (only when a byte-rarity heuristic predicts it beats scalar, or the pattern was compiled with `hints: [prefer-no-match]`, which forces it regardless of the heuristic) — nibble-table SIMD set-membership test over the candidate set itself, not per-candidate comparisons |
+| **Shufti** | 9–16 first-byte candidates (unconditional), or 17–64 (only when a byte-rarity heuristic predicts it beats scalar, or the pattern was compiled with `hints: [prefer-no-match]`, which forces it regardless of the heuristic) — nibble-table SIMD set-membership test over the candidate set itself, not per-candidate comparisons. A set that is one or two contiguous byte ranges (`[a-z]`, `[a-zA-Z]`, `[!-~]`) is tested with two SIMD range compares per range instead of the nibble tables: same answer, half the instructions |
 | **Scalar** | 0 first-byte candidates, > 64 candidates, or a 17–64-candidate set the rarity heuristic predicts scalar wins for |
 
 Every Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
@@ -174,10 +174,17 @@ shorter alternates in a mixed-length alternation).
 
 The 17–64-candidate Shufti path also has a **runtime adaptive fallback**:
 if the compile-time rarity heuristic guessed wrong and Shufti is running
-against unexpectedly dense match data, the scan self-disables back to
-scalar after a bounded number of unproductive attempts, so a wrong guess
-only costs a bounded amount rather than paying Shufti's fixed per-chunk
-cost for the rest of the input.
+against unexpectedly dense match data, the scan gives up after a bounded
+number of unproductive attempts and hands the rest of the call to a second
+copy of the find compiled without the hint, so a wrong guess only costs a
+bounded amount rather than paying Shufti's fixed per-chunk cost for the rest
+of the input. A byte that can begin a match right at the attempt's start
+spends the whole budget at once, and the find's callers (the exported
+wrappers, or a switch's dispatcher) test that byte for the first attempt
+themselves and call the unhinted copy directly. What the fallback still costs
+on no-match text dense in those bytes is per call: 6 fuel above the unhinted
+build when the text starts with such a byte, 37 when it starts with another
+(one probe and one failed walk before the hand-off; `[a-zA-Z]{20,}`).
 
 **2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start.
 

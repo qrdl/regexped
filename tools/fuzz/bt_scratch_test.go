@@ -150,11 +150,9 @@ func (c btScratchCase) check(t *testing.T, got int64, slots []int) {
 	if got != want {
 		t.Fatalf("answered %d, want %d", got, want)
 	}
-	if wantSlots != nil {
-		for i, s := range wantSlots {
-			if slots[i] != s {
-				t.Fatalf("slot %d = %d, want %d (all: got %v, want %v)", i, slots[i], s, slots[:len(wantSlots)], wantSlots)
-			}
+	for i, s := range wantSlots {
+		if slots[i] != s {
+			t.Fatalf("slot %d = %d, want %d (all: got %v, want %v)", i, slots[i], s, slots[:len(wantSlots)], wantSlots)
 		}
 	}
 }

@@ -723,7 +723,13 @@ func (g *moduleGlobals) Section() []byte {
 //
 // def, when non-nil, is the export's default search state for a caller that
 // hands no block over (default_search.go); only an ffNative find has one.
-func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch) []byte {
+//
+// route, when non-nil, says findFuncIdx is a prefer-no-match body with a
+// neutral twin, and the call goes through emitFindBodyCall.
+func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch, route *twinRoute) []byte {
+	if route != nil && !mode.native() {
+		panic("compile: a neutral-twin route on a " + mode.String() + " find")
+	}
 	var b []byte
 
 	switch {
@@ -800,23 +806,18 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 	if mode.native() && def != nil {
 		l := defLocals{a: 3, t: 4, s: 5, n: 6, n2: 7}
 		b = def.emitEnter(b, 0, 1, 2, l)
-		b = emitFindFromSet(b, 0x02)          // find_from = from
-		b = append(b, 0x20, 0x00, 0x20, 0x01) // ptr, len — the WHOLE buffer
-		b = append(b, 0x10)
-		b = utils.AppendULEB128(b, uint32(findFuncIdx))
-		b = append(b, 0x22, 0x08) // local.tee r: the result
+		b = emitFindFromSet(b, 0x02)                                // find_from = from
+		b = emitFindBodyCall(b, findFuncIdx, route, minLen <= 1) // ptr, len — the WHOLE buffer
+		b = append(b, 0x22, 0x08)                                  // local.tee r: the result
 		b = def.emitFindWindow(b, l, 8)
 		return append(b, 0x0B) // end function
 	}
 	if mode.native() {
-		b = emitFindFromSet(b, 0x02)          // find_from = from
-		b = append(b, 0x20, 0x00, 0x20, 0x01) // ptr, len — the WHOLE buffer
-		b = append(b, 0x10)
-		b = utils.AppendULEB128(b, uint32(findFuncIdx))
-		b = append(b, 0x0B) // end function; positions are already absolute
+		b = emitFindFromSet(b, 0x02)                                // find_from = from
+		b = emitFindBodyCall(b, findFuncIdx, route, minLen <= 1) // ptr, len — the WHOLE buffer
+		b = append(b, 0x0B)                                        // end function; positions are already absolute
 		return b
 	}
-
 	// ffLegacyNarrow: reproduce, inside WASM, exactly what the generated
 	// stubs used to do host-side — call the body on input[from:] and shift
 	// the returned pair back up by `from`.
@@ -853,9 +854,68 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 	return b
 }
 
+// twinRoute lets a CALLER of a prefer-no-match find body make the body's
+// first decision for it. Such a body (findCodeEntry.twin) hands the rest of a
+// call to its neutral twin once the input proves dense, and the first test it
+// makes, before any probe, is whether the byte at the attempt's start is
+// already a candidate (firstByteFlags) — a candidate there spends the whole
+// density budget. On dense input that is every call: the body was entered,
+// set up, tested one byte and handed off, and the twin was entered and set up
+// again — 19 fuel per call above neutral (`[a-zA-Z]{20,}`, `[!-~]{12,}`,
+// `\pL{12,}`; 25 for `[a-zA-Z]+\d`), the whole of the hint's cost on
+// no-match input it does not suit. Testing that byte BEFORE the call and
+// calling the twin directly leaves 6: the test itself.
+//
+// The twin is the function right after the body (funcLayout: slotFind, then
+// slotFindNeutral). Only a caller of TODAY'S find may take this route: with a
+// start-anywhere switch, the find's callers reach the dispatcher, which is the
+// one caller of today's find, and the twin's switch sentinel must reach it.
+type twinRoute struct {
+	firstByteOff int32 // the hinted body's firstByteFlags, in table memory
+	tableMemIdx  int
+}
+
+// emitFindBodyCall emits a call of the find body findFuncIdx with (ptr, len)
+// from locals 0 and 1 — the whole buffer; the body reads `from` from the
+// find-from channel, which the caller has already set. With a route, it
+// calls the neutral twin instead when the byte at `from` is a candidate
+// (twinRoute).
+//
+// guard: `from` may equal `len`, so the byte must not be read without
+// testing. A caller that has already ruled out `len - from < 2` (the find
+// wrapper's minimum-length exit) passes false and saves four instructions.
+func emitFindBodyCall(b []byte, findFuncIdx int, route *twinRoute, guard bool) []byte {
+	call := func(b []byte, idx int) []byte {
+		b = append(b, 0x20, 0x00, 0x20, 0x01, 0x10)
+		return utils.AppendULEB128(b, uint32(idx))
+	}
+	if route == nil {
+		return call(b, findFuncIdx)
+	}
+	if guard {
+		b = append(b, 0x23)
+		b = utils.AppendULEB128(b, findFromGlobalIdx)
+		b = append(b, 0x20, 0x01, 0x49) // from < len
+		b = append(b, 0x04, 0x7F)       // if (result i32)
+	}
+	b = append(b, 0x20, 0x00, 0x23)
+	b = utils.AppendULEB128(b, findFromGlobalIdx)
+	b = append(b, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u: the byte at `from` (input memory)
+	b = appendTableLoad8uAt(b, route.firstByteOff, route.tableMemIdx)
+	if guard {
+		b = append(b, 0x05, 0x41, 0x00, 0x0B) // else 0 — nothing to read
+	}
+	b = append(b, 0x04, 0x7E) // if (result i64) — a candidate: dense from the start
+	b = call(b, findFuncIdx+1)
+	b = append(b, 0x05)
+	b = call(b, findFuncIdx)
+	return append(b, 0x0B)
+}
+
 // appendFindFromWrapperCodeEntry appends a size-prefixed find wrapper body.
-func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch) []byte {
-	body := buildFindFromWrapperBody(findFuncIdx, mode, minLen, def)
+func appendFindFromWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, minLen int32, def *defaultSearch, route *twinRoute) []byte {
+	body := buildFindFromWrapperBody(findFuncIdx, mode, minLen, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -889,7 +949,10 @@ func moduleUsesFindFrom(patterns []*compiledPattern) bool {
 // Shared by the batch find and batch groups wrappers because getting the two
 // modes' calling conventions subtly different between them is exactly the kind
 // of divergence that would show up as one export disagreeing with the other.
-func emitFindCallFromPos(b []byte, findFuncIdx int, mode findFromMode, posLocal, rLocal byte) []byte {
+func emitFindCallFromPos(b []byte, findFuncIdx int, mode findFromMode, posLocal, rLocal byte, route *twinRoute) []byte {
+	if route != nil && !mode.native() {
+		panic("compile: a neutral-twin route on a " + mode.String() + " find")
+	}
 	if mode == ffAnchoredZeroOnly {
 		// This body reports only matches beginning at 0 and ignores the
 		// channel entirely, so a resumed call at pos > 0 must NOT reach it:
@@ -916,7 +979,8 @@ func emitFindCallFromPos(b []byte, findFuncIdx int, mode findFromMode, posLocal,
 		// The body reads the channel, so it gets the whole buffer and the
 		// position. Results come back ABSOLUTE.
 		b = emitFindFromSet(b, posLocal)
-		b = append(b, 0x20, 0x00, 0x20, 0x01)
+		b = emitFindBodyCall(b, findFuncIdx, route, true)
+		return append(b, 0x21, rLocal)
 	}
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(findFuncIdx))

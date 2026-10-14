@@ -231,7 +231,12 @@ regexped/
 │   │                          #   (emitFindSwitchChargeEvery). u16 tables in Unicode mode only
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan). A Unicode-mode literal that
 │   │                          #   begins with a non-ASCII character is checked a whole character at a
-│   │                          #   time on a first-byte hit (UTF8Text / charProbe)
+│   │                          #   time on a first-byte hit (UTF8Text / charProbe). emitShuftiMask, the
+│   │                          #   SIMD set test every prefilter and skip shares: nibble tables in
+│   │                          #   general (buildShuftiPairs, at most two pairs for any set), a range
+│   │                          #   compare (i8x16.sub + unsigned compare, 8 instructions per range
+│   │                          #   against 16 per pair) for a set of 1-2 contiguous ranges
+│   │                          #   (contiguousRanges) — up to −28.6% fuel where it sits on a hot path
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
@@ -366,9 +371,7 @@ regexped/
 │   │                          #   state's self-loop run. Exact, not
 │   │                          #   approximate: only NON-mid-accepting states qualify, so a run
 │   │                          #   has no effect but the position, and these bodies report no
-│   │                          #   position. It probes the EXIT set, never the self-loop set —
-│   │                          #   one nibble-table pair per 8 members makes a 230-byte
-│   │                          #   self-loop 29 pairs against the exit set's 4. The detector
+│   │                          #   position. It probes the EXIT set. The detector
 │   │                          #   treats a move to an INDISTINGUISHABLE state as staying put
 │   │                          #   (same rows AND same accepts): before the automaton was
 │   │                          #   minimized (dfaTableFrom), without that the exit set was \w

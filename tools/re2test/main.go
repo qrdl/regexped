@@ -953,7 +953,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						// live here too — moving the emitters alone would make
 						// this loop disagree with them and misattribute the
 						// difference to the engine.
-						if !(s == e && s == prevEnd) {
+						if s != e || s != prevEnd {
 							gotAll = append(gotAll, [2]int{s, e})
 							prevEnd = e
 						}
@@ -1092,7 +1092,7 @@ func run(testFile string, verbose bool, maxErrors int, validateGo bool, validate
 						// above: suppress an EMPTY match beginning exactly
 						// where the previous reported match ended.
 						absStart, absEnd := shifted[0], shifted[1]
-						if !(absStart == absEnd && absStart == prevEnd) {
+						if absStart != absEnd || absStart != prevEnd {
 							gotAll = append(gotAll, shifted)
 							prevEnd = absEnd
 						}

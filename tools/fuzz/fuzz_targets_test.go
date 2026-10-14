@@ -1464,7 +1464,7 @@ func enumerateSetEmitters(t *testing.T) []emitterDecl {
 				continue
 			}
 			n := fn.Name.Name
-			if !(strings.HasPrefix(n, "build") || strings.HasPrefix(n, "emit") || strings.HasPrefix(n, "gen")) {
+			if !strings.HasPrefix(n, "build") && !strings.HasPrefix(n, "emit") && !strings.HasPrefix(n, "gen") {
 				continue
 			}
 			if !returnsBytes(fn) {

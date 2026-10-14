@@ -753,8 +753,8 @@ func ValidateSets(cfg *BuildConfig) error {
 			}
 		}
 		if s.PatternCount(*cfg) == 0 {
-			return fmt.Errorf("set %q has no members: select top-level patterns with patterns: "+
-				"(\"all\" or a list of names) or give it its own regexps:", s.Name)
+			return fmt.Errorf("set %q has no members: select top-level patterns with `patterns` "+
+				"(\"all\" or a list of names), or give it its own `regexps` list", s.Name)
 		}
 		// The find_batch cursor's k field is capped at 24 bits, so past
 		// 2^24 members it cannot hold every intra-position resume index and a
@@ -1022,8 +1022,8 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	// Every regexp may live inside sets, so the top-level list is optional —
 	// but a file with no regexp anywhere has nothing to build.
 	if len(cfg.Patterns) == 0 && !anyInlineRegexp(cfg) {
-		return BuildConfig{}, fmt.Errorf("config %s has no patterns: declare a top-level patterns: list "+
-			"or give a set its own regexps:", configPath)
+		return BuildConfig{}, fmt.Errorf("config %s has no patterns: declare a top-level `patterns` list, "+
+			"or give a set its own `regexps` list", configPath)
 	}
 	// An EMPTY regexp was accepted and compiled to something that matches the
 	// empty string everywhere — almost certainly a YAML slip (a missing value,

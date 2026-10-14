@@ -999,7 +999,7 @@ anywhere in it — and takes the per-byte walk as before.
 | ≤64 distinct literals (≤16 when the shortest literal is 1 byte) | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch. For 9+ literals it uses two groups of 8 (`TwoGroups=true`), ORing two independent nibble probes per 16-byte chunk |
 | >16 distinct literals with low first-byte diversity | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
 | (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
-| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain. First-byte union 17–64, or 17–128 with the hint |
+| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain (or, for a union of one or two contiguous byte ranges, two SIMD range compares per range: same answer, half the instructions). First-byte union 17–64, or 17–128 with the hint |
 | No mandatory literal at all | **Scalar** |
 
 Aho-Corasick's root-state prefilter skips ahead to the next position whose byte

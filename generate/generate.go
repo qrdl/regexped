@@ -29,7 +29,7 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	// refuses the same entry (compile.ErrNoCaptureGroup).
 	for _, re := range cfg.Patterns {
 		if re.GroupsWithoutCaptures() {
-			return fmt.Errorf("regexp %q: groups_func %q: %s", re.Regexp, re.GroupsFunc, config.NoCaptureGroupProblem)
+			return fmt.Errorf("pattern %q: groups_func %q: %s", re.Regexp, re.GroupsFunc, config.NoCaptureGroupProblem)
 		}
 	}
 	stubType, err := ResolveStubType(cfg)

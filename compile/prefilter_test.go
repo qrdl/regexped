@@ -2,6 +2,7 @@ package compile
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"regexp"
 	"regexp/syntax"
@@ -22,6 +23,37 @@ func decodeShuftiPairs(pairs [][2][16]byte, c byte) bool {
 		merged |= p[0][c&0x0F] & p[1][c>>4]
 	}
 	return merged != 0
+}
+
+// TestContiguousRanges pins which sets take emitShuftiMask's range form: one
+// or two contiguous runs, the top of the byte range included, and nothing
+// that needs three runs or is empty.
+func TestContiguousRanges(t *testing.T) {
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	for _, c := range []struct {
+		name string
+		set  []byte
+		want [][2]int // nil = not served
+	}{
+		{"empty", nil, nil},
+		{"[a-z]", []byte("abcdefghijklmnopqrstuvwxyz"), [][2]int{{'a', 'z'}}},
+		{"[a-zA-Z]", []byte("zyxwvutsrqponmlkjihgfedcbaABCDEFGHIJKLMNOPQRSTUVWXYZ"), [][2]int{{'A', 'Z'}, {'a', 'z'}}},
+		{"{a,c,e}", []byte("ace"), nil},
+		{"[0xFE-0xFF]", []byte{0xFF, 0xFE}, [][2]int{{0xFE, 0xFF}}},
+		{"all 256", all, [][2]int{{0, 255}}},
+	} {
+		rs, ok := contiguousRanges(c.set)
+		if ok != (c.want != nil) {
+			t.Errorf("%s: ok = %v, want %v (ranges %v)", c.name, ok, c.want != nil, rs)
+			continue
+		}
+		if ok && fmt.Sprint(rs) != fmt.Sprint(c.want) {
+			t.Errorf("%s: ranges %v, want %v", c.name, rs, c.want)
+		}
+	}
 }
 
 // TestBuildShuftiPairsExact is the correctness contract for the rectangle
@@ -135,35 +167,56 @@ func TestEmitShuftiPrefixCheckEmpty(t *testing.T) {
 // in the wrong emitter, every bulk skip in the compiler advances to the first
 // byte that IS a member — a walk that stops immediately and never strides,
 // which costs performance silently rather than failing.
+//
+// A set of one or two contiguous ranges takes the range form instead
+// (contiguousRanges), where the polarity is the per-range compare (le_u for a
+// member, gt_u for a stop) and, with two ranges, the combiner (or: in either;
+// and: in neither) — so the pairs of differing opcodes are decided per set.
 func TestShuftiMaskPolarities(t *testing.T) {
 	const (
-		opEq = 0x23 // i8x16.eq, after the 0xFD prefix
-		opNe = 0x24 // i8x16.ne
+		opEq  = 0x23 // i8x16.eq, after the 0xFD prefix
+		opNe  = 0x24 // i8x16.ne
+		opGtU = 0x28 // i8x16.gt_u
+		opLeU = 0x2A // i8x16.le_u
+		opAnd = 0x4E // v128.and
+		opOr  = 0x50 // v128.or
 	)
 	for _, set := range [][]byte{
 		[]byte("abcdefghijklmnopqrstuvwxyz"),
 		[]byte("0123456789"),
+		[]byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
 		{0x00, 0x7F, 0x80, 0xFF},
 	} {
+		// want: the (member, stop) opcode pairs that may differ, and how often.
+		allowed := map[[2]byte]bool{{opNe, opEq}: true}
+		wantDiffs := 1
+		if rs, ok := contiguousRanges(set); ok {
+			allowed = map[[2]byte]bool{{opLeU, opGtU}: true}
+			wantDiffs = 1
+			if len(rs) == 2 {
+				allowed[[2]byte{opOr, opAnd}] = true
+				wantDiffs = 3
+			}
+		}
 		member := emitShuftiPrefixCheck(nil, set, 7)
 		stop := emitShuftiStopMask(nil, set, 7)
 		if len(member) != len(stop) {
 			t.Fatalf("polarities differ in length: member %d, stop %d — the stop "+
-				"mask must be the same emission with one opcode changed",
+				"mask must be the same emission with its compares changed",
 				len(member), len(stop))
 		}
 		diffs := 0
 		for i := range member {
 			if member[i] != stop[i] {
 				diffs++
-				if member[i] != opNe || stop[i] != opEq {
-					t.Fatalf("byte %d differs as %#02x/%#02x, want the compare "+
-						"opcode %#02x/%#02x", i, member[i], stop[i], opNe, opEq)
+				if !allowed[[2]byte{member[i], stop[i]}] {
+					t.Fatalf("%q: byte %d differs as %#02x/%#02x, want one of %v",
+						set, i, member[i], stop[i], allowed)
 				}
 			}
 		}
-		if diffs != 1 {
-			t.Fatalf("polarities differ in %d bytes, want exactly 1 (the compare)", diffs)
+		if diffs != wantDiffs {
+			t.Fatalf("%q: polarities differ in %d bytes, want %d", set, diffs, wantDiffs)
 		}
 		// No 0xFFFF constant may survive in either emission: its presence is
 		// the signature of the inversion this replaced.

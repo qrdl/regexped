@@ -674,6 +674,11 @@ type compiledPattern struct {
 	// assembleModule, where the twin's function index is finally known.
 	findTwinCallOff int
 
+	// findTwinRoute is how a caller of the find body can make its first
+	// decision for it and call findNeutralBody directly (twinRoute). nil when
+	// there is no twin.
+	findTwinRoute *twinRoute
+
 	// findMarkedBody is the MARKED copy of the find body under per-search
 	// notes (search_notes.go), laid out after findBody and its neutral twin.
 	// findMarkedCallOff and findTwinMarkedCallOff are the handoffs to it in
@@ -1035,6 +1040,20 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 
 // todayFindOff is the sub-index of TODAY'S find function — findOff minus the
 // start-anywhere dispatcher a switch puts in front of it — or -1.
+// twinRouteFor is the route a caller of the function at calleeOff may take:
+// the find body's own, when calleeOff IS the find body. A caller of a
+// start-anywhere dispatcher gets none — the dispatcher is the one caller of
+// today's find that may, since it consumes the twin's switch sentinel.
+func (p *compiledPattern) twinRouteFor(calleeOff int) *twinRoute {
+	if p.findTwinRoute == nil || calleeOff < 0 || calleeOff != p.slotIndex(slotFind) {
+		return nil
+	}
+	if p.slotIndex(slotFindNeutral) != calleeOff+1 {
+		panic("compile: the neutral twin is not laid out right after the find body it routes from")
+	}
+	return p.findTwinRoute
+}
+
 func (p *compiledPattern) todayFindOff() int {
 	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
 		if i := p.slotIndex(k); i >= 0 {
@@ -2524,6 +2543,9 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 					// state-ID compares (unchanged).
 					applyDominantStateEncoding(l,
 						p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
+					if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+						placePlainMidAccept(l)
+					}
 				} else {
 					l.dominantStates = nil
 				}
@@ -2565,6 +2587,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 					p.setFind(e.body, e.mode)
 					p.findNeutralBody = e.twin
 					p.findTwinCallOff = e.twinPatch
+					p.findTwinRoute = e.twinRoute
 					if (e.twin != nil) != (e.twinPatch >= 0) {
 						panic("compile: find twin and its handoff call-site patch must be emitted together")
 					}
@@ -3365,13 +3388,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
 		// see archive Section 16.
 		if p.batchFindExport != "" {
-			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.defBatchFind)
+			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.defBatchFind, p.twinRouteFor(findOff))
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -3387,7 +3410,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups)
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3396,7 +3419,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
 			checkStartRule(p.startRule, p.findFromMode)
-			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen, p.defFind)
+			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen, p.defFind, p.twinRouteFor(findOff))
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -4321,7 +4344,7 @@ func (p resolvedProg) refusedByByteGate() bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
 // to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
 // engine_backtrack.go for the reading side.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -4330,10 +4353,7 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	// wrapper in front of this one sets it, and zeroing it here would discard
 	// the caller's position. This body is only ever reached through that
 	// wrapper.
-	b = append(b, 0x20, 0x00)
-	b = append(b, 0x20, 0x01)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+	b = emitFindBodyCall(b, findFuncIdx, route, true)
 	b = append(b, 0x22, 0x06)
 	// Any negative find result is forwarded verbatim (wrapped to i32), not
 	// collapsed to -1: a BT find body can return abi.BTStackOverflow (-2), and
@@ -4442,8 +4462,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -4531,7 +4551,7 @@ func (p *compiledPattern) clearLitAnchor() {
 //
 // def, when non-nil, is the export's default search state for a caller that
 // hands no block over (default_search.go).
-func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
+func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultSearch, route *twinRoute) []byte {
 
 	var b []byte
 	// Locals: 2×i32 (pos, count), 1×i64 (r), 3×i32 (relStart, relEnd, prevEnd)
@@ -4566,7 +4586,7 @@ func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultS
 	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
 
 	// r = find(...), searching from pos
-	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07)
+	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07, route)
 
 	// if r < -1: return abi.BTStackOverflow. Must be tested BEFORE the
 	// r < 0 exit below, which would otherwise report the batch collected so
@@ -4645,8 +4665,8 @@ func emitBatchWindow(b []byte, def *defaultSearch, l defLocals, count, pos byte)
 }
 
 // appendBatchFindWrapperCodeEntry appends a size-prefixed batch find wrapper body to cs.
-func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
-	body := buildBatchFindWrapperBody(findFuncIdx, mode, def)
+func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, def *defaultSearch, route *twinRoute) []byte {
+	body := buildBatchFindWrapperBody(findFuncIdx, mode, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -4695,7 +4715,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -4738,7 +4758,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
 
 	// r = find(...), searching from pos
-	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07)
+	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07, route)
 
 	// if r < -1: return abi.BTStackOverflow — see the batch find wrapper's
 	// matching comment for why this precedes the r < 0 exit.
@@ -4877,8 +4897,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

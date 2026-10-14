@@ -739,12 +739,14 @@ func decodeControlFlow(t *testing.T, b []byte) []string {
 				skipLEB()
 			case 0x0C: // v128.const: 16 raw bytes
 				i += 16
-			case 0x0E, 0x0F, 0x23, 0x24, 0x4E, 0x50, 0x64, 0x6D:
-				// swizzle, splat, eq, ne, and, or, bitmask, shr_u — no
-				// immediates. eq joined the list when the bulk skip switched to
-				// the STOP polarity (emitShuftiStopMask): it compares the merged
-				// lanes against zero instead of taking a member mask and
-				// inverting it with an i32 xor.
+			case 0x0E, 0x0F, 0x23, 0x24, 0x28, 0x2A, 0x4E, 0x50, 0x64, 0x6D, 0x71:
+				// swizzle, splat, eq, ne, gt_u, le_u, and, or, bitmask, shr_u,
+				// sub — no immediates. eq joined the list when the bulk skip
+				// switched to the STOP polarity (emitShuftiStopMask): it
+				// compares the merged lanes against zero instead of taking a
+				// member mask and inverting it with an i32 xor. sub, gt_u and
+				// le_u are the range form a 1-2-range class takes instead of
+				// the nibble tables (contiguousRanges).
 			default:
 				t.Fatalf("decodeControlFlow: unhandled SIMD subopcode 0x%02x at byte %d", sub, i-2)
 			}

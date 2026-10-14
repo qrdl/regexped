@@ -182,7 +182,7 @@ func wasmFindIterMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, 
 		e := int(uint32(v))
 		// (B): Go suppresses an empty match beginning where the previous
 		// reported match ended. The advance below is unaffected.
-		if !(s == e && s == prevEnd) {
+		if s != e || s != prevEnd {
 			out = append(out, [2]int{s, e})
 			prevEnd = e
 		}
@@ -859,7 +859,7 @@ func testFindFromIterationTerminates(t *testing.T, mode searchblock.Mode) {
 				// generated stub applies this, and so must the model — without
 				// it an empty-capable pattern reports one match too many and
 				// the comparison below fails for the wrong reason.
-				if !(sp[0] == sp[1] && sp[0] == prevEnd) {
+				if sp[0] != sp[1] || sp[0] != prevEnd {
 					got = append(got, sp)
 					prevEnd = sp[1]
 				}
@@ -1219,7 +1219,7 @@ func checkUnicodeFindIteration(t *testing.T, re *regexp.Regexp, mod *wasmtime.Mo
 		if state == findNone {
 			break
 		}
-		if !(sp[0] == sp[1] && sp[0] == prevEnd) {
+		if sp[0] != sp[1] || sp[0] != prevEnd {
 			got = append(got, sp)
 			prevEnd = sp[1]
 		}
@@ -2173,7 +2173,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 				if state == findNone {
 					break
 				}
-				if !(m[0] == m[1] && m[0] == prevEnd) {
+				if m[0] != m[1] || m[0] != prevEnd {
 					got = append(got, m)
 					prevEnd = m[1]
 				}
@@ -2184,10 +2184,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 				off += adv
 			}
 
-			var want [][]int
-			for _, m := range re.FindAllStringSubmatchIndex(c.input, -1) {
-				want = append(want, m)
-			}
+			want := append([][]int(nil), re.FindAllStringSubmatchIndex(c.input, -1)...)
 			gs, ws := make([]string, len(got)), make([]string, len(want))
 			for i, v := range got {
 				gs[i] = fmtSlots(v)
@@ -3158,7 +3155,7 @@ func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
 		// Byte-mode folding stays inside the byte range: \xe0-\xfe folds to
 		// \xc0-\xde except × (0xD7) and ÷ (0xF7), which have no partner.
 		{`(?i)[^\xe0-\xfe]`, true, func(b byte) bool {
-			return !((b >= 0xc0 && b <= 0xd6) || (b >= 0xd8 && b <= 0xde) || (b >= 0xe0 && b <= 0xfe))
+			return (b < 0xc0 || b > 0xd6) && (b < 0xd8 || b > 0xde) && (b < 0xe0 || b > 0xfe)
 		}},
 	}
 	type path struct {
@@ -3527,30 +3524,6 @@ var findStrategyShapes = []struct {
 	{`ab?c|x[a-z]*Y`, "x", "xY", nil},
 }
 
-// hasEmptyWidthAssertion reports whether pat carries \b, \B, ^, $, \A or \z,
-// which the start-anywhere find refuses.
-func hasEmptyWidthAssertion(pat string) bool {
-	re, err := syntax.Parse(pat, syntax.Perl)
-	if err != nil {
-		return false
-	}
-	var walk func(*syntax.Regexp) bool
-	walk = func(r *syntax.Regexp) bool {
-		switch r.Op {
-		case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText,
-			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-			return true
-		}
-		for _, s := range r.Sub {
-			if walk(s) {
-				return true
-			}
-		}
-		return false
-	}
-	return walk(re)
-}
-
 // TestFindStrategiesMatchGo drives every find strategy — today's find, the
 // start-anywhere find alone, today's find with a work counter that trips
 // almost at once (N = 1), and whatever the classifier picks — at EVERY start
@@ -3713,6 +3686,85 @@ func TestFindStrategiesLinear(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestNeutralTwinRouteMatchesGo drives every caller that can take a
+// prefer-no-match body's route to its neutral twin — a caller tests the byte at
+// `from` and calls the twin itself when the body's first test would hand off —
+// at every start position, against Go. Each caller tests that byte in its own
+// code: the find wrapper with its minimum-length exit (unguarded) and without
+// one (guarded, since `from` may equal `len`), the start-anywhere dispatcher
+// (the one caller of today's find under a switch), and the groups wrapper. The
+// inputs mix dense runs, where the route is taken, with text that starts on a
+// byte outside the class, where it is not.
+func TestNeutralTwinRouteMatchesGo(t *testing.T) {
+	inputs := []string{"", "a", ";", "abcdefgh", ";abcdefghij;", "ab cd efghijklm no pqrstuvwxyz;",
+		strings.Repeat("ab ", 30) + "abcdefghijk", ";;" + strings.Repeat("abcdefg;", 12) + "abcdefgh"}
+	lnm := compile.CompileOptions{LikelyMode: compile.LikelyNoMatch}
+	sw := compile.CompileOptions{LikelyMode: compile.LikelyNoMatch, StartAnywhereSwitchN: 1}
+	finds := []struct {
+		name, pat string
+		opts      compile.CompileOptions
+	}{
+		{"wrapper, length exit", `[a-zA-Z]{8,}`, lnm},
+		{"wrapper, guarded", `[a-zA-Z]+`, lnm},
+		{"dispatcher", `[a-zA-Z]{8,}`, sw},
+	}
+	for _, c := range finds {
+		t.Run(c.name, func(t *testing.T) {
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true, c.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, in := range inputs {
+				call, done, ok := findCaller(t, w, in)
+				if !ok {
+					t.Fatal("module would not instantiate")
+				}
+				ends := endsAt(t, c.pat, in)
+				for from := 0; from <= len(in); from++ {
+					got, state := call(from)
+					want, wantOK := goFirstFrom(ends, from)
+					switch {
+					case state == findHang:
+						t.Fatalf("%q from=%d: watchdog fired", in, from)
+					case state == findNone && wantOK:
+						t.Fatalf("%q from=%d: got -1, want %v", in, from, want)
+					case state == findMatch && (!wantOK || got != want):
+						t.Fatalf("%q from=%d: got %v, want %v (%v)", in, from, got, want, wantOK)
+					}
+				}
+				done()
+			}
+		})
+	}
+	t.Run("groups wrapper", func(t *testing.T) {
+		const pat = `([a-zA-Z]{8,})`
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, lnm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range inputs {
+			call, done, ok := groupsCaller(t, w, in, 4)
+			if !ok {
+				t.Fatal("module would not instantiate")
+			}
+			ends := groupsEndsAt(t, pat, in)
+			for from := 0; from <= len(in); from++ {
+				got, state := call(from)
+				want, wantOK := groupsFirstFrom(ends, from)
+				switch {
+				case state == findHang:
+					t.Fatalf("%q from=%d: watchdog fired", in, from)
+				case state == findNone && wantOK:
+					t.Fatalf("%q from=%d: got no-match, want %s", in, from, fmtSlots(want))
+				case state == findMatch && (!wantOK || fmtSlots(got) != fmtSlots(want)):
+					t.Fatalf("%q from=%d: got %s, want %s (%v)", in, from, fmtSlots(got), fmtSlots(want), wantOK)
+				}
+			}
+			done()
+		}
+	})
 }
 
 // TestUnicodeModeSelectedGroupsMatchGo: in Unicode mode a capture pattern

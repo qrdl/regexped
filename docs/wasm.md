@@ -608,7 +608,7 @@ Applied when the match starts at the scanned position:
 | **3-byte Teddy** | ≤ 8 first bytes, selective 3rd byte | nibble tables check bytes 0, 1, 2 simultaneously |
 | **2-byte Teddy** | ≤ 8 first bytes | nibble tables check bytes 0 and 1 simultaneously |
 | **1-byte Teddy** | 1-byte prefix, multiple candidates | T_lo/T_hi nibble tables |
-| **Shufti** | 9–16 first bytes (unconditional), or 17–64 (rarity heuristic predicts a win, or `hints: [prefer-no-match]` forces it) | nibble-table SIMD set-membership test over the whole candidate set (supersedes an older per-candidate `i8x16.eq`+bitmask emission) |
+| **Shufti** | 9–16 first bytes (unconditional), or 17–64 (rarity heuristic predicts a win, or `hints: [prefer-no-match]` forces it) | nibble-table SIMD set-membership test over the whole candidate set (supersedes an older per-candidate `i8x16.eq`+bitmask emission); a set of one or two contiguous byte ranges takes `i8x16.sub` + an unsigned compare per range instead — same answer, half the instructions |
 | **Scalar** | 0 first bytes, > 64, or a 17–64 set the rarity heuristic predicts scalar wins for | byte-by-byte scan; the 17–64 Shufti path also self-disables back to scalar at runtime if the heuristic guessed wrong and match data turns out denser than expected |
 
 Each Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally

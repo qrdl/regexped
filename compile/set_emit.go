@@ -1162,6 +1162,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			// recomputed.
 			bkt.sparseScratch = art.sparseScratch
 			bkt.sparseIDMapOff = art.sparseIDMapOff
+			bkt.sparseMemberGlobalP1 = art.memberGlobalP1
 		}
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
@@ -2975,11 +2976,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		if p.batchFindExport != "" {
-			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.defBatchFind)
+			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.defBatchFind, p.twinRouteFor(findOff))
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -2993,7 +2994,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups)
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3002,7 +3003,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
 			checkStartRule(p.startRule, p.findFromMode)
-			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen, p.defFind)
+			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen, p.defFind, p.twinRouteFor(findOff))
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -4104,12 +4105,18 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	st := &blockStack{}
 	b = append(b, 0x02, 0x40) // block $batch_done
 	st.Push("batch_done")
+	if adaptive {
+		// Left for good when the density switch trips: the scan continues in
+		// a plain per-position loop below, with no prefilter and no gate.
+		b = append(b, 0x02, 0x40) // block $tripped
+		st.Push("tripped")
+	}
 	b = append(b, 0x03, 0x40) // loop $scan
 	st.Push("scan")
 
 	// Exit conditions.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, st.Depth("batch_done")) // lPos > pInLen
-	b = c.emitDrainCheck(b, lPos, 0x01)
+	b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
 
 	if adaptive {
 		// Reset once per attempt (one $scan iteration = one search for the
@@ -4266,8 +4273,8 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		// frontend (emitSetMatchFnFinalScalar) which never pre-filters at
 		// all. Depths from the else branch: $dense_gate (0, current),
 		// $skip_loop (1), $skip_done (2).
-		b = append(b, 0x05) // else
-		b = append(b, 0x0C, st.Depth("skip_done"))
+		b = append(b, 0x05) // else — tripped: leave for the plain loop
+		b = append(b, 0x0C, st.Depth("tripped"))
 		b = append(b, 0x0B) // end if $dense_gate
 		st.Pop()
 	}
@@ -4283,7 +4290,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// The prefilter also moved lPos past the drain bound checked at the top of
 	// $scan, so re-check it here — that is what keeps perPositionDrain true for
 	// this body (the bucket work below sees exactly one candidate position).
-	b = c.emitDrainCheck(b, lPos, 0x01)
+	b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
 
 	// Literal buckets only (selection requires no fallback). Shortest literal
 	// first for the same ordering reason as the scalar path, and with the
@@ -4294,6 +4301,22 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = append(b, 0x0C, st.Depth("scan"))
 	b = append(b, 0x0B) // end loop $scan
 	st.Pop()
+	if adaptive {
+		b = append(b, 0x0B) // end block $tripped
+		st.Pop()
+		// The plain loop: exactly what the tripped arm did per position —
+		// no prefilter, every position goes to the buckets, which do their
+		// own first-byte compares (the scalar frontend's loop).
+		b = append(b, 0x03, 0x40) // loop $plain
+		st.Push("plain")
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("batch_done")) // lPos >= pInLen
+		b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
+		b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+		b = append(b, 0x0C, st.Depth("plain"))
+		b = append(b, 0x0B) // end loop $plain
+		st.Pop()
+	}
 	b = append(b, 0x0B) // end block $batch_done
 	st.Pop()
 	if st.Open() != 0 {

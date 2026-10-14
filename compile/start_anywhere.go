@@ -1391,7 +1391,7 @@ func buildStartAnywhereFindBody(fwdFuncIdx, revFuncIdx int, resume *uint32, rule
 // resume, when non-nil, is the search global: a handed-over call's match is
 // where the host resumes, and today's marked copy checks the next call
 // against it (search_notes.go), so the dispatcher stores it.
-func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int, resume *uint32) []byte {
+func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int, resume *uint32, route *twinRoute) []byte {
 	const (
 		locPtr = 0
 		locLen = 1
@@ -1402,8 +1402,7 @@ func buildStartAnywhereDispatchBody(todayFuncIdx, startAnywhereFuncIdx int, resu
 	if resume != nil {
 		b = []byte{0x02, 0x01, 0x7E, 0x01, 0x7F} // r, blk
 	}
-	b = append(b, 0x20, locPtr, 0x20, locLen, 0x10)
-	b = utils.AppendULEB128(b, uint32(todayFuncIdx))
+	b = emitFindBodyCall(b, todayFuncIdx, route, true) // locPtr, locLen are locals 0 and 1
 	b = append(b, 0x22, locR, 0x42)
 	b = utils.AppendSLEB128(b, startAnywhereSwitchSentinel)
 	b = append(b, 0x51, 0x04, 0x40) // i64.eq; if
@@ -1590,7 +1589,7 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 			panic("compile: start-anywhere switch: today's find and the Backtracking handover read `from` differently")
 		}
 		cs = appendBTFindParts(cs, p.saBT.fast, *p.saBT, base+p.slotIndex(slotSABT))
-		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT), p.notes.resumeGlobal())
+		d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSABT), p.notes.resumeGlobal(), p.twinRouteFor(p.todayFindOff()))
 		cs = utils.AppendULEB128(cs, uint32(len(d)))
 		return append(cs, d...)
 	}
@@ -1620,7 +1619,7 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 	if glueMode != p.findFromMode {
 		panic("compile: start-anywhere switch: today's find and the start-anywhere find read `from` differently")
 	}
-	d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSAGlue), p.notes.resumeGlobal())
+	d := buildStartAnywhereDispatchBody(base+p.todayFindOff(), base+p.slotIndex(slotSAGlue), p.notes.resumeGlobal(), p.twinRouteFor(p.todayFindOff()))
 	cs = utils.AppendULEB128(cs, uint32(len(d)))
 	return append(cs, d...)
 }

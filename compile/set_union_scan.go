@@ -139,19 +139,23 @@ type unionScanDFA struct {
 type unionSkipInfo struct {
 	state int // emitted (renumbered) state id
 	// exitSet is the bytes that LEAVE the state — the complement of the
-	// self-loop set, and the side actually probed. Probing the self-loop set
-	// directly would be the wrong choice by an order of magnitude:
-	// emitShuftiPrefixCheck costs one nibble-table pair per 8 SET MEMBERS, so
-	// a 230-byte self-loop is 29 table pairs against the exit set's 4.
+	// self-loop set, and the side actually probed. emitShuftiPrefixCheck's
+	// cost no longer grows with the set (buildShuftiPairs needs at most two
+	// nibble pairs for any set, and a set of one or two contiguous ranges
+	// takes a range compare instead), so the choice of side is now about
+	// which one those cheaper forms fit; the probe reads the exit set.
 	exitSet []byte
 }
 
-// maxUnionSkipExit bounds the exit set at eight nibble-table halves, which is
-// emitShuftiPrefixCheck's own practical ceiling (EmitPrefixScan gates its
-// callers at the same 64). A state with a wider exit set has a self-loop
-// narrower than 192 of 256 bytes, where a stride is unlikely to clear a full
-// 16-byte chunk often enough to pay for the probe.
-const maxUnionSkipExit = 64
+// maxUnionSkipExit bounds the exit set. It was 64, when the probe's cost grew
+// with the set; at most two nibble pairs (or a range compare) for any set took
+// that reason away, and 256 admits every exit set. A wide one — a set member
+// such as `\p{Latin}{3,}\d`, whose start state leaves on the 52 ASCII letters
+// and the Latin lead bytes — strides where it pays (digits −91.5% fuel), and on
+// text dense in its exit set the stride disarms at the first next byte that
+// leaves the state (emitUnionSkip), so a wide set costs a few fuel per call
+// there, not per byte.
+const maxUnionSkipExit = 256
 
 // maxUnionSkipStates caps how many states get a dispatch compare at the top of
 // the bulk loop.
@@ -938,25 +942,40 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x02, 0x40) // block $bulk_exit
-	b = append(b, 0x03, 0x40) // loop $bulk
 
-	// pos + unionUnroll > len → the block would read past the end: leave the
-	// bulk loop and finish in the tail. Unsigned, and no overflow to worry
-	// about: pos <= len < 2^31 on entry (the from > len case already returned).
-	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // gt_u → br $bulk_exit
+	// bulk emits one copy of the bulk loop. extra is 1 when the copy sits
+	// inside block $disarmed (the striding copy), shifting every outward
+	// branch by one level.
+	bulk := func(b []byte, withSkip bool, extra byte) []byte {
+		b = append(b, 0x03, 0x40) // loop $bulk
 
+		// pos + unionUnroll > len → the block would read past the end: leave
+		// the bulk loop and finish in the tail. Unsigned, and no overflow to
+		// worry about: pos <= len < 2^31 on entry (the from > len case
+		// already returned).
+		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+		b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01+extra) // gt_u → br $bulk_exit
+
+		if withSkip {
+			b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, pInLen, 2+extra, 2, tableMemIdx)
+		}
+
+		for k := byte(0); k < unionUnroll; k++ {
+			b = emitStep(b, k)
+		}
+		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
+		b = emitExit(b, 0x02+extra) // → $done, past $bulk and $bulk_exit
+		b = append(b, 0x0C, 0x00)
+		return append(b, 0x0B) // end loop $bulk
+	}
 	if skip {
-		b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, pInLen, 2)
+		// Two copies: the striding one, left for good when the stride gives
+		// up, and a plain one that carries no guard at all.
+		b = append(b, 0x02, 0x40) // block $disarmed
+		b = bulk(b, true, 1)
+		b = append(b, 0x0B) // end block $disarmed
 	}
-
-	for k := byte(0); k < unionUnroll; k++ {
-		b = emitStep(b, k)
-	}
-	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
-	b = emitExit(b, 0x02) // → $done, past $bulk and $bulk_exit
-	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B) // end loop $bulk
+	b = bulk(b, false, 0)
 	b = append(b, 0x0B) // end block $bulk_exit
 
 	b = append(b, 0x03, 0x40)                               // loop $tail
@@ -1096,7 +1115,12 @@ func emitUnionScanBody(u *unionScanDFA, mode setCapKind, fullMask uint64, tableM
 // bulkExitDepth is the br depth of the enclosing $bulk_exit block counted from
 // INSIDE this function's own `if armed` arm — 2 for both callers (if / loop
 // $bulk / block $bulk_exit).
-func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed, lChunk, lStale, lLen, bulkExitDepth byte) []byte {
+//
+// disarmDepth is the br depth, counted from INSIDE the `if armed` arm, of the
+// block that ends the striding copy of the bulk loop: a stride that gives up
+// leaves that copy for good and the scan continues in a second copy with no
+// stride and no guard, so a disarmed stride costs nothing per iteration.
+func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed, lChunk, lStale, lLen, bulkExitDepth, disarmDepth byte, tableMemIdx int) []byte {
 	// Depths come from st, not from counting `end`s by eye: this body nests
 	// if / block / loop / if, and the inner branch target is two levels out,
 	// which is exactly the literal a hand count gets wrong (see
@@ -1118,6 +1142,21 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed,
 		b = append(b, 0x46)       // i32.eq
 		b = append(b, 0x04, 0x40) // if
 		st.Push("enabled")
+
+		// CHEAP PRE-CHECK: does the very next byte already leave S? Then a
+		// probe can stride nothing; count the attempt as failed for one
+		// transition lookup instead of a 16/32-byte SIMD probe. On text dense
+		// in the exit set this is the whole cost of learning it is dense.
+		b = emitUnionNextState(b, u, lState, 0, tableMemIdx, func(b []byte) []byte {
+			return append(b, 0x20, lPos)
+		})
+		b = append(b, 0x20, lArmed, 0x47) // i32.ne — leaves S
+		b = append(b, 0x04, 0x40)         // if $leaves
+		st.Push("leaves")
+		// V4: the first next byte that leaves S disarms the stride for the call.
+		b = append(b, 0x0C, st.Depth("enabled")+disarmDepth) // br → $disarmed
+		b = append(b, 0x05)                                  // else — the next byte stays in S: worth a probe
+		// (else keeps the same block level as $leaves)
 
 		b = append(b, 0x02, 0x40) // block $skip_done
 		st.Push("skip_done")
@@ -1171,10 +1210,10 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed,
 		b = append(b, 0x20, lStale, 0x41, 0x01, 0x6A, 0x22, lStale)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, unionSkipStaleLimit)
-		b = append(b, 0x4E)                     // i32.ge_s
-		b = append(b, 0x04, 0x40)               // if
-		b = append(b, 0x41, 0x7F, 0x21, lArmed) // armed = -1
-		b = append(b, 0x0B)                     // end if
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x04, 0x40) // if — give up: leave the striding copy
+		b = append(b, 0x0C, st.Depth("enabled")+1+disarmDepth)
+		b = append(b, 0x0B) // end if
 		b = append(b, 0x0C, st.Depth("skip_done"))
 		b = append(b, 0x0B) // end if
 		st.Pop()
@@ -1263,10 +1302,10 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed,
 		b = append(b, 0x20, lStale, 0x41, 0x01, 0x6A, 0x22, lStale)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, unionSkipStaleLimit)
-		b = append(b, 0x4E)                     // i32.ge_s
-		b = append(b, 0x04, 0x40)               // if
-		b = append(b, 0x41, 0x7F, 0x21, lArmed) // armed = -1
-		b = append(b, 0x0B)                     // end if
+		b = append(b, 0x4E)       // i32.ge_s
+		b = append(b, 0x04, 0x40) // if — give up: leave the striding copy
+		b = append(b, 0x0C, st.Depth("enabled")+1+disarmDepth)
+		b = append(b, 0x0B) // end if
 		b = append(b, 0x0C, st.Depth("skip_done"))
 		b = append(b, 0x0B) // end if
 		st.Pop()
@@ -1290,8 +1329,10 @@ func emitUnionSkip(b []byte, u *unionScanDFA, lPos, lState, lEnd, lMask, lArmed,
 		// iteration either way, which measured as most of an 18-20% regression
 		// on prose. The byte-at-a-time tail finishes what is left.
 		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-		b = append(b, 0x20, lEnd, 0x4B, 0x0D, bulkExitDepth) // gt_u -> $bulk_exit
-		b = append(b, 0x0B)                                  // end if enabled
+		b = append(b, 0x20, lEnd, 0x4B, 0x0D, bulkExitDepth+1) // gt_u -> $bulk_exit (inside $leaves' else)
+		b = append(b, 0x0B)                                    // end if $leaves
+		st.Pop()
+		b = append(b, 0x0B) // end if enabled
 		st.Pop()
 		if st.Open() != 0 {
 			panic("compile: emitUnionSkip left a block open")
@@ -1525,21 +1566,28 @@ func emitUnionScanWideBody(u *unionScanDFA, mode setCapKind, tableMemIdx int, ln
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x02, 0x40) // block $bulk_exit
-	b = append(b, 0x03, 0x40) // loop $bulk
-	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
-	b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01) // cur+4 > end (u) -> $bulk_exit
-
+	// One copy of the bulk loop; see the narrow body's for the two copies.
+	bulk := func(b []byte, withSkip bool, extra byte) []byte {
+		b = append(b, 0x03, 0x40) // loop $bulk
+		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A)
+		b = append(b, 0x20, lEnd, 0x4B, 0x0D, 0x01+extra) // cur+4 > end (u) -> $bulk_exit
+		if withSkip {
+			b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, pInLen, 2+extra, 2, tableMemIdx)
+		}
+		for k := byte(0); k < unionUnroll; k++ {
+			b = step(b, k)
+		}
+		b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
+		b = append(b, 0x0C, 0x00) // br $bulk
+		return append(b, 0x0B)    // end loop $bulk
+	}
 	if skip {
-		b = emitUnionSkip(b, u, lPos, lState, lEnd, lSkipMask, lArmed, lChunk, lStale, pInLen, 2)
+		b = append(b, 0x02, 0x40) // block $disarmed
+		b = bulk(b, true, 1)
+		b = append(b, 0x0B) // end block $disarmed
 	}
-
-	for k := byte(0); k < unionUnroll; k++ {
-		b = step(b, k)
-	}
-	b = append(b, 0x20, lPos, 0x41, unionUnroll, 0x6A, 0x21, lPos)
-	b = append(b, 0x0C, 0x00) // br $bulk
-	b = append(b, 0x0B)       // end loop $bulk
-	b = append(b, 0x0B)       // end block $bulk_exit
+	b = bulk(b, false, 0)
+	b = append(b, 0x0B) // end block $bulk_exit
 
 	b = append(b, 0x03, 0x40)                               // loop $tail
 	b = append(b, 0x20, lPos, 0x20, lEnd, 0x4F, 0x0D, 0x01) // cur >= end -> $done
@@ -2434,6 +2482,13 @@ func emitUnionTransitionOffset(b []byte, u *unionScanDFA, lBase, lOff, lState, k
 // emitUnionTransitionAddr is the body both forms share; pushAddr leaves the
 // address of the input byte on the stack.
 func emitUnionTransitionAddr(b []byte, u *unionScanDFA, lState, k byte, tableMemIdx int, pushAddr func([]byte) []byte) []byte {
+	b = emitUnionNextState(b, u, lState, k, tableMemIdx, pushAddr)
+	return append(b, 0x21, lState)
+}
+
+// emitUnionNextState pushes the state lState moves to on the input byte at
+// pushAddr()+k, without storing it.
+func emitUnionNextState(b []byte, u *unionScanDFA, lState, k byte, tableMemIdx int, pushAddr func([]byte) []byte) []byte {
 	rowLen := u.numClasses * u.stateWidth
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, u.transOff)
@@ -2469,7 +2524,7 @@ func emitUnionTransitionAddr(b []byte, u *unionScanDFA, lState, k byte, tableMem
 	} else {
 		b = appendTableLoad16u(b, tableMemIdx)
 	}
-	return append(b, 0x21, lState)
+	return b
 }
 
 // shiftForRow returns the shift for a power-of-two row length, or -1 when the

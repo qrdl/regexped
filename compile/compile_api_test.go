@@ -2681,6 +2681,14 @@ func TestFindNeutralTwinEmission(t *testing.T) {
 			if twin != nil && len(twin) == 0 {
 				t.Error("twin is non-nil but empty")
 			}
+			// Callers route around the hinted body by its first test, so the
+			// route comes with the twin and reads the body's own table.
+			if (e.twinRoute != nil) != tc.wantTwin {
+				t.Errorf("twinRoute = %v, want one iff a twin", e.twinRoute)
+			}
+			if e.twinRoute != nil && e.twinRoute.firstByteOff != l.firstByteOff {
+				t.Errorf("twinRoute reads %d, the body's firstByteFlags is at %d", e.twinRoute.firstByteOff, l.firstByteOff)
+			}
 		})
 	}
 }

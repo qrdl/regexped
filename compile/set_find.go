@@ -1078,9 +1078,21 @@ func (c *setFindCtx) emitSuffixCall(b []byte, bi, litLen int, posLocal byte, mas
 	b = utils.AppendSLEB128(b, abi.SetMatchTupleBytes)
 	b = append(b, 0x6C, 0x6A)
 	b = append(b, 0x20, c.pOutCap, 0x20, c.lBase, 0x6B)
-	b = append(b, 0x20, c.lValidMask, 0x41)
-	b = utils.AppendSLEB128(b, int32(mask))
-	b = append(b, 0x71)
+	if c.sparseBucket(bi) {
+		// A sparse body filters per pattern itself and reads this slot as
+		// its member-skip verdict (buildSparseSuffixBody): one global.get,
+		// or 0 for a bucket with no skip, where the mask cost three.
+		if g := c.cs.buckets[bi].sparseMemberGlobalP1; g > 0 {
+			b = append(b, 0x23)
+			b = utils.AppendULEB128(b, uint32(g-1))
+		} else {
+			b = append(b, 0x41, 0x00)
+		}
+	} else {
+		b = append(b, 0x20, c.lValidMask, 0x41)
+		b = utils.AppendSLEB128(b, int32(mask))
+		b = append(b, 0x71)
+	}
 	if c.gated {
 		b = append(b, 0x20, c.pGate)
 	} else if c.cs.suffixHasSkip {

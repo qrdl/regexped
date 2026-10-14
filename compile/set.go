@@ -1758,6 +1758,9 @@ type bucket struct {
 	sparseScratch sparseScratch
 	// sparseIDMapOff maps bucket-local index -> global pattern id at runtime.
 	sparseIDMapOff int32
+	// sparseMemberGlobalP1 is one past the member-skip verdict global, 0 =
+	// none: emitSuffixCall pushes it as a sparse body's validMask argument.
+	sparseMemberGlobalP1 int32
 	// dp is the table geometry the overlapping backward sweep
 	// reads, copied from the very params buildSetSuffixBody was given so the
 	// forward and backward readers cannot disagree about where a table is.

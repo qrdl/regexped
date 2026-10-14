@@ -614,7 +614,7 @@ func analysePattern(prog *syntax.Prog) *patternAnalysis {
 func estimatedDFAStates(prog *syntax.Prog) int {
 	alternations := 0
 	for pc, inst := range prog.Inst {
-		if inst.Op == syntax.InstAlt && !(inst.Out < uint32(pc) && inst.Arg >= uint32(pc)) {
+		if inst.Op == syntax.InstAlt && (inst.Out >= uint32(pc) || inst.Arg < uint32(pc)) {
 			alternations++
 		}
 	}

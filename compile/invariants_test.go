@@ -577,9 +577,9 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil, nil)
 
 	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
 		if len(body) == 0 {
@@ -618,12 +618,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -1098,7 +1098,7 @@ func TestFindFromWrapperBodyAllModes(t *testing.T) {
 
 func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
 	{
-		body := buildFindFromWrapperBody(7, mode, minLen, nil)
+		body := buildFindFromWrapperBody(7, mode, minLen, nil, nil)
 		if len(body) == 0 {
 			t.Fatalf("mode %v: emitted nothing", mode)
 		}
@@ -1242,7 +1242,7 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 			t.Errorf("panic message %q does not name the offending mode", msg)
 		}
 	}()
-	buildFindFromWrapperBody(7, findFromMode(0), 0, nil)
+	buildFindFromWrapperBody(7, findFromMode(0), 0, nil, nil)
 }
 
 // TestEmitFindCallFromPos covers the shared call sequence the BATCH wrappers
@@ -1254,9 +1254,9 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 // anchored-zero-only mode emits MORE (it has to answer "no match" for pos != 0
 // without calling the body at all).
 func TestEmitFindCallFromPos(t *testing.T) {
-	native := emitFindCallFromPos(nil, 7, ffNative, 4, 5)
-	anchored := emitFindCallFromPos(nil, 7, ffAnchoredZeroOnly, 4, 5)
-	legacy := emitFindCallFromPos(nil, 7, ffLegacyNarrow, 4, 5)
+	native := emitFindCallFromPos(nil, 7, ffNative, 4, 5, nil)
+	anchored := emitFindCallFromPos(nil, 7, ffAnchoredZeroOnly, 4, 5, nil)
+	legacy := emitFindCallFromPos(nil, 7, ffLegacyNarrow, 4, 5, nil)
 	for name, got := range map[string][]byte{
 		"native": native, "anchored-zero-only": anchored, "legacy-narrow": legacy,
 	} {
@@ -1268,6 +1268,77 @@ func TestEmitFindCallFromPos(t *testing.T) {
 		t.Errorf("anchored-zero-only emitted %d bytes, native %d: the anchored mode "+
 			"must add the pos != 0 guard that answers without calling the body",
 			len(anchored), len(native))
+	}
+}
+
+// TestEmitFindBodyCallRoute pins the neutral-twin route's call shape: without
+// a route a bare call of the body; with one, a test of the byte at `from` that
+// picks between the TWIN (the body's index plus one) and the body, guarded by
+// `from < len` unless the caller says it ruled that out. A route on a mode
+// whose body does not read the channel cannot be honoured and must not build.
+func TestEmitFindBodyCallRoute(t *testing.T) {
+	route := &twinRoute{firstByteOff: 300, tableMemIdx: 1}
+	plain := emitFindBodyCall(nil, 7, nil, true)
+	if want := []byte{0x20, 0x00, 0x20, 0x01, 0x10, 0x07}; !bytes.Equal(plain, want) {
+		t.Errorf("no route: % x, want % x", plain, want)
+	}
+	routed := emitFindBodyCall(nil, 7, route, false)
+	guarded := emitFindBodyCall(nil, 7, route, true)
+	for name, b := range map[string][]byte{"routed": routed, "guarded": guarded} {
+		if !bytes.Contains(b, []byte{0x10, 0x08}) || !bytes.Contains(b, []byte{0x10, 0x07}) {
+			t.Errorf("%s: % x calls the twin (8) or the body (7) nowhere", name, b)
+		}
+	}
+	if len(guarded) <= len(routed) {
+		t.Errorf("guarded %d bytes, unguarded %d: the guard must add the from < len test", len(guarded), len(routed))
+	}
+	for _, m := range []findFromMode{ffLegacyNarrow, ffAnchoredZeroOnly} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: a route was accepted on a body that does not read the channel", m)
+				}
+			}()
+			buildFindFromWrapperBody(7, m, 0, nil, route)
+		}()
+	}
+}
+
+// TestTwinRouteForCallers pins WHICH caller of a prefer-no-match find takes
+// the route to its twin: a caller of the find body itself — the find wrapper
+// when nothing fronts the body — and, under a start-anywhere switch, only the
+// dispatcher, which is the one caller of today's find and the one that
+// consumes the switch sentinel the twin can answer. A neutral compile has no
+// twin and no route.
+func TestTwinRouteForCallers(t *testing.T) {
+	lnm := CompileOptions{LikelyMode: LikelyNoMatch}
+	find := func(pat string) config.PatternEntry { return config.PatternEntry{Regexp: pat, FindFunc: "find"} }
+	// The last two are tools/fuzz TestNeutralTwinRouteMatchesGo's guarded find
+	// and groups shapes: pinned here so that test cannot pass without a route.
+	for _, c := range []struct {
+		name           string
+		entry          config.PatternEntry
+		opts           CompileOptions
+		viaFind, today bool
+	}{
+		{"neutral", find(`[a-zA-Z]{8,}`), CompileOptions{}, false, false},
+		{"prefer-no-match", find(`[a-zA-Z]{8,}`), lnm, true, true},
+		{"prefer-no-match, switch", find(`[a-zA-Z]{8,}`), CompileOptions{LikelyMode: LikelyNoMatch, StartAnywhereSwitchN: 1}, false, true},
+		{"prefer-no-match, no length exit", find(`[a-zA-Z]+`), lnm, true, true},
+		{"prefer-no-match, groups", config.PatternEntry{Regexp: `([a-zA-Z]{8,})`, GroupsFunc: "groups"}, lnm, true, true},
+	} {
+		c.opts.globals = &moduleGlobals{}
+		p, err := compilePattern(c.entry, 0, 0, c.opts)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		_, _, findOff, _, _ := p.offsets()
+		if got := p.twinRouteFor(findOff) != nil; got != c.viaFind {
+			t.Errorf("%s: route for the find's callers = %v, want %v", c.name, got, c.viaFind)
+		}
+		if got := p.twinRouteFor(p.todayFindOff()) != nil; got != c.today {
+			t.Errorf("%s: route for today's find = %v, want %v", c.name, got, c.today)
+		}
 	}
 }
 

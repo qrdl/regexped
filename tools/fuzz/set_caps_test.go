@@ -1657,20 +1657,14 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	return run
 }
 
-// gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
-// runGatedFindBlocks is runGatedFind handing the set's search blocks over the
+// runGatedDriveBlocks is runGatedFind handing the set's search blocks over the
 // way mode says, through the shared helper (internal/searchblock), as a
-// generated iterator does. switched reports whether block 0 — a counted sparse
-// bucket's drive state — recorded the handover to the split companion.
-func runGatedFindBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode) (matches []setMatch, switched bool) {
-	t.Helper()
-	return runGatedDriveBlocks(t, pats, input, mode, 0)
-}
-
-// runGatedDriveBlocks is runGatedFindBlocks for a set that may batch: with
-// batchCap > 0 the set is compiled with `hints: [batch-find]` and the BATCH
-// entry is driven at that capacity, cursor handed back as a stub does; with
-// batchCap < 0 the set batches and its `find` is driven.
+// generated iterator does, for a set that may batch. switched reports whether
+// block 0 — a counted sparse bucket's drive state — recorded the handover to
+// the split companion. With batchCap > 0 the set is compiled with
+// `hints: [batch-find]` and the BATCH entry is driven at that capacity, cursor
+// handed back as a stub does; with batchCap < 0 the set batches and its `find`
+// is driven.
 func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32) (matches []setMatch, switched bool) {
 	t.Helper()
 	entries := make([]config.PatternEntry, len(pats))
@@ -1869,6 +1863,7 @@ func TestSparseCounterHandoverMatchesGo(t *testing.T) {
 	}
 }
 
+// gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
 func gatedOracle(pats []string, input string) []setMatch {
 	var out []setMatch
 	for k, p := range pats {

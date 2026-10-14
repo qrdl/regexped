@@ -2539,6 +2539,11 @@ type dfaLayout struct {
 	// Find-mode flags
 	midAcceptOff   int32
 	midAcceptBytes []byte
+	// The find body's off switch for the non-mid channel: a copy of
+	// midAcceptBytes with every non-mid value cleared, or nil
+	// (placePlainMidAccept).
+	plainMidAcceptOff   int32
+	plainMidAcceptBytes []byte
 
 	// LeftmostFirst immediate-accept flags (both match and find).
 	// The side table (immediateAcceptOff/Bytes) is kept populated for TDFA
@@ -4643,6 +4648,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			ds = appendDataSegment(ds, l.acceptOff, l.acceptBytes)
 		}
 		ds = appendDataSegment(ds, l.midAcceptOff, l.midAcceptBytes)
+		if l.plainMidAcceptBytes != nil {
+			ds = appendDataSegment(ds, l.plainMidAcceptOff, l.plainMidAcceptBytes)
+		}
 		if l.hasImmAccept && l.useAcceptSideTable {
 			ds = appendDataSegment(ds, l.immediateAcceptOff, l.immediateAcceptBytes)
 		}
@@ -4657,6 +4665,9 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 	}
 	findSegCount := func(base int) byte {
 		n := byte(base)
+		if l.plainMidAcceptBytes != nil {
+			n++
+		}
 		if l.hasImmAccept && l.useAcceptSideTable {
 			n++
 		}
@@ -5210,6 +5221,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		art.sparseScratch = scratch
 		art.sparseIDMapOff = idMapOff
 		art.sparseProbeReady = true
+		art.memberGlobalP1 = memberGlobal + 1
 		sp := sparseSuffixParams{
 			l: l, tabs: tabs, scratch: scratch, globalIDs: patternIDs,
 			idMapOff: idMapOff, prefixLen: prefixLen,
@@ -5292,6 +5304,9 @@ type suffixArtifacts struct {
 	sparseScratch    sparseScratch
 	sparseIDMapOff   int32
 	sparseProbeReady bool
+	// memberGlobalP1 is one past the member-skip verdict global; 0 = none.
+	// The driver hands the global to the sparse body in its validMask slot.
+	memberGlobalP1 int32
 	// dp carries the table geometry the overlapping backward sweep
 	// reads. It is the SAME layout and the SAME bitmask tables this body walks
 	// FORWARD — the sweep reads them in the other direction and emits nothing
@@ -6339,6 +6354,8 @@ type findCodeEntry struct {
 	mode      findFromMode
 	twin      []byte // the neutral twin, or nil
 	twinPatch int    // in body: the handoff to the twin, or -1
+	// twinRoute lets callers of body take its first decision (twinRoute), or nil.
+	twinRoute *twinRoute
 	marked    []byte // the marked copy, or nil
 	// markedCall is the handoff to the marked copy in body, and twinMarkedCall
 	// the same in twin; markedBack is the marked copy's handback to body.
@@ -6461,6 +6478,7 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 			prefixEndStateNewline: l.wasmPrefixEndNewline,
 			tableOff:              l.tableOff,
 			midAcceptOff:          l.midAcceptOff,
+			plainMidDelta:         plainMidDeltaOf(l),
 			firstByteOff:          l.firstByteOff,
 			prefix:                l.prefix,
 			classMapOff:           l.classMapOff,
@@ -6540,6 +6558,10 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 			e.twinMarkedCall = tnc.callOff
 		}
 		e.twin = sized(tb, &e.twinMarkedCall)
+		// The hinted body's first test is firstByteFlags at the attempt's
+		// start (emitPrefixScan's adaptive path); a twin implies no literal
+		// prefix, so the table is laid out.
+		e.twinRoute = &twinRoute{firstByteOff: l.firstByteOff, tableMemIdx: tableMemIdx}
 	}
 	if nc != nil {
 		// The marked copy: built neutral, since it serves only searches that
@@ -6763,7 +6785,11 @@ const nonMidHystStreak = 2
 // wrapped in the runtime hysteresis. The caller has already
 // established that the current state IS this dominant (via the 254+
 // midAcceptBytes value dispatch — see emitNonMidValDispatch), so no state
-// compare is emitted here:
+// compare is emitted here.
+//
+// A byte-class dominant takes emitHystBulkSkipRotated. A UTF-8 one keeps the
+// form below, whose skip is emitUTF8BulkSkip and which the rotation was never
+// measured on:
 //
 //	if hystCounter < N:           ; still enabled this call
 //	  hystPos = pos
@@ -6777,12 +6803,16 @@ const nonMidHystStreak = 2
 // channel stays off for the rest of the call. The gate runs only on
 // dominant-state bytes — everything else pays nothing at all.
 //
-// The bounds-exit path of emitDominantBulkSkip (pos+17 > len) can bump
-// the counter with advance < 16 even though nothing was learned about
-// run length; it fires at most once per call, at EOF, and is harmless.
+// deltaLocal / plainDelta are the find body's off switch (see
+// emitHystBulkSkipRotated), 0xFF / 0 for a body without one; this form
+// ignores them.
 func emitHystBulkSkip(b []byte, info dominantInfo,
 	posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-	hystCounterLocal, hystPosLocal byte) []byte {
+	hystCounterLocal, hystPosLocal, deltaLocal byte, plainDelta int32) []byte {
+	if !info.utf8 {
+		return emitHystBulkSkipRotated(b, info, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+			hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
+	}
 	// if hystCounter < N (channel still enabled)
 	b = append(b, 0x20, hystCounterLocal)
 	b = append(b, 0x41, nonMidHystStreak)
@@ -6821,6 +6851,202 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 	return b
 }
 
+// placePlainMidAccept lays out a PLAIN copy of l.midAcceptBytes above
+// l.tableEnd — every non-mid value (254, 255) cleared to 0, every other value
+// kept — when the layout has a non-mid dominant. It is the find body's off
+// switch for the non-mid channel: the body reads midAccept through a base
+// local that starts at 0 (this table) and is moved to the copy when the
+// channel closes (emitHystBulkSkipRotated), after which the dominant reads as
+// an ordinary state and its bytes cost what an unhinted walk's do.
+//
+// The copy costs numWASM bytes of table. A layout whose only non-mid dominants
+// are UTF-8 ones carries it too, unread by their (counter-gated) skip: that is
+// how it was measured, and its find body still reads midAccept through the
+// base local.
+func placePlainMidAccept(l *dfaLayout) {
+	has := false
+	for _, info := range l.dominantStates {
+		if !info.isMidAccept {
+			has = true
+		}
+	}
+	if !has {
+		return
+	}
+	pb := make([]byte, len(l.midAcceptBytes))
+	for i, v := range l.midAcceptBytes {
+		if v < 254 {
+			pb[i] = v
+		}
+	}
+	l.plainMidAcceptOff = int32(l.tableEnd)
+	l.plainMidAcceptBytes = pb
+	l.tableEnd += int64(len(pb))
+}
+
+// plainMidDeltaOf is the offset of the plain midAccept copy from midAccept
+// itself (placePlainMidAccept), the value the find body's base local takes
+// when the channel closes; 0 when the layout has no copy.
+func plainMidDeltaOf(l *dfaLayout) int32 {
+	if l.plainMidAcceptBytes == nil {
+		return 0
+	}
+	return l.plainMidAcceptOff - l.midAcceptOff
+}
+
+// isPrologueState reports whether st is a state the find body's prologue can
+// enter an attempt in, so whether its start-accept test must decode the
+// non-mid range of midAccept (a non-mid dominant reads 254+, which is not an
+// accept). A class chain's verify enters the walk at the chain's END state, so
+// with one every state counts: the fold without that answered 0-12 on
+// `[a-z]{12,}[0-9]` over sixteen a's.
+func isPrologueState(p findBodyParams, st int32) bool {
+	if p.classChain != nil {
+		return true
+	}
+	for _, c := range []uint32{p.startState, p.midStartState, p.midStartWordState, p.midStartNewlineState,
+		p.prefixEndState, p.prefixEndStateWord, p.prefixEndStateStart, p.prefixEndStateNewline} {
+		if int32(c) == st {
+			return true
+		}
+	}
+	return false
+}
+
+// emitHystBulkSkipRotated is the byte-class non-mid dominant's skip attempt.
+// The bounds test runs FIRST, so an attempt that cannot run (fewer than 17
+// bytes left) costs that test and closes the channel; the loop is rotated so
+// its first lap does not repeat the test, and a bounds exit inside it leaves
+// past the counter update.
+//
+//	[if counter < N]                 ; a body without an off switch
+//	  if pos + 17 > len: CLOSE
+//	  else
+//	    block $out
+//	      hystPos = pos
+//	      block $done
+//	        loop
+//	          m = stopmask(load(ptr+pos+1))
+//	          if m == 0
+//	            pos += 16
+//	            if pos + 17 > len: CLOSE; br $out
+//	            br loop
+//	          else
+//	            pos += ctz(m); br $done
+//	      if pos - hystPos < 16: counter++ [, at N: CLOSE] else counter = 0
+//
+// CLOSE is how the channel turns off, and there are two:
+//
+//   - a FIND body (deltaLocal != 0xFF) moves its midAccept base to the plain
+//     copy (placePlainMidAccept): the dominant then reads 0, so the channel's
+//     dispatch is never reached again and the gate is a plain `block`. A
+//     closed channel used to cost ~9 instructions on every later byte in the
+//     state (the `< 254` test, the counter gate); this costs nothing.
+//   - a MATCH body (emitMatchBulkSkipDispatch: no base local, no copy) keeps
+//     the counter gate and closes by `counter = N`.
+//
+// Measured on `<([a-z]+)>` find under prefer-match (whose `[a-z]+` state is
+// non-mid there): 5–16 B lines +20..+25% → +6..+9% against the unhinted
+// build, 20–64 B lines −11..−16% → −13..−18%, long tags −80.8% → −82.7%; a
+// match body (`(?:https?)://(?:[^/]+)/(?:.*)`, unhinted) 11 of 20 rows down
+// −1.8..−9.2%, none up.
+func emitHystBulkSkipRotated(b []byte, info dominantInfo,
+	posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
+	hystCounterLocal, hystPosLocal, deltaLocal byte, plainDelta int32) []byte {
+	bounds := func(b []byte) []byte {
+		b = append(b, 0x20, posLocal)
+		b = append(b, 0x41, 0x11)
+		b = append(b, 0x6A)
+		b = append(b, 0x20, lenLocal)
+		return append(b, 0x4B) // i32.gt_u
+	}
+	plain := deltaLocal != 0xFF
+	closeCh := func(b []byte) []byte {
+		if plain {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, plainDelta)
+			return append(b, 0x21, deltaLocal)
+		}
+		b = append(b, 0x41, nonMidHystStreak)
+		return append(b, 0x21, hystCounterLocal)
+	}
+	if plain {
+		b = append(b, 0x02, 0x40) // block: a closed channel never reaches here
+	} else {
+		b = append(b, 0x20, hystCounterLocal)
+		b = append(b, 0x41, nonMidHystStreak)
+		b = append(b, 0x49)       // i32.lt_u
+		b = append(b, 0x04, 0x40) // if counter < N
+	}
+	b = bounds(b)
+	b = append(b, 0x04, 0x40) // if pos + 17 > len: the attempt cannot run
+	b = closeCh(b)
+	b = append(b, 0x05)       // else
+	b = append(b, 0x02, 0x40) // block $out
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x21, hystPosLocal)
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x03, 0x40) // loop
+	b = emitBulkSkipLoadChunk(b, ptrLocal, posLocal, chunkLocal)
+	if len(info.selfLoopSet) > 0 {
+		b = emitShuftiStopMask(b, info.selfLoopSet, chunkLocal)
+	} else {
+		b = emitBulkSkipExitMask(b, info.exitBytes, chunkLocal)
+	}
+	b = append(b, 0x22, tmpLocal)
+	b = append(b, 0x45)       // i32.eqz
+	b = append(b, 0x04, 0x40) // if m == 0: the whole chunk self-loops
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x41, 0x10)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, posLocal)
+	b = bounds(b)
+	b = append(b, 0x04, 0x40) // if pos + 17 > len
+	b = closeCh(b)
+	b = append(b, 0x0C, 0x04) // br $out (if, if, loop, $done, $out)
+	b = append(b, 0x0B)
+	b = append(b, 0x0C, 0x01) // br loop
+	b = append(b, 0x05)       // else
+	b = append(b, 0x20, tmpLocal)
+	b = append(b, 0x68) // i32.ctz
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x6A)
+	b = append(b, 0x21, posLocal)
+	b = append(b, 0x0C, 0x02) // br $done
+	b = append(b, 0x0B)       // end if
+	b = append(b, 0x0B)       // end loop
+	b = append(b, 0x0B)       // end $done
+	// counter = (pos - hystPos < 16) ? counter + 1 : 0
+	b = append(b, 0x20, posLocal)
+	b = append(b, 0x20, hystPosLocal)
+	b = append(b, 0x6B)
+	b = append(b, 0x41, 0x10)
+	b = append(b, 0x49)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, hystCounterLocal)
+	b = append(b, 0x41, 0x01)
+	b = append(b, 0x6A)
+	if plain {
+		// counter++; at N the channel closes for the rest of the call
+		b = append(b, 0x22, hystCounterLocal)
+		b = append(b, 0x41, nonMidHystStreak)
+		b = append(b, 0x4F) // i32.ge_u
+		b = append(b, 0x04, 0x40)
+		b = closeCh(b)
+		b = append(b, 0x0B)
+	} else {
+		b = append(b, 0x21, hystCounterLocal)
+	}
+	b = append(b, 0x05)
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0x21, hystCounterLocal)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B) // end $out
+	b = append(b, 0x0B) // end if pos + 17 > len
+	b = append(b, 0x0B) // end gate
+	return b
+}
+
 // emitNonMidValDispatch emits the non-mid dominant dispatch bodies. The
 // caller has already branched on `val >= 254` (val = the cached
 // midAcceptBytes[state] load), so with a single non-mid entry no further
@@ -6831,12 +7057,12 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 // mid-accept last_accept update.
 func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 	valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-	hystCounterLocal, hystPosLocal byte) []byte {
+	hystCounterLocal, hystPosLocal, deltaLocal byte, plainDelta int32) []byte {
 	switch len(nonMid) {
 	case 1:
 		b = emitHystBulkSkip(b, nonMid[0],
 			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-			hystCounterLocal, hystPosLocal)
+			hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
 	case 2:
 		// val is 254 or 255 here; one compare discriminates. The else
 		// branch runs before any tmp/val clobber can happen, so the
@@ -6848,11 +7074,11 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 		b = append(b, 0x04, 0x40) // if (void)
 		b = emitHystBulkSkip(b, nonMid[0],
 			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-			hystCounterLocal, hystPosLocal)
+			hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
 		b = append(b, 0x05) // else
 		b = emitHystBulkSkip(b, nonMid[1],
 			posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-			hystCounterLocal, hystPosLocal)
+			hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
 		b = append(b, 0x0B) // end if
 	}
 	return b
@@ -6883,7 +7109,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	useMandatoryLit bool, midAcceptOff int32, tableMemIdx int,
 	stateLocal, posLocal, lenLocal, lastAcceptLocal, ptrLocal,
 	chunkLocal, valLocal, errLocal, hystCounterLocal, hystPosLocal byte,
-	soleMid bool, nc *notesCtx) []byte {
+	soleMid bool, nc *notesCtx, deltaLocal byte, plainDelta int32) []byte {
 
 	var mid, nonMid []dominantInfo
 	for _, info := range dominantStates {
@@ -6927,11 +7153,21 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 	skipValDispatch := soleMid && emitMidDom && !hasNonMidVals && len(mid) == 1
 
 	// val = midAccept[state]
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, midAcceptOff)
-	b = append(b, 0x20, stateLocal)
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx)
+	if deltaLocal != 0xFF {
+		// Through the base local: 0 reads this table, the plain copy's
+		// offset reads the copy once the non-mid channel has closed
+		// (placePlainMidAccept). Same instruction count as the constant base.
+		b = append(b, 0x20, deltaLocal)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8uAt(b, midAcceptOff, tableMemIdx)
+	} else {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, midAcceptOff)
+		b = append(b, 0x20, stateLocal)
+		b = append(b, 0x6A)
+		b = appendTableLoad8u(b, tableMemIdx)
+	}
 	if (emitMidDom || hasNonMidVals) && !skipValDispatch {
 		b = append(b, 0x22, valLocal) // local.tee — cache val
 	}
@@ -6958,7 +7194,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 			b = append(b, 0x05) // else — val >= 254: non-mid dominant
 			b = emitNonMidValDispatch(b, nonMid,
 				valLocal, posLocal, lenLocal, ptrLocal, chunkLocal, valLocal, errLocal,
-				hystCounterLocal, hystPosLocal)
+				hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
 		}
 		b = append(b, 0x0B) // end if (val < 254)
 	} else {
@@ -7089,7 +7325,7 @@ func emitMatchBulkSkipDispatch(b []byte, dominantStates []dominantInfo,
 		b = append(b, 0x05) // else — val >= 254: non-mid dominant
 		b = emitNonMidValDispatch(b, nonMid,
 			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-			hystCounterLocal, hystPosLocal)
+			hystCounterLocal, hystPosLocal, 0xFF, 0) // no off switch: the counter gate
 		b = append(b, 0x0B) // end if (val < 254)
 	case len(mid) > 0:
 		b = emitMidChain(b)
@@ -7103,7 +7339,7 @@ func emitMatchBulkSkipDispatch(b []byte, dominantStates []dominantInfo,
 		b = append(b, 0x04, 0x40) // if (val >= 254)
 		b = emitNonMidValDispatch(b, nonMid,
 			tmpLocal, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal,
-			hystCounterLocal, hystPosLocal)
+			hystCounterLocal, hystPosLocal, 0xFF, 0) // no off switch: the counter gate
 		b = append(b, 0x0B) // end if (val >= 254)
 	}
 	b = append(b, 0x0B) // end if (val != 0)
@@ -9085,8 +9321,9 @@ func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 		locChunk     = 3
 		locPrefixTlo = 4
 		locPow2      = 5
+		locChunkByte = 6
 	)
-	b = append(b, 0x02, 0x01, 0x7F, 0x03, 0x7B)
+	b = append(b, 0x03, 0x01, 0x7F, 0x03, 0x7B, 0x01, 0x7F)
 
 	// base = scan_end + 1  (the position right after the last byte to verify —
 	// same role as `attempt_start` in emitPrefixClassVerify's other caller).
@@ -9094,12 +9331,6 @@ func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 	b = append(b, 0x41, 0x01)
 	b = append(b, 0x6A)
 	b = append(b, 0x21, locBase)
-
-	// Hoist v128 tables.
-	b = emitV128Const(b, tlo)
-	b = append(b, 0x21, locPrefixTlo)
-	b = emitV128Const(b, pow2VecConst)
-	b = append(b, 0x21, locPow2)
 
 	// Bounds AND the find-from floor: base < find_from + count → either there
 	// is not enough room for the prefix, or the window would start before the
@@ -9125,6 +9356,40 @@ func buildSimplePrefixCheckBody(tlo [16]byte, count int) []byte {
 	b = append(b, 0x41, 0x7F)
 	b = append(b, 0x0F)
 	b = append(b, 0x0B)
+
+	// CHEAP PRE-CHECK: the byte right before the literal (scan_end, inside
+	// the input: the bounds test above guarantees base >= count >= 1) must be
+	// in the class, or no window can verify. Most failed candidates fail on
+	// exactly this byte, and the scalar walk this body replaces fails there
+	// after one step; test it against the class's 128-bit bitmap (two i64
+	// constants, no table) before loading the SIMD tables.
+	var bits [2]uint64
+	for c := 0; c < 128; c++ {
+		if tlo[c&15]&pow2VecConst[c>>4] != 0 {
+			bits[c>>6] |= 1 << uint(c&63)
+		}
+	}
+	b = append(b, 0x20, locPtr, 0x20, locScanEnd, 0x6A)
+	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u — the byte before the literal
+	b = append(b, 0x22, locChunkByte)
+	b = append(b, 0x41, 0x80, 0x01, 0x4F) // >= 128 → never in an ASCII class
+	b = append(b, 0x04, 0x40, 0x41, 0x7F, 0x0F, 0x0B)
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(bits[0]))
+	b = append(b, 0x42)
+	b = utils.AppendSLEB128_64(b, int64(bits[1]))
+	b = append(b, 0x20, locChunkByte, 0x41, 0xC0, 0x00, 0x49) // byte < 64
+	b = append(b, 0x1B)                                       // select → the word
+	b = append(b, 0x20, locChunkByte, 0xAD)                   // i64.extend_i32_u
+	b = append(b, 0x88)                                       // i64.shr_u (count mod 64)
+	b = append(b, 0x42, 0x01, 0x83, 0x50)                     // & 1; i64.eqz
+	b = append(b, 0x04, 0x40, 0x41, 0x7F, 0x0F, 0x0B)         // not in the class → -1
+
+	// Hoist v128 tables.
+	b = emitV128Const(b, tlo)
+	b = append(b, 0x21, locPrefixTlo)
+	b = emitV128Const(b, pow2VecConst)
+	b = append(b, 0x21, locPow2)
 
 	// Class verify (single SIMD chunk); non-zero bad_mask → -1.
 	b = emitPrefixClassVerify(b, count, locPtr, locBase, locChunk, locPrefixTlo, locPow2)
@@ -10291,6 +10556,7 @@ type findBodyParams struct {
 	prefixEndStateNewline uint32
 	tableOff              int32
 	midAcceptOff          int32
+	plainMidDelta         int32 // the plain midAccept copy's offset - midAcceptOff, 0 = none (plainMidDeltaOf)
 	firstByteOff          int32
 	prefix                []byte
 	classMapOff           int32
@@ -10570,6 +10836,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		}
 	}
 	var bulkHystCounterLocal, bulkHystPosLocal byte
+	// The midAccept base local the non-mid channel's off switch moves to the
+	// plain copy (emitHystBulkSkipRotated), 0xFF when the body has no copy.
+	bulkHystDeltaLocal := byte(0xFF)
+	hasPlainDelta := needsBulkHyst && p.plainMidDelta != 0
 	// utf8ErrLocal: the UTF-8 skip's error lanes (emitUTF8BulkSkip), a v128
 	// declared LAST by appendLocalGroups so no other local moves. The
 	// mandatory-literal paths suppress the dominant dispatch, so they need none.
@@ -10629,6 +10899,10 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			bulkHystCounterLocal = next
 			next++
 			bulkHystPosLocal = next
+			if hasPlainDelta {
+				next++
+				bulkHystDeltaLocal = next
+			}
 		}
 	}
 	// appendLocalGroups appends the i32 group (count i32Count), then, only
@@ -10696,6 +10970,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		}
 		if needsBulkHyst {
 			trailingI32 += 2
+			if hasPlainDelta {
+				trailingI32++
+			}
 		}
 		numGroups := byte(1)
 		if numV128ForScan > 0 {
@@ -11213,10 +11490,16 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 				// values can appear in the table at all (mirrors
 				// emitFindMidAcceptDispatch's hasNonMidVals gate) — for
 				// every other pattern this is byte-identical to the
-				// pre-fix emission.
+				// pre-fix emission. Narrower still: only when a state the
+				// prologue can set IS a non-mid dominant (isPrologueState),
+				// since every other state's value is read at its real
+				// meaning by the plain test — 3 instructions per attempt.
 				hasNonMidValsAtStart := false
 				for _, info := range dominantStates {
 					if !info.isMidAccept {
+						if !isPrologueState(p, info.state) {
+							continue
+						}
 						hasNonMidValsAtStart = true
 						break
 					}
@@ -11564,7 +11847,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, 0x06, utf8ErrLocal,
-			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc, bulkHystDeltaLocal, p.plainMidDelta)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -11644,7 +11927,7 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
 			/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
 			chunkLocal /*val+tmp=*/, simdMaskLocal, utf8ErrLocal,
-			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc)
+			bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc, bulkHystDeltaLocal, p.plainMidDelta)
 
 		b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 

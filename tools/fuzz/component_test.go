@@ -986,7 +986,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 					break
 				}
 				start, end := int(r>>32), int(uint32(r))
-				if !(start == end && start == prevEnd) {
+				if start != end || start != prevEnd {
 					got = append(got, [2]int{start, end})
 				}
 				prevEnd = end
@@ -1013,7 +1013,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 				for i := range m {
 					m[i] = int(int32(binary.LittleEndian.Uint32(buf[int(out)+4*i:])))
 				}
-				if !(m[0] == m[1] && m[0] == prevEnd) {
+				if m[0] != m[1] || m[0] != prevEnd {
 					got = append(got, m)
 				}
 				prevEnd = m[1]
@@ -1082,7 +1082,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 					break
 				}
 				start, end := int(u32(ret+8)), int(u32(ret+12))
-				if !(start == end && start == prevEnd) {
+				if start != end || start != prevEnd {
 					got = append(got, [2]int{start, end})
 				}
 				prevEnd = end
@@ -1114,7 +1114,7 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 						m[2*i], m[2*i+1] = -1, -1
 					}
 				}
-				if !(m[0] == m[1] && m[0] == prevEnd) {
+				if m[0] != m[1] || m[0] != prevEnd {
 					got = append(got, m)
 				}
 				prevEnd = m[1]

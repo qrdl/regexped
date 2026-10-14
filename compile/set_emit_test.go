@@ -1158,6 +1158,149 @@ func TestSetEmitSuffixCallSkipDefault(t *testing.T) {
 	}
 }
 
+// TestSparseVerdictTravelsInValidMaskSlot pins the member-skip verdict's path
+// into a sparse suffix body: the frontend pushes the verdict global in the
+// call's validMask slot, which the body otherwise ignores, and the body's entry
+// test reads that PARAMETER rather than the global. Both sides have to name
+// the same slot and the same global: a frontend still pushing the mask would
+// hand the body a pattern mask as its verdict (the walk choice goes wrong,
+// silently, since both walks answer alike), and a body still reading the
+// global pays the load the cut removed.
+func TestSparseVerdictTravelsInValidMaskSlot(t *testing.T) {
+	entries := make([]config.PatternEntry, 40)
+	for i := range entries {
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: fmt.Sprintf(`union[ \t]+k%02da+`, i)}
+	}
+	cfg := config.BuildConfig{
+		Patterns: entries,
+		Sets: []config.SetConfig{{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
+			Hints: []string{"prefer-match"}}},
+	}
+	wasm, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	imports, bodies := wasmFuncBodies(t, wasm)
+
+	// The sparse body: its entry test is `local.get 6; local.get 3; i32.and;
+	// if`, and it ends by storing the verdict with `select; global.set g`.
+	entry := []byte{0x20, 0x06, 0x20, 0x03, 0x71, 0x04, 0x40}
+	bodyIdx, g := -1, uint64(0)
+	for i, body := range bodies {
+		if !bytes.Contains(body, entry) {
+			continue
+		}
+		at := bytes.Index(body, []byte{0x1B, 0x24}) // select; global.set
+		if at < 0 {
+			t.Fatalf("function %d reads the verdict parameter but stores no verdict", imports+i)
+		}
+		v, _, err := utils.DecodeULEB128(body[at+2:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bodyIdx >= 0 {
+			t.Fatalf("two sparse bodies with a member skip (%d, %d); this set should have one", bodyIdx, imports+i)
+		}
+		bodyIdx, g = imports+i, v
+	}
+	if bodyIdx < 0 {
+		t.Fatal("no function's entry test reads the verdict from the validMask slot (local 6)")
+	}
+
+	// The call site: `global.get g`, then at most the gate pointer, then
+	// `call bodyIdx`.
+	push := utils.AppendULEB128([]byte{0x23}, uint32(g)) //nolint:gosec // a global index
+	call := utils.AppendULEB128([]byte{0x10}, uint32(bodyIdx)) //nolint:gosec // a function index
+	found := false
+	for _, body := range bodies {
+		for at := bytes.Index(body, call); at >= 0; {
+			before := body[:at]
+			if bytes.HasSuffix(before, push) ||
+				(len(before) >= 2 && before[len(before)-2] == 0x20 && bytes.HasSuffix(before[:len(before)-2], push)) {
+				found = true
+			}
+			next := bytes.Index(body[at+1:], call)
+			if next < 0 {
+				break
+			}
+			at += 1 + next
+		}
+	}
+	if !found {
+		t.Errorf("no call of the sparse body %d is preceded by global.get %d in its validMask slot", bodyIdx, g)
+	}
+}
+
+// wasmFuncBodies returns a module's imported-function count and its code
+// section's bodies (locals and instructions), in function-index order after
+// the imports.
+func wasmFuncBodies(t *testing.T, wasm []byte) (imports int, bodies [][]byte) {
+	t.Helper()
+	uleb := func(b []byte, at *int) int {
+		v, n, err := utils.DecodeULEB128(b[*at:])
+		if err != nil {
+			t.Fatalf("bad LEB at %d: %v", *at, err)
+		}
+		*at += n
+		return int(v)
+	}
+	at := 8
+	for at < len(wasm) {
+		id := wasm[at]
+		at++
+		size := uleb(wasm, &at)
+		sec := wasm[at : at+size]
+		switch id {
+		case 2: // imports: count those of kind 0 (function)
+			p := 0
+			for n := uleb(sec, &p); n > 0; n-- {
+				p += uleb(sec, &p) // module name
+				p += uleb(sec, &p) // field name
+				kind := sec[p]
+				p++
+				switch kind {
+				case 0:
+					imports++
+					uleb(sec, &p)
+				case 1:
+					p++ // reftype
+					if sec[p] == 0 {
+						p++
+						uleb(sec, &p)
+					} else {
+						p++
+						uleb(sec, &p)
+						uleb(sec, &p)
+					}
+				case 2:
+					flags := sec[p]
+					p++
+					if flags&0x40 != 0 { // 64-bit memory
+						t.Fatal("wasmFuncBodies: a 64-bit memory import")
+					}
+					uleb(sec, &p)
+					if flags&1 != 0 {
+						uleb(sec, &p)
+					}
+				case 3:
+					p += 2 // valtype, mutability
+				default:
+					t.Fatalf("wasmFuncBodies: import kind %d", kind)
+				}
+			}
+		case 10:
+			p := 0
+			for n := uleb(sec, &p); n > 0; n-- {
+				sz := uleb(sec, &p)
+				bodies = append(bodies, sec[p:p+sz])
+				p += sz
+			}
+		}
+		at += size
+	}
+	return imports, bodies
+}
+
 // newSetFindCtxWithSkip builds the batch worker's context — the one that does
 // carry a real skip — by setting the same transient flag emitSetWorkerBody
 // sets.

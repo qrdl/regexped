@@ -2404,7 +2404,7 @@ func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
 			break
 		}
 		s, e := m[0]+off, m[1]+off
-		if !(s == e && s == prevEnd) {
+		if s != e || s != prevEnd {
 			all = append(all, [2]int{s, e})
 			prevEnd = e
 		}

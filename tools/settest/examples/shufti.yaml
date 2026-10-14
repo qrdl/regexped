@@ -3,9 +3,11 @@
 # Shufti is reachable ONLY out of the scalar frontend branch, which in
 # production needs Aho-Corasick to decline over its 512 KB table budget first.
 # These 21 short literals would be picked up by Teddy instead, so the example
-# target passes -force-frontend scalar to restore the intended A/B: neutral
-# stays scalar (this literal set's rarity sum is 42 against the threshold of
-# 40) and only prefer-no-match flips to Shufti.
+# target passes -force-frontend scalar to reach that branch. It no longer
+# shows the hint's A/B: neutral picks Shufti for this set too (the two
+# builds are identical WASM), so the prefer-no-match row measures nothing the
+# neutral one does not. A set whose first bytes number 65–128 is where the
+# hint still changes the frontend.
 #
 # Read the deltas as an UPPER BOUND — 21 buckets inflate the prefilter's share
 # of the work, and the absolute fuel here models no real workload.

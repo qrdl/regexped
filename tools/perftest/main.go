@@ -829,12 +829,8 @@ func sourceCodeInput(singleLine, blockComments []string) string {
 	}
 
 	all := make([]string, 0, len(singleLine)+len(blockComments))
-	for _, c := range singleLine {
-		all = append(all, c)
-	}
-	for _, c := range blockComments {
-		all = append(all, c)
-	}
+	all = append(all, singleLine...)
+	all = append(all, blockComments...)
 
 	result := []byte(base)
 	step := len(result) / (len(all) + 1)
@@ -2588,23 +2584,17 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	return benchResult{avgExec: computeStat(buf[timingsBase:timingsBase+timingsBytes], pct), wasmSize: len(wasmBytes)}
 }
 
-// exhaustSetFind drives a set `find` export to exhaustion, the way a generated
-// iterator does: zero the gate array, then call
+// exhaustSetFindBlocks drives a set `find` export to exhaustion, the way a
+// generated iterator does: zero the gate array, then call
 //
 //	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
-// start, so reading the first tuple is enough to resume.
-// gatePtr points at the gate array; the SCRATCH DESCRIPTOR the export actually
-// takes is built immediately above it (internal/abi), so one argument still
-// describes all of the caller's scratch.
-func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
-	inBase, inLen, gatePtr, outBase, outCap int32) int {
-	return exhaustSetFindBlocks(store, mem, findFn, inBase, inLen, gatePtr, outBase, outCap, nil)
-}
-
-// exhaustSetFindBlocks is exhaustSetFind handing the set's split members their
-// search blocks, as a generated iterator does (sb nil: none).
+// start, so reading the first tuple is enough to resume. gatePtr points at the
+// gate array; the SCRATCH DESCRIPTOR the export actually takes is built
+// immediately above it (internal/abi), so one argument still describes all of
+// the caller's scratch. The set's split members get their search blocks as a
+// generated iterator hands them over (sb nil: none).
 func exhaustSetFindBlocks(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
 	inBase, inLen, gatePtr, outBase, outCap int32, sb *searchblock.Blocks) int {
 	buf := mem.UnsafeData(store)

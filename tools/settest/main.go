@@ -55,7 +55,6 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -168,9 +167,8 @@ const cacheNone = int32(-99)
 
 func main() {
 	wcallCase = "settest"
-	// Silence regexped's slog output. Set-composition warnings (a dropped
-	// pattern, a demoted frontend) reach us through SetDiag instead, which is
-	// reported per mode.
+	// Silence regexped's slog output. Set-composition warnings (a demoted
+	// frontend) reach us through SetDiag instead, which is reported per mode.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	configFlag := flag.String("config", "", "YAML config file declaring the set (required)")
@@ -265,12 +263,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The oracle is built from what the set ACTUALLY contains: a pattern the
-	// packer dropped cannot match, so counting it would put inputs in the
-	// wrong bucket and then fail the sanity check for a reason that is not a
-	// bug. Drops are a property of the compile, so they are read from the
-	// neutral build's diagnostics.
-	oracle, exact := buildOracle(cfg, cfg.Sets[setIdx], builds[0].diag, kind)
+	// The oracle is built from the set's members — every one of them, in every
+	// capability: a set never compiles without a member it selected.
+	oracle, exact := buildOracle(cfg, cfg.Sets[setIdx], kind)
 	if len(oracle) == 0 {
 		fmt.Fprintln(os.Stderr, "error: no pattern in the set could be compiled by Go's regexp package; cannot bucket inputs")
 		os.Exit(1)
@@ -456,23 +451,19 @@ type oracleEntry struct {
 	re *regexp.Regexp
 }
 
-// buildOracle compiles the patterns the set actually contains, in the form the
-// capability's semantics require. The second result is false when some
-// selected pattern could not be compiled by Go — the bucketing is then a
-// best effort and the sanity check is skipped rather than trusted.
-func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDiag, kind capKind) ([]oracleEntry, bool) {
-	// Every capability answers for every member: a member no engine takes
-	// fails the compile, and one whose anchored DFA cannot be built answers
-	// match_any / match_all through Backtracking.
-	dropped := map[int]bool{}
-
+// buildOracle compiles the set's members, in the form the capability's
+// semantics require. The second result is false when some member could not be
+// compiled by Go — the bucketing is then a best effort and the sanity check is
+// skipped rather than trusted.
+//
+// Every capability answers for every member: a member no engine takes fails
+// the compile, and one whose anchored DFA is over max_dfa_states answers
+// match_any / match_all through a Backtracking probe.
+func buildOracle(cfg config.BuildConfig, sc config.SetConfig, kind capKind) ([]oracleEntry, bool) {
 	exact := true
 	var out []oracleEntry
 	for _, m := range sc.Members(cfg) {
 		id, re := m.ID, m.Entry
-		if dropped[id] {
-			continue
-		}
 		src := re.Regexp
 		if kind.anchored() {
 			// "Anchored" here is full consumption, 0..len — the same rule
@@ -486,15 +477,6 @@ func buildOracle(cfg config.BuildConfig, sc config.SetConfig, diag compile.SetDi
 			continue
 		}
 		out = append(out, oracleEntry{id: id, re: c})
-	}
-	if len(dropped) > 0 {
-		var ids []int
-		for id := range dropped {
-			ids = append(ids, id)
-		}
-		sort.Ints(ids)
-		fmt.Fprintf(os.Stderr, "warning: %d pattern(s) dropped from the set by the compiler (ids %v); excluded from the oracle\n",
-			len(ids), ids)
 	}
 	return out, exact
 }
