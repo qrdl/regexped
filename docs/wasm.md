@@ -488,6 +488,13 @@ Find mode appends additional arrays after the base table:
 | `midAcceptNW`, `midAcceptW` | `u8[numStates]` each | word-boundary variants of midAccept |
 | `midAcceptNL` | `u8[numStates]` | 1 if state accepts immediately before a `\n` byte — multiline `(?m:$)` patterns only |
 
+A module carries `firstByteFlags` and `wordCharTable` only where its code
+reads them: the space stays reserved, but a table no body addresses — the
+first-byte flags of a find another body serves (a literal-anchored find, one
+that tries position 0 only), a lenient alternation's match-mode word table —
+gets no data segment, the one place every module's code and data meet
+deciding it. A pattern's layouts share ONE word table, placed below them all.
+
 For TDFA paths (`useAcceptSideTable=true`) only:
 
 | Array | Size | Purpose |

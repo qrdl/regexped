@@ -2564,13 +2564,16 @@ type dfaLayout struct {
 	// noWordCharTable: the layout has the \b/\B accept channels
 	// (needWordCharTable) but no reserved or emitted wordCharTable, because
 	// no body over it reads one (dfaLayoutParams.noWordCharTable).
-	noWordCharTable  bool
-	midAcceptNWOff   int32
-	midAcceptWOff    int32
-	midAcceptNLOff   int32
-	midAcceptNWBytes []byte
-	midAcceptWBytes  []byte
-	midAcceptNLBytes []byte
+	noWordCharTable bool
+	// sharedWordCharTable: wordCharTableOff is the pattern's shared table
+	// (dfaLayoutParams.sharedWordTable), which compilePattern emits.
+	sharedWordCharTable bool
+	midAcceptNWOff      int32
+	midAcceptWOff       int32
+	midAcceptNLOff      int32
+	midAcceptNWBytes    []byte
+	midAcceptWBytes     []byte
+	midAcceptNLBytes    []byte
 
 	// lmBareShufti lifts detectShuftiSelfLoop's
 	// len(l.prefix)==0 bail for bare (no literal-anchor) moderately-wide
@@ -2831,6 +2834,10 @@ type dfaLayoutParams struct {
 	// (emitInlineAnchoredDFAVerify). It was emitted, unread, into every
 	// lenient alternation's match module with \b/\B.
 	noWordCharTable bool
+	// sharedWordTable, when it holds an offset, is the pattern's one word
+	// table (patternWordTable): the layout reads it there and reserves and
+	// emits none of its own. nil for a set's layouts.
+	sharedWordTable *patternWordTable
 	// forceNewline builds the newline pre-accept table outside find mode, for
 	// the lenient alternation's inline DFA verify, which is a find body over a
 	// non-find layout. Like forceWordChar, but for (?m:$) before a '\n'.
@@ -2906,7 +2913,12 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	l.needWordCharTable = wantWordChar && t.hasWordBoundary
 	l.noWordCharTable = l.needWordCharTable && p.noWordCharTable
 	wordCharTableSize := int32(0)
-	if l.needWordCharTable && !l.noWordCharTable {
+	if l.needWordCharTable && !l.noWordCharTable && p.sharedWordTable != nil {
+		l.sharedWordCharTable = true
+		l.wordCharTableOff = p.sharedWordTable.off
+		l.wordCharTableBytes = wordCharTableBytes
+		p.sharedWordTable.used = true
+	} else if l.needWordCharTable && !l.noWordCharTable {
 		l.wordCharTableOff = int32(tableBase)
 		wordCharTableSize = 256
 		for b := 0; b < 256; b++ {
@@ -4784,8 +4796,8 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 	// TDFA path (useAcceptSideTable=true): state IDs are not partitioned, so a
 	// per-state side table is emitted at acceptOff and read at EOF.
 	emitFindSegs := func(ds, transSegs []byte) []byte {
-		if l.needWordCharTable && !l.noWordCharTable {
-			ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
+		if l.emitsWordCharTable() {
+			ds = appendDroppableDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 		}
 		ds = append(ds, transSegs...)
 		if l.useAcceptSideTable {
@@ -4817,7 +4829,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 		}
 		if l.needWordCharTable {
 			n += 2 // midAcceptNW + midAcceptW
-			if !l.noWordCharTable {
+			if l.emitsWordCharTable() {
 				n++ // wordCharTable
 			}
 		}
@@ -4858,7 +4870,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if len(l.prefix) == 0 {
 				ds = append(ds, findSegCount(4)+teddyExtraSegs) // classMap+table+midAccept+firstByte
 				ds = emitFindSegs(ds, transSegs)
-				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
+				ds = appendDroppableDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
 				if len(l.teddyLoBytes) > 0 {
 					ds = appendDataSegment(ds, l.teddyLoOff, l.teddyLoBytes)
 					ds = appendDataSegment(ds, l.teddyHiOff, l.teddyHiBytes)
@@ -4904,7 +4916,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			}
 			if l.needWordCharTable {
 				count += 2 // midAcceptNW + midAcceptW
-				if !l.noWordCharTable {
+				if l.emitsWordCharTable() {
 					count++ // wordCharTable
 				}
 			}
@@ -4912,8 +4924,8 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				count++ // forceNewline only
 			}
 			ds = append(ds, count)
-			if l.needWordCharTable && !l.noWordCharTable {
-				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
+			if l.emitsWordCharTable() {
+				ds = appendDroppableDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 			}
 			ds = appendDataSegment(ds, l.classMapOff, l.classMap[:])
 			if l.useRowDedup {
@@ -4947,7 +4959,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			if len(l.prefix) == 0 {
 				ds = append(ds, findSegCount(3)+teddyExtraSegs) // table+midAccept+firstByte
 				ds = emitFindSegs(ds, transSegs)
-				ds = appendDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
+				ds = appendDroppableDataSegment(ds, l.firstByteOff, l.firstByteFlags[:])
 				if len(l.teddyLoBytes) > 0 {
 					ds = appendDataSegment(ds, l.teddyLoOff, l.teddyLoBytes)
 					ds = appendDataSegment(ds, l.teddyHiOff, l.teddyHiBytes)
@@ -4992,7 +5004,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			}
 			if l.needWordCharTable {
 				count += 2 // midAcceptNW + midAcceptW
-				if !l.noWordCharTable {
+				if l.emitsWordCharTable() {
 					count++ // wordCharTable
 				}
 			}
@@ -5000,8 +5012,8 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				count++ // forceNewline only
 			}
 			ds = append(ds, count)
-			if l.needWordCharTable && !l.noWordCharTable {
-				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
+			if l.emitsWordCharTable() {
+				ds = appendDroppableDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 			}
 			if l.useRowDedup {
 				ds = appendDataSegment(ds, l.rowMapOff, l.rowMapBytes)
@@ -17027,7 +17039,7 @@ type lenAltLayout struct {
 // find is true for the find body, whose inline DFA verify tests the newline
 // pre-accept channel, so each DFA branch's layout must carry that table; the
 // anchored match body needs a match ending at len and never reads it.
-func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool) lenAltLayout {
+func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool, wt *patternWordTable) lenAltLayout {
 	l := lenAltLayout{
 		branchBitmapOff: make([]int32, len(altp.branches)),
 	}
@@ -17066,6 +17078,7 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool) lenAltLay
 			// The anchored match's verify consumes the whole input, so it
 			// emits no word-boundary pre-accept check, the table's reader.
 			noWordCharTable: !find,
+			sharedWordTable: wt,
 			forceNewline:    find && br.dfaTable.hasNewlineBoundary,
 			// The anchored match walks a branch with its run skips
 			// (inlineVerifySkip); over whole characters in Unicode mode.
@@ -17748,4 +17761,38 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	b = append(b, 0x42, 0x7F)
 	b = append(b, 0x0B)
 	return b, findFrom
+}
+
+// emitsWordCharTable reports whether the layout's data segments carry its
+// word table: it has one, of its own — not none (noWordCharTable) and not the
+// pattern's shared one, which compilePattern emits.
+func (l *dfaLayout) emitsWordCharTable() bool {
+	return l.needWordCharTable && !l.noWordCharTable && !l.sharedWordCharTable
+}
+
+// patternWordTable is a pattern's ONE word table: compilePattern reserves it
+// below every layout of a pattern with \b/\B and a find or groups export,
+// the layouts built for the pattern read it at off instead of each carrying a
+// copy (`1*\b$`'s find module carried three: the find's layout and the
+// start-anywhere passes'), and compilePattern emits it when one did (used).
+type patternWordTable struct {
+	off  int32
+	used bool
+}
+
+// wordCharTableBytes is the word table: 1 for [0-9A-Za-z_].
+var wordCharTableBytes = func() (t [256]byte) {
+	for b := 0; b < 256; b++ {
+		if isWordByte(byte(b)) {
+			t[b] = 1
+		}
+	}
+	return t
+}()
+
+// patternHasWordBoundary reports whether pattern holds \b or \B. A pattern
+// that does not parse holds neither: compilePatternBody reports the error.
+func patternHasWordBoundary(pattern string) bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	return err == nil && regexpHasWordBoundary(re)
 }

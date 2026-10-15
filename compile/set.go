@@ -748,6 +748,10 @@ type CompileSetOptions struct {
 	// more than 8,192 frames deep. Zero is the default.
 	BTStackStart int
 
+	// KeepUnreadTables is CompileOptions.KeepUnreadTables for a set-bearing
+	// module. TEST-ONLY, as there.
+	KeepUnreadTables bool
+
 	// globals is the MODULE's global allocator, shared with every pattern and
 	// every other set in the same compile. A set reaches for it when a bucket
 	// wants module-scoped state — today only the sparse member skip's

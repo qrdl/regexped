@@ -1970,6 +1970,81 @@ func TestSparseMemberCharSkipMatchesGo(t *testing.T) {
 	}
 }
 
+// TestSetDroppedTablesChangeNoAnswer is TestDroppedTablesChangeNoAnswer for
+// set-bearing modules: every capability, compiled with the assembler's table
+// drop and without it (CompileSetOptions.KeepUnreadTables), answers alike from
+// every start — the set's bucket layouts carry first-byte and word tables of
+// their own.
+func TestSetDroppedTablesChangeNoAnswer(t *testing.T) {
+	sets := [][]string{
+		{`\bfoo\b`, `bar\d+`, `^start`, `x\B[a-z]+`},
+		{`\bword\w*`, `\d+\b`, `(?m)^key=\w+`, `[a-z]+@[a-z]+`},
+		{`alpha|beta`, `gamma[0-9]{2}`, `\Bmid\B`, `end$`},
+	}
+	inputs := []string{"", "foo bar12 start", "start foo xabc word123 4 5", "key=v\nkey=w a@b alpha gamma12 amidb end",
+		"subfoo foobar xx bar7 wordy 99", "жж foo ёё bar1 \xff"}
+	differed := 0
+	on := true
+	for _, pats := range sets {
+		for _, overlapping := range []bool{false, true} {
+			for _, uni := range []*bool{nil, &on} {
+				for _, hints := range [][]string{nil, {"prefer-match"}, {"prefer-no-match"}} {
+					entries := make([]config.PatternEntry, len(pats))
+					names := make([]string, len(pats))
+					for i, p := range pats {
+						names[i] = fmt.Sprintf("p%d", i)
+						entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+					}
+					cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
+						Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+						ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+						Patterns: config.PatternSelector{Names: names}, Unicode: uni, Hints: hints}}}
+					wKeep, _, _, errK := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{KeepUnreadTables: true})
+					wDrop, _, _, errD := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{})
+					if errK != nil || errD != nil {
+						t.Fatalf("%q: %v / %v", pats, errK, errD)
+					}
+					if bytes.Equal(wKeep, wDrop) {
+						continue
+					}
+					differed++
+					for _, in := range inputs {
+						if a, b := setAnswers(t, wKeep, pats, in), setAnswers(t, wDrop, pats, in); a != b {
+							t.Errorf("%q (overlapping %v, unicode %v, hints %v) over %q:\n  every table %s\n  dropped     %s",
+								pats, overlapping, uni != nil, hints, in, a, b)
+						}
+					}
+				}
+			}
+		}
+	}
+	if differed == 0 {
+		t.Fatal("no set module lost a table: the drop went unexercised")
+	}
+}
+
+// setAnswers renders every capability's answer over in, from every start.
+func setAnswers(t *testing.T, w []byte, pats []string, in string) string {
+	t.Helper()
+	r := newCapRunnerFrom(t, w, pats, in)
+	defer r.Close()
+	n := int32(len(in))
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "any=%v all=%v ", r.call(t, "cap_match_any", r.inBase, n), r.allIDs(t, "cap_match_all", r.inBase, n))
+	for f := int32(0); f <= n; f++ {
+		fmt.Fprintf(&sb, "|%d sa=%v sl=%v", f, r.call(t, "cap_scan_any", r.inBase, n, f), r.allIDs(t, "cap_scan_all", r.inBase, n, f))
+		r.resetGates()
+		total := int(r.call(t, "cap_find", r.inBase, n, f, r.scratchPtr(), r.outPtr, int32(r.npat)).(int32))
+		buf := r.mem.UnsafeData(r.store)
+		fmt.Fprintf(&sb, " f=%d", total)
+		for i := 0; i < total && i < r.npat; i++ {
+			base := int(r.outPtr) + i*12
+			fmt.Fprintf(&sb, " %d", buf[base:base+12])
+		}
+	}
+	return sb.String()
+}
+
 // TestSetCharLoopSkipMatchesGo drives a Unicode set whose members walk a loop
 // over SOME characters (a letter class) under prefer-match: the bucket bodies'
 // character skip, gated on the next byte and with the structural validity

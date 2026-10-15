@@ -414,6 +414,11 @@ type CompileOptions struct {
 	// does not already have it. A measurement knob.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTStackStart int
+	// KeepUnreadTables keeps every droppable table in the module, read or
+	// not (dropUnaddressedTables). TEST-ONLY: the differential test that
+	// holds the drop to its rule compiles each pattern both ways.
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	KeepUnreadTables bool
 	// MaxMemory is the config's max_memory: the module's memory declares it as
 	// its maximum, and a module whose static memory already exceeds it does not
 	// compile. The zero value is no cap.
@@ -437,6 +442,9 @@ type CompileOptions struct {
 	// paths that compile a body without assembling a module (helper DFAs,
 	// SelectEngine); those allocate nothing, so nothing dereferences it.
 	globals *moduleGlobals
+	// wordTable is the pattern's one word table (patternWordTable), reserved by
+	// compilePattern and shared by every layout built for the pattern.
+	wordTable *patternWordTable
 
 	// searchSizes, when non-nil, receives each export's SearchSize: what a
 	// generated stub allocates for its searches (SearchSizes).
@@ -1421,7 +1429,22 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	// The body opens the pattern's verbose scope; it is closed here, after
 	// the facts below are recorded in it.
 	defer buildOpts.report().End()
+	// One word table for all of the pattern's layouts, reserved where no
+	// layout lives — below them all — and emitted after the body, so a layout
+	// the body builds and then discards (the switch's start-anywhere trial
+	// truncates the pattern's data back to a mark) can neither own it nor
+	// take its data along.
+	var wt *patternWordTable
+	if (re.FindFunc != "" || re.GroupsFunc != "") && patternHasWordBoundary(re.Regexp) {
+		wt = &patternWordTable{off: int32(tableBase)} //nolint:gosec // a table address
+		buildOpts.wordTable = wt
+		tableBase += 256
+	}
 	p, err := compilePatternBody(re, tableBase, forceGroupsEngine, buildOpts, &rp)
+	if err == nil && p != nil && wt != nil && wt.used {
+		p.dataBytes = append(p.dataBytes, appendDroppableDataSegment(nil, wt.off, wordCharTableBytes[:])...)
+		p.dataSegCount++
+	}
 	if rep := buildOpts.report(); rep != nil && !rep.HasEngine() && !rep.hasReason() {
 		// Nothing recorded an engine or a refusal. A specialised body (the
 		// literal-chain family and its kin) never builds a general DFA; a
@@ -1674,7 +1697,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 							p.groupNames = extractGroupNames(parsed)
 
 							// Lenient-alt data + find body.
-							lenLayout := planLenAltLayout(lenAltp, tableBase, true)
+							lenLayout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
 							lenData, lenSeg := buildLenAltDataSegments(lenAltp, lenLayout)
 							if needFind {
 								p.findExport = re.FindFunc
@@ -1812,7 +1835,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			}
 			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, false); ok {
-				layout := planLenAltLayout(lenAltp, tableBase, false)
+				layout := planLenAltLayout(lenAltp, tableBase, false, buildOpts.wordTable)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
 					matchExport:  re.MatchFunc,
@@ -1890,7 +1913,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// keeps walking without accepting makes it quadratic, so such a
 			// pattern takes the ordinary find, which gets the switch.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
-				layout := planLenAltLayout(lenAltp, tableBase, true)
+				layout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
 				var findBody []byte
@@ -1980,6 +2003,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			lm := buildDFALayout(dfaLayoutParams{
 				t:                    llTable,
 				tableBase:            cur,
+				sharedWordTable:      buildOpts.wordTable,
 				needFind:             false,
 				leftmostFirst:        false,
 				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
@@ -2170,6 +2194,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			report:               buildOpts.report(),
 			t:                    table,
 			tableBase:            cur,
+			sharedWordTable:      buildOpts.wordTable,
 			needFind:             needFindBody,
 			leftmostFirst:        true,
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
@@ -2309,6 +2334,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 						revL := buildDFALayout(dfaLayoutParams{
 							t:                    revTable,
 							tableBase:            revTableBase,
+							sharedWordTable:      buildOpts.wordTable,
 							needFind:             true,
 							leftmostFirst:        false,
 							compiledDFAThreshold: 0,
@@ -3462,7 +3488,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	if searchSetterIdx >= 0 {
 		cs = appendCodeEntry(cs, searchSetterBody(searchG))
 	}
-	return appendCodeAndData(out, cs, rawData, totalSegs, standalone)
+	return appendCodeAndData(out, cs, rawData, totalSegs, standalone, opts.keepUnreadTables)
 }
 
 // ownerName is how a message about one of p's function bodies names p.

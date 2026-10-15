@@ -1425,6 +1425,92 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 	}
 }
 
+// TestDroppedTablesChangeNoAnswer holds the assembler's table drop to the
+// rule it rests on. A module leaves out a first-byte or word table its code
+// never addresses — no i32.const of its offset, no load whose offset
+// immediate it is — so a body that reached one some other way would read
+// zeros. Each shape is compiled with the drop and without it
+// (KeepUnreadTables), and the two modules must answer alike: find from every
+// start, match, and the groups drive.
+func TestDroppedTablesChangeNoAnswer(t *testing.T) {
+	shapes := []string{
+		`^[a-z]+[0-9]`, `^(?:\b)`, `\Afoo\d+`, `^abc|^x\b`, // match only at 0: the first-byte table unread
+		`&k=[^&]+&`, `\w+@\w+`, `foo[0-9]+bar`, `[a-z]+@example\.com`, // literal bodies: the general layout's table unread
+		`[a-z]+[0-9]`, `x\d+y|zz`, `(?:alpha|beta)[0-9a-f]{4}`, `\bclass\b`, `1*\b$`, `\B\d+\B`, // tables read
+		`0$|x(?:\b|0)`, `q[a ]{24,26}\b|zz[0-9]{24}`, `(?m)^\w+\b`, `\b\pL+\b`, `[^,]+,`, `AKIA[A-Z0-9]{24}`,
+	}
+	inputs := []string{"", "a", "abc1 x9y zz", "class subclass cl ass", "&k=v& &k=& foo12bar",
+		"me@x.com a@example.com", "alpha00ff beta1234", "AKIA0123456789ABCDEF01234567", "q" + strings.Repeat("a", 25) + " zz" + strings.Repeat("7", 24),
+		"0 x x0 -0", "123 45 6789", "line1\nword two\n", "жил-был ёж, 12 ёлок", "\xff\x80 abc"}
+	modes := []compile.CompileOptions{{ForceByteMode: true}, {ForceByteMode: true, LikelyMode: compile.LikelyMatch},
+		{ForceByteMode: true, LikelyMode: compile.LikelyNoMatch}, {Unicode: true}}
+	differed := 0
+	for _, pat := range shapes {
+		for _, o := range modes {
+			for _, e := range []config.PatternEntry{{Regexp: pat, FindFunc: "find"}, {Regexp: pat, MatchFunc: "match"}, {Regexp: "(" + pat + ")", GroupsFunc: "groups"}} {
+				keep := o
+				keep.KeepUnreadTables = true
+				wKeep, _, errK := compile.Compile([]config.PatternEntry{e}, pathsTableBase, true, keep)
+				wDrop, _, errD := compile.Compile([]config.PatternEntry{e}, pathsTableBase, true, o)
+				if (errK == nil) != (errD == nil) {
+					t.Fatalf("%q: compiles %v with every table, %v without", pat, errK, errD)
+				}
+				if errK != nil || bytes.Equal(wKeep, wDrop) {
+					continue
+				}
+				differed++
+				for _, in := range inputs {
+					switch {
+					case e.FindFunc != "":
+						if a, b := findFromEvery(t, wKeep, in), findFromEvery(t, wDrop, in); a != b {
+							t.Errorf("%q find over %q:\n  every table %s\n  dropped     %s", pat, in, a, b)
+						}
+					case e.MatchFunc != "":
+						end1, ok1, _, err1 := runWasmMatch(wKeep, in)
+						end2, ok2, _, err2 := runWasmMatch(wDrop, in)
+						if end1 != end2 || ok1 != ok2 || (err1 == nil) != (err2 == nil) {
+							t.Errorf("%q match over %q: every table (%d, %v), dropped (%d, %v)", pat, in, end1, ok1, end2, ok2)
+						}
+					default:
+						n := regexp.MustCompile(e.Regexp).NumSubexp() + 1
+						g1, ok1 := runGroupsIter(t, wKeep, in, n)
+						g2, ok2 := runGroupsIter(t, wDrop, in, n)
+						if ok1 != ok2 || fmtGroups(g1) != fmtGroups(g2) {
+							t.Errorf("%q groups over %q:\n  every table %s\n  dropped     %s", pat, in, fmtGroups(g1), fmtGroups(g2))
+						}
+					}
+				}
+			}
+		}
+	}
+	// Not vacuous: the drop must have left tables out of some of these modules.
+	if differed == 0 {
+		t.Fatal("no module lost a table: the drop went unexercised")
+	}
+}
+
+// findFromEvery renders find's answer from every start position of in.
+func findFromEvery(t *testing.T, w []byte, in string) string {
+	t.Helper()
+	engine, _ := sharedEngine()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mod.Close()
+	call, done, ok := findCallerModule(t, mod, nil, in, searchblock.Off, false)
+	if !ok {
+		t.Fatal("module would not instantiate")
+	}
+	defer done()
+	var sb strings.Builder
+	for off := 0; off <= len(in); off++ {
+		sp, state := call(off)
+		fmt.Fprintf(&sb, "%d:%v/%d ", off, sp, state)
+	}
+	return sb.String()
+}
+
 // characterRunGroupsShapes are Unicode-mode captures whose TDFA capture body
 // has such a loop — a group of states with identical rows — and crosses it
 // with the UTF-8 skip from the arms where the walk enters it, or, with no tag

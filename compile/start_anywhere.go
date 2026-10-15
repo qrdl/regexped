@@ -725,7 +725,8 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 		return startAnywherePasses{}, false
 	}
 	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true, utf8Text: pattern.unicode(),
-		lmCharLoop: opts.LikelyMode == LikelyMatch})
+		sharedWordTable: opts.wordTable,
+		lmCharLoop:      opts.LikelyMode == LikelyMatch})
 	var fwdNotes *notesRows
 	if nr != nil {
 		if fwdNotes = newNotesRows(fwdTable, fwdL); fwdNotes != nil {
@@ -738,7 +739,7 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 	if revTable == nil {
 		return startAnywherePasses{}, false
 	}
-	revL := buildDFALayout(dfaLayoutParams{t: revTable, tableBase: align(fwdL.tableEnd), needFind: true})
+	revL := buildDFALayout(dfaLayoutParams{t: revTable, tableBase: align(fwdL.tableEnd), needFind: true, sharedWordTable: opts.wordTable})
 
 	fwdRaw, fwdSegs := stripSegCount(dfaDataSegments(fwdL, true, false))
 	revRaw, revSegs := stripSegCount(dfaDataSegments(revL, true, false))

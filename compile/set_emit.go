@@ -2146,6 +2146,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	if err := validateBTWorkBudget(over.BTWorkBudget); err != nil {
 		return nil, 0, nil, err
 	}
+	comp.keepUnreadTables = over.KeepUnreadTables
 
 	// A component owns and exports its own memory, so the embedded shape — and
 	// the `output:` key that selects it for a module — has no meaning here.
@@ -3276,7 +3277,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	if searchSetterIdx >= 0 {
 		cs_bytes = appendCodeEntry(cs_bytes, searchSetterBody(searchG))
 	}
-	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone)
+	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone, opts.keepUnreadTables)
 }
 
 // rebuildSetMatchBody re-emits the set match function with correct function indices.

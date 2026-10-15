@@ -817,7 +817,7 @@ func litChainLenAltBody(t *testing.T, pattern string) []byte {
 	if !ok {
 		t.Fatalf("analyseLitChainAltLenient(%q) rejected the shape", pattern)
 	}
-	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
+	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false, nil), 0)
 }
 
 // TestLenAltMatchBodySkipsImpossibleBranches covers the compile-time start
@@ -906,7 +906,7 @@ func TestLenAltMatchBodyScalarBranch(t *testing.T) {
 	if altp.branches[0].useSIMD {
 		t.Fatalf("branch 0 (N=6) chose the SIMD verify; the scalar path is what this test covers")
 	}
-	layout := planLenAltLayout(altp, 0, false)
+	layout := planLenAltLayout(altp, 0, false, nil)
 	if layout.branchBitmapOff[0] < 0 {
 		t.Fatalf("no bitmap allocated for the scalar branch: the verify has nothing to read")
 	}
@@ -934,7 +934,7 @@ func TestLenAltWordCharTableOnlyForFind(t *testing.T) {
 		if !ok {
 			t.Fatalf("analyseLitChainAltLenient(%q, %v) rejected the shape", pattern, find)
 		}
-		planLenAltLayout(altp, 0, find)
+		planLenAltLayout(altp, 0, find, nil)
 		wbBranches := 0
 		for _, br := range altp.branches {
 			if br.isLitChain || !br.dfaTable.hasWordBoundary {
@@ -979,7 +979,7 @@ func TestLenAltMatchBodyMasksPartialSimdChunk(t *testing.T) {
 		t.Fatalf("chunk plan = %+v, want a single partial-lane chunk", chunks)
 	}
 
-	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
+	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false, nil), 0)
 	// `i32.const <laneMask>; i32.and` — the lanes holding literal bytes are
 	// cleared out of the bad-byte mask before it is branched on.
 	wantMask := utils.AppendSLEB128([]byte{0x41}, int32(chunks[0].laneMask))
@@ -1017,7 +1017,7 @@ func TestLenAltMatchBodyGatedCompressed(t *testing.T) {
 	if !ok {
 		t.Fatalf("%s is not a lenient alternation", pattern)
 	}
-	planLenAltLayout(altp, 0, false)
+	planLenAltLayout(altp, 0, false, nil)
 	found := false
 	for _, br := range altp.branches {
 		if !br.isLitChain && br.dfaLayout.useCompression && len(br.dfaLayout.dominantStates) > 0 {
