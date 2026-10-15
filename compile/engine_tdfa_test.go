@@ -1283,7 +1283,7 @@ func TestTDFAUTF8Skip(t *testing.T) {
 		}
 		tt.tagOps[idx] = []tdfaTagOp{{dst: 99, src: -1}}
 	}
-	if loops := detectTDFAUTF8Skip(tt); len(loops) != 0 {
+	if loops := detectTDFAUTF8Skip(tt, false); len(loops) != 0 {
 		t.Errorf("a lead byte setting a register outside the batch: loops %+v, want none", loops)
 	}
 	// More states with one row than the test on every arm is allowed to name.
@@ -1292,7 +1292,7 @@ func TestTDFAUTF8Skip(t *testing.T) {
 		dead[i] = -1
 	}
 	wide := &tdfaTable{dfaTable: &dfaTable{numStates: maxTDFAUTF8SkipLoopStates + 1, transitions: dead}}
-	if loops := detectTDFAUTF8Skip(wide); len(loops) != 0 {
+	if loops := detectTDFAUTF8Skip(wide, false); len(loops) != 0 {
 		t.Errorf("%d identical states: loops %+v, want none", wide.numStates, loops)
 	}
 

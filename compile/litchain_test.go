@@ -915,6 +915,50 @@ func TestLenAltMatchBodyScalarBranch(t *testing.T) {
 	}
 }
 
+// TestLenAltWordCharTableOnlyForFind pins where a lenient alternation's DFA
+// branch gets its 256-byte wordCharTable: the find layout reads it (the
+// verify's word-boundary pre-accept check), the match layout never does — its
+// verify consumes the whole input and emits no such check — so the match
+// layout keeps the \b/\B accept channels and drops the table, which every
+// such match module used to carry unread.
+func TestLenAltWordCharTableOnlyForFind(t *testing.T) {
+	const pattern = `0$|x(?:\b|0)`
+	var tbl [256]byte
+	for c := range tbl {
+		if isWordByte(byte(c)) {
+			tbl[c] = 1
+		}
+	}
+	for _, find := range []bool{false, true} {
+		altp, ok := analyseLitChainAltLenient(bytePat(pattern), find)
+		if !ok {
+			t.Fatalf("analyseLitChainAltLenient(%q, %v) rejected the shape", pattern, find)
+		}
+		planLenAltLayout(altp, 0, find)
+		wbBranches := 0
+		for _, br := range altp.branches {
+			if br.isLitChain || !br.dfaTable.hasWordBoundary {
+				continue
+			}
+			wbBranches++
+			dl := br.dfaLayout
+			if !dl.needWordCharTable {
+				t.Fatalf("find=%v: the \\b branch lost its word-boundary channels", find)
+			}
+			if dl.noWordCharTable == find {
+				t.Errorf("find=%v: noWordCharTable = %v", find, dl.noWordCharTable)
+			}
+			emitted := bytes.Contains(br.dfaDataBytes, tbl[:])
+			if emitted != find {
+				t.Errorf("find=%v: the word table is emitted = %v", find, emitted)
+			}
+		}
+		if wbBranches == 0 {
+			t.Fatalf("%q has no DFA branch with \\b: the test covers nothing", pattern)
+		}
+	}
+}
+
 // TestLenAltMatchBodyMasksPartialSimdChunk covers the partial-lane arm of the
 // SIMD class verify. It is white-box on purpose: today's analyser only sets
 // useSIMD when N>=24, and planLitChainChunks only produces a reduced lane mask

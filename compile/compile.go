@@ -1663,6 +1663,8 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 						// no match from groups() where find() was correct.
 						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
 						if selEng == EngineTDFA && tt != nil {
+							plainTT := tt
+							tt = tdfaWithCharLoops(tt, prog, buildOpts.LikelyMode)
 							p := &compiledPattern{
 								tableEnd:  tableBase,
 								numGroups: tt.numGroups,
@@ -1698,7 +1700,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 								lmNonMidShufti:       false,
 								lmWideShufti:         false,
 							})
-							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false, -1)
+							p.captureBody, p.captureFallbackBody, p.captureFallbackCallOffs = tdfaCaptureBodies(tt, plainTT, tdfaLayout, buildOpts.tableMemIdx, false, -1)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
@@ -1985,6 +1987,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				lmBareShufti:         false,
 				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+				lmCharLoop:           buildOpts.LikelyMode == LikelyMatch,
 				// In Unicode mode a loop over whole characters is a
 				// dominant state too, as it is for the find layout: without
 				// it a match body walked `.+` byte by byte, 24 fuel/byte
@@ -2174,6 +2177,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(rp),
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+			lmCharLoop:           buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 			startRule:            startRuleFor(rp),
 			utf8Text:             rp.unicode(),
@@ -2788,6 +2792,8 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			groupsEngine = EngineBacktrack
 		} else {
 			p.isTDFA = true
+			plainTT := tt
+			tt = tdfaWithCharLoops(tt, mp, buildOpts.LikelyMode)
 			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(dfaLayoutParams{
 				t:                    tt.dfaTable,
@@ -2817,7 +2823,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			if !anchored && buildOpts.globals != nil {
 				p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
 			}
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
+			p.captureBody, p.captureFallbackBody, p.captureFallbackCallOffs = tdfaCaptureBodies(tt, plainTT, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))

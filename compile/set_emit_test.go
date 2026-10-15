@@ -1209,7 +1209,7 @@ func TestSparseVerdictTravelsInValidMaskSlot(t *testing.T) {
 
 	// The call site: `global.get g`, then at most the gate pointer, then
 	// `call bodyIdx`.
-	push := utils.AppendULEB128([]byte{0x23}, uint32(g)) //nolint:gosec // a global index
+	push := utils.AppendULEB128([]byte{0x23}, uint32(g))       //nolint:gosec // a global index
 	call := utils.AppendULEB128([]byte{0x10}, uint32(bodyIdx)) //nolint:gosec // a function index
 	found := false
 	for _, body := range bodies {
@@ -2759,7 +2759,7 @@ func TestSetCoreProbeBodyClampsBucketWidthTo32(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mergeAnchoredDFA: %v", err)
 	}
-	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40), false)
+	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40), false, false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM emitted no body for a 40-id bucket")
 	}
@@ -2772,7 +2772,7 @@ func TestSetCoreGenAnchoredWASMEmptyTable(t *testing.T) {
 	// An empty bucket DFA still needs a callable probe: the anchored capability
 	// bodies call every bucket in turn with no nil check, so the degenerate
 	// case has to be a function returning 0, not a missing one.
-	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2), false)
+	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2), false, false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM(nil) emitted no body")
 	}
@@ -3537,7 +3537,7 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 		for b := 0; b < width; b++ {
 			tbl.transitions[1*256+b] = 1 // global state 1 self-loops on `width` bytes
 		}
-		idTab, setTab := buildMemberSets(tbl, 3)
+		idTab, setTab, _ := buildMemberSets(tbl, 3, false)
 		if len(setTab) != memberSetBytes {
 			t.Fatalf("width %d: got %d table bytes, want one set of %d",
 				width, len(setTab), memberSetBytes)
@@ -3568,7 +3568,7 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 	for i := range tbl.transitions {
 		tbl.transitions[i] = -1
 	}
-	if idTab, setTab := buildMemberSets(tbl, 3); idTab != nil || setTab != nil {
+	if idTab, setTab, _ := buildMemberSets(tbl, 3, false); idTab != nil || setTab != nil {
 		t.Error("a table with no self-loop state produced member tables")
 	}
 }

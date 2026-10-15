@@ -138,11 +138,16 @@ func buildSetProbeBodyExit(p setSuffixParams, anchored bool, exit probeExit) []b
 				(int(st) < len(l.midAcceptWBytes) && l.midAcceptWBytes[st] != 0)) {
 				continue
 			}
-			ex, ok := l.utf8SelfLoopExits(st, 8)
-			if !ok {
+			info := dominantInfo{state: st, utf8: true}
+			if ex, ok := l.utf8SelfLoopExits(st, 8); ok {
+				info.exitBytes = ex
+			} else if !l.lmCharLoop {
+				continue
+			} else if allow, ok := l.charLoopAllowSet(st); ok {
+				info.allowSet = allow
+			} else {
 				continue
 			}
-			info := dominantInfo{state: st, exitBytes: ex, utf8: true}
 			if unrollAnchored {
 				unrolledSkips = append(unrolledSkips, info)
 			} else {
@@ -664,7 +669,7 @@ func buildCountedChainProbeBody(class []byte, n int, anchored bool) []byte {
 // bitmask. Nothing else — the anchored probe reads no mid-accept, immediate-
 // accept or zero-width side table, because "did the run reach `len` in an
 // accepting state" is answered entirely at the end.
-func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int, utf8Text bool) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32, sparse *sparseAnchoredInfo) {
+func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs []int, utf8Text, lmCharLoop bool) (body []byte, dataBytes []byte, dataSegCount int, nextTableOffset int32, sparse *sparseAnchoredInfo) {
 	numPatterns := len(patternIDs)
 	nextTableOffset = int32(tableBase)
 	if t == nil || t.numStates == 0 {
@@ -679,8 +684,10 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		needFind:      false,
 		leftmostFirst: false,
 		// A Unicode-mode set's state looping over whole characters takes the
-		// character skip (buildSetProbeBodyExit's run skips).
-		utf8Text: utf8Text,
+		// character skip (buildSetProbeBodyExit's run skips) — under
+		// prefer-match a loop over only some characters too.
+		utf8Text:   utf8Text,
+		lmCharLoop: lmCharLoop,
 	})
 
 	// Sparse accept: an anchored bucket whose accept is a per-state LIST takes the sparse
@@ -689,7 +696,7 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 	if t.acceptWide != nil {
 		// The ANCHORED probe never skips: it walks to prove full consumption,
 		// and a skip would have to preserve the same proof. Not attempted.
-		tabs := buildSparseAcceptTables(t, int32(l.tableEnd), l.numWASM, false)
+		tabs := buildSparseAcceptTables(t, int32(l.tableEnd), l.numWASM, false, false)
 		idMapOff := tabs.end
 		idMap := make([]byte, numPatterns*4)
 		for i, gid := range patternIDs {

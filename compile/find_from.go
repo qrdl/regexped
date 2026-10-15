@@ -806,16 +806,16 @@ func buildFindFromWrapperBody(findFuncIdx int, mode findFromMode, minLen int32, 
 	if mode.native() && def != nil {
 		l := defLocals{a: 3, t: 4, s: 5, n: 6, n2: 7}
 		b = def.emitEnter(b, 0, 1, 2, l)
-		b = emitFindFromSet(b, 0x02)                                // find_from = from
+		b = emitFindFromSet(b, 0x02)                             // find_from = from
 		b = emitFindBodyCall(b, findFuncIdx, route, minLen <= 1) // ptr, len — the WHOLE buffer
-		b = append(b, 0x22, 0x08)                                  // local.tee r: the result
+		b = append(b, 0x22, 0x08)                                // local.tee r: the result
 		b = def.emitFindWindow(b, l, 8)
 		return append(b, 0x0B) // end function
 	}
 	if mode.native() {
-		b = emitFindFromSet(b, 0x02)                                // find_from = from
+		b = emitFindFromSet(b, 0x02)                             // find_from = from
 		b = emitFindBodyCall(b, findFuncIdx, route, minLen <= 1) // ptr, len — the WHOLE buffer
-		b = append(b, 0x0B)                                        // end function; positions are already absolute
+		b = append(b, 0x0B)                                      // end function; positions are already absolute
 		return b
 	}
 	// ffLegacyNarrow: reproduce, inside WASM, exactly what the generated

@@ -1184,7 +1184,7 @@ func newTDFA(mp resolvedProg, limit int) (*tdfaTable, bool) {
 	tt = minimizeTDFARegisters(tt)
 	tt.bulkSkip = detectTDFABulkSkip(tt)
 	if mp.unicode() {
-		tt.utf8Skip = detectTDFAUTF8Skip(tt)
+		tt.utf8Skip = detectTDFAUTF8Skip(tt, false)
 	}
 	return tt, true
 }
@@ -1199,11 +1199,42 @@ func newTDFA(mp resolvedProg, limit int) (*tdfaTable, bool) {
 // buildTDFAMatchBody's doc comment for why that changes what "len" means and
 // what code gets emitted.
 func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
-	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal)
+	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal, nil)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
 	return append(cs, b...)
+}
+
+// tdfaShortMatchBytes is the window under which a capture body with
+// character-loop skips hands the call to its copy without them
+// (tdfaCaptureBodies). Measured on `(\pL+)=(\pL+)` (fuel, prefer-match vs
+// unhinted, words of n letters a side): 16 gives n=3 −5.7%, 4 −21.8%, 6
+// −41.2%; 32 gives 4 −11.9%, 6 −19.0%; no copy gives 3 +8.2%.
+const tdfaShortMatchBytes = 16
+
+// tdfaCaptureBodies returns the capture body for tt and, when tt has
+// character-loop skips (prefer-match; allowSet) and the body sits behind a
+// find, a second function: plain's body, which the first calls for a window
+// under tdfaShortMatchBytes. The window is then the match, and a short match
+// has no run the skip could pay for, while the skip's test runs in every arm
+// that enters its loop — once per character crossed outside it, 262 arms a
+// loop for `(\pL+)=(\pL+)`, whose words of one or two letters cost +15.8%
+// without the copy and +6.6% with it. The call costs a short window about
+// ten fuel. nil second when there is nothing to hand over: no such skip, or
+// the body is the anchored export, whose window is the whole input.
+func tdfaCaptureBodies(tt, plain *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) (body, second []byte, callOffs []int) {
+	has := false
+	for _, info := range tt.utf8Skip {
+		has = has || info.allowSet != nil
+	}
+	if nativeAnchored || !has {
+		return appendTDFACodeEntry(nil, tt, l, tableMemIdx, nativeAnchored, capStartGlobal), nil, nil
+	}
+	var offs []int
+	inner := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal, &offs)
+	body, offs = btSizePrefix(inner, offs)
+	return body, appendTDFACodeEntry(nil, plain, l, tableMemIdx, nativeAnchored, capStartGlobal), offs
 }
 
 // buildTDFAMatchBody emits the WASM function body for anchored TDFA matching.
@@ -1270,7 +1301,11 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // hasWordBoundary/hasLineAnchors/hasUnsafeBeginText gates route those to
 // Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
 // variants, is sufficient.
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
+//
+// shortCallOffs non-nil: the body first hands a window under
+// tdfaShortMatchBytes to a second function, through a call whose index is a
+// placeholder recorded there (tdfaCaptureBodies).
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32, shortCallOffs *[]int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
@@ -1347,6 +1382,15 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	}
 	if len(tt.utf8Skip) > 0 {
 		b = append(b, 0x01, 0x7B) // 1 × v128: localUTF8Err
+	}
+	if shortCallOffs != nil {
+		// A window under tdfaShortMatchBytes: the copy without the character
+		// skips answers (tdfaCaptureBodies).
+		b = append(b, 0x20, 0x01, 0x41)
+		b = utils.AppendSLEB128(b, int32(tdfaShortMatchBytes))
+		b = append(b, 0x49, 0x04, 0x40) // i32.lt_u; if
+		b = emitBTFallbackCall(b, 3, shortCallOffs)
+		b = append(b, 0x0B)
 	}
 
 	// midAcceptCheck: if midAccept[state], eagerly write captures for
@@ -1453,28 +1497,53 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	// in the tag-op dispatch's arm of every state outside the loop with a
 	// transition into it (emitTDFAUTF8Skip). With no tag ops there is no
 	// dispatch, and the loop's states are tested for at the top of the loop.
+	midAcceptTailFor := func(info tdfaUTF8SkipInfo) func([]byte) []byte {
+		if !hasMidAccept || tt.midAcceptStates[int(info.wasmStates[0])-1] == 0 {
+			return nil
+		}
+		return func(b []byte) []byte {
+			b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
+			b = append(b, 0x20, byte(localPos))
+			b = append(b, 0x21, byte(localLastAcceptPos))
+			return b
+		}
+	}
 	utf8SkipAt := func(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32) []byte {
 		b = emitTDFAStateIn(b, info.wasmStates, byte(localState))
 		b = append(b, 0x04, 0x40) // if
-		var midAcceptTail func([]byte) []byte
-		if hasMidAccept && tt.midAcceptStates[int(info.wasmStates[0])-1] != 0 {
-			midAcceptTail = func(b []byte) []byte {
-				b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
-				b = append(b, 0x20, byte(localPos))
-				b = append(b, 0x21, byte(localLastAcceptPos))
-				return b
-			}
-		}
-		b = emitTDFAUTF8Skip(b, info, mainDepth+1, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTail)
+		b = emitTDFAUTF8Skip(b, info, mainDepth+1, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTailFor(info))
 		return append(b, 0x0B) // end if
 	}
+	// A loop over SOME characters (prefer-match; allowSet) is entered from an
+	// arm per partial-character state — 262 a loop for `\pL` — so its skip is
+	// emitted ONCE, after the dispatch, in block $enter_k's wake, and each arm
+	// that enters the loop branches there. Inline in every arm, the skip made
+	// `^(\pL+)=(\pL+)`'s capture body 8.3 MB, over WebAssembly's function cap.
+	var shared []tdfaUTF8SkipInfo
+	sharedIdx := map[int]uint32{}
 	var utf8Hook func([]byte, int, uint32) []byte
 	if tdfaHasTagOps(tt) {
+		for i, info := range tt.utf8Skip {
+			if info.allowSet != nil {
+				sharedIdx[i] = uint32(len(shared))
+				shared = append(shared, info)
+			}
+		}
+		K := uint32(len(shared))
 		utf8Hook = func(b []byte, gs int, mainDepth uint32) []byte {
-			for _, info := range tt.utf8Skip {
-				if info.entersFrom(tt, gs) {
-					b = utf8SkipAt(b, info, mainDepth)
+			for i, info := range tt.utf8Skip {
+				if !info.entersFrom(tt, gs) {
+					continue
 				}
+				if k, ok := sharedIdx[i]; ok {
+					// The K $enter blocks sit where loop $main was: $enter_k
+					// (0-based) is mainDepth + k out.
+					b = emitTDFAStateIn(b, info.wasmStates, byte(localState))
+					b = append(b, 0x0D) // br_if $enter_k
+					b = utils.AppendULEB128(b, mainDepth+k)
+					continue
+				}
+				b = utf8SkipAt(b, info, mainDepth+K)
 			}
 			return b
 		}
@@ -1553,33 +1622,48 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	b = append(b, 0x0F) // return
 	b = append(b, 0x0B) // end if state==0
 
+	for range shared {
+		b = append(b, 0x02, 0x40) // block $enter_k, innermost k = 0
+	}
 	// Emit tag ops keyed on (prevState, byte).
 	// At this point pos = exclusive end of consumed byte.
 	b = emitTDFATagOps(tt, b, localPrevState, localByte, localPos, localCapBase, utf8Hook)
 
-	// Immediate-accept check.
-	if l.hasImmAccept {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
-		b = append(b, 0x20, byte(localState))
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
-		b = append(b, 0x04, 0x40)
-		// Accept here: write captures and return pos (pos already = exclusive end).
-		b = emitTDFAAccept(tt, b, localState, localPos, localCapBase, capStartGlobal)
-		b = append(b, 0x0B)
+	// What follows the dispatch — the accept checks — also follows each shared
+	// skip that skipped nothing, so it is emitted once more per $enter_k.
+	afterDispatch := func(b []byte) []byte {
+		// Immediate-accept check.
+		if l.hasImmAccept {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, l.immediateAcceptOff)
+			b = append(b, 0x20, byte(localState))
+			b = append(b, 0x6A)
+			b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
+			b = append(b, 0x04, 0x40)
+			// Accept here: write captures and return pos (pos already = exclusive end).
+			b = emitTDFAAccept(tt, b, localState, localPos, localCapBase, capStartGlobal)
+			b = append(b, 0x0B)
+		}
+		// Record a fallback accept (eagerly writing captures) if the state we
+		// just transitioned into is mid-accepting. Only reached when
+		// immediateAccept didn't already fire and return above, so this never
+		// overrides a higher-priority immediate accept — it only ever matters if
+		// every higher-priority continuation from here eventually dies.
+		return midAcceptCheck(b, localState, localPos)
 	}
-
-	// Record a fallback accept (eagerly writing captures) if the state we
-	// just transitioned into is mid-accepting. Only reached when
-	// immediateAccept didn't already fire and return above, so this never
-	// overrides a higher-priority immediate accept — it only ever matters if
-	// every higher-priority continuation from here eventually dies.
-	b = midAcceptCheck(b, localState, localPos)
-
-	b = append(b, 0x0C, 0x00) // br $main
-	b = append(b, 0x0B)       // end loop
-	b = append(b, 0x0B)       // end block $done
+	b = afterDispatch(b)
+	b = append(b, 0x0C) // br $main
+	b = utils.AppendULEB128(b, uint32(len(shared)))
+	for k := range shared {
+		b = append(b, 0x0B) // end $enter_k: an arm entered shared[k]'s loop
+		out := uint32(len(shared) - 1 - k)
+		b = emitTDFAUTF8Skip(b, shared[k], out, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTailFor(shared[k]))
+		b = afterDispatch(b) // it skipped nothing
+		b = append(b, 0x0C)  // br $main
+		b = utils.AppendULEB128(b, out)
+	}
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block $done
 
 	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
 	// (State-ID partitioning is not applied to TDFA tables because state IDs

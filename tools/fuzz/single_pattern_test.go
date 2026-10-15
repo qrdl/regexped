@@ -1277,9 +1277,9 @@ var characterRunShapes = []struct{ name, pat, body string }{
 // loop with the skip over whole UTF-8 characters too, over every prefix of each
 // input that ends just after an exit byte — where a full match can end — and
 // over the whole input, against Go's full match of oracle.
-func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []string) {
+func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []string, opts compile.CompileOptions) {
 	t.Helper()
-	w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, MatchFunc: "match"}}, pathsTableBase, true, compile.CompileOptions{Unicode: true})
+	w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, MatchFunc: "match"}}, pathsTableBase, true, opts)
 	if err != nil {
 		t.Fatalf("compile %q: %v", pat, err)
 	}
@@ -1292,8 +1292,8 @@ func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []st
 	for _, in := range inputs {
 		cuts := []int{len(in)}
 		for i := 0; i < len(in); i++ {
-			if strings.IndexByte(",\n\"y>&z", in[i]) >= 0 {
-				cuts = append(cuts, i+1)
+			if strings.IndexByte(",\n\"y>&z ", in[i]) >= 0 {
+				cuts = append(cuts, i, i+1)
 			}
 		}
 		for _, cut := range cuts {
@@ -1306,6 +1306,122 @@ func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []st
 				t.Errorf("%q match over %q: got (%d, %v), want %v", pat, s, end, ok, want)
 			}
 		}
+	}
+}
+
+// TestUnicodeCharLoopSkip drives prefer-match's skip over a loop of only
+// SOME characters (dominantInfo.allowSet: a letter class, `\pL+`) — which
+// strides a chunk only while every character's lead byte is one ALL of whose
+// characters the class holds — through find (from every start position, and
+// iterated), match and groups, against Go with U+FFFD taken out (so invalid
+// UTF-8 is judged too). The inputs put the characters a lead byte's subset
+// leaves out where a chunk would cross them: Cyrillic's U+0482..U+0489
+// (symbols and combining marks under the letters' own lead byte D2), CJK
+// punctuation beside Han, a two-letter run, runs cut at every chunk offset.
+func TestUnicodeCharLoopSkip(t *testing.T) {
+	lm := compile.CompileOptions{Unicode: true, LikelyMode: compile.LikelyMatch}
+	r := rand.New(rand.NewSource(20261015))
+	pieces := []string{"а", "ж", "щ", "ё", "і", "Ѣ", "ң", "ӭ", "҂", "҃", "҈", "a", "Z", "é", "ω", "東", "語", "。", "、", "ア", " ", ",", "=", "1", "😀", "\xff", "\x80", "\xd0", "\xe6\x97",
+		// 4-byte letters under F1..F3 and their neighbours under F0 and F4,
+		// 3-byte ones under E0, ED and EE (the leads the structural test
+		// refuses), and invalid sequences only Keiser-Lemire or the
+		// structure catches: overlong, surrogate, past U+10FFFF, truncated,
+		// a lead where a continuation belongs, a stray continuation.
+		"\U00040000", "\U000ABCDE", "\U000FFFFF", "\U00100000", "\u0800", "\ud7ff", "\ue000",
+		"\xc0\x80", "\xe0\x80\x80", "\xed\xa0\x80", "\xf0\x80\x80\x80", "\xf4\x90\x80\x80", "\xf1\x80\x80", "\xd0\xd0", "\xe6\x97\xa5\x80"}
+	var inputs []string
+	for i := 0; i < 40; i++ {
+		var b strings.Builder
+		b.WriteString(strings.Repeat("x", r.Intn(16)))
+		for n := r.Intn(120) + 1; n > 0; n-- {
+			p := pieces[r.Intn(len(pieces))]
+			if r.Intn(3) > 0 { // mostly letters, in runs
+				p = []string{"ж", "щ", "ё", "東", "語", "ア", "a", "\U00050000", "\u0800", "\ue000"}[r.Intn(10)]
+			}
+			b.WriteString(p)
+		}
+		inputs = append(inputs, b.String())
+	}
+	inputs = append(inputs, strings.Repeat("ж", 40)+"҂"+strings.Repeat("ж", 40), strings.Repeat("東語", 30)+"。", "жж", "ж",
+		// Words of one and two letters, where the skip's gate declines.
+		strings.Repeat("я и он в мы до ", 5), strings.Repeat("a b cd e fg ", 5), strings.Repeat("я=он в=мы ab=c ", 4),
+		strings.Repeat("\U00050000", 12)+" "+strings.Repeat("\U00050000\xf1\x80", 6))
+	// Invalid bytes inside long letter runs on both sides of '=', where only
+	// the skip's validity test keeps it from crossing them.
+	for _, bad := range []string{"\xd0\xd0", "\x80", "\xe6\x97", "\xc0\x80", "\xf1\x80\x80"} {
+		inputs = append(inputs, "незав"+bad+"исимость=правительство решение", "независимость=правит"+bad+"ельство решение",
+			strings.Repeat("ж", 30)+bad+"=ж "+strings.Repeat("東", 12)+bad+strings.Repeat("語", 12))
+	}
+	// A run the main loop crosses (16 bytes and more) that then ends 1..3
+	// bytes before the input does: the end-of-input form declines after pos
+	// has moved, and must still record the run.
+	for n := 7; n <= 20; n++ {
+		inputs = append(inputs, strings.Repeat("ж", n)+",", "x"+strings.Repeat("ж", n)+",;", "1"+strings.Repeat("ж", n))
+	}
+	for k := 0; k < 6; k++ { // a run ending 0..5 bytes before the input does
+		inputs = append(inputs, strings.Repeat("x", 20+k)+"ж"+strings.Repeat("y", 5-k), strings.Repeat("x", 20+k)+"жжж")
+	}
+	finds := []string{`\p{Cyrillic}+`, `\pL+`, `\p{Han}+`, `[\x{0400}-\x{047F}]+`, `x\p{Cyrillic}*,`, `\pL{3,}1`,
+		`[\x{0800}-\x{FFFF}]+`,   // E0 and ED among its leads: Keiser-Lemire's test, gated
+		`[\x{40000}-\x{FFFFF}]+`, // 4-byte leads only: the structural test's F0 term
+		`\pL+=\pL+`}              // two loops behind a literal anchor
+	for _, pat := range finds {
+		t.Run(pat, func(t *testing.T) {
+			rep := &compile.Reporter{}
+			o := lm
+			o.Report = rep
+			if _, _, err := compile.Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "find"}}, pathsTableBase, true, o); err != nil {
+				t.Fatal(err)
+			}
+			var report strings.Builder
+			rep.Render(&report)
+			if !strings.Contains(report.String(), "SIMD bulk skip") {
+				t.Fatalf("%q takes no skip under prefer-match:\n%s", pat, report.String())
+			}
+			oracle := noReplacement(t, pat)
+			re := regexp.MustCompile(oracle)
+			w, sizes, err := compileFindOpts("charloop\x00"+pat, pat, pathsTableBase, lm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			engine, _ := sharedEngine()
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mod.Close()
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				for _, in := range inputs {
+					checkUnicodeFindFrom(t, oracle, mod, sizes, in, mode)
+					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
+				}
+			}
+			checkUnicodeCharacterRunMatch(t, pat, oracle, inputs, lm)
+		})
+	}
+	// `^(\pL+)=(\pL+)` IS its groups export: its capture body walks the
+	// whole input, not a match the find has already found valid, so only it
+	// reaches the capture body's validity test with invalid bytes.
+	for _, pat := range []string{`(\p{Cyrillic}+)\s(\d*)`, `(\pL+)=(\pL+)`, `<(\p{Han}+)>`, `^(\pL+)=(\pL+)`, `(\d)([^\d,]+)`} {
+		t.Run("groups "+pat, func(t *testing.T) {
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, lm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			re := regexp.MustCompile(noReplacement(t, pat))
+			// Windows on both sides of tdfaShortMatchBytes (16): a shorter match
+			// runs the capture body's copy without the character skips.
+			pairs := []string{"жжжж=жжж", "жжжж=жжжa", "жжжж=жжжж", "независимость=правительство", "я=он"}
+			for _, in := range append(append(inputs, "ж ж12 "+strings.Repeat("ё", 40)+" 7", "a=b ж=ё", "<東語>"), pairs...) {
+				got, ok := runGroupsIter(t, w, in, re.NumSubexp()+1)
+				if !ok {
+					t.Fatalf("%q over %q: watchdog or overflow", pat, in)
+				}
+				if want := goGroupsAll(re, in); fmtGroups(got) != fmtGroups(want) {
+					t.Errorf("%q over %q:\n  got  %s\n  want %s", pat, in, fmtGroups(got), fmtGroups(want))
+				}
+			}
+		})
 	}
 }
 
@@ -1456,7 +1572,7 @@ func TestUnicodeCharacterRunSkip(t *testing.T) {
 					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
 				}
 			}
-			checkUnicodeCharacterRunMatch(t, c.pat, oracle, inputs)
+			checkUnicodeCharacterRunMatch(t, c.pat, oracle, inputs, compile.CompileOptions{Unicode: true})
 		})
 	}
 	for _, pat := range characterRunGroupsShapes {

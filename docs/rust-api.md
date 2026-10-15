@@ -10,7 +10,7 @@ Each stub file is a plain Rust source file intended to be pulled in with `includ
 include!("stubs.rs");
 
 // import_module: "regexps" in the config → module path "regexps::<func_name>"
-patterns::find_github_token(input, 0);
+regexps::find_github_token(input, 0);
 ```
 
 The `pub mod` name is `rust_module`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name, which may be anything — while `pub mod` needs a Rust identifier. Set `rust_module` when the wire name is a Rust keyword (`match`) or simply reads badly as a module path (`url_ipv6`); the `#[link(wasm_import_module = …)]` inside keeps using `import_module` either way.

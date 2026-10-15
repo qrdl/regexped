@@ -1518,15 +1518,19 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			if bi >= len(diag.Buckets) || bkt.suffixDFA == nil || !bkt.sparse {
 				continue
 			}
-			idTab, setTab := buildMemberSets(bkt.suffixDFA, bkt.suffixDFA.numStates+1)
-			n := 0
+			idTab, setTab, firstChar := buildMemberSets(bkt.suffixDFA, bkt.suffixDFA.numStates+1, unicodeSet)
+			n, chars := 0, 0
 			for _, id := range idTab {
 				if id != 0 {
 					n++
+					if firstChar > 0 && int(id) >= firstChar {
+						chars++
+					}
 				}
 			}
 			diag.Buckets[bi].MemberSkipStates = n
 			diag.Buckets[bi].MemberSkipSets = len(setTab) / memberSetBytes
+			diag.Buckets[bi].MemberSkipCharStates = chars
 		}
 	}
 
@@ -1831,7 +1835,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 					ids[j] = globalIDOf[ap]
 				}
 				cs.anchoredIDs[bi] = ids
-				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids, unicodeSet)
+				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids, unicodeSet, opts.LikelyMode == LikelyMatch)
 				if sp != nil {
 					ab.sparseScratch = sp.scratch
 					ab.sparseIDMapOff = sp.idMapOff

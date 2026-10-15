@@ -64,6 +64,15 @@ set a hint or not.
   SIMD skip through that run a single pattern gets. Worth setting when your
   inputs are match-dense with long bodies; short bodies neither gain nor
   lose much, because the skip turns itself off once it stops paying.
+- In **Unicode mode**, a run over a letter class — `\p{Cyrillic}+`, `\pL+`
+  between delimiters, captures such as `(\pL+)=(\pL+)`, set members such as
+  `key=\p{Cyrillic}+;` — strides over whole letters 16 bytes at a time
+  instead of walking them. Long words gain most (−54% to −66% fuel against
+  the unhinted build), ordinary Russian prose −32%. Words of one or two
+  letters cost a little more than unhinted (+2% to +7%; a text made only of
+  one-letter words up to +9%), because each word still pays for checking
+  whether a stride could start; no-match text costs nothing more. Modules
+  grow, by up to a fifth (`\p{Cyrillic}+`: 6.3 → 7.4 KB).
 
 **`prefer-no-match` targets:**
 - A first-byte set of roughly 17–64 distinct bytes in `find_func` mode (or
@@ -115,14 +124,16 @@ provably linear — see
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.
 
-In Unicode mode the shapes above mostly stop applying, because a class with
-multi-byte members is a cycle of several states rather than one self-loop.
-Measured over four Unicode shapes (a `\pL{12,}` run, `key=[^;]+;` over
-Cyrillic, `привет\s+\pL+`, a set over four scripts), no hint lowered fuel:
-of the eight hinted builds, four were the same module as the unhinted one, two
-cost nothing, and two cost more — **+19%** (`prefer-match` on `key=[^;]+;`,
-matching text) and +4% (`prefer-no-match` on `\pL{12,}`, matching text).
-Measure before hinting a Unicode pattern.
+In Unicode mode the other shapes above mostly stop applying, because a class
+with multi-byte members is a cycle of several states rather than one
+self-loop. Measured over four more Unicode shapes (fuel against the unhinted
+build): `key=[^;]+;` over Cyrillic compiles to the same module under either
+hint; `привет\s+\pL+` and a `\pL{12,}` run cost the same under
+`prefer-match`, and `\pL{12,}` costs **+7%** under `prefer-no-match` on
+matching text; a set over four scripts driven through `scan_all` costs the
+same under either hint on matching text and **−92%** under
+`prefer-no-match` on text holding none of its scripts. Measure before
+hinting a Unicode pattern.
 
 ## The optimisations, briefly
 
@@ -160,14 +171,14 @@ Measure before hinting a Unicode pattern.
   character class, and only to sets large enough to pack into a sparse
   bucket.
 
-  **In Unicode mode it strides over ASCII only.** A repeated class with
-  multi-byte members (`[^;]+`, `\pL+`) is a cycle of several states once
-  decoded byte by byte, and only its ASCII bytes keep the walk in one state.
-  Measured on 40 members of the shape `union[ \t]+kNN[^;]+` over 64 KB with
-  long tails: −93% fuel when the tails are ASCII, but **+78%** when they are
-  Cyrillic, where the stride stops at every character and its bookkeeping
-  costs more than it saves. Measure a Unicode set's real traffic before
-  shipping `prefer-match` on it.
+  **In Unicode mode it strides over whole characters** where every
+  multi-byte character keeps the walk in the run — a class holding every
+  non-ASCII character, `[^;]+`, `.+`: 16 bytes at a time over valid UTF-8,
+  stopping on a character boundary. Measured on 40 members of the shape
+  `union[ \t]+kNN[^;]+` over 64 KB records, against the unhinted build:
+  −80% fuel with 100–400-byte Cyrillic tails, −89% with ASCII ones, −28% /
+  −35% with 2–12-byte tails. A class that keeps only SOME characters
+  (`\pL+`, `\p{Cyrillic}+`) still strides over its ASCII bytes alone.
 
 Each of the SIMD skips above turns itself off for the rest of a call once it
 has failed to skip anything several times in a row, so a hint that turns out

@@ -2561,12 +2561,16 @@ type dfaLayout struct {
 	needWordCharTable  bool
 	wordCharTableOff   int32
 	wordCharTableBytes [256]byte
-	midAcceptNWOff     int32
-	midAcceptWOff      int32
-	midAcceptNLOff     int32
-	midAcceptNWBytes   []byte
-	midAcceptWBytes    []byte
-	midAcceptNLBytes   []byte
+	// noWordCharTable: the layout has the \b/\B accept channels
+	// (needWordCharTable) but no reserved or emitted wordCharTable, because
+	// no body over it reads one (dfaLayoutParams.noWordCharTable).
+	noWordCharTable  bool
+	midAcceptNWOff   int32
+	midAcceptWOff    int32
+	midAcceptNLOff   int32
+	midAcceptNWBytes []byte
+	midAcceptWBytes  []byte
+	midAcceptNLBytes []byte
 
 	// lmBareShufti lifts detectShuftiSelfLoop's
 	// len(l.prefix)==0 bail for bare (no literal-anchor) moderately-wide
@@ -2603,6 +2607,12 @@ type dfaLayout struct {
 	// detectClassChainPrefix). LikelyMatch only, and set from the same
 	// buildOpts.LikelyMode as its siblings above.
 	lmClassChain bool
+
+	// lmCharLoop lets detectShuftiSelfLoop (and the set probes) take a
+	// Unicode-mode loop over only SOME characters — a letter class, `\pL+` —
+	// as a utf8 dominant with an allowSet. LikelyMatch only: the chunk test
+	// is paid on every entry into the loop and loses on one-letter runs.
+	lmCharLoop bool
 
 	// Fast-skip / SIMD (find mode only)
 	prefix         []byte
@@ -2764,7 +2774,16 @@ type dominantInfo struct {
 	// through a state per byte of it, and exitBytes are its ASCII exits
 	// (0..8). Unicode mode only; emitUTF8BulkSkip serves it. See
 	// (*dfaLayout).utf8SelfLoopExits.
-	utf8        bool
+	utf8 bool
+	// allowSet: a utf8 loop over only SOME characters (`\pL+`,
+	// `\p{Cyrillic}+`) — the bytes a chunk may hold without the skip
+	// stopping: the ASCII bytes the state loops on, the lead bytes every one of
+	// whose characters leads back to it, and every continuation byte (the
+	// validity check judges those). Every lane outside it is an exit, a
+	// character start, so the skip stops on a boundary. nil for a loop over
+	// every character, whose exits are exitBytes. LikelyMatch only
+	// (dfaLayout.lmCharLoop); see (*dfaLayout).charLoopAllowSet.
+	allowSet    []byte
 	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
 	isMidAccept bool // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
 }
@@ -2803,7 +2822,15 @@ type dfaLayoutParams struct {
 	lmNonMidShufti       bool
 	lmWideShufti         bool
 	lmClassChain         bool
+	lmCharLoop           bool
 	forceWordChar        bool
+	// noWordCharTable keeps the \b/\B accept channels forceWordChar or
+	// needFind builds but reserves no 256-byte wordCharTable: for a layout
+	// whose every body is a FULL-CONSUMPTION anchored verify, which never
+	// emits the word-boundary pre-accept check, the table's only reader there
+	// (emitInlineAnchoredDFAVerify). It was emitted, unread, into every
+	// lenient alternation's match module with \b/\B.
+	noWordCharTable bool
 	// forceNewline builds the newline pre-accept table outside find mode, for
 	// the lenient alternation's inline DFA verify, which is a find body over a
 	// non-find layout. Like forceWordChar, but for (?m:$) before a '\n'.
@@ -2837,6 +2864,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
 	l.lmClassChain = p.lmClassChain
+	l.lmCharLoop = p.lmCharLoop
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
 	// acceptLimit: WASM-state ID K such that "state in [1, K]" iff the DFA state
@@ -2876,8 +2904,9 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 
 	// Word char table (find + word boundary, or when forceWordChar is set).
 	l.needWordCharTable = wantWordChar && t.hasWordBoundary
+	l.noWordCharTable = l.needWordCharTable && p.noWordCharTable
 	wordCharTableSize := int32(0)
-	if l.needWordCharTable {
+	if l.needWordCharTable && !l.noWordCharTable {
 		l.wordCharTableOff = int32(tableBase)
 		wordCharTableSize = 256
 		for b := 0; b < 256; b++ {
@@ -4323,6 +4352,100 @@ func (l *dfaLayout) utf8SelfLoopExits(state int32, maxExit int) ([]byte, bool) {
 	return exits, true
 }
 
+// charLoopAllowSet reports whether state loops over at least one lead byte's
+// worth of whole characters, and returns the bytes a chunk may hold for the
+// skip to cross it (dominantInfo.allowSet): the ASCII bytes the state loops
+// on, every lead byte ALL of whose valid characters lead back to it through
+// states that are live and record nothing (as utf8SelfLoopExits requires of
+// every character), and the continuation bytes. A lead byte with even one
+// character that leaves the loop — U+0482..U+0489 under D2 for `\pL`, which
+// are symbols — is left out, so its characters are exits and the walk judges
+// them: the subset is taken per lead byte because no chunk test can see a
+// hole inside one. A word-boundary state is refused, as there; a `(?m:$)`
+// accept makes '\n' an exit.
+func (l *dfaLayout) charLoopAllowSet(state int32) ([]byte, bool) {
+	for _, ch := range [][]byte{l.midAcceptNWBytes, l.midAcceptWBytes} {
+		if int(state) < len(ch) && ch[state] != 0 {
+			return nil, false
+		}
+	}
+	quiet := func(s int) bool {
+		if s <= 0 || s == int(state) || s >= l.numWASM {
+			return false
+		}
+		for _, ch := range [][]byte{l.midAcceptBytes, l.midAcceptNLBytes, l.midAcceptNWBytes, l.midAcceptWBytes} {
+			if s < len(ch) && ch[s] != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	step := func(s, c int) int { return int(l.transitionOn(s, c)) }
+	var in [256]bool
+	for c := 0; c < 0x80; c++ {
+		in[c] = l.transitionOn(int(state), c) == state
+	}
+	if int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 {
+		in['\n'] = false
+	}
+	leads := 0
+	for _, seq := range utf8Sequences {
+		for lead := int(seq[0][0]); lead <= int(seq[0][1]); lead++ {
+			if leadLoops(int(state), lead, seq, step, quiet) {
+				in[lead] = true
+				leads++
+			}
+		}
+	}
+	if leads == 0 {
+		return nil, false
+	}
+	for c := 0x80; c < 0xC0; c++ {
+		in[c] = true
+	}
+	var allow []byte
+	for c, ok := range in {
+		if ok {
+			allow = append(allow, byte(c))
+		}
+	}
+	return allow, true
+}
+
+// leadLoops reports whether every valid character with lead byte lead (one
+// of seq's) read from state leads back to it, every state inside it being
+// one inside admits: loopsOverUTF8 for one lead byte.
+func leadLoops(state, lead int, seq [][2]byte, step func(s, c int) int, inside func(s int) bool) bool {
+	cur := map[int]bool{step(state, lead): true}
+	for i, r := range seq[1:] {
+		next := map[int]bool{}
+		for s := range cur {
+			if !inside(s) {
+				return false
+			}
+			for c := int(r[0]); c <= int(r[1]); c++ {
+				t := step(s, c)
+				if i == len(seq)-2 && t != state {
+					return false
+				}
+				next[t] = true
+			}
+		}
+		cur = next
+	}
+	return true
+}
+
+// emitCharExitMask pushes the i32 mask of a character skip's exit lanes: its
+// ASCII exit bytes, or, for a loop over only some characters, every lane
+// outside its allowSet.
+func emitCharExitMask(b []byte, exitBytes, allowSet []byte, chunk byte) []byte {
+	if allowSet != nil {
+		return emitShuftiStopMask(b, allowSet, chunk)
+	}
+	return emitBulkSkipExitMask(b, exitBytes, chunk)
+}
+
 // countUTF8Dominants counts the dominant states the UTF-8 skip serves.
 func countUTF8Dominants(ds []dominantInfo) int {
 	n := 0
@@ -4417,7 +4540,11 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 	if l.numWASM <= 1 {
 		return
 	}
-	if len(l.prefix) == 0 && !l.lmBareShufti {
+	// Character loops (lmCharLoop) are taken bare as well: the hint is the
+	// whole of their gate, as it is the whole reason for having them.
+	charLoops := l.lmCharLoop && l.utf8Text
+	byteLoops := len(l.prefix) > 0 || l.lmBareShufti
+	if !byteLoops && !charLoops {
 		return
 	}
 
@@ -4454,6 +4581,23 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			if !l.lmNonMidShufti || nonMidIdx >= maxNonMid {
 				continue
 			}
+		}
+		if charLoops && (!isMid || idx < maxStates) {
+			if allow, ok := l.charLoopAllowSet(state); ok {
+				info := dominantInfo{state: state, utf8: true, allowSet: allow, isMidAccept: isMid}
+				if isMid {
+					info.encodedByte = byte(128 + idx)
+					idx++
+				} else {
+					info.encodedByte = byte(254 + nonMidIdx)
+					nonMidIdx++
+				}
+				l.dominantStates = append(l.dominantStates, info)
+				continue
+			}
+		}
+		if !byteLoops {
+			continue
 		}
 		var selfSet []byte
 		for c := 0; c < cellsPerState; c++ {
@@ -4640,7 +4784,7 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 	// TDFA path (useAcceptSideTable=true): state IDs are not partitioned, so a
 	// per-state side table is emitted at acceptOff and read at EOF.
 	emitFindSegs := func(ds, transSegs []byte) []byte {
-		if l.needWordCharTable {
+		if l.needWordCharTable && !l.noWordCharTable {
 			ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 		}
 		ds = append(ds, transSegs...)
@@ -4672,7 +4816,10 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 			n++
 		}
 		if l.needWordCharTable {
-			n += 3
+			n += 2 // midAcceptNW + midAcceptW
+			if !l.noWordCharTable {
+				n++ // wordCharTable
+			}
 		}
 		if l.midAcceptNLBytes != nil {
 			n++
@@ -4756,13 +4903,16 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				count++
 			}
 			if l.needWordCharTable {
-				count += 3 // wordCharTable + midAcceptNW + midAcceptW
+				count += 2 // midAcceptNW + midAcceptW
+				if !l.noWordCharTable {
+					count++ // wordCharTable
+				}
 			}
 			if l.midAcceptNLBytes != nil {
 				count++ // forceNewline only
 			}
 			ds = append(ds, count)
-			if l.needWordCharTable {
+			if l.needWordCharTable && !l.noWordCharTable {
 				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 			}
 			ds = appendDataSegment(ds, l.classMapOff, l.classMap[:])
@@ -4841,13 +4991,16 @@ func dfaDataSegments(l *dfaLayout, needFind bool, forceMidAccept bool) []byte {
 				count++
 			}
 			if l.needWordCharTable {
-				count += 3 // wordCharTable + midAcceptNW + midAcceptW
+				count += 2 // midAcceptNW + midAcceptW
+				if !l.noWordCharTable {
+					count++ // wordCharTable
+				}
 			}
 			if l.midAcceptNLBytes != nil {
 				count++ // forceNewline only
 			}
 			ds = append(ds, count)
-			if l.needWordCharTable {
+			if l.needWordCharTable && !l.noWordCharTable {
 				ds = appendDataSegment(ds, l.wordCharTableOff, l.wordCharTableBytes[:])
 			}
 			if l.useRowDedup {
@@ -5034,6 +5187,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		lmBareShufti:         lmShufti,
 		lmNonMidShufti:       lmShufti,
 		lmWideShufti:         lmShufti,
+		lmCharLoop:           lmShufti,
 		forceWordChar:        t.hasWordBoundary,
 		utf8Text:             utf8Text,
 	})
@@ -5164,7 +5318,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		// stride, the adaptive switch): it saves a great deal on buckets with
 		// long self-loop runs and costs a few percent on buckets that have
 		// none, and only the caller knows which their traffic is.
-		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM, lm == LikelyMatch)
+		tabs := buildSparseAcceptTables(t, nextTableOffset, l.numWASM, lm == LikelyMatch, utf8Text)
 		idMapOff := tabs.end
 		idMap := make([]byte, len(patternIDs)*4)
 		for i, gid := range patternIDs {
@@ -5217,7 +5371,7 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		if len(prefixFixedLens) > 0 && prefixFixedLens[0] > 0 {
 			prefixLen = prefixFixedLens[0]
 		}
-		art.memberStates, art.memberSets = tabs.memberStates, tabs.memberSets
+		art.memberStates, art.memberSets, art.memberCharStates = tabs.memberStates, tabs.memberSets, tabs.memberCharStates
 		art.sparseScratch = scratch
 		art.sparseIDMapOff = idMapOff
 		art.sparseProbeReady = true
@@ -5316,8 +5470,9 @@ type suffixArtifacts struct {
 	// memberStates / memberSets record how many states got a member self-loop
 	// skip arm and how many distinct sets back them, for --diag-json. Zero
 	// when the bucket is neutral or has no eligible state.
-	memberStates int
-	memberSets   int
+	memberStates     int
+	memberSets       int
+	memberCharStates int
 	// walkEndGlobal is the module global the tuple-writing body stamps with the
 	// FARTHEST input position its walk reached, or -1 when this bucket does not
 	// carry the store. It is the overlapping answer cache's trigger input: the
@@ -6813,6 +6968,15 @@ func emitHystBulkSkip(b []byte, info dominantInfo,
 		return emitHystBulkSkipRotated(b, info, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal,
 			hystCounterLocal, hystPosLocal, deltaLocal, plainDelta)
 	}
+	if info.allowSet != nil {
+		// A character skip's gate keeps it from the runs it cannot cross,
+		// and one that crosses nothing all the same (the next character
+		// inside the gate's hull but not the loop, or invalid) is followed
+		// by the walk crossing that character before the next entry: at
+		// most one wasted skip per character, so the counter would only add
+		// its own cost to every entry.
+		return emitUTF8CharLoopSkip(b, info, false, posLocal, lenLocal, 0x00, ptrLocal, chunkLocal, tmpLocal, errLocal, nil)
+	}
 	// if hystCounter < N (channel still enabled)
 	b = append(b, 0x20, hystCounterLocal)
 	b = append(b, 0x41, nonMidHystStreak)
@@ -7492,6 +7656,10 @@ func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	if errLocal == 0 {
 		panic("compile: a UTF-8 bulk skip in a body that declared no error-lanes local")
 	}
+	if info.allowSet != nil {
+		return emitUTF8CharLoopSkip(b, info, updateLastAccept,
+			posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, onBoundsExit)
+	}
 	b = append(b, 0x02, 0x40) // block $bulk_done
 	b = append(b, 0x03, 0x40) // loop $bulk_outer
 	// pos + 17 > len: the hook, then the last chunk, overlapping (depth 2 is
@@ -7500,7 +7668,7 @@ func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	if onBoundsExit != nil {
 		b = onBoundsExit(b)
 	}
-	b = emitUTF8SkipTail(b, info.exitBytes, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, true, 2)
+	b = emitUTF8SkipTail(b, info.exitBytes, nil, posLocal, lenLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, true, 2)
 	b = append(b, 0x0B) // end if
 	b = emitBulkSkipLoadChunk(b, ptrLocal, posLocal, chunkLocal)
 	b = emitBulkSkipExitMask(b, info.exitBytes, chunkLocal)
@@ -7546,6 +7714,137 @@ func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	return b
 }
 
+// emitUTF8CharLoopSkip is emitUTF8BulkSkip for a loop over SOME characters
+// (dominantInfo.allowSet, prefer-match): the same stops, shaped for a loop
+// whose runs are words, where most entries cross a few characters and many
+// cross none.
+//
+// A run of the skip costs about what walking two characters of two bytes does
+// (62 fuel in a find body), so one that crosses none pays for nothing: as
+// first built, a word of one letter cost +84 fuel and one of two +22. Hence:
+//
+//   - the GATE: the skip runs only when the byte after pos can start a
+//     character the loop takes (charLoopGate), read under the first chunk's
+//     bounds test, which it shares; a decline there leaves at once, past the
+//     last_accept update (the dispatch has already set it to pos + 1, and pos
+//     has not moved);
+//   - the end-of-input form is gated the same way, and taken only with
+//     charSkipTailMin bytes left, below which the walk is cheaper;
+//   - the validity test is the structural one where allowSet allows it
+//     (utf8StructOK), which brings a run from 84 fuel to 62;
+//   - with no ASCII byte in allowSet an all-ASCII chunk needs no step of its
+//     own: lane 0 is an exit and the general step stops there.
+//
+// A word of one letter then costs 16 fuel more than unhinted and one of two
+// 4 (`\p{Cyrillic}+`); from three letters on the skip wins (−58 at three,
+// −368 at eight). Positions are emitUTF8BulkSkip's.
+func emitUTF8CharLoopSkip(b []byte, info dominantInfo, updateLastAccept bool,
+	pos, lenL, lastAccept, ptr, chunk, tmp, errL byte,
+	onBoundsExit func([]byte) []byte) []byte {
+	hasASCII := false
+	for _, c := range info.allowSet {
+		hasASCII = hasASCII || c < 0x80
+	}
+	structural := utf8StructOK(info.allowSet)
+	// Depths from the body of the blocks below: $tail 0, $done 1, $declined 2
+	// (just $done when last_accept is not kept here).
+	declined := byte(1)
+	if updateLastAccept {
+		declined = 2
+		b = append(b, 0x02, 0x40) // block $declined
+	}
+	bounds := func(b []byte, depth byte) []byte { // pos + 17 > len: br_if depth
+		return append(b, 0x20, pos, 0x41, 0x11, 0x6A, 0x20, lenL, 0x4B, 0x0D, depth)
+	}
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x02, 0x40) // block $tail
+	b = bounds(b, 0)
+	b = emitCharLoopGate(b, info.allowSet, ptr, pos, 1, declined)
+	b = append(b, 0x03, 0x40)                                                      // loop $outer
+	b = append(b, 0x20, ptr, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x01, 0x21, chunk) // chunk = v128.load(ptr + pos + 1)
+	b = emitCharExitMask(b, nil, info.allowSet, chunk)
+	b = append(b, 0x21, tmp) // tmp = exit lanes
+	if hasASCII {
+		// An all-ASCII chunk: the byte skip's step.
+		b = append(b, 0x20, chunk, 0xFD, 0x64, 0x45, 0x04, 0x40) // if (no byte above 0x7F)
+		b = append(b, 0x20, tmp, 0x45, 0x04, 0x40)               //   if (tmp == 0)
+		b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x21, pos)
+		b = bounds(b, 3)
+		b = append(b, 0x0C, 0x02, 0x0B) //     br $outer
+		b = append(b, 0x20, tmp, 0x68, 0x20, pos, 0x6A, 0x21, pos)
+		b = append(b, 0x0C, 0x03, 0x0B) //   br $done
+	}
+	b = emitCharLoopInvalidStop(b, structural, info.allowSet, chunk, tmp, errL)
+	b = append(b, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x03, 0x0B) // br $done
+	// No exit byte: advance to the open character's lead byte, or by 16.
+	b = append(b, 0x20, tmp, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, chunk, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64, 0x41) // i8x16.gt_u; i8x16.bitmask
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68, 0x20, pos, 0x6A, 0x21, pos) // i32.or; i32.ctz → 16 when none is open
+	b = bounds(b, 2)
+	b = append(b, 0x0C, 0x01, 0x0B) // br $outer
+	b = append(b, 0x20, tmp, 0x68, 0x20, pos, 0x6A, 0x21, pos)
+	b = append(b, 0x0C, 0x02) // br $done
+	b = append(b, 0x0B)       // end loop $outer
+	b = append(b, 0x0B)       // end $tail: fewer than 16 bytes after pos
+	if onBoundsExit != nil {
+		b = onBoundsExit(b)
+	}
+	// The end-of-input form is reached from the main loop too, after pos has
+	// moved, so its declines leave through $done, past last_accept's update.
+	b = append(b, 0x20, pos, 0x41, 1+charSkipTailMin, 0x6A, 0x20, lenL, 0x4B, 0x0D, 0x00)
+	b = emitCharLoopGate(b, info.allowSet, ptr, pos, 1, 0)
+	b = emitUTF8SkipTail(b, nil, info.allowSet, pos, lenL, ptr, chunk, tmp, errL, true, 0)
+	b = append(b, 0x0B) // end $done
+	if updateLastAccept {
+		b = append(b, 0x20, pos, 0x41, 0x01, 0x6A, 0x21, lastAccept)
+		b = append(b, 0x0B) // end $declined
+	}
+	return b
+}
+
+// charSkipTailMin is the fewest bytes after the skip's start for which a
+// character skip runs its end-of-input form (emitUTF8SkipTail): fewer hold at
+// most one character of several bytes, which the walk crosses for less than
+// the overlapping chunk costs.
+const charSkipTailMin = 4
+
+// emitCharLoopGate emits the character skip's gate: br_if depth unless the
+// byte at ptr + pos + off can start a character the loop takes. The test is
+// one unsigned range compare over the hull of allowSet's bytes that are not
+// continuation bytes (D0..D3 for `\p{Cyrillic}`, whose D2 is not taken):
+// a byte inside the hull that is not in allowSet only costs a skip that stops
+// at once. The caller has bounds-checked the read.
+func emitCharLoopGate(b []byte, allowSet []byte, ptr, pos, off, depth byte) []byte {
+	lo, span := charLoopGate(allowSet)
+	b = append(b, 0x20, ptr, 0x20, pos, 0x6A, 0x2D, 0x00, off) // i32.load8_u offset=off
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(lo))
+	b = append(b, 0x6B, 0x41) // i32.sub
+	b = utils.AppendSLEB128(b, int32(span))
+	return append(b, 0x4B, 0x0D, depth) // i32.gt_u; br_if depth
+}
+
+// emitCharLoopInvalidStop emits a character skip's validity test over the
+// chunk, as an if whose body pushes the lane to stop at (emitUTF8ErrorStop's)
+// and is left open for the caller to advance pos and branch out: the
+// structural test where allowSet allows it, Keiser-Lemire's otherwise.
+func emitCharLoopInvalidStop(b []byte, structural bool, allowSet []byte, chunk, tmp, errL byte) []byte {
+	if structural {
+		b = emitUTF8StructDiff(b, chunk, errL, allowSet)
+		b = append(b, 0x04, 0x40) // if (any lane breaks the structure)
+		return emitUTF8ErrorStopJ(b, chunk, tmp, func(b []byte) []byte {
+			return emitUTF8StructDiff(b, chunk, errL, allowSet)
+		})
+	}
+	b = emitUTF8ErrorLanes(b, chunk)
+	b = append(b, 0x22, errL)             // local.tee err: the stop reads it again
+	b = append(b, 0xFD, 0x53, 0x04, 0x40) // v128.any_true; if (invalid)
+	return emitUTF8ErrorStop(b, chunk, tmp, errL)
+}
+
 // emitUTF8ErrorStop pushes where a chunk that is not valid UTF-8 can be left
 // to the walk: the last character start at or before both the lane before
 // the first error and the first exit byte (tmpLocal's mask), or 0.
@@ -7565,6 +7864,17 @@ func emitUTF8BulkSkip(b []byte, info dominantInfo, updateLastAccept bool,
 // errLocal holds the chunk's error lanes, which the validity test computed
 // and kept: recomputing them here emitted the ~300-byte check twice per site.
 func emitUTF8ErrorStop(b []byte, chunkLocal, tmpLocal, errLocal byte) []byte {
+	return emitUTF8ErrorStopJ(b, chunkLocal, tmpLocal, func(b []byte) []byte {
+		b = append(b, 0x20, errLocal)
+		b = append(b, 0xFD, 0x0C)
+		b = append(b, make([]byte, 16)...)
+		return append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask
+	})
+}
+
+// emitUTF8ErrorStopJ is emitUTF8ErrorStop with the error lanes as an i32
+// mask errMask pushes.
+func emitUTF8ErrorStopJ(b []byte, chunkLocal, tmpLocal byte, errMask func([]byte) []byte) []byte {
 	b = append(b, 0x41, 0x1F) // i32.const 31
 	// The character starts: bytes that are not 10xxxxxx.
 	b = append(b, 0x20, chunkLocal, 0xFD, 0x0C)
@@ -7578,12 +7888,10 @@ func emitUTF8ErrorStop(b []byte, chunkLocal, tmpLocal, errLocal byte) []byte {
 	b = append(b, 0xFD, 0x24, 0xFD, 0x64) // i8x16.ne; i8x16.bitmask
 	// Lanes up to j - 1: (1 << j) - 1, j the first error lane.
 	b = append(b, 0x41, 0x01)
-	b = append(b, 0x20, errLocal)
-	b = append(b, 0xFD, 0x0C)
-	b = append(b, make([]byte, 16)...)
-	b = append(b, 0xFD, 0x24, 0xFD, 0x64, 0x68) // i8x16.ne; i8x16.bitmask; i32.ctz
-	b = append(b, 0x74, 0x41, 0x01, 0x6B)       // i32.shl; i32.const 1; i32.sub
-	b = append(b, 0x71)                         // i32.and
+	b = errMask(b)
+	b = append(b, 0x68)                   // i32.ctz
+	b = append(b, 0x74, 0x41, 0x01, 0x6B) // i32.shl; i32.const 1; i32.sub
+	b = append(b, 0x71)                   // i32.and
 	// Lanes up to the first exit byte: (lowest bit << 1) - 1, all for none.
 	b = append(b, 0x20, tmpLocal, 0x41, 0x00, 0x20, tmpLocal, 0x6B, 0x71) // tmp & -tmp
 	b = append(b, 0x41, 0x01, 0x74, 0x41, 0x01, 0x6B, 0x71)               // << 1; - 1; and
@@ -7613,7 +7921,7 @@ func emitUTF8ErrorStop(b []byte, chunkLocal, tmpLocal, errLocal byte) []byte {
 // ends on the lane. ptr and len are the input's locals. Every way out — at
 // once when nothing is left or len < 16, or with pos moved — branches to the
 // block out levels up from where the code starts.
-func emitUTF8SkipTail(b []byte, exitBytes []byte, pos, lenL, ptrL, chunk, mask, errLanes byte, before bool, out byte) []byte {
+func emitUTF8SkipTail(b []byte, exitBytes, allowSet []byte, pos, lenL, ptrL, chunk, mask, errLanes byte, before bool, out byte) []byte {
 	start := func(b []byte) []byte { // the position the chunk starts from: pos, or pos + 1
 		b = append(b, 0x20, pos)
 		if before {
@@ -7641,7 +7949,7 @@ func emitUTF8SkipTail(b []byte, exitBytes []byte, pos, lenL, ptrL, chunk, mask, 
 	b = append(b, 0x20, lenL, 0x41, 0x10, 0x49, 0x0D, out) // len < 16: leave
 	// chunk = v128.load(ptr + len - 16)
 	b = append(b, 0x20, ptrL, 0x20, lenL, 0x6A, 0x41, 0x10, 0x6B, 0xFD, 0x00, 0x00, 0x00, 0x21, chunk)
-	b = emitBulkSkipExitMask(b, exitBytes, chunk)
+	b = emitCharExitMask(b, exitBytes, allowSet, chunk)
 	b = append(hi(b), 0x71, 0x21, mask) // mask = exit lanes past d
 	// No byte above 0x7F past d: stop at the first exit byte, or take it all.
 	b = append(b, 0x20, chunk, 0xFD, 0x64)
@@ -7700,6 +8008,80 @@ func emitUTF8ErrorStopFrom(b []byte, chunkLocal, tmpLocal, errLocal byte, hi fun
 	b = hi(b)
 	b = append(b, 0x6B, 0x71, 0x72, 0x67, 0x6B) // i32.sub; i32.and; i32.or; i32.clz; i32.sub
 	return b
+}
+
+// charLoopGate returns the hull [lo, lo + span] of allowSet's bytes that are
+// not continuation bytes: the bytes a character of the loop starts with
+// (charLoopAllowSet keeps at least one lead byte).
+func charLoopGate(allowSet []byte) (lo, span byte) {
+	first, last := -1, -1
+	for _, c := range allowSet {
+		if c >= 0x80 && c < 0xC0 {
+			continue
+		}
+		if first < 0 {
+			first = int(c)
+		}
+		last = int(c)
+	}
+	return byte(first), byte(last - first)
+}
+
+// utf8StructOK reports whether a character skip's allowSet admits the
+// structural validity test (emitUTF8StructDiff): it holds no byte that is
+// never valid (C0, C1, F5..FF) and no lead byte whose second byte is
+// narrowed (E0, ED, F0, F4), so a run of its bytes is valid UTF-8 exactly
+// when every lead is followed by as many continuation bytes as it announces
+// and no continuation byte stands anywhere else.
+func utf8StructOK(allowSet []byte) bool {
+	if allowSet == nil {
+		return false
+	}
+	for _, c := range allowSet {
+		if c == 0xC0 || c == 0xC1 || c == 0xE0 || c == 0xED || c >= 0xF0 && c != 0xF1 && c != 0xF2 && c != 0xF3 {
+			return false
+		}
+	}
+	return true
+}
+
+// emitUTF8StructDiff pushes the i32 mask of the lanes where a chunk read from
+// a character boundary breaks UTF-8's structure: a continuation byte where
+// no lead announced one, or another byte where one did. Before the chunk's
+// first byte outside allowSet (utf8StructOK) that is exactly Keiser-Lemire's
+// verdict, in about half its instructions; past it the lanes are the exit's to
+// judge, so only lead lengths allowSet can hold are modelled and a longer
+// character after the exit costs the error path, never a wrong stop.
+// scratch is a v128 local the mask may use.
+func emitUTF8StructDiff(b []byte, chunk, scratch byte, allowSet []byte) []byte {
+	var has3, has4 bool
+	for _, c := range allowSet {
+		has3 = has3 || c >= 0xE0
+		has4 = has4 || c >= 0xF0
+	}
+	geMask := func(b []byte, v byte) []byte { // bitmask(chunk >= v), unsigned
+		b = append(b, 0x20, chunk, 0xFD, 0x0C)
+		for i := 0; i < 16; i++ {
+			b = append(b, v)
+		}
+		return append(b, 0xFD, 0x2C) // i8x16.ge_u
+	}
+	b = append(b, 0x20, chunk, 0xFD, 0x64) // the bytes above 0x7F
+	b = geMask(b, 0xC0)
+	b = append(b, 0x22, scratch, 0xFD, 0x64) // local.tee; i8x16.bitmask: the leads
+	b = append(b, 0x73)                      // i32.xor: the continuation bytes
+	b = append(b, 0x20, scratch, 0xFD, 0x64, 0x41, 0x01, 0x74)
+	if has3 {
+		b = geMask(b, 0xE0)
+		b = append(b, 0xFD, 0x64, 0x41, 0x02, 0x74, 0x72)
+	}
+	if has4 {
+		b = geMask(b, 0xF0)
+		b = append(b, 0xFD, 0x64, 0x41, 0x03, 0x74, 0x72)
+	}
+	b = append(b, 0x73, 0x41) // i32.xor; i32.const 0xFFFF
+	b = utils.AppendSLEB128(b, 0xFFFF)
+	return append(b, 0x71) // i32.and
 }
 
 // utf8OpenTail holds, per lane, the largest byte that cannot open a
@@ -16681,7 +17063,10 @@ func planLenAltLayout(altp *lenAltPattern, tableBase int64, find bool) lenAltLay
 			lmNonMidShufti:       false,
 			lmWideShufti:         false,
 			forceWordChar:        br.dfaTable.hasWordBoundary,
-			forceNewline:         find && br.dfaTable.hasNewlineBoundary,
+			// The anchored match's verify consumes the whole input, so it
+			// emits no word-boundary pre-accept check, the table's reader.
+			noWordCharTable: !find,
+			forceNewline:    find && br.dfaTable.hasNewlineBoundary,
 			// The anchored match walks a branch with its run skips
 			// (inlineVerifySkip); over whole characters in Unicode mode.
 			utf8Text: !find && altp.unicode,
@@ -16938,6 +17323,9 @@ func emitInlineAnchoredDFAVerify(b []byte, dl *dfaLayout,
 	// ever moves below this point, step one stops holding and this becomes a
 	// silent wrong answer.
 	if !fullConsumption {
+		if dl.noWordCharTable {
+			panic("compile: a word-boundary pre-accept check over a layout without its wordCharTable")
+		}
 		b = emitWBPreAcceptCheck(b, dl.wordCharTableOff, dl.midAcceptWOff, dl.midAcceptNWOff,
 			dl.needWordCharTable, locPtr, locPos, locState, locOutEnd, tableMemIdx)
 	}

@@ -1,9 +1,11 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -1667,6 +1669,13 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 // is driven.
 func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32) (matches []setMatch, switched bool) {
 	t.Helper()
+	return runGatedDriveBlocksWith(t, pats, input, mode, batchCap, nil)
+}
+
+// runGatedDriveBlocksWith is runGatedDriveBlocks with the set's config passed
+// through setCfg first (a hint, the set's mode), when it is not nil.
+func runGatedDriveBlocksWith(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32, setCfg func(*config.SetConfig)) (matches []setMatch, switched bool) {
+	t.Helper()
 	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
@@ -1677,6 +1686,9 @@ func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchb
 		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names}}}}
 	if batchCap != 0 {
 		cfg.Sets[0].Hints = []string{"batch-find"}
+	}
+	if setCfg != nil {
+		setCfg(&cfg.Sets[0])
 	}
 	w, _, diags, err := compile.CompileFileDiag(cfg, "")
 	if err != nil {
@@ -1860,6 +1872,200 @@ func TestSparseCounterHandoverMatchesGo(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestSparseMemberCharSkipMatchesGo drives a Unicode-mode prefer-match set
+// whose one sparse bucket's member states loop over whole characters — 40
+// members `union[ \t]+kNN[^;]+`, the member skip's CHARACTER sets
+// (buildMemberSets) — over tails of 2-, 3- and 4-byte characters, mixed with
+// ASCII, cut by the skip's 16-byte chunks at every offset, ending at the
+// input's end or at a `;`. Valid UTF-8 is judged against Go; over invalid
+// UTF-8 (a stray 0xFF, a stray continuation, an overlong form, a sequence cut
+// at the end), where Go's answers differ from Unicode mode's by design, the
+// hinted build must answer exactly as the neutral one does, which has no skip.
+func TestSparseMemberCharSkipMatchesGo(t *testing.T) {
+	pats := make([]string, 40)
+	for i := range pats {
+		pats[i] = fmt.Sprintf(`union[ \t]+k%02d[^;]+`, i)
+	}
+	on := true
+	hinted := func(sc *config.SetConfig) { sc.Unicode = &on; sc.Hints = []string{"prefer-match"} }
+	neutral := func(sc *config.SetConfig) { sc.Unicode = &on }
+
+	// Not vacuous: the bucket must carry character sets.
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names}}
+	hinted(&sc)
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chars := 0
+	for _, b := range diags[0].Buckets {
+		chars += b.MemberSkipCharStates
+	}
+	if chars == 0 {
+		t.Fatal("no member state strides whole characters: the character skip went unexercised")
+	}
+
+	rng := rand.New(rand.NewSource(124))
+	alphabets := []string{"абвгдежзиклмнопрстуфхцчшщыэюя", "日本語文字列検索", "😀🎉🚀𝄞", "aé ж日😀x\t", "abc def"}
+	tail := func(n int) string {
+		var sb strings.Builder
+		alpha := []rune(alphabets[rng.Intn(len(alphabets))])
+		for sb.Len() < n {
+			sb.WriteRune(alpha[rng.Intn(len(alpha))])
+		}
+		return sb.String()
+	}
+	var valid []string
+	for i := 0; i < 24; i++ {
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("x", rng.Intn(16))) // shifts the chunks against the characters
+		for r := rng.Intn(5) + 1; r > 0; r-- {
+			sb.WriteString(fmt.Sprintf("union%sk%02d%s", []string{" ", "\t", "  "}[rng.Intn(3)], rng.Intn(40), tail(rng.Intn(120)+1)))
+			if rng.Intn(4) > 0 {
+				sb.WriteString("; ")
+			}
+		}
+		valid = append(valid, sb.String())
+	}
+	valid = append(valid, "union k07"+strings.Repeat("ж", 200), "union k01ж;union k02日;union k03😀", "union k00"+strings.Repeat("日x", 50)+";")
+	invalid := []string{
+		"union k05" + strings.Repeat("ж", 20) + "\xff" + strings.Repeat("ж", 20) + ";",
+		"union k05" + strings.Repeat("ж", 20) + "\x80" + strings.Repeat("日", 20),
+		"union k05" + strings.Repeat("ж", 20) + "\xc0\xaf" + strings.Repeat("ж", 20),
+		"union k05" + strings.Repeat("ж", 30) + "\xd0",
+		"union k05" + strings.Repeat("ж", 7) + "\xe6\x97" + strings.Repeat("a", 30),
+	}
+	for i, in := range valid {
+		t.Run(fmt.Sprintf("valid/%d", i), func(t *testing.T) {
+			want := gatedOracle(pats, in)
+			sortMatches(want)
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				got, _ := runGatedDriveBlocksWith(t, pats, in, mode, 0, hinted)
+				sortMatches(got)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s over %q:\n  got  %v\n  want %v", mode, in, got, want)
+				}
+			}
+		})
+	}
+	for i, in := range invalid {
+		t.Run(fmt.Sprintf("invalid/%d", i), func(t *testing.T) {
+			want, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, neutral)
+			got, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, hinted)
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("over %q:\n  hinted  %v\n  neutral %v", in, got, want)
+			}
+		})
+	}
+}
+
+// TestSetCharLoopSkipMatchesGo drives a Unicode set whose members walk a loop
+// over SOME characters (a letter class) under prefer-match: the bucket bodies'
+// character skip, gated on the next byte and with the structural validity
+// test, against Go over valid text — values of every length, the chunks
+// shifted against the characters — and against the unhinted build over
+// invalid text.
+func TestSetCharLoopSkipMatchesGo(t *testing.T) {
+	var pats []string
+	for i := 0; i < 8; i++ {
+		pats = append(pats, fmt.Sprintf(`ключ%d=\p{Cyrillic}+;`, i))
+	}
+	pats = append(pats, `val:\pL+=\pL+`)
+	on := true
+	hinted := func(sc *config.SetConfig) { sc.Unicode = &on; sc.Hints = []string{"prefer-match"} }
+	neutral := func(sc *config.SetConfig) { sc.Unicode = &on }
+
+	// Not vacuous: the hinted module carries the structural test (its lead
+	// mask, chunk >= 0xC0), the unhinted one does not.
+	sig := append(append([]byte{0xFD, 0x0C}, bytes.Repeat([]byte{0xC0}, 16)...), 0xFD, 0x2C)
+	for _, c := range []struct {
+		cfg  func(*config.SetConfig)
+		want bool
+	}{{hinted, true}, {neutral, false}} {
+		entries := make([]config.PatternEntry, len(pats))
+		names := make([]string, len(pats))
+		for i, p := range pats {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+		}
+		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names}}
+		c.cfg(&sc)
+		w, _, _, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Contains(w, sig); got != c.want {
+			t.Fatalf("hints %v: the structural test emitted = %v, want %v", sc.Hints, got, c.want)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(1015))
+	word := func(n int) string {
+		alpha := []rune("абвгдежзиклмнопрстуфхцчшщыэюяёіѣӭ")
+		var sb strings.Builder
+		for ; n > 0; n-- {
+			sb.WriteRune(alpha[rng.Intn(len(alpha))])
+		}
+		return sb.String()
+	}
+	var valid []string
+	for i := 0; i < 24; i++ {
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("x", rng.Intn(16)))
+		for r := rng.Intn(6) + 1; r > 0; r-- {
+			n := []int{1, 2, 3, rng.Intn(40) + 1}[rng.Intn(4)]
+			switch rng.Intn(3) {
+			case 0:
+				sb.WriteString(fmt.Sprintf("ключ%d=%s; ", rng.Intn(8), word(n)))
+			case 1:
+				sb.WriteString(fmt.Sprintf("val:%s=%s ", word(n), []string{"ab", word(rng.Intn(5) + 1), "ж"}[rng.Intn(3)]))
+			default:
+				sb.WriteString(word(n) + " ")
+			}
+		}
+		valid = append(valid, sb.String())
+	}
+	valid = append(valid, "ключ1="+strings.Repeat("ж", 200)+";", "ключ2=ж;ключ3=жж;", "val:a=b val:ж=ё val:"+word(30)+"="+word(30))
+	invalid := []string{
+		"ключ5=" + strings.Repeat("ж", 20) + "\xd0\xd0" + strings.Repeat("ж", 20) + ";",
+		"ключ5=" + strings.Repeat("ж", 20) + "\x80" + strings.Repeat("ж", 20) + ";",
+		"ключ5=" + strings.Repeat("ж", 7) + "\xd0;",
+		"val:" + strings.Repeat("ж", 9) + "\xe6\x97=" + strings.Repeat("ж", 9),
+	}
+	for i, in := range valid {
+		t.Run(fmt.Sprintf("valid/%d", i), func(t *testing.T) {
+			want := gatedOracle(pats, in)
+			sortMatches(want)
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				got, _ := runGatedDriveBlocksWith(t, pats, in, mode, 0, hinted)
+				sortMatches(got)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s over %q:\n  got  %v\n  want %v", mode, in, got, want)
+				}
+			}
+		})
+	}
+	for i, in := range invalid {
+		t.Run(fmt.Sprintf("invalid/%d", i), func(t *testing.T) {
+			want, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, neutral)
+			got, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, hinted)
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("over %q:\n  hinted  %v\n  neutral %v", in, got, want)
+			}
+		})
 	}
 }
 

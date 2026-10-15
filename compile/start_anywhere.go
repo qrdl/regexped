@@ -724,7 +724,8 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 	if fwdTable == nil {
 		return startAnywherePasses{}, false
 	}
-	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true, utf8Text: pattern.unicode()})
+	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true, utf8Text: pattern.unicode(),
+		lmCharLoop: opts.LikelyMode == LikelyMatch})
 	var fwdNotes *notesRows
 	if nr != nil {
 		if fwdNotes = newNotesRows(fwdTable, fwdL); fwdNotes != nil {

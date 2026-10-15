@@ -269,7 +269,11 @@ type BucketDiag struct {
 	// and silently stopped firing".
 	MemberSkipStates int `json:"member_skip_states,omitempty"`
 	MemberSkipSets   int `json:"member_skip_sets,omitempty"`
-	TableBytes       int `json:"table_bytes"`
+	// MemberSkipCharStates is how many of those states stride whole UTF-8
+	// characters rather than bytes (a Unicode-mode set's `[^;]+`, `.+` tails:
+	// buildMemberSets' character sets).
+	MemberSkipCharStates int `json:"member_skip_char_states,omitempty"`
+	TableBytes           int `json:"table_bytes"`
 }
 
 // ConflictDiag records a bin-packing rejection.

@@ -950,6 +950,41 @@ alternation literal-anchored find's branch verify: a member like
 `&ключ=[^&]+&` over records with 40-letter Russian values went 63.50 → 19.02
 fuel/byte, `x{3}abc[^,]*z|y{3}ghi[^,]*z` 32.97 → 12.74.
 
+**Runs of some characters (`prefer-match`).** A letter class — `\pL`,
+`\p{Cyrillic}` — keeps only SOME non-ASCII characters, so the skip above,
+which needs every one of them to loop, cannot serve it. Under `prefer-match`
+such a loop is taken per lead byte: a lead byte ALL of whose characters lead
+back to the state joins the bytes a chunk may hold, with the ASCII bytes the
+state loops on and every continuation byte; a lead byte with even one
+character outside the class is an exit, and the walk judges its characters
+(D2 under `\p{Cyrillic}`, which also holds two combining marks of another
+script). Its runs are words, and one run of the skip costs about what walking
+two two-byte letters does, so a run that crosses none pays for nothing. Hence
+three things the skip above does not need. It runs only when the byte after
+the walk's position can start a letter of the loop — one range compare over
+the hull of those bytes, under the first chunk's bounds test, which it shares.
+Where the allowed lead bytes need no second-byte range check (none of E0, ED,
+F0, F4), validity is STRUCTURAL: each lead followed by as many continuation
+bytes as it announces and no continuation byte anywhere else, read off two
+or three SIMD compares; a run then costs 62 fuel in a find body rather than
+84. And in the TDFA, whose arms entering the loop are one per partial-letter
+state (262 a loop for `(\pL+)=(\pL+)`), the skip is emitted ONCE per loop,
+after the tag-op dispatch, and each entering arm branches to it — inline in
+every arm it made `^(\pL+)=(\pL+)`'s capture body 8.3 MB, over WebAssembly's
+function size cap — and a capture call whose window (the match) is under 16
+bytes runs a second copy of the capture body without these skips.
+
+Measured in fuel, prefer-match against the unhinted build, over Russian text:
+`\p{Cyrillic}+` find over 13-14-letter words −66.0%, over prose −32.4%, over
+words of one and two letters +5.0%; `(\p{Cyrillic}+)\s(\d*)` groups −25.0% /
++4.2% (long / short words); `(\pL+)=(\pL+)` groups −54.0% / +6.6%; a set of
+`ключN=\p{Cyrillic}+;` members −54% to −55% over long values and +1.9% over
+values of one or two letters; no-match text unchanged. Per word, against the
+unhinted find: a one-letter word +16, a two-letter one +4, from three letters
+on less (−58 at three). Without the gate, the structural test and the copy,
+the short-word rows cost +27.6%, +7.5% (sets) and +15.8%. Modules grow:
+`\p{Cyrillic}+` 6.3 → 7.4 KB, `(\pL+)=(\pL+)` 1.74 → 1.80 MB.
+
 **Run skips in the set probes and the lenient match.** A set's scan probes
 (`scan_any`, `scan_all`), its anchored probes (`match_any`, `match_all`) and a
 lenient alternation's anchored match (a literal-chain branch beside DFA
