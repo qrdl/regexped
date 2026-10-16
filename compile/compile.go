@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"regexp/syntax"
 	"strconv"
@@ -143,6 +144,15 @@ const maxBTFallbackPrefixLen = 64
 // Backtracking frame stack now grows at call time in the run-time scratch, so
 // only the table base is left to check.
 var ErrBTStackTooLarge = errors.New("compile: backtracking tables would start past WASM's 4GiB memory limit")
+
+// ErrTablesOutOfRange is returned when a module's tables would not all lie in
+// [0, 2 GiB): the caller's tableBase is negative or past it, or the tables
+// laid out from it reach past it. Table addresses are held as int32 here, so
+// such a module used to compile without an error — its offsets wrapped, its
+// memory was sized from the wrapped end, and its code read outside it (a base
+// just under 4 GiB) or on top of the caller's own data (a base of 8 GiB).
+// WebAssembly addresses up to 4 GiB; this compiler places tables below 2.
+var ErrTablesOutOfRange = errors.New("compile: tables must lie below 2 GiB (2147483648 bytes)")
 
 // maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
 // section cannot declare more than 65536 pages of 65536 bytes each.
@@ -3561,6 +3571,12 @@ func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool
 	globals := &moduleGlobals{}
 	opts.globals = globals
 	var compiled []*compiledPattern
+	// A base past int32 loses its high bits outright (8 GiB lays the tables
+	// out at 0); one inside it wraps only the tables that reach past it, which
+	// the assembled module's data segments show below.
+	if tableBase < 0 || tableBase > math.MaxInt32 {
+		return nil, 0, fmt.Errorf("%w: the table base is %d", ErrTablesOutOfRange, tableBase)
+	}
 	cur := tableBase
 	for _, re := range patterns {
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
@@ -3605,6 +3621,12 @@ func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool
 	w := assembleModule(compiled, memPages, standalone, globals, asm)
 	if err := checkFunctionSizes(w, owners); err != nil {
 		return nil, 0, err
+	}
+	// A table whose int32 address wrapped is a segment at a negative offset;
+	// literal-anchored tables are laid out here, at assembly, so this is the
+	// one place every table's address is known.
+	if low, high, err := utils.DataSegmentBounds(sectionContent(w, 11)); err == nil && (low < 0 || high > math.MaxInt32+1) {
+		return nil, 0, fmt.Errorf("%w: tables from the base %d reach past it", ErrTablesOutOfRange, tableBase)
 	}
 	opts.Report.noteModule(globals)
 	return w, lastTableEnd, nil

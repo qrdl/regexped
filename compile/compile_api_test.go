@@ -3369,6 +3369,278 @@ func TestOddShapesValidate(t *testing.T) {
 	}
 }
 
+// TestUnicodeCharLoopSkipsValidate compiles prefer-match's character skips in
+// Unicode mode — the find and match bodies' loop over SOME characters (a
+// letter class, charLoopAllowSet), the TDFA capture body's copy of it, a set
+// bucket's, and a sparse bucket's member CHARACTER sets — and validates every
+// module. Leads of every width are among the classes: E0 and ED (the
+// structural test refuses them, so Keiser-Lemire's runs), and 4-byte ones
+// only (its F0 term). Answers are checked against Go in tools/fuzz
+// (TestUnicodeCharLoopSkip, TestSetCharLoopSkipMatchesGo,
+// TestSparseMemberCharSkipMatchesGo); here every shape must take the skip, or
+// the test exercises nothing.
+func TestUnicodeCharLoopSkipsValidate(t *testing.T) {
+	lm := CompileOptions{Unicode: true, LikelyMode: LikelyMatch}
+	for _, pat := range []string{
+		`\p{Cyrillic}+`, `\pL+`, `\p{Han}+`, `[\x{0400}-\x{047F}]+`, `x\p{Cyrillic}*,`, `\pL{3,}1`,
+		`[\x{0800}-\x{FFFF}]+`, `[\x{40000}-\x{FFFFF}]+`, `\pL+=\pL+`, `(?m:\pL+$)`,
+	} {
+		for _, e := range []config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "f"}, {Name: "p", Regexp: pat, MatchFunc: "m"}} {
+			rep := &Reporter{}
+			o := lm
+			o.Report = rep
+			w, _, err := Compile([]config.PatternEntry{e}, 0, true, o)
+			if err != nil {
+				t.Fatalf("%s: %v", pat, err)
+			}
+			validateWASM(t, w)
+			rep.End()
+			var sb strings.Builder
+			rep.Render(&sb)
+			if e.FindFunc != "" && !strings.Contains(sb.String(), "SIMD bulk skip") {
+				t.Errorf("%s: find takes no skip under prefer-match:\n%s", pat, sb.String())
+			}
+		}
+	}
+	// A capture loop with no ASCII byte in it (`\p{Han}+`) takes no skip:
+	// detectTDFAUTF8Skip learns the loop's ops from an ASCII byte.
+	for _, c := range []struct {
+		pat  string
+		skip bool
+	}{
+		{`(\pL+)=(\pL+)`, true}, {`^(\pL+)=(\pL+)`, true}, {`(\d)([^\d,]+)`, true},
+		{`(\p{Cyrillic}+)\s(\d*)`, false}, {`<(\p{Han}+)>`, false},
+		{`([\x{0800}-\x{FFFF}]+);`, false}, {`([\x{40000}-\x{FFFFF}]+);`, false},
+	} {
+		pat := c.pat
+		w, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "g"}}, 0, true, lm)
+		if err != nil {
+			t.Fatalf("%s: %v", pat, err)
+		}
+		validateWASM(t, w)
+		rp, err := resolvePattern(pat, nil, &lm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tt, ok := newTDFA(mp, 1<<14)
+		if !ok {
+			t.Fatalf("%s: no TDFA", pat)
+		}
+		if got := slices.ContainsFunc(tdfaWithCharLoops(tt, mp, LikelyMatch).utf8Skip,
+			func(i tdfaUTF8SkipInfo) bool { return i.allowSet != nil }); got != c.skip {
+			t.Errorf("%s: the capture body takes a character skip = %v, want %v", pat, got, c.skip)
+		}
+	}
+
+	on := true
+	sets := [][]string{{`val:\pL+=\pL+`, `ключ0=\p{Cyrillic}+;`, `ключ1=\p{Cyrillic}+;`, `ключ2=[\x{0800}-\x{FFFF}]+;`}}
+	// Two sparse buckets: tails that loop on ASCII bytes too, and tails that
+	// loop on no ASCII byte, only on every non-ASCII character (a member
+	// CHARACTER set with no ASCII members).
+	var sparse, sparseHigh []string
+	for i := 0; i < 40; i++ {
+		sparse = append(sparse, fmt.Sprintf(`union[ \t]+k%02d[^;]+`, i))
+		sparseHigh = append(sparseHigh, fmt.Sprintf(`union[ \t]+k%02d[^\x00-\x7F]+`, i))
+	}
+	sets = append(sets, sparse, sparseHigh)
+	for _, pats := range sets {
+		entries := make([]config.PatternEntry, len(pats))
+		for i, p := range pats {
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
+		}
+		for _, sc := range []config.SetConfig{
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true}},
+			{Name: "s", Find: "f", Hints: []string{"batch-find"}, Patterns: config.PatternSelector{All: true}},
+			{Name: "s", ScanAny: "sa", ScanAll: "sl", MatchAny: "ma", MatchAll: "ml", Patterns: config.PatternSelector{All: true}},
+		} {
+			sc.Unicode = &on
+			sc.Hints = append(sc.Hints, "prefer-match")
+			w, _, diags, err := CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+			if err != nil {
+				t.Fatalf("%v: %v", sc, err)
+			}
+			validateWASM(t, w)
+			if len(pats) == 40 && sc.Find != "" && !sc.Overlapping {
+				chars := 0
+				for _, b := range diags[0].Buckets {
+					chars += b.MemberSkipCharStates
+				}
+				if chars == 0 {
+					t.Errorf("%v: no member state strides whole characters", sc)
+				}
+			}
+		}
+	}
+}
+
+// TestRareSinglePatternPaths compiles single patterns that each reach a branch
+// no other test does — limits a pattern exceeds (a reversed prefix automaton
+// over 255 or 2,048 states, per-search notes that cannot cover the cycle
+// states, a find DFA over max_dfa_memory), a switch with nothing to hand over
+// to once Backtracking is off, shapes at the edges of the literal-chain and
+// alternation analysers — and validates every module. Where the branch ends
+// the compile, the error must say why; where it shows in the report, the
+// report must say so.
+func TestRareSinglePatternPaths(t *testing.T) {
+	// prefixAlt(n): n alternatives whose forward automaton stays small and
+	// whose reversed one needs about 2^n states.
+	prefixAlt := func(n int) string {
+		alts := make([]string, 0, n)
+		for k := 0; k < n; k++ {
+			s := string(rune('a' + k))
+			if k > 0 {
+				s += fmt.Sprintf("[xy]{%d}", k)
+			}
+			s += "x"
+			if r := n - 1 - k; r > 0 {
+				s += fmt.Sprintf("[xy]{%d}", r)
+			}
+			alts = append(alts, s)
+		}
+		return "(?:" + strings.Join(alts, "|") + ")"
+	}
+	var nine, ten []string
+	for c := 'a'; c <= 'i'; c++ {
+		nine = append(nine, string(c)+"0[0-9]{24}") // one past the two-byte Teddy's eight
+	}
+	for c := 'a'; c <= 'j'; c++ {
+		ten = append(ten, string(c)+"[0-9]{230}x") // the lenient alternation over 2,048 states
+	}
+	const btOff = -1
+	find := func(re string) config.PatternEntry { return config.PatternEntry{Name: "p", Regexp: re, FindFunc: "f"} }
+	groups := func(re string) config.PatternEntry {
+		return config.PatternEntry{Name: "p", Regexp: re, GroupsFunc: "g"}
+	}
+	for _, c := range []struct {
+		e        config.PatternEntry
+		o        CompileOptions
+		wantErr  string // the compile must fail with this
+		wantNote string // the report must carry this
+	}{
+		{e: find(prefixAlt(12) + "foo|[a-z]{13}bar")}, // reversed prefix over the build cap
+		{e: find(prefixAlt(8) + "foo|[a-z]{9}bar")},   // reversed prefix over u8 ids
+		{e: find(`[a-z]+x`), o: CompileOptions{MaxDFAMemory: 1, MaxBTInstructions: btOff},
+			wantErr: "its find DFA table is over the memory bound (1 bytes)"},
+		{e: find(` (?:\b|0*)0`), o: CompileOptions{MaxBTInstructions: btOff},
+			wantErr: "its find DFA has an ambiguous word-boundary target"},
+		{e: find(`[a-k][ab]{6}foo`), o: CompileOptions{MaxDFAStates: 20, StartAnywhereSwitchN: 1, MaxBTInstructions: btOff},
+			wantNote: "find: switch — forced"},
+		{e: find(`a(?:\b*b|c)`)}, // the zero-width collapse changes the program, so it is undone
+		{e: find(`[^\x{17E}-\x{180}]`)},
+		{e: config.PatternEntry{Name: "p", Regexp: `x{130}[^y]*y`, MatchFunc: "m"}, wantNote: "byte-class compressed table"},
+		{e: find(`xy[a-z]{130}(?m:$)|zz[0-9]{24}`)},
+		{e: find(`[a-z]{2}foo[a-z]{130}x|[0-9]{2}bar[0-9]+y`), wantNote: "byte-class compressed table"},
+		{e: find(`[a-z]{2}ab[^\n]*c[^\n]*|[0-9]{2}xy[^\n]*z[^\n]*`), wantNote: "alternation literal-anchored find"},
+		{e: find(`[a-z]{2}(?:ab|cb|db|eb|fb)x|[0-9]{2}(?:gb|hb|ib|jb|kb)y`), wantNote: "alternation literal-anchored find"},
+		{e: find(`foo[a-z]{13,20}^|bar[0-9]{13,20}`)},
+		{e: find(`[ab]{4}XY[0-9]{24,30}`), wantNote: "literal-anchored find"},
+		{e: groups(`foo([a-z]){24}`)},
+		{e: groups(`foo([a-z]){24,30}`)},
+		{e: groups(`foo([a-z]){24}|bar([0-9]){24}`)},
+		{e: find(strings.Join(nine, "|"))},
+		{e: groups(`^(a)^(b)`)},
+		{e: find(strings.Join(ten, "|"))},
+		{e: find(`foo,\b[a-z]*y?x|bar[0-9]{24}`), wantNote: "find: switch — not provably linear"},
+		// A switch whose start-anywhere find is over the limits and whose
+		// Backtracking find is off keeps today's find, plain and literal-anchored.
+		{e: find(`a[ab]{11}[ab]*x`), o: CompileOptions{MaxBTInstructions: btOff}, wantNote: "find: switch unavailable — today's find kept"},
+		{e: find(`a[ab]{11}[ab]*xyz[a-z]*q`), o: CompileOptions{MaxBTInstructions: btOff}, wantNote: "find: switch unavailable — today's find kept"},
+		// 2,048 cycle states: more than per-search notes cover.
+		{e: find(`(?:a|b)*a(?:a|b){10}c|a`), o: CompileOptions{MaxDFAStates: 20000}},
+		{e: find(`(?:a|b)*a(?:a|b){10}c|a`), o: CompileOptions{MaxDFAStates: 20000, MaxBTInstructions: btOff},
+			wantErr: "more than per-search notes cover"},
+		// The part after the literal is over the build cap when unanchored, so
+		// whether it can contain the literal is answered "yes".
+		{e: find(`[0-9]+xyz(?:|[ab]*a[ab]{11})`), wantNote: "find: switch — not provably linear"},
+		// More looping states than the start-anywhere forward pass skips over.
+		{e: find(`x[^\n]*|y[^\n]*1|z[^\n]*2`), o: CompileOptions{StartAnywhereFind: true}, wantNote: "find: start-anywhere — forced"},
+		// Shapes from tools/re2test's custom corpora, each the one input there
+		// that reaches its branch.
+		{e: find(`\bfoo\b`), o: CompileOptions{Unicode: true, LikelyMode: LikelyMatch}},
+		{e: groups(`((a*)+)`), o: CompileOptions{Unicode: true}},
+		{e: find(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}gzork[0-9]{4}`), wantNote: "alternation literal-anchored find"},
+		{e: find(`^A[0-9]{24,30}?|zz[0-9]{24}`)},
+		{e: find(`[a-z]{12,}[0-9]`), o: CompileOptions{LikelyMode: LikelyMatch}},
+		{e: find(`^(\B|0)*`)}, // a fallback-only find that matches only at 0
+		{e: find(`0$|-(\b|0*)0`)},
+		{e: find(`[^\p{L}\s]+`), o: CompileOptions{Unicode: true, LikelyMode: LikelyNoMatch}},
+		{e: config.PatternEntry{Name: "p", Regexp: `\P{Any}`, MatchFunc: "m"}, o: CompileOptions{Unicode: true}},
+		{e: groups(`([^,]+),[0-9]*`)}, // not the single-capture affix shape
+	} {
+		r := &Reporter{}
+		o := c.o
+		o.Report = r
+		w, _, err := Compile([]config.PatternEntry{c.e}, 0, true, o)
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("%s: err = %v, want %q", c.e.Regexp, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", c.e.Regexp, err)
+		}
+		validateWASM(t, w)
+		r.End()
+		var sb strings.Builder
+		r.Render(&sb)
+		if !strings.Contains(sb.String(), c.wantNote) {
+			t.Errorf("%s: report lacks %q:\n%s", c.e.Regexp, c.wantNote, sb.String())
+		}
+	}
+	if _, err := SelectEngine(`^(a)^(b)`, CompileOptions{}); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestCompileRejectsTablesPastTwoGiB: tables are laid out with int32
+// addresses, so a table base past 2 GiB — or tables that grow past it — used
+// to wrap and compile without an error into a module whose memory did not hold
+// its own tables. Each such base must now be refused, naming the address; a
+// base whose tables fit must still compile.
+func TestCompileRejectsTablesPastTwoGiB(t *testing.T) {
+	entry := config.PatternEntry{Regexp: `[a-z]+@example\.com`, FindFunc: "f"}
+	for _, c := range []struct {
+		name    string
+		base    int64
+		entries []config.PatternEntry
+		want    string // "" = compiles
+	}{
+		{"negative base", -1, []config.PatternEntry{entry}, "the table base is -1"},
+		{"base at 2 GiB", 1 << 31, []config.PatternEntry{entry}, "the table base is 2147483648"},
+		{"base just under 4 GiB", 1<<32 - 1<<16, []config.PatternEntry{entry}, "the table base is 4294901760"},
+		{"base of 8 GiB", 1 << 33, []config.PatternEntry{entry}, "the table base is 8589934592"},
+		{"tables crossing 2 GiB", 1<<31 - 1000, []config.PatternEntry{entry}, "reach past it"},
+		// The first pattern fits; the page boundary after it is 2 GiB, where
+		// the second would start.
+		{"second pattern past 2 GiB", 1<<31 - 1<<16, []config.PatternEntry{entry, {Regexp: `x[0-9]+`, FindFunc: "g"}},
+			"reach past it"},
+		{"tables below 2 GiB", 1 << 30, []config.PatternEntry{entry}, ""},
+	} {
+		w, _, err := Compile(c.entries, c.base, true)
+		if c.want == "" {
+			if err != nil {
+				t.Errorf("%s: %v", c.name, err)
+				continue
+			}
+			validateWASM(t, w)
+			continue
+		}
+		if !errors.Is(err, ErrTablesOutOfRange) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want ErrTablesOutOfRange with %q", c.name, err, c.want)
+		}
+	}
+}
+
 // TestFailedWalkBound pins the bounded-walk clause on both sides of it: a
 // pattern whose failed attempts can only walk a few bytes, and one whose
 // non-accepting loop lets them walk to the end — including the case where

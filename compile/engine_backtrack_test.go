@@ -2979,6 +2979,16 @@ func TestFunctionSizeCap(t *testing.T) {
 			t.Errorf("error lacks %q: %v", w, err)
 		}
 	}
+	// The same body in a module that also carries a set, which a config
+	// compile assembles on its own path.
+	_, _, _, err = CompileFileDiag(config.BuildConfig{
+		Patterns:     []config.PatternEntry{{Name: "long", Regexp: pattern, MatchFunc: "m"}, {Name: "x", Regexp: `x[0-9]+`}},
+		Sets:         []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"x"}}}},
+		MaxDFAStates: 1, MaxBTInstructions: 200000,
+	}, "")
+	if !errors.Is(err, ErrFunctionTooLarge) || !strings.Contains(err.Error(), `pattern "long"`) {
+		t.Fatalf("with a set: err = %v, want ErrFunctionTooLarge naming the pattern", err)
+	}
 
 	// The scan itself: owners by offset, a glue body, malformed input.
 	body := func(n int) []byte { return append(utils.AppendULEB128(nil, uint32(n)), make([]byte, n)...) }
@@ -3011,4 +3021,66 @@ func TestFunctionSizeCap(t *testing.T) {
 	}
 	var none *codeOwners
 	none.mark(1, "ignored") // nil-safe: an assembly nobody checks records nothing
+}
+
+// TestBTFindBodyRareParams emits Backtracking find bodies under parameters no
+// compile of a real pattern passes — a program that still carries its
+// captures, a two-byte Teddy scan, a per-call work budget with no search, a
+// fallback with no search — each a branch buildBTFindBody keeps for a caller
+// that may pass it. Every one must still emit a body, and each must differ
+// from the ordinary body, or the parameter was ignored.
+func TestBTFindBodyRareParams(t *testing.T) {
+	btFor := func(src string) (*backtrack, prefixScanParams) {
+		t.Helper()
+		re, err := syntax.Parse(src, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bt := newBacktrack(byteProg(prog)) // captures NOT stripped
+		bt.numGroups = 0
+		fb, flags, all := nfaFirstBytes(prog)
+		sp, _, _ := buildBTScanTables(fb, flags, all, 0)
+		return bt, sp
+	}
+	plain := func(src string) []byte {
+		bt, sp := btFor(src)
+		b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+		return b
+	}
+	sc := (&moduleGlobals{}).BTScratch()
+	for _, c := range []struct {
+		name, src string
+		emit      func(*backtrack, prefixScanParams) []byte
+	}{
+		{"captures kept", `(a)b|c`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+			return b
+		}},
+		{"two-byte Teddy", `ab|cd`, func(bt *backtrack, sp prefixScanParams) []byte {
+			sp.TeddyTwoByte = true
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+			return b
+		}},
+		{"per-call budget", `a+b`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 1, true, nil, &btGrowth{})
+			return b
+		}},
+		{"fallback without a search", `a+b`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, &sc, nil)
+			return b
+		}},
+	} {
+		bt, sp := btFor(c.src)
+		got := c.emit(bt, sp)
+		if len(got) == 0 {
+			t.Errorf("%s: empty body", c.name)
+		}
+		if c.name != "captures kept" && bytes.Equal(got, plain(c.src)) {
+			t.Errorf("%s: body is the ordinary one", c.name)
+		}
+	}
 }

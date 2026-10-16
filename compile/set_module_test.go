@@ -2206,3 +2206,190 @@ func TestSetMatrixDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+// TestRareSetPaths compiles sets that each reach a branch no other test does —
+// limits a set exceeds (a reversed literal-bucket prefix over the build cap, a
+// whole-set merge over it, a sparse promotion over max_dfa_states, more member
+// sets than one byte numbers, a projection over its cell cap, a literal-
+// crossing check over its node cap, a member over the split analysis cap, a
+// nesting check over its slot budget), shapes only a few configurations
+// produce, and the configurations that refuse a set — and validates every
+// module. A refused set must say why.
+func TestRareSetPaths(t *testing.T) {
+	on, off := true, false
+	big, err := config.ParseMemorySize("256MB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pairClass(i): disjoint two-byte classes over printable ASCII, none
+	// holding 'k', ',' or ';'.
+	var sel []byte
+	for b := byte(0x21); b <= 0x7e; b++ {
+		if b != 'k' && b != ',' && b != ';' {
+			sel = append(sel, b)
+		}
+	}
+	pairClass := func(i int) string { return fmt.Sprintf(`[\x%02x\x%02x]`, sel[2*i], sel[2*i+1]) }
+	gen := func(n int, f func(int) string) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = f(i)
+		}
+		return out
+	}
+	set := func(sc config.SetConfig) config.BuildConfig {
+		sc.Name = "s"
+		return config.BuildConfig{Sets: []config.SetConfig{sc}}
+	}
+	with := func(cfg config.BuildConfig, f func(*config.BuildConfig)) config.BuildConfig { f(&cfg); return cfg }
+
+	// A reversed fixed-length prefix whose automaton needs 2^12 states.
+	var alts []string
+	for i := 0; i < 12; i++ {
+		ab := func(n int) string {
+			if n == 0 {
+				return ""
+			}
+			return fmt.Sprintf("[ab]{%d}", n)
+		}
+		alts = append(alts, ab(i)+"a"+ab(11-i))
+	}
+	// 33 members with 8 segments each, every segment a 23-letter class: more
+	// distinct self-loop sets than a member-set byte numbers.
+	const noK = "abcdefghijlmnopqrstuvwxyz"
+	var segs []string
+	for p := 0; p < len(noK); p++ {
+		for q := p + 1; q < len(noK); q++ {
+			var sb strings.Builder
+			sb.WriteByte('[')
+			for r := 0; r < len(noK); r++ {
+				if r != p && r != q {
+					sb.WriteByte(noK[r])
+				}
+			}
+			sb.WriteByte(']')
+			segs = append(segs, sb.String())
+		}
+	}
+	manySets := gen(33, func(i int) string {
+		var sb strings.Builder
+		sb.WriteString("key:" + pairClass(i))
+		for s := 0; s < 8; s++ {
+			sb.WriteString(segs[i*8+s] + "*,")
+		}
+		return sb.String() + ";"
+	})
+	zeroWidthChain := []string{"(?m:$*$*$*$*$*$*$*$*$*$*)*0$", "(?m:$*$*$*$*$*$*$*$*$*$*<*)*\t$*$",
+		"(?m:$*$*$*$*$*$*$*$*)*$*$*$*\x01*\x01$", "(?m:$*$*$*$*$*$*$*$*$*$*)*$dd*", "(?m:$*$*$*$*$*$*$*$*$*)*\x01*0$",
+		"(?m:$*$*$*$*$*$*$+$+$*$*)*$*0$", "(?m:$*0*$*\x01*$*$*$*$$*0*$*$*)*$*$* $*$", "(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)",
+		"a\\b*b", "(?m:x(?:^|$)+\\ny)"}
+	scripts := gen(5, func(i int) string {
+		return []string{`\p{Cyrillic}`, `\p{Greek}`, `\p{Armenian}`, `\p{Hebrew}`, `\p{Georgian}`}[i] + "+;"
+	})
+
+	for _, c := range []struct {
+		name    string
+		cfg     config.BuildConfig
+		opts    *CompileSetOptions
+		wantErr string
+	}{
+		{name: "reversed prefix over the build cap", cfg: set(config.SetConfig{MatchAny: "ma",
+			Regexps: []string{"(?:" + strings.Join(alts, "|") + ")QQQ"}})},
+		{name: "whole-set merge over the build cap", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: gen(40, func(i int) string { return fmt.Sprintf("kw%02d[0-9]{70}", i) })})},
+		{name: "sparse promotion over max_dfa_states", cfg: with(set(config.SetConfig{Find: "f",
+			Regexps: gen(40, func(i int) string { return pairClass(i) + "[0-9]{70}" })}),
+			func(c *config.BuildConfig) { c.MaxDFAStates = 200 })},
+		{name: "sparse promotion with a newline channel", cfg: set(config.SetConfig{Find: "f",
+			Regexps: gen(33, func(i int) string { return pairClass(i) + "[0-9](?m:$)" })})},
+		{name: "byte mode refuses a non-ASCII member", cfg: set(config.SetConfig{Find: "f", Unicode: &off, Regexps: []string{"café"}}),
+			wantErr: `unicode: false, but member "café" asks for Unicode mode`},
+		{name: "an unparsable member", cfg: set(config.SetConfig{Find: "f", Regexps: []string{"("}}),
+			wantErr: "missing closing )"},
+		{name: "wide sweep rows with an empty-matching member", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Unicode: &on,
+			Regexps: append([]string{`\pL*`}, gen(32, func(i int) string { return fmt.Sprintf("q%02d", i) })...)})},
+		{name: "a dominant accept under one boundary context", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`a\B|b\w*`}})},
+		{name: "projection over its cell cap", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: append([]string{`x\w+`}, gen(182, func(j int) string { return fmt.Sprintf("x[a-wyz]{%d}", j+1) })...)})},
+		{name: "projection over deduplicated u16 rows", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: append([]string{`[{|][a-z{|]*`}, gen(32, func(i int) string { return pairClass(i) + "[0-9]{7}" })...)})},
+		{name: "more member sets than a byte numbers", cfg: with(set(config.SetConfig{Find: "f", Hints: []string{"prefer-match"},
+			Regexps: manySets}), func(c *config.BuildConfig) { c.MaxSetBucketSize = big })},
+		{name: "member sets of whole characters only", cfg: set(config.SetConfig{Find: "f", Unicode: &on, Hints: []string{"prefer-match"},
+			Regexps: gen(33, func(i int) string { return "key:" + pairClass(i) + "[^;k]*;" })})},
+		{name: "an anchored member promoted into a sparse bucket", cfg: set(config.SetConfig{Find: "f",
+			Regexps: append([]string{`\A[xy]+`}, gen(33, func(k int) string { return fmt.Sprintf("[ab][0-9]{%d}", k+1) })...)})},
+		{name: "a counted sparse bucket beside another", cfg: set(config.SetConfig{Find: "f",
+			Regexps: append([]string{`bar[0-9]`, `foo[ab]{12}a\w*`}, gen(32, func(k int) string { return fmt.Sprintf(`foo[0-9]{%d}\w*`, k+1) })...)})},
+		{name: "a batching split member with no program sweep", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Hints: []string{"batch-find"}, Regexps: []string{`foo\w+`, `[a-z]*?(?:a?){400}b`}})},
+		{name: "literal crossing over its node cap", cfg: set(config.SetConfig{Find: "f",
+			Regexps: []string{strings.Repeat("Z", 300) + `(?:[a-z]{900})*!`}})},
+		{name: "a scan counter on the scalar frontend", cfg: set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: []string{`foo[a-z]+bar`, `baz[0-9]`}}), opts: new(CompileSetOptions{}.WithForcedFrontend(SetFrontendScalar))},
+		// The anchored member is over max_dfa_states (a Backtracking probe)
+		// while the leftmost-first find stops at `a`: a batching, cache-served
+		// find over a set with a Backtracking member.
+		{name: "batching with an answer cache and a Backtracking probe", cfg: with(set(config.SetConfig{Find: "f", MatchAny: "ma",
+			Overlapping: true, Hints: []string{"batch-find"}, Regexps: []string{`a|a(?:a|b)*a(?:a|b){8}`, `foo\w+`}}),
+			func(c *config.BuildConfig) { c.MaxDFAStates = 300 })},
+		{name: "anchored probes over letter-class loops", cfg: with(set(config.SetConfig{MatchAny: "ma", MatchAll: "ml", Unicode: &on,
+			Hints: []string{"prefer-match"}, Regexps: scripts}), func(c *config.BuildConfig) { c.MaxUnionStates = 4 })},
+		{name: "nesting check over its slot budget", cfg: with(set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`x[ab]*a[ab]{11}`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxSetBucketSize, c.MaxUnionStates = 10000, big, 20000
+		})},
+		{name: "a member over the split analysis cap", cfg: with(set(config.SetConfig{ScanAny: "sa", ScanAll: "sl", Find: "f", Unicode: &on,
+			Regexps: []string{`[ab]*a[ab]{12}`, `x[a-z]*y`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxUnionStates, c.MaxSplitTableSize, c.MaxSetBucketSize = 2000, 4, big, big
+		})},
+		// The first member's forward pass has more cycle states than notes
+		// cover, so it keeps no search block; the second keeps one.
+		{name: "a split scan over a member with no search block", cfg: with(set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: []string{`(?:a|b)*a(?:a|b){10}c|a`, `x[a-z]*y`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxUnionStates, c.MaxSplitTableSize, c.MaxSetBucketSize = 10000, 4, big, big
+		})},
+		// Blocks of tools/re2test's custom-sets.txt: the zero-width repeat
+		// chain (a split member's program sweep over (?m:$) contexts; anchored
+		// Backtracking probes forced onto the fallback at max_dfa_states 1)
+		// and the boundary branch priorities (a sweep closure item met twice).
+		{name: "zero-width repeat chain, overlapping", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Regexps: zeroWidthChain})},
+		{name: "zero-width repeat chain, anchored on Backtracking", cfg: with(set(config.SetConfig{MatchAny: "ma", MatchAll: "ml",
+			Regexps: zeroWidthChain}), func(c *config.BuildConfig) { c.MaxDFAStates = 1 })},
+		{name: "boundary branch priority, overlapping", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`(\B|(?:(a|(b|b)*)))a`, `(?:\B|a|)a`, `(?:\b|a|)a`, `(?:\B|a*)a`, `foo(?:\B|a|)a`, `(?:\B|a)a`}})},
+		// Literal buckets beside more than 64 literal-less members: the scan
+		// pair's two-phase split over a wide union.
+		{name: "two-phase scan over a wide union", cfg: set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: append(gen(40, func(i int) string { return fmt.Sprintf("kw%02d[0-9]+", i) }),
+				gen(70, func(i int) string { return fmt.Sprintf("[a-z]{%d}[0-9]", i+3) })...)})},
+		{name: "a sweep whose start state is on the cycle", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Regexps: []string{`[ab]*c\b`}})},
+		{name: "split candidates with splitting off", cfg: set(config.SetConfig{Find: "f", Regexps: []string{`x[a-z]*y`, `foo[0-9]`}}),
+			opts: &CompileSetOptions{NoSplit: true}},
+		// The scan pair alone needs the split, so its wide `_all` export
+		// forwards to the split copy.
+		{name: "a forwarded wide scan_all", cfg: set(config.SetConfig{Find: "f", Overlapping: true, ScanAll: "sl",
+			Regexps: []string{`foo\w+`, `a[ab]{12}c[a-z]*z`, `\bbar\b`}})},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var w []byte
+			var err error
+			if c.opts != nil {
+				w, _, _, err = CompileFileOpts(c.cfg, "", *c.opts)
+			} else {
+				w, _, _, err = CompileFileDiag(c.cfg, "")
+			}
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			validateWASM(t, w)
+		})
+	}
+}

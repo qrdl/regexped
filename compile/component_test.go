@@ -727,6 +727,27 @@ func TestSetComponentSkipsMissingCapabilityName(t *testing.T) {
 	}
 }
 
+// TestSetComponentSkipsFindWithoutResourceBuiltin: a find set whose name table
+// carries no [resource-new] builtin gets no find resource — no constructor that
+// would call function index -1 — while its other capabilities stay.
+func TestSetComponentSkipsFindWithoutResourceBuiltin(t *testing.T) {
+	names := setComponentNames("s")
+	n := names["s"]
+	n.ResourceNew = ""
+	names["s"] = n
+	core, _, err := CompileFileComponent(setComponentCfg(3), "regexped:t/matcher", nil, nil, names, nil)
+	if err != nil {
+		t.Fatalf("CompileFileComponent: %v", err)
+	}
+	validateWASM(t, core)
+	if moduleExports(core, n.Constructor) {
+		t.Error("a find resource was emitted with no builtin to create it")
+	}
+	if !moduleExports(core, "regexped:t/sets#which-matches") {
+		t.Error("the set's other capabilities must still be exported")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The single-pattern find/groups RESOURCES, from the compile package's side.
 //

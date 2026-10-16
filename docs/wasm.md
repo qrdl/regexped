@@ -429,7 +429,7 @@ Single memory (index 0, exported as "memory"):
 0              tableBase         tableEnd
 ```
 
-The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test). A module with a Backtracking program may also use memory above the host's data as run-time scratch — see "The Backtracking scratch base" above.
+The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test). Every table must lie below 2 GiB: a negative base, a base past 2 GiB, or tables that reach past it make `Compile` return `ErrTablesOutOfRange` rather than a module whose tables are not where its code reads them. A module with a Backtracking program may also use memory above the host's data as run-time scratch — see "The Backtracking scratch base" above.
 
 ---
 

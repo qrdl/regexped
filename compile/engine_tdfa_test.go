@@ -1310,3 +1310,23 @@ func TestTDFAUTF8Skip(t *testing.T) {
 		}
 	}
 }
+
+// TestTDFAWriteCapturesAcceptOps: an accept state's own tag ops are fired
+// before its captures are written. newTDFA builds no such table today, so the
+// table is made by hand; the ops must appear in the output.
+func TestTDFAWriteCapturesAcceptOps(t *testing.T) {
+	tt := func(ops [][]tdfaTagOp) *tdfaTable {
+		return &tdfaTable{
+			dfaTable:     &dfaTable{numStates: 1},
+			acceptOps:    ops,
+			acceptRegMap: [][]int{{-1, -1}},
+			numRegs:      1,
+			numGroups:    1,
+		}
+	}
+	with := emitTDFAWriteCaptures(tt([][]tdfaTagOp{{{dst: 0, src: -1}}}), nil, 3, 4, 8, -1)
+	without := emitTDFAWriteCaptures(tt([][]tdfaTagOp{nil}), nil, 3, 4, 8, -1)
+	if op := emitTDFATagOp(tdfaTagOp{dst: 0, src: -1}, nil, 4, 8); !bytes.Contains(with, op) || len(with) <= len(without) {
+		t.Errorf("accept ops not emitted:\nwith    % x\nwithout % x", with, without)
+	}
+}

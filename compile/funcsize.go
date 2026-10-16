@@ -58,7 +58,7 @@ func (o codeOwners) ownerAt(at int) string {
 // maxWasmFunctionBytes, naming its owner. wasm is the whole module; the
 // owners' offsets are into its code section's content.
 func checkFunctionSizes(wasm []byte, owners codeOwners) error {
-	code := codeSectionContent(wasm)
+	code := sectionContent(wasm, 10)
 	if code == nil {
 		return nil
 	}
@@ -90,14 +90,15 @@ func checkFunctionSizes(wasm []byte, owners codeOwners) error {
 	return nil
 }
 
-// codeSectionContent is the content of wasm's code section, or nil.
-func codeSectionContent(wasm []byte) []byte {
+// sectionContent is the content of wasm's section id (10 = code, 11 = data),
+// or nil.
+func sectionContent(wasm []byte, id byte) []byte {
 	if len(wasm) < 8 {
 		return nil
 	}
 	p := 8
 	for p < len(wasm) {
-		id := wasm[p]
+		sec := wasm[p]
 		size, k, err := utils.DecodeULEB128(wasm[p+1:])
 		if err != nil {
 			return nil
@@ -107,7 +108,7 @@ func codeSectionContent(wasm []byte) []byte {
 		if end > len(wasm) {
 			return nil
 		}
-		if id == 10 {
+		if sec == id {
 			return wasm[start:end]
 		}
 		p = end

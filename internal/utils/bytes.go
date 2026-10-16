@@ -504,6 +504,36 @@ func findMagicInDataSection(data []byte) (int64, error) {
 	return 0, nil
 }
 
+// DataSegmentBounds returns the lowest offset and the highest end (offset +
+// size) across the active data segments of a data section payload, both 0 when
+// it has none. An offset is the segment's i32.const read as signed, so a
+// segment placed at or past 2 GiB by an address that wrapped reads negative.
+func DataSegmentBounds(data []byte) (low, high int64, err error) {
+	count, off, err := DecodeULEB128(data)
+	if err != nil {
+		return 0, 0, err
+	}
+	first := true
+	for i := uint64(0); i < count && off < len(data); i++ {
+		h, next, err := parseSegmentHeader(data, off, int(i))
+		if err != nil {
+			return low, high, err
+		}
+		off = next
+		if !h.active {
+			continue
+		}
+		if end := h.offset + int64(h.size); first || end > high {
+			high = end
+		}
+		if first || h.offset < low {
+			low = h.offset
+		}
+		first = false
+	}
+	return low, high, nil
+}
+
 // ParseDataSection returns the highest byte address (offset + size) across all
 // active data segments.
 func ParseDataSection(data []byte) (int64, error) {
