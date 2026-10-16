@@ -130,7 +130,17 @@ const packedPairMaxLiterals = 16
 // the lowest summed background frequency (byteRank) — the rarest pair produces
 // the fewest candidates. Ties break toward the earlier columns, which keeps the
 // choice deterministic and keeps the two loads close together.
-func choosePackedPair(literals [][]byte) (*packedPairPlan, bool) {
+//
+// In Unicode mode a column of UTF-8 LEAD bytes alone (0xC2-0xF4) is never a
+// probe: a lead byte begins every character of its script, so in that script's
+// text it selects nearly every character. It is also the column a set of
+// literals in one script most often fits the byte budget with — each
+// character's lead is one of a few, its continuation one of many. Measured on
+// eight Cyrillic keywords over 64 KB of Russian text, `find`: such a pair cost
+// 3.36M fuel with no keyword present and 5.51M with many, Teddy 0.57M and
+// 1.27M, and no literal frontend at all 1.01M and 10.81M; the pair's set
+// falls to Teddy instead.
+func choosePackedPair(literals [][]byte, unicode bool) (*packedPairPlan, bool) {
 	if len(literals) == 0 || len(literals) > packedPairMaxLiterals {
 		return nil, false
 	}
@@ -169,11 +179,22 @@ func choosePackedPair(literals [][]byte) (*packedPairPlan, bool) {
 		}
 	}
 
+	leadsOnly := func(col []byte) bool {
+		for _, c := range col {
+			if c < 0xC2 || c > 0xF4 {
+				return false
+			}
+		}
+		return true
+	}
 	best := (*packedPairPlan)(nil)
 	bestRank := 1 << 30
 	for o1 := 0; o1 < window; o1++ {
 		for o2 := o1 + 1; o2 < window; o2++ {
 			if len(cols[o1])+len(cols[o2]) > packedPairByteBudget {
+				continue
+			}
+			if unicode && (leadsOnly(cols[o1]) || leadsOnly(cols[o2])) {
 				continue
 			}
 			// Summing the ranks of every byte in both columns scores a wide

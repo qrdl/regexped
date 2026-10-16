@@ -15,7 +15,7 @@
 # Neutral compiles this pattern with no dominant at all, so this fixture and a
 # neutral build of the same pattern are deliberately different bodies; nothing
 # here should ever move on a change that claims to be neutral-only.
-regexps:
-  - pattern: '[a-zA-Z]{20,}'
+patterns:
+  - regexp: '[a-zA-Z]{20,}'
     find_func: lm_dominant_find
     hints: [prefer-match]

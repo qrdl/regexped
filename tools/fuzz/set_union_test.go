@@ -46,11 +46,11 @@ import (
 // the id space larger than the pattern count.
 func wideUnionSet(t *testing.T, pats []string, selected []int, withFind bool) ([]byte, []compile.SetDiag) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	allNames := make([]string, len(pats))
 	for i, p := range pats {
 		allNames[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: allNames[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: allNames[i], Regexp: p}
 	}
 	names := allNames
 	if selected != nil {
@@ -69,7 +69,7 @@ func wideUnionSet(t *testing.T, pats []string, selected []int, withFind bool) ([
 		set.Find = "cap_find"
 	}
 	w, _, diags, err := compile.CompileFileDiag(
-		config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+		config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -745,9 +745,9 @@ func TestUnionScanDegenerateLimits(t *testing.T) {
 func TestWideUnionScanSingleCapability(t *testing.T) {
 	const n = 96
 	pats := classChain(n)
-	entries := make([]config.RegexEntry, n)
+	entries := make([]config.PatternEntry, n)
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	input := "abcdefgh12345678 zz9"
 
@@ -759,7 +759,7 @@ func TestWideUnionScanSingleCapability(t *testing.T) {
 			set := config.SetConfig{Name: "s", ScanAny: tc.any_, ScanAll: tc.all,
 				Patterns: config.PatternSelector{All: true}}
 			w, _, diags, err := compile.CompileFileDiag(
-				config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+				config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}, "")
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -939,11 +939,11 @@ func compileUnionPreflightSet(t *testing.T, pats []string) []byte {
 
 func compileUnionPreflightSetWidth(t *testing.T, pats []string, wide bool) []byte {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:     "s",
@@ -957,7 +957,7 @@ func compileUnionPreflightSetWidth(t *testing.T, pats []string, wide bool) []byt
 	// runs. The bucket body still serves them wherever the split does not
 	// apply (a batching set), so the preflight is still reached in production.
 	w, _, diags, err := compile.CompileFileOpts(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "", compile.CompileSetOptions{NoSplit: true})
+		config.BuildConfig{Patterns: entries, Sets: sets}, "", compile.CompileSetOptions{NoSplit: true})
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}
@@ -1315,17 +1315,17 @@ func TestWideUnionAliveMaskPreflightResumes(t *testing.T) {
 func TestWideUnionPreflightFindOnly(t *testing.T) {
 	const n = 70
 	pats := digitRunWideSet(n)
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names},
 	}}
 	w, _, diags, err := compile.CompileFileDiag(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

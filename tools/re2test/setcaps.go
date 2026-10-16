@@ -35,6 +35,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
@@ -97,9 +98,10 @@ var (
 	//
 	// This is the only configuration in which <SET>_PATTERN_COUNT and
 	// <SET>_ID_SPACE differ, and confusing them is a memory-safety bug rather
-	// than a wrong answer: pattern_id is the GLOBAL index into `regexps:`, so
-	// the gate array and the `_all` bitmap are sized from the id space while
-	// the tuple buffer is sized from the pattern count. Sizing the gate array
+	// than a wrong answer: a selected member's pattern_id is its index into
+	// the top-level `patterns:`, so the gate array and the `_all` bitmap are
+	// sized from the id space while the tuple buffer is sized from the
+	// pattern count. Sizing the gate array
 	// from the count let the module write past the caller's array, and
 	// `patterns: all` makes the two equal, so no run that used it
 	// could ever have caught that.
@@ -241,10 +243,12 @@ type setCapStats struct {
 	order    []string
 	timeouts int
 	dataErrs int
-	chunks   int
-	skipped  int // chunks skipped by --sample
-	dropped  int // pattern/capability pairs the compiler legitimately excluded
-	printed  int // failure reports emitted so far
+	// asciiBlocks counts the blocks a Unicode-mode run skipped as all-ASCII.
+	asciiBlocks int
+	chunks      int
+	skipped     int // chunks skipped by --sample
+	dropped     int // pattern/capability pairs the compiler legitimately excluded
+	printed     int // failure reports emitted so far
 	// btUnknown counts calls that answered with abi.BTStackOverflow — the
 	// Backtracking engine giving up. Counted rather than folded into "no
 	// match": an engine that wrongly gives up when nothing further matches
@@ -281,16 +285,22 @@ type setCapStats struct {
 	// to a chunk's compile, counted once per compile so it lines up with
 	// `dropped`.
 	eligible int
+	// forcedRefusals counts chunk compiles refused because a member fits no
+	// engine under --set-bt's forced max_dfa_states: the compile is right to
+	// refuse (a member over both limits must not compile), and the chunk is
+	// unchecked in that profile. Without --set-bt the refusal is a FAILURE.
+	forcedRefusals int
 }
 
 // setMaxDropFraction is the share of eligible patterns the compiler may
 // legitimately exclude before the run FAILS.
 //
-// Drops are documented behaviour — a fallback bucket's suffix DFA over
-// max_fallback_states — and are excluded from the comparison, so a regression
-// that made the compiler drop EVERYTHING would empty every expectation and
-// exit 0 with a green table. That is the masking direction, so it needs a
-// ceiling rather than a printed number.
+// No drop is documented behaviour any more (a member no engine takes fails
+// the compile; one whose anchored DFA is over the limits answers the anchored
+// pair through Backtracking), and every drop already fails its chunk. The
+// ceiling stays as a second guard in the masking direction: a regression that
+// made the compiler drop EVERYTHING would otherwise empty every expectation
+// and exit 0 with a green table.
 const setMaxDropFraction = 0.01
 
 // setMaxTimeoutFraction is the same idea for the watchdog: a timed-out call is
@@ -363,10 +373,18 @@ func (s *setCapStats) report() {
 		fmt.Printf("  %-28s pass %10d  fail %6d%s\n", label+":", p, f, flag)
 	}
 	fmt.Printf("  %-28s pass %10d  fail %6d\n", "TOTAL:", total, totalFail)
-	if setHighByteLive > 0 || setHighBytePinned > 0 {
+	if *unicodeFlag && setHighByteLive > 0 {
+		fmt.Printf("  high-byte inputs: %d via the live oracle over the text itself (all capabilities)\n", setHighByteLive)
+	} else if setHighByteLive > 0 || setHighBytePinned > 0 {
 		// Reported so a collapse back to the pinned path cannot hide as "green".
 		fmt.Printf("  high-byte inputs: %d via the live twin oracle (all capabilities), %d via pinned col4 (gated find only)\n",
 			setHighByteLive, setHighBytePinned)
+	}
+	if s.asciiBlocks > 0 {
+		fmt.Printf("  all-ASCII blocks skipped (Unicode mode answers them as byte mode does): %d\n", s.asciiBlocks)
+	}
+	if setUnicodeFFFDSkipped > 0 {
+		fmt.Printf("  invalid UTF-8 inputs skipped (a pattern can match U+FFFD): %d\n", setUnicodeFFFDSkipped)
 	}
 	if s.timeouts > 0 {
 		fmt.Printf("  timeouts (input skipped):    %d\n", s.timeouts)
@@ -399,6 +417,10 @@ func (s *setCapStats) report() {
 		fmt.Printf("  patterns dropped by compiler (state limit, excluded from comparison): %d of %d eligible\n",
 			s.dropped, s.eligible)
 	}
+	if s.forcedRefusals > 0 {
+		fmt.Printf("  chunk compiles refused under --set-bt's forced limit (a member fits no engine; unchecked): %d\n",
+			s.forcedRefusals)
+	}
 }
 
 // gateProblems returns the run-level failures that are not individual
@@ -408,7 +430,7 @@ func (s *setCapStats) report() {
 func (s *setCapStats) gateProblems(forceBacktrack bool) []string {
 	var out []string
 	// BOTH gates are lifted under --set-bt / --force-backtrack, which cap
-	// max_fallback_states on purpose: mass drops and timeouts are the point of
+	// max_dfa_states on purpose: mass drops and timeouts are the point of
 	// those runs, not a regression in them.
 	if forceBacktrack {
 		return nil
@@ -456,7 +478,7 @@ func (s *setCapStats) totalPass() int {
 // the first, most informative report under megabytes of output.
 var setMaxPrint int
 
-// setBTFallback caps max_fallback_states for set compilation, forcing members
+// setBTFallback caps max_dfa_states for set compilation, forcing members
 // onto the Backtracking fallback engine. 0 = off.
 var setBTFallback int
 
@@ -493,6 +515,10 @@ type setOracle struct {
 // exactly like "all green" — is visible in the summary.
 var setHighByteLive, setHighBytePinned int
 
+// setUnicodeFFFDSkipped counts the inputs a Unicode-mode run cannot judge:
+// invalid UTF-8 beside a pattern that can match U+FFFD (setOracleTwins).
+var setUnicodeFFFDSkipped int
+
 // buildSetOracle computes the expectations for one chunk.
 //
 // The start-position map uses the whole-input technique: `\A(?s:.{p})(?:pat)`
@@ -501,7 +527,9 @@ var setHighByteLive, setHighBytePinned int
 // replaces (`\A(?:pat)` over input[p:]) judges them against a slice boundary —
 // which is the mistake the two-oracle discipline exists to prevent.
 //
-// `.{p}` counts RUNES, so the caller must have excluded non-ASCII inputs.
+// `.{p}` counts Go's tokens, so p steps through the positions that start one
+// (setTokenStarts); a high-byte input in byte mode is read through its ASCII
+// twin, where every position does.
 func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFindAll bool) (*setOracle, error) {
 	o := &setOracle{}
 	if needAnchored {
@@ -534,9 +562,10 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 		if !hasHighByte(s) {
 			continue
 		}
-		if usable[si] {
+		switch {
+		case usable[si]:
 			setHighByteLive++
-		} else {
+		case !*unicodeFlag:
 			setHighBytePinned++
 		}
 	}
@@ -589,17 +618,26 @@ func buildSetOracle(pats []string, strs []string, needAnchored, needSPM, needFin
 					continue
 				}
 				s := twins[pi][si]
+				// The probe counts Go's tokens: p steps through the byte
+				// positions that start one, and tok counts them. Inside a
+				// character no match starts. Over ASCII (every twin) tok is p.
+				starts := setTokenStarts(s)
+				tok := -1
 				for p := 0; p <= len(s); p++ {
-					if probes[p] == nil {
-						pr, err := regexp.Compile(`\A` + setDotPrefix(p) + `(?:` + body + `)`)
+					if !starts[p] {
+						continue
+					}
+					tok++
+					if probes[tok] == nil {
+						pr, err := regexp.Compile(`\A` + setDotPrefix(tok) + `(?:` + body + `)`)
 						if err != nil {
 							// Never fall through to "no matches": a broken
 							// probe would read as the engine over-reporting.
 							return nil, fmt.Errorf("oracle: position-%d probe for %q: %w", p, pat, err)
 						}
-						probes[p] = pr
+						probes[tok] = pr
 					}
-					if m := probes[p].FindStringIndex(s); m != nil {
+					if m := probes[tok].FindStringIndex(s); m != nil {
 						row[si] = append(row[si], [2]int{p, m[1]})
 					}
 				}
@@ -648,6 +686,20 @@ func normalizeSetOraclePattern(pat string) (string, error) {
 		return "", fmt.Errorf("cannot be embedded in an oracle wrapper: it needs re-serialising (unterminated \\Q) and the re-serialised form re-parses to a different language")
 	}
 	return rt, nil
+}
+
+// setTokenStarts marks the byte positions of s where Go's decoding starts a
+// token — a valid UTF-8 sequence's first byte, or any byte of invalid input,
+// read as a one-byte U+FFFD — and len(s).
+func setTokenStarts(s string) []bool {
+	out := make([]bool, len(s)+1)
+	for i := 0; i < len(s); {
+		out[i] = true
+		_, w := utf8.DecodeRuneInString(s[i:])
+		i += w
+	}
+	out[len(s)] = true
+	return out
 }
 
 // setDotPrefix builds a regexp matching exactly p runes of anything.
@@ -989,21 +1041,21 @@ func (r *setRunner) readBitmap() ([]int, error) {
 // ---------------------------------------------------------------------------
 // Dropped patterns.
 //
-// A set can legitimately EXCLUDE a pattern whose suffix DFA exceeds the
-// fallback bucket's state budget: the compiler warns, records it in
-// --diag-json's `state_limit_dropped`, and compiles the rest (docs/sets.md
-// "Fallback buckets can drop patterns"). A dropped pattern
-// reports nothing, so comparing it against an oracle that still expects its
-// matches would manufacture failures out of documented behaviour.
+// A set never leaves a member out of any capability: a member no engine takes
+// is a compile error, and one whose anchored DFA is over max_dfa_states
+// answers match_any / match_all through Backtracking. A drop is therefore a
+// FAILURE, never an exclusion — which is how `.{0,870}` in a Unicode-mode set
+// was seen: its DFA was built under a fixed 2,048 states, its Backtracking
+// program was over 20,000 instructions, and the set compiled without it.
+// Until 2026-10-12 an anchored-only drop was the one exclusion this harness
+// made; there are none left.
 //
 // The drop is captured from the warning itself rather than by re-deriving it:
 // re-running the analysis through CmdWriteDiagJSON would double the compile
 // cost of every chunk, and the warning is emitted by the very compile whose
 // module is about to be driven — there is no way for the two to disagree.
 //
-// `where` decides the scope: an "anchored bucket" drop removes the pattern
-// from match/match_any/match_all only, while a fallback-bucket drop removes it
-// from everything non-anchored.
+// Every drop is recorded as the failure above.
 
 type dropHandler struct {
 	find     map[int]bool
@@ -1018,24 +1070,17 @@ func (h *dropHandler) Handle(_ context.Context, r slog.Record) error {
 	if !strings.HasPrefix(r.Message, "Pattern dropped from set") {
 		return nil
 	}
-	id, where := -1, ""
+	id := -1
 	r.Attrs(func(a slog.Attr) bool {
-		switch a.Key {
-		case "id":
+		if a.Key == "id" {
 			id = int(a.Value.Int64())
-		case "where":
-			where = a.Value.String()
 		}
 		return true
 	})
 	if id < 0 {
 		return nil
 	}
-	if strings.HasPrefix(where, "anchored bucket") {
-		h.anchored[id] = true
-	} else {
-		h.find[id] = true
-	}
+	h.find[id] = true
 	return nil
 }
 
@@ -1052,9 +1097,9 @@ func captureDrops(fn func()) (find, anchored map[int]bool) {
 
 // buildSetProfileConfig turns a profile into a BuildConfig over pats.
 func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selected []int) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sel := config.PatternSelector{All: true}
 	if selected != nil {
@@ -1071,6 +1116,7 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 			Patterns:    sel,
 			Overlapping: s.overlapping,
 			Hints:       hints,
+			Unicode:     setModeKey(),
 		}
 		if s.matchAny {
 			sc.MatchAny = s.setName + "_match_any"
@@ -1092,15 +1138,16 @@ func buildSetProfileConfig(pats []string, prof setProfile, hints []string, selec
 		}
 		sets = append(sets, sc)
 	}
-	cfg := config.BuildConfig{Regexps: entries, Sets: sets}
-	// --set-bt drives Backtracking set members: a low max_fallback_states pushes
+	cfg := config.BuildConfig{Patterns: entries, Sets: sets}
+	// --set-bt drives Backtracking set members: a low max_dfa_states pushes
 	// ordinary corpus patterns onto the Backtracking fallback engine in bulk,
 	// the same way --force-backtrack does for single patterns by setting
-	// MaxDFAStates = -1. The naturally-dropped population is tiny (2 patterns
-	// in custom-sets, none in a 40-chunk corpus sample), so forcing the path
-	// is the only way to exercise it at corpus scale.
+	// MaxDFAStates = -1. Forcing the path is the only way to exercise it at
+	// corpus scale. A member whose Backtracking program is over
+	// max_bt_instructions then fits no engine and the chunk's compile is
+	// refused (forcedRefusals): `.{0,870}` in custom-sets-unicode.txt.
 	if setBTFallback > 0 {
-		cfg.MaxFallbackStates = setBTFallback
+		cfg.MaxDFAStates = config.Limit(setBTFallback)
 	}
 	return cfg
 }
@@ -1139,6 +1186,15 @@ func newSetRunner(
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
+	}
+	if len(droppedFind) > 0 {
+		ids := make([]int, 0, len(droppedFind))
+		for id := range droppedFind {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		return nil, fmt.Errorf("the set compiled without member(s) %v in find and the scan pair: "+
+			"a member no engine takes must fail the compile, not be dropped", ids)
 	}
 	// UNIQUE ids, not the sum of the two maps: a pattern dropped from both the
 	// find and the anchored packing is ONE pattern the comparison excludes,
@@ -1233,8 +1289,9 @@ func newSetRunner(
 				wideAll = true
 			}
 		}
-		// A member split out onto the Backtracking find forces it too.
-		if len(d.SplitBacktracking) > 0 {
+		// A member split out onto the Backtracking find forces it too, and so
+		// does an anchored pair's Backtracking probe.
+		if len(d.SplitBacktracking) > 0 || len(d.AnchoredBacktracking) > 0 {
 			wideAll = true
 		}
 	}
@@ -1351,6 +1408,13 @@ func runSetProfile(
 	verbose bool,
 ) error {
 	r, err := newSetRunner(engine, wd, chunk.pats, strs, prof, hints)
+	if err != nil && setBTFallback > 0 && errors.Is(err, compile.ErrSetMemberFitsNoEngine) {
+		// --set-bt forced max_dfa_states down to push members onto
+		// Backtracking; one whose program is also over max_bt_instructions
+		// fits no engine, and the compile is right to refuse it.
+		setStats.forcedRefusals++
+		return nil
+	}
 	if err != nil {
 		setStats.bad("compile["+prof.name+"]", len(chunk.pats)*len(strs))
 		setFailf("FAIL  set chunk compile error (profile %s, %d patterns): %v\n      first pattern: %q\n",
@@ -1402,6 +1466,13 @@ func runSetProfile(
 	}
 
 	for si, text := range strs {
+		if si < len(orc.live) && !orc.live[si] && *unicodeFlag {
+			// Invalid UTF-8 beside a pattern that can match U+FFFD: Go and
+			// Unicode mode differ by design, and the pinned column was written
+			// for byte mode's advance, so nothing states the answer.
+			setUnicodeFFFDSkipped++
+			continue
+		}
 		if si < len(orc.live) && !orc.live[si] {
 			// A high-byte input for which no ASCII twin exists under this
 			// chunk's patterns, so the live oracle cannot state an expectation

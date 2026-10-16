@@ -28,7 +28,68 @@ code shape — see [prefer-hints.md](prefer-hints.md)), and `matchonly`,
 `findonly`, `groupsonly` — plus `sets`, which exercises the multi-pattern
 composition pipeline described in [sets.md](sets.md) across all five
 capabilities (plus `find`'s batch entry and both overlap policies). `sets-exhaustive` and `set-batch` are the whole-corpus set runs;
-they are not part of `test` (see "Sets" below for why).
+they are not part of `test` (see "Sets" below for why). `unicode` re-runs the
+corpus's six blocks that hold characters above 0x7F in Unicode mode, against
+RE2's own columns (see "Unicode-mode rows" below), and `sets-unicode` does the
+same for every set capability (see "Sets in Unicode mode" below).
+
+Three targets outside `test` run Unicode mode over the rest:
+`unicode-all` re-runs EVERY block in Unicode mode, the all-ASCII ones included
+(`-unicode-all`) — their answers are byte mode's, but each pattern is lowered
+and its engine chosen as Unicode mode does, which `unicode`, skipping them,
+never exercises (12,364,931 rows, 0 failures); `unicode-groups` is the same over
+the capture-adjusted corpus with `--validate-groups`, the corpus's capture
+bodies in Unicode mode (3,757,680 rows, 0 failures — TDFA 179,928, Backtracking
+488,376); and `custom-unicode` runs `custom-tests.txt` that way, its rows naming
+characters above 0x7F — which `custom` skips in byte mode — included (8,658
+rows, 0 failures). A row whose input is not valid UTF-8, for a pattern that can
+match U+FFFD, is skipped in Unicode mode: its columns are Go's, and Unicode mode
+differs from Go there by design ("Invalid UTF-8 in the input", below) — 55 rows
+of `custom-tests.txt`; the RE2 corpus has no such input.
+
+Every pattern in those corpora is ASCII but five, so none of them reaches what
+only a pattern NAMING Unicode content does. `custom-tests-unicode` does:
+`custom-tests-unicode.txt` holds single patterns written for Unicode mode —
+`\p{..}` and `\P{..}` by category and script, non-ASCII literals and literals
+mixing ASCII with them, written ranges with ends at the 2/3- and 3/4-byte
+boundaries, `(?i)` over whole fold orbits (`k` against U+212A, `σ`/`ς`/`Σ`,
+3- and 4-byte orbits), `.` and negated classes in counted repeats, empty
+matches and `\b`/`\B`/`(?m)^`/`(?m)$` beside 2- to 4-byte characters,
+captures through TDFA, Backtracking and the shortcuts, runs of characters
+long enough for the 16-byte skips at every length around a chunk boundary
+with invalid bytes in every lane, and the byte-mode fast paths' shapes over
+multi-byte text — over valid input and every kind of invalid sequence (stray
+continuation, cut-off, overlong, surrogate, past U+10FFFF). Its blocks,
+strings and patterns are written by hand; its rows are Go's answers over each
+pattern without U+FFFD, rewritten in place by `go run ./make_adjusted
+-unicode-regen custom-tests-unicode.txt`, so every row — invalid input
+included — is judged (`-unicode-oracle`). Thirteen legs: neutral, both hints,
+armed notes, no search block, forced Backtracking (plain, hinted, armed,
+fallback alone) and match-, find- and groups-only: 536 patterns, 43,022 rows,
+1,290,387 checks, 0 failures. Each code path only Unicode mode reaches was
+also broken on purpose — the start rule at each of its seven call sites, the
+character skips' open tail, error stop and tail chunk, the TDFA skip's tag
+ops, the first-character check of the prefix scan, the literal-anchored find's
+two-byte backward table, the Backtracking fallback's dispatch — and a leg of
+this target or `sets-unicode` failed every time.
+
+`unicode-ext` runs those four and the rest of the byte-mode modes in Unicode
+mode over the whole corpus: `unicode-likely` (both hints),
+`unicode-force-backtrack`, `unicode-bt-fallback` (every Backtracking program
+answered by its memoised fallback alone), `unicode-notes-armed`,
+`sets-unicode-all` and `sets-unicode-likely` (the `sets` and `sets-likely`
+runs, the all-ASCII blocks included, the batch entry and Backtracking members
+too), and `unicode-variants`. That last one is the corpus's multi-byte and
+invalid input: `make_adjusted -unicode-variants` rewrites every string of the
+capture-adjusted corpus into three variants — a two-byte character inside it,
+a three- and a four-byte one around it, a stray 0xFF and a cut sequence — and
+computes every column, every match included, with Go over the pattern without
+U+FFFD, so the columns are Unicode mode's own answers on invalid input too;
+the harness reads such a file with `-unicode-oracle`, which judges every row.
+None of these is in `test`. Current results, all 0 failures: `unicode-variants`
+14,597,031 checks in each of its three legs (plain, armed notes, forced
+Backtracking); `sets-unicode-all` 20,362,084; `sets-unicode-likely`
+11,883,952; and every leg of the single-pattern mode targets.
 
 The last three compile each pattern with only one of `match_func`,
 `find_func`, `groups_func` set. That is not redundant with the default
@@ -50,7 +111,7 @@ without them.
 | Compiled DFA | ~4,602,000 |
 | **Total passing** | **~4,936,000** |
 | **Failed** | **0** |
-| **Skipped** | **~781,000** |
+| **Skipped** | **~781,000** — ~270K need Unicode mode and are checked by `make unicode`; see [Skipped cases](#skipped-cases-781k) |
 
 **Adjusted test** (`re2-adjusted.txt`, with `--validate-groups`):
 
@@ -114,7 +175,8 @@ This ensures patterns like `(a*)*?` return the same result as RE2 (longest
 match), not Perl semantics (shortest match), while keeping all matching logic
 inside WASM.
 
-Examples of patterns handled by Backtracking:
+Examples of patterns handled by Backtracking (in byte mode; in Unicode mode
+both take a TDFA, see `docs/engines.md`):
 - `<([^>]+)>` — the loop's exit branch has an indeterminate first-byte set
   (inverted class wider than 256 codepoints), which stays ambiguous
   regardless of the 2026-08-01 quantifier-loop relaxation
@@ -197,16 +259,16 @@ chunk-size, subset and profile axes are already covered by the neutral run.
 What is new here is the emission, and one chunk size per hint reaches it
 across the whole corpus.
 
-A pattern the compiler legitimately drops from a set — a fallback bucket's
-suffix DFA over the `max_fallback_states` budget, or one the anchored packer
-alone refused — is excluded from the comparison and counted separately in the
-summary, so a documented exclusion cannot masquerade as either a pass or a
-failure. The exclusion is taken from the compiler's own drop WARNING rather
-than from `--diag-json`, and it is SCOPED by that warning's `where`: an
-"anchored bucket" drop excludes the pattern from `match_any`/`match_all` only,
-while a fallback-bucket drop excludes it from everything non-anchored. Merging
-the two scopes would make the oracle expect matches from a pattern the module
-no longer holds, or drop ones it still reports.
+A pattern the compiler legitimately leaves out of a set's `match_any` /
+`match_all` — its anchored DFA over `max_dfa_states`, the anchored pair having
+no Backtracking path — is excluded from those two capabilities' comparison and
+counted separately in the summary, so a documented exclusion cannot masquerade
+as either a pass or a failure. The exclusion is taken from the compiler's own
+drop WARNING rather than from `--diag-json`, and it is SCOPED by that warning's
+`where`: only an "anchored bucket" drop is an exclusion. Any other drop is a
+FAILURE, since a member no engine takes for `find` or the scan pair must fail
+the compile rather than be left out — `custom-sets-unicode.txt`'s
+`UniMemberOverOldBuildCap` (`.{0,870}` in Unicode mode) is the one that was.
 
 ### Batched sets (`make set-batch`)
 
@@ -219,18 +281,56 @@ delivered-tuple gate rule of — at every
 empty-match shape, anchor and extent it contains, rather than at the handful a
 hand-written test can think of. Also runs clean with **0 failures**.
 
+### Sets in Unicode mode (`make sets-unicode`)
+
+The set sweep with `-unicode`: every set is compiled in Unicode mode (the
+set-level `unicode:` key states it), and the live oracle reads the input as Go
+does — its whole-input probe `\A(?s:.{p})(?:pat)` counts Go's TOKENS, so p
+steps through the positions where a character starts, and a position inside
+one is expected to start no match, empty ones included. That is the rule the
+set bodies keep and the one Go keeps; the scan pair at an `offset` inside a
+character is answered from the next start. A high-byte input is its own twin
+here: Unicode mode reads it as Go does. Two populations are skipped and
+counted: the corpus's all-ASCII blocks, which Unicode mode answers exactly as
+byte mode does and the byte-mode targets already check, and input that is not
+valid UTF-8 beside a member that can match U+FFFD (where Go and Unicode mode
+differ by design). Runs the corpus's blocks with characters above 0x7F,
+`custom-sets.txt`, and `custom-sets-unicode.txt` — Go-regenerated blocks of
+the shapes whose empty matches could land inside a character (`x*`, `(?:)`,
+`\B`, `a?\B`, line and text anchors, `.` and negated classes) over 2- to
+4-byte characters, invalid bytes, cut-off, overlong and surrogate sequences,
+plus multi-byte literals and members a set splits out, `(?i)` over whole fold
+orbits, written non-ASCII ranges, `\p{..}` members (a union automaton past 64
+ids among them), keyword sets for each literal frontend (packed pair, Teddy,
+Aho-Corasick, and Shufti once 600 keywords put Aho-Corasick over its budget),
+runs of characters after a literal, and a sparse bucket with and without
+assertions — neutral, under both hints, on Backtracking members and through
+the batch entry. **40,329,659 checks, 0 failures** over its ten runs, the
+answer cache swept on every forced-sweep leg the shape allows.
+
 ---
 
 ## Skipped cases (~781K)
 
-### Unicode support not implemented (~270K)
+### Unicode-mode rows (~270K)
 
 Patterns or inputs containing characters outside the ASCII range (code points
-> 127) require Unicode character class expansion (`\p{L}`, `\p{Digit}`, etc.).
-Regexped currently operates on byte-level input only. All such test cases are
-skipped.
+> 127) need Unicode mode (`\p{L}`, `\p{Digit}`, `é`, etc.). The byte-mode
+targets skip them, under `requires Unicode support`.
 
-Skip reason: `requires Unicode support`
+`make unicode` (from `tools/re2test/`) checks them: the six blocks that hold
+such characters are compiled in Unicode mode and judged against RE2's own
+columns — byte offsets, `.` reading a whole character — an oracle that is not
+Go, plus Go's every-match column. 702,938 checks pass, 0 fail. Two kinds of
+row are left out, each counted under its own reason: 337 where RE2's `\B`
+holds between two bytes of one character (`\B` over `"a\u0080b"`: RE2 2-2,
+Go and Unicode mode no match — they keep no match inside a character); the
+other 2,359 `\B` rows over such input, where RE2's columns equal Go's, are
+judged, although Go's own exhaustive test skips every one of them. And, for
+Go's column only, input that is not valid UTF-8 for a pattern that can
+match U+FFFD (see "Invalid UTF-8 in the input" below; this corpus has none).
+`--high-bytes` cannot be combined with Unicode mode: its ASCII-twin oracle is
+sound for byte mode only.
 
 ### Unsupported `\C` syntax (~511K)
 
@@ -263,9 +363,70 @@ Skip reason: `timeout (exponential backtracking)`
 
 ---
 
+## Differences from Go's `regexp`
+
+Regexped implements RE2 semantics. Wherever a check above takes its
+expectation from Go's `regexp` rather than from the corpus, it relies on Go
+giving the same answer; the places where regexped's answers differ from Go's
+are listed here. The default byte mode's own differences — `.` and negated
+classes match one byte — are in
+[Bytes, not codepoints](engines.md#bytes-not-codepoints).
+
+### `byte_mode`: raw bytes Go cannot match
+
+An entry with
+[`byte_mode: true`](cli.md#byte_mode--matching-raw-bytes-above-127) reads the
+characters `0x80`-`0xFF` in its pattern as those raw BYTES. Go's `regexp` has
+no such mode: a character in a pattern is always a codepoint, matched as its
+UTF-8 encoding, so no Go pattern can match a raw byte above `0x7F` — Go reads
+one as invalid UTF-8. `\xe9` and `é` are the same character to both parsers,
+so they behave alike:
+
+| Pattern (`byte_mode: true`) | Input bytes | Go `regexp` | Regexped |
+|---|---|---|---|
+| `\xe9` | `E9` | no match | `[0,1)` |
+| `\xe9` | `C3 A9` (é) | `[0,2)` | no match |
+| `é` | `E9` | no match | `[0,1)` |
+| `[\xc0-\xdf]` | `C3` | no match | `[0,1)` |
+| `[\xc0-\xdf]` | `C3 83` (Ã) | `[0,2)` | `[0,1)` |
+
+Without `byte_mode`, a pattern naming a character above `0x7F` is compiled in
+[Unicode mode](engines.md#unicode-mode), where `é` and `\xe9` are the
+character U+00E9, as in the Go column above. The raw byte is never taken by
+accident: it has to be asked for with `byte_mode`.
+
+### Invalid UTF-8 in the input (Unicode mode)
+
+Unicode mode reads the input as UTF-8, and a
+byte that does not belong to a
+valid UTF-8 sequence — a stray `0xFF` or continuation byte, a sequence cut
+short, an overlong or a surrogate encoding — **matches nothing**: no class,
+not even `.` or a negated class, can consume it. This is RE2's behaviour,
+and Rust's `regex` behaves the same way. Go's `regexp` instead decodes each such byte as U+FFFD,
+one byte wide, which `.`, a negated class and any other class containing
+U+FFFD then match:
+
+| Pattern | Input | Go `regexp` | Regexped (Unicode mode) |
+|---|---|---|---|
+| `.` | `"\xff"` | `[0,1)` | no match |
+| `a.c` | `"a\xffc"` | `[0,3)` | no match |
+| `[^,]+` | `"x\xffy,z"` | `[0,3)` `[4,5)` | `[0,1)` `[2,3)` `[4,5)` |
+| `.+` | `"\xe2\x82A"` | `[0,3)` | `[2,3)` |
+| `\pL+` | `"é\xffж"` | `[0,2)` `[3,5)` | `[0,2)` `[3,5)` |
+
+Valid UTF-8 input is not affected. Neither is the default byte mode, where
+every byte is a character of its own and there is no such thing as an invalid
+one (see [Bytes, not codepoints](engines.md#bytes-not-codepoints)).
+
+Matching Go here would cost more than the rule itself suggests: whether a byte
+such as `E2` is one invalid character or the start of `€` depends on the next
+one to three bytes (`E2 82 AC` versus `E2 82 41`), so every automaton would
+have to confirm a match up to three bytes after it ends.
+
+---
+
 ## What remains unimplemented
 
 | Category | Count | Required feature |
 |---|---|---|
-| Unicode character classes | ~270K | Unicode mode (large table expansion) |
 | `\C` byte escape | ~511K | Depends on Go `regexp/syntax` support |

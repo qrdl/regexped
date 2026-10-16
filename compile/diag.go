@@ -16,7 +16,6 @@ func (p PatternRef) String() string {
 // Diagnostics is the top-level diagnostic structure produced by CompileFile.
 type Diagnostics struct {
 	PatternsTotal       int       `json:"patterns_total"`
-	CaptureBearing      int       `json:"capture_bearing"`
 	InSet               int       `json:"in_set"`
 	PrefixDedupPoolSize int       `json:"prefix_dedup_pool_size"`
 	Sets                []SetDiag `json:"sets"`
@@ -24,7 +23,9 @@ type Diagnostics struct {
 
 // SetDiag holds diagnostics for one set.
 type SetDiag struct {
-	Name     string `json:"name"`
+	Name string `json:"name"`
+	// Mode is the mode the set runs in, "byte" or "unicode" (resolveSetMode).
+	Mode     string `json:"mode"`
 	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"
 	// Capabilities lists the set's declared capability keys, in the
 	// canonical grid order.
@@ -44,9 +45,11 @@ type SetDiag struct {
 	// promised -1 for that case; setMaxLookback cannot return it.
 	MaxLookback int `json:"max_lookback"`
 	// IDSpaceSize is one past the largest pattern id this set can report.
-	// For `patterns: all` it equals the pattern count;
-	// for a named subset it is the largest selected pattern's global index
-	// plus one, and it — not the pattern count — is the size of the gate array
+	// For `patterns: all` with no inline regexps it equals the pattern count;
+	// for a named subset it is the largest selected pattern's index plus one,
+	// and for a set with regexps of its own it is the number of top-level
+	// patterns plus its own regexps (config.SetConfig.IDSpaceSize). It — not
+	// the pattern count — is the size of the gate array
 	// and the `_all` bitmap, and what decides the narrow-vs-wide `_all` ABI.
 	IDSpaceSize int `json:"id_space_size"`
 	// BareBodyShape records which body shape each declared bare capability
@@ -54,28 +57,17 @@ type SetDiag struct {
 	// emitted today: the union collapse is not built, so
 	// this field exists to make that visible rather than to be guessed at, and
 	// gains a "collapsed" value if the collapse ever lands.
-	BareBodyShape         map[string]string `json:"bare_body_shape,omitempty"`
-	Buckets               []BucketDiag      `json:"buckets"`
-	Conflicts             []ConflictDiag    `json:"conflicts"`
-	CaptureBearingDropped []PatternRef      `json:"capture_bearing_dropped"`
-	StateLimitDropped     []PatternRef      `json:"state_limit_dropped,omitempty"`
-	// AnchoredStateLimitDropped lists patterns whose own anchored DFA could not
-	// be built inside the packer's limits, so they left match_any/match_all
-	// while scan_any, scan_all and `find` kept them.
-	//
-	// Separate from StateLimitDropped on purpose. That field is written by the
-	// `find` packers and means the pattern left the set ENTIRELY; this one is
-	// scoped to the anchored capabilities. One field carried both meanings
-	// until 2026-09-20, so nothing downstream could tell a pattern that still
-	// answers from one that does not — a consumer excluded a pattern the scan
-	// pair correctly reported, and read the disagreement as a wrong answer.
-	AnchoredStateLimitDropped []PatternRef `json:"anchored_state_limit_dropped,omitempty"`
-	// UnparseableDropped lists patterns the anchored packer could not re-parse
-	// and therefore excluded from match/match_any/match_all while `find` kept
-	// them. Defensive — analyzePattern already parsed these once — but a
-	// silent `continue` there would leave the capabilities disagreeing with no
-	// diagnostic trail at all.
-	UnparseableDropped []PatternRef `json:"unparseable_dropped,omitempty"`
+	BareBodyShape map[string]string `json:"bare_body_shape,omitempty"`
+	Buckets       []BucketDiag      `json:"buckets"`
+	Conflicts     []ConflictDiag    `json:"conflicts"`
+	// AnchoredBacktracking lists members whose own anchored DFA cannot be
+	// built inside the limits, so match_any / match_all answer for them
+	// through a Backtracking probe over the whole input, run after the DFA
+	// part. No member is ever left out of a capability: one that Backtracking
+	// cannot take either fails the compile. (The fields that once listed
+	// members DROPPED from the anchored pair — anchored_state_limit_dropped,
+	// unparseable_dropped — are gone with the drops.)
+	AnchoredBacktracking []PatternRef `json:"anchored_backtracking,omitempty"`
 	// FrontendDemotion records that the frontend chooseLiteralFrontend picked
 	// was NOT the one emitted, and why. Nil when the chosen frontend shipped.
 	//
@@ -152,6 +144,11 @@ type SetDiag struct {
 	// when the set's buckets cannot be swept directly: every member's full
 	// pattern merged, beside the buckets the walk keeps.
 	WholeSetSweep *WholeSetSweepDiag `json:"whole_set_sweep,omitempty"`
+	// CacheBytesPerByte is what the region an overlapping `find` is offered —
+	// its answer cache and its split members' program sweep — costs per input
+	// byte, up to the single-block budget (64 MiB), past which it grows with
+	// the square root of the input. 0 when the set keeps no such region.
+	CacheBytesPerByte int `json:"cache_bytes_per_byte,omitempty"`
 }
 
 // WholeSetSweepDiag is the whole-set automaton's size: its states, and the
@@ -224,6 +221,15 @@ type ACTableDiag struct {
 	// ByteClasses and Stride are meaningful only when Compressed.
 	ByteClasses int `json:"byte_classes,omitempty"`
 	Stride      int `json:"stride,omitempty"`
+	// ProbeColumns are the two byte offsets the root-state prefilter tests
+	// in place of the first byte — a Unicode-mode set whose literals all
+	// begin with a non-ASCII character (chooseACProbe); omitted when the
+	// prefilter tests the first byte. A body with a fallback bucket has no
+	// prefilter at all and walks every position, whatever this says.
+	ProbeColumns []int `json:"probe_columns,omitempty"`
+	// VerifyColumn is the column a probe hit dispatches on before the trie
+	// walk (planACVerify); omitted without the verify.
+	VerifyColumn *int `json:"verify_column,omitempty"`
 }
 
 // FrontendDemotionDiag explains why a literal frontend was downgraded.
@@ -263,7 +269,11 @@ type BucketDiag struct {
 	// and silently stopped firing".
 	MemberSkipStates int `json:"member_skip_states,omitempty"`
 	MemberSkipSets   int `json:"member_skip_sets,omitempty"`
-	TableBytes       int `json:"table_bytes"`
+	// MemberSkipCharStates is how many of those states stride whole UTF-8
+	// characters rather than bytes (a Unicode-mode set's `[^;]+`, `.+` tails:
+	// buildMemberSets' character sets).
+	MemberSkipCharStates int `json:"member_skip_char_states,omitempty"`
+	TableBytes           int `json:"table_bytes"`
 }
 
 // ConflictDiag records a bin-packing rejection.

@@ -3,6 +3,7 @@ package compile
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/utils"
@@ -15,6 +16,10 @@ import (
 // The match function body is not stored here — it is built at assemble time
 // (when function-table indices are known) by emitSetMatchFnFinal.
 type compiledSet struct {
+	// err is a member that fits no engine (setFailure): the set does not
+	// compile. Every caller of CompileSet that builds a module checks it.
+	err error
+
 	// midSweepWork / midSweepBudget are the module globals of the
 	// overlapping `find`'s in-call counter, emitted wherever the answer cache
 	// is: once the walk has cost what the sweep would, the body bails out and
@@ -215,6 +220,14 @@ type compiledSet struct {
 	// anchoredIDs then holds the whole set's ids as a single group because the
 	// automaton reports for every pattern.
 	anchoredUnion *anchoredUnion
+	// anchoredBT are the anchored pair's Backtracking buckets — a member whose
+	// own anchored DFA cannot be built inside the limits — one pattern each,
+	// anchoredBTIDs their global ids. Their probes (anchoredBTProbeBodies,
+	// filled by buildBTBodies) sit after the anchored DFA probes and are
+	// called after the DFA part, by the bucket body and the union body alike.
+	anchoredBT            []*bucket
+	anchoredBTIDs         []int
+	anchoredBTProbeBodies [][]byte
 
 	// btFnBodies[i] is the Backtracking driver for the i-th BT fallback bucket
 	//: (ptr, len, out_ptr) -> i32, the same shape a
@@ -234,6 +247,7 @@ type compiledSet struct {
 	// reached through setFindCtx can address them.
 	tableMemIdx int
 	btFnBodies  [][]byte
+	btFnOwners  []string // the member each btFnBodies entry serves, for messages
 	btRegions   *btSharedRegions
 	// btWorkBudget and btStackStart are CompileSetOptions.BTWorkBudget and
 	// BTStackStart, kept for buildBTBodies, which builds the drivers at
@@ -333,6 +347,15 @@ type compiledSet struct {
 	acDataSegCount      int
 	acFirstByteSet      []byte // distinct first bytes for SIMD prefilter
 	acFirstByteFlagsOff int32  // data offset of firstByteFlags[256] table
+	// acProbe, when set, replaces the root-state prefilter's first-byte test
+	// with a two-column one: a position is a candidate iff input[p+Off1] is
+	// in Bytes1 AND input[p+Off2] is in Bytes2 (chooseACProbe says when).
+	acProbe *packedPairPlan
+	// acVerify: at a probe hit, dispatch on input[p+Col] and compare the
+	// literals carrying that byte there; a matching ELIGIBLE literal jumps
+	// straight to its trie node, no literal at all skips the position
+	// (planACVerify, emitACVerify).
+	acVerify *acVerifyPlan
 
 	// Teddy frontend (fe == frontendTeddy): SIMD nibble tables.
 	teddyTabs         *teddyTables
@@ -475,12 +498,18 @@ func (cs *compiledSet) capFnOffset(kind setCapKind) int {
 func (cs *compiledSet) funcCount() int {
 	return len(cs.capFns()) + cs.hiddenFnCount() + cs.numSuffixFns + len(cs.prefixFnBodies) +
 		len(cs.scanProbeBodies) + len(cs.scanProbeAnyBodies) + len(cs.anchoredProbeBodies) +
-		cs.numBTFns + cs.extraFnCount()
+		len(cs.anchoredBTProbeBodies) + cs.numBTFns + cs.extraFnCount()
 }
 
 // btFnBaseOffset returns the index of the first Backtracking driver, which sit
 // last so that adding them moved no existing sub-index.
 func (cs *compiledSet) btFnBaseOffset() int {
+	return cs.anchoredBTProbeBaseOffset() + len(cs.anchoredBTProbeBodies)
+}
+
+// anchoredBTProbeBaseOffset returns the index of the first anchored-pair
+// Backtracking probe, right after the anchored DFA probes.
+func (cs *compiledSet) anchoredBTProbeBaseOffset() int {
 	return cs.anchoredProbeBaseOffset() + len(cs.anchoredProbeBodies)
 }
 
@@ -683,6 +712,10 @@ type SetSpec struct {
 	// directly (rather than from a config) get.
 	IDSpaceSize int
 
+	// MaxUnionStates is config.BuildConfig.MaxUnionStates: the union
+	// automaton's construction cap (maxUnionStates); 0 for the default.
+	MaxUnionStates int
+
 	// DeclaredPatternCount is config.SetConfig.PatternCount — the number of
 	// patterns the set SELECTS, before any are dropped for carrying captures
 	// or exceeding the state limit. It sizes the stubs' tuple buffer, and with
@@ -693,8 +726,8 @@ type SetSpec struct {
 	// which is what the internal harnesses building a SetSpec directly get.
 	DeclaredPatternCount int
 
-	Patterns   []*PatternInfo // resolved, capture-bearing dropped
-	PatternIDs []int          // global indices into the regexps list
+	Patterns   []*PatternInfo // resolved, every selected entry
+	PatternIDs []int          // pattern ids: top-level indices, then the set's own regexps (config.SetMember)
 }
 
 // patternCount is the count the batch cursor and the stubs' buffer are sized
@@ -776,7 +809,19 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 	if opts.globals == nil {
 		opts.globals = &moduleGlobals{}
 	}
-	return compileSetSplit(spec, prefixPool, suffixPool, opts)
+	opts = opts.resolvedFor(spec)
+	cs := compileSetSplit(spec, prefixPool, suffixPool, opts)
+	cs.err = opts.fail.err
+	return cs
+}
+
+// memorySizeLimit is a config size spelled as the set options spell a limit
+// (exactLimit): unset is 0, "derive it"; a written 0 is negative.
+func memorySizeLimit(m config.MemorySize) int {
+	if !m.IsSet() {
+		return 0
+	}
+	return exactLimit(int(min(m.Bytes(), math.MaxInt32)))
 }
 
 // compileSetWith is CompileSet with the members at the spec.Patterns indices
@@ -785,6 +830,7 @@ func CompileSet(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOp
 // capabilities are split. nonLinear says a member is not provably linear in
 // the set's bodies, which is what the work counters exist for.
 func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSetOptions, split []splitCand, nonLinear bool) *compiledSet {
+	opts = opts.resolvedFor(spec)
 	// THE nil-allocator fallback for the whole set path. A nil allocator means
 	// this set is being compiled outside a module assembly — CompileSet is
 	// reachable that way from tests that inspect the result rather than run
@@ -807,7 +853,10 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	if opts.globals == nil {
 		opts.globals = &moduleGlobals{}
 	}
-	diag := &SetDiag{Name: spec.Name}
+	diag := &SetDiag{Name: spec.Name, Mode: "byte"}
+	if len(spec.Patterns) > 0 {
+		diag.Mode = spec.Patterns[0].rp.modeName() // one mode for the whole set
+	}
 	// full is the whole set; spec, from here on, is what the buckets serve.
 	full := spec
 	spec = keptSpec(full, splitIndices(split))
@@ -878,7 +927,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			}
 		}
 	}
-	fe := chooseLiteralFrontend(lits)
+	unicodeSet := len(spec.Patterns) > 0 && spec.Patterns[0].rp.unicode()
+	fe := chooseLiteralFrontend(lits, unicodeSet)
 	// TEST-ONLY measurement override. Placed here, before every
 	// structural refusal below, so a forced frontend is still subject to the
 	// rules that exist for correctness rather than for speed — a fallback
@@ -1097,7 +1147,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		if bkt.sparse && sparseCycle(bkt) {
 			ctr = sparseCtr
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
+		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, unicodeSet, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
 			bucketLivenessExit(bkt))
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
@@ -1112,6 +1162,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			// recomputed.
 			bkt.sparseScratch = art.sparseScratch
 			bkt.sparseIDMapOff = art.sparseIDMapOff
+			bkt.sparseMemberGlobalP1 = art.memberGlobalP1
 		}
 		if needSuffixFns {
 			suffixFnBodies[bi] = art.fnBody
@@ -1230,6 +1281,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	var acDataBytes []byte
 	acDataSegCount := 0
 	var acFirstByteSet []byte
+	var acProbe *packedPairPlan
+	var acVerify *acVerifyPlan
 	var acFirstByteFlagsOff int32
 	if fe == frontendAC {
 		ac := buildAC(lits)
@@ -1321,6 +1374,20 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			acFirstByteFlagsOff = acL.tableEnd
 			acDataBytes = append(acDataBytes, appendDataSegment(nil, acFirstByteFlagsOff, fbFlags)...)
 			acDataSegCount++ // one more segment for firstByteFlags
+			// Both modes: chooseACProbe declines unless every literal begins
+			// with a byte 0xC2-0xF4, which in byte mode only a `byte_mode`
+			// literal can — UTF-8 keywords written as bytes, whose first byte
+			// stalls the first-byte probe exactly as in Unicode mode (20
+			// Russian keywords as bytes, no match: 42.5 → 2.7 fuel/byte).
+			acProbe = chooseACProbe(lits)
+			if acProbe != nil {
+				acVerify = planACVerify(ac, acL, lits)
+				diag.ACTable.ProbeColumns = []int{acProbe.Off1, acProbe.Off2}
+				if acVerify != nil {
+					col := acVerify.Col
+					diag.ACTable.VerifyColumn = &col
+				}
+			}
 		} else {
 			fe = frontendScalar
 			diag.FrontendDemotion = &FrontendDemotionDiag{
@@ -1361,7 +1428,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// kind only when choosePackedPair succeeded on the same literals.
 	var packedPair *packedPairPlan
 	if fe == frontendPackedPair {
-		packedPair, _ = choosePackedPair(lits)
+		packedPair, _ = choosePackedPair(lits, unicodeSet)
 	}
 
 	// density-heuristic / LikelyNoMatch Shufti for the
@@ -1451,15 +1518,19 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			if bi >= len(diag.Buckets) || bkt.suffixDFA == nil || !bkt.sparse {
 				continue
 			}
-			idTab, setTab := buildMemberSets(bkt.suffixDFA, bkt.suffixDFA.numStates+1)
-			n := 0
+			idTab, setTab, firstChar := buildMemberSets(bkt.suffixDFA, bkt.suffixDFA.numStates+1, unicodeSet)
+			n, chars := 0, 0
 			for _, id := range idTab {
 				if id != 0 {
 					n++
+					if firstChar > 0 && int(id) >= firstChar {
+						chars++
+					}
 				}
 			}
 			diag.Buckets[bi].MemberSkipStates = n
 			diag.Buckets[bi].MemberSkipSets = len(setTab) / memberSetBytes
+			diag.Buckets[bi].MemberSkipCharStates = chars
 		}
 	}
 
@@ -1525,7 +1596,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		for bi, bkt := range buckets {
 			if bkt.btFallback != nil && planBT(bkt.btFallback.bt, opts.BTWorkBudget).fallback {
 				m := allocBTDriveMember(opts.globals, btRegions.drive)
-				m.rowBytes = int32((len(bkt.btFallback.bt.prog.Inst) + 7) / 8) //nolint:gosec // a program size
+				m.rowBytes = int32(bkt.btFallback.bt.memoRowBytes()) //nolint:gosec // a program's Alts / 8
 				btRegions.members[bi] = m
 				// A member with an ordinary body keeps its budget per
 				// `find` drive in a search block (emitBTWorkInitMember).
@@ -1622,6 +1693,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		acDataBytes:         acDataBytes,
 		acDataSegCount:      acDataSegCount,
 		acFirstByteSet:      acFirstByteSet,
+		acProbe:             acProbe,
+		acVerify:            acVerify,
 		acFirstByteFlagsOff: acFirstByteFlagsOff,
 		teddyTabs:           teddyTabs,
 		teddyDataOffset:     teddyDataOffset,
@@ -1672,13 +1745,25 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		// itself part of the union's eligibility — see anchoredUnionBeatsBuckets.
 		// Its result is discarded when the union wins, which costs compile time
 		// only (CLAUDE.md: runtime over compile time).
-		abuckets, amembers := compileAnchoredBuckets(full.Patterns, opts, diag)
+		abuckets, amembers, abt := compileAnchoredBuckets(full.Patterns, opts, diag)
+		if len(abt) > 0 {
+			// Counted before anything asks hasBTMember(): the set's `_all`
+			// pair goes to the out_ptr form, where -2 is unambiguous.
+			var fns int
+			cs.btRegions, fns = allocAnchoredBTRegions(cs.btRegions, abt, opts.BTWorkBudget, opts.globals)
+			cs.numBTFns += fns
+			cs.anchoredBT = abt
+			cs.anchoredBTProbeBodies = make([][]byte, len(abt))
+			for _, b := range abt {
+				cs.anchoredBTIDs = append(cs.anchoredBTIDs, globalIDOf[b.patterns[0]])
+			}
+		}
 		// The union must answer for exactly the patterns the PACKER kept.
 		//
-		// It is built from a spec, and the packer drops a pattern whose solo
-		// anchored DFA exceeds max_fallback_states (and admits no Backtracking
-		// member — see docs/sets.md "Backtracking members and the anchored
-		// pair"). Building the union from the unfiltered spec made the two
+		// It is built from a spec, and the packer leaves out a pattern whose
+		// solo anchored DFA exceeds the limits — that one runs on its own
+		// Backtracking probe after the union. Building the union from the
+		// unfiltered spec made the two
 		// halves of one capability disagree: with the union, match_any and
 		// match_all reported patterns that with buckets they do not, and the
 		// --set-bt corpus leg found exactly that.
@@ -1750,7 +1835,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 					ids[j] = globalIDOf[ap]
 				}
 				cs.anchoredIDs[bi] = ids
-				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids)
+				body, data, segs, next, sp := genAnchoredWASM(ab.suffixDFA, int64(anchoredOffset), opts.TableMemIdx, ids, unicodeSet, opts.LikelyMode == LikelyMatch)
 				if sp != nil {
 					ab.sparseScratch = sp.scratch
 					ab.sparseIDMapOff = sp.idMapOff
@@ -2024,12 +2109,9 @@ func CompileFileComponent(cfg config.BuildConfig, pkg string, exportNames map[st
 // CompileFileDiag is CompileFile plus the per-set diagnostics the same compile
 // already produced — one SetDiag per entry of cfg.Sets, in that order.
 //
-// It exists because a set can legitimately EXCLUDE a pattern the caller asked
-// for: a suffix DFA over max_dfa_states is dropped with a warning and recorded
-// in SetDiag.StateLimitDropped, and a set that does not contain a pattern does
-// not report its matches. Any differential test therefore has to know which
-// patterns actually made it in, or it compares the engine against an oracle
-// for a set the engine was never asked to build.
+// It exists so a differential test can see how the set was built — which
+// frontend, which members split, which members' anchored pair runs on
+// Backtracking (SetDiag.AnchoredBacktracking) — without compiling it twice.
 //
 // CmdWriteDiagJSON answers the same question by RE-RUNNING the whole set
 // compilation. That is fine for a CLI flag and wrong for a caller in a hot
@@ -2054,6 +2136,7 @@ func compileFileDiagReport(cfg config.BuildConfig, output string, over CompileSe
 // options. `comp` is the zero value — meaning MODULE — on every path but
 // CompileFileComponent, which is the arm component/ drives.
 func compileFileComponentReport(cfg config.BuildConfig, output string, over CompileSetOptions, rep *Reporter, comp asmOpts) ([]byte, int64, []SetDiag, error) {
+	defer rep.startProgress()()
 	if err := config.ValidateSets(&cfg); err != nil {
 		return nil, 0, nil, err
 	}
@@ -2063,6 +2146,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	if err := validateBTWorkBudget(over.BTWorkBudget); err != nil {
 		return nil, 0, nil, err
 	}
+	comp.keepUnreadTables = over.KeepUnreadTables
 
 	// A component owns and exports its own memory, so the embedded shape — and
 	// the `output:` key that selects it for a module — has no meaning here.
@@ -2073,8 +2157,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// that logic here is bug-prone — earlier versions produced under-sized
 	// memory for standalone modules whose DFA tables exceeded 64 KiB.
 	if len(cfg.Sets) == 0 {
-		w, top, err := Compile(cfg.Regexps, 0, standalone, CompileOptions{
-			MaxDFAStates:              cfg.MaxDFAStates,
+		w, top, err := Compile(cfg.Patterns, 0, standalone, CompileOptions{
+			MaxDFAStates:              int(cfg.MaxDFAStates),
+			MaxBTInstructions:         int(cfg.MaxBTInstructions),
 			MaxTDFARegs:               cfg.MaxTDFARegs,
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
@@ -2095,9 +2180,10 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	var compiled []*compiledPattern
 	var lastTableEnd int64
 	opts := CompileOptions{
-		MaxDFAStates: cfg.MaxDFAStates,
-		MaxTDFARegs:  cfg.MaxTDFARegs,
-		Report:       rep,
+		MaxDFAStates:      int(cfg.MaxDFAStates),
+		MaxBTInstructions: int(cfg.MaxBTInstructions),
+		MaxTDFARegs:       cfg.MaxTDFARegs,
+		Report:            rep,
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		BTWorkBudget: over.BTWorkBudget,
 		BTStackStart: over.BTStackStart,
@@ -2109,7 +2195,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// below and by every set — the same rule compileAll follows.
 	globals := &moduleGlobals{}
 	opts.globals = globals
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
 			return nil, 0, nil, err
@@ -2138,32 +2224,13 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	fillSearchSizes(compiled, over.searchSizes)
 
 	// Resolve and compile sets.
-	// Build name→index map.
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
-		}
-	}
-
 	var prefixPool, suffixPool dfaPool
 	var compiledSets []*compiledSet
 	setTableBase := lastTableEnd // each set's tables start after all preceding data
 	for _, sc := range cfg.Sets {
-		// Resolve patterns.
-		var selectedIdx []int
-		if sc.Patterns.All {
-			for i := range cfg.Regexps {
-				selectedIdx = append(selectedIdx, i)
-			}
-		} else {
-			for _, name := range sc.Patterns.Names {
-				selectedIdx = append(selectedIdx, nameIdx[name])
-			}
-		}
-
-		// Drop capture-bearing patterns; build PatternInfos.
-		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		rep.progressSubject("set %q", sc.Name)
+		// Build PatternInfos, one per member: selected and inline.
+		infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, rep.progress())
 		if err != nil {
 			return nil, 0, nil, err
 		}
@@ -2174,10 +2241,14 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		}
 		setOpts.TableBase = int32(setTableBase)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
+		if cs.err != nil {
+			return nil, 0, nil, fmt.Errorf("set %q: %w", sc.Name, cs.err)
+		}
 		compiledSets = append(compiledSets, cs)
 		fillSetSearchSizes(sc, cs, over.searchSizes)
 		if cs.diag != nil {
 			cs.diag.SearchBlocks, cs.diag.SearchBlocksBTMemo = diagSearchBlocks(cs.searchBlocks())
+			cs.diag.CacheBytesPerByte = overlapShapeOf(cs).bytesPerByte()
 		}
 		if cs.companion != nil {
 			// Its tables sit above the set's own; its functions follow the
@@ -2245,7 +2316,12 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	// caller trusting it on a set-bearing module wrote its input over the
 	// first set's tables. tools/perftest already worked around this by
 	// re-parsing the data section; nothing else did.
+	var owners codeOwners
+	comp.owners = &owners
 	w := assembleModuleWithSets(compiled, compiledSets, memPages, standalone, globals, comp)
+	if err := checkFunctionSizes(w, owners); err != nil {
+		return nil, 0, nil, err
+	}
 	rep.noteModule(globals)
 	return w, dataTop, diags, nil
 }
@@ -2626,6 +2702,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for range cs.anchoredProbeBodies {
 			fs = append(fs, byte(setTypeI32x4ToI32))
 		}
+		for range cs.anchoredBTProbeBodies {
+			fs = append(fs, byte(setTypeI32x4ToI32))
+		}
 		for i := 0; i < cs.numBTFns; i++ {
 			// (ptr, len, out_ptr) -> i32, the capture-body shape.
 			fs = append(fs, byte(setTypeI32x3ToI32))
@@ -2852,6 +2931,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	// Defined functions only — `total` counts the imported canon builtins too.
 	cs_bytes = utils.AppendULEB128(cs_bytes, uint32(total-numFuncImports))
 	for i, p := range patterns {
+		opts.owners.mark(len(cs_bytes), p.ownerName())
 		base := baseIdx[i]
 		matchOff, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
@@ -2901,11 +2981,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		if p.batchFindExport != "" {
-			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.defBatchFind)
+			cs_bytes = appendBatchFindWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.defBatchFind, p.twinRouteFor(findOff))
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -2919,7 +2999,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups)
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -2927,7 +3007,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen, p.defFind)
+			checkStartRule(p.startRule, p.findFromMode)
+			cs_bytes = appendFindFromWrapperCodeEntry(cs_bytes, base+findOff, p.findFromMode, p.minLen, p.defFind, p.twinRouteFor(findOff))
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -2947,6 +3028,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		tableMemIdx = 1
 	}
 	for si, cs := range sets {
+		opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 		base := setBaseIdx[si]
 		scanProbeBase := base + cs.scanProbeBaseOffset()
 		anchoredProbeBase := base + cs.anchoredProbeBaseOffset()
@@ -2992,7 +3074,8 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			case capMatchAny, capMatchAll:
 				if cs.anchoredUnion != nil {
 					out = append(out,
-						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx)...)
+						emitAnchoredUnionBody(cs.anchoredUnion, c.kind, cs.wideAll(), tableMemIdx,
+							base+cs.anchoredBTProbeBaseOffset(), cs.anchoredBTIDs)...)
 					break
 				}
 				out = append(out, emitSetAnchoredCapBody(cs, c.kind, anchoredProbeBase)...)
@@ -3022,9 +3105,10 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				out = append(out, body...)
 			}
 			// Every exported capability that can reach a Backtracking member
-			// starts a new host call for it. The anchored pair cannot: no BT
-			// bucket is admitted there.
-			if cs.btRegions != nil && cs.btRegions.hasDrive && c.kind != capMatchAny && c.kind != capMatchAll {
+			// starts a new host call for it — the anchored pair when it has
+			// Backtracking probes of its own.
+			anchoredCap := c.kind == capMatchAny || c.kind == capMatchAll
+			if cs.btRegions != nil && cs.btRegions.hasDrive && (!anchoredCap || len(cs.anchoredBT) > 0) {
 				out = injectBTDrivePrologue(out, cs.btRegions.drive, cs.emitBTBlocksPrologue(c.kind))
 			}
 			return out
@@ -3136,10 +3220,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		for _, pb := range cs.anchoredProbeBodies {
 			cs_bytes = append(cs_bytes, pb...)
 		}
+		for _, pb := range cs.anchoredBTProbeBodies {
+			cs_bytes = append(cs_bytes, pb...)
+		}
 		// Backtracking drivers last, matching btFnBaseOffset.
-		for _, bb := range cs.btFnBodies {
+		for bi, bb := range cs.btFnBodies {
+			opts.owners.mark(len(cs_bytes), fmt.Sprintf("member %q of set %q", cs.btFnOwners[bi], cs.name))
 			cs_bytes = append(cs_bytes, bb...)
 		}
+		opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 		// Then a split set's functions, in extraFnTypes' order.
 		for _, c := range cs.keptCaps() {
 			cs_bytes = append(cs_bytes, capBody(c)...)
@@ -3152,7 +3241,9 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		for i, sm := range cs.split {
 			if sm.bt != nil {
+				opts.owners.mark(len(cs_bytes), fmt.Sprintf("member %q of set %q", sm.name, cs.name))
 				cs_bytes = appendBTFindParts(cs_bytes, sm.bt.fast, *sm.bt, base+cs.splitFwdOffset(i))
+				opts.owners.mark(len(cs_bytes), fmt.Sprintf("set %q", cs.name))
 				continue
 			}
 			cs_bytes = append(cs_bytes, sm.fwdBody...)
@@ -3162,6 +3253,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			cs_bytes = append(cs_bytes, cs.emitSweepFnBody(tableMemIdx)...)
 		}
 	}
+	opts.owners.mark(len(cs_bytes), "")
 	if opts.Component {
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
@@ -3185,7 +3277,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	if searchSetterIdx >= 0 {
 		cs_bytes = appendCodeEntry(cs_bytes, searchSetterBody(searchG))
 	}
-	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone)
+	return appendCodeAndData(out, cs_bytes, rawData, totalSegs, standalone, opts.keepUnreadTables)
 }
 
 // rebuildSetMatchBody re-emits the set match function with correct function indices.
@@ -3490,6 +3582,274 @@ func emitSetTailProbe(b []byte, p setTailProbeParams) []byte {
 // on a 17-byte call) and at two it is already ahead.
 const acTailProbeMinLeft = 2
 
+// chooseACProbe picks a two-column probe for the Aho-Corasick root-state
+// prefilter, or nil to keep the first-byte probe.
+//
+// Taken only when every literal begins with a UTF-8 lead byte (0xC2-0xF4) —
+// in Unicode mode a non-ASCII first character, in byte mode a `byte_mode`
+// literal whose first byte is in that range (UTF-8 keywords written as
+// bytes). Such a byte begins a large share of its own script's characters —
+// D0/D1 half of all Russian letters — so on text in that script the
+// first-byte probe stops every byte or two and the trie walks nearly every
+// byte: 27-35 fuel per byte with no match, against 5-7 with this probe.
+// packed-pair's column chooser refuses a lead-only column for the same reason.
+//
+// Columns lie in 0..min(minLen,4)-1; the pair with the fewest distinct bytes
+// wins, ties toward the earlier columns, and at least one of its columns must
+// not be lead bytes only. For a 2-byte script that is the whole first
+// character. The probe is a SUPERSET filter: every literal has its own bytes
+// at both columns, so every real start passes, and the trie resolves the rest.
+func chooseACProbe(literals [][]byte) *packedPairPlan {
+	minLen := 1 << 30
+	for _, lit := range literals {
+		if len(lit) < minLen {
+			minLen = len(lit)
+		}
+	}
+	window := minLen
+	if window > 4 {
+		window = 4
+	}
+	if window < 2 {
+		return nil
+	}
+	cols := make([][]byte, window)
+	for o := 0; o < window; o++ {
+		var seen [256]bool
+		for _, lit := range literals {
+			seen[lit[o]] = true
+		}
+		for i := 0; i < 256; i++ {
+			if seen[i] {
+				cols[o] = append(cols[o], byte(i))
+			}
+		}
+	}
+	leadsOnly := func(col []byte) bool {
+		for _, c := range col {
+			if c < 0xC2 || c > 0xF4 {
+				return false
+			}
+		}
+		return true
+	}
+	if !leadsOnly(cols[0]) {
+		return nil
+	}
+	var best *packedPairPlan
+	bestN := 1 << 30
+	for o1 := 0; o1 < window; o1++ {
+		for o2 := o1 + 1; o2 < window; o2++ {
+			if leadsOnly(cols[o1]) && leadsOnly(cols[o2]) {
+				continue
+			}
+			if n := len(cols[o1]) + len(cols[o2]); n < bestN {
+				bestN = n
+				best = &packedPairPlan{Off1: o1, Off2: o2, Bytes1: cols[o1], Bytes2: cols[o2], MinLen: minLen}
+			}
+		}
+	}
+	return best
+}
+
+// acVerifyPlan is the per-candidate verify in front of the Aho-Corasick trie
+// walk, taken at every probe hit.
+//
+// A br_table on input[p+Col] — Col the column, inside the shortest literal,
+// with the most distinct bytes — selects the literals carrying that byte
+// there, and a compare chain tests just those. Two exits beside "walk the trie
+// as before":
+//
+//   - an ELIGIBLE literal that matches sets the trie state to the literal's
+//     node and the position to its last byte, and the walk's transition for
+//     that byte is skipped: exactly where Aho-Corasick from the root at p
+//     arrives after consuming the literal, so its output list (the literal
+//     and its suffix literals) is processed as before. A literal is
+//     INELIGIBLE when another literal occurs inside it ending before its end:
+//     the walk would report that one first, a jump would not. An ineligible
+//     literal stays in the chain and, when it matches, falls through to the
+//     trie walk unchanged.
+//   - no literal of the chain matching (or fitting) means no literal starts
+//     at p, and the scan resumes at p+1: the root-state walk from p finds
+//     only literals starting at or after p, and the prefilter finds the later
+//     ones itself.
+//
+// Cases are tried in literal order, and the order cannot matter: two
+// literals matching at p are a prefix pair, the longer is ineligible (the
+// shorter ends inside it), and jumping to the shorter's node walks on into
+// the longer.
+type acVerifyPlan struct {
+	Col      int      // dispatch column: input[p+Col] selects the case
+	Cases    [][]int  // literal ids per distinct byte value at Col, in Vals order
+	Vals     []byte   // the distinct byte values at Col
+	Eligible []bool   // per literal: no other literal ends INSIDE it before its end
+	Node     []int    // per literal: the emitted id of its trie node
+	Lits     [][]byte // the literals, by literal id (cs.litToBuckets' ids)
+	MinLen   int
+}
+
+func planACVerify(ac *acAutomaton, acL *acLayout, lits [][]byte) *acVerifyPlan {
+	minLen := 1 << 30
+	for _, lit := range lits {
+		if len(lit) < minLen {
+			minLen = len(lit)
+		}
+	}
+	if minLen < 1 {
+		return nil
+	}
+	// The column with the most distinct bytes; ties toward the earlier one.
+	bestCol, bestN := -1, 0
+	for o := 0; o < minLen; o++ {
+		var seen [256]bool
+		n := 0
+		for _, lit := range lits {
+			if !seen[lit[o]] {
+				seen[lit[o]] = true
+				n++
+			}
+		}
+		if n > bestN {
+			bestN, bestCol = n, o
+		}
+	}
+	pl := &acVerifyPlan{Col: bestCol, MinLen: minLen, Lits: lits}
+	var byVal [256][]int
+	for i, lit := range lits {
+		byVal[lit[bestCol]] = append(byVal[lit[bestCol]], i)
+	}
+	for v := 0; v < 256; v++ {
+		if len(byVal[v]) > 0 {
+			pl.Vals = append(pl.Vals, byte(v))
+			pl.Cases = append(pl.Cases, byVal[v])
+		}
+	}
+	pl.Eligible = make([]bool, len(lits))
+	pl.Node = make([]int, len(lits))
+	for i, lit := range lits {
+		pl.Eligible[i] = true
+		for j, m := range lits {
+			if j == i {
+				continue
+			}
+			// m occurring in lit and ending before lit's end: AC would report
+			// it first, a direct jump to lit's node would not.
+			for off := 0; off+len(m) < len(lit); off++ {
+				if string(lit[off:off+len(m)]) == string(m) {
+					pl.Eligible[i] = false
+				}
+			}
+		}
+		cur := 0
+		for _, c := range lit {
+			cur = ac.nodes[cur].gotoTable[c]
+		}
+		pl.Node[i] = acL.oldToNew[cur]
+	}
+	return pl
+}
+
+// emitACVerify emits the verify at a probe hit (lACState == 0, lPos the
+// candidate or pInLen). Leaves lPos/lACState/lVerified set for a direct
+// report, lPos unchanged for a literal the trie must walk, or restarts the
+// scan at lPos+1 when no literal starts at lPos.
+func emitACVerify(b []byte, cs *compiledSet, st *blockStack, lPos, pInPtr, pInLen, lACState, lVerified byte) []byte {
+	pl := cs.acVerify
+	pp := cs.acProbe
+	b = append(b, 0x02, 0x40) // block $vdone
+	st.Push("vdone")
+	// lPos + Col >= pInLen: cannot dispatch; the trie walk handles it.
+	b = append(b, 0x20, lPos, 0x41)
+	b = utils.AppendSLEB128(b, int32(pl.Col))
+	b = append(b, 0x6A, 0x20, pInLen, 0x4F, 0x0D, st.Depth("vdone"))
+
+	n := len(pl.Vals)
+	b = append(b, 0x02, 0x40) // block $vdefault
+	st.Push("vdefault")
+	for i := 0; i < n; i++ {
+		b = append(b, 0x02, 0x40)
+		st.Push(fmt.Sprintf("vcase%d", i))
+	}
+	b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00)
+	b = utils.AppendULEB128(b, uint32(pl.Col))
+	b = append(b, 0x0E) // br_table
+	b = utils.AppendULEB128(b, 256)
+	caseOf := map[byte]int{}
+	for i, v := range pl.Vals {
+		caseOf[v] = i
+	}
+	for v := 0; v < 256; v++ {
+		if i, ok := caseOf[byte(v)]; ok {
+			b = utils.AppendULEB128(b, uint32(i))
+		} else {
+			b = utils.AppendULEB128(b, uint32(n)) // default
+		}
+	}
+	b = utils.AppendULEB128(b, uint32(n))
+	for i := 0; i < n; i++ {
+		b = append(b, 0x0B) // end $vcase_i
+		st.Pop()
+		for _, li := range pl.Cases[i] {
+			lit := pl.Lits[li]
+			b = append(b, 0x02, 0x40) // block $no
+			st.Push("vno")
+			b = append(b, 0x20, lPos, 0x41)
+			b = utils.AppendSLEB128(b, int32(len(lit)))
+			b = append(b, 0x6A, 0x20, pInLen, 0x4B, 0x0D, st.Depth("vno")) // does not fit
+			for j, c := range lit {
+				if j == pl.Col || (j == pp.Off1 && len(pp.Bytes1) == 1) || (j == pp.Off2 && len(pp.Bytes2) == 1) {
+					continue
+				}
+				b = append(b, 0x20, pInPtr, 0x20, lPos, 0x6A, 0x2D, 0x00)
+				b = utils.AppendULEB128(b, uint32(j))
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(c))
+				b = append(b, 0x47, 0x0D, st.Depth("vno")) // ne → $no
+			}
+			if pl.Eligible[li] {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(pl.Node[li]))
+				b = append(b, 0x21, lACState)
+				b = append(b, 0x20, lPos, 0x41)
+				b = utils.AppendSLEB128(b, int32(len(lit)-1))
+				b = append(b, 0x6A, 0x21, lPos)
+				b = append(b, 0x41, 0x01, 0x21, lVerified)
+			}
+			b = append(b, 0x0C, st.Depth("vdone"))
+			b = append(b, 0x0B) // end $no
+			st.Pop()
+		}
+		// No literal of this case starts here.
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+		b = append(b, 0x0C, st.Depth("scan"))
+	}
+	b = append(b, 0x0B) // end $vdefault
+	st.Pop()
+	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, st.Depth("scan"))
+	b = append(b, 0x0B) // end $vdone
+	st.Pop()
+	return b
+}
+
+// emitACColumnMask leaves on the stack the 16-bit mask of lanes of the chunk
+// in chunkLocal whose byte is in set: a compare chain up to 3 bytes, Shufti
+// above (the AC first-byte probe's own crossover).
+func emitACColumnMask(b []byte, set []byte, chunkLocal byte) []byte {
+	if len(set) > 3 {
+		return emitShuftiPrefixCheck(b, set, chunkLocal)
+	}
+	for i, c := range set {
+		b = append(b, 0x20, chunkLocal, 0x41)
+		b = utils.AppendSLEB128(b, int32(c))
+		b = append(b, 0xFD, 0x0F, 0xFD, 0x23) // i8x16.splat; i8x16.eq
+		if i > 0 {
+			b = append(b, 0xFD, 0x50) // v128.or
+		}
+	}
+	return append(b, 0xFD, 0x64) // i8x16.bitmask
+}
+
 // hasSetFallbackBucketsIn is the same question about a raw bucket list, for
 // use during compilation before a compiledSet exists.
 func hasSetFallbackBucketsIn(buckets []*bucket) bool {
@@ -3641,6 +4001,10 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// no-match `find` — which is exactly what the preflight exists to avoid.
 	b = c.emitGateLocalsPrologue(b)
 	b = c.emitFindPrologue(b, lPos)
+	// Not under phase1Only, where the fallback buckets are the union pass's.
+	if !cs.phase1Only {
+		b = c.emitStepStart(b, lPos)
+	}
 
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x03, 0x40) // loop $scan
@@ -3659,12 +4023,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// evaluated at every position. Skipped entirely under phase1Only, where
 	// they are the union pass's job instead.
 	if !cs.phase1Only {
-		for bi, bkt := range cs.buckets {
-			if !bkt.isFallback {
-				continue
-			}
-			b = c.emitBucketAt(b, bi, 0, lPos)
-		}
+		b = c.emitFallbackBuckets(b, lPos)
 	}
 
 	// The position's first byte is loaded once for the whole bucket chain: an
@@ -3672,7 +4031,7 @@ func emitSetMatchFnFinalScalar(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, t
 	// one of them opened by reading the same byte again.
 	b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
 
-	b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos)
+	b = c.emitAdvance(b, lPos)
 	b = append(b, 0x0C, 0x00)
 	b = append(b, 0x0B) // end loop $scan
 	b = append(b, 0x0B) // end block $done
@@ -3751,12 +4110,18 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	st := &blockStack{}
 	b = append(b, 0x02, 0x40) // block $batch_done
 	st.Push("batch_done")
+	if adaptive {
+		// Left for good when the density switch trips: the scan continues in
+		// a plain per-position loop below, with no prefilter and no gate.
+		b = append(b, 0x02, 0x40) // block $tripped
+		st.Push("tripped")
+	}
 	b = append(b, 0x03, 0x40) // loop $scan
 	st.Push("scan")
 
 	// Exit conditions.
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4B, 0x0D, st.Depth("batch_done")) // lPos > pInLen
-	b = c.emitDrainCheck(b, lPos, 0x01)
+	b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
 
 	if adaptive {
 		// Reset once per attempt (one $scan iteration = one search for the
@@ -3913,8 +4278,8 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 		// frontend (emitSetMatchFnFinalScalar) which never pre-filters at
 		// all. Depths from the else branch: $dense_gate (0, current),
 		// $skip_loop (1), $skip_done (2).
-		b = append(b, 0x05) // else
-		b = append(b, 0x0C, st.Depth("skip_done"))
+		b = append(b, 0x05) // else — tripped: leave for the plain loop
+		b = append(b, 0x0C, st.Depth("tripped"))
 		b = append(b, 0x0B) // end if $dense_gate
 		st.Pop()
 	}
@@ -3930,7 +4295,7 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	// The prefilter also moved lPos past the drain bound checked at the top of
 	// $scan, so re-check it here — that is what keeps perPositionDrain true for
 	// this body (the bucket work below sees exactly one candidate position).
-	b = c.emitDrainCheck(b, lPos, 0x01)
+	b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
 
 	// Literal buckets only (selection requires no fallback). Shortest literal
 	// first for the same ordering reason as the scalar path, and with the
@@ -3941,6 +4306,22 @@ func emitSetMatchFnFinalShufti(cs *compiledSet, suffixFnBase, prefixFnBaseIdx in
 	b = append(b, 0x0C, st.Depth("scan"))
 	b = append(b, 0x0B) // end loop $scan
 	st.Pop()
+	if adaptive {
+		b = append(b, 0x0B) // end block $tripped
+		st.Pop()
+		// The plain loop: exactly what the tripped arm did per position —
+		// no prefilter, every position goes to the buckets, which do their
+		// own first-byte compares (the scalar frontend's loop).
+		b = append(b, 0x03, 0x40) // loop $plain
+		st.Push("plain")
+		b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, st.Depth("batch_done")) // lPos >= pInLen
+		b = c.emitDrainCheck(b, lPos, st.Depth("batch_done"))
+		b = c.emitLiteralBucketsHoisted(b, lPos, lFirstByte)
+		b = append(b, 0x20, lPos, 0x41, 0x01, 0x6A, 0x21, lPos) // lPos++
+		b = append(b, 0x0C, st.Depth("plain"))
+		b = append(b, 0x0B) // end loop $plain
+		st.Pop()
+	}
 	b = append(b, 0x0B) // end block $batch_done
 	st.Pop()
 	if st.Open() != 0 {
@@ -3990,7 +4371,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 
 	// Prefilter locals: the skip mask, the backward tail probe's four, and a
 	// v128 chunk.
-	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk byte
+	var lSkipMask, lTailBase, lTailMask, lTailProbed, lTailSkip, lChunk, lChunk2, lCol1 byte
 	if usePrefilter {
 		lSkipMask = a.I32()
 		lTailBase = a.I32()
@@ -3998,6 +4379,21 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		lTailProbed = a.I32()
 		lTailSkip = a.I32()
 		lChunk = a.V128()
+		if cs.acProbe != nil {
+			lCol1 = a.I32()
+			lChunk2 = a.V128()
+		}
+	}
+	var lVerified byte
+	useVerify := usePrefilter && cs.acVerify != nil
+	if useVerify {
+		lVerified = a.I32()
+	}
+	// probeOff2 is how many bytes past a chunk's last lane the two-column
+	// probe reads: its second column. 0 for the one-column probe.
+	probeOff2 := int32(0)
+	if usePrefilter && cs.acProbe != nil {
+		probeOff2 = int32(cs.acProbe.Off2)
 	}
 
 	c.lMinStart = a.I32()
@@ -4027,12 +4423,7 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 
 	// Fallback buckets at every position — the union pass's job under phase1Only.
 	if !cs.phase1Only {
-		for bi, bkt := range cs.buckets {
-			if !bkt.isFallback {
-				continue
-			}
-			b = c.emitBucketAt(b, bi, 0, lPos)
-		}
+		b = c.emitFallbackBuckets(b, lPos)
 	}
 
 	// AC transition: only when lPos < pInLen (there is a byte to consume)
@@ -4062,7 +4453,35 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		// candidate bitmask — the positions whose byte can begin some literal —
 		// on the stack. A closure because the backward tail probe below runs
 		// exactly this at a different position.
+		// loadAt loads the 16-byte chunk at posLocal+off into dst.
+		loadAt := func(b []byte, posLocal byte, off int, dst byte) []byte {
+			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
+			if off > 0 {
+				b = append(b, 0x41)
+				b = utils.AppendSLEB128(b, int32(off))
+				b = append(b, 0x6A)
+			}
+			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load
+			return append(b, 0x21, dst)
+		}
 		emitCandMask := func(b []byte, posLocal byte) []byte {
+			if pp := cs.acProbe; pp != nil {
+				// Two-column probe: each column's membership mask, AND-ed.
+				// The second column is loaded and tested only when the first
+				// has a hit in the chunk. This mask-on-the-stack form serves
+				// the tail probe, once per call; the SIMD path below tests
+				// the same two columns with its own branch structure, and
+				// TestACProbeTailAndChunkMasksAgree pins that they agree.
+				b = loadAt(b, posLocal, pp.Off1, lChunk)
+				b = emitACColumnMask(b, pp.Bytes1, lChunk)
+				b = append(b, 0x22, lCol1) // local.tee lCol1
+				b = append(b, 0x04, 0x7F)  // if (result i32)
+				b = loadAt(b, posLocal, pp.Off2, lChunk2)
+				b = emitACColumnMask(b, pp.Bytes2, lChunk2)
+				b = append(b, 0x20, lCol1, 0x71) // i32.and
+				b = append(b, 0x05, 0x41, 0x00)  // else: i32.const 0
+				return append(b, 0x0B)           // end if
+			}
 			// Load 16-byte chunk from memory[0] (input)
 			b = append(b, 0x20, pInPtr, 0x20, posLocal, 0x6A)
 			b = append(b, 0xFD, 0x00, 0x00, 0x00) // v128.load align=0 offset=0
@@ -4111,21 +4530,48 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 			return b
 		}
 
-		// SIMD path: if lPos + 15 < pInLen
-		b = append(b, 0x20, lPos, 0x41, 15, 0x6A, 0x20, pInLen, 0x49) // lt_u
-		b = append(b, 0x04, 0x40)                                     // if (void) — SIMD path
+		// SIMD path: if lPos + 15 (+ the probe's second column) < pInLen
+		b = append(b, 0x20, lPos, 0x41)
+		b = utils.AppendSLEB128(b, 15+probeOff2)
+		b = append(b, 0x6A, 0x20, pInLen, 0x49) // lt_u
+		b = append(b, 0x04, 0x40)               // if (void) — SIMD path
 		st.Push("simd_if")
 
-		b = emitCandMask(b, lPos)
-		b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+		if pp := cs.acProbe; pp != nil {
+			// The first column's mask is tested ONCE; only a chunk with a
+			// first-column hit loads and tests the second. Chaining the two
+			// tests into one mask cost text where the literals' lead byte is
+			// rare 3.5% over the first-byte probe; tested this way it costs
+			// 6.9% less (67,601 against 72,583 fuel over 40 KB of English
+			// for Russian keywords).
+			b = loadAt(b, lPos, pp.Off1, lChunk)
+			b = emitACColumnMask(b, pp.Bytes1, lChunk)
+			b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
+			b = append(b, 0x04, 0x40)      // if (void) — first column hit
+			st.Push("col1_if")
+			b = loadAt(b, lPos, pp.Off2, lChunk2)
+			b = emitACColumnMask(b, pp.Bytes2, lChunk2)
+			b = append(b, 0x20, lSkipMask, 0x71, 0x22, lSkipMask) // i32.and; local.tee
+			b = append(b, 0x04, 0x40)                             // if (void) — mask non-zero
+			st.Push("mask_if")
+			b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
+			b = append(b, 0x0C, st.Depth("skip_done"))
+			b = append(b, 0x0B) // end if mask
+			st.Pop()
+			b = append(b, 0x0B) // end if first column
+			st.Pop()
+		} else {
+			b = emitCandMask(b, lPos)
+			b = append(b, 0x22, lSkipMask) // local.tee lSkipMask
 
-		// if mask != 0: candidate found at lPos + ctz(mask)
-		b = append(b, 0x04, 0x40) // if (void) — mask non-zero
-		st.Push("mask_if")
-		b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
-		b = append(b, 0x0C, st.Depth("skip_done"))
-		b = append(b, 0x0B) // end if mask
-		st.Pop()
+			// if mask != 0: candidate found at lPos + ctz(mask)
+			b = append(b, 0x04, 0x40) // if (void) — mask non-zero
+			st.Push("mask_if")
+			b = append(b, 0x20, lPos, 0x20, lSkipMask, 0x68, 0x6A, 0x21, lPos) // lPos += ctz(mask)
+			b = append(b, 0x0C, st.Depth("skip_done"))
+			b = append(b, 0x0B) // end if mask
+			st.Pop()
+		}
 
 		// No candidate: advance 16 and restart
 		b = append(b, 0x20, lPos, 0x41, 0x10, 0x6A, 0x21, lPos) // lPos += 16
@@ -4152,7 +4598,8 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 			lTailBase: lTailBase, lTailMask: lTailMask,
 			lTailProbed: lTailProbed, lTailSkip: lTailSkip,
 			survivor:       lSkipMask,
-			window:         16,
+			window:         16 + probeOff2,
+			wideShift:      probeOff2 > 0,
 			minLeft:        acTailProbeMinLeft,
 			exitsPrefilter: true,
 			// One deeper than the block this emitter is about to open.
@@ -4180,6 +4627,10 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 		b = append(b, 0x0B) // end block $skip_done
 		st.Pop()
 
+		if useVerify {
+			b = emitACVerify(b, cs, st, lPos, pInPtr, pInLen, lACState, lVerified)
+		}
+
 		b = append(b, 0x0B) // end if lACState == 0
 		st.Pop()
 
@@ -4190,6 +4641,14 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	// lACState = goto_table[lACState * stride*2 + col(input[lPos]) * 2] as u16,
 	// where col is the byte itself, or its equivalence class when the table is
 	// byte-class compressed (one extra table load per input byte).
+	if useVerify {
+		// A verified literal has already set lACState and lPos to what this
+		// transition would reach at its last byte: skip it, once.
+		b = append(b, 0x20, lVerified, 0x04, 0x40) // if lVerified
+		b = append(b, 0x41, 0x00, 0x21, lVerified)
+		b = append(b, 0x05) // else
+		st.Push("verified_if")
+	}
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, acL.gotoOff)
 	b = append(b, 0x20, lACState, 0x41, byte(acL.strideShift), 0x74, 0x6A) // + lACState * stride*2
@@ -4207,6 +4666,10 @@ func emitSetMatchFnFinalAC(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, table
 	b = append(b, 0x41, 0x01, 0x74, 0x6A) // * 2; add
 	b = appendTableLoad16u(b, tableMemIdx)
 	b = append(b, 0x21, lACState)
+	if useVerify {
+		b = append(b, 0x0B) // end if lVerified
+		st.Pop()
+	}
 
 	// Does this node report anything? ONE unsigned compare against a
 	// constant, and the two u16 loads below happen only when it does.
@@ -5121,6 +5584,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		DeclaredPatternCount: sc.PatternCount(cfg),
 		Overlapping:          sc.Overlapping,
 		IDSpaceSize:          sc.IDSpaceSize(cfg),
+		MaxUnionStates:       cfg.MaxUnionStates,
 		Patterns:             infos,
 		PatternIDs:           globalIDs,
 	}
@@ -5128,13 +5592,11 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		// Set-level LikelyMode precedence: set hints > neutral.
 		// Used by the set frontend density gate.
 		LikelyMode: resolveHints(sc.Hints),
-		// The knob that decides whether a pattern survives into the set at
-		// all: a fallback bucket over this limit is DROPPED, not demoted to
-		// another engine. It was unreachable before — CompileSetOptions was
-		// built without it, so the default 1024 always won and the drop
-		// warning's own "raise max_dfa_states" hint pointed at a field that
-		// does not feed this budget.
-		MaxFallbackStates: cfg.MaxFallbackStates,
+		// The state limits (MaxFallbackStates, BudgetStates) are
+		// max_dfa_states, which every member carries (buildLimits):
+		// resolvedFor reads them there. The two sizes are the config's own.
+		BudgetBytes:      memorySizeLimit(cfg.MaxSetBucketSize),
+		SplitTableBudget: int64(memorySizeLimit(cfg.MaxSplitTableSize)),
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		ACBudgetBytes: over.ACBudgetBytes,
 		BTWorkBudget:  over.BTWorkBudget,
@@ -5162,33 +5624,28 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 // table address; the automaton is identical either way. `over` carries the same
 // overrides CompileFileOpts takes, and is the zero value on every real build.
 func compileSetForInspection(sc config.SetConfig, cfg config.BuildConfig, over CompileSetOptions) (*compiledSet, error) {
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
+	if !sc.Patterns.All {
+		idx := make(map[string]bool, len(cfg.Patterns))
+		for _, re := range cfg.Patterns {
+			idx[re.Name] = re.Name != ""
 		}
-	}
-	var selectedIdx []int
-	if sc.Patterns.All {
-		for i := range cfg.Regexps {
-			selectedIdx = append(selectedIdx, i)
-		}
-	} else {
 		for _, name := range sc.Patterns.Names {
-			idx, ok := nameIdx[name]
-			if !ok {
+			if !idx[name] {
 				return nil, fmt.Errorf("set %q: unknown pattern %q", sc.Name, name)
 			}
-			selectedIdx = append(selectedIdx, idx)
 		}
 	}
 	var prefixPool, suffixPool dfaPool
-	infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+	infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		return nil, err
 	}
 	spec, opts := setSpecAndOptions(sc, cfg, infos, globalIDs, over, &moduleGlobals{})
-	return CompileSet(spec, &prefixPool, &suffixPool, opts), nil
+	cs := CompileSet(spec, &prefixPool, &suffixPool, opts)
+	if cs.err != nil {
+		return nil, fmt.Errorf("set %q: %w", sc.Name, cs.err)
+	}
+	return cs, nil
 }
 
 // wantsWalkExtent reports whether this bucket's tuple-writing body should

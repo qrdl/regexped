@@ -1,12 +1,12 @@
 // Shared by BOTH hosts in this directory: main.rs (module) and
 // main_component.rs (component).
 //
-// A native host does not get `pattern_name` for free. `emit_name_map: true` in
-// the config generates that helper into a STUB, and a stub is for a guest
-// compiled to WASM — this binary is native and has no stub in either format. So
-// the table lives here, and `include!` keeps one copy of it.
+// A native host does not get a name lookup for free. `emit_name_map: true` on
+// the set generates one, `scanner_pattern_name`, into a STUB, and a stub is for
+// a guest compiled to WASM — this binary is native and has no stub in either
+// format. So the table lives here, and `include!` keeps one copy of it.
 //
-// The order is the order of `regexps:` in the config, because a pattern id IS
+// The order is the order of `patterns:` in the config, because a pattern id IS
 // that index.
 const PATTERN_NAMES: &[&str] = &[
     "aws_key",

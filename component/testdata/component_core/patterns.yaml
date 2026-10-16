@@ -7,12 +7,12 @@
 wasm_format: component
 import_module: "byteident"
 
-regexps:
-  - pattern: '[a-z]+'
+patterns:
+  - regexp: '[a-z]+'
     match_func: "lower_match"
-  - pattern: 'ghp_[A-Za-z0-9]{4}'
+  - regexp: 'ghp_[A-Za-z0-9]{4}'
     find_func: "token_find"
-  - pattern: 'AKIA[A-Z0-9]{4}'
+  - regexp: 'AKIA[A-Z0-9]{4}'
     find_func: "aws_find"
-  - pattern: '(?P<opt>x)?(?P<tail>y+)'
+  - regexp: '(?P<opt>x)?(?P<tail>y+)'
     groups_func: "opt_groups"

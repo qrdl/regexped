@@ -1,8 +1,6 @@
 package compile
 
 import (
-	"regexp/syntax"
-
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -42,8 +40,9 @@ type compiledAltLitAnchor struct {
 // All-or-nothing: any single branch failing any gate rejects the whole
 // alternation (ok=false), matching the mixed-prefix path's existing contract. Callers must
 // fall through cleanly to the standard combined-DFA find path on rejection.
-func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, buildOpts CompileOptions) (*compiledAltLitAnchor, bool) {
-	maxStates := resolveMaxDFAStates(&buildOpts)
+// rp is the pattern the branches were cut from.
+func compileAltLitAnchorBranches(rp resolvedPattern, branches []altLitAnchorBranch, cur int64, buildOpts CompileOptions) (*compiledAltLitAnchor, bool) {
+	maxStates := resolveMaxDFAStates(&buildOpts, rp.unicode())
 	result := &compiledAltLitAnchor{}
 
 	compiled := make([]altLitAnchorCompiledBranch, 0, len(branches))
@@ -51,7 +50,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 
 	for i, br := range branches {
 		lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true}
-		matcher, err := compile(br.branchRe.String(), lfOpts)
+		matcher, err := compile(rp.source(br.branchRe.String()), lfOpts)
 		if err != nil {
 			return nil, false
 		}
@@ -87,6 +86,10 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 			lmBareShufti:         false,
 			lmNonMidShufti:       false,
 			lmWideShufti:         false,
+			// A branch's forward verify over whole characters takes the
+			// character skip, as a single pattern's find does: 32.97 →
+			// 12.74 fuel/byte over 40-letter Russian values.
+			utf8Text: rp.unicode(),
 		})
 		if !l.useU8 {
 			return nil, false
@@ -94,13 +97,11 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 
 		// Reversed-prefix DFA for the backward scan (same sequence as the
 		// single-pattern lit-anchor path in compile.go).
-		revRe := reverseRegexp(br.lap.prefixRe)
-		revSimplified := revRe.Simplify()
-		revProg, revCompErr := syntax.Compile(revSimplified)
-		if revCompErr != nil || needsUnicodeSupport(revProg) {
+		revProg, revCompErr := compileProg(rp.tree(br.lap.prefixRe).reversed())
+		if revCompErr != nil || revProg.refusedByByteGate() {
 			return nil, false
 		}
-		revDFA, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+		revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
 		if !revOk {
 			return nil, false
 		}
@@ -137,7 +138,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		// encodeNonMid=false: the forward-verify body dispatches non-mid
 		// via state-ID compares and reads midAccept with plain `!= 0`
 		// accept semantics (the 254+ value encoding is decoded only
-		// by buildFindBody/emitPhase4Dispatch consumers).
+		// by buildFindBody/emitMatchBulkSkipDispatch consumers).
 		applyDominantStateEncoding(l, false)
 		fvBody := buildAltLitAnchorForwardVerifyBody(table, l, buildOpts.tableMemIdx)
 
@@ -162,7 +163,7 @@ func compileAltLitAnchorBranches(branches []altLitAnchorBranch, cur int64, build
 		allLits = append(allLits, br.lap.litSet...)
 
 		if i == 0 {
-			minLen, _ := regexpMinMaxLen(br.lap.prefixRe, buildOpts.ByteMode)
+			minLen, _ := rp.tree(br.lap.prefixRe).minMaxLen()
 			result.fixedPrefixLen = int32(minLen)
 		}
 	}

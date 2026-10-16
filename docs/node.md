@@ -10,8 +10,8 @@ wasm_file:     "urls.wasm"
 import_module: "urls"
 stub_file:     "regexp.ts"    # .ts → TypeScript stub; use .js for plain JS
 
-regexps:
-  - pattern:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
+patterns:
+  - regexp:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
     groups_func:       "extract_domain"
 ```
 
@@ -89,24 +89,25 @@ See [`examples/node/domain-extract/`](../examples/node/domain-extract/) for the 
 [`examples/node/sql-validator/`](../examples/node/sql-validator/) demonstrates the `sets:` composition feature instead — classifying SQL statements by which of four patterns matches, via an anchored `match` set with `emit_name_map: true`:
 
 ```yaml
-regexps:
+patterns:
   - name: "select"
-    pattern: 'SELECT\s+.+\s+FROM\s+\w[\w.]*(\s+.*)?'
+    regexp: 'SELECT\s+.+\s+FROM\s+\w[\w.]*(\s+.*)?'
   # ... insert, update, delete
 
 sets:
   - name: "sql"
-    match: "validate_sql"
+    match_any: "validate_sql"
     emit_name_map: true
     patterns: ["select", "insert", "update", "delete"]
 ```
 
 ```ts
-import { init, validate_sql, patternName } from './stubs.ts';
+import { init, validate_sql, sqlPatternName } from './stubs.ts';
 
-const m = validate_sql(sql);
-if (m) {
-    console.log(`${patternName(m.patternId)}: ${sql}`);
+// match_any returns a pattern id or null — NOT a boolean: id 0 is a match.
+const id = validate_sql(sql);
+if (id !== null) {
+    console.log(`${sqlPatternName(id)}: ${sql}`);
 }
 ```
 

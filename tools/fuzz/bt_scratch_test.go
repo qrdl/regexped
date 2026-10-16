@@ -47,7 +47,7 @@ const btScratchInCap = 256 * 1024
 // btScratchCase is one pattern driven past the ordinary body's static regions.
 type btScratchCase struct {
 	name  string
-	entry config.RegexEntry
+	entry config.PatternEntry
 	opts  compile.CompileOptions
 	input string
 }
@@ -58,17 +58,19 @@ func btScratchCases() []btScratchCase {
 	squeezed := compile.CompileOptions{MaxDFAStates: 1}
 	return []btScratchCase{
 		// The fast frame stack ends near 16 KB of greedy descent here.
-		{"groups/empty-body-loop/match", config.RegexEntry{Pattern: `^(\w*|)*c`, GroupsFunc: "groups"}, compile.CompileOptions{}, w(100000) + "c"},
-		{"groups/empty-body-loop/no-match", config.RegexEntry{Pattern: `^(\w*|)*c`, GroupsFunc: "groups"}, compile.CompileOptions{}, w(60000)},
-		{"groups/overlapping-branches", config.RegexEntry{Pattern: `^(aa|a)*b`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(80000) + "b"},
+		{"groups/empty-body-loop/match", config.PatternEntry{Regexp: `^(\w*|)*c`, GroupsFunc: "groups"}, compile.CompileOptions{}, w(100000) + "c"},
+		{"groups/empty-body-loop/no-match", config.PatternEntry{Regexp: `^(\w*|)*c`, GroupsFunc: "groups"}, compile.CompileOptions{}, w(60000)},
+		{"groups/overlapping-branches", config.PatternEntry{Regexp: `^(aa|a)*b`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(80000) + "b"},
 		// Composed behind the groups wrapper, in window mode (\b).
-		{"groups/window", config.RegexEntry{Pattern: `x(\w*|)*c\b`, GroupsFunc: "groups"}, compile.CompileOptions{}, "--x" + w(70000) + "c--"},
-		{"match/empty-body-loop", config.RegexEntry{Pattern: `(\w*|)*c`, MatchFunc: "match"}, squeezed, w(100000) + "c"},
-		{"find/empty-body-loop", config.RegexEntry{Pattern: `(\w*|)*c`, FindFunc: "find"}, squeezed, "--" + w(90000) + "c"},
+		{"groups/window", config.PatternEntry{Regexp: `x(\w*|)*c\b`, GroupsFunc: "groups"}, compile.CompileOptions{}, "--x" + w(70000) + "c--"},
+		{"match/empty-body-loop", config.PatternEntry{Regexp: `(\w*|)*c`, MatchFunc: "match"}, squeezed, w(100000) + "c"},
+		{"find/empty-body-loop", config.PatternEntry{Regexp: `(\w*|)*c`, FindFunc: "find"}, squeezed, "--" + w(90000) + "c"},
 		// A non-greedy loop whose body can match empty: a zero-width cycle, so
 		// the fallback alone, over an input far past any compile-time memo.
-		{"find/static-memo-ceiling", config.RegexEntry{Pattern: `(?:a?)+?xyz`, FindFunc: "find"}, squeezed, a(200000) + "xyz"},
-		{"groups/static-memo-ceiling", config.RegexEntry{Pattern: `((?:a?)+?)xyz`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(200000) + "xyz"},
+		{"find/static-memo-ceiling", config.PatternEntry{Regexp: `(?:a?)+?xyz`, FindFunc: "find"}, squeezed, a(200000) + "xyz"},
+		// `z+`, not `z`: a capture between plain literals takes its span from
+		// the match and has no capture body at all.
+		{"groups/static-memo-ceiling", config.PatternEntry{Regexp: `((?:a?)+?)xyz+`, GroupsFunc: "groups"}, compile.CompileOptions{}, a(200000) + "xyz"},
 	}
 }
 
@@ -79,18 +81,18 @@ func (c btScratchCase) want(t *testing.T) (int64, []int) {
 	e := c.entry
 	switch {
 	case e.GroupsFunc != "":
-		loc := regexp.MustCompile(e.Pattern).FindStringSubmatchIndex(c.input)
+		loc := regexp.MustCompile(e.Regexp).FindStringSubmatchIndex(c.input)
 		if loc == nil {
 			return abi.NoMatch, nil
 		}
 		return int64(loc[1]), loc
 	case e.MatchFunc != "":
-		if regexp.MustCompile(`^(?:` + e.Pattern + `)$`).MatchString(c.input) {
+		if regexp.MustCompile(`^(?:` + e.Regexp + `)$`).MatchString(c.input) {
 			return int64(len(c.input)), nil
 		}
 		return abi.NoMatch, nil
 	default:
-		loc := regexp.MustCompile(e.Pattern).FindStringIndex(c.input)
+		loc := regexp.MustCompile(e.Regexp).FindStringIndex(c.input)
 		if loc == nil {
 			return abi.NoMatch, nil
 		}
@@ -148,11 +150,9 @@ func (c btScratchCase) check(t *testing.T, got int64, slots []int) {
 	if got != want {
 		t.Fatalf("answered %d, want %d", got, want)
 	}
-	if wantSlots != nil {
-		for i, s := range wantSlots {
-			if slots[i] != s {
-				t.Fatalf("slot %d = %d, want %d (all: got %v, want %v)", i, slots[i], s, slots[:len(wantSlots)], wantSlots)
-			}
+	for i, s := range wantSlots {
+		if slots[i] != s {
+			t.Fatalf("slot %d = %d, want %d (all: got %v, want %v)", i, slots[i], s, slots[:len(wantSlots)], wantSlots)
 		}
 	}
 }
@@ -166,18 +166,22 @@ func (c btScratchCase) check(t *testing.T, got int64, slots []int) {
 // has none: its stack is the run-time one, so alone it must ANSWER.
 func (c btScratchCase) requireFallbackAnswers(t *testing.T) {
 	t.Helper()
-	pat := c.entry.Pattern
+	pat := c.entry.Regexp
 	if c.entry.GroupsFunc == "" {
 		pat = withoutCaptures(t, pat) // the program match and find compile
 	}
-	if cyc, err := compile.BacktrackHasZeroWidthCycle(pat); err != nil {
+	// The options the build below compiles with, the entry's byte_mode
+	// included, as compilePattern adopts it.
+	cycOpts := c.opts
+	cycOpts.ByteMode = cycOpts.ByteMode || c.entry.ByteMode
+	if cyc, err := compile.BacktrackHasZeroWidthCycle(pat, cycOpts); err != nil {
 		t.Fatalf("control: %v", err)
 	} else if cyc {
 		return
 	}
 	opts := c.opts
 	opts.BTWorkBudget = compile.BTWorkBudgetOff
-	w, _, err := compile.Compile([]config.RegexEntry{c.entry}, btScratchTableBase, true, opts)
+	w, _, err := compile.Compile([]config.PatternEntry{c.entry}, btScratchTableBase, true, opts)
 	if err != nil {
 		t.Fatalf("control compile: %v", err)
 	}
@@ -229,7 +233,7 @@ func (c btScratchCase) numSlots() int {
 	if c.entry.GroupsFunc == "" {
 		return 0
 	}
-	return 2 * (regexp.MustCompile(c.entry.Pattern).NumSubexp() + 1)
+	return 2 * (regexp.MustCompile(c.entry.Regexp).NumSubexp() + 1)
 }
 
 // tableBase is where c's tables start: past the input window and a page of
@@ -245,7 +249,7 @@ func TestBTFallbackScratchStandalone(t *testing.T) {
 				name = c.name + "/global-set"
 			}
 			t.Run(name, func(t *testing.T) {
-				w, _, err := compile.Compile([]config.RegexEntry{c.entry}, btScratchTableBase, true, c.opts)
+				w, _, err := compile.Compile([]config.PatternEntry{c.entry}, btScratchTableBase, true, c.opts)
 				if err != nil {
 					t.Fatalf("compile: %v", err)
 				}
@@ -301,12 +305,12 @@ func TestBTFallbackScratchStandalone(t *testing.T) {
 // the global set past it the fallback must leave it intact; with the global at
 // 0 it must take fresh pages instead.
 func TestBTFallbackScratchHostWritesAboveTables(t *testing.T) {
-	entry := config.RegexEntry{Pattern: `^(\w*|)*c`, GroupsFunc: "groups"}
+	entry := config.PatternEntry{Regexp: `^(\w*|)*c`, GroupsFunc: "groups"}
 	input := strings.Repeat("w", 100000) + "c"
-	loc := regexp.MustCompile(entry.Pattern).FindStringSubmatchIndex(input)
+	loc := regexp.MustCompile(entry.Regexp).FindStringSubmatchIndex(input)
 	btScratchCase{entry: entry, input: input}.requireFallbackAnswers(t)
 
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, 0, true, compile.CompileOptions{})
+	w, _, err := compile.Compile([]config.PatternEntry{entry}, 0, true, compile.CompileOptions{})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -399,8 +403,8 @@ func TestBTSetSplitMemberFollowsTheHostGlobal(t *testing.T) {
 			hints = []string{"batch-find"}
 		}
 		cfg := config.BuildConfig{
-			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
-			Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+			MaxDFAStates: 1, // every member's suffix DFA is over it: Backtracking
+			Patterns:     []config.PatternEntry{{Name: "p0", Regexp: pats[0]}, {Name: "p1", Regexp: pats[1]}},
 			Sets: []config.SetConfig{{Name: "s", Find: "s_find", Overlapping: overlapping, Hints: hints,
 				Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
 		}
@@ -526,7 +530,7 @@ func TestBTFallbackScratchEmbedded(t *testing.T) {
 	for _, c := range btScratchCases() {
 		t.Run(c.name, func(t *testing.T) {
 			c.requireFallbackAnswers(t)
-			w, _, err := compile.Compile([]config.RegexEntry{c.entry}, 0, false, c.opts)
+			w, _, err := compile.Compile([]config.PatternEntry{c.entry}, 0, false, c.opts)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -578,7 +582,7 @@ func TestBTFallbackScratchComponent(t *testing.T) {
 	} {
 		t.Run(c.pattern, func(t *testing.T) {
 			pattern := c.pattern
-			h, res := newPatternResourceHarness(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			h, res := newPatternResourceHarness(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 			n := res["g"]
 			if h.inst.GetExport(h.store, abi.ScratchBaseExport) != nil {
 				t.Errorf("a component core exports %q; its allocator owns the heap", abi.ScratchBaseExport)
@@ -586,7 +590,7 @@ func TestBTFallbackScratchComponent(t *testing.T) {
 
 			inA, inB := c.inA, c.inB
 			for _, in := range []string{inA, inB} {
-				btScratchCase{entry: config.RegexEntry{Pattern: pattern, GroupsFunc: "g"}, input: in}.requireFallbackAnswers(t)
+				btScratchCase{entry: config.PatternEntry{Regexp: pattern, GroupsFunc: "g"}, input: in}.requireFallbackAnswers(t)
 			}
 			pa, la := h.writeInput(inA)
 			a := h.call(n.Constructor, pa, la, int32(0))

@@ -427,7 +427,7 @@ func TestLitChainRangeMatchBodyCompiles(t *testing.T) {
 		t.Run(pattern, func(t *testing.T) {
 			// Match-only: the find half of this path deliberately rejects
 			// anchored ranges and falls back to the DFA.
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 		})
 	}
 }
@@ -436,7 +436,7 @@ func TestLitChainRangeMatchBodyCompiles(t *testing.T) {
 // extractLitChainCaptures
 // ---------------------------------------------------------------------------
 
-// TestLitChainExtractCaptures pins the walk's per-node arithmetic and its two
+// TestLitChainExtractCaptures pins the walk's per-node arithmetic and its
 // refusal reasons. The offsets it returns are baked into the emitted slot
 // writes as compile-time constants, so a node type mis-measured here becomes a
 // capture span that is silently off by that many bytes.
@@ -476,6 +476,18 @@ func TestLitChainExtractCaptures(t *testing.T) {
 			pattern: `(?m)(A[0-9]{24})^`,
 			wantOK:  false,
 			why:     "(?m)^ matches at every line start, so no single compile-time offset describes the match",
+		},
+		{
+			name:    "non_ascii_literal_is_refused",
+			pattern: `(é[0-9]{24})`,
+			wantOK:  false,
+			why:     "a rune above 0x7F is one byte in byte mode and two in Unicode mode, and the walk has no mode",
+		},
+		{
+			name:    "repeat_of_a_non_ascii_literal_is_refused",
+			pattern: `(Aé{24})`,
+			wantOK:  false,
+			why:     "the repeat's width is its literal's, which depends on the mode as the bare literal's does",
 		},
 	}
 	for _, testCase := range cases {
@@ -689,7 +701,7 @@ func TestLitChainRangeGroupsCompiles(t *testing.T) {
 				t.Fatalf("analyseLitChainGroupsRange(%q) rejected the shape, so the "+
 					"range groups body is not the path under test", pattern)
 			}
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 		})
 	}
 }
@@ -723,7 +735,7 @@ func TestLitChainAltLayoutOneByteLiteral(t *testing.T) {
 			t.Errorf("%q: second-byte tables placed at %d/%d without 2-byte Teddy",
 				tc.pattern, l.teddyT1LoOff, l.teddyT1HiOff)
 		}
-		wasm, _, err := Compile([]config.RegexEntry{{Pattern: tc.pattern, MatchFunc: "m", FindFunc: "f"}}, 0, true)
+		wasm, _, err := Compile([]config.PatternEntry{{Regexp: tc.pattern, MatchFunc: "m", FindFunc: "f"}}, 0, true)
 		if err != nil {
 			t.Fatalf("%q: %v", tc.pattern, err)
 		}
@@ -783,7 +795,7 @@ func TestLitChainAltLenientRejects(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			for _, leftmostFirst := range []bool{false, true} {
-				if _, ok := analyseLitChainAltLenient(testCase.pattern, leftmostFirst); ok {
+				if _, ok := analyseLitChainAltLenient(bytePat(testCase.pattern), leftmostFirst); ok {
 					t.Errorf("analyseLitChainAltLenient(%q, leftmostFirst=%v) accepted; %s",
 						testCase.pattern, leftmostFirst, testCase.why)
 				}
@@ -801,11 +813,11 @@ func TestLitChainAltLenientRejects(t *testing.T) {
 // caller uses (see the analyser's doc comment).
 func litChainLenAltBody(t *testing.T, pattern string) []byte {
 	t.Helper()
-	altp, ok := analyseLitChainAltLenient(pattern, false)
+	altp, ok := analyseLitChainAltLenient(bytePat(pattern), false)
 	if !ok {
 		t.Fatalf("analyseLitChainAltLenient(%q) rejected the shape", pattern)
 	}
-	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
+	return buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false, nil), 0)
 }
 
 // TestLenAltMatchBodySkipsImpossibleBranches covers the compile-time start
@@ -887,19 +899,63 @@ func TestLenAltMatchBodyEndAnchors(t *testing.T) {
 // a per-branch bitmap for it at all.
 func TestLenAltMatchBodyScalarBranch(t *testing.T) {
 	const pattern = `abcdefghij[a-z]{6}|qq[0-9]z`
-	altp, ok := analyseLitChainAltLenient(pattern, false)
+	altp, ok := analyseLitChainAltLenient(bytePat(pattern), false)
 	if !ok {
 		t.Fatalf("analyseLitChainAltLenient(%q) rejected the shape", pattern)
 	}
 	if altp.branches[0].useSIMD {
 		t.Fatalf("branch 0 (N=6) chose the SIMD verify; the scalar path is what this test covers")
 	}
-	layout := planLenAltLayout(altp, 0, false)
+	layout := planLenAltLayout(altp, 0, false, nil)
 	if layout.branchBitmapOff[0] < 0 {
 		t.Fatalf("no bitmap allocated for the scalar branch: the verify has nothing to read")
 	}
 	if len(buildLenAltMatchBody(altp, layout, 0)) == 0 {
 		t.Fatalf("empty match body")
+	}
+}
+
+// TestLenAltWordCharTableOnlyForFind pins where a lenient alternation's DFA
+// branch gets its 256-byte wordCharTable: the find layout reads it (the
+// verify's word-boundary pre-accept check), the match layout never does — its
+// verify consumes the whole input and emits no such check — so the match
+// layout keeps the \b/\B accept channels and drops the table, which every
+// such match module used to carry unread.
+func TestLenAltWordCharTableOnlyForFind(t *testing.T) {
+	const pattern = `0$|x(?:\b|0)`
+	var tbl [256]byte
+	for c := range tbl {
+		if isWordByte(byte(c)) {
+			tbl[c] = 1
+		}
+	}
+	for _, find := range []bool{false, true} {
+		altp, ok := analyseLitChainAltLenient(bytePat(pattern), find)
+		if !ok {
+			t.Fatalf("analyseLitChainAltLenient(%q, %v) rejected the shape", pattern, find)
+		}
+		planLenAltLayout(altp, 0, find, nil)
+		wbBranches := 0
+		for _, br := range altp.branches {
+			if br.isLitChain || !br.dfaTable.hasWordBoundary {
+				continue
+			}
+			wbBranches++
+			dl := br.dfaLayout
+			if !dl.needWordCharTable {
+				t.Fatalf("find=%v: the \\b branch lost its word-boundary channels", find)
+			}
+			if dl.noWordCharTable == find {
+				t.Errorf("find=%v: noWordCharTable = %v", find, dl.noWordCharTable)
+			}
+			emitted := bytes.Contains(br.dfaDataBytes, tbl[:])
+			if emitted != find {
+				t.Errorf("find=%v: the word table is emitted = %v", find, emitted)
+			}
+		}
+		if wbBranches == 0 {
+			t.Fatalf("%q has no DFA branch with \\b: the test covers nothing", pattern)
+		}
 	}
 }
 
@@ -912,7 +968,7 @@ func TestLenAltMatchBodyScalarBranch(t *testing.T) {
 // against a future analyser that lowers the SIMD threshold.
 func TestLenAltMatchBodyMasksPartialSimdChunk(t *testing.T) {
 	const pattern = `abcdefghij[a-z]{6}|qq[0-9]z`
-	altp, ok := analyseLitChainAltLenient(pattern, false)
+	altp, ok := analyseLitChainAltLenient(bytePat(pattern), false)
 	if !ok {
 		t.Fatalf("analyseLitChainAltLenient(%q) rejected the shape", pattern)
 	}
@@ -923,7 +979,7 @@ func TestLenAltMatchBodyMasksPartialSimdChunk(t *testing.T) {
 		t.Fatalf("chunk plan = %+v, want a single partial-lane chunk", chunks)
 	}
 
-	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false), 0)
+	body := buildLenAltMatchBody(altp, planLenAltLayout(altp, 0, false, nil), 0)
 	// `i32.const <laneMask>; i32.and` — the lanes holding literal bytes are
 	// cleared out of the bad-byte mask before it is branched on.
 	wantMask := utils.AppendSLEB128([]byte{0x41}, int32(chunks[0].laneMask))
@@ -948,9 +1004,30 @@ func TestLenAltMatchBodyCompiles(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 		})
 	}
+}
+
+// TestLenAltMatchBodyGatedCompressed: the gated branch walk over a branch table
+// big enough to be class-compressed, which still has a run to skip.
+func TestLenAltMatchBodyGatedCompressed(t *testing.T) {
+	const pattern = `ERROR[0-9]{3}|x[^,]*,[a-z]{1,140};`
+	altp, ok := analyseLitChainAltLenient(bytePat(pattern), false)
+	if !ok {
+		t.Fatalf("%s is not a lenient alternation", pattern)
+	}
+	planLenAltLayout(altp, 0, false, nil)
+	found := false
+	for _, br := range altp.branches {
+		if !br.isLitChain && br.dfaLayout.useCompression && len(br.dfaLayout.dominantStates) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no compressed DFA branch with a run skip: the shape no longer reaches the gated walk's compressed step")
+	}
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}})
 }
 
 // Regression tests for the lit-chain anchored/find body defects.
@@ -1303,23 +1380,37 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 		if lit == nil {
 			t.Fatal("no OpLiteral node found")
 		}
-		if got := extractLitSet(lit); got != nil {
+		if got := extractLitSet(lit, false); got != nil {
 			t.Errorf("extractLitSet(foldcase literal) = %v, want nil", got)
 		}
 	})
 
-	// Non-ASCII rune in literal → nil.
+	// Non-ASCII rune in literal: in byte mode 0x80-0xFF is that byte and a
+	// rune above has none; its UTF-8 bytes in Unicode mode, a surrogate
+	// excepted (it matches nothing once lowered).
 	t.Run("non_ascii_literal", func(t *testing.T) {
 		re := parse(`café`)
-		if got := extractLitSet(re); got != nil {
-			t.Errorf("extractLitSet(non-ASCII) = %v, want nil", got)
+		if got := extractLitSet(re, false); len(got) != 1 || string(got[0]) != "caf\xe9" {
+			t.Errorf("byte mode: extractLitSet(café) = %q, want [caf\\xe9]", got)
+		}
+		if got := extractLitSet(parse(`cafα`), false); got != nil {
+			t.Errorf("byte mode: extractLitSet(cafα) = %q, want nil", got)
+		}
+		if got := extractLitSet(re, true); len(got) != 1 || string(got[0]) != "café" {
+			t.Errorf("Unicode mode: extractLitSet(café) = %q, want [café]", got)
+		}
+		if got := extractLitSet(parse(`é`), true); len(got) != 1 || len(got[0]) != 2 {
+			t.Errorf("Unicode mode: extractLitSet(é) = %q, want its two bytes", got)
+		}
+		if got := extractLitSet(parse(`a\x{D800}`), true); got != nil {
+			t.Errorf("Unicode mode: extractLitSet(surrogate) = %q, want nil", got)
 		}
 	})
 
 	// Single-byte literal → nil (len(bs) < 2 path).
 	t.Run("single_byte_literal", func(t *testing.T) {
 		re := parse(`x`)
-		if got := extractLitSet(re); got != nil {
+		if got := extractLitSet(re, false); got != nil {
 			t.Errorf("extractLitSet(single byte) = %v, want nil", got)
 		}
 	})
@@ -1327,7 +1418,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 	// Alternation with non-literal branch → nil.
 	t.Run("alternation_with_non_literal_branch", func(t *testing.T) {
 		re := parse(`foo|[a-z]+`)
-		if got := extractLitSet(re); got != nil {
+		if got := extractLitSet(re, false); got != nil {
 			t.Errorf("extractLitSet(mixed alt) = %v, want nil", got)
 		}
 	})
@@ -1337,7 +1428,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 		inner := parse(`ab|cd`)
 		outer := parse(`ef`)
 		alt := &syntax.Regexp{Op: syntax.OpAlternate, Sub: []*syntax.Regexp{inner, outer}}
-		if got := extractLitSet(alt); got != nil {
+		if got := extractLitSet(alt, false); got != nil {
 			t.Errorf("extractLitSet(nested alt) = %v, want nil", got)
 		}
 	})
@@ -1345,7 +1436,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 	// Capture wrapping a literal → recurses and succeeds.
 	t.Run("capture_single_sub", func(t *testing.T) {
 		re := parse(`(foo)`)
-		got := extractLitSet(re)
+		got := extractLitSet(re, false)
 		if len(got) != 1 || string(got[0]) != "foo" {
 			t.Errorf("extractLitSet((foo)) = %v, want [foo]", got)
 		}
@@ -1354,7 +1445,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 	// Capture with zero subs (defensive) → nil.
 	t.Run("capture_zero_subs", func(t *testing.T) {
 		cap := &syntax.Regexp{Op: syntax.OpCapture}
-		if got := extractLitSet(cap); got != nil {
+		if got := extractLitSet(cap, false); got != nil {
 			t.Errorf("extractLitSet(empty capture) = %v, want nil", got)
 		}
 	})
@@ -1362,7 +1453,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 	// Empty alternation → nil because result is empty.
 	t.Run("empty_alternation", func(t *testing.T) {
 		alt := &syntax.Regexp{Op: syntax.OpAlternate}
-		if got := extractLitSet(alt); got != nil {
+		if got := extractLitSet(alt, false); got != nil {
 			t.Errorf("extractLitSet(empty alt) = %v, want nil", got)
 		}
 	})
@@ -1370,7 +1461,7 @@ func TestExtractLitSet_RejectionPaths(t *testing.T) {
 	// Unsupported op (default) → nil.
 	t.Run("char_class", func(t *testing.T) {
 		re := parse(`[a-z]`)
-		if got := extractLitSet(re); got != nil {
+		if got := extractLitSet(re, false); got != nil {
 			t.Errorf("extractLitSet(charclass) = %v, want nil", got)
 		}
 	})
@@ -1389,11 +1480,100 @@ func TestReverseRegexp_LineAnchors(t *testing.T) {
 }
 
 func TestFindLitAnchorPoint_ParseError(t *testing.T) {
-	if got := findLitAnchorPoint("[invalid"); got != nil {
+	if got := findLitAnchorPoint("[invalid", false); got != nil {
 		t.Errorf("findLitAnchorPoint(invalid) = %+v, want nil", got)
 	}
-	if got := findLitAnchorPoint("[a-z]"); got != nil {
+	if got := findLitAnchorPoint("[a-z]", false); got != nil {
 		t.Errorf("findLitAnchorPoint([a-z]) = %+v, want nil", got)
+	}
+}
+
+// TestFindLitAnchorPointOneByte pins when a ONE-byte inner literal anchors
+// the find: only failing a longer literal, and only behind a leading repeat of
+// a class common in prose (wideLeadingRepeat). Where the first bytes are
+// selective (`\d+-…`), or bounded, or the pattern begins with a literal, the
+// find keeps its own scan.
+func TestFindLitAnchorPointOneByte(t *testing.T) {
+	for _, c := range []struct {
+		pat     string
+		unicode bool
+		lit     string // "" = no literal-anchored point
+	}{
+		{`\w+@\w+`, false, "@"},
+		{`[a-z]+-[0-9]+`, false, "-"},
+		{`(\w+)=(\w+)`, false, "="},
+		{`\w+(@)\w+`, false, "@"},     // the literal under a capture
+		{`\w+\xe9\w+`, false, "\xe9"}, // 0x80-0xFF is that byte in byte mode
+		{`\w+\x{3b1}\w+`, false, ""},  // above 0xFF: no byte for it
+		{`\pL+@\pL+`, true, "@"},
+		{`\w+_x\d`, false, "_x"}, // a longer literal wins
+		{`\d+-\d+`, false, ""},   // digits: selective first bytes
+		{`[^,]+,`, false, ""},    // a class with the space byte keeps today's find
+		{`.+=.+`, false, ""},
+		{`[a-z]{3}-[0-9]+`, false, ""}, // a bounded leading repeat
+		{`x[a-f]+y`, false, ""},        // begins with a literal
+		{`\w+(?i:k)\d+`, false, ""},    // a folded literal
+		// Unicode mode: a class common only for its characters above 0x7F
+		// takes a one-byte literal that is not common in text itself.
+		{`[α-ω]+@[α-ω]+`, true, "@"},
+		{`[а-я]+=\d`, true, "="},
+		{`[éèê]+@[a-z]+`, true, "@"},
+		{`\p{Han}+x\d`, true, ""},    // `x` is common in text
+		{`[α-ω]+@[α-ω]+`, false, ""}, // byte mode cannot name them
+	} {
+		lap := findLitAnchorPoint(c.pat, c.unicode)
+		got := ""
+		if lap != nil {
+			got = string(lap.litSet[0])
+		}
+		if got != c.lit {
+			t.Errorf("findLitAnchorPoint(%q) literal %q, want %q", c.pat, got, c.lit)
+		}
+		if lap != nil && lap.oneByte() != (len(c.lit) == 1) {
+			t.Errorf("findLitAnchorPoint(%q).oneByte() = %v", c.pat, lap.oneByte())
+		}
+	}
+	if wideLeadingRepeat(`(`, false) {
+		t.Error("wideLeadingRepeat(unparseable) = true")
+	}
+
+	// In Unicode mode the leading repeat's set is its characters' first
+	// bytes: `[α-ω]` begins with 0xCE or 0xCF, which byte mode's rune values
+	// never named, and `\pL` holds no rune 0xC0-0xFF as a byte of its own.
+	for _, c := range []struct {
+		pat  string
+		want []byte // bytes the set must hold
+		not  []byte // bytes it must not
+	}{
+		{`[α-ω]+x`, []byte{0xCE, 0xCF}, []byte{'a', 0xB1}},
+		{`\pL+x`, []byte{'a', 'Z', 0xC3, 0xD0, 0xE4}, []byte{'1', ' ', 0x80, 0xC0}},
+		{`.+x`, []byte{'a', ' ', 0xC2, 0xF4}, []byte{'\n', 0x80, 0xC1, 0xF5}},
+		{`(?s).+x`, []byte{'\n', 0xF0}, []byte{0xBF, 0xFF}},
+		{`é+x`, []byte{0xC3}, []byte{0xE9}},
+		{`(?i:ǅ)+x`, []byte{0xC7}, []byte{'d'}},
+	} {
+		re, err := syntax.Parse(c.pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		set, ok := leadingRepeatBytes(re, true)
+		if !ok {
+			t.Errorf("%q: no leading repeat", c.pat)
+			continue
+		}
+		for _, b := range c.want {
+			if !set[b] {
+				t.Errorf("%q: set lacks %#x", c.pat, b)
+			}
+		}
+		for _, b := range c.not {
+			if set[b] {
+				t.Errorf("%q: set holds %#x", c.pat, b)
+			}
+		}
+	}
+	if re, _ := syntax.Parse(`(?:ab)+x`, syntax.Perl); func() bool { _, ok := leadingRepeatBytes(re, true); return ok }() {
+		t.Error("(?:ab)+x: a repeat of a concatenation counted as a leading class repeat")
 	}
 }
 
@@ -1551,7 +1731,7 @@ func TestBuildSimplePrefixCheckBody(t *testing.T) {
 // reaches this path — see the alt-lit-anchor dispatch test for the analogous
 // alternation case.
 func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
-	entry := config.RegexEntry{Pattern: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f"}
+	entry := config.PatternEntry{Regexp: `[0-9]{8}ghp_[^\s]+`, FindFunc: "f"}
 
 	p, err := compilePattern(entry, 0, 0, CompileOptions{LikelyMode: LikelyNoMatch})
 	if err != nil {
@@ -1560,8 +1740,8 @@ func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
 	if p.litAnchorBackScanBody == nil {
 		t.Fatal("compilePattern did not take the lit-anchor path")
 	}
-	re, _ := syntax.Parse(entry.Pattern, syntax.Perl)
-	lap := findLitAnchorPointInRegexp(re)
+	re, _ := syntax.Parse(entry.Regexp, syntax.Perl)
+	lap := findLitAnchorPointInRegexp(re, false, nil)
 	if lap == nil {
 		t.Fatal("findLitAnchorPointInRegexp returned nil")
 	}
@@ -1584,12 +1764,12 @@ func TestCompileLikelyNoMatchSimpleClassPrefix(t *testing.T) {
 		t.Error("LikelyNeutral unexpectedly took the buildSimplePrefixCheckBody shortcut")
 	}
 
-	mustCompileEntries(t, []config.RegexEntry{entry}, CompileOptions{LikelyMode: LikelyNoMatch})
+	mustCompileEntries(t, []config.PatternEntry{entry}, CompileOptions{LikelyMode: LikelyNoMatch})
 }
 
 func TestFindAltLitAnchorPoints(t *testing.T) {
 	t.Run("accepts_equal_fixed_prefix", func(t *testing.T) {
-		branches, ok := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false)
+		branches, ok := findAltLitAnchorPoints(bytePat(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`))
 		if !ok {
 			t.Fatalf("findAltLitAnchorPoints rejected the target pattern")
 		}
@@ -1599,13 +1779,13 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 	})
 
 	t.Run("rejects_invalid_syntax", func(t *testing.T) {
-		if _, ok := findAltLitAnchorPoints(`[`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`[`)); ok {
 			t.Errorf("accepted invalid syntax")
 		}
 	})
 
 	t.Run("rejects_non_alternate_top_level", func(t *testing.T) {
-		if _, ok := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`[0-9]{8}ghp_[A-Za-z0-9]{36}`)); ok {
 			t.Errorf("accepted a non-alternation top-level pattern")
 		}
 	})
@@ -1616,26 +1796,26 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 		// use a construct that stays OpAlternate with exactly one sub is not
 		// generally reachable; instead verify the >=2 branch count gate
 		// directly against a 3-branch pattern where all qualify.
-		branches, ok := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}|[0-9]{8}akey_[A-Za-z0-9]{20}`, false)
+		branches, ok := findAltLitAnchorPoints(bytePat(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}|[0-9]{8}akey_[A-Za-z0-9]{20}`))
 		if !ok || len(branches) != 3 {
 			t.Fatalf("expected 3 qualifying branches, got ok=%v len=%d", ok, len(branches))
 		}
 	})
 
 	t.Run("rejects_unequal_prefix_lengths", func(t *testing.T) {
-		if _, ok := findAltLitAnchorPoints(`[0-9]{4}ghp_[A-Za-z0-9]{36}|[a-f]{16}secret_[A-Za-z0-9]{20}`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`[0-9]{4}ghp_[A-Za-z0-9]{36}|[a-f]{16}secret_[A-Za-z0-9]{20}`)); ok {
 			t.Errorf("accepted branches with unequal fixed prefix lengths (4 vs 16)")
 		}
 	})
 
 	t.Run("rejects_non_fixed_length_prefix", func(t *testing.T) {
-		if _, ok := findAltLitAnchorPoints(`[0-9]{4,8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`[0-9]{4,8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`)); ok {
 			t.Errorf("accepted a branch with a ranged (non-fixed-length) prefix")
 		}
 	})
 
 	t.Run("rejects_unbounded_prefix", func(t *testing.T) {
-		if _, ok := findAltLitAnchorPoints(`.*ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`.*ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`)); ok {
 			t.Errorf("accepted a branch with an unbounded prefix")
 		}
 	})
@@ -1643,7 +1823,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 	t.Run("rejects_mixed_qualifying_and_non_qualifying_branch", func(t *testing.T) {
 		// Second branch's top-level shape isn't OpConcat with a qualifying
 		// literal (it's a bare class run with no anchor literal at all).
-		if _, ok := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f0-9]{20}`, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f0-9]{20}`)); ok {
 			t.Errorf("accepted an alternation with a non-qualifying branch")
 		}
 	})
@@ -1654,7 +1834,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 		for i := 0; i < maxAltLitAnchorBranches; i++ {
 			full += "|" + pattern
 		}
-		if _, ok := findAltLitAnchorPoints(full, false); ok {
+		if _, ok := findAltLitAnchorPoints(bytePat(full)); ok {
 			t.Errorf("accepted more than %d branches", maxAltLitAnchorBranches)
 		}
 	})
@@ -1671,7 +1851,7 @@ func TestFindAltLitAnchorPoints(t *testing.T) {
 // shape, so it falls through to this path instead.
 func TestCompileAltLitAnchorDispatch(t *testing.T) {
 	pattern := `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`
-	entry := config.RegexEntry{Pattern: pattern, FindFunc: "f"}
+	entry := config.PatternEntry{Regexp: pattern, FindFunc: "f"}
 
 	p, err := compilePattern(entry, 0, 0, CompileOptions{})
 	if err != nil {
@@ -1692,7 +1872,7 @@ func TestCompileAltLitAnchorDispatch(t *testing.T) {
 		}
 	}
 
-	mustCompileEntries(t, []config.RegexEntry{entry})
+	mustCompileEntries(t, []config.PatternEntry{entry})
 }
 
 // ccpLayout builds a find-mode layout the way appendFindCodeEntry's callers do,
@@ -1709,7 +1889,7 @@ func TestCompileAltLitAnchorDispatch(t *testing.T) {
 // field is caught here rather than in a corpus run.
 func ccpLayout(t *testing.T, pattern string) (*dfaLayout, *dfaTable) {
 	t.Helper()
-	m, err := compile(pattern, CompileOptions{
+	m, err := compile(bytePat(pattern), CompileOptions{
 		MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true,
 	})
 	if err != nil {

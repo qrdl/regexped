@@ -14,6 +14,8 @@
 // stdlib regexp package (RE2 semantics, matching this project's own
 // leftmost-first semantics) as ground truth: -mode match checks for a match
 // anchored at the start of the input; -mode find checks for a match anywhere.
+// Go reads runes, so in byte mode (the default) an input with a byte above
+// 0x7F is left out, with a warning; -unicode measures it.
 package main
 
 import (
@@ -56,6 +58,37 @@ type cell struct {
 	avgTime time.Duration
 }
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// maxDFAStatesFlag is max_dfa_states for every compile of this run, 0 for the
+// mode's default (1,024 in byte mode, 16,384 in Unicode mode): what raising
+// or lowering it does to a pattern — which engine it gets, its module size,
+// its fuel — is measured here rather than guessed.
+var maxDFAStatesFlag = flag.Int("max-dfa-states", 0, "max_dfa_states for every compile (0 = the mode's default)")
+
+// isASCII reports whether s has no byte above 0x7F.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	wcallCase = "pattest"
 	// Silence regexped's slog output.
@@ -84,6 +117,29 @@ func main() {
 	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "error: no inputs found in file")
 		os.Exit(1)
+	}
+	// Byte mode reads bytes and the Go oracle reads runes, so on an input with
+	// a byte above 0x7F the two disagree about what matches — `.{2}` matches
+	// the two bytes of `é` in byte mode, and Go puts it in the non-matching
+	// bucket — and every number reported for that bucket is about the wrong
+	// inputs. Such inputs are left out, as tools/fuzz leaves them out, and the
+	// run says how many; -unicode compiles in the mode the oracle reads.
+	if !*unicodeFlag {
+		ascii := inputs[:0:0]
+		for _, in := range inputs {
+			if isASCII(in) {
+				ascii = append(ascii, in)
+			}
+		}
+		if n := len(inputs) - len(ascii); n > 0 {
+			fmt.Fprintf(os.Stderr, "warning: %d input(s) with bytes above 0x7F left out: byte mode reads bytes, "+
+				"the Go oracle reads runes, so it cannot bucket them; use -unicode to measure them\n", n)
+		}
+		if len(ascii) == 0 {
+			fmt.Fprintln(os.Stderr, "error: no ASCII inputs left to measure in byte mode; use -unicode")
+			os.Exit(1)
+		}
+		inputs = ascii
 	}
 
 	classifyRe, err := classifierRegexp(*patternFlag, *modeFlag)
@@ -179,15 +235,15 @@ func classifierRegexp(pattern, mode string) (*regexp.Regexp, error) {
 // compilePattern compiles pattern as a standalone WASM module exporting
 // match_func or find_func (named after the mode) under the given LikelyMode.
 func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, error) {
-	re := config.RegexEntry{Pattern: pattern}
+	re := config.PatternEntry{Regexp: pattern}
 	switch mode {
 	case "match":
 		re.MatchFunc = "match"
 	case "find":
 		re.FindFunc = "find"
 	}
-	opts := compile.CompileOptions{LikelyMode: likely}
-	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	opts := withMode(compile.CompileOptions{LikelyMode: likely, MaxDFAStates: *maxDFAStatesFlag})
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, opts)
 	if err == nil {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc])
 	}

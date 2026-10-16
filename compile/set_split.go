@@ -60,19 +60,28 @@ import (
 // member's search from its bound is repeated only on the call that reports
 // it: each byte is walked a bounded number of times over the whole drive.
 
-// splitTableBudget bounds the start-anywhere tables one set's split members
-// add to the module. Members get the start-anywhere find smallest tables
-// first while the total stays within it; the rest are served by the
-// Backtracking find (buildBTFindParts), linear per call too, whose own tables
-// are a few scan bytes and whose frame stack all of them share — the merge
-// wrapper calls one member at a time. Without a bound a set with hundreds of
-// such members compiled hundreds of automata, each up to ~1 MB.
-const splitTableBudget = 4 << 20
+// splitTableBudget and splitTableBudgetUnicode are max_split_table_size's
+// defaults: the start-anywhere tables one set's split members may add to the
+// module. Members get the start-anywhere find smallest tables first while the
+// total stays within it; the rest are served by the Backtracking find
+// (buildBTFindParts), linear per call too, whose own tables are a few scan
+// bytes and whose frame stack all of them share — the merge wrapper calls one
+// member at a time. Without a bound a set with hundreds of such members
+// compiled hundreds of automata, each up to ~1 MB. Unicode-mode tables are
+// larger (a lowered letter class costs hundreds of states), and 12 members
+// like `\pL*\p{Greek}\pN{3}` put 5 on Backtracking at 4 MB: `find` cost
+// 872/904/132 fuel per byte over mixed-script / English / digit text, 310/90/90
+// with all 12 on the start-anywhere find, for 0.38 MB more module.
+const (
+	splitTableBudget        = 4 << 20
+	splitTableBudgetUnicode = 64 << 20
+)
 
 // splitMember is one member a set serves outside its buckets: by its
 // start-anywhere find's two passes, or — bt non-nil — by the Backtracking find.
 type splitMember struct {
 	id               int    // global pattern id
+	name             string // its name, or its pattern, for messages
 	fwdBody, revBody []byte // size-prefixed code entries
 	// ctx: the passes are the context ones (startAnywherePasses.ctx) — the
 	// forward pass reads the whole input from the find-from global and
@@ -82,6 +91,11 @@ type splitMember struct {
 	// notes: the forward pass keeps per-search notes (search_notes.go) in
 	// the member's own search block (searchBlocks).
 	notes *notesRows
+	// roundFrom: the passes' search position must be rounded up to a start
+	// position before they run (the member's startRule is not none). The
+	// glue that does it for a single pattern is not used here, and the
+	// Backtracking find rounds its own.
+	roundFrom bool
 }
 
 // mslot is one of the merge's per-member values: a local, or a word of the
@@ -168,7 +182,7 @@ func budgetSplit(cands []splitCand, pats []*PatternInfo, opts CompileSetOptions,
 	var total int64
 	for _, k := range order {
 		if total+cands[k].saBytes > budget {
-			if btFindBuildable(pats[cands[k].idx].fullPattern) {
+			if btFindBuildable(pats[cands[k].idx].rp) {
 				cands[k].bt = true
 				continue
 			}
@@ -237,9 +251,9 @@ func sparseSplitCands(spec SetSpec, opts CompileSetOptions, buckets []*bucket, i
 				continue
 			}
 			i := idx[p]
-			if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok {
+			if sa, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), 0, align8, nil); ok {
 				cands = append(cands, splitCand{idx: i, saBytes: sa.end})
-			} else if btFindBuildable(p.fullPattern) {
+			} else if btFindBuildable(p.rp) {
 				cands = append(cands, splitCand{idx: i, bt: true})
 			}
 		}
@@ -268,7 +282,7 @@ func sparseCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 				continue
 			}
 			p := spec.Patterns[k]
-			if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok && sm.bt == nil {
+			if sa, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), 0, align8, nil); ok && sm.bt == nil {
 				cands = append(cands, splitCand{idx: k, saBytes: sa.end})
 			} else {
 				cands = append(cands, splitCand{idx: k, bt: true})
@@ -285,7 +299,7 @@ func sparseCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compile
 	o.noSparseCounter, o.quiet = true, true
 	base := max(int64(primary.regionEnd), primary.dataTop())
 	o.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
-	comp := compileSetWith(c, prefixPool, suffixPool, o, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+	comp := compileSetWith(c, prefixPool, suffixPool, o, budgetSplit(cands, spec.Patterns, opts, opts.splitTableBudget()), true)
 	comp.internal = true
 	comp.forceAcceptBlocks = true
 	if primary.diag != nil && comp.diag != nil {
@@ -323,7 +337,7 @@ func compileSetSplitPrimary(spec SetSpec, prefixPool, suffixPool *dfaPool, opts 
 		}
 		return trial
 	}
-	cands = budgetSplit(cands, spec.Patterns, opts, splitTableBudget)
+	cands = budgetSplit(cands, spec.Patterns, opts, opts.splitTableBudget())
 	// The trial has already warned about every pattern this compile drops or
 	// puts on Backtracking: the split members are neither, and the others
 	// are packed by the same per-pattern rules.
@@ -464,7 +478,7 @@ func noCacheCompanion(spec SetSpec, prefixPool, suffixPool *dfaPool, opts Compil
 	o.noCache, o.quiet = true, true
 	base := max(int64(primary.regionEnd), primary.dataTop())
 	o.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
-	comp := compileSetWith(c, prefixPool, suffixPool, o, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+	comp := compileSetWith(c, prefixPool, suffixPool, o, budgetSplit(cands, spec.Patterns, opts, opts.splitTableBudget()), true)
 	comp.internal = true
 	if primary.diag != nil && comp.diag != nil {
 		primary.diag.NoCacheSplitMembers = comp.diag.SplitMembers
@@ -509,9 +523,9 @@ func setSplitCandidates(spec SetSpec, opts CompileSetOptions) []splitCand {
 		if !setMemberNeedsSplit(p, opts) {
 			continue
 		}
-		if sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), 0, align8, nil); ok {
+		if sa, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), 0, align8, nil); ok {
 			out = append(out, splitCand{idx: i, saBytes: sa.end})
-		} else if btFindBuildable(p.fullPattern) {
+		} else if btFindBuildable(p.rp) {
 			out = append(out, splitCand{idx: i, bt: true})
 		}
 	}
@@ -535,7 +549,7 @@ func setMemberNeedsSplit(p *PatternInfo, opts CompileSetOptions) bool {
 	}
 	stripCaptures(parsed)
 	limit := max(opts.maxFallbackStates(), splitAnalysisStates)
-	m, err := compile(p.fullPattern, CompileOptions{MaxDFAStates: limit, ForceEngine: EngineDFA,
+	m, err := compile(p.rp, CompileOptions{MaxDFAStates: limit, ForceEngine: EngineDFA,
 		LeftmostFirst: true, ByteMode: p.byteMode})
 	if err != nil {
 		return true
@@ -586,10 +600,10 @@ const maxLiteralCrossingNodes = 1 << 18
 // through NON-ACCEPTING states can read lit arbitrarily many times: whether
 // the product of those states with a matcher for lit has a cycle containing a
 // completed occurrence. Unsure answers are true, the safe direction.
-func regexpCrossesLiteralUnboundedly(re *syntax.Regexp, lit []byte) bool {
+func regexpCrossesLiteralUnboundedly(re resolvedTree, lit []byte) bool {
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(re.Simplify())
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	prog, _ := compileProg(re)
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
 	if !ok {
 		return true
 	}
@@ -719,7 +733,7 @@ func dfaCrossesLiteralUnboundedly(t *dfaTable, lit []byte, throughAccepts bool) 
 // splitPassOpts is the CompileOptions a split member's two passes are built
 // under: the set's state ceiling, and the member's own byte mode.
 func splitPassOpts(p *PatternInfo, opts CompileSetOptions) CompileOptions {
-	return CompileOptions{MaxDFAStates: opts.maxFallbackStates(), ByteMode: p.byteMode, tableMemIdx: opts.TableMemIdx}
+	return CompileOptions{MaxDFAStates: opts.dfaStatesOption(), ByteMode: p.byteMode, tableMemIdx: opts.TableMemIdx}
 }
 
 func align8(v int64) int64 { return (v + 7) &^ 7 }
@@ -947,30 +961,31 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 			// in the member's own block, as a pattern's find keeps it.
 			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget, BTStackStart: opts.BTStackStart,
 				tableMemIdx: opts.TableMemIdx, globals: opts.globals, btDrive: drive}
-			bt, err := buildBTFindParts(p.fullPattern, nil, findMandatoryLit(p.fullPattern, p.byteMode), int64(base), &o)
+			bt, err := buildBTFindParts(p.rp, nil, findMandatoryLit(p.rp), int64(base), &o)
 			if err != nil {
 				panic("compile: a split member Backtracking was classified to take refused it: " + err.Error())
 			}
 			ra.Commit(int32(bt.end)) //nolint:gosec // table addresses fit in i32
-			cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], bt: &bt})
+			cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], name: patternRefFor(p).Name, bt: &bt})
 			cs.splitData = append(cs.splitData, bt.data...)
 			cs.splitSegs += bt.segs
 			continue
 		}
 		base := ra.Reserve("split-member", 8)
 		// The member's own search, across the set's calls, keeps notes in a
-		// block of its own (D5: the overrun member stays split, its search
-		// counter-armed).
+		// block of its own: a member whose walks overran stays split, and its
+		// search keeps the counter that arms the notes.
 		var nr *walkNotesReq
 		if opts.globals != nil {
 			nr = &walkNotesReq{globals: opts.globals}
 		}
-		sa, ok := buildStartAnywherePasses(p.fullPattern, splitPassOpts(p, opts), int64(base), align8, nr)
+		sa, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), int64(base), align8, nr)
 		if !ok {
 			panic("compile: a split member's start-anywhere find was classified buildable and then refused")
 		}
 		ra.Commit(int32(sa.end)) //nolint:gosec // table addresses fit in i32
-		cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], fwdBody: sa.fwdBody, revBody: sa.revBody, ctx: sa.ctx, notes: sa.fwdNotes})
+		cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], name: patternRefFor(p).Name, fwdBody: sa.fwdBody, revBody: sa.revBody, ctx: sa.ctx, notes: sa.fwdNotes,
+			roundFrom: startRuleFor(p.rp) != startRuleNone})
 		cs.splitData = append(cs.splitData, sa.data...)
 		cs.splitSegs += sa.segs
 	}
@@ -1263,6 +1278,15 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		swGeo.m64, swGeo.k64, swGeo.b64 = uint32(a.I64()), uint32(a.I64()), uint32(a.I64())
 	}
 	swIdx := cs.sweepIdx
+	// The Unicode start rule's scratch, for rounding a member's search
+	// position (splitMember.roundFrom).
+	var u8 utf8StartLocals
+	for _, sm := range cs.split {
+		if sm.roundFrom {
+			u8 = utf8StartLocals{ptr: pPtr, len: pLen, pos: uint32(lQ), c: uint32(a.I32()), k: uint32(a.I32()), n: uint32(a.I32())}
+			break
+		}
+	}
 	// Four values per member — its lower bound, the start and end of its
 	// answer, its done flag — in four locals each, or past
 	// splitMergeLocalMembers in the set's merge state region; every
@@ -1555,6 +1579,9 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		// and lE; with none it runs onNone, records the member done and
 		// branches `depth` out to $found.
 		search := func(b []byte, depth byte, onNone func([]byte) []byte) []byte {
+			if sm.roundFrom {
+				b = emitUTF8Start(b, u8, nil) // q up to a start position
+			}
 			if sm.bt != nil {
 				// The Backtracking find from q: (start << 32) | end, -1 for no
 				// match, or its "gave up" error, which is this call's answer.
@@ -2081,7 +2108,7 @@ func scanSplitOnly(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileSe
 			base = max(base, int64(primary.companion.regionEnd), primary.companion.dataTop())
 		}
 		so.TableBase = int32(align8(base)) //nolint:gosec // table addresses fit in i32
-		comp := compileSetWith(sc, prefixPool, suffixPool, so, budgetSplit(cands, spec.Patterns, opts, splitTableBudget), true)
+		comp := compileSetWith(sc, prefixPool, suffixPool, so, budgetSplit(cands, spec.Patterns, opts, opts.splitTableBudget()), true)
 		if comp.wideAll() != primary.wideAll() {
 			continue
 		}

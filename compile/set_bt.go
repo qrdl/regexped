@@ -2,7 +2,6 @@ package compile
 
 import (
 	"fmt"
-	"regexp/syntax"
 
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/abi"
@@ -11,9 +10,9 @@ import (
 
 // ── Backtracking as a set fallback engine ────────────────
 //
-// A set member whose fallback-bucket DFA exceeds max_fallback_states used to be
-// DROPPED: warned, recorded in --diag-json's state_limit_dropped, and then
-// absent from every capability of that set at runtime. The same pattern
+// A set member whose fallback-bucket DFA exceeded its state limit used to be
+// DROPPED: warned, recorded in --diag-json, and then absent from every
+// capability of that set at runtime. The same pattern
 // compiled on its own falls back to Backtracking and keeps working, so the set
 // path was strictly weaker than the single-pattern path on identical input.
 //
@@ -42,25 +41,23 @@ import (
 // rather than inheriting confidence from the single-pattern paths.
 //
 // A pattern Backtracking cannot take either — its NFA exceeds
-// maxBTFallbackInstructions, or its suffix AST does not compile — is still
-// dropped and still reported: admitBTFallback returns nil and the caller keeps
-// its existing warn-and-continue. No pattern known to reach that branch
-// remains: a member over the instruction cap fails the whole set compile
-// earlier, in analyzePattern.
+// max_bt_instructions, or its suffix AST does not compile — fits no engine,
+// and the set does not compile (admitFallback). `.{0,870}` in Unicode mode
+// reached it before a member's DFA was built under max_dfa_states: 7,832
+// states over a fixed 2,048, then 21,752 instructions over 20,000.
 
-// admitBTFallback tries to build a Backtracking driver for a pattern that is
-// about to be dropped from a set. Returns nil when BT cannot take it either,
-// in which case the caller drops the pattern exactly as before.
+// admitBTFallback tries to build a Backtracking driver for a pattern no DFA
+// bucket takes. Returns nil when BT cannot take it either.
 //
 // ast is the pattern's full AST (patternSuffixAST), captures already
 // irrelevant because sets never report them.
-func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
-	if ast == nil {
+func admitBTFallback(ast resolvedTree) *btBucketInfo {
+	if ast.re == nil {
 		return nil
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(ast.Simplify())
-	if len(prog.Inst) > maxBTFallbackInstructions {
+	prog, _ := compileProg(ast)
+	if !prog.lim.btFits(len(prog.prog.Inst)) {
 		return nil
 	}
 	bt := newBacktrack(prog)
@@ -70,37 +67,52 @@ func admitBTFallback(ast *syntax.Regexp) *btBucketInfo {
 	return &btBucketInfo{bt: bt}
 }
 
-// setPatternInfos resolves one set's selected pattern indices into the
-// PatternInfos CompileSet works from, dropping capture-bearing entries the way
-// a set always has.
+// setPatternInfos resolves one set's members (config.SetConfig.Members: the
+// selected top-level patterns, then the set's own regexps) into the
+// PatternInfos CompileSet works from — every one of them — and the pattern id
+// each is reported under. An entry with
+// groups_func is a member too: a set reports group 0 only, and
+// analyzeSetMember strips the capture groups for the set alone, as it does
+// for any member whose pattern has them; the entry's own groups export is
+// unchanged. Such entries used to be dropped from every set that selected
+// them, silently.
 //
 // Extracted so CompileFileDiag and SetAdmitsBacktracking share ONE
 // implementation. They must: the predicate exists to tell `generate` which ABI
 // the emitter chose, so any divergence between the two would be a stub whose
 // signature disagrees with the WASM it calls — a silently wrong return value
 // rather than a build error.
-func setPatternInfos(sc config.SetConfig, cfg config.BuildConfig, selectedIdx []int,
-	prefixPool, suffixPool *dfaPool) ([]*PatternInfo, []int, error) {
+//
+// progress is the compile's progress sink, nil for a compile that reports
+// none; the members' programs carry it to their constructions.
+func setPatternInfos(sc config.SetConfig, members []config.SetMember, cfg config.BuildConfig,
+	prefixPool, suffixPool *dfaPool, progress *progressSink) ([]*PatternInfo, []int, error) {
 
+	mode, err := resolveSetMode(sc, members)
+	if err != nil {
+		return nil, nil, err
+	}
+	mode.pg = progress
+	mode.lim = limitsOfConfig(cfg)
 	var infos []*PatternInfo
 	var globalIDs []int
-	for _, idx := range selectedIdx {
-		re := cfg.Regexps[idx]
-		if re.CaptureStubsRequested() {
-			continue // drop capture-bearing
-		}
-		info, err := analyzePattern(re, prefixPool, suffixPool)
+	for _, m := range members {
+		re := m.Entry
+		info, err := analyzeSetMember(re, mode.member(re.Regexp), prefixPool, suffixPool)
 		if err != nil {
-			patLabel := re.Name
+			kind, patLabel := "pattern", re.Name
 			if patLabel == "" {
-				patLabel = re.Pattern
+				patLabel = re.Regexp
 			}
-			return nil, nil, fmt.Errorf("set %q: pattern %q: %w", sc.Name, patLabel, err)
+			if m.Inline {
+				kind = "regexp"
+			}
+			return nil, nil, fmt.Errorf("set %q: %s %q: %w", sc.Name, kind, patLabel, err)
 		}
-		info.globalID = idx
+		info.globalID = m.ID
 		info.name = re.Name
 		infos = append(infos, info)
-		globalIDs = append(globalIDs, idx)
+		globalIDs = append(globalIDs, m.ID)
 	}
 	return infos, globalIDs, nil
 }
@@ -176,6 +188,10 @@ type btSharedRegions struct {
 	drive    btDrive
 	hasDrive bool
 	members  map[int]*btDriveMember
+	// anchored holds the btDriveMember of each anchored-pair Backtracking
+	// bucket (cs.anchoredBT, same order), nil where its program has no
+	// fallback body.
+	anchored []*btDriveMember
 }
 
 // btBucketCall is how a BT bucket's suffix or probe body reaches its bodies:
@@ -251,7 +267,20 @@ func planBTRegions(buckets []*bucket, globals *moduleGlobals) *btSharedRegions {
 // exactly one pattern: BT has no merged form, so there is nothing to share
 // with.
 func newBTBucket(p *PatternInfo) *bucket {
-	info := admitBTFallback(patternSuffixAST(p))
+	return btBucketFor(p, patternSuffixAST(p))
+}
+
+// newAnchoredBTBucket builds the anchored pair's Backtracking bucket for p:
+// the WHOLE pattern, captures stripped, which its driver — built with
+// whole-input acceptance (buildBTBodies) — matches only when it consumes the
+// entire input, exactly as match_any / match_all ask. nil when Backtracking
+// cannot take it either (the compile then fails).
+func newAnchoredBTBucket(p *PatternInfo) *bucket {
+	return btBucketFor(p, patternFullAST(p))
+}
+
+func btBucketFor(p *PatternInfo, ast resolvedTree) *bucket {
+	info := admitBTFallback(ast)
 	if info == nil {
 		return nil
 	}
@@ -261,6 +290,35 @@ func newBTBucket(p *PatternInfo) *bucket {
 		isFallback: true,
 		btFallback: info,
 	}
+}
+
+// allocAnchoredBTRegions gives a set whose anchored pair has Backtracking
+// buckets the shared regions they run in — the set's own when its `find`
+// buckets already made them — and a btDriveMember per budgeted bucket.
+// Returns the regions and how many functions the buckets add (a driver each,
+// plus a fallback each where planBT keeps one).
+func allocAnchoredBTRegions(regions *btSharedRegions, anchored []*bucket, budget int, globals *moduleGlobals) (*btSharedRegions, int) {
+	if len(anchored) == 0 {
+		return regions, 0
+	}
+	if regions == nil {
+		regions = planBTRegions(anchored, globals)
+		regions.scratch = globals.BTScratch()
+		regions.drive = allocBTDrive(globals)
+		regions.hasDrive = true
+	}
+	fns := 0
+	regions.anchored = make([]*btDriveMember, len(anchored))
+	for k, bkt := range anchored {
+		fns++
+		if planBT(bkt.btFallback.bt, budget).fallback {
+			fns++
+			m := allocBTDriveMember(globals, regions.drive)
+			m.rowBytes = int32(bkt.btFallback.bt.memoRowBytes()) //nolint:gosec // a program's Alts / 8
+			regions.anchored[k] = m
+		}
+	}
+	return regions, fns
 }
 
 // buildSetBTSuffixBody emits a fallback bucket's suffix function backed by the
@@ -468,13 +526,14 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 	out := make(map[int][]byte)
 	// Drivers sit at btFnBase+k, the index each suffix body calls; every
 	// fallback follows the last driver, so adding them moved no driver.
-	numDrivers := 0
+	numDrivers := len(cs.anchoredBT)
 	for _, bkt := range cs.buckets {
 		if bkt.btFallback != nil {
 			numDrivers++
 		}
 	}
 	var fallbacks [][]byte
+	var fallbackOwners []string
 	calls := map[int]btBucketCall{}
 	k := 0
 	for bi, bkt := range cs.buckets {
@@ -523,8 +582,10 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 			call.route = !plan.force && member != nil
 			driver = patchBTFallbackCall(driver, callOffs, call.fallbackIdx)
 			fallbacks = append(fallbacks, fb)
+			fallbackOwners = append(fallbackOwners, patternRefFor(bkt.patterns[0]).Name)
 		}
 		cs.btFnBodies = append(cs.btFnBodies, driver)
+		cs.btFnOwners = append(cs.btFnOwners, patternRefFor(bkt.patterns[0]).Name)
 
 		// gated and skip-carrying are mutually exclusive and mean DIFFERENT
 		// things for parameter 7; passing them as one flag made the body read
@@ -536,7 +597,49 @@ func (cs *compiledSet) buildBTBodies(btFnBase, tableMemIdx int) map[int][]byte {
 		calls[bi] = call
 		k++
 	}
+	// The anchored pair's buckets: the WHOLE pattern, driven with
+	// whole-input acceptance (nativeAnchored false: InstMatch accepts only
+	// at the window end, so a derivation that stops short backtracks into
+	// the next — `a|ab` over "ab" answers through its second branch), drivers
+	// after the `find` drivers, fallbacks with the others after every driver.
+	for ak, bkt := range cs.anchoredBT {
+		info := bkt.btFallback
+		plan := planBT(info.bt, cs.btWorkBudget)
+		member := cs.btRegions.anchored[ak]
+		call := btBucketCall{driverIdx: btFnBase + k, fallbackIdx: -1}
+		var driver []byte
+		var callOffs []int
+		if plan.force {
+			driver, callOffs = btTailCallBody(3)
+		} else {
+			sc := cs.btRegions.scratch
+			sc.drive = &cs.btRegions.drive
+			growth := &btGrowth{scratch: sc, start: btStackStart(cs.btStackStart, btNoCaptureFrameSize)}
+			driver, callOffs = appendBacktrackCodeEntry(nil, info.bt,
+				btNoCaptureFrameSize,
+				false, // whole-input acceptance
+				tableMemIdx, cs.btRegions.winGlobal, -1,
+				plan.k, plan.fallback, nil, member, true, growth)
+		}
+		if plan.fallback {
+			fb, _ := appendBacktrackCodeEntry(nil, info.bt,
+				btNoCaptureFrameSize,
+				false, tableMemIdx, cs.btRegions.winGlobal, -1,
+				0, false, &cs.btRegions.scratch, member, true, nil)
+			call.fallbackIdx = btFnBase + numDrivers + len(fallbacks)
+			call.member = member
+			call.route = !plan.force && member != nil
+			driver = patchBTFallbackCall(driver, callOffs, call.fallbackIdx)
+			fallbacks = append(fallbacks, fb)
+			fallbackOwners = append(fallbackOwners, patternRefFor(bkt.patterns[0]).Name)
+		}
+		cs.btFnBodies = append(cs.btFnBodies, driver)
+		cs.btFnOwners = append(cs.btFnOwners, patternRefFor(bkt.patterns[0]).Name)
+		cs.anchoredBTProbeBodies[ak] = sizePrefixed(buildSetBTProbeBody(cs.btRegions, call, tableMemIdx))
+		k++
+	}
 	cs.btFnBodies = append(cs.btFnBodies, fallbacks...)
+	cs.btFnOwners = append(cs.btFnOwners, fallbackOwners...)
 	// Probes, for the scan and anchored capabilities. A bucket that filled
 	// only its suffix slot left these EMPTY — a declared function with no
 	// body, which is a module that will not parse.
@@ -580,13 +683,10 @@ func sizePrefixed(body []byte) []byte {
 // function at all. A BT bucket that emitted only one of the two left the other
 // capability's slot EMPTY, which is a function declared but not emitted — a
 // module that fails to parse, and exactly how this was found.
-// There is no `anchored` flavour, and no parameter for one. A Backtracking
-// bucket is admitted by the FIND-path packers only: compileAnchoredBuckets
-// (set.go) has no newBTBucket call, so a pattern BT-rescued for find/scan is
-// simply absent from match_any/match_all — see docs/sets.md "Backtracking
-// members and the anchored pair". The parameter and its full-consumption arm
-// were once dead code that made the exclusion look like an oversight rather
-// than the contract it is.
+// The anchored pair's buckets use this same body: what makes their answer
+// "the whole input" is their DRIVER, built with whole-input acceptance
+// (buildBTBodies), and the anchored bodies call it with start 0. The body
+// itself is the same either way.
 func buildSetBTProbeBody(regions *btSharedRegions, call btBucketCall, tableMemIdx int) []byte {
 	const (
 		pPtr       = 0

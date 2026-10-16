@@ -27,6 +27,64 @@ type backtrack struct {
 	// search keeps the work budget, the tripped flag and the fallback's memo
 	// per SEARCH through the caller's block (bt_search.go); nil = per call.
 	search *btSearch
+
+	// startRule is the Unicode start rule the find body keeps (find_from.go).
+	startRule startRule
+
+	// dispatch is the first-byte dispatch over the program's alternation
+	// chains (bt_dispatch.go), built on first use by altDispatch.
+	dispatch *btDispatchPlan
+
+	// unicode: the program was compiled in a Unicode mode, so a literal its
+	// find scans for is UTF-8 text (prefixScanParams.UTF8Text).
+	unicode bool
+
+	// memoIdx is the fallback memo's bit for each pc (memoIndex), built on
+	// first use.
+	memoIdx []int
+
+	// budgetN is the work budget's N, pops per byte per unit of k: the
+	// instruction count of the program BEFORE lowering (resolvedProg.orig;
+	// prog itself in byte mode). Lowering puts a class's byte sequences in
+	// the program, `\pL+` 1,552 instructions against 4, while the first-byte
+	// dispatch walks one in a few steps — so the lowered count let an
+	// exponential search run hundreds of times more pops than its byte twin
+	// before the memoised fallback took over.
+	budgetN int
+}
+
+// memoIndex maps each pc the fallback body guards to its bit in a memo row,
+// in pc order, and every other pc to -1. The guarded pcs are the Alts — the
+// only instructions whose (pc, pos) the fallback marks — less the inner Alts
+// of a dispatched chain, which are never reached. A row
+// over every instruction was mostly bits never set: `\pL+` 194 bytes per
+// input position where its Alts need 41.
+func (bt *backtrack) memoIndex() []int {
+	if bt.memoIdx == nil {
+		plan := bt.altDispatch()
+		bt.memoIdx = make([]int, len(bt.prog.Inst))
+		n := 0
+		for pc, in := range bt.prog.Inst {
+			bt.memoIdx[pc] = -1
+			if (in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch) && !plan.dead[pc] {
+				bt.memoIdx[pc] = n
+				n++
+			}
+		}
+	}
+	return bt.memoIdx
+}
+
+// memoRowBytes is one fallback memo row: a bit per guarded pc (memoIndex),
+// at least one byte.
+func (bt *backtrack) memoRowBytes() int {
+	n := 0
+	for _, i := range bt.memoIndex() {
+		if i >= 0 {
+			n++
+		}
+	}
+	return max((n+7)/8, 1)
 }
 
 func (b *backtrack) Type() EngineType { return EngineBacktrack }
@@ -88,8 +146,12 @@ func progHasZeroWidthCycle(prog *syntax.Prog) bool {
 }
 
 // newBacktrack builds the backtrack struct from a compiled NFA program.
-func newBacktrack(prog *syntax.Prog) *backtrack {
-	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2}
+func newBacktrack(mp resolvedProg) *backtrack {
+	prog := mp.prog
+	bt := &backtrack{prog: prog, numGroups: prog.NumCap / 2, unicode: mp.unicode(), budgetN: len(prog.Inst)}
+	if mp.orig != nil {
+		bt.budgetN = len(mp.orig.Inst)
+	}
 	for _, inst := range prog.Inst {
 		if inst.Op == syntax.InstAlt {
 			bt.numAlts++
@@ -272,7 +334,7 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	totalLocals := 4 + numCapLocals + memoLocalsCount + winLocalsCount
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, N)
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dynBase := uint32(3 + totalLocals)
 		dyn.memoBase, dyn.cleared, dyn.stackBase, dyn.stackTop = dynBase, dynBase+1, dynBase+2, dynBase+3
 		totalLocals += 4
@@ -381,9 +443,9 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	}
 	if useWork && member != nil {
 		// A set member's budget lasts the host call (btDriveMember).
-		body = emitBTWorkInitMember(body, member, workK, N, workSpan)
+		body = emitBTWorkInitMember(body, member, workK, bt.budgetN, workSpan)
 	} else if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, N, workSpan)
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, workSpan)
 	}
 
 	// ── Part 3: Memo table lazy clear ──────────────────────────────────────
@@ -498,6 +560,14 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 	if useWork && tripCalls && member != nil {
 		overflow = btArmTripMember(member, dyn, giveUp)
 	}
+	// The charge the pop path makes, n pops at once, for an alternation's
+	// dispatch.
+	var charge func([]byte, int) []byte
+	if useWork && member != nil {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeMemberN(b, member, workLocal, n, giveUp) }
+	} else if useWork {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeN(b, workLocal, n, giveUp) }
+	}
 
 	// After each end of block $pc_p, emit the handler for PC p.
 	// brRun(p) = N-1-p  (depth from handler top level to restart $run)
@@ -509,7 +579,7 @@ func buildBacktrackBody(bt *backtrack, frameSize int32, nativeAnchored bool, tab
 		brRun := uint32(N - 1 - p)
 
 		body = emitBTInstHandler(body, bt, p, inst, brRun, frameSize, numCapLocals, memoByteAddr, memoMemoByte, false, !slotless, nativeAnchored, nil, overflow, tableMemIdx, limitLocal, winStartLocal, useWindow, capStartGlobal,
-			memoOrigin, useWindow, dyn)
+			memoOrigin, useWindow, dyn, charge)
 	}
 
 	body = append(body, 0x00)       // unreachable (after all handlers, inside $run)
@@ -590,6 +660,9 @@ func emitBTInstHandler(
 	// The body's run-time frame stack (bt_scratch.go): a FALLBACK body's
 	// region, or an ordinary body's growing stack (dyn.grow).
 	dyn *btDyn,
+	// charge charges the body's work budget n pops; nil when it keeps none.
+	// An alternation's dispatch charges the arms it skips (emitBTAltDispatch).
+	charge func([]byte, int) []byte,
 ) []byte {
 	// brRunNested = br depth from inside one extra if/block to restart $run
 	brRunNested := brRun + 1
@@ -650,8 +723,37 @@ func emitBTInstHandler(
 		// first visit would already have returned. Every cycle in a
 		// syntax.Prog passes through an Alt, and an Alt is entered at a given
 		// pos at most once per call.
+		//
+		// The fallback dispatches a chain too, behind the memo guard at its
+		// HEAD: the chain's inner Alts are reached only through the head, so
+		// a second arrival at one of them is a second arrival at (head, pos),
+		// which the guard cuts, and the dispatch only chooses which arms to
+		// push. Walked arm by arm with a guard at every Alt, a chain cost a
+		// guard, a push and a pop per arm at every position: a lowered class
+		// is such a chain on every character, `(\pL*)*x` 1,206 → 266
+		// fuel/byte over Russian words and 1,662 → 259 over CJK; in byte mode
+		// `((?:the|and|for|you)|[a-z]*)*x`, whose zero-width cycle makes the
+		// fallback its only body, 404.55 → 230.49 over words each ending in
+		// `x`.
 		if !dyn.grow {
-			body = emitBitStateGuardDyn(body, dyn, p, memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
+			plan := bt.altDispatch()
+			if plan.dead[p] {
+				body = append(body, 0x00) // unreachable
+				break
+			}
+			body = emitBitStateGuardDyn(body, dyn, bt.memoIndex()[p], memoByteAddr, memoMemoByte, brRunNested, memoOriginLocal, hasMemoOrigin)
+			if d := plan.heads[p]; d != nil {
+				body = emitBTAltDispatch(body, d, brRun, numCapLocals, frameSize, overflowFn, tableMemIdx, dyn, limitLocal, charge)
+				break
+			}
+		} else if plan := bt.altDispatch(); plan.dead[p] {
+			// An inner Alt of a dispatched chain: reached only through the
+			// chain's head, which branches past it (bt_dispatch.go).
+			body = append(body, 0x00) // unreachable
+			break
+		} else if d := plan.heads[p]; d != nil {
+			body = emitBTAltDispatch(body, d, brRun, numCapLocals, frameSize, overflowFn, tableMemIdx, dyn, limitLocal, charge)
+			break
 		}
 		body = btPushFrame(body, numCapLocals, inst.Arg, frameSize, brRunNested, overflowFn, tableMemIdx, dyn)
 		body = contOut(body)
@@ -924,7 +1026,14 @@ func btCheckRune1(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 
 // btCheckRuneRanges emits a range check for InstRune.
 // Fails (state=-1, br brDepth) if no range matches.
-// Uses: block $matched (result i32) pattern.
+//
+// A void block $ok that each in-range test leaves with br_if, the failure at
+// its end: no 0/1 is produced. wasmtime makes every value-typed block a
+// Cranelift variable whose SSA table keeps a slot per block of the function,
+// so the block (result i32) this used to be — one per InstRune, thousands in a
+// Unicode-mode body, where `.` lowers to several byte-range InstRunes — made
+// wasmtime's compile memory grow with the square of the body: a 2.8 MB module
+// took 3.4 GB to compile, and 0.78 GB this way.
 func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	isFold := syntax.Flags(inst.Arg)&syntax.FoldCase != 0
 
@@ -935,8 +1044,7 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
 
-	// Use block $matched (result i32): emit 1 and br if matched, else 0 falls through.
-	b = append(b, 0x02, 0x7F) // block (result i32)
+	b = append(b, 0x02, 0x40) // block $ok
 
 	for i := 0; i < len(inst.Rune); i += 2 {
 		var lo, hi rune
@@ -963,20 +1071,13 @@ func btCheckRuneRanges(b []byte, inst syntax.Inst, brDepth uint32) []byte {
 		b = btEmitRangeMatch(b, lo, hi, isFold)
 	}
 
-	// No range matched: push 0 as block result
-	b = append(b, 0x41, 0x00)
-	b = append(b, 0x0B) // end block $matched — stack has 0 or 1
-
-	// if result == 0 → fail
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if void
+	// No range matched.
 	b = btFail(b, brDepth)
-	b = append(b, 0x0B) // end if
-	return b
+	return append(b, 0x0B) // end block $ok
 }
 
-// btEmitRangeMatch emits code inside a block (result i32) that checks if scratch
-// is in [lo, hi] and br_if 0 (to produce 1 and exit the block) on match.
+// btEmitRangeMatch emits code inside block $ok that leaves it (br_if 0) when
+// scratch is in [lo, hi], or under FoldCase in its other-case range.
 func btEmitRangeMatch(b []byte, lo, hi rune, isFold bool) []byte {
 	b = btEmitSingleRange(b, lo, hi)
 	if isFold {
@@ -989,34 +1090,33 @@ func btEmitRangeMatch(b []byte, lo, hi rune, isFold bool) []byte {
 	return b
 }
 
-// btEmitSingleRange emits: (scratch >= lo && scratch <= hi); br_if 0 with result 1
+// btEmitSingleRange emits: br_if 0 when scratch is in [lo, hi], tested as one
+// unsigned compare, scratch - lo <= hi - lo.
 func btEmitSingleRange(b []byte, lo, hi rune) []byte {
 	// Same saturation as btCheckRuneRanges — see the comment there. scratch is
-	// an i32.load8_u, so it is 0..255 and the ge_u/le_u pair below compares
-	// correctly against a bound anywhere in that space.
+	// an i32.load8_u, so it is 0..255 and the compare below is exact against
+	// bounds anywhere in that space.
 	if lo > 0xFF {
 		return b
 	}
 	if hi > 0xFF {
 		hi = 0xFF
 	}
+	// An empty range matches nothing — and lo > hi would make hi - lo wrap to
+	// a bound every byte is under.
+	if lo > hi {
+		return b
+	}
 	b = append(b, 0x20, localScratch)
+	if lo != 0 {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, lo)
+		b = append(b, 0x6B) // i32.sub
+	}
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, lo)
-	b = append(b, 0x4F) // i32.ge_u
-
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, hi)
-	b = append(b, 0x4D) // i32.le_u
-
-	b = append(b, 0x71) // i32.and → 0 or 1
-
-	// if this range matched: push 1 and br out of block
-	b = append(b, 0x04, 0x40) // if void
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x0C, 0x01) // br 1 (out of the result block; depth 0=this if, 1=block $matched)
-	b = append(b, 0x0B)       // end if
+	b = utils.AppendSLEB128(b, hi-lo)
+	b = append(b, 0x4D)       // i32.le_u
+	b = append(b, 0x0D, 0x00) // br_if $ok
 	return b
 }
 
@@ -1101,8 +1201,10 @@ const defaultBTWorkK = 1
 //
 // Counting pops bounds time as well, not just backtracks. Every cycle in a
 // syntax.Prog passes through an Alt, and in the ordinary body every Alt pushes a
-// frame, so the stretch between two consecutive push or pop events is acyclic:
-// at most N instructions. A call is therefore at most N·(2·pops + stack depth +
+// frame — or, at an alternation's first-byte dispatch that enters its only arm
+// directly, charges the budget as a pop does (bt_dispatch.go) — so the stretch
+// between two consecutive push, pop or charge events is acyclic: at most N
+// instructions. A call is therefore at most N·(2·pops + stack depth +
 // 1) instructions — linear in the input, since pops are bounded by the budget
 // and depth by N·(span+1): the frames on the stack lie on one path, which
 // without a zero-width cycle (the ordinary body's precondition, planBT) never
@@ -1345,6 +1447,26 @@ func emitBTWorkCharge(b []byte, workLocal uint32, trip func([]byte) []byte) []by
 	return append(b, 0x0B) // end if
 }
 
+// emitBTWorkChargeN charges n at once: `work -= n; if work <= 0 trip`. n == 1
+// is emitBTWorkCharge byte for byte. An alternation's first-byte dispatch
+// charges the arms it skips (bt_dispatch.go).
+func emitBTWorkChargeN(b []byte, workLocal uint32, n int, trip func([]byte) []byte) []byte {
+	if n == 1 {
+		return emitBTWorkCharge(b, workLocal, trip)
+	}
+	b = btLocalGet(b, workLocal)
+	b = append(b, 0x42) // i64.const n
+	b = utils.AppendSLEB128_64(b, int64(n))
+	b = append(b, 0x7D) // i64.sub
+	b = append(b, 0x22) // local.tee work
+	b = utils.AppendULEB128(b, workLocal)
+	b = append(b, 0x42, 0x00) // i64.const 0
+	b = append(b, 0x57)       // i64.le_s
+	b = append(b, 0x04, 0x40) // if void
+	b = trip(b)
+	return append(b, 0x0B) // end if
+}
+
 // btWorkTrip returns what an exhausted budget runs in a body with nParams
 // parameters: the fallback tail call when tripCalls, else unknown — the -2 the
 // body's frame-stack overflow already answers. nil when the body carries no
@@ -1453,8 +1575,11 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, frameSize int32, br
 // wantBoundary=true: fail if NOT a word boundary.
 // wantBoundary=false: fail if IS a word boundary.
 //
-// Uses scratch local to hold loaded bytes.
-// Computes: prevIsWord XOR nextIsWord; check against wantBoundary.
+// Computes prevIsWord XOR nextIsWord into locals — state for the previous
+// byte, scratch for the next — and checks it against wantBoundary. state is
+// free here: the instruction sets it again on both exits (contOut, btFail).
+// No value-typed block: wasmtime's compile memory for one grows with the
+// whole function (see btCheckRuneRanges).
 //
 // The captureBody's (ptr,len) are always the caller's true input under
 // window mode (see buildBacktrackBody's winGlobal), so pos==0 / pos==len
@@ -1462,17 +1587,10 @@ func btPushFrame(b []byte, numCapLocals int, retryPC uint32, frameSize int32, br
 // this is what a past defect’s (origPtr,origEnd) scratch used to
 // reconstruct for a narrowed slice.
 func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
-	// Compute prevIsWord (0 or 1) using block (result i32):
-	//   if pos == 0: push 0
-	//   else: load input[pos-1]; isWordChar → push 0 or 1
-	b = append(b, 0x02, 0x7F) // block (result i32) $prevWord
+	// state = input[pos-1] is a word character; 0 at pos == 0.
+	b = append(b, 0x41, 0x00, 0x21, localState)
 	b = append(b, 0x20, localPos)
-	b = append(b, 0x45)       // i32.eqz
-	b = append(b, 0x04, 0x40) // if void (pos == 0)
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0C, 0x01) // br 1 → out of $prevWord
-	b = append(b, 0x0B)       // end if
-	// load input[pos-1]
+	b = append(b, 0x04, 0x40) // if pos != 0
 	b = append(b, 0x20, localPtr)
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x41, 0x01)
@@ -1480,120 +1598,64 @@ func btWordBoundary(b []byte, wantBoundary bool, brDepth uint32) []byte {
 	b = append(b, 0x6A)             // i32.add (ptr + pos - 1)
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
-	b = emitIsWordCharFromScratch(b) // → 0 or 1 on stack
-	b = append(b, 0x0B)              // end block $prevWord → prevIsWord on stack
-
-	// Compute nextIsWord:
-	b = append(b, 0x02, 0x7F) // block (result i32) $nextWord
+	b = emitIsWordCharFromScratch(b)
+	b = append(b, 0x21, localState)
+	b = append(b, 0x0B) // end if
+	// scratch = input[pos] is a word character; 0 at pos >= len.
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x20, localLen)
-	b = append(b, 0x4F)       // i32.ge_u
-	b = append(b, 0x04, 0x40) // if void (pos >= len)
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0C, 0x01) // br 1 → out of $nextWord
-	b = append(b, 0x0B)       // end if
-	// load input[pos]
+	b = append(b, 0x49)       // i32.lt_u
+	b = append(b, 0x04, 0x40) // if pos < len
 	b = append(b, 0x20, localPtr)
 	b = append(b, 0x20, localPos)
 	b = append(b, 0x6A)
 	b = append(b, 0x2D, 0x00, 0x00) // i32.load8_u
 	b = append(b, 0x21, localScratch)
-	b = emitIsWordCharFromScratch(b) // → 0 or 1 on stack
-	b = append(b, 0x0B)              // end block $nextWord → nextIsWord on stack
-
+	b = emitIsWordCharFromScratch(b)
+	b = append(b, 0x21, localScratch)
+	b = append(b, 0x05) // else
+	b = append(b, 0x41, 0x00, 0x21, localScratch)
+	b = append(b, 0x0B) // end if
 	// boundary = prevIsWord XOR nextIsWord
+	b = append(b, 0x20, localState, 0x20, localScratch)
 	b = append(b, 0x73) // i32.xor
-
-	// After both result blocks close, we are back at handler top level.
-	// brDepth = brRunNested = brRun+1 (passed from caller as depth to restart $run
-	// from inside one extra block).  Inside the if void here we are inside one extra
-	// block, so depth to $run = brDepth.
 	if wantBoundary {
 		// fail if boundary == 0 (no boundary when we want one)
-		b = append(b, 0x45)       // i32.eqz
-		b = append(b, 0x04, 0x40) // if void
-		b = btFail(b, brDepth)
-		b = append(b, 0x0B) // end if
-	} else {
-		// fail if boundary != 0 (boundary present when we want none)
-		b = append(b, 0x04, 0x40) // if void (nonzero = boundary)
-		b = btFail(b, brDepth)
-		b = append(b, 0x0B) // end if
+		b = append(b, 0x45) // i32.eqz
 	}
+	// else fail if boundary != 0 (boundary present when we want none)
+	b = append(b, 0x04, 0x40) // if void
+	b = btFail(b, brDepth)
+	b = append(b, 0x0B) // end if
 	return b
 }
 
-// emitIsWordCharFromScratch emits code that reads scratch local and pushes
-// 1 if it is a word character [a-zA-Z0-9_], 0 otherwise.
-// Uses block (result i32) pattern with early exits.
+// emitIsWordCharFromScratch pushes 1 if the scratch local holds a word
+// character [a-zA-Z0-9_], 0 otherwise — three unsigned compares OR'd, no
+// branch: scratch|0x20 folds A-Z onto a-z, and no other byte lands there.
 func emitIsWordCharFromScratch(b []byte) []byte {
-	// block $isword (result i32)
-	//   scratch >= 'a' && scratch <= 'z' → 1; br out
-	//   scratch >= 'A' && scratch <= 'Z' → 1; br out
-	//   scratch >= '0' && scratch <= '9' → 1; br out
-	//   scratch == '_' → 1; br out
-	//   0 (fallthrough)
-	// end
-	b = append(b, 0x02, 0x7F) // block (result i32) $isword
-
-	// [a-z]
 	b = append(b, 0x20, localScratch)
+	b = append(b, 0x41, 0x20)
+	b = append(b, 0x72) // i32.or
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('a'))
-	b = append(b, 0x4F) // i32.ge_u
-	b = append(b, 0x20, localScratch)
+	b = append(b, 0x6B) // i32.sub
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('z'))
-	b = append(b, 0x4D)       // i32.le_u
-	b = append(b, 0x71)       // i32.and
-	b = append(b, 0x04, 0x40) // if void
-	b = append(b, 0x41, 0x01) // i32.const 1
-	b = append(b, 0x0C, 0x01) // br 1 → out of $isword
-	b = append(b, 0x0B)       // end if
-
-	// [A-Z]
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('A'))
-	b = append(b, 0x4F)
-	b = append(b, 0x20, localScratch)
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('Z'))
+	b = utils.AppendSLEB128(b, int32('z'-'a'))
 	b = append(b, 0x4D) // i32.le_u
-	b = append(b, 0x71)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// [0-9]
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('0'))
-	b = append(b, 0x4F)
-	b = append(b, 0x20, localScratch)
+	b = append(b, 0x6B)
 	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32('9'))
-	b = append(b, 0x4D) // i32.le_u
-	b = append(b, 0x71)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// '_'
+	b = utils.AppendSLEB128(b, int32('9'-'0'))
+	b = append(b, 0x4D)
+	b = append(b, 0x72) // i32.or
 	b = append(b, 0x20, localScratch)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32('_'))
 	b = append(b, 0x46) // i32.eq
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x0C, 0x01)
-	b = append(b, 0x0B)
-
-	// not a word char
-	b = append(b, 0x41, 0x00) // i32.const 0
-	b = append(b, 0x0B)       // end $isword
+	b = append(b, 0x72) // i32.or
 	return b
 }
 
@@ -1618,11 +1680,11 @@ func btFoldRune(r rune) rune {
 // pattern string successfully (via compile()/syntax.Parse earlier in
 // compilePattern), so the parse here cannot fail; syntax.Compile never
 // returns a non-nil error (see its stdlib source).
-func compileBTProg(pattern string) *syntax.Prog {
-	re, _ := syntax.Parse(pattern, syntax.Perl)
-	stripCaptures(re)
-	prog, _ := syntax.Compile(re.Simplify())
-	return prog
+func compileBTProg(pattern resolvedPattern) resolvedProg {
+	t, _ := pattern.parse()
+	stripCaptures(t.re)
+	mp, _ := compileProg(t)
+	return mp
 }
 
 // btNoCaptureFrameSize is a no-capture body's frame: pos and retryPC.
@@ -1822,6 +1884,10 @@ func buildBTInnerDisp(
 	numCapLocals := 0
 	prog := bt.prog
 	N := len(prog.Inst)
+	var charge func([]byte, int) []byte
+	if workTrip != nil {
+		charge = func(b []byte, n int) []byte { return emitBTWorkChargeN(b, workLocal, n, workTrip) }
+	}
 
 	// ── FAIL handler (state == -1) ──
 	body = append(body, 0x20, localState, 0x41, 0x7F, 0x46, 0x04, 0x40) // state==-1; if void
@@ -1882,6 +1948,7 @@ func buildBTInnerDisp(
 			-1,
 			memoOriginLocal, hasMemoOrigin,
 			dyn,
+			charge,
 		)
 	}
 	return body
@@ -1937,7 +2004,7 @@ func buildBTMatchBody(bt *backtrack, frameSize int32, tableMemIdx int, workK int
 	totalLocals := 4 + memoLocalsCount + 1
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, len(prog.Inst))
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dynBase := uint32(2 + totalLocals)
 		dyn.memoBase, dyn.cleared, dyn.stackBase, dyn.stackTop = dynBase, dynBase+1, dynBase+2, dynBase+3
 		totalLocals += 4
@@ -1980,7 +2047,7 @@ func buildBTMatchBody(bt *backtrack, frameSize int32, tableMemIdx int, workK int
 	}
 
 	if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
 	}
@@ -2193,7 +2260,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// arithmetic.
 	var dyn *btDyn
 	if fallback != nil {
-		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, len(prog.Inst))
+		dyn = newBTDyn(*fallback, tableMemIdx, frameSize, bt.memoRowBytes())
 		dyn.memoBase, dyn.cleared = uint32(a.I32()), uint32(a.I32())
 		dyn.stackBase, dyn.stackTop = uint32(a.I32()), uint32(a.I32())
 		dyn.tmp64 = uint32(a.I64())
@@ -2242,6 +2309,16 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	} else {
 		srch = nil
 	}
+	// The Unicode start rule's scratch, after every index named by arithmetic.
+	var startLocals utf8StartLocals
+	if bt.startRule != startRuleNone {
+		if mandLit != nil {
+			// A mandatory literal means no empty match, so no rule.
+			panic("compile: a Unicode start rule on a mandatory-literal Backtracking find")
+		}
+		startLocals = utf8StartLocals{ptr: 0, len: uint32(localLen), pos: uint32(attemptCursor.Local()),
+			c: uint32(a.I32()), k: uint32(a.I32()), n: uint32(a.I32())}
+	}
 	body = a.EmitDecls(body)
 	if dyn != nil && dyn.search == nil && srch != nil && fallback.searchTwin {
 		// An embedded build's per-call fallback: a search with a usable memo
@@ -2256,7 +2333,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// body already handles a nonzero start — its memo-skip computes
 	// `attempt_start >> 3` precisely so earlier bytes are not revisited — it
 	// was simply never told where to start.
-	body, findFrom = emitFindFromSeed(body, attemptCursor)
+	body, findFrom = emitFindFromSeedRule(body, attemptCursor, bt.startRule, startLocals)
 
 	// A program that can only match at position 0 (every match starts with
 	// \A or a non-multiline ^) answers a search from any later position at
@@ -2277,9 +2354,9 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 	// input rather than len - from — a larger budget only delays a trip, and
 	// the bound stays linear in the input.
 	if useWork && srch != nil {
-		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, len(prog.Inst), &callOffs)
+		body = srch.emitFindEntry(body, sBlk, sTmp, workLocal, workK, bt.budgetN, &callOffs)
 	} else if useWork {
-		body = emitBTWorkInit(body, workLocal, workK, len(prog.Inst), func(b []byte) []byte {
+		body = emitBTWorkInit(body, workLocal, workK, bt.budgetN, func(b []byte) []byte {
 			return append(b, 0x20, localLen)
 		})
 	}
@@ -2429,6 +2506,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 		// (bounded by loop-PC count + 9 extra locals), so byte-casting is safe.
 		mlScan := prefixScanParams{
 			Prefix:      mandLit.bytes,
+			UTF8Text:    bt.unicode,
 			EngineDepth: 2,
 			// AttemptStart is the mandatory-literal scan's OWN cursor, not
 			// the body's: this scan restarts from scanStartLocal per literal
@@ -2562,6 +2640,11 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 
 	scanParams.EngineDepth = 2
 	scanParams.OnMatch = func(b []byte) []byte {
+		if bt.startRule == startRuleScan {
+			// A candidate inside a character is no start position: continue
+			// $outer (depth 1 inside the rule's block) from the next one.
+			b = emitUTF8Start(b, startLocals, func(b []byte) []byte { return append(b, 0x0C, 0x01) })
+		}
 		// Re-init BT state.
 		b = memoPrepare(b)
 		b = append(b, 0x20, locAttemptStart, 0x21, localPos)

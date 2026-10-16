@@ -80,7 +80,7 @@ func (m matchMode) String() string {
 type testCase struct {
 	name         string
 	pattern      string   // unset when mode == modeSet
-	setPatterns  []string // only set when mode == modeSet; passed as separate RegexEntry per pattern
+	setPatterns  []string // only set when mode == modeSet; passed as separate PatternEntry per pattern
 	mode         matchMode
 	notes        string // one-line description of which optimisation it targets
 	matchInput   string
@@ -131,6 +131,63 @@ const (
 	setCapScanAny = "scan_any" // one call; returns a bare id or -1
 	setCapScanAll = "scan_all" // one call; returns an i64 id bitmask
 )
+
+// unicodeTests replace tests under -unicode: the shapes whose Unicode-mode
+// lowering changes what a hint can do — a letter-class run (its self-loop is a
+// multi-state cycle over multi-byte characters), a negated class over
+// multi-byte text, a non-ASCII literal and a Unicode set. A byte-mode run
+// cannot compile them, which is why they are a table of their own.
+var unicodeTests = []testCase{
+	{name: "u-letter-run", pattern: `\pL{12,}`, mode: modeFind, exhaustive: true,
+		notes:        "letter run: a multi-state cycle where byte mode has a self-loop",
+		matchInput:   strings.Repeat("Unabhängigkeitserklärungen привет ", 300),
+		nomatchInput: strings.Repeat("Ωμέγα αλφα 12 мир ", 600)},
+	{name: "u-negated-tail", pattern: `key=[^;]+;`, mode: modeFind, exhaustive: true,
+		notes:        "negated class over multi-byte text: the dominant self-loop covers ASCII bytes only",
+		matchInput:   strings.Repeat("key=значение с пробелами и ещё немного текста; ", 200),
+		nomatchInput: strings.Repeat("значение с пробелами и ещё немного текста ", 200)},
+	{name: "u-literal", pattern: `привет\s+\pL+`, mode: modeFind, exhaustive: true,
+		notes:        "a non-ASCII literal prefix: the prefix scan over its UTF-8 bytes",
+		matchInput:   strings.Repeat("Grüße, привет мир! 東京 ", 300),
+		nomatchInput: strings.Repeat("Grüße, мир! 東京タワー abc ", 300)},
+	// A run of a class holding only SOME characters — the skip prefer-match
+	// takes over the lead bytes all of whose characters the class holds. Win
+	// half on words of 4-14 letters; harm half on words of one and two, where
+	// every entry into the run pays the chunk test for a character or two.
+	{name: "u-cyrillic-run", pattern: `\p{Cyrillic}+`, mode: modeFind, exhaustive: true,
+		notes:        "letter-class run, long words: the per-lead-byte character skip's win",
+		matchInput:   strings.Repeat("независимость правительства решение ", 400),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ abc ", 600)},
+	{name: "u-cyrillic-short", pattern: `\p{Cyrillic}+`, mode: modeFind, exhaustive: true,
+		notes:        "letter-class run, one- and two-letter words: the skip's cost",
+		matchInput:   strings.Repeat("я и он в мы до ", 900),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ abc ", 600)},
+	{name: "u-letter-groups", pattern: `(\p{Cyrillic}+)\s(\d*)`, mode: modeGroups, exhaustive: true,
+		notes:        "the TDFA capture body's loop over some characters",
+		matchInput:   strings.Repeat("независимость 2024 правительство 7 ", 400),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ abc ", 600)},
+	{name: "u-letter-groups-short", pattern: `(\p{Cyrillic}+)\s(\d*)`, mode: modeGroups, exhaustive: true,
+		notes:        "the TDFA capture body's loop, one- and two-letter words: the skip's cost",
+		matchInput:   strings.Repeat("я 1 он 22 в 3 мы 4 до 5 ", 400),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ abc ", 600)},
+	{name: "u-letter-pairs", pattern: `(\pL+)=(\pL+)`, mode: modeGroups, exhaustive: true,
+		notes:        "the TDFA capture body's skip over a letter loop, long words",
+		matchInput:   strings.Repeat("независимость=правительство решение=государства ", 300),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ ", 600)},
+	{name: "u-letter-pairs-short", pattern: `(\pL+)=(\pL+)`, mode: modeGroups, exhaustive: true,
+		notes:        "the TDFA capture body's skip over a letter loop, one- and two-letter words",
+		matchInput:   strings.Repeat("я=он в=мы до=и ", 600),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ ", 600)},
+	{name: "u-cyrillic-prose", pattern: `\p{Cyrillic}+`, mode: modeFind, exhaustive: true,
+		notes:        "letter-class run over ordinary prose: words of every length",
+		matchInput:   strings.Repeat("Вечером мы вышли к реке, и на том берегу уже горели огни. Он сказал, что до города ещё далеко, а я не стал спорить: в такую погоду идти по лесу было бы глупо. ", 60),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ abc ", 600)},
+	{name: "u-set-scripts", mode: modeSet, setCap: setCapScanAll,
+		setPatterns:  []string{`\p{Greek}{3,}`, `\p{Cyrillic}{3,}`, `\p{Han}{2,}`, `\p{Latin}{3,}\d`},
+		notes:        "a Unicode set's union scan",
+		matchInput:   strings.Repeat("Grüße aus Köln, привет мир! 東京タワー Ωμέγα x12 ", 300),
+		nomatchInput: strings.Repeat("0123456789 ,.;:!?-+ ", 600)},
+}
 
 var tests = []testCase{
 	// ── Shufti prefix-scan targets ───────────────────────
@@ -1687,7 +1744,7 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	if tc.mode == modeSet {
 		return compileSetMode(tc, mode)
 	}
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	switch tc.mode {
 	case modeAnchored:
 		re.MatchFunc = "match"
@@ -1696,8 +1753,8 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 	case modeGroups:
 		re.GroupsFunc = "groups"
 	}
-	opts := compile.CompileOptions{LikelyMode: mode}
-	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, opts)
+	opts := withMode(compile.CompileOptions{LikelyMode: mode})
+	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, opts)
 	if err == nil && tc.mode != modeAnchored {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc+re.GroupsFunc])
 	}
@@ -1711,14 +1768,17 @@ func compileMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 // these entries carry their own _func fields, so there is no per-pattern
 // fallback to plumb.
 func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(tc.setPatterns))
+	entries := make([]config.PatternEntry, len(tc.setPatterns))
 	for i, p := range tc.setPatterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
+	unicode := *unicodeFlag
 	sc := config.SetConfig{
 		Name:     "bench_set",
 		Patterns: config.PatternSelector{All: true},
 		Hints:    hintsYAML(mode),
+		// The run's mode, stated rather than resolved from the members.
+		Unicode: &unicode,
 	}
 	// Exactly ONE capability per case, on purpose: the compiler emits only the
 	// machinery the declared capabilities need, so a set that also declared
@@ -1733,8 +1793,8 @@ func compileSetMode(tc testCase, mode compile.LikelyMode) ([]byte, error) {
 		sc.Find = "set_find"
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
-		Sets:    []config.SetConfig{sc},
+		Patterns: entries,
+		Sets:     []config.SetConfig{sc},
 	}
 	// Output empty → standalone.
 	if tc.forceScalarFrontend {
@@ -2376,7 +2436,7 @@ func expectedFindAll(re *regexp.Regexp, input string) [][2]int {
 			break
 		}
 		s, e := m[0]+off, m[1]+off
-		if !(s == e && s == prevEnd) {
+		if s != e || s != prevEnd {
 			all = append(all, [2]int{s, e})
 			prevEnd = e
 		}
@@ -2981,9 +3041,27 @@ func warmup(engine *wasmtime.Engine) {
 // --------------------------------------------------------------------------
 // Main
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	setsOnly := flag.Bool("sets", false, "run only the set-composition cases (mode == modeSet)")
 	flag.Parse()
+	if *unicodeFlag {
+		tests = unicodeTests
+	}
 
 	// Silence regexped's slog output.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))

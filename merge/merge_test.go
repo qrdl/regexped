@@ -191,7 +191,7 @@ func TestCmdMergeAcceptsSaturatingConversions(t *testing.T) {
 	}
 	cfg := config.BuildConfig{
 		Output: filepath.Join(dir, "out.wasm"), ImportModule: "re", WasmMergePath: tool,
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `ab+c`, FindFunc: "p_find"}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `ab+c`, FindFunc: "p_find"}},
 	}
 	regexWasm := filepath.Join(dir, "re.wasm")
 	if err := compile.CmdCompile(cfg, regexWasm); err != nil {
@@ -564,16 +564,16 @@ func TestMultiPlugComposition(t *testing.T) {
 wasm_format: component
 wit_package: "pkg-a"
 import_module: "pkga"
-regexps:
-  - pattern: '[0-9]+'
+patterns:
+  - regexp: '[0-9]+'
     match_func: match_a
 `)
 	bCfgPath := write("b.yaml", `wasm_file:   "b.wasm"
 wasm_format: component
 wit_package: "pkg-b"
 import_module: "pkgb"
-regexps:
-  - pattern: '[a-z]+'
+patterns:
+  - regexp: '[a-z]+'
     match_func: match_b
 `)
 	for _, cfgPath := range []string{aCfgPath, bCfgPath} {
@@ -621,8 +621,8 @@ regexps:
 	mergeCfgPath := write("merge.yaml", `output:      "final.wasm"
 wasm_format: component
 wit_package: "pkg-a"
-regexps:
-  - pattern: '[0-9]+'
+patterns:
+  - regexp: '[0-9]+'
     match_func: match_a
 `)
 	mergeCfg, err := config.LoadConfig(mergeCfgPath)

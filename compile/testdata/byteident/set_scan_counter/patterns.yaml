@@ -2,11 +2,11 @@
 # (the part after `foo` can read `foo`) and no `find` to split it out for: the
 # probes stamp how far they walked, and the scan bodies carry the work counter
 # that hands the call to a union automaton over the set.
-regexps:
+patterns:
   - name: p0
-    pattern: 'foo[a-z]+bar'
+    regexp: 'foo[a-z]+bar'
   - name: p1
-    pattern: 'zz'
+    regexp: 'zz'
 sets:
   - name: s
     scan_any: s_scan_any

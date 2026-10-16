@@ -56,25 +56,18 @@ type absenceLit struct {
 //
 // Returns the LONGEST literal it can find, since selectivity is the whole
 // point: a 5-byte literal rules a pattern out far more often than a 1-byte one.
-func findAbsenceLit(re *syntax.Regexp) []byte {
+func findAbsenceLit(re *syntax.Regexp, unicode bool) []byte {
 	if re == nil {
 		return nil
 	}
 	switch re.Op {
 	case syntax.OpLiteral:
-		// FoldCase would need a case-insensitive search; non-ASCII would need
-		// the UTF-8 encoding of each rune. Neither is worth it here.
+		// FoldCase would need a case-insensitive search.
 		if re.Flags&syntax.FoldCase != 0 {
 			return nil
 		}
-		bs := make([]byte, 0, len(re.Rune))
-		for _, r := range re.Rune {
-			if r > 127 {
-				return nil
-			}
-			bs = append(bs, byte(r))
-		}
-		if len(bs) == 0 {
+		bs, ok := literalBytes(re.Rune, unicode)
+		if !ok || len(bs) == 0 {
 			return nil
 		}
 		if len(bs) > absenceLitMax {
@@ -84,20 +77,20 @@ func findAbsenceLit(re *syntax.Regexp) []byte {
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			return findAbsenceLit(re.Sub[0])
+			return findAbsenceLit(re.Sub[0], unicode)
 		}
 		return nil
 
 	case syntax.OpPlus:
 		// The body runs at least once, so its literal is mandatory.
 		if len(re.Sub) == 1 {
-			return findAbsenceLit(re.Sub[0])
+			return findAbsenceLit(re.Sub[0], unicode)
 		}
 		return nil
 
 	case syntax.OpRepeat:
 		if re.Min >= 1 && len(re.Sub) == 1 {
-			return findAbsenceLit(re.Sub[0])
+			return findAbsenceLit(re.Sub[0], unicode)
 		}
 		return nil
 
@@ -107,7 +100,7 @@ func findAbsenceLit(re *syntax.Regexp) []byte {
 		// first, and picking the longest is strictly better.
 		var best []byte
 		for _, sub := range re.Sub {
-			if lit := findAbsenceLit(sub); len(lit) > len(best) {
+			if lit := findAbsenceLit(sub, unicode); len(lit) > len(best) {
 				best = lit
 			}
 		}
@@ -142,7 +135,7 @@ func buildAbsenceLits(spec SetSpec) (lits []absenceLit, alwaysAlive uint64, ok b
 			return nil, 0, false
 		}
 		stripCaptures(parsed)
-		lit := findAbsenceLit(parsed)
+		lit := findAbsenceLit(parsed, p.rp.unicode())
 		if len(lit) == 0 || len(lits) >= absenceMaxLits {
 			alwaysAlive |= uint64(1) << uint(gid)
 			continue

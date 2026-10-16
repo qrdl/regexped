@@ -34,29 +34,128 @@ func appendSection(out []byte, id byte, content []byte) []byte {
 // module's bytes (a 339-set configuration's 69.7 MB), so out grows ONCE to
 // hold both instead of reallocating, and copying everything before it, as
 // each is appended.
-func appendCodeAndData(out, code, rawData []byte, totalSegs int, standalone bool) []byte {
+//
+// It is also where a table the code never reads is left out (keepUnread
+// false): see dropUnaddressedTables.
+func appendCodeAndData(out, code, rawData []byte, totalSegs int, standalone, keepUnread bool) []byte {
 	var ds []byte
 	if totalSegs > 0 {
-		if !standalone {
-			segs := parseDataSegments(rawData)
+		segs := dropUnaddressedTables(parseDataSegments(rawData), code, keepUnread)
+		if standalone {
+			ds = make([]byte, 0, 5+len(rawData))
+		} else {
 			// Each segment's header grows by its memory index: one byte.
 			ds = make([]byte, 0, 5+len(rawData)+len(segs))
-			ds = utils.AppendULEB128(ds, uint32(len(segs)))
-			for _, seg := range segs {
+		}
+		ds = utils.AppendULEB128(ds, uint32(len(segs))) //nolint:gosec // a segment count
+		for _, seg := range segs {
+			if standalone {
+				ds = appendDataSegment(ds, seg.offset, seg.data)
+			} else {
 				ds = appendDataSegmentMem1(ds, seg.offset, seg.data)
 			}
-		} else {
-			ds = make([]byte, 0, 5+len(rawData))
-			ds = utils.AppendULEB128(ds, uint32(totalSegs)) //nolint:gosec // a segment count
-			ds = append(ds, rawData...)
 		}
 	}
 	out = slices.Grow(out, 2*(1+5)+len(code)+len(ds))
 	out = appendSection(out, 10, code)
-	if totalSegs > 0 {
+	if len(ds) > 0 {
 		out = appendSection(out, 11, ds)
 	}
 	return out
+}
+
+// droppableSegFlag marks, in the compiler's own segment stream, an active
+// memory-0 segment the module may leave out (appendDroppableDataSegment). It
+// never reaches a module: appendCodeAndData re-encodes every segment.
+const droppableSegFlag = 0x80
+
+// appendDroppableDataSegment is appendDataSegment for a table some bodies over
+// a layout read and others never do — the first-byte flags only the general
+// find's prefix scan and the hinted twin route read, the word table only the
+// word-boundary checks do — so that the module carries it only when its code
+// addresses it (dropUnaddressedTables).
+func appendDroppableDataSegment(out []byte, offset int32, data []byte) []byte {
+	at := len(out)
+	out = appendDataSegment(out, offset, data)
+	out[at] = droppableSegFlag
+	return out
+}
+
+// dropUnaddressedTables leaves out every droppable segment (droppableSegFlag)
+// whose offset the module's code never ADDRESSES — no `i32.const <offset>` and
+// no load or store whose offset immediate is <offset>, the two ways every
+// reader of these tables addresses one. Anything else that merely holds the
+// same bytes counts as addressing too, so the test errs towards keeping a
+// table. Offsets do not move: a dropped table leaves its range unwritten,
+// which is all its readers-that-are-not would have seen.
+//
+// One byte stands in at the old top when the highest segment is dropped:
+// harnesses and utils.WasmMemTop take "where free memory starts" from the
+// data segments.
+//
+// THE RULE THIS RESTS ON: a body reads such a table only through its offset as
+// a constant or as a memarg offset. A reader that computed the address any
+// other way would have its table dropped and read zeros; the differential test
+// (compiled with keepUnread on and off, identical answers) is what catches it.
+// keepUnread keeps every table (CompileOptions.KeepUnreadTables, test-only).
+func dropUnaddressedTables(segs []dataSegment, code []byte, keepUnread bool) []dataSegment {
+	addressed := map[int32]bool{}
+	var top int64
+	for _, s := range segs {
+		if s.droppable {
+			addressed[s.offset] = false
+		}
+		top = max(top, int64(s.offset)+int64(len(s.data)))
+	}
+	if len(addressed) == 0 || keepUnread {
+		return segs
+	}
+	markAddressedOffsets(code, addressed)
+	out := make([]dataSegment, 0, len(segs))
+	var newTop int64
+	for _, s := range segs {
+		if s.droppable && !addressed[s.offset] {
+			continue
+		}
+		out = append(out, s)
+		newTop = max(newTop, int64(s.offset)+int64(len(s.data)))
+	}
+	if newTop < top {
+		out = append(out, dataSegment{offset: int32(top - 1), data: []byte{0}}) //nolint:gosec // a table address
+	}
+	return out
+}
+
+// markAddressedOffsets sets addressed[o] for every key o that code holds as an
+// i32.const's operand (SLEB128 after 0x41) or as an unsigned LEB128 anywhere —
+// a memarg's offset immediate among others, which over-counts and so only
+// ever keeps a table that could have gone.
+func markAddressedOffsets(code []byte, addressed map[int32]bool) {
+	uleb := func(i int) (uint32, bool) {
+		var v uint32
+		for k := 0; k < 5 && i+k < len(code); k++ {
+			c := code[i+k]
+			v |= uint32(c&0x7F) << (7 * k)
+			if c&0x80 == 0 {
+				return v, true
+			}
+		}
+		return 0, false
+	}
+	for i := range code {
+		if v, ok := uleb(i); ok {
+			if _, want := addressed[int32(v)]; want { //nolint:gosec // compared, not used
+				addressed[int32(v)] = true //nolint:gosec // compared, not used
+			}
+		}
+		if code[i] == 0x41 && i+1 < len(code) {
+			if v, n, err := utils.DecodeSLEB128(code[i+1:]); err == nil && n <= 5 {
+				if _, want := addressed[int32(v)]; want { //nolint:gosec // compared, not used
+					addressed[int32(v)] = true //nolint:gosec // compared, not used
+				}
+			}
+		}
+	}
 }
 
 // appendDataSegment appends an active data segment (type 0, memory 0) to out.
@@ -104,6 +203,8 @@ func (s *segAccum) add(offset int32, data []byte) {
 type dataSegment struct {
 	offset int32
 	data   []byte
+	// droppable: encoded with droppableSegFlag (appendDroppableDataSegment).
+	droppable bool
 }
 
 // parseDataSegments extracts all type-0 (active, memory-0) data segments
@@ -116,7 +217,9 @@ func parseDataSegments(rawData []byte) []dataSegment {
 	var segs []dataSegment
 	off := 0
 	for off < len(rawData) {
-		if rawData[off] != 0x00 { // type 0 (active, memory 0)
+		// type 0 (active, memory 0), or the compiler's droppable mark for one
+		droppable := rawData[off] == droppableSegFlag
+		if rawData[off] != 0x00 && !droppable {
 			break
 		}
 		off++
@@ -148,7 +251,7 @@ func parseDataSegments(rawData []byte) []dataSegment {
 		data := make([]byte, size)
 		copy(data, rawData[off:off+int(size)])
 		off += int(size)
-		segs = append(segs, dataSegment{int32(offset64), data})
+		segs = append(segs, dataSegment{offset: int32(offset64), data: data, droppable: droppable})
 	}
 	return segs
 }
@@ -191,6 +294,18 @@ func appendTableLoad8u(b []byte, tableMemIdx int) []byte {
 	b = append(b, 0x2D, 0x40)
 	b = utils.AppendULEB128(b, uint32(tableMemIdx))
 	return append(b, 0x00)
+}
+
+// appendTableLoad8uAt is appendTableLoad8u with a static byte offset, for a
+// table whose base is a compile-time constant and whose index is on the stack.
+func appendTableLoad8uAt(b []byte, offset int32, tableMemIdx int) []byte {
+	if tableMemIdx == 0 {
+		b = append(b, 0x2D, 0x00)
+		return utils.AppendULEB128(b, uint32(offset))
+	}
+	b = append(b, 0x2D, 0x40)
+	b = utils.AppendULEB128(b, uint32(tableMemIdx))
+	return utils.AppendULEB128(b, uint32(offset))
 }
 
 // appendTableLoadV128At emits v128.load align=0 with a static byte offset,

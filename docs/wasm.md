@@ -429,7 +429,7 @@ Single memory (index 0, exported as "memory"):
 0              tableBase         tableEnd
 ```
 
-The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test). A module with a Backtracking program may also use memory above the host's data as run-time scratch — see "The Backtracking scratch base" above.
+The caller writes input into low pages and passes the pointer. Tables start at `tableBase` (caller-chosen, e.g. page 1 for re2test). Every table must lie below 2 GiB: a negative base, a base past 2 GiB, or tables that reach past it make `Compile` return `ErrTablesOutOfRange` rather than a module whose tables are not where its code reads them. A module with a Backtracking program may also use memory above the host's data as run-time scratch — see "The Backtracking scratch base" above.
 
 ---
 
@@ -487,6 +487,13 @@ Find mode appends additional arrays after the base table:
 | `wordCharTable` | `u8[256]` | `\w` lookup (word-boundary patterns only) |
 | `midAcceptNW`, `midAcceptW` | `u8[numStates]` each | word-boundary variants of midAccept |
 | `midAcceptNL` | `u8[numStates]` | 1 if state accepts immediately before a `\n` byte — multiline `(?m:$)` patterns only |
+
+A module carries `firstByteFlags` and `wordCharTable` only where its code
+reads them: the space stays reserved, but a table no body addresses — the
+first-byte flags of a find another body serves (a literal-anchored find, one
+that tries position 0 only), a lenient alternation's match-mode word table —
+gets no data segment, the one place every module's code and data meet
+deciding it. A pattern's layouts share ONE word table, placed below them all.
 
 For TDFA paths (`useAcceptSideTable=true`) only:
 
@@ -568,9 +575,11 @@ empty-mask group skip are not emitted for such a bucket at all, because an
 
 Promotion is refused when the merged DFA misses the state or byte budget, in
 which case the packer would have split it again anyway. In practice the byte
-budget binds first: past 256 states a table switches to u16 cells, and 64 KB of
-those is 128 states — so a merge over ~255 states is declined and the group
-keeps its split packing.
+budget binds first: past 256 states a table switches to u16 cells, 512 bytes a
+state before byte-class compression, so at the default budget —
+`max_set_bucket_size`, 128 bytes per `max_dfa_states` state: 128 KB in byte
+mode, 2 MB in Unicode mode — a merge past about 256 states (byte mode) or
+4,096 (Unicode mode) is declined and the group keeps its split packing.
 
 Three further refusals are about what a sparse body CANNOT see, and each exists
 because ignoring it produced wrong answers rather than slow ones:
@@ -606,7 +615,7 @@ Applied when the match starts at the scanned position:
 | **3-byte Teddy** | ≤ 8 first bytes, selective 3rd byte | nibble tables check bytes 0, 1, 2 simultaneously |
 | **2-byte Teddy** | ≤ 8 first bytes | nibble tables check bytes 0 and 1 simultaneously |
 | **1-byte Teddy** | 1-byte prefix, multiple candidates | T_lo/T_hi nibble tables |
-| **Shufti** | 9–16 first bytes (unconditional), or 17–64 (rarity heuristic predicts a win, or `hints: [prefer-no-match]` forces it) | nibble-table SIMD set-membership test over the whole candidate set (supersedes an older per-candidate `i8x16.eq`+bitmask emission) |
+| **Shufti** | 9–16 first bytes (unconditional), or 17–64 (rarity heuristic predicts a win, or `hints: [prefer-no-match]` forces it) | nibble-table SIMD set-membership test over the whole candidate set (supersedes an older per-candidate `i8x16.eq`+bitmask emission); a set of one or two contiguous byte ranges takes `i8x16.sub` + an unsigned compare per range instead — same answer, half the instructions |
 | **Scalar** | 0 first bytes, > 64, or a 17–64 set the rarity heuristic predicts scalar wins for | byte-by-byte scan; the 17–64 Shufti path also self-disables back to scalar at runtime if the heuristic guessed wrong and match data turns out denser than expected |
 
 Each Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
@@ -977,7 +986,7 @@ The rules:
 
 The engine may decline even when offered a large enough region: the sweep is
 emitted only where it reproduces the per-position semantics exactly — an
-automaton within `max_fallback_states`, no member whose answers the automaton
+automaton within `max_dfa_states`, no member whose answers the automaton
 cannot give (a Backtracking or non-greedy member is SPLIT out instead, and gets
 the program sweep) — and only where a drive can have arbitrarily many walks
 alive at once (see [sets.md](sets.md), "Overlap policy"). The member count is no

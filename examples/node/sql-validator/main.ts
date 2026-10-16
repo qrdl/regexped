@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { init, validate_sql, patternName } from './stubs.ts';
+import { init, validate_sql, sqlPatternName } from './stubs.ts';
 
 // tsc emits this file into dist/, so the .wasm beside main.ts is one level up.
 const wasmPath = fileURLToPath(new URL('../patterns.wasm', import.meta.url));
@@ -12,7 +12,7 @@ for (const sql of lines) {
     // It returns a pattern id or null — NOT a boolean.
     const id = validate_sql(sql);
     if (id !== null) {
-        console.log(`[VALID ${patternName(id).toUpperCase()}] ${sql}`);
+        console.log(`[VALID ${sqlPatternName(id).toUpperCase()}] ${sql}`);
     } else {
         console.log(`[INVALID] ${sql}`);
     }

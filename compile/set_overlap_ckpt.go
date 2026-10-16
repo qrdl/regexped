@@ -119,6 +119,15 @@ type ckptEmit struct {
 	// for a column with boundary accepts; allocated only for one.
 	lIsWord, lIsNL byte
 
+	// u8 is the Unicode start check's scratch, for a set some member of
+	// which can match empty inside a character (bucket.utf8StartCheck): its
+	// row at such a position must say nothing, as the walk's would.
+	// Allocated with the boundary locals; nil otherwise.
+	u8 *utf8StartLocals
+
+	// utf8Start: allocate u8 (allocBoundary).
+	utf8Start bool
+
 	// proj is the column's projection, or nil when the column stays one cell per
 	// (state, pattern). When set, the column is indexed by CELL and a runtime
 	// successor table stands between the state loop and the update.
@@ -165,6 +174,9 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 		numStates: sw.dp.numWASM,
 	}
 	e.rowBytes = int32(e.numPat * 4)
+	for _, bkt := range cs.buckets {
+		e.utf8Start = e.utf8Start || bkt.utf8StartCheck(capFind)
+	}
 	e.proj = cs.overlapProjFor()
 	e.projOff = cs.overlapProjTabOff
 	e.succOff = cs.overlapSuccOff
@@ -190,6 +202,10 @@ func (e *ckptEmit) allocBoundary(a *localAlloc) {
 	}
 	if e.dp.hasNewlineBoundary {
 		e.lIsNL = a.I32()
+	}
+	if e.utf8Start {
+		e.u8 = &utf8StartLocals{ptr: uint32(e.pPtr), len: uint32(e.pLen),
+			pos: uint32(a.I32()), c: uint32(a.I32()), k: uint32(a.I32()), n: uint32(a.I32())}
 	}
 }
 
@@ -533,6 +549,43 @@ func (e *ckptEmit) maskWide() bool { return config.SetOverlapRowMaskBytes(e.numP
 // '\n' is never a word byte, and a first-match switch on the two channels
 // once left a set carrying both unable to reach the newline state.
 func (e *ckptEmit) emitAtPositionGuarded(b []byte, write bool) []byte {
+	if e.u8 == nil {
+		return e.emitAtPositionStart(b, write)
+	}
+	// Inside a character no match starts: count nothing and, writing, store
+	// the row's empty mask, which is all a reader consults.
+	b = append(b, 0x02, 0x40, 0x02, 0x40) // block $out, block $inside
+	b = e.get(b, e.lPos)
+	b = append(b, 0x21, byte(e.u8.pos))
+	b = emitUTF8Start(b, *e.u8, func(b []byte) []byte { return append(b, 0x0C, 0x01) }) // moved: $inside
+	b = e.emitAtPositionStart(b, write)
+	b = append(b, 0x0C, 0x01, 0x0B) // br $out; end $inside
+	if write {
+		b = e.get(b, e.lBlkBase)
+		b = e.get(b, e.lPos)
+		b = e.get(b, e.lRowBase)
+		b = append(b, 0x6B) // pos - rowBase
+		b = e.konst(b, e.rowBytesB())
+		b = append(b, 0x6C, 0x6A)
+		b = e.set(b, e.lWrite)
+		if e.maskWide() {
+			for w := 0; w < (e.numPat+63)/64; w++ {
+				b = e.get(b, e.lWrite)
+				b = e.konst64(b, 0)
+				b = append(b, 0x37, 0x03) // i64.store
+				b = utils.AppendULEB128(b, uint32(8*w))
+			}
+		} else {
+			b = e.get(b, e.lWrite)
+			b = e.konst(b, 0)
+			b = append(b, 0x36, 0x02, 0x00)
+		}
+	}
+	return append(b, 0x0B) // end $out
+}
+
+// emitAtPositionStart is emitAtPositionGuarded at a start position.
+func (e *ckptEmit) emitAtPositionStart(b []byte, write bool) []byte {
 	b = e.get(b, e.lPos)
 	b = append(b, 0x45) // i32.eqz
 	b = append(b, 0x04, 0x40)

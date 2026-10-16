@@ -5,8 +5,8 @@
 options:
   budget_states: 1
 patterns:
-  - pattern: '(foo)+bar'
-  - pattern: '(foo){2,3}baz'
+  - regexp: '(foo)+bar'
+  - regexp: '(foo){2,3}baz'
 expect:
   bucket_count: 2
   fallback_count: 2

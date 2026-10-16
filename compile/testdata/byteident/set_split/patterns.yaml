@@ -4,15 +4,15 @@
 # wrappers over the buckets' bodies and theirs. The `\b` member keeps a union
 # automaton from serving the scan pair, which is what puts the MERGED scan
 # wrappers (the kept body plus one forward pass per split member) here.
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]+0[0-9]+'
+    regexp: '[a-z]+0[0-9]+'
   - name: p1
-    pattern: '[a-z]+1[0-9]+'
+    regexp: '[a-z]+1[0-9]+'
   - name: p2
-    pattern: 'foo'
+    regexp: 'foo'
   - name: p3
-    pattern: '\bbar'
+    regexp: '\bbar'
 sets:
   - name: s
     find: s_find

@@ -2,15 +2,15 @@
 # 10 patterns with distinct mandatory literals (5-7 bytes each). With the
 # extended Teddy limit of 16, these use Teddy with partial probing.
 patterns:
-  - pattern: 'alpha\d+'
-  - pattern: 'beta\w+'
-  - pattern: 'gamma[a-z]+'
-  - pattern: 'delta[0-9]+'
-  - pattern: 'epsilon\d+'
-  - pattern: 'zeta\w+'
-  - pattern: 'eta[a-z]+'
-  - pattern: 'theta[0-9]+'
-  - pattern: 'iota\d+'
-  - pattern: 'kappa\w+'
+  - regexp: 'alpha\d+'
+  - regexp: 'beta\w+'
+  - regexp: 'gamma[a-z]+'
+  - regexp: 'delta[0-9]+'
+  - regexp: 'epsilon\d+'
+  - regexp: 'zeta\w+'
+  - regexp: 'eta[a-z]+'
+  - regexp: 'theta[0-9]+'
+  - regexp: 'iota\d+'
+  - regexp: 'kappa\w+'
 expect:
   frontend: teddy

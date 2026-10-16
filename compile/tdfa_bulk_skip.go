@@ -1,5 +1,13 @@
 package compile
 
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/qrdl/regexped/internal/utils"
+)
+
 // --------------------------------------------------------------------------
 // TDFA capture-body bulk-skip for dominant self-loop states.
 //
@@ -258,4 +266,416 @@ func emitTDFABulkSkip(b []byte, info *tdfaBulkSkipInfo, localPos, localChunk, lo
 	b = append(b, 0x0B)       // end if
 
 	return b
+}
+
+// tdfaUTF8SkipInfo is a TDFA loop over whole UTF-8 characters — a
+// Unicode-mode class holding every non-ASCII character, `.`, `[^,]`, lowered
+// to a cycle through one state per character byte — that the UTF-8 skip
+// crosses 16 bytes at a time (emitTDFAUTF8Skip). The TDFA is not minimized,
+// so the loop can be several states with identical rows: `[^>]`'s ASCII is
+// two ranges, `<([^>]+)>` keeps one state for each, and every character leads
+// back to one of them.
+type tdfaUTF8SkipInfo struct {
+	wasmStates []int32     // the loop's states, gs+1; identical rows and accept data
+	exitBytes  []byte      // its ASCII exits, at most 8
+	ops        []tdfaTagOp // fired by every ASCII byte that stays in the loop and every character's last byte; all set-to-pos
+	// allowSet: a loop over only SOME characters (charLoops), as
+	// dominantInfo.allowSet; nil for a loop over every character.
+	allowSet []byte
+}
+
+// maxTDFAUTF8SkipLoops caps the loops, and maxTDFAUTF8SkipLoopStates each
+// loop's states, the match body tests for on every byte.
+const (
+	maxTDFAUTF8SkipLoops      = 2
+	maxTDFAUTF8SkipLoopStates = 4
+)
+
+// detectTDFAUTF8Skip returns the loops of a Unicode-mode TDFA the UTF-8 skip
+// may serve. A loop is a state together with every state whose row (each
+// byte's successor and tag ops) and accept data are identical to its own, so
+// that any one of them behaves as any other from there on. Every ASCII byte
+// but at most eight leads from the loop back into it, firing one batch of
+// set-to-pos ops; every valid multi-byte character does too, through states
+// outside it that neither accept nor are dead, with that same batch on the
+// character's last byte and, before it, only set-to-pos ops on registers the
+// batch sets again. A run of such characters and bytes then leaves every
+// register the batch sets at the run's end — as one firing of the batch there
+// does — and the walk in a state of the loop, which the skip need not name.
+//
+// charLoops (prefer-match) also takes a loop over only SOME characters — a
+// letter class, `(\pL+)` — judged per lead byte: a lead byte all of whose
+// characters satisfy the above joins the allowSet, the rest are exits, and the
+// ASCII exits are not capped. A loop that qualifies without it is reported
+// exactly as without it.
+func detectTDFAUTF8Skip(tt *tdfaTable, charLoops bool) []tdfaUTF8SkipInfo {
+	at := func(s, c int) (int, []tdfaTagOp) {
+		idx := s*256 + c
+		var ops []tdfaTagOp
+		if idx < len(tt.tagOps) {
+			ops = tt.tagOps[idx]
+		}
+		return tt.transitions[idx], ops
+	}
+	// Group the states by row and accept data, once: a loop is a group.
+	key := func(s int) string {
+		var k strings.Builder
+		for c := 0; c < 256; c++ {
+			t, o := at(s, c)
+			fmt.Fprintf(&k, "%d%v;", t, o)
+		}
+		var acceptOps []tdfaTagOp
+		if s < len(tt.acceptOps) {
+			acceptOps = tt.acceptOps[s]
+		}
+		var regs []int
+		if s < len(tt.acceptRegMap) {
+			regs = tt.acceptRegMap[s]
+		}
+		fmt.Fprintf(&k, "|%d|%d|%d|%v|%v", tt.acceptStates[s], tt.midAcceptStates[s], tt.immediateAcceptStates[s], acceptOps, regs)
+		return k.String()
+	}
+	groups := map[string][]int{}
+	keys := make([]string, tt.numStates)
+	for s := 0; s < tt.numStates; s++ {
+		keys[s] = key(s)
+		groups[keys[s]] = append(groups[keys[s]], s)
+	}
+	claimed := map[int]bool{}
+	var out []tdfaUTF8SkipInfo
+	for gs := 0; gs < tt.numStates && len(out) < maxTDFAUTF8SkipLoops; gs++ {
+		if claimed[gs] || tt.immediateAcceptStates[gs] != 0 {
+			continue
+		}
+		members := groups[keys[gs]]
+		if len(members) > maxTDFAUTF8SkipLoopStates {
+			continue
+		}
+		loop := map[int]bool{}
+		for _, m := range members {
+			loop[m] = true
+		}
+		var exits []byte
+		var ops []tdfaTagOp
+		haveOps, ok := false, true
+		for c := 0; c < 0x80 && ok; c++ {
+			next, o := at(gs, c)
+			switch {
+			case next < 0 || !loop[next]:
+				exits = append(exits, byte(c))
+				ok = len(exits) <= 8 || charLoops
+			case !haveOps:
+				ops, haveOps = o, true
+			default:
+				ok = tdfaTagOpsEqual(ops, o)
+			}
+		}
+		if !ok || !haveOps {
+			continue
+		}
+		sets := map[int]bool{}
+		for _, op := range ops {
+			if op.src != -1 {
+				ok = false
+			}
+			sets[op.dst] = true
+		}
+		inner := func(s int, o []tdfaTagOp) bool {
+			if s < 0 || loop[s] || tt.immediateAcceptStates[s] != 0 || tt.midAcceptStates[s] != 0 {
+				return false
+			}
+			for _, op := range o {
+				if op.src != -1 || !sets[op.dst] {
+					return false
+				}
+			}
+			return true
+		}
+		// leadOK: every character with this lead byte (of seq) leads back
+		// into the loop as described above.
+		leadOK := func(lead int, seq [][2]byte) bool {
+			next, o := at(gs, lead)
+			if !inner(next, o) {
+				return false
+			}
+			cur := map[int]bool{next: true}
+			for i, r := range seq[1:] {
+				nxt := map[int]bool{}
+				for s := range cur {
+					for c := int(r[0]); c <= int(r[1]); c++ {
+						t, o := at(s, c)
+						if i == len(seq)-2 {
+							if t < 0 || !loop[t] || !tdfaTagOpsEqual(ops, o) {
+								return false
+							}
+						} else if !inner(t, o) {
+							return false
+						}
+						nxt[t] = true
+					}
+				}
+				cur = nxt
+			}
+			return true
+		}
+		if !ok {
+			continue // an op that copies: not a batch the skip can fire once
+		}
+		var leads []int
+		all := true
+		for _, seq := range utf8Sequences {
+			for lead := int(seq[0][0]); lead <= int(seq[0][1]) && (all || charLoops); lead++ {
+				if leadOK(lead, seq) {
+					leads = append(leads, lead)
+				} else {
+					all = false
+				}
+			}
+		}
+		info := tdfaUTF8SkipInfo{exitBytes: exits, ops: ops}
+		switch {
+		case all && len(exits) <= 8:
+			// Every character loops: today's skip, exactly.
+		case charLoops && len(leads) > 0:
+			var in [256]bool
+			for c := 0; c < 0x80; c++ {
+				next, _ := at(gs, c)
+				in[c] = next >= 0 && loop[next]
+			}
+			for _, lead := range leads {
+				in[lead] = true
+			}
+			for c := 0x80; c < 0xC0; c++ {
+				in[c] = true
+			}
+			for c, ok := range in {
+				if ok {
+					info.allowSet = append(info.allowSet, byte(c))
+				}
+			}
+			info.exitBytes = nil
+		default:
+			continue
+		}
+		for s := range loop {
+			claimed[s] = true
+			info.wasmStates = append(info.wasmStates, int32(s+1))
+		}
+		slices.Sort(info.wasmStates)
+		out = append(out, info)
+	}
+	return out
+}
+
+// tdfaWithCharLoops returns tt with its UTF-8 skip loops detected again for
+// prefer-match, letter-class loops included (detectTDFAUTF8Skip's
+// charLoops), as a COPY: tt can be the selector's, which other compiles of
+// the pattern read.
+func tdfaWithCharLoops(tt *tdfaTable, mp resolvedProg, lm LikelyMode) *tdfaTable {
+	if lm != LikelyMatch || !mp.unicode() {
+		return tt
+	}
+	cp := *tt
+	cp.utf8Skip = detectTDFAUTF8Skip(&cp, true)
+	return &cp
+}
+
+// emitTDFAUTF8Skip emits the UTF-8 skip for info: the dominant DFA skip's
+// stops (emitUTF8BulkSkip) with the TDFA loop's positions — pos is the next
+// byte to read, so the chunk starts at pos and pos ends on the first byte not
+// skipped — and, when anything was skipped, info.ops fired once at the new
+// pos, then a jump back to loop $main, mainDepth blocks out from where this
+// is emitted. The state is left as it is: every state of the loop behaves
+// alike. On entry the state is one of info.wasmStates.
+//
+// It runs where the walk ENTERS the loop — in the tag-op dispatch's arm of
+// every state outside the loop that has a transition into it
+// (emitTDFATagOps' hook): a run of whole characters starts only there, since
+// the skip leaves the walk in the loop only before a byte that leaves it, a
+// character the chunk cuts, invalid UTF-8 or the end of the input, and from
+// each of those the walk re-enters, if at all, through such an arm. Tested at
+// the top of the main loop instead, the test ran on every byte — `(.+)=(.+)`
+// over text with `=` every 15 bytes, whose walk leaves the loop at the first
+// `=`, cost 5% more fuel for it. A loop over SOME characters (allowSet) is
+// the exception: its skip is emitted once after the dispatch and the arms
+// branch to it (buildTDFAMatchBody), mainDepth then counted from there.
+func emitTDFAUTF8Skip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, localPos, localChunk, localMask, localSkipStart, localErr, localCapBase uint32, midAcceptTail func([]byte) []byte) []byte {
+	pos, chunk, mask, errLanes := byte(localPos), byte(localChunk), byte(localMask), byte(localErr)
+	if info.allowSet != nil {
+		return emitTDFACharLoopSkip(b, info, mainDepth, pos, chunk, mask, byte(localSkipStart), errLanes, localPos, localCapBase, midAcceptTail)
+	}
+	b = append(b, 0x20, pos, 0x21, byte(localSkipStart)) // skipStart = pos
+	b = append(b, 0x02, 0x40)                            // block $skip_done
+	b = append(b, 0x03, 0x40)                            // loop $chunks
+	// pos + 16 > len: the last chunk, overlapping, then $skip_done.
+	b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x20, 0x01, 0x4B, 0x04, 0x40)
+	b = emitUTF8SkipTail(b, info.exitBytes, nil, pos, 0x01, 0x00, chunk, mask, errLanes, false, 2)
+	b = append(b, 0x0B)
+	// chunk = v128.load(ptr + pos)
+	b = append(b, 0x20, 0x00, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, chunk)
+	b = emitBulkSkipExitMask(b, info.exitBytes, chunk)
+	b = append(b, 0x21, mask)
+	// An all-ASCII chunk: stop at the first exit byte, or take all 16.
+	b = append(b, 0x20, chunk, 0xFD, 0x64, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, mask, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x21, pos, 0x0C, 0x02) // br $chunks
+	b = append(b, 0x0B)
+	b = append(b, 0x20, mask, 0x68, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x02) // br $skip_done
+	b = append(b, 0x0B)
+	// Invalid UTF-8: stop before the faulty character.
+	b = emitUTF8ErrorLanes(b, chunk)
+	b = append(b, 0x22, errLanes) // local.tee: the stop reads them again
+	b = append(b, 0xFD, 0x53, 0x04, 0x40)
+	b = emitUTF8ErrorStop(b, chunk, mask, errLanes)
+	b = append(b, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x02) // br $skip_done
+	b = append(b, 0x0B)
+	// No exit byte: to the lead byte of a character the chunk cuts, or 16.
+	b = append(b, 0x20, mask, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, chunk, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64, 0x41)
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x01) // br $chunks
+	b = append(b, 0x0B)
+	b = append(b, 0x20, mask, 0x68, 0x20, pos, 0x6A, 0x21, pos) // on the exit byte
+	b = append(b, 0x0B, 0x0B)                                   // end loop, end block
+	// if pos != skipStart: fire the ops once, loop back to $main
+	b = append(b, 0x20, pos, 0x20, byte(localSkipStart), 0x47, 0x04, 0x40)
+	for _, op := range info.ops {
+		b = emitTDFATagOp(op, b, localPos, localCapBase)
+	}
+	if midAcceptTail != nil {
+		b = midAcceptTail(b)
+	}
+	b = append(b, 0x0C) // br -> loop $main
+	b = utils.AppendULEB128(b, mainDepth+1)
+	b = append(b, 0x0B)
+	return b
+}
+
+// emitTDFACharLoopSkip is emitTDFAUTF8Skip for a loop over SOME characters
+// (allowSet, prefer-match), shaped as emitUTF8CharLoopSkip is and for the
+// same reason — a word's run is short, and a skip that crosses nothing pays
+// for nothing: the gate on the next byte under the first chunk's bounds test,
+// the end-of-input form gated too and taken only with charSkipTailMin bytes
+// left (a groups call's window is the match, so on short words that form is
+// the only one), the structural validity test where allowSet allows it, and
+// no all-ASCII step when allowSet holds no ASCII byte. The first gate's
+// decline leaves past the ops, as nothing was skipped.
+func emitTDFACharLoopSkip(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32, pos, chunk, mask, skipStart, errL byte, localPos, localCapBase uint32, midAcceptTail func([]byte) []byte) []byte {
+	const ptr, lenL = 0x00, 0x01
+	hasASCII := false
+	for _, c := range info.allowSet {
+		hasASCII = hasASCII || c < 0x80
+	}
+	bounds := func(b []byte, depth byte) []byte { // pos + 16 > len: br_if depth
+		return append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x20, lenL, 0x4B, 0x0D, depth)
+	}
+	b = append(b, 0x02, 0x40) // block $declined
+	b = append(b, 0x02, 0x40) // block $done
+	b = append(b, 0x02, 0x40) // block $tail
+	// skipStart = pos, folded into the first bounds test.
+	b = append(b, 0x20, pos, 0x22, skipStart, 0x41, 0x10, 0x6A, 0x20, lenL, 0x4B, 0x0D, 0x00)
+	b = emitCharLoopGate(b, info.allowSet, ptr, pos, 0, 2)
+	b = append(b, 0x03, 0x40)                                                      // loop $outer
+	b = append(b, 0x20, ptr, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, chunk) // chunk = v128.load(ptr + pos)
+	b = emitCharExitMask(b, nil, info.allowSet, chunk)
+	b = append(b, 0x21, mask)
+	if hasASCII {
+		// An all-ASCII chunk: stop at the first exit byte, or take all 16.
+		b = append(b, 0x20, chunk, 0xFD, 0x64, 0x45, 0x04, 0x40)
+		b = append(b, 0x20, mask, 0x45, 0x04, 0x40)
+		b = append(b, 0x20, pos, 0x41, 0x10, 0x6A, 0x21, pos)
+		b = bounds(b, 3)
+		b = append(b, 0x0C, 0x02, 0x0B) // br $outer
+		b = append(b, 0x20, mask, 0x68, 0x20, pos, 0x6A, 0x21, pos)
+		b = append(b, 0x0C, 0x03, 0x0B) // br $done
+	}
+	b = emitCharLoopInvalidStop(b, utf8StructOK(info.allowSet), info.allowSet, chunk, mask, errL)
+	b = append(b, 0x20, pos, 0x6A, 0x21, pos, 0x0C, 0x03, 0x0B) // br $done
+	// No exit byte: to the lead byte of a character the chunk cuts, or 16.
+	b = append(b, 0x20, mask, 0x45, 0x04, 0x40)
+	b = append(b, 0x20, chunk, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64, 0x41)
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68, 0x20, pos, 0x6A, 0x21, pos)
+	b = bounds(b, 2)
+	b = append(b, 0x0C, 0x01, 0x0B) // br $outer
+	b = append(b, 0x20, mask, 0x68, 0x20, pos, 0x6A, 0x21, pos)
+	b = append(b, 0x0C, 0x02) // br $done
+	b = append(b, 0x0B)       // end loop $outer
+	b = append(b, 0x0B)       // end $tail: fewer than 16 bytes from pos
+	// Reached from the main loop too, after pos has moved: its declines
+	// leave through $done, so the ops still fire for what was skipped.
+	b = append(b, 0x20, pos, 0x41, charSkipTailMin, 0x6A, 0x20, lenL, 0x4B, 0x0D, 0x00)
+	b = emitCharLoopGate(b, info.allowSet, ptr, pos, 0, 0)
+	b = emitUTF8SkipTail(b, nil, info.allowSet, pos, lenL, ptr, chunk, mask, errL, false, 0)
+	b = append(b, 0x0B) // end $done
+	// if pos != skipStart: fire the ops once, loop back to $main
+	b = append(b, 0x20, pos, 0x20, skipStart, 0x47, 0x04, 0x40)
+	for _, op := range info.ops {
+		b = emitTDFATagOp(op, b, localPos, localCapBase)
+	}
+	if midAcceptTail != nil {
+		b = midAcceptTail(b)
+	}
+	b = append(b, 0x0C)
+	b = utils.AppendULEB128(b, mainDepth+2)
+	b = append(b, 0x0B)
+	b = append(b, 0x0B) // end $declined
+	return b
+}
+
+// emitTDFAStateIn pushes whether the state local holds one of states (sorted):
+// one compare for one state, a range compare for consecutive ones — the test
+// runs on every byte of the match body — and a chain of compares otherwise.
+func emitTDFAStateIn(b []byte, states []int32, stateLocal byte) []byte {
+	lo, n := states[0], int32(len(states))
+	if n == 1 {
+		b = append(b, 0x20, stateLocal, 0x41)
+		b = utils.AppendSLEB128(b, lo)
+		return append(b, 0x46) // i32.eq
+	}
+	if states[n-1]-lo == n-1 {
+		b = append(b, 0x20, stateLocal, 0x41)
+		b = utils.AppendSLEB128(b, lo)
+		b = append(b, 0x6B, 0x41) // i32.sub
+		b = utils.AppendSLEB128(b, n)
+		return append(b, 0x49) // i32.lt_u
+	}
+	for i, st := range states {
+		b = append(b, 0x20, stateLocal, 0x41)
+		b = utils.AppendSLEB128(b, st)
+		b = append(b, 0x46) // i32.eq
+		if i > 0 {
+			b = append(b, 0x72) // i32.or
+		}
+	}
+	return b
+}
+
+// entersFrom reports whether state gs lies outside the loop and has a
+// transition into it: the arms emitTDFAUTF8Skip runs in.
+func (info tdfaUTF8SkipInfo) entersFrom(tt *tdfaTable, gs int) bool {
+	if slices.Contains(info.wasmStates, int32(gs+1)) {
+		return false
+	}
+	for c := 0; c < 256; c++ {
+		if t := tt.transitions[gs*256+c]; t >= 0 && slices.Contains(info.wasmStates, int32(t+1)) {
+			return true
+		}
+	}
+	return false
+}
+
+// tdfaHasTagOps reports whether any transition of tt carries a tag op —
+// whether emitTDFATagOps emits a dispatch at all.
+func tdfaHasTagOps(tt *tdfaTable) bool {
+	for _, ops := range tt.tagOps {
+		if len(ops) > 0 {
+			return true
+		}
+	}
+	return false
 }

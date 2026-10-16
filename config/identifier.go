@@ -35,7 +35,7 @@ import (
 //     keyword check at all.
 //   - Violations are a hard error before any compile or generate work.
 //
-// Deliberately NOT validated: `regexps[].name` and `sets[].name`. Those are
+// Deliberately NOT validated: `patterns[].name` and `sets[].name`. Those are
 // selection keys, and they reach generated code only as quoted string literals
 // (%q) in the optional name-map helpers — not as identifiers. Applying the
 // reserved-word rule to them would reject shipped configs such as
@@ -178,12 +178,12 @@ func init() {
 // in config order: the three _func fields, then every set capability.
 func exportNameRefs(cfg *BuildConfig) []exportRef {
 	var refs []exportRef
-	for _, re := range cfg.Regexps {
-		owner := "regexp"
+	for _, re := range cfg.Patterns {
+		owner := "pattern"
 		if re.Name != "" {
-			owner = fmt.Sprintf("regexp %q", re.Name)
-		} else if re.Pattern != "" {
-			owner = fmt.Sprintf("regexp %q", re.Pattern)
+			owner = fmt.Sprintf("pattern %q", re.Name)
+		} else if re.Regexp != "" {
+			owner = fmt.Sprintf("pattern %q", re.Regexp)
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
@@ -270,18 +270,18 @@ func validateWITNames(cfg *BuildConfig, rustBindings bool) []string {
 // Called from LoadConfig, i.e. on the config-file path only. It is deliberately
 // NOT called from compile.Compile / compile.CompileFile: the internal
 // benchmark and test harnesses (tools/re2test, perftest, likelytest, pattest,
-// fuzz, and the compile package's own tests) build config.RegexEntry values
+// fuzz, and the compile package's own tests) build config.PatternEntry values
 // directly and use bare names such as "match", "find" and "groups". The threat
 // model here is a checked-in regexped.yaml, which this placement covers.
 func ValidateConfig(cfg *BuildConfig) error {
 	var problems []string
 
-	for _, re := range cfg.Regexps {
-		owner := "regexp"
+	for _, re := range cfg.Patterns {
+		owner := "pattern"
 		if re.Name != "" {
-			owner = fmt.Sprintf("regexp %q", re.Name)
-		} else if re.Pattern != "" {
-			owner = fmt.Sprintf("regexp %q", re.Pattern)
+			owner = fmt.Sprintf("pattern %q", re.Name)
+		} else if re.Regexp != "" {
+			owner = fmt.Sprintf("pattern %q", re.Regexp)
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
@@ -296,8 +296,11 @@ func ValidateConfig(cfg *BuildConfig) error {
 			}
 		}
 		if re.GroupsFunc != "" {
-			for _, problem := range captureNameProblems(re.Pattern) {
+			for _, problem := range captureNameProblems(re.Regexp) {
 				problems = append(problems, fmt.Sprintf("%s: %s", owner, problem))
+			}
+			if re.GroupsWithoutCaptures() {
+				problems = append(problems, fmt.Sprintf("%s: groups_func %q: %s", owner, re.GroupsFunc, NoCaptureGroupProblem))
 			}
 		}
 	}
@@ -333,20 +336,24 @@ func ValidateConfig(cfg *BuildConfig) error {
 	// output for a control character is a sequence C and AssemblyScript read
 	// differently from Go. Restricting the value to printable ASCII without a
 	// quote or backslash makes %q's output identical in all six.
-	emitsNames := false
+	// Only the names a lookup emits: the members of each set that asks for one.
+	checked := map[string]bool{}
 	for _, sc := range cfg.Sets {
-		if sc.EmitNameMap {
-			emitsNames = true
-			break
+		if !sc.EmitNameMap {
+			continue
 		}
-	}
-	if emitsNames {
-		for _, re := range cfg.Regexps {
-			for i := 0; i < len(re.Name); i++ {
-				if c := re.Name[i]; c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
+		for _, m := range sc.Members(*cfg) {
+			name := m.Entry.Name
+			if name == "" || checked[name] {
+				continue
+			}
+			checked[name] = true
+			for i := 0; i < len(name); i++ {
+				if c := name[i]; c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
 					problems = append(problems, fmt.Sprintf(
-						"regexp name %q contains %q at offset %d, which cannot be emitted as a string literal in all six stub languages (emit_name_map is on)",
-						re.Name, string(rune(c)), i))
+						"pattern name %q contains %q at offset %d, which cannot be emitted as a string literal in all six stub languages "+
+							"(set %q has emit_name_map on)",
+						name, string(rune(c)), i, sc.Name))
 					break
 				}
 			}
@@ -527,13 +534,12 @@ func quoteAll(names []string) []string {
 // (TestSharedSymbolsMirrorIsInStep), which is the only thing that keeps a copy
 // honest.
 var stubSharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch",
 		"searchBlock", "searchNotes", "searchBTMemo", "ffi_regexped_search"},
-	"js": {"patternName"},
-	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
+	"ts": {"SetMatch"},
+	"as": {"SetMatch", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
-		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
+		"rx_match_t", "rx_group_t", "rx_set_match_t",
 		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED", "rx_search_set_",
 	},
@@ -558,7 +564,7 @@ var stubPrivateHelpers = map[string][]string{
 	"js": {
 		"init", "_exp", "_mem", "_staticTop", "_bump", "_live", "_enc",
 		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
-		"_att", "_patternNames", "_notes", "_btmemo",
+		"_att", "_notes", "_btmemo",
 	},
 	// Go declares no private helpers of its own, but `init` is reserved by the
 	// LANGUAGE: `func init(input []byte) (uint, bool, error)` is a compile
@@ -569,7 +575,7 @@ var stubPrivateHelpers = map[string][]string{
 	// guest, so they track the heap of the one cabi_realloc the linker keeps.
 	"c": {
 		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release", "regexped_cabi_foreign_allocator",
-		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "rx_pattern_names", "RX_CABI_EXPECT_OURS",
+		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "RX_CABI_EXPECT_OURS",
 		"rx_search_notes_", "rx_search_btmemo_",
 	},
 	"rust": {"Span", "Error", "Result", "SetMatch", "SearchBlock", "search_notes", "search_btmemo", "ffi_regexped_search"},
@@ -631,7 +637,7 @@ func ResolveStubType(cfg BuildConfig) (string, error) {
 // exportRef is one user-supplied export name together with a human-readable
 // description of where it came from, for error messages.
 type exportRef struct {
-	owner string // e.g. `regexp "url"` or `set "keywords"`
+	owner string // e.g. `pattern "url"` or `set "keywords"`
 	field string // e.g. "find_func"
 	name  string
 }
@@ -640,12 +646,12 @@ type exportRef struct {
 // order. Empty fields are skipped.
 func allExportRefs(cfg *BuildConfig) []exportRef {
 	var refs []exportRef
-	for _, re := range cfg.Regexps {
-		owner := "regexp"
+	for _, re := range cfg.Patterns {
+		owner := "pattern"
 		if re.Name != "" {
-			owner = fmt.Sprintf("regexp %q", re.Name)
-		} else if re.Pattern != "" {
-			owner = fmt.Sprintf("regexp %q", re.Pattern)
+			owner = fmt.Sprintf("pattern %q", re.Name)
+		} else if re.Regexp != "" {
+			owner = fmt.Sprintf("pattern %q", re.Regexp)
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
@@ -1024,7 +1030,12 @@ func CamelSetName(name string) string {
 
 // setDerivedNames returns the module-scope names stubType's generator
 // synthesizes from one set's NAME — the pattern-count and id-space constants,
-// plus JS/TS's batch-size limit.
+// JS/TS's batch-size limit, and the `emit_name_map: true` lookup
+// (SetPatternNameFunc).
+//
+// The lookup is reserved whether or not the set asks for it, for the same
+// reason as the batch constant: adding `emit_name_map: true` to a working
+// config must not turn a valid export name into a collision.
 //
 // The batch constant is reserved whether or not the set carries
 // `hints: [batch-find]` today, for the reason jsHelperNames denies its list
@@ -1055,11 +1066,31 @@ func setDerivedNames(s SetConfig, stubType string) []string {
 	default:
 		return nil
 	}
-	out := make([]string, len(suffixes))
+	out := make([]string, len(suffixes), len(suffixes)+1)
 	for i, suf := range suffixes {
 		out[i] = stem + suf
 	}
-	return out
+	return append(out, SetPatternNameFunc(s.Name, stubType))
+}
+
+// SetPatternNameFunc is the name of the lookup a set with `emit_name_map:
+// true` gets in stubType's stub: pattern id → that member's `name:`, "" for
+// an unnamed member, an inline regexp, or an id the set does not hold. It is
+// named from the set like the set's other derived symbols, so each set has
+// its own — its inline regexps' ids are numbered per set and mean different
+// regexps in different sets. "" for a stub type that emits none.
+func SetPatternNameFunc(setName, stubType string) string {
+	switch stubType {
+	case "rust":
+		return strings.ToLower(ScreamingSetName(setName)) + "_pattern_name"
+	case "c":
+		return "rx_" + SanitizeSetName(setName) + "_pattern_name"
+	case "go":
+		return PascalSetName(setName) + "PatternName"
+	case "js", "ts", "as":
+		return CamelSetName(setName) + "PatternName"
+	}
+	return ""
 }
 
 // SetDerivedNamesForValidation exposes setDerivedNames so the generate package

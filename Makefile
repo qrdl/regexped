@@ -12,7 +12,7 @@ GO_SRCS := main.go $(filter-out %_test.go, $(wildcard compile/*.go config/*.go g
 # `docker` MUST stay in this list: it is now a directory as well as a target, so
 # without it make compares docker/'s mtime against regexped's and reports the
 # image "up to date" rather than building it.
-.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive perftest perftest-check setperf setperf-check setperf-fuel-cross adversary byteident examples clean unittest lint fmt docker
+.PHONY: from-coverage set-coverage re2test setcaps setcaps-likely setcaps-exhaustive setcaps-unicode perftest perftest-check setperf setperf-check setperf-fuel-cross adversary byteident examples clean unittest lint fmt docker
 
 build: regexped
 
@@ -35,6 +35,11 @@ setcaps-likely:
 
 setcaps-exhaustive:
 	$(MAKE) -C tools/re2test sets-exhaustive
+
+# The set capabilities in Unicode mode — see tools/re2test/Makefile's
+# `sets-unicode`.
+setcaps-unicode:
+	$(MAKE) -C tools/re2test sets-unicode
 
 # Emitter reach for the find/groups property sweeps.
 #
@@ -111,7 +116,7 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
+	go test -p 1 -timeout 20m -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 

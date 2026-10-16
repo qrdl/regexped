@@ -19,8 +19,8 @@ max_dfa_states: 1  # forces Backtracking engine for match and find
 # sets the cap from the largest value it must still answer for.
 max_memory: 1MiB
 
-regexps:
-  - pattern: |-
+patterns:
+  - regexp: |-
       (?i)(?P<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?P<payload>[^\n]*)
     match_func:  "is_sqli"
     find_func:   "find_sqli"

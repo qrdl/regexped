@@ -2,6 +2,7 @@ package compile
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"regexp"
 	"regexp/syntax"
@@ -22,6 +23,37 @@ func decodeShuftiPairs(pairs [][2][16]byte, c byte) bool {
 		merged |= p[0][c&0x0F] & p[1][c>>4]
 	}
 	return merged != 0
+}
+
+// TestContiguousRanges pins which sets take emitShuftiMask's range form: one
+// or two contiguous runs, the top of the byte range included, and nothing
+// that needs three runs or is empty.
+func TestContiguousRanges(t *testing.T) {
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	for _, c := range []struct {
+		name string
+		set  []byte
+		want [][2]int // nil = not served
+	}{
+		{"empty", nil, nil},
+		{"[a-z]", []byte("abcdefghijklmnopqrstuvwxyz"), [][2]int{{'a', 'z'}}},
+		{"[a-zA-Z]", []byte("zyxwvutsrqponmlkjihgfedcbaABCDEFGHIJKLMNOPQRSTUVWXYZ"), [][2]int{{'A', 'Z'}, {'a', 'z'}}},
+		{"{a,c,e}", []byte("ace"), nil},
+		{"[0xFE-0xFF]", []byte{0xFF, 0xFE}, [][2]int{{0xFE, 0xFF}}},
+		{"all 256", all, [][2]int{{0, 255}}},
+	} {
+		rs, ok := contiguousRanges(c.set)
+		if ok != (c.want != nil) {
+			t.Errorf("%s: ok = %v, want %v (ranges %v)", c.name, ok, c.want != nil, rs)
+			continue
+		}
+		if ok && fmt.Sprint(rs) != fmt.Sprint(c.want) {
+			t.Errorf("%s: ranges %v, want %v", c.name, rs, c.want)
+		}
+	}
 }
 
 // TestBuildShuftiPairsExact is the correctness contract for the rectangle
@@ -135,35 +167,56 @@ func TestEmitShuftiPrefixCheckEmpty(t *testing.T) {
 // in the wrong emitter, every bulk skip in the compiler advances to the first
 // byte that IS a member — a walk that stops immediately and never strides,
 // which costs performance silently rather than failing.
+//
+// A set of one or two contiguous ranges takes the range form instead
+// (contiguousRanges), where the polarity is the per-range compare (le_u for a
+// member, gt_u for a stop) and, with two ranges, the combiner (or: in either;
+// and: in neither) — so the pairs of differing opcodes are decided per set.
 func TestShuftiMaskPolarities(t *testing.T) {
 	const (
-		opEq = 0x23 // i8x16.eq, after the 0xFD prefix
-		opNe = 0x24 // i8x16.ne
+		opEq  = 0x23 // i8x16.eq, after the 0xFD prefix
+		opNe  = 0x24 // i8x16.ne
+		opGtU = 0x28 // i8x16.gt_u
+		opLeU = 0x2A // i8x16.le_u
+		opAnd = 0x4E // v128.and
+		opOr  = 0x50 // v128.or
 	)
 	for _, set := range [][]byte{
 		[]byte("abcdefghijklmnopqrstuvwxyz"),
 		[]byte("0123456789"),
+		[]byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
 		{0x00, 0x7F, 0x80, 0xFF},
 	} {
+		// want: the (member, stop) opcode pairs that may differ, and how often.
+		allowed := map[[2]byte]bool{{opNe, opEq}: true}
+		wantDiffs := 1
+		if rs, ok := contiguousRanges(set); ok {
+			allowed = map[[2]byte]bool{{opLeU, opGtU}: true}
+			wantDiffs = 1
+			if len(rs) == 2 {
+				allowed[[2]byte{opOr, opAnd}] = true
+				wantDiffs = 3
+			}
+		}
 		member := emitShuftiPrefixCheck(nil, set, 7)
 		stop := emitShuftiStopMask(nil, set, 7)
 		if len(member) != len(stop) {
 			t.Fatalf("polarities differ in length: member %d, stop %d — the stop "+
-				"mask must be the same emission with one opcode changed",
+				"mask must be the same emission with its compares changed",
 				len(member), len(stop))
 		}
 		diffs := 0
 		for i := range member {
 			if member[i] != stop[i] {
 				diffs++
-				if member[i] != opNe || stop[i] != opEq {
-					t.Fatalf("byte %d differs as %#02x/%#02x, want the compare "+
-						"opcode %#02x/%#02x", i, member[i], stop[i], opNe, opEq)
+				if !allowed[[2]byte{member[i], stop[i]}] {
+					t.Fatalf("%q: byte %d differs as %#02x/%#02x, want one of %v",
+						set, i, member[i], stop[i], allowed)
 				}
 			}
 		}
-		if diffs != 1 {
-			t.Fatalf("polarities differ in %d bytes, want exactly 1 (the compare)", diffs)
+		if diffs != wantDiffs {
+			t.Fatalf("%q: polarities differ in %d bytes, want %d", set, diffs, wantDiffs)
 		}
 		// No 0xFFFF constant may survive in either emission: its presence is
 		// the signature of the inversion this replaced.
@@ -331,7 +384,7 @@ func TestPrefixResumeDivergenceArms(t *testing.T) {
 			// Build the DFA exactly as compile.go's LF-DFA find path does; a
 			// different option set here would prove nothing about the code that
 			// actually ships.
-			matcher, err := compile(testCase.pattern, CompileOptions{
+			matcher, err := compile(bytePat(testCase.pattern), CompileOptions{
 				MaxDFAStates:  1024,
 				ForceEngine:   EngineDFA,
 				LeftmostFirst: true,
@@ -394,8 +447,8 @@ func TestPrefixResumeDivergenceArms(t *testing.T) {
 
 			// Emit for real: this is what executes the arm's bytecode-building
 			// statements and validates that what it built is a legal module.
-			mustCompileEntries(t, []config.RegexEntry{{
-				Pattern:  testCase.pattern,
+			mustCompileEntries(t, []config.PatternEntry{{
+				Regexp:   testCase.pattern,
 				FindFunc: "diverge_find",
 			}})
 		})
@@ -413,7 +466,7 @@ func TestPrefixResumeConstantArmStillReached(t *testing.T) {
 	// with a long counted tail (`ghp_[a-zA-Z0-9]{36}`) does not — it routes to
 	// the literal-anchor find body instead and would emit none of this switch.
 	const pattern = `abc`
-	matcher, err := compile(pattern, CompileOptions{
+	matcher, err := compile(bytePat(pattern), CompileOptions{
 		MaxDFAStates:  1024,
 		ForceEngine:   EngineDFA,
 		LeftmostFirst: true,
@@ -440,7 +493,7 @@ func TestPrefixResumeConstantArmStillReached(t *testing.T) {
 		t.Errorf("an unanchored literal-prefix pattern selects the %q arm, want %q",
 			arm, armConstant)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "constant_find"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "constant_find"}})
 }
 
 // Unit coverage for the small routers and pure helpers that decide what the
@@ -639,15 +692,15 @@ func TestShuftiPrefixPlanBands(t *testing.T) {
 // would be wrong — the function gives up instead, and a caller that took a
 // derived answer here would skip positions where a match can begin.
 func TestFirstByteSetGivesUpOnNonASCII(t *testing.T) {
-	if got := firstByteSet(`\x{00e9}cafe`); got != nil {
+	if got := firstByteSet(bytePat(`\x{00e9}cafe`)); got != nil {
 		t.Error("a pattern starting with a non-ASCII rune produced a first-byte set")
 	}
-	if got := firstByteSet(`[`); got != nil {
+	if got := firstByteSet(bytePat(`[`)); got != nil {
 		t.Error("an unparseable pattern produced a first-byte set")
 	}
 	// The positive control: an ordinary ASCII pattern resolves, and only to
 	// the bytes that can actually lead it.
-	got := firstByteSet(`abc`)
+	got := firstByteSet(bytePat(`abc`))
 	if got == nil {
 		t.Fatal("an ASCII literal produced no first-byte set")
 	}
@@ -658,6 +711,25 @@ func TestFirstByteSetGivesUpOnNonASCII(t *testing.T) {
 		if got[b] {
 			t.Errorf("%q is marked startable for /abc/", b)
 		}
+	}
+	// In Unicode mode the program is lowered, so the same non-ASCII start
+	// resolves to its UTF-8 lead byte: `é` is C3 A9, so C3 and nothing else
+	// — not A9, a continuation byte, which no match begins with.
+	uni := firstByteSet(unicodePat(`\x{00e9}cafe`))
+	if uni == nil {
+		t.Fatal("Unicode mode: a pattern starting with é produced no first-byte set")
+	}
+	for b, want := range map[byte]bool{0xC3: true, 0xA9: false, 'c': false, 0xE9: false} {
+		if uni[b] != want {
+			t.Errorf("Unicode mode, /\\x{00e9}cafe/: byte %#x startable = %v, want %v", b, uni[b], want)
+		}
+	}
+	// A class over several scripts gives their lead bytes; `.` stays
+	// undetermined (every lead byte and every ASCII byte but \n is too wide
+	// to bother narrowing — getFirstRuneSet declines it).
+	greek := firstByteSet(unicodePat(`[α-ω]x`))
+	if greek == nil || !greek[0xCE] || !greek[0xCF] || greek['x'] {
+		t.Errorf("Unicode mode, /[α-ω]x/: got %v, want the lead bytes CE and CF", greek)
 	}
 }
 
@@ -782,6 +854,37 @@ func TestDominantWalkStatesEdges(t *testing.T) {
 	}
 }
 
+// TestUTF8LoopState pins the never-dying test's second half: a state that
+// loops over whole UTF-8 characters. A lowered class holding every non-ASCII
+// character self-loops on ASCII bytes only, so dominantWalkStates cannot see
+// it, and a set built on such a member lost its overlapping preflight.
+func TestUTF8LoopState(t *testing.T) {
+	for _, c := range []struct {
+		pattern     string
+		unicode     bool
+		loop, never bool
+	}{
+		{`[^,]+;`, true, true, true},   // every character but ASCII ','
+		{`.+`, true, true, true},       // `.` stops only at '\n'
+		{`[^,]+;`, false, false, true}, // byte mode: a byte self-loop, dominantWalkStates' case
+		{`\p{Cyrillic}+!`, true, false, false},
+		{`[a-zé]+`, true, false, false},
+		{`[^,é]+;`, true, false, false},  // one character leads out
+		{`[^a-z]+;`, true, false, false}, // 26 ASCII exits, past dominantMaxExceptions
+	} {
+		tbl := compileTestDFAMode(t, c.pattern, c.unicode)
+		if got := utf8LoopState(tbl); got != c.loop {
+			t.Errorf("utf8LoopState(%q, unicode=%v) = %v, want %v", c.pattern, c.unicode, got, c.loop)
+		}
+		if got := hasNeverDyingState(tbl); got != c.never {
+			t.Errorf("hasNeverDyingState(%q, unicode=%v) = %v, want %v", c.pattern, c.unicode, got, c.never)
+		}
+	}
+	if utf8LoopState(nil) || utf8LoopState(&dfaTable{}) {
+		t.Error("utf8LoopState reported a loop in an empty table")
+	}
+}
+
 // ── The absence-literal prefilter's AST walk ───────────────────────────────
 //
 // findAbsenceLit answers "does every match of this pattern contain this exact
@@ -810,7 +913,8 @@ func TestFindAbsenceLit(t *testing.T) {
 		{"quest: the body may be skipped", `(?:abc)?`, ""},
 		{"repeat with min 0", `(?:abc){0,3}`, ""},
 		{"case-folded literal needs a case-insensitive search", `(?i)abcd`, ""},
-		{"non-ASCII literal needs UTF-8 encoding", `caf\x{e9}xx`, ""},
+		{"a rune 0x80-0xFF is that byte in byte mode", `caf\x{e9}xx`, "caf\xe9xx"},
+		{"a rune above 0xFF: byte mode has no byte for it", `caf\x{3b1}xx`, ""},
 		{"a class is not a literal", `[a-z]+`, ""},
 		{"empty", `(?:)`, ""},
 
@@ -831,15 +935,25 @@ func TestFindAbsenceLit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.pattern, err)
 			}
-			got := string(findAbsenceLit(re.Simplify()))
+			got := string(findAbsenceLit(re.Simplify(), false))
 			if got != tc.want {
 				t.Errorf("findAbsenceLit(%q) = %q, want %q", tc.pattern, got, tc.want)
 			}
 		})
 	}
 	// A nil AST is reachable from the recursive walk over a malformed subtree.
-	if got := findAbsenceLit(nil); got != nil {
+	if got := findAbsenceLit(nil, false); got != nil {
 		t.Errorf("findAbsenceLit(nil) = %q, want nil", got)
+	}
+	// Unicode mode: a non-ASCII literal is its UTF-8 bytes.
+	for pat, want := range map[string]string{`caf\x{e9}xx`: "caféxx", `\pL+привет`: "привет", `(?i)привет`: ""} {
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(findAbsenceLit(re.Simplify(), true)); got != want {
+			t.Errorf("Unicode mode: findAbsenceLit(%q) = %q, want %q", pat, got, want)
+		}
 	}
 }
 
@@ -865,7 +979,7 @@ func TestFindAbsenceLitIsSound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %q: %v", pat, err)
 		}
-		lit := findAbsenceLit(re.Simplify())
+		lit := findAbsenceLit(re.Simplify(), false)
 		if len(lit) == 0 {
 			continue
 		}

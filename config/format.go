@@ -65,14 +65,14 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 	// interface does not expose.
 	// The same for a REGEXP's batch-find: the batch groups export it adds has no
 	// WIT form, and its only consumers, JS and TS, are refused under component.
-	for i, re := range cfg.Regexps {
+	for i, re := range cfg.Patterns {
 		for _, h := range re.Hints {
 			if h == "batch-find" {
 				label := re.Name
 				if label == "" {
 					label = fmt.Sprintf("#%d", i)
 				}
-				return fmt.Errorf("regexp %s: hints: [batch-find] is not supported for wasm_format: %s — the batch groups export it adds has no WIT form",
+				return fmt.Errorf("pattern %s: hints: [batch-find] is not supported for wasm_format: %s — the batch groups export it adds has no WIT form",
 					label, formatComponent)
 			}
 		}

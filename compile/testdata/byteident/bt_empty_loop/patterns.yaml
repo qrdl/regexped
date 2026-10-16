@@ -2,6 +2,6 @@
 # `*`'s body can match empty through the `|` branch. Such a program gets no
 # ordinary body (planBT): its fast body is the bare tail call into the memoised
 # fallback body, which answers every call.
-regexps:
-  - pattern: '^(\w*|)*c'
+patterns:
+  - regexp: '^(\w*|)*c'
     groups_func: bt_empty_loop

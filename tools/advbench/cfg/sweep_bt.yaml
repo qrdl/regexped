@@ -1,8 +1,8 @@
 import_module: m
 wasm_file: x.wasm
-regexps:
-  - pattern: 'foo\w+'
-  - pattern: '(?:a|b)*a(?:a|b){12}c'
+patterns:
+  - regexp: 'foo\w+'
+  - regexp: '(?:a|b)*a(?:a|b){12}c'
 sets:
   - name: s
     find: sfind

@@ -2,7 +2,9 @@ package compile
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp/syntax"
 	"strings"
 	"testing"
@@ -50,7 +52,7 @@ func setEmitCovInfos(t *testing.T, patterns []string) ([]*PatternInfo, []int, *d
 	infos := make([]*PatternInfo, 0, len(patterns))
 	globalIDs := make([]int, 0, len(patterns))
 	for i, pattern := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -79,10 +81,10 @@ func setEmitCovCompileSet(t *testing.T, spec SetSpec, patterns []string, opts Co
 
 // setEmitCovEntries turns patterns into named config entries p00, p01, ... so
 // a set can select them by name.
-func setEmitCovEntries(patterns []string) []config.RegexEntry {
-	entries := make([]config.RegexEntry, len(patterns))
+func setEmitCovEntries(patterns []string) []config.PatternEntry {
+	entries := make([]config.PatternEntry, len(patterns))
 	for i, pattern := range patterns {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pattern}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pattern}
 	}
 	return entries
 }
@@ -132,11 +134,11 @@ var litLessNeverDying = []string{`[^\n]*[0-2]`, `[^\n]*[3-5]`}
 // reads the HOST's memory as if it were the table — silently wrong answers
 // rather than a validation error.
 func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		// A literal-anchored find: emits a backward-scan body plus a find body
 		// built around it, the pair that carries the lit-anchor table index.
 		{
-			Name: "lit_anchor", Pattern: `[a-z]+@example\.com`,
+			Name: "lit_anchor", Regexp: `[a-z]+@example\.com`,
 			FindFunc: "lit_anchor_find",
 		},
 		// Captures the selector routes to BACKTRACKING, not TDFA: an inverted
@@ -145,7 +147,7 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		// the composed wrapper has to pass the BT window scratch offset rather
 		// than -1. Non-anchored, so the wrapper composes find + capture.
 		{
-			Name: "bt_groups", Pattern: `<([^>]+)>`,
+			Name: "bt_groups", Regexp: `<([^>]+)>`,
 			GroupsFunc: "bt_groups_groups", FindFunc: "bt_groups_find",
 			Hints: []string{"batch-find"},
 		},
@@ -153,19 +155,19 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		// body is ANCHORED, which selects the other batch-groups wrapper —
 		// the native lit-chain one, with no find body to compose.
 		{
-			Name: "lit_chain", Pattern: `ghp_(?P<id>[A-Za-z0-9]{36})`,
+			Name: "lit_chain", Regexp: `ghp_(?P<id>[A-Za-z0-9]{36})`,
 			GroupsFunc: "lit_chain_groups",
 			Hints:      []string{"batch-find"},
 		},
 		// A plain member so the set has something left after the
 		// capture-bearing entries are dropped from it.
-		{Name: "plain", Pattern: `plain[0-9]+`},
+		{Name: "plain", Regexp: `plain[0-9]+`},
 	}
 	cfg := config.BuildConfig{
 		// The only thing that selects the embedded arm. CompileFile's second
 		// argument is an output PATH and does not affect it.
-		Output:  "merged.wasm",
-		Regexps: entries,
+		Output:   "merged.wasm",
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", MatchAny: "s_match_any",
 			Patterns: config.PatternSelector{All: true},
@@ -210,7 +212,7 @@ func TestSetEmitFindPreflightTakesUnionWalk(t *testing.T) {
 	// preflight dormant on purpose (set_emit.go's "byte-identical" note). So
 	// scan_any is declared alongside.
 	gated := config.BuildConfig{
-		Regexps: setEmitCovEntries(litLessNeverDying),
+		Patterns: setEmitCovEntries(litLessNeverDying),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAny: "s_scan_any",
 			Patterns: config.PatternSelector{All: true},
@@ -224,7 +226,7 @@ func TestSetEmitFindPreflightTakesUnionWalk(t *testing.T) {
 	// pattern from validMask with — which is the difference between one
 	// overlapping call and a quadratic one.
 	overlapping := config.BuildConfig{
-		Regexps: setEmitCovEntries(litLessNeverDying),
+		Patterns: setEmitCovEntries(litLessNeverDying),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Patterns: config.PatternSelector{All: true},
@@ -256,11 +258,11 @@ func TestSetEmitOverlapPreflightIDSpaceExceedsMembers(t *testing.T) {
 	entries := setEmitCovEntries(litLessNeverDying)
 	// Declared last, dropped from the set, and its index is what IDSpaceSize
 	// is computed from.
-	entries = append(entries, config.RegexEntry{
-		Name: "dropped", Pattern: `(?P<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
+	entries = append(entries, config.PatternEntry{
+		Name: "dropped", Regexp: `(?P<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
 	})
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Patterns: config.PatternSelector{All: true},
@@ -307,7 +309,7 @@ func TestSetEmitACFrontendWithFallbackBucket(t *testing.T) {
 	patterns = append(patterns, `[0-9]{4,}`)
 
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAll: "s_scan_all", MatchAll: "s_match_all",
 			Patterns: config.PatternSelector{All: true},
@@ -357,7 +359,7 @@ func TestSetEmitACFrontendSingleByteLiteral(t *testing.T) {
 	patterns = append(patterns, `k[0-9]{3}`)
 
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", ScanAll: "s_scan_all",
 			Patterns: config.PatternSelector{All: true},
@@ -465,7 +467,7 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 	// And the whole config compiles: the sweep body is emitted at assembly
 	// time, so the predicate agreeing is only half the check.
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries([]string{wideButU8}),
+		Patterns: setEmitCovEntries([]string{wideButU8}),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Overlapping: true,
 			Hints:    []string{"batch-find"},
@@ -483,15 +485,19 @@ func TestSetEmitOverlapDPCompressedTable(t *testing.T) {
 // through the constructor directly because a set that is refused simply takes
 // the per-position path, leaving nothing in the module to observe.
 func TestSetEmitUnionScanRefusals(t *testing.T) {
-	buildFor := func(t *testing.T, patterns []string) *unionScanDFA {
+	specFor := func(t *testing.T, patterns []string, maxUnion int) SetSpec {
 		t.Helper()
 		infos, globalIDs, _, _ := setEmitCovInfos(t, patterns)
-		spec := SetSpec{
-			Name: "s", ScanAny: "s_scan_any",
+		return SetSpec{
+			Name: "s", ScanAny: "s_scan_any", MatchAny: "s_match_any",
 			Patterns: infos, PatternIDs: globalIDs,
 			DeclaredPatternCount: len(infos), IDSpaceSize: len(infos),
+			MaxUnionStates: maxUnion,
 		}
-		return buildUnionScanDFA(spec, 0, false)
+	}
+	buildFor := func(t *testing.T, patterns []string) *unionScanDFA {
+		t.Helper()
+		return buildUnionScanDFA(specFor(t, patterns, 0), 0, false)
 	}
 
 	// A start-anywhere determinisation is `.*`-prefixed, so it is bigger than
@@ -506,6 +512,79 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	if got := buildFor(t, []string{`a.{13}b`}); got != nil {
 		t.Errorf("a union automaton past the %d-state budget was accepted (%d states); "+
 			"the budget no longer refuses it", maxUnionScanStates, got.numStates)
+	}
+	// max_union_states moves the budget, both ways and for both union
+	// automata: the same shape builds under a larger one, and a set the
+	// default admits is refused under a tiny one.
+	if got := buildUnionScanDFA(specFor(t, []string{`a.{13}b`}, 65536), 0, false); got == nil {
+		t.Error("a.{13}b was refused under max_union_states 65536")
+	}
+	// The default follows the set's mode: 16,384 in Unicode mode, where a
+	// letter class costs hundreds of states. `\pL{4}x` needs more than 4,096
+	// states to BUILD and keeps 1,162 once minimized, so the byte-mode default
+	// refused it (with `\pN{3}\pL{3}` and `\pL{5}x` beside it, scan_any went
+	// from 378 fuel/byte to 20.9 at 16,384).
+	uni := []string{`\pL{4}x`}
+	if got := specFor(t, uni, 0).maxUnionStates(); got != maxUnionScanStatesUnicode {
+		t.Errorf("Unicode-mode set: default union bound %d, want %d", got, maxUnionScanStatesUnicode)
+	}
+	if got := specFor(t, []string{`a.{13}b`}, 0).maxUnionStates(); got != maxUnionScanStates {
+		t.Errorf("byte-mode set: default union bound %d, want %d", got, maxUnionScanStates)
+	}
+	if got := buildUnionScanDFA(specFor(t, uni, 0), 0, false); got == nil {
+		t.Errorf("%v was refused under the Unicode-mode default", uni)
+	}
+	if got := buildUnionScanDFA(specFor(t, uni, maxUnionScanStates), 0, false); got != nil {
+		t.Errorf("%v was accepted under max_union_states %d (%d states); "+
+			"the shape no longer reaches the byte-mode bound", uni, maxUnionScanStates, got.numStates)
+	}
+	small := []string{`[0-9]{3}`, `[a-z]{2}`}
+	if buildUnionScanDFA(specFor(t, small, 0), 0, false) == nil || buildAnchoredUnionDFA(specFor(t, small, 0), 0, false, false) == nil {
+		t.Fatal("a two-member set was refused at the default budget")
+	}
+	if buildUnionScanDFA(specFor(t, small, 2), 0, false) != nil {
+		t.Error("the scan union was built under max_union_states 2")
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, 2), 0, false, false) != nil {
+		t.Error("the anchored union was built under max_union_states 2")
+	}
+	// The budget is inclusive, as newDFA's and the scan union's are: an
+	// anchored union whose DFA has exactly max_union_states states is built,
+	// and refused one state below. It used to be refused AT the budget. The
+	// count is the DFA's own (dfa.numStates) — the union wrappers' numStates
+	// differ from it by one either way.
+	spec := specFor(t, small, 0)
+	progs := make([]resolvedProg, 0, len(spec.Patterns))
+	for _, p := range spec.Patterns {
+		pr, _ := compileProg(patternFullAST(p))
+		progs = append(progs, pr)
+	}
+	prog, bits := buildUnionProg(progs, 64)
+	d, ok := newDFA(prog, false, 1<<20, bits)
+	if !ok {
+		t.Fatal("the two-member anchored union did not build")
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, d.numStates), 0, false, false) == nil {
+		t.Errorf("the anchored union (%d states) was refused under max_union_states %d", d.numStates, d.numStates)
+	}
+	if buildAnchoredUnionDFA(specFor(t, small, d.numStates-1), 0, false, false) != nil {
+		t.Errorf("the anchored union (%d states) was built under max_union_states %d", d.numStates, d.numStates-1)
+	}
+	// From a config: the key reaches the set's union.
+	cfg := config.BuildConfig{
+		Patterns: []config.PatternEntry{{Name: "d", Regexp: `[0-9]{3}`}, {Name: "w", Regexp: `[a-z]{2}`}},
+		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
+			Patterns: config.PatternSelector{All: true}}},
+	}
+	for _, c := range []struct {
+		maxUnion int
+		used     bool
+	}{{0, true}, {2, false}} {
+		cfg.MaxUnionStates = c.maxUnion
+		_, _, diags, err := CompileFileDiag(cfg, "")
+		if err != nil || len(diags) != 1 || diags[0].UnionScan == nil || diags[0].UnionScan.Used != c.used {
+			t.Errorf("max_union_states %d: diags %+v, err %v; want the union used = %v", c.maxUnion, diags, err, c.used)
+		}
 	}
 
 	// The id-space ceiling. It was 64 — one u64 accept mask — until the
@@ -542,7 +621,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 	// PatternInfo is built by analyzePattern, which parses, so an
 	// unparseable fullPattern cannot arrive here from a config — it is set by
 	// hand to reach the guard.
-	broken := &PatternInfo{fullPattern: `(unclosed`, globalID: 0}
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`), globalID: 0}
 	unparseable := SetSpec{
 		Name: "s", ScanAny: "s_scan_any",
 		Patterns: []*PatternInfo{broken}, PatternIDs: []int{0},
@@ -568,7 +647,7 @@ func TestSetEmitUnionScanWideSetCompiles(t *testing.T) {
 		patterns[i] = fmt.Sprintf(`[0-9]{%d}[a-c]`, i+1)
 	}
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
 			Patterns: config.PatternSelector{All: true},
@@ -801,6 +880,54 @@ func TestSetEmitShuftiNonAdaptiveBody(t *testing.T) {
 	}
 }
 
+// TestSetEmitUnicodeStartCheckOncePerCharacter pins where a Unicode set's
+// `find` checks start positions when a fallback member can match empty. The
+// scalar walk rounds its first position once and then steps from one start
+// position to the next (emitUTF8NextStart, whose continuation probe is a
+// 16-bit load), so the loop holds no per-position check. The Aho-Corasick
+// walk, which must feed every byte to its automaton, keeps ONE check per
+// position for every fallback bucket. A byte-mode set has neither.
+func TestSetEmitUnicodeStartCheckOncePerCharacter(t *testing.T) {
+	probe := []byte{0x2F, 0x00, 0x01, 0x41, 0xC0, 0x81, 0x03, 0x71} // i32.load16_u offset=1; i32.const 0xC0C0; i32.and
+	lead := []byte{0x41, 0xC2, 0x01, 0x49, 0x0D, 0x00}              // i32.const 0xC2; i32.lt_u; br_if 0: a lead's check
+	body := func(t *testing.T, patterns []string, wantFE frontendKind) []byte {
+		t.Helper()
+		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}
+		cfg := config.BuildConfig{Patterns: setEmitCovEntries(patterns), Sets: []config.SetConfig{sc}}
+		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fe := emittedFrontend(cs); fe != wantFE {
+			t.Fatalf("%q: frontend %v, want %v", patterns, fe, wantFE)
+		}
+		base := cs.funcCount()
+		return emitSetMatchFnFinal(cs, base, base, 0, capFind, base)
+	}
+	kws := make([]string, 17)
+	for i := range kws {
+		kws[i] = fmt.Sprintf("kw%02dzz", i)
+	}
+	for _, c := range []struct {
+		name            string
+		patterns        []string
+		fe              frontendKind
+		probes, checked int
+	}{
+		{"scalar", []string{`\p{Han}*`, `foo`}, frontendScalar, 1, 2},
+		{"aho-corasick", append([]string{`\p{Han}*`}, kws...), frontendAC, 0, 1},
+		{"byte mode", []string{`[a-z]*`, `foo`}, frontendScalar, 0, 0},
+	} {
+		b := body(t, c.patterns, c.fe)
+		if got := bytes.Count(b, probe); got != c.probes {
+			t.Errorf("%s: %d steps to the next start position, want %d", c.name, got, c.probes)
+		}
+		if got := bytes.Count(b, lead); got != c.checked {
+			t.Errorf("%s: %d sequence checks, want %d", c.name, got, c.checked)
+		}
+	}
+}
+
 // setEmitCovLocalsOfType counts the locals of one value type declared by a
 // size-prefixed WASM function body. It sums across groups on purpose: the
 // allocator coalesces adjacent same-type runs, so which GROUP a local lands in
@@ -839,7 +966,7 @@ func setEmitCovLocalsOfType(t *testing.T, body []byte, ty byte) int {
 // cannot be built — so they are asserted at the predicate rather than through
 // a compile that would merely lose the pattern either way.
 func TestSetEmitBTAdmissionRefusals(t *testing.T) {
-	if got := admitBTFallback(nil); got != nil {
+	if got := admitBTFallback(byteTree(nil)); got != nil {
 		t.Error("a nil AST was admitted to the Backtracking fallback")
 	}
 
@@ -847,7 +974,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// instructions, which is the cheapest way to build a program of a known
 	// size without tripping the parser's repeat limits.
 	long := parseForBTFallback(t, strings.Repeat("a", maxBTFallbackInstructions+500))
-	if got := admitBTFallback(long); got != nil {
+	if got := admitBTFallback(byteTree(long)); got != nil {
 		t.Errorf("a %d-instruction program was admitted; the NFA size cap no longer refuses it",
 			maxBTFallbackInstructions+500)
 	}
@@ -855,7 +982,7 @@ func TestSetEmitBTAdmissionRefusals(t *testing.T) {
 	// A pattern the cap does admit, so the refusals above are not passing for
 	// the wrong reason.
 	ok := parseForBTFallback(t, `[0-9]+x`)
-	if got := admitBTFallback(ok); got == nil {
+	if got := admitBTFallback(byteTree(ok)); got == nil {
 		t.Error("an ordinary pattern was refused; the cases above prove nothing")
 	}
 }
@@ -891,7 +1018,7 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 		Patterns: config.PatternSelector{Names: []string{"p00", "p01"}},
 	}
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{byName}, MaxFallbackStates: 1,
+		Patterns: entries, Sets: []config.SetConfig{byName}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(byName, cramped) {
 		t.Error("a NAMED selection of members that all land on Backtracking reported none")
@@ -910,12 +1037,12 @@ func TestSetEmitSetAdmitsBacktrackingSelection(t *testing.T) {
 	// UNNAMED so the error path labels it by its pattern text instead — the
 	// only branch where the label falls back that way.
 	unparseable := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Pattern: `(unclosed`}},
+		Patterns: []config.PatternEntry{{Regexp: `(unclosed`}},
 		Sets: []config.SetConfig{{
 			Name: "s", MatchAll: "s_match_all",
 			Patterns: config.PatternSelector{All: true},
 		}},
-		MaxFallbackStates: 1,
+		MaxDFAStates: 1,
 	}
 	if SetAdmitsBacktracking(unparseable.Sets[0], unparseable) {
 		t.Error("a set whose only member does not parse was predicted to admit Backtracking")
@@ -930,7 +1057,7 @@ func TestSetEmitPlanBTRegions(t *testing.T) {
 	if got := planBTRegions([]*bucket{{isFallback: true}}, &moduleGlobals{}); got != nil {
 		t.Error("regions were planned for a set with no Backtracking bucket")
 	}
-	info := admitBTFallback(parseForBTFallback(t, `(?:a|ab)+c`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `(?:a|ab)+c`)))
 	if info == nil {
 		t.Fatal("the witness was refused by the Backtracking fallback")
 	}
@@ -953,7 +1080,7 @@ func TestSetEmitPlanBTRegions(t *testing.T) {
 // nobody has checked, and the failure it prevents is a "local index out of
 // bounds" at module validation, which is how it was originally caught.
 func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `[0-9]+x`)))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -981,7 +1108,7 @@ func TestSetEmitBTSuffixBodyRejectsBothTrailingParams(t *testing.T) {
 // parameter and its arm are gone, because dead machinery made a documented
 // exclusion look like an oversight.
 func TestSetEmitBTProbeBody(t *testing.T) {
-	info := admitBTFallback(parseForBTFallback(t, `[0-9]+x`))
+	info := admitBTFallback(byteTree(parseForBTFallback(t, `[0-9]+x`)))
 	if info == nil {
 		t.Fatal("the witness pattern was refused by the Backtracking fallback")
 	}
@@ -1029,6 +1156,149 @@ func TestSetEmitSuffixCallSkipDefault(t *testing.T) {
 	if string(plain) == string(real) {
 		t.Error("the constant-zero skip and the real one emitted identical bytes")
 	}
+}
+
+// TestSparseVerdictTravelsInValidMaskSlot pins the member-skip verdict's path
+// into a sparse suffix body: the frontend pushes the verdict global in the
+// call's validMask slot, which the body otherwise ignores, and the body's entry
+// test reads that PARAMETER rather than the global. Both sides have to name
+// the same slot and the same global: a frontend still pushing the mask would
+// hand the body a pattern mask as its verdict (the walk choice goes wrong,
+// silently, since both walks answer alike), and a body still reading the
+// global pays the load the cut removed.
+func TestSparseVerdictTravelsInValidMaskSlot(t *testing.T) {
+	entries := make([]config.PatternEntry, 40)
+	for i := range entries {
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: fmt.Sprintf(`union[ \t]+k%02da+`, i)}
+	}
+	cfg := config.BuildConfig{
+		Patterns: entries,
+		Sets: []config.SetConfig{{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
+			Hints: []string{"prefer-match"}}},
+	}
+	wasm, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	imports, bodies := wasmFuncBodies(t, wasm)
+
+	// The sparse body: its entry test is `local.get 6; local.get 3; i32.and;
+	// if`, and it ends by storing the verdict with `select; global.set g`.
+	entry := []byte{0x20, 0x06, 0x20, 0x03, 0x71, 0x04, 0x40}
+	bodyIdx, g := -1, uint64(0)
+	for i, body := range bodies {
+		if !bytes.Contains(body, entry) {
+			continue
+		}
+		at := bytes.Index(body, []byte{0x1B, 0x24}) // select; global.set
+		if at < 0 {
+			t.Fatalf("function %d reads the verdict parameter but stores no verdict", imports+i)
+		}
+		v, _, err := utils.DecodeULEB128(body[at+2:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bodyIdx >= 0 {
+			t.Fatalf("two sparse bodies with a member skip (%d, %d); this set should have one", bodyIdx, imports+i)
+		}
+		bodyIdx, g = imports+i, v
+	}
+	if bodyIdx < 0 {
+		t.Fatal("no function's entry test reads the verdict from the validMask slot (local 6)")
+	}
+
+	// The call site: `global.get g`, then at most the gate pointer, then
+	// `call bodyIdx`.
+	push := utils.AppendULEB128([]byte{0x23}, uint32(g))       //nolint:gosec // a global index
+	call := utils.AppendULEB128([]byte{0x10}, uint32(bodyIdx)) //nolint:gosec // a function index
+	found := false
+	for _, body := range bodies {
+		for at := bytes.Index(body, call); at >= 0; {
+			before := body[:at]
+			if bytes.HasSuffix(before, push) ||
+				(len(before) >= 2 && before[len(before)-2] == 0x20 && bytes.HasSuffix(before[:len(before)-2], push)) {
+				found = true
+			}
+			next := bytes.Index(body[at+1:], call)
+			if next < 0 {
+				break
+			}
+			at += 1 + next
+		}
+	}
+	if !found {
+		t.Errorf("no call of the sparse body %d is preceded by global.get %d in its validMask slot", bodyIdx, g)
+	}
+}
+
+// wasmFuncBodies returns a module's imported-function count and its code
+// section's bodies (locals and instructions), in function-index order after
+// the imports.
+func wasmFuncBodies(t *testing.T, wasm []byte) (imports int, bodies [][]byte) {
+	t.Helper()
+	uleb := func(b []byte, at *int) int {
+		v, n, err := utils.DecodeULEB128(b[*at:])
+		if err != nil {
+			t.Fatalf("bad LEB at %d: %v", *at, err)
+		}
+		*at += n
+		return int(v)
+	}
+	at := 8
+	for at < len(wasm) {
+		id := wasm[at]
+		at++
+		size := uleb(wasm, &at)
+		sec := wasm[at : at+size]
+		switch id {
+		case 2: // imports: count those of kind 0 (function)
+			p := 0
+			for n := uleb(sec, &p); n > 0; n-- {
+				p += uleb(sec, &p) // module name
+				p += uleb(sec, &p) // field name
+				kind := sec[p]
+				p++
+				switch kind {
+				case 0:
+					imports++
+					uleb(sec, &p)
+				case 1:
+					p++ // reftype
+					if sec[p] == 0 {
+						p++
+						uleb(sec, &p)
+					} else {
+						p++
+						uleb(sec, &p)
+						uleb(sec, &p)
+					}
+				case 2:
+					flags := sec[p]
+					p++
+					if flags&0x40 != 0 { // 64-bit memory
+						t.Fatal("wasmFuncBodies: a 64-bit memory import")
+					}
+					uleb(sec, &p)
+					if flags&1 != 0 {
+						uleb(sec, &p)
+					}
+				case 3:
+					p += 2 // valtype, mutability
+				default:
+					t.Fatalf("wasmFuncBodies: import kind %d", kind)
+				}
+			}
+		case 10:
+			p := 0
+			for n := uleb(sec, &p); n > 0; n-- {
+				sz := uleb(sec, &p)
+				bodies = append(bodies, sec[p:p+sz])
+				p += sz
+			}
+		}
+		at += size
+	}
+	return imports, bodies
 }
 
 // newSetFindCtxWithSkip builds the batch worker's context — the one that does
@@ -1147,7 +1417,7 @@ func TestSetEmitUnionScanTableLayouts(t *testing.T) {
 			// And the module built from it: the emitter runs at assembly time,
 			// so the geometry agreeing is only half the check.
 			cfg := config.BuildConfig{
-				Regexps: setEmitCovEntries(testCase.patterns),
+				Patterns: setEmitCovEntries(testCase.patterns),
 				Sets: []config.SetConfig{{
 					Name: "s", ScanAny: "s_scan_any", ScanAll: "s_scan_all",
 					Find:     "s_find",
@@ -1315,7 +1585,7 @@ func TestSetEmitPrefixCheckPerPatternGuard(t *testing.T) {
 
 	// And the module: the emitter runs at assembly time.
 	cfg := config.BuildConfig{
-		Regexps: setEmitCovEntries(patterns),
+		Patterns: setEmitCovEntries(patterns),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find",
 			Patterns: config.PatternSelector{All: true},
@@ -1464,7 +1734,7 @@ func TestSetEmitJumpProfitabilityIgnoresUnrecoverablePattern(t *testing.T) {
 		fe: frontendScalar,
 		buckets: []*bucket{{
 			isFallback: true,
-			patterns:   []*PatternInfo{{fullPattern: `(unclosed`, globalID: 0}},
+			patterns:   []*PatternInfo{{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`), globalID: 0}},
 		}},
 	}
 	if unrecoverable.jumpIsProfitable() {
@@ -1493,7 +1763,7 @@ func TestSetEmitJumpProfitabilityIgnoresUnrecoverablePattern(t *testing.T) {
 func setCoreCovAnalyze(t *testing.T, pattern string) *PatternInfo {
 	t.Helper()
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern(%q): %v", pattern, err)
 	}
@@ -1507,7 +1777,7 @@ func setCoreCovAnalyzeAll(t *testing.T, patterns ...string) []*PatternInfo {
 	var prefixPool, suffixPool dfaPool
 	infos := make([]*PatternInfo, len(patterns))
 	for i, pattern := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -1634,12 +1904,12 @@ func TestSetCorePatternASTHelpersOnUnparseablePattern(t *testing.T) {
 	// parsed it once already, so a failure here means the string was rewritten
 	// between the two — the helpers answer nil and the packers drop the
 	// pattern with a diagnostic rather than dereferencing.
-	broken := &PatternInfo{fullPattern: `(unclosed`}
-	if got := patternSuffixAST(broken); got != nil {
-		t.Errorf("patternSuffixAST on an unparseable pattern = %v, want nil", got)
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`)}
+	if got := patternSuffixAST(broken); got.re != nil {
+		t.Errorf("patternSuffixAST on an unparseable pattern = %v, want nil", got.re)
 	}
-	if got := patternFullAST(broken); got != nil {
-		t.Errorf("patternFullAST on an unparseable pattern = %v, want nil", got)
+	if got := patternFullAST(broken); got.re != nil {
+		t.Errorf("patternFullAST on an unparseable pattern = %v, want nil", got.re)
 	}
 }
 
@@ -1684,7 +1954,7 @@ func TestSetCoreMergeSuffixDFASparseSetRejects(t *testing.T) {
 	}
 	// maxPatternsPerBucket is the sparse form's own ceiling; the u16 accept
 	// lists cannot address past it.
-	if _, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
+	if _, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
 		t.Error("mergeSuffixDFASparseSet past maxPatternsPerBucket returned no error")
 	}
 
@@ -1692,7 +1962,7 @@ func TestSetCoreMergeSuffixDFASparseSetRejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, _, err := mergeSuffixDFASparseSet(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, _, err := mergeSuffixDFASparseSet(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeSuffixDFASparseSet over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -1708,7 +1978,7 @@ func TestSetCoreMergeAnchoredDFARejects(t *testing.T) {
 	}
 	// The anchored bitmask form is capped by bitmaskWidth exactly as the find
 	// one is: bit k of the returned mask IS bucket-local index k.
-	if _, err := mergeAnchoredDFA(asts, CompileSetOptions{BitmaskWidth: 2}); err == nil {
+	if _, err := mergeAnchoredDFA(byteTrees(asts), CompileSetOptions{BitmaskWidth: 2}); err == nil {
 		t.Error("mergeAnchoredDFA past bitmaskWidth returned no error")
 	}
 
@@ -1716,7 +1986,7 @@ func TestSetCoreMergeAnchoredDFARejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, err := mergeAnchoredDFA(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, err := mergeAnchoredDFA(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeAnchoredDFA over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -1730,7 +2000,7 @@ func TestSetCoreMergeAnchoredDFASparseSetRejects(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `a`)
 	}
-	if _, _, err := mergeAnchoredDFASparseSet(asts, CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
+	if _, _, err := mergeAnchoredDFASparseSet(byteTrees(asts), CompileSetOptions{MaxPatternsPerBucket: 2}); err == nil {
 		t.Error("mergeAnchoredDFASparseSet past maxPatternsPerBucket returned no error")
 	}
 
@@ -1738,7 +2008,7 @@ func TestSetCoreMergeAnchoredDFASparseSetRejects(t *testing.T) {
 		mustParse(t, setCoreCovOversizedPair[0]),
 		mustParse(t, setCoreCovOversizedPair[1]),
 	}
-	if _, _, err := mergeAnchoredDFASparseSet(big, CompileSetOptions{}); err != ErrDFAStateLimit {
+	if _, _, err := mergeAnchoredDFASparseSet(byteTrees(big), CompileSetOptions{}); err != ErrDFAStateLimit {
 		t.Errorf("mergeAnchoredDFASparseSet over the helper state limit: err = %v, want ErrDFAStateLimit", err)
 	}
 }
@@ -1792,7 +2062,7 @@ func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
 	// handling (noOwnDFA) rather than carrying its own.
 	for _, pat := range []string{`[a-z]{1000}[0-9]{1000}[a-z]{1000}`, `x[ab]*a[ab]{11}c`} {
 		var prefixPool, suffixPool dfaPool
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("%s: analyzePattern failed instead of routing to Backtracking: %v", pat, err)
 		}
@@ -1808,9 +2078,9 @@ func TestSetCoreAnalyzePatternStateLimits(t *testing.T) {
 
 	// In a set it lands on a Backtracking bucket, not in an error.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "chain", Pattern: `[a-z]{1000}[0-9]{1000}[a-z]{1000}`},
-			{Name: "zz", Pattern: `zz`},
+		Patterns: []config.PatternEntry{
+			{Name: "chain", Regexp: `[a-z]{1000}[0-9]{1000}[a-z]{1000}`},
+			{Name: "zz", Regexp: `zz`},
 		},
 		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sa", Patterns: config.PatternSelector{All: true}}},
 	}
@@ -1916,10 +2186,11 @@ func TestSetCoreCompileFallbackIsolatedAdmittedToBT(t *testing.T) {
 
 // TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses is the NEGATIVE half
 // of the test above: when the DFA path cannot serve a member and Backtracking
-// refuses it too — past maxBTFallbackInstructions — the member is dropped, with
-// a warning and a StateLimitDropped entry, never kept in a bucket that cannot
-// answer for it. Both of admitOrDropFallback's reasons: no DFA at all, and a
-// DFA over max_fallback_states.
+// refuses it too — past max_bt_instructions — the set does not compile: the
+// member fits no engine, the error names it and the limits, and it is never
+// kept in a bucket that cannot answer for it, nor dropped. All three of
+// admitFallback's reasons: no DFA at all, a DFA over max_dfa_states, and a DFA
+// that would lose a boundary branch's priority.
 func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 	// 21 × Q{1000} puts the program past 20,000 instructions in an alternative
 	// that dies on its first byte, so the DFA's states stay cheap to build.
@@ -1935,8 +2206,8 @@ func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 	}{
 		// Non-greedy, so isolated; its own merge has 2^12 states.
 		{"own-dfa-unbuildable", `x*?[ab]*a[ab]{11}X|` + manyInsts, CompileSetOptions{}},
-		// A ~1000-state DFA over a 100-state max_fallback_states.
-		{"over-max-fallback-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
+		// A ~1000-state DFA over a 100-state max_dfa_states.
+		{"over-max-dfa-states", strings.Join(alts, "|"), CompileSetOptions{MaxFallbackStates: 100}},
 		// Its DFA loses the `\B` branch's priority, so there is no DFA to
 		// fall back to; 20,001 assertions put its program past 20,000
 		// instructions without adding a DFA state.
@@ -1954,15 +2225,24 @@ func TestSetCoreCompileFallbackDropsWhatBacktrackingRefuses(t *testing.T) {
 			buf, restore := captureWarnings(t)
 			defer restore()
 			diag := &SetDiag{Name: tc.name}
-			buckets := compileFallback([]*PatternInfo{info}, tc.opts, diag)
+			opts := tc.opts
+			opts.fail = &setFailure{}
+			buckets := compileFallback([]*PatternInfo{info}, opts, diag)
 			if len(buckets) != 0 {
-				t.Errorf("%d buckets, want the member dropped", len(buckets))
+				t.Errorf("%d buckets, want none: the member fits no engine", len(buckets))
 			}
-			if len(diag.StateLimitDropped) != 1 {
-				t.Errorf("StateLimitDropped = %v, want the member", diag.StateLimitDropped)
+			err := opts.fail.err
+			if !errors.Is(err, ErrSetMemberFitsNoEngine) || !errors.Is(err, ErrBTProgramTooLarge) {
+				t.Fatalf("failure = %v, want ErrSetMemberFitsNoEngine (and ErrBTProgramTooLarge)", err)
 			}
-			if !strings.Contains(buf.String(), "Pattern dropped from set") {
-				t.Errorf("no drop warning; got %q", buf.String())
+			if !strings.Contains(err.Error(), "raise max_bt_instructions to at least") {
+				t.Errorf("the error does not name the limit to raise: %v", err)
+			}
+			if wantDFAKey := tc.name != "boundary-ambiguous"; strings.Contains(err.Error(), "max_dfa_states") != wantDFAKey {
+				t.Errorf("the error names max_dfa_states = %v, want %v: %v", !wantDFAKey, wantDFAKey, err)
+			}
+			if strings.Contains(buf.String(), "Pattern dropped from set") {
+				t.Errorf("a member that fits no engine was dropped (%q), not refused", buf.String())
 			}
 		})
 	}
@@ -1993,9 +2273,6 @@ func TestSetCoreCompileFallbackNewBucketDFAUnbuildable(t *testing.T) {
 
 	if len(buckets) != 1 || buckets[0].btFallback == nil {
 		t.Fatalf("expected one Backtracking bucket, got %d buckets", len(buckets))
-	}
-	if len(diag.StateLimitDropped) != 0 {
-		t.Errorf("an admitted pattern was recorded as dropped: StateLimitDropped = %v", diag.StateLimitDropped)
 	}
 	if out := buf.String(); strings.Contains(out, "Pattern dropped from set") {
 		t.Errorf("a BT-admitted pattern must not warn about being dropped; got %q", out)
@@ -2220,7 +2497,7 @@ func TestSetCorePromoteSparseBucketsRefusesNewlineBoundary(t *testing.T) {
 	in := []*bucket{setCoreCovBucketOf(infos[0]), setCoreCovBucketOf(infos[1])}
 
 	merged, _, err := mergeSuffixDFASparseSet(
-		[]*syntax.Regexp{patternSuffixAST(infos[0]), patternSuffixAST(infos[1])},
+		[]resolvedTree{patternSuffixAST(infos[0]), patternSuffixAST(infos[1])},
 		CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
@@ -2244,109 +2521,88 @@ func TestSetCorePromoteSparseBucketsRefusesNewlineBoundary(t *testing.T) {
 // --------------------------------------------------------------------------
 // compileAnchoredBuckets
 
-func TestSetCoreCompileAnchoredBucketsDropsUnparseable(t *testing.T) {
-	// Defensive, but not silent: analyzePattern parsed the string once, so a
-	// failure here means it was rewritten. A bare `continue` would drop the
-	// pattern from the anchored trio while `find` kept it, with nothing in
-	// --diag-json to explain the disagreement.
-	broken := &PatternInfo{fullPattern: `(unclosed`}
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-unparseable"}
-	buckets, members := compileAnchoredBuckets([]*PatternInfo{broken}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 || len(members) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+func TestSetCoreCompileAnchoredBucketsUnparseableIsAnError(t *testing.T) {
+	// Defensive, but not silent: the member was parsed once, so a failure
+	// here means it was rewritten — and leaving it out of the anchored pair
+	// while `find` kept it would be a silent drop. It fails the compile.
+	broken := &PatternInfo{fullPattern: `(unclosed`, rp: bytePat(`(unclosed`)}
+	opts := CompileSetOptions{fail: &setFailure{}}
+	buckets, members, bt := compileAnchoredBuckets([]*PatternInfo{broken}, opts, &SetDiag{Name: "anchored-unparseable"})
+	if len(buckets) != 0 || len(members) != 0 || len(bt) != 0 {
+		t.Fatalf("got %d buckets / %d member lists / %d Backtracking buckets, want none", len(buckets), len(members), len(bt))
 	}
-	if len(diag.UnparseableDropped) != 1 {
-		t.Errorf("drop not recorded in --diag-json: UnparseableDropped = %v", diag.UnparseableDropped)
-	}
-	if out := buf.String(); !strings.Contains(out, "Pattern dropped from set") {
-		t.Errorf("silent drop: slog output was %q", out)
+	if !errors.Is(opts.fail.err, ErrSetMemberFitsNoEngine) {
+		t.Fatalf("error %v, want ErrSetMemberFitsNoEngine", opts.fail.err)
 	}
 }
 
 // setCoreCovAnchoredUnbuildable is a FuzzSetCaps crasher's own member.
 // Its solo anchored DFA hits maxHelperDFAStates INSIDE mergeAnchoredDFA, so
 // that call returns an error rather than an oversized table — the arm where
-// there is no state count to report and max_fallback_states is not the limit
-// that bound anything.
+// there is no state count to report.
 var setCoreCovAnchoredUnbuildable = "|0..+0.........\".\x00\x10$"
 
-func TestSetCoreCompileAnchoredBucketsUnbuildableIsScopedAndHonest(t *testing.T) {
-	info := setCoreCovAnalyze(t, setCoreCovAnchoredUnbuildable)
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-unbuildable"}
-	buckets, members := compileAnchoredBuckets([]*PatternInfo{info}, CompileSetOptions{}, diag)
-
-	if len(buckets) != 0 || len(members) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets / %d member lists", len(buckets), len(members))
+// A member whose anchored DFA cannot be built — construction stops at the
+// cap, or the finished DFA is over max_dfa_states — answers match_any /
+// match_all through a Backtracking bucket over its WHOLE pattern, with a
+// warning naming the limit that bound it and --diag-json listing it. With
+// Backtracking off it fails the compile, naming both limits.
+func TestSetCoreCompileAnchoredBucketsOverLimitRunsOnBacktracking(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		pattern string
+		opts    CompileSetOptions
+		states  string
+		limit   string
+	}{
+		{"construction cap", setCoreCovAnchoredUnbuildable, CompileSetOptions{}, "", fmt.Sprintf("limit=%d", maxHelperDFAStates)},
+		{"over max_dfa_states", `[a-z]{40}`, CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, "states=", "limit=4"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			info := setCoreCovAnalyze(t, c.pattern)
+			buf, restore := captureWarnings(t)
+			defer restore()
+			diag := &SetDiag{Name: "anchored-bt"}
+			opts := c.opts
+			opts.fail = &setFailure{}
+			buckets, _, bt := compileAnchoredBuckets([]*PatternInfo{info}, opts, diag)
+			if opts.fail.err != nil {
+				t.Fatal(opts.fail.err)
+			}
+			if len(buckets) != 0 || len(bt) != 1 || bt[0].btFallback == nil || bt[0].patterns[0] != info {
+				t.Fatalf("got %d DFA buckets / %d Backtracking buckets, want 0 / 1 holding the member", len(buckets), len(bt))
+			}
+			// The WHOLE pattern, not the post-literal suffix find runs on.
+			whole, _ := compileProg(patternFullAST(info))
+			if got, want := len(bt[0].btFallback.bt.prog.Inst), len(whole.prog.Inst); got != want {
+				t.Errorf("Backtracking program has %d instructions, the whole pattern's has %d", got, want)
+			}
+			if len(diag.AnchoredBacktracking) != 1 {
+				t.Errorf("--diag-json AnchoredBacktracking = %v, want the member", diag.AnchoredBacktracking)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "Set member runs on Backtracking: its anchored DFA") || strings.Contains(out, "Pattern dropped from set") {
+				t.Errorf("warning %q", out)
+			}
+			if !strings.Contains(out, c.limit) || (c.states != "" && !strings.Contains(out, c.states)) {
+				t.Errorf("warning should name %q %q: %q", c.states, c.limit, out)
+			}
+		})
 	}
-	// The ANCHORED capabilities lose it and scan_any/scan_all/find keep
-	// it, so it must NOT land in StateLimitDropped, which the find packers use
-	// to mean "gone from the set entirely". A consumer reading one field for
-	// both excluded a pattern scan_any correctly reported.
-	if len(diag.AnchoredStateLimitDropped) != 1 {
-		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
-			diag.AnchoredStateLimitDropped)
-	}
-	if len(diag.StateLimitDropped) != 0 {
-		t.Errorf("anchored-only drop recorded as a whole-set drop: StateLimitDropped = %v",
-			diag.StateLimitDropped)
-	}
-	// The message used to be "suffix DFA exceeds state limit ...
-	// states=0 limit=1024" with a "raise max_fallback_states" hint — a size the
-	// pattern never reached and a knob that cannot change the outcome, since
-	// what bound the build is the hard-coded maxHelperDFAStates.
-	out := buf.String()
-	if !strings.Contains(out, "Pattern dropped from set") {
-		t.Fatalf("silent drop: slog output was %q", out)
-	}
-	if strings.Contains(out, "max_fallback_states") {
-		t.Errorf("warning still points at max_fallback_states, which cannot change this outcome: %q", out)
-	}
-	if !strings.Contains(out, fmt.Sprintf("limit=%d", maxHelperDFAStates)) {
-		t.Errorf("warning should name the limit that actually bound the build (%d): %q",
-			maxHelperDFAStates, out)
-	}
-}
-
-func TestSetCoreCompileAnchoredBucketsOverFallbackLimitKeepsItsMessage(t *testing.T) {
-	// The other arm of the same switch, and the reason the message is a split
-	// rather than a rewrite: here the DFA BUILDS and is genuinely over
-	// max_fallback_states, so the size and the knob in the message are both
-	// true and the wording must not change.
-	info := setCoreCovAnalyze(t, `[a-z]{40}`)
-
-	buf, restore := captureWarnings(t)
-	defer restore()
-
-	diag := &SetDiag{Name: "anchored-over-limit"}
-	buckets, _ := compileAnchoredBuckets([]*PatternInfo{info},
-		CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20}, diag)
-
-	if len(buckets) != 0 {
-		t.Fatalf("expected the pattern dropped; got %d buckets", len(buckets))
-	}
-	if len(diag.AnchoredStateLimitDropped) != 1 {
-		t.Errorf("anchored-only drop not recorded: AnchoredStateLimitDropped = %v",
-			diag.AnchoredStateLimitDropped)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "exceeds state limit") {
-		t.Errorf("the over-limit arm should still say so: %q", out)
-	}
-	if !strings.Contains(out, "limit=4") {
-		t.Errorf("warning should name max_fallback_states as given: %q", out)
-	}
-	if strings.Contains(out, "states=0") {
-		t.Errorf("this arm has a real state count and must report it: %q", out)
-	}
+	t.Run("Backtracking off", func(t *testing.T) {
+		info := setCoreCovAnalyze(t, `[a-z]{40}`)
+		info.rp.lim.btInsts = -1
+		opts := CompileSetOptions{MaxFallbackStates: 4, BudgetStates: 4, BudgetBytes: 1 << 20, fail: &setFailure{}}
+		buckets, _, bt := compileAnchoredBuckets([]*PatternInfo{info}, opts, &SetDiag{})
+		if len(buckets) != 0 || len(bt) != 0 {
+			t.Fatalf("got %d / %d buckets, want none", len(buckets), len(bt))
+		}
+		err := opts.fail.err
+		if !errors.Is(err, ErrSetMemberFitsNoEngine) || !strings.Contains(err.Error(), "match_any / match_all") ||
+			!strings.Contains(err.Error(), "max_bt_instructions") {
+			t.Fatalf("error %v, want ErrSetMemberFitsNoEngine for match_any / match_all naming max_bt_instructions", err)
+		}
+	})
 }
 
 func TestSetCoreCompileAnchoredBucketsMergeRefusalStartsNewBucket(t *testing.T) {
@@ -2355,7 +2611,7 @@ func TestSetCoreCompileAnchoredBucketsMergeRefusalStartsNewBucket(t *testing.T) 
 	// merge has to open a new bucket rather than reorder anything.
 	infos := setCoreCovAnalyzeAll(t, setCoreCovOversizedPair...)
 	opts := CompileSetOptions{MaxFallbackStates: 2048, BudgetStates: 2048, BudgetBytes: 1 << 20}
-	buckets, members := compileAnchoredBuckets(infos, opts, nil)
+	buckets, members, _ := compileAnchoredBuckets(infos, opts, nil)
 
 	if len(buckets) != 2 {
 		t.Fatalf("expected the anchored merge refused (2 buckets), got %d", len(buckets))
@@ -2498,12 +2754,12 @@ func TestSetCoreProbeBodyClampsBucketWidthTo32(t *testing.T) {
 	// eligible pattern seen" mask must be capped at 32 bits however many ids
 	// the bucket carries. binPack caps a bucket at 32 today, so this is
 	// reached by handing genAnchoredWASM a wider id vector directly.
-	table, err := mergeAnchoredDFA([]*syntax.Regexp{mustParse(t, `alpha`), mustParse(t, `beta`)},
+	table, err := mergeAnchoredDFA(byteTrees([]*syntax.Regexp{mustParse(t, `alpha`), mustParse(t, `beta`)}),
 		CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeAnchoredDFA: %v", err)
 	}
-	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40))
+	body, _, _, _, sparse := genAnchoredWASM(table, 0, 0, setCoreCovIDs(40), false, false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM emitted no body for a 40-id bucket")
 	}
@@ -2516,7 +2772,7 @@ func TestSetCoreGenAnchoredWASMEmptyTable(t *testing.T) {
 	// An empty bucket DFA still needs a callable probe: the anchored capability
 	// bodies call every bucket in turn with no nil check, so the degenerate
 	// case has to be a function returning 0, not a missing one.
-	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2))
+	body, dataBytes, segCount, next, sparse := genAnchoredWASM(nil, 4096, 0, setCoreCovIDs(2), false, false)
 	if len(body) == 0 {
 		t.Fatal("genAnchoredWASM(nil) emitted no body")
 	}
@@ -2528,6 +2784,43 @@ func TestSetCoreGenAnchoredWASMEmptyTable(t *testing.T) {
 	}
 	if sparse != nil {
 		t.Error("an empty table must not report sparse anchored info")
+	}
+}
+
+// TestSetProbeRunSkips: a scan probe takes a run skip for every state its
+// table loops over whole characters in — past the two non-accepting dominants a
+// layout keeps — and leaves out a state with a zero-width newline or word
+// accept, whose per-byte check reads the bytes a skip would jump.
+func TestSetProbeRunSkips(t *testing.T) {
+	probe := func(t *testing.T, pattern string, unicode, newline bool) ([]byte, *dfaLayout) {
+		t.Helper()
+		tbl := compileTestDFAMode(t, pattern, unicode)
+		l := buildDFALayout(dfaLayoutParams{t: tbl, utf8Text: unicode, forceNewline: newline})
+		p := setSuffixParams{
+			l: l, patternIDs: []int{0},
+			wasmStart: uint32(tbl.startState + 1), wasmMidStart: uint32(tbl.midStartState + 1),
+			hasNewlineBoundary: newline,
+		}
+		return buildSetProbeBodyExit(p, false, probeExitMaskComplete), l
+	}
+	// Three value loops: the layout keeps two, the probe skips all three
+	// (each skip emits the open-tail table twice, in its loop and its tail).
+	body, l := probe(t, `a[^&,]+&|b[^,;]+;|c[^<>]+<`, true, false)
+	if len(l.dominantStates) != 2 {
+		t.Fatalf("the layout kept %d dominants, want the two its encoding allows", len(l.dominantStates))
+	}
+	if got := bytes.Count(body, utf8OpenTail[:]); got != 6 {
+		t.Errorf("the scan probe carries %d open-tail tables, want 6 (three character skips)", got)
+	}
+	// A loop whose state may accept before a newline, `(?m)$`: no skip at all.
+	// (A word-boundary accept never reaches here: the word/non-word split
+	// halves every self-loop below the dominant threshold.)
+	body, l = probe(t, `(?m)x[^&,]*$`, false, true)
+	if len(l.dominantStates) == 0 {
+		t.Fatal("the precondition failed: no dominant state to leave out")
+	}
+	if bytes.Contains(body, []byte{0xFD, 0x00, 0x00, 0x00}) {
+		t.Error("the scan probe skips over a state with a newline accept")
 	}
 }
 
@@ -2576,18 +2869,18 @@ func TestSetCoreFirstByteSetGivesUpSafely(t *testing.T) {
 	// The table must OVER-approximate: a pattern wrongly cleared is a lost
 	// match. Both give-up paths therefore answer nil ("assume every byte")
 	// rather than an empty or partial set.
-	if got := firstByteSet(`(unclosed`); got != nil {
+	if got := firstByteSet(bytePat(`(unclosed`)); got != nil {
 		t.Error("firstByteSet on an unparseable pattern returned a set; it must give up")
 	}
 	// A non-ASCII first rune is encoded as several bytes and what leads it is
 	// a UTF-8 lead byte, not the rune. Deriving that is out of scope for a
 	// byte-oriented engine, so the whole pattern gives up.
-	if got := firstByteSet("étude"); got != nil {
+	if got := firstByteSet(bytePat("étude")); got != nil {
 		t.Error("firstByteSet on a non-ASCII first rune returned a set; it must give up")
 	}
 	// The positive control: a plain ASCII first byte is derivable, and only
 	// that byte may be set.
-	set := firstByteSet(`keyword`)
+	set := firstByteSet(bytePat(`keyword`))
 	if set == nil {
 		t.Fatal("firstByteSet(keyword) gave up on a derivable ASCII first byte")
 	}
@@ -2609,7 +2902,7 @@ func TestSetCoreBuildStartableTableDeclines(t *testing.T) {
 
 	wide := &bucket{patterns: make([]*PatternInfo, 33)}
 	for i := range wide.patterns {
-		wide.patterns[i] = &PatternInfo{fullPattern: `keyword`}
+		wide.patterns[i] = &PatternInfo{fullPattern: `keyword`, rp: bytePat(`keyword`)}
 	}
 	if got := buildStartableTable(wide); got != nil {
 		t.Error("buildStartableTable on a 33-pattern bucket returned a table; bits past 31 have no home")
@@ -2617,7 +2910,7 @@ func TestSetCoreBuildStartableTableDeclines(t *testing.T) {
 
 	// The positive control, so the two nils above cannot pass for the table
 	// having been switched off entirely.
-	narrow := &bucket{patterns: []*PatternInfo{{fullPattern: `keyword`}, {fullPattern: `[0-9]+`}}}
+	narrow := &bucket{patterns: []*PatternInfo{{fullPattern: `keyword`, rp: bytePat(`keyword`)}, {fullPattern: `[0-9]+`, rp: bytePat(`[0-9]+`)}}}
 	tab := buildStartableTable(narrow)
 	if tab == nil {
 		t.Fatal("buildStartableTable declined a bucket with a derivable first byte")
@@ -2652,7 +2945,7 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `suffix`+string(rune('a'+i%26))+string(rune('a'+i/26)))
 	}
-	table, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	table, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
 	}
@@ -2728,14 +3021,14 @@ func TestSetCoreSparseSuffixBodySubtractsFixedPrefix(t *testing.T) {
 
 // setPlusPatternsConfig is a BuildConfig with BOTH a set and standalone
 // patterns chosen to select the specialised emitters.
-func setPlusPatternsConfig(extra []config.RegexEntry, hints []string) config.BuildConfig {
-	base := []config.RegexEntry{
-		{Name: "s0", Pattern: `alpha[0-9]{3}`},
-		{Name: "s1", Pattern: `bravo[0-9]{3}`},
-		{Name: "s2", Pattern: `charlie[0-9]{3}`},
+func setPlusPatternsConfig(extra []config.PatternEntry, hints []string) config.BuildConfig {
+	base := []config.PatternEntry{
+		{Name: "s0", Regexp: `alpha[0-9]{3}`},
+		{Name: "s1", Regexp: `bravo[0-9]{3}`},
+		{Name: "s2", Regexp: `charlie[0-9]{3}`},
 	}
 	return config.BuildConfig{
-		Regexps: append(base, extra...),
+		Patterns: append(base, extra...),
 		Sets: []config.SetConfig{{
 			Name:     "s",
 			Find:     "s_find",
@@ -2748,7 +3041,7 @@ func setPlusPatternsConfig(extra []config.RegexEntry, hints []string) config.Bui
 func TestSetAssemblerPerPatternBodies(t *testing.T) {
 	cases := []struct {
 		name    string
-		entries []config.RegexEntry
+		entries []config.PatternEntry
 		exports []string
 	}{
 		{
@@ -2756,14 +3049,14 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// plus ONE dispatcher built at assembly time from indices that do
 			// not exist before then.
 			name: "alt lit anchor dispatcher",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name: "alt",
 				// The branches need an UNBOUNDED suffix. A bounded one is
 				// caught earlier by analyseLitChainAltPrefixed and never
 				// reaches the alt-lit-anchor block at all — see
 				// TestCompileAltLitAnchorDispatch, which learned the same
 				// thing the same way.
-				Pattern:  `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`,
+				Regexp:   `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`,
 				FindFunc: "alt_find",
 			}},
 			exports: []string{"alt_find", "s_find"},
@@ -2772,9 +3065,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// Lit-anchor: a backward DFA recovers the match start, and the
 			// forward half is generated at assembly time too.
 			name: "lit anchor pair",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "mail",
-				Pattern:  `[a-z]+@example\.com`,
+				Regexp:   `[a-z]+@example\.com`,
 				FindFunc: "mail_find",
 			}},
 			exports: []string{"mail_find", "s_find"},
@@ -2783,9 +3076,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// A capture body beside a set: the groups wrapper composes a find
 			// and a capture function, both indexed by the set assembler.
 			name: "groups wrapper",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:       "grp",
-				Pattern:    `<([a-z]+)>`,
+				Regexp:     `<([a-z]+)>`,
 				GroupsFunc: "grp_groups",
 			}},
 			exports: []string{"grp_groups", "s_find"},
@@ -2794,9 +3087,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// An anchored match body, which takes the assembler's matchBody
 			// arm rather than any find arm.
 			name: "match only",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:      "m",
-				Pattern:   `[0-9]{4}-[0-9]{2}`,
+				Regexp:    `[0-9]{4}-[0-9]{2}`,
 				MatchFunc: "m_match",
 			}},
 			exports: []string{"m_match", "s_find"},
@@ -2813,9 +3106,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// mandatory literal, or there is no dense switch to escape and no
 			// twin to emit (TestFindNeutralTwinEmission pins that predicate).
 			name: "prefer-no-match find twin",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "tw",
-				Pattern:  `[a-zA-Z]{20,}`,
+				Regexp:   `[a-zA-Z]{20,}`,
 				FindFunc: "tw_find",
 				Hints:    []string{"prefer-no-match"},
 			}},
@@ -2825,9 +3118,9 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 			// Batch wrappers beside a set: a second entry point over the same
 			// body, whose index the assembler also has to resolve.
 			name: "batch find",
-			entries: []config.RegexEntry{{
+			entries: []config.PatternEntry{{
 				Name:     "b",
-				Pattern:  `[a-z]+@example\.com`,
+				Regexp:   `[a-z]+@example\.com`,
 				FindFunc: "b_find",
 				Hints:    []string{"batch-find"},
 			}},
@@ -2862,8 +3155,8 @@ func TestSetAssemblerPerPatternBodies(t *testing.T) {
 // which is the set half of the reporting path: SetDiag records rendered beside
 // per-pattern ones.
 func TestSetAssemblerWithReporter(t *testing.T) {
-	cfg := setPlusPatternsConfig([]config.RegexEntry{{
-		Name: "mail", Pattern: `[a-z]+@example\.com`, FindFunc: "mail_find",
+	cfg := setPlusPatternsConfig([]config.PatternEntry{{
+		Name: "mail", Regexp: `[a-z]+@example\.com`, FindFunc: "mail_find",
 	}}, nil)
 	rep := &Reporter{}
 	if _, _, diags, err := CompileFileDiag(cfg, ""); err != nil {
@@ -2895,13 +3188,13 @@ func TestSetAssemblerWithReporter(t *testing.T) {
 // the bytes the shared emitter produces at the pattern's real function index
 // catches both, without a WASM parser.
 func TestSetAssemblerFindTwinHandoff(t *testing.T) {
-	entry := config.RegexEntry{
+	entry := config.PatternEntry{
 		Name:     "tw",
-		Pattern:  `[a-zA-Z]{20,}`,
+		Regexp:   `[a-zA-Z]{20,}`,
 		FindFunc: "tw_find",
 		Hints:    []string{"prefer-no-match"},
 	}
-	cfg := setPlusPatternsConfig([]config.RegexEntry{entry}, nil)
+	cfg := setPlusPatternsConfig([]config.PatternEntry{entry}, nil)
 	w, _, _, err := CompileFileOpts(cfg, "", CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -2922,7 +3215,7 @@ func TestSetAssemblerFindTwinHandoff(t *testing.T) {
 	// they compile to nothing here and the twin is the module's first — and
 	// only — standalone pattern.
 	base := 0
-	for _, e := range cfg.Regexps[:len(cfg.Regexps)-1] {
+	for _, e := range cfg.Patterns[:len(cfg.Patterns)-1] {
 		q, cErr := compilePattern(e, 0, 0, CompileOptions{})
 		if cErr != nil {
 			t.Fatalf("compilePattern(%s): %v", e.Name, cErr)
@@ -2959,11 +3252,12 @@ func TestSetAssemblerFindTwinHandoff(t *testing.T) {
 }
 
 // btABISet builds a one-set config declaring the capabilities the `_all` ABI
-// switch touches. maxFallback = 1 forces its fallback members onto BT.
+// switch touches. maxFallback = 1 forces its fallback members onto BT — and,
+// with the anchored pair declared, every member's anchored probe too.
 func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildConfig) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name: "s", MatchAll: "s_match_all", ScanAll: "s_scan_all",
@@ -2971,29 +3265,35 @@ func btABISet(pats []string, maxFallback int) (config.SetConfig, config.BuildCon
 		Patterns: config.PatternSelector{All: true},
 	}
 	return sc, config.BuildConfig{
-		Regexps: entries, MaxFallbackStates: maxFallback,
+		Patterns: entries, MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{sc},
 	}
 }
 
 // compileBTABISet compiles the set and hands back the artefact, so a test can
-// ask what the emitter actually decided rather than infer it.
-func compileBTABISet(t *testing.T, pats []string, maxFallback int) *compiledSet {
+// ask what the emitter actually decided rather than infer it. anchored = false
+// leaves the anchored pair out, so its Backtracking probes cannot be what
+// selects the wide `_all` form.
+func compileBTABISet(t *testing.T, pats []string, maxFallback int, anchored bool) *compiledSet {
 	t.Helper()
 	sc, cfg := btABISet(pats, maxFallback)
-	var prefixPool, suffixPool dfaPool
-	idxs := make([]int, len(cfg.Regexps))
-	for i := range idxs {
-		idxs[i] = i
+	if !anchored {
+		sc.MatchAll = ""
+		cfg.Sets[0].MatchAll = ""
 	}
-	infos, gids, err := setPatternInfos(sc, cfg, idxs, &prefixPool, &suffixPool)
+	var prefixPool, suffixPool dfaPool
+	members := make([]config.SetMember, len(cfg.Patterns))
+	for i, e := range cfg.Patterns {
+		members[i] = config.SetMember{Entry: e, ID: i}
+	}
+	infos, gids, err := setPatternInfos(sc, members, cfg, &prefixPool, &suffixPool, nil)
 	if err != nil {
 		t.Fatalf("setPatternInfos: %v", err)
 	}
 	spec := SetSpec{
 		Name: sc.Name, MatchAll: sc.MatchAll, ScanAll: sc.ScanAll,
 		ScanAny: sc.ScanAny, Find: sc.Find,
-		DeclaredPatternCount: len(cfg.Regexps), IDSpaceSize: len(cfg.Regexps),
+		DeclaredPatternCount: len(cfg.Patterns), IDSpaceSize: len(cfg.Patterns),
 		Patterns: infos, PatternIDs: gids,
 	}
 	return CompileSet(spec, &prefixPool, &suffixPool,
@@ -3016,7 +3316,7 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	// see the end of this test).
 	pats := []string{`(?:ab|cd)+`, `hello`}
 
-	plain := compileBTABISet(t, pats, 0)
+	plain := compileBTABISet(t, pats, 0, true)
 	if plain.hasBTMember() {
 		t.Fatal("no BT member expected at the default limit; the rest of this test is meaningless")
 	}
@@ -3024,12 +3324,15 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 		t.Error("a set with no BT member and a 2-id space must keep the narrow i64 _all form")
 	}
 
-	bt := compileBTABISet(t, pats, 1)
-	if !bt.hasBTMember() {
+	// Without the anchored pair, so the find side's Backtracking bucket is the
+	// only Backtracking in the set (TestAnchoredBacktrackingForcesWideAll
+	// covers the anchored probes).
+	bt := compileBTABISet(t, pats, 1, false)
+	if !bt.hasBTMember() || len(bt.anchoredBT) != 0 {
 		// Failing to build the required fixture is a failure, not a skip:
 		// without a BT member there is no wide-_all arm left to assert, and a
 		// skip would make this ABI regression test silently vacuous.
-		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
+		t.Fatal("max_fallback_states=1 admitted no find-side BT member; the forced-BT " +
 			"fixture no longer builds and the wide-_all arm is untested")
 	}
 	if !bt.wideAll() {
@@ -3039,7 +3342,9 @@ func TestSetBTForcesMemoryAllABI(t *testing.T) {
 	// A member that is not linear leaves its Backtracking bucket for a split
 	// member on the Backtracking find, and the form must STAY wide: the stub
 	// generator decides it from the unsplit packing (SetAdmitsBacktracking).
-	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1)
+	// Without the anchored pair, whose probes would select the wide form
+	// whatever the split does.
+	split := compileBTABISet(t, []string{`(?:ab|cd)+xyz`, `hello`}, 1, false)
 	if split.hasBTMember() || len(split.split) == 0 || split.split[0].bt == nil {
 		t.Fatal("`(?:ab|cd)+xyz` under max_fallback_states=1 should be a Backtracking split member")
 	}
@@ -3058,7 +3363,7 @@ func TestSetBTDisablesTwoPhaseSplit(t *testing.T) {
 	// A literal-bearing pattern and a literal-less one: the mixed shape the
 	// split exists for.
 	pats := []string{`hello[0-9]{3}`, `(?:ab|cd)+`}
-	bt := compileBTABISet(t, pats, 1)
+	bt := compileBTABISet(t, pats, 1, false)
 	if !bt.hasBTMember() {
 		t.Fatal("max_fallback_states=1 admitted no BT member; the forced-BT " +
 			"fixture no longer builds and the split-suppression arm is untested")
@@ -3088,11 +3393,11 @@ func TestSetBTDisablesTwoPhaseSplit(t *testing.T) {
 func TestMemberSkipIsVisibleAndHintGated(t *testing.T) {
 	// 40 patterns behind one shared literal, each with a one-byte self-loop
 	// tail — the shape that packs into a single sparse bucket.
-	eligible := make([]config.RegexEntry, 40)
+	eligible := make([]config.PatternEntry, 40)
 	for i := range eligible {
-		eligible[i] = config.RegexEntry{
-			Name:    fmt.Sprintf("p%d", i),
-			Pattern: fmt.Sprintf(`union[ \t]+k%02da+`, i),
+		eligible[i] = config.PatternEntry{
+			Name:   fmt.Sprintf("p%d", i),
+			Regexp: fmt.Sprintf(`union[ \t]+k%02da+`, i),
 		}
 	}
 	// Same shape, but the tail self-loop is \w — 63 bytes. Under the old
@@ -3100,17 +3405,17 @@ func TestMemberSkipIsVisibleAndHintGated(t *testing.T) {
 	// oversized and only the shared `[ \t]+` run stayed eligible. The
 	// rectangle cover spends a bit per nibble ROW instead, so \w is one pair
 	// like every other class and those forty states are now served too.
-	wide := make([]config.RegexEntry, 40)
+	wide := make([]config.PatternEntry, 40)
 	for i := range wide {
-		wide[i] = config.RegexEntry{
-			Name:    fmt.Sprintf("p%d", i),
-			Pattern: fmt.Sprintf(`union[ \t]+k%02d\w+`, i),
+		wide[i] = config.PatternEntry{
+			Name:   fmt.Sprintf("p%d", i),
+			Regexp: fmt.Sprintf(`union[ \t]+k%02d\w+`, i),
 		}
 	}
 
-	count := func(entries []config.RegexEntry, hints []string) int {
+	count := func(entries []config.PatternEntry, hints []string) int {
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{{
 				Name:     "s",
 				Find:     "s_find",
@@ -3232,7 +3537,7 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 		for b := 0; b < width; b++ {
 			tbl.transitions[1*256+b] = 1 // global state 1 self-loops on `width` bytes
 		}
-		idTab, setTab := buildMemberSets(tbl, 3)
+		idTab, setTab, _ := buildMemberSets(tbl, 3, false)
 		if len(setTab) != memberSetBytes {
 			t.Fatalf("width %d: got %d table bytes, want one set of %d",
 				width, len(setTab), memberSetBytes)
@@ -3263,7 +3568,7 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 	for i := range tbl.transitions {
 		tbl.transitions[i] = -1
 	}
-	if idTab, setTab := buildMemberSets(tbl, 3); idTab != nil || setTab != nil {
+	if idTab, setTab, _ := buildMemberSets(tbl, 3, false); idTab != nil || setTab != nil {
 		t.Error("a table with no self-loop state produced member tables")
 	}
 }
@@ -3283,10 +3588,10 @@ func TestMemberSetsAdmitWide(t *testing.T) {
 // disagree. These tests pin BOTH directions: the downgrade is reported, and a
 // set with no fallback bucket still reports its real literal frontend.
 
-func diagFrontendEntries(pats []string) []config.RegexEntry {
-	out := make([]config.RegexEntry, len(pats))
+func diagFrontendEntries(pats []string) []config.PatternEntry {
+	out := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		out[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: p}
+		out[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: p}
 	}
 	return out
 }
@@ -3294,7 +3599,7 @@ func diagFrontendEntries(pats []string) []config.RegexEntry {
 func diagFrontendFor(t *testing.T, pats []string) string {
 	t.Helper()
 	cfg := config.BuildConfig{
-		Regexps: diagFrontendEntries(pats),
+		Patterns: diagFrontendEntries(pats),
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find",
 			Patterns: config.PatternSelector{All: true},
@@ -3355,5 +3660,147 @@ func TestEmittedFrontendMatchesSelectionWithoutFallback(t *testing.T) {
 					"when no fallback bucket is present", got)
 			}
 		})
+	}
+}
+
+// TestSetNeverDropsAMember pins the set's side of the limits: a member no
+// engine takes fails the compile, naming itself and the limits; written zeros
+// mean what the config says; a groups_func entry is a member; and the two
+// set sizes reach the packers.
+func TestSetNeverDropsAMember(t *testing.T) {
+	cfgOf := func(pats []string, set config.SetConfig) config.BuildConfig {
+		set.Name, set.Patterns = "s", config.PatternSelector{All: true}
+		return config.BuildConfig{Patterns: setEmitCovEntries(pats), Sets: []config.SetConfig{set}}
+	}
+	// 2^13 states, over byte mode's 2,048-state build cap; its Backtracking
+	// program is about 20 instructions (`(?:a|b)` is one class), so a
+	// 5-instruction limit refuses it too.
+	huge := `(?:a|b)*a(?:a|b){12}c`
+	cfg := cfgOf([]string{huge, `foo`}, config.SetConfig{Find: "f"})
+	cfg.MaxBTInstructions = 5
+	_, _, err := CompileFile(cfg, "")
+	if !errors.Is(err, ErrSetMemberFitsNoEngine) || !errors.Is(err, ErrBTProgramTooLarge) {
+		t.Fatalf("a member no engine takes: err = %v, want ErrSetMemberFitsNoEngine", err)
+	}
+	for _, w := range []string{`"p00"`, "max_bt_instructions (5)", "raise max_bt_instructions to at least", "max_dfa_states"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error lacks %q: %v", w, err)
+		}
+	}
+	if err := CmdWriteDiagJSON(cfg, "", filepath.Join(t.TempDir(), "d.json")); !errors.Is(err, ErrSetMemberFitsNoEngine) {
+		t.Errorf("--diag-json on that config: err = %v, want the same refusal", err)
+	}
+	if SetAdmitsBacktracking(cfg.Sets[0], cfg) {
+		t.Error("a set that does not compile was predicted to admit Backtracking")
+	}
+	cfg.MaxBTInstructions = config.LimitOff
+	if _, _, err := CompileFile(cfg, ""); err == nil || !strings.Contains(err.Error(), "Backtracking is off (max_bt_instructions: 0)") {
+		t.Errorf("max_bt_instructions: 0: err = %v, want Backtracking named as off", err)
+	}
+
+	// max_dfa_states: 0 — every member on Backtracking, the literal one
+	// included, and no warning about what the config asked for.
+	buf, restore := captureWarnings(t)
+	off := cfgOf([]string{`foo\d+`, `[a-z]+@x`}, config.SetConfig{Find: "f", ScanAny: "sa"})
+	off.MaxDFAStates = config.LimitOff
+	_, _, diags, err := CompileFileDiag(off, "")
+	restore()
+	if err != nil {
+		t.Fatalf("max_dfa_states: 0: %v", err)
+	}
+	for _, b := range diags[0].Buckets {
+		if b.Type != "bt-fallback" {
+			t.Errorf("max_dfa_states: 0 left bucket %+v off Backtracking", b)
+		}
+	}
+	if strings.Contains(buf.String(), "runs on Backtracking") {
+		t.Errorf("warned about Backtracking the config asked for: %q", buf.String())
+	}
+
+	// A groups_func entry is a member: its captures are stripped for the set.
+	groups := cfgOf(nil, config.SetConfig{Find: "f"})
+	groups.Patterns = []config.PatternEntry{
+		{Name: "url", Regexp: `(https?)://([^/]+)`, GroupsFunc: "url_groups"},
+		{Name: "num", Regexp: `[0-9]+`},
+	}
+	_, _, diags, err = CompileFileDiag(groups, "")
+	if err != nil {
+		t.Fatalf("groups_func member: %v", err)
+	}
+	inBucket := false
+	for _, b := range diags[0].Buckets {
+		for _, p := range b.Patterns {
+			inBucket = inBucket || p.Name == "url"
+		}
+	}
+	if !inBucket {
+		t.Errorf("the groups_func entry is in no bucket: %+v", diags[0].Buckets)
+	}
+
+	// max_set_bucket_size: 0 — no two members share a bucket.
+	shared := cfgOf([]string{`foo[a-z]+`, `foo[0-9]+`}, config.SetConfig{Find: "f"})
+	buckets := func(cfg config.BuildConfig) int {
+		_, _, d, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(d[0].Buckets)
+	}
+	if n := buckets(shared); n != 1 {
+		t.Fatalf("two members behind one literal: %d buckets, want 1", n)
+	}
+	if shared.MaxSetBucketSize, err = config.ParseMemorySize("0"); err != nil {
+		t.Fatal(err)
+	}
+	if n := buckets(shared); n != 2 {
+		t.Errorf("max_set_bucket_size: 0: %d buckets, want 2", n)
+	}
+
+	// max_split_table_size: 0 — every split member takes the Backtracking
+	// search. `[a-z]*@[0-9]+` is split (its walks can cross candidates).
+	split := cfgOf([]string{`\w+@\w+`, `ghp_[0-9a-z]{8}`}, config.SetConfig{Find: "f"})
+	splitBT := func(cfg config.BuildConfig) (members, bt int) {
+		_, _, d, err := CompileFileDiag(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(d[0].SplitMembers), len(d[0].SplitBacktracking)
+	}
+	if m, bt := splitBT(split); m == 0 || bt != 0 {
+		t.Fatalf("default budget: %d split members, %d on Backtracking; want some, none", m, bt)
+	}
+	if split.MaxSplitTableSize, err = config.ParseMemorySize("0"); err != nil {
+		t.Fatal(err)
+	}
+	if m, bt := splitBT(split); bt != m {
+		t.Errorf("max_split_table_size: 0: %d of %d split members on Backtracking, want all", bt, m)
+	}
+}
+
+// TestBinPackSendsAnUnbuildableLiteralMemberToFallback covers the literal
+// packer's last refusal: a member whose own suffix DFA cannot be built when it
+// opens a bucket goes to the fallback packer WHOLE — a copy, unsplit — where
+// Backtracking takes it; the shared PatternInfo is left as it was.
+func TestBinPackSendsAnUnbuildableLiteralMemberToFallback(t *testing.T) {
+	info := setCoreCovAnalyze(t, `fooab`)
+	if !info.splittable || info.mandLit == nil {
+		t.Fatal("`fooab` should be a literal member")
+	}
+	// A suffix whose automaton needs 2^13 states, past byte mode's cap.
+	re, err := syntax.Parse(`(?:a|b)*a(?:a|b){12}c`, syntax.Perl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.suffixAST = re
+	opts := (CompileSetOptions{}).resolvedFor(SetSpec{Patterns: []*PatternInfo{info}})
+	buckets := binPack([]*PatternInfo{info}, opts, &SetDiag{})
+	if opts.fail.err != nil {
+		t.Fatalf("the member fits Backtracking: %v", opts.fail.err)
+	}
+	if len(buckets) != 1 || buckets[0].btFallback == nil || buckets[0].literal != "" {
+		t.Fatalf("buckets = %+v, want one Backtracking fallback bucket", buckets)
+	}
+	if !info.splittable || info.noOwnDFA {
+		t.Error("the shared PatternInfo was changed; the fallback needs a copy")
 	}
 }

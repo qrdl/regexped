@@ -443,9 +443,9 @@ func TestSetComponentCacheGeometry(t *testing.T) {
 		WasmFormat:   "component",
 		ImportModule: "t",
 		WitPackage:   "t",
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: `[^\n]*[0-2]`},
-			{Name: "p1", Pattern: `[^\n]*[3-5]`},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: `[^\n]*[0-2]`},
+			{Name: "p1", Regexp: `[^\n]*[3-5]`},
 		},
 		Sets: []config.SetConfig{{
 			Name:        "s",
@@ -577,9 +577,9 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil, nil)
 
 	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
 		if len(body) == 0 {
@@ -618,12 +618,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -677,25 +677,42 @@ func TestPackedPairSplatCount(t *testing.T) {
 // so a zero-length literal has no such column, and the frontend chooser sizes
 // its budget on at most packedPairMaxLiterals members.
 func TestChoosePackedPairRefusals(t *testing.T) {
-	if _, ok := choosePackedPair(nil); ok {
+	if _, ok := choosePackedPair(nil, false); ok {
 		t.Error("an empty literal set produced a packed-pair plan")
 	}
 	tooMany := make([][]byte, packedPairMaxLiterals+1)
 	for i := range tooMany {
 		tooMany[i] = []byte{byte('a' + i%26), 'x', 'y', 'z'}
 	}
-	if _, ok := choosePackedPair(tooMany); ok {
+	if _, ok := choosePackedPair(tooMany, false); ok {
 		t.Errorf("%d literals produced a plan; the cap is %d",
 			len(tooMany), packedPairMaxLiterals)
 	}
 	withEmpty := [][]byte{[]byte("abcd"), {}, []byte("efgh")}
-	if _, ok := choosePackedPair(withEmpty); ok {
+	if _, ok := choosePackedPair(withEmpty, false); ok {
 		t.Error("a zero-length literal produced a plan; it has no byte for either probe column")
 	}
 	// The positive control, so the refusals above are evidence of a working
 	// gate rather than of a function that never succeeds.
-	if _, ok := choosePackedPair([][]byte{[]byte("abcd"), []byte("abce")}); !ok {
+	if _, ok := choosePackedPair([][]byte{[]byte("abcd"), []byte("abce")}, false); !ok {
 		t.Error("two ordinary 4-byte literals were refused")
+	}
+	// Unicode mode: Cyrillic literals fit the budget only on their lead-byte
+	// columns (D0/D1), which select nearly every Cyrillic character — refused,
+	// and the chooser takes Teddy. The same bytes in byte mode, and ASCII
+	// literals in Unicode mode, keep their pair.
+	cyr := [][]byte{[]byte("привет"), []byte("москва"), []byte("собака"), []byte("город")}
+	if p, ok := choosePackedPair(cyr, true); ok {
+		t.Errorf("Unicode mode: a pair over lead bytes was chosen: %+v", p)
+	}
+	if fe := chooseLiteralFrontend(cyr, true); fe != frontendTeddy {
+		t.Errorf("Unicode mode: Cyrillic keywords took %v, want Teddy", fe)
+	}
+	if _, ok := choosePackedPair(cyr, false); !ok {
+		t.Error("byte mode: the lead-byte refusal applied outside Unicode mode")
+	}
+	if _, ok := choosePackedPair([][]byte{[]byte("abcd"), []byte("abce")}, true); !ok {
+		t.Error("Unicode mode: two ASCII literals were refused")
 	}
 }
 
@@ -732,7 +749,7 @@ func shuftiCompiledSetOpts(t *testing.T, over func(*CompileSetOptions)) *compile
 	var ids []int
 	for i := 0; i < teddyMaxLiterals+1; i++ {
 		pat := fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i%len(alphabet)], i)
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -843,7 +860,7 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 	var patterns []*PatternInfo
 	var ids []int
 	for i, pat := range []string{`a+`, `[^\n]*ERROR`, `x?y`} {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pat, err)
 		}
@@ -881,9 +898,9 @@ func TestUnionAliveMaskEmits(t *testing.T) {
 // actually did.
 func TestSetAdmitsBacktracking(t *testing.T) {
 	pats := []string{`a+`, `[^\n]*ERROR`}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name: "s", MatchAll: "m_all", Find: "f",
@@ -891,13 +908,13 @@ func TestSetAdmitsBacktracking(t *testing.T) {
 	}
 
 	// A generous fallback budget: every member gets a DFA, so no BT.
-	roomy := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	roomy := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 	if SetAdmitsBacktracking(sc, roomy) {
 		t.Error("a set whose members all fit their DFA budget must not admit Backtracking")
 	}
 	// A budget no fallback DFA can meet: every member lands on BT.
 	cramped := config.BuildConfig{
-		Regexps: entries, Sets: []config.SetConfig{sc}, MaxFallbackStates: 1,
+		Patterns: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: 1,
 	}
 	if !SetAdmitsBacktracking(sc, cramped) {
 		t.Error("max_fallback_states = 1 must push these members onto Backtracking")
@@ -933,6 +950,7 @@ func TestFindFromModeString(t *testing.T) {
 		{ffLegacyNarrow, "legacy-narrow"},
 		{ffNative, "native"},
 		{ffAnchoredZeroOnly, "anchored-zero-only"},
+		{ffNativeUTF8, "native-utf8"},
 		{findFromMode(0), "UNSET"},
 		{findFromMode(99), "UNSET"},
 	} {
@@ -1040,8 +1058,8 @@ func TestNeedsUnicodeSupportExported(t *testing.T) {
 // Backtracking and compare — which is only meaningful if the override is
 // actually honoured, and nothing here checked that it was.
 func TestCompileForcedSelectsTheNamedEngine(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Name: "p", Pattern: `(a+)(b+)`, GroupsFunc: "p_groups"},
+	entries := []config.PatternEntry{
+		{Name: "p", Regexp: `(a+)(b+)`, GroupsFunc: "p_groups"},
 	}
 	for _, forced := range []EngineType{EngineTDFA, EngineBacktrack} {
 		wasm, _, err := CompileForced(entries, 65536, true, forced)
@@ -1069,7 +1087,7 @@ func TestCompileForcedSelectsTheNamedEngine(t *testing.T) {
 func TestFindFromWrapperBodyAllModes(t *testing.T) {
 	// minLen 0 and 11 both, since a non-zero one adds the early exit and that
 	// arm has its own `end` to get right.
-	for _, mode := range []findFromMode{ffLegacyNarrow, ffNative, ffAnchoredZeroOnly} {
+	for _, mode := range []findFromMode{ffLegacyNarrow, ffNative, ffAnchoredZeroOnly, ffNativeUTF8} {
 		for _, minLen := range []int32{0, 11} {
 			t.Run(fmt.Sprintf("%v/minLen=%d", mode, minLen), func(t *testing.T) {
 				checkFindFromWrapperBody(t, mode, minLen)
@@ -1080,7 +1098,7 @@ func TestFindFromWrapperBodyAllModes(t *testing.T) {
 
 func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
 	{
-		body := buildFindFromWrapperBody(7, mode, minLen, nil)
+		body := buildFindFromWrapperBody(7, mode, minLen, nil, nil)
 		if len(body) == 0 {
 			t.Fatalf("mode %v: emitted nothing", mode)
 		}
@@ -1102,6 +1120,114 @@ func checkFindFromWrapperBody(t *testing.T, mode findFromMode, minLen int32) {
 	}
 }
 
+// TestStartRule pins which Unicode start rule a pattern needs: none when it
+// cannot match empty (or is in byte mode), the seed's rounding when it can,
+// and the per-candidate check when an empty match through `\B` can fall
+// inside a character — which an assertion that fixes the position (`^`, `$`,
+// `\A`, `\z`, their multi-line forms) or contradicts `\B` (`\b`) rules out.
+func TestStartRule(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		want startRule
+	}{
+		{`a+`, startRuleNone},
+		{`é`, startRuleNone},
+		{`a*`, startRuleSeed},
+		{`(?:)`, startRuleSeed},
+		{`\b`, startRuleSeed},
+		{`(?m)^`, startRuleSeed},
+		{`\B`, startRuleScan},
+		{`a|\B`, startRuleScan},
+		{`(?:x|\B)?`, startRuleScan},
+		{`(\B)`, startRuleScan},
+		{`^\B`, startRuleSeed},
+		{`\B$`, startRuleSeed},
+		{`(?m)\B$`, startRuleSeed},
+		{`\b\B`, startRuleSeed},
+		{`\Ba`, startRuleNone},
+		// A loop that consumes nothing revisits its own instructions.
+		{`(?:a?)*`, startRuleSeed},
+		{`(?:a?)*\B`, startRuleScan},
+	} {
+		if got := startRuleFor(unicodePat(c.pat)); got != c.want {
+			t.Errorf("startRuleFor(%q) = %d, want %d", c.pat, got, c.want)
+		}
+		if got := startRuleFor(bytePat(c.pat)); got != startRuleNone {
+			t.Errorf("startRuleFor(%q) in byte mode = %d, want none", c.pat, got)
+		}
+	}
+	if got := startRuleFor(unicodePat(`(`)); got != startRuleNone {
+		t.Errorf("a pattern that does not parse needs no rule, got %d", got)
+	}
+
+	// A body that keeps the rule its pattern needs passes; one that does not,
+	// or keeps one it does not need, is a build failure. A body that matches
+	// only at 0 needs none.
+	checkStartRule(startRuleNone, ffNative)
+	checkStartRule(startRuleSeed, ffNativeUTF8)
+	checkStartRule(startRuleScan, ffNativeUTF8)
+	checkStartRule(startRuleScan, ffAnchoredZeroOnly)
+	mustPanic(t, "does not keep its matches off positions inside a character", func() { checkStartRule(startRuleSeed, ffNative) })
+	mustPanic(t, "does not need", func() { checkStartRule(startRuleNone, ffNativeUTF8) })
+	mustPanic(t, "start-anywhere find", func() { startAnywhereStartLocals(newLocalAlloc(2), startRuleScan) })
+	if l := startAnywhereStartLocals(newLocalAlloc(2), startRuleNone); l != (utf8StartLocals{}) {
+		t.Errorf("no rule, but scratch locals %+v", l)
+	}
+	mustPanic(t, "mandatory-literal find body", func() {
+		buildFindBody(findBodyParams{startRule: startRuleSeed, mandatoryLit: &mandatoryLit{bytes: []byte("x")}})
+	})
+	mustPanic(t, "mandatory-literal Backtracking find", func() {
+		re, _ := syntax.Parse(`x`, syntax.Perl)
+		prog, _ := syntax.Compile(re)
+		bt := newBacktrack(byteProg(prog))
+		bt.startRule = startRuleSeed
+		buildBTFindBody(bt, prefixScanParams{}, &mandatoryLit{bytes: []byte("x")}, btNoCaptureFrameSize, 1, 0, false, nil,
+			&btGrowth{})
+	})
+}
+
+// TestUnicodeFindBodiesKeepTheStartRule compiles one Unicode-mode shape per
+// find body a pattern that can match empty reaches, and checks that the
+// pattern needs the rule it should and its find body claims it — the claim
+// checkStartRule holds the assemblers to. tools/fuzz's
+// TestUnicodeFindFromStartPositions checks the answers.
+func TestUnicodeFindBodiesKeepTheStartRule(t *testing.T) {
+	for _, c := range []struct {
+		pat       string
+		maxStates int
+		fallback  bool
+		rule      startRule
+	}{
+		{`a*`, 0, false, startRuleSeed},
+		{`\B`, 0, false, startRuleScan},
+		{`\pL*`, 0, false, startRuleSeed},
+		{`\pL*\b`, 0, false, startRuleSeed},
+		{`(?:é|a)*\b`, 0, false, startRuleSeed},
+		{`(?:é|a)*\B`, 0, false, startRuleScan},
+		{`\B`, 1, false, startRuleScan},
+		{`\pL*`, 1, false, startRuleSeed},
+		{`\B`, 1, true, startRuleScan},
+		{`\w+é`, 0, false, startRuleNone},
+	} {
+		o := CompileOptions{Unicode: true, MaxDFAStates: c.maxStates}
+		if c.fallback {
+			o.BTWorkBudget = BTWorkBudgetForceFallback
+		}
+		w, _, err := Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, 0, true, o)
+		if err != nil || len(w) == 0 {
+			t.Fatalf("%q: compile: %v", c.pat, err)
+		}
+		p, err := compilePattern(config.PatternEntry{Regexp: c.pat, FindFunc: "find"}, 0, 0,
+			CompileOptions{Unicode: true, MaxDFAStates: c.maxStates, BTWorkBudget: o.BTWorkBudget, globals: &moduleGlobals{}})
+		if err != nil {
+			t.Fatalf("%q: compilePattern: %v", c.pat, err)
+		}
+		if p.startRule != c.rule {
+			t.Errorf("%q: startRule %d, want %d", c.pat, p.startRule, c.rule)
+		}
+	}
+}
+
 // TestBuildFindFromWrapperBodyRejectsUnsetMode: findFromMode's zero value is
 // invalid ON PURPOSE, so an emitter that never claimed a mode must be a BUILD
 // failure rather than a silently wrong scan start. That is what the panic is
@@ -1116,7 +1242,7 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 			t.Errorf("panic message %q does not name the offending mode", msg)
 		}
 	}()
-	buildFindFromWrapperBody(7, findFromMode(0), 0, nil)
+	buildFindFromWrapperBody(7, findFromMode(0), 0, nil, nil)
 }
 
 // TestEmitFindCallFromPos covers the shared call sequence the BATCH wrappers
@@ -1128,9 +1254,9 @@ func TestBuildFindFromWrapperBodyRejectsUnsetMode(t *testing.T) {
 // anchored-zero-only mode emits MORE (it has to answer "no match" for pos != 0
 // without calling the body at all).
 func TestEmitFindCallFromPos(t *testing.T) {
-	native := emitFindCallFromPos(nil, 7, ffNative, 4, 5)
-	anchored := emitFindCallFromPos(nil, 7, ffAnchoredZeroOnly, 4, 5)
-	legacy := emitFindCallFromPos(nil, 7, ffLegacyNarrow, 4, 5)
+	native := emitFindCallFromPos(nil, 7, ffNative, 4, 5, nil)
+	anchored := emitFindCallFromPos(nil, 7, ffAnchoredZeroOnly, 4, 5, nil)
+	legacy := emitFindCallFromPos(nil, 7, ffLegacyNarrow, 4, 5, nil)
 	for name, got := range map[string][]byte{
 		"native": native, "anchored-zero-only": anchored, "legacy-narrow": legacy,
 	} {
@@ -1142,6 +1268,77 @@ func TestEmitFindCallFromPos(t *testing.T) {
 		t.Errorf("anchored-zero-only emitted %d bytes, native %d: the anchored mode "+
 			"must add the pos != 0 guard that answers without calling the body",
 			len(anchored), len(native))
+	}
+}
+
+// TestEmitFindBodyCallRoute pins the neutral-twin route's call shape: without
+// a route a bare call of the body; with one, a test of the byte at `from` that
+// picks between the TWIN (the body's index plus one) and the body, guarded by
+// `from < len` unless the caller says it ruled that out. A route on a mode
+// whose body does not read the channel cannot be honoured and must not build.
+func TestEmitFindBodyCallRoute(t *testing.T) {
+	route := &twinRoute{firstByteOff: 300, tableMemIdx: 1}
+	plain := emitFindBodyCall(nil, 7, nil, true)
+	if want := []byte{0x20, 0x00, 0x20, 0x01, 0x10, 0x07}; !bytes.Equal(plain, want) {
+		t.Errorf("no route: % x, want % x", plain, want)
+	}
+	routed := emitFindBodyCall(nil, 7, route, false)
+	guarded := emitFindBodyCall(nil, 7, route, true)
+	for name, b := range map[string][]byte{"routed": routed, "guarded": guarded} {
+		if !bytes.Contains(b, []byte{0x10, 0x08}) || !bytes.Contains(b, []byte{0x10, 0x07}) {
+			t.Errorf("%s: % x calls the twin (8) or the body (7) nowhere", name, b)
+		}
+	}
+	if len(guarded) <= len(routed) {
+		t.Errorf("guarded %d bytes, unguarded %d: the guard must add the from < len test", len(guarded), len(routed))
+	}
+	for _, m := range []findFromMode{ffLegacyNarrow, ffAnchoredZeroOnly} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: a route was accepted on a body that does not read the channel", m)
+				}
+			}()
+			buildFindFromWrapperBody(7, m, 0, nil, route)
+		}()
+	}
+}
+
+// TestTwinRouteForCallers pins WHICH caller of a prefer-no-match find takes
+// the route to its twin: a caller of the find body itself — the find wrapper
+// when nothing fronts the body — and, under a start-anywhere switch, only the
+// dispatcher, which is the one caller of today's find and the one that
+// consumes the switch sentinel the twin can answer. A neutral compile has no
+// twin and no route.
+func TestTwinRouteForCallers(t *testing.T) {
+	lnm := CompileOptions{LikelyMode: LikelyNoMatch}
+	find := func(pat string) config.PatternEntry { return config.PatternEntry{Regexp: pat, FindFunc: "find"} }
+	// The last two are tools/fuzz TestNeutralTwinRouteMatchesGo's guarded find
+	// and groups shapes: pinned here so that test cannot pass without a route.
+	for _, c := range []struct {
+		name           string
+		entry          config.PatternEntry
+		opts           CompileOptions
+		viaFind, today bool
+	}{
+		{"neutral", find(`[a-zA-Z]{8,}`), CompileOptions{}, false, false},
+		{"prefer-no-match", find(`[a-zA-Z]{8,}`), lnm, true, true},
+		{"prefer-no-match, switch", find(`[a-zA-Z]{8,}`), CompileOptions{LikelyMode: LikelyNoMatch, StartAnywhereSwitchN: 1}, false, true},
+		{"prefer-no-match, no length exit", find(`[a-zA-Z]+`), lnm, true, true},
+		{"prefer-no-match, groups", config.PatternEntry{Regexp: `([a-zA-Z]{8,})`, GroupsFunc: "groups"}, lnm, true, true},
+	} {
+		c.opts.globals = &moduleGlobals{}
+		p, err := compilePattern(c.entry, 0, 0, c.opts)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		_, _, findOff, _, _ := p.offsets()
+		if got := p.twinRouteFor(findOff) != nil; got != c.viaFind {
+			t.Errorf("%s: route for the find's callers = %v, want %v", c.name, got, c.viaFind)
+		}
+		if got := p.twinRouteFor(p.todayFindOff()) != nil; got != c.today {
+			t.Errorf("%s: route for today's find = %v, want %v", c.name, got, c.today)
+		}
 	}
 }
 
@@ -1394,7 +1591,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 		var prefixPool, suffixPool dfaPool
 		var out []*PatternInfo
 		for _, p := range pats {
-			info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1494,5 +1691,60 @@ func TestEmitterGuardsFire(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			mustPanic(t, c.want, func() { c.fn(t) })
 		})
+	}
+}
+
+// TestPrefixScanCharProbe pins when the hybrid prefix scan checks a literal's
+// whole first character on a hit: only for a Unicode-mode literal that begins
+// with a UTF-8 lead byte followed by a continuation byte. A byte_mode literal
+// with the same bytes keeps the scan it always had.
+func TestPrefixScanCharProbe(t *testing.T) {
+	for _, c := range []struct {
+		prefix string
+		utf8   bool
+		want   bool
+	}{
+		{"привет", true, true},
+		{"é1", true, true},
+		{"東京", true, true},
+		{"😀x", true, true},
+		{"привет", false, false},          // not Unicode-mode text
+		{"\xd0", true, false},             // one byte: no character to check
+		{"\xc0\x80", true, false},         // 0xC0 never leads a sequence
+		{"\xd0a", true, false},            // no continuation byte
+		{"ab", true, false},               // ASCII
+		{"\xf5\x80\x80\x80", true, false}, // past U+10FFFF
+	} {
+		p := prefixScanParams{Prefix: []byte(c.prefix), UTF8Text: c.utf8}
+		if got := p.charProbe(); got != c.want {
+			t.Errorf("charProbe(%q, UTF8Text %v) = %v, want %v", c.prefix, c.utf8, got, c.want)
+		}
+		if note := p.strategyNote(); strings.Contains(note, "first character checked") != c.want {
+			t.Errorf("strategyNote(%q, UTF8Text %v) = %q", c.prefix, c.utf8, note)
+		}
+	}
+	// Through a compile: a Unicode literal gets the check, the same bytes as
+	// a byte_mode literal do not.
+	for _, c := range []struct {
+		re   config.PatternEntry
+		opts CompileOptions
+		want bool
+	}{
+		{config.PatternEntry{Regexp: `привет\s+\pL+`, FindFunc: "f"}, CompileOptions{}, true},
+		{config.PatternEntry{Regexp: `\xd0\xbf\xd1\x80[0-9a-f]{300}`, FindFunc: "f", ByteMode: true}, CompileOptions{}, false},
+	} {
+		rep := &Reporter{}
+		c.opts.Report = rep
+		if _, _, err := Compile([]config.PatternEntry{c.re}, 65536, true, c.opts); err != nil {
+			t.Fatalf("Compile(%q): %v", c.re.Regexp, err)
+		}
+		var b bytes.Buffer
+		rep.Render(&b)
+		if !strings.Contains(b.String(), "prefix scan: hybrid SIMD") {
+			t.Fatalf("Compile(%q): no hybrid prefix scan, so the check is not exercised:\n%s", c.re.Regexp, b.String())
+		}
+		if got := strings.Contains(b.String(), "first character checked on a hit"); got != c.want {
+			t.Errorf("Compile(%q): first-character check reported %v, want %v:\n%s", c.re.Regexp, got, c.want, b.String())
+		}
 	}
 }

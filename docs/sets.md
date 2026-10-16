@@ -18,7 +18,7 @@ their positions and pattern IDs.
 ## Pipeline overview
 
 ```
-regexps: [p1, p2, ..., pN]
+patterns: [p1, p2, ..., pN]
             │
             ▼
     analyzePattern()       ← split each pattern at its mandatory literal
@@ -52,11 +52,11 @@ the machinery those questions require. The **key** names the capability; the
 **value** is the WASM export / generated-function name you choose.
 
 ```yaml
-regexps:
-  - name: aws_key          # name: required for sets.patterns list references
-    pattern: 'AKIA[0-9A-Z]{16}'
+patterns:
+  - name: aws_key          # name: required to select it by name from a set
+    regexp: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
-    pattern: 'ghp_[0-9a-zA-Z]{36}'
+    regexp: 'ghp_[0-9a-zA-Z]{36}'
 
 sets:
   - name: secret_scanner
@@ -76,6 +76,46 @@ sets:
 The grid: `match_*` is anchored, `scan_*` is not; `_any` is one arbitrary
 matching pattern, `_all` is every matching pattern. `find` is the only
 capability that reports positions and extents.
+
+### Members: top-level patterns and the set's own regexps
+
+A set's members come from two keys, and it needs at least one member from the
+two together:
+
+- **`patterns:`** selects entries of the top-level `patterns:` list: `all`
+  (every top-level pattern, named or not), or a list of their `name:` values.
+  An entry there is a PATTERN — a regexp plus optional metadata (a name, its
+  own exports, mode keys, hints).
+- **`regexps:`** lists bare regexps that belong to this set alone. Nothing
+  outside the set sees them: `patterns: all` in another set never includes
+  them. They take the set's own `unicode:` and `hints:`.
+
+```yaml
+patterns:
+  - name: aws_key
+    regexp: 'AKIA[0-9A-Z]{16}'
+
+sets:
+  - name: secrets
+    find: scan_secrets
+    patterns: [aws_key]
+    regexps: ['xox[baprs]-[0-9A-Za-z-]{10,48}']
+  - name: log_levels             # no top-level patterns needed at all
+    match_any: level_of
+    regexps: ['ERROR', 'WARN', 'INFO']
+```
+
+A config whose every regexp is inline needs no top-level `patterns:`; a config
+with no regexp anywhere is a load error.
+
+**Equivalent members are a load error.** Two members of one set that compile
+to the same program — selected by name, through `all`, or inline — are refused
+with a message naming both: `set "levels": regexp 'ERROR' and regexp
+'(?:ERROR)' are equivalent`. Capture groups do not count, since a set reports
+group 0 only. Identical programs give identical answers on every input, so the
+check never refuses two regexps a set could tell apart; it does not catch every
+pair that matches alike (`a+` and `aa*` compile differently). Top-level
+patterns are not checked against each other outside a set.
 
 At least one capability must be declared. Every capability value must be a
 valid identifier in all six stub languages (see
@@ -118,7 +158,8 @@ See [component.md](component.md#sets).
 
 A set's `name:` is yours, and so are the symbols derived from it —
 `<SET>_PATTERN_COUNT`, `<SET>_ID_SPACE`, `rx_<set>_scanner_t`,
-`<Set>PatternCount` — which `namespace:` does not prefix. Two stubs generated
+`<Set>PatternCount`, and the `emit_name_map` lookup `<set>_pattern_name` —
+which `namespace:` does not prefix. Two stubs generated
 into one package, or included in one C translation unit, therefore need distinct
 set names. Choosing them is up to you, as it is for func and capability names.
 
@@ -368,7 +409,7 @@ a drive can have arbitrarily many walks alive at once — some input of the form
 `W`×N starts a walk every few bytes that is still going at the end, as `foo\w+`
 over `foo`×N does, where `union[ \t]+[a-z]{3}` can match unboundedly long but
 no match holds the start of another — since otherwise every drive is linear
-already, and within these limits: at most `max_fallback_states` states and a
+already, and within these limits: at most `max_dfa_states` states and a
 projected column of at most 16,383 cells. A member the automaton cannot answer
 for exactly — a Backtracking or non-greedy member — is not a limit on the set:
 it is split out (see "Members that are not provably linear" below), the members
@@ -397,8 +438,11 @@ the rest: one backward pass over the member's own compiled program, one column
 per position, holding for every start the end of the member's leftmost-first
 match there — the per-position answer the overlapping `find` needs, which the
 member's own search can only give by walking from each start. It runs only once
-the member's searches have walked more than `4 × len + 64` bytes in the drive,
-so ordinary text pays for the counter alone; its answers live in the same
+the member's searches have walked more than `4 × len + 64` bytes in the drive
+(in Unicode mode `k × len + 64`, where k is the sweep's estimated cost per
+input byte counted in walked bytes: a lowered class makes the sweep thousands of
+times dearer per byte, and it must not be bought before the walks have spent
+as much), so ordinary text pays for the counter alone; its answers live in the same
 caller's region, after the cache, checkpointed exactly as the cache is. It
 supports every assertion (`\b`, `\B`, `^`, `$`, `(?m)`) and zero-width cycles.
 Measured over `{foo\w+, a[a-z]*?z}` and `a`×N + `z`: 131,456 → 795
@@ -425,9 +469,38 @@ effect.
 
 The empty-match rule follows Go's: after a match ending at `e` the next match
 may start at `e`, except an empty match exactly at `e` is skipped; after an
-empty match at `e` the search resumes past it. We advance by one **byte** where
-Go advances by one rune — the same byte-orientation the single-pattern stub
-iterators document.
+empty match at `e` the search resumes past it. In byte mode we advance by one
+**byte** where Go advances by one rune — the same byte-orientation the
+single-pattern stub iterators document. In Unicode mode the answers are Go's:
+see below.
+
+### Sets in Unicode mode
+
+A set runs in one mode, byte or Unicode, decided by its members and its own
+`unicode:` key — the rule is in [cli.md](cli.md#unicode--codepoint-mode). In
+Unicode mode every capability answers as Go does over valid UTF-8: no match
+starts, and no empty match is reported, inside a character, so `x*` over
+`"é"` reports `[0,0)` and `[2,2)` and never `[1,1)`, and `\B` — the one
+assertion that holds between two bytes of a character — counts only where a
+character starts. An `offset` inside a character is read as the start of the
+next one. This holds for every capability, both `find` policies, the batch
+entry and the answer cache. An invalid byte matches nothing (see
+[engines.md](engines.md#unicode-mode)).
+
+The rule costs nothing for a set whose members cannot match empty, which is
+nearly every set: a match that consumes a byte begins with an ASCII or a lead
+byte, never inside a character. A set with a member that can match empty
+checks, at each candidate position of that member's bucket, whether the
+position is inside a character — one byte load and compare where it is not.
+
+`max_dfa_states`, the state limit of every automaton — a set member's and a
+bucket's included — is 16,384 by default in Unicode mode (1,024 in byte
+mode): a lowered Unicode class costs hundreds of states, and a member over the
+limit runs on Backtracking, which measured up to 57 times dearer on
+mixed-script text — see [cli.md](cli.md#unicode--codepoint-mode). A member's
+automaton is BUILT up to the same limit, so a member that fits it gets its DFA:
+`.{0,870}` (7,832 states) used to stop at a fixed 2,048, and with its
+Backtracking program over 20,000 instructions the set compiled without it.
 
 ## The gate array
 
@@ -572,13 +645,17 @@ before. When one is not:
 A split member's search is its **start-anywhere find** — for a member with an
 assertion, the context passes that judge every assertion against the real
 neighbouring bytes — or, where that cannot be built (an automaton over
-`max_fallback_states` or the memory bound, or one that cannot represent an
+`max_dfa_states` or the memory bound, or one that cannot represent an
 assertion exactly), the **Backtracking find**, which memoises every
 (instruction, position) it tries and is linear per call too. A member the set
 had put on a Backtracking bucket is split out the same way: its bucket's
 memory of failed walks lasts one host call, so a drive whose other members
 match often would re-walk them on every call. Start-anywhere members are chosen
-smallest tables first while their tables total at most 4 MB; the rest take the
+smallest tables first while their tables total at most `max_split_table_size`
+(4 MB, 64 MB for a Unicode-mode set, whose tables are larger: 12 members like
+`\pL*\p{Greek}\pN{3}` put 5 on Backtracking at 4 MB, and their `find` cost
+872/904/132 instructions per byte over mixed-script, English and digit text,
+against 310/90/90 with all 12 on the start-anywhere find); the rest take the
 Backtracking find, whose own tables are a few scan bytes and which all share
 one frame stack. There is no limit on how many members are split.
 
@@ -642,8 +719,6 @@ does not fit what is left of the buffer ends the call, and is split across
 calls only when it does not fit an empty one — and gives its split members the
 program sweep.
 
-**Not split:** a member the compiler dropped from the set stays dropped.
-
 `--diag-json` reports all of it: `split_members` (the ids served outside the
 buckets), `split_backtracking` (those of them on the Backtracking find),
 `no_cache_split_members` (the members the no-cache companion splits out),
@@ -656,7 +731,7 @@ is the counter's switch target) and `in_call_counter`.
 
 | offset | field | type |
 |---|---|---|
-| 0 | `pattern_id` | i32 — index into `regexps:` in YAML order |
+| 0 | `pattern_id` | i32 — the member's pattern id (see [Pattern ids](#pattern-ids-and-the-two-emitted-constants)) |
 | 4 | `start` | i32 — absolute, same for every tuple in one call |
 | 8 | `end` | i32 — absolute (an END, not a length) |
 
@@ -684,9 +759,14 @@ the responsible buckets as `"bt-fallback"`.
 
 ### Pattern ids and the two emitted constants
 
-A `pattern_id` is the pattern's **global** index into `regexps:`, so a set that
-selects a subset does not renumber: a set holding the last two of seventy
-patterns reports ids 68 and 69. Two constants therefore accompany every set,
+A top-level pattern's `pattern_id` is its index into the top-level `patterns:`
+list, in YAML order, so a set that selects a subset does not renumber: a set
+holding the last two of seventy patterns reports ids 68 and 69. A set's own
+`regexps:` come after every top-level pattern and are numbered **per set**: with
+seventy top-level patterns, each set's first inline regexp is id 70, whatever
+the set selects, and editing one set's `regexps:` never renumbers another set.
+An id therefore means one pattern within its set, and the same inline id can
+mean different regexps in different sets. Two constants accompany every set,
 and they are not interchangeable:
 
 | constant | value | sizes |
@@ -694,8 +774,10 @@ and they are not interchangeable:
 | `<SET>_PATTERN_COUNT` | patterns in the set | the `find` tuple buffer (`out_cap`), and the width of the batch cursor's `k` field |
 | `<SET>_ID_SPACE` | largest reportable id + 1 | the gate array and the `_all` bitmask/bitmap. Which `_all` ABI is exported depends on it AND on whether the set has a Backtracking member — see above |
 
-For `patterns: all` — the common case — the two are equal. They diverge only
-for a named subset, and using the wrong one there is a memory-safety bug: the
+For `patterns: all` with no inline regexps — the common case — the two are
+equal. They diverge for a named subset and for a set with inline regexps that
+does not select every top-level pattern, and using the wrong one there is a
+memory-safety bug: the
 gate array is indexed by pattern id, so sizing it at the pattern count lets the
 module write past the caller's array. Both constants are emitted in all six
 stub languages, and every generated declaration is written in terms of the
@@ -718,8 +800,13 @@ splitting into several sets if its scan capabilities are hot. `--diag-json`
 reports which body a set got under `union_scan`; there is no other way to see
 it.
 
-`emit_name_map: true` additionally emits a `pattern_name(id)` helper mapping a
-pattern id back to its `name:` string.
+`emit_name_map: true` additionally emits the SET's own name lookup, named from
+the set like its constants — for a set `secrets`, `secrets_pattern_name` in
+Rust, `rx_secrets_pattern_name` in C, `SecretsPatternName` in Go and
+`secretsPatternName` in JS, TypeScript and AssemblyScript. It maps one of the
+set's pattern ids to that member's `name:`, and answers `""` for an unnamed
+pattern, an inline regexp, or an id the set does not hold. Each set gets its own
+because inline ids are numbered per set.
 
 ### `--diag-json` reports what the compiler chose
 
@@ -746,10 +833,19 @@ suffix DFAs within each group:
 |---|---|---|
 | Max patterns per bitmask bucket | 32 | `bitmask_width` (internal) |
 | Max patterns per sparse-set bucket | 4096 | `max_patterns_per_bucket` (internal) |
-| Max merged DFA table bytes | 64 KB | `budget_bytes` (internal) |
-| Max merged DFA states | 512 | `budget_states` (internal) |
-| Pre-filter (states × combined classes) | 65536 | `budget_states_prefilter` (internal) |
-| Max fallback-bucket DFA states | 1024 | `max_fallback_states` (top-level config key) |
+| Max merged DFA states | 1,024 (16,384 in Unicode mode) | `max_dfa_states` |
+| Max merged DFA table bytes | 128 bytes per state of that limit: 128 KB (2 MB in Unicode mode) | `max_set_bucket_size` |
+| Pre-filter (states × combined classes) | the table bytes' number | follows `max_set_bucket_size` (internal) |
+| Max fallback-bucket DFA states | 1,024 (16,384 in Unicode mode) | `max_dfa_states` |
+| Split members' start-anywhere tables, total | 4 MB (64 MB in Unicode mode) | `max_split_table_size` |
+
+Fewer, bigger buckets cost less per input byte, since each bucket is a walk of
+its own: on Unicode-mode sets, raising these limits from a fixed 512 states /
+64 KB to `max_dfa_states` took a 3-member set's `find` from 494 to 308
+instructions per byte (3 buckets → 2) and a 6-member set's from 836 to 444
+(6 → 3), with smaller modules and faster compiles. `max_set_bucket_size` and
+`max_split_table_size` are sizes, written like `max_memory` (`2MB`, `64MiB`);
+a written 0 is a real 0 — no merges, or no member on the start-anywhere find.
 
 A bucket holding more than 32 patterns switches its accept representation from
 a bitmask to a per-state LIST of pattern indices, which is what lets a group of
@@ -778,36 +874,32 @@ optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged
 into the same bucket, even if they'd otherwise fit — recorded as conflict
 reason `lm_counted_chain_split` in diagnostics.
 
-**Over `max_fallback_states`, a pattern changes engine.** A fallback bucket's
-own merged DFA is still subject to the `max_fallback_states` budget above; a
-pattern that would push it over that limit is not merged but moved onto the
-Backtracking engine, in a bucket of its own — see [When a set member falls back
-to Backtracking](#when-a-set-member-falls-back-to-backtracking). It still
-matches, at Backtracking's cost, and it switches the set's `match_all` and
-`scan_all` to the `out_ptr` form. Check `--diag-json` for `"bt-fallback"`
-buckets, and raise `max_fallback_states` to keep such a pattern on a DFA.
+**Over `max_dfa_states`, a pattern changes engine.** A fallback bucket's own
+merged DFA is still subject to `max_dfa_states`; a pattern that would push it
+over that limit is not merged but moved onto the Backtracking engine, in a
+bucket of its own — see [When a set member falls back to
+Backtracking](#when-a-set-member-falls-back-to-backtracking). It still matches,
+at Backtracking's cost, and it switches the set's `match_all` and `scan_all` to
+the `out_ptr` form. Check `--diag-json` for `"bt-fallback"` buckets, and raise
+`max_dfa_states` to keep such a pattern on a DFA.
 
-A member the FIND-path packers could not place at all would be absent from
-those capabilities and recorded in `state_limit_dropped`; the build still
-succeeds, so a pipeline that only checks the exit code would ship a set that
-under-reports — read the warning, or `state_limit_dropped`.
+**A set never compiles without a member it selected.** A member no engine
+takes — its DFA over `max_dfa_states` and its Backtracking program over
+`max_bt_instructions` — fails the compile, and the error names the member and
+both limits, with the value that would let it compile. It used to be left out
+of `find` and the scan pair with a warning, and the build succeeded: `.{0,870}`
+in a Unicode-mode set (7,832 states, 21,752 Backtracking instructions) was
+dropped that way while the same pattern compiled on its own, and listed in
+`--diag-json`'s `state_limit_dropped`, which is gone with the drops.
 
-**Which capabilities a drop removes it from.** A pattern the FIND-path packers
-drop is gone from `find` and the scan pair; the anchored pair is packed
-separately, from the unfiltered pattern list, so `match_any` and `match_all`
-still answer for it. The reverse also happens and is worth stating plainly:
-
-**Backtracking members and the anchored pair.** A pattern whose suffix DFA
-exceeds `max_fallback_states` can be rescued onto the Backtracking engine for
-`find` and the scan pair. The ANCHORED packing admits no Backtracking member —
-it has no BT bucket path at all — so such a pattern is silently absent from
-`match_any` and `match_all`. `--diag-json` shows it in both places: in a
-`bt-fallback` bucket, and in `anchored_state_limit_dropped` for the anchored
-packing. That is a SEPARATE array from `state_limit_dropped`, which means the
-pattern left the set entirely — here it is still answered by `find` and the
-scan pair.
-If your set needs the anchored pair to answer for every member, raise
-`max_fallback_states` until nothing is BT-rescued.
+**The anchored pair follows the same rule.** `match_any` and `match_all` are
+packed separately (see "The anchored capabilities use their own automata"),
+and a member whose anchored DFA is over `max_dfa_states` answers there through
+a Backtracking probe over the whole input, run after the DFA part — with a
+warning, and listed in `--diag-json`'s `anchored_backtracking`. One that
+Backtracking cannot take either fails the compile, naming the limits. Until
+2026-10-12 such a member was left out of `match_any` and `match_all` with a
+warning, and the build succeeded.
 
 ## Diagnostics
 
@@ -818,21 +910,23 @@ describing how patterns were placed:
 regexped compile --config=regexped.yaml --diag-json=diag.json
 ```
 
-The JSON contains `patterns_total`, `capture_bearing` (dropped from sets),
-`in_set` (patterns actually placed into a set), `prefix_dedup_pool_size`,
-and per-set `frontend`
+The JSON contains `patterns_total`, `in_set` (patterns actually placed into a
+set), `prefix_dedup_pool_size`, and per-set `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
-`conflicts`, `capture_bearing_dropped`, `state_limit_dropped` (patterns
-dropped for exceeding a fallback bucket's state budget — see
-[Bin-packing](#bin-packing-and-merge-constraints) above) and
-`anchored_state_limit_dropped` arrays.
+`conflicts` and `anchored_backtracking` arrays.
 
-The last two are not the same thing and a consumer must not merge them.
-`state_limit_dropped` means the pattern left the set ENTIRELY: no capability
-answers for it. `anchored_state_limit_dropped` means only the ANCHORED packing
-refused it, so `match_any` and `match_all` no longer see it while `scan_any`,
-`scan_all` and `find` still do. `unparseable_dropped` has the anchored-only
-scope too.
+`anchored_backtracking` lists the members whose anchored DFA could not be
+built, so `match_any` and `match_all` answer for them through Backtracking.
+Nothing leaves a set or a capability any more — a member no engine takes
+fails the compile — so the arrays that listed dropped members
+(`state_limit_dropped`, `anchored_state_limit_dropped`, `unparseable_dropped`)
+are gone.
+
+An entry with `groups_func` is a set member like any other: a set reports the
+whole match only, so its capture groups are stripped for the set, and its own
+`groups_func` export is unchanged. (Such entries used to be left out of every
+set that selected them, silently, and `--diag-json` listed them as
+`capture_bearing_dropped`.)
 
 If a set's frontend was **downgraded** from the one its literals selected, the
 per-set `frontend_demotion` object says so, with `from`, `to`, a machine-
@@ -905,7 +999,7 @@ anywhere in it — and takes the per-byte walk as before.
 | ≤64 distinct literals (≤16 when the shortest literal is 1 byte) | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch. For 9+ literals it uses two groups of 8 (`TwoGroups=true`), ORing two independent nibble probes per 16-byte chunk |
 | >16 distinct literals with low first-byte diversity | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
 | (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
-| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain. First-byte union 17–64, or 17–128 with the hint |
+| High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain (or, for a union of one or two contiguous byte ranges, two SIMD range compares per range: same answer, half the instructions). First-byte union 17–64, or 17–128 with the hint |
 | No mandatory literal at all | **Scalar** |
 
 Aho-Corasick's root-state prefilter skips ahead to the next position whose byte
@@ -913,6 +1007,24 @@ could begin some literal. With **1–3 distinct first bytes** it compares agains
 each in turn; with **4 or more** it uses the same nibble-table membership test
 as Shufti below, whose cost depends on the size of the first-byte *set* rather
 than growing with every literal added.
+
+In Unicode mode, when every literal begins with a non-ASCII character, the
+first byte is a UTF-8 lead byte that begins a large share of its script's
+characters (D0/D1 begin half of all Russian letters), so a first-byte probe
+would stop every byte or two. Such a set's root prefilter tests **two byte
+columns** instead — the pair with the fewest distinct bytes among the
+literals' first four, at least one not a lead byte; for a two-byte script,
+the whole first character — and each hit is **verified** before the trie
+walk: one `br_table` on the literals' most varied byte selects the literals
+that can start there, a compare chain tests them, and a match jumps straight
+to the literal's trie node unless another literal ends inside it first. No
+match skips the position. Over 40 KB of text with no match this is 3.5 fuel
+per byte against 28 for the first-byte probe when the text is in the
+keywords' script, and 7% less than the first-byte probe when it is not.
+`--diag-json`'s `ac_table` reports the two columns as `probe_columns` and the
+verify's as `verify_column`. In byte mode the same holds for `byte_mode`
+literals whose first byte is 0xC2–0xF4 — UTF-8 keywords written as bytes; an
+ASCII keyword set keeps the first-byte probe.
 
 ### Shufti — SIMD first-byte prefilter for the scalar case
 
@@ -1012,7 +1124,7 @@ disqualifies.
 
 ## When a set member falls back to Backtracking
 
-A set member whose fallback-bucket DFA exceeds `max_fallback_states` is not
+A set member whose fallback-bucket DFA exceeds `max_dfa_states` is not
 dropped: it is compiled on the **Backtracking engine** instead, so the member
 behaves like the same pattern compiled on its own. Backtracking is the only
 engine here not bound by a compiled table size — it walks the NFA with an
@@ -1028,25 +1140,40 @@ route, this switches the set's `match_all` and `scan_all` to the `out_ptr` form.
 Unlike it, the member stays in `match_any` and `match_all`, whose whole-input
 answer does not depend on which branch wins.
 
-A member whose own DFA cannot be built at all goes to Backtracking too, as the
-same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a` needs 2^13
-states, past the internal limit of 2,048 on one member's set automaton, and
-`max_fallback_states` cannot raise that limit. Such a member used to fail the
-whole set's compile. Like the `max_fallback_states` route, it is absent from
-`match_any` and `match_all` (`anchored_state_limit_dropped`, with its own
-warning) and switches `match_all` and `scan_all` to the `out_ptr` form.
+A member whose own DFA cannot be built within the limit goes to Backtracking
+too, as the same pattern does compiled on its own: `(?:a|b)*a(?:a|b){12}c|a`
+needs 2^13 states. A member's automaton is built up to the larger of
+`max_dfa_states` and a construction cap (2,048 states in byte mode, 16,384 in
+Unicode mode), so raising `max_dfa_states` lets it finish. Like the other
+route, it switches `match_all` and `scan_all` to the `out_ptr` form.
 
-A member Backtracking cannot take either is still excluded, still warned
-about, and still recorded in `--diag-json`'s `state_limit_dropped` — for either
-reason above, since a DFA bucket would give the second kind wrong extents. No
-pattern is known to reach that any more: the main refusal left is the engine's
-instruction cap, and a member that large fails the whole set compile earlier.
-Buckets that were admitted appear in `--diag-json` as `"bt-fallback"`, with
+A member's ANCHORED automaton can be over the limit too — it is the whole
+pattern, without leftmost-first pruning, so it is often larger than the find
+path's — and then `match_any` and `match_all` answer for it through a
+Backtracking probe over the whole input: whole-input acceptance, so a
+derivation that stops short of the end backtracks into the next (`(?:x|xy)…`
+over `xy…` answers through its second branch). The probe runs after the
+anchored DFA part, so `match_any` returns a DFA member's hit without it; it
+costs what the same pattern costs as a Backtracking `match` on its own
+(`(?:a|b)*a(?:a|b){12}c` over `ab`×N + `x`: 279 fuel per byte alone, 282 in a
+set), linear in the input. Such a member, too, switches `match_all` and
+`scan_all` to the `out_ptr` form, whether or not `find` needs Backtracking.
+`--diag-json` lists it in `anchored_backtracking`, and the compile warns "Set
+member runs on Backtracking: its anchored DFA is over the state limit".
+
+A member Backtracking cannot take either — its program over
+`max_bt_instructions`, or Backtracking turned off with `max_bt_instructions: 0`
+— fits no engine, for either reason above (a DFA bucket would give the second
+kind wrong extents), and the set does not compile: the error names the member,
+why no DFA takes it, its program's size, and the limit to raise. With
+`max_dfa_states: 0` every member is put on Backtracking. Buckets that were
+admitted appear in `--diag-json` as `"bt-fallback"`, with
 `suffix_states` and `table_bytes` of 0 — they have no table — and `compile
 --verbose` prints their engine as `Backtracking`. Every compile also WARNS,
 once per such member and for every route onto Backtracking: "Set member runs
-on Backtracking: <reason>", with a hint for keeping it on a DFA. It is a
-warning, not a drop — the member still matches.
+on Backtracking: <reason>", with a hint for keeping it on a DFA — except under
+`max_dfa_states: 0`, which asked for it. It is a warning, not a drop — the
+member still matches.
 
 **What one costs.** Measured on a set of 15 ordinary patterns (credentials,
 log fields) plus ONE member routed here for word-boundary ambiguity,
@@ -1065,7 +1192,7 @@ would turn giving up into a confident wrong answer, so it gets its own channel:
 
 | capability | how "unknown" arrives |
 |---|---|
-| `scan_any` | the return is `-2`, distinct from `-1` for "no match" |
+| `scan_any`, `match_any` | the return is `-2`, distinct from `-1` for "no match" |
 | `match_all`, `scan_all` | these use the `out_ptr` form for this set at any id space, so the return is a count — and `-2` there is the sentinel |
 | `find` | the return is `-2` instead of a match count |
 | `find`'s batch entry | the cursor's resume-position word is `0xFFFFFFFE`, beside `0xFFFFFFFF` for "done", with a zero count |
@@ -1119,3 +1246,5 @@ bitmask form and none of these checks are emitted.
 - [examples/wasmtime/go/secret-scanner/](../examples/wasmtime/go/secret-scanner/) — `find`, secret detection (Go wasip1)
 - [examples/wasmtime/rust/secret-scanner/](../examples/wasmtime/rust/secret-scanner/) — `find` called directly from a native Rust host, gate array and all
 - [examples/fastedge/url-guard/](../examples/fastedge/url-guard/) — `scan_any`, URL rule matching (FastEdge)
+- [examples/fastedge/script-detect/](../examples/fastedge/script-detect/) — `find` and `match_all` over Unicode-mode patterns, script detection by letters (FastEdge HTTP app, component)
+- [examples/browser/homoglyph/](../examples/browser/homoglyph/) — `find` over Unicode-mode patterns, lookalike and hidden characters, with byte offsets turned into JS string positions (browser)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"regexp/syntax"
 	"strconv"
@@ -58,7 +59,52 @@ var ErrDFAStateLimit = errors.New("compile: DFA state limit exceeded during cons
 // error via errors.Is.
 var ErrBTProgramTooLarge = errors.New("compile: backtracking fallback program exceeds size limit")
 
-// maxBTFallbackInstructions caps the NFA program size (len(prog.Inst)) any
+// btTooLarge is ErrBTProgramTooLarge for one body, saying what a user can do
+// about it: the program's size against max_bt_instructions, and why the body
+// went to Backtracking at all — with the key that would keep it on its
+// automaton, when one would. A Unicode-mode program is far larger than its
+// byte-mode counterpart (a lowered `\pL` is hundreds of instructions), so this
+// is where a pattern over max_dfa_states usually lands.
+type btTooLarge struct {
+	body  string // "find", "match" or "capture"
+	insts int
+	why   string // why the body is on Backtracking; "" when unknown
+	limit int    // max_bt_instructions in force
+	off   bool   // max_bt_instructions: 0 — Backtracking is off
+}
+
+// newBTTooLarge is btTooLarge under lim.
+func newBTTooLarge(body string, insts int, why string, lim buildLimits) *btTooLarge {
+	return &btTooLarge{body: body, insts: insts, why: why, limit: lim.btLimit(), off: lim.btOff()}
+}
+
+func (e *btTooLarge) Error() string {
+	why := ""
+	if e.why != "" {
+		why = " because " + e.why
+	}
+	if e.off {
+		return fmt.Sprintf("%v: the %s body needs Backtracking%s, and max_bt_instructions: 0 turns Backtracking off; "+
+			"set max_bt_instructions to at least %d", ErrBTProgramTooLarge, e.body, why, e.insts)
+	}
+	return fmt.Sprintf("%v: the %s body went to Backtracking%s, but its program there has %d instructions, "+
+		"over max_bt_instructions (%d); raise max_bt_instructions to at least %d",
+		ErrBTProgramTooLarge, e.body, why, e.insts, e.limit, e.insts)
+}
+
+func (e *btTooLarge) Is(target error) bool { return target == ErrBTProgramTooLarge }
+
+// dfaLimitWhy is btTooLarge.why for a DFA refused for its size: tooMany when
+// its construction stopped at the limit with no count, else its count.
+func dfaLimitWhy(what string, states, maxStates int, tooMany bool) string {
+	if tooMany {
+		return fmt.Sprintf("its %s needs more than %d states (max_dfa_states; raise it to keep the DFA)", what, maxStates)
+	}
+	return fmt.Sprintf("its %s needs %d states, over %d (max_dfa_states; raise it to keep the DFA)", what, states, maxStates)
+}
+
+// maxBTFallbackInstructions is max_bt_instructions' DEFAULT: the NFA program
+// size (len(prog.Inst)) any
 // Backtracking engine construction site — no-capture find/match fallback,
 // capture-tracking fallback when TDFA is ineligible, and the general
 // engine-executor path — is willing to turn into WASM.
@@ -99,6 +145,15 @@ const maxBTFallbackPrefixLen = 64
 // only the table base is left to check.
 var ErrBTStackTooLarge = errors.New("compile: backtracking tables would start past WASM's 4GiB memory limit")
 
+// ErrTablesOutOfRange is returned when a module's tables would not all lie in
+// [0, 2 GiB): the caller's tableBase is negative or past it, or the tables
+// laid out from it reach past it. Table addresses are held as int32 here, so
+// such a module used to compile without an error — its offsets wrapped, its
+// memory was sized from the wrapped end, and its code read outside it (a base
+// just under 4 GiB) or on top of the caller's own data (a base of 8 GiB).
+// WebAssembly addresses up to 4 GiB; this compiler places tables below 2.
+var ErrTablesOutOfRange = errors.New("compile: tables must lie below 2 GiB (2147483648 bytes)")
+
 // maxWasmMemoryBytes is WASM32's hard linear-memory ceiling: a memory
 // section cannot declare more than 65536 pages of 65536 bytes each.
 const maxWasmMemoryBytes = 1 << 32
@@ -121,6 +176,11 @@ func checkBTMemoryBudget(base int64, extra int64) error {
 // not validate, so without this the module would fail at load, with a message
 // about memory limits rather than about the config.
 var ErrMemoryCapTooSmall = errors.New("compile: max_memory is below the module's static memory")
+
+// ErrNoCaptureGroup is returned for a groups_func on a pattern with no capture
+// group that can take part in a match (config.PatternEntry.GroupsWithoutCaptures):
+// it would compile to no groups export while every stub calls one.
+var ErrNoCaptureGroup = errors.New("compile: " + config.NoCaptureGroupProblem)
 
 // memoryMaxPages resolves max_memory for a module that declares declPages
 // pages: the maximum its memory declares, 0 meaning none. A value above what a
@@ -280,24 +340,53 @@ type CompileOptions struct {
 	ComponentPatternResources map[string]ComponentPatternResource
 	// MaxDFAStates is the maximum number of states allowed when building a DFA
 	// (match/find) or TDFA (capture groups). If the DFA/TDFA exceeds this limit
-	// the engine falls back to Backtracking. 0 means use the default (1024).
+	// the engine falls back to Backtracking. 0 means the pattern's mode's
+	// default: 1024 in byte mode, 16384 in Unicode mode (resolveMaxDFAStates).
 	// Exposed as max_dfa_states in the YAML config.
 	MaxDFAStates int
 	// MaxTDFARegs is the maximum number of WASM capture registers a TDFA may
 	// use before falling back to Backtracking. 0 means use the default (32).
 	// Exposed as max_tdfa_regs in the YAML config.
 	MaxTDFARegs  int
-	MaxDFAMemory int // Maximum DFA memory in bytes (default: 102400)
-	// ByteMode is config.RegexEntry.ByteMode for the pattern being compiled:
-	// runes 0x80-0xFF are legal and mean that byte. See unsupportedRune.
+	MaxDFAMemory int // Maximum DFA table bytes, checked beside MaxDFAStates; 0 = no limit (not a config key)
+	// MaxBTInstructions caps a Backtracking program, in instructions — the
+	// size its emitted body grows with (buildLimits.btLimit). 0 means the
+	// default (maxBTFallbackInstructions, 20,000); negative means no
+	// Backtracking at all, so a pattern that needs it does not compile.
+	// Exposed as max_bt_instructions in the YAML config, whose written 0
+	// arrives here as -1.
+	MaxBTInstructions int
+	// The three mode fields answer three DIFFERENT questions; none stands in
+	// for another (resolvePattern reads them):
+	//
+	//   Unicode  ForceByteMode  ByteMode  → mode
+	//   false    false          false       resolved: the entry's `unicode:`
+	//                                       key, else the pattern's own text
+	//   false    false          true        byte, runes 0x80-0xFF are bytes
+	//   false    true           false       byte, ASCII only: a rune above
+	//                                       0x7F is refused with the byte
+	//                                       gate's message, never detected
+	//   false    true           true        byte, runes 0x80-0xFF are bytes
+	//   true     false          false       Unicode, whatever the pattern
+	//   true     true           either      panic: a programming error
+	//   true     false          true        panic: a programming error
+	//
+	// ByteMode is config.PatternEntry.IsByteMode for the pattern being compiled
+	// (`byte_mode: true` or `unicode: false`): runes 0x80-0xFF are legal and
+	// mean that byte. It implies byte mode; ForceByteMode does not imply it,
+	// and every `byteMode bool` parameter downstream means this field.
 	ByteMode bool
-	// Unicode does NOT enable Unicode support — nothing implements it. It
-	// suppresses the unsupported-rune rejection, so the compiler emits its
-	// usual byte automaton for a pattern known to be wrong on non-ASCII
-	// input. It exists for tests that need a Unicode-bearing pattern to reach
-	// the selector, is not reachable from YAML, and is not the byte-oriented
-	// opt-in — that is ByteMode.
-	Unicode       bool
+	// Unicode, set by a caller, compiles the pattern in Unicode mode without
+	// resolving it — the route tests and CompileForced callers take to a
+	// definite mode. Unset, compilePattern
+	// sets it to the RESOLVED mode, for the options it derives.
+	Unicode bool
+	// ForceByteMode compiles in byte mode without resolving: a pattern that
+	// would ask for Unicode mode is refused with the byte gate's message
+	// instead. Every harness sets it unless it asks for Unicode mode, so no
+	// harness run is ever in a mode it did not ask for. Read by
+	// resolvePattern only; it is NOT ByteMode.
+	ForceByteMode bool
 	ForceEngine   EngineType // If non-zero, skip engine selection and use this engine type
 	LeftmostFirst bool       // Use leftmost-first (RE2/Perl) semantics for alternations
 	// LikelyMode hints which suffix-DFA structural optimisation to favour.
@@ -335,6 +424,11 @@ type CompileOptions struct {
 	// does not already have it. A measurement knob.
 	// NOT exposed in the YAML config schema — internal/programmatic use only.
 	BTStackStart int
+	// KeepUnreadTables keeps every droppable table in the module, read or
+	// not (dropUnaddressedTables). TEST-ONLY: the differential test that
+	// holds the drop to its rule compiles each pattern both ways.
+	// NOT exposed in the YAML config schema — internal/programmatic use only.
+	KeepUnreadTables bool
 	// MaxMemory is the config's max_memory: the module's memory declares it as
 	// its maximum, and a module whose static memory already exceeds it does not
 	// compile. The zero value is no cap.
@@ -358,6 +452,9 @@ type CompileOptions struct {
 	// paths that compile a body without assembling a module (helper DFAs,
 	// SelectEngine); those allocate nothing, so nothing dereferences it.
 	globals *moduleGlobals
+	// wordTable is the pattern's one word table (patternWordTable), reserved by
+	// compilePattern and shared by every layout built for the pattern.
+	wordTable *patternWordTable
 
 	// searchSizes, when non-nil, receives each export's SearchSize: what a
 	// generated stub allocates for its searches (SearchSizes).
@@ -384,13 +481,16 @@ func (o *CompileOptions) btScratch() btScratch {
 	return sc
 }
 
-// compiledPattern holds the intermediate compilation result for one RegexEntry.
+// compiledPattern holds the intermediate compilation result for one PatternEntry.
 // All function bodies are size-prefixed (ready for the WASM code section).
 type compiledPattern struct {
 	matchBody   []byte // (i32,i32)→i32; nil if not requested
 	findBody    []byte // (i32,i32)→i64; nil if not needed. Set via setFind, never directly.
 	captureBody []byte // (i32,i32,i32)→i32; nil if no groups; always internal
 
+	// label is the pattern's name, or its source when it has none: who owns
+	// its function bodies, for messages (codeOwners).
+	label        string
 	matchExport  string // empty = not exported
 	findExport   string // empty = internal-only (for wrapper use)
 	groupsExport string
@@ -439,7 +539,7 @@ type compiledPattern struct {
 	// nothing to scan.
 	//
 	// Unconditional by decision — not gated on any declared input length. It is
-	// exact at every length (regexpMinMaxLen is a true lower bound and already
+	// exact at every length (minMaxLen is a true lower bound and already
 	// gates lmBareShuftiEligible, lit-anchor and set analysis), and one code
 	// path is cheaper to keep right than two.
 	minLen     int32
@@ -592,6 +692,11 @@ type compiledPattern struct {
 	// assembleModule, where the twin's function index is finally known.
 	findTwinCallOff int
 
+	// findTwinRoute is how a caller of the find body can make its first
+	// decision for it and call findNeutralBody directly (twinRoute). nil when
+	// there is no twin.
+	findTwinRoute *twinRoute
+
 	// findMarkedBody is the MARKED copy of the find body under per-search
 	// notes (search_notes.go), laid out after findBody and its neutral twin.
 	// findMarkedCallOff and findTwinMarkedCallOff are the handoffs to it in
@@ -601,6 +706,10 @@ type compiledPattern struct {
 	findMarkedCallOff     int
 	findTwinMarkedCallOff int
 	findMarkedBackOff     int
+	// startRule is the Unicode start rule every find body of the pattern must
+	// keep (find_from.go); the assemblers check each body's findFromMode
+	// against it.
+	startRule startRule
 	// btSearch: a Backtracking body of the pattern keeps its work budget per
 	// search in the caller's block (bt_search.go); btMemoBytes is the memo
 	// bytes per position the stub gives a search that tripped (0: none).
@@ -649,7 +758,7 @@ type compiledPattern struct {
 	// independent of LikelyMode. Empty = not requested.
 	//
 	// batchGroupsExport's base name prefers groupsExport, falling back to
-	// namedGroupsExport (same priority as config.RegexEntry.GroupsExportName)
+	// namedGroupsExport (same priority as config.PatternEntry.GroupsExportName)
 	// — a named_groups_func-only pattern gets a batch export too, since at
 	// the WASM level namedGroupsExport is always a pass-through wrapper over
 	// the same captureFuncIdx (see appendNamedGroupsWrapperCodeEntry), so one
@@ -949,6 +1058,20 @@ func (p *compiledPattern) offsets() (matchOff, backwardScanOff, findOff, capture
 
 // todayFindOff is the sub-index of TODAY'S find function — findOff minus the
 // start-anywhere dispatcher a switch puts in front of it — or -1.
+// twinRouteFor is the route a caller of the function at calleeOff may take:
+// the find body's own, when calleeOff IS the find body. A caller of a
+// start-anywhere dispatcher gets none — the dispatcher is the one caller of
+// today's find that may, since it consumes the twin's switch sentinel.
+func (p *compiledPattern) twinRouteFor(calleeOff int) *twinRoute {
+	if p.findTwinRoute == nil || calleeOff < 0 || calleeOff != p.slotIndex(slotFind) {
+		return nil
+	}
+	if p.slotIndex(slotFindNeutral) != calleeOff+1 {
+		panic("compile: the neutral twin is not laid out right after the find body it routes from")
+	}
+	return p.findTwinRoute
+}
+
 func (p *compiledPattern) todayFindOff() int {
 	for _, k := range []funcSlotKind{slotAltDispatch, slotLitAnchorFind, slotFind} {
 		if i := p.slotIndex(k); i >= 0 {
@@ -1072,14 +1195,15 @@ type btFindParts struct {
 // otherwise. Its frame stack is not laid out here: the ordinary body places a
 // growing one at call time through the scratch globals (btGrowth), and a set's
 // split member hands those globals the set's drive (CompileOptions.btDrive).
-func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions) (btFindParts, error) {
+func buildBTFindParts(pattern resolvedPattern, table *dfaTable, mandLit *mandatoryLit, cur int64, o *CompileOptions) (btFindParts, error) {
 	var parts btFindParts
 	btProg := compileBTProg(pattern)
-	if len(btProg.Inst) > maxBTFallbackInstructions {
-		return parts, ErrBTProgramTooLarge
+	if !btProg.lim.btFits(len(btProg.prog.Inst)) {
+		return parts, newBTTooLarge("find", len(btProg.prog.Inst), "", btProg.lim)
 	}
 	bt := newBacktrack(btProg)
 	bt.numGroups = 0
+	bt.startRule = startRuleFor(pattern)
 	// Choose scan strategy (in priority order):
 	//   1. Multi-byte literal prefix from the (large) LF DFA — no data tables, pure SIMD.
 	//   2. Mandatory interior literal via two-level outer loop.
@@ -1103,7 +1227,8 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 	if len(btPrefix) >= 2 {
 		// Multi-byte prefix: use SIMD prefix scan; no memory tables needed.
 		btScanParams = prefixScanParams{
-			Prefix: btPrefix,
+			Prefix:   btPrefix,
+			UTF8Text: pattern.unicode(),
 			// The layout is buildBTFindBody's, and comes from the
 			// allocation that decides it — not from five indices
 			// written out here, in a different file.
@@ -1116,7 +1241,7 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 		btMandLit = mandLit
 	} else {
 		// Fallback: first-byte SIMD/Teddy tables from NFA.
-		btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg)
+		btFirstBytes, btFirstByteFlags, btAllBytes := nfaFirstBytes(btProg.prog)
 		btScanParams, btScanDataBytes, btScanSegCnt = buildBTScanTables(btFirstBytes, btFirstByteFlags, btAllBytes, cur)
 		btScanParams.TableMemIdx = o.tableMemIdx
 		btScanParams.LikelyNoMatch = o.LikelyMode == LikelyNoMatch
@@ -1126,6 +1251,7 @@ func buildBTFindParts(pattern string, table *dfaTable, mandLit *mandatoryLit, cu
 	// stack grows at call time, and the fallback's region is sized then too.
 	btBase := cur + int64(len(btScanDataBytes))
 	plan := planBT(bt, o.BTWorkBudget)
+	reportBTMemo(o.report(), pattern.unicode(), "find", bt, plan)
 	bt.search = btSearchFor(o)
 	var fallbackMode findFromMode
 	if plan.fallback {
@@ -1205,10 +1331,11 @@ func appendBTFindParts(cs []byte, fast []byte, parts btFindParts, fastIdx int) [
 }
 
 // btFindBuildable reports whether Backtracking can take pattern's find at all:
-// its program fits maxBTFallbackInstructions. Nothing else is sized at compile
+// its program fits max_bt_instructions. Nothing else is sized at compile
 // time — the find's frame stack grows at call time.
-func btFindBuildable(pattern string) bool {
-	return len(compileBTProg(pattern).Inst) <= maxBTFallbackInstructions
+func btFindBuildable(pattern resolvedPattern) bool {
+	p := compileBTProg(pattern)
+	return p.lim.btFits(len(p.prog.Inst))
 }
 
 // appendMatchBodies appends matchBody and its fallback, if any; matchFuncIdx is
@@ -1297,7 +1424,7 @@ func (p *compiledPattern) capStartGlobal() int32 { return p.capStartGlobalP1 - 1
 // this pattern is not in window mode. Same encoding, same reason.
 func (p *compiledPattern) winGlobal() int32 { return p.winGlobalP1 - 1 }
 
-// compilePattern compiles one RegexEntry into an intermediate compiledPattern.
+// compilePattern compiles one PatternEntry into an intermediate compiledPattern.
 // It does not build the final WASM module; call assembleModule for that.
 // forceGroupsEngine overrides engine selection for the capture path (0 = auto).
 //
@@ -1307,71 +1434,132 @@ func (p *compiledPattern) winGlobal() int32 { return p.winGlobalP1 - 1 }
 // fact stated at each of them is a fact that will be forgotten at the next one
 // added — and stating it at a CALLER is worse still, which is how minLen came
 // to exist on the compileAll path and not on CompileFile's.
-func compilePattern(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
-	p, err := compilePatternBody(re, tableBase, forceGroupsEngine, buildOpts)
+func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+	var rp resolvedPattern
+	// The body opens the pattern's verbose scope; it is closed here, after
+	// the facts below are recorded in it.
+	defer buildOpts.report().End()
+	// One word table for all of the pattern's layouts, reserved where no
+	// layout lives — below them all — and emitted after the body, so a layout
+	// the body builds and then discards (the switch's start-anywhere trial
+	// truncates the pattern's data back to a mark) can neither own it nor
+	// take its data along.
+	var wt *patternWordTable
+	if (re.FindFunc != "" || re.GroupsFunc != "") && patternHasWordBoundary(re.Regexp) {
+		wt = &patternWordTable{off: int32(tableBase)} //nolint:gosec // a table address
+		buildOpts.wordTable = wt
+		tableBase += 256
+	}
+	p, err := compilePatternBody(re, tableBase, forceGroupsEngine, buildOpts, &rp)
+	if err == nil && p != nil && wt != nil && wt.used {
+		p.dataBytes = append(p.dataBytes, appendDroppableDataSegment(nil, wt.off, wordCharTableBytes[:])...)
+		p.dataSegCount++
+	}
+	if rep := buildOpts.report(); rep != nil && !rep.HasEngine() && !rep.hasReason() {
+		// Nothing recorded an engine or a refusal. A specialised body (the
+		// literal-chain family and its kin) never builds a general DFA; a
+		// failed compile may have stopped before recording one. Say which of
+		// the three this is rather than guess.
+		switch {
+		case err != nil:
+			rep.Reason("failed — " + err.Error())
+		case re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "":
+			rep.Reason("specialised body — no general engine (literal-chain family)")
+		default:
+			rep.Reason("none — set member only, or declares no *_func")
+		}
+	}
 	if err != nil || p == nil {
 		return p, err
+	}
+	p.label = re.Name
+	if p.label == "" {
+		p.label = re.Regexp
+	}
+	p.startRule = startRuleFor(rp)
+	// What a search of a Unicode-mode pattern keeps per input byte, so the
+	// cost is visible before it is paid (the Backtracking memo is recorded
+	// where its body is built).
+	if rp.unicode() {
+		if n := p.notes.bytesPerPos(); n > 0 {
+			buildOpts.report().Memory("per-search notes", int(n), "once a search arms")
+		}
 	}
 	// minLen: the shortest string this pattern can match, which the exported
 	// find wrapper turns into a one-test early exit.
 	//
-	// byteMode is the pattern's own mode ORed with the build's, exactly as
-	// compilePatternBody adopts it — an over-estimate here REFUSES an input
-	// that matches, so the two must not disagree.
-	if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
-		if n, _ := regexpMinMaxLen(parsed, buildOpts.ByteMode || re.ByteMode); n > 0 {
+	// It is measured in the mode the body resolved, and handed back here, so
+	// the two cannot disagree — an over-estimate REFUSES an input that
+	// matches.
+	if t, perr := rp.parse(); perr == nil {
+		if n, _ := t.minMaxLen(); n > 0 {
 			p.minLen = int32(n)
 		}
 	}
 	return p, nil
 }
 
-func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions) (*compiledPattern, error) {
+// compilePatternBody is compilePattern's body. It stores the pattern it
+// resolved in *resolved — the form its bodies are built from, after
+// collapseZeroWidthRepeats, which changes no length — for the facts
+// compilePattern attaches.
+func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngine EngineType, buildOpts CompileOptions, resolved *resolvedPattern) (*compiledPattern, error) {
 	// The mode is a property of the PATTERN, so it is adopted here rather than
 	// being expected in the build-wide options every caller would have to
 	// thread.
-	buildOpts.ByteMode = buildOpts.ByteMode || re.ByteMode
+	buildOpts.ByteMode = buildOpts.ByteMode || re.IsByteMode()
+	// Opens the verbose scope every decision below records into, which
+	// compilePattern closes. Nil-safe, and End is idempotent. Opened before
+	// the mode is resolved, so that a pattern refused for its mode is reported
+	// with it.
+	buildOpts.report().Begin(re.Name, re.Regexp)
+	// The pattern's mode is decided here, once: every tree and program built
+	// for it below comes from rp, and buildOpts.Unicode records it for the
+	// options derived from buildOpts.
+	rp, err := resolvePattern(re.Regexp, re.Unicode, &buildOpts)
+	if err != nil {
+		buildOpts.report().Reason("refused — " + err.Error())
+		return nil, err
+	}
+	*resolved = rp
+	buildOpts.report().Mode(rp.modeName())
+	buildOpts.Unicode = rp.unicode()
 	// Rejected BEFORE any fast path. compile() carries the same gate, but half
 	// of this function's bodies (the lit-chain family, lit-anchor, the
 	// alternation shapes) never reach it — so gating only there would let a
 	// pattern's acceptability depend on which emitter it happened to qualify
-	// for.
-	if !buildOpts.Unicode {
-		if parsed, perr := syntax.Parse(re.Pattern, syntax.Perl); perr == nil {
-			if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil {
-				if bad := unsupportedRuneIn(re.Pattern, prog, buildOpts.ByteMode); bad >= 0 {
+	// for. Byte mode only: a Unicode-mode pattern names its runes legally.
+	if !rp.unicode() {
+		if parsed, perr := rp.parse(); perr == nil {
+			if prog, cerr := compileProg(parsed); cerr == nil {
+				if bad := unsupportedRuneIn(re.Regexp, prog.prog, buildOpts.ByteMode); bad >= 0 {
+					buildOpts.report().Reason("refused — " + unsupportedRuneError(bad).Error())
 					return nil, unsupportedRuneError(bad)
 				}
 			}
 		}
 	}
-	// Opens the verbose scope every decision below records into. Nil-safe, and
-	// End is idempotent, so an early return cannot lose the record — the next
-	// Begin flushes it.
-	buildOpts.report().Begin(re.Name, re.Pattern)
-	defer func() {
-		if rep := buildOpts.report(); rep != nil && !rep.HasEngine() {
-			// A specialised body (the literal-chain family and its kin) never
-			// builds a general DFA, so nothing above recorded an engine. Say
-			// which of the two situations this is rather than guess.
-			if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
-				rep.Reason("specialised body — no general engine (literal-chain family)")
-			} else {
-				rep.Reason("none — set member only, or declares no *_func")
-			}
-		}
-		buildOpts.report().End()
-	}()
-	// Every body below parses re.Pattern for itself, so the rewrite is applied
+	// Every body below parses re.Regexp for itself, so the rewrite is applied
 	// to the string, once, before any of them sees it. The verbose scope above
 	// keeps the pattern as the user wrote it.
-	re.Pattern = collapseZeroWidthRepeats(re.Pattern)
+	rp = collapseZeroWidthRepeats(rp)
+	*resolved = rp // no length or emptiness changed: compilePattern's facts hold
+	re.Regexp = rp.src
 	needMatch := re.MatchFunc != ""
 	needFind := re.FindFunc != ""
 	needGroups := re.CaptureStubsRequested()
 
 	if !needMatch && !needFind && !needGroups {
 		return &compiledPattern{tableEnd: tableBase}, nil
+	}
+	// Checked on the program compiled here rather than through the config's
+	// own parse, so the refusal answers for exactly what would be built.
+	if needGroups {
+		if t, err := rp.parse(); err == nil {
+			if mp, _ := compileProg(t); mp.prog.NumCap <= 2 {
+				return nil, fmt.Errorf("groups_func %q: %w", re.GroupsFunc, ErrNoCaptureGroup)
+			}
+		}
 	}
 
 	// Per-pattern hints (from YAML `hints:`) override whatever the caller
@@ -1400,7 +1588,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// by the match start.
 	if needGroups {
 		// Lit-chain range: single pattern with captures (greedy).
-		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Pattern); ok {
+		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Regexp); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
@@ -1416,13 +1604,13 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				p.matchBody = appendLitChainRangeMatchCodeEntry(nil, lcp)
 			}
 			p.setCaptureBody(appendLitChainRangeFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx))
-			parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
+			parsed, perr := syntax.Parse(re.Regexp, syntax.Perl)
 			if perr == nil {
 				p.groupNames = extractGroupNames(parsed)
 			}
 			return p, nil
 		}
-		if lcp, lcc, ok := analyseLitChainGroups(re.Pattern); ok {
+		if lcp, lcc, ok := analyseLitChainGroups(re.Regexp); ok {
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
@@ -1440,13 +1628,13 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// Native find-with-captures body — replaces the find+capture wrapper
 			// composition. Single SIMD pass with inline slot writes.
 			p.setCaptureBody(appendLitChainFindGroupsCodeEntry(nil, lcp, lcc, buildOpts.tableMemIdx))
-			parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+			parsed, err := syntax.Parse(re.Regexp, syntax.Perl)
 			if err == nil {
 				p.groupNames = extractGroupNames(parsed)
 			}
 			return p, nil
 		}
-		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Pattern); ok {
+		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Regexp); ok {
 			if needMatch {
 				// Anchored alt match for the capture path is not specialised
 				// here. Fall through to the standard pipeline.
@@ -1472,7 +1660,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				p.tableEnd = layout.tableEnd
 				// Native single-function alt find-with-captures.
 				p.setCaptureBody(appendLitChainAltFindGroupsCodeEntry(nil, altp, branchCaps, layout, buildOpts.tableMemIdx))
-				parsed, err := syntax.Parse(re.Pattern, syntax.Perl)
+				parsed, err := syntax.Parse(re.Regexp, syntax.Perl)
 				if err == nil {
 					p.groupNames = extractGroupNames(parsed)
 				}
@@ -1486,11 +1674,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// TDFA's find phase (linear DFA scan) with the Teddy frontend; keep
 		// TDFA-correct capture semantics for DFA branches.
 		if !needMatch {
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
-				parsed, perr := syntax.Parse(re.Pattern, syntax.Perl)
+			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
+				pt, perr := rp.parse()
+				parsed := pt.re
 				if perr == nil && parsed.MaxCap() > 0 {
-					prog, cerr := syntax.Compile(parsed.Simplify())
-					if cerr == nil && !needsUnicodeSupport(prog) {
+					prog, cerr := compileProg(pt)
+					if cerr == nil && !prog.refusedByByteGate() {
 						// Go through the selector rather than calling newTDFA
 						// directly. newTDFA happily builds a table for patterns
 						// TDFA cannot express correctly — non-greedy
@@ -1507,6 +1696,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 						// no match from groups() where find() was correct.
 						selEng, tt := selectBestEngineWithTDFA(prog, &buildOpts)
 						if selEng == EngineTDFA && tt != nil {
+							plainTT := tt
+							tt = tdfaWithCharLoops(tt, prog, buildOpts.LikelyMode)
 							p := &compiledPattern{
 								tableEnd:  tableBase,
 								numGroups: tt.numGroups,
@@ -1516,7 +1707,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 							p.groupNames = extractGroupNames(parsed)
 
 							// Lenient-alt data + find body.
-							lenLayout := planLenAltLayout(lenAltp, tableBase, true)
+							lenLayout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
 							lenData, lenSeg := buildLenAltDataSegments(lenAltp, lenLayout)
 							if needFind {
 								p.findExport = re.FindFunc
@@ -1542,7 +1733,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 								lmNonMidShufti:       false,
 								lmWideShufti:         false,
 							})
-							p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, false, -1)
+							p.captureBody, p.captureFallbackBody, p.captureFallbackCallOffs = tdfaCaptureBodies(tt, plainTT, tdfaLayout, buildOpts.tableMemIdx, false, -1)
 							rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
 							p.dataBytes = append(p.dataBytes, rawTDFA...)
 							p.dataSegCount += cntTDFA
@@ -1558,7 +1749,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 	if !needGroups {
 		// Mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
-		if lcp, ok := analyseLitChainPrefixed(re.Pattern); ok {
+		if lcp, ok := analyseLitChainPrefixed(re.Regexp); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
 				findExport:  re.FindFunc,
@@ -1578,7 +1769,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		if buildOpts.LikelyMode == LikelyMatch {
 			litChainMinCount = 1
 		}
-		if lcp, ok := analyseLitChain(re.Pattern, litChainMinCount); ok {
+		if lcp, ok := analyseLitChain(re.Regexp, litChainMinCount); ok {
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
 				findExport:  re.FindFunc,
@@ -1610,7 +1801,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// The anchored *match* body handles anchors correctly (it requires
 		// full input consumption, which also makes greedy and non-greedy
 		// equivalent), so a match-only compile keeps the fast path.
-		if lcp, ok := analyseLitChainRange(re.Pattern, litChainMinCount); ok &&
+		if lcp, ok := analyseLitChainRange(re.Regexp, litChainMinCount); ok &&
 			(!needFind || !lcp.hasAnchor()) {
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
@@ -1643,7 +1834,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 		// Anchored match for strict lit-chain alternation.
 		if needMatch && !needFind {
-			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
+			if altp, ok := analyseLitChainAlt(re.Regexp); ok {
 				p := &compiledPattern{
 					matchExport: re.MatchFunc,
 					anchored:    false,
@@ -1653,8 +1844,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				return p, nil
 			}
 			// Lenient: anchored match for mixed lit-chain + DFA branches.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, false); ok {
-				layout := planLenAltLayout(lenAltp, tableBase, false)
+			if lenAltp, ok := analyseLitChainAltLenient(rp, false); ok {
+				layout := planLenAltLayout(lenAltp, tableBase, false, buildOpts.wordTable)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
 					matchExport:  re.MatchFunc,
@@ -1670,7 +1861,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 		// Strict alt of mixed-prefix branches.
 		if needFind && !needMatch {
-			if altp, ok := analyseLitChainAltPrefixed(re.Pattern); ok {
+			if altp, ok := analyseLitChainAltPrefixed(re.Regexp); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltPrefixedFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
@@ -1686,13 +1877,13 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			}
 		}
 
-		// Phase 2: alternation of strict lit-chain branches. Find-mode only;
+		// An alternation of strict lit-chain branches. Find-mode only;
 		// anchored match is handled above. Skipped (falls through to the
 		// classic DFA below) only for the specific shape measured to regress
 		// there — every branch a simple chain with at least one unbounded
 		// (`+`/`*`/open `{N,}`) segment; see shouldTryLitChainAlt.
-		if needFind && !needMatch && shouldTryLitChainAlt(re.Pattern) {
-			if altp, ok := analyseLitChainAlt(re.Pattern); ok {
+		if needFind && !needMatch && shouldTryLitChainAlt(re.Regexp) {
+			if altp, ok := analyseLitChainAlt(re.Regexp); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				body, ffMode := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
@@ -1711,7 +1902,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				return p, nil
 			}
 			// Strict alt of lit-chain branches with at least one range.
-			if altp, ok := analyseLitChainAltRange(re.Pattern); ok {
+			if altp, ok := analyseLitChainAltRange(re.Regexp); ok {
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltRangeFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
@@ -1731,8 +1922,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// are bounded: the body has no work counter, and a DFA branch that
 			// keeps walking without accepting makes it quadratic, so such a
 			// pattern takes the ordinary find, which gets the switch.
-			if lenAltp, ok := analyseLitChainAltLenient(re.Pattern, true); ok && lenientAltLinear(re.Pattern, buildOpts) {
-				layout := planLenAltLayout(lenAltp, tableBase, true)
+			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
+				layout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
 				var findBody []byte
@@ -1752,7 +1943,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 	}
 
-	maxStates := resolveMaxDFAStates(&buildOpts)
+	maxStates := resolveMaxDFAStates(&buildOpts, rp.unicode())
 	memLimit := resolveMaxDFAMemory(&buildOpts)
 
 	// Match function uses LL (leftmostFirst=false): finds the longest full-string
@@ -1777,8 +1968,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// pos 0, loses the `aa` path, then can't reach the end of input).
 		// This matches Go stdlib semantics: regexp.MustCompile("^(a|aa)$").MatchString("aa") = true.
 		llOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: false,
-			ByteMode: buildOpts.ByteMode, Unicode: buildOpts.Unicode}
-		llMatch, llErr := compile(re.Pattern, llOpts)
+			ByteMode: buildOpts.ByteMode}
+		llMatch, llErr := compile(rp, llOpts)
 		if llErr != nil && !errors.Is(llErr, ErrDFAStateLimit) {
 			return nil, fmt.Errorf("compile match DFA: %w", llErr)
 		}
@@ -1788,9 +1979,17 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		}
 		if llErr != nil || llTable.numStates > maxStates || (memLimit > 0 && dfaTableBytes(llTable) > memLimit) {
 			// DFA too large — fall back to Backtracking match.
-			btProg := compileBTProg(re.Pattern)
-			if len(btProg.Inst) > maxBTFallbackInstructions {
-				return nil, ErrBTProgramTooLarge
+			btProg := compileBTProg(rp)
+			if !btProg.lim.btFits(len(btProg.prog.Inst)) {
+				why := fmt.Sprintf("its match DFA table is over the memory bound (%d bytes)", memLimit)
+				if llErr != nil || llTable.numStates > maxStates {
+					n := 0
+					if llErr == nil {
+						n = llTable.numStates
+					}
+					why = dfaLimitWhy("match DFA", n, maxStates, llErr != nil)
+				}
+				return nil, newBTTooLarge("match", len(btProg.prog.Inst), why, btProg.lim)
 			}
 			bt := newBacktrack(btProg)
 			bt.numGroups = 0
@@ -1798,6 +1997,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// time (btGrowth) and the fallback's memo and stack are sized then
 			// too (bt_scratch.go), through the same scratch globals.
 			plan := planBT(bt, buildOpts.BTWorkBudget)
+			reportBTMemo(buildOpts.report(), rp.unicode(), "match", bt, plan)
 			if plan.force {
 				matchBody, matchFallbackCallOffs = btTailCallBody(2)
 			} else {
@@ -1813,6 +2013,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			lm := buildDFALayout(dfaLayoutParams{
 				t:                    llTable,
 				tableBase:            cur,
+				sharedWordTable:      buildOpts.wordTable,
 				needFind:             false,
 				leftmostFirst:        false,
 				compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
@@ -1820,6 +2021,12 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				lmBareShufti:         false,
 				lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 				lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+				lmCharLoop:           buildOpts.LikelyMode == LikelyMatch,
+				// In Unicode mode a loop over whole characters is a
+				// dominant state too, as it is for the find layout: without
+				// it a match body walked `.+` byte by byte, 24 fuel/byte
+				// against 4.9 with the skip.
+				utf8Text: rp.unicode(),
 			})
 			// Since 2026-07-18: non-mid dominants are default-on for
 			// every LikelyMode again, replacing the LikelyMatch-only
@@ -1852,8 +2059,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 
 	// LF DFA for find and/or groups.
 	lfOpts := CompileOptions{MaxDFAStates: maxStates, ForceEngine: EngineDFA, LeftmostFirst: true,
-		ByteMode: buildOpts.ByteMode, Unicode: buildOpts.Unicode}
-	matcher, err := compile(re.Pattern, lfOpts)
+		ByteMode: buildOpts.ByteMode}
+	matcher, err := compile(rp, lfOpts)
 	if err != nil && !errors.Is(err, ErrDFAStateLimit) {
 		return nil, fmt.Errorf("compile DFA: %w", err)
 	}
@@ -1907,7 +2114,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if notesOverflow {
 		dfaTooLarge = true
 		slog.Warn("Pattern runs on Backtracking: its find automaton has more cycle states than per-search notes can cover",
-			"pattern", re.Pattern, "cycle_states", countCycleStates(table), "limit", maxNotesBytesPerPos*8,
+			"pattern", re.Regexp, "cycle_states", countCycleStates(table), "limit", maxNotesBytesPerPos*8,
 			"effect", "linear on every input, about 2.5x the cost on ordinary text",
 			"hint", "lower max_dfa_states or simplify the pattern to keep it on a DFA with notes")
 	}
@@ -1982,7 +2189,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				rep.Note("u16 row dedup")
 			}
 			if len(l.dominantStates) > 0 {
-				rep.Note(fmt.Sprintf("SIMD bulk skip (%d dominant state(s))", len(l.dominantStates)))
+				note := fmt.Sprintf("SIMD bulk skip (%d dominant state(s))", len(l.dominantStates))
+				if n := countUTF8Dominants(l.dominantStates); n > 0 {
+					note += fmt.Sprintf(", %d over whole UTF-8 characters", n)
+				}
+				rep.Note(note)
 			}
 			if l.skipSafeOnDead {
 				rep.Note("skip-safe-on-dead")
@@ -1993,17 +2204,21 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			report:               buildOpts.report(),
 			t:                    table,
 			tableBase:            cur,
+			sharedWordTable:      buildOpts.wordTable,
 			needFind:             needFindBody,
 			leftmostFirst:        true,
 			compiledDFAThreshold: resolveCompiledDFAThreshold(&buildOpts),
 			useAcceptSideTable:   false,
-			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(re.Pattern, buildOpts.ByteMode),
+			lmBareShufti:         buildOpts.LikelyMode == LikelyMatch && lmBareShuftiEligible(rp),
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
+			lmCharLoop:           buildOpts.LikelyMode == LikelyMatch,
 			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
+			startRule:            startRuleFor(rp),
+			utf8Text:             rp.unicode(),
 		})
 	}
-	patMandLit := findMandatoryLit(re.Pattern, buildOpts.ByteMode)
+	patMandLit := findMandatoryLit(rp)
 	if patMandLit != nil {
 		buildOpts.report().Note("mandatory literal extracted")
 	}
@@ -2046,7 +2261,24 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if needFindBody {
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
-			parts, err := buildBTFindParts(re.Pattern, table, patMandLit, cur, &buildOpts)
+			parts, err := buildBTFindParts(rp, table, patMandLit, cur, &buildOpts)
+			if tl := (*btTooLarge)(nil); errors.As(err, &tl) {
+				switch {
+				case dfaStateLimitExceeded || table.numStates > maxStates:
+					n := 0
+					if !dfaStateLimitExceeded {
+						n = table.numStates
+					}
+					tl.why = dfaLimitWhy("find DFA", n, maxStates, dfaStateLimitExceeded)
+				case memLimit > 0 && dfaTableBytes(table) > memLimit:
+					tl.why = fmt.Sprintf("its find DFA table is over the memory bound (%d bytes)", memLimit)
+				case notesOverflow:
+					tl.why = fmt.Sprintf("its find automaton has %d cycle states, more than per-search notes cover (%d)",
+						countCycleStates(table), maxNotesBytesPerPos*8)
+				default:
+					tl.why = "its find DFA has an ambiguous word-boundary target"
+				}
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -2063,7 +2295,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// classifier sends to the start-anywhere find drops them again.
 			dataMark, segMark := len(p.dataBytes), p.dataSegCount
 			// DFA find path: check for lit-anchor optimisation first.
-			lap := findLitAnchorPoint(re.Pattern)
+			lap := findLitAnchorPoint(re.Regexp, rp.unicode())
 			// Reject prefixes containing `\b`/`\B` explicitly. The
 			// reversed-prefix DFA doesn't evaluate word boundaries backward,
 			// and the lit-anchor find body doesn't verify them at candidate
@@ -2091,25 +2323,28 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				lineAnchorOK = (!table.hasNewlineBoundary && !prefixContainsLineAnchor(lap.prefixRe)) ||
 					lineAnchoredPrefixSafe(lap.prefixRe)
 			}
-			if lap != nil && l.useU8 && !table.hasWordBoundary && lineAnchorOK &&
+			// Tables past 256 states (u16 ids) are taken in Unicode mode, where
+			// a lowered letter class alone makes them common: the e-mail-like
+			// `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}` has a 1,219-state forward
+			// DFA. Byte mode keeps the u8 tables it had.
+			if lap != nil && (l.useU8 || rp.unicode()) && !table.hasWordBoundary && lineAnchorOK &&
 				!prefixContainsWordBoundary(lap.prefixRe) {
 				// Compile the reversed prefix DFA for the backward scan.
-				revRe := reverseRegexp(lap.prefixRe)
-				revSimplified := revRe.Simplify()
-				revProg, revCompErr := syntax.Compile(revSimplified)
-				if revCompErr == nil && !needsUnicodeSupport(revProg) {
-					revDFA, revOk := newDFA(revProg, false, false, maxHelperDFAStates)
+				revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
+				if revCompErr == nil && !revProg.refusedByByteGate() {
+					revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
 					var revTable *dfaTable
 					if revOk {
 						revTable = dfaTableFrom(revDFA)
 					}
-					if revOk && revTable.numStates+1 <= 256 &&
+					if revOk && (revTable.numStates+1 <= 256 || rp.unicode()) &&
 						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(dfaLayoutParams{
 							t:                    revTable,
 							tableBase:            revTableBase,
+							sharedWordTable:      buildOpts.wordTable,
 							needFind:             true,
 							leftmostFirst:        false,
 							compiledDFAThreshold: 0,
@@ -2156,23 +2391,29 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 								litTeddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
 								litTeddyHiBytes[fb>>4] |= byte(1 << uint(i))
 							}
-							t1Lo := make([]byte, 16)
-							t1Hi := make([]byte, 16)
-							fbToBit := make(map[byte]int)
-							for i, fb := range litFirstBytes {
-								fbToBit[fb] = i
+							// The two-byte tables need every literal's second byte. A
+							// one-byte inner literal is a SINGLE literal, which the
+							// find scans for with the prefix scan and never reads
+							// these tables for.
+							if len(lap.litSet[0]) >= 2 {
+								t1Lo := make([]byte, 16)
+								t1Hi := make([]byte, 16)
+								fbToBit := make(map[byte]int)
+								for i, fb := range litFirstBytes {
+									fbToBit[fb] = i
+								}
+								for _, lit := range lap.litSet {
+									// lit[0] is guaranteed present: fbToBit was built from
+									// litFirstBytes, which was deduped from this same litSet.
+									bit := fbToBit[lit[0]]
+									t1Lo[lit[1]&0x0F] |= byte(1 << uint(bit))
+									t1Hi[lit[1]>>4] |= byte(1 << uint(bit))
+								}
+								litTeddyT1LoOff = litTeddyHiOff + 16
+								litTeddyT1HiOff = litTeddyT1LoOff + 16
+								litTeddyT1LoBytes = t1Lo
+								litTeddyT1HiBytes = t1Hi
 							}
-							for _, lit := range lap.litSet {
-								// lit[0] is guaranteed present: fbToBit was built from
-								// litFirstBytes, which was deduped from this same litSet.
-								bit := fbToBit[lit[0]]
-								t1Lo[lit[1]&0x0F] |= byte(1 << uint(bit))
-								t1Hi[lit[1]>>4] |= byte(1 << uint(bit))
-							}
-							litTeddyT1LoOff = litTeddyHiOff + 16
-							litTeddyT1HiOff = litTeddyT1LoOff + 16
-							litTeddyT1LoBytes = t1Lo
-							litTeddyT1HiBytes = t1Hi
 						}
 
 						revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
@@ -2238,8 +2479,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// for v1's simple "return on first success" dispatch to be
 			// correct.
 			if p.litAnchorBackScanBody == nil && !needGroups {
-				if altBranches, ok := findAltLitAnchorPoints(re.Pattern, buildOpts.ByteMode); ok {
-					if altCompiled, altOK := compileAltLitAnchorBranches(altBranches, l.tableEnd, buildOpts); altOK {
+				if altBranches, ok := findAltLitAnchorPoints(rp); ok {
+					if altCompiled, altOK := compileAltLitAnchorBranches(rp, altBranches, l.tableEnd, buildOpts); altOK {
 						buildOpts.report().Note("alternation literal-anchored find")
 						p.altLitAnchorBranches = altCompiled.branches
 						// findFromMode not set here either — the branch
@@ -2267,14 +2508,14 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			// with the work counter (start_anywhere.go). Decided HERE — after
 			// today's body is known, before it is built — because the
 			// classifier's proofs are about that body.
-			strategy, why := p.chooseFindStrategy(re, table, l, lap, patMandLit, anchored, buildOpts)
+			strategy, why := p.chooseFindStrategy(rp, table, l, lap, patMandLit, anchored, buildOpts)
 			if strategy == findNewSearch {
 				trial := &compiledPattern{}
 				var nr *walkNotesReq
 				if buildOpts.globals != nil {
 					nr = &walkNotesReq{globals: buildOpts.globals, checkResume: true}
 				}
-				if trial.buildStartAnywhereFind(re, cur, buildOpts, nr) {
+				if trial.buildStartAnywhereFind(rp, cur, buildOpts, nr) {
 					p.dataBytes = append(p.dataBytes[:dataMark], trial.dataBytes...)
 					p.dataSegCount = segMark + trial.dataSegCount
 					p.clearLitAnchor()
@@ -2289,7 +2530,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				} else {
 					// Today's body with the counter, handing over to the
 					// Backtracking find (buildSwitchHandover) — linear either way.
-					strategy, why = findSwitch, why+"; start-anywhere find refused: "+startAnywhereRefusal(re.Pattern)
+					strategy, why = findSwitch, why+"; start-anywhere find refused: "+startAnywhereRefusal(rp)
 				}
 			}
 			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
@@ -2342,6 +2583,9 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					// state-ID compares (unchanged).
 					applyDominantStateEncoding(l,
 						p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil)
+					if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil {
+						placePlainMidAccept(l)
+					}
 				} else {
 					l.dominantStates = nil
 				}
@@ -2368,7 +2612,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					if l.notes != nil {
 						notesAt = l.notes.bytes
 					}
-					if sw.buildSwitchHandover(re, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(notesAt, buildOpts)) {
+					if sw.buildSwitchHandover(rp, utils.PageAlign(l.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(notesAt, buildOpts)) {
 						l.switchN = switchNFor(buildOpts)
 						if sw.saNotes != nil && l.notes != nil {
 							// One record per position holds both automata's rows.
@@ -2383,6 +2627,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					p.setFind(e.body, e.mode)
 					p.findNeutralBody = e.twin
 					p.findTwinCallOff = e.twinPatch
+					p.findTwinRoute = e.twinRoute
 					if (e.twin != nil) != (e.twinPatch >= 0) {
 						panic("compile: find twin and its handoff call-site patch must be emitted together")
 					}
@@ -2432,7 +2677,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 				if strategy == findSwitch && sw == nil && (p.litAnchorBackScanBody != nil || p.altLitAnchorBranches != nil) &&
 					buildOpts.globals != nil {
 					sw = &compiledPattern{}
-					if sw.buildSwitchHandover(re, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(p.notes.bytesPerPos(), buildOpts)) {
+					if sw.buildSwitchHandover(rp, utils.PageAlign(p.tableEnd), table, patMandLit, buildOpts, handoverNotesReq(p.notes.bytesPerPos(), buildOpts)) {
 						p.switchN = switchNFor(buildOpts)
 						if sw.saNotes != nil {
 							if p.notes == nil {
@@ -2468,7 +2713,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 					p.saSwitch = true
 					if sw.saBT != nil {
 						buildOpts.report().Note("switch handover: Backtracking — start-anywhere find refused: " +
-							startAnywhereRefusal(re.Pattern))
+							startAnywhereRefusal(rp))
 					}
 				} else if strategy == findSwitch {
 					buildOpts.report().Note("find: switch unavailable — today's find kept")
@@ -2496,8 +2741,10 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// returned for an unsupported rune under these same ByteMode and Unicode
 	// options, on every path to this line. syntax.Compile never returns a
 	// non-nil error (see its stdlib source).
-	parsed, _ := syntax.Parse(re.Pattern, syntax.Perl)
-	prog, _ := syntax.Compile(parsed.Simplify())
+	pt, _ := rp.parse()
+	parsed := pt.re
+	mp, _ := compileProg(pt)
+	prog := mp.prog
 
 	p.groupNames = extractGroupNames(parsed)
 
@@ -2533,6 +2780,15 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		// winGlobalP1 stays 0: not in window mode. No -1 to remember.
 		return p, nil
 	}
+	// One capture between fixed literals: the same shortcut, the span
+	// offset by the literals' bytes (affixSingleCapture).
+	if !dfaStateLimitExceeded && !anchored {
+		if pre, suf, ok := affixSingleCapture(parsed, rp.unicode()); ok {
+			p.numGroups = 2
+			p.captureBody = appendAffixSingleCaptureCodeEntry(nil, pre, suf)
+			return p, nil
+		}
+	}
 
 	// selTDFA is the table the selector already built to decide eligibility; it
 	// is non-nil only when groupsEngine came back as EngineTDFA, so a
@@ -2546,27 +2802,14 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	// 94% to 98% of such a compile — 1.68 s of 1.78 s for a 41-instruction
 	// pattern — and the harnesses that force Backtracking pay it per compile
 	// (FuzzGroupsBothBodies three times per case, for its three budgets).
-	//
-	// The prog.NumCap > 2 guard keeps the skip off the one path with a side
-	// effect to lose. The selector is also where a pattern with NO capture
-	// groups picks up opts.LeftmostFirst (selector.go's DFA arm), and
-	// groups_func on a capture-less pattern does reach here — needGroups is
-	// re.CaptureStubsRequested(), which never looks at the pattern.
-	//
-	// Stated exactly, because it would be easy to overclaim: nothing
-	// downstream of this point reads buildOpts.LeftmostFirst today. The
-	// capture engines take the prog alone (newBacktrack(prog), newTDFA(prog,
-	// maxStates)), and the find/match bodies were emitted far above with their
-	// own explicit llOpts/lfOpts. So the guard is insurance against a future
-	// reader of the flag, not a fix for an observable difference — and
-	// TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath is the tripwire
-	// that fires when that stops being true.
+	// Every pattern that reaches here has a capture group: groups_func on one
+	// without is refused at the top of compilePatternBody (ErrNoCaptureGroup).
 	var groupsEngine EngineType
 	var selTDFA *tdfaTable
-	if forceGroupsEngine == EngineBacktrack && prog.NumCap > 2 {
+	if forceGroupsEngine == EngineBacktrack {
 		groupsEngine = EngineBacktrack
 	} else {
-		groupsEngine, selTDFA = selectBestEngineWithTDFA(prog, &buildOpts)
+		groupsEngine, selTDFA = selectBestEngineWithTDFA(mp, &buildOpts)
 		if forceGroupsEngine != 0 {
 			groupsEngine = forceGroupsEngine
 		}
@@ -2575,7 +2818,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	if groupsEngine == EngineTDFA {
 		tt, ok := selTDFA, selTDFA != nil
 		if !ok {
-			tt, ok = newTDFA(prog, resolveMaxDFAStates(&buildOpts))
+			tt, ok = newTDFA(mp, resolveMaxDFAStates(&buildOpts, mp.unicode()))
 		}
 		if ok && tt.numRegs > resolveMaxTDFARegs(&buildOpts) {
 			ok = false
@@ -2585,6 +2828,8 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			groupsEngine = EngineBacktrack
 		} else {
 			p.isTDFA = true
+			plainTT := tt
+			tt = tdfaWithCharLoops(tt, mp, buildOpts.LikelyMode)
 			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(dfaLayoutParams{
 				t:                    tt.dfaTable,
@@ -2614,7 +2859,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 			if !anchored && buildOpts.globals != nil {
 				p.capStartGlobalP1 = int32(buildOpts.globals.Alloc()) + 1
 			}
-			p.captureBody = appendTDFACodeEntry(nil, tt, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
+			p.captureBody, p.captureFallbackBody, p.captureFallbackCallOffs = tdfaCaptureBodies(tt, plainTT, tdfaLayout, buildOpts.tableMemIdx, anchored, p.capStartGlobal())
 			// TDFA only needs the transition table (no stack/memo).
 			p.tableEnd = tdfaLayout.tableEnd
 			rawTDFA, cntTDFA := stripSegCount(dfaDataSegments(tdfaLayout, false, false))
@@ -2624,10 +2869,11 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 	}
 
 	if groupsEngine == EngineBacktrack {
-		if len(prog.Inst) > maxBTFallbackInstructions {
-			return nil, ErrBTProgramTooLarge
+		if !mp.lim.btFits(len(prog.Inst)) {
+			return nil, newBTTooLarge("capture", len(prog.Inst),
+				"TDFA could not take it (--verbose says why; a TDFA over max_dfa_states is one reason)", mp.lim)
 		}
-		bt := newBacktrack(prog)
+		bt := newBacktrack(mp)
 
 		// Nothing is reserved in the tables for this body: its frame stack is
 		// placed at call time, in the run-time scratch region, and grows with the
@@ -2639,6 +2885,7 @@ func compilePatternBody(re config.RegexEntry, tableBase int64, forceGroupsEngine
 		frameSize := 4 + numCapLocs*4 + 4 // pos, captures, retryPC
 
 		plan := planBT(bt, buildOpts.BTWorkBudget)
+		reportBTMemo(buildOpts.report(), mp.unicode(), "capture", bt, plan)
 
 		// Window mode: patterns whose assertions are defined against the
 		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
@@ -3130,6 +3377,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	var cs []byte
 	cs = utils.AppendULEB128(cs, uint32(total-numFuncImports))
 	for i, p := range patterns {
+		opts.owners.mark(len(cs), p.ownerName())
 		base := baseIdx[i]
 		matchOff, backwardScanOff, findOff, captureOff, wrapperOff := p.offsets()
 		if p.matchBody != nil {
@@ -3182,13 +3430,13 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal())
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
 		// see archive Section 16.
 		if p.batchFindExport != "" {
-			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.defBatchFind)
+			cs = appendBatchFindWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.defBatchFind, p.twinRouteFor(findOff))
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
@@ -3204,7 +3452,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups)
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3212,7 +3460,8 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				panic("compile: pattern contributes a find function but no findFromMode was recorded — " +
 					"a find emitter bypassed setFind (see find_from.go)")
 			}
-			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen, p.defFind)
+			checkStartRule(p.startRule, p.findFromMode)
+			cs = appendFindFromWrapperCodeEntry(cs, base+findOff, p.findFromMode, p.minLen, p.defFind, p.twinRouteFor(findOff))
 		}
 		if p.hasGroupsFromWrapper() {
 			inner, anchoredOnly := base+wrapperOff, false
@@ -3228,6 +3477,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 			cs = appendGroupsFromWrapperCodeEntry(cs, inner, anchoredOnly, p.defGroups)
 		}
 	}
+	opts.owners.mark(len(cs), "")
 	if opts.Component {
 		cs = appendCodeEntry(cs, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
 		cs = appendCodeEntry(cs, buildComponentFreeBody(classHeadsBase))
@@ -3248,7 +3498,12 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 	if searchSetterIdx >= 0 {
 		cs = appendCodeEntry(cs, searchSetterBody(searchG))
 	}
-	return appendCodeAndData(out, cs, rawData, totalSegs, standalone)
+	return appendCodeAndData(out, cs, rawData, totalSegs, standalone, opts.keepUnreadTables)
+}
+
+// ownerName is how a message about one of p's function bodies names p.
+func (p *compiledPattern) ownerName() string {
+	return fmt.Sprintf("pattern %q", p.label)
 }
 
 // Compile compiles multiple regexp patterns to a single WASM module.
@@ -3259,7 +3514,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 //     pass a non-zero value to reserve low pages for their own test input buffers.
 //
 // All patterns must compile successfully; any error stops compilation immediately.
-func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
+func Compile(patterns []config.PatternEntry, tableBase int64, standalone bool, userOpts ...CompileOptions) ([]byte, int64, error) {
 	var opts CompileOptions
 	if len(userOpts) > 0 {
 		opts = userOpts[0]
@@ -3280,7 +3535,7 @@ func Compile(patterns []config.RegexEntry, tableBase int64, standalone bool, use
 // has no effect on capture-path patterns that hit one of compilePattern's
 // literal-chain fast paths (analyseLitChainGroupsRange and friends), which
 // bypass selectBestEngine entirely.
-func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
+func CompileForced(patterns []config.PatternEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, userOpts ...CompileOptions) ([]byte, int64, error) {
 	if forceGroupsEngine != 0 && forceGroupsEngine != EngineTDFA && forceGroupsEngine != EngineBacktrack {
 		return nil, 0, fmt.Errorf("CompileForced: forceGroupsEngine must be 0, EngineTDFA, or EngineBacktrack, got %v", forceGroupsEngine)
 	}
@@ -3291,7 +3546,8 @@ func CompileForced(patterns []config.RegexEntry, tableBase int64, standalone boo
 	return compileAll(patterns, tableBase, standalone, forceGroupsEngine, opts)
 }
 
-func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
+func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, error) {
+	defer opts.Report.startProgress()()
 	if !standalone {
 		opts.tableMemIdx = 1
 		// A component's allocator grows memory 0 and its exported "memory" is
@@ -3315,11 +3571,17 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 	globals := &moduleGlobals{}
 	opts.globals = globals
 	var compiled []*compiledPattern
+	// A base past int32 loses its high bits outright (8 GiB lays the tables
+	// out at 0); one inside it wraps only the tables that reach past it, which
+	// the assembled module's data segments show below.
+	if tableBase < 0 || tableBase > math.MaxInt32 {
+		return nil, 0, fmt.Errorf("%w: the table base is %d", ErrTablesOutOfRange, tableBase)
+	}
 	cur := tableBase
 	for _, re := range patterns {
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
 		if err != nil {
-			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Pattern, err)
+			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Regexp, err)
 		}
 		// Batch find/groups export trigger. Sole
 		// trigger for batchFindExport/batchGroupsExport — independent of
@@ -3354,7 +3616,18 @@ func compileAll(patterns []config.RegexEntry, tableBase int64, standalone bool, 
 		return nil, 0, err
 	}
 	asm.MaxPages = maxPages
+	var owners codeOwners
+	asm.owners = &owners
 	w := assembleModule(compiled, memPages, standalone, globals, asm)
+	if err := checkFunctionSizes(w, owners); err != nil {
+		return nil, 0, err
+	}
+	// A table whose int32 address wrapped is a segment at a negative offset;
+	// literal-anchored tables are laid out here, at assembly, so this is the
+	// one place every table's address is known.
+	if low, high, err := utils.DataSegmentBounds(sectionContent(w, 11)); err == nil && (low < 0 || high > math.MaxInt32+1) {
+		return nil, 0, fmt.Errorf("%w: tables from the base %d reach past it", ErrTablesOutOfRange, tableBase)
+	}
 	opts.Report.noteModule(globals)
 	return w, lastTableEnd, nil
 }
@@ -3377,11 +3650,12 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 // Backtracking by a state limit, and a pattern dropped from a set.
 func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) error {
 	outPath := output
-	slog.Info("Compiling regexps", "count", len(cfg.Regexps), "output", outPath)
+	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "output", outPath)
 
 	// Always a Reporter: it only records, and WarnUnboundedMemory reads what
-	// the compile found. It is rendered only under --verbose.
-	rep := &Reporter{}
+	// the compile found. It is rendered only under --verbose. Progress lines
+	// from a long construction go to stderr whatever the flags (progress.go).
+	rep := &Reporter{Progress: os.Stderr}
 
 	var wasmBytes []byte
 	if len(cfg.Sets) > 0 {
@@ -3389,20 +3663,25 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 		var diags []SetDiag
 		wasmBytes, _, diags, err = compileFileDiagReport(cfg, output, CompileSetOptions{}, rep)
 		if err != nil {
+			// What was decided before the error — a refused pattern's mode
+			// among it — is worth showing.
+			rep.Render(report)
 			return fmt.Errorf("compile: %w", err)
 		}
 		rep.Sets = diags
 	} else {
 		compOpts := CompileOptions{
-			MaxDFAStates: cfg.MaxDFAStates,
-			MaxTDFARegs:  cfg.MaxTDFARegs,
-			MaxMemory:    cfg.MaxMemory,
-			Report:       rep,
+			MaxDFAStates:      int(cfg.MaxDFAStates),
+			MaxBTInstructions: int(cfg.MaxBTInstructions),
+			MaxTDFARegs:       cfg.MaxTDFARegs,
+			MaxMemory:         cfg.MaxMemory,
+			Report:            rep,
 		}
 		standalone := cfg.Output == ""
 		var err error
-		wasmBytes, _, err = Compile(cfg.Regexps, 0, standalone, compOpts)
+		wasmBytes, _, err = Compile(cfg.Patterns, 0, standalone, compOpts)
 		if err != nil {
+			rep.Render(report)
 			return fmt.Errorf("compile: %w", err)
 		}
 	}
@@ -3442,41 +3721,15 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 	// Gather diagnostics by re-running CompileFile (it already computed them;
 	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
 	var prefixPool, suffixPool dfaPool
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			nameIdx[re.Name] = i
-		}
-	}
-	diag := Diagnostics{PatternsTotal: len(cfg.Regexps)}
+	diag := Diagnostics{PatternsTotal: len(cfg.Patterns)}
 	for _, sc := range cfg.Sets {
-		var selectedIdx []int
-		if sc.Patterns.All {
-			for i := range cfg.Regexps {
-				selectedIdx = append(selectedIdx, i)
-			}
-		} else {
-			for _, name := range sc.Patterns.Names {
-				if idx, ok := nameIdx[name]; ok {
-					selectedIdx = append(selectedIdx, idx)
-				}
-			}
-		}
-		var droppedRefs []PatternRef
-		for _, idx := range selectedIdx {
-			re := cfg.Regexps[idx]
-			if re.CaptureStubsRequested() {
-				diag.CaptureBearing++
-				droppedRefs = append(droppedRefs, PatternRef{ID: idx, Name: re.Name})
-			}
-		}
 		// setPatternInfos, not a second copy of its loop. This used to
 		// `continue` past an analyzePattern error where CompileFile treats the
 		// same error as FATAL, so a config that cannot build could still
 		// produce a clean-looking diagnostics file describing a set with the
 		// broken pattern quietly missing from it.
 		// Sharing the function is what stops the two answers drifting again.
-		infos, globalIDs, err := setPatternInfos(sc, cfg, selectedIdx, &prefixPool, &suffixPool)
+		infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, nil)
 		if err != nil {
 			return err
 		}
@@ -3489,8 +3742,10 @@ func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
 		// and this file is the only window onto those.
 		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
 		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
+		if cs.err != nil {
+			return fmt.Errorf("set %q: %w", sc.Name, cs.err)
+		}
 		if cs.diag != nil {
-			cs.diag.CaptureBearingDropped = droppedRefs
 			diag.Sets = append(diag.Sets, *cs.diag)
 		}
 		diag.InSet += len(infos)
@@ -3543,22 +3798,23 @@ func stripCaptures(re *syntax.Regexp) {
 // The rewritten tree is printed with Regexp.String and kept only when the
 // printed pattern compiles to the same NFA program as the tree it came from,
 // so nothing the printer fails to round-trip can change what a pattern means.
-func collapseZeroWidthRepeats(pattern string) string {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil || !collapseZeroWidthRepeatsRe(re) {
+// The rewritten pattern keeps pattern's mode.
+func collapseZeroWidthRepeats(pattern resolvedPattern) resolvedPattern {
+	t, err := pattern.parse()
+	if err != nil || !collapseZeroWidthRepeatsRe(t.re) {
 		return pattern
 	}
-	out := re.String()
+	out := t.re.String()
 	back, err := syntax.Parse(out, syntax.Perl)
 	if err != nil {
 		return pattern
 	}
-	want, err1 := syntax.Compile(re.Simplify())
-	got, err2 := syntax.Compile(back.Simplify())
-	if err1 != nil || err2 != nil || want.String() != got.String() {
+	want, err1 := compileProg(t)
+	got, err2 := compileProg(t.tree(back))
+	if err1 != nil || err2 != nil || want.prog.String() != got.prog.String() {
 		return pattern
 	}
-	return out
+	return pattern.source(out)
 }
 
 // collapseZeroWidthRepeatsRe applies collapseZeroWidthRepeats' rewrite to re
@@ -3641,10 +3897,12 @@ func NeedsUnicodeSupport(pattern string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("parse error: %w", err)
 	}
-	prog, _ := syntax.Compile(re.Simplify())
+	// Byte mode, not a resolved one: this is the detector's public face, and
+	// what it detects is exactly what byte mode cannot express.
+	prog, _ := compileProg(resolvedTree{re: re, pm: progModeByte})
 	// The text as well as the program: Compile refuses a fold-artifact rune
 	// the pattern writes (`[sSſ]`), which the program alone cannot see.
-	return unsupportedRuneIn(pattern, prog, false) >= 0, nil
+	return unsupportedRuneIn(pattern, prog.prog, false) >= 0, nil
 }
 
 // BacktrackHasZeroWidthCycle reports whether pattern's GROUPS program — the
@@ -3659,27 +3917,40 @@ func NeedsUnicodeSupport(pattern string) (bool, error) {
 // the captures stripped, and Go's simplifier can then collapse the cycle:
 // `(a*)*b` has one here, while its find program has none and keeps its ordinary
 // body.
-func BacktrackHasZeroWidthCycle(pattern string) (bool, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+//
+// opts are the options the caller compiles pattern with: its mode is resolved
+// from them, so the program inspected is the one that build compiles.
+func BacktrackHasZeroWidthCycle(pattern string, opts CompileOptions) (bool, error) {
+	rp, err := resolvePattern(pattern, nil, &opts)
+	if err != nil {
+		return false, err
+	}
+	re, err := rp.parse()
 	if err != nil {
 		return false, fmt.Errorf("parse error: %w", err)
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(re.Simplify())
-	return progHasZeroWidthCycle(prog), nil
+	prog, _ := compileProg(re)
+	return progHasZeroWidthCycle(prog.prog), nil
 }
 
 // SelectEngine returns the EngineType that would be chosen for the given pattern,
 // without actually compiling it. Returns an error if the pattern cannot be parsed
 // or compiled to NFA bytecode.
 func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+	rp, err := resolvePattern(pattern, nil, &opts)
+	if err != nil {
+		return 0, err
+	}
+	re, err := rp.parse()
 	if err != nil {
 		return 0, fmt.Errorf("parse error: %w", err)
 	}
-	prog, _ := syntax.Compile(re.Simplify())
-	if bad := unsupportedRuneIn(pattern, prog, opts.ByteMode); bad >= 0 && !opts.Unicode {
-		return 0, unsupportedRuneError(bad)
+	prog, _ := compileProg(re)
+	if !rp.unicode() {
+		if bad := unsupportedRuneIn(pattern, prog.prog, opts.ByteMode); bad >= 0 {
+			return 0, unsupportedRuneError(bad)
+		}
 	}
 	return selectBestEngine(prog, &opts), nil
 }
@@ -3694,39 +3965,40 @@ func SelectEngine(pattern string, opts CompileOptions) (EngineType, error) {
 // point; no production caller reached any of them. ForceEngine is accepted
 // for the callers that still spell out EngineDFA, and any other value is a
 // programming error.
-func compile(pattern string, opts ...CompileOptions) (matcher, error) {
-	re, err := syntax.Parse(pattern, syntax.Perl)
+func compile(pattern resolvedPattern, opts ...CompileOptions) (matcher, error) {
+	re, err := pattern.parse()
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
 
-	simplified := re.Simplify()
-	prog, _ := syntax.Compile(simplified)
+	prog, _ := compileProg(re)
 
 	var options CompileOptions
 	if len(opts) > 0 {
 		options = opts[0]
 	}
 
-	if bad := unsupportedRuneIn(pattern, prog, options.ByteMode); bad >= 0 && !options.Unicode {
-		return nil, unsupportedRuneError(bad)
+	if !pattern.unicode() {
+		if bad := unsupportedRuneIn(pattern.src, prog.prog, options.ByteMode); bad >= 0 {
+			return nil, unsupportedRuneError(bad)
+		}
 	}
 
 	if options.ForceEngine != 0 && options.ForceEngine != EngineDFA {
 		panic(fmt.Sprintf("compile: builds a DFA only, asked for engine %v", options.ForceEngine))
 	}
 
-	// max(maxHelperDFAStates, resolveMaxDFAStates(&options)): callers
-	// (compile.go's match/find construction) deliberately set
-	// MaxDFAStates arbitrarily low to force a BT fallback while still
-	// expecting a real (if oversized) table back for prefix-extraction
-	// optimisations — see maxHelperDFAStates' doc comment. But a caller
-	// that configures a MaxDFAStates ABOVE maxHelperDFAStates (e.g.
-	// re2test's 100000) must have construction actually reach that
-	// budget, or the 2048 ceiling silently downgrades DFA-eligible
-	// patterns to Backtracking regardless of the configured threshold.
-	ceiling := max(maxHelperDFAStates, resolveMaxDFAStates(&options))
-	d, ok := newDFA(prog, options.Unicode, options.LeftmostFirst, ceiling)
+	// The larger of the mode's construction cap and the state limit
+	// (buildLimits.dfaBuildCap): callers (compile.go's match/find
+	// construction) deliberately set MaxDFAStates arbitrarily low to force a
+	// BT fallback while still expecting a real (if oversized) table back for
+	// prefix-extraction optimisations — see maxHelperDFAStates' doc comment.
+	// But a caller that configures a MaxDFAStates ABOVE the cap (e.g.
+	// re2test's 100000) must have construction actually reach that budget,
+	// or the cap silently downgrades DFA-eligible patterns to Backtracking
+	// regardless of the configured threshold.
+	ceiling := buildLimits{dfaStates: options.MaxDFAStates}.dfaBuildCap(pattern.unicode())
+	d, ok := newDFA(prog, options.LeftmostFirst, ceiling)
 	if !ok {
 		return nil, ErrDFAStateLimit
 	}
@@ -4092,15 +4364,24 @@ func unsupportedRuneError(r rune) error {
 		return fmt.Errorf("pattern contains the non-ASCII rune U+%04X; regexped matches bytes, "+
 			"so set byte_mode: true to match it as the single byte 0x%02X, or remove it", r, r)
 	}
-	return fmt.Errorf("pattern contains the rune U+%04X, above U+00FF; regexped matches bytes "+
-		"and has no Unicode support", r)
+	return fmt.Errorf("pattern contains the rune U+%04X, above U+00FF, which byte mode cannot "+
+		"match; without byte mode the pattern compiles in Unicode mode", r)
 }
 
-// needsUnicodeSupport reports whether prog names a rune the DEFAULT (non-byte)
-// mode refuses. Kept as the predicate form for the internal optimisation
-// guards, which ask only "can a byte automaton represent this sub-program".
+// needsUnicodeSupport reports whether prog names a rune the byte gate refuses
+// at the ASCII limit.
 func needsUnicodeSupport(prog *syntax.Prog) bool {
 	return unsupportedRune(prog, false) >= 0
+}
+
+// refusedByByteGate is the internal optimisation guards' question, "can a
+// byte automaton represent this sub-program": no, for a byte-mode program
+// naming a rune the gate refuses; always yes for a Unicode-mode one, which is
+// lowered to bytes. Asking needsUnicodeSupport of a lowered program instead
+// read its bytes 0x80-0xFF as refused runes, and declined every fast path the
+// guards protect — `é+@example\.com` lost its literal-anchored find.
+func (p resolvedProg) refusedByByteGate() bool {
+	return !p.unicode() && needsUnicodeSupport(p.prog)
 }
 
 // buildGroupsWrapperBody emits the WASM body for the exported groups wrapper function.
@@ -4117,7 +4398,7 @@ func needsUnicodeSupport(prog *syntax.Prog) bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
 // to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
 // engine_backtrack.go for the reading side.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -4126,10 +4407,7 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 	// wrapper in front of this one sets it, and zeroing it here would discard
 	// the caller's position. This body is only ever reached through that
 	// wrapper.
-	b = append(b, 0x20, 0x00)
-	b = append(b, 0x20, 0x01)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(findFuncIdx))
+	b = emitFindBodyCall(b, findFuncIdx, route, true)
 	b = append(b, 0x22, 0x06)
 	// Any negative find result is forwarded verbatim (wrapped to i32), not
 	// collapsed to -1: a BT find body can return abi.BTStackOverflow (-2), and
@@ -4238,8 +4516,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -4276,6 +4554,14 @@ func emitBTOverflowGuardI32(b []byte, localIdx byte) []byte {
 	b = utils.AppendSLEB128(b, abi.BTStackOverflow)
 	b = append(b, 0x0F) //   return
 	return append(b, 0x0B)
+}
+
+// litAnchorOneByte reports whether the literal-anchored find scans for a
+// single one-byte literal (findLitAnchorPoint's wide-repeat fallback), whose
+// failed candidates the start-anywhere switch's counter charges every one of
+// (emitFindSwitchChargeEvery).
+func (p *compiledPattern) litAnchorOneByte() bool {
+	return len(p.litAnchorLitSet) == 1 && len(p.litAnchorLitSet[0]) == 1
 }
 
 // clearLitAnchor drops every literal-anchored find artifact, for a pattern
@@ -4319,7 +4605,7 @@ func (p *compiledPattern) clearLitAnchor() {
 //
 // def, when non-nil, is the export's default search state for a caller that
 // hands no block over (default_search.go).
-func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
+func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultSearch, route *twinRoute) []byte {
 
 	var b []byte
 	// Locals: 2×i32 (pos, count), 1×i64 (r), 3×i32 (relStart, relEnd, prevEnd)
@@ -4354,7 +4640,7 @@ func buildBatchFindWrapperBody(findFuncIdx int, mode findFromMode, def *defaultS
 	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
 
 	// r = find(...), searching from pos
-	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07)
+	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07, route)
 
 	// if r < -1: return abi.BTStackOverflow. Must be tested BEFORE the
 	// r < 0 exit below, which would otherwise report the batch collected so
@@ -4433,8 +4719,8 @@ func emitBatchWindow(b []byte, def *defaultSearch, l defLocals, count, pos byte)
 }
 
 // appendBatchFindWrapperCodeEntry appends a size-prefixed batch find wrapper body to cs.
-func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, def *defaultSearch) []byte {
-	body := buildBatchFindWrapperBody(findFuncIdx, mode, def)
+func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMode, def *defaultSearch, route *twinRoute) []byte {
+	body := buildBatchFindWrapperBody(findFuncIdx, mode, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -4483,7 +4769,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -4526,7 +4812,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 	b = append(b, 0x20, 0x05, 0x20, 0x01, 0x4B, 0x0D, 0x01)
 
 	// r = find(...), searching from pos
-	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07)
+	b = emitFindCallFromPos(b, findFuncIdx, mode, 0x05, 0x07, route)
 
 	// if r < -1: return abi.BTStackOverflow — see the batch find wrapper's
 	// matching comment for why this precedes the r < 0 exit.
@@ -4665,8 +4951,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMe
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }
@@ -4717,11 +5003,11 @@ func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, n
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=recBase i32,
 // 8=r i32, 9=slotVal i32 (narrowing form only).
 func buildBatchLitChainGroupsWrapperBody(captureFuncIdx, numGroups int, mode findFromMode) []byte {
-	if mode != ffNative && mode != ffAnchoredZeroOnly {
+	if !mode.native() && mode != ffAnchoredZeroOnly {
 		panic("compile: batch groups over an anchored capture body with mode " +
 			mode.String() + " — see find_from.go")
 	}
-	native := mode == ffNative
+	native := mode.native()
 	recordSize := 8 + numGroups*8
 
 	var b []byte

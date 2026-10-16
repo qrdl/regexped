@@ -95,9 +95,10 @@ func TestBtCheckRune1FoldDirect(t *testing.T) {
 }
 
 func TestBtCheckRune1CaseFold(t *testing.T) {
-	// (?i:a) compiled with BT engine exercises btCheckRune1 with isFold=true.
+	// (?i:a) compiled with BT engine exercises btCheckRune1 with isFold=true;
+	// the empty group gives groups_func a capture group.
 	_, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(?i:a)", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: "(?i:a)()", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 	)
 	if err != nil {
@@ -115,34 +116,34 @@ func TestBtCheckRune1CaseFold(t *testing.T) {
 func TestBTCompileDeterminism(t *testing.T) {
 	cases := []struct {
 		name string
-		re   config.RegexEntry
+		re   config.PatternEntry
 		opts []CompileOptions
 	}{
 		// buildBacktrackBody (capture path): a non-greedy loop wrapping a
 		// capture — a zero-width cycle, so the fallback body alone.
-		{"capture_loop_snapshot", config.RegexEntry{Pattern: "((a?)*?)", GroupsFunc: "g"}, nil},
+		{"capture_loop_snapshot", config.PatternEntry{Regexp: "((a?)*?)", GroupsFunc: "g"}, nil},
 		// buildBacktrackBody: 4 quantified sub-expressions.
-		{"capture_multi_loop", config.RegexEntry{Pattern: `(?i)(\bOR\b|\bAND\b)\s+[0-9]+\s*=\s*[0-9]+`, GroupsFunc: "g"}, nil},
+		{"capture_multi_loop", config.PatternEntry{Regexp: `(?i)(\bOR\b|\bAND\b)\s+[0-9]+\s*=\s*[0-9]+`, GroupsFunc: "g"}, nil},
 		// buildBTMatchBody (no-capture match, forced via DFA-too-large
 		// fallback): 2 independent loops.
-		{"match_bt_multi_loop", config.RegexEntry{Pattern: "[a-z]+[0-9]+", MatchFunc: "m"}, []CompileOptions{{MaxDFAStates: 1}}},
+		{"match_bt_multi_loop", config.PatternEntry{Regexp: "[a-z]+[0-9]+", MatchFunc: "m"}, []CompileOptions{{MaxDFAStates: 1}}},
 		// buildBTFindBody, mandatory-literal branch (no-capture find,
 		// forced via DFA-too-large fallback): loops on both sides of a
 		// mandatory interior literal.
-		{"find_bt_mandlit", config.RegexEntry{Pattern: "[a-z]+SECRET[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
+		{"find_bt_mandlit", config.PatternEntry{Regexp: "[a-z]+SECRET[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
 		// buildBTFindBody, general-scan (OnMatch closure) branch: same
 		// loop shape but no mandatory literal to anchor the scan.
-		{"find_bt_no_mandlit", config.RegexEntry{Pattern: "[a-z]+[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
+		{"find_bt_no_mandlit", config.PatternEntry{Regexp: "[a-z]+[0-9]+", FindFunc: "f"}, []CompileOptions{{MaxDFAStates: 1}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			first, _, err := Compile([]config.RegexEntry{c.re}, 0, true, c.opts...)
+			first, _, err := Compile([]config.PatternEntry{c.re}, 0, true, c.opts...)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
 			const iterations = 20
 			for i := 0; i < iterations; i++ {
-				got, _, err := Compile([]config.RegexEntry{c.re}, 0, true, c.opts...)
+				got, _, err := Compile([]config.PatternEntry{c.re}, 0, true, c.opts...)
 				if err != nil {
 					t.Fatalf("iteration %d: Compile: %v", i+1, err)
 				}
@@ -160,7 +161,7 @@ func TestBTCompileDeterminism(t *testing.T) {
 // whole-pattern-single-capture shortcut (which requires MaxCap()==1) does not
 // intercept it, unlike its close cousin ((?:a?)+?).
 func TestBTZeroWidthCycleGroupsCompile(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "((a?)*?)", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "((a?)*?)", GroupsFunc: "g"}})
 }
 
 // TestBTNonLoopAltPushContinue exercises the plain-alternation (non-loop
@@ -169,7 +170,7 @@ func TestBTZeroWidthCycleGroupsCompile(t *testing.T) {
 // are TDFA-exclusion gates in selectBestEngine); (?:x|y) is a non-loop
 // InstAlt.
 func TestBTNonLoopAltPushContinue(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a)\B(?:x|y)`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(a)\B(?:x|y)`, GroupsFunc: "g"}})
 }
 
 // TestBTWordBoundaryFalse exercises the \B case dispatch and the
@@ -180,7 +181,7 @@ func TestBTNonLoopAltPushContinue(t *testing.T) {
 // single-capture shortcut and never reaches BT capture compilation at all;
 // the second group makes isWholePatternSingleCapture reject it.
 func TestBTWordBoundaryFalse(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a)\B(c)`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(a)\B(c)`, GroupsFunc: "g"}})
 }
 
 // TestBTInstNop exercises the InstNop case in emitBTInstHandler, only
@@ -191,7 +192,7 @@ func TestBTWordBoundaryFalse(t *testing.T) {
 // confirmed live to still produce an InstNop instruction and route to
 // Backtracking.
 func TestBTInstNop(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(a|)\B(c)`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(a|)\B(c)`, GroupsFunc: "g"}})
 }
 
 // TestBTInvertedClassNonASCIISkip exercises the Unicode-range skip
@@ -202,7 +203,7 @@ func TestBTInstNop(t *testing.T) {
 // documents (hasAmbiguousCaptures routes inverted-class captures to
 // Backtracking, deliberately, not a bug).
 func TestBTInvertedClassNonASCIISkip(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `<([^>]+)>`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `<([^>]+)>`, GroupsFunc: "g"}})
 }
 
 // TestBTInstCaptureNoCapturesFallback exercises the InstCapture no-captures
@@ -212,7 +213,7 @@ func TestBTInvertedClassNonASCIISkip(t *testing.T) {
 // no user captures are requested (MatchFunc/FindFunc only); MaxDFAStates: 1
 // forces the DFA-too-large fallback to Backtracking.
 func TestBTInstCaptureNoCapturesFallback(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[^a]+", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[^a]+", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
@@ -292,7 +293,7 @@ func TestNfaFirstBytesCaseFold(t *testing.T) {
 // body built is the memoised fallback.
 // MaxDFAStates: 1 forces the DFA-too-large fallback to BT find.
 func TestBTFindMandatoryLitCluster(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{1,3}SECRET(?:b?)*?", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{1,3}SECRET(?:b?)*?", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
@@ -819,7 +820,7 @@ func TestEnginesCovCompileForcedRejectsBadEngine(t *testing.T) {
 	// forced, which is exactly the confusion the guard exists to prevent.
 	for _, bad := range []EngineType{EngineDFA, EngineCompiledDFA, EngineType(99)} {
 		_, _, err := CompileForced(
-			[]config.RegexEntry{{Pattern: "(a)", GroupsFunc: "g"}}, 0, true, bad)
+			[]config.PatternEntry{{Regexp: "(a)", GroupsFunc: "g"}}, 0, true, bad)
 		if err == nil {
 			t.Errorf("CompileForced(forceGroupsEngine=%v): no error, want rejection", bad)
 		}
@@ -831,7 +832,7 @@ func TestEnginesCovCompileForcedHonoursUserOpts(t *testing.T) {
 	// were dropped, MaxDFAStates below would be ignored and the pattern would
 	// compile on the TDFA path instead of the forced Backtracking one.
 	wasm, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: "(a)(b)", GroupsFunc: "g"}},
+		[]config.PatternEntry{{Regexp: "(a)(b)", GroupsFunc: "g"}},
 		0, true, EngineBacktrack,
 		CompileOptions{MaxDFAStates: 512},
 	)
@@ -876,12 +877,12 @@ func TestEnginesCovIsAlternationDeterministic(t *testing.T) {
 
 	// Out-of-range PC: callers index prog.Inst with the value they pass, so a
 	// bad PC must be rejected rather than panic.
-	if isAlternationDeterministic(prog, len(prog.Inst), false) {
+	if isAlternationDeterministic(prog, len(prog.Inst), false, false) {
 		t.Error("isAlternationDeterministic(out-of-range PC) = true, want false")
 	}
 	// A PC that is not an alternation at all cannot be "deterministic".
 	runePC := enginesCovFindInst(t, prog, syntax.InstRune1)
-	if isAlternationDeterministic(prog, runePC, false) {
+	if isAlternationDeterministic(prog, runePC, false, false) {
 		t.Error("isAlternationDeterministic(non-Alt PC) = true, want false")
 	}
 }
@@ -981,11 +982,12 @@ func TestEnginesCovSelectBestEngineDebugLogging(t *testing.T) {
 		t.Fatal("debug logging not enabled after SetDefault; test would not reach the branch")
 	}
 
-	// A Unicode pattern also picks the "Unicode" complexity label, which is
-	// only computed on this path.
+	// A program with a rune above 0x7F also picks the "Unicode" complexity
+	// label, which is only computed on this path. The program is built here,
+	// not through the resolver, so its class keeps those runes.
 	prog := enginesCovProg(t, `[\x{100}-\x{200}](a)`)
-	opts := CompileOptions{Unicode: true}
-	if engine, _ := selectBestEngineWithTDFA(prog, &opts); engine == 0 {
+	var opts CompileOptions
+	if engine, _ := selectBestEngineWithTDFA(byteProg(prog), &opts); engine == 0 {
 		t.Error("selectBestEngineWithTDFA returned no engine")
 	}
 }
@@ -1102,6 +1104,36 @@ func TestEnginesCovEpsWalkerGenerationWrap(t *testing.T) {
 // whole_capture.go / mandatory_lit.go / prefix_scan.go — small helpers
 // ---------------------------------------------------------------------------
 
+// TestAffixSingleCapture pins the affix shortcut's shape: one capture between
+// unfolded literals, and the literals' byte lengths in each mode.
+func TestAffixSingleCapture(t *testing.T) {
+	for _, c := range []struct {
+		pat      string
+		unicode  bool
+		pre, suf int
+		ok       bool
+	}{
+		{`([^,]+),`, false, 0, 1, true},
+		{`<([^>]*)>`, false, 1, 1, true},
+		{`key=(\w+)`, false, 4, 0, true},
+		{`ab(c*)de`, false, 2, 2, true},
+		{`ж(\pL+)жж`, true, 2, 4, true},
+		{`(a)`, false, 0, 0, false},       // the whole-pattern shortcut's
+		{`x(a)(b)`, false, 0, 0, false},   // two captures
+		{`(?i:k)(a)`, false, 0, 0, false}, // a folded literal has no fixed length
+		{`(a)b*`, false, 0, 0, false},     // not a literal
+		{`a?(b)`, false, 0, 0, false},
+		{`x(a)y(b)z`, false, 0, 0, false},
+		{`xy`, false, 0, 0, false},
+	} {
+		re := enginesCovParse(t, c.pat)
+		pre, suf, ok := affixSingleCapture(re, c.unicode)
+		if ok != c.ok || pre != c.pre || suf != c.suf {
+			t.Errorf("affixSingleCapture(%q) = %d, %d, %v; want %d, %d, %v", c.pat, pre, suf, ok, c.pre, c.suf, c.ok)
+		}
+	}
+}
+
 func TestEnginesCovIsWholePatternSingleCapture(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1182,6 +1214,173 @@ func TestEnginesCovBTEmitSingleRangeClampsAboveByteRange(t *testing.T) {
 	if hi := btEmitSingleRange(nil, 0x80, 0xFF); hi == nil {
 		t.Error("btEmitSingleRange(0x80, 0xFF) emitted nothing, want a range check")
 	}
+	// An empty range matches nothing. The test is one unsigned compare,
+	// scratch - lo <= hi - lo, and lo > hi would wrap hi - lo to a bound every
+	// byte is under.
+	if got := btEmitSingleRange(nil, 'z', 'a'); got != nil {
+		t.Errorf("btEmitSingleRange('z', 'a') emitted % x, want nothing", got)
+	}
+}
+
+// TestBacktrackBodiesHaveNoValueTypedBlocks pins that a Backtracking body's
+// per-instruction checks — the byte-range test and the word-boundary test —
+// produce no value through a block. wasmtime makes every value-typed block a
+// Cranelift variable whose SSA table keeps a slot per block of the function,
+// so one per instruction made its compile memory grow with the square of the
+// body: a Unicode-mode find of `^..(S........(S)+){70}` (2.8 MB) took 3.4 GB to
+// compile. Every shape must have none, the word-boundary one at two sizes.
+func TestBacktrackBodiesHaveNoValueTypedBlocks(t *testing.T) {
+	uni := CompileOptions{Unicode: true}
+	byteMode := CompileOptions{ForceByteMode: true}
+	cases := []struct {
+		name  string
+		entry config.PatternEntry
+		opts  CompileOptions
+	}{
+		{"unicode groups classes", config.PatternEntry{Regexp: `(\pL+)\s(\pN+)`, GroupsFunc: "g"}, uni},
+		{"unicode groups dot", config.PatternEntry{Regexp: `(.+)=(.+)`, GroupsFunc: "g"}, uni},
+		{"unicode groups fold", config.PatternEntry{Regexp: `(?i)(привет)\s+(мир)`, GroupsFunc: "g"}, uni},
+		{"unicode groups word boundary x5", config.PatternEntry{Regexp: `^(?:\b(.)\b ){5}`, GroupsFunc: "g"}, uni},
+		{"unicode groups word boundary x40", config.PatternEntry{Regexp: `^(?:\b(.)\b ){40}`, GroupsFunc: "g"}, uni},
+		{"unicode find x10", config.PatternEntry{Regexp: `^..(S........(S)+){10}`, FindFunc: "f"}, uni},
+		{"byte groups classes and boundaries", config.PatternEntry{Regexp: `([a-z]+)\b(\d+)\B(x)`, GroupsFunc: "g"}, byteMode},
+	}
+	for _, c := range cases {
+		var w []byte
+		var err error
+		if c.entry.GroupsFunc != "" {
+			w, _, err = CompileForced([]config.PatternEntry{c.entry}, 65536, true, EngineBacktrack, c.opts)
+		} else {
+			w, _, err = Compile([]config.PatternEntry{c.entry}, 65536, true, c.opts)
+		}
+		if err != nil {
+			t.Fatalf("%s: compile %q: %v", c.name, c.entry.Regexp, err)
+		}
+		if n := wasmValueTypedBlocks(t, w); n != 0 {
+			t.Errorf("%s: %q has %d value-typed blocks, want none", c.name, c.entry.Regexp, n)
+		}
+	}
+}
+
+// wasmValueTypedBlocks counts, over every function body of a module, the
+// `block` and `loop` instructions whose block type is a value type. It
+// decodes every instruction regexped emits and fails the test unless each
+// body ends exactly where its size says — a decoding slip must not pass for a
+// zero count.
+func wasmValueTypedBlocks(t *testing.T, wasm []byte) int {
+	t.Helper()
+	uleb := func(p *int) uint64 {
+		v, n, err := utils.DecodeULEB128(wasm[*p:])
+		if err != nil {
+			t.Fatalf("bad ULEB128 at %d: %v", *p, err)
+		}
+		*p += n
+		return v
+	}
+	sleb := func(p *int) {
+		_, n, err := utils.DecodeSLEB128(wasm[*p:])
+		if err != nil {
+			t.Fatalf("bad SLEB128 at %d: %v", *p, err)
+		}
+		*p += n
+	}
+	memarg := func(p *int) {
+		if uleb(p)&0x40 != 0 { // multi-memory: a memory index follows
+			uleb(p)
+		}
+		uleb(p)
+	}
+	count := 0
+	for pos := 8; pos < len(wasm); {
+		id := wasm[pos]
+		pos++
+		size := int(uleb(&pos))
+		end := pos + size
+		if id != 10 {
+			pos = end
+			continue
+		}
+		for n := uleb(&pos); n > 0; n-- {
+			bodyEnd := int(uleb(&pos))
+			bodyEnd += pos
+			for groups := uleb(&pos); groups > 0; groups-- {
+				uleb(&pos)
+				pos++
+			}
+			for pos < bodyEnd {
+				op := wasm[pos]
+				pos++
+				switch {
+				case op == 0x02 || op == 0x03 || op == 0x04: // block, loop, if
+					bt := wasm[pos]
+					switch {
+					case bt == 0x40:
+						pos++
+					case bt >= 0x6F: // a value type
+						if op != 0x04 {
+							count++
+						}
+						pos++
+					default: // a type index
+						sleb(&pos)
+						if op != 0x04 {
+							count++
+						}
+					}
+				case op == 0x0C || op == 0x0D || op == 0x10 || op == 0xD2 || (op >= 0x20 && op <= 0x26):
+					uleb(&pos)
+				case op == 0x0E: // br_table
+					for k := uleb(&pos) + 1; k > 0; k-- {
+						uleb(&pos)
+					}
+				case op == 0x11: // call_indirect
+					uleb(&pos)
+					uleb(&pos)
+				case op == 0x1C: // select t*
+					pos += int(uleb(&pos))
+				case op >= 0x28 && op <= 0x3E:
+					memarg(&pos)
+				case op == 0x3F || op == 0x40:
+					uleb(&pos)
+				case op == 0x41 || op == 0x42:
+					sleb(&pos)
+				case op == 0x43:
+					pos += 4
+				case op == 0x44:
+					pos += 8
+				case op == 0xD0:
+					pos++
+				case op == 0xFC:
+					switch sub := uleb(&pos); {
+					case sub == 8 || sub == 10 || sub == 12 || sub == 14:
+						uleb(&pos)
+						uleb(&pos)
+					case sub == 9 || sub == 11 || sub == 13 || (sub >= 15 && sub <= 17):
+						uleb(&pos)
+					}
+				case op == 0xFD:
+					switch sub := uleb(&pos); {
+					case sub <= 11 || sub == 92 || sub == 93:
+						memarg(&pos)
+					case sub == 12 || sub == 13:
+						pos += 16
+					case sub >= 21 && sub <= 34:
+						pos++
+					case sub >= 84 && sub <= 91:
+						memarg(&pos)
+						pos++
+					}
+				}
+			}
+			if pos != bodyEnd {
+				t.Fatalf("function body decoded past its end: at %d, want %d", pos, bodyEnd)
+			}
+		}
+		if pos != end {
+			t.Fatalf("code section decoded to %d, want %d", pos, end)
+		}
+	}
+	return count
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,7 +1542,7 @@ func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
 			t.Errorf("%s: progHasZeroWidthCycle = %v, want %v", c.pattern, got, c.cycle)
 			continue
 		}
-		bt := newBacktrack(prog)
+		bt := newBacktrack(byteProg(prog))
 		for _, budget := range []int{0, 8} {
 			plan := planBT(bt, budget)
 			if plan.force != c.cycle || !plan.fallback {
@@ -1373,11 +1572,11 @@ func TestEnginesCovBTWindowedBitState(t *testing.T) {
 	if !progHasZeroWidthCycle(enginesCovProg(t, pattern)) {
 		t.Fatalf("%s has no zero-width cycle — witness pattern no longer has the shape", pattern)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 
 	// The same nest with a multiline anchor instead of a word boundary — the
 	// other trigger for window mode.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `((?m:^)(?:a*)+b)`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `((?m:^)(?:a*)+b)`, GroupsFunc: "g"}})
 }
 
 func TestEnginesCovNFAFirstBytesFoldedRuneRange(t *testing.T) {
@@ -1427,20 +1626,24 @@ func TestEnginesCovBTComposedCaptureBodyWindowAndMemo(t *testing.T) {
 	if isWholePatternSingleCapture(enginesCovParse(t, pattern)) {
 		t.Fatalf("%s is a whole-pattern single capture — it would bypass the composed body", pattern)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `((?m:^)(?:a*)+b)c`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `((?m:^)(?:a*)+b)c`, GroupsFunc: "g"}})
 }
 
 func TestEnginesCovBTNonASCIIRuneRange(t *testing.T) {
 	// The BT rune-range check compares a single input BYTE, so a class range
-	// that starts above 0x7F can never match and must be skipped rather than
-	// emitted with a truncated constant that would match the wrong bytes.
-	pattern := `([a-c\x{100}-\x{200}]+)x`
+	// that starts above the byte space can never match and must be skipped
+	// rather than emitted with a truncated constant that would match the wrong
+	// bytes. Only byte mode can hand Backtracking such a range — Unicode mode
+	// lowers every class to bytes first — and it does through case folding:
+	// `(?i)[k-s]` arrives carrying U+017F (ſ, a fold of s) and U+212A (the
+	// Kelvin sign, a fold of k), which the byte gate tolerates as artifacts.
+	pattern := `((?i)[k-s]+)x`
 	_, _, err := CompileForced(
-		[]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}},
-		0, true, EngineBacktrack, CompileOptions{Unicode: true})
+		[]config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}},
+		0, true, EngineBacktrack, CompileOptions{ForceByteMode: true})
 	if err != nil {
-		t.Fatalf("CompileForced(BT groups, mixed ASCII/non-ASCII class): %v", err)
+		t.Fatalf("CompileForced(BT groups, folded class with ranges past 0xFF): %v", err)
 	}
 }
 
@@ -1456,13 +1659,13 @@ func TestEnginesCovLitChainRangeNonGreedyFind(t *testing.T) {
 	// unanchored.
 	// The range analyser also gates on N >= 24 outside LikelyMatch, so the
 	// witness has to clear that too or it never reaches the greedy split.
-	mustCompileEntries(t, []config.RegexEntry{{
-		Pattern:  `AKIA[A-Z0-9]{24,40}?`,
+	mustCompileEntries(t, []config.PatternEntry{{
+		Regexp:   `AKIA[A-Z0-9]{24,40}?`,
 		FindFunc: "akia_nongreedy_find",
 	}})
 	// Greedy sibling, for contrast: same shape, different emitter.
-	mustCompileEntries(t, []config.RegexEntry{{
-		Pattern:  `AKIA[A-Z0-9]{24,40}`,
+	mustCompileEntries(t, []config.PatternEntry{{
+		Regexp:   `AKIA[A-Z0-9]{24,40}`,
 		FindFunc: "akia_greedy_find",
 	}})
 }
@@ -1489,7 +1692,7 @@ func TestEnginesCovBTProgramTooLarge(t *testing.T) {
 	t.Run("match_fallback", func(t *testing.T) {
 		pattern := enginesCovHugeBTPattern(t, `x`)
 		_, _, err := Compile(
-			[]config.RegexEntry{{Pattern: pattern, MatchFunc: "m"}}, 0, true,
+			[]config.PatternEntry{{Regexp: pattern, MatchFunc: "m"}}, 0, true,
 			CompileOptions{MaxDFAStates: 1})
 		if !errors.Is(err, ErrBTProgramTooLarge) {
 			t.Fatalf("Compile(match): err = %v, want ErrBTProgramTooLarge", err)
@@ -1498,7 +1701,7 @@ func TestEnginesCovBTProgramTooLarge(t *testing.T) {
 	t.Run("find_fallback", func(t *testing.T) {
 		pattern := enginesCovHugeBTPattern(t, `x`)
 		_, _, err := Compile(
-			[]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}}, 0, true,
+			[]config.PatternEntry{{Regexp: pattern, FindFunc: "f"}}, 0, true,
 			CompileOptions{MaxDFAStates: 1})
 		if !errors.Is(err, ErrBTProgramTooLarge) {
 			t.Fatalf("Compile(find): err = %v, want ErrBTProgramTooLarge", err)
@@ -1506,7 +1709,7 @@ func TestEnginesCovBTProgramTooLarge(t *testing.T) {
 	})
 	t.Run("groups", func(t *testing.T) {
 		pattern := enginesCovHugeBTPattern(t, `(x)`)
-		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
+		_, _, err := Compile([]config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}}, 0, true)
 		if !errors.Is(err, ErrBTProgramTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTProgramTooLarge", err)
 		}
@@ -1518,18 +1721,19 @@ func TestEnginesCovGroupsPathInputErrors(t *testing.T) {
 	// earlier parse, so it needs its own error handling for both a syntax
 	// error and a Unicode construct the engines cannot represent.
 	t.Run("parse_error", func(t *testing.T) {
-		_, _, err := Compile([]config.RegexEntry{{Pattern: `(`, GroupsFunc: "g"}}, 0, true)
+		_, _, err := Compile([]config.PatternEntry{{Regexp: `(`, GroupsFunc: "g"}}, 0, true)
 		if err == nil {
 			t.Fatal("Compile(groups, unbalanced paren): no error")
 		}
 	})
 	t.Run("unicode_unsupported", func(t *testing.T) {
-		_, _, err := Compile([]config.RegexEntry{{Pattern: `(\x{100})`, GroupsFunc: "g"}}, 0, true)
+		// Byte mode, as a harness forces it: a rune above U+00FF has no byte.
+		_, _, err := Compile([]config.PatternEntry{{Regexp: `(\x{100})`, GroupsFunc: "g"}}, 0, true, CompileOptions{ForceByteMode: true})
 		if err == nil {
 			t.Fatal("Compile(groups, non-ASCII class): no error")
 		}
-		if !strings.Contains(err.Error(), "Unicode") {
-			t.Fatalf("Compile(groups, non-ASCII class): err = %v, want a Unicode-support error", err)
+		if !strings.Contains(err.Error(), "U+0100") {
+			t.Fatalf("Compile(groups, non-ASCII class): err = %v, want the rune named", err)
 		}
 	})
 }
@@ -1539,7 +1743,7 @@ func TestEnginesCovFindPathDFACompileError(t *testing.T) {
 	// state-limit sentinel, which just means "fall back to Backtracking".
 	// Any other error is a real failure and must be reported, not swallowed
 	// into a silent Backtracking compile of a pattern the DFA rejected.
-	_, _, err := Compile([]config.RegexEntry{{Pattern: `[\x{100}-\x{200}]x`, FindFunc: "f"}}, 0, true)
+	_, _, err := Compile([]config.PatternEntry{{Regexp: `[\x{100}-\x{200}]x`, FindFunc: "f"}}, 0, true, CompileOptions{ForceByteMode: true})
 	if err == nil {
 		t.Fatal("Compile(find, non-ASCII class): no error")
 	}
@@ -1551,7 +1755,7 @@ func TestEnginesCovAltLitAnchorWithMatchBody(t *testing.T) {
 	// dispatcher's calls at the wrong functions — a wrong answer, not a
 	// crash, since the signatures happen to line up.
 	pattern := `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+|[0-9]{8}akey_[^\s]+`
-	entry := config.RegexEntry{Pattern: pattern, MatchFunc: "m", FindFunc: "f"}
+	entry := config.PatternEntry{Regexp: pattern, MatchFunc: "m", FindFunc: "f"}
 
 	compiled, err := compilePattern(entry, 0, 0, CompileOptions{})
 	if err != nil {
@@ -1567,15 +1771,15 @@ func TestEnginesCovAltLitAnchorWithMatchBody(t *testing.T) {
 	if back != 1 || fwd != 2 {
 		t.Errorf("altLitAnchorBranchFuncIdx(0) = (%d, %d), want (1, 2) — slot 0 is the match body", back, fwd)
 	}
-	mustCompileEntries(t, []config.RegexEntry{entry})
+	mustCompileEntries(t, []config.PatternEntry{entry})
 }
 
 func TestEnginesCovFindAltLitAnchorPointsUnwrapsBranchCaptures(t *testing.T) {
 	// Branch-level captures are transparent to the anchor analysis: the same
 	// alternation written with or without them must produce the same
 	// branches, or a capture-bearing pattern silently loses the optimisation.
-	plain, okPlain := findAltLitAnchorPoints(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`, false)
-	captured, okCaptured := findAltLitAnchorPoints(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`, false)
+	plain, okPlain := findAltLitAnchorPoints(bytePat(`[0-9]{8}ghp_[A-Za-z0-9]{36}|[a-f]{8}secret_[A-Za-z0-9]{36}`))
+	captured, okCaptured := findAltLitAnchorPoints(bytePat(`([0-9]{8}ghp_[A-Za-z0-9]{36})|([a-f]{8}secret_[A-Za-z0-9]{36})`))
 	if !okPlain || !okCaptured {
 		t.Fatalf("findAltLitAnchorPoints: plain ok = %v, captured ok = %v, want both true", okPlain, okCaptured)
 	}
@@ -1613,7 +1817,7 @@ func TestEnginesCovHasAmbiguousCapturesAltMatch(t *testing.T) {
 		},
 		Start: 0,
 	}
-	if !hasAmbiguousCaptures(ambiguous) {
+	if !hasAmbiguousCaptures(ambiguous, false) {
 		t.Error("hasAmbiguousCaptures(InstAltMatch with overlapping branches) = false, want true")
 	}
 
@@ -1627,7 +1831,7 @@ func TestEnginesCovHasAmbiguousCapturesAltMatch(t *testing.T) {
 		},
 		Start: 0,
 	}
-	if hasAmbiguousCaptures(disjoint) {
+	if hasAmbiguousCaptures(disjoint, false) {
 		t.Error("hasAmbiguousCaptures(InstAltMatch with disjoint branches) = true, want false")
 	}
 }
@@ -1649,8 +1853,8 @@ func TestEnginesCovAnalysePatternUnicodeLabel(t *testing.T) {
 		t.Fatalf("witness pattern has %d alternations; the Unicode label is only chosen below 6",
 			analysis.NumAlternations)
 	}
-	opts := CompileOptions{Unicode: true}
-	if engine, _ := selectBestEngineWithTDFA(prog, &opts); engine == 0 {
+	var opts CompileOptions
+	if engine, _ := selectBestEngineWithTDFA(byteProg(prog), &opts); engine == 0 {
 		t.Error("selectBestEngineWithTDFA returned no engine")
 	}
 }
@@ -1660,10 +1864,10 @@ func TestEnginesCovShuftiRareFirstByteBand(t *testing.T) {
 	// the bytes are RARE enough that scalar cannot exit a chunk early. Control
 	// bytes have rarity 0, so `[\x01-\x1f]` (31 bytes) is on the Shufti side
 	// even without the LikelyNoMatch override — the one route into that arm.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[\x01-\x1f]xyz", FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[\x01-\x1f]xyz", FindFunc: "f"}})
 	// The dense counterpart stays scalar: 52 letters, rarity sum far over the
 	// threshold.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `[a-zA-Z]xyz`, FindFunc: "f2"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `[a-zA-Z]xyz`, FindFunc: "f2"}})
 }
 
 // ---------------------------------------------------------------------------
@@ -1687,7 +1891,7 @@ func TestEnginesCovGroupsOnlyBTLimits(t *testing.T) {
 		if got := len(enginesCovProg(t, pattern).Inst); got <= maxBTFallbackInstructions {
 			t.Skipf("witness pattern produces %d instructions, need > %d", got, maxBTFallbackInstructions)
 		}
-		_, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
+		_, _, err := Compile([]config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}}, 0, true)
 		if !errors.Is(err, ErrBTProgramTooLarge) {
 			t.Fatalf("Compile(groups): err = %v, want ErrBTProgramTooLarge", err)
 		}
@@ -1705,14 +1909,14 @@ func TestEnginesCovBTStackReservationOverCeiling(t *testing.T) {
 	const nearCeiling = int64(1)<<32 - 4096
 	for _, testCase := range []struct {
 		name  string
-		entry config.RegexEntry
+		entry config.PatternEntry
 	}{
-		{"match_fallback", config.RegexEntry{Pattern: `abc`, MatchFunc: "m"}},
-		{"find_fallback", config.RegexEntry{Pattern: `abc`, FindFunc: "f"}},
+		{"match_fallback", config.PatternEntry{Regexp: `abc`, MatchFunc: "m"}},
+		{"find_fallback", config.PatternEntry{Regexp: `abc`, FindFunc: "f"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			_, _, err := Compile(
-				[]config.RegexEntry{testCase.entry}, nearCeiling, true,
+				[]config.PatternEntry{testCase.entry}, nearCeiling, true,
 				CompileOptions{MaxDFAStates: 1})
 			if errors.Is(err, ErrBTStackTooLarge) {
 				t.Fatalf("Compile: err = %v, want no stack reservation to refuse", err)
@@ -1727,7 +1931,7 @@ func TestEnginesCovBTFallbackPrefixTruncation(t *testing.T) {
 	// longer than maxBTFallbackPrefixLen must be truncated, not emitted whole.
 	pattern := strings.Repeat("ab", 40) + `[0-9]`
 	compiled, err := compilePattern(
-		config.RegexEntry{Pattern: pattern, FindFunc: "f"}, 0, 0,
+		config.PatternEntry{Regexp: pattern, FindFunc: "f"}, 0, 0,
 		CompileOptions{MaxDFAStates: 1, globals: &moduleGlobals{}})
 	if err != nil {
 		t.Fatalf("compilePattern: %v", err)
@@ -1736,7 +1940,7 @@ func TestEnginesCovBTFallbackPrefixTruncation(t *testing.T) {
 		t.Fatal("no find body emitted")
 	}
 	mustCompileEntries(t,
-		[]config.RegexEntry{{Pattern: pattern, FindFunc: "f"}},
+		[]config.PatternEntry{{Regexp: pattern, FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 1})
 }
 
@@ -1750,19 +1954,19 @@ func TestEnginesCovBatchGroupsWrapperWindowMode(t *testing.T) {
 	// (ptr,len) — the same window-mode contract the single-match wrapper has
 	//. A Backtracking capture body with a
 	// word boundary is what turns that on; a TDFA one never does.
-	entry := config.RegexEntry{
-		Pattern:    `(\b(?:a*)+b)c`,
+	entry := config.PatternEntry{
+		Regexp:     `(\b(?:a*)+b)c`,
 		FindFunc:   "wf",
 		GroupsFunc: "wg",
 		Hints:      []string{"batch-find"},
 	}
 	t.Run("standalone", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{entry})
+		mustCompileEntries(t, []config.PatternEntry{entry})
 	})
 	t.Run("embedded", func(t *testing.T) {
 		// Embedded mode puts the tables in memory[1], which the batch
 		// wrapper's scratch stores have to address explicitly.
-		wasm, _, err := Compile([]config.RegexEntry{entry}, 0, false)
+		wasm, _, err := Compile([]config.PatternEntry{entry}, 0, false)
 		if err != nil {
 			t.Fatalf("Compile(embedded batch groups): %v", err)
 		}
@@ -1786,9 +1990,9 @@ func TestEnginesCovBatchGroupsWrapperWindowMode(t *testing.T) {
 
 func enginesCovAltBranches(t *testing.T, pattern string) []altLitAnchorBranch {
 	t.Helper()
-	branches, ok := findAltLitAnchorPoints(pattern, false)
+	branches, ok := findAltLitAnchorPoints(bytePat(pattern))
 	if !ok {
-		t.Fatalf("findAltLitAnchorPoints(%q, false) rejected the pattern before the gate under test", pattern)
+		t.Fatalf("findAltLitAnchorPoints(%q) rejected the pattern before the gate under test", pattern)
 	}
 	return branches
 }
@@ -1800,7 +2004,7 @@ func TestEnginesCovCompileAltLitAnchorRejections(t *testing.T) {
 		// Baseline, so the rejections below are attributable to the gate
 		// under test rather than to a fixture that never qualified.
 		branches := enginesCovAltBranches(t, goodPattern)
-		if _, ok := compileAltLitAnchorBranches(branches, 0, CompileOptions{}); !ok {
+		if _, ok := compileAltLitAnchorBranches(bytePat(goodPattern), branches, 0, CompileOptions{}); !ok {
 			t.Fatal("compileAltLitAnchorBranches rejected the known-good alternation")
 		}
 	})
@@ -1811,7 +2015,7 @@ func TestEnginesCovCompileAltLitAnchorRejections(t *testing.T) {
 		// ids. Accepting it would emit a dispatcher whose per-branch scan
 		// functions read a table indexed with a truncated state.
 		branches := enginesCovAltBranches(t, `[0-9]{1000}ghp_[^\s]+|[a-f]{1000}secret_[^\s]+`)
-		if result, ok := compileAltLitAnchorBranches(branches, 0, CompileOptions{}); ok {
+		if result, ok := compileAltLitAnchorBranches(bytePat(`[0-9]{1000}ghp_[^\s]+|[a-f]{1000}secret_[^\s]+`), branches, 0, CompileOptions{}); ok {
 			t.Errorf("compileAltLitAnchorBranches accepted a DFA needing u16 state ids: %+v", result)
 		}
 	})
@@ -1823,7 +2027,7 @@ func TestEnginesCovCompileAltLitAnchorRejections(t *testing.T) {
 		pattern := `[0-9]{1000}[a-f]{1000}[g-m]{1000}ghp_[^\s]+|` +
 			`[n-s]{1000}[t-z]{1000}[0-4]{1000}secret_[^\s]+`
 		branches := enginesCovAltBranches(t, pattern)
-		if result, ok := compileAltLitAnchorBranches(branches, 0, CompileOptions{}); ok {
+		if result, ok := compileAltLitAnchorBranches(bytePat(pattern), branches, 0, CompileOptions{}); ok {
 			t.Errorf("compileAltLitAnchorBranches accepted a 3000-byte prefix: %+v", result)
 		}
 	})
@@ -1836,7 +2040,7 @@ func TestEnginesCovCompileAltLitAnchorRejections(t *testing.T) {
 		// differ so the parser does not factor the shared 'g' out and change
 		// the top-level shape.
 		branches := enginesCovAltBranches(t, `[0-9]{8}ghp_[^\s]+|[a-f]{8}gzz_[^\s]+`)
-		result, ok := compileAltLitAnchorBranches(branches, 0, CompileOptions{})
+		result, ok := compileAltLitAnchorBranches(bytePat(`[0-9]{8}ghp_[^\s]+|[a-f]{8}gzz_[^\s]+`), branches, 0, CompileOptions{})
 		if !ok {
 			t.Fatal("compileAltLitAnchorBranches rejected a T1-colliding alternation; it should skip T1 instead")
 		}
@@ -1859,7 +2063,7 @@ func TestEnginesCovAnalysePatternHighAlternationLabel(t *testing.T) {
 		t.Fatalf("witness pattern has %d alternations, need more than 5", analysis.NumAlternations)
 	}
 	opts := CompileOptions{}
-	if engine, _ := selectBestEngineWithTDFA(prog, &opts); engine == 0 {
+	if engine, _ := selectBestEngineWithTDFA(byteProg(prog), &opts); engine == 0 {
 		t.Error("selectBestEngineWithTDFA returned no engine")
 	}
 }
@@ -1900,12 +2104,12 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	// automaton that matches something other than the original pattern.
 	pattern := `[0-9]{2}([a-z]MANDATORYLIT[0-9]b)[0-9]`
 	parsed := enginesCovParse(t, pattern)
-	mandLit, path := findMandatoryLitRec(parsed, 0, 0, false)
+	mandLit, path := findMandatoryLitRec(byteTree(parsed), 0, 0)
 	if mandLit == nil {
-		t.Fatalf("findMandatoryLitRec(%q, false) = nil; the witness no longer has a liftable literal", pattern)
+		t.Fatalf("findMandatoryLitRec(%q) = nil; the witness no longer has a liftable literal", pattern)
 	}
 	if string(mandLit.bytes) != "MANDATORYLIT" {
-		t.Fatalf("findMandatoryLitRec(%q, false) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
+		t.Fatalf("findMandatoryLitRec(%q) lifted %q, want %q", pattern, mandLit.bytes, "MANDATORYLIT")
 	}
 
 	prefixAST, suffixAST, ok := splitAtPath(parsed, path)
@@ -1920,11 +2124,11 @@ func TestEnginesCovMandatoryLitSplitsNestedConcat(t *testing.T) {
 	}
 	// Both sides must still account for the inner-concat material, which is
 	// exactly what the two branches under test contribute.
-	prefixMin, prefixMax := regexpMinMaxLen(prefixAST, false)
+	prefixMin, prefixMax := byteTree(prefixAST).minMaxLen()
 	if prefixMin != 3 || prefixMax != 3 {
 		t.Errorf("prefix length = [%d, %d], want [3, 3] (two digits plus the capture's leading class)", prefixMin, prefixMax)
 	}
-	suffixMin, suffixMax := regexpMinMaxLen(suffixAST, false)
+	suffixMin, suffixMax := byteTree(suffixAST).minMaxLen()
 	if suffixMin != 3 || suffixMax != 3 {
 		t.Errorf("suffix length = [%d, %d], want [3, 3] (digit, 'b', trailing digit)", suffixMin, suffixMax)
 	}
@@ -1944,7 +2148,7 @@ func TestBacktrackHasZeroWidthCycle(t *testing.T) {
 		{`(a+)(b)`, false},
 		{`[a-z]+x`, false},
 	} {
-		got, err := BacktrackHasZeroWidthCycle(c.pat)
+		got, err := BacktrackHasZeroWidthCycle(c.pat, CompileOptions{})
 		if err != nil {
 			t.Fatalf("%q: %v", c.pat, err)
 		}
@@ -1952,7 +2156,7 @@ func TestBacktrackHasZeroWidthCycle(t *testing.T) {
 			t.Errorf("BacktrackHasZeroWidthCycle(%q) = %v, want %v", c.pat, got, c.want)
 		}
 	}
-	if _, err := BacktrackHasZeroWidthCycle(`(`); err == nil {
+	if _, err := BacktrackHasZeroWidthCycle(`(`, CompileOptions{}); err == nil {
 		t.Error("BacktrackHasZeroWidthCycle on an unparsable pattern returned no error")
 	}
 }
@@ -1988,7 +2192,7 @@ var forcedBTPatterns = []string{
 // enough for that.
 func TestForcedBacktrackMatchesSelectedBacktrack(t *testing.T) {
 	for _, pat := range forcedBTPatterns {
-		entry := []config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}
+		entry := []config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}
 
 		eng, err := SelectEngine(pat, CompileOptions{})
 		if err != nil {
@@ -2019,48 +2223,6 @@ func TestForcedBacktrackMatchesSelectedBacktrack(t *testing.T) {
 	}
 }
 
-// TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath is a TRIPWIRE, not a
-// gate, and the difference matters.
-//
-// compilePatternBody skips engine selection when the groups engine is forced
-// onto Backtracking, but only for a pattern WITH capture groups. The reason for
-// that restriction is that the selector's DFA arm sets opts.LeftmostFirst for an
-// alternation, and `groups_func` on a capture-LESS pattern reaches the selector
-// too.
-//
-// Today that assignment has no consumer downstream: the capture engines take
-// the prog alone, and the find/match bodies were emitted earlier from their own
-// explicit options. So this test passes whether or not the restriction is in
-// place — verified by removing it and re-running — and it is recorded here as
-// such rather than dressed up as a gate that bites.
-//
-// What it is for: the moment anything downstream of that call starts reading
-// LeftmostFirst, the explicit build below keeps the flag where the plain one
-// loses it, these bytes part company, and this test names the guard to restore.
-func TestForcedBacktrackLeftmostFirstIsInertOnTheGroupsPath(t *testing.T) {
-	// Branches where one is a prefix of the other, so leftmost-first and
-	// leftmost-longest genuinely differ in extent.
-	for _, pat := range []string{`a|ab`, `(?:a|ab)c`, `foo|foobar`} {
-		entry := []config.RegexEntry{{Pattern: pat, GroupsFunc: "groups"}}
-
-		plain, _, err := CompileForced(entry, 0, true, EngineBacktrack)
-		if err != nil {
-			t.Fatalf("CompileForced(%q): %v", pat, err)
-		}
-		explicit, _, err := CompileForced(entry, 0, true, EngineBacktrack,
-			CompileOptions{LeftmostFirst: true})
-		if err != nil {
-			t.Fatalf("CompileForced(%q, LeftmostFirst): %v", pat, err)
-		}
-		if !bytes.Equal(plain, explicit) {
-			t.Errorf("%q: LeftmostFirst is no longer inert on the forced groups path "+
-				"(%d bytes without it, %d with it explicitly) — the prog.NumCap > 2 "+
-				"guard in compilePatternBody is now load-bearing, keep it",
-				pat, len(plain), len(explicit))
-		}
-	}
-}
-
 // TestBTWorkBudgetOffCyclicIsFallbackAlone pins what BTWorkBudgetOff does to a
 // program with a zero-width cycle: nothing. The ordinary body carries no loop
 // guard, so such a program gets the fallback body alone under every budget,
@@ -2075,22 +2237,25 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 	// them the ordinary body.
 	for _, p := range []string{`(?:a?)+b`, `(?:a??){1,}b`, `(?:a|)+b`, `(a?)+b`, `x(?:a|b?)+y`,
 		`(?:(a?)|b)+c`, `(?:ab|a?)+c`, `(a??)*?b`, `(a*b*)*c`, `(?:a*|b*)*`} {
-		if cyc, err := BacktrackHasZeroWidthCycle(p); err != nil || !cyc {
+		if cyc, err := BacktrackHasZeroWidthCycle(p, CompileOptions{}); err != nil || !cyc {
 			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — witness no longer has the shape", p, cyc, err)
 		}
-		if !progHasZeroWidthCycle(compileBTProg(p)) {
+		if !progHasZeroWidthCycle(compileBTProg(bytePat(p)).prog) {
 			t.Fatalf("%s: the capture-stripped program has no zero-width cycle — witness no longer has the shape", p)
 		}
-		for _, e := range []config.RegexEntry{
-			{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"},
-			{Pattern: p, GroupsFunc: "g"}, {Pattern: p, FindFunc: "f", GroupsFunc: "g"},
-		} {
-			off, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+		entries := []config.PatternEntry{{Regexp: p, MatchFunc: "m"}, {Regexp: p, FindFunc: "f"}}
+		// groups_func needs a capture group (ErrNoCaptureGroup).
+		if !(config.PatternEntry{Regexp: p, GroupsFunc: "g"}).GroupsWithoutCaptures() {
+			entries = append(entries, config.PatternEntry{Regexp: p, GroupsFunc: "g"},
+				config.PatternEntry{Regexp: p, FindFunc: "f", GroupsFunc: "g"})
+		}
+		for _, e := range entries {
+			off, _, err := Compile([]config.PatternEntry{e}, 65536, true,
 				CompileOptions{MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
 			if err != nil {
 				t.Fatalf("Compile(%q, Off): %v", p, err)
 			}
-			forced, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+			forced, _, err := Compile([]config.PatternEntry{e}, 65536, true,
 				CompileOptions{MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetForceFallback})
 			if err != nil {
 				t.Fatalf("Compile(%q, ForceFallback): %v", p, err)
@@ -2103,6 +2268,151 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 	}
 }
 
+// TestBTMemoIndexedByAlt pins the fallback memo's row: a bit per Alt, in pc
+// order — the only instructions whose (pc, pos) the fallback marks — less the
+// inner Alts of a dispatched chain, never reached, in either mode; every other
+// pc has none. The row a stub is told to allocate per position (SearchSizes)
+// is that many bits.
+func TestBTMemoIndexedByAlt(t *testing.T) {
+	bt := newBacktrack(byteProg(compileBTTestProg(t, `(?:ab|cd|ef)+x`)))
+	bplan := bt.altDispatch()
+	alts, guardedB := 0, 0
+	for pc, in := range bt.prog.Inst {
+		isAlt := in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch
+		if isAlt {
+			alts++
+		}
+		want := -1
+		if isAlt && !bplan.dead[pc] {
+			want = guardedB
+			guardedB++
+		}
+		if got := bt.memoIndex()[pc]; got != want {
+			t.Errorf("byte mode: pc %d (%v, dead %v) has memo bit %d, want %d", pc, in.Op, bplan.dead[pc], got, want)
+		}
+	}
+	// The three-arm chain is dispatched, so one of its Alts is never reached.
+	if alts < 3 || guardedB >= alts || bt.memoRowBytes() != (guardedB+7)/8 {
+		t.Errorf("byte mode: %d of %d Alts guarded, row %d bytes", guardedB, alts, bt.memoRowBytes())
+	}
+
+	rp, err := resolvePattern(`\pL+?@\pL+`, nil, &CompileOptions{Unicode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := rp.parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, err := compileProg(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := newBacktrack(mp)
+	plan := u.altDispatch()
+	guarded := 0
+	for pc, in := range u.prog.Inst {
+		isAlt := in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch
+		switch got := u.memoIndex()[pc]; {
+		case isAlt && !plan.dead[pc]:
+			if got != guarded {
+				t.Errorf("unicode: guarded Alt at pc %d has memo bit %d, want %d", pc, got, guarded)
+			}
+			guarded++
+		case got != -1:
+			t.Errorf("unicode: pc %d (%v, dead %v) has memo bit %d, want none", pc, in.Op, plan.dead[pc], got)
+		}
+	}
+	if u.memoRowBytes() != (guarded+7)/8 || guarded >= u.numAlts {
+		t.Errorf("unicode: %d of %d Alts guarded, row %d bytes", guarded, u.numAlts, u.memoRowBytes())
+	}
+
+	// A Backtracking find keeps the memo for the rest of its search once it
+	// trips (a groups body keeps only the tripped flag).
+	sz, err := SearchSizes(config.BuildConfig{MaxDFAStates: 1, Patterns: []config.PatternEntry{
+		{Name: "f", Regexp: `\pL+?@\pL+`, FindFunc: "f"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sz["f"].BTMemoBytes; got != u.memoRowBytes() {
+		t.Errorf("SearchSizes: memo %d bytes per position, want the row's %d", got, u.memoRowBytes())
+	}
+}
+
+// TestBTWorkBudgetFromCodepointProgram pins the work budget's N: the
+// instruction count of the program before lowering, in Unicode mode as in byte
+// mode (where it is the program itself). Lowering puts a class's byte
+// sequences in the program, so its count let an exponential search run
+// hundreds of times more pops than its byte twin before the fallback took
+// over.
+func TestBTWorkBudgetFromCodepointProgram(t *testing.T) {
+	budget := func(n int) []byte { // emitBTWorkInit's k × N, after (span + 1)
+		return utils.AppendSLEB128_64([]byte{0xAD, 0x42, 0x01, 0x7C, 0x42}, int64(defaultBTWorkK)*int64(n))
+	}
+	for _, c := range []struct {
+		pat     string
+		unicode bool
+	}{{`\pL+x`, true}, {`\w+x`, false}} {
+		rp, err := resolvePattern(c.pat, nil, &CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := newBacktrack(mp).budgetN, len(mp.orig.Inst); got != want {
+			t.Errorf("%s: budget N %d, want the codepoint program's %d", c.pat, got, want)
+		}
+		wasm, _, err := Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "f"}}, 65536, true,
+			CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode, MaxDFAStates: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(wasm, budget(len(mp.orig.Inst))) {
+			t.Errorf("%s: no work budget of k × %d in the module", c.pat, len(mp.orig.Inst))
+		}
+		if c.unicode && bytes.Contains(wasm, budget(len(mp.prog.Inst))) {
+			t.Errorf("%s: a work budget sized from the lowered program (%d)", c.pat, len(mp.prog.Inst))
+		}
+	}
+}
+
+// TestBTFallbackDispatches pins the first-byte dispatch in the memoised
+// FALLBACK body, which is the only body of a program with a zero-width cycle:
+// its alternation chains — a lowered class in Unicode mode, a keyword chain in
+// either mode — are dispatched on the byte (a 257-entry br_table, the byte or
+// the end of input).
+func TestBTFallbackDispatches(t *testing.T) {
+	brTable257 := []byte{0x0E, 0x81, 0x02} // br_table, 257 targets
+	for _, c := range []struct {
+		pat     string
+		unicode bool
+		want    bool
+	}{
+		{`(\pL*)*x`, true, true},
+		{`((?:the|and|for|you)|[a-z]*)*x`, true, true},
+		{`((?:the|and|for|you)|[a-z]*)*x`, false, true},
+	} {
+		if cyc, err := BacktrackHasZeroWidthCycle(c.pat, CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode}); err != nil || !cyc {
+			t.Fatalf("%s: no zero-width cycle (%v), so the fallback is not its only body", c.pat, err)
+		}
+		wasm, _, err := CompileForced([]config.PatternEntry{{Regexp: c.pat, GroupsFunc: "g"}}, 65536, true,
+			EngineBacktrack, CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		validateWASM(t, wasm)
+		if got := bytes.Contains(wasm, brTable257); got != c.want {
+			t.Errorf("%s (unicode %v): first-byte dispatch in the fallback body %v, want %v", c.pat, c.unicode, got, c.want)
+		}
+	}
+}
+
 // TestBTWorkBudgetOffAcyclicDropsTheFallback is the other half: a program with
 // no zero-width cycle keeps its ordinary body under BTWorkBudgetOff, with no
 // work counter and no fallback body behind it — so the module is smaller than
@@ -2111,15 +2421,15 @@ func TestBTWorkBudgetOffCyclicIsFallbackAlone(t *testing.T) {
 // is a fixed region rather than one grown at run time.
 func TestBTWorkBudgetOffAcyclicDropsTheFallback(t *testing.T) {
 	for _, p := range []string{`^(aa|a)*b`, `x(?:ab|a)*y`} {
-		if cyc, err := BacktrackHasZeroWidthCycle(p); err != nil || cyc {
+		if cyc, err := BacktrackHasZeroWidthCycle(p, CompileOptions{}); err != nil || cyc {
 			t.Fatalf("%s: BacktrackHasZeroWidthCycle = %v, %v — witness no longer acyclic", p, cyc, err)
 		}
-		for _, e := range []config.RegexEntry{{Pattern: p, MatchFunc: "m"}, {Pattern: p, FindFunc: "f"}} {
-			def, _, err := Compile([]config.RegexEntry{e}, 65536, true, CompileOptions{MaxDFAStates: 1})
+		for _, e := range []config.PatternEntry{{Regexp: p, MatchFunc: "m"}, {Regexp: p, FindFunc: "f"}} {
+			def, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{MaxDFAStates: 1})
 			if err != nil {
 				t.Fatalf("Compile(%q): %v", p, err)
 			}
-			off, _, err := Compile([]config.RegexEntry{e}, 65536, true,
+			off, _, err := Compile([]config.PatternEntry{e}, 65536, true,
 				CompileOptions{MaxDFAStates: 1, BTWorkBudget: BTWorkBudgetOff})
 			if err != nil {
 				t.Fatalf("Compile(%q, Off): %v", p, err)
@@ -2135,8 +2445,8 @@ func TestBTWorkBudgetOffAcyclicDropsTheFallback(t *testing.T) {
 	// A set member whose DFA would lose the `\B` branch's priority goes to a
 	// Backtracking bucket.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `(?:\B|a|)a`}},
-		Sets:    []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `(?:\B|a|)a`}},
+		Sets:     []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
 	}
 	if !SetAdmitsBacktracking(cfg.Sets[0], cfg) {
 		t.Fatal("the member is not on Backtracking; this case needs a Backtracking bucket")
@@ -2175,7 +2485,7 @@ func TestBTStackStartResolution(t *testing.T) {
 	}
 	// Through Compile: the start is a constant in the capture body, so a
 	// different start builds a different, still valid, module.
-	e := []config.RegexEntry{{Pattern: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}}
+	e := []config.PatternEntry{{Regexp: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "g"}}
 	def, _, err := CompileForced(e, 65536, true, EngineBacktrack)
 	if err != nil {
 		t.Fatal(err)
@@ -2243,11 +2553,11 @@ func TestBTCaptureStackNotReservedAtLoad(t *testing.T) {
 	if eng, err := SelectEngine(pattern, CompileOptions{}); err != nil || eng != EngineBacktrack {
 		t.Fatalf("SelectEngine = %v, %v; want Backtracking — witness no longer has the shape", eng, err)
 	}
-	numAlts := newBacktrack(compileBTTestProg(t, pattern)).numAlts
+	numAlts := newBacktrack(byteProg(compileBTTestProg(t, pattern))).numAlts
 	if numAlts < 60 {
 		t.Fatalf("witness has %d Alts, want at least 60", numAlts)
 	}
-	w, _, err := Compile([]config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}}, 0, true)
+	w, _, err := Compile([]config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}}, 0, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -2266,7 +2576,7 @@ func TestBTCaptureStackNotReservedAtLoad(t *testing.T) {
 // 339-set WAF module claimed before its first call, against 47 MB of tables.
 func TestBTStacksNotReservedAtLoad(t *testing.T) {
 	pattern := `(?:a|bc){1,60}?x`
-	numAlts := newBacktrack(compileBTTestProg(t, pattern)).numAlts
+	numAlts := newBacktrack(byteProg(compileBTTestProg(t, pattern))).numAlts
 	if numAlts < 60 {
 		t.Fatalf("witness has %d Alts, want at least 60", numAlts)
 	}
@@ -2275,13 +2585,13 @@ func TestBTStacksNotReservedAtLoad(t *testing.T) {
 	forceBT := CompileOptions{MaxDFAStates: -1}
 	for _, c := range []struct {
 		name  string
-		entry config.RegexEntry
+		entry config.PatternEntry
 	}{
-		{"match", config.RegexEntry{Pattern: pattern, MatchFunc: "m"}},
-		{"find", config.RegexEntry{Pattern: pattern, FindFunc: "f"}},
+		{"match", config.PatternEntry{Regexp: pattern, MatchFunc: "m"}},
+		{"find", config.PatternEntry{Regexp: pattern, FindFunc: "f"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			w, _, err := Compile([]config.RegexEntry{c.entry}, 0, true, forceBT)
+			w, _, err := Compile([]config.PatternEntry{c.entry}, 0, true, forceBT)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
@@ -2300,9 +2610,9 @@ func TestBTStacksNotReservedAtLoad(t *testing.T) {
 				Patterns: config.PatternSelector{All: true}})
 		}
 		cfg := config.BuildConfig{
-			MaxFallbackStates: 1, // every member's suffix DFA is over it: Backtracking
-			Regexps:           []config.RegexEntry{{Name: "a", Pattern: pattern}, {Name: "b", Pattern: `(?:c|de){1,60}?y`}},
-			Sets:              sets,
+			MaxDFAStates: 1, // every member's suffix DFA is over it: Backtracking
+			Patterns:     []config.PatternEntry{{Name: "a", Regexp: pattern}, {Name: "b", Regexp: `(?:c|de){1,60}?y`}},
+			Sets:         sets,
 		}
 		w, _, diags, err := CompileFileDiag(cfg, "")
 		if err != nil {
@@ -2330,7 +2640,7 @@ func TestBTStacksNotReservedAtLoad(t *testing.T) {
 // maximum on every assembly path, rounded down to pages; unset declares none,
 // which is the bytes every module had before.
 func TestMaxMemoryDeclaredAsMaximum(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: `(a.*?b)(c+)`, GroupsFunc: "g"}, {Pattern: `foo`, FindFunc: "f"}}
+	entries := []config.PatternEntry{{Regexp: `(a.*?b)(c+)`, GroupsFunc: "g"}, {Regexp: `foo`, FindFunc: "f"}}
 	capped := CompileOptions{MaxMemory: mustMemorySize(t, "1.5MiB")} // 24 pages
 	for _, c := range []struct {
 		name       string
@@ -2364,7 +2674,7 @@ func TestMaxMemoryDeclaredAsMaximum(t *testing.T) {
 	t.Run("sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
 			MaxMemory: capped.MaxMemory,
-			Regexps:   []config.RegexEntry{{Name: "a", Pattern: `foo[0-9]+`}, {Name: "b", Pattern: `bar`}},
+			Patterns:  []config.PatternEntry{{Name: "a", Regexp: `foo[0-9]+`}, {Name: "b", Regexp: `bar`}},
 			Sets:      []config.SetConfig{{Name: "s", ScanAny: "s_any", Patterns: config.PatternSelector{All: true}}},
 		}
 		w, _, err := CompileFile(cfg, "")
@@ -2385,7 +2695,7 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 	// A large DFA table is static memory: (a|b)*a(a|b){10} needs 2^11 states,
 	// u16 ids and 256 columns — 1 MB, several pages. (Backtracking reserves
 	// nothing at compile time any more; its frame stacks grow at call time.)
-	entries := []config.RegexEntry{{Pattern: `(a|b)*a(a|b){10}`, MatchFunc: "m"}}
+	entries := []config.PatternEntry{{Regexp: `(a|b)*a(a|b){10}`, MatchFunc: "m"}}
 	opts := CompileOptions{MaxDFAStates: 1 << 13}
 	w, _, err := Compile(entries, 0, true, opts)
 	if err != nil {
@@ -2415,14 +2725,14 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 	}
 
 	t.Run("below_one_page", func(t *testing.T) {
-		_, _, err := Compile([]config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}, 0, true,
+		_, _, err := Compile([]config.PatternEntry{{Regexp: `foo`, FindFunc: "f"}}, 0, true,
 			CompileOptions{MaxMemory: mustMemorySize(t, "60KB")})
 		if !errors.Is(err, ErrMemoryCapTooSmall) {
 			t.Errorf("60KB rounds down to 0 pages: err = %v, want ErrMemoryCapTooSmall", err)
 		}
 	})
 	t.Run("component_allocator_page", func(t *testing.T) {
-		e := []config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}
+		e := []config.PatternEntry{{Regexp: `foo`, FindFunc: "f"}}
 		w, _, err := Compile(e, 0, true)
 		if err != nil {
 			t.Fatal(err)
@@ -2441,7 +2751,7 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 	t.Run("sets", func(t *testing.T) {
 		cfg := config.BuildConfig{
 			MaxMemory: mustMemorySize(t, "1KB"),
-			Regexps:   []config.RegexEntry{{Name: "a", Pattern: `foo[0-9]+`}, {Name: "b", Pattern: `bar`}},
+			Patterns:  []config.PatternEntry{{Name: "a", Regexp: `foo[0-9]+`}, {Name: "b", Regexp: `bar`}},
 			Sets:      []config.SetConfig{{Name: "s", ScanAny: "s_any", Patterns: config.PatternSelector{All: true}}},
 		}
 		if _, _, err := CompileFile(cfg, ""); !errors.Is(err, ErrMemoryCapTooSmall) {
@@ -2455,7 +2765,7 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 func TestMaxMemoryAbove4GiBWarns(t *testing.T) {
 	buf, restore := captureWarnings(t)
 	defer restore()
-	w, _, err := Compile([]config.RegexEntry{{Pattern: `foo`, FindFunc: "f"}}, 0, true,
+	w, _, err := Compile([]config.PatternEntry{{Regexp: `foo`, FindFunc: "f"}}, 0, true,
 		CompileOptions{MaxMemory: mustMemorySize(t, "8GB")})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -2469,3 +2779,308 @@ func TestMaxMemoryAbove4GiBWarns(t *testing.T) {
 }
 
 func itoa(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// TestBTDispatchPlan pins the first-byte dispatch over an alternation chain
+// (bt_dispatch.go): which arms each byte tries, in priority order; one
+// dispatch per chain, its inner Alts dead; the compact encoding where the
+// direct one would push more than the chain has arms; and the budget charge.
+func TestBTDispatchPlan(t *testing.T) {
+	plan := func(t *testing.T, pat string) *btDispatchPlan {
+		t.Helper()
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return buildBTDispatchPlan(prog, false)
+	}
+	only := func(t *testing.T, p *btDispatchPlan) *btAltDispatch {
+		t.Helper()
+		if len(p.heads) != 1 {
+			t.Fatalf("%d dispatched chains, want 1", len(p.heads))
+		}
+		for _, d := range p.heads {
+			return d
+		}
+		return nil
+	}
+	expect := func(t *testing.T, d *btAltDispatch, want map[int][]int) {
+		t.Helper()
+		for c, w := range want {
+			got := d.cases[d.caseOf[c]]
+			if len(got) != len(w) {
+				t.Errorf("byte %d: arms %v, want %v", c, got, w)
+				continue
+			}
+			for i := range w {
+				if got[i] != w[i] {
+					t.Errorf("byte %d: arms %v, want %v", c, got, w)
+					break
+				}
+			}
+		}
+	}
+	const eof = 256
+
+	t.Run("keywords", func(t *testing.T) {
+		p := plan(t, `(?:get|head|post|delete)`)
+		d := only(t, p)
+		expect(t, d, map[int][]int{'g': {0}, 'h': {1}, 'p': {2}, 'd': {3}, 'x': {}, eof: {}})
+		if len(p.dead) != 2 || d.compact {
+			t.Errorf("inner Alts %d (want 2), compact %v (want false)", len(p.dead), d.compact)
+		}
+	})
+	t.Run("fold", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?i)(?:get|head|post)`)), map[int][]int{'g': {0}, 'G': {0}, 'P': {2}})
+	})
+	t.Run("overlapping first bytes keep priority", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?:a1|[ab]2|b3)`)), map[int][]int{'a': {0, 1}, 'b': {1, 2}, 'c': {}})
+	})
+	t.Run("an arm that can match empty is in every case", func(t *testing.T) {
+		expect(t, only(t, plan(t, `(?:ab|cd|e*)`)), map[int][]int{'a': {0, 2}, 'x': {2}, eof: {2}})
+	})
+	t.Run("a chain every byte starts is left alone", func(t *testing.T) {
+		if p := plan(t, `(?:.a|.b|.c)`); len(p.heads) != 0 {
+			t.Errorf("%d dispatched chains, want 0", len(p.heads))
+		}
+	})
+	t.Run("compact", func(t *testing.T) {
+		d := only(t, plan(t, `(?:\w+a|[a-z]+b|[0-9a-z]+c|x)`))
+		if !d.compact {
+			t.Error("compact = false: the direct encoding would push 6 frames for 4 arms")
+		}
+		expect(t, d, map[int][]int{'a': {0, 1, 2}, 'x': {0, 1, 2, 3}, '5': {0, 2}, '_': {0}, '-': {}})
+	})
+	t.Run("pairs", func(t *testing.T) {
+		// Two arms no byte starts both of: dispatched in Unicode mode only.
+		if p := plan(t, `(?:ab|cd)`); len(p.heads) != 0 {
+			t.Errorf("byte mode: %d dispatched pairs, want 0", len(p.heads))
+		}
+		pairs := func(t *testing.T, pat string) *btDispatchPlan {
+			t.Helper()
+			re, err := syntax.Parse(pat, syntax.Perl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prog, err := syntax.Compile(re.Simplify())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return buildBTDispatchPlan(prog, true)
+		}
+		expect(t, only(t, pairs(t, `(?:ab|cd)`)), map[int][]int{'a': {0}, 'c': {1}, 'x': {}, eof: {}})
+		if p := pairs(t, `(?:a1|a2)`); len(p.heads) != 0 {
+			t.Errorf("a pair one byte starts both arms of: %d dispatched, want 0 — it needs the frame", len(p.heads))
+		}
+		// Every Alt of a lowered class is a dispatch head or reached only
+		// through one, so Backtracking pushes no frame inside it.
+		for _, pat := range []string{`(?i)k`, `\p{Han}`, `\pL`} {
+			_, low := lowerTestProgs(t, pat, false)
+			p := buildBTDispatchPlan(low, true)
+			for pc, in := range low.Inst {
+				if in.Op == syntax.InstAlt && p.heads[pc] == nil && !p.dead[pc] {
+					t.Errorf("%s: the Alt at pc %d is walked arm by arm", pat, pc)
+				}
+			}
+		}
+	})
+	t.Run("charge", func(t *testing.T) {
+		d := only(t, plan(t, `(?:get|head|post|delete)`))
+		for _, c := range []struct {
+			list []int
+			want int
+		}{{nil, 3}, {[]int{0}, 3}, {[]int{1, 2}, 2}} {
+			if got := btDispatchCharge(d, c.list); got != c.want {
+				t.Errorf("charge for %v = %d, want %d", c.list, got, c.want)
+			}
+		}
+	})
+}
+
+// TestBTFirstSets pins the first-byte supersets the dispatch reads, one per
+// instruction kind, and the budget charge's amount forms.
+func TestBTFirstSets(t *testing.T) {
+	firstOf := func(t *testing.T, pat string) *btFirst {
+		t.Helper()
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return btFirstSets(prog)(uint32(prog.Start))
+	}
+	count := func(f *btFirst) int {
+		n := 0
+		for _, b := range f.bytes {
+			if b {
+				n++
+			}
+		}
+		return n
+	}
+	for _, c := range []struct {
+		pat      string
+		bytes    int
+		has      []byte
+		nullable bool
+	}{
+		{`(?s).x`, 256, []byte{'\n'}, false},
+		{`.x`, 255, []byte{'a'}, false},
+		{`(?i)k`, 2, []byte{'k', 'K'}, false},           // one folded rune
+		{`[a-c\x{100}-\x{200}]`, 3, []byte{'b'}, false}, // a range above the byte space adds nothing
+		{`[^\x00-\x{10FFFF}]`, 0, nil, false},           // Fail
+		{`(a*)*b`, 256, nil, true},                      // a zero-width cycle: anything
+		{`\bfoo`, 1, []byte{'f'}, false},                // an assertion is looked through
+		{`x*`, 1, []byte{'x'}, true},
+	} {
+		f := firstOf(t, c.pat)
+		if got := count(f); got != c.bytes || f.nullable != c.nullable {
+			t.Errorf("%s: %d bytes, nullable %v; want %d, %v", c.pat, got, f.nullable, c.bytes, c.nullable)
+		}
+		for _, b := range c.has {
+			if !f.bytes[b] {
+				t.Errorf("%s: misses %q", c.pat, b)
+			}
+		}
+	}
+	trip := func(b []byte) []byte { return append(b, 0x00) }
+	if !bytes.Equal(emitBTWorkChargeN(nil, 7, 1, trip), emitBTWorkCharge(nil, 7, trip)) {
+		t.Error("emitBTWorkChargeN(1) is not emitBTWorkCharge")
+	}
+	m := &btDriveMember{budget: 3}
+	if !bytes.Equal(emitBTWorkChargeMemberN(nil, m, 7, 1, trip), emitBTWorkChargeMember(nil, m, 7, trip)) {
+		t.Error("emitBTWorkChargeMemberN(1) is not emitBTWorkChargeMember")
+	}
+	if bytes.Equal(emitBTWorkChargeMemberN(nil, m, 7, 2, trip), emitBTWorkChargeMember(nil, m, 7, trip)) {
+		t.Error("emitBTWorkChargeMemberN(2) charges 1")
+	}
+}
+
+// TestFunctionSizeCap pins the one limit no key raises: WebAssembly loads no
+// function body over 7,654,321 bytes, and a Backtracking body grows with its
+// program (about 64 bytes per literal instruction). max_bt_instructions raised
+// far enough lets such a body through, and the compile refuses it there,
+// naming the pattern — not the runtime, at load.
+func TestFunctionSizeCap(t *testing.T) {
+	pattern := strings.Repeat("abcdefghij", 15000) // 150,000 instructions
+	_, _, err := Compile([]config.PatternEntry{{Name: "long", Regexp: pattern, MatchFunc: "m"}}, 0, true,
+		CompileOptions{MaxDFAStates: 1, MaxBTInstructions: 200000})
+	if !errors.Is(err, ErrFunctionTooLarge) {
+		t.Fatalf("err = %v, want ErrFunctionTooLarge", err)
+	}
+	for _, w := range []string{`pattern "long"`, "over WebAssembly's cap of 7654321 bytes", "lower max_bt_instructions"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error lacks %q: %v", w, err)
+		}
+	}
+	// The same body in a module that also carries a set, which a config
+	// compile assembles on its own path.
+	_, _, _, err = CompileFileDiag(config.BuildConfig{
+		Patterns:     []config.PatternEntry{{Name: "long", Regexp: pattern, MatchFunc: "m"}, {Name: "x", Regexp: `x[0-9]+`}},
+		Sets:         []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"x"}}}},
+		MaxDFAStates: 1, MaxBTInstructions: 200000,
+	}, "")
+	if !errors.Is(err, ErrFunctionTooLarge) || !strings.Contains(err.Error(), `pattern "long"`) {
+		t.Fatalf("with a set: err = %v, want ErrFunctionTooLarge naming the pattern", err)
+	}
+
+	// The scan itself: owners by offset, a glue body, malformed input.
+	body := func(n int) []byte { return append(utils.AppendULEB128(nil, uint32(n)), make([]byte, n)...) }
+	code := utils.AppendULEB128(nil, 2)
+	small := len(code)
+	code = append(code, body(3)...)
+	big := len(code)
+	code = append(code, body(maxWasmFunctionBytes+1)...)
+	module := append([]byte("\x00asm\x01\x00\x00\x00"), 10)
+	module = append(utils.AppendULEB128(module, uint32(len(code))), code...)
+	owners := codeOwners{{at: small, name: `pattern "a"`}, {at: big, name: `member "b" of set "s"`}}
+	if err := checkFunctionSizes(module, owners); err == nil || !strings.Contains(err.Error(), `member "b" of set "s"`) {
+		t.Errorf("oversized body: err = %v, want it named by its owner", err)
+	}
+	if err := checkFunctionSizes(module, codeOwners{{at: big + 1, name: "later"}}); err == nil ||
+		!strings.Contains(err.Error(), "the module's own glue") {
+		t.Errorf("a body before every owner mark: err = %v, want the glue named", err)
+	}
+	hdr := "\x00asm\x01\x00\x00\x00"
+	for _, bad := range [][]byte{nil, []byte(hdr), module[:20], append([]byte(hdr), 10, 0xff),
+		append([]byte(hdr), 10, 1, 0xff),      // a code section whose count does not decode
+		append([]byte(hdr), 10, 2, 1, 0xff)} { // one body, whose size does not decode
+		if err := checkFunctionSizes(bad, nil); err != nil {
+			t.Errorf("no readable code section (%d bytes): err = %v, want nil", len(bad), err)
+		}
+	}
+	fits := append([]byte(hdr), 10, 4, 1, 2, 0, 0x0b) // one 2-byte body
+	if err := checkFunctionSizes(fits, nil); err != nil {
+		t.Errorf("a module whose bodies fit: err = %v", err)
+	}
+	var none *codeOwners
+	none.mark(1, "ignored") // nil-safe: an assembly nobody checks records nothing
+}
+
+// TestBTFindBodyRareParams emits Backtracking find bodies under parameters no
+// compile of a real pattern passes — a program that still carries its
+// captures, a two-byte Teddy scan, a per-call work budget with no search, a
+// fallback with no search — each a branch buildBTFindBody keeps for a caller
+// that may pass it. Every one must still emit a body, and each must differ
+// from the ordinary body, or the parameter was ignored.
+func TestBTFindBodyRareParams(t *testing.T) {
+	btFor := func(src string) (*backtrack, prefixScanParams) {
+		t.Helper()
+		re, err := syntax.Parse(src, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bt := newBacktrack(byteProg(prog)) // captures NOT stripped
+		bt.numGroups = 0
+		fb, flags, all := nfaFirstBytes(prog)
+		sp, _, _ := buildBTScanTables(fb, flags, all, 0)
+		return bt, sp
+	}
+	plain := func(src string) []byte {
+		bt, sp := btFor(src)
+		b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+		return b
+	}
+	sc := (&moduleGlobals{}).BTScratch()
+	for _, c := range []struct {
+		name, src string
+		emit      func(*backtrack, prefixScanParams) []byte
+	}{
+		{"captures kept", `(a)b|c`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+			return b
+		}},
+		{"two-byte Teddy", `ab|cd`, func(bt *backtrack, sp prefixScanParams) []byte {
+			sp.TeddyTwoByte = true
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, nil, &btGrowth{})
+			return b
+		}},
+		{"per-call budget", `a+b`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 1, true, nil, &btGrowth{})
+			return b
+		}},
+		{"fallback without a search", `a+b`, func(bt *backtrack, sp prefixScanParams) []byte {
+			b, _, _ := buildBTFindBody(bt, sp, nil, btNoCaptureFrameSize, 0, 0, false, &sc, nil)
+			return b
+		}},
+	} {
+		bt, sp := btFor(c.src)
+		got := c.emit(bt, sp)
+		if len(got) == 0 {
+			t.Errorf("%s: empty body", c.name)
+		}
+		if c.name != "captures kept" && bytes.Equal(got, plain(c.src)) {
+			t.Errorf("%s: body is the ordinary one", c.name)
+		}
+	}
+}

@@ -2,11 +2,11 @@
 # as in set_split, and the merge lives in the shared per-position worker, so
 # `find` and the batch entry both reach it. The worker's resume rule — a gate
 # for every match delivered — is what a buffer smaller than a position needs.
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]+0[0-9]+'
+    regexp: '[a-z]+0[0-9]+'
   - name: p1
-    pattern: 'foo'
+    regexp: 'foo'
 sets:
   - name: s
     find: s_find

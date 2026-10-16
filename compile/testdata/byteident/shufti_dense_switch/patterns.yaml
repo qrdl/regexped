@@ -7,7 +7,7 @@
 # The sibling `shufti` fixture does NOT reach this path: its first-byte set is
 # 16 bytes, which takes the unconditional SIMD branch and never consults the
 # rarity model, so the dense switch had no fixture at all until this one.
-regexps:
-  - pattern: '[a-zA-Z]{20,}'
+patterns:
+  - regexp: '[a-zA-Z]{20,}'
     find_func: dense_switch_find
     hints: [prefer-no-match]

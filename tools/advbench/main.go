@@ -96,6 +96,34 @@ type sizeResult struct {
 
 func (r sizeResult) fuelPerByte() float64 { return float64(r.Fuel) / float64(max(r.N, 1)) }
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode, and a loaded config's `unicode:` keys); without it
+// every compile is forced to byte mode (ForceByteMode, `unicode: false`), so
+// no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
+// withConfigMode is withMode for a loaded config, which CompileFile compiles
+// without options: it sets the `unicode:` key of every set and every pattern.
+func withConfigMode(cfg *config.BuildConfig) {
+	u := *unicodeFlag
+	for i := range cfg.Sets {
+		cfg.Sets[i].Unicode = &u
+	}
+	for i := range cfg.Patterns {
+		cfg.Patterns[i].Unicode = &u
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *suite {
@@ -200,6 +228,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("load: %w", err)
 		}
+		withConfigMode(&cfg)
 		found := false
 		for _, s := range cfg.Sets {
 			if sp.Set == "" || s.Name == sp.Set {
@@ -215,7 +244,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 			sizes, err = compile.SearchSizes(cfg)
 		}
 	} else {
-		e := config.RegexEntry{Pattern: sp.Pattern, ByteMode: sp.ByteMode}
+		e := config.PatternEntry{Regexp: sp.Pattern, ByteMode: sp.ByteMode}
 		switch sp.Fn {
 		case "find":
 			e.FindFunc = "find"
@@ -229,12 +258,12 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 		if sp.Fn == "batchgroups" {
 			e.Hints = []string{"batch-find"}
 		}
-		opts := compile.CompileOptions{MaxDFAStates: sp.MaxDFA}
+		opts := withMode(compile.CompileOptions{MaxDFAStates: sp.MaxDFA})
 		var force compile.EngineType
 		if sp.BT {
 			force = compile.EngineBacktrack
 		}
-		wasmBytes, top, sizes, err = compile.CompileWithSearchSizes([]config.RegexEntry{e}, tableBase, true, force, opts)
+		wasmBytes, top, sizes, err = compile.CompileWithSearchSizes([]config.PatternEntry{e}, tableBase, true, force, opts)
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("compile: %w", err)
@@ -294,7 +323,7 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if isSet {
 		inBase = pageAlign(top)
 	}
-	idSpace := len(cfg.Regexps)
+	idSpace := len(cfg.Patterns)
 	capN := sp.Cap
 	if capN == 0 {
 		capN = idSpace

@@ -1,0 +1,12 @@
+# A Unicode-mode set whose members' part after the literal runs over whole
+# characters (`[^&]`, `[^,]`, `[^<]` lowered): the bucket suffix bodies take the
+# character skip, as a single pattern's find does.
+patterns:
+  - { name: k, regexp: '&ключ=[^&]+&' }
+  - { name: p, regexp: ',поле=[^,]*,' }
+  - { name: t, regexp: '<тег>[^<]+<' }
+sets:
+  - name: us
+    find: us_find
+    scan_all: us_scan_all
+    patterns: all

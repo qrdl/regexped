@@ -23,7 +23,30 @@ func compileTestDFA(t *testing.T, pattern string, leftmostFirst bool) *dfaTable 
 	if err != nil {
 		t.Fatalf("syntax.Compile(%q): %v", pattern, err)
 	}
-	d, ok := newDFA(prog, false, leftmostFirst, maxHelperDFAStates)
+	d, ok := newDFA(byteProg(prog), leftmostFirst, maxHelperDFAStates)
+	if !ok {
+		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+	}
+	return dfaTableFrom(d)
+}
+
+// compileTestDFAMode is compileTestDFA in a stated mode: the pattern resolved,
+// lowered when unicode is set, and built leftmost-first.
+func compileTestDFAMode(t *testing.T, pattern string, unicode bool) *dfaTable {
+	t.Helper()
+	rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := rp.parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, err := compileProg(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := newDFA(mp, true, 16384)
 	if !ok {
 		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
 	}
@@ -42,7 +65,7 @@ func dfaStateCount(pattern string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	d, ok := newDFA(prog, false, true, maxHelperDFAStates) // leftmostFirst
+	d, ok := newDFA(byteProg(prog), true, maxHelperDFAStates) // leftmostFirst
 	if !ok {
 		return 0, fmt.Errorf("newDFA(%q): state limit exceeded", pattern)
 	}
@@ -178,6 +201,89 @@ func TestComputePrefix(t *testing.T) {
 	}
 }
 
+// TestDFALayoutScanPrefixCap pins the literal prefix a Unicode-mode find scans
+// for: its first two characters, cut at a character's end, 8 bytes of an
+// all-ASCII literal, and the resume state walked over exactly those bytes.
+// Byte mode scans the whole literal.
+func TestDFALayoutScanPrefixCap(t *testing.T) {
+	for _, c := range []struct {
+		prefix string
+		utf8   bool
+		want   string
+	}{
+		{"здравствуйте", true, "зд"},
+		{"日本語", true, "日本"},
+		{"😀😁😂", true, "😀😁"},
+		{"aé日", true, "aé"},
+		{"é", true, "é"},
+		{"\xd0", true, "\xd0"}, // shorter than its character: kept as it is
+		{"abcdefghijkl", true, "abcdefgh"},
+		{"abc", true, "abc"},
+		{"здравствуйте", false, "здравствуйте"},
+		{"abcdefghijkl", false, "abcdefghijkl"},
+	} {
+		if got := string(scanPrefixCap([]byte(c.prefix), c.utf8)); got != c.want {
+			t.Errorf("scanPrefixCap(%q, %v) = %q, want %q", c.prefix, c.utf8, got, c.want)
+		}
+	}
+
+	layout := func(t *testing.T, pattern string, unicode bool) (*dfaTable, *dfaLayout) {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := newDFA(mp, true, 16384)
+		if !ok {
+			t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+		}
+		p := dfaLayoutCovFindParams()
+		p.t = dfaTableFrom(d)
+		p.utf8Text = unicode
+		return p.t, buildDFALayout(p)
+	}
+	for _, c := range []struct {
+		pattern string
+		unicode bool
+		want    string
+	}{
+		{`здравствуйте\s+\pL+`, true, "зд"},
+		{`日本語\s+x`, true, "日本"},
+		{`abcdefghijklmnopqrstuvwx\s+\w+`, false, "abcdefghijklmnopqrstuvwx"},
+	} {
+		tab, l := layout(t, c.pattern, c.unicode)
+		if string(l.prefix) != c.want {
+			t.Errorf("%q: layout prefix %q, want %q", c.pattern, l.prefix, c.want)
+		}
+		end := tab.midStartState
+		for _, ch := range l.prefix {
+			end = tab.transitions[end*256+int(ch)]
+		}
+		if l.wasmPrefixEnd != uint32(end+1) {
+			t.Errorf("%q: resume state %d, want the state after %q, %d", c.pattern, l.wasmPrefixEnd, l.prefix, end+1)
+		}
+	}
+
+	rep := &Reporter{}
+	re := config.PatternEntry{Regexp: `здравствуйте\s+\pL+`, FindFunc: "f"}
+	if _, _, err := Compile([]config.PatternEntry{re}, 65536, true, CompileOptions{Report: rep}); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Render(&b)
+	if !strings.Contains(b.String(), "prefix scan: hybrid SIMD, 4-byte prefix") {
+		t.Errorf("--verbose does not name the 4-byte scanned prefix:\n%s", b.String())
+	}
+}
+
 // TestDFAU16RowDedup exercises the u16 transition-table row-dedup path
 // (buildDFALayout's rowMap, emitU16Transition, dfaDataSegments).
 // [a-z]{300} produces 301 states (> 256 -> u16 table); the uniform class-run
@@ -185,11 +291,11 @@ func TestComputePrefix(t *testing.T) {
 // useRowDedup triggers.
 func TestDFAU16RowDedup(t *testing.T) {
 	t.Run("match", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{300}", MatchFunc: "m"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{300}", MatchFunc: "m"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 	t.Run("find", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: "[a-z]{300}", FindFunc: "f"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "[a-z]{300}", FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 }
@@ -202,12 +308,12 @@ func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 	t.Run("newline_boundary_u8_compressed", func(t *testing.T) {
 		// (?m)^[a-z]{150}FOOBAR$: >128 states, u8-compressed table, mandatory
 		// literal "FOOBAR" with no fixed prefix, newline-boundary anchors.
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m)^[a-z]{150}FOOBAR$`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m)^[a-z]{150}FOOBAR$`, FindFunc: "f"}})
 	})
 	t.Run("word_boundary_u16", func(t *testing.T) {
 		// \b[a-z]{300}FOOBAR\b: > 256 states forces u16, mandatory literal +
 		// word-boundary variant.
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `\b[a-z]{300}FOOBAR\b`, FindFunc: "f"}},
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `\b[a-z]{300}FOOBAR\b`, FindFunc: "f"}},
 			CompileOptions{MaxDFAStates: 100000})
 	})
 }
@@ -225,7 +331,7 @@ func TestDFAMandLitFindWordNewlineBoundary(t *testing.T) {
 // nil for it (no fixed prefix on either side), so this reaches the general
 // (non-mandatory-lit) dispatch branch rather than T2's mandatory-lit path.
 func TestDFANonMidDominantU16Sentinel(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "[^,]{300,}XYZ", FindFunc: "f"}},
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "[^,]{300,}XYZ", FindFunc: "f"}},
 		CompileOptions{MaxDFAStates: 100000})
 }
 
@@ -235,7 +341,7 @@ func TestDFANonMidDominantU16Sentinel(t *testing.T) {
 // literal prefix, reaches the general DFA find path (not the lit-chain-alt
 // frontend) and has few enough distinct first bytes for Teddy.
 func TestDFATeddyThreeFourBytePrefix(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:cat|dog|bird|frog)[0-9]+`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:cat|dog|bird|frog)[0-9]+`, FindFunc: "f"}})
 }
 
 // TestDFACaseFoldUnicodeOrbit exercises the full-Unicode SimpleFold orbit
@@ -243,7 +349,7 @@ func TestDFATeddyThreeFourBytePrefix(t *testing.T) {
 // (InstRune1). (?i)k folds across a 3-way orbit: Kelvin sign
 // U+212A <-> 'K' <-> 'k' — not just ASCII upper/lower.
 func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?i)k`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?i)k`, MatchFunc: "m"}})
 }
 
 // TestDFAImmAcceptMidStartSinglePattern exercises the bits==0 -> bits=1
@@ -252,10 +358,10 @@ func TestDFACaseFoldUnicodeOrbit(t *testing.T) {
 // nfaAcceptBits is always 0.
 func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 	t.Run("word_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:x)?\b`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:x)?\b`, FindFunc: "f"}})
 	})
 	t.Run("newline_boundary", func(t *testing.T) {
-		mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?m)(?:x)?$`, FindFunc: "f"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?m)(?:x)?$`, FindFunc: "f"}})
 	})
 }
 
@@ -267,7 +373,7 @@ func TestDFAImmAcceptMidStartSinglePattern(t *testing.T) {
 // and findLitAnchorPoint/l.useU8 both qualify (numWASM=5) so the pattern
 // reaches the lit-anchor path rather than the general find dispatch.
 func TestDFALitAnchorNonMidDominant(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `.*bar`, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `.*bar`, FindFunc: "f"}})
 }
 
 // TestDFAAltLitAnchorNoSIMDFallback exercises the default (scalar-scan, no
@@ -286,11 +392,11 @@ func TestDFAAltLitAnchorNoSIMDFallback(t *testing.T) {
 		}
 		pattern += string(c) + `[a-z]+end`
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "f"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "f"}})
 }
 
 // TestDFAMixedMidNonMidDominant exercises the mixed mid-accept +
-// non-mid-accept dominant dispatch in emitPhase4Dispatch (buildMatchBody).
+// non-mid-accept dominant dispatch in emitMatchBulkSkipDispatch (buildMatchBody).
 // [^,]*bar[^\n]* produces (confirmed live via buildDFALayout
 // probing with the LL/leftmostFirst=false DFA that match mode actually
 // uses) two mid-accept dominants and one non-mid-accept dominant: the
@@ -298,7 +404,7 @@ func TestDFAAltLitAnchorNoSIMDFallback(t *testing.T) {
 // self-loop), while the leading [^,]* run before the mandatory "bar" cannot
 // (non-mid-accept).
 func TestDFAMixedMidNonMidDominant(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `[^,]*bar[^\n]*`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `[^,]*bar[^\n]*`, MatchFunc: "m"}})
 }
 
 // TestDFALenAltAnchorSkipPartialLane exercises the lenAlt (length-
@@ -307,7 +413,7 @@ func TestDFAMixedMidNonMidDominant(t *testing.T) {
 // buildLenAltMatchBody. Branches have mixed \b anchors and
 // non-16-multiple literal lengths.
 func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `\bfoo[0-9]{3}|bar[0-9]{5}`, MatchFunc: "m"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `\bfoo[0-9]{3}|bar[0-9]{5}`, MatchFunc: "m"}})
 }
 
 // TestDFASetsEmptyFallbackStrictPrefix exercises the constant "no match"
@@ -316,9 +422,9 @@ func TestDFALenAltAnchorSkipPartialLane(t *testing.T) {
 // the same bucket).
 func TestDFASetsEmptyFallbackStrictPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p_cat", Pattern: "cat"},
-			{Name: "p_catalog", Pattern: "catalog"},
+		Patterns: []config.PatternEntry{
+			{Name: "p_cat", Regexp: "cat"},
+			{Name: "p_catalog", Regexp: "catalog"},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s1", Find: "s1_find", Patterns: config.PatternSelector{All: true}},
@@ -410,7 +516,7 @@ func dfaLayoutCovTable(t *testing.T, pattern string) *dfaTable {
 	if err != nil {
 		t.Fatalf("syntax.Compile(%q): %v", pattern, err)
 	}
-	dfa, ok := newDFA(prog, false, true, maxHelperDFAStates)
+	dfa, ok := newDFA(byteProg(prog), true, maxHelperDFAStates)
 	if !ok {
 		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
 	}
@@ -432,6 +538,170 @@ func dfaLayoutCovBuild(t *testing.T, pattern string, params dfaLayoutParams) (*d
 // emission to the hybrid dispatch bodies instead of buildFindBody).
 func dfaLayoutCovFindParams() dfaLayoutParams {
 	return dfaLayoutParams{needFind: true, leftmostFirst: true, compiledDFAThreshold: 0}
+}
+
+// TestDFALayoutUTF8SelfLoop pins which Unicode-mode states the UTF-8 bulk skip
+// serves: a state that loops on every valid multi-byte character, through
+// states that record nothing, with at most eight ASCII exits. In byte mode the
+// same patterns keep their byte dominants and get none.
+// TestSuffixBodyUTF8Skip: a set bucket's suffix body takes the skip over whole
+// characters exactly when the set is in Unicode mode (genSuffixWASMWalkEndCtr's
+// utf8Text). The skip is recognised by its open-tail table, which only the
+// character skip emits.
+func TestSuffixBodyUTF8Skip(t *testing.T) {
+	tbl := compileTestDFAMode(t, `[^&]+&`, true)
+	body := func(utf8Text bool) []byte {
+		art, _, _, _ := genSuffixWASMWalkEndCtr(nil, -1, tbl, 0, 0, []int{0}, []int{0}, LikelyNeutral, utf8Text, false, true, nil)
+		return art.fnBody
+	}
+	if !bytes.Contains(body(true), utf8OpenTail[:]) {
+		t.Error("a Unicode-mode set's suffix body has no character skip")
+	}
+	if bytes.Contains(body(false), utf8OpenTail[:]) {
+		t.Error("a byte-mode suffix body carries the character skip")
+	}
+}
+
+func TestDFALayoutUTF8SelfLoop(t *testing.T) {
+	layout := func(t *testing.T, pattern string, unicode bool) *dfaLayout {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := newDFA(mp, true, 16384)
+		if !ok {
+			t.Fatalf("newDFA(%q): state limit exceeded", pattern)
+		}
+		p := dfaLayoutCovFindParams()
+		p.t = dfaTableFrom(d)
+		p.utf8Text = unicode
+		return buildDFALayout(p)
+	}
+	utf8Exits := func(l *dfaLayout) []string {
+		var out []string
+		for _, info := range l.dominantStates {
+			if info.utf8 {
+				out = append(out, string(info.exitBytes))
+			}
+		}
+		return out
+	}
+	cases := []struct {
+		pattern string
+		want    []string // each UTF-8 dominant's ASCII exits
+		why     string
+	}{
+		{`[^,]+,`, []string{","}, "a negated class: one exit"},
+		{`.+`, []string{"\n"}, "`.`: the newline is its exit"},
+		{`(?s).+`, []string{""}, "`(?s).`: no ASCII exit at all"},
+		{`"[^"\\]*"`, []string{"\"\\"}, "two exits, the Shufti mask"},
+		{`(.+)=`, []string{"\n="}, "`=` leaves too: after it the match may end"},
+		{`[^,]+é,`, nil, "a character that advances another thread leads out of the loop"},
+		{`\pL+`, nil, "not every character: Han, digits and punctuation leave"},
+		{`[^\x{3b1}]+,`, nil, "one non-ASCII character leaves"},
+		{`[^\x{80}-\x{7ff}]+,`, nil, "no two-byte character: their lead bytes are dead"},
+		{`[^a-q]+,`, nil, "seventeen ASCII exits"},
+		{`[^,]+\b`, nil, "a word-boundary accept depends on the next byte"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.why, func(t *testing.T) {
+			got := utf8Exits(layout(t, tc.pattern, true))
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("%q: UTF-8 dominants' exits = %q, want %q", tc.pattern, got, tc.want)
+			}
+		})
+	}
+	// `(?m)[^,]+$`: a newline-channel accept makes '\n' an exit, as for a
+	// byte dominant.
+	if got := utf8Exits(layout(t, `(?m)[^,]+$`, true)); len(got) != 1 || !strings.Contains(got[0], "\n") {
+		t.Errorf("(?m)[^,]+$: UTF-8 dominants' exits = %q, want one holding '\\n'", got)
+	}
+	// A state inside a character that records anything — here a word-boundary
+	// accept, which no lowered program puts between a character's bytes —
+	// makes the run more than a position change, and the state is refused.
+	l := layout(t, `[^,]+,`, true)
+	var loop int32
+	for _, info := range l.dominantStates {
+		if info.utf8 {
+			loop = info.state
+		}
+	}
+	if _, ok := l.utf8SelfLoopExits(loop, 8); !ok {
+		t.Fatal("[^,]+,: the character loop is not recognised before the change")
+	}
+	inner := l.transitionOn(int(loop), 0xD0)
+	if l.midAcceptNWBytes == nil {
+		l.midAcceptNWBytes = make([]byte, l.numWASM)
+	}
+	l.midAcceptNWBytes[inner] = 1
+	if _, ok := l.utf8SelfLoopExits(loop, 8); ok {
+		t.Error("[^,]+,: a character loop through a state that records an accept is still recognised")
+	}
+
+	// Emitted through every find body shape the skip takes — an exit mask of
+	// none, one and two bytes, a mid-accepting state — and named by --verbose.
+	for _, pat := range []string{`[^,]+,`, `.+`, `(?s).+`, `"[^"\\]*"`} {
+		rep := &Reporter{}
+		if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "f"}}, 0, true, CompileOptions{Unicode: true, Report: rep}); err != nil {
+			t.Fatalf("%q: %v", pat, err)
+		}
+		var b strings.Builder
+		rep.Render(&b)
+		if !strings.Contains(b.String(), "1 over whole UTF-8 characters") {
+			t.Errorf("%q: --verbose does not name the UTF-8 skip:\n%s", pat, b.String())
+		}
+	}
+	for _, pat := range []string{`[^,]+,`, `.+`} {
+		l := layout(t, pat, false)
+		if got := utf8Exits(l); len(got) != 0 {
+			t.Errorf("byte mode %q: UTF-8 dominants %q, want none", pat, got)
+		}
+		if len(l.dominantStates) == 0 {
+			t.Errorf("byte mode %q: no byte dominant", pat)
+		}
+	}
+}
+
+// TestMatchUTF8ErrLocal pins where a match body keeps the UTF-8 skip's error
+// lanes: one v128 after its last local — the chunk at 5, or the hysteresis
+// pair at 6 and 7 once a dominant state does not accept — declared only when a
+// dominant state takes that skip.
+func TestMatchUTF8ErrLocal(t *testing.T) {
+	mid, nonMid := dominantInfo{isMidAccept: true}, dominantInfo{}
+	utf8Mid, utf8NonMid := dominantInfo{isMidAccept: true, utf8: true}, dominantInfo{utf8: true}
+	for _, c := range []struct {
+		name  string
+		infos []dominantInfo
+		want  byte
+	}{
+		{"none", nil, 0},
+		{"byte loops only", []dominantInfo{mid, nonMid}, 0},
+		{"accepting UTF-8 loop", []dominantInfo{utf8Mid}, 0x06},
+		{"accepting UTF-8 loop, hysteresis", []dominantInfo{utf8Mid, nonMid}, 0x08},
+		{"non-accepting UTF-8 loop", []dominantInfo{utf8NonMid}, 0x08},
+	} {
+		if got := matchUTF8ErrLocal(c.infos); got != c.want {
+			t.Errorf("%s: matchUTF8ErrLocal = %d, want %d", c.name, got, c.want)
+		}
+		decl := []byte{0x02, 0x03, 0x7F, 0x01, 0x7B}
+		got := appendMatchUTF8Err(append([]byte(nil), decl...), 0, c.infos)
+		want := decl
+		if c.want != 0 {
+			want = []byte{0x03, 0x03, 0x7F, 0x01, 0x7B, 0x01, 0x7B}
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: appendMatchUTF8Err = % x, want % x", c.name, got, want)
+		}
+	}
 }
 
 // TestDFALayoutTeddyTiers pins how deep the Teddy prefilter is built for
@@ -998,7 +1268,7 @@ func TestDFALayoutFindBodyStartContexts(t *testing.T) {
 			if isAnchoredFind(table) {
 				t.Fatalf("%q routes to buildAnchoredFindBody, not buildFindBody — case is not testing what it claims", tc.pattern)
 			}
-			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(bytePat(tc.pattern)), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1055,7 +1325,7 @@ func TestDFALayoutFindBodyPrefixWalkDivergence(t *testing.T) {
 				t.Fatalf("%q: all four prefix-end states agree (%d) — nothing diverges to emit",
 					tc.pattern, layout.wasmPrefixEnd)
 			}
-			body := buildFindCodeEntry(layout, table, findMandatoryLit(tc.pattern, false), 0).body
+			body := buildFindCodeEntry(layout, table, findMandatoryLit(bytePat(tc.pattern)), 0).body
 			if len(body) == 0 {
 				t.Fatalf("%q: empty find body", tc.pattern)
 			}
@@ -1088,7 +1358,7 @@ func TestDFALayoutFindBodyU16NonMidDominant(t *testing.T) {
 	if nonMid == 0 {
 		t.Fatalf("%q: expected at least one non-mid dominant state", pattern)
 	}
-	body := buildFindCodeEntry(layout, table, findMandatoryLit(pattern, false), 0).body
+	body := buildFindCodeEntry(layout, table, findMandatoryLit(bytePat(pattern)), 0).body
 	if len(body) == 0 {
 		t.Fatalf("%q: empty find body", pattern)
 	}
@@ -1121,7 +1391,7 @@ func TestDFALayoutFindBodyMandatoryLit(t *testing.T) {
 			if len(layout.prefix) != 0 {
 				t.Fatalf("%q: literal prefix %q present, so the mandatory-literal path is not taken", tc.pattern, layout.prefix)
 			}
-			lit := findMandatoryLit(tc.pattern, false)
+			lit := findMandatoryLit(bytePat(tc.pattern))
 			if lit == nil || len(lit.bytes) == 0 {
 				t.Fatalf("%q: no mandatory literal found — case is not testing what it claims", tc.pattern)
 			}
@@ -1551,7 +1821,7 @@ func TestSoleMidDominantOnRealPatterns(t *testing.T) {
 // is there to prevent.
 func TestDFATailMinimizeSingleState(t *testing.T) {
 	for _, pattern := range []string{``, `(?:)`} {
-		matcher, err := compile(pattern, CompileOptions{
+		matcher, err := compile(bytePat(pattern), CompileOptions{
 			MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true,
 		})
 		if err != nil {
@@ -1580,7 +1850,7 @@ func TestDFATailMinimizeSingleState(t *testing.T) {
 // away from the DFA find path entirely.
 func TestDFATailBoundaryOutranked(t *testing.T) {
 	const pattern = `0*\b|0*`
-	matcher, err := compile(pattern, CompileOptions{
+	matcher, err := compile(bytePat(pattern), CompileOptions{
 		MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true,
 	})
 	if err != nil {
@@ -1594,7 +1864,7 @@ func TestDFATailBoundaryOutranked(t *testing.T) {
 	}
 	// It still has to COMPILE — the routing sends it to Backtracking rather
 	// than rejecting it.
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, FindFunc: "outranked_find"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, FindFunc: "outranked_find"}})
 }
 
 // TestDFATailAmbiguousBoundaryTarget covers the sibling analysis
@@ -1605,7 +1875,7 @@ func TestDFATailBoundaryOutranked(t *testing.T) {
 // the higher-priority derivation with no dominant bit left to catch it.
 func TestDFATailAmbiguousBoundaryTarget(t *testing.T) {
 	const pattern = ` (\b|0*)0`
-	matcher, err := compile(stripCapturesFromPattern(t, pattern), CompileOptions{
+	matcher, err := compile(bytePat(stripCapturesFromPattern(t, pattern)), CompileOptions{
 		MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true,
 	})
 	if err != nil {
@@ -1647,8 +1917,8 @@ func TestDFATailAnchorShapes(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "anchor_match", FindFunc: "anchor_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "anchor_match", FindFunc: "anchor_find"},
 			})
 		})
 	}
@@ -1668,8 +1938,8 @@ func TestDFATailLitChainAltGroups(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, GroupsFunc: "chain_groups"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, GroupsFunc: "chain_groups"},
 			})
 		})
 	}
@@ -1693,7 +1963,7 @@ func TestDFATailComputePrefixWordWalk(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.pattern, func(t *testing.T) {
-			matcher, err := compile(testCase.pattern, CompileOptions{
+			matcher, err := compile(bytePat(testCase.pattern), CompileOptions{
 				MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true,
 			})
 			if err != nil {
@@ -1724,7 +1994,7 @@ func TestDFATailUnparseablePatternGuards(t *testing.T) {
 		t.Error("shouldTryLitChainAlt failed OPEN on an unparseable pattern: it must " +
 			"fall back to the general path, not claim the alternation shape was ruled out")
 	}
-	if lmBareShuftiEligible(unparseable, false) {
+	if lmBareShuftiEligible(bytePat(unparseable)) {
 		t.Error("lmBareShuftiEligible failed OPEN on an unparseable pattern: it must " +
 			"decline the bare-Shufti optimisation rather than assert a minimum length " +
 			"it could not compute")
@@ -1763,8 +2033,8 @@ func TestDFATailShouldTryLitChainAltUnbounded(t *testing.T) {
 func TestDFATailLeadingEndTextAnchor(t *testing.T) {
 	for _, pattern := range []string{`\zabc[a-z]{20}`, `\zabc[a-z]{20,24}`} {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "endtext_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "endtext_match"},
 			})
 		})
 	}
@@ -1787,8 +2057,8 @@ func TestDFATailEOFSkipSafe(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, FindFunc: "eofskip_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, FindFunc: "eofskip_find"},
 			})
 		})
 	}
@@ -1800,8 +2070,8 @@ func TestDFATailEOFSkipSafe(t *testing.T) {
 func TestDFATailEmptyPatternFind(t *testing.T) {
 	for _, pattern := range []string{``, `(?:)`, `a*`} {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "empty_match", FindFunc: "empty_find"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, MatchFunc: "empty_match", FindFunc: "empty_find"},
 			})
 		})
 	}
@@ -1951,8 +2221,8 @@ func TestDFATailAltBranchAnchorsResolvedAtCompileTime(t *testing.T) {
 	}
 	for _, testCase := range patterns {
 		t.Run(testCase.pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: testCase.pattern, MatchFunc: "altanchor_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: testCase.pattern, MatchFunc: "altanchor_match"},
 			})
 		})
 	}
@@ -1974,8 +2244,8 @@ func TestDFATailAltBranchAnchorsWithCaptures(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, GroupsFunc: "altanchor_groups"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: pattern, GroupsFunc: "altanchor_groups"},
 			})
 		})
 	}
@@ -1993,9 +2263,11 @@ func TestDFATailAltBranchRangeCounts(t *testing.T) {
 	}
 	for _, pattern := range patterns {
 		t.Run(pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: pattern, MatchFunc: "altrange_match", GroupsFunc: "altrange_groups"},
-			})
+			e := config.PatternEntry{Regexp: pattern, MatchFunc: "altrange_match", GroupsFunc: "altrange_groups"}
+			if e.GroupsWithoutCaptures() {
+				e.GroupsFunc = "" // refused without a capture group (ErrNoCaptureGroup)
+			}
+			mustCompileEntries(t, []config.PatternEntry{e})
 		})
 	}
 }
@@ -2018,8 +2290,8 @@ func TestDFATailSingleBranchAnchorsResolvedAtCompileTime(t *testing.T) {
 	}
 	for _, testCase := range patterns {
 		t.Run(testCase.pattern, func(t *testing.T) {
-			mustCompileEntries(t, []config.RegexEntry{
-				{Pattern: testCase.pattern, MatchFunc: "chainanchor_match"},
+			mustCompileEntries(t, []config.PatternEntry{
+				{Regexp: testCase.pattern, MatchFunc: "chainanchor_match"},
 			})
 		})
 	}
@@ -2091,13 +2363,13 @@ func TestDFA_HighPCsDoNotCollide(t *testing.T) {
 		if err != nil {
 			t.Fatalf("compile %q: %v", pat, err)
 		}
-		base, ok := newDFA(prog, false, false, 1024)
+		base, ok := newDFA(byteProg(prog), false, 1024)
 		if !ok {
 			t.Fatalf("%q: baseline DFA construction failed", pat)
 		}
 
 		for _, off := range offsets {
-			moved, ok := newDFA(relocateProg(prog, off), false, false, 1024)
+			moved, ok := newDFA(byteProg(relocateProg(prog, off)), false, 1024)
 			if !ok {
 				t.Fatalf("%q @ off=%#x: relocated DFA construction failed", pat, off)
 			}
@@ -2255,7 +2527,7 @@ func TestAnchoredFindBodyReadsTheRowMap(t *testing.T) {
 	// fuzz crashers that reported this.
 	const pat = `^.{0,170}0`
 
-	matcher, err := compile(pat, CompileOptions{MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true})
+	matcher, err := compile(bytePat(pat), CompileOptions{MaxDFAStates: 1024, ForceEngine: EngineDFA, LeftmostFirst: true})
 	if err != nil {
 		t.Fatalf("compile %q: %v", pat, err)
 	}
@@ -2311,7 +2583,7 @@ func TestCountedClassChainShortTail(t *testing.T) {
 	for _, p := range []string{`[a-z]{5,}`, `[a-f]{8,}`, `\w{12,}x`, `[0-9]{3,}-[0-9]{4,}`} {
 		for _, lm := range []LikelyMode{LikelyNeutral, LikelyMatch, LikelyNoMatch} {
 			t.Run(fmt.Sprintf("%s/%v", p, lm), func(t *testing.T) {
-				if _, _, err := Compile([]config.RegexEntry{{Pattern: p, FindFunc: "f"}},
+				if _, _, err := Compile([]config.PatternEntry{{Regexp: p, FindFunc: "f"}},
 					65536, true, CompileOptions{LikelyMode: lm}); err != nil {
 					t.Fatalf("Compile(%q): %v", p, err)
 				}
@@ -2469,11 +2741,18 @@ func TestDFAHasOutrankedStateChannels(t *testing.T) {
 func TestEmitterCornerPatterns(t *testing.T) {
 	for _, pat := range []string{`(?:(?:(?:.|\b|\d))+?)?`, `(?:\B|a)(?:^|a)`, `\A(a)|a`} {
 		t.Run(pat, func(t *testing.T) {
-			wasm, _, err := Compile([]config.RegexEntry{{Pattern: pat, MatchFunc: "m", FindFunc: "f", GroupsFunc: "g"}}, 65536, true)
-			if err != nil {
-				t.Fatalf("Compile: %v", err)
+			// groups on `(?:pat)()`: a pattern with no capture group of its
+			// own is refused for groups_func (ErrNoCaptureGroup).
+			for _, e := range []config.PatternEntry{
+				{Regexp: pat, MatchFunc: "m", FindFunc: "f"},
+				{Regexp: "(?:" + pat + ")()", GroupsFunc: "g"},
+			} {
+				wasm, _, err := Compile([]config.PatternEntry{e}, 65536, true)
+				if err != nil {
+					t.Fatalf("Compile(%+v): %v", e, err)
+				}
+				validateWASM(t, wasm)
 			}
-			validateWASM(t, wasm)
 		})
 	}
 }

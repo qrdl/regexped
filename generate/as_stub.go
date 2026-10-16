@@ -32,7 +32,7 @@ func asStub(cfg config.BuildConfig, out string) error {
 func genASStubFile(cfg config.BuildConfig) (string, error) {
 	var parts []string
 	sizes := searchSizesFor(cfg)
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		part, err := genASStubsForEntrySized(re, cfg.ImportModule, sizes)
 		if err != nil {
 			return "", err
@@ -117,7 +117,7 @@ func genASSetSectionSized(cfg config.BuildConfig, sizes map[string]compile.Searc
 		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "// Number of patterns in set %q. Sizes the match buffer: the iterator can\n// receive at most this many matches at one position.\nexport const %s: i32 = %d;\n\n", s.Name, konst, n)
-		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids are global\n// indices into regexps:, so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "// One past the largest pattern id set %q can report. Pattern ids index\n// patterns: (then the set's own regexps:), so a set holding a few late-declared patterns has a\n// small count and a large id space. Everything indexed BY an id \u2014 the gate\n// array, the _all bitmask \u2014 is sized from this.\nexport const %s: i32 = %d;\n\n", s.Name, idKonst, idN)
 
 		decl := func(name, sig string) {
 			fmt.Fprintf(&out, "@external(%q, %q)\ndeclare function ffi_%s%s;\n\n", cfg.ImportModule, name, name, sig)
@@ -398,21 +398,14 @@ export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
 		}
 		out.WriteString("\n")
 	}
-	if hasEmitNameMap(cfg) {
-		names := make([]string, len(cfg.Regexps))
-		for i, re := range cfg.Regexps {
-			names[i] = fmt.Sprintf("%q", re.Name)
-		}
-		fmt.Fprintf(&out, "const _patternNames: string[] = [%s];\n", strings.Join(names, ", "))
-		out.WriteString("export function patternName(id: i32): string { return id >= 0 && id < _patternNames.length ? _patternNames[id] : ''; }\n")
-	}
+	out.WriteString(jsPatternNameFns(cfg, "as", "id: i32", ": string"))
 	return out.String()
 }
 
 // genASStubsForEntrySized generates the AS stub content for a single regexp
 // entry, with each export's search block (search_stub.go); nil sizes means
 // none.
-func genASStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
+func genASStubsForEntrySized(re config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -426,7 +419,7 @@ func genASStubsForEntrySized(re config.RegexEntry, importModule string, sizes ma
 		written = true
 	}
 	if re.GroupsFunc != "" {
-		numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+		numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 		if err != nil {
 			return "", err
 		}

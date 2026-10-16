@@ -1,0 +1,12 @@
+# A Unicode-mode set of multi-byte literals: their UTF-8 bytes reach the
+# literal frontend.
+patterns:
+  - { name: k0, regexp: 'привет' }
+  - { name: k1, regexp: 'москва' }
+  - { name: k2, regexp: 'собака' }
+  - { name: k3, regexp: 'город\d+' }
+sets:
+  - name: ul
+    find: ul_find
+    scan_all: ul_scan_all
+    patterns: all

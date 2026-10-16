@@ -1,8 +1,6 @@
 package compile
 
 import (
-	"regexp/syntax"
-
 	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -21,7 +19,11 @@ import (
 // bitmask has 32 usable bits, a list has as many entries as the state needs.
 //
 // WHAT IT DELIBERATELY DOES NOT DO, and why the driver needs no changes:
-// `validMask` is ignored. Every mask on the per-candidate path — the group
+// it does not filter by a validMask. Its `validMask` slot carries the
+// member-skip verdict instead (the mask the walk choice reads, or 0 for a
+// bucket with no member skip): the driver pushes the verdict global there for
+// one instruction where computing the mask cost three, −2 fuel per candidate
+// on every sparse bucket. Every mask on the per-candidate path — the group
 // mask, the gate pre-mask, the first-byte mask — is an i32 and cannot
 // express more than 32 patterns, and widening all of them to i64 was rejected
 // as bigger and riskier than this format, for half the benefit. So the
@@ -165,8 +167,13 @@ type sparseAcceptTables struct {
 	// because the body they described had drifted to another emitter.
 	memberStates int
 	memberSets   int
-	end          int32
-	data         []byte
+	// memberFirstChar is the first set id (+1, as the id table stores it) of
+	// a CHARACTER set (buildMemberSets), every id from it up being one; 0 when
+	// the bucket has none. The body tests the id against it to pick the skip.
+	memberFirstChar  int
+	memberCharStates int
+	end              int32
+	data             []byte
 }
 
 // Member self-loop skip sizing.
@@ -201,9 +208,25 @@ const (
 //
 // There is no width ceiling: see the memberSetPairs comment above for why two
 // pairs cover any set, and why this used to stop at sixteen bytes.
-func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
-	idTab = make([]byte, numWASM)
-	seen := map[string]int{}
+//
+// unicode (a Unicode-mode set) adds CHARACTER sets: a state that every valid
+// multi-byte character leads back to, through states that record nothing on
+// the way (memberCharLoop), strides whole characters instead of bytes
+// (emitMemberCharSkip) — its byte set is then the ASCII bytes it loops on, and
+// may be empty. In Unicode mode a class holding every non-ASCII character,
+// `[^;]` say, is a cycle through one state per character byte, so its state
+// self-loops on ASCII alone and the byte skip stopped at every character:
+// over Cyrillic tails it never strode at all. Character sets take the ids
+// after every byte set, firstChar being the first (+1, as stored; 0 when there
+// is none), so the body tells the two kinds apart with one compare. Without
+// unicode nothing changes, byte for byte.
+func buildMemberSets(t *dfaTable, numWASM int, unicode bool) (idTab, setTab []byte, firstChar int) {
+	type memberSet struct {
+		members []byte
+		char    bool
+	}
+	states := make([]memberSet, numWASM)
+	charLoops := unicode && !t.hasWordBoundary && !t.hasNewlineBoundary
 	for gs := 0; gs < t.numStates; gs++ {
 		ws := gs + 1
 		if ws >= numWASM {
@@ -215,26 +238,55 @@ func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
 				members = append(members, byte(by))
 			}
 		}
-		if len(members) == 0 {
+		char := charLoops && memberCharLoop(t, gs)
+		if len(members) == 0 && !char {
 			continue
 		}
-		key := string(members)
-		id, ok := seen[key]
-		if !ok {
-			// Set ids are stored as id+1 in a u8, so 255 sets is the ceiling.
-			if len(seen) >= 255 {
+		states[ws] = memberSet{members: members, char: char}
+	}
+	idTab = make([]byte, numWASM)
+	seen := map[string]int{}
+	assign := func(char bool) {
+		for ws, st := range states {
+			if (st.members == nil && !st.char) || st.char != char {
 				continue
 			}
-			id = len(seen)
-			seen[key] = id
-			setTab = append(setTab, encodeMemberSet(members)...)
+			key := string(st.members)
+			if char {
+				key = "\x00char" + key
+			}
+			id, ok := seen[key]
+			if !ok {
+				// Set ids are stored as id+1 in a u8, so 255 sets is the ceiling.
+				if len(seen) >= 255 {
+					continue
+				}
+				id = len(seen)
+				seen[key] = id
+				setTab = append(setTab, encodeMemberSet(st.members)...)
+				if char && firstChar == 0 {
+					firstChar = id + 1
+				}
+			}
+			idTab[ws] = byte(id + 1)
 		}
-		idTab[ws] = byte(id + 1)
 	}
+	assign(false)
+	assign(true)
 	if len(setTab) == 0 {
-		return nil, nil
+		return nil, nil, 0
 	}
-	return idTab, setTab
+	return idTab, setTab, firstChar
+}
+
+// memberCharLoop reports whether every valid multi-byte character read from
+// state gs leads back to it, every state inside the character being live and
+// recording nothing — the member skip's condition for striding whole
+// characters, as utf8SelfLoopExits is the find body's: a run of them then
+// changes nothing but the position.
+func memberCharLoop(t *dfaTable, gs int) bool {
+	quiet := func(q int) bool { return q >= 0 && q != gs && len(t.midAcceptWide[q]) == 0 }
+	return loopsOverUTF8(gs, func(s, c int) int { return t.transitions[s*256+c] }, quiet)
 }
 
 // encodeMemberSet lays out one set as memberSetPairs (tLo,tHi) nibble tables,
@@ -255,6 +307,10 @@ func buildMemberSets(t *dfaTable, numWASM int) (idTab, setTab []byte) {
 // panic rather than a silent truncation, since truncating is precisely the
 // wrong-extent bug above.
 func encodeMemberSet(members []byte) []byte {
+	if len(members) == 0 {
+		// A character set that loops on no ASCII byte: every lane misses.
+		return make([]byte, memberSetBytes)
+	}
 	pairs := buildShuftiPairs(members)
 	if len(pairs) > memberSetPairs {
 		panic("compile: member self-loop set needs more than memberSetPairs nibble pairs")
@@ -270,7 +326,7 @@ func encodeMemberSet(members []byte) []byte {
 // buildSparseAcceptTables serialises the three channels. Pattern indices are
 // BUCKET-LOCAL; the body maps them to global ids through a compile-time table
 // when it writes tuples.
-func buildSparseAcceptTables(t *dfaTable, base int32, numWASM int, memberSkip bool) sparseAcceptTables {
+func buildSparseAcceptTables(t *dfaTable, base int32, numWASM int, memberSkip, unicode bool) sparseAcceptTables {
 	out := sparseAcceptTables{}
 	cur := base
 	emit := func(m map[int][]uint16) (offTab, listTab int32, blob []byte) {
@@ -304,13 +360,17 @@ func buildSparseAcceptTables(t *dfaTable, base int32, numWASM int, memberSkip bo
 	b = append(b, blob...)
 	// Member self-loop tables. Empty unless the caller opted in.
 	if memberSkip {
-		idTab, setTab := buildMemberSets(t, numWASM)
+		idTab, setTab, firstChar := buildMemberSets(t, numWASM, unicode)
 		if len(setTab) > 0 {
 			for _, id := range idTab {
 				if id != 0 {
 					out.memberStates++
+					if firstChar > 0 && int(id) >= firstChar {
+						out.memberCharStates++
+					}
 				}
 			}
+			out.memberFirstChar = firstChar
 			out.memberSets = len(setTab) / memberSetBytes
 			out.memberOff = cur
 			b = append(b, idTab...)
@@ -334,6 +394,7 @@ type memberSkipLocals struct {
 	setID            byte // i32: set id + 1, as loaded from the id table
 	mask             byte // i32 scratch
 	chunk            byte // v128 scratch
+	high             byte // i32 scratch, the character skip's lanes >= 0x80
 }
 
 // emitMemberSetSkip advances `pos` past a run of bytes belonging to the
@@ -355,17 +416,7 @@ type memberSkipLocals struct {
 // by the ordinary loop on the following iterations, which costs at most 15
 // ordinary steps and keeps this emitter small enough to reason about.
 func emitMemberSetSkip(b []byte, l memberSkipLocals, setTabOff int32, tableMemIdx int) []byte {
-	// base = setTabOff + (setID-1)*memberSetBytes, kept in `mask` until the
-	// tables are loaded — it is free at this point and this avoids a local.
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, setTabOff)
-	b = append(b, 0x20, l.setID)
-	b = append(b, 0x41, 0x01, 0x6B) // i32.const 1 ; i32.sub
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, int32(memberSetBytes))
-	b = append(b, 0x6C)          // i32.mul
-	b = append(b, 0x6A)          // i32.add
-	b = append(b, 0x21, l.setID) // setID now holds the table base
+	b = emitMemberSetBase(b, l, setTabOff)
 
 	b = append(b, 0x02, 0x40) // block $skip_done
 	b = append(b, 0x03, 0x40) // loop $skip
@@ -378,6 +429,49 @@ func emitMemberSetSkip(b []byte, l memberSkipLocals, setTabOff int32, tableMemId
 	b = append(b, 0x4B)
 	b = append(b, 0x0D, 0x01)
 
+	b = emitMemberSetHits(b, l, tableMemIdx)
+
+	// stop-mask: lanes whose member bits are all zero.
+	b = append(b, 0x41, 0x00)
+	b = append(b, 0xFD, 0x0F) // i8x16.splat 0
+	b = append(b, 0xFD, 0x23) // i8x16.eq → lane == 0 (NOT a member)
+	b = append(b, 0xFD, 0x64) // i8x16.bitmask
+	b = append(b, 0x22, l.mask)
+	b = append(b, 0x45)       // i32.eqz — every lane is a member
+	b = append(b, 0x04, 0x40) // if
+	b = append(b, 0x20, l.pos, 0x41, 0x10, 0x6A, 0x21, l.pos)
+	b = append(b, 0x0C, 0x01) // continue
+	b = append(b, 0x05)       // else
+	b = append(b, 0x20, l.mask, 0x68)
+	b = append(b, 0x20, l.pos, 0x6A, 0x21, l.pos)
+	b = append(b, 0x0C, 0x02) // br $skip_done
+	b = append(b, 0x0B)       // end if
+
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block
+	return b
+}
+
+// emitMemberSetBase turns setID (id + 1, as the id table stores it) into the
+// set's table base, setTabOff + (setID-1)*memberSetBytes, kept in setID itself
+// — it is free once the tables are addressed, and this avoids a local.
+func emitMemberSetBase(b []byte, l memberSkipLocals, setTabOff int32) []byte {
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, setTabOff)
+	b = append(b, 0x20, l.setID)
+	b = append(b, 0x41, 0x01, 0x6B) // i32.const 1 ; i32.sub
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(memberSetBytes))
+	b = append(b, 0x6C)          // i32.mul
+	b = append(b, 0x6A)          // i32.add
+	b = append(b, 0x21, l.setID) // setID now holds the table base
+	return b
+}
+
+// emitMemberSetHits loads the chunk at ptr + pos into chunk and leaves the
+// v128 of its member bits on the stack: nonzero exactly in the lanes holding
+// a member of the set whose base is in setID.
+func emitMemberSetHits(b []byte, l memberSkipLocals, tableMemIdx int) []byte {
 	// chunk = v128.load(ptr + pos)   — INPUT memory, always index 0
 	b = append(b, 0x20, l.ptr)
 	b = append(b, 0x20, l.pos)
@@ -409,22 +503,71 @@ func emitMemberSetSkip(b []byte, l memberSkipLocals, setTabOff int32, tableMemId
 			b = append(b, 0xFD, 0x50) // v128.or with the previous pair
 		}
 	}
+	return b
+}
 
-	// stop-mask: lanes whose member bits are all zero.
-	b = append(b, 0x41, 0x00)
-	b = append(b, 0xFD, 0x0F) // i8x16.splat 0
-	b = append(b, 0xFD, 0x23) // i8x16.eq → lane == 0 (NOT a member)
-	b = append(b, 0xFD, 0x64) // i8x16.bitmask
-	b = append(b, 0x22, l.mask)
-	b = append(b, 0x45)       // i32.eqz — every lane is a member
-	b = append(b, 0x04, 0x40) // if
+// emitMemberCharSkip is emitMemberSetSkip for a CHARACTER set
+// (buildMemberSets): the state loops on the set's ASCII bytes and on every
+// valid multi-byte character, so it strides chunks that are valid UTF-8 and
+// hold no ASCII byte outside the set, and stops on a character boundary,
+// where the walk is back in the state — the chunk logic of emitUTF8BulkSkip,
+// with the exit lanes read from the loaded tables instead of constants:
+//
+//	exits = ASCII lanes that are not members
+//	all-ASCII chunk:  the byte skip's step
+//	otherwise:        invalid UTF-8 anywhere → stop at the last character
+//	                                            start before the first error
+//	                                            and the first exit
+//	                  an exit                → stop on it
+//	                  else                   → on to the lead byte of a
+//	                                            character the chunk cuts, or 16
+//
+// The skip starts on a boundary (the walk is in the state), so the validity
+// check's zeros before the chunk are right. pos is the next byte to walk,
+// before and after, so every advance is the stop lane's index added to it.
+// As in the byte skip, a run's last <16 bytes are left to the walk.
+func emitMemberCharSkip(b []byte, l memberSkipLocals, errLocal byte, setTabOff int32, tableMemIdx int) []byte {
+	b = emitMemberSetBase(b, l, setTabOff)
+	b = append(b, 0x02, 0x40)                                                      // block $skip_done
+	b = append(b, 0x03, 0x40)                                                      // loop $skip
+	b = append(b, 0x20, l.pos, 0x41, 0x10, 0x6A, 0x20, l.length, 0x4B, 0x0D, 0x01) // pos + 16 > len: done
+	b = emitMemberSetHits(b, l, tableMemIdx)
+	// Every lane a member — every byte loops on the state by itself — is the
+	// byte skip's own step, tested first and as cheaply: ASCII text pays
+	// nothing for the character test behind it.
+	b = append(b, 0x41, 0x00, 0xFD, 0x0F, 0xFD, 0x23, 0xFD, 0x64) // splat 0; eq; bitmask
+	b = append(b, 0x22, l.mask, 0x45, 0x04, 0x40)                 // if no lane misses
 	b = append(b, 0x20, l.pos, 0x41, 0x10, 0x6A, 0x21, l.pos)
-	b = append(b, 0x0C, 0x01) // continue
-	b = append(b, 0x05)       // else
-	b = append(b, 0x20, l.mask, 0x68)
+	b = append(b, 0x0C, 0x01) //   br $skip
+	b = append(b, 0x0B)
+	// mask = the missing lanes below 0x80: the exits.
+	b = append(b, 0x20, l.chunk, 0xFD, 0x64, 0x22, l.high)            // the lanes >= 0x80
+	b = append(b, 0x41, 0x7F, 0x73, 0x20, l.mask, 0x71, 0x21, l.mask) // ~high & mask
+	b = append(b, 0x20, l.high, 0x45, 0x04, 0x40)                     // if no lane high: stop on the exit
+	b = append(b, 0x20, l.mask, 0x68, 0x20, l.pos, 0x6A, 0x21, l.pos)
+	b = append(b, 0x0C, 0x02) //   br $skip_done
+	b = append(b, 0x0B)
+
+	b = emitUTF8ErrorLanes(b, l.chunk)
+	b = append(b, 0x22, errLocal)         // local.tee err: the stop reads it again
+	b = append(b, 0xFD, 0x53, 0x04, 0x40) // v128.any_true; if (invalid)
+	b = emitUTF8ErrorStop(b, l.chunk, l.mask, errLocal)
 	b = append(b, 0x20, l.pos, 0x6A, 0x21, l.pos)
-	b = append(b, 0x0C, 0x02) // br $skip_done
-	b = append(b, 0x0B)       // end if
+	b = append(b, 0x0C, 0x02) //   br $skip_done
+	b = append(b, 0x0B)
+
+	// No exit: on to the open character's lead byte, or by 16.
+	b = append(b, 0x20, l.mask, 0x45, 0x04, 0x40) // if no exit
+	b = append(b, 0x20, l.chunk, 0xFD, 0x0C)
+	b = append(b, utf8OpenTail[:]...)
+	b = append(b, 0xFD, 0x28, 0xFD, 0x64) // i8x16.gt_u; i8x16.bitmask
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, 0x10000)
+	b = append(b, 0x72, 0x68) // i32.or; i32.ctz → 16 when none is open
+	b = append(b, 0x20, l.pos, 0x6A, 0x21, l.pos)
+	b = append(b, 0x0C, 0x01) //   br $skip
+	b = append(b, 0x0B)
+	b = append(b, 0x20, l.mask, 0x68, 0x20, l.pos, 0x6A, 0x21, l.pos) // stop on the exit
 
 	b = append(b, 0x0B) // end loop
 	b = append(b, 0x0B) // end block
@@ -485,19 +628,22 @@ type sparseSuffixParams struct {
 // sparse-set bucket. Signature is identical to the bitmask body's, so the
 // driver calls it the same way:
 //
-//	ungated (type 3): (ptr, start, len, lPos, out_ptr, out_cap, validMask) -> i32
-//	gated   (type 9): ... , gate_ptr                                       -> i32
+//	ungated (type 3): (ptr, start, len, lPos, out_ptr, out_cap, verdict) -> i32
+//	gated   (type 9): ... , gate_ptr                                     -> i32
+//
+// verdict is the member-skip verdict mask in the bitmask body's validMask
+// slot (see the file header), 0 for a bucket with no member skip.
 func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 	const (
-		pPtr    = byte(0)
-		pStart  = byte(1)
-		pLen    = byte(2)
-		pLPos   = byte(3)
-		pOutPtr = byte(4)
-		pOutCap = byte(5)
-		_       = byte(6) // validMask: see the file header for why it is unused
-		pGate   = byte(7)
-		pSkip   = byte(7)
+		pPtr     = byte(0)
+		pStart   = byte(1)
+		pLen     = byte(2)
+		pLPos    = byte(3)
+		pOutPtr  = byte(4)
+		pOutCap  = byte(5)
+		pVerdict = byte(6) // the validMask slot: see the file header
+		pGate    = byte(7)
+		pSkip    = byte(7)
 	)
 	// The parameter count varies: a gated or skip-taking body has one more.
 	// The declared locals then follow it, and `nLocals` used to be a separate
@@ -538,6 +684,12 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		lTried = a.I32()
 		lAdvanced = a.I32()
 		lVec = a.V128()
+	}
+	// The character skip's error lanes, only for a bucket with a character
+	// set — last, so no index above moves.
+	var lErr byte
+	if p.tabs.memberFirstChar > 0 {
+		lErr = a.V128()
 	}
 	// lFar: the farthest end this candidate delivered, which the counter
 	// charges the walk from (sparseCounter.emitCharge).
@@ -703,10 +855,28 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 			b = append(b, 0x72)       // i32.or
 			b = append(b, 0x04, 0x40) // if (void): attempt
 			b = append(b, 0x20, lPos, 0x21, lWas)
-			b = emitMemberSetSkip(b, memberSkipLocals{
+			// high borrows lPat: record, its only other reader, sets it
+			// before use.
+			ml := memberSkipLocals{
 				pos: lPos, length: pLen, ptr: pPtr, setID: lTmp,
-				mask: lIdx, chunk: lVec,
-			}, p.tabs.memberSetOff, p.tableMemIdx)
+				mask: lIdx, chunk: lVec, high: lPat,
+			}
+			// A character set's id is at or past memberFirstChar
+			// (buildMemberSets numbers them after every byte set).
+			switch first := p.tabs.memberFirstChar; first {
+			case 0:
+				b = emitMemberSetSkip(b, ml, p.tabs.memberSetOff, p.tableMemIdx)
+			case 1:
+				b = emitMemberCharSkip(b, ml, lErr, p.tabs.memberSetOff, p.tableMemIdx)
+			default:
+				b = append(b, 0x20, lTmp, 0x41)
+				b = utils.AppendSLEB128(b, int32(first))
+				b = append(b, 0x4F, 0x04, 0x40) // i32.ge_u; if: a character set
+				b = emitMemberCharSkip(b, ml, lErr, p.tabs.memberSetOff, p.tableMemIdx)
+				b = append(b, 0x05)
+				b = emitMemberSetSkip(b, ml, p.tabs.memberSetOff, p.tableMemIdx)
+				b = append(b, 0x0B)
+			}
 			// stale[state] = advanced ? 0 : 1, and the same verdict OR-ed into
 			// the call-wide one the caller reads to choose next time's walk.
 			b = append(b, 0x41)
@@ -751,9 +921,11 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		//	stale_mask & lPos == 0  ⇔  dispatch (either not stale, or on the tick)
 		//
 		// A zero mask ANDs to zero at every position, so "not stale" needs no
-		// separate test at all — which is the whole saving, five instructions
+		// separate test at all — which is the whole saving, four instructions
 		// per candidate against eight, on every candidate of every sparse
-		// bucket that carries a skip.
+		// bucket that carries a skip. The mask arrives as the pVerdict
+		// parameter: the driver reads the global into the call's otherwise
+		// unused validMask slot, so the test here is a local read.
 		//
 		// The arms are the opposite way round from the boolean form: a NON-zero
 		// result now means "stale and not on the tick", i.e. take the plain
@@ -761,8 +933,7 @@ func buildSparseSuffixBody(p sparseSuffixParams) []byte {
 		// the tick when it should always dispatch, which costs the skip's whole
 		// win and no correctness — exactly the kind of silent loss the
 		// `sparse-member-skip` win-half row exists to catch.
-		b = append(b, 0x23) // global.get: the verdict mask
-		b = utils.AppendULEB128(b, uint32(p.memberGlobal))
+		b = append(b, 0x20, pVerdict) // the verdict mask (the driver's global.get)
 		b = append(b, 0x20, pLPos)
 		b = append(b, 0x71)       // i32.and — mask & candidate position
 		b = append(b, 0x04, 0x40) // if (void): stale AND off the tick
@@ -1263,20 +1434,20 @@ func sparseUnboundedMembers(bkt *bucket) []bool {
 // true, the safe direction.
 func sparseMemberUnbounded(bkt *bucket, p *PatternInfo) bool {
 	ast := patternSuffixAST(p)
-	if ast == nil {
+	if ast.re == nil {
 		return true
 	}
 	if bkt.literal == "" {
 		// Matching only at 0: \A (or a non-multiline ^) leading the pattern.
 		// startAnchor is not set on every path that packs a fallback member,
 		// so it is read off the pattern here.
-		if full := fullPatternAST(p); p.startAnchor || full != nil && topLevelBeginAnchorKind(full) == beginAnchorText {
+		if full := fullPatternAST(p); p.startAnchor || full.re != nil && topLevelBeginAnchorKind(full.re) == beginAnchorText {
 			return false
 		}
 	}
 	// syntax.Compile never returns a non-nil error (see its stdlib source).
-	prog, _ := syntax.Compile(ast.Simplify())
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	prog, _ := compileProg(ast)
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
 	if !ok {
 		return true
 	}

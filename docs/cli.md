@@ -27,37 +27,47 @@ wit_version: "1.2.0"       # optional; component only. UNSET MEANS NO VERSION �
 stub_file: "src/stubs.rs"  # stub output file; extension determines type: .rs, .js, .ts, .go, .h, .wit
 stub_type: "rust"          # optional; overrides extension-based type inference: rust, js, ts, go, c, as, wit
 namespace:      "acme"     # optional; prefixes the fixed symbols a stub declares — Span, SetMatch,
-                           #   the error type, the pattern-name helper, C's rx_match_t, rx_group_t and
-                           #   rx_set_match_t — so two stubs can share one package. It does NOT prefix
-                           #   names you choose: func and capability names, or what a set's NAME
-                           #   derives (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, rx_<set>_scanner_t,
-                           #   <Set>PatternCount). Two stubs in one package or C translation unit need
+                           #   the error type, C's rx_match_t, rx_group_t and rx_set_match_t — so
+                           #   two stubs can share one package. It does NOT prefix names you choose:
+                           #   func and capability names, or what a set's NAME derives
+                           #   (<SET>_PATTERN_COUNT, <SET>_ID_SPACE, rx_<set>_scanner_t,
+                           #   <Set>PatternCount, <set>_pattern_name). Two stubs in one package or C translation unit need
                            #   distinct set names, and choosing them is yours. No-op for Rust, whose
                            #   `pub mod <rust_module>` already isolates each stub.
-max_dfa_states: 1024       # optional; max DFA/TDFA states before falling back to Backtracking (default 1024)
+max_dfa_states: 1024       # optional; max states of ANY DFA/TDFA — a single pattern's, a set member's,
+                           #   a set bucket's — before falling back to Backtracking (default 1024;
+                           #   16384 in Unicode mode, see `unicode:`). 0 = always Backtracking.
+                           #   See "Limits" below
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
                            #   `compile --verbose` prints, per pattern, the engine chosen, why, and
                            #   the DFA/TDFA state and TDFA register counts against these limits
-max_fallback_states: 1024  # optional; max suffix-DFA states for one fallback bucket in a SET (default 1024)
-                           #   A member over it moves to the Backtracking engine, with a warning;
-                           #   `compile --verbose` prints each bucket's engine
+max_bt_instructions: 20000 # optional; max Backtracking program size, in instructions (default 20000).
+                           #   0 = never Backtracking: a pattern or set member that needs it fails
+max_set_bucket_size: 2MB   # optional; max table of one SET bucket (default 128 bytes per max_dfa_states
+                           #   state: 128 KB; 2 MB in Unicode mode). A size, spelled like max_memory
+max_split_table_size: 64MB # optional; max TOTAL tables of one SET's split members (default 4 MB;
+                           #   64 MB for a Unicode-mode set). A size, spelled like max_memory
+max_union_states: 4096     # optional; max states while building a SET's union automata (default 4096; 16384 for a Unicode-mode set)
+                           #   — see "max_union_states:" below
 max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
                            #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
                            #   fractions allowed; a bare number is bytes. See "max_memory:" below
 
-regexps:
-  - pattern: 'https?://...' # RE2 regexp pattern
-    name: "my_pattern"      # required when referenced by sets: patterns list
+# A REGEXP is a bare expression; a PATTERN is a regexp plus optional metadata.
+patterns:                  # optional when every regexp lives inside sets (their regexps: key)
+  - regexp: 'https?://...' # required: the RE2 regexp itself
+    name: "my_pattern"      # optional; required to select it by name from a set's patterns: list
 
     # One or more func fields — only those set are compiled and stubbed.
     # The func name becomes both the WASM export name and the generated function name.
-    # An entry with only 'pattern' is valid; no code is generated for it.
+    # An entry with only 'regexp' is valid; no code is generated for it.
     match_func:        "url_match"         # anchored match
     find_func:         "url_find"          # non-anchored find
     groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
     byte_mode: false           # optional; see "byte_mode:" below
+    unicode: false             # optional; see "unicode:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -68,9 +78,11 @@ sets:
     scan_all:   "all_kinds"    # non-anchored: every pattern matching somewhere
     find:       "locate"       # non-anchored: positions and extents
     overlapping: false         # optional; default false = per-pattern non-overlapping
-    emit_name_map: true        # emit patternName(id) lookup helper in stubs
-    patterns: all              # "all" or list of name: values from regexps:
+    emit_name_map: true        # emit this set's own name lookup, <set>_pattern_name(id), in stubs
+    patterns: all              # "all" (every top-level pattern) or a list of their name: values
+    regexps: ['xox[bp]-\d+']   # optional; bare regexps private to this set (needs this or patterns:)
     hints: [batch-find]        # optional; see "hints:" below
+    unicode: false             # optional; the set's mode — see "unicode:" below
 ```
 
 > **Three set keys were retired and are now load errors.**
@@ -92,6 +104,10 @@ sets:
 > line-numbered load error. That catches typos (`mach_func:`) and the retired
 > set keys `match`, `scan`, `find_batch`, `find_any`, `find_all` and
 > `batch_size` — see [sets.md](sets.md#the-five-capabilities).
+
+> **`max_fallback_states:` was retired and is a load error.** A set member's
+> state limit is `max_dfa_states`, the one key for every automaton; give it
+> there.
 
 > **Three tool keys were retired and are now load errors:** `wasm_merge:`,
 > `wasm_tools:` and `wac:`. Use `wasm_merge_path:`, `wasm_tools_path:` and
@@ -136,14 +152,14 @@ runs. A violation is a hard error: nothing is written and the exit status is non
 - Contextual keywords that are legal identifiers in their own language — TypeScript's
   `type`, `from`, `of`, `get`, `set`, `string`, `number`, or Go's predeclared `len`/`cap` —
   are **not** rejected.
-- **Not** covered: `regexps[].name` and `sets[].name`. Those are selection keys only, and
+- **Not** covered: `patterns[].name` and `sets[].name`. Those are selection keys only, and
   reach generated code as quoted string literals rather than identifiers, so reserved
   words and punctuation are fine there.
 
 All offending names are reported in a single pass rather than one per run.
 
 Suffix `_batch` is separately reserved for the compiler-synthesized batch export (see
-`hints: [batch-find]` below), and export names must be unique across all `regexps:` and
+`hints: [batch-find]` below), and export names must be unique across all `patterns:` and
 `sets:` entries.
 
 #### Rules that depend on `stub_type`
@@ -160,10 +176,11 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
 | `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
-| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_patternNames`, `patternName`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
-| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `PatternName`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
-| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `pattern_name`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `rx_pattern_names`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
-| Export names must not collide with a generator helper (`SetMatch`, `patternName`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
+| Export names must not collide with a generator helper (`SetMatch`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not collide with a symbol DERIVED from a set's name: its pattern-count, id-space and batch-size constants and its name lookup — for a set `scanner`, `SCANNER_PATTERN_COUNT` / `scanner_pattern_name` in Rust, `SCANNER_PATTERN_COUNT` / `rx_scanner_pattern_name` in C, `ScannerPatternCount` / `ScannerPatternName` in Go, `scannerPatternCount` / `scannerPatternName` in JS and TS, `SCANNER_PATTERN_COUNT` / `scannerPatternName` in AssemblyScript | all | The generator declares them beside the set's exports. All are reserved whether or not the set asks for batching or `emit_name_map`, so turning either on never breaks a working config. |
 | Export names must not start with `ffi_` | `rust`, `go`, `c` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
 | An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
@@ -172,6 +189,7 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
 | Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
 | Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
+| A `groups_func` pattern must have a capture group that can take part in a match | all | `a*`, or `(?:(a){0})b`, whose only group simplification removes, has no groups to report: it would compile to no groups export while every stub calls one. `compile` and `generate` refuse it too. Use `find_func` for the match's span. |
 
 ### Engine selection
 
@@ -182,6 +200,46 @@ Setting `groups_func` triggers capture-tracking compilation:
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
 See [engines.md](engines.md) for full details on engine selection and capabilities.
+
+### Limits — what each key bounds, and what happens past it
+
+Every limit says the same thing at its edge: a pattern or set member over a
+DFA limit moves to Backtracking; one that no engine takes **does not compile**,
+and the error names the pattern and the key that would let it compile. Nothing
+is ever left out of `find` or the scan pair to make a build succeed.
+
+| Key | Default | Bounds | Past it |
+|---|---|---|---|
+| `max_dfa_states` | 1,024 (16,384 in Unicode mode) | every DFA/TDFA: a single pattern's, a set member's, a set bucket's | Backtracking |
+| `max_bt_instructions` | 20,000 | a Backtracking program | compile error naming `max_bt_instructions` (and `max_dfa_states`, when raising it would keep the pattern on a DFA) |
+| `max_tdfa_regs` | 32 | a TDFA's capture registers | Backtracking |
+| `max_set_bucket_size` | 128 bytes per `max_dfa_states` state | one set bucket's table | the member goes to another bucket (more buckets, a dearer walk) |
+| `max_split_table_size` | 4 MB (64 MB in Unicode mode) | the tables of one set's split members, in total | the rest of them take the Backtracking search |
+| `max_union_states` | 4,096 (16,384 in Unicode mode) | a set's union automata, while being built | a slower scan / probe route |
+| `max_memory` | none | the module's whole memory | a search answers `-2`; tables over it are a compile error |
+
+**`0` means off** for the two count limits: `max_dfa_states: 0` puts every
+pattern and set member on Backtracking, and `max_bt_instructions: 0` forbids
+Backtracking, so a pattern or member that needs it fails the compile. Leaving
+a key out means its default; a negative value is a load error. For the two
+sizes, `0` is a real 0: no two members share a bucket, or no split member gets
+the table-driven search.
+
+**How far an automaton is built.** A DFA is built up to the larger of
+`max_dfa_states` and a construction cap — 2,048 states in byte mode, 16,384 in
+Unicode mode — so a configured limit above the cap always takes effect, and a
+set member is built as far as the same pattern alone. A set member used to stop
+at a fixed 2,048: `.{0,870}` in Unicode mode needs 7,832 states and 21,752
+Backtracking instructions, and the set compiled without it.
+
+**`max_bt_instructions` and WebAssembly's function size.** A Backtracking body
+grows with its program — about 86 bytes per instruction in byte mode and 120
+in Unicode mode — and WebAssembly loads no function over 7,654,321 bytes. Raised
+far enough (past roughly 89,000 instructions in byte mode, 60,000 in Unicode
+mode), the key lets a pattern through whose module no runtime would load; that
+is a compile error saying one generated function is over WebAssembly's cap,
+naming the pattern and the size. Of 894 real patterns measured (WAF rules, the
+examples), none needs more than 20,000 instructions in its own mode.
 
 ### `max_memory:` — a cap on the module's memory
 
@@ -247,34 +305,97 @@ the tables and the search's working memory only.
 - A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
   4 GiB, with a compile warning saying so.
 
-### `byte_mode:` — matching raw bytes above 127
+### `max_union_states:` — the budget of a set's union automata
 
-Regexped is a **byte** engine. `.` consumes one byte, classes are byte classes,
-and `\b` is ASCII. A rune above U+007F has no byte to be, so a pattern naming
-one is rejected:
+A set whose members have no literal to search for is scanned by ONE automaton
+built over all of them: `scan_any` and `scan_all` read the input once, whatever
+the member count. `match_any` and `match_all` use an anchored automaton of the
+same kind. `max_union_states` caps their construction: by default 4,096 states
+in byte mode and **16,384 for a set in Unicode mode**. A set past the cap still
+answers correctly, by a slower route: members that are not provably linear are
+split out to searches of their own, and the rest are walked position by
+position (`match_any` / `match_all`: probed bucket by bucket).
+`compile --diag-json` shows which route a set took (`union_scan.used` and
+`anchored_union.used`, with `refused: "construction"` when the cap was the
+reason).
 
-```
-pattern contains the non-ASCII rune U+00E9; regexped matches bytes,
-so set byte_mode: true to match it as the single byte 0xE9, or remove it
-```
+The cap counts states WHILE the automaton is being built, before duplicate
+states are merged, so a set can need far more than it finally keeps: the set
+{`\pL{4}\pN`, `\pN{3}\pL{3}`, `\pL{5}x`} passes 8,192 while building and
+keeps 2,740.
 
-Setting `byte_mode: true` on a `regexps:` entry declares the pattern
-byte-oriented: runes `0x80`-`0xFF` become legal and mean **exactly that byte**.
+The default is larger in Unicode mode because a letter class such as `\pL`
+costs hundreds of states, so a few literal-less members pass 4,096. Measured
+on 4 KB inputs (fuel per byte), 4,096 against 16,384:
+
+| Set | Capability, input | Fuel per byte | Compile time | Compiler memory | Module |
+|---|---|---|---|---|---|
+| the 3-member set above | `scan_any`, English text (no match) | 378 → 20.9 | 1.9 → 8.6 s | 157 → 491 MB | 2.06 → 2.64 MB |
+| `examples/fastedge/script-detect`'s `latin` set, 23 members when measured | `match_all`, English text (no match) | 174 → 29 | 12.1 → 25.7 s | 136 → 449 MB | 1.08 → 2.60 MB |
+| `examples/browser/homoglyph`, script-detect's `cyrillic` | `scan_*`, `match_all` | unchanged: their automata fit 4,096 | — | — | — |
+
+No input measured slower at 16,384. Set `max_union_states: 4096` on a
+Unicode-mode config to get the byte-mode budget back when compile time or
+compiler memory matters more than scan speed.
+
+An earlier measurement, on an 8-member Unicode-mode set scanning 64 KB of
+mixed-script text that no member matches:
 
 ```yaml
-regexps:
+max_union_states: 16384   # the Unicode-mode default
+patterns:
+  - { name: m0, regexp: '\pL+\p{Greek}' }
+  - { name: m1, regexp: '\p{Greek}+\p{Cyrillic}' }
+  - { name: m2, regexp: '\p{Cyrillic}+\p{Han}' }
+  - { name: m3, regexp: '\p{Han}+\pN' }
+  - { name: m4, regexp: '\pN+\p{Lu}' }
+  - { name: m5, regexp: '\p{Lu}+\p{Ll}' }
+  - { name: m6, regexp: '\p{Ll}+[^\x00-\x7f]' }
+  - { name: m7, regexp: '[^\x00-\x7f]+\pL' }
+sets:
+  - name: s
+    scan_any: s_any
+    scan_all: s_all
+    patterns: all
+```
+
+| `max_union_states` | union automaton | `scan_all` fuel per byte | module | compile time |
+|---|---|---|---|---|
+| 4096 (the byte-mode default) | refused: needs more states | 102 (members split out) | 1.39 MB | 55 s |
+| 16384 (the Unicode-mode default) | 2,179 states | 23 | 0.94 MB | 173 s |
+
+A larger cap costs compile time and compiler memory, never correctness; a
+32-member set of the same kind did not fit in 16,384, and at 65,536 its
+construction ran out of 4 GB of compiler memory. In byte mode the cap is
+reached by shapes that must remember many positions at once, such as
+`a.{13}b`.
+
+### `byte_mode:` — matching raw bytes above 127
+
+A pattern is matched byte by byte unless it asks for Unicode mode: `.` consumes
+one byte, classes are byte classes, and `\b` is ASCII. A pattern naming a rune
+above U+007F asks for Unicode mode (see `unicode:` below), where `é` means the
+character, two bytes of UTF-8.
+
+Setting `byte_mode: true` on a `patterns:` entry declares the pattern
+byte-oriented instead: runes `0x80`-`0xFF` mean **exactly that byte**. A
+literal carrying such bytes is a literal like any other: a set's literal
+frontends, the literal-anchored find and the prefilters search for it —
+UTF-8 keywords written as bytes (`\xd0\xbf\xd1\x80…`) included.
+
+```yaml
+patterns:
   - name: utf8_lead
-    pattern: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
+    regexp: '[\xc0-\xdf]'        # a UTF-8 two-byte lead — needs byte_mode
     byte_mode: true
     find_func: find_lead
 ```
 
-Runes above `U+00FF` are rejected in **both** modes — no byte holds one — with
-a different message that does not suggest the flag:
+Runes above `U+00FF` are rejected under `byte_mode` — no byte holds one:
 
 ```
-pattern contains the rune U+03B1, above U+00FF; regexped matches bytes
-and has no Unicode support
+pattern contains the rune U+03B1, above U+00FF, which byte mode cannot match;
+without byte mode the pattern compiles in Unicode mode
 ```
 
 The flag is per pattern because it is a statement about that pattern's text,
@@ -282,7 +403,8 @@ and it applies to set members as well as to `_func` patterns. Rust's regex
 crate spells the same distinction `(?-u)` / `regex::bytes`; an inline flag was
 not chosen here because Go's parser rejects `(?-u)` outright.
 
-**What is NOT rejected**, in either mode:
+**What does not ask for Unicode mode**, so a pattern with nothing else stays in
+byte mode:
 
 - **`.` and negated classes.** `[^,]` names every rune there is, and consumes
   one byte. This is documented byte semantics, not an oversight.
@@ -292,18 +414,86 @@ not chosen here because Go's parser rejects `(?-u)` outright.
   `(?i)` therefore keeps working over letter classes, `\w` and ASCII literals,
   and over NEGATED classes too: `(?i)[^a-z]` and `(?i)\W` arrive with holes at
   exactly those runes, and match every byte that is not a letter (or word
-  character), `0x80`-`0xFF` included. In byte mode `(?i)` over Latin-1 adds
-  U+212B (from `å`) the same way. A rune you DID write stays refused, negated
-  or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`, `[^sSſ]` and
-  `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or the octal
-  `\577` — and the byte engine cannot match the `ſ` they ask for.
-  The consequence is that `(?i)k` does not match a Kelvin sign and
-  `(?i:[a-z]+)` does not match a long s: case folding is ASCII-only in
-  practice, and folding within `0x00`-`0xFF` in byte mode.
+  character), `0x80`-`0xFF` included. Under `byte_mode` `(?i)` over Latin-1
+  adds U+212B (from `å`) the same way. A rune you DID write asks for Unicode
+  mode, negated or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`,
+  `[^sSſ]` and `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or
+  the octal `\577`; under `byte_mode` they are refused, since no byte is `ſ`.
+  The consequence is that in byte mode `(?i)k` does not match a Kelvin sign
+  and `(?i:[a-z]+)` does not match a long s: folding stays within the bytes.
+  `unicode: true` folds across Unicode, as Go does.
+
+### `unicode:` — codepoint mode
+
+What Unicode mode
+changes — `.` and classes reading whole UTF-8 characters, `(?i)` across
+Unicode, no match starting inside a character, invalid bytes matching nothing
+— is in [engines.md](engines.md#unicode-mode).
+
+On a `patterns:` entry:
+
+- **No key** — the pattern picks its own mode: Unicode when it names a
+  character above U+007F or uses a `\p{..}` / `\P{..}` class, byte mode
+  otherwise. `.` and negated classes never pick Unicode by themselves.
+- **`unicode: true`** — Unicode mode even for an ASCII-only pattern, which is
+  how to make `.` match a whole character.
+- **`unicode: false`** — exactly `byte_mode: true`.
+- `unicode: true` with `byte_mode: true`, and `unicode: false` with
+  `byte_mode: false`, on the same entry are load errors.
+
+```yaml
+patterns:
+  - name: word
+    regexp: '\pL+'          # Unicode mode: names a Unicode class
+    find_func: find_word
+  - name: any3
+    regexp: 'a.c'
+    unicode: true            # Unicode mode on request: `.` is one character
+    find_func: find_any3
+  - name: raw
+    regexp: '[\xc0-\xdf]'
+    unicode: false           # the same as byte_mode: true — raw bytes
+    find_func: find_raw
+```
+
+On a `sets:` entry the key sets the set's mode, and a set runs in one mode:
+
+- A member that sets `byte_mode: true` or `unicode: false`, together with a
+  member that asks for Unicode (by its key or by its pattern), is a compile
+  error; so is a set-level `unicode: true` with such a byte member, or a
+  set-level `unicode: false` with a member asking for Unicode.
+- Otherwise one member asking for Unicode puts the whole set in Unicode mode,
+  and members that say nothing follow it; failing that, the set-level key
+  decides, and with neither the set runs in byte mode.
+- A pattern's own `match_func` / `find_func` / `groups_func` follow the
+  pattern's rule above, whichever mode a set it belongs to runs in.
+
+`compile --verbose` and `--diag-json` report the mode each pattern and set
+was compiled in.
+
+**`max_dfa_states` is 16,384 by default in Unicode mode** (1,024 in byte
+mode), for a single pattern and a set alike. A Unicode class is decoded byte by
+byte, so it costs DFA states per position — about 290 for `\pL` — and a
+pattern over the limit falls back to Backtracking, whose program grows with
+the class too: `\pL{5}x` needs 1,452 states and measured 39 fuel per byte as a
+DFA against about 26,000 on Backtracking. A DFA table over 256 states takes 512
+bytes per state, so the default allows about 8 MB per automaton. When a pattern
+needs more and its Backtracking program is over `max_bt_instructions`, the
+compile error says which, and `compile --verbose` prints the state count and,
+for a Unicode-mode pattern, the working memory a search keeps per input byte
+(`memory:` lines). `tools/pattest` takes `-max-dfa-states N` to measure what a
+different limit does to your pattern.
+
+In a set the same limit decides whether a member keeps its DFA: on a 32-member
+set over 64 KB of mixed-script text, the one member past 1,024 (`\pL{4}\pN`,
+1,250 states) on Backtracking took `scan_all` to 152,500 fuel per byte; as a
+DFA, 2,661, in a smaller module (3.7 MB against 5.5 MB). It also bounds a set
+bucket (with `max_set_bucket_size`), so in Unicode mode several large members
+can share one walk.
 
 ### `hints:` — LikelyMode and batch-find compile hints
 
-Both `regexps:` entries and `sets:` entries accept an optional `hints:` list.
+Both `patterns:` entries and `sets:` entries accept an optional `hints:` list.
 Three values are recognised; `batch-find` is independent of the other two and
 may be combined with either (or neither) — the "mutually exclusive" rule only
 ever applies between `prefer-match` and `prefer-no-match`:
@@ -311,7 +501,7 @@ ever applies between `prefer-match` and `prefer-no-match`:
 - **`prefer-match`** — biases the compiler's code-shape choice for fast-accept.
 - **`prefer-no-match`** — biases for fast-reject. Mutually exclusive with
   `prefer-match`.
-- **`batch-find`** — requests batching. On a `regexps:` entry it emits a
+- **`batch-find`** — requests batching. On a `patterns:` entry it emits a
   `<func>_batch` WASM export for that pattern's `find_func` and/or
   `groups_func` (see below). On a `sets:` entry it emits one alongside the
   set's `find` and gives the generated `find` an optional `batchSize`
@@ -325,7 +515,7 @@ export). The `prefer-match`/`prefer-no-match` choice never affects match
 correctness — only which optimisation path is emitted.
 
 `prefer-match`/`prefer-no-match` resolve **per entry, with no fallback chain
-between the two levels**. A `regexps:` entry's hint governs only that
+between the two levels**. A `patterns:` entry's hint governs only that
 pattern's own exported bodies (`match_func`/`find_func`/`groups_func`); a
 `sets:` entry's hint governs only that set's own frontend and bucket suffix
 bodies. A set's hint is not inherited by a member's own exported bodies, and a
@@ -334,7 +524,7 @@ suffix DFA for several patterns, so there is no per-pattern choice for it to
 honour. An entry with no `hints:` is neutral regardless of what encloses it.
 
 `batch-find` has no fallback to resolve either: it is read on the entry (or
-set) that carries it, and each one decides for itself. On a `regexps:` entry
+set) that carries it, and each one decides for itself. On a `patterns:` entry
 it requires `find_func` or `groups_func`, and on a `sets:` entry it requires
 `find` — there is otherwise nothing to batch, and accepting the hint anyway
 would leave the caller believing they had asked for something.
@@ -345,7 +535,7 @@ measure the effect on your own patterns with `tools/pattest`.
 
 #### `batch-find` — batched multi-match export (JS/TS only)
 
-Setting `hints: [batch-find]` on a `regexps:` entry adds a `<func>_batch` WASM
+Setting `hints: [batch-find]` on a `patterns:` entry adds a `<func>_batch` WASM
 export — `(ptr, len, out_ptr, out_cap, start_pos) → count` — that drains
 multiple matches per host call instead of one, for `find_func` and
 `groups_func`. One capability means one batch export and one name; the rule
@@ -382,7 +572,7 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 | Capture groups (Backtracking engine) | Yes |
 | Backreferences `\1` | No |
 | Lookahead / lookbehind | No |
-| Unicode beyond ASCII | No |
+| Unicode: characters above U+007F, `\p{..}` classes, `(?i)` across Unicode | Yes — [Unicode mode](#unicode--codepoint-mode) |
 
 ---
 
@@ -551,6 +741,17 @@ regexped [--debug] compile [--config=<file>] [--output=<file>|-]
 
 Compiles each regexp pattern to a single WASM module, or to a Component Model component.
 
+A compile can take minutes — a Unicode-mode set's union automaton, a large
+TDFA — and that is the price of a faster module. Any automaton construction
+that runs past 5 seconds prints a line on stderr, and another every 5 seconds
+after it, so a long compile is visibly working:
+
+```
+regexped: compiling set "s": DFA construction, 12400 of 16384 states so far (38 s)
+```
+
+A compile under 5 seconds prints nothing, and the module is the same either way.
+
 ### Output kinds
 
 `wasm_format` selects the kind. It is a **config key, not a CLI flag** — there is deliberately no `--wasm-format` and no `--component` — because `generate` must make the same choice, and a flag lets the two commands diverge.
@@ -572,7 +773,7 @@ target — so there is no host under `component` it could help.
 | Config | Error |
 |---|---|
 | a set with `hints: [batch-find]` | "…is not supported for wasm_format: component — the component interface exposes one position per call through the find resource" |
-| a `regexps:` entry with `hints: [batch-find]` | "…is not supported for wasm_format: component — the batch groups export it adds has no WIT form" |
+| a `patterns:` entry with `hints: [batch-find]` | "…is not supported for wasm_format: component — the batch groups export it adds has no WIT form" |
 | no `import_module` and no `wit_package` | "…is required for wasm_format: component: it names the WIT package, the world, and every export" |
 
 `sets:` IS supported. Their raw ABI does not cross the boundary: `match_all` and
@@ -604,7 +805,7 @@ That makes adding, removing or changing it a **breaking change** for anyone who 
 | Field | Notes |
 |---|---|
 | `wasm_file` | Required unless `--output` is given |
-| `regexps` | One or more patterns to compile |
+| `patterns` | One or more patterns to compile — unless every regexp lives in a set's `regexps:`, in which case it may be left out. A file with no regexp anywhere is a load error |
 
 Entries with no `_func` fields produce no individual exports. If such an
 entry is also not referenced by any `sets:` block, it is silently skipped;
@@ -615,11 +816,11 @@ otherwise it participates only as a member of the set(s) that select it.
 When the config contains a `sets:` block, `compile` also emits multi-pattern set-match functions. Each set entry produces one exported WASM function per declared capability, plus a batch entry when it asks for one.
 
 ```yaml
-regexps:
-  - name: aws_key      # name is required for sets: pattern references
-    pattern: 'AKIA[0-9A-Z]{16}'
+patterns:
+  - name: aws_key      # name is required to select it from a set's patterns: list
+    regexp: 'AKIA[0-9A-Z]{16}'
   - name: github_pat
-    pattern: 'ghp_[0-9a-zA-Z]{36}'
+    regexp: 'ghp_[0-9a-zA-Z]{36}'
 
 sets:
   - name: secret_scanner
@@ -627,11 +828,17 @@ sets:
     scan_any: which_secret   # non-anchored: one pattern id, or -1 (optional)
     match_any: validate      # anchored (whole input): one pattern id (optional)
     hints: [batch-find]      # optional: work several positions ahead per call
-    emit_name_map: true      # emit pattern_name(id) helper in stubs
+    emit_name_map: true      # emit secret_scanner_pattern_name(id) in stubs
     patterns:
-      - aws_key              # list of regexps.name values
+      - aws_key              # names of top-level patterns
       - github_pat
-      # or: patterns: "all" to include every entry in regexps:
+      # or: patterns: "all" to include every top-level pattern
+    regexps:                 # optional: bare regexps of this set's own
+      - 'xox[baprs]-[0-9A-Za-z-]{10,48}'
+
+  - name: log_levels         # a set may hold ONLY regexps of its own
+    match_any: level_of
+    regexps: ['ERROR', 'WARN', 'INFO']
 ```
 
 | `sets:` field | Required | Description |
@@ -643,14 +850,31 @@ sets:
 | `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
 | `find` | At least one | Non-anchored: every match at the next matching position — the only capability reporting positions and extents |
 | `overlapping` | No | `false` (default) = per-pattern non-overlapping; `true` = every start position. Affects `find` only, and is silently ignored on a set without it |
-| `patterns` | Yes | Either `"all"` or a list of `name:` values from `regexps:` |
-| `emit_name_map` | No | Emit `pattern_name(id)` lookup in generated stubs |
+| `patterns` | One of these two | Top-level patterns this set holds: `"all"` (every top-level pattern, named or not) or a list of their `name:` values |
+| `regexps` | One of these two | Bare regexps of this set's own. Private to it: `patterns: all` in another set never includes them |
+| `emit_name_map` | No | Emit this set's own name lookup in generated stubs (`<set>_pattern_name(id)` in each language's spelling): a member's `name:`, or `""` for an unnamed pattern, an inline regexp or an id the set does not hold |
 | `hints` | No | `[prefer-match]` or `[prefer-no-match]` (per-set LikelyMode default), and/or `[batch-find]`, which requires `find` — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 
 `match:`, `scan:` and `find_batch:` are **retired keys** and are load errors;
 see the note under the schema above.
 
-The `name:` field on `regexps:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+The `name:` field on `patterns:` entries is required when using `patterns: [list]`; optional with `patterns: "all"`.
+
+**Pattern ids.** A top-level pattern a set holds reports its index in the
+top-level `patterns:` list. A set's own `regexps:` come after every top-level
+pattern and are numbered per set: with 4 top-level patterns, each set's first
+inline regexp is id 4, so editing one set's `regexps:` never renumbers
+another set.
+
+**Equivalent members are a load error.** Two members of one set — selected by
+name, through `all`, or inline — that compile to the same program are
+refused, with a message naming both, for example
+`set "levels": regexp 'ERROR' and regexp '(?:ERROR)' are equivalent`. Capture
+groups do not count (a set reports group 0 only), and the check compares Go's
+compiled program, so it never refuses two regexps a set could tell apart; it
+does not catch every pair that matches alike (`a+` and `aa*` compile
+differently). Top-level patterns are not checked against each other outside a
+set.
 
 See [sets.md](sets.md) for full pipeline details and output tuple formats.
 

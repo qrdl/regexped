@@ -1,8 +1,8 @@
 import_module: m
 wasm_file: x.wasm
-regexps:
-  - pattern: 'foo\w+bar'
-  - pattern: 'foo'
+patterns:
+  - regexp: 'foo\w+bar'
+  - regexp: 'foo'
 sets:
   - name: s
     find: sfind

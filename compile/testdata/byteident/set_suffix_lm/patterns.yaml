@@ -9,15 +9,15 @@
 #
 # `prefer-match` is what turns the three channels on; without it this fixture
 # would be byte-identical to a neutral one and would pin nothing.
-regexps:
+patterns:
   - name: p0
-    pattern: 'A="[a-z0-9]+"'
+    regexp: 'A="[a-z0-9]+"'
   - name: p1
-    pattern: 'B="[a-z0-9]+"'
+    regexp: 'B="[a-z0-9]+"'
   - name: p2
-    pattern: 'C="[a-z0-9]+"'
+    regexp: 'C="[a-z0-9]+"'
   - name: p3
-    pattern: 'D="[a-z0-9]+"'
+    regexp: 'D="[a-z0-9]+"'
 sets:
   - name: s
     find: s_find

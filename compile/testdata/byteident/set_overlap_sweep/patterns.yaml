@@ -6,13 +6,13 @@
 # body, no projection table and no successor scratch. So none of the
 # checkpointed cache was pinned by anything — "only set_batch moved" proved
 # nothing about the half of this work that lives in those two bodies.
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]+'
+    regexp: '[a-z]+'
   - name: p1
-    pattern: '[0-9]+'
+    regexp: '[0-9]+'
   - name: p2
-    pattern: '[A-Z]+'
+    regexp: '[A-Z]+'
 sets:
   - name: s
     find: s_find

@@ -4,15 +4,15 @@
 options:
   bitmask_width: 8
 patterns:
-  - pattern: 'foo\d+'
-  - pattern: 'foo\w+'
-  - pattern: 'foo[a-z]+'
-  - pattern: 'foo[A-Z]+'
-  - pattern: 'foo[0-9]+'
-  - pattern: 'foo[a-zA-Z]+'
-  - pattern: 'foo[a-z0-9]+'
-  - pattern: 'foo[A-Z0-9]+'
-  - pattern: 'foo[^a-z]+'
+  - regexp: 'foo\d+'
+  - regexp: 'foo\w+'
+  - regexp: 'foo[a-z]+'
+  - regexp: 'foo[A-Z]+'
+  - regexp: 'foo[0-9]+'
+  - regexp: 'foo[a-zA-Z]+'
+  - regexp: 'foo[a-z0-9]+'
+  - regexp: 'foo[A-Z0-9]+'
+  - regexp: 'foo[^a-z]+'
 expect:
   bucket_count: 2
   conflict_reasons:

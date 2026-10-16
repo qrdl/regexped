@@ -33,7 +33,7 @@ func mustParse(t *testing.T, pattern string) *syntax.Regexp {
 func findPath(t *testing.T, pattern string) ([]splitFrame, bool) {
 	t.Helper()
 	re := mustParse(t, pattern)
-	lit, path := findMandatoryLitRec(re, 0, 0, false)
+	lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 	if lit == nil {
 		return nil, false
 	}
@@ -166,7 +166,7 @@ func TestSplitAtPath_RejectsQuantifier(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			re := mustParse(t, tc.pattern)
-			lit, path := findMandatoryLitRec(re, 0, 0, false)
+			lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 			if lit == nil {
 				t.Skip("no mandatory lit found (pattern not eligible)")
 			}
@@ -182,7 +182,7 @@ func TestSplitAtPath_RejectsAlternate(t *testing.T) {
 	// Construct a path that contains OpAlternate manually (findMandatoryLitRec
 	// never returns a path with OpAlternate, but splitAtPath must reject it).
 	re := mustParse(t, `foo`)
-	lit, path := findMandatoryLitRec(re, 0, 0, false)
+	lit, path := findMandatoryLitRec(byteTree(re), 0, 0)
 	if lit == nil {
 		t.Fatal("no mandatory lit found")
 	}
@@ -207,7 +207,7 @@ func buildCanonicalDFA(t *testing.T, pattern string) *dfaTable {
 	if err != nil {
 		t.Fatalf("Compile(%q): %v", pattern, err)
 	}
-	d, ok := newDFA(prog, false, false, maxHelperDFAStates)
+	d, ok := newDFA(byteProg(prog), false, maxHelperDFAStates)
 	if !ok {
 		t.Fatalf("newDFA(%q): state limit exceeded", pattern)
 	}
@@ -261,7 +261,7 @@ func TestAnalyzePattern_Trivial(t *testing.T) {
 	// ^foo: the mandatory literal "foo" has a zero-byte prefix (BeginText anchor)
 	// which is treated as trivial.
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `^foo`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `^foo`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestAnalyzePattern_Trivial(t *testing.T) {
 func TestAnalyzePattern_FullSplit(t *testing.T) {
 	// \d{3}foo\w+ has a bounded prefix (\d{3}) and a suffix (\w+) around "foo".
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `\d{3}foo\w+`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `\d{3}foo\w+`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestAnalyzePattern_FullSplit(t *testing.T) {
 
 func TestAnalyzePattern_ParseError(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
-	_, err := analyzePattern(config.RegexEntry{Pattern: `[invalid`}, &prefixPool, &suffixPool)
+	_, err := analyzePattern(config.PatternEntry{Regexp: `[invalid`}, &prefixPool, &suffixPool)
 	if err == nil {
 		t.Error("expected error for invalid pattern, got nil")
 	}
@@ -630,7 +630,7 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	var firstSuffixID int
 	for i, p := range patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("pattern %q: %v", p, err)
 		}
@@ -645,12 +645,12 @@ func TestAnalyzePattern_SharedSuffix(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 2: fixture loader and tests
+// Fixture loader and tests
 
 type setFixture struct {
 	Patterns []struct {
-		Name    string `yaml:"name"`
-		Pattern string `yaml:"pattern"`
+		Name   string `yaml:"name"`
+		Regexp string `yaml:"regexp"`
 	} `yaml:"patterns"`
 	Options struct {
 		BitmaskWidth          int `yaml:"bitmask_width"`
@@ -684,9 +684,9 @@ func (f setFixture) patternInfos(t *testing.T) []*PatternInfo {
 	var prefixPool, suffixPool dfaPool
 	infos := make([]*PatternInfo, len(f.Patterns))
 	for i, p := range f.Patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: p.Pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p.Regexp}, &prefixPool, &suffixPool)
 		if err != nil {
-			t.Fatalf("analyzePattern(%q): %v", p.Pattern, err)
+			t.Fatalf("analyzePattern(%q): %v", p.Regexp, err)
 		}
 		infos[i] = info
 	}
@@ -710,7 +710,7 @@ func testdataFixture(t *testing.T, name string) setFixture {
 func TestBitmaskPropagation_TwoPatterns(t *testing.T) {
 	// "ab" and "ac": after consuming 'b' only bit 0 accepts; after 'c' only bit 1.
 	asts := []*syntax.Regexp{mustParse(t, `ab`), mustParse(t, `ac`)}
-	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, kind, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -743,7 +743,7 @@ func TestBitmaskPropagation_TwoPatterns(t *testing.T) {
 func TestBitmaskPropagation_EpsilonClosure(t *testing.T) {
 	// "a?" has an epsilon path to accept (can match empty string).
 	asts := []*syntax.Regexp{mustParse(t, `a?`), mustParse(t, `b`)}
-	table, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -786,8 +786,8 @@ func TestBuildUnionProg_SinglePattern(t *testing.T) {
 	// Single pattern: altCount == 0, union.Start = starts[0], no Alt chain.
 	re, _ := syntax.Parse(`ab`, syntax.Perl)
 	prog, _ := syntax.Compile(re.Simplify())
-	union, patternBits := buildUnionProg([]*syntax.Prog{prog}, 64)
-	if union == nil {
+	union, patternBits := buildUnionProg(byteProgs([]*syntax.Prog{prog}), 64)
+	if union.prog == nil {
 		t.Fatal("buildUnionProg: nil result")
 	}
 	// At least the single InstMatch should be assigned bit 0.
@@ -805,7 +805,7 @@ func TestMergeSuffixDFA_TooManyPatterns(t *testing.T) {
 	for i := range asts {
 		asts[i] = mustParse(t, `a`)
 	}
-	_, _, err := mergeSuffixDFA(asts, CompileSetOptions{BitmaskWidth: 64})
+	_, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{BitmaskWidth: 64})
 	if err == nil {
 		t.Error("expected error for 65 patterns with BitmaskWidth=64, got nil")
 	}
@@ -1013,9 +1013,40 @@ func TestChooseLiteralFrontend(t *testing.T) {
 	}{seventeenShort, frontendAC})
 
 	for _, c := range cases {
-		got := chooseLiteralFrontend(c.lits)
+		got := chooseLiteralFrontend(c.lits, false)
 		if got != c.want {
 			t.Errorf("chooseLiteralFrontend(%v) = %v, want %v", c.lits, got, c.want)
+		}
+	}
+
+	// Unicode mode counts first CHARACTERS: twenty Cyrillic keywords start on
+	// two lead bytes (D0, D1) but twenty letters, and take Teddy, whose
+	// two-byte probe holds the whole letter; the same bytes in byte mode keep
+	// AC. Twenty keywords sharing two first letters keep AC in both, and a Han
+	// set under one lead byte is judged by its characters too.
+	cyr := []rune("абвгдежзийклмнопрст") // 19 letters under D0 …
+	cyr = append(cyr, 'ф')               // … and one under D1
+	var distinct, shared, han [][]byte
+	for i, r := range cyr {
+		distinct = append(distinct, []byte(string(r)+"ова"))
+		shared = append(shared, []byte(string([]rune("пр")[i%2])+string(r)+"ова"))
+	}
+	for i := 0; i < 20; i++ {
+		han = append(han, []byte(string(rune(0x4E00+i%5))+string(rune(0x4E10+i))))
+	}
+	for _, c := range []struct {
+		name    string
+		lits    [][]byte
+		unicode bool
+		want    frontendKind
+	}{
+		{"cyrillic, distinct letters", distinct, true, frontendTeddy},
+		{"cyrillic as bytes", distinct, false, frontendAC},
+		{"cyrillic, two first letters", shared, true, frontendAC},
+		{"han, five first characters under E4", han, true, frontendTeddy},
+	} {
+		if got := chooseLiteralFrontend(c.lits, c.unicode); got != c.want {
+			t.Errorf("%s: chooseLiteralFrontend = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
@@ -1115,7 +1146,7 @@ func assertDataSectionConsistent(t *testing.T, wasm []byte) {
 	// No data section present; nothing to check.
 }
 
-// ---- Phase 5.5: AC/Teddy WASM emitter tests ----
+// ---- AC/Teddy WASM emitter tests ----
 
 // TestACBudget covers the Aho-Corasick table budget, which replaced a
 // 32-NODE cap that silently demoted any set past ~17-26
@@ -1146,7 +1177,7 @@ func TestACBudget(t *testing.T) {
 				fb := "abcdefghijklmnopqrstuvwxyz0123456789"[i%36]
 				pat = fmt.Sprintf("%cQ%03d[0-9a-z]{3}", fb, i)
 			}
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -1228,7 +1259,7 @@ func TestACOutputOverflow(t *testing.T) {
 		var ids []int
 		for i := 0; i < n; i++ {
 			pat := strings.Repeat("a", i+1) + "[0-9]"
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -1493,7 +1524,7 @@ func TestCompileFallback_BudgetCap(t *testing.T) {
 	pats := []string{`\w+`, `[a-z]+`, `[0-9]+`}
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1517,7 +1548,7 @@ func TestCompileFallback_Merges(t *testing.T) {
 	pats := []string{`\d+`, `[0-9]+`} // both have no mandatory lit, simple DFAs
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1531,15 +1562,8 @@ func TestCompileFallback_Merges(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // --------------------------------------------------------------------------
-// Phase 3: bin-packing tests
+// Bin-packing tests
 
 func TestBinPacking_BitmaskCap(t *testing.T) {
 	// 9 patterns all sharing mandatory literal "foo" (variable-length suffix keeps
@@ -1552,7 +1576,7 @@ func TestBinPacking_BitmaskCap(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1574,7 +1598,7 @@ func TestBinPacking_BudgetCap(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	patterns := make([]*PatternInfo, 3)
 	for i, pat := range []string{`baz[a-z]+`, `baz[0-9]+`, `baz\w+`} {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1595,7 +1619,7 @@ func TestBinPacking_FirstFitDecreasing(t *testing.T) {
 	pats := []string{`foo\w+`, `fooa+`, `foob+`}
 	patterns := make([]*PatternInfo, len(pats))
 	for i, pat := range pats {
-		p, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		p, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -1730,7 +1754,7 @@ func TestTopLevelBeginAnchorKind(t *testing.T) {
 
 func TestAnalyzePattern_NonGreedyFallback(t *testing.T) {
 	// Non-greedy pattern: should go to isolated fallback (no error).
-	re := config.RegexEntry{Pattern: `(?:a+?)b`}
+	re := config.PatternEntry{Regexp: `(?:a+?)b`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1746,7 +1770,7 @@ func TestAnalyzePattern_NonGreedyFallback(t *testing.T) {
 
 func TestAnalyzePattern_ZeroLengthFallback(t *testing.T) {
 	// Pattern with minLen=0: routes to fallback.
-	re := config.RegexEntry{Pattern: `(?:aa)*`}
+	re := config.PatternEntry{Regexp: `(?:aa)*`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1759,7 +1783,7 @@ func TestAnalyzePattern_ZeroLengthFallback(t *testing.T) {
 
 func TestAnalyzePattern_ZeroLengthBeginAnchor(t *testing.T) {
 	// Pattern with minLen=0 and begin-anchor at top level: startAnchor=true.
-	re := config.RegexEntry{Pattern: `^(?:aa)*`}
+	re := config.PatternEntry{Regexp: `^(?:aa)*`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1776,7 +1800,7 @@ func TestAnalyzePattern_ZeroLengthBeginAnchor(t *testing.T) {
 func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
 	// Pattern where the prefix is a non-begin zero-length assertion ($a):
 	// should route to fallback (splittable=false).
-	re := config.RegexEntry{Pattern: `(?:$)a`}
+	re := config.PatternEntry{Regexp: `(?:$)a`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1789,7 +1813,7 @@ func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
 
 func TestAnalyzePattern_BeginSuffixFallback(t *testing.T) {
 	// Pattern whose suffix contains a begin-anchor (a^): routes to fallback.
-	re := config.RegexEntry{Pattern: `a^`}
+	re := config.PatternEntry{Regexp: `a^`}
 	var pp, sp dfaPool
 	info, err := analyzePattern(re, &pp, &sp)
 	if err != nil {
@@ -1827,11 +1851,11 @@ var setCapNames = map[string]string{
 
 // setConfigWith builds a config declaring exactly the named capabilities.
 func setConfigWith(patterns []string, overlapping bool, caps ...string) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(patterns))
+	entries := make([]config.PatternEntry, len(patterns))
 	names := make([]string, len(patterns))
 	for i, p := range patterns {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sc := config.SetConfig{
 		Name:        "s",
@@ -1854,15 +1878,15 @@ func setConfigWith(patterns []string, overlapping bool, caps ...string) config.B
 			panic("unknown capability " + c)
 		}
 	}
-	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	return config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 }
 
 // setConfigSubset builds a config whose set selects `pick` (indices into
 // patterns) by name, leaving the rest of the regexps out of the set.
 func setConfigSubset(patterns []string, pick []int, caps ...string) config.BuildConfig {
-	entries := make([]config.RegexEntry, len(patterns))
+	entries := make([]config.PatternEntry, len(patterns))
 	for i, p := range patterns {
-		entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 	}
 	var names []string
 	for _, i := range pick {
@@ -1883,7 +1907,7 @@ func setConfigSubset(patterns []string, pick []int, caps ...string) config.Build
 			panic("unknown capability " + c)
 		}
 	}
-	return config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+	return config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 }
 
 // exportTypeIndex returns the type-section index of the function exported
@@ -2081,7 +2105,7 @@ func sparseGroup(t *testing.T, n int, opts CompileSetOptions) []*bucket {
 	infos := make([]*PatternInfo, 0, n)
 	for i := 0; i < n; i++ {
 		p := fmt.Sprintf(`union[ \t]+[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern %q: %v", p, err)
 		}
@@ -2150,7 +2174,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 	var infos []*PatternInfo
 	for i := 0; i < 128; i++ {
 		p := fmt.Sprintf(`union[ \t]+\b[a-z]{%d}[0-9]{%d}`, 1+i/16, 1+i%16)
-		info, err := analyzePattern(config.RegexEntry{Pattern: p}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p}, &prefixPool, &suffixPool)
 		if err != nil {
 			continue
 		}
@@ -2175,7 +2199,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		var pp, sp dfaPool
 		var in []*bucket
 		for i := 0; i < bucketMaskBits; i++ {
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9]`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`kw%03d[0-9]`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2201,7 +2225,7 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		for i := 0; i < bucketMaskBits+1; i++ {
 			// A counted class chain: literal + [0-9a-z]{N}, N large enough for
 			// isCountedClassChain.
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`kw%03d[0-9a-z]{6}`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`kw%03d[0-9a-z]{6}`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2233,12 +2257,12 @@ func TestSparsePromotionIsConservative(t *testing.T) {
 		var pp, sp dfaPool
 		var in []*bucket
 		for i := 0; i < bucketMaskBits+8; i++ {
-			info, err := analyzePattern(config.RegexEntry{Pattern: fmt.Sprintf(`^kw%03d[0-9]+$`, i)}, &pp, &sp)
+			info, err := analyzePattern(config.PatternEntry{Regexp: fmt.Sprintf(`^kw%03d[0-9]+$`, i)}, &pp, &sp)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
 			info.globalID = i
-			solo, err := mergeAnchoredDFA([]*syntax.Regexp{patternFullAST(info)}, opts)
+			solo, err := mergeAnchoredDFA([]resolvedTree{patternFullAST(info)}, opts)
 			if err != nil {
 				t.Fatalf("mergeAnchoredDFA: %v", err)
 			}
@@ -2291,11 +2315,11 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 	asts, _ := sparseTestASTs(t, 128)
 	opts := CompileSetOptions{}
 
-	if _, _, err := mergeSuffixDFA(asts, opts); err == nil {
+	if _, _, err := mergeSuffixDFA(byteTrees(asts), opts); err == nil {
 		t.Fatal("mergeSuffixDFA accepted 128 patterns; the 32-pattern bitmask cap is the premise of sparse accept")
 	}
 
-	tab, d, err := mergeSuffixDFASparseSet(asts, opts)
+	tab, d, err := mergeSuffixDFASparseSet(byteTrees(asts), opts)
 	if err != nil {
 		t.Fatalf("mergeSuffixDFASparseSet: %v", err)
 	}
@@ -2322,7 +2346,7 @@ func TestSparseSetMergeExceeds64(t *testing.T) {
 // misunderstanding cannot pass.
 func TestSparseSetAcceptListsAreCorrect(t *testing.T) {
 	asts, pats := sparseTestASTs(t, 128)
-	_, d, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	_, d, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("sparse merge: %v", err)
 	}
@@ -2379,7 +2403,7 @@ func TestSparseSetAcceptListsAreCorrect(t *testing.T) {
 // the emitted bytes; this covers the accept maps directly.
 func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 	asts, _ := sparseTestASTs(t, 8)
-	tab, _, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	tab, _, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("bitmask merge: %v", err)
 	}
@@ -2387,7 +2411,7 @@ func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, ok := newDFA(prog, false, true, maxHelperDFAStates)
+	d, ok := newDFA(byteProg(prog), true, maxHelperDFAStates)
 	if !ok {
 		t.Fatal("newDFA failed")
 	}
@@ -2412,7 +2436,7 @@ func TestSparseSetLeavesBitmaskPathAlone(t *testing.T) {
 // lists differed. The symptom was a 25-state table where 137 is correct.
 func TestSparseSetTableAcceptListsAreCorrect(t *testing.T) {
 	asts, pats := sparseTestASTs(t, 128)
-	tab, _, err := mergeSuffixDFASparseSet(asts, CompileSetOptions{})
+	tab, _, err := mergeSuffixDFASparseSet(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("sparse merge: %v", err)
 	}
@@ -2565,7 +2589,7 @@ func TestCompileSetRejectsBucketWithNoSuffixDFA(t *testing.T) {
 			t.Fatalf("panic = %v, want one naming the missing suffix DFA", r)
 		}
 	}()
-	assertBucketEmittable(3, &bucket{literal: "KEY", patterns: []*PatternInfo{{fullPattern: `KEY[0-9]+`}}})
+	assertBucketEmittable(3, &bucket{literal: "KEY", patterns: []*PatternInfo{{fullPattern: `KEY[0-9]+`, rp: bytePat(`KEY[0-9]+`)}}})
 }
 
 // binPack must not produce a bucket with a nil suffix DFA for any pattern that
@@ -2583,7 +2607,7 @@ func TestBinPackLiteralSingletonAlwaysHasSuffixDFA(t *testing.T) {
 	for _, pat := range pats {
 		t.Run(pat, func(t *testing.T) {
 			var prefixPool, suffixPool dfaPool
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Skipf("analyzePattern refused %q: %v", pat, err)
 			}
@@ -2624,7 +2648,7 @@ func TestCompileFallback_AdmitsToBTOverStateLimit(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	// No literal anywhere, so this lands in the fallback bucket rather than a
 	// literal bucket. ~200 suffix DFA states, comfortably over the limit below.
-	info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2664,12 +2688,12 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 		opts                  CompileSetOptions
 	}{
 		{"word-boundary", `(?:\B|a|)a`, "lose a word-boundary branch's priority", CompileSetOptions{}},
-		{"over-max-fallback-states", btNullableChainPattern, "exceeds max_fallback_states", CompileSetOptions{MaxFallbackStates: 8}},
+		{"over-max-dfa-states", btNullableChainPattern, "exceeds max_dfa_states", CompileSetOptions{MaxFallbackStates: 8}},
 		{"own-dfa-unbuildable", setCoreCovNullableUnbuildable, "could not be built", CompileSetOptions{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var prefixPool, suffixPool dfaPool
-			info, err := analyzePattern(config.RegexEntry{Pattern: tc.pattern}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: tc.pattern}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern: %v", err)
 			}
@@ -2690,7 +2714,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 	}
 	// And the control: a member that stays on a DFA warns about nothing.
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `(?:\B|a)a`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `(?:\B|a)a`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2708,7 +2732,7 @@ func TestCompileFallback_WarnsWhenMovedToBT(t *testing.T) {
 func TestAdmitBTFallback_AdmitsNullableChain(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	for _, pattern := range []string{btNullableChainPattern, `[a-z0-9]{200}`} {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pattern}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern(%q): %v", pattern, err)
 		}
@@ -2723,7 +2747,7 @@ func TestAdmitBTFallback_AdmitsNullableChain(t *testing.T) {
 // unconditionally would still pass the test above.
 func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
-	info, err := analyzePattern(config.RegexEntry{Pattern: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
+	info, err := analyzePattern(config.PatternEntry{Regexp: `[a-z0-9]{200}`}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
 	}
@@ -2741,27 +2765,26 @@ func TestCompileFallback_NoWarnWhenAdmitted(t *testing.T) {
 	}
 }
 
-// TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch.
+// TestMaxFallbackStatesReachesCompiler pins the wiring, not the branch: a set
+// member's state limit is the config's max_dfa_states.
 //
 // Driving compileFallback through CompileSetOptions proves the branch works but
-// says nothing about whether a user can reach it. They could not:
-// CompileSetOptions was constructed in two places and NEITHER set
-// MaxFallbackStates, so the hardcoded default of 1024 always won — and the
-// drop warning's own hint said "raise max_dfa_states", a field that feeds a
-// different budget entirely.
+// says nothing about whether a user can reach it. Once they could not:
+// CompileSetOptions was constructed in two places and neither set the limit,
+// so the hardcoded default of 1024 always won.
 //
 // This drives the real entry point, CompileFileDiag, so a future refactor that
-// rebuilds CompileSetOptions without the field fails here rather than silently
-// restoring the unreachable knob. The budget's observable effect is the bucket
+// rebuilds the options without the limit fails here rather than silently
+// restoring the unreachable knob. The limit's observable effect is the bucket
 // the member lands in: over it, a Backtracking bucket; under it, a DFA one.
 func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	cfg := func(limit int) config.BuildConfig {
 		return config.BuildConfig{
-			MaxFallbackStates: limit,
-			Regexps: []config.RegexEntry{
+			MaxDFAStates: config.Limit(limit),
+			Patterns: []config.PatternEntry{
 				// No usable literal, so it lands in a fallback bucket, and
 				// enough states to clear a small limit and not a large one.
-				{Name: "big", Pattern: btNullableChainPattern},
+				{Name: "big", Regexp: btNullableChainPattern},
 			},
 			Sets: []config.SetConfig{{
 				Name:     "s",
@@ -2780,7 +2803,7 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 	} {
 		_, _, diags, err := CompileFileDiag(cfg(tc.limit), "")
 		if err != nil {
-			t.Fatalf("max_fallback_states=%d: CompileFileDiag: %v", tc.limit, err)
+			t.Fatalf("max_dfa_states=%d: CompileFileDiag: %v", tc.limit, err)
 		}
 		gotBT := false
 		for _, d := range diags {
@@ -2811,7 +2834,7 @@ func TestMaxFallbackStatesReachesCompiler(t *testing.T) {
 func TestCompileFallback_NilSuffixDFANoPanic(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	info, err := analyzePattern(
-		config.RegexEntry{Pattern: strings.Repeat(`(?:[a-z]*[0-9]*)`, 3000)},
+		config.PatternEntry{Regexp: strings.Repeat(`(?:[a-z]*[0-9]*)`, 3000)},
 		&prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatalf("analyzePattern: %v", err)
@@ -2855,11 +2878,11 @@ func TestWideSetShapesCompile(t *testing.T) {
 				for _, hints := range [][]string{nil, {"prefer-no-match"}, {"prefer-match"}} {
 					name := fmt.Sprintf("%s/ov=%v/all=%v/%v", f.name, ov, all, hints)
 					t.Run(name, func(t *testing.T) {
-						entries := make([]config.RegexEntry, len(f.pats))
+						entries := make([]config.PatternEntry, len(f.pats))
 						names := make([]string, len(f.pats))
 						for i, p := range f.pats {
 							names[i] = fmt.Sprintf("p%d", i)
-							entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+							entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 						}
 						sc := config.SetConfig{
 							Name: "s", Overlapping: ov, Hints: hints,
@@ -2870,7 +2893,7 @@ func TestWideSetShapesCompile(t *testing.T) {
 							sc.MatchAll, sc.ScanAll = "mall", "sall"
 						}
 						if _, _, err := CompileFile(
-							config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
+							config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, ""); err != nil {
 							t.Fatalf("CompileFile: %v", err)
 						}
 					})
@@ -2885,8 +2908,9 @@ func TestWideSetShapesCompile(t *testing.T) {
 // but named by no bucket, so the emitted mask arithmetic has to restrict the
 // answer to the patterns that can actually be reported.
 //
-// A low MaxFallbackStates is what forces the drop; nothing else in the suite
-// compiles a set that loses a member this way.
+// A low max_dfa_states is what forces the drop — from match_any / match_all,
+// the anchored pair, which has no Backtracking path; nothing else in the
+// suite compiles a set that loses a member this way.
 func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 	fams := [][]string{
 		{`[a-z]{0,60}x`, `abc`, `def`},
@@ -2895,11 +2919,11 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 		{`\w{0,50}!`, `foo`, `bar`, `baz`},
 	}
 	for _, f := range fams {
-		entries := make([]config.RegexEntry, len(f))
+		entries := make([]config.PatternEntry, len(f))
 		names := make([]string, len(f))
 		for i, p := range f {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
 		for _, lim := range []int{2, 4, 8, 16, 32} {
 			for _, ov := range []bool{false, true} {
@@ -2907,7 +2931,7 @@ func TestSetWithPatternDroppedAtStateLimit(t *testing.T) {
 					MatchAny: "ma", MatchAll: "mall", ScanAny: "sa", ScanAll: "sall", Find: "fi",
 					Patterns: config.PatternSelector{Names: names}}
 				if _, _, err := CompileFile(config.BuildConfig{
-					Regexps: entries, Sets: []config.SetConfig{sc}, MaxFallbackStates: lim}, ""); err != nil {
+					Patterns: entries, Sets: []config.SetConfig{sc}, MaxDFAStates: config.Limit(lim)}, ""); err != nil {
 					t.Fatalf("CompileFile(%v, limit=%d): %v", f, lim, err)
 				}
 			}
@@ -2926,7 +2950,7 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 		var infos []*PatternInfo
 		var ids []int
 		for i, pat := range pats {
-			info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+			info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 			if err != nil {
 				t.Fatalf("analyzePattern(%q): %v", pat, err)
 			}
@@ -2960,9 +2984,9 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 		}
 	})
 
-	t.Run("nil_diag_drop_record", func(t *testing.T) {
+	t.Run("nil_diag_anchored_bt_record", func(t *testing.T) {
 		spec, _, _ := build(t, []string{`abc`})
-		recordAnchoredStateLimitDrop(nil, spec.Patterns[0]) // must not panic
+		recordAnchoredBacktracking(nil, spec.Patterns[0]) // must not panic
 	})
 }
 
@@ -2973,9 +2997,9 @@ func TestCompileSetDirectAPIShapes(t *testing.T) {
 func TestCompileFileEmbeddedSet(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output: "merged.wasm",
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\d+`}, {Name: "p2", Pattern: `(?:bar|baz)[a-z]+`},
-			{Name: "alt", Pattern: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+`, FindFunc: "alt_find"},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\d+`}, {Name: "p2", Regexp: `(?:bar|baz)[a-z]+`},
+			{Name: "alt", Regexp: `[0-9]{8}ghp_[^\s]+|[a-f]{8}secret_[^\s]+`, FindFunc: "alt_find"},
 		},
 		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAny: "sa", MatchAll: "ml",
 			Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}}},
@@ -3012,10 +3036,10 @@ func TestSparseCounterModulesBuild(t *testing.T) {
 		{"splitting off", "", false, CompileSetOptions{NoSplit: true}},
 	} {
 		t.Run(v.name, func(t *testing.T) {
-			var res []config.RegexEntry
+			var res []config.PatternEntry
 			for i, p := range append(append([]string(nil), members...), v.extra) {
 				if p != "" {
-					res = append(res, config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p})
+					res = append(res, config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p})
 				}
 			}
 			set := config.SetConfig{Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true}}
@@ -3023,12 +3047,283 @@ func TestSparseCounterModulesBuild(t *testing.T) {
 				set.Hints = []string{"batch-find"}
 			}
 			for _, out := range []string{"", "merged.wasm"} {
-				w, _, _, err := CompileFileOpts(config.BuildConfig{Output: out, Regexps: res, Sets: []config.SetConfig{set}}, "", v.opts)
+				w, _, _, err := CompileFileOpts(config.BuildConfig{Output: out, Patterns: res, Sets: []config.SetConfig{set}}, "", v.opts)
 				if err != nil {
 					t.Fatalf("output=%q: %v", out, err)
 				}
 				validateWASM(t, w)
 			}
 		})
+	}
+}
+
+// acProbeKeywords is twenty Russian keywords that all begin with `п`
+// (D0 BF), with varied second letters: under the first-characters rule
+// (fewer than 4 distinct) they keep the Aho-Corasick frontend.
+var acProbeKeywords = []string{
+	"пример", "привет", "правда", "письмо", "птица", "пожар", "пустота", "печать", "поле", "пирог",
+	"палец", "песок", "плита", "почта", "пенал", "пчела", "пакет", "повар", "пруд", "парус",
+}
+
+func asBytes(ss ...string) [][]byte {
+	out := make([][]byte, len(ss))
+	for i, s := range ss {
+		out[i] = []byte(s)
+	}
+	return out
+}
+
+// TestChooseACProbe pins which two columns the Aho-Corasick root probe tests:
+// only for literals that all begin with a UTF-8 lead byte, the pair with the
+// fewest distinct bytes, ties toward the earlier columns, never two lead-only
+// columns.
+func TestChooseACProbe(t *testing.T) {
+	type want struct {
+		off1, off2     int
+		bytes1, bytes2 []byte
+	}
+	prefixed := func(prefix string, n int) []string {
+		var out []string
+		for i := 0; i < n; i++ {
+			out = append(out, prefix+acProbeKeywords[i][len("п"):])
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name string
+		lits [][]byte
+		want *want
+	}{
+		{"п… keywords", asBytes(acProbeKeywords...), &want{0, 1, []byte{0xD0}, []byte{0xBF}}},
+		{"an ASCII literal beside them", asBytes(append(append([]string{}, acProbeKeywords...), "abc")...), nil},
+		{"a one-byte literal", append(asBytes(acProbeKeywords...), []byte{0xD0}), nil},
+		{"Han 日… keywords", asBytes("日本", "日記", "日曜日", "日光", "日中"), &want{0, 1, []byte{0xE6}, []byte{0x97}}},
+		// Columns {D0}, {BF}, {D1}, {80}: every allowed pair counts two
+		// bytes, and the earliest wins.
+		{"пр… keywords", asBytes(prefixed("пр", 20)...), &want{0, 1, []byte{0xD0}, []byte{0xBF}}},
+		// ѿ is D1 BF: columns {D0, D1}, {BF}, {D1}, {80} — (1, 2) is the
+		// earliest pair at two bytes with a column that is not lead-only.
+		{"пр… beside ѿр…", asBytes(append(prefixed("пр", 10), prefixed("ѿр", 10)...)...), &want{1, 2, []byte{0xBF}, []byte{0xD1}}},
+		// р is D1 80, so column 1 holds two bytes too; with varied second
+		// letters column 3 holds many, and (0, 1) stays the cheapest.
+		{"п… beside р…", asBytes(append(append([]string{}, acProbeKeywords[:10]...), "рука", "река", "роза", "рыба", "рама", "рост", "ручей", "рожь", "рябь", "рис")...), &want{0, 1, []byte{0xD0, 0xD1}, []byte{0x80, 0xBF}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := chooseACProbe(c.lits)
+			if c.want == nil {
+				if got != nil {
+					t.Fatalf("probe %+v, want none", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("no probe")
+			}
+			if got.Off1 != c.want.off1 || got.Off2 != c.want.off2 ||
+				!bytes.Equal(got.Bytes1, c.want.bytes1) || !bytes.Equal(got.Bytes2, c.want.bytes2) {
+				t.Fatalf("probe (%d, %d) % x / % x, want (%d, %d) % x / % x", got.Off1, got.Off2, got.Bytes1, got.Bytes2,
+					c.want.off1, c.want.off2, c.want.bytes1, c.want.bytes2)
+			}
+		})
+	}
+}
+
+// TestPlanACVerify pins the per-candidate verify's plan: its dispatch column,
+// which literals may jump straight to their node, and that node.
+func TestPlanACVerify(t *testing.T) {
+	plan := func(t *testing.T, ss ...string) (*acVerifyPlan, *acLayout, [][]byte) {
+		t.Helper()
+		lits := asBytes(ss...)
+		ac := buildAC(lits)
+		l := buildACLayoutMode(ac, 0, false)
+		return planACVerify(ac, l, lits), l, lits
+	}
+	// The dispatch column: the most distinct bytes inside the shortest
+	// literal, ties toward the earlier column.
+	pl, _, lits := plan(t, acProbeKeywords...)
+	minLen := 1 << 30
+	for _, l := range lits {
+		minLen = min(minLen, len(l))
+	}
+	best, bestN := -1, 0
+	for o := 0; o < minLen; o++ {
+		seen := map[byte]bool{}
+		for _, l := range lits {
+			seen[l[o]] = true
+		}
+		if len(seen) > bestN {
+			best, bestN = o, len(seen)
+		}
+	}
+	if pl.Col != best {
+		t.Fatalf("dispatch column %d, want %d", pl.Col, best)
+	}
+	if len(pl.Vals) != bestN || len(pl.Cases) != bestN {
+		t.Fatalf("%d cases over %d values, want %d", len(pl.Cases), len(pl.Vals), bestN)
+	}
+
+	for _, c := range []struct {
+		lits     []string
+		eligible []bool
+	}{
+		// рим occurs inside пример and ends before its end: the walk reports
+		// рим first, so пример may not jump.
+		{[]string{"пример", "рим"}, []bool{false, true}},
+		// мер ends where пример ends: jumping to пример's node reports both.
+		{[]string{"пример", "мер"}, []bool{true, true}},
+		// A prefix pair: при ends inside пример.
+		{[]string{"при", "пример"}, []bool{true, false}},
+	} {
+		pl, l, lits := plan(t, c.lits...)
+		for i := range lits {
+			if pl.Eligible[i] != c.eligible[i] {
+				t.Errorf("%q: %q eligible = %v, want %v", c.lits, lits[i], pl.Eligible[i], c.eligible[i])
+			}
+			// The node a jump sets: walking the EMITTED goto table from the
+			// root over the literal must arrive there.
+			state := 0
+			for _, b := range lits[i] {
+				state = int(binary.LittleEndian.Uint16(l.gotoBytes[(state*l.stride+int(b))*2:]))
+			}
+			if pl.Node[i] != state {
+				t.Errorf("%q: %q node %d, the emitted table reaches %d", c.lits, lits[i], pl.Node[i], state)
+			}
+			if !bytes.Equal(pl.Lits[i], lits[i]) {
+				t.Errorf("%q: literal %d is %q in the plan", c.lits, i, pl.Lits[i])
+			}
+		}
+	}
+}
+
+// TestACProbeByMode: a set of keywords that all begin with a byte 0xC2-0xF4
+// gets the two-column probe and the verify, and --diag-json says so — in
+// Unicode mode from non-ASCII first characters, in byte mode from `byte_mode`
+// literals written as UTF-8 bytes (`\xd0\xbf…`, extracted since such bytes
+// count as literal bytes there). An ASCII keyword set keeps the first-byte
+// probe in byte mode — the body byteident pins.
+func TestACProbeByMode(t *testing.T) {
+	inspect := func(t *testing.T, patterns []string, byteMode bool) *compiledSet {
+		t.Helper()
+		entries := make([]config.PatternEntry, len(patterns))
+		for i, p := range patterns {
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("k%02d", i), Regexp: p, ByteMode: byteMode}
+		}
+		mode := !byteMode
+		sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{All: true}, Unicode: &mode}
+		cs, err := compileSetForInspection(sc, config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cs
+	}
+	escaped := make([]string, len(acProbeKeywords))
+	ascii := make([]string, len(acProbeKeywords))
+	for i, kw := range acProbeKeywords {
+		var sb strings.Builder
+		for _, b := range []byte(kw) {
+			fmt.Fprintf(&sb, `\x%02x`, b)
+		}
+		escaped[i] = sb.String()
+		ascii[i] = fmt.Sprintf("kw%02dzz", i)
+	}
+	for _, c := range []struct {
+		name     string
+		patterns []string
+		byteMode bool
+		probe    bool
+	}{
+		{"unicode", acProbeKeywords, false, true},
+		{"byte mode, UTF-8 bytes", escaped, true, true},
+		{"byte mode, ASCII", ascii, true, false},
+	} {
+		cs := inspect(t, c.patterns, c.byteMode)
+		if emittedFrontend(cs) != frontendAC {
+			t.Fatalf("%s: frontend %v, want AC", c.name, emittedFrontend(cs))
+		}
+		if got := cs.acProbe != nil && cs.acVerify != nil; got != c.probe {
+			t.Fatalf("%s: probe %+v, verify %v; want both %v", c.name, cs.acProbe, cs.acVerify != nil, c.probe)
+		}
+		d := cs.diag.ACTable
+		if !c.probe {
+			if d.ProbeColumns != nil || d.VerifyColumn != nil {
+				t.Fatalf("%s: diag %+v reports a probe", c.name, d)
+			}
+			continue
+		}
+		if fmt.Sprint(d.ProbeColumns) != "[0 1]" || d.VerifyColumn == nil || *d.VerifyColumn != cs.acVerify.Col {
+			t.Fatalf("%s: diag probe columns %v, verify column %v; want [0 1] and %d", c.name, d.ProbeColumns, d.VerifyColumn, cs.acVerify.Col)
+		}
+	}
+}
+
+// acWideColumnKeywords begin with five different letters under one lead byte
+// (а..д, D0 B0..D0 B4) and vary in their second letter: the chooser keeps
+// columns (0, 1), and column 1 holds five bytes — past the three a compare
+// chain serves, so the probe tests it with nibble tables. Five first
+// characters select Teddy on their own; the frontend is forced to AC.
+var acWideColumnKeywords = []string{
+	"арбуз", "банан", "вишня", "груша", "дыня", "азбука", "буря", "весна", "гроза", "дождь",
+	"аист", "белка", "волк", "гусь", "дятел", "акула", "бобр", "ворон", "голубь", "дельфин",
+}
+
+// TestACProbeWideColumn: a probe column of more than three bytes takes the
+// nibble-table membership test, and the module validates.
+func TestACProbeWideColumn(t *testing.T) {
+	p := chooseACProbe(asBytes(acWideColumnKeywords...))
+	if p == nil || p.Off1 != 0 || p.Off2 != 1 || len(p.Bytes2) != 5 {
+		t.Fatalf("probe %+v, want columns (0, 1) with five bytes in column 1", p)
+	}
+	entries := make([]config.PatternEntry, len(acWideColumnKeywords))
+	for i, kw := range acWideColumnKeywords {
+		entries[i] = config.PatternEntry{Name: fmt.Sprintf("k%02d", i), Regexp: kw}
+	}
+	on := true
+	sc := config.SetConfig{Name: "s", Find: "f", ScanAll: "a", ScanAny: "y", Patterns: config.PatternSelector{All: true}, Unicode: &on}
+	cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
+	opts := CompileSetOptions{}.WithForcedFrontend(frontendAC)
+	cs, err := compileSetForInspection(sc, cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emittedFrontend(cs) != frontendAC || cs.acProbe == nil || len(cs.acProbe.Bytes2) != 5 || cs.acVerify == nil {
+		t.Fatalf("frontend %v, probe %+v, verify %v", emittedFrontend(cs), cs.acProbe, cs.acVerify != nil)
+	}
+	w, _, _, err := CompileFileOpts(cfg, "", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+}
+
+// TestAnchoredBacktrackingForcesWideAll: a member whose anchored DFA cannot be
+// built gives the anchored pair a Backtracking probe, which can answer -2 —
+// so the set's `_all` pair takes the out_ptr form even when `find` and the
+// scan pair need no Backtracking, and SetAdmitsBacktracking (what `generate`
+// reads to pick the stubs' form) says so. Without the member the set keeps
+// the i64 mask.
+func TestAnchoredBacktrackingForcesWideAll(t *testing.T) {
+	inspect := func(t *testing.T, pats ...string) (*compiledSet, bool) {
+		t.Helper()
+		entries := make([]config.PatternEntry, len(pats))
+		for i, p := range pats {
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
+		}
+		sc := config.SetConfig{Name: "s", MatchAny: "ma", MatchAll: "mall", Patterns: config.PatternSelector{All: true}}
+		cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
+		cs, err := compileSetForInspection(sc, cfg, CompileSetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cs, SetAdmitsBacktracking(sc, cfg)
+	}
+	cs, admits := inspect(t, `abc`, `[a-c]+`, `(?:a|b)*a(?:a|b){12}c`)
+	if len(cs.anchoredBT) != 1 || cs.anchoredBTIDs[0] != 2 {
+		t.Fatalf("anchored Backtracking buckets %d (ids %v), want the third member", len(cs.anchoredBT), cs.anchoredBTIDs)
+	}
+	if !cs.wideAll() || !admits {
+		t.Fatalf("wideAll %v, SetAdmitsBacktracking %v; want both true", cs.wideAll(), admits)
+	}
+	if cs, admits := inspect(t, `abc`, `[a-c]+`); cs.wideAll() || admits || len(cs.anchoredBT) != 0 {
+		t.Fatalf("without the member: wideAll %v, admits %v, %d anchored Backtracking buckets", cs.wideAll(), admits, len(cs.anchoredBT))
 	}
 }

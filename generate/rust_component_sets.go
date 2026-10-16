@@ -47,7 +47,7 @@ func genRustComponentSetInner(cfg config.BuildConfig, wsets []witSet) string {
 		// The same constants the module stub emits, with the same doc text: a
 		// caller may well be using them to size something of its own.
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. `find` can report at most this many\n/// matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
-		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids index\n/// `patterns:` (then the set's own `regexps:`), so a set holding a few late-declared\n/// patterns has a small count and a large id space.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
 
 		for _, c := range s.Capabilities() {
 			kebab := witSetKebab(ws, c)
@@ -61,9 +61,7 @@ func genRustComponentSetInner(cfg config.BuildConfig, wsets []witSet) string {
 			}
 		}
 	}
-	if hasEmitNameMap(cfg) {
-		out.WriteString(rustPatternNameFn(cfg))
-	}
+	out.WriteString(rustPatternNameFns(cfg))
 	return out.String()
 }
 

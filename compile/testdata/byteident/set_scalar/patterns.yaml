@@ -2,15 +2,15 @@
 # and every pattern lands in a fallback bucket whose DFA runs anchored at each
 # position. The letter runs are BOUNDED so every member is provably linear and
 # stays in the buckets: `[a-z]+0[0-9]+` would be split out (see set_split).
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]{1,8}0[0-9]+'
+    regexp: '[a-z]{1,8}0[0-9]+'
   - name: p1
-    pattern: '[a-z]{1,8}1[0-9]+'
+    regexp: '[a-z]{1,8}1[0-9]+'
   - name: p2
-    pattern: '[a-z]{1,8}2[0-9]+'
+    regexp: '[a-z]{1,8}2[0-9]+'
   - name: p3
-    pattern: '[a-z]{1,8}3[0-9]+'
+    regexp: '[a-z]{1,8}3[0-9]+'
 sets:
   - name: s
     find: s_find

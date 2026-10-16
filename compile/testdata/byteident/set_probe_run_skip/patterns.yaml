@@ -1,0 +1,10 @@
+# Byte mode: a set whose scan probes and anchored probes take the run skip over
+# a byte run (`[^&,]` loops on all but a few bytes).
+patterns:
+  - { name: k, regexp: '&key=[^&,]+&' }
+  - { name: p, regexp: ',fld=[^,;]*;' }
+sets:
+  - name: bp
+    scan_all: bp_scan_all
+    match_any: bp_match_any
+    patterns: all

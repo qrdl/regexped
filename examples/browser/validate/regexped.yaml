@@ -1,0 +1,10 @@
+wasm_file:     "regexps.wasm"
+import_module: "regexps"
+stub_file:     "regexp.js"
+
+patterns:
+  - regexp:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+    match_func: "email_match"
+
+  - regexp:    'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
+    match_func: "url_match"

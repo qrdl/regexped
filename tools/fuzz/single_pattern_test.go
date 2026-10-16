@@ -1,15 +1,19 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
@@ -119,23 +123,18 @@ func wasmFindIter(t *testing.T, wasmBytes []byte, input string) ([][2]int, bool)
 // way mode says; sizes is what the find export's searches keep.
 func wasmFindIterMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, input string, mode searchblock.Mode) ([][2]int, bool) {
 	t.Helper()
-	engine, wd := sharedEngine()
-	mod, err := wasmtime.NewModule(engine, wasmBytes)
-	if err != nil {
-		t.Fatalf("module: %v", err)
-	}
-	defer mod.Close()
-	store := wasmtime.NewStore(engine)
-	defer store.Close()
-	store.SetEpochDeadline(1)
-	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+	_, wd := sharedEngine()
+	// instantiate takes the module a fuzz run under -unicode already built
+	// inside the compile deadline; building it here again cost FuzzFindIteration
+	// a wasmtime build per mode, ≈ 1 s each for a 900 KB module.
+	store, inst, mem, release, err := instantiate(wasmBytes)
+	defer release()
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
 	findFn := inst.GetFunc(store, "find")
-	mem := inst.GetExport(store, "memory").Memory()
-	if findFn == nil || mem == nil {
-		t.Fatal("module missing find export or memory")
+	if findFn == nil {
+		t.Fatal("module missing find export")
 	}
 	copy(mem.UnsafeData(store), input)
 	sr, err := newSearchRegion(store, inst, mem, len(input), sizes, mode)
@@ -183,7 +182,7 @@ func wasmFindIterMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, 
 		e := int(uint32(v))
 		// (B): Go suppresses an empty match beginning where the previous
 		// reported match ended. The advance below is unaffected.
-		if !(s == e && s == prevEnd) {
+		if s != e || s != prevEnd {
 			out = append(out, [2]int{s, e})
 			prevEnd = e
 		}
@@ -295,16 +294,17 @@ func FuzzFindIteration(f *testing.F) {
 	for _, c := range iterSeeds {
 		f.Add(c.pat, c.input)
 	}
+	unicodeSeeds(f)
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		if len(input) > inputCap || len(pat) > 120 {
 			t.Skip()
 		}
-		// The engine is byte-oriented: `.` consumes one byte, and iteration
-		// steps past an empty match by one byte where Go steps by one rune
-		// (docs/sets.md, "The empty-match rule"). Over non-ASCII input the two
-		// disagree by design, so the oracle cannot judge it — the same skip
-		// FuzzCorrectness makes.
-		if hasUnsupportedUnicode(input) {
+		// In byte mode `.` consumes one byte, and iteration steps past an
+		// empty match by one byte where Go steps by one rune (docs/sets.md,
+		// "The empty-match rule"). Over non-ASCII input the two disagree by
+		// design, so the oracle cannot judge it — the same skip
+		// FuzzCorrectness makes. Unicode mode reads runes as Go does.
+		if unicodeModeOutOfScope(pat, input) != "" || !*unicodeMode && hasUnsupportedUnicode(input) {
 			t.Skip()
 		}
 		re, err := regexp.Compile(pat)
@@ -321,7 +321,7 @@ func FuzzFindIteration(f *testing.F) {
 		if prog, cerr := syntax.Compile(parsed.Simplify()); cerr == nil && len(prog.Inst) > maxNFAInsts() {
 			t.Skip()
 		}
-		if namedRuneCeiling(pat, parsed) > 0x7F {
+		if namedRuneCeiling(pat, parsed) > 0x7F && !*unicodeMode {
 			t.Skip()
 		}
 		w, sizes, err := compileFindSized(pat)
@@ -627,9 +627,15 @@ var findFromShapes = []struct{ name, pat, input string }{
 	{"lnm_simple_prefix", `[0-9]{4}MARKER`, "1234MARKER5678MARKERyy"},
 	{"lnm_lit_anchor", `[a-f]{6}TAIL`, "abcdefTAILabcdefTAIL"},
 	{"lnm_lit_chain", `AKIA[A-Z0-9]{16}`, "AKIA0123456789ABCDEF AKIAFEDCBA9876543210"},
+	// A one-byte inner literal behind a wide leading repeat: the literal-
+	// anchored find with the counter that charges every failed candidate —
+	// matches, near misses, and a run dense enough to hand over.
+	{"one_byte_lit_anchor", `[a-z]+-[0-9]+`, "not-a-log-line ab-12 x-y-z-9 " + strings.Repeat("q-r-", 40) + "end-7"},
+	{"one_byte_lit_anchor_email", `[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}`, "a@b x.y@ex-ample.com @@ q@r.st @x.yy"},
+	{"one_byte_lit_anchor_space", `\w+ \w+`, "ab cd  ef gh-ij kl mn_op qr"},
 
-	// Six shapes added after compile's TestEveryFindEmitterIsCovered reported
-	// that the emitters below were reached by NOTHING — not by this corpus and
+	// Six shapes added after an emitter-reach check reported that the
+	// emitters below were reached by NOTHING — not by this corpus and
 	// not by any byteident fixture. The locals fingerprint had hidden it: two
 	// of them share a fingerprint with a shape already here, so the count this
 	// file checks looked healthy while the bodies went undriven.
@@ -691,8 +697,10 @@ func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error)
 // byte. Anchoring a prefix of exactly s characters instead gives the pattern its
 // true left context.
 //
-// Note the probe counts RUNES; every input in findFromShapes is ASCII, so rune
-// and byte offsets coincide.
+// The probe counts Go's TOKENS — `(?s:.)` reads an invalid byte as a one-byte
+// U+FFFD — so it skips the tokens before s, and a position that starts no
+// token (inside a character) can start no match: -1, which is Unicode mode's
+// rule. Over ASCII the two counts coincide, which is what byte mode needs.
 //
 // The naive oracle — "first entry of FindAllStringIndex whose start is >= from"
 // — is WRONG, and wrongly failed two shapes when this file was first written.
@@ -703,17 +711,22 @@ func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error)
 // match at or after f, not the next entry of an iteration that began at 0.
 func endsAt(t *testing.T, pat, input string) []int {
 	t.Helper()
+	starts := goTokenStarts(input)
 	out := make([]int, len(input)+1)
+	tokens := 0
 	for s := range out {
-		probe, err := regexp.Compile(`\A(?s:.{` + strconv.Itoa(s) + `})(?:` + pat + `)`)
+		out[s] = -1
+		if !starts[s] {
+			continue
+		}
+		probe, err := regexp.Compile(`\A(?s:.{` + strconv.Itoa(tokens) + `})(?:` + pat + `)`)
 		if err != nil {
 			t.Skipf("Go rejects probe for %q at %d: %v", pat, s, err)
 		}
 		if m := probe.FindStringIndex(input); m != nil {
 			out[s] = m[1]
-		} else {
-			out[s] = -1
 		}
+		tokens++
 	}
 	return out
 }
@@ -846,7 +859,7 @@ func testFindFromIterationTerminates(t *testing.T, mode searchblock.Mode) {
 				// generated stub applies this, and so must the model — without
 				// it an empty-capable pattern reports one match too many and
 				// the comparison below fails for the wrong reason.
-				if !(sp[0] == sp[1] && sp[0] == prevEnd) {
+				if sp[0] != sp[1] || sp[0] != prevEnd {
 					got = append(got, sp)
 					prevEnd = sp[1]
 				}
@@ -878,11 +891,12 @@ func testFindFromIterationTerminates(t *testing.T, mode searchblock.Mode) {
 // written the count looked fine while SIX of the fourteen find emitters were
 // driven by nothing at all.
 //
-// compile's TestEveryFindEmitterIsCovered is the authority: it parses the
-// package for emitFindFromSeed call sites and traces which ones a corpus
-// actually reaches, so it can name the emitter that is missing. Keep this test
-// for what it does cheaply — noticing the corpus shrinking — and fix coverage
-// gaps there.
+// TestEveryEmitterIsReachedBySweeps (fuzz_targets_test.go, run by `make
+// from-coverage`) is the authority: it lists every find and capture emitter
+// from the compile package's own source and checks, against the coverage
+// profile of these sweeps, that each was reached, so it can name the emitter
+// that is missing. Keep this test for what it does cheaply — noticing the
+// corpus shrinking — and fix coverage gaps there.
 func TestFindFromShapesReachDistinctBodies(t *testing.T) {
 	byFingerprint := map[string][]string{}
 	for _, c := range findFromShapes {
@@ -908,12 +922,837 @@ func TestFindFromShapesReachDistinctBodies(t *testing.T) {
 
 	// Empirical, and a floor rather than a target: a DROP means the corpus
 	// shrank. It is NOT evidence that every emitter is covered — see the doc
-	// comment, and compile's TestEveryFindEmitterIsCovered for that claim.
+	// comment, and TestEveryEmitterIsReachedBySweeps for that claim.
 	const minBodies = 12
 	if len(byFingerprint) < minBodies {
 		t.Errorf("find-from shapes reach only %d distinct find bodies, want >= %d — "+
-			"the corpus has shrunk; compile's TestEveryFindEmitterIsCovered says "+
-			"which emitter is now unreached", len(byFingerprint), minBodies)
+			"the corpus has shrunk; `make from-coverage` (TestEveryEmitterIsReachedBySweeps) "+
+			"says which emitter is now unreached", len(byFingerprint), minBodies)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unicode mode: where a match may start
+//
+// In Unicode mode no match starts, and no empty match is reported, inside a
+// character: the start positions are exactly where Go's decoding starts a
+// token — a valid UTF-8 sequence's first byte, or any byte of invalid input,
+// which Go reads as a one-byte U+FFFD. A lowered program consumes only whole
+// characters, so only a pattern that can match EMPTY could start anywhere
+// else, and only those are here: each reaches one of the find bodies such a
+// pattern can reach (TestUnicodeFindShapesReachTheirBodies), and is driven
+// from every byte position, inside characters included, over inputs with 2-,
+// 3- and 4-byte characters — first, last, alone, adjacent, between ASCII —
+// and over invalid input: stray continuation bytes, sequences cut off at 2, 3
+// and 4 bytes, overlong and surrogate encodings, bytes no sequence starts
+// with.
+//
+// Invalid input is compared with Go only for a pattern that cannot match
+// U+FFFD (canMatchReplacement): in Unicode mode an invalid byte matches
+// nothing, RE2's rule, where Go matches it as U+FFFD — the one designed
+// difference (docs/re2.md). Every other pattern answers exactly as Go does
+// there too, start positions included.
+
+var unicodeStartInputs = []string{
+	"", "abc", "é", "ж", "日", "😀", "aé", "éa", "ééé", "a日b", "日本", "😀😀", "x😀y",
+	"αβγ δ", "a é b", "é b 日 c 😀", "aa\nжж\n", "é\n",
+	// Invalid: stray continuation bytes.
+	"\x80", "\x80\x80", "a\x80b", "é\x80", "\x80é", "\xbf\xbf\xbf\xbf",
+	// Cut off: 2-, 3- and 4-byte sequences missing their tail.
+	"\xc3", "a\xc3", "\xc3a", "\xe2\x82", "a\xe2\x82b", "\xe2\x82é", "\xf0\x9f\x98", "\xf0\x9f\x98a", "日\xe6\x97",
+	// Overlong, surrogate, past U+10FFFF, never a lead.
+	"\xc0\xaf", "\xe0\x80\xaf", "\xed\xa0\x80", "a\xed\xa0\x80b", "\xf4\x90\x80\x80", "\xff", "é\xffé", "\xf5\x80",
+	// A match right after an invalid byte: the start-anywhere find restarts
+	// at every byte, invalid ones included.
+	"\xffaé", "a\x80bé", "\xe2\x82wé x", "\xff\xffжж",
+	// Multi-byte literals for the literal-anchored finds: found, cut off,
+	// after an invalid byte, and twice.
+	"мы@пример", "x@пример@пример", "@приме", "\xffя@пример", "xxxкотabz yyyпёсz", "кот", "yyyпёс9z",
+	// Literals that begin with a non-ASCII character, for the prefix scan's
+	// whole-first-character check: the literal after a run of characters
+	// sharing its lead byte (о is 0xD0 0xBE, п 0xD0 0xBF) long enough that the
+	// start positions put it at every lane of a 16-byte chunk; near misses;
+	// cut off; after an invalid byte; a 3-byte script.
+	"ооооооооооооооооприветмир", "при привык привет мир", "ппривет", "привет",
+	"прив", "12привет", "ab\xffпривет", "приве\xd0", "東京タワー東京", "東京タワ", "x東京タワーy",
+	// One-byte literals among multi-byte text.
+	"пользователь@пример.рф", "é@ж.日本 @@ a@b.cd", "x@@y.zz", "@\xffж@ю.яя", "日本@語.テキ",
+	// A literal longer than the two characters its scan looks for: cut at
+	// and past that boundary, once, twice adjacent, after sixteen characters
+	// sharing its first character, after runs of its first two, cut inside a
+	// character, after an invalid byte.
+	"зд", "здр", "x зд", "здравствуй", "здравствуйте мир", "12здравствуйте",
+	"здравствуйтездравствуйте мир", "1здравствуйте2здравствуйте3",
+	"зззззззззззззззздравствуйте мир", "здздздздздздздздздравствуйте7", "аздравствуйте1",
+	"здравствуй\xd1", "\xffздравствуйте ж",
+}
+
+// unicodeFindShapes are Unicode-mode finds that can match empty, each with
+// the body it must reach ("body": text the pattern's --verbose report shows),
+// and the two start-anywhere finds' shapes that cannot: their forward pass
+// restarts at EVERY byte, invalid ones included, which is how a match after
+// an invalid byte is found at all.
+var unicodeFindShapes = []struct {
+	name, pat string
+	maxStates int  // 0: the default
+	fallback  bool // Backtracking's memoised fallback answers every call
+	body      string
+}{
+	{"star", `a*`, 0, false, "Compiled DFA"},
+	{"empty", `(?:)`, 0, false, "Compiled DFA"},
+	{"quest", `x?`, 0, false, "Compiled DFA"},
+	{"word-boundary", `\b`, 0, false, "Compiled DFA"},
+	{"no-word-boundary", `\B`, 0, false, "Compiled DFA"},
+	{"line-begin", `(?m)^`, 0, false, "Compiled DFA"},
+	{"line-end", `(?m)$`, 0, false, "Compiled DFA"},
+	{"text-begin", `\A`, 0, false, "matches only at 0"},
+	{"text-end", `\z`, 0, false, "Compiled DFA"},
+	{"begin", `^`, 0, false, "matches only at 0"},
+	{"end", `$`, 0, false, "Compiled DFA"},
+	{"alt-a-no-boundary", `a|\B`, 0, false, "Compiled DFA"},
+	{"alt-boundary-e", `\b|é`, 0, false, "Compiled DFA"},
+	{"alt-quest-ri", `x?|日`, 0, false, "Compiled DFA"},
+	{"alt-no-boundary-plus", `\B|a+`, 0, false, "Compiled DFA"},
+	{"quest-no-boundary", `é?\B`, 0, false, "Compiled DFA"},
+	{"no-boundary-letter", `\B\pL?`, 0, false, "find: today"},
+	{"letters", `\pL*`, 0, false, "u16 state ids"},
+	// Matches U+FFFD, so it is compared with Go on valid input only.
+	{"negated-class", `[^a]*`, 0, false, "Compiled DFA"},
+	{"letter-pairs", `(?:\pL\pL)*`, 0, false, "u16 state ids"},
+	// Not `(?:é|a)*\b`: a leading repeat of a class holding a character
+	// above 0x7F counts as common in text and takes the start-anywhere find
+	// alone; an alternation of a character and a pair keeps the switch.
+	{"switch-start-anywhere", `(?:é|ab)*\b`, 0, false, "find: switch"},
+	{"switch-backtracking", `(?:é|a)*\B`, 0, false, "switch handover: Backtracking"},
+	{"start-anywhere", `\pL*\b`, 0, false, "find: start-anywhere"},
+	{"start-anywhere-restart", `\w+[éж]`, 0, false, "find: start-anywhere"},
+	{"lit-anchor-restart", `\w+é`, 0, false, "literal-anchored find"},
+	{"start-anywhere-restart-context", `\pL+\b`, 0, false, "find: start-anywhere"},
+	{"bt-no-boundary", `\B`, 1, false, "Backtracking"},
+	{"bt-letters", `\pL*`, 1, false, "Backtracking"},
+	{"bt-fallback-no-boundary", `\B`, 1, true, "Backtracking"},
+	{"bt-fallback-letters", `\pL*\b`, 1, true, "Backtracking"},
+	{"lit-anchor-utf8", `[а-я]+@пример`, 0, false, "literal-anchored find"},
+	{"alt-lit-anchor-utf8", `x{3}кот\w*z|y{3}пёс\w*z`, 0, false, "alternation literal-anchored find"},
+	// The prefix scan checks a literal's whole first character on a hit,
+	// through each body that scans for a literal.
+	{"char-probe-dfa", `привет\s*\pL+`, 0, false, "first character checked on a hit"},
+	{"char-probe-literal", `привет`, 0, false, "Compiled DFA"},
+	{"char-probe-cjk", `東京タワー`, 0, false, "Compiled DFA"},
+	{"char-probe-mandatory", `\d{0,3}привет`, 0, false, "mandatory literal extracted"},
+	{"char-probe-lit-anchor", `[a-z]+привет`, 0, false, "literal-anchored find"},
+	{"char-probe-bt", `привет\s*\pL+`, 1, false, "Backtracking"},
+	// A literal over two characters: the scan looks for the first two and
+	// the automaton verifies the rest, in the prefix scan and the
+	// mandatory-literal scan.
+	{"scan-cap-prefix", `здравствуйте\s+\pL+`, 0, false, "prefix scan: hybrid SIMD, 4-byte prefix"},
+	{"scan-cap-mandatory", `\d{0,3}здравствуйте`, 0, false, "mandatory literal extracted"},
+	{"scan-cap-lit-anchor", `\pL+здравствуйте\d`, 0, false, "literal-anchored find"},
+	// A one-byte inner literal behind a wide leading repeat, on tables past
+	// 256 states (u16 ids).
+	{"lit-anchor-u16-email", `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}`, 0, false, "literal-anchored find"},
+	{"lit-anchor-u16-letters", `\pL+@\pL+`, 0, false, "u16 state ids"},
+}
+
+func unicodeFindOpts(maxStates int, fallback bool) compile.CompileOptions {
+	o := compile.CompileOptions{Unicode: true, MaxDFAStates: maxStates}
+	if fallback {
+		o.BTWorkBudget = compile.BTWorkBudgetForceFallback
+	}
+	return o
+}
+
+func compileUnicodeFindShape(pat string, maxStates int, fallback bool) ([]byte, []searchblock.Size, error) {
+	return compileFindOpts(fmt.Sprintf("findutf8\x00%d\x00%v\x00%s", maxStates, fallback, pat), pat, pathsTableBase,
+		unicodeFindOpts(maxStates, fallback))
+}
+
+// goTokenStarts reports, for every position of input and its end, whether
+// Go's decoding starts a token there.
+func goTokenStarts(input string) []bool {
+	out := make([]bool, len(input)+1)
+	for i := 0; i < len(input); {
+		out[i] = true
+		_, w := utf8.DecodeRuneInString(input[i:])
+		i += w
+	}
+	out[len(input)] = true
+	return out
+}
+
+// canMatchReplacement reports whether pat has a rune instruction U+FFFD
+// satisfies: the patterns whose answers on invalid input differ from Go's by
+// design.
+func canMatchReplacement(pat string) bool {
+	re, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return false
+	}
+	for _, in := range prog.Inst {
+		switch in.Op {
+		case syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
+			return true
+		case syntax.InstRune, syntax.InstRune1:
+			if in.MatchRune(utf8.RuneError) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestUnicodeFindFromStartPositions drives every Unicode shape from every
+// byte position of every input, and through the iteration a stub runs, in
+// all three search-block modes — the default state's continuation window
+// (Off), a fresh block per search, and a block armed with notes before its
+// first call, whose resume point is carried across the calls of a drive.
+func TestUnicodeFindFromStartPositions(t *testing.T) {
+	// The answer the plan pins: Go's empty matches of `a*` over "é".
+	w, sizes, err := compileUnicodeFindShape(`a*`, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, done, ok := findCallerMode(t, w, sizes, "é", searchblock.Fresh, false)
+	if !ok {
+		t.Fatal("module would not instantiate")
+	}
+	var got [][2]int
+	for off := 0; off <= 2; {
+		sp, state := call(off)
+		if state != findMatch {
+			break
+		}
+		got = append(got, sp)
+		off = sp[1] + 1
+	}
+	done()
+	if want := [][2]int{{0, 0}, {2, 2}}; fmtSpanList(got) != fmtSpanList(want) {
+		t.Errorf("a* over \"é\": got %s, want %s", fmtSpanList(got), fmtSpanList(want))
+	}
+
+	for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
+		n := notesGiven.Load()
+		t.Run(mode.String(), func(t *testing.T) {
+			skipped := 0
+			for _, c := range unicodeFindShapes {
+				t.Run(c.name, func(t *testing.T) {
+					re := regexp.MustCompile(c.pat)
+					w, sizes, err := compileUnicodeFindShape(c.pat, c.maxStates, c.fallback)
+					if err != nil {
+						t.Fatalf("compile %q: %v", c.pat, err)
+					}
+					engine, _ := sharedEngine()
+					mod, err := wasmtime.NewModule(engine, w)
+					if err != nil {
+						t.Fatalf("module: %v", err)
+					}
+					defer mod.Close()
+					for _, in := range unicodeStartInputs {
+						if !utf8.ValidString(in) && canMatchReplacement(c.pat) {
+							skipped++
+							continue
+						}
+						checkUnicodeFindFrom(t, c.pat, mod, sizes, in, mode)
+						checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
+					}
+				})
+			}
+			if skipped == 0 {
+				t.Error("no input was skipped as invalid UTF-8 for a pattern that can match U+FFFD: the skip rule went unexercised")
+			}
+		})
+		if mode == searchblock.Armed && notesGiven.Load() == n {
+			t.Error("the armed run gave no drive notes: the notes' resume point went unchecked")
+		}
+	}
+}
+
+func checkUnicodeFindFrom(t *testing.T, pat string, mod *wasmtime.Module, sizes []searchblock.Size, in string, mode searchblock.Mode) {
+	t.Helper()
+	call, done, ok := findCallerModule(t, mod, sizes, in, mode, true)
+	if !ok {
+		t.Fatal("module would not instantiate")
+	}
+	defer done()
+	ends := endsAt(t, pat, in)
+	for from := 0; from <= len(in); from++ {
+		got, state := call(from)
+		if state == findHang || state == findOverflow {
+			t.Fatalf("%q from=%d: state %d", in, from, state)
+		}
+		want, wantOK := goFirstFrom(ends, from)
+		switch {
+		case state == findNone && wantOK:
+			t.Errorf("%q from=%d: got -1, want [%d,%d)", in, from, want[0], want[1])
+		case state == findMatch && !wantOK:
+			t.Errorf("%q from=%d: got [%d,%d), want -1", in, from, got[0], got[1])
+		case state == findMatch && got != want:
+			t.Errorf("%q from=%d: got [%d,%d), want [%d,%d)", in, from, got[0], got[1], want[0], want[1])
+		}
+	}
+}
+
+// checkUnicodeFindIteration runs a stub's drive — advance to the match's end,
+// or one byte past an empty match, and drop an empty match where the last one
+// ended — and compares it with Go's FindAllStringIndex.
+func checkUnicodeFindIteration(t *testing.T, re *regexp.Regexp, mod *wasmtime.Module, sizes []searchblock.Size, in string, mode searchblock.Mode) {
+	t.Helper()
+	call, done, ok := findCallerModule(t, mod, sizes, in, mode, false)
+	if !ok {
+		t.Fatal("module would not instantiate")
+	}
+	defer done()
+	var got [][2]int
+	off, prevEnd := 0, -1
+	for steps := 0; off <= len(in); steps++ {
+		if steps > 4*len(in)+16 {
+			t.Fatalf("%q: iteration did not terminate", in)
+		}
+		sp, state := call(off)
+		if state == findHang || state == findOverflow {
+			t.Fatalf("%q off=%d: state %d", in, off, state)
+		}
+		if state == findNone {
+			break
+		}
+		if sp[0] != sp[1] || sp[0] != prevEnd {
+			got = append(got, sp)
+			prevEnd = sp[1]
+		}
+		off = max(sp[1], off+1)
+	}
+	var want [][2]int
+	for _, m := range re.FindAllStringIndex(in, -1) {
+		want = append(want, [2]int{m[0], m[1]})
+	}
+	if fmtSpanList(got) != fmtSpanList(want) {
+		t.Errorf("iteration over %q:\n  got  %s\n  want %s", in, fmtSpanList(got), fmtSpanList(want))
+	}
+}
+
+// TestUnicodeFindShapesReachTheirBodies fails when a shape stops reaching the
+// find body it is in unicodeFindShapes for, so the start-position tests keep
+// driving every body a Unicode pattern that can match empty reaches.
+func TestUnicodeFindShapesReachTheirBodies(t *testing.T) {
+	for _, c := range unicodeFindShapes {
+		rep := &compile.Reporter{}
+		o := unicodeFindOpts(c.maxStates, c.fallback)
+		o.Report = rep
+		if _, _, err := compile.Compile([]config.PatternEntry{{Name: c.name, Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true, o); err != nil {
+			t.Fatalf("%s: compile: %v", c.name, err)
+		}
+		var b strings.Builder
+		rep.Render(&b)
+		if !strings.Contains(b.String(), c.body) {
+			t.Errorf("%s (%q) no longer reaches %q:\n%s", c.name, c.pat, c.body, b.String())
+		}
+	}
+}
+
+// characterRunShapes are Unicode-mode finds with a state that loops on every
+// character, which the find body crosses 16 bytes at a time with the UTF-8
+// bulk skip; body is text their --verbose report shows ("" for a shape whose
+// skip is in the start-anywhere forward pass, which the report does not name).
+var characterRunShapes = []struct{ name, pat, body string }{
+	{"negated-class", `[^,]+,`, "over whole UTF-8 characters"},
+	{"dot", `.+`, "over whole UTF-8 characters"},
+	{"not-newline", `[^\n]+`, "over whole UTF-8 characters"},
+	{"dot-all", `(?s).+`, "over whole UTF-8 characters"},
+	{"delimited", `x[^y]*y`, "over whole UTF-8 characters"},
+	{"accepting-tail", `a.*`, "over whole UTF-8 characters"},
+	{"two-exits", `"[^"\\]*"`, "over whole UTF-8 characters"},
+	{"line-end", `(?m)[^,]+$`, "over whole UTF-8 characters"},
+	{"two-loops", `[^,]+[^ab]*,`, "over whole UTF-8 characters"},
+	{"after-literal", `=.+`, "over whole UTF-8 characters"},
+	// The switch's start-anywhere forward pass, reached on the inputs whose
+	// overlapping walks die far from where they started (characterRunInputs).
+	{"forward-pass", `[ab]+[^z]*z`, "find: switch"},
+}
+
+// checkUnicodeCharacterRunMatch drives pat's match body, which crosses its
+// loop with the skip over whole UTF-8 characters too, over every prefix of each
+// input that ends just after an exit byte — where a full match can end — and
+// over the whole input, against Go's full match of oracle.
+func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []string, opts compile.CompileOptions) {
+	t.Helper()
+	w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, MatchFunc: "match"}}, pathsTableBase, true, opts)
+	if err != nil {
+		t.Fatalf("compile %q: %v", pat, err)
+	}
+	// The validity check's first table, emitted once per skip site.
+	sig := []byte{0xFD, 0x0C, 2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73}
+	if !bytes.Contains(w, sig) {
+		t.Fatalf("%q: the match body takes no skip over whole characters", pat)
+	}
+	full := regexp.MustCompile(`\A(?:` + oracle + `)\z`)
+	for _, in := range inputs {
+		cuts := []int{len(in)}
+		for i := 0; i < len(in); i++ {
+			if strings.IndexByte(",\n\"y>&z ", in[i]) >= 0 {
+				cuts = append(cuts, i, i+1)
+			}
+		}
+		for _, cut := range cuts {
+			s := in[:cut]
+			end, ok, hang, err := runWasmMatch(w, s)
+			if err != nil || hang {
+				t.Fatalf("%q over %q: err %v, hang %v", pat, s, err, hang)
+			}
+			if want := full.MatchString(s); ok != want || ok && end != len(s) {
+				t.Errorf("%q match over %q: got (%d, %v), want %v", pat, s, end, ok, want)
+			}
+		}
+	}
+}
+
+// TestUnicodeCharLoopSkip drives prefer-match's skip over a loop of only
+// SOME characters (dominantInfo.allowSet: a letter class, `\pL+`) — which
+// strides a chunk only while every character's lead byte is one ALL of whose
+// characters the class holds — through find (from every start position, and
+// iterated), match and groups, against Go with U+FFFD taken out (so invalid
+// UTF-8 is judged too). The inputs put the characters a lead byte's subset
+// leaves out where a chunk would cross them: Cyrillic's U+0482..U+0489
+// (symbols and combining marks under the letters' own lead byte D2), CJK
+// punctuation beside Han, a two-letter run, runs cut at every chunk offset.
+func TestUnicodeCharLoopSkip(t *testing.T) {
+	lm := compile.CompileOptions{Unicode: true, LikelyMode: compile.LikelyMatch}
+	r := rand.New(rand.NewSource(20261015))
+	pieces := []string{"а", "ж", "щ", "ё", "і", "Ѣ", "ң", "ӭ", "҂", "҃", "҈", "a", "Z", "é", "ω", "東", "語", "。", "、", "ア", " ", ",", "=", "1", "😀", "\xff", "\x80", "\xd0", "\xe6\x97",
+		// 4-byte letters under F1..F3 and their neighbours under F0 and F4,
+		// 3-byte ones under E0, ED and EE (the leads the structural test
+		// refuses), and invalid sequences only Keiser-Lemire or the
+		// structure catches: overlong, surrogate, past U+10FFFF, truncated,
+		// a lead where a continuation belongs, a stray continuation.
+		"\U00040000", "\U000ABCDE", "\U000FFFFF", "\U00100000", "\u0800", "\ud7ff", "\ue000",
+		"\xc0\x80", "\xe0\x80\x80", "\xed\xa0\x80", "\xf0\x80\x80\x80", "\xf4\x90\x80\x80", "\xf1\x80\x80", "\xd0\xd0", "\xe6\x97\xa5\x80"}
+	var inputs []string
+	for i := 0; i < 40; i++ {
+		var b strings.Builder
+		b.WriteString(strings.Repeat("x", r.Intn(16)))
+		for n := r.Intn(120) + 1; n > 0; n-- {
+			p := pieces[r.Intn(len(pieces))]
+			if r.Intn(3) > 0 { // mostly letters, in runs
+				p = []string{"ж", "щ", "ё", "東", "語", "ア", "a", "\U00050000", "\u0800", "\ue000"}[r.Intn(10)]
+			}
+			b.WriteString(p)
+		}
+		inputs = append(inputs, b.String())
+	}
+	inputs = append(inputs, strings.Repeat("ж", 40)+"҂"+strings.Repeat("ж", 40), strings.Repeat("東語", 30)+"。", "жж", "ж",
+		// Words of one and two letters, where the skip's gate declines.
+		strings.Repeat("я и он в мы до ", 5), strings.Repeat("a b cd e fg ", 5), strings.Repeat("я=он в=мы ab=c ", 4),
+		strings.Repeat("\U00050000", 12)+" "+strings.Repeat("\U00050000\xf1\x80", 6))
+	// Invalid bytes inside long letter runs on both sides of '=', where only
+	// the skip's validity test keeps it from crossing them.
+	for _, bad := range []string{"\xd0\xd0", "\x80", "\xe6\x97", "\xc0\x80", "\xf1\x80\x80"} {
+		inputs = append(inputs, "незав"+bad+"исимость=правительство решение", "независимость=правит"+bad+"ельство решение",
+			strings.Repeat("ж", 30)+bad+"=ж "+strings.Repeat("東", 12)+bad+strings.Repeat("語", 12))
+	}
+	// A run the main loop crosses (16 bytes and more) that then ends 1..3
+	// bytes before the input does: the end-of-input form declines after pos
+	// has moved, and must still record the run.
+	for n := 7; n <= 20; n++ {
+		inputs = append(inputs, strings.Repeat("ж", n)+",", "x"+strings.Repeat("ж", n)+",;", "1"+strings.Repeat("ж", n))
+	}
+	for k := 0; k < 6; k++ { // a run ending 0..5 bytes before the input does
+		inputs = append(inputs, strings.Repeat("x", 20+k)+"ж"+strings.Repeat("y", 5-k), strings.Repeat("x", 20+k)+"жжж")
+	}
+	finds := []string{`\p{Cyrillic}+`, `\pL+`, `\p{Han}+`, `[\x{0400}-\x{047F}]+`, `x\p{Cyrillic}*,`, `\pL{3,}1`,
+		`[\x{0800}-\x{FFFF}]+`,   // E0 and ED among its leads: Keiser-Lemire's test, gated
+		`[\x{40000}-\x{FFFFF}]+`, // 4-byte leads only: the structural test's F0 term
+		`\pL+=\pL+`}              // two loops behind a literal anchor
+	for _, pat := range finds {
+		t.Run(pat, func(t *testing.T) {
+			rep := &compile.Reporter{}
+			o := lm
+			o.Report = rep
+			if _, _, err := compile.Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "find"}}, pathsTableBase, true, o); err != nil {
+				t.Fatal(err)
+			}
+			var report strings.Builder
+			rep.Render(&report)
+			if !strings.Contains(report.String(), "SIMD bulk skip") {
+				t.Fatalf("%q takes no skip under prefer-match:\n%s", pat, report.String())
+			}
+			oracle := noReplacement(t, pat)
+			re := regexp.MustCompile(oracle)
+			w, sizes, err := compileFindOpts("charloop\x00"+pat, pat, pathsTableBase, lm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			engine, _ := sharedEngine()
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mod.Close()
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				for _, in := range inputs {
+					checkUnicodeFindFrom(t, oracle, mod, sizes, in, mode)
+					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
+				}
+			}
+			checkUnicodeCharacterRunMatch(t, pat, oracle, inputs, lm)
+		})
+	}
+	// `^(\pL+)=(\pL+)` IS its groups export: its capture body walks the
+	// whole input, not a match the find has already found valid, so only it
+	// reaches the capture body's validity test with invalid bytes.
+	for _, pat := range []string{`(\p{Cyrillic}+)\s(\d*)`, `(\pL+)=(\pL+)`, `<(\p{Han}+)>`, `^(\pL+)=(\pL+)`, `(\d)([^\d,]+)`} {
+		t.Run("groups "+pat, func(t *testing.T) {
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, lm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			re := regexp.MustCompile(noReplacement(t, pat))
+			// Windows on both sides of tdfaShortMatchBytes (16): a shorter match
+			// runs the capture body's copy without the character skips.
+			pairs := []string{"жжжж=жжж", "жжжж=жжжa", "жжжж=жжжж", "независимость=правительство", "я=он"}
+			for _, in := range append(append(inputs, "ж ж12 "+strings.Repeat("ё", 40)+" 7", "a=b ж=ё", "<東語>"), pairs...) {
+				got, ok := runGroupsIter(t, w, in, re.NumSubexp()+1)
+				if !ok {
+					t.Fatalf("%q over %q: watchdog or overflow", pat, in)
+				}
+				if want := goGroupsAll(re, in); fmtGroups(got) != fmtGroups(want) {
+					t.Errorf("%q over %q:\n  got  %s\n  want %s", pat, in, fmtGroups(got), fmtGroups(want))
+				}
+			}
+		})
+	}
+}
+
+// TestDroppedTablesChangeNoAnswer holds the assembler's table drop to the
+// rule it rests on. A module leaves out a first-byte or word table its code
+// never addresses — no i32.const of its offset, no load whose offset
+// immediate it is — so a body that reached one some other way would read
+// zeros. Each shape is compiled with the drop and without it
+// (KeepUnreadTables), and the two modules must answer alike: find from every
+// start, match, and the groups drive.
+func TestDroppedTablesChangeNoAnswer(t *testing.T) {
+	shapes := []string{
+		`^[a-z]+[0-9]`, `^(?:\b)`, `\Afoo\d+`, `^abc|^x\b`, // match only at 0: the first-byte table unread
+		`&k=[^&]+&`, `\w+@\w+`, `foo[0-9]+bar`, `[a-z]+@example\.com`, // literal bodies: the general layout's table unread
+		`[a-z]+[0-9]`, `x\d+y|zz`, `(?:alpha|beta)[0-9a-f]{4}`, `\bclass\b`, `1*\b$`, `\B\d+\B`, // tables read
+		`0$|x(?:\b|0)`, `q[a ]{24,26}\b|zz[0-9]{24}`, `(?m)^\w+\b`, `\b\pL+\b`, `[^,]+,`, `AKIA[A-Z0-9]{24}`,
+	}
+	inputs := []string{"", "a", "abc1 x9y zz", "class subclass cl ass", "&k=v& &k=& foo12bar",
+		"me@x.com a@example.com", "alpha00ff beta1234", "AKIA0123456789ABCDEF01234567", "q" + strings.Repeat("a", 25) + " zz" + strings.Repeat("7", 24),
+		"0 x x0 -0", "123 45 6789", "line1\nword two\n", "жил-был ёж, 12 ёлок", "\xff\x80 abc"}
+	modes := []compile.CompileOptions{{ForceByteMode: true}, {ForceByteMode: true, LikelyMode: compile.LikelyMatch},
+		{ForceByteMode: true, LikelyMode: compile.LikelyNoMatch}, {Unicode: true}}
+	differed := 0
+	for _, pat := range shapes {
+		for _, o := range modes {
+			for _, e := range []config.PatternEntry{{Regexp: pat, FindFunc: "find"}, {Regexp: pat, MatchFunc: "match"}, {Regexp: "(" + pat + ")", GroupsFunc: "groups"}} {
+				keep := o
+				keep.KeepUnreadTables = true
+				wKeep, _, errK := compile.Compile([]config.PatternEntry{e}, pathsTableBase, true, keep)
+				wDrop, _, errD := compile.Compile([]config.PatternEntry{e}, pathsTableBase, true, o)
+				if (errK == nil) != (errD == nil) {
+					t.Fatalf("%q: compiles %v with every table, %v without", pat, errK, errD)
+				}
+				if errK != nil || bytes.Equal(wKeep, wDrop) {
+					continue
+				}
+				differed++
+				for _, in := range inputs {
+					switch {
+					case e.FindFunc != "":
+						if a, b := findFromEvery(t, wKeep, in), findFromEvery(t, wDrop, in); a != b {
+							t.Errorf("%q find over %q:\n  every table %s\n  dropped     %s", pat, in, a, b)
+						}
+					case e.MatchFunc != "":
+						end1, ok1, _, err1 := runWasmMatch(wKeep, in)
+						end2, ok2, _, err2 := runWasmMatch(wDrop, in)
+						if end1 != end2 || ok1 != ok2 || (err1 == nil) != (err2 == nil) {
+							t.Errorf("%q match over %q: every table (%d, %v), dropped (%d, %v)", pat, in, end1, ok1, end2, ok2)
+						}
+					default:
+						n := regexp.MustCompile(e.Regexp).NumSubexp() + 1
+						g1, ok1 := runGroupsIter(t, wKeep, in, n)
+						g2, ok2 := runGroupsIter(t, wDrop, in, n)
+						if ok1 != ok2 || fmtGroups(g1) != fmtGroups(g2) {
+							t.Errorf("%q groups over %q:\n  every table %s\n  dropped     %s", pat, in, fmtGroups(g1), fmtGroups(g2))
+						}
+					}
+				}
+			}
+		}
+	}
+	// Not vacuous: the drop must have left tables out of some of these modules.
+	if differed == 0 {
+		t.Fatal("no module lost a table: the drop went unexercised")
+	}
+}
+
+// findFromEvery renders find's answer from every start position of in.
+func findFromEvery(t *testing.T, w []byte, in string) string {
+	t.Helper()
+	engine, _ := sharedEngine()
+	mod, err := wasmtime.NewModule(engine, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mod.Close()
+	call, done, ok := findCallerModule(t, mod, nil, in, searchblock.Off, false)
+	if !ok {
+		t.Fatal("module would not instantiate")
+	}
+	defer done()
+	var sb strings.Builder
+	for off := 0; off <= len(in); off++ {
+		sp, state := call(off)
+		fmt.Fprintf(&sb, "%d:%v/%d ", off, sp, state)
+	}
+	return sb.String()
+}
+
+// characterRunGroupsShapes are Unicode-mode captures whose TDFA capture body
+// has such a loop — a group of states with identical rows — and crosses it
+// with the UTF-8 skip from the arms where the walk enters it, or, with no tag
+// ops at all (`()[^,]+,`), from the top of its main loop.
+var characterRunGroupsShapes = []string{
+	`<([^>]+)>(x)`, `(.+)=(.+)`, `([^,]+)(,)`, `(\w+)=([^&]+)&`, `()[^,]+,`, `^([^,]+)`, `x([^y]*)y`, `"([^"\\]*)"`,
+	`<([^>]+)>(\d)`, `([^,]+),(\d*)`,
+}
+
+// noReplacement returns pat with U+FFFD taken out of every class and of `.`:
+// Go's regexp then matches an invalid byte — which it decodes as U+FFFD — with
+// nothing, as Unicode mode does, so it is an oracle for invalid input too, on
+// any input that holds no real U+FFFD.
+func noReplacement(t *testing.T, pat string) string {
+	t.Helper()
+	re, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	without := func(rs []rune) []rune {
+		var out []rune
+		for i := 0; i+1 < len(rs); i += 2 {
+			lo, hi := rs[i], rs[i+1]
+			if lo <= utf8.RuneError && utf8.RuneError <= hi {
+				if lo < utf8.RuneError {
+					out = append(out, lo, utf8.RuneError-1)
+				}
+				if hi > utf8.RuneError {
+					out = append(out, utf8.RuneError+1, hi)
+				}
+				continue
+			}
+			out = append(out, lo, hi)
+		}
+		return out
+	}
+	var walk func(*syntax.Regexp)
+	walk = func(r *syntax.Regexp) {
+		switch r.Op {
+		case syntax.OpAnyChar:
+			r.Op, r.Rune = syntax.OpCharClass, without([]rune{0, utf8.MaxRune})
+		case syntax.OpAnyCharNotNL:
+			r.Op, r.Rune = syntax.OpCharClass, without([]rune{0, '\n' - 1, '\n' + 1, utf8.MaxRune})
+		case syntax.OpCharClass:
+			r.Rune = without(r.Rune)
+		}
+		for _, sub := range r.Sub {
+			walk(sub)
+		}
+	}
+	walk(re)
+	return re.String()
+}
+
+// characterRunInputs mixes long runs of 1- to 4-byte characters with the
+// shapes' exit bytes and every kind of invalid sequence — a stray byte, an
+// overlong, a surrogate, a sequence cut short, a lead past U+10FFFF — so the
+// skip meets each of its stops at every lane of a chunk: an exit, an error,
+// a character the chunk cuts, and the end of the input.
+func characterRunInputs() []string {
+	r := rand.New(rand.NewSource(20261006))
+	chars := []string{"a", "b", "x", "y", "=", " ", "é", "ж", "ω", "東", "タ", "😀", "𝄞"}
+	exits := []string{",", "\n", "\"", "\\", "y", "<", ">", "&"}
+	invalid := []string{"\xff", "\x80", "\xc0\x80", "\xed\xa0\x80", "\xe2\x82", "\xf0\x9f\x98", "\xf5\x80\x80\x80", "\xf4\x90\x80\x80", "\xc2"}
+	var out []string
+	for i := 0; i < 60; i++ {
+		var b strings.Builder
+		width := r.Intn(5) // 0: any character; 1-4: only characters of that width
+		for b.Len() < 40+r.Intn(160) {
+			for n := r.Intn(40); n > 0; n-- {
+				c := chars[r.Intn(len(chars))]
+				for width != 0 && len(c) != width {
+					c = chars[r.Intn(len(chars))]
+				}
+				b.WriteString(c)
+			}
+			switch r.Intn(4) {
+			case 0:
+				b.WriteString(exits[r.Intn(len(exits))])
+			case 1:
+				b.WriteString(invalid[r.Intn(len(invalid))])
+			}
+		}
+		out = append(out, b.String())
+	}
+	// Twenty overlapping walks that each die at an invalid byte a hundred
+	// characters on trip the switch's work counter, and the forward pass finds
+	// the match after them.
+	for _, run := range []string{"ж", "東", "😀", "aé"} {
+		for _, bad := range []string{"\xff", "\xe2\x82", "\xed\xa0\x80"} {
+			unit := strings.Repeat("a", 20) + strings.Repeat(run, 100) + bad
+			out = append(out, strings.Repeat(unit, 4)+"b"+strings.Repeat("東", 30)+"z"+strings.Repeat("ω", 20))
+		}
+	}
+	// Short windows, whose last chunk overlaps what the skip already walked:
+	// matches of 15-31 bytes, valid, after an invalid byte the last chunk
+	// holds below where the skip resumes, and ending in a character cut short.
+	for k := 6; k <= 14; k++ {
+		run := strings.Repeat("ж", k)
+		out = append(out, "<"+run+">5", "ab\xff<"+run+">7 ", run+",12", "\x80"+run+"=x"+run,
+			"<"+strings.Repeat("東", k/2+1)+"a>9", "q"+run+"\xe6\x97", "\xc2"+run+"y")
+	}
+	return out
+}
+
+// TestUnicodeCharacterRunSkip drives every characterRunShapes pattern from
+// every start position, and through a stub's iteration, in all three
+// search-block modes, and its match body; and every characterRunGroupsShapes
+// pattern through the groups iteration — all against Go over the same pattern
+// without U+FFFD.
+func TestUnicodeCharacterRunSkip(t *testing.T) {
+	inputs := characterRunInputs()
+	for _, in := range inputs {
+		if strings.Contains(in, "\uFFFD") {
+			t.Fatalf("input holds a real U+FFFD, which the oracle cannot judge: %q", in)
+		}
+	}
+	for _, c := range characterRunShapes {
+		t.Run(c.name, func(t *testing.T) {
+			rep := &compile.Reporter{}
+			opts := compile.CompileOptions{Unicode: true, Report: rep}
+			if _, _, err := compile.Compile([]config.PatternEntry{{Name: c.name, Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true, opts); err != nil {
+				t.Fatalf("compile %q: %v", c.pat, err)
+			}
+			var report strings.Builder
+			rep.Render(&report)
+			if !strings.Contains(report.String(), c.body) {
+				t.Fatalf("%q no longer reaches %q:\n%s", c.pat, c.body, report.String())
+			}
+			oracle := noReplacement(t, c.pat)
+			re := regexp.MustCompile(oracle)
+			w, sizes, err := compileUnicodeFindShape(c.pat, 0, false)
+			if err != nil {
+				t.Fatalf("compile %q: %v", c.pat, err)
+			}
+			engine, _ := sharedEngine()
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatalf("module: %v", err)
+			}
+			defer mod.Close()
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh, searchblock.Armed} {
+				for _, in := range inputs {
+					checkUnicodeFindFrom(t, oracle, mod, sizes, in, mode)
+					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
+				}
+			}
+			checkUnicodeCharacterRunMatch(t, c.pat, oracle, inputs, compile.CompileOptions{Unicode: true})
+		})
+	}
+	for _, pat := range characterRunGroupsShapes {
+		t.Run("groups "+pat, func(t *testing.T) {
+			if eng, err := compile.SelectEngine(pat, compile.CompileOptions{Unicode: true}); err != nil || eng != compile.EngineTDFA {
+				t.Fatalf("%q: engine %v (%v), want TDFA", pat, eng, err)
+			}
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, compile.CompileOptions{Unicode: true})
+			if err != nil {
+				t.Fatalf("compile %q: %v", pat, err)
+			}
+			re := regexp.MustCompile(noReplacement(t, pat))
+			for _, in := range inputs {
+				got, ok := runGroupsIter(t, w, in, re.NumSubexp()+1)
+				if !ok {
+					t.Fatalf("%q over %q: watchdog or overflow", pat, in)
+				}
+				if want := goGroupsAll(re, in); fmtGroups(got) != fmtGroups(want) {
+					t.Errorf("%q over %q:\n  got  %s\n  want %s", pat, in, fmtGroups(got), fmtGroups(want))
+				}
+			}
+		})
+	}
+}
+
+// TestUnicodeGroupsStartPositions is the start-position rule through the
+// groups export, from every byte position, and through the batch groups
+// export, which carries its next position inside WASM.
+func TestUnicodeGroupsStartPositions(t *testing.T) {
+	const outBase, outCap = int32(128 * 1024), int32(64)
+	for _, pat := range []string{`(a*)`, `(\B)`, `(x?)(é?)`, `(\pL*)\b`, `(é|)\B`, `(?:(\pL)\B)?`} {
+		t.Run(pat, func(t *testing.T) {
+			re := regexp.MustCompile(pat)
+			nGroups := re.NumSubexp() + 1
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups", Hints: []string{"batch-find"}}},
+				pathsTableBase, true, compile.CompileOptions{Unicode: true})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			engine, _ := sharedEngine()
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatalf("module: %v", err)
+			}
+			defer mod.Close()
+			for _, in := range unicodeStartInputs {
+				if !utf8.ValidString(in) && canMatchReplacement(pat) {
+					continue
+				}
+				ends := groupsEndsAt(t, pat, in)
+				call, done, ok := groupsCallerModule(t, mod, in, 2*nGroups)
+				if !ok {
+					t.Fatal("module would not instantiate")
+				}
+				for from := 0; from <= len(in); from++ {
+					got, state := call(from)
+					want, wantOK := groupsFirstFrom(ends, from)
+					if (state == findMatch) != wantOK || (wantOK && fmtSlots(got) != fmtSlots(want)) {
+						t.Errorf("groups %q from=%d: got %s (state %d), want %s", in, from, fmtSlots(got), state, fmtSlots(want))
+					}
+				}
+				done()
+
+				store := wasmtime.NewStore(engine)
+				store.SetEpochDeadline(1)
+				release := store.Close
+				inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
+				if err != nil {
+					release()
+					t.Fatalf("instantiate: %v", err)
+				}
+				mem := inst.GetExport(store, "memory").Memory()
+				copy(mem.UnsafeData(store)[pathsInputBase:], in)
+				res, callErr := inst.GetFunc(store, "groups_batch").Call(store, pathsInputBase, int32(len(in)), outBase, outCap, int32(0))
+				if callErr != nil {
+					release()
+					t.Fatalf("batch: %v", callErr)
+				}
+				buf := mem.UnsafeData(store)
+				var batch [][]int
+				for i := 0; i < int(res.(int32)); i++ {
+					base := int(outBase) + i*(8+nGroups*8) + 8
+					m := make([]int, nGroups*2)
+					for j := range m {
+						m[j] = int(int32(binary.LittleEndian.Uint32(buf[base+j*4:])))
+					}
+					batch = append(batch, m)
+				}
+				release()
+				if fmtGroups(batch) != fmtGroups(goGroupsAll(re, in)) {
+					t.Errorf("batch groups over %q:\n  got  %s\n  want %s", in, fmtGroups(batch), fmtGroups(goGroupsAll(re, in)))
+				}
+			}
+		})
 	}
 }
 
@@ -943,22 +1782,33 @@ func findCaller(t *testing.T, wasmBytes []byte, input string) (func(int) ([2]int
 // drive.
 func findCallerMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, input string, mode searchblock.Mode, perCall bool) (func(int) ([2]int, findState), func(), bool) {
 	t.Helper()
-	engine, wd := sharedEngine()
+	engine, _ := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		t.Fatalf("module: %v", err)
 	}
+	call, done, ok := findCallerModule(t, mod, sizes, input, mode, perCall)
+	if !ok {
+		mod.Close()
+		return nil, nil, false
+	}
+	return call, func() { done(); mod.Close() }, true
+}
+
+// findCallerModule is findCallerMode over a module already compiled, for a
+// caller driving one module over many inputs; done closes the instance only.
+func findCallerModule(t *testing.T, mod *wasmtime.Module, sizes []searchblock.Size, input string, mode searchblock.Mode, perCall bool) (func(int) ([2]int, findState), func(), bool) {
+	t.Helper()
+	engine, wd := sharedEngine()
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
-		mod.Close()
 		t.Fatalf("instantiate: %v", err)
 	}
 	findFn := inst.GetFunc(store, "find")
 	memExp := inst.GetExport(store, "memory")
 	if findFn == nil || memExp == nil || memExp.Memory() == nil {
-		mod.Close()
 		store.Close()
 		return nil, nil, false
 	}
@@ -999,7 +1849,7 @@ func findCallerMode(t *testing.T, wasmBytes []byte, sizes []searchblock.Size, in
 		}
 		return [2]int{int(uint32(v >> 32)), int(uint32(v))}, findMatch
 	}
-	return call, func() { store.Close(); mod.Close() }, true
+	return call, func() { store.Close() }, true
 }
 
 // localsFingerprint renders every function's locals declaration in a module,
@@ -1193,8 +2043,8 @@ func fmtSpanList(v [][2]int) string {
 // compileFindLNM compiles pat with a find export under LikelyNoMatch, which is
 // what gates buildSimplePrefixCheckBody's substitution (compile.go).
 func compileFindLNM(pat string) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+	entry := config.PatternEntry{Regexp: pat, FindFunc: "find"}
+	w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true,
 		compile.CompileOptions{LikelyMode: compile.LikelyNoMatch})
 	return w, err
 }
@@ -1248,6 +2098,11 @@ var groupsFromShapes = []struct {
 	{name: "empty_capable_tdfa", pat: `(a*)`, input: "baab", engine: compile.EngineTDFA},
 	{name: "empty_capable_bt", pat: `(a*?)(b?)`, input: "bab", engine: compile.EngineBacktrack},
 	{name: "trivial_whole_empty", pat: `([a-z]*)`, input: "ab cd"},
+	// One capture between fixed literals: the span from the match alone.
+	{name: "affix_suffix", pat: `([^,]+),`, input: "a,bb,,ccc,d"},
+	{name: "affix_both_empty", pat: `<([^>]*)>`, input: "<a> <> x<bc>y <d"},
+	{name: "affix_prefix", pat: `key=(\w+)`, input: "key=a key= key=bc"},
+	{name: "affix_long", pat: `ab(c*)de`, input: "abde abccde abcd"},
 }
 
 // groupsEndsAt returns, for every start position s, the submatch indices of the
@@ -1260,9 +2115,14 @@ var groupsFromShapes = []struct {
 // and the byte offset coincide.
 func groupsEndsAt(t *testing.T, pat, input string) [][]int {
 	t.Helper()
+	starts := goTokenStarts(input)
 	out := make([][]int, len(input)+1)
+	tokens := 0
 	for s := range out {
-		probe, err := regexp.Compile(`\A(?s:.{` + strconv.Itoa(s) + `})(?:` + pat + `)`)
+		if !starts[s] {
+			continue // inside a character: no match starts here (see endsAt)
+		}
+		probe, err := regexp.Compile(`\A(?s:.{` + strconv.Itoa(tokens) + `})(?:` + pat + `)`)
 		if err != nil {
 			t.Skipf("Go rejects probe for %q at %d: %v", pat, s, err)
 		}
@@ -1271,6 +2131,7 @@ func groupsEndsAt(t *testing.T, pat, input string) [][]int {
 			cp[0] = s // the probe is anchored at 0; the real match starts at s
 			out[s] = cp
 		}
+		tokens++
 	}
 	return out
 }
@@ -1400,22 +2261,33 @@ func TestGroupsFromShapesReachDistinctBodies(t *testing.T) {
 // export at a given `from`, decoding the absolute slot buffer.
 func groupsCaller(t *testing.T, wasmBytes []byte, input string, slots int) (func(int) ([]int, findState), func(), bool) {
 	t.Helper()
-	engine, wd := sharedEngine()
+	engine, _ := sharedEngine()
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		t.Fatalf("module: %v", err)
 	}
+	call, done, ok := groupsCallerModule(t, mod, input, slots)
+	if !ok {
+		mod.Close()
+		return nil, nil, false
+	}
+	return call, func() { done(); mod.Close() }, true
+}
+
+// groupsCallerModule is groupsCaller over a module already compiled; done
+// closes the instance only.
+func groupsCallerModule(t *testing.T, mod *wasmtime.Module, input string, slots int) (func(int) ([]int, findState), func(), bool) {
+	t.Helper()
+	engine, wd := sharedEngine()
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {
-		mod.Close()
 		t.Fatalf("instantiate: %v", err)
 	}
 	fn := inst.GetFunc(store, "groups")
 	memExp := inst.GetExport(store, "memory")
 	if fn == nil || memExp == nil || memExp.Memory() == nil {
-		mod.Close()
 		store.Close()
 		return nil, nil, false
 	}
@@ -1454,7 +2326,7 @@ func groupsCaller(t *testing.T, wasmBytes []byte, input string, slots int) (func
 		}
 		return out, findMatch
 	}
-	return call, func() { store.Close(); mod.Close() }, true
+	return call, func() { store.Close() }, true
 }
 
 // TestGroupsFromIterationMatchesGo is half (B) for the groups export.
@@ -1503,7 +2375,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 				if state == findNone {
 					break
 				}
-				if !(m[0] == m[1] && m[0] == prevEnd) {
+				if m[0] != m[1] || m[0] != prevEnd {
 					got = append(got, m)
 					prevEnd = m[1]
 				}
@@ -1514,10 +2386,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 				off += adv
 			}
 
-			var want [][]int
-			for _, m := range re.FindAllStringSubmatchIndex(c.input, -1) {
-				want = append(want, m)
-			}
+			want := append([][]int(nil), re.FindAllStringSubmatchIndex(c.input, -1)...)
 			gs, ws := make([]string, len(got)), make([]string, len(want))
 			for i, v := range got {
 				gs[i] = fmtSlots(v)
@@ -1548,8 +2417,8 @@ func TestBatchGroupsMatchesGo(t *testing.T) {
 		t.Run(c.pat+"/"+c.input, func(t *testing.T) {
 			re := regexp.MustCompile(c.pat)
 			nGroups := re.NumSubexp() + 1
-			w, _, err := compile.Compile([]config.RegexEntry{{
-				Pattern: c.pat, GroupsFunc: "groups", Hints: []string{"batch-find"},
+			w, _, err := compile.Compile([]config.PatternEntry{{
+				Regexp: c.pat, GroupsFunc: "groups", Hints: []string{"batch-find"},
 			}}, pathsTableBase, true)
 			if err != nil {
 				// Fixed, valid fixtures: a compile failure is the regression,
@@ -1645,12 +2514,12 @@ func TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall(t *testing.T) {
 		{"backtracking", `(\w+?)@(\w+)`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := config.RegexEntry{
-				Pattern:    tc.pat,
+			entry := config.PatternEntry{
+				Regexp:     tc.pat,
 				GroupsFunc: "groups",
 				Hints:      []string{"batch-find"},
 			}
-			w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -1817,8 +2686,8 @@ func TestAltLitAnchorIteration(t *testing.T) {
 // compileFindLM compiles a find export under prefer-match, which is the only
 // mode that emits the probe.
 func compileFindLM(pat string) ([]byte, error) {
-	entry := config.RegexEntry{Pattern: pat, FindFunc: "find"}
-	w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true,
+	entry := config.PatternEntry{Regexp: pat, FindFunc: "find"}
+	w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true,
 		compile.CompileOptions{LikelyMode: compile.LikelyMatch})
 	return w, err
 }
@@ -1992,7 +2861,7 @@ func TestClassChainAgreesWithNeutral(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Regression: under `byte_mode: true` a literal rune 0x80..0xFF means exactly
 // that BYTE, so it consumes ONE byte — not the two its UTF-8 encoding would
-// take. regexpMinMaxLen sized every such rune by its encoding, which makes it
+// take. The length analysis sized every such rune by its encoding, which made it
 // an OVER-estimate, and its callers all read it as a true bound:
 //
 //   - the exported find wrapper turns minLen into an early exit, so an
@@ -2013,7 +2882,7 @@ func TestClassChainAgreesWithNeutral(t *testing.T) {
 //
 // The shapes are chosen to reach different emitters — plain DFA find,
 // mandatory-literal lit-anchor, alternation lit-anchor, counted chain — so a
-// length bug in any of the analysers that consume regexpMinMaxLen shows up
+// length bug in any of the analysers that consume the minimum length shows up
 // here and not only in the wrapper's early exit.
 
 func TestByteModeLengthsAcrossEmitters(t *testing.T) {
@@ -2030,6 +2899,10 @@ func TestByteModeLengthsAcrossEmitters(t *testing.T) {
 		{"counted", `\xe9{2}xy`},
 		{"two-high-bytes", `\xe9\xe9ab`},
 		{"high-byte-class", `[\x80-\xff]ab`},
+		// A high byte inside the literal a literal-anchored find scans for:
+		// extracted as a literal byte since `byte_mode` bytes count as such.
+		{"lit-anchor-high-literal", `[a-y]+\xe9t\xe9`},
+		{"lit-anchor-high-mid", `[a-y]+caf\xe9\d`},
 	}
 
 	// The shortest input for each shape is the one that matters: the early
@@ -2041,12 +2914,14 @@ func TestByteModeLengthsAcrossEmitters(t *testing.T) {
 		"m\xe9zzzz", "a\xe9b", "\xe9\xe9xy", "\xe9\xe9ab",
 		strings.Repeat("z", 40) + "\xe9ab",
 		strings.Repeat("z", 9) + "a\xe9foo",
+		"a\xe9t\xe9", "xa\xe9t\xe9y", "\xe9t\xe9", "abc\xe9t", "acaf\xe95", "zzcaf\xe9x caf\xe97",
+		strings.Repeat("b", 30) + "\xe9t\xe9", strings.Repeat("q", 20) + "caf\xe90",
 	}
 
 	for _, sh := range shapes {
 		t.Run(sh.name, func(t *testing.T) {
-			entry := config.RegexEntry{Pattern: sh.pat, FindFunc: "find", ByteMode: true}
-			w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+			entry := config.PatternEntry{Regexp: sh.pat, FindFunc: "find", ByteMode: true}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -2087,6 +2962,194 @@ func TestByteModeLengthsAcrossEmitters(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestByteModeLengthsAcrossEmitters' Unicode-mode sibling. In Unicode mode a
+// rune is its UTF-8 encoding: a literal weighs 1 to 4 bytes, a `(?i)` literal
+// anything from its fold orbit's narrowest to its widest, a class from its
+// lowest rune's width to its highest's, and `.` 1 to 4. An over-estimated
+// minimum refuses the shortest input that matches and no longer one; an
+// under-estimated maximum misplaces a mandatory literal's search window or a
+// lit-anchor's fixed prefix. So every shape is driven over its SHORTEST
+// matching inputs — one per way its minimum can be reached — and over longer
+// ones that reach its maximum.
+//
+// The oracle is Go itself: in Unicode mode regexped answers as Go does on
+// valid UTF-8, and every input here is valid UTF-8.
+func TestUnicodeModeLengthsAcrossEmitters(t *testing.T) {
+	shapes := []struct {
+		name, pat string
+		inputs    []string
+	}{
+		{"literal-only", `éab`, []string{"éab", "éa", "xéab"}},
+		{"class-then-lit", `[a-y]éfoo`, []string{"aéfoo", "qaéfooq", "éfoo"}},
+		{"plus-then-lit", `é+bar`, []string{"ébar", "ééébar", "bar"}},
+		{"lit-anchor-fixed-prefix", `[a-y]ézzzz`, []string{"mézzzz", "zzmézzzzz", "ézzzz"}},
+		{"alt-lit", `(?:éab|écd)`, []string{"écd", "xéab", "éa"}},
+		{"mand-lit-mid", `aéb`, []string{"aéb", "aaéb", "ab"}},
+		{"counted", `é{2}xy`, []string{"ééxy", "éxy", "éééxy"}},
+		{"4-byte-literal", `𐀀ab`, []string{"𐀀ab", "x𐀀ab", "𐀀a"}},
+		{"dot-then-lit", `.foo`, []string{"afoo", "éfoo", "日foo", "𐀀foo", "foo"}},
+		{"dot-mid", `a.b`, []string{"axb", "aéb", "a日b", "a𐀀b", "ab"}},
+		{"dot-counted-then-lit", `.{2}foo`, []string{"abfoo", "a𐀀foo", "𐀀𐀀foo", "日éfoo", "afoo"}},
+		{"negated-class-then-lit", `[^a]bar`, []string{"xbar", "ébar", "日bar", "𐀀bar", "abar"}},
+		{"greek-class", `[α-ω]+x`, []string{"αx", "αβγx", "ax"}},
+		{"greek-prefix-lit", `[α-ω]foo`, []string{"αfoo", "zαfoo", "afoo"}},
+		{"letter-class-counted", `\pL{2}x`, []string{"abx", "aéx", "日本x", "𐐀𐐀x", "ax"}},
+		{"3-byte-class", `[\x{800}-\x{FFFF}]x`, []string{"日x", "z日x", "éx", "x"}},
+		{"fold-k", `(?i)kx`, []string{"kx", "Kx", "\u212Ax", "x"}},
+		{"fold-s-then-lit", `(?i)sfoo`, []string{"sfoo", "Sfoo", "\u017Ffoo", "foo"}},
+		{"fold-word", `(?i)straße`, []string{"straße", "STRAẞE", "ſtraße", "strasse"}},
+		{"fold-prefix-lit", `(?i)k=\d`, []string{"k=1", "\u212A=1", "=1"}},
+		// A fold scoped to the prefix leaves the literal after it unfolded,
+		// so the mandatory-literal search window is the fold's widest width.
+		{"scoped-fold-then-lit", `(?i:k)=\d`, []string{"k=1", "\u212A=1", "x\u212A=1", "=1"}},
+		{"scoped-fold-s-then-lit", `(?i:s)foo`, []string{"sfoo", "\u017Ffoo", "a\u017Ffoo", "foo"}},
+		{"lit-scoped-fold-then-lit", `a(?i:k)foo`, []string{"akfoo", "a\u212Afoo", "za\u212Afoo", "afoo"}},
+	}
+
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			entry := config.PatternEntry{Regexp: sh.pat, FindFunc: "find"}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true,
+				compile.CompileOptions{Unicode: true})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatalf("instantiate: %v", err)
+			}
+			re := regexp.MustCompile(sh.pat)
+			for _, in := range sh.inputs {
+				if !utf8.ValidString(in) {
+					t.Fatalf("input %q is not valid UTF-8; Go is not the oracle there", in)
+				}
+				copy(mem.UnsafeData(store)[pathsInputBase:], in)
+				res, cerr := inst.GetFunc(store, "find").Call(store,
+					pathsInputBase, int32(len(in)), int32(0))
+				if cerr != nil {
+					t.Fatalf("input %q: %v", in, cerr)
+				}
+				got := res.(int64)
+				loc := re.FindStringIndex(in)
+				var want int64 = -1
+				if loc != nil {
+					want = int64(loc[0])<<32 | int64(loc[1])
+				}
+				if got != want {
+					t.Errorf("pattern %q input %q (len %d): got %#x, want %#x (oracle %v)\n"+
+						"in Unicode mode a rune weighs its UTF-8 encoding; a wrong length "+
+						"bound refuses or misplaces a match",
+						sh.pat, in, len(in), uint64(got), uint64(want), loc)
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unicode mode from a config, end to end: an entry that names a non-ASCII
+// character, or sets `unicode: true`, compiles in Unicode mode with no option
+// set, and answers as Go does. The literal-anchored shapes carry a non-ASCII
+// part beside the anchor literal, which their backward pass reads reversed
+// and lowered last byte first; they must reach those bodies, which a guard
+// asking a lowered program whether it names refused runes used to decline.
+func TestUnicodeModeFromConfig(t *testing.T) {
+	yaml := `import_module: uni
+wasm_file: uni.wasm
+patterns:
+  - name: e
+    regexp: 'é+'
+    find_func: find_e
+  - name: mail
+    regexp: 'é+@example\.com'
+    find_func: find_mail
+  - name: prefix
+    regexp: '(?:ü|ö)xyz'
+    find_func: find_prefix
+  - name: alt
+    regexp: '[à-ÿ]foo|[α-ω]bar'
+    find_func: find_alt
+  - name: dot
+    regexp: 'a.c'
+    unicode: true
+    find_func: find_dot
+`
+	path := filepath.Join(t.TempDir(), "uni.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	rep := &compile.Reporter{}
+	w, _, err := compile.Compile(cfg.Patterns, pathsTableBase, true, compile.CompileOptions{Report: rep})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	var b strings.Builder
+	rep.Render(&b)
+	report := b.String()
+	if strings.Count(report, "mode:   unicode") != len(cfg.Patterns) {
+		t.Errorf("not every entry compiled in Unicode mode:\n%s", report)
+	}
+	for _, want := range []string{"literal-anchored find (SIMD", "alternation literal-anchored find"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("no pattern reached %q:\n%s", want, report)
+		}
+	}
+
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	for _, c := range []struct {
+		fn, pat string
+		inputs  []string
+	}{
+		{"find_e", `é+`, []string{"é", "aéé b é", "e", "日é"}},
+		{"find_mail", `é+@example\.com`, []string{"ééé@example.com", "xé@example.com y é@example.com", "@example.com", "e@example.com", "日é@example.com"}},
+		{"find_prefix", `(?:ü|ö)xyz`, []string{"üxyz", "aöxyz üxyz", "xyz", "uxyz"}},
+		{"find_alt", `[à-ÿ]foo|[α-ω]bar`, []string{"àfoo", "αbar", "ÿfoo ωbar àbaz", "afoo", "日foo"}},
+		{"find_dot", `a.c`, []string{"aéc a日c abc a😀c axyc", "ac"}},
+	} {
+		re := regexp.MustCompile(c.pat)
+		f := inst.GetFunc(store, c.fn)
+		for _, in := range c.inputs {
+			copy(mem.UnsafeData(store)[pathsInputBase:], in)
+			var got [][2]int
+			for from := 0; from <= len(in); {
+				res, err := f.Call(store, pathsInputBase, int32(len(in)), int32(from))
+				if err != nil {
+					t.Fatalf("%s %q: %v", c.fn, in, err)
+				}
+				v := res.(int64)
+				if v < 0 {
+					break
+				}
+				sp := [2]int{int(uint32(v >> 32)), int(uint32(v))}
+				got = append(got, sp)
+				from = max(sp[1], sp[0]+1)
+			}
+			var want [][2]int
+			for _, m := range re.FindAllStringIndex(in, -1) {
+				want = append(want, [2]int{m[0], m[1]})
+			}
+			if fmtSpanList(got) != fmtSpanList(want) {
+				t.Errorf("%s over %q:\n  got  %s\n  want %s", c.fn, in, fmtSpanList(got), fmtSpanList(want))
+			}
+		}
+	}
+	// The answer the plan pins.
+	copy(mem.UnsafeData(store)[pathsInputBase:], "é")
+	if res, err := inst.GetFunc(store, "find_e").Call(store, pathsInputBase, int32(2), int32(0)); err != nil || res.(int64) != 2 {
+		t.Errorf(`é+ over "é": got %v (%v), want [0,2)`, res, err)
 	}
 }
 
@@ -2145,8 +3208,8 @@ func TestEmptyWidthBoundaryFindsEveryPosition(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.pat+"/"+c.in, func(t *testing.T) {
-			entry := config.RegexEntry{Pattern: c.pat, FindFunc: "find"}
-			w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+			entry := config.PatternEntry{Regexp: c.pat, FindFunc: "find"}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -2209,8 +3272,8 @@ func TestEmptyWidthBoundaryOverHighBytes(t *testing.T) {
 	}
 	for _, in := range []string{"a\xe9b", "a\xc3\xa2b", "a\xe9", "\xe9a", "\xe9\xe9", "a\xe9\xe9b"} {
 		t.Run(in, func(t *testing.T) {
-			entry := config.RegexEntry{Pattern: `\b`, FindFunc: "find"}
-			w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+			entry := config.PatternEntry{Regexp: `\b`, FindFunc: "find"}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -2294,7 +3357,7 @@ func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
 		// Byte-mode folding stays inside the byte range: \xe0-\xfe folds to
 		// \xc0-\xde except × (0xD7) and ÷ (0xF7), which have no partner.
 		{`(?i)[^\xe0-\xfe]`, true, func(b byte) bool {
-			return !((b >= 0xc0 && b <= 0xd6) || (b >= 0xd8 && b <= 0xde) || (b >= 0xe0 && b <= 0xfe))
+			return (b < 0xc0 || b > 0xd6) && (b < 0xd8 || b > 0xde) && (b < 0xe0 || b > 0xfe)
 		}},
 	}
 	type path struct {
@@ -2303,12 +3366,12 @@ func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
 		run   func(w []byte, in string) (bool, error)
 	}
 	const selected = compile.EngineType(0) // the engine the selector picks
-	single := func(e config.RegexEntry, base int64, eng compile.EngineType) ([]byte, error) {
+	single := func(e config.PatternEntry, base int64, eng compile.EngineType) ([]byte, error) {
 		if eng != selected {
-			w, _, err := compile.CompileForced([]config.RegexEntry{e}, base, true, eng)
+			w, _, err := compile.CompileForced([]config.PatternEntry{e}, base, true, eng)
 			return w, err
 		}
-		w, _, err := compile.Compile([]config.RegexEntry{e}, base, true, compile.CompileOptions{})
+		w, _, err := compile.Compile([]config.PatternEntry{e}, base, true, compile.CompileOptions{})
 		return w, err
 	}
 	groupsRun := func(w []byte, in string) (bool, error) {
@@ -2317,13 +3380,13 @@ func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
 	}
 	paths := []path{
 		{"find", func(p string, bm bool) ([]byte, error) {
-			return single(config.RegexEntry{Pattern: p, FindFunc: "find", ByteMode: bm}, tableBase, selected)
+			return single(config.PatternEntry{Regexp: p, FindFunc: "find", ByteMode: bm}, tableBase, selected)
 		}, func(w []byte, in string) (bool, error) {
 			_, ok, _, err := runWasmFind(w, in)
 			return ok, err
 		}},
 		{"find/backtrack", func(p string, bm bool) ([]byte, error) {
-			w, _, err := compile.Compile([]config.RegexEntry{{Pattern: p, FindFunc: "find", ByteMode: bm}},
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: p, FindFunc: "find", ByteMode: bm}},
 				tableBase, true, compile.CompileOptions{MaxDFAStates: -1})
 			return w, err
 		}, func(w []byte, in string) (bool, error) {
@@ -2331,20 +3394,20 @@ func TestCaseFoldedNegatedClassesOverAllBytes(t *testing.T) {
 			return ok, err
 		}},
 		{"match", func(p string, bm bool) ([]byte, error) {
-			return single(config.RegexEntry{Pattern: p, MatchFunc: "match", ByteMode: bm}, pathsTableBase, selected)
+			return single(config.PatternEntry{Regexp: p, MatchFunc: "match", ByteMode: bm}, pathsTableBase, selected)
 		}, func(w []byte, in string) (bool, error) {
 			_, ok, _, err := runWasmMatch(w, in)
 			return ok, err
 		}},
 		{"groups/tdfa", func(p string, bm bool) ([]byte, error) {
-			return single(config.RegexEntry{Pattern: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineTDFA)
+			return single(config.PatternEntry{Regexp: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineTDFA)
 		}, groupsRun},
 		{"groups/backtrack", func(p string, bm bool) ([]byte, error) {
-			return single(config.RegexEntry{Pattern: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineBacktrack)
+			return single(config.PatternEntry{Regexp: "(" + p + ")", GroupsFunc: "groups", ByteMode: bm}, pathsTableBase, compile.EngineBacktrack)
 		}, groupsRun},
 		{"set", func(p string, bm bool) ([]byte, error) {
 			cfg := config.BuildConfig{
-				Regexps: []config.RegexEntry{{Name: "p0", Pattern: p, ByteMode: bm}},
+				Patterns: []config.PatternEntry{{Name: "p0", Regexp: p, ByteMode: bm}},
 				Sets: []config.SetConfig{{Name: "s", Find: "set_find", Overlapping: true,
 					Patterns: config.PatternSelector{Names: []string{"p0"}}}},
 			}
@@ -2420,8 +3483,8 @@ func TestRangeVerifyNoOverreadAtMemoryEnd(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		entry := config.RegexEntry{Pattern: c.pattern, MatchFunc: "match", FindFunc: "find"}
-		wasmBytes, _, err := compile.Compile([]config.RegexEntry{entry}, tableBase, true)
+		entry := config.PatternEntry{Regexp: c.pattern, MatchFunc: "match", FindFunc: "find"}
+		wasmBytes, _, err := compile.Compile([]config.PatternEntry{entry}, tableBase, true)
 		if err != nil {
 			t.Fatalf("pattern=%q compile: %v", c.pattern, err)
 		}
@@ -2479,7 +3542,7 @@ func checkTDFAGroups(t *testing.T, cases []tdfaCase) {
 			name = c.pattern
 		}
 		t.Run(name, func(t *testing.T) {
-			eng, err := compile.SelectEngine(c.pattern, compile.CompileOptions{})
+			eng, err := compile.SelectEngine(c.pattern, withMode(compile.CompileOptions{}))
 			if err != nil {
 				t.Fatalf("SelectEngine(%q): %v", c.pattern, err)
 			}
@@ -2663,30 +3726,6 @@ var findStrategyShapes = []struct {
 	{`ab?c|x[a-z]*Y`, "x", "xY", nil},
 }
 
-// hasEmptyWidthAssertion reports whether pat carries \b, \B, ^, $, \A or \z,
-// which the start-anywhere find refuses.
-func hasEmptyWidthAssertion(pat string) bool {
-	re, err := syntax.Parse(pat, syntax.Perl)
-	if err != nil {
-		return false
-	}
-	var walk func(*syntax.Regexp) bool
-	walk = func(r *syntax.Regexp) bool {
-		switch r.Op {
-		case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText,
-			syntax.OpWordBoundary, syntax.OpNoWordBoundary:
-			return true
-		}
-		for _, s := range r.Sub {
-			if walk(s) {
-				return true
-			}
-		}
-		return false
-	}
-	return walk(re)
-}
-
 // TestFindStrategiesMatchGo drives every find strategy — today's find, the
 // start-anywhere find alone, today's find with a work counter that trips
 // almost at once (N = 1), and whatever the classifier picks — at EVERY start
@@ -2732,7 +3771,7 @@ func TestFindStrategiesMatchGo(t *testing.T) {
 				r := &compile.Reporter{}
 				o := st.opts
 				o.Report = r
-				w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true, o)
+				w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true, o)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2828,7 +3867,7 @@ func TestFindStrategiesLinear(t *testing.T) {
 	for _, c := range findStrategyShapes {
 		for _, m := range modes {
 			t.Run(c.pat+"/"+m.name, func(t *testing.T) {
-				w, _, err := compile.Compile([]config.RegexEntry{{Pattern: c.pat, FindFunc: "find"}}, pathsTableBase, true,
+				w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true,
 					compile.CompileOptions{LikelyMode: m.lm})
 				if err != nil {
 					t.Fatal(err)
@@ -2847,6 +3886,133 @@ func TestFindStrategiesLinear(t *testing.T) {
 					t.Errorf("fuel grew %.1f× for a 4× longer worst-case run (%d → %d): quadratic", ratio, small, large)
 				}
 			})
+		}
+	}
+}
+
+// TestNeutralTwinRouteMatchesGo drives every caller that can take a
+// prefer-no-match body's route to its neutral twin — a caller tests the byte at
+// `from` and calls the twin itself when the body's first test would hand off —
+// at every start position, against Go. Each caller tests that byte in its own
+// code: the find wrapper with its minimum-length exit (unguarded) and without
+// one (guarded, since `from` may equal `len`), the start-anywhere dispatcher
+// (the one caller of today's find under a switch), and the groups wrapper. The
+// inputs mix dense runs, where the route is taken, with text that starts on a
+// byte outside the class, where it is not.
+func TestNeutralTwinRouteMatchesGo(t *testing.T) {
+	inputs := []string{"", "a", ";", "abcdefgh", ";abcdefghij;", "ab cd efghijklm no pqrstuvwxyz;",
+		strings.Repeat("ab ", 30) + "abcdefghijk", ";;" + strings.Repeat("abcdefg;", 12) + "abcdefgh"}
+	lnm := compile.CompileOptions{LikelyMode: compile.LikelyNoMatch}
+	sw := compile.CompileOptions{LikelyMode: compile.LikelyNoMatch, StartAnywhereSwitchN: 1}
+	finds := []struct {
+		name, pat string
+		opts      compile.CompileOptions
+	}{
+		{"wrapper, length exit", `[a-zA-Z]{8,}`, lnm},
+		{"wrapper, guarded", `[a-zA-Z]+`, lnm},
+		{"dispatcher", `[a-zA-Z]{8,}`, sw},
+	}
+	for _, c := range finds {
+		t.Run(c.name, func(t *testing.T) {
+			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find"}}, pathsTableBase, true, c.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, in := range inputs {
+				call, done, ok := findCaller(t, w, in)
+				if !ok {
+					t.Fatal("module would not instantiate")
+				}
+				ends := endsAt(t, c.pat, in)
+				for from := 0; from <= len(in); from++ {
+					got, state := call(from)
+					want, wantOK := goFirstFrom(ends, from)
+					switch {
+					case state == findHang:
+						t.Fatalf("%q from=%d: watchdog fired", in, from)
+					case state == findNone && wantOK:
+						t.Fatalf("%q from=%d: got -1, want %v", in, from, want)
+					case state == findMatch && (!wantOK || got != want):
+						t.Fatalf("%q from=%d: got %v, want %v (%v)", in, from, got, want, wantOK)
+					}
+				}
+				done()
+			}
+		})
+	}
+	t.Run("groups wrapper", func(t *testing.T) {
+		const pat = `([a-zA-Z]{8,})`
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, lnm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range inputs {
+			call, done, ok := groupsCaller(t, w, in, 4)
+			if !ok {
+				t.Fatal("module would not instantiate")
+			}
+			ends := groupsEndsAt(t, pat, in)
+			for from := 0; from <= len(in); from++ {
+				got, state := call(from)
+				want, wantOK := groupsFirstFrom(ends, from)
+				switch {
+				case state == findHang:
+					t.Fatalf("%q from=%d: watchdog fired", in, from)
+				case state == findNone && wantOK:
+					t.Fatalf("%q from=%d: got no-match, want %s", in, from, fmtSlots(want))
+				case state == findMatch && (!wantOK || fmtSlots(got) != fmtSlots(want)):
+					t.Fatalf("%q from=%d: got %s, want %s (%v)", in, from, fmtSlots(got), fmtSlots(want), wantOK)
+				}
+			}
+			done()
+		}
+	})
+}
+
+// TestUnicodeModeSelectedGroupsMatchGo: in Unicode mode a capture pattern
+// goes to whichever engine the selector picks for it — the selector judging
+// the pattern as written, the engine running the lowered program — and its
+// groups equal Go's over valid UTF-8.
+func TestUnicodeModeSelectedGroupsMatchGo(t *testing.T) {
+	cases := []struct {
+		pat    string
+		inputs []string
+	}{
+		{`(\pL+)@(\pL+)`, []string{"user@host", "é@ж", "日本@語", "x é@ж y", "a@", "ÀÉ@ü1"}},
+		{`([α-ω]+)-(\d+)`, []string{"αβγ-42", "x αβ-7 y", "ΑΒ-1", "α-", "-1", "ωω-9z"}},
+		// Wide classes, `.` and folded literals have computed first sets in
+		// Unicode mode, so these take a TDFA rather than Backtracking — and the
+		// overlapping alternations must still be found ambiguous.
+		{`(\pL+)\s(\pN+)`, []string{"Straße 42", "x Straße 42", "日本 ٣٤", "a 1 b 2", "Straße", ""}},
+		{`<([^>]+)>`, []string{"<é>", "a<日本>b", "<>", "<a<b>", "<<é>>", "x"}},
+		{`([^,]+),`, []string{"привет,мир", ",x", "é,", "日本語,,", "a"}},
+		{`(.+)=(.+)`, []string{"a=b=c", "ключ=значение", "=x", "é=", "x\n=y", "é=ж\nz"}},
+		{`((\pL)|(\pN))+`, []string{"é٣a1", "!é", "٣", ""}},
+		{`((\pL)|(a))`, []string{"a", "é", "1"}},
+		{`((?i:é)|(É))`, []string{"É", "é", "e", "xÉ"}},
+		{`(\pL+)(\pL)`, []string{"Straße", "日本", "é", "ab"}},
+		{`([\pL\pN]+)@(\pL+)\.(\pL{2,})`, []string{"пользователь@пример.рф", "a1@b.cd", "x@y.z", "é@ж.日本"}},
+	}
+	for _, c := range cases {
+		eng, err := compile.SelectEngine(c.pat, compile.CompileOptions{Unicode: true})
+		if err != nil {
+			t.Fatalf("%s: SelectEngine: %v", c.pat, err)
+		}
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, GroupsFunc: "groups"}},
+			pathsTableBase, true, compile.CompileOptions{Unicode: true})
+		if err != nil {
+			t.Fatalf("%s: compile: %v", c.pat, err)
+		}
+		re := regexp.MustCompile(c.pat)
+		for _, in := range c.inputs {
+			want := re.FindStringSubmatchIndex(in)
+			got, ok, hang, err := runWasmGroupsPath(w, in, re.NumSubexp()+1)
+			if err != nil || hang {
+				t.Fatalf("%s (%v) over %q: err=%v hang=%v", c.pat, eng, in, err, hang)
+			}
+			if msg := compareSlots(want, got, ok); msg != "" {
+				t.Errorf("%s (%v) over %q (%s): got %v, want %v", c.pat, eng, in, msg, got, want)
+			}
 		}
 	}
 }

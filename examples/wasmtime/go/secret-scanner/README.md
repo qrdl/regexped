@@ -66,7 +66,8 @@ regexped merge      →  merge app + patterns into final.wasm
 `stub.go` is auto-generated. The scan function keeps the config's name
 VERBATIM — `find: scan_secrets` in `regexped.yaml` yields `func scan_secrets`,
 not `ScanSecrets`; the PascalCase transform was retired. Symbols
-with no user-supplied name, like `PatternName`, keep Go's convention.
+derived from the SET's name, like its name lookup `ScannerPatternName`, keep
+Go's convention.
 
 `main.go` is ~20 lines:
 
@@ -74,7 +75,7 @@ with no user-supplied name, like `PatternName`, keep Go's convention.
 scanIter := scan_secrets(input, 0)
 for m := range scanIter.Matches() {
     fmt.Printf("[%s] at %d..%d: %s\n",
-        PatternName(m.PatternID), m.Start, m.End,
+        ScannerPatternName(m.PatternID), m.Start, m.End,
         string(input[m.Start:m.End]))
 }
 // Err() after the loop: an engine that gave up ends iteration the same way

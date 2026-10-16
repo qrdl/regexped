@@ -14,7 +14,7 @@ import (
 // out is the full output path or "-" for stdout.
 func rustStub(cfg config.BuildConfig, out string) error {
 	sizes := searchSizesFor(cfg)
-	singleInner, err := genRustStubsInnerSized(cfg.Regexps, cfg.ImportModule, sizes)
+	singleInner, err := genRustStubsInnerSized(cfg.Patterns, cfg.ImportModule, sizes)
 	if err != nil {
 		return fmt.Errorf("generate Rust stub: %w", err)
 	}
@@ -71,7 +71,7 @@ func genRustSetInnerSized(cfg config.BuildConfig, sizes map[string]compile.Searc
 		wide := shapes.wideAll(setIdx)
 
 		fmt.Fprintf(&out, "/// Number of patterns in set %q. Sizes the match buffer: `find` can\n/// report at most this many matches at one position.\npub const %s: usize = %d;\n\n", s.Name, konst, n)
-		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids are\n/// global indices into `regexps:`, so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
+		fmt.Fprintf(&out, "/// One past the largest pattern id set %q can report. Pattern ids index\n/// `patterns:` (then the set's own `regexps:`), so a set holding a few late-declared\n/// patterns has a small count and a large id space. Everything indexed BY an\n/// id — the gate array, the `_all` bitmask — is sized from this.\npub const %s: usize = %d;\n\n", s.Name, idKonst, idN)
 
 		fmt.Fprintf(&out, "#[link(wasm_import_module = %q)]\nunsafe extern \"C\" {\n", cfg.ImportModule)
 		// Parameter lists come from the ONE descriptor in set_stub.go; only
@@ -113,9 +113,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 			if wide {
 				fmt.Fprintf(&out, `    let mut bits = [0u8; (%s + 7) / 8];
     let n = unsafe { ffi_%s(input.as_ptr(), input.len() as i32, bits.as_mut_ptr()) };
-    // The wide form returns a COUNT, so -2 can only be the sentinel: the
-    // bitmap is then unknown, not empty. The anchored path never calls a
-    // Backtracking probe today, so this cannot fire yet.
+    // The wide form returns a COUNT, so -2 can only be the sentinel: a
+    // member's Backtracking probe gave up, and the bitmap is unknown, not empty.
     if n == %d { return Err(Error::BacktrackOverflow); }
     Ok((0..%s as i32).filter(move |k| bits[(*k / 8) as usize] & (1u8 << (*k %% 8)) != 0))
 }
@@ -407,34 +406,35 @@ impl<'a> Iterator for %s<'a> {
 `, s.Find, iterName, iterName, gateInit, bufInit)
 		}
 	}
-	if hasEmitNameMap(cfg) {
-		out.WriteString(rustPatternNameFn(cfg))
-	}
+	out.WriteString(rustPatternNameFns(cfg))
 	return out.String()
 }
 
-// rustPatternNameFn is the `emit_name_map: true` helper, shared verbatim with
-// the component stub: it maps pattern ids to names and has nothing to do with
-// the output kind.
-func rustPatternNameFn(cfg config.BuildConfig) string {
+// rustPatternNameFns is every `emit_name_map: true` lookup, one per set,
+// shared verbatim with the component stub: it maps pattern ids to names and
+// has nothing to do with the output kind.
+func rustPatternNameFns(cfg config.BuildConfig) string {
 	var out strings.Builder
-	out.WriteString("pub fn pattern_name(id: i32) -> &'static str {\n    match id {\n")
-	for i, re := range cfg.Regexps {
-		fmt.Fprintf(&out, "        %d => %q,\n", i, re.Name)
+	for _, s := range nameMapSets(cfg) {
+		fmt.Fprintf(&out, "/// `%s` %s\n", config.SetPatternNameFunc(s.Name, "rust"), nameMapDoc(s))
+		fmt.Fprintf(&out, "pub fn %s(id: i32) -> &'static str {\n    match id {\n", config.SetPatternNameFunc(s.Name, "rust"))
+		for _, m := range namedMembers(s, cfg) {
+			fmt.Fprintf(&out, "        %d => %q,\n", m.ID, m.Entry.Name)
+		}
+		out.WriteString("        _ => \"\",\n    }\n}\n\n")
 	}
-	out.WriteString("        _ => \"\",\n    }\n}\n\n")
 	return out.String()
 }
 
 // genRustStubsInner generates the unindented inner content for single-pattern stubs
 // (without the pub mod wrapper). Returns "" when there is nothing to emit.
-func genRustStubsInner(entries []config.RegexEntry, importModule string) (string, error) {
+func genRustStubsInner(entries []config.PatternEntry, importModule string) (string, error) {
 	return genRustStubsInnerSized(entries, importModule, nil)
 }
 
 // genRustStubsInnerSized is genRustStubsInner with each export's search block
 // (search_stub.go); nil sizes means none.
-func genRustStubsInnerSized(entries []config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
+func genRustStubsInnerSized(entries []config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var bodyParts []string
 	if anySearchBlock(sizes) {
 		bodyParts = append(bodyParts, rustSearchPreamble(importModule))
@@ -471,7 +471,7 @@ func wrapRustModule(inner, moduleName string) string {
 }
 
 // genRustStubFile is kept for backward compatibility with tests.
-func genRustStubFile(entries []config.RegexEntry, importModule string) (string, error) {
+func genRustStubFile(entries []config.PatternEntry, importModule string) (string, error) {
 	inner, err := genRustStubsInner(entries, importModule)
 	if err != nil || inner == "" {
 		return "", err
@@ -481,7 +481,7 @@ func genRustStubFile(entries []config.RegexEntry, importModule string) (string, 
 
 // genRustStubsForEntrySized generates the Rust stub content for a single
 // entry, with each export's search block; nil sizes means none.
-func genRustStubsForEntrySized(re config.RegexEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
+func genRustStubsForEntrySized(re config.PatternEntry, importModule string, sizes map[string]compile.SearchSize) (string, error) {
 	var out string
 	written := false
 
@@ -495,7 +495,7 @@ func genRustStubsForEntrySized(re config.RegexEntry, importModule string, sizes 
 		written = true
 	}
 	if re.GroupsFunc != "" {
-		numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+		numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 		if err != nil {
 			return "", err
 		}

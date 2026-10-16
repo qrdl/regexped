@@ -131,7 +131,7 @@ func TestExtractGroupInfo(t *testing.T) {
 }
 
 func TestGenRustStubFileSingle(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		{MatchFunc: "url_match"},
 	}
 	out, err := genRustStubFile(entries, "url")
@@ -150,7 +150,7 @@ func TestGenRustStubFileSingle(t *testing.T) {
 }
 
 func TestGenRustStubFileMultiple(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		{MatchFunc: "url_match"},
 		{FindFunc: "tok_find"},
 	}
@@ -173,9 +173,9 @@ func TestGenJSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regexp.js",
-		Regexps: []config.RegexEntry{
+		Patterns: []config.PatternEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", Pattern: "(?P<first>a)(b)"},
+			{GroupsFunc: "tok_groups", Regexp: "(?P<first>a)(b)"},
 		},
 	}
 	out, err := genJSStubFile(cfg)
@@ -197,9 +197,9 @@ func TestGenTSStubFile(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regexp.ts",
-		Regexps: []config.RegexEntry{
+		Patterns: []config.PatternEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", Pattern: "(?P<first>a)(b)"},
+			{GroupsFunc: "tok_groups", Regexp: "(?P<first>a)(b)"},
 		},
 	}
 	out, err := genTSStubFile(cfg)
@@ -302,7 +302,7 @@ func TestGenGoGroupIndexConsts(t *testing.T) {
 }
 
 func TestGenGoStubFileMatchOnly(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		{MatchFunc: "url_match"},
 	}
 	out, err := genGoStubFile(entries, "url", "url")
@@ -325,10 +325,10 @@ func TestGenGoStubFileMatchOnly(t *testing.T) {
 }
 
 func TestGenGoStubFileFull(t *testing.T) {
-	entries := []config.RegexEntry{
+	entries := []config.PatternEntry{
 		{MatchFunc: "url_match", FindFunc: "url_find",
 			GroupsFunc: "url_groups",
-			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)"},
+			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
 	out, err := genGoStubFile(entries, "url", "url")
 	if err != nil {
@@ -351,9 +351,9 @@ func TestGenGoStubFileFull(t *testing.T) {
 }
 
 func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
-	entries := []config.RegexEntry{{
+	entries := []config.PatternEntry{{
 		GroupsFunc: "url_groups",
-		Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
+		Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -372,9 +372,9 @@ func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
 }
 
 func TestGenRustStubFileNamedOnly(t *testing.T) {
-	entries := []config.RegexEntry{{
+	entries := []config.PatternEntry{{
 		GroupsFunc: "url_groups",
-		Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
+		Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -389,7 +389,7 @@ func TestGenRustStubFileNamedOnly(t *testing.T) {
 }
 
 func TestGenRustStubFileNoFuncs(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: "something"}}
+	entries := []config.PatternEntry{{Regexp: "something"}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
 		t.Fatalf("genRustStubFile no-funcs: %v", err)
@@ -462,7 +462,7 @@ func TestGenCGroupsStubParts(t *testing.T) {
 }
 
 func TestGenCStubFilesFind(t *testing.T) {
-	entries := []config.RegexEntry{{FindFunc: "tok_find"}}
+	entries := []config.PatternEntry{{FindFunc: "tok_find"}}
 	h, c, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
 		t.Fatalf("genCStubFiles find: %v", err)
@@ -480,7 +480,7 @@ func TestGenCStubFilesFind(t *testing.T) {
 }
 
 func TestGenCStubFilesSingle(t *testing.T) {
-	entries := []config.RegexEntry{{MatchFunc: "url_match"}}
+	entries := []config.PatternEntry{{MatchFunc: "url_match"}}
 	h, c, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
 		t.Fatalf("genCStubFiles: %v", err)
@@ -501,8 +501,8 @@ func TestGenCStubFilesSingle(t *testing.T) {
 // in C: C used to REJECT the key outright, and now gets the
 // named access it never had, through index constants.
 func TestGenCStubFilesNamedGroupIndices(t *testing.T) {
-	entries := []config.RegexEntry{
-		{GroupsFunc: "url_groups", Pattern: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+	entries := []config.PatternEntry{
+		{GroupsFunc: "url_groups", Regexp: "(?P<scheme>https?)://(?P<host>[^/]+)"},
 	}
 	h, _, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
@@ -519,9 +519,9 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regexp.js",
-		Regexps: []config.RegexEntry{{
+		Patterns: []config.PatternEntry{{
 			GroupsFunc: "url_groups",
-			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
+			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
 	}
 	out, err := genJSStubFile(cfg)
@@ -539,9 +539,9 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output:   "merged.wasm",
 		StubFile: "regexp.ts",
-		Regexps: []config.RegexEntry{{
+		Patterns: []config.PatternEntry{{
 			GroupsFunc: "url_groups",
-			Pattern:    "(?P<scheme>https?)://(?P<host>[^/]+)",
+			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
 		}},
 	}
 	out, err := genTSStubFile(cfg)
@@ -718,10 +718,10 @@ func TestGenASGroupsStub(t *testing.T) {
 }
 
 func TestGenASStubFileGroupsFunc(t *testing.T) {
-	entries := []config.RegexEntry{
-		{GroupsFunc: "find_email", Pattern: "(?P<user>[^@]+)@(?P<domain>.+)"},
+	entries := []config.PatternEntry{
+		{GroupsFunc: "find_email", Regexp: "(?P<user>[^@]+)@(?P<domain>.+)"},
 	}
-	out, err := genASStubFile(config.BuildConfig{Regexps: entries, ImportModule: "mymod"})
+	out, err := genASStubFile(config.BuildConfig{Patterns: entries, ImportModule: "mymod"})
 	if err != nil {
 		t.Fatalf("genASStubFile: %v", err)
 	}
@@ -747,7 +747,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "rust",
 				ImportModule: "mymod",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -756,7 +756,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "go",
 				ImportModule: "mymod",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -766,7 +766,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "js",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -776,7 +776,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "ts",
 				ImportModule: "mymod",
 				Output:       "merged.wasm",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -786,7 +786,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 				StubType:     "c",
 				ImportModule: "mymod",
 				StubFile:     "stub.h",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 		{
@@ -795,7 +795,7 @@ func TestCmdGenerateStubDispatchers(t *testing.T) {
 			cfg: config.BuildConfig{
 				StubType:     "as",
 				ImportModule: "mymod",
-				Regexps:      []config.RegexEntry{{MatchFunc: "url_match"}},
+				Patterns:     []config.PatternEntry{{MatchFunc: "url_match"}},
 			},
 		},
 	}
@@ -824,16 +824,16 @@ func TestWriteStub(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Set stub tests (Phase 5)
+// Set stub tests
 
 // setTestCfg builds a BuildConfig with two named patterns and one set that
 // exercises all three export types: find_all, find_any, and match.
 func setTestCfg() config.BuildConfig {
 	return config.BuildConfig{
 		ImportModule: "mymod",
-		Regexps: []config.RegexEntry{
-			{Name: "pat_a", Pattern: `foo\d+`},
-			{Name: "pat_b", Pattern: `bar\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "pat_a", Regexp: `foo\d+`},
+			{Name: "pat_b", Regexp: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
 			{
@@ -862,7 +862,7 @@ func TestGenRustSetInner(t *testing.T) {
 		"gates: [u32; SCANNER_ID_SPACE]",         // indexed by pattern id
 		"set_find", "probe_any", "probe_all", "probe",
 		"validate", "validate_any", "validate_all",
-		"pattern_name",
+		"pub fn scanner_pattern_name(id: i32) -> &'static str {",
 		"\"pat_a\"",
 		"\"pat_b\"",
 		"ffi_set_find",
@@ -890,7 +890,7 @@ func TestGenGoSetSection(t *testing.T) {
 		"ScannerPatternCount",
 		"set_find", "probe_any", "probe_all", "probe",
 		"validate", "validate_any", "validate_all",
-		"PatternName",
+		"func ScannerPatternName(id int) string {",
 		"set_find", // wasmimport directive
 		"validate", // wasmimport directive
 		"iter.Seq[SetMatch]",
@@ -910,7 +910,7 @@ func TestGenJSSetSection(t *testing.T) {
 		"probe_any",
 		"validate",
 		"scannerPatternCount",
-		"patternName",
+		"export function scannerPatternName(id) {",
 		"patternId",
 		"_exp",
 		// The live buffer, not the cached `_mem` view: a call into the module
@@ -936,7 +936,7 @@ func TestGenTSSetSection(t *testing.T) {
 		"probe_any",
 		"validate",
 		"scannerPatternCount",
-		"patternName",
+		"export function scannerPatternName(id: number): string {",
 		"_exp",
 		"(_exp.memory as WebAssembly.Memory).buffer",
 	}
@@ -961,7 +961,7 @@ func TestGenCStubFilesWithSets(t *testing.T) {
 	}
 	for _, s := range []string{
 		"rx_set_match_t", "set_find_init", "rx_scanner_scanner_t",
-		"SCANNER_PATTERN_COUNT", "validate", "probe_all", "pattern_name",
+		"SCANNER_PATTERN_COUNT", "validate", "probe_all", "const char *rx_scanner_pattern_name(int id)",
 	} {
 		if !strings.Contains(h, s) && !strings.Contains(c, s) {
 			t.Errorf("genCStubFilesWithSets: missing %q in output", s)
@@ -978,7 +978,7 @@ func TestGenASSetSection(t *testing.T) {
 		"class SetFindIter",
 		"probe_any",
 		"validate",
-		"patternName",
+		"export function scannerPatternName(id: i32): string {",
 	}
 	disallowed := []string{"Generator<", "function*", "yield"}
 	for _, s := range disallowed {
@@ -995,7 +995,7 @@ func TestGenASSetSection(t *testing.T) {
 
 func TestRustStub_WithSets(t *testing.T) {
 	cfg := setTestCfg()
-	inner, err := genRustStubsInner(cfg.Regexps, cfg.ImportModule)
+	inner, err := genRustStubsInner(cfg.Patterns, cfg.ImportModule)
 	if err != nil {
 		t.Fatalf("genRustStubsInner: %v", err)
 	}
@@ -1010,7 +1010,7 @@ func TestRustStub_WithSets(t *testing.T) {
 }
 
 func TestSetSection_NoSets_Empty(t *testing.T) {
-	cfg := config.BuildConfig{ImportModule: "m", Regexps: []config.RegexEntry{{Pattern: `foo`}}}
+	cfg := config.BuildConfig{ImportModule: "m", Patterns: []config.PatternEntry{{Regexp: `foo`}}}
 	if s := genRustSetInner(cfg); s != "" {
 		t.Errorf("genRustSetInner with no sets: got non-empty %q", s)
 	}
@@ -1031,7 +1031,7 @@ func TestSetSection_NoSets_Empty(t *testing.T) {
 func TestSetSection_FindOnly(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
-		Regexps:      []config.RegexEntry{{Pattern: `foo`}},
+		Patterns:     []config.PatternEntry{{Regexp: `foo`}},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1050,10 +1050,10 @@ func TestSetSection_FindOnly(t *testing.T) {
 
 func TestPatternsInSet_Names(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "a", Pattern: "a"},
-			{Name: "b", Pattern: "b"},
-			{Name: "c", Pattern: "c"},
+		Patterns: []config.PatternEntry{
+			{Name: "a", Regexp: "a"},
+			{Name: "b", Regexp: "b"},
+			{Name: "c", Regexp: "c"},
 		},
 	}
 	s := config.SetConfig{
@@ -1068,6 +1068,17 @@ func TestCmdGenerateStub_ResolveError(t *testing.T) {
 	cfg := config.BuildConfig{StubType: "bogus"}
 	if err := CmdGenerateStub(cfg, "-"); err == nil {
 		t.Fatal("CmdGenerateStub(bogus stub_type): expected error, got nil")
+	}
+}
+
+// TestCmdGenerateStub_GroupsWithoutCaptures: the stub of a groups_func on a
+// pattern with no capture group would call an export the module does not have,
+// so generate refuses it, as compile does.
+func TestCmdGenerateStub_GroupsWithoutCaptures(t *testing.T) {
+	cfg := config.BuildConfig{StubType: "js", Patterns: []config.PatternEntry{{Regexp: `a*`, GroupsFunc: "g"}}}
+	err := CmdGenerateStub(cfg, "-")
+	if err == nil || !strings.Contains(err.Error(), config.NoCaptureGroupProblem) {
+		t.Fatalf("CmdGenerateStub(groups_func on a*) = %v, want the no-capture-group refusal", err)
 	}
 }
 
@@ -1121,10 +1132,10 @@ func TestSetAllDecodesOverIDSpace(t *testing.T) {
 	// either bit.
 	cfg := config.BuildConfig{
 		ImportModule: "mymod",
-		Regexps: []config.RegexEntry{
-			{Name: "p0", Pattern: "a"}, {Name: "p1", Pattern: "b"},
-			{Name: "p2", Pattern: "c"}, {Name: "p3", Pattern: "d"},
-			{Name: "p4", Pattern: "e"}, {Name: "p5", Pattern: "f"},
+		Patterns: []config.PatternEntry{
+			{Name: "p0", Regexp: "a"}, {Name: "p1", Regexp: "b"},
+			{Name: "p2", Regexp: "c"}, {Name: "p3", Regexp: "d"},
+			{Name: "p4", Regexp: "e"}, {Name: "p5", Regexp: "f"},
 		},
 		Sets: []config.SetConfig{{
 			Name:     "scanner",
@@ -1224,8 +1235,8 @@ func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 		{"c", hStub + cStub},
 	} {
 		names := config.SetDerivedNamesForValidation(set, lang.name)
-		if len(names) != 3 {
-			t.Errorf("%s: reserved %d names, want 3 (pattern count, id space, batch size limit)", lang.name, len(names))
+		if len(names) != 4 {
+			t.Errorf("%s: reserved %d names, want 4 (pattern count, id space, batch size limit, name lookup)", lang.name, len(names))
 		}
 		for _, n := range names {
 			// The batch-size limit is reserved in every language but EMITTED
@@ -1310,13 +1321,13 @@ func TestSetBatchSizeAbsentWithoutHint(t *testing.T) {
 // budget: 300 patterns is 300*12 + 300*4 = 4,800 bytes of inline arrays.
 func bigSetCfg(t *testing.T, n int) config.BuildConfig {
 	t.Helper()
-	regexps := make([]config.RegexEntry, n)
+	regexps := make([]config.PatternEntry, n)
 	for i := range regexps {
-		regexps[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: fmt.Sprintf(`kw%d\d+`, i)}
+		regexps[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: fmt.Sprintf(`kw%d\d+`, i)}
 	}
 	return config.BuildConfig{
 		ImportModule: "mymod",
-		Regexps:      regexps,
+		Patterns:     regexps,
 		Sets: []config.SetConfig{{
 			Name:     "scanner",
 			Find:     "set_find",
@@ -1468,25 +1479,30 @@ func TestNamespacePrefixesOnlySharedSymbols(t *testing.T) {
 		ImportModule: "demo",
 		Namespace:    "acme",
 		StubFile:     "stubs.go",
-		Regexps: []config.RegexEntry{
-			{Name: "u", Pattern: `(?P<host>[a-z.]+)`, GroupsFunc: "url_groups"},
+		Patterns: []config.PatternEntry{
+			{Name: "u", Regexp: `(?P<host>[a-z.]+)`, GroupsFunc: "url_groups"},
 		},
 		Sets: []config.SetConfig{
 			{Name: "sec", Find: "scan_secrets", Patterns: config.PatternSelector{All: true}, EmitNameMap: true},
 		},
 	}
 	body, needsIter := genGoSetBody(cfg, newSetShapes(cfg))
-	single, _, err := genGoStubsBody(cfg.Regexps, cfg.ImportModule)
+	single, _, err := genGoStubsBody(cfg.Patterns, cfg.ImportModule)
 	if err != nil {
 		t.Fatalf("genGoStubsBody: %v", err)
 	}
 	_ = needsIter
 	out := applyNamespace(cfg, "go", goErrorPreamble(cfg, true)+single+body)
 
-	for _, want := range []string{"acme_Span", "acme_ErrBacktrackOverflow", "acme_SetMatch", "acme_PatternName"} {
+	for _, want := range []string{"acme_Span", "acme_ErrBacktrackOverflow", "acme_SetMatch"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("namespace: missing %q", want)
 		}
+	}
+	// The set's name lookup is named from the SET, like its constants, and
+	// is not prefixed: two stubs sharing a package need distinct set names.
+	if !strings.Contains(out, "func SecPatternName(") || strings.Contains(out, "acme_SecPatternName") {
+		t.Errorf("namespace: the set's lookup should be SecPatternName, unprefixed")
 	}
 	// The user's own names, and anything derived from them, are untouched.
 	for _, keep := range []string{"url_groups", "scan_secrets", "url_groups_host", "url_groups_index"} {
@@ -1665,16 +1681,16 @@ func TestDerivedFuncName(t *testing.T) {
 // describe, and the next call would restart in the wrong place.
 func TestDefaultBatchCapBounds(t *testing.T) {
 	mk := func(n int) (config.SetConfig, config.BuildConfig) {
-		entries := make([]config.RegexEntry, n)
+		entries := make([]config.PatternEntry, n)
 		for i := range entries {
-			entries[i] = config.RegexEntry{
-				Name: string(rune('a'+i%26)) + string(rune('0'+i/26)), Pattern: `x`,
+			entries[i] = config.PatternEntry{
+				Name: string(rune('a'+i%26)) + string(rune('0'+i/26)), Regexp: `x`,
 			}
 		}
 		s := config.SetConfig{
 			Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
 		}
-		return s, config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{s}}
+		return s, config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{s}}
 	}
 	t.Run("small sets take the floor", func(t *testing.T) {
 		s, cfg := mk(3)
@@ -1861,7 +1877,7 @@ func TestMustCapByKindPanicsOnDisagreement(t *testing.T) {
 		Patterns: config.PatternSelector{All: true},
 		Find:     "s_find",
 	}
-	capCfg := config.BuildConfig{Regexps: []config.RegexEntry{{Pattern: "a"}}}
+	capCfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: "a"}}}
 	caps := setCapabilities(capSet, capCfg, wideAllForm(capSet, capCfg))
 
 	if got := mustCapByKind(caps, "find", "C"); got == nil || got.Export != "s_find" {
@@ -1891,7 +1907,7 @@ func TestMustCapByKindPanicsOnDisagreement(t *testing.T) {
 func TestGenerateStubRejectsUnknownType(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
-		Regexps:      []config.RegexEntry{{Pattern: "a", MatchFunc: "a_match"}},
+		Patterns:     []config.PatternEntry{{Regexp: "a", MatchFunc: "a_match"}},
 	}
 	err := generateStub(cfg, "kotlin", filepath.Join(t.TempDir(), "stub.kt"))
 	if err == nil {
@@ -1916,7 +1932,7 @@ func TestCmdGenerateStubDispatchesEveryResolvableType(t *testing.T) {
 				StubType:     tc.stubType,
 				Output:       "merged.wasm",
 				WasmFile:     "m.wasm",
-				Regexps:      []config.RegexEntry{{Pattern: "a", MatchFunc: "a_match"}},
+				Patterns:     []config.PatternEntry{{Regexp: "a", MatchFunc: "a_match"}},
 			}
 			if tc.stubType == "wit" {
 				cfg.WasmFormat = "component"
@@ -1963,7 +1979,7 @@ func TestDefaultBatchCapClampsToCursorCount(t *testing.T) {
 func TestGenGoSetSectionWithoutIter(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "m",
-		Regexps:      []config.RegexEntry{{Name: "a", Pattern: "[a-z]+"}, {Name: "b", Pattern: "[0-9]+"}},
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: "[a-z]+"}, {Name: "b", Regexp: "[0-9]+"}},
 		Sets: []config.SetConfig{{
 			Name:     "s",
 			Patterns: config.PatternSelector{All: true},
@@ -1991,14 +2007,14 @@ func TestGenGoSetSectionWithoutIter(t *testing.T) {
 // wrapper: entries with no _func fields produce no stub at all, and a file
 // holding only a package clause is worse than no file.
 func TestGenGoStubFileEmpty(t *testing.T) {
-	got, err := genGoStubFile([]config.RegexEntry{{Pattern: "[a-z]+"}}, "m", "m")
+	got, err := genGoStubFile([]config.PatternEntry{{Regexp: "[a-z]+"}}, "m", "m")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "" {
 		t.Errorf("genGoStubFile for a func-less entry = %q, want empty", got)
 	}
-	if _, err := genGoStubFile([]config.RegexEntry{{Pattern: "(", GroupsFunc: "g"}}, "m", "m"); err == nil {
+	if _, err := genGoStubFile([]config.PatternEntry{{Regexp: "(", GroupsFunc: "g"}}, "m", "m"); err == nil {
 		t.Error("genGoStubFile on an unparseable pattern succeeded")
 	}
 }
@@ -2118,7 +2134,7 @@ func TestComponentStubsRejectUnparseablePattern(t *testing.T) {
 		WasmFormat:   "component",
 		ImportModule: "m",
 		WasmFile:     "m.wasm",
-		Regexps:      []config.RegexEntry{{Pattern: "(?P<a>", GroupsFunc: "g"}},
+		Patterns:     []config.PatternEntry{{Regexp: "(?P<a>", GroupsFunc: "g"}},
 	}
 	if _, _, err := genCComponentStubFiles(cfg, "stub.h"); err == nil {
 		t.Error("genCComponentStubFiles accepted an unparseable pattern")
@@ -2144,8 +2160,8 @@ func errCfg(stubFile string) config.BuildConfig {
 	return config.BuildConfig{
 		ImportModule: "demo",
 		StubFile:     stubFile,
-		Regexps: []config.RegexEntry{
-			{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
+		Patterns: []config.PatternEntry{
+			{Name: "p", Regexp: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
 		},
 		Sets: []config.SetConfig{{
 			Name: "s", Find: "s_find", Patterns: config.PatternSelector{All: true},
@@ -2278,9 +2294,9 @@ func noFuncCfg(stubFile string) config.BuildConfig {
 	return config.BuildConfig{
 		ImportModule: "demo",
 		StubFile:     stubFile,
-		Regexps: []config.RegexEntry{
-			{Name: "a", Pattern: `[a-z]+`},
-			{Name: "b", Pattern: `[0-9]+`},
+		Patterns: []config.PatternEntry{
+			{Name: "a", Regexp: `[a-z]+`},
+			{Name: "b", Regexp: `[0-9]+`},
 		},
 	}
 }
@@ -2351,8 +2367,8 @@ func TestStubWritersToStdout(t *testing.T) {
 			ImportModule: "demo",
 			StubFile:     "stub." + stubType,
 			StubType:     stubType,
-			Regexps: []config.RegexEntry{
-				{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
+			Patterns: []config.PatternEntry{
+				{Name: "p", Regexp: `[a-z]+`, MatchFunc: "p_match", FindFunc: "p_find"},
 			},
 		}
 	}
@@ -2416,8 +2432,8 @@ func TestCmdGenerateStubUnknownType(t *testing.T) {
 	cfg := config.BuildConfig{
 		ImportModule: "demo",
 		StubFile:     filepath.Join(t.TempDir(), "stub.xyz"),
-		Regexps: []config.RegexEntry{
-			{Name: "p", Pattern: `[a-z]+`, MatchFunc: "p_match"},
+		Patterns: []config.PatternEntry{
+			{Name: "p", Regexp: `[a-z]+`, MatchFunc: "p_match"},
 		},
 	}
 	err := CmdGenerateStub(cfg, cfg.StubFile)
@@ -2449,12 +2465,12 @@ func badPatternCfg(stubType, out string) config.BuildConfig {
 		ImportModule: "demo",
 		StubFile:     out,
 		StubType:     stubType,
-		Regexps: []config.RegexEntry{
+		Patterns: []config.PatternEntry{
 			// A valid entry first, so the failure happens PART WAY through
 			// the loop rather than on its first iteration — the shape that
 			// would otherwise let a generator emit a partial file.
-			{Name: "ok", Pattern: `[a-z]+`, GroupsFunc: "ok_groups"},
-			{Name: "bad", Pattern: `([a-z]+`, GroupsFunc: "bad_groups"},
+			{Name: "ok", Regexp: `([a-z]+)`, GroupsFunc: "ok_groups"},
+			{Name: "bad", Regexp: `([a-z]+`, GroupsFunc: "bad_groups"},
 		},
 	}
 }
@@ -2561,8 +2577,8 @@ func writeGoStubInner(t *testing.T, dirName, importModule, matchFunc, setFind st
 	cfg := config.BuildConfig{
 		ImportModule: importModule,
 		StubFile:     out,
-		Regexps: []config.RegexEntry{
-			{Name: "p", Pattern: `[a-z]+`, MatchFunc: matchFunc},
+		Patterns: []config.PatternEntry{
+			{Name: "p", Regexp: `[a-z]+`, MatchFunc: matchFunc},
 		},
 	}
 	if setFind != "" {
@@ -2725,8 +2741,8 @@ type stubShape struct {
 	wantAll []string
 }
 
-func entry(name, pattern string, match, find, groups bool) config.RegexEntry {
-	e := config.RegexEntry{Name: name, Pattern: pattern}
+func entry(name, pattern string, match, find, groups bool) config.PatternEntry {
+	e := config.PatternEntry{Name: name, Regexp: pattern}
 	if match {
 		e.MatchFunc = name + "_match"
 	}
@@ -2739,31 +2755,31 @@ func entry(name, pattern string, match, find, groups bool) config.RegexEntry {
 	return e
 }
 
-func manyEntries(n int) []config.RegexEntry {
-	out := make([]config.RegexEntry, n)
+func manyEntries(n int) []config.PatternEntry {
+	out := make([]config.PatternEntry, n)
 	for i := range out {
-		out[i] = config.RegexEntry{
-			Name: fmt.Sprintf("p%02d", i), Pattern: fmt.Sprintf("lit%02d[a-z]+", i),
+		out[i] = config.PatternEntry{
+			Name: fmt.Sprintf("p%02d", i), Regexp: fmt.Sprintf("lit%02d[a-z]+", i),
 		}
 	}
 	return out
 }
 
 func stubShapes() []stubShape {
-	base := []config.RegexEntry{
+	base := []config.PatternEntry{
 		entry("url", `(?P<scheme>https?)://(?P<host>[a-z.]+)/`, true, true, true),
 		entry("num", `[0-9]+`, true, true, false),
 	}
 	return []stubShape{
 		{
 			name: "patterns-only", selects: "a config with NO sets: the single-pattern arms alone",
-			cfg:     config.BuildConfig{ImportModule: "demo", Regexps: base},
+			cfg:     config.BuildConfig{ImportModule: "demo", Patterns: base},
 			wantAll: []string{"url_match", "url_find", "url_groups", "num_match"},
 		},
 		{
 			name: "find-only-set", selects: "a set declaring only `find`",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "scan_all", Patterns: config.PatternSelector{All: true},
 				}},
@@ -2773,7 +2789,7 @@ func stubShapes() []stubShape {
 		{
 			name: "anchored-only-set", selects: "a set with only the anchored pair, and hence no find machinery",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", MatchAny: "which", MatchAll: "all_kinds",
 					Patterns: config.PatternSelector{All: true},
@@ -2784,7 +2800,7 @@ func stubShapes() []stubShape {
 		{
 			name: "scan-only-set", selects: "a set with only the scan pair",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", ScanAny: "first_hit", ScanAll: "every_hit",
 					Patterns: config.PatternSelector{All: true},
@@ -2795,7 +2811,7 @@ func stubShapes() []stubShape {
 		{
 			name: "overlapping-batch-set", selects: "`overlapping: true` plus `hints: [batch-find]` — the answer-cache shape",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "scan_overlapping",
 					Patterns:    config.PatternSelector{All: true},
@@ -2807,7 +2823,7 @@ func stubShapes() []stubShape {
 		{
 			name: "wide-all-set", selects: "the WIDE `_all` form: past 64 ids the bitmask becomes a memory bitmap",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: manyEntries(70),
+				ImportModule: "demo", Patterns: manyEntries(70),
 				Sets: []config.SetConfig{{
 					Name: "s", MatchAll: "wide_all", ScanAll: "wide_scan_all",
 					Find: "wide_find", Patterns: config.PatternSelector{All: true},
@@ -2818,7 +2834,7 @@ func stubShapes() []stubShape {
 		{
 			name: "named-subset-set", selects: "ID_SPACE > PATTERN_COUNT, which sizes the gate array and the bitmap",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: manyEntries(20),
+				ImportModule: "demo", Patterns: manyEntries(20),
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "subset_find", MatchAll: "subset_all",
 					Patterns: config.PatternSelector{Names: []string{"p00", "p19"}},
@@ -2829,7 +2845,7 @@ func stubShapes() []stubShape {
 		{
 			name: "two-sets", selects: "several sets in one config, whose derived constants must not collide",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{
 					{Name: "alpha", Find: "alpha_find", Patterns: config.PatternSelector{All: true}},
 					{Name: "beta", MatchAny: "beta_any", Patterns: config.PatternSelector{All: true}},
@@ -2840,7 +2856,7 @@ func stubShapes() []stubShape {
 		{
 			name: "name-map", selects: "emit_name_map, which adds the pattern-name helper",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Regexps: base,
+				ImportModule: "demo", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "named_find", EmitNameMap: true,
 					Patterns: config.PatternSelector{All: true},
@@ -2851,7 +2867,7 @@ func stubShapes() []stubShape {
 		{
 			name: "namespace", selects: "the optional namespace, which prefixes symbols with no user name to inherit",
 			cfg: config.BuildConfig{
-				ImportModule: "demo", Namespace: "rx2", Regexps: base,
+				ImportModule: "demo", Namespace: "rx2", Patterns: base,
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "ns_find", Patterns: config.PatternSelector{All: true},
 				}},

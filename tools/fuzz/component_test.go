@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -205,10 +206,10 @@ const narrowSetCfg = `
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: 'ghp_[A-Za-z0-9]{4}'
-  - pattern: 'AKIA[A-Z0-9]{6}'
-  - pattern: '[0-9]{3}-[0-9]{2}'
+patterns:
+  - regexp: 'ghp_[A-Za-z0-9]{4}'
+  - regexp: 'AKIA[A-Z0-9]{6}'
+  - regexp: '[0-9]{3}-[0-9]{2}'
 sets:
   - name: s
     patterns: all
@@ -345,9 +346,9 @@ func TestComponentSetScannerReclaimsItsState(t *testing.T) {
 // reused memory and the body only ORs, so a stale bitmap reports ids from an
 // earlier call. The loop below alternates answers for exactly that reason.
 func TestComponentSetWideAll(t *testing.T) {
-	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n"
+	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n"
 	for i := 0; i < 70; i++ {
-		cfg += fmt.Sprintf("  - pattern: 'kw%03d[a-z]{2}'\n", i)
+		cfg += fmt.Sprintf("  - regexp: 'kw%03d[a-z]{2}'\n", i)
 	}
 	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n    find: scan_it\n"
 	h := newSetHarness(t, cfg)
@@ -394,9 +395,9 @@ func TestComponentSetWideAll(t *testing.T) {
 // return the sentinel at all, and the adapter used to turn this mask into
 // err(backtrack-overflow).
 func TestComponentNarrowAllReportsBit63(t *testing.T) {
-	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n  - pattern: 'zzz'\n"
+	cfg := "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n  - regexp: 'zzz'\n"
 	for i := 1; i < 64; i++ {
-		cfg += fmt.Sprintf("  - pattern: 'a{1,%d}'\n", i)
+		cfg += fmt.Sprintf("  - regexp: 'a{1,%d}'\n", i)
 	}
 	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n"
 	h := newSetHarness(t, cfg)
@@ -422,8 +423,8 @@ func TestComponentNarrowAllReportsBit63(t *testing.T) {
 	}
 
 	// And the ordinary case beside it: one pattern of two matching, mask 2.
-	h2 := newSetHarness(t, "\nwasm_format: component\nwit_package: t\nimport_module: t\nregexps:\n"+
-		"  - pattern: 'zzz'\n  - pattern: 'a'\nsets:\n  - name: s\n    patterns: all\n"+
+	h2 := newSetHarness(t, "\nwasm_format: component\nwit_package: t\nimport_module: t\npatterns:\n"+
+		"  - regexp: 'zzz'\n  - regexp: 'a'\nsets:\n  - name: s\n    patterns: all\n"+
 		"    match_all: all_matches\n    scan_all: all_hits\n")
 	p2, n2 := h2.writeInput("a")
 	if got, errored := h2.list(h2.call(h2.pkg+"#all-matches", p2, n2)); errored || fmt.Sprint(got) != "[1]" {
@@ -466,7 +467,7 @@ type allocHarness struct {
 
 func newAllocHarness(t *testing.T) *allocHarness {
 	t.Helper()
-	entries := []config.RegexEntry{{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"}}
+	entries := []config.PatternEntry{{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"}}
 	core, _, err := compile.Compile(entries, 0, true, compile.CompileOptions{
 		Component:            true,
 		ComponentPackage:     "regexped:t/matcher",
@@ -693,9 +694,9 @@ func TestCabiReallocTrapsWhenTheCarveWrapsTheAddressSpace(t *testing.T) {
 
 // componentWasm compiles entries as a component core module and returns the
 // bytes plus the canonical export name for each configured func name.
-func componentWasm(t *testing.T, entries []config.RegexEntry, opts compile.CompileOptions) ([]byte, map[string]string, map[string]generate.PatternResourceNames) {
+func componentWasm(t *testing.T, entries []config.PatternEntry, opts compile.CompileOptions) ([]byte, map[string]string, map[string]generate.PatternResourceNames) {
 	t.Helper()
-	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Regexps: entries}
+	cfg := config.BuildConfig{WasmFormat: "component", ImportModule: "regexps", Patterns: entries}
 	_, names, resources, _, prefix, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
 		t.Fatalf("component artifacts: %v", err)
@@ -730,10 +731,10 @@ type adapterResult struct {
 }
 
 func TestComponentAdaptersOverTheRealABI(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Pattern: `[a-z]+`, MatchFunc: "m"},
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
-		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
+	entries := []config.PatternEntry{
+		{Regexp: `[a-z]+`, MatchFunc: "m"},
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
 	}
 	w, names, res := componentWasm(t, entries, compile.CompileOptions{})
 	// instantiateCore, not instantiate: every find and groups resource imports a
@@ -925,6 +926,267 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 	})
 }
 
+// TestUnicodeModeOutputKinds drives one Unicode-mode config through each
+// output kind — a standalone module, an EMBEDDED one reading its input from a
+// host's memory, and a component's core module through its find and groups
+// RESOURCES — over input mixing 1- to 4-byte characters and invalid UTF-8
+// (characterRunInputs). The three must answer alike, and the finds and groups
+// as Go does over the patterns without U+FFFD (noReplacement), which makes an
+// invalid byte match nothing, as Unicode mode does. The patterns reach the
+// Unicode-mode paths a kind could treat differently: the character-run skip in
+// a find and in a TDFA capture body, Backtracking over a lowered class, and a
+// one-byte literal behind a class common only for its characters above 0x7F.
+func TestUnicodeModeOutputKinds(t *testing.T) {
+	entries := []config.PatternEntry{
+		{Regexp: `[^,]+,`, FindFunc: "f1"},
+		{Regexp: `\p{Cyrillic}+@\pL+`, FindFunc: "f2"},
+		{Regexp: `<([^>]+)>(x)`, GroupsFunc: "g1"},
+		{Regexp: `(\pL+?)(\pL*)`, GroupsFunc: "g2"},
+		{Regexp: `(.+)=(.+)`, GroupsFunc: "g3"},
+		{Regexp: `\pL+`, MatchFunc: "m"},
+	}
+	opts := compile.CompileOptions{Unicode: true}
+	inputs := characterRunInputs()
+	inputs = append(inputs, "<ключ>x <東京>x <a\xffb>x", "имя@домен, ж@ю\xff@я", "Straße 42, 日本語,\xe2\x82,")
+
+	// The kinds' answers, per input: every find match and every groups record
+	// of each export, and the match export's answer.
+	type answers struct {
+		finds  map[string][][2]int
+		groups map[string][][]int
+		match  int64
+	}
+	newAnswers := func() answers {
+		return answers{finds: map[string][][2]int{}, groups: map[string][][]int{}}
+	}
+
+	// rawDrive answers through the raw exports, as a module stub drives them:
+	// the input at in, the slots at out, both in mem.
+	rawDrive := func(t *testing.T, store *wasmtime.Store, inst *wasmtime.Instance, mem *wasmtime.Memory, in, out int32, input string) answers {
+		t.Helper()
+		a := newAnswers()
+		copy(mem.UnsafeData(store)[in:], input)
+		call := func(name string, args ...any) any {
+			t.Helper()
+			r, err := inst.GetFunc(store, name).Call(store, args...)
+			if err != nil {
+				t.Fatalf("%s over %q: %v", name, input, err)
+			}
+			return r
+		}
+		for _, f := range []string{"f1", "f2"} {
+			var got [][2]int
+			pos, prevEnd := 0, -1
+			for pos <= len(input) {
+				r := call(f, in, int32(len(input)), int32(pos)).(int64)
+				if r < 0 {
+					if r != -1 {
+						t.Fatalf("%s over %q from %d: %d", f, input, pos, r)
+					}
+					break
+				}
+				start, end := int(r>>32), int(uint32(r))
+				if start != end || start != prevEnd {
+					got = append(got, [2]int{start, end})
+				}
+				prevEnd = end
+				pos = max(end, pos+1)
+				if end > start {
+					pos = end
+				}
+			}
+			a.finds[f] = got
+		}
+		for g, n := range map[string]int{"g1": 3, "g2": 3, "g3": 3} {
+			var got [][]int
+			pos, prevEnd := 0, -1
+			for pos <= len(input) {
+				r := call(g, in, int32(len(input)), out, int32(pos)).(int32)
+				if r < 0 {
+					if r != -1 {
+						t.Fatalf("%s over %q from %d: %d", g, input, pos, r)
+					}
+					break
+				}
+				buf := mem.UnsafeData(store)
+				m := make([]int, 2*n)
+				for i := range m {
+					m[i] = int(int32(binary.LittleEndian.Uint32(buf[int(out)+4*i:])))
+				}
+				if m[0] != m[1] || m[0] != prevEnd {
+					got = append(got, m)
+				}
+				prevEnd = m[1]
+				if m[1] > m[0] {
+					pos = m[1]
+				} else {
+					pos = m[0] + 1
+				}
+			}
+			a.groups[g] = got
+		}
+		a.match = int64(call("m", in, int32(len(input))).(int32))
+		return a
+	}
+
+	// The standalone module.
+	standalone, _, err := compile.Compile(entries, pathsTableBase, true, opts)
+	if err != nil {
+		t.Fatalf("compile standalone: %v", err)
+	}
+	// The embedded one: its tables in its own memory, its input in the host's.
+	embedded, _, err := compile.Compile(entries, 0, false, opts)
+	if err != nil {
+		t.Fatalf("compile embedded: %v", err)
+	}
+	engine, _ := sharedEngine()
+	embMod, err := wasmtime.NewModule(engine, embedded)
+	if err != nil {
+		t.Fatalf("embedded module: %v", err)
+	}
+	defer embMod.Close()
+	// The component's core module, driven through its resources.
+	core, names, res := componentWasm(t, entries, opts)
+	cStore, cInst, cMem := instantiateCore(t, core)
+	cCall := func(name string, args ...any) uint32 {
+		t.Helper()
+		r, err := cInst.GetFunc(cStore, name).Call(cStore, args...)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return uint32(r.(int32))
+	}
+	drop := func(name string, h int32) { // a destructor returns nothing
+		t.Helper()
+		if _, err := cInst.GetFunc(cStore, name).Call(cStore, h); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	u32 := func(addr uint32) uint32 { return binary.LittleEndian.Uint32(cMem.UnsafeData(cStore)[addr:]) }
+	componentDrive := func(t *testing.T, input string) answers {
+		t.Helper()
+		a := newAnswers()
+		load := func() { copy(cMem.UnsafeData(cStore)[pathsInputBase:], input) }
+		for _, f := range []string{"f1", "f2"} {
+			load()
+			h := int32(cCall(res[f].Constructor, int32(pathsInputBase), int32(len(input)), int32(0)))
+			var got [][2]int
+			prevEnd := -1
+			for {
+				ret := cCall(res[f].Next, h)
+				b := cMem.UnsafeData(cStore)
+				if b[ret] == 1 {
+					t.Fatalf("%s over %q: next answered an error", f, input)
+				}
+				if b[ret+4] != 1 {
+					break
+				}
+				start, end := int(u32(ret+8)), int(u32(ret+12))
+				if start != end || start != prevEnd {
+					got = append(got, [2]int{start, end})
+				}
+				prevEnd = end
+			}
+			drop(res[f].Dtor, h)
+			a.finds[f] = got
+		}
+		for _, g := range []string{"g1", "g2", "g3"} {
+			load()
+			h := int32(cCall(res[g].Constructor, int32(pathsInputBase), int32(len(input)), int32(0)))
+			var got [][]int
+			prevEnd := -1
+			for {
+				ret := cCall(res[g].Next, h)
+				b := cMem.UnsafeData(cStore)
+				if b[ret] == 1 {
+					t.Fatalf("%s over %q: next answered an error", g, input)
+				}
+				ptr, n := u32(ret+4), u32(ret+8)
+				if n == 0 {
+					break
+				}
+				m := make([]int, 2*n)
+				for i := uint32(0); i < n; i++ {
+					e := ptr + 12*i
+					if b[e] == 1 {
+						m[2*i], m[2*i+1] = int(u32(e+4)), int(u32(e+8))
+					} else {
+						m[2*i], m[2*i+1] = -1, -1
+					}
+				}
+				if m[0] != m[1] || m[0] != prevEnd {
+					got = append(got, m)
+				}
+				prevEnd = m[1]
+			}
+			drop(res[g].Dtor, h)
+			a.groups[g] = got
+		}
+		load()
+		ret := cCall(names["m"], int32(pathsInputBase), int32(len(input)))
+		b := cMem.UnsafeData(cStore)
+		a.match = -1
+		if b[ret+4] == 1 {
+			a.match = int64(u32(ret + 8))
+		}
+		return a
+	}
+
+	oracle := map[string]*regexp.Regexp{}
+	for _, e := range entries {
+		oracle[e.FindFunc+e.GroupsFunc] = regexp.MustCompile(noReplacement(t, e.Regexp))
+	}
+	for _, input := range inputs {
+		store, inst, mem, release, err := instantiate(standalone)
+		if err != nil {
+			t.Fatalf("instantiate standalone: %v", err)
+		}
+		if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+			t.Fatal(err)
+		}
+		want := rawDrive(t, store, inst, mem, pathsInputBase, pathsOutBase, input)
+		release()
+
+		eStore := wasmtime.NewStore(engine)
+		eStore.SetEpochDeadline(1 << 40)
+		mt, err := wasmtime.NewMemoryType(4, false, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, err := wasmtime.NewMemory(eStore, mt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		eInst, err := wasmtime.NewInstance(eStore, embMod, []wasmtime.AsExtern{host})
+		if err != nil {
+			t.Fatalf("instantiate embedded: %v", err)
+		}
+		emb := rawDrive(t, eStore, eInst, host, 0, 128*1024, input)
+		eStore.Close()
+		comp := componentDrive(t, input)
+
+		for kind, got := range map[string]answers{"embedded": emb, "component": comp} {
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s over %q answers %v, the standalone module %v", kind, input, got, want)
+			}
+		}
+		for _, f := range []string{"f1", "f2"} {
+			var goAll [][2]int
+			for _, m := range oracle[f].FindAllStringIndex(input, -1) {
+				goAll = append(goAll, [2]int{m[0], m[1]})
+			}
+			if fmt.Sprint(want.finds[f]) != fmt.Sprint(goAll) {
+				t.Errorf("%s over %q: %v, Go without U+FFFD %v", f, input, want.finds[f], goAll)
+			}
+		}
+		for _, g := range []string{"g1", "g2", "g3"} {
+			if fmt.Sprint(want.groups[g]) != fmt.Sprint(oracle[g].FindAllStringSubmatchIndex(input, -1)) {
+				t.Errorf("%s over %q: %v, Go without U+FFFD %v", g, input, want.groups[g], oracle[g].FindAllStringSubmatchIndex(input, -1))
+			}
+		}
+	}
+}
+
 // The -2 sentinel means the answer is UNKNOWN, and must lift to
 // err(backtrack-overflow) rather than to a definite ok(none). Reaching it needs
 // the same squeeze tools/fuzz uses elsewhere: Backtracking forced by a tiny
@@ -932,7 +1194,7 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 // pattern must have no zero-width cycle — such a program has no ordinary body
 // in any build, and only the ordinary body has a static ceiling to hit.
 func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
-	entries := []config.RegexEntry{{Pattern: btNoCapturePattern, FindFunc: "f"}}
+	entries := []config.PatternEntry{{Regexp: btNoCapturePattern, FindFunc: "f"}}
 	// BTWorkBudgetOff: with the budget on, a body past its static stack hands
 	// the call to its fallback, which sizes its memory from the input and
 	// answers — so -2 would need memory that cannot grow. Off, the body keeps
@@ -1148,10 +1410,10 @@ const overlapSetCfg = `
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: '[a-z]+'
-  - pattern: '[0-9]+'
-  - pattern: '[A-Z]+'
+patterns:
+  - regexp: '[a-z]+'
+  - regexp: '[0-9]+'
+  - regexp: '[A-Z]+'
 sets:
   - name: s
     patterns: all
@@ -1419,11 +1681,11 @@ func TestComponentScannerReportsOutOfOrder(t *testing.T) {
 const geometrySetCfg = `wasm_format: component
 import_module: t
 wit_package: t
-regexps:
+patterns:
   - name: p0
-    pattern: '[^\n]*[0-2]'
+    regexp: '[^\n]*[0-2]'
   - name: p1
-    pattern: '[^\n]*[3-5]'
+    regexp: '[^\n]*[3-5]'
 sets:
   - name: s
     patterns: all
@@ -1473,9 +1735,9 @@ func TestComponentWideOverlapCache(t *testing.T) {
 	for _, n := range []int{40, 70} {
 		pats := letterRuns(n)
 		var b strings.Builder
-		b.WriteString("wasm_format: component\nimport_module: t\nwit_package: t\nregexps:\n")
+		b.WriteString("wasm_format: component\nimport_module: t\nwit_package: t\npatterns:\n")
 		for i, p := range pats {
-			fmt.Fprintf(&b, "  - name: p%d\n    pattern: '%s'\n", i, p)
+			fmt.Fprintf(&b, "  - name: p%d\n    regexp: '%s'\n", i, p)
 		}
 		b.WriteString("sets:\n  - name: s\n    patterns: all\n    overlapping: true\n    find: scan_it\n")
 		var cfg config.BuildConfig
@@ -1549,10 +1811,10 @@ func TestComponentWideOverlapCache(t *testing.T) {
 // `[resource-new]` builtin stubbed by instantiateCore's identity function.
 
 // patternResourceHarness is setHarness pointed at the `matcher` interface.
-func newPatternResourceHarness(t *testing.T, entries []config.RegexEntry) (*setHarness, map[string]generate.PatternResourceNames) {
+func newPatternResourceHarness(t *testing.T, entries []config.PatternEntry) (*setHarness, map[string]generate.PatternResourceNames) {
 	t.Helper()
 	cfg := config.BuildConfig{
-		WasmFormat: "component", ImportModule: "t", WitPackage: "t", Regexps: entries,
+		WasmFormat: "component", ImportModule: "t", WitPackage: "t", Patterns: entries,
 	}
 	_, _, resources, _, _, err := generate.ComponentArtifactsWithSets(cfg)
 	if err != nil {
@@ -1582,9 +1844,9 @@ func (h *setHarness) spans(ret int32) (start, end uint32, some, errored bool) {
 // checks the positions AND the advance rule: every match is reported once, in
 // order, and a scan over an empty-matchable pattern terminates.
 func TestComponentPatternFindResource(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
-		{Pattern: `a*`, FindFunc: "empties"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Regexp: `a*`, FindFunc: "empties"},
 	})
 
 	drive := func(funcName, input string) [][2]uint32 {
@@ -1641,8 +1903,8 @@ func TestComponentPatternFindResource(t *testing.T) {
 // UNSET group — the element path a happy-path test never reaches — and the
 // empty list that means the scan is finished.
 func TestComponentPatternGroupsResource(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `(?P<opt>x)?y`, GroupsFunc: "g"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
 	})
 	n := res["g"]
 	if !n.Groups {
@@ -1703,8 +1965,8 @@ func TestComponentPatternGroupsResource(t *testing.T) {
 // pattern, interleaved, must not share a position — the property the resource
 // exists to provide and the one a module-level global would break.
 func TestComponentPatternScannersAreIndependent(t *testing.T) {
-	h, res := newPatternResourceHarness(t, []config.RegexEntry{
-		{Pattern: `[0-9]+`, FindFunc: "nums"},
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `[0-9]+`, FindFunc: "nums"},
 	})
 	n := res["nums"]
 	pa, la := h.writeInput("1 22 333")
@@ -1744,10 +2006,10 @@ func TestComponentSplitSet(t *testing.T) {
 wasm_format: component
 wit_package: t
 import_module: t
-regexps:
-  - pattern: '[a-z]+X'
-  - pattern: 'foo'
-  - pattern: '\bbar'
+patterns:
+  - regexp: '[a-z]+X'
+  - regexp: 'foo'
+  - regexp: '\bbar'
 sets:
   - name: s
     patterns: all
@@ -1847,7 +2109,7 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 	})
 
 	t.Run("pattern notes", func(t *testing.T) {
-		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\nregexps:\n  - name: ov\n    pattern: 'a*b|a'\n    find_func: ov_find\n", 2)
+		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\npatterns:\n  - name: ov\n    regexp: 'a*b|a'\n    find_func: ov_find\n", 2)
 		var cfg config.BuildConfig
 		if err := yaml.Unmarshal([]byte(yml), &cfg); err != nil {
 			t.Fatal(err)

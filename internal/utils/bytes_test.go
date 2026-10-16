@@ -324,6 +324,40 @@ func TestParseDataSection(t *testing.T) {
 	}
 }
 
+// TestDataSegmentBounds: the lowest offset and highest end over the active
+// segments, a passive one skipped, an offset that wrapped past 2 GiB read
+// negative, and malformed input reported rather than read.
+func TestDataSegmentBounds(t *testing.T) {
+	passive := []byte{1, 2, 0xAA, 0xBB} // kind 1: no offset, 2 bytes
+	sec := func(segs ...[]byte) []byte {
+		b := AppendULEB128(nil, uint32(len(segs)))
+		for _, s := range segs {
+			b = append(b, s...)
+		}
+		return b
+	}
+	for _, c := range []struct {
+		name      string
+		data      []byte
+		low, high int64
+	}{
+		{"no segments", sec(), 0, 0},
+		{"two active", sec(buildDataSegment(300, 10), buildDataSegment(100, 50)), 100, 310},
+		{"a passive one is skipped", sec(passive, buildDataSegment(64, 4)), 64, 68},
+		{"a wrapped offset", sec(buildDataSegment(1000, 8), buildDataSegment(-2147483648, 16)), -2147483648, 1008},
+	} {
+		low, high, err := DataSegmentBounds(c.data)
+		if err != nil || low != c.low || high != c.high {
+			t.Errorf("%s: (%d, %d, %v), want (%d, %d, nil)", c.name, low, high, err, c.low, c.high)
+		}
+	}
+	for _, bad := range [][]byte{nil, {1, 9}} { // no count; an unknown segment kind
+		if _, _, err := DataSegmentBounds(bad); err == nil {
+			t.Errorf("% x: no error", bad)
+		}
+	}
+}
+
 func TestParseDataSectionAllTypes(t *testing.T) {
 	// type 0 at offset 100, size 50 → end=150
 	var seg0 []byte

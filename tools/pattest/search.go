@@ -68,14 +68,3 @@ func (s *searchBlock) before(store *wasmtime.Store) {
 	}
 	_ = s.global.Set(store, wasmtime.ValI32(s.blocks.At))
 }
-
-// after runs after a call that reported a match: an armed search gets notes,
-// a tripped one its memo.
-func (s *searchBlock) after(store *wasmtime.Store) {
-	if s == nil {
-		return
-	}
-	if err := s.blocks.After(s.data(store)); err != nil {
-		panic(err)
-	}
-}

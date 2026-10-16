@@ -1,12 +1,16 @@
 # conflict_004: budget_overflow_states
 # Patterns with same literal "qux". The merged DFA exceeds the state count
 # budget.
+# The byte budget and the pre-filter follow the state budget unless set, so
+# both are set here: the fixture isolates the state budget.
 options:
   bitmask_width: 64
   budget_states: 1
+  budget_bytes: 1048576
+  budget_states_prefilter: 65536
 patterns:
-  - pattern: 'qux[a-z]+'
-  - pattern: 'qux[0-9]+'
+  - regexp: 'qux[a-z]+'
+  - regexp: 'qux[0-9]+'
 expect:
   bucket_count: 2
   conflict_reasons:

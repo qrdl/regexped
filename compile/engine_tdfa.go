@@ -3,6 +3,7 @@ package compile
 import (
 	"math/bits"
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -58,6 +59,9 @@ type tdfaTable struct {
 	// bulkSkip describes a single dominant self-loop state eligible for SIMD
 	// bulk-skip in the match body; nil when no qualifying state exists.
 	bulkSkip *tdfaBulkSkipInfo
+	// utf8Skip lists the states that loop on whole UTF-8 characters, which
+	// the match body crosses 16 bytes at a time; Unicode mode only.
+	utf8Skip []tdfaUTF8SkipInfo
 }
 
 // --------------------------------------------------------------------------
@@ -348,33 +352,54 @@ func tdfaEpsCapOps(prog *syntax.Prog, fromPC int, visited map[int]bool) (targetP
 // come back in leftmost-first order. newTDFA's transition construction uses it
 // to find capture ops through Alt loops.
 //
-// It exists as a WORKSPACE rather than a function because its two allocations
-// sat in the innermost loop of the construction — a fresh map[int]bool per
-// call, at one call per source thread per byte per state, and a new slice per
-// capture. One generation-stamped visited array and one reusable buffer per
-// construction replace both.
+// It answers from a MEMO of whole walks. find(from, target) is the path the
+// depth-first walk from `from` takes to its FIRST arrival at target, and that
+// is a function of the program and the two PCs alone — so one walk from
+// `from` that runs to completion, recording each PC's first arrival, answers
+// find(from, t) for every t: up to its first arrival at t, a walk looking for
+// t and the complete walk visit the same PCs in the same order. newTDFA asks
+// once per state, byte, successor thread and source thread, and a lowered
+// Unicode class is an alternation of hundreds of byte sequences
+// (`\pL`: 800 branches) that a per-target walk crossed on every one of those
+// questions — `(\pL+)\s(\pN+)` spent 80% of a 23 s TDFA construction there.
 type epsWalker struct {
 	prog *syntax.Prog
 	seen []uint32
 	gen  uint32
 	buf  []captureOp
+	memo map[int]*epsReach
+}
+
+// epsReach is one complete walk: every PC it reached, and the capture ops on
+// the path of the first arrival at each PC that has any.
+type epsReach struct {
+	reached []uint64
+	ops     map[int][]captureOp
 }
 
 func newEpsWalker(prog *syntax.Prog) *epsWalker {
-	return &epsWalker{prog: prog, seen: make([]uint32, len(prog.Inst))}
+	return &epsWalker{prog: prog, seen: make([]uint32, len(prog.Inst)), memo: make(map[int]*epsReach)}
 }
 
 // find reports whether targetPC is reachable from fromPC through epsilons, and
-// returns the capture ops on the path that reached it.
-//
-// The returned slice is the walker's OWN buffer and is only VALID UNTIL THE
-// NEXT CALL to find. Both callers in newTDFA consume it immediately — one
-// inside the `if` that tested `found`, the other before the `break` that ends
-// its loop — so nothing copies it. Copying here instead would put an
-// allocation per successful thread back into the innermost loop, which is the
-// cost this type exists to remove. A caller that needs to keep the ops past
-// its next find must copy them itself; tdfaEpsCapOpsTo does.
+// returns the capture ops on the path that reached it — nil when there are
+// none. The slice belongs to the memo: a caller must not modify it.
 func (w *epsWalker) find(fromPC, targetPC int) (bool, []captureOp) {
+	r, ok := w.memo[fromPC]
+	if !ok {
+		r = w.walkAll(fromPC)
+		w.memo[fromPC] = r
+	}
+	return r.has(targetPC), r.ops[targetPC]
+}
+
+func (r *epsReach) has(pc int) bool {
+	return pc >= 0 && pc>>6 < len(r.reached) && r.reached[pc>>6]&(1<<(pc&63)) != 0
+}
+
+// walkAll runs one complete walk from fromPC in a new generation of the
+// visited array.
+func (w *epsWalker) walkAll(fromPC int) *epsReach {
 	w.gen++
 	if w.gen == 0 {
 		for i := range w.seen {
@@ -382,44 +407,34 @@ func (w *epsWalker) find(fromPC, targetPC int) (bool, []captureOp) {
 		}
 		w.gen = 1
 	}
+	r := &epsReach{reached: make([]uint64, (len(w.prog.Inst)+63)/64), ops: make(map[int][]captureOp)}
 	w.buf = w.buf[:0]
-	if !w.walk(fromPC, targetPC) {
-		return false, nil
-	}
-	return true, w.buf
+	w.visit(fromPC, r)
+	return r
 }
 
-func (w *epsWalker) walk(fromPC, targetPC int) bool {
+func (w *epsWalker) visit(fromPC int, r *epsReach) {
 	// Iterative in the TAIL positions, and reading each instruction through a
-	// POINTER.
-	//
-	// Every arm but one recurses in tail position — Nop and EmptyWidth on Out,
-	// Capture on Out, Alt on Arg after its Out branch failed — so those become
-	// `fromPC = …; continue` and only Alt's FIRST branch is still a call. The
-	// buffer rollback survives the change: a recursive frame truncated to its
-	// own mark on failure, and since each frame's mark is at least the one
-	// below it, the net effect after the whole chain fails is a truncation to
-	// the OUTERMOST mark — which is what entryMark is.
-	//
-	// `inst := w.prog.Inst[fromPC]` copied a whole syntax.Inst (Op, Out, Arg
-	// and a Rune slice header) at every node, and was the single most
-	// expensive line in this function.
+	// POINTER: only Alt's FIRST branch is a call. The buffer holds the capture
+	// ops of the path being walked; every return truncates it to the length it
+	// had on entry, so after a branch returns it holds the ops of the path to
+	// the Alt again. `inst := w.prog.Inst[fromPC]` copied a whole syntax.Inst
+	// (Op, Out, Arg and a Rune slice header) at every node, and was once the
+	// single most expensive line of the per-target walk this replaced.
 	insts := w.prog.Inst
 	entryMark := len(w.buf)
 	for {
 		if fromPC < 0 || fromPC >= len(insts) || w.seen[fromPC] == w.gen {
 			w.buf = w.buf[:entryMark]
-			return false
-		}
-		if fromPC == targetPC {
-			return true
+			return
 		}
 		w.seen[fromPC] = w.gen
+		r.reached[fromPC>>6] |= 1 << (fromPC & 63)
+		if len(w.buf) > 0 {
+			r.ops[fromPC] = append([]captureOp(nil), w.buf...)
+		}
 		inst := &insts[fromPC]
 		switch inst.Op {
-		case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:
-			w.buf = w.buf[:entryMark]
-			return false
 		case syntax.InstCapture:
 			op := captureOp{open: inst.Arg&1 == 0, group: int(inst.Arg >> 1)}
 			w.buf = append(w.buf, op)
@@ -427,17 +442,44 @@ func (w *epsWalker) walk(fromPC, targetPC int) bool {
 		case syntax.InstNop, syntax.InstEmptyWidth:
 			fromPC = int(inst.Out)
 		case syntax.InstAlt, syntax.InstAltMatch:
-			mark := len(w.buf)
-			if w.walk(int(inst.Out), targetPC) {
-				return true
-			}
-			w.buf = w.buf[:mark]
+			w.visit(int(inst.Out), r)
 			fromPC = int(inst.Arg)
 		default:
+			// A consumer, Match or Fail: reached, and the end of the path.
 			w.buf = w.buf[:entryMark]
-			return false
+			return
 		}
 	}
+}
+
+// tdfaTransMemo is one state's answer for every byte whose input-map entry
+// (next, src) and word context equal these: the successor's id, -1 for none,
+// and its tag ops.
+type tdfaTransMemo struct {
+	word      bool
+	next, src []uint32
+	id        int
+	ops       []tdfaTagOp
+}
+
+// tdfaTransHash is FNV-1a over a byte's word context and input-map entry.
+func tdfaTransHash(word bool, next, src []uint32) uint64 {
+	h := uint64(14695981039346656037)
+	mix := func(v uint32) {
+		h ^= uint64(v)
+		h *= 1099511628211
+	}
+	if word {
+		mix(1)
+	}
+	for _, v := range next {
+		mix(v)
+	}
+	mix(^uint32(0))
+	for _, v := range src {
+		mix(v)
+	}
+	return h
 }
 
 // tdfaEpsCapOpsTo is a thin adapter over epsWalker, kept so the unit tests that
@@ -446,8 +488,8 @@ func (w *epsWalker) walk(fromPC, targetPC int) bool {
 // outside tests.
 //
 // `visited` is honoured: its PCs are pre-marked in the walker's generation
-// array, which is what the "already visited" test depends on. The ops are
-// COPIED out, because find's buffer is only valid until its next call.
+// array, which is what the "already visited" test depends on, and the walk is
+// not memoised. The ops are COPIED out.
 func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bool) (bool, []captureOp) {
 	w := newEpsWalker(prog)
 	w.gen = 1
@@ -456,13 +498,15 @@ func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bo
 			w.seen[pc] = w.gen
 		}
 	}
-	if !w.walk(fromPC, targetPC) {
+	r := &epsReach{reached: make([]uint64, (len(prog.Inst)+63)/64), ops: make(map[int][]captureOp)}
+	w.visit(fromPC, r)
+	if !r.has(targetPC) {
 		return false, nil
 	}
-	if len(w.buf) == 0 {
+	if len(r.ops[targetPC]) == 0 {
 		return true, nil
 	}
-	return true, append([]captureOp(nil), w.buf...)
+	return true, append([]captureOp(nil), r.ops[targetPC]...)
 }
 
 // --------------------------------------------------------------------------
@@ -471,8 +515,9 @@ func tdfaEpsCapOpsTo(prog *syntax.Prog, fromPC, targetPC int, visited map[int]bo
 // newTDFA builds a tdfaTable from a compiled NFA program using Laurikari's algorithm.
 // Returns (table, true) on success, (nil, false) if the state limit is exceeded.
 // Always uses leftmostFirst=true (RE2/Perl semantics).
-func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
+func newTDFA(mp resolvedProg, limit int) (*tdfaTable, bool) {
 	const leftmostFirst = true
+	prog := mp.prog
 
 	numGroups := prog.NumCap / 2 // includes group 0
 	numTags := prog.NumCap       // open tag for group i = tag i*2, close tag = i*2+1
@@ -598,7 +643,8 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	canonicalise := func(threads []tdfaThread) (canonical, priorityOrder []tdfaThread, rename map[int]int, newRegs int) {
 		sorted := make([]tdfaThread, len(threads))
 		copy(sorted, threads)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i].pc < sorted[j].pc })
+		// A state's threads have distinct pcs, so any sort gives this order.
+		slices.SortFunc(sorted, func(a, b tdfaThread) int { return a.pc - b.pc })
 
 		rename = make(map[int]int)
 		counter := 0
@@ -871,10 +917,12 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	_, entryOps := getOrAddState(startThreads, false)
 
 	// ---- main BFS ----
+	pg := mp.pg.startStep("TDFA construction")
 	for si := 0; si < len(states); si++ {
 		if nextStateID > limit {
 			return nil, false
 		}
+		pg.tick(nextStateID, limit)
 
 		sd := states[si]
 		pcSet := sd.priorityPCs
@@ -896,17 +944,24 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 		inputMapWord, srcMapWord := buildInputMap(expandedWord)
 		inputMapNonWord, srcMapNonWord := buildInputMap(expandedNonWord)
 
-		// For each byte, compute the set of (nextPC, tagOps) pairs.
-		// We process all 256 bytes; word/non-word uses appropriate inputMap.
-		processTransition := func(b byte, inputMap, srcMap map[rune][]uint32) {
-			nextNFAPCs, ok := inputMap[rune(b)]
-			if !ok || len(nextNFAPCs) == 0 {
-				return
-			}
+		// Bytes whose input-map entries and word context are equal build equal
+		// successor threads, and getOrAddState answers equal threads alike with
+		// no further side effect (the state exists, the register high-water mark
+		// and the scratch flag are already set) — so each distinct entry is
+		// built ONCE per state and its answer reused, which leaves the table,
+		// the state numbering and every tag op as they were. A lowered Unicode
+		// class splits the 256 bytes into a few dozen such groups, and building
+		// every byte separately was most of a 23 s construction.
+		transMemo := make(map[uint64][]*tdfaTransMemo)
 
-			// The instructions that actually consumed byte b. A source thread is
-			// only a valid source if ITS OWN instruction is among them — which
-			// also keeps a thread that cannot match b from claiming as source via
+		// buildTransition builds the successor of this state on a byte whose
+		// input-map entry is nextNFAPCs (srcPCs: the instructions that consumed
+		// it), returning its id and tag ops, or -1 when there is none.
+		buildTransition := func(nextNFAPCs, srcPCs []uint32, nextPrevWasWord bool) (int, []tdfaTagOp) {
+			// srcPCs are the instructions that actually consumed the byte. A
+			// source thread is only a valid source if ITS OWN instruction is
+			// among them — which also keeps a thread that cannot match b from
+			// claiming as source via
 			// an epsilon exit path (e.g. a letter-loop thread for a space
 			// transition when [a-z] and \s are disjoint but share an Alt exit).
 			//
@@ -927,7 +982,7 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			// Indexed unguarded: every pc here is a prog index by
 			// construction, so an out-of-range one is a compiler bug and a
 			// panic says so. A bounds check would hide it.
-			for _, srcPC := range srcMap[rune(b)] {
+			for _, srcPC := range srcPCs {
 				firedGen[int(srcPC)] = firedTick
 			}
 
@@ -995,25 +1050,51 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 			}
 
 			if len(nextThreads) == 0 {
+				return -1, nil
+			}
+			return getOrAddState(nextThreads, nextPrevWasWord)
+		}
+
+		// For each byte, compute the set of (nextPC, tagOps) pairs.
+		// We process all 256 bytes; word/non-word uses appropriate inputMap.
+		processTransition := func(b byte, inputMap, srcMap map[rune][]uint32) {
+			nextNFAPCs, ok := inputMap[rune(b)]
+			if !ok || len(nextNFAPCs) == 0 {
 				return
 			}
-
 			nextPrevWasWord := isWordChar(b)
-			nextStateIDVal, ops := getOrAddState(nextThreads, nextPrevWasWord)
+			h := tdfaTransHash(nextPrevWasWord, nextNFAPCs, srcMap[rune(b)])
+			var memo *tdfaTransMemo
+			for _, m := range transMemo[h] {
+				if m.word == nextPrevWasWord && slices.Equal(m.next, nextNFAPCs) && slices.Equal(m.src, srcMap[rune(b)]) {
+					memo = m
+					break
+				}
+			}
+			if memo == nil {
+				memo = &tdfaTransMemo{word: nextPrevWasWord, next: nextNFAPCs, src: srcMap[rune(b)], id: -1}
+				memo.id, memo.ops = buildTransition(nextNFAPCs, srcMap[rune(b)], nextPrevWasWord)
+				transMemo[h] = append(transMemo[h], memo)
+			}
+			if memo.id < 0 {
+				return
+			}
 
 			// Store DFA transition.
 			for len(dfaTransitions) <= si*256+int(b) {
 				dfaTransitions = append(dfaTransitions, -1)
 			}
-			dfaTransitions[si*256+int(b)] = nextStateIDVal
+			dfaTransitions[si*256+int(b)] = memo.id
 
-			// Store tag ops (pos + reconcile ops are all returned by getOrAddState).
+			// Store tag ops (pos + reconcile ops are all returned by
+			// getOrAddState). Each byte gets its own copy: later passes rewrite
+			// a table entry's ops in place.
 			idx := si*256 + int(b)
 			for len(tagOpTable) <= idx {
 				tagOpTable = append(tagOpTable, nil)
 			}
-			if len(ops) > 0 {
-				tagOpTable[idx] = ops
+			if len(memo.ops) > 0 {
+				tagOpTable[idx] = append([]tdfaTagOp(nil), memo.ops...)
 			}
 		}
 
@@ -1102,6 +1183,9 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 	}
 	tt = minimizeTDFARegisters(tt)
 	tt.bulkSkip = detectTDFABulkSkip(tt)
+	if mp.unicode() {
+		tt.utf8Skip = detectTDFAUTF8Skip(tt, false)
+	}
 	return tt, true
 }
 
@@ -1115,11 +1199,42 @@ func newTDFA(prog *syntax.Prog, limit int) (*tdfaTable, bool) {
 // buildTDFAMatchBody's doc comment for why that changes what "len" means and
 // what code gets emitted.
 func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
-	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal)
+	body := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal, nil)
 	var b []byte
 	b = utils.AppendULEB128(b, uint32(len(body)))
 	b = append(b, body...)
 	return append(cs, b...)
+}
+
+// tdfaShortMatchBytes is the window under which a capture body with
+// character-loop skips hands the call to its copy without them
+// (tdfaCaptureBodies). Measured on `(\pL+)=(\pL+)` (fuel, prefer-match vs
+// unhinted, words of n letters a side): 16 gives n=3 −5.7%, 4 −21.8%, 6
+// −41.2%; 32 gives 4 −11.9%, 6 −19.0%; no copy gives 3 +8.2%.
+const tdfaShortMatchBytes = 16
+
+// tdfaCaptureBodies returns the capture body for tt and, when tt has
+// character-loop skips (prefer-match; allowSet) and the body sits behind a
+// find, a second function: plain's body, which the first calls for a window
+// under tdfaShortMatchBytes. The window is then the match, and a short match
+// has no run the skip could pay for, while the skip's test runs in every arm
+// that enters its loop — once per character crossed outside it, 262 arms a
+// loop for `(\pL+)=(\pL+)`, whose words of one or two letters cost +15.8%
+// without the copy and +6.6% with it. The call costs a short window about
+// ten fuel. nil second when there is nothing to hand over: no such skip, or
+// the body is the anchored export, whose window is the whole input.
+func tdfaCaptureBodies(tt, plain *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) (body, second []byte, callOffs []int) {
+	has := false
+	for _, info := range tt.utf8Skip {
+		has = has || info.allowSet != nil
+	}
+	if nativeAnchored || !has {
+		return appendTDFACodeEntry(nil, tt, l, tableMemIdx, nativeAnchored, capStartGlobal), nil, nil
+	}
+	var offs []int
+	inner := buildTDFAMatchBody(tt, l, tableMemIdx, nativeAnchored, capStartGlobal, &offs)
+	body, offs = btSizePrefix(inner, offs)
+	return body, appendTDFACodeEntry(nil, plain, l, tableMemIdx, nativeAnchored, capStartGlobal), offs
 }
 
 // buildTDFAMatchBody emits the WASM function body for anchored TDFA matching.
@@ -1186,7 +1301,11 @@ func appendTDFACodeEntry(cs []byte, tt *tdfaTable, l *dfaLayout, tableMemIdx int
 // hasWordBoundary/hasLineAnchors/hasUnsafeBeginText gates route those to
 // Backtracking) — so a single ctx=0 midAccept table, with no NW/W/NL
 // variants, is sufficient.
-func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) []byte {
+//
+// shortCallOffs non-nil: the body first hands a window under
+// tdfaShortMatchBytes to a second function, through a call whose index is a
+// placeholder recorded there (tdfaCaptureBodies).
+func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32, shortCallOffs *[]int) []byte {
 	var b []byte
 
 	numCapRegs := tt.numRegs
@@ -1205,7 +1324,8 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	needClassLocal := l.useU8 && l.useCompression
 	// Locals: pos(1) + state(1) + prevState(1) + byte(1) [+ lastAcceptPos(1)
 	// when hasMidAccept] [+ class(1) when needClassLocal] + capture regs
-	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)].
+	// [+ bulk-skip locals: chunk(v128) + mask(i32) + skipStart(i32)]
+	// [+ the UTF-8 skip's error lanes (v128), last, when it has one].
 	extraLocals := 4 + numCapRegs
 	if hasMidAccept {
 		extraLocals++
@@ -1214,10 +1334,14 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		extraLocals++
 	}
 	hasBulkSkip := enableTDFABulkSkip && tt.bulkSkip != nil
+	needSkipLocals := hasBulkSkip || len(tt.utf8Skip) > 0
 
-	if hasBulkSkip {
+	switch {
+	case len(tt.utf8Skip) > 0:
+		b = utils.AppendULEB128(b, uint32(4)) // 3 groups + the UTF-8 skip's error lanes
+	case needSkipLocals:
 		b = utils.AppendULEB128(b, uint32(3)) // 3 local declaration groups
-	} else {
+	default:
 		b = utils.AppendULEB128(b, uint32(1)) // 1 local declaration group
 	}
 	b = utils.AppendULEB128(b, uint32(extraLocals))
@@ -1248,12 +1372,25 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	localChunk := localCapBase + uint32(numCapRegs)
 	localMask := localChunk + 1
 	localSkipStart := localMask + 1
+	localUTF8Err := localSkipStart + 1 // the UTF-8 skip's error lanes, v128
 
-	if hasBulkSkip {
+	if needSkipLocals {
 		b = utils.AppendULEB128(b, uint32(1))
 		b = append(b, 0x7B) // v128
 		b = utils.AppendULEB128(b, uint32(2))
 		b = append(b, 0x7F) // i32
+	}
+	if len(tt.utf8Skip) > 0 {
+		b = append(b, 0x01, 0x7B) // 1 × v128: localUTF8Err
+	}
+	if shortCallOffs != nil {
+		// A window under tdfaShortMatchBytes: the copy without the character
+		// skips answers (tdfaCaptureBodies).
+		b = append(b, 0x20, 0x01, 0x41)
+		b = utils.AppendSLEB128(b, int32(tdfaShortMatchBytes))
+		b = append(b, 0x49, 0x04, 0x40) // i32.lt_u; if
+		b = emitBTFallbackCall(b, 3, shortCallOffs)
+		b = append(b, 0x0B)
 	}
 
 	// midAcceptCheck: if midAccept[state], eagerly write captures for
@@ -1356,6 +1493,65 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 		b = emitTDFABulkSkip(b, tt.bulkSkip, localPos, localChunk, localMask, localSkipStart, localCapBase, midAcceptTail)
 		b = append(b, 0x0B) // end if
 	}
+	// The UTF-8 skip runs where the walk enters a loop over whole characters:
+	// in the tag-op dispatch's arm of every state outside the loop with a
+	// transition into it (emitTDFAUTF8Skip). With no tag ops there is no
+	// dispatch, and the loop's states are tested for at the top of the loop.
+	midAcceptTailFor := func(info tdfaUTF8SkipInfo) func([]byte) []byte {
+		if !hasMidAccept || tt.midAcceptStates[int(info.wasmStates[0])-1] == 0 {
+			return nil
+		}
+		return func(b []byte) []byte {
+			b = emitTDFAWriteCaptures(tt, b, localState, localPos, localCapBase, capStartGlobal)
+			b = append(b, 0x20, byte(localPos))
+			b = append(b, 0x21, byte(localLastAcceptPos))
+			return b
+		}
+	}
+	utf8SkipAt := func(b []byte, info tdfaUTF8SkipInfo, mainDepth uint32) []byte {
+		b = emitTDFAStateIn(b, info.wasmStates, byte(localState))
+		b = append(b, 0x04, 0x40) // if
+		b = emitTDFAUTF8Skip(b, info, mainDepth+1, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTailFor(info))
+		return append(b, 0x0B) // end if
+	}
+	// A loop over SOME characters (prefer-match; allowSet) is entered from an
+	// arm per partial-character state — 262 a loop for `\pL` — so its skip is
+	// emitted ONCE, after the dispatch, in block $enter_k's wake, and each arm
+	// that enters the loop branches there. Inline in every arm, the skip made
+	// `^(\pL+)=(\pL+)`'s capture body 8.3 MB, over WebAssembly's function cap.
+	var shared []tdfaUTF8SkipInfo
+	sharedIdx := map[int]uint32{}
+	var utf8Hook func([]byte, int, uint32) []byte
+	if tdfaHasTagOps(tt) {
+		for i, info := range tt.utf8Skip {
+			if info.allowSet != nil {
+				sharedIdx[i] = uint32(len(shared))
+				shared = append(shared, info)
+			}
+		}
+		K := uint32(len(shared))
+		utf8Hook = func(b []byte, gs int, mainDepth uint32) []byte {
+			for i, info := range tt.utf8Skip {
+				if !info.entersFrom(tt, gs) {
+					continue
+				}
+				if k, ok := sharedIdx[i]; ok {
+					// The K $enter blocks sit where loop $main was: $enter_k
+					// (0-based) is mainDepth + k out.
+					b = emitTDFAStateIn(b, info.wasmStates, byte(localState))
+					b = append(b, 0x0D) // br_if $enter_k
+					b = utils.AppendULEB128(b, mainDepth+k)
+					continue
+				}
+				b = utf8SkipAt(b, info, mainDepth+K)
+			}
+			return b
+		}
+	} else {
+		for _, info := range tt.utf8Skip {
+			b = utf8SkipAt(b, info, 0)
+		}
+	}
 
 	// prevState = state
 	b = append(b, 0x20, byte(localState))
@@ -1426,33 +1622,48 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 	b = append(b, 0x0F) // return
 	b = append(b, 0x0B) // end if state==0
 
+	for range shared {
+		b = append(b, 0x02, 0x40) // block $enter_k, innermost k = 0
+	}
 	// Emit tag ops keyed on (prevState, byte).
 	// At this point pos = exclusive end of consumed byte.
-	b = emitTDFATagOps(tt, b, localPrevState, localByte, localPos, localCapBase)
+	b = emitTDFATagOps(tt, b, localPrevState, localByte, localPos, localCapBase, utf8Hook)
 
-	// Immediate-accept check.
-	if l.hasImmAccept {
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.immediateAcceptOff)
-		b = append(b, 0x20, byte(localState))
-		b = append(b, 0x6A)
-		b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
-		b = append(b, 0x04, 0x40)
-		// Accept here: write captures and return pos (pos already = exclusive end).
-		b = emitTDFAAccept(tt, b, localState, localPos, localCapBase, capStartGlobal)
-		b = append(b, 0x0B)
+	// What follows the dispatch — the accept checks — also follows each shared
+	// skip that skipped nothing, so it is emitted once more per $enter_k.
+	afterDispatch := func(b []byte) []byte {
+		// Immediate-accept check.
+		if l.hasImmAccept {
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, l.immediateAcceptOff)
+			b = append(b, 0x20, byte(localState))
+			b = append(b, 0x6A)
+			b = appendTableLoad8u(b, tableMemIdx) // immediateAccept[state]
+			b = append(b, 0x04, 0x40)
+			// Accept here: write captures and return pos (pos already = exclusive end).
+			b = emitTDFAAccept(tt, b, localState, localPos, localCapBase, capStartGlobal)
+			b = append(b, 0x0B)
+		}
+		// Record a fallback accept (eagerly writing captures) if the state we
+		// just transitioned into is mid-accepting. Only reached when
+		// immediateAccept didn't already fire and return above, so this never
+		// overrides a higher-priority immediate accept — it only ever matters if
+		// every higher-priority continuation from here eventually dies.
+		return midAcceptCheck(b, localState, localPos)
 	}
-
-	// Record a fallback accept (eagerly writing captures) if the state we
-	// just transitioned into is mid-accepting. Only reached when
-	// immediateAccept didn't already fire and return above, so this never
-	// overrides a higher-priority immediate accept — it only ever matters if
-	// every higher-priority continuation from here eventually dies.
-	b = midAcceptCheck(b, localState, localPos)
-
-	b = append(b, 0x0C, 0x00) // br $main
-	b = append(b, 0x0B)       // end loop
-	b = append(b, 0x0B)       // end block $done
+	b = afterDispatch(b)
+	b = append(b, 0x0C) // br $main
+	b = utils.AppendULEB128(b, uint32(len(shared)))
+	for k := range shared {
+		b = append(b, 0x0B) // end $enter_k: an arm entered shared[k]'s loop
+		out := uint32(len(shared) - 1 - k)
+		b = emitTDFAUTF8Skip(b, shared[k], out, localPos, localChunk, localMask, localSkipStart, localUTF8Err, localCapBase, midAcceptTailFor(shared[k]))
+		b = afterDispatch(b) // it skipped nothing
+		b = append(b, 0x0C)  // br $main
+		b = utils.AppendULEB128(b, out)
+	}
+	b = append(b, 0x0B) // end loop
+	b = append(b, 0x0B) // end block $done
 
 	// EOF accept check (TDFA): read per-state side table at l.acceptOff.
 	// (State-ID partitioning is not applied to TDFA tables because state IDs
@@ -1484,33 +1695,36 @@ func buildTDFAMatchBody(tt *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnch
 // Dispatches on prevState-1 (0-based) via br_table for O(1) per-byte overhead.
 // localByte holds the current input byte (already saved in a local).
 // localPos holds the current position (after pos++, = exclusive end of consumed byte).
+//
+// hook, when non-nil, is emitted in the arm of every previous state, after
+// its ops, with the depth of loop $main from there (the dispatch sits
+// directly in the main loop's body); it emits nothing for a state it does
+// not concern. A table with no ops at all has no dispatch and no arms, and
+// tdfaHasTagOps says so.
 func emitTDFATagOps(tt *tdfaTable, b []byte,
-	localPrevState, localByte, localPos, localCapBase uint32) []byte {
+	localPrevState, localByte, localPos, localCapBase uint32,
+	hook func(b []byte, gs int, mainDepth uint32) []byte) []byte {
 
 	// tt.numStates is always ≥ 1 for a table built by newTDFA (the start
 	// state alone guarantees this).
 	n := tt.numStates
 
 	// Precompute per-state entries (bytes with non-empty ops).
-	type byteOps struct {
-		bv  int
-		ops []tdfaTagOp
-	}
 	type stateInfo struct {
-		entries          []byteOps
+		entries          []tdfaByteOps
 		allSame          bool
 		sameOps          []tdfaTagOp
-		majorityOps      []tdfaTagOp // majority-group ops (non-nil iff !allSame && majority exists)
-		minorityBytewise []byteOps   // minority entries (bytes whose ops ≠ majorityOps)
+		majorityOps      []tdfaTagOp   // majority-group ops (non-nil iff !allSame && majority exists)
+		minorityBytewise []tdfaByteOps // minority entries (bytes whose ops ≠ majorityOps)
 	}
 	infos := make([]stateInfo, n)
 	anyHasOps := false
 	for gs := 0; gs < n; gs++ {
-		var entries []byteOps
+		var entries []tdfaByteOps
 		for bv := 0; bv < 256; bv++ {
 			idx := gs*256 + bv
 			if idx < len(tt.tagOps) && len(tt.tagOps[idx]) > 0 {
-				entries = append(entries, byteOps{bv, tt.tagOps[idx]})
+				entries = append(entries, tdfaByteOps{bv, tt.tagOps[idx]})
 			}
 		}
 		if len(entries) == 0 {
@@ -1535,7 +1749,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 				}
 				transIdx := gs*256 + bv
 				if transIdx < len(tt.transitions) && tt.transitions[transIdx] >= 0 {
-					entries = append(entries, byteOps{bv, nil}) // nil = no ops
+					entries = append(entries, tdfaByteOps{bv, nil}) // nil = no ops
 				}
 			}
 		}
@@ -1560,20 +1774,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 			count int
 		}
 		var groups []opsGroup
-		// strconv.AppendInt, not fmt.Appendf — same reasoning as keyString's doc
-		// comment, and this runs once per transition entry,
-		// i.e. up to 256 times per state. Byte-identical to "%d:%d," including
-		// negative dst/src (-1 = assign-from-pos, -2 = scratchRegSentinel).
-		keyFor := func(ops []tdfaTagOp) string {
-			s := make([]byte, 0, len(ops)*8)
-			for _, op := range ops {
-				s = strconv.AppendInt(s, int64(op.dst), 10)
-				s = append(s, ':')
-				s = strconv.AppendInt(s, int64(op.src), 10)
-				s = append(s, ',')
-			}
-			return string(s)
-		}
+		keyFor := tdfaOpsKey
 		groupIdx := make(map[string]int)
 		for _, e := range entries {
 			k := keyFor(e.ops)
@@ -1593,7 +1794,7 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 		}
 		majorityOps := groups[majIdx].ops
 		majKey := keyFor(majorityOps)
-		var minority []byteOps
+		var minority []tdfaByteOps
 		for _, e := range entries {
 			if keyFor(e.ops) != majKey {
 				minority = append(minority, e)
@@ -1677,24 +1878,32 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 				// "br $maj_done+1" from inside the `if` block: the if block is
 				// at depth 0, $maj_done is at depth 1, so we need br 1.
 				b = append(b, 0x02, 0x40) // block $maj_done
-				for _, e := range info.minorityBytewise {
-					b = append(b, 0x20, byte(localByte))
-					b = append(b, 0x41)
-					b = utils.AppendSLEB128(b, int32(e.bv))
-					b = append(b, 0x46)       // i32.eq
-					b = append(b, 0x04, 0x40) // if
-					for _, op := range e.ops {
+				if len(info.minorityBytewise) > 1 {
+					b = emitTDFAMinorityTable(b, info.minorityBytewise, info.majorityOps, localByte, localPos, localCapBase)
+				} else {
+					for _, e := range info.minorityBytewise {
+						b = append(b, 0x20, byte(localByte))
+						b = append(b, 0x41)
+						b = utils.AppendSLEB128(b, int32(e.bv))
+						b = append(b, 0x46)       // i32.eq
+						b = append(b, 0x04, 0x40) // if
+						for _, op := range e.ops {
+							b = emitTDFATagOp(op, b, localPos, localCapBase)
+						}
+						b = append(b, 0x0C, 0x01) // br 1 → exit $maj_done (skip majority)
+						b = append(b, 0x0B)       // end if
+					}
+					// majority ops (fire when no minority byte matched)
+					for _, op := range info.majorityOps {
 						b = emitTDFATagOp(op, b, localPos, localCapBase)
 					}
-					b = append(b, 0x0C, 0x01) // br 1 → exit $maj_done (skip majority)
-					b = append(b, 0x0B)       // end if
-				}
-				// majority ops (fire when no minority byte matched)
-				for _, op := range info.majorityOps {
-					b = emitTDFATagOp(op, b, localPos, localCapBase)
 				}
 				b = append(b, 0x0B) // end $maj_done
 			}
+		}
+
+		if hook != nil {
+			b = hook(b, gs, uint32(n-gs))
 		}
 
 		// Break out of $exit. From handler gs, $exit is at depth (n-1-gs).
@@ -1704,6 +1913,91 @@ func emitTDFATagOps(tt *tdfaTable, b []byte,
 	}
 
 	b = append(b, 0x0B) // end $exit
+	return b
+}
+
+// tdfaByteOps is a transition byte and its tag ops.
+type tdfaByteOps struct {
+	bv  int
+	ops []tdfaTagOp
+}
+
+// tdfaOpsKey is ops serialised, for grouping equal op lists: strconv, not
+// fmt.Appendf — it runs once per transition entry, up to 256 times per state.
+// Byte-identical to "%d:%d," including negative dst/src (-1 = assign-from-pos,
+// -2 = scratchRegSentinel).
+func tdfaOpsKey(ops []tdfaTagOp) string {
+	s := make([]byte, 0, len(ops)*8)
+	for _, op := range ops {
+		s = strconv.AppendInt(s, int64(op.dst), 10)
+		s = append(s, ':')
+		s = strconv.AppendInt(s, int64(op.src), 10)
+		s = append(s, ',')
+	}
+	return string(s)
+}
+
+// emitTDFAMinorityTable emits, inside block $maj_done, a state's tag ops for
+// a byte that has MORE than one minority byte: one br_table on the byte to the
+// handler of its minority ops group (the bytes grouped by equal ops) or, for
+// a majority byte, past them to the majority ops.
+//
+//	block $default
+//	  block g[G-1] … block g[0]
+//	    local.get byte; br_table [256: group index, G for the majority] G
+//	  end g[0]: ops of group 0; br G → $maj_done
+//	  …
+//	  end g[G-1]: ops of group G-1; br 1 → $maj_done
+//	end $default: majority ops
+//
+// A compare per minority byte cost a lowered loop state (`(\pL+)\s`, ~50 lead
+// bytes and ~52 letters on its two sides) ~50 compares on every byte its
+// losing side reads: `(\pL+)\s(\pL+)` 146.75 → 116.67 fuel/byte over Russian,
+// 159.30 → 115.58 over CJK, and the byte-mode `(\w+)\s(\w+)` 123.01 → 117.05.
+// One minority byte keeps its compare, cheaper than a table.
+func emitTDFAMinorityTable(b []byte, minority []tdfaByteOps, majority []tdfaTagOp, localByte, localPos, localCapBase uint32) []byte {
+	group := [256]int{}
+	var groups [][]tdfaTagOp
+	keys := map[string]int{}
+	for _, e := range minority {
+		k := tdfaOpsKey(e.ops)
+		g, ok := keys[k]
+		if !ok {
+			g = len(groups)
+			keys[k] = g
+			groups = append(groups, e.ops)
+		}
+		group[e.bv] = g + 1 // 0: a majority byte
+	}
+	G := len(groups)
+	b = append(b, 0x02, 0x40) // block $default
+	for range G {
+		b = append(b, 0x02, 0x40) // block g[i], innermost g[0]
+	}
+	b = append(b, 0x20, byte(localByte))
+	b = append(b, 0x0E) // br_table
+	b = utils.AppendULEB128(b, 256)
+	for c := range 256 {
+		t := G // the majority, past every handler
+		if group[c] > 0 {
+			t = group[c] - 1
+		}
+		b = utils.AppendULEB128(b, uint32(t)) //nolint:gosec // at most 256 groups
+	}
+	b = utils.AppendULEB128(b, uint32(G)) //nolint:gosec // default: the majority
+	for i, ops := range groups {
+		b = append(b, 0x0B) // end g[i]
+		for _, op := range ops {
+			b = emitTDFATagOp(op, b, localPos, localCapBase)
+		}
+		// br → $maj_done, past g[i+1..G-1] and $default.
+		b = append(b, 0x0C)
+		b = utils.AppendULEB128(b, uint32(G-i)) //nolint:gosec // at most 256 groups
+	}
+	b = append(b, 0x0B) // end $default: a majority byte
+	for _, op := range majority {
+		b = emitTDFATagOp(op, b, localPos, localCapBase)
+	}
 	return b
 }
 

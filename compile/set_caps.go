@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -442,9 +443,42 @@ func emitSetAnchoredCapBody(cs *compiledSet, kind setCapKind, probeFnBase int) [
 		}
 		b = acc.emitRecordBits(b, lBits, cs.anchoredIDs[bi], 0)
 	}
+	b = emitAnchoredBTProbes(b, cs, kind, wide, probeFnBase+len(cs.anchoredProbeBodies), pInPtr, pInLen, lBits,
+		func(b []byte, id int) []byte { return acc.emitRecordBits(b, lBits, []int{id}, 0) })
 
 	b = append(b, 0x0B) // end $done
 	return finishAnchoredCapBody(b, kind, wide, lAcc, lCount, lAnyID)
+}
+
+// emitAnchoredBTProbes calls the anchored pair's Backtracking probes, after
+// every DFA part, each over the whole input (start 0): a probe that gave up
+// (-2) returns -2 from the capability at once — "unknown", the scan pair's
+// rule, never folded into a "no" — and one that matched is recorded by
+// record. Nothing for a set without such members, so every other anchored
+// body is byte-identical.
+//
+// match_all reaches here only in its out_ptr form: a Backtracking member
+// moves the set's `_all` pair there (wideAll), because the i64 mask has no
+// value free to carry -2.
+func emitAnchoredBTProbes(b []byte, cs *compiledSet, kind setCapKind, wide bool, btBase int, pInPtr, pInLen, lRes byte,
+	record func(b []byte, id int) []byte) []byte {
+	if len(cs.anchoredBTIDs) == 0 {
+		return b
+	}
+	if kind == capMatchAll && !wide {
+		panic("compile: an anchored Backtracking probe in a narrow match_all")
+	}
+	for k, id := range cs.anchoredBTIDs {
+		b = append(b, 0x20, pInPtr, 0x41, 0x00, 0x20, pInLen, 0x41, 0x01, 0x10)
+		b = utils.AppendULEB128(b, uint32(btBase+k)) //nolint:gosec // a function index
+		b = append(b, 0x21, lRes)
+		b = append(b, 0x20, lRes, 0x41, 0x00, 0x48, 0x04, 0x40) // gave up: if (res < 0)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.BTStackOverflow))
+		b = append(b, 0x0F, 0x0B) // return -2; end
+		b = record(b, id)
+	}
+	return b
 }
 
 // ---------------------------------------------------------------------------

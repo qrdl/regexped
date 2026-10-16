@@ -10,14 +10,14 @@ wasm_file:     "regexps.wasm"
 import_module: "regexps"
 stub_file:     "regexp.js"
 
-regexps:
-  - pattern:   'ghp_[A-Za-z0-9]{36}'
+patterns:
+  - regexp:   'ghp_[A-Za-z0-9]{36}'
     find_func: "find_github_token"
 
-  - pattern:   'eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+'
+  - regexp:   'eyJ[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+\.[A-Za-z0-9+/\-_]+'
     find_func: "find_jwt_token"
 
-  - pattern:   'AKIA[A-Z0-9]{16}'
+  - regexp:   'AKIA[A-Z0-9]{16}'
     find_func: "find_aws_key"
 ```
 

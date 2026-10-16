@@ -3,6 +3,7 @@ package fuzz
 import (
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
@@ -43,13 +44,39 @@ const (
 	maxFuzzGroups = 128
 )
 
+// unicodeMode puts every run-helper compile of this package's tests and fuzz
+// targets in Unicode mode: `go test ./tools/fuzz -args -unicode`. Byte mode
+// is the default. Either way the mode is forced, never resolved from the
+// pattern, so no run is in a mode it did not ask for.
+var unicodeMode = flag.Bool("unicode", false, "compile every run helper's pattern in Unicode mode (default: byte mode)")
+
+// setModeKey is the set-level `unicode:` key the set fuzz targets compile
+// with: the run's mode, stated rather than left to the members to resolve.
+func setModeKey() *bool {
+	v := *unicodeMode
+	return &v
+}
+
+// withMode sets on o the mode the run asks for.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeMode {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
+// runOpts is the run helpers' options: the run's mode and nothing else.
+func runOpts() compile.CompileOptions { return withMode(compile.CompileOptions{}) }
+
 // compileMatch compiles pat into a standalone module exporting a single
 // anchored match function. No captures, so this exercises the DFA /
 // CompiledDFA / lit-chain match bodies.
 func compileMatch(pat string) ([]byte, error) {
 	return cachedCompile("match\x00"+pat, func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, MatchFunc: "match"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		entry := config.PatternEntry{Regexp: pat, MatchFunc: "match"}
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -58,8 +85,8 @@ func compileMatch(pat string) ([]byte, error) {
 // the engine (TDFA when eligible, Backtracking otherwise).
 func compileGroups(pat string) ([]byte, error) {
 	return cachedCompile("groups\x00"+pat, func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.Compile([]config.RegexEntry{entry}, pathsTableBase, true)
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
 		return w, err
 	})
 }
@@ -70,8 +97,8 @@ func compileGroups(pat string) ([]byte, error) {
 // sees for a given pattern shape, and the other backend stays dark.
 func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true, eng)
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true, eng, runOpts())
 		return w, err
 	})
 }
@@ -81,9 +108,9 @@ func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
 // body and its fallback can each be run alone.
 func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), func() ([]byte, error) {
-		entry := config.RegexEntry{Pattern: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.RegexEntry{entry}, pathsTableBase, true,
-			compile.EngineBacktrack, compile.CompileOptions{BTWorkBudget: budget})
+		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
+		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true,
+			compile.EngineBacktrack, withMode(compile.CompileOptions{BTWorkBudget: budget}))
 		return w, err
 	})
 }
@@ -93,11 +120,11 @@ func compileGroupsBudget(pat string, budget int) ([]byte, error) {
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
 	w, drops, err := cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, setDrops, error) {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
 		sets := []config.SetConfig{{
 			Name: "s",
@@ -106,13 +133,14 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 			// allStartPositionMatches models.
 			Overlapping: true,
 			Patterns:    config.PatternSelector{Names: names},
+			Unicode:     setModeKey(),
 		}}
 		// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
 		// tables always start at address 0 and the input CANNOT live at offset 0
 		// the way it does for the single-pattern paths. cfg.Output == "" selects
 		// standalone. runWasmSetFindAll therefore derives its layout from the
 		// emitted data section rather than using pathsInputBase.
-		cfg := config.BuildConfig{Regexps: entries, Sets: sets}
+		cfg := config.BuildConfig{Patterns: entries, Sets: sets}
 		w, _, diags, err := compile.CompileFileDiag(cfg, "")
 		return w, dropsFromSet(diags), err
 	})
@@ -122,15 +150,14 @@ func compileSet(pats []string) ([]byte, map[int]bool, error) {
 }
 
 // droppedFromSet returns the indices of the patterns the compiler EXCLUDED
-// from the set it just built.
+// from the set it just built — always none now: a member no engine takes
+// fails the compile instead (see CLAUDE.md).
 //
-// A set is allowed to drop a pattern: a suffix DFA over max_dfa_states is
-// warned about and recorded rather than failing the compile (see CLAUDE.md,
-// and compile/set.go's warnPatternDropped). Such a pattern is not in the set,
-// so the set reports none of its matches — and a differential test that keeps
-// it in the oracle reports the engine as wrong for obeying its own contract.
-// That was a real harness defect, whose threshold was exactly one DFA state
-// wide: 1024 states passed, 1025 was dropped and "failed".
+// A set used to drop such a pattern with a warning, and a differential test
+// that kept it in the oracle then reported the engine as wrong for obeying
+// its own contract. That was a real harness defect, whose threshold was
+// exactly one DFA state wide: 1024 states passed, 1025 was dropped and
+// "failed".
 //
 // The ids here are the set's global pattern ids, which compileSet assigns as
 // the index into pats — so they index the caller's slice directly.
@@ -143,10 +170,14 @@ func droppedFromSet(diags []compile.SetDiag) map[int]bool {
 // `scan_any` correctly reported a pattern this harness had already written off,
 // and the disagreement was read as a wrong answer.
 //
-//   - all: the pattern left the set ENTIRELY. No capability answers for it.
+//   - all: the pattern left the set ENTIRELY. Always empty now: a member no
+//     engine takes for `find` or the scan pair fails the compile, and the
+//     diagnostic that listed such members is gone. Kept so every oracle keeps
+//     one shape — and so a harness that sees it non-empty fails loudly
+//     (set_caps_test's "members dropped").
 //   - anchored: `all`, PLUS the patterns the anchored packer alone refused.
-//     Those keep scan_any, scan_all and `find`, and lose only
-//     match_any/match_all.
+//     Always empty too since 2026-10-12: such a member's anchored pair runs
+//     on Backtracking, and one no engine takes fails the compile.
 //
 // So an anchored oracle uses `anchored` and every other oracle uses `all`.
 type setDrops struct {
@@ -154,31 +185,14 @@ type setDrops struct {
 	anchored map[int]bool
 }
 
-// dropsFromSet reads both scopes out of the compiler's own diagnostics.
-//
-// The scope is the compiler's to state, not this harness's to guess: see
-// compile.SetDiag's AnchoredStateLimitDropped, which exists because one field
-// used to carry both meanings.
+// dropsFromSet reads both scopes out of the compiler's own diagnostics —
+// both empty since 2026-10-12: the anchored packing no longer drops a member
+// (a member its DFA cannot take runs on Backtracking there, and one no
+// engine takes fails the compile), so every oracle answers for every member.
+// Kept as the one place a future scope would be read from.
 func dropsFromSet(diags []compile.SetDiag) setDrops {
-	d := setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
-	for _, sd := range diags {
-		for _, ref := range sd.StateLimitDropped {
-			d.all[ref.ID] = true
-		}
-		for _, ref := range sd.CaptureBearingDropped {
-			d.all[ref.ID] = true
-		}
-		for _, ref := range sd.AnchoredStateLimitDropped {
-			d.anchored[ref.ID] = true
-		}
-		for _, ref := range sd.UnparseableDropped {
-			d.anchored[ref.ID] = true
-		}
-	}
-	for id := range d.all {
-		d.anchored[id] = true
-	}
-	return d
+	_ = diags
+	return setDrops{all: map[int]bool{}, anchored: map[int]bool{}}
 }
 
 // instantiate builds and instantiates a module, returning the store, instance,
@@ -204,15 +218,21 @@ func dropsFromSet(diags []compile.SetDiag) setDrops {
 // inside it and the module's compiled code is what the instance runs.
 func instantiate(wasmBytes []byte) (*wasmtime.Store, *wasmtime.Instance, *wasmtime.Memory, func(), error) {
 	engine, _ := sharedEngine()
-	mod, err := wasmtime.NewModule(engine, wasmBytes)
-	if err != nil {
-		return nil, nil, nil, func() {}, err
+	mod, owned := warmedModule(wasmBytes), false
+	if mod == nil {
+		var err error
+		if mod, err = wasmtime.NewModule(engine, wasmBytes); err != nil {
+			return nil, nil, nil, func() {}, err
+		}
+		owned = true
 	}
 	store := wasmtime.NewStore(engine)
 	store.SetEpochDeadline(1)
 	release := func() {
 		store.Close()
-		mod.Close()
+		if owned {
+			mod.Close()
+		}
 	}
 	inst, err := wasmtime.NewInstance(store, mod, []wasmtime.AsExtern{})
 	if err != nil {

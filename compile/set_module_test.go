@@ -20,9 +20,9 @@ func TestEquivalence_Compat001(t *testing.T) {
 	var prefixPool, suffixPool dfaPool
 	var firstSuffixID int
 	for i, p := range fix.Patterns {
-		info, err := analyzePattern(config.RegexEntry{Pattern: p.Pattern}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: p.Regexp}, &prefixPool, &suffixPool)
 		if err != nil {
-			t.Fatalf("pattern %d %q: %v", i, p.Pattern, err)
+			t.Fatalf("pattern %d %q: %v", i, p.Regexp, err)
 		}
 		if i == 0 {
 			firstSuffixID = info.suffixID
@@ -30,7 +30,7 @@ func TestEquivalence_Compat001(t *testing.T) {
 		}
 		if fix.Expect.SuffixDedupPoolSize > 0 && info.suffixID != firstSuffixID {
 			t.Errorf("pattern %d %q: suffixID=%d, want %d (suffix dedup failed)",
-				i, p.Pattern, info.suffixID, firstSuffixID)
+				i, p.Regexp, info.suffixID, firstSuffixID)
 		}
 	}
 	if fix.Expect.SuffixDedupPoolSize > 0 && len(suffixPool.tables) != fix.Expect.SuffixDedupPoolSize {
@@ -42,9 +42,9 @@ func TestEquivalence_Compat003(t *testing.T) {
 	fix := testdataFixture(t, "compat_003")
 	asts := make([]*syntax.Regexp, len(fix.Patterns))
 	for i, p := range fix.Patterns {
-		asts[i] = mustParse(t, p.Pattern)
+		asts[i] = mustParse(t, p.Regexp)
 	}
-	table, kind, err := mergeSuffixDFA(asts, CompileSetOptions{})
+	table, kind, err := mergeSuffixDFA(byteTrees(asts), CompileSetOptions{})
 	if err != nil {
 		t.Fatalf("mergeSuffixDFA: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestEquivalence_Compat004(t *testing.T) {
 		}
 	}
 	if len(lits) > 0 {
-		fe := chooseLiteralFrontend(lits)
+		fe := chooseLiteralFrontend(lits, false)
 		if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
 			t.Errorf("compat_004: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
 		}
@@ -110,7 +110,7 @@ func TestEquivalence_Compat005(t *testing.T) {
 			}
 		}
 	}
-	fe := chooseLiteralFrontend(lits)
+	fe := chooseLiteralFrontend(lits, false)
 	if fix.Expect.Frontend != "" && fe.String() != fix.Expect.Frontend {
 		t.Errorf("compat_005: frontend = %q, want %q", fe.String(), fix.Expect.Frontend)
 	}
@@ -150,9 +150,9 @@ func TestPatternSelector_UnmarshalYAML_List(t *testing.T) {
 
 func TestConfig_DuplicateName_Rejected(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "dup", Pattern: `foo`},
-			{Name: "dup", Pattern: `bar`},
+		Patterns: []config.PatternEntry{
+			{Name: "dup", Regexp: `foo`},
+			{Name: "dup", Regexp: `bar`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "ma", Patterns: config.PatternSelector{All: true}},
@@ -165,8 +165,8 @@ func TestConfig_DuplicateName_Rejected(t *testing.T) {
 
 func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "known", Pattern: `foo`},
+		Patterns: []config.PatternEntry{
+			{Name: "known", Regexp: `foo`},
 		},
 		Sets: []config.SetConfig{
 			{
@@ -183,7 +183,7 @@ func TestConfig_UnknownPatternRef_Rejected(t *testing.T) {
 
 func TestConfig_MissingCapabilities_Rejected(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo`}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `foo`}},
 		Sets: []config.SetConfig{
 			{Name: "s", Patterns: config.PatternSelector{All: true}},
 		},
@@ -197,10 +197,10 @@ func TestCompileFile_NoSets_ByteIdentical(t *testing.T) {
 	// CompileFile with no sets must produce byte-identical output to Compile,
 	// including across multi-pattern page alignment and the final memory page
 	// count for standalone modules with large DFA tables.
-	patternSets := map[string][]config.RegexEntry{
-		"single":      {{Pattern: `[a-z]+`, FindFunc: "find"}},
-		"multi":       {{Pattern: `[a-z]+`, FindFunc: "find1"}, {Pattern: `\d+`, FindFunc: "find2"}},
-		"large_table": {{Pattern: `[a-zA-Z0-9_]{8,}`, FindFunc: "find"}},
+	patternSets := map[string][]config.PatternEntry{
+		"single":      {{Regexp: `[a-z]+`, FindFunc: "find"}},
+		"multi":       {{Regexp: `[a-z]+`, FindFunc: "find1"}, {Regexp: `\d+`, FindFunc: "find2"}},
+		"large_table": {{Regexp: `[a-zA-Z0-9_]{8,}`, FindFunc: "find"}},
 	}
 	for name, patterns := range patternSets {
 		t.Run(name, func(t *testing.T) {
@@ -208,7 +208,7 @@ func TestCompileFile_NoSets_ByteIdentical(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
-			cfg := config.BuildConfig{Regexps: patterns}
+			cfg := config.BuildConfig{Patterns: patterns}
 			wasmB, _, err := CompileFile(cfg, "")
 			if err != nil {
 				t.Fatalf("CompileFile: %v", err)
@@ -225,9 +225,9 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 	// CompileFile with sets must produce a non-empty WASM module with the
 	// correct magic bytes and at least one exported function.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "foo_pat", Pattern: `foo\d+`},
-			{Name: "bar_pat", Pattern: `bar\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "foo_pat", Regexp: `foo\d+`},
+			{Name: "bar_pat", Regexp: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
 			{
@@ -258,9 +258,9 @@ func TestCompileFile_WithSets_ValidWASM(t *testing.T) {
 // batch wrapper — sets already cover multi-match via find_all/find_any.
 func TestCompileFile_WithSets_BatchFindStillWorks(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "foo_pat", Pattern: `foo\d+`, FindFunc: "find_foo", Hints: []string{"batch-find"}},
-			{Name: "bar_pat", Pattern: `bar\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "foo_pat", Regexp: `foo\d+`, FindFunc: "find_foo", Hints: []string{"batch-find"}},
+			{Name: "bar_pat", Regexp: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
 			{
@@ -288,7 +288,7 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 	patterns := []*PatternInfo{}
 	patternIDs := []int{}
 	for i, pat := range []string{`foo\d+`, `foo[a-z]+`} {
-		info, err := analyzePattern(config.RegexEntry{Pattern: pat}, &prefixPool, &suffixPool)
+		info, err := analyzePattern(config.PatternEntry{Regexp: pat}, &prefixPool, &suffixPool)
 		if err != nil {
 			t.Fatalf("analyzePattern[%d]: %v", i, err)
 		}
@@ -314,13 +314,13 @@ func TestSetMatch_SingleBucket_Equivalence(t *testing.T) {
 // TestCompileFile_ACFrontend exercises emitSetMatchFnFinalAC (0% coverage without this).
 // 17 unique 2-byte literals → >16 → frontendAC.
 func TestCompileFile_ACFrontend(t *testing.T) {
-	pats := make([]config.RegexEntry, 17)
+	pats := make([]config.PatternEntry, 17)
 	for i := range pats {
 		// "aa\w+", "ab\w+", ..., "aq\w+" — 17 distinct 2-byte mandatory literals
-		pats[i] = config.RegexEntry{Pattern: "a" + string(rune('a'+i)) + `\w+`}
+		pats[i] = config.PatternEntry{Regexp: "a" + string(rune('a'+i)) + `\w+`}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -352,12 +352,12 @@ func TestCompileFile_ACFrontend(t *testing.T) {
 func TestCompileFile_ShuftiFrontend(t *testing.T) {
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	n := 33
-	pats := make([]config.RegexEntry, n)
+	pats := make([]config.PatternEntry, n)
 	for i := range pats {
-		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i], i)}
+		pats[i] = config.PatternEntry{Regexp: fmt.Sprintf("%cq%02dx[a-z]+", alphabet[i], i)}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{
 				Name:     "s",
@@ -380,12 +380,12 @@ func TestCompileFile_ShuftiFrontend(t *testing.T) {
 // TestCompileFile_TeddyTwoGroups exercises the TwoGroups path in emitSetMatchFnFinalTeddy.
 // 10 unique 1-byte literals → ≤16, TwoGroups=true.
 func TestCompileFile_TeddyTwoGroups(t *testing.T) {
-	pats := make([]config.RegexEntry, 10)
+	pats := make([]config.PatternEntry, 10)
 	for i := range pats {
-		pats[i] = config.RegexEntry{Pattern: string(rune('a'+i)) + `\w+`}
+		pats[i] = config.PatternEntry{Regexp: string(rune('a'+i)) + `\w+`}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -403,10 +403,10 @@ func TestCompileFile_TeddyTwoGroups(t *testing.T) {
 // TestCompileFile_TeddyPartialProbe exercises tail-byte verification for literals >4 bytes.
 func TestCompileFile_TeddyPartialProbe(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Pattern: `sk_live_[0-9a-zA-Z]{24}`},
-			{Pattern: `sk_test_[0-9a-zA-Z]{24}`},
-			{Pattern: `gh_pat_[0-9a-zA-Z]{36}`},
+		Patterns: []config.PatternEntry{
+			{Regexp: `sk_live_[0-9a-zA-Z]{24}`},
+			{Regexp: `sk_test_[0-9a-zA-Z]{24}`},
+			{Regexp: `gh_pat_[0-9a-zA-Z]{36}`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
@@ -424,8 +424,8 @@ func TestCompileFile_TeddyPartialProbe(t *testing.T) {
 func TestCompileFile_Embedded_WithSets(t *testing.T) {
 	// Non-empty cfg.Output triggers embedded mode. Must produce valid WASM.
 	cfg := config.BuildConfig{
-		Output:  "merged.wasm", // non-empty → embedded
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `bar\w+`}},
+		Output:   "merged.wasm", // non-empty → embedded
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `bar\w+`}},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "s_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -442,8 +442,8 @@ func TestCompileFile_Embedded_WithSets(t *testing.T) {
 func TestAssembleModuleWithSets_ValidWASM(t *testing.T) {
 	// assembleModuleWithSets with at least one set must produce valid WASM magic.
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\d+`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\d+`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "ma", Patterns: config.PatternSelector{All: true}},
@@ -505,13 +505,13 @@ func TestDiagnostics_ConflictReasons(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 4.5: anchored match tests
+// Anchored match tests
 
 func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "sel", Pattern: `(?i)^\s*SELECT\b`},
-			{Name: "ins", Pattern: `(?i)^\s*INSERT\s+INTO\b`},
+		Patterns: []config.PatternEntry{
+			{Name: "sel", Regexp: `(?i)^\s*SELECT\b`},
+			{Name: "ins", Regexp: `(?i)^\s*INSERT\s+INTO\b`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "sql", MatchAny: "validate_sql", Patterns: config.PatternSelector{All: true}},
@@ -528,8 +528,8 @@ func TestSetMatch_Anchored_ValidWASM(t *testing.T) {
 
 func TestSetMatch_Anchored_FindOnlyCompiles(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `foo\d+`}},
-		Sets:    []config.SetConfig{{Name: "s", Find: "find_foo", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `foo\d+`}},
+		Sets:     []config.SetConfig{{Name: "s", Find: "find_foo", Patterns: config.PatternSelector{All: true}}},
 	}
 	if _, _, err := CompileFile(cfg, ""); err != nil {
 		t.Fatalf("CompileFile find-only: %v", err)
@@ -538,9 +538,9 @@ func TestSetMatch_Anchored_FindOnlyCompiles(t *testing.T) {
 
 func TestSetMatch_Anchored_BothExports(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\d+`},
-			{Name: "p2", Pattern: `bar\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\d+`},
+			{Name: "p2", Regexp: `bar\w+`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "both", Find: "find_all_fn", MatchAny: "match_fn", Patterns: config.PatternSelector{All: true}},
@@ -558,13 +558,13 @@ func TestSetMatch_Anchored_BothExports(t *testing.T) {
 func TestSetMatch_Anchored_SQLValidator_Fixture(t *testing.T) {
 	fix := testdataFixture(t, "sql_validator")
 	cfg := config.BuildConfig{
-		Regexps: make([]config.RegexEntry, len(fix.Patterns)),
+		Patterns: make([]config.PatternEntry, len(fix.Patterns)),
 		Sets: []config.SetConfig{
 			{Name: "sql", MatchAny: "validate_sql", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	for i, p := range fix.Patterns {
-		cfg.Regexps[i] = config.RegexEntry{Pattern: p.Pattern}
+		cfg.Patterns[i] = config.PatternEntry{Regexp: p.Regexp}
 	}
 	wasm, _, err := CompileFile(cfg, "")
 	if err != nil {
@@ -580,9 +580,9 @@ func TestSetMatch_Anchored_SQLValidator_Fixture(t *testing.T) {
 // length 3 followed by the mandatory literal "foo".
 func TestSetMatch_Anchored_FixedLenPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `\d{3}foo`},
-			{Name: "p2", Pattern: `[a-z]{2}bar`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `\d{3}foo`},
+			{Name: "p2", Regexp: `[a-z]{2}bar`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -602,8 +602,8 @@ func TestSetMatch_Anchored_FixedLenPrefix(t *testing.T) {
 // mandatory literal "foo" at the end.
 func TestSetMatch_Anchored_VarLenEmptySuffix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `\d+foo`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `\d+foo`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -623,8 +623,8 @@ func TestSetMatch_Anchored_VarLenEmptySuffix(t *testing.T) {
 // and a non-empty suffix around the mandatory literal "foo".
 func TestSetMatch_Anchored_VarLenNonEmptySuffix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `\d+foo\d+`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `\d+foo\d+`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -646,14 +646,14 @@ func TestSetMatch_Anchored_VarLenNonEmptySuffix(t *testing.T) {
 func TestSetMatch_Anchored_LargeFallback(t *testing.T) {
 	const n = 40
 	cfg := config.BuildConfig{
-		Regexps: make([]config.RegexEntry, n),
+		Patterns: make([]config.PatternEntry, n),
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
 		},
 	}
 	for i := 0; i < n; i++ {
-		cfg.Regexps[i] = config.RegexEntry{
-			Pattern: fmt.Sprintf(`(?i)tok%02d`, i),
+		cfg.Patterns[i] = config.PatternEntry{
+			Regexp: fmt.Sprintf(`(?i)tok%02d`, i),
 		}
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -672,7 +672,7 @@ func TestSetMatch_Anchored_LargeFallback(t *testing.T) {
 func TestSetMatch_Anchored_NoLiteralFallback_Large(t *testing.T) {
 	const n = 35
 	cfg := config.BuildConfig{
-		Regexps: make([]config.RegexEntry, n),
+		Patterns: make([]config.PatternEntry, n),
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
 		},
@@ -680,8 +680,8 @@ func TestSetMatch_Anchored_NoLiteralFallback_Large(t *testing.T) {
 	// Patterns with no mandatory literal: character classes / quantified.
 	classes := []string{`\d+`, `\w+`, `\s+`, `[ab]+`, `[xy]+`, `[0-9]+`, `[A-Z]+`}
 	for i := 0; i < n; i++ {
-		cfg.Regexps[i] = config.RegexEntry{
-			Pattern: classes[i%len(classes)],
+		cfg.Patterns[i] = config.PatternEntry{
+			Regexp: classes[i%len(classes)],
 		}
 	}
 	wasm, _, err := CompileFile(cfg, "")
@@ -698,9 +698,9 @@ func TestSetMatch_Anchored_NoLiteralFallback_Large(t *testing.T) {
 // `li > 0` offset-add path inside the literal-byte-check loop.
 func TestSetMatch_Anchored_TrivialPrefixMultiByte(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foobar.*`}, // literal "foobar" at offset 0
-			{Name: "p2", Pattern: `quux.+`},   // literal "quux" at offset 0
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foobar.*`}, // literal "foobar" at offset 0
+			{Name: "p2", Regexp: `quux.+`},   // literal "quux" at offset 0
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Patterns: config.PatternSelector{All: true}},
@@ -722,9 +722,9 @@ func TestSetMatch_Anchored_TrivialPrefixMultiByte(t *testing.T) {
 // findMandatoryLitRec and route to the fallback bucket instead.
 func TestSetMatch_Anchored_VarLenEmpty(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `[ab]?foo`},     // bounded varlen prefix, empty suffix
-			{Name: "p2", Pattern: `[xy]{0,3}bar`}, // bounded varlen prefix, empty suffix
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `[ab]?foo`},     // bounded varlen prefix, empty suffix
+			{Name: "p2", Regexp: `[xy]{0,3}bar`}, // bounded varlen prefix, empty suffix
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -745,9 +745,9 @@ func TestSetMatch_Anchored_VarLenEmpty(t *testing.T) {
 // suffix following the literal.
 func TestSetMatch_Anchored_VarLenNonEmpty(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `[ab]?foo[xy]`},     // bounded varlen prefix, non-empty suffix
-			{Name: "p2", Pattern: `[cd]{0,2}bar[zz]`}, // bounded varlen prefix, non-empty suffix
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `[ab]?foo[xy]`},     // bounded varlen prefix, non-empty suffix
+			{Name: "p2", Regexp: `[cd]{0,2}bar[zz]`}, // bounded varlen prefix, non-empty suffix
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "m", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -768,7 +768,7 @@ func TestSetMatch_Anchored_VarLenNonEmpty(t *testing.T) {
 // prefix (`[ab]?`) so its bucket has varLenMasks bits set.
 func TestSetFind_AC_VarLenPrefix(t *testing.T) {
 	const n = 20
-	regs := make([]config.RegexEntry, n)
+	regs := make([]config.PatternEntry, n)
 	for i := 0; i < n; i++ {
 		// Bounded varlen prefix + unique 4-byte literal. The {0,1} form
 		// yields varLenEmptySuffix for half the patterns and we add a tail
@@ -779,10 +779,10 @@ func TestSetFind_AC_VarLenPrefix(t *testing.T) {
 		} else {
 			pat = fmt.Sprintf(`[cd]{0,2}wrd%02d[xy]`, i)
 		}
-		regs[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}
+		regs[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pat}
 	}
 	cfg := config.BuildConfig{
-		Regexps: regs,
+		Patterns: regs,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
@@ -803,10 +803,10 @@ func TestSetFind_AC_VarLenPrefix(t *testing.T) {
 // bodies.
 func TestSetWithIndividualFuncs(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo\d+`, MatchFunc: "p1_match", FindFunc: "p1_find"},
-			{Name: "p2", Pattern: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups"},
-			{Name: "p3", Pattern: `baz\w+`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo\d+`, MatchFunc: "p1_match", FindFunc: "p1_find"},
+			{Name: "p2", Regexp: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups"},
+			{Name: "p3", Regexp: `baz\w+`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "set_find", Patterns: config.PatternSelector{All: true}},
@@ -827,12 +827,12 @@ func TestSetWithIndividualFuncs(t *testing.T) {
 // scalar frontend (Teddy with fallback buckets routes to scalar).
 func TestSetFind_Scalar_StartAnchorVarLen(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "anchored", Pattern: `^foo`},          // start-anchor literal
-			{Name: "varlen_e", Pattern: `[ab]?bar`},      // varlen-empty
-			{Name: "varlen_ne", Pattern: `[cd]?baz[xy]`}, // varlen-nonempty
-			{Name: "lit", Pattern: `quux`},               // plain literal
-			{Name: "fallback", Pattern: `\d+`},           // no mandatory literal → fallback bucket → scalar frontend
+		Patterns: []config.PatternEntry{
+			{Name: "anchored", Regexp: `^foo`},          // start-anchor literal
+			{Name: "varlen_e", Regexp: `[ab]?bar`},      // varlen-empty
+			{Name: "varlen_ne", Regexp: `[cd]?baz[xy]`}, // varlen-nonempty
+			{Name: "lit", Regexp: `quux`},               // plain literal
+			{Name: "fallback", Regexp: `\d+`},           // no mandatory literal → fallback bucket → scalar frontend
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -851,7 +851,7 @@ func TestSetFind_Scalar_StartAnchorVarLen(t *testing.T) {
 // CompileFile (early return on invalid config).
 func TestCompileFile_ValidateError(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: "foo"}},
 		Sets: []config.SetConfig{
 			// Empty set name is invalid.
 			{Name: "", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -869,9 +869,9 @@ func TestCompileFile_ValidateError(t *testing.T) {
 func TestCompileFile_Embedded(t *testing.T) {
 	cfg := config.BuildConfig{
 		Output: "ignored.wasm", // non-empty → embedded mode
-		Regexps: []config.RegexEntry{
-			{Name: "p1", Pattern: `foo`},
-			{Name: "p2", Pattern: `bar`},
+		Patterns: []config.PatternEntry{
+			{Name: "p1", Regexp: `foo`},
+			{Name: "p2", Regexp: `bar`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -888,8 +888,8 @@ func TestCompileFile_Embedded(t *testing.T) {
 
 func TestValidateSets_MatchOnly(t *testing.T) {
 	cfg := &config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: "foo"}},
-		Sets:    []config.SetConfig{{Name: "s", MatchAny: "validate", Patterns: config.PatternSelector{All: true}}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: "foo"}},
+		Sets:     []config.SetConfig{{Name: "s", MatchAny: "validate", Patterns: config.PatternSelector{All: true}}},
 	}
 	if err := config.ValidateSets(cfg); err != nil {
 		t.Errorf("ValidateSets match-only set: %v", err)
@@ -897,7 +897,7 @@ func TestValidateSets_MatchOnly(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Phase 5: fuzzer, mixed_004, diag JSON tests
+// Fuzzer, mixed_004, diag JSON tests
 
 func FuzzSetMatchEquivalence(f *testing.F) {
 	// Seed corpus: simple patterns that exercise different code paths.
@@ -912,7 +912,7 @@ func FuzzSetMatchEquivalence(f *testing.F) {
 	f.Fuzz(func(t *testing.T, pat, input string) {
 		// Compile the pattern — skip if it's invalid or uses captures.
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "p", Pattern: pat, FindFunc: "find"}},
+			Patterns: []config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "find"}},
 			Sets: []config.SetConfig{
 				{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 			},
@@ -936,11 +936,11 @@ func TestMixed004_Fixture_CompileFile(t *testing.T) {
 		t.Skip("mixed_004 fixture has no sets block — skipping CompileFile test")
 	}
 	cfg := config.BuildConfig{
-		Regexps: make([]config.RegexEntry, len(fix.Patterns)),
-		Sets:    fix.Sets,
+		Patterns: make([]config.PatternEntry, len(fix.Patterns)),
+		Sets:     fix.Sets,
 	}
 	for i, p := range fix.Patterns {
-		cfg.Regexps[i] = config.RegexEntry{Name: p.Name, Pattern: p.Pattern}
+		cfg.Patterns[i] = config.PatternEntry{Name: p.Name, Regexp: p.Regexp}
 	}
 	if err := config.ValidateSets(&cfg); err != nil {
 		t.Fatalf("ValidateSets: %v", err)
@@ -963,11 +963,11 @@ func TestDiagJSON_Schema(t *testing.T) {
 		t.Skip("mixed_004 has no sets")
 	}
 	cfg := config.BuildConfig{
-		Regexps: make([]config.RegexEntry, len(fix.Patterns)),
-		Sets:    fix.Sets,
+		Patterns: make([]config.PatternEntry, len(fix.Patterns)),
+		Sets:     fix.Sets,
 	}
 	for i, p := range fix.Patterns {
-		cfg.Regexps[i] = config.RegexEntry{Name: p.Name, Pattern: p.Pattern}
+		cfg.Patterns[i] = config.PatternEntry{Name: p.Name, Regexp: p.Regexp}
 	}
 	if err := config.ValidateSets(&cfg); err != nil {
 		t.Fatalf("ValidateSets: %v", err)
@@ -1006,12 +1006,12 @@ func TestDiagJSON_Schema(t *testing.T) {
 // both without and with the prefer-no-match hint.
 func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
 	alphabet := lowRarityFirstBytes()
-	pats := make([]config.RegexEntry, len(alphabet))
+	pats := make([]config.PatternEntry, len(alphabet))
 	for i, c := range alphabet {
-		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("%cq%02dx[a-z]+", c, i)}
+		pats[i] = config.PatternEntry{Regexp: fmt.Sprintf("%cq%02dx[a-z]+", c, i)}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1040,7 +1040,7 @@ func TestCompileFile_ShuftiNonAdaptive(t *testing.T) {
 // fields (sam, varLen, varLenNE, prefixFnIdx) have non-zero/real entries.
 func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 	alphabet := lowRarityFirstBytes()
-	pats := make([]config.RegexEntry, len(alphabet))
+	pats := make([]config.PatternEntry, len(alphabet))
 	for i, c := range alphabet {
 		var pat string
 		switch i % 4 {
@@ -1053,10 +1053,10 @@ func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 		default:
 			pat = fmt.Sprintf("[EF]%cq%02dx[a-z]+", c, i) // fixed-length mandatory prefix
 		}
-		pats[i] = config.RegexEntry{Pattern: pat}
+		pats[i] = config.PatternEntry{Regexp: pat}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1078,7 +1078,7 @@ func TestCompileFile_ShuftiVarLenAndAnchor(t *testing.T) {
 // Confirmed live via CompileSet probing: fe=ac, startAnchorMasks[0]=1.
 func TestCompileFile_ACStartAnchor(t *testing.T) {
 	const n = 20
-	regs := make([]config.RegexEntry, n)
+	regs := make([]config.PatternEntry, n)
 	for i := 0; i < n; i++ {
 		var pat string
 		switch {
@@ -1089,10 +1089,10 @@ func TestCompileFile_ACStartAnchor(t *testing.T) {
 		default:
 			pat = fmt.Sprintf(`[cd]{0,2}wrd%02d[xy]`, i)
 		}
-		regs[i] = config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: pat}
+		regs[i] = config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: pat}
 	}
 	cfg := config.BuildConfig{
-		Regexps: regs,
+		Patterns: regs,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1115,12 +1115,12 @@ func TestCompileFile_ACStartAnchor(t *testing.T) {
 // probing: fe=teddy, teddyTabs.TwoGroups=true, teddyTabs.FourByte=true.
 func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
 	const n = 9
-	pats := make([]config.RegexEntry, n)
+	pats := make([]config.PatternEntry, n)
 	for i := 0; i < n; i++ {
-		pats[i] = config.RegexEntry{Pattern: fmt.Sprintf("lit%02d_[a-z]+", i)}
+		pats[i] = config.PatternEntry{Regexp: fmt.Sprintf("lit%02d_[a-z]+", i)}
 	}
 	cfg := config.BuildConfig{
-		Regexps: pats,
+		Patterns: pats,
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "find_all", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1147,10 +1147,10 @@ func TestCompileFile_TeddyTwoGroupsFourByte(t *testing.T) {
 // used.
 func TestAssembleModuleWithSets_LitAnchorAndAnchoredGroups(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{
-			{Name: "lit_anchor", Pattern: `secret_[A-Za-z0-9]+`, FindFunc: "f1"},
-			{Name: "anchored_groups", Pattern: `^(a)(b)$`, GroupsFunc: "g1"},
-			{Name: "set_member", Pattern: `foo|bar`},
+		Patterns: []config.PatternEntry{
+			{Name: "lit_anchor", Regexp: `secret_[A-Za-z0-9]+`, FindFunc: "f1"},
+			{Name: "anchored_groups", Regexp: `^(a)(b)$`, GroupsFunc: "g1"},
+			{Name: "set_member", Regexp: `foo|bar`},
 		},
 		Sets: []config.SetConfig{
 			{Name: "s", Find: "s_find", Patterns: config.PatternSelector{Names: []string{"set_member"}}},
@@ -1175,9 +1175,9 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 		// block: hits the compilePattern error path (CompileFile's
 		// per-pattern loop, before set resolution).
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{
-				{Name: "bad", Pattern: `[invalid`, MatchFunc: "m"},
-				{Name: "ok", Pattern: "foo"},
+			Patterns: []config.PatternEntry{
+				{Name: "bad", Regexp: `[invalid`, MatchFunc: "m"},
+				{Name: "ok", Regexp: "foo"},
 			},
 			Sets: []config.SetConfig{
 				{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: []string{"ok"}}},
@@ -1194,8 +1194,8 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 		// compile), so the error surfaces later via analyzePattern inside
 		// set resolution, wrapped as `set %q: pattern %q: %w`.
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{
-				{Name: "bad", Pattern: `[invalid`},
+			Patterns: []config.PatternEntry{
+				{Name: "bad", Regexp: `[invalid`},
 			},
 			Sets: []config.SetConfig{
 				{Name: "myset", Find: "f", Patterns: config.PatternSelector{All: true}},
@@ -1222,7 +1222,7 @@ func TestCompileFile_ErrorPropagation(t *testing.T) {
 // fnIdx>=0 combination the doc flagged as needing verification.
 func TestSetMatch_ZeroWidthNonNilPrefix(t *testing.T) {
 	cfg := config.BuildConfig{
-		Regexps: []config.RegexEntry{{Name: "p", Pattern: `\bfoo`}},
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `\bfoo`}},
 		Sets: []config.SetConfig{
 			{Name: "s", MatchAny: "s_match", Patterns: config.PatternSelector{All: true}},
 		},
@@ -1373,7 +1373,7 @@ func TestSetDiagRecordsRouting(t *testing.T) {
 			var prefixPool, suffixPool dfaPool
 			var infos []*PatternInfo
 			var ids []int
-			for i, re := range cfg.Regexps {
+			for i, re := range cfg.Patterns {
 				info, err := analyzePattern(re, &prefixPool, &suffixPool)
 				if err != nil {
 					t.Fatal(err)
@@ -1405,7 +1405,7 @@ func TestSetDiagRecordsRouting(t *testing.T) {
 // Every harness in this project builds sets that select ALL of the config's
 // patterns, which keeps global pattern ids dense and equal to set-local
 // indices — and that is precisely why this hazard survived 4.9M corpus cases. A
-// pattern id is the GLOBAL index into `regexps:`, so a set selecting a
+// selected member's id is its index into the top-level `patterns:`, so a set selecting a
 // non-prefix subset reports ids above its own pattern count, and everything
 // indexed by an id has to be sized for that.
 
@@ -1535,14 +1535,14 @@ func TestJumpIsProfitable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			entries := make([]config.RegexEntry, len(tc.pats))
+			entries := make([]config.PatternEntry, len(tc.pats))
 			names := make([]string, len(tc.pats))
 			for i, p := range tc.pats {
 				names[i] = string(rune('a' + i))
-				entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+				entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 			}
 			cfg := config.BuildConfig{
-				Regexps: entries,
+				Patterns: entries,
 				Sets: []config.SetConfig{{
 					Name: "s", Find: "f",
 					Patterns: config.PatternSelector{Names: names},
@@ -1554,7 +1554,7 @@ func TestJumpIsProfitable(t *testing.T) {
 			for i, e := range entries {
 				info, err := analyzePattern(e, &pp, &sp)
 				if err != nil {
-					t.Fatalf("analyzePattern %q: %v", e.Pattern, err)
+					t.Fatalf("analyzePattern %q: %v", e.Regexp, err)
 				}
 				infos = append(infos, info)
 				ids = append(ids, i)
@@ -1576,13 +1576,13 @@ func TestJumpIsProfitable(t *testing.T) {
 // cursor, the split-position resume — needs a WASM runtime and lives in
 // tools/fuzz/set_caps_test.go.
 func TestSetFindBatch_Emission(t *testing.T) {
-	entries := []config.RegexEntry{
-		{Name: "a", Pattern: `foo\d+`},
-		{Name: "b", Pattern: `bar\w+`},
+	entries := []config.PatternEntry{
+		{Name: "a", Regexp: `foo\d+`},
+		{Name: "b", Regexp: `bar\w+`},
 	}
 	build := func(s config.SetConfig) []byte {
 		t.Helper()
-		w, _, err := CompileFile(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{s}}, "")
+		w, _, err := CompileFile(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{s}}, "")
 		if err != nil {
 			t.Fatalf("CompileFile: %v", err)
 		}
@@ -2022,9 +2022,9 @@ func diverseFirstBytes(n int) []string {
 }
 
 func (c setMatrixCase) build() config.BuildConfig {
-	entries := make([]config.RegexEntry, len(c.patterns))
+	entries := make([]config.PatternEntry, len(c.patterns))
 	for i, p := range c.patterns {
-		e := config.RegexEntry{Name: fmt.Sprintf("p%02d", i), Pattern: p}
+		e := config.PatternEntry{Name: fmt.Sprintf("p%02d", i), Regexp: p}
 		if c.perPattern.match {
 			e.MatchFunc = fmt.Sprintf("p%02d_match", i)
 		}
@@ -2073,9 +2073,9 @@ func (c setMatrixCase) build() config.BuildConfig {
 		set.Hints = append(append([]string(nil), set.Hints...), "batch-find")
 	}
 	return config.BuildConfig{
-		Regexps:           entries,
-		Sets:              []config.SetConfig{set},
-		MaxFallbackStates: c.maxFallbackStates,
+		Patterns:     entries,
+		Sets:         []config.SetConfig{set},
+		MaxDFAStates: config.Limit(c.maxFallbackStates),
 	}
 }
 
@@ -2203,6 +2203,193 @@ func TestSetMatrixDiagnostics(t *testing.T) {
 					t.Errorf("%s: no buckets, though not every pattern is capture-bearing", c.name)
 				}
 			}
+		})
+	}
+}
+
+// TestRareSetPaths compiles sets that each reach a branch no other test does —
+// limits a set exceeds (a reversed literal-bucket prefix over the build cap, a
+// whole-set merge over it, a sparse promotion over max_dfa_states, more member
+// sets than one byte numbers, a projection over its cell cap, a literal-
+// crossing check over its node cap, a member over the split analysis cap, a
+// nesting check over its slot budget), shapes only a few configurations
+// produce, and the configurations that refuse a set — and validates every
+// module. A refused set must say why.
+func TestRareSetPaths(t *testing.T) {
+	on, off := true, false
+	big, err := config.ParseMemorySize("256MB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pairClass(i): disjoint two-byte classes over printable ASCII, none
+	// holding 'k', ',' or ';'.
+	var sel []byte
+	for b := byte(0x21); b <= 0x7e; b++ {
+		if b != 'k' && b != ',' && b != ';' {
+			sel = append(sel, b)
+		}
+	}
+	pairClass := func(i int) string { return fmt.Sprintf(`[\x%02x\x%02x]`, sel[2*i], sel[2*i+1]) }
+	gen := func(n int, f func(int) string) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = f(i)
+		}
+		return out
+	}
+	set := func(sc config.SetConfig) config.BuildConfig {
+		sc.Name = "s"
+		return config.BuildConfig{Sets: []config.SetConfig{sc}}
+	}
+	with := func(cfg config.BuildConfig, f func(*config.BuildConfig)) config.BuildConfig { f(&cfg); return cfg }
+
+	// A reversed fixed-length prefix whose automaton needs 2^12 states.
+	var alts []string
+	for i := 0; i < 12; i++ {
+		ab := func(n int) string {
+			if n == 0 {
+				return ""
+			}
+			return fmt.Sprintf("[ab]{%d}", n)
+		}
+		alts = append(alts, ab(i)+"a"+ab(11-i))
+	}
+	// 33 members with 8 segments each, every segment a 23-letter class: more
+	// distinct self-loop sets than a member-set byte numbers.
+	const noK = "abcdefghijlmnopqrstuvwxyz"
+	var segs []string
+	for p := 0; p < len(noK); p++ {
+		for q := p + 1; q < len(noK); q++ {
+			var sb strings.Builder
+			sb.WriteByte('[')
+			for r := 0; r < len(noK); r++ {
+				if r != p && r != q {
+					sb.WriteByte(noK[r])
+				}
+			}
+			sb.WriteByte(']')
+			segs = append(segs, sb.String())
+		}
+	}
+	manySets := gen(33, func(i int) string {
+		var sb strings.Builder
+		sb.WriteString("key:" + pairClass(i))
+		for s := 0; s < 8; s++ {
+			sb.WriteString(segs[i*8+s] + "*,")
+		}
+		return sb.String() + ";"
+	})
+	zeroWidthChain := []string{"(?m:$*$*$*$*$*$*$*$*$*$*)*0$", "(?m:$*$*$*$*$*$*$*$*$*$*<*)*\t$*$",
+		"(?m:$*$*$*$*$*$*$*$*)*$*$*$*\x01*\x01$", "(?m:$*$*$*$*$*$*$*$*$*$*)*$dd*", "(?m:$*$*$*$*$*$*$*$*$*)*\x01*0$",
+		"(?m:$*$*$*$*$*$*$+$+$*$*)*$*0$", "(?m:$*0*$*\x01*$*$*$*$$*0*$*$*)*$*$* $*$", "(?m:$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*0$)",
+		"a\\b*b", "(?m:x(?:^|$)+\\ny)"}
+	scripts := gen(5, func(i int) string {
+		return []string{`\p{Cyrillic}`, `\p{Greek}`, `\p{Armenian}`, `\p{Hebrew}`, `\p{Georgian}`}[i] + "+;"
+	})
+
+	for _, c := range []struct {
+		name    string
+		cfg     config.BuildConfig
+		opts    *CompileSetOptions
+		wantErr string
+	}{
+		{name: "reversed prefix over the build cap", cfg: set(config.SetConfig{MatchAny: "ma",
+			Regexps: []string{"(?:" + strings.Join(alts, "|") + ")QQQ"}})},
+		{name: "whole-set merge over the build cap", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: gen(40, func(i int) string { return fmt.Sprintf("kw%02d[0-9]{70}", i) })})},
+		{name: "sparse promotion over max_dfa_states", cfg: with(set(config.SetConfig{Find: "f",
+			Regexps: gen(40, func(i int) string { return pairClass(i) + "[0-9]{70}" })}),
+			func(c *config.BuildConfig) { c.MaxDFAStates = 200 })},
+		{name: "sparse promotion with a newline channel", cfg: set(config.SetConfig{Find: "f",
+			Regexps: gen(33, func(i int) string { return pairClass(i) + "[0-9](?m:$)" })})},
+		{name: "byte mode refuses a non-ASCII member", cfg: set(config.SetConfig{Find: "f", Unicode: &off, Regexps: []string{"café"}}),
+			wantErr: `unicode: false, but member "café" asks for Unicode mode`},
+		{name: "an unparsable member", cfg: set(config.SetConfig{Find: "f", Regexps: []string{"("}}),
+			wantErr: "missing closing )"},
+		{name: "wide sweep rows with an empty-matching member", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Unicode: &on,
+			Regexps: append([]string{`\pL*`}, gen(32, func(i int) string { return fmt.Sprintf("q%02d", i) })...)})},
+		{name: "a dominant accept under one boundary context", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`a\B|b\w*`}})},
+		{name: "projection over its cell cap", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: append([]string{`x\w+`}, gen(182, func(j int) string { return fmt.Sprintf("x[a-wyz]{%d}", j+1) })...)})},
+		{name: "projection over deduplicated u16 rows", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: append([]string{`[{|][a-z{|]*`}, gen(32, func(i int) string { return pairClass(i) + "[0-9]{7}" })...)})},
+		{name: "more member sets than a byte numbers", cfg: with(set(config.SetConfig{Find: "f", Hints: []string{"prefer-match"},
+			Regexps: manySets}), func(c *config.BuildConfig) { c.MaxSetBucketSize = big })},
+		{name: "member sets of whole characters only", cfg: set(config.SetConfig{Find: "f", Unicode: &on, Hints: []string{"prefer-match"},
+			Regexps: gen(33, func(i int) string { return "key:" + pairClass(i) + "[^;k]*;" })})},
+		{name: "an anchored member promoted into a sparse bucket", cfg: set(config.SetConfig{Find: "f",
+			Regexps: append([]string{`\A[xy]+`}, gen(33, func(k int) string { return fmt.Sprintf("[ab][0-9]{%d}", k+1) })...)})},
+		{name: "a counted sparse bucket beside another", cfg: set(config.SetConfig{Find: "f",
+			Regexps: append([]string{`bar[0-9]`, `foo[ab]{12}a\w*`}, gen(32, func(k int) string { return fmt.Sprintf(`foo[0-9]{%d}\w*`, k+1) })...)})},
+		{name: "a batching split member with no program sweep", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Hints: []string{"batch-find"}, Regexps: []string{`foo\w+`, `[a-z]*?(?:a?){400}b`}})},
+		{name: "literal crossing over its node cap", cfg: set(config.SetConfig{Find: "f",
+			Regexps: []string{strings.Repeat("Z", 300) + `(?:[a-z]{900})*!`}})},
+		{name: "a scan counter on the scalar frontend", cfg: set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: []string{`foo[a-z]+bar`, `baz[0-9]`}}), opts: new(CompileSetOptions{}.WithForcedFrontend(SetFrontendScalar))},
+		// The anchored member is over max_dfa_states (a Backtracking probe)
+		// while the leftmost-first find stops at `a`: a batching, cache-served
+		// find over a set with a Backtracking member.
+		{name: "batching with an answer cache and a Backtracking probe", cfg: with(set(config.SetConfig{Find: "f", MatchAny: "ma",
+			Overlapping: true, Hints: []string{"batch-find"}, Regexps: []string{`a|a(?:a|b)*a(?:a|b){8}`, `foo\w+`}}),
+			func(c *config.BuildConfig) { c.MaxDFAStates = 300 })},
+		{name: "anchored probes over letter-class loops", cfg: with(set(config.SetConfig{MatchAny: "ma", MatchAll: "ml", Unicode: &on,
+			Hints: []string{"prefer-match"}, Regexps: scripts}), func(c *config.BuildConfig) { c.MaxUnionStates = 4 })},
+		{name: "nesting check over its slot budget", cfg: with(set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`x[ab]*a[ab]{11}`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxSetBucketSize, c.MaxUnionStates = 10000, big, 20000
+		})},
+		{name: "a member over the split analysis cap", cfg: with(set(config.SetConfig{ScanAny: "sa", ScanAll: "sl", Find: "f", Unicode: &on,
+			Regexps: []string{`[ab]*a[ab]{12}`, `x[a-z]*y`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxUnionStates, c.MaxSplitTableSize, c.MaxSetBucketSize = 2000, 4, big, big
+		})},
+		// The first member's forward pass has more cycle states than notes
+		// cover, so it keeps no search block; the second keeps one.
+		{name: "a split scan over a member with no search block", cfg: with(set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: []string{`(?:a|b)*a(?:a|b){10}c|a`, `x[a-z]*y`}}), func(c *config.BuildConfig) {
+			c.MaxDFAStates, c.MaxUnionStates, c.MaxSplitTableSize, c.MaxSetBucketSize = 10000, 4, big, big
+		})},
+		// Blocks of tools/re2test's custom-sets.txt: the zero-width repeat
+		// chain (a split member's program sweep over (?m:$) contexts; anchored
+		// Backtracking probes forced onto the fallback at max_dfa_states 1)
+		// and the boundary branch priorities (a sweep closure item met twice).
+		{name: "zero-width repeat chain, overlapping", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Regexps: zeroWidthChain})},
+		{name: "zero-width repeat chain, anchored on Backtracking", cfg: with(set(config.SetConfig{MatchAny: "ma", MatchAll: "ml",
+			Regexps: zeroWidthChain}), func(c *config.BuildConfig) { c.MaxDFAStates = 1 })},
+		{name: "boundary branch priority, overlapping", cfg: set(config.SetConfig{Find: "f", Overlapping: true,
+			Regexps: []string{`(\B|(?:(a|(b|b)*)))a`, `(?:\B|a|)a`, `(?:\b|a|)a`, `(?:\B|a*)a`, `foo(?:\B|a|)a`, `(?:\B|a)a`}})},
+		// Literal buckets beside more than 64 literal-less members: the scan
+		// pair's two-phase split over a wide union.
+		{name: "two-phase scan over a wide union", cfg: set(config.SetConfig{ScanAny: "sa", ScanAll: "sl",
+			Regexps: append(gen(40, func(i int) string { return fmt.Sprintf("kw%02d[0-9]+", i) }),
+				gen(70, func(i int) string { return fmt.Sprintf("[a-z]{%d}[0-9]", i+3) })...)})},
+		{name: "a sweep whose start state is on the cycle", cfg: set(config.SetConfig{Find: "f", Overlapping: true, Regexps: []string{`[ab]*c\b`}})},
+		{name: "split candidates with splitting off", cfg: set(config.SetConfig{Find: "f", Regexps: []string{`x[a-z]*y`, `foo[0-9]`}}),
+			opts: &CompileSetOptions{NoSplit: true}},
+		// The scan pair alone needs the split, so its wide `_all` export
+		// forwards to the split copy.
+		{name: "a forwarded wide scan_all", cfg: set(config.SetConfig{Find: "f", Overlapping: true, ScanAll: "sl",
+			Regexps: []string{`foo\w+`, `a[ab]{12}c[a-z]*z`, `\bbar\b`}})},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var w []byte
+			var err error
+			if c.opts != nil {
+				w, _, _, err = CompileFileOpts(c.cfg, "", *c.opts)
+			} else {
+				w, _, _, err = CompileFileDiag(c.cfg, "")
+			}
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			validateWASM(t, w)
 		})
 	}
 }

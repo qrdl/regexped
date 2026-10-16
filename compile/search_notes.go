@@ -943,7 +943,7 @@ func SearchSizes(cfg config.BuildConfig) (map[string]SearchSize, error) {
 
 // CompileWithSearchSizes is CompileForced plus SearchSizes for the same
 // compile, for harnesses that drive raw exports with a search block.
-func CompileWithSearchSizes(patterns []config.RegexEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, map[string]SearchSize, error) {
+func CompileWithSearchSizes(patterns []config.PatternEntry, tableBase int64, standalone bool, forceGroupsEngine EngineType, opts CompileOptions) ([]byte, int64, map[string]SearchSize, error) {
 	opts.searchSizes = map[string]SearchSize{}
 	w, top, err := CompileForced(patterns, tableBase, standalone, forceGroupsEngine, opts)
 	return w, top, opts.searchSizes, err

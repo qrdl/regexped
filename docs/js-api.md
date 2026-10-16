@@ -173,7 +173,7 @@ export function* <find>(input, offset = 0)    // yields {patternId, start, end}
 export const <set>BatchMaxSize
 export function* <find>(input, offset = 0, batchSize = <default>) // <default> = max(256, <set>PatternCount), capped at <set>BatchMaxSize
 
-export function patternName(id)             // only if any set sets emit_name_map: true
+export function <set>PatternName(id)        // per set, only if it sets emit_name_map: true
 ```
 
 **`_all` and `_any` return data, not predicates.** JavaScript cannot catch the
@@ -214,8 +214,11 @@ exception and plausible-looking output. If you are on an older
 generated stub, that hazard is real and the old rule ("do not call other stub
 functions while a generator is suspended") still applies to it.
 
-`patternName` is a single shared lookup across every set in the config that
-requested `emit_name_map: true`.
+`<set>PatternName(id)` — `secretsPatternName` for a set named `secrets` — is
+emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ---
 

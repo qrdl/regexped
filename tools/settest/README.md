@@ -60,15 +60,15 @@ decision.
 
 `-inputs` is a text file, one candidate input per line; `#` lines and blank
 lines are skipped. Bucketing uses Go's stdlib `regexp` as ground truth: an
-input is "matching" when **any** pattern the set actually contains matches it —
+input is "matching" when **any** member of the set matches it —
 anchored over the whole input for `match_any`/`match_all`, unanchored for
 `scan_any`/`scan_all`/`find`.
 
-"Actually contains" is doing work there. A pattern the compiler dropped from
-the set (over `max_fallback_states`, capture-bearing) can never match, so it is
-excluded from the oracle and a warning names it. Otherwise inputs would land in
-the wrong bucket and the sanity check below would fail for a reason that is not
-a bug.
+The set contains every member it selects, in every capability, so the oracle
+holds all of them: the top-level patterns the set names (or `all`) and its own
+`regexps:`. A member whose anchored DFA is over `max_dfa_states` still answers
+`match_any`/`match_all`, through a Backtracking probe, and a member that fits
+no engine fails the compile instead of being left out.
 
 Before any measurement, settest checks that the driven export agrees with the
 oracle about whether each input matches at all. It is not a correctness suite —

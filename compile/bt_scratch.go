@@ -71,7 +71,7 @@ type btDyn struct {
 	memoMemIdx int
 	// frameSize is this body's frame, in bytes.
 	frameSize int32
-	// rowBytes is one memo row: ceil(N/8).
+	// rowBytes is one memo row: a bit per guarded pc (backtrack.memoRowBytes).
 	rowBytes int32
 
 	memoBase  uint32 // i32 local: the memo's first byte
@@ -302,13 +302,13 @@ func (d *btDyn) clearLimit() uint32 {
 	return d.stackBase
 }
 
-func newBTDyn(scratch btScratch, memIdx int, frameSize int32, numInsts int) *btDyn {
+func newBTDyn(scratch btScratch, memIdx int, frameSize int32, rowBytes int) *btDyn {
 	return &btDyn{
 		scratch:    scratch,
 		memIdx:     memIdx,
 		memoMemIdx: memIdx,
 		frameSize:  frameSize,
-		rowBytes:   int32((numInsts + 7) / 8),
+		rowBytes:   int32(rowBytes), //nolint:gosec // a program's Alts / 8
 	}
 }
 
@@ -550,7 +550,8 @@ func emitBTDynPushCheck(b []byte, d *btDyn, unknown func([]byte) []byte) []byte 
 func emitBitStateGuardDyn(b []byte, d *btDyn, p int, byteAddr, memoByte uint32,
 	brDepth uint32, memoOriginLocal uint32, hasMemoOrigin bool) []byte {
 
-	// byteAddr = memoBase + (pos - origin)·rowBytes + p/8
+	// byteAddr = memoBase + (pos - origin)·rowBytes + p/8, p the pc's memo
+	// bit (backtrack.memoIndex)
 	b = append(b, 0x20, localPos)
 	if hasMemoOrigin {
 		b = btLocalGet(b, memoOriginLocal)
@@ -740,7 +741,7 @@ type btDriveMember struct {
 	// call burns it once.
 	blk     int
 	blocksG uint32
-	// rowBytes is one memo row, ⌈instructions / 8⌉ — what a match's reset
+	// rowBytes is one memo row, a bit per guarded pc — what a match's reset
 	// needs to find the candidate's row (emitBTMemberMatched).
 	rowBytes int32
 }
@@ -873,6 +874,27 @@ func emitBTWorkChargeMember(b []byte, m *btDriveMember, tmp uint32, trip func([]
 	b = append(b, 0x42, 0x01) // i64.const 1
 	b = append(b, 0x7D)       // i64.sub
 	b = append(b, 0x22)       // local.tee tmp
+	b = utils.AppendULEB128(b, tmp)
+	b = appendGlobalSet(b, m.budget)
+	b = btLocalGet(b, tmp)
+	b = append(b, 0x42, 0x01) // i64.const 1
+	b = append(b, 0x53)       // i64.lt_s
+	b = append(b, 0x04, 0x40) // if
+	b = trip(b)
+	return append(b, 0x0B) // end if
+}
+
+// emitBTWorkChargeMemberN charges n at once; n == 1 is emitBTWorkChargeMember
+// byte for byte.
+func emitBTWorkChargeMemberN(b []byte, m *btDriveMember, tmp uint32, n int, trip func([]byte) []byte) []byte {
+	if n == 1 {
+		return emitBTWorkChargeMember(b, m, tmp, trip)
+	}
+	b = appendGlobalGet(b, m.budget)
+	b = append(b, 0x42) // i64.const n
+	b = utils.AppendSLEB128_64(b, int64(n))
+	b = append(b, 0x7D) // i64.sub
+	b = append(b, 0x22) // local.tee tmp
 	b = utils.AppendULEB128(b, tmp)
 	b = appendGlobalSet(b, m.budget)
 	b = btLocalGet(b, tmp)

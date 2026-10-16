@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"regexp/syntax"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -85,27 +87,45 @@ type BuildConfig struct {
 	// equivalent, and the shared Span and error type widen the
 	// exposure. A NO-OP for Rust, whose `pub mod <import_module>` wrapper
 	// already isolates every stub.
-	Namespace    string `yaml:"namespace"`
-	MaxDFAStates int    `yaml:"max_dfa_states"` // 0 = default (1024)
-	MaxTDFARegs  int    `yaml:"max_tdfa_regs"`  // 0 = default (32)
+	Namespace string `yaml:"namespace"`
+	// MaxDFAStates is the largest DFA or TDFA, in states, any automaton may
+	// be: a single pattern's, and a set's per-member and per-bucket automata
+	// alike. Over it a pattern or member runs on Backtracking. Unset is the
+	// mode's default (1,024; 16,384 in Unicode mode); 0 means always
+	// Backtracking. See Limit for how the YAML value decodes.
+	MaxDFAStates Limit `yaml:"max_dfa_states"`
+	MaxTDFARegs  int   `yaml:"max_tdfa_regs"` // 0 = default (32)
+	// MaxBTInstructions caps a Backtracking program, in instructions — the
+	// size its emitted body grows with. Unset is 20,000; 0 means never
+	// Backtracking, so a pattern or set member that needs it does not compile.
+	MaxBTInstructions Limit `yaml:"max_bt_instructions"`
 	// MaxMemory caps ALL of the module's memory — its tables, the buffers a
 	// JS/TS stub copies inputs into, and a search's working memory — and is
 	// declared as the WASM memory's maximum, so the engine refuses every grow
 	// past it. Unset means no cap. See MemorySize for the spelling.
 	MaxMemory MemorySize `yaml:"max_memory"`
-	// MaxFallbackStates caps the suffix DFA of a single-pattern fallback
-	// bucket in a SET. It is a different budget from MaxDFAStates: that one
-	// bounds a whole single-pattern automaton, this one bounds one bucket of
-	// many inside a set, which is why they are separate keys despite sharing
-	// a default.
-	//
-	// It is load-bearing in a way the other two are not. A single pattern over
-	// MaxDFAStates falls back to another engine and still matches; a set
-	// member over this limit is DROPPED from the set and can never match. So
-	// this is the knob that decides whether a set contains what you put in it.
-	MaxFallbackStates int          `yaml:"max_fallback_states"` // 0 = default (1024)
-	Regexps           []RegexEntry `yaml:"regexps"`
-	Sets              []SetConfig  `yaml:"sets"` // optional set composition entries
+	// MaxSetBucketSize caps one set BUCKET's table — the automaton several
+	// members share, so the input is walked once for all of them. A member
+	// that would push a bucket past it goes to another bucket, or one of its
+	// own; fewer, bigger buckets are cheaper per input byte. Unset is 128
+	// bytes per max_dfa_states state (128 KB; 2 MB in Unicode mode).
+	MaxSetBucketSize MemorySize `yaml:"max_set_bucket_size"`
+	// MaxSplitTableSize caps the TOTAL tables of one set's split members —
+	// members served by a search of their own, outside the buckets. Members
+	// get the table-driven search smallest first while the total fits; the
+	// rest get the Backtracking search, which needs no table and is slower.
+	// Unset is 4 MB (64 MB for a Unicode-mode set).
+	MaxSplitTableSize MemorySize `yaml:"max_split_table_size"`
+	// MaxUnionStates caps the construction of a SET's union automata — the
+	// one pass that serves scan_any / scan_all for members with no literal,
+	// and the anchored one serving match_any / match_all. Past it the set
+	// falls back to the per-position walk, or splits members out to searches
+	// of their own, both dearer per byte. A larger cap costs compile time and
+	// compiler memory, not correctness. The default follows the set's mode:
+	// 16,384 in Unicode mode, where a letter class costs hundreds of states.
+	MaxUnionStates int            `yaml:"max_union_states"` // 0 = default (4096; 16384 for a Unicode-mode set)
+	Patterns       []PatternEntry `yaml:"patterns"`
+	Sets           []SetConfig    `yaml:"sets"` // optional set composition entries
 }
 
 // SetConfig describes one `sets:` entry in the YAML config.
@@ -155,8 +175,18 @@ type SetConfig struct {
 	// `find:`, since no other capability gates.
 	Overlapping bool `yaml:"overlapping"`
 
-	Patterns    PatternSelector `yaml:"patterns"`      // which regexps belong to this set
-	EmitNameMap bool            `yaml:"emit_name_map"` // generate pattern_name / patternName helper in stubs (does not change WASM)
+	// Patterns selects members from the top-level `patterns:` list: "all", or
+	// a list of their names. Regexps adds members of the set's own: bare
+	// regexps, private to this set — `all` in another set never sees them,
+	// and their ids are numbered per set (Members). A set needs at least one
+	// member from the two together.
+	Patterns PatternSelector `yaml:"patterns"`
+	Regexps  []string        `yaml:"regexps"`
+	// EmitNameMap generates this set's own name lookup in the stubs,
+	// <set>_pattern_name(id) in each language's spelling: the `name:` of a
+	// named top-level member, "" for an unnamed one and for an inline regexp.
+	// It does not change the WASM.
+	EmitNameMap bool `yaml:"emit_name_map"`
 	// Hints biases which suffix-DFA optimisation path to favour for this set.
 	// Also serves as the per-set default for unhinted patterns in this set
 	// when they reach the set's suffix DFA body. Accepted values: nil/empty
@@ -165,6 +195,11 @@ type SetConfig struct {
 	// "batch-find" is NOT accepted here — it is a
 	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry.
 	Hints []string `yaml:"hints"`
+	// Unicode states the set's mode: true for Unicode mode, false for byte
+	// mode. Unset, the set takes its mode from its members. A set runs in ONE
+	// mode; the rules that combine this key with its members' are in the
+	// compiler, because a member's own choice can come from its pattern text.
+	Unicode *bool `yaml:"unicode"`
 }
 
 // SetCapability is one (yaml key, export name) pair from a set entry.
@@ -258,23 +293,83 @@ func SanitizeSetName(name string) string {
 	return string(b)
 }
 
-// PatternCount returns the number of patterns the set selects.
+// SetMember is one member of a set: the entry it compiles from and the
+// pattern id the set reports it under.
+type SetMember struct {
+	// Entry is the top-level entry for a selected member. For an inline
+	// regexp it is an entry holding only Regexp: no name, no exports, no
+	// mode keys — the set's own `unicode:` and `hints:` apply to it.
+	Entry PatternEntry
+	// ID is the pattern id: a selected member's index into the top-level
+	// `patterns:` list, an inline regexp's len(patterns) + its position in
+	// the set's `regexps:`. Inline ids are numbered PER SET, so editing one
+	// set's regexps never renumbers another set.
+	ID int
+	// Inline reports whether the member came from the set's `regexps:`.
+	Inline bool
+}
+
+// Members returns the set's members in id order within each source: the
+// selected top-level patterns (`all` in list order, names in the order
+// listed), then the set's own regexps. It is THE member list: the compiler,
+// the stub generators and the harnesses all read it, so the ids a module
+// reports and the ids a stub sizes for cannot disagree. A name that is not
+// declared is skipped here; ValidateSets reports it.
+func (s SetConfig) Members(cfg BuildConfig) []SetMember {
+	var out []SetMember
+	if s.Patterns.All {
+		for i, e := range cfg.Patterns {
+			out = append(out, SetMember{Entry: e, ID: i})
+		}
+	} else {
+		idx := patternNameIndex(cfg)
+		for _, name := range s.Patterns.Names {
+			if i, ok := idx[name]; ok {
+				out = append(out, SetMember{Entry: cfg.Patterns[i], ID: i})
+			}
+		}
+	}
+	for k, r := range s.Regexps {
+		out = append(out, SetMember{Entry: PatternEntry{Regexp: r}, ID: len(cfg.Patterns) + k, Inline: true})
+	}
+	return out
+}
+
+// patternNameIndex maps each named top-level pattern to its index; the first
+// of two equal names wins (ValidateSets refuses the second).
+func patternNameIndex(cfg BuildConfig) map[string]int {
+	idx := make(map[string]int, len(cfg.Patterns))
+	for i, re := range cfg.Patterns {
+		if re.Name != "" {
+			if _, dup := idx[re.Name]; !dup {
+				idx[re.Name] = i
+			}
+		}
+	}
+	return idx
+}
+
+// PatternCount returns the number of patterns the set holds: those it
+// selects plus its own regexps.
 //
 // This is <SET>_PATTERN_COUNT: the worst-case number of matches at a
 // single `find` position, and therefore the size of the tuple buffer. It is
 // NOT a bound on pattern id values — see IDSpaceSize.
 func (s SetConfig) PatternCount(cfg BuildConfig) int {
+	n := len(s.Patterns.Names)
 	if s.Patterns.All {
-		return len(cfg.Regexps)
+		n = len(cfg.Patterns)
 	}
-	return len(s.Patterns.Names)
+	return n + len(s.Regexps)
 }
 
 // IDSpaceSize returns one past the largest pattern id this set can report.
 //
-// A set's pattern_id is the GLOBAL index into `regexps:` in YAML order
-// (docs/sets.md), so a set selecting the last two of seventy patterns reports
-// ids 68 and 69 even though it holds two patterns. Everything indexed BY that
+// A selected member's pattern_id is its index into the top-level `patterns:`
+// in YAML order (docs/sets.md), so a set selecting the last two of seventy
+// patterns reports ids 68 and 69 even though it holds two patterns. A set's
+// own regexps follow every top-level pattern: with seventy declared, its
+// first inline regexp is id 70, whatever it selects. Everything indexed BY that
 // id — the gate array, the `_all` bitmask/bitmap, and hence the narrow-vs-wide
 // `_all` ABI choice — must be sized from this, not from PatternCount.
 //
@@ -286,23 +381,18 @@ func (s SetConfig) PatternCount(cfg BuildConfig) int {
 // This is deliberately an UPPER BOUND computed from the config alone, and it
 // is THE definition for both sides: the compiler calls it (through
 // SetSpec.IDSpaceSize) and so does every stub generator, so the two cannot
-// drift. Patterns dropped later — capture-bearing ones, or ones over the DFA
-// state limit — only lower the ids actually emitted, never raise them, so an
-// upper bound stays safe. Deriving it instead from what survived compilation
+// drift. The ids a set actually emits never exceed it, so an upper bound
+// stays safe. Deriving it instead from what survived compilation
 // would be tighter but unavailable to the generators, which never see the
 // compiled module.
 func (s SetConfig) IDSpaceSize(cfg BuildConfig) int {
+	if len(s.Regexps) > 0 {
+		return len(cfg.Patterns) + len(s.Regexps)
+	}
 	if s.Patterns.All {
-		return len(cfg.Regexps)
+		return len(cfg.Patterns)
 	}
-	idx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
-		if re.Name != "" {
-			if _, dup := idx[re.Name]; !dup {
-				idx[re.Name] = i
-			}
-		}
-	}
+	idx := patternNameIndex(cfg)
 	max := -1
 	for _, name := range s.Patterns.Names {
 		if i, ok := idx[name]; ok && i > max {
@@ -339,10 +429,7 @@ func setBatchPatternCount(s SetConfig, cfg *BuildConfig) (n int, ok bool) {
 	if !s.BatchFind() {
 		return 0, true
 	}
-	n = len(s.Patterns.Names)
-	if s.Patterns.All {
-		n = len(cfg.Regexps)
-	}
+	n = s.PatternCount(*cfg)
 	return n, n <= SetCursorMaxPatterns
 }
 
@@ -449,8 +536,10 @@ const SetCursorOutOfOrderPos = 0xFFFFFFFC
 // finish, which is the one outcome strictly worse than not sweeping.
 const SetOverlapCacheMaxBytes = 64 << 20
 
-// PatternSelector selects patterns for a set. It can be the scalar string "all"
-// or a list of pattern names.
+// PatternSelector selects top-level patterns for a set. It can be the scalar
+// string "all" — every entry of the top-level `patterns:`, named or not, and
+// never another set's own regexps — or a list of pattern names. Absent, it
+// selects nothing, and the set's own `regexps:` are its only members.
 type PatternSelector struct {
 	All   bool     // true when the YAML value was the scalar "all"
 	Names []string // pattern names when All is false
@@ -483,7 +572,7 @@ func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error
 	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
 }
 
-// ValidHints reports whether hints is a valid `hints:` list for a regexp
+// ValidHints reports whether hints is a valid `hints:` list for a pattern
 // entry: every entry must be "prefer-match", "prefer-no-match", or
 // "batch-find"; "prefer-match" and "prefer-no-match" are mutually exclusive
 // (both cannot appear in the same list) but "batch-find" may combine with
@@ -524,16 +613,16 @@ func validateHintList(hints []string) error {
 	return nil
 }
 
-// validateHints checks the hints fields of every regexp and set entry in
+// validateHints checks the hints fields of every pattern and set entry in
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		label := re.Name
 		if label == "" {
-			label = re.Pattern
+			label = re.Regexp
 		}
 		if err := validateHintList(re.Hints); err != nil {
-			return fmt.Errorf("regexp %q: hints: %w", label, err)
+			return fmt.Errorf("pattern %q: hints: %w", label, err)
 		}
 		// "batch-find" batches a find or groups DRIVE. On an entry with
 		// neither there is nothing to batch, and accepting the hint silently
@@ -541,7 +630,7 @@ func validateHints(cfg *BuildConfig) error {
 		// reasoning the set arm below already applied.
 		for _, h := range re.Hints {
 			if h == "batch-find" && re.FindFunc == "" && re.GroupsFunc == "" {
-				return fmt.Errorf("regexp %q: hints: \"batch-find\" requires find_func or groups_func on the same entry", label)
+				return fmt.Errorf("pattern %q: hints: \"batch-find\" requires find_func or groups_func on the same entry", label)
 			}
 		}
 	}
@@ -562,18 +651,19 @@ func validateHints(cfg *BuildConfig) error {
 	return nil
 }
 
-// ValidateSets validates the `sets:` block against the `regexps:` list.
-// Returns an error if any set name is not unique, any pattern reference is
-// unknown, a set entry declares none of the five capabilities, or patterns is
-// empty. `overlapping` on a set with no `find` is ignored, not rejected — it
+// ValidateSets validates the `sets:` block against the top-level `patterns:`
+// list. Returns an error if any set name is not unique, any pattern reference
+// is unknown, a set entry declares none of the five capabilities, a set has no
+// members, or an inline regexp is empty. Two equivalent members are refused
+// by validateSetMembers, at config load only. `overlapping` on a set with no `find` is ignored, not rejected — it
 // selects between two find bodies, and with no find body it has no effect.
 func ValidateSets(cfg *BuildConfig) error {
 	// Build name → index map.
-	nameIdx := make(map[string]int, len(cfg.Regexps))
-	for i, re := range cfg.Regexps {
+	nameIdx := make(map[string]int, len(cfg.Patterns))
+	for i, re := range cfg.Patterns {
 		if re.Name != "" {
 			if _, dup := nameIdx[re.Name]; dup {
-				return fmt.Errorf("duplicate regexp name %q", re.Name)
+				return fmt.Errorf("duplicate pattern name %q", re.Name)
 			}
 			nameIdx[re.Name] = i
 		}
@@ -581,14 +671,14 @@ func ValidateSets(cfg *BuildConfig) error {
 
 	setNames := make(map[string]bool)
 	setStems := make(map[string]string)    // sanitized stem → the set name that claimed it
-	exportNames := make(map[string]string) // export name → owner ("set X" or "regexp Y")
-	// Seed with per-regexp export names so set exports can't collide with them.
-	for _, re := range cfg.Regexps {
-		owner := "regexp"
+	exportNames := make(map[string]string) // export name → owner ("set X" or "pattern Y")
+	// Seed with per-pattern export names so set exports can't collide with them.
+	for _, re := range cfg.Patterns {
+		owner := "pattern"
 		if re.Name != "" {
-			owner = fmt.Sprintf("regexp %q", re.Name)
-		} else if re.Pattern != "" {
-			owner = fmt.Sprintf("regexp %q", re.Pattern)
+			owner = fmt.Sprintf("pattern %q", re.Name)
+		} else if re.Regexp != "" {
+			owner = fmt.Sprintf("pattern %q", re.Regexp)
 		}
 		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
 			if name == "" {
@@ -654,11 +744,17 @@ func ValidateSets(cfg *BuildConfig) error {
 				return fmt.Errorf("duplicate WASM export name %q (used by %s and %s)", name, prior, owner)
 			}
 			exportNames[name] = owner
-			// See the regexp side above: the `*_batch` suffix ban is the one
+			// See the pattern side above: the `*_batch` suffix ban is the one
 			// mechanism, so there is nothing to reserve.
 		}
-		if !s.Patterns.All && len(s.Patterns.Names) == 0 {
-			return fmt.Errorf("set %q: patterns is required (use \"all\" or a non-empty list of pattern names)", s.Name)
+		for k, r := range s.Regexps {
+			if r == "" {
+				return fmt.Errorf("set %q: regexps item %d is empty", s.Name, k)
+			}
+		}
+		if s.PatternCount(*cfg) == 0 {
+			return fmt.Errorf("set %q has no members: select top-level patterns with `patterns` "+
+				"(\"all\" or a list of names), or give it its own `regexps` list", s.Name)
 		}
 		// The find_batch cursor's k field is capped at 24 bits, so past
 		// 2^24 members it cannot hold every intra-position resume index and a
@@ -685,12 +781,86 @@ func ValidateSets(cfg *BuildConfig) error {
 	return nil
 }
 
-// RegexEntry describes a single regexp pattern and the functions to generate for it.
+// validateSetMembers refuses a set holding two equivalent members
+// (EquivalentMembers). It runs at config LOAD only, like ValidateConfig's
+// identifier rules, and not inside CompileFile: a config built in code — the
+// corpus harnesses' chunked sets, which hold the corpus's equivalent patterns
+// side by side — compiles such a set as it always has, every member reported
+// under its own id.
+func validateSetMembers(cfg *BuildConfig) error {
+	for _, s := range cfg.Sets {
+		if a, b, ok := EquivalentMembers(s.Members(*cfg)); ok {
+			return fmt.Errorf("set %q: %s and %s are equivalent", s.Name, a.label(), b.label())
+		}
+	}
+	return nil
+}
+
+// label names a member in a message: a named pattern by its name, an unnamed
+// one and an inline regexp by their text.
+func (m SetMember) label() string {
+	switch {
+	case m.Entry.Name != "":
+		return fmt.Sprintf("pattern %q", m.Entry.Name)
+	case m.Inline:
+		return "regexp '" + m.Entry.Regexp + "'"
+	}
+	return "pattern '" + m.Entry.Regexp + "'"
+}
+
+// EquivalentMembers returns the first two members, in member order, that
+// compile to the SAME program — Go's syntax.Prog of the regexp with its
+// capture groups removed (a set reports group 0 only) and simplified.
+// Identical programs give identical answers on every input, so this never
+// reports two members that a set could tell apart; it does not catch every
+// pair that matches alike (`a+` and `aa*` compile differently). A set runs
+// its members in one mode, so the program alone decides. A member that does
+// not parse is skipped: compile reports it.
+func EquivalentMembers(members []SetMember) (a, b SetMember, ok bool) {
+	seen := make(map[string]int, len(members))
+	for i, m := range members {
+		key, valid := memberProgram(m.Entry.Regexp)
+		if !valid {
+			continue
+		}
+		if j, dup := seen[key]; dup {
+			return members[j], m, true
+		}
+		seen[key] = i
+	}
+	return SetMember{}, SetMember{}, false
+}
+
+// memberProgram is the printed program EquivalentMembers compares.
+func memberProgram(src string) (string, bool) {
+	re, err := syntax.Parse(src, syntax.Perl)
+	if err == nil {
+		var prog *syntax.Prog
+		if prog, err = syntax.Compile(withoutCaptures(re).Simplify()); err == nil {
+			return prog.String(), true
+		}
+	}
+	return "", false
+}
+
+// withoutCaptures replaces every capture group in re by its contents.
+func withoutCaptures(re *syntax.Regexp) *syntax.Regexp {
+	if re.Op == syntax.OpCapture {
+		return withoutCaptures(re.Sub[0])
+	}
+	for i, sub := range re.Sub {
+		re.Sub[i] = withoutCaptures(sub)
+	}
+	return re
+}
+
+// PatternEntry describes one top-level pattern: a regexp plus optional metadata
+// (a name, the functions to generate for it, mode keys, hints).
 // One or more of the Func fields must be set; only those stubs are generated.
 // The WASM export names are derived automatically from the function type.
-type RegexEntry struct {
-	Name    string `yaml:"name"` // optional; used by sets: for pattern selection
-	Pattern string `yaml:"pattern"`
+type PatternEntry struct {
+	Name   string `yaml:"name"`   // optional; used by sets: for pattern selection
+	Regexp string `yaml:"regexp"` // the bare expression; required
 
 	// ByteMode declares this pattern BYTE-oriented, which is what regexped
 	// has always been: `.` consumes one byte, classes are byte classes, `\b`
@@ -708,6 +878,16 @@ type RegexEntry struct {
 	// here because Go's parser refuses `(?-u)` outright, so it would have to
 	// be stripped from the source before syntax.Parse.
 	ByteMode bool `yaml:"byte_mode"`
+
+	// Unicode states the pattern's mode explicitly: true compiles it in
+	// Unicode mode, where the input is read as UTF-8 and `.` and classes
+	// consume a whole character; false is exactly ByteMode: true, and
+	// LoadConfig sets ByteMode for it. Unset, the pattern picks its own mode:
+	// Unicode when it names a character above U+007F or uses a \p class, byte
+	// mode otherwise. With ByteMode, true is a load error, and so is false
+	// with an explicit `byte_mode: false`. IsByteMode is the one reading of the
+	// pair.
+	Unicode *bool `yaml:"unicode"`
 
 	// Optional function names — only those set are compiled and stubbed.
 	MatchFunc  string `yaml:"match_func"`  // anchored match → the end position, or none
@@ -736,17 +916,85 @@ type RegexEntry struct {
 }
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
-func (r RegexEntry) CaptureStubsRequested() bool {
+func (r PatternEntry) CaptureStubsRequested() bool {
 	return r.GroupsFunc != ""
 }
 
+// NoCaptureGroupProblem is why a groups_func on a pattern with no capture
+// group is refused (GroupsWithoutCaptures). compile returns the same words.
+const NoCaptureGroupProblem = "the pattern has no capture group that can take part in a match, " +
+	"so there are no groups to report; use find_func for the match's span"
+
+// GroupsWithoutCaptures reports whether groups_func is set on a pattern with
+// no capture group that can take part in a match: `a*`, or `(?:(a){0})b`,
+// whose only group simplification removes. Such a pattern compiles to no
+// groups export while every stub would call one, so it is refused —
+// ValidateConfig at load, `compile`, and `generate`. A pattern that does not
+// parse answers false; its own error is reported elsewhere.
+func (r PatternEntry) GroupsWithoutCaptures() bool {
+	if r.GroupsFunc == "" {
+		return false
+	}
+	re, err := syntax.Parse(r.Regexp, syntax.Perl)
+	if err != nil {
+		return false
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	return err == nil && prog.NumCap <= 2
+}
+
 // GroupsExportName returns the WASM export name for the groups function.
-func (r RegexEntry) GroupsExportName() string {
+func (r PatternEntry) GroupsExportName() string {
 	return r.GroupsFunc
 }
 
 // LoadConfig reads and parses the YAML config at configPath.
 // If configPath is empty it looks for regexped.yaml in the current directory.
+// IsByteMode reports whether the entry is explicitly byte-oriented:
+// `byte_mode: true`, or `unicode: false`, which means the same.
+func (e PatternEntry) IsByteMode() bool {
+	return e.ByteMode || (e.Unicode != nil && !*e.Unicode)
+}
+
+// validateModeKeys rejects the two mode-key conflicts on one entry, which
+// need no parse: `unicode: true` with `byte_mode: true`, and `unicode: false`
+// with an explicit `byte_mode: false`. byteModeSet[i] says whether entry i
+// wrote `byte_mode:` at all, which the decoded bool cannot tell. It then
+// makes `unicode: false` set ByteMode, so every later reader sees one field.
+func validateModeKeys(cfg *BuildConfig, byteModeSet []bool) error {
+	for i := range cfg.Patterns {
+		re := &cfg.Patterns[i]
+		if re.Unicode == nil {
+			continue
+		}
+		label := re.Name
+		if label == "" {
+			label = re.Regexp
+		}
+		explicit := i < len(byteModeSet) && byteModeSet[i]
+		switch {
+		case *re.Unicode && re.ByteMode:
+			return fmt.Errorf("pattern %q: unicode: true and byte_mode: true contradict each other", label)
+		case !*re.Unicode && explicit && !re.ByteMode:
+			return fmt.Errorf("pattern %q: unicode: false and byte_mode: false contradict each other "+
+				"(unicode: false means byte_mode: true)", label)
+		case !*re.Unicode:
+			re.ByteMode = true
+		}
+	}
+	return nil
+}
+
+// anyInlineRegexp reports whether some set carries regexps of its own.
+func anyInlineRegexp(cfg BuildConfig) bool {
+	for _, s := range cfg.Sets {
+		if len(s.Regexps) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func LoadConfig(configPath string) (BuildConfig, error) {
 	if configPath == "" {
 		configPath = "regexped.yaml"
@@ -771,19 +1019,22 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
-	if len(cfg.Regexps) == 0 {
-		return BuildConfig{}, fmt.Errorf("config %s has no regexps", configPath)
+	// Every regexp may live inside sets, so the top-level list is optional —
+	// but a file with no regexp anywhere has nothing to build.
+	if len(cfg.Patterns) == 0 && !anyInlineRegexp(cfg) {
+		return BuildConfig{}, fmt.Errorf("config %s has no patterns: declare a top-level `patterns` list, "+
+			"or give a set its own `regexps` list", configPath)
 	}
-	// An EMPTY pattern was accepted and compiled to something that matches the
+	// An EMPTY regexp was accepted and compiled to something that matches the
 	// empty string everywhere — almost certainly a YAML slip (a missing value,
-	// or a quoting mistake that ate the pattern) rather than an intent.
-	for i, re := range cfg.Regexps {
-		if re.Pattern == "" {
+	// or a quoting mistake that ate the regexp) rather than an intent.
+	for i, re := range cfg.Patterns {
+		if re.Regexp == "" {
 			label := re.Name
 			if label == "" {
 				label = fmt.Sprintf("#%d", i)
 			}
-			return BuildConfig{}, fmt.Errorf("config %s: regexp %s has an empty pattern", configPath, label)
+			return BuildConfig{}, fmt.Errorf("config %s: pattern %s has an empty regexp", configPath, label)
 		}
 	}
 
@@ -807,7 +1058,26 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	if err := ValidateSets(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
+	if err := validateSetMembers(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
 	if err := validateHints(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	// Whether each entry WROTE `byte_mode:`, which the decoded bool cannot
+	// say: a second, lenient pass over the same bytes reads only that key.
+	var written struct {
+		Patterns []struct {
+			ByteMode *bool `yaml:"byte_mode"`
+		} `yaml:"patterns"`
+	}
+	// It cannot fail: the strict decode of the same bytes above succeeded.
+	_ = yaml.Unmarshal(raw, &written)
+	byteModeSet := make([]bool, len(written.Patterns))
+	for i, r := range written.Patterns {
+		byteModeSet[i] = r.ByteMode != nil
+	}
+	if err := validateModeKeys(&cfg, byteModeSet); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 	// An unrecognised `stub_type` used to pass the `compile` command silently
@@ -922,7 +1192,52 @@ const MaxWasmMemoryPages = 1 << 16
 // pages, because a memory's maximum is declared in pages.
 const wasmPageBytes = 64 << 10
 
-// MemorySize is a `max_memory:` value: a number, fractions allowed, optionally
+// Limit is a count limit in the config — `max_dfa_states:` and
+// `max_bt_instructions:` — whose three cases are not three numbers:
+//
+//   - UNSET (the key absent, or null) is the zero value, and means the
+//     limit's default;
+//   - 0, written, means the thing it bounds is OFF: no DFA at all for
+//     max_dfa_states (always Backtracking), no Backtracking at all for
+//     max_bt_instructions. It decodes to -1, which is how CompileOptions
+//     spells "off", so a written 0 cannot be mistaken for "unset" anywhere
+//     downstream;
+//   - a positive number is that limit.
+//
+// A negative value, a fraction or anything that is not a number is a
+// line-numbered load error.
+type Limit int
+
+// LimitOff is the value a written 0 decodes to.
+const LimitOff Limit = -1
+
+// UnmarshalYAML implements yaml.NodeUnmarshaler; see MemorySize.UnmarshalYAML
+// for why it takes the node.
+func (l *Limit) UnmarshalYAML(node ast.Node) error {
+	n, ok := node.(*ast.IntegerNode)
+	if !ok {
+		return &yaml.SyntaxError{
+			Message: "want a whole number, 0 or more, got " + node.Type().String(),
+			Token:   node.GetToken(),
+		}
+	}
+	v, err := strconv.ParseInt(n.GetToken().Value, 0, 64)
+	if err != nil || v < 0 || v > math.MaxInt32 {
+		return &yaml.SyntaxError{
+			Message: fmt.Sprintf("want a whole number from 0 to %d, got %s", math.MaxInt32, n.GetToken().Value),
+			Token:   node.GetToken(),
+		}
+	}
+	if v == 0 {
+		*l = LimitOff
+		return nil
+	}
+	*l = Limit(v)
+	return nil
+}
+
+// MemorySize is a size in the config — `max_memory:`, `max_set_bucket_size:`,
+// `max_split_table_size:` — a number, fractions allowed, optionally
 // followed by a unit — KB, MB, GB (powers of 1,000) or KiB, MiB, GiB (powers
 // of 1,024), in any letter case, with or without a space before it. A bare
 // number is bytes. Anything else is a load error.
@@ -993,13 +1308,13 @@ func (m *MemorySize) UnmarshalYAML(node ast.Node) error {
 	case *ast.StringNode, *ast.IntegerNode, *ast.FloatNode:
 	default:
 		return &yaml.SyntaxError{
-			Message: "max_memory: want a size such as 100MB, got " + node.Type().String(),
+			Message: "want a size such as 100MB, got " + node.Type().String(),
 			Token:   node.GetToken(),
 		}
 	}
 	v, err := ParseMemorySize(node.GetToken().Value)
 	if err != nil {
-		return &yaml.SyntaxError{Message: "max_memory: " + err.Error(), Token: node.GetToken()}
+		return &yaml.SyntaxError{Message: err.Error(), Token: node.GetToken()}
 	}
 	*m = v
 	return nil

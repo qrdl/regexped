@@ -24,7 +24,7 @@ func tdfaStats(pattern string) (numStates, numRegs, totalTagOps int, ok bool) {
 	if err != nil {
 		return
 	}
-	tt, success := newTDFA(prog, 2000)
+	tt, success := newTDFA(byteProg(prog), 2000)
 	if !success {
 		numStates = -1
 		ok = false
@@ -364,19 +364,19 @@ func TestTDFAEpsCapOps(t *testing.T) {
 func TestTDFACompileDeterminism(t *testing.T) {
 	// url-parse is a 6-group TDFA pattern with non-trivial register operations.
 	// It was observed to produce different WASM sizes across runs before the fix.
-	re := config.RegexEntry{
-		Pattern: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
+	re := config.PatternEntry{
+		Regexp: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
 			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
 			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
 		GroupsFunc: "groups",
 	}
-	first, _, err := Compile([]config.RegexEntry{re}, 0, true)
+	first, _, err := Compile([]config.PatternEntry{re}, 0, true)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	const iterations = 20
 	for i := 0; i < iterations; i++ {
-		got, _, err := Compile([]config.RegexEntry{re}, 0, true)
+		got, _, err := Compile([]config.PatternEntry{re}, 0, true)
 		if err != nil {
 			t.Fatalf("iteration %d: Compile: %v", i+1, err)
 		}
@@ -422,7 +422,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 			if prog.NumCap != tc.rawTags {
 				t.Errorf("rawTags: got %d want %d (test case stale?)", prog.NumCap, tc.rawTags)
 			}
-			tt, ok := newTDFA(prog, 2000)
+			tt, ok := newTDFA(byteProg(prog), 2000)
 			if !ok {
 				t.Fatalf("newTDFA failed — pattern ineligible for TDFA")
 			}
@@ -442,7 +442,7 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 // group, resolved entirely via entry ops before the first byte-consuming
 // transition (anyHasOps=false).
 func TestTDFAAllZeroTagOpsSkip(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "()a", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "()a", GroupsFunc: "g"}})
 }
 
 // TestTDFAMinimizeRegistersApplyColoring exercises the block in
@@ -461,7 +461,7 @@ func TestTDFAMinimizeRegistersApplyColoring(t *testing.T) {
 		t.Fatalf("tdfaStats(%q): pattern ineligible for TDFA", pattern)
 	}
 	t.Logf("numStates=%d numRegs=%d", numStates, numRegs)
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 }
 
 // TestTDFAU16TableAddressing exercises the useU8=false (2-byte state ID)
@@ -479,7 +479,7 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 	if numStates <= 256 {
 		t.Fatalf("tdfaStats(%q): numStates = %d, want > 256 (u16 table)", pattern, numStates)
 	}
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 }
 
 // TestTDFAEpsWalkAltFallthrough exercises the "try inst.Arg after inst.Out
@@ -490,7 +490,7 @@ func TestTDFAU16TableAddressing(t *testing.T) {
 // so the whole-pattern-single-capture shortcut never applies
 // regardless of MaxCap — confirmed live.
 func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: `(?:(a)|(b))`, GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: `(?:(a)|(b))`, GroupsFunc: "g"}})
 }
 
 // TestTDFAStartThreadOffMainEntry exercises startThreads[i]'s capture-op
@@ -503,7 +503,7 @@ func TestTDFAEpsWalkAltFallthrough(t *testing.T) {
 // InstMatch is still reachable via pure epsilon from Start, preserving the
 // mechanism) while MaxCap()==2 keeps clear of the shortcut.
 func TestTDFAStartThreadOffMainEntry(t *testing.T) {
-	mustCompileEntries(t, []config.RegexEntry{{Pattern: "(a*)(b*)", GroupsFunc: "g"}})
+	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a*)(b*)", GroupsFunc: "g"}})
 }
 
 func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
@@ -516,7 +516,7 @@ func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
 	if err != nil {
 		t.Fatalf("compile %q: %v", pattern, err)
 	}
-	tt, ok := newTDFA(prog, 2000)
+	tt, ok := newTDFA(byteProg(prog), 2000)
 	if !ok {
 		t.Fatalf("newTDFA rejected pattern %q", pattern)
 	}
@@ -739,12 +739,14 @@ func decodeControlFlow(t *testing.T, b []byte) []string {
 				skipLEB()
 			case 0x0C: // v128.const: 16 raw bytes
 				i += 16
-			case 0x0E, 0x0F, 0x23, 0x24, 0x4E, 0x50, 0x64, 0x6D:
-				// swizzle, splat, eq, ne, and, or, bitmask, shr_u — no
-				// immediates. eq joined the list when the bulk skip switched to
-				// the STOP polarity (emitShuftiStopMask): it compares the merged
-				// lanes against zero instead of taking a member mask and
-				// inverting it with an i32 xor.
+			case 0x0E, 0x0F, 0x23, 0x24, 0x28, 0x2A, 0x4E, 0x50, 0x64, 0x6D, 0x71:
+				// swizzle, splat, eq, ne, gt_u, le_u, and, or, bitmask, shr_u,
+				// sub — no immediates. eq joined the list when the bulk skip
+				// switched to the STOP polarity (emitShuftiStopMask): it
+				// compares the merged lanes against zero instead of taking a
+				// member mask and inverting it with an i32 xor. sub, gt_u and
+				// le_u are the range form a 1-2-range class takes instead of
+				// the nibble tables (contiguousRanges).
 			default:
 				t.Fatalf("decodeControlFlow: unhandled SIMD subopcode 0x%02x at byte %d", sub, i-2)
 			}
@@ -857,7 +859,7 @@ func TestTDFABulkSkipMidAcceptModuleValid(t *testing.T) {
 			if detectTDFABulkSkip(tt) == nil {
 				t.Fatalf("pattern %q no longer has a bulk-skip state — this test would compile nothing relevant", pattern)
 			}
-			mustCompileEntries(t, []config.RegexEntry{{Pattern: pattern, GroupsFunc: "g"}})
+			mustCompileEntries(t, []config.PatternEntry{{Regexp: pattern, GroupsFunc: "g"}})
 		})
 	}
 }
@@ -1090,11 +1092,241 @@ func TestTDFARegisterEdgeShapes(t *testing.T) {
 			if eng != EngineTDFA {
 				t.Fatalf("engine = %v, want TDFA — the shape no longer reaches TDFA construction", eng)
 			}
-			wasm, _, err := Compile([]config.RegexEntry{{Pattern: pat, GroupsFunc: "g"}}, 65536, true)
+			wasm, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "g"}}, 65536, true)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
 			validateWASM(t, wasm)
 		})
+	}
+}
+
+// TestTDFAMinorityTable pins the tag-op dispatch of a state with more than
+// one minority byte: one br_table on the byte to a handler per group of equal
+// ops, the majority by default, each handler leaving past the rest; a state
+// with ONE minority byte keeps its compare.
+func TestTDFAMinorityTable(t *testing.T) {
+	setPos := func(dst int) []tdfaTagOp { return []tdfaTagOp{{dst: dst, src: -1}} }
+	got := emitTDFAMinorityTable(nil, []tdfaByteOps{{'a', setPos(0)}, {'b', setPos(1)}, {'c', setPos(0)}},
+		setPos(2), 5, 6, 10)
+	want := []byte{0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x20, 5, 0x0E, 0x80, 0x02}
+	for c := range 256 {
+		switch c {
+		case 'a', 'c':
+			want = append(want, 0)
+		case 'b':
+			want = append(want, 1)
+		default:
+			want = append(want, 2)
+		}
+	}
+	want = append(want, 2,
+		0x0B, 0x20, 6, 0x21, 10, 0x0C, 2, // group 0 ('a', 'c'): reg 0 = pos; br $maj_done
+		0x0B, 0x20, 6, 0x21, 11, 0x0C, 1, // group 1 ('b'): reg 1 = pos
+		0x0B, 0x20, 6, 0x21, 12) // the majority: reg 2 = pos
+	if !bytes.Equal(got, want) {
+		t.Errorf("emitTDFAMinorityTable:\n got %x\nwant %x", got, want)
+	}
+
+	tdfaOf := func(t *testing.T, pattern string, unicode bool) *tdfaTable {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tt, ok := newTDFA(mp, 16384)
+		if !ok {
+			t.Fatalf("newTDFA(%q) failed", pattern)
+		}
+		return tt
+	}
+	brTable256 := []byte{0x0E, 0x80, 0x02}
+	for _, c := range []struct {
+		pattern string
+		unicode bool
+		table   bool
+	}{
+		{`(\pL+)\s(\pL+)`, true, true}, // lead bytes and letters split a loop state
+		{`(\w+)\s(\w+)`, false, true},
+		{`(a+)b`, false, false}, // one minority byte: its compare
+	} {
+		b := emitTDFATagOps(tdfaOf(t, c.pattern, c.unicode), nil, 1, 2, 3, 4, nil)
+		if got := bytes.Contains(b, brTable256); got != c.table {
+			t.Errorf("%q: a 256-entry br_table %v, want %v", c.pattern, got, c.table)
+		}
+	}
+}
+
+// TestTDFAUTF8Skip pins which loops of a Unicode-mode TDFA the UTF-8 skip
+// serves — a group of states with identical rows that every ASCII byte but a
+// few and every character leads back into, firing one batch of set-to-pos
+// ops — where the match body runs it, and the three forms of its state test.
+func TestTDFAUTF8Skip(t *testing.T) {
+	table := func(t *testing.T, pattern string, unicode bool) *tdfaTable {
+		t.Helper()
+		rp, err := resolvePattern(pattern, nil, &CompileOptions{Unicode: unicode, ForceByteMode: !unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := rp.parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp, err := compileProg(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tt, ok := newTDFA(mp, 16384)
+		if !ok {
+			t.Fatalf("newTDFA(%q) failed", pattern)
+		}
+		return tt
+	}
+	cases := []struct {
+		pattern string
+		exits   []string // each loop's ASCII exits
+		ops     int      // the first loop's batch size
+		hasOps  bool     // the table has tag ops, so the skip sits in the dispatch arms
+	}{
+		{`<([^>]+)>(x)`, []string{">"}, 1, true},
+		{`(.+)=(.+)`, []string{"\n="}, 1, true},
+		{`([^,]+)(,)`, []string{","}, 2, true},
+		{`(\w+)=([^&]+)&`, []string{"&"}, 1, true},
+		{`()[^,]+,`, []string{","}, 0, false},
+		{`(\pL+)\s(\pN+)`, nil, 0, true},
+		{`(.)+y`, nil, 0, true},                 // the group is a copy away: not a set-to-pos batch
+		{`([^\x{80}-\x{7ff}]+),`, nil, 0, true}, // a two-byte lead is dead
+		{`^([^,]+)`, []string{","}, 1, true},    // anchored: the loop's states accept
+	}
+	for _, c := range cases {
+		tt := table(t, c.pattern, true)
+		var exits []string
+		for _, info := range tt.utf8Skip {
+			exits = append(exits, string(info.exitBytes))
+			if len(info.wasmStates) < 2 {
+				t.Errorf("%q: loop %v: want the two states lowered `[^x]`'s ASCII ranges give", c.pattern, info.wasmStates)
+			}
+		}
+		if fmt.Sprint(exits) != fmt.Sprint(c.exits) {
+			t.Errorf("%q: loops' exits = %q, want %q", c.pattern, exits, c.exits)
+			continue
+		}
+		if len(exits) > 0 && len(tt.utf8Skip[0].ops) != c.ops {
+			t.Errorf("%q: batch %v, want %d ops", c.pattern, tt.utf8Skip[0].ops, c.ops)
+		}
+		if tdfaHasTagOps(tt) != c.hasOps {
+			t.Errorf("%q: tdfaHasTagOps = %v, want %v", c.pattern, !c.hasOps, c.hasOps)
+		}
+		// Every case compiles to a valid groups export — the skip in the
+		// dispatch arms, or at the top of the main loop with no dispatch.
+		if _, _, err := Compile([]config.PatternEntry{{Regexp: c.pattern, GroupsFunc: "g"}}, 0, true, CompileOptions{Unicode: true}); err != nil {
+			t.Errorf("%q: compile: %v", c.pattern, err)
+		}
+	}
+	if tt := table(t, `<([^>]+)>(x)`, false); len(tt.utf8Skip) != 0 {
+		t.Errorf("byte mode: loops %+v, want none", tt.utf8Skip)
+	}
+	// Its last chunk overlaps what it walked: the lanes below the skip's
+	// start are cut by -1 << (start - len + 16).
+	cut := []byte{0x6B, 0x41, 0x10, 0x6A, 0x74} // i32.sub; i32.const 16; i32.add; i32.shl
+	for _, c := range []struct {
+		unicode bool
+		want    bool
+	}{{true, true}, {false, false}} {
+		w, _, err := Compile([]config.PatternEntry{{Regexp: `<([^>]+)>(x)`, GroupsFunc: "g"}}, 0, true,
+			CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Contains(w, cut); got != c.want {
+			t.Errorf("unicode %v: the last chunk's lane cut %v, want %v", c.unicode, got, c.want)
+		}
+	}
+
+	// The skip runs in the arms of states outside the loop that lead into it:
+	// the state after `<` and the states before a character's last byte —
+	// never a state of the loop.
+	tt := table(t, `<([^>]+)>(x)`, true)
+	info := tt.utf8Skip[0]
+	entering := 0
+	for gs := 0; gs < tt.numStates; gs++ {
+		in := false
+		for _, st := range info.wasmStates {
+			in = in || int(st) == gs+1
+		}
+		if in && info.entersFrom(tt, gs) {
+			t.Errorf("state %d of the loop counts as entering it", gs)
+		}
+		if info.entersFrom(tt, gs) {
+			entering++
+		}
+	}
+	if entering < 2 {
+		t.Errorf("%d states enter the loop, want the opener's and the last-byte states'", entering)
+	}
+
+	// A character whose lead byte sets a register the batch does not set
+	// again would leave it at a position inside the run: refused.
+	tt = table(t, `<([^>]+)>(x)`, true)
+	for _, st := range tt.utf8Skip[0].wasmStates {
+		idx := int(st-1)*256 + 0xD0
+		for len(tt.tagOps) <= idx {
+			tt.tagOps = append(tt.tagOps, nil)
+		}
+		tt.tagOps[idx] = []tdfaTagOp{{dst: 99, src: -1}}
+	}
+	if loops := detectTDFAUTF8Skip(tt, false); len(loops) != 0 {
+		t.Errorf("a lead byte setting a register outside the batch: loops %+v, want none", loops)
+	}
+	// More states with one row than the test on every arm is allowed to name.
+	dead := make([]int, (maxTDFAUTF8SkipLoopStates+1)*256)
+	for i := range dead {
+		dead[i] = -1
+	}
+	wide := &tdfaTable{dfaTable: &dfaTable{numStates: maxTDFAUTF8SkipLoopStates + 1, transitions: dead}}
+	if loops := detectTDFAUTF8Skip(wide, false); len(loops) != 0 {
+		t.Errorf("%d identical states: loops %+v, want none", wide.numStates, loops)
+	}
+
+	// The state test: one compare, a range for consecutive states, a chain.
+	for _, c := range []struct {
+		states []int32
+		want   []byte
+	}{
+		{[]int32{5}, []byte{0x20, 4, 0x41, 5, 0x46}},
+		{[]int32{3, 4}, []byte{0x20, 4, 0x41, 3, 0x6B, 0x41, 2, 0x49}},
+		{[]int32{2, 5}, []byte{0x20, 4, 0x41, 2, 0x46, 0x20, 4, 0x41, 5, 0x46, 0x72}},
+	} {
+		if got := emitTDFAStateIn(nil, c.states, 4); !bytes.Equal(got, c.want) {
+			t.Errorf("emitTDFAStateIn(%v) = % x, want % x", c.states, got, c.want)
+		}
+	}
+}
+
+// TestTDFAWriteCapturesAcceptOps: an accept state's own tag ops are fired
+// before its captures are written. newTDFA builds no such table today, so the
+// table is made by hand; the ops must appear in the output.
+func TestTDFAWriteCapturesAcceptOps(t *testing.T) {
+	tt := func(ops [][]tdfaTagOp) *tdfaTable {
+		return &tdfaTable{
+			dfaTable:     &dfaTable{numStates: 1},
+			acceptOps:    ops,
+			acceptRegMap: [][]int{{-1, -1}},
+			numRegs:      1,
+			numGroups:    1,
+		}
+	}
+	with := emitTDFAWriteCaptures(tt([][]tdfaTagOp{{{dst: 0, src: -1}}}), nil, 3, 4, 8, -1)
+	without := emitTDFAWriteCaptures(tt([][]tdfaTagOp{nil}), nil, 3, 4, 8, -1)
+	if op := emitTDFATagOp(tdfaTagOp{dst: 0, src: -1}, nil, 4, 8); !bytes.Contains(with, op) || len(with) <= len(without) {
+		t.Errorf("accept ops not emitted:\nwith    % x\nwithout % x", with, without)
 	}
 }

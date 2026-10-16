@@ -1,9 +1,11 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -35,11 +37,11 @@ import (
 // serve every oracle: conflating them made this harness exclude a pattern the
 // scan pair still answers for, and read the disagreement as a wrong answer.
 func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -50,9 +52,10 @@ func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 		Find:        "cap_find",
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
+		Unicode:     setModeKey(),
 	}}
 	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, dropsFromSet(diags), err
 	})
 }
@@ -304,8 +307,25 @@ func probeFor(pat string, p int) *regexp.Regexp {
 	return re
 }
 
+// matchesAt reports whether pat matches starting at byte position p. The
+// probe counts Go's tokens (dotPrefix), so p must start one; inside a
+// character nothing starts, which over ASCII never arises.
 func matchesAt(pat, input string, p int) bool {
-	return probeFor(pat, p).MatchString(input)
+	tok, ok := tokenIndex(input, p)
+	return ok && probeFor(pat, tok).MatchString(input)
+}
+
+// tokenIndex is how many of Go's tokens precede byte position p of input,
+// and whether p starts one (goTokenStarts).
+func tokenIndex(input string, p int) (int, bool) {
+	starts := goTokenStarts(input)
+	n := 0
+	for i := 0; i < p; i++ {
+		if starts[i] {
+			n++
+		}
+	}
+	return n, starts[p]
 }
 
 func startsMatching(pat, input string, from int) []int {
@@ -508,23 +528,78 @@ func checkCapsAgainstOracleDropped(t *testing.T, r *capRunner, pats []string, in
 	}
 }
 
+// TestSetInlineRegexps drives a set whose members are partly its own
+// `regexps:` beside a second set with regexps of its own, in one module. An
+// inline regexp's id follows every top-level pattern and is numbered per set,
+// so set "a"'s inline ids are 2 and 3 while set "b"'s first is 2 as well; a
+// top-level pattern "a" does not select (id 0) must never be reported.
+func TestSetInlineRegexps(t *testing.T) {
+	cfg := config.BuildConfig{
+		Patterns: []config.PatternEntry{
+			{Name: "foo", Regexp: `foo`},
+			{Name: "bar", Regexp: `bar[0-9]+`},
+		},
+		Sets: []config.SetConfig{{
+			Name: "a", MatchAny: "cap_match_any", MatchAll: "cap_match_all",
+			ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find",
+			// The oracle asks `find` from every position, which only the
+			// overlapping body answers without a drive's gates.
+			Overlapping: true,
+			Patterns:    config.PatternSelector{Names: []string{"bar"}},
+			Regexps:     []string{`baz`, `qu+x`},
+		}, {
+			Name: "b", ScanAll: "b_scan_all",
+			Regexps: []string{`zip`, `foo`},
+		}},
+	}
+	if err := config.ValidateSets(&cfg); err != nil {
+		t.Fatalf("ValidateSets: %v", err)
+	}
+	w, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("CompileFile: %v", err)
+	}
+	// Indexed by set "a"'s ids; id 0 is not a member, so it gets a regexp that
+	// matches nothing and the oracle expects no report of it.
+	never := `[^\x00-\x{10FFFF}]`
+	pats := []string{never, `bar[0-9]+`, `baz`, `qu+x`}
+	for _, input := range []string{"foo bar12 baz quux zip", "quux", "bar7", "baz", "zip foo", ""} {
+		r := newCapRunnerFrom(t, w, pats, input)
+		checkCapsAgainstOracle(t, r, pats, input)
+		// Set "b": `zip` is id 2 and `foo` id 3 — its own numbering, not
+		// after set "a"'s regexps — and top-level `foo` (id 0) is not its member.
+		var want []int
+		for id, re := range map[int]string{2: `zip`, 3: `foo`} {
+			if strings.Contains(input, re) {
+				want = append(want, id)
+			}
+		}
+		sort.Ints(want)
+		r.npat = 4
+		got := r.allIDs(t, "b_scan_all", r.inBase, int32(len(input)), int32(0))
+		if !eqIDs(want, got) {
+			t.Errorf("%q: set b scan_all = %v, want %v", input, got, want)
+		}
+		r.Close()
+	}
+}
+
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's
-// compile. Every non-anchored capability answers as Go does, gated `find`
-// included; match_any and match_all drop such a member, with a warning, as
-// they drop any member over the anchored state limit.
+// compile. Every capability answers as Go does, gated `find` included;
+// match_any and match_all answer for such a member through a Backtracking
+// probe, as for any member over the anchored state limit.
 func TestSetMemberWithoutAnOwnDFA(t *testing.T) {
 	pats := []string{`(?:a|b)*a(?:a|b){12}c|a`, `zz`, `x[ab]*a[ab]{11}c`}
 	inputs := []string{"", "b", "zz", "a", strings.Repeat("a", 13) + "c",
 		"bbbb" + strings.Repeat("a", 13) + "c zz", "x" + strings.Repeat("a", 12) + "c",
 		"xb" + strings.Repeat("ab", 6) + "c bab"}
-	anchoredDropped := map[int]bool{0: true, 2: true}
 	for _, in := range inputs {
 		t.Run("caps/"+in, func(t *testing.T) {
 			r := newCapRunner(t, pats, in, true)
 			defer r.Close()
-			checkCapsAgainstOracleDropped(t, r, pats, in, anchoredDropped)
+			checkCapsAgainstOracle(t, r, pats, in)
 		})
 		t.Run("gated/"+in, func(t *testing.T) { checkGated(t, pats, in) })
 	}
@@ -577,7 +652,11 @@ func anchoredExtent(pat, input string, p int) int {
 	// per pattern per capability, so an uncached compile made the harness's
 	// cost scale with PATTERN LENGTH x positions — the term that pushed large
 	// patterns past the fuzz worker's 10s deadline.
-	m := probeFor(pat, p).FindStringIndex(input)
+	tok, ok := tokenIndex(input, p)
+	if !ok {
+		return -1
+	}
+	m := probeFor(pat, tok).FindStringIndex(input)
 	if m == nil {
 		return -1
 	}
@@ -651,16 +730,14 @@ func FuzzSetCaps(f *testing.F) {
 	f.Add(`a*`, `b`, "bab")
 	f.Add(`a.cX`, `X`, "abcXX")
 
+	unicodeSetSeeds(f)
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
-		// The whole-input oracle counts runes in its `.{p}` prefix, and the
-		// per-`from` sweep below is quadratic, so keep inputs short and ASCII.
+		beginFuzzInput()
+		// The per-`from` sweep below is quadratic, so keep inputs short. The
+		// oracles count Go's tokens, so non-ASCII input is checked in
+		// Unicode mode (skipPattern skips it in byte mode).
 		if len(input) > 64 {
 			t.Skip("input too long for the per-from sweep")
-		}
-		for i := 0; i < len(input); i++ {
-			if input[i] >= 0x80 {
-				t.Skip("non-ASCII input: the rune-counted whole-input oracle would misalign")
-			}
 		}
 		pats := []string{pat1, pat2}
 		for _, p := range pats {
@@ -676,98 +753,699 @@ func FuzzSetCaps(f *testing.F) {
 					t.Skip("NFA too large for FuzzSetCaps' eight-body compile (see maxSetCapsNFAInsts)")
 				}
 			}
-			if regexp.MustCompile(p).NumSubexp() > 0 {
-				t.Skip("capture-bearing patterns are dropped from sets by design")
-			}
 		}
 
-		w, dropped, err := compileCaps(pats, true)
+		checkSetCapsAllFroms(t, pats, input)
+	})
+}
+
+// checkSetCapsAllFroms compiles pats as an `overlapping: true` set exporting
+// every capability and checks the anchored pair, the scan pair at every
+// `from`, and the gated find's drive against the whole-input oracles.
+func checkSetCapsAllFroms(t *testing.T, pats []string, input string) {
+	t.Helper()
+	pat1, pat2 := pats[0], pats[len(pats)-1]
+	w, dropped, err := compileCaps(pats, true)
+	if err != nil {
+		if isResourceCeiling(err) {
+			t.Skip("resource ceiling")
+		}
+		t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, err)
+	}
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	const pageSize = 65536
+	dataTop, err := utils.ParseDataSectionBytes(w)
+	if err != nil {
+		t.Fatalf("parse data section: %v", err)
+	}
+	inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+	outPtr := inBase + pageSize
+	needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
+	if cur := mem.Size(store); needed > cur {
+		if _, err := mem.Grow(store, needed-cur); err != nil {
+			t.Fatalf("grow: %v", err)
+		}
+	}
+	if len(input) > 0 {
+		copy(mem.UnsafeData(store)[inBase:], input)
+	}
+	r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
+	n := int32(len(input))
+
+	// The anchored oracle gets the ANCHORED scope and the two below get the
+	// global one: a pattern the anchored packer alone refused is gone from
+	// match_any/match_all and still live for scan and find.
+	wantAnchored := oracleAnchored(pats, input, dropped.anchored)
+	gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
+	if len(wantAnchored) == 0 {
+		if gotAny != -1 {
+			t.Fatalf("match_any = %d, want -1: pats=%q,%q input=%q", gotAny, pat1, pat2, input)
+		}
+	} else if !containsInt(wantAnchored, gotAny) {
+		t.Fatalf("match_any = %d, not among %v: pats=%q,%q input=%q", gotAny, wantAnchored, pat1, pat2, input)
+	}
+	gotAll := r.allIDs(t, "cap_match_all", inBase, n)
+	if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
+		t.Fatalf("match_all = %v, want %v: pats=%q,%q input=%q", gotAll, wantAnchored, pat1, pat2, input)
+	}
+
+	for from := 0; from <= len(input); from++ {
+		f32 := int32(from)
+		wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
+
+		wantScanAll := oracleScanAll(pats, input, from, dropped.all)
+
+		// See site 1: a bare id, checked against the anywhere-set.
+		gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
+		if wantPos < 0 {
+			if gotScanAny != -1 {
+				t.Fatalf("scan_any(from=%d) = %d, want -1: pats=%q,%q input=%q", from, gotScanAny, pat1, pat2, input)
+			}
+		} else if !containsInt(wantScanAll, int(gotScanAny)) {
+			t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
+		}
+		gotScanAll := r.allIDs(t, "cap_scan_all", inBase, n, f32)
+		if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
+			t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)
+		}
+	}
+
+	// The DEFAULT `find` configuration, against the union oracle.
+	// The loop above compiled the set with overlapping: true, so this is
+	// the one place the fuzzer reaches the gated body.
+	gotGated := runGatedFind(t, pats, input).matches
+	wantGated := gatedOracle(pats, input)
+	sortMatches(gotGated)
+	sortMatches(wantGated)
+	if len(gotGated) != len(wantGated) {
+		t.Fatalf("gated find: expected %d matches %v, got %d %v: pats=%q,%q input=%q",
+			len(wantGated), wantGated, len(gotGated), gotGated, pat1, pat2, input)
+	}
+	for i := range wantGated {
+		if gotGated[i] != wantGated[i] {
+			t.Fatalf("gated find: match %d expected %+v, got %+v: pats=%q,%q input=%q",
+				i, wantGated[i], gotGated[i], pat1, pat2, input)
+		}
+	}
+}
+
+// TestUnicodeSetStartPositions runs sets in Unicode mode through every
+// capability against Go: no match starts, and no empty match is reported,
+// inside a character. Each pair carries a member whose empty match could
+// otherwise sit inside one — anywhere (`x*`), or only through `\B` — beside
+// a literal member, a split one or one sharing the answer cache, over inputs
+// of one- to four-byte characters, invalid bytes and cut-off sequences. Then
+// the answer cache and the program sweep, forced or triggered, over runs
+// where every character is multi-byte.
+func TestUnicodeSetStartPositions(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	pairs := [][2]string{
+		{`x*`, `é`},
+		{`\B`, `b`},
+		{`a?\B`, `\pL+`},
+		{`(?:é|)`, `ж+`},
+		{`[^x]*`, `日本`},
+		{`(?:a[^z]*?z)?`, `foo\w+`},
+		{`\B(?:a[^z]*?z)?`, `foo\w+`},
+		{`(?:)`, `[a-zé]+`},
+		{`\b`, `x*`},
+	}
+	inputs := []string{"", "é", "aéb", "éé", "aé日b", "日本語 abc", "\xffé\x80", "fooéa..z", "Grüße", "𝄞a𝄞", "\xe6\x97", "a\xe6\x97b"}
+	skipped := 0
+	for _, pr := range pairs {
+		pats := []string{pr[0], pr[1]}
+		refs := []*regexp.Regexp{regexp.MustCompile(pr[0]), regexp.MustCompile(pr[1])}
+		for _, in := range inputs {
+			if unicodeModeOutOfScope(pr[0], in) != "" || unicodeModeOutOfScope(pr[1], in) != "" {
+				skipped++
+				continue
+			}
+			t.Run(fmt.Sprintf("%s|%s|%q", pr[0], pr[1], in), func(t *testing.T) {
+				checkSetFindAllStarts(t, pats, refs, in)
+				checkSetCapsAllFroms(t, pats, in)
+				checkBatch(t, pats, in)
+			})
+		}
+	}
+	if skipped == 0 {
+		t.Error("no input was skipped as invalid UTF-8 for a pattern that can match U+FFFD: the skip rule went unexercised")
+	}
+
+	// The answer cache, swept from the first call, through `find` and the
+	// batch entry, and the walk beside it.
+	for _, pats := range [][]string{{`[a-zé]+`, `a*`}, {`x*`, `[^x]+`}, {`\B`, `[а-я]+`}} {
+		if sh := overlapShapeOf(t, pats); !sh.Eligible {
+			t.Fatalf("%v: the answer cache does not serve this set", pats)
+		}
+		for _, in := range []string{"", "é", "aéb", "жж", strings.Repeat("aé", 40), strings.Repeat("日x", 30)} {
+			want := overlapCacheOracle(pats, in)
+			scratch := cacheFindScratchLen(in, pats)
+			got := canonCache(driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAlways,
+				&cacheDriveOpt{preArmWork: true}))
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%v sweep over %q:\n  got  %v\n  want %v", pats, in, got, want)
+			}
+			walk := canonCache(driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), false, scratch, engageNever, nil))
+			if fmt.Sprint(walk) != fmt.Sprint(want) {
+				t.Fatalf("%v walk over %q:\n  got  %v\n  want %v", pats, in, walk, want)
+			}
+			batch := canonCache(driveOverlapCacheArmed(t, pats, in, 0, 3, true, scratch, engageAlways, nil, true))
+			if fmt.Sprint(batch) != fmt.Sprint(want) {
+				t.Fatalf("%v batch sweep over %q:\n  got  %v\n  want %v", pats, in, batch, want)
+			}
+		}
+	}
+
+	// A split member's program sweep, over a run its own searches re-read
+	// from every start, so the drive must have swept. `\B` holds between two
+	// `a`s, and inside every `é`, where nothing may start.
+	for _, m := range []struct{ pat, trigger string }{
+		{`(?:a[^z]*?z)?`, strings.Repeat("aé", 300) + "z"},
+		{`\B(?:a[^z]*?z)?`, strings.Repeat("aaé", 200) + "z"},
+	} {
+		pats, trigger := []string{`foo\w+`, m.pat}, m.trigger
+		sh, err := cachedOverlapShape(pats)
 		if err != nil {
-			if isResourceCeiling(err) {
-				t.Skip("resource ceiling")
+			t.Fatal(err)
+		}
+		if sh.SweepCells == 0 {
+			t.Fatalf("%v: no program sweep", pats)
+		}
+		for _, in := range []string{"", "aéz", "éaé", trigger} {
+			want := overlapOracleCtx(t, pats, in)
+			scratch, _ := overlapCacheFor(in, pats)
+			opt := &cacheDriveOpt{}
+			got := driveCacheFindOpt(t, pats, in, 0, int32(len(pats)), true, scratch, engageAny, opt)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%v find over %d bytes: got %v\nwant %v", pats, len(in), got, want)
 			}
-			t.Fatalf("set compile error on patterns Go stdlib accepts: %q + %q: %v", pat1, pat2, err)
-		}
-		store, inst, mem, release, err := instantiate(w)
-		defer release()
-		if err != nil {
-			t.Fatalf("instantiate: %v", err)
-		}
-		const pageSize = 65536
-		dataTop, err := utils.ParseDataSectionBytes(w)
-		if err != nil {
-			t.Fatalf("parse data section: %v", err)
-		}
-		inBase := int32((dataTop + pageSize - 1) / pageSize * pageSize)
-		outPtr := inBase + pageSize
-		needed := uint64((int64(outPtr) + pageSize + pageSize - 1) / pageSize)
-		if cur := mem.Size(store); needed > cur {
-			if _, err := mem.Grow(store, needed-cur); err != nil {
-				t.Fatalf("grow: %v", err)
+			if in == trigger && opt.header[0] != 1 {
+				t.Fatalf("%v: the sweep never ran (header word 0 = %d)", pats, opt.header[0])
 			}
-		}
-		if len(input) > 0 {
-			copy(mem.UnsafeData(store)[inBase:], input)
-		}
-		r := &capRunner{store: store, inst: inst, mem: mem, inBase: inBase, outPtr: outPtr, npat: len(pats)}
-		n := int32(len(input))
-
-		// The anchored oracle gets the ANCHORED scope and the two below get the
-		// global one: a pattern the anchored packer alone refused is gone from
-		// match_any/match_all and still live for scan and find.
-		wantAnchored := oracleAnchored(pats, input, dropped.anchored)
-		gotAny := int(r.call(t, "cap_match_any", inBase, n).(int32))
-		if len(wantAnchored) == 0 {
-			if gotAny != -1 {
-				t.Fatalf("match_any = %d, want -1: pats=%q,%q input=%q", gotAny, pat1, pat2, input)
-			}
-		} else if !containsInt(wantAnchored, gotAny) {
-			t.Fatalf("match_any = %d, not among %v: pats=%q,%q input=%q", gotAny, wantAnchored, pat1, pat2, input)
-		}
-		gotAll := r.allIDs(t, "cap_match_all", inBase, n)
-		if !eqIDs(append([]int(nil), wantAnchored...), gotAll) {
-			t.Fatalf("match_all = %v, want %v: pats=%q,%q input=%q", gotAll, wantAnchored, pat1, pat2, input)
-		}
-
-		for from := 0; from <= len(input); from++ {
-			f32 := int32(from)
-			wantPos, _ := oracleFirstPosition(pats, input, from, dropped.all)
-
-			wantScanAll := oracleScanAll(pats, input, from, dropped.all)
-
-			// See site 1: a bare id, checked against the anywhere-set.
-			gotScanAny := r.call(t, "cap_scan_any", inBase, n, f32).(int32)
-			if wantPos < 0 {
-				if gotScanAny != -1 {
-					t.Fatalf("scan_any(from=%d) = %d, want -1: pats=%q,%q input=%q", from, gotScanAny, pat1, pat2, input)
+			for _, cp := range []int32{1, 3} {
+				if got := driveOverlapCache(t, pats, in, cp, true); fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%v batch cap %d over %d bytes: got %v\nwant %v", pats, cp, len(in), got, want)
 				}
-			} else if !containsInt(wantScanAll, int(gotScanAny)) {
-				t.Fatalf("scan_any(from=%d) id = %d, not among %v: pats=%q,%q input=%q", from, gotScanAny, wantScanAll, pat1, pat2, input)
-			}
-			gotScanAll := r.allIDs(t, "cap_scan_all", inBase, n, f32)
-			if !eqIDs(append([]int(nil), wantScanAll...), gotScanAll) {
-				t.Fatalf("scan_all(from=%d) = %v, want %v: pats=%q,%q input=%q", from, gotScanAll, wantScanAll, pat1, pat2, input)
 			}
 		}
+	}
+}
 
-		// The DEFAULT `find` configuration, against the union oracle.
-		// The loop above compiled the set with overlapping: true, so this is
-		// the one place the fuzzer reaches the gated body.
-		gotGated := runGatedFind(t, pats, input).matches
-		wantGated := gatedOracle(pats, input)
-		sortMatches(gotGated)
-		sortMatches(wantGated)
-		if len(gotGated) != len(wantGated) {
-			t.Fatalf("gated find: expected %d matches %v, got %d %v: pats=%q,%q input=%q",
-				len(wantGated), wantGated, len(gotGated), gotGated, pat1, pat2, input)
+// acProbeSet is a Unicode-mode keyword set that keeps Aho-Corasick (fewer
+// than four distinct first characters) and whose literals all begin with a
+// lead byte, so the root prefilter tests two byte columns and every probe hit
+// runs the per-candidate verify. It carries every case the verify's jump
+// rule distinguishes: prefix pairs, the longer listed first (пример / при,
+// so its own case is tried before the shorter one's) and the shorter first
+// (пром / промокашка); a literal occurring inside another and ending before
+// its end with no prefix partner (рам in пирамида), and beside one (рим in
+// пример, мок in промокашка); a suffix literal (рог of пирог, мер of
+// пример); and two literals that differ only past the dispatch column
+// (почтальон / почтамт).
+var acProbeSet = []string{
+	"пример", "при", "рим", "мер", "пром", "промокашка", "мок", "пирог", "рог", "почтальон",
+	"почтамт", "пирамида", "рам", "правда", "письмо", "птица", "пустота", "печать", "поле", "палец",
+	"песок", "плита",
+}
+
+// acProbeDiag compiles acProbeSet in Unicode mode and returns its AC table
+// report, failing unless the two-column probe and the verify shipped.
+func acProbeDiag(t *testing.T, pats []string) *compile.ACTableDiag {
+	t.Helper()
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	on := true
+	sets := []config.SetConfig{{Name: "s", Find: "f", ScanAll: "a", Patterns: config.PatternSelector{Names: names}, Unicode: &on}}
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := diags[0]
+	if d.Frontend != "ac" || d.ACTable == nil || len(d.ACTable.ProbeColumns) != 2 || d.ACTable.VerifyColumn == nil {
+		t.Fatalf("frontend %q, AC table %+v: the two-column probe and the verify did not ship", d.Frontend, d.ACTable)
+	}
+	return d.ACTable
+}
+
+// TestUnicodeACRootProbe drives every capability of acProbeSet against Go:
+// match_any/match_all, scan_any/scan_all from every position (scan_all's
+// answer must hold every id, so a jump that skipped a literal's suffix
+// literals shows there), the gated find to exhaustion (Go's per-pattern
+// non-overlapping rule) and the overlapping find from every start. The
+// inputs: a long text with keywords planted, adjacent and at the very end;
+// inputs shorter than the probe's window; inputs ending 0, 1 and Col bytes
+// after the last candidate (the verify's "no room to dispatch" arm and its
+// fit check); and texts whose only candidates are words no keyword matches
+// (the "no literal starts here" exit).
+func TestUnicodeACRootProbe(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	d := acProbeDiag(t, acProbeSet)
+	col := *d.VerifyColumn
+	refs := make([]*regexp.Regexp, len(acProbeSet))
+	for i, p := range acProbeSet {
+		refs[i] = regexp.MustCompile(p)
+	}
+	words := []string{"мама", "пёс", "дом", "привычка", "приют", "пустяк", "рама", "море", "почта", "прима", "пирожок", "пирамида", "Grüße", "x"}
+	var long strings.Builder
+	for i := 0; long.Len() < 1024; i++ {
+		long.WriteString(words[i%len(words)])
+		long.WriteByte(' ')
+		if i%5 == 2 {
+			long.WriteString(acProbeSet[(i*7)%len(acProbeSet)])
+			long.WriteByte(' ')
 		}
-		for i := range wantGated {
-			if gotGated[i] != wantGated[i] {
-				t.Fatalf("gated find: match %d expected %+v, got %+v: pats=%q,%q input=%q",
-					i, wantGated[i], gotGated[i], pat1, pat2, input)
+		if i%11 == 4 {
+			long.WriteString("примерпирогрог промокашкамок")
+		}
+	}
+	long.WriteString("пример")
+	tail := string([]byte("пирог")[:col])
+
+	// The long text: the gated find's drive against Go, and the scan pair
+	// from a spread of starts. Every start of a 1 KB input costs minutes.
+	t.Run("long", func(t *testing.T) {
+		in := long.String()
+		checkGated(t, acProbeSet, in)
+		r := newCapRunner(t, acProbeSet, in, false)
+		defer r.Close()
+		n := int32(len(in))
+		for _, from := range []int{0, 1, 2, 17, 100, 511, len(in) - 12, len(in) - 6, len(in)} {
+			want := oracleScanAll(acProbeSet, in, from, nil)
+			got := r.allIDs(t, "cap_scan_all", r.inBase, n, int32(from))
+			if !eqIDs(append([]int(nil), want...), got) {
+				t.Fatalf("scan_all(from=%d) = %v, want %v", from, got, want)
+			}
+			anyID := int(r.call(t, "cap_scan_any", r.inBase, n, int32(from)).(int32))
+			if len(want) == 0 && anyID != -1 || len(want) > 0 && !containsInt(want, anyID) {
+				t.Fatalf("scan_any(from=%d) = %d, want one of %v", from, anyID, want)
 			}
 		}
 	})
+	inputs := []string{
+		"", "п", "пр", "при", "пример", "примерпри", "пирамида", "пирамидарам", "рог", "\xd0", "при\xd0", "xпримерx", "почтальонпочтамт",
+		"пёс пёс пёс " + "пирог",
+		"пёс пёс пёс " + "пирог" + "x",
+		"пёс пёс пёс " + "пирог" + strings.Repeat("y", col),
+		"пёс пёс пёс " + tail,
+		"пёс пёс пёс п" + "\xbf",
+		"это пустяк, приют и прима — привычка",
+		strings.Repeat("пёс ", 20),
+	}
+	for _, in := range inputs {
+		in := in
+		t.Run(fmt.Sprintf("%d:%.24q", len(in), in), func(t *testing.T) {
+			checkSetFindAllStarts(t, acProbeSet, refs, in)
+			checkSetCapsAllFroms(t, acProbeSet, in)
+		})
+	}
+}
+
+// TestACProbeTailAndChunkMasksAgree: the probe's two columns are tested by
+// the SIMD path one way (the second column only inside the first's hit
+// branch) and by the backward tail probe another (both masks on the stack),
+// once per call. An input of 16 + Off2 to 32 + Off2 bytes leaves its last
+// candidates to the tail probe alone; both shapes must find them, and miss
+// the non-keyword candidates around them.
+func TestACProbeTailAndChunkMasksAgree(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	d := acProbeDiag(t, acProbeSet)
+	off2 := d.ProbeColumns[1]
+	refs := make([]*regexp.Regexp, len(acProbeSet))
+	for i, p := range acProbeSet {
+		refs[i] = regexp.MustCompile(p)
+	}
+	checked := 0
+	for _, kw := range []string{"при", "рим", "пример", "мок"} {
+		for pad := 16; pad < 32; pad++ {
+			for _, lead := range []string{"", "пёс"} {
+				in := lead + strings.Repeat("x", pad-len(lead)) + kw
+				if len(in) < 16+off2 || len(in) >= 32+off2 || strings.Index(in, kw) < 16 {
+					continue
+				}
+				checked++
+				t.Run(fmt.Sprintf("%s+%d+%s", lead, pad, kw), func(t *testing.T) {
+					checkSetFindAllStarts(t, acProbeSet, refs, in)
+					checkSetCapsAllFroms(t, acProbeSet, in)
+				})
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no input put its candidate where only the tail probe sees it")
+	}
+}
+
+// TestACProbeWideColumnAgainstOracle: Aho-Corasick forced on keywords whose
+// probe column holds five bytes (а..д under one lead byte), so the root probe
+// tests that column with nibble tables rather than a compare chain; every
+// capability against Go. `find` is the overlapping one, the contract
+// checkCapsAgainstOracle checks from every start with one gate array; the
+// gated body shares the probe and runs in TestUnicodeACRootProbe.
+func TestACProbeWideColumnAgainstOracle(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	*unicodeMode = true
+	pats := []string{
+		"арбуз", "банан", "вишня", "груша", "дыня", "азбука", "буря", "весна", "гроза", "дождь",
+		"аист", "белка", "волк", "гусь", "дятел", "акула", "бобр", "ворон", "голубь", "дельфин",
+	}
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	on := true
+	sets := []config.SetConfig{{
+		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true, Patterns: config.PatternSelector{Names: names}, Unicode: &on,
+	}}
+	w, _, diags, err := compile.CompileFileOpts(config.BuildConfig{Patterns: entries, Sets: sets}, "",
+		compile.CompileSetOptions{}.WithForcedFrontend(compile.SetFrontendAC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := diags[0]; d.Frontend != "ac" || d.ACTable == nil || fmt.Sprint(d.ACTable.ProbeColumns) != "[0 1]" {
+		t.Fatalf("frontend %q, AC table %+v: not the two-column probe this test is for", d.Frontend, d.ACTable)
+	}
+	for _, in := range []string{"", "арбуз", "вишнягруша", "на опушке белка и волк", "дятел\xd0", "абвгд еёжз", "x дельфин"} {
+		t.Run(fmt.Sprintf("%q", in), func(t *testing.T) {
+			r := newCapRunnerFrom(t, w, pats, in)
+			defer r.Close()
+			checkCapsAgainstOracle(t, r, pats, in)
+		})
+	}
+}
+
+// byteModeTwin maps every byte above 0x7F in texts to an ASCII stand-in that
+// appears in none of them, one stand-in per byte: under a byte engine a high
+// byte behaves exactly like any other byte the pattern names literally, so
+// the mapped pattern over the mapped input asks Go the same question — an
+// isomorphism, the oracle TestByteModeLengthsAcrossEmitters uses for one byte.
+func byteModeTwin(t *testing.T, texts ...string) func(string) string {
+	t.Helper()
+	used := map[byte]bool{}
+	var high []byte
+	for _, s := range texts {
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c < 0x80 {
+				used[c] = true
+			} else if !used[c] {
+				used[c] = true
+				high = append(high, c)
+			}
+		}
+	}
+	m := map[byte]byte{}
+	pool := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for _, c := range high {
+		for len(pool) > 0 && used[pool[0]] {
+			pool = pool[1:]
+		}
+		if len(pool) == 0 {
+			t.Fatalf("no ASCII stand-in left for byte %#x", c)
+		}
+		m[c] = pool[0]
+		used[pool[0]] = true
+		pool = pool[1:]
+	}
+	return func(s string) string {
+		b := []byte(s)
+		for i, c := range b {
+			if r, ok := m[c]; ok {
+				b[i] = r
+			}
+		}
+		return string(b)
+	}
+}
+
+// TestByteModeHighByteLiteralSets: `byte_mode` keyword sets whose literals
+// carry bytes above 0x7F — UTF-8 Russian written as bytes (every first byte
+// D0/D1, so Aho-Corasick with the two-column probe and the verify) and
+// Latin-1 words — against Go through byteModeTwin: the gated find's drive
+// against FindAllIndex per member, every capability of the overlapping set
+// from every start. Until such bytes counted as literal bytes the sets walked
+// a fallback bucket, which answered right but at 200-320 fuel per byte.
+func TestByteModeHighByteLiteralSets(t *testing.T) {
+	ru := []string{"пример", "при", "рим", "мер", "пром", "промокашка", "мок", "пирог", "рог", "почтальон",
+		"почтамт", "пирамида", "рам", "правда", "письмо", "птица", "пустота", "печать", "поле", "палец"}
+	lat := []string{"caf\xe9", "na\xefve", "r\xe9sum\xe9", "fa\xe7ade", "se\xf1or", "\xfcber", "gr\xf6\xdfe",
+		"\xe9t\xe9", "cr\xe8me", "d\xe9j\xe0", "ma\xf1ana", "pi\xf1ata", "S\xe3o", "Ni\xf1o", "fran\xe7ais",
+		"Z\xfcrich", "M\xfcnchen", "K\xf6ln", "\xe0 la", "a\xf1o"}
+	for _, c := range []struct {
+		name   string
+		kws    []string
+		probe  bool
+		inputs []string
+	}{
+		{"utf8-bytes", ru, true, []string{"", "пример", "примерпри", "пирамидарам", "это пёс и пирог", "почтальонпочтамт",
+			"мама мыла раму и пирог пирамида при", "пёс\xd0", strings.Repeat("пёс ", 12) + "палец"}},
+		{"latin1", lat, false, []string{"", "caf\xe9", "a caf\xe9 au lait", "\xe9t\xe9 r\xe9sum\xe9", "M\xfcnchenK\xf6ln",
+			"the fran\xe7ais se\xf1or", "na\xefve", strings.Repeat("the ", 10) + "d\xe9j\xe0"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pats := make([]string, len(c.kws))
+			raw := make([]string, len(c.kws))
+			for i, kw := range c.kws {
+				raw[i] = kw
+				var sb strings.Builder
+				for _, b := range []byte(kw) {
+					fmt.Fprintf(&sb, `\x%02x`, b)
+				}
+				pats[i] = sb.String()
+			}
+			twin := byteModeTwin(t, append(append([]string{}, raw...), c.inputs...)...)
+			twinPats := make([]string, len(raw))
+			for i, kw := range raw {
+				twinPats[i] = regexp.QuoteMeta(twin(kw))
+			}
+			compileSet := func(overlapping bool) []byte {
+				entries := make([]config.PatternEntry, len(pats))
+				names := make([]string, len(pats))
+				for i, p := range pats {
+					names[i] = fmt.Sprintf("p%d", i)
+					entries[i] = config.PatternEntry{Name: names[i], Regexp: p, ByteMode: true}
+				}
+				off := false
+				w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
+					Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+					ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+					Patterns: config.PatternSelector{Names: names}, Unicode: &off,
+				}}}, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				d := diags[0]
+				if d.Frontend == "scalar" {
+					t.Fatalf("frontend scalar: the high-byte literals were not extracted")
+				}
+				if probe := d.ACTable != nil && len(d.ACTable.ProbeColumns) == 2; probe != c.probe {
+					t.Fatalf("frontend %q, AC table %+v: two-column probe %v, want %v", d.Frontend, d.ACTable, probe, c.probe)
+				}
+				return w
+			}
+			gated, ovl := compileSet(false), compileSet(true)
+			for _, in := range c.inputs {
+				t.Run(fmt.Sprintf("%.20q", in), func(t *testing.T) {
+					r := newCapRunnerFrom(t, gated, pats, in)
+					defer r.Close()
+					got := driveGatedCaps(t, r, in)
+					want := gatedOracle(twinPats, twin(in))
+					sortMatches(got)
+					sortMatches(want)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("gated find over %q:\n  got  %v\n  want %v", in, got, want)
+					}
+					r2 := newCapRunnerFrom(t, ovl, pats, in)
+					defer r2.Close()
+					checkCapsAgainstOracle(t, r2, twinPats, twin(in))
+				})
+			}
+		})
+	}
+}
+
+// anchoredBTSets are sets with a member whose anchored automaton cannot be
+// built inside the default limits, so match_any / match_all answer for it
+// through a Backtracking probe over the whole input: in byte mode
+// `(?:a|b)*a(?:a|b){12}c` (2^13 states, past max_dfa_states and the 2,048
+// construction cap) and the same behind `(?:x|xy)`, which needs the probe to
+// backtrack out of the higher-priority branch that stops short of the end;
+// in Unicode mode `[аб]*а[аб]{14}` (2^15 states, past 16,384). Each sits
+// beside DFA members, so the DFA part runs first and the probe after it.
+//
+// maxUnion 2 refuses the anchored union automaton, so the set answers through
+// its anchored DFA buckets and then the probes — the other anchored body; a
+// set with no DFA member at all has no union to build and takes it too.
+var anchoredBTSets = []struct {
+	name     string
+	unicode  bool
+	maxUnion int
+	pats     []string
+	inputs   []string
+}{
+	{"byte", false, 0,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`, `[a-c]+`, `abc`},
+		[]string{"", "abc", "aaaa", "bbba" + strings.Repeat("ab", 6) + "c", "a" + strings.Repeat("b", 12) + "c",
+			"a" + strings.Repeat("b", 11) + "c", "xa" + strings.Repeat("b", 12) + "c", "xya" + strings.Repeat("b", 12) + "c",
+			"xyz", "xy" + strings.Repeat("ab", 7) + "c", strings.Repeat("ab", 20) + "c", strings.Repeat("ab", 20) + "x"}},
+	{"unicode", true, 0,
+		[]string{`[аб]*а[аб]{14}`, `привет`, `[а-я]+!`, `\p{Greek}+`},
+		[]string{"", "привет", "абв!", "αβγ", "ббба" + strings.Repeat("б", 14), "а" + strings.Repeat("б", 13),
+			strings.Repeat("а", 15), strings.Repeat("аб", 12) + "!", "\xff", "а\xd0" + strings.Repeat("б", 14)}},
+	{"byte-buckets", false, 2,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `[a-c]+`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`, `abc`},
+		[]string{"", "abc", "aaaa", "bbba" + strings.Repeat("ab", 6) + "c", "a" + strings.Repeat("b", 11) + "c",
+			"xya" + strings.Repeat("b", 12) + "c", strings.Repeat("ab", 20) + "x"}},
+	{"unicode-buckets", true, 2,
+		[]string{`привет`, `[аб]*а[аб]{14}`, `[а-я]+!`},
+		[]string{"", "привет", "абв!", "ббба" + strings.Repeat("б", 14), strings.Repeat("а", 15), "а" + strings.Repeat("б", 13)}},
+	{"byte-only-bt", false, 0,
+		[]string{`(?:a|b)*a(?:a|b){12}c`, `(?:x|xy)(?:a|b)*a(?:a|b){12}c`},
+		[]string{"", "abc", "bbba" + strings.Repeat("ab", 6) + "c", "xya" + strings.Repeat("b", 12) + "c", "xy" + strings.Repeat("ab", 7) + "c"}},
+}
+
+func compileAnchoredBTSet(t *testing.T, pats []string, unicode, overlapping bool, maxMemory config.MemorySize, maxUnion int) ([]byte, compile.SetDiag) {
+	t.Helper()
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	mode := unicode
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Patterns: entries, Sets: []config.SetConfig{{
+		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+		Patterns: config.PatternSelector{Names: names}, Unicode: &mode,
+	}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, diags[0]
+}
+
+// TestAnchoredPairBacktrackingMembers: such a member is in match_any /
+// match_all — --diag-json lists it as running there on Backtracking — the
+// `_all` pair is in its out_ptr form, and every capability answers against Go
+// (the overlapping set from every start, the gated drive against
+// FindAllIndex). Until 2026-10-12 the member was dropped from the anchored
+// pair with a warning.
+func TestAnchoredPairBacktrackingMembers(t *testing.T) {
+	defer func(v bool) { *unicodeMode = v }(*unicodeMode)
+	for _, c := range anchoredBTSets {
+		t.Run(c.name, func(t *testing.T) {
+			*unicodeMode = c.unicode
+			ovl, d := compileAnchoredBTSet(t, c.pats, c.unicode, true, config.MemorySize{}, c.maxUnion)
+			if len(d.AnchoredBacktracking) == 0 {
+				t.Fatalf("--diag-json anchored_backtracking is empty: no member's anchored pair is on Backtracking")
+			}
+			if union := d.AnchoredUnion != nil && d.AnchoredUnion.Used; union != (c.maxUnion == 0 && len(c.pats) > len(d.AnchoredBacktracking)) {
+				t.Fatalf("anchored union used %v: not the body this case is for", union)
+			}
+			gated, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, config.MemorySize{}, c.maxUnion)
+			for _, in := range c.inputs {
+				if unicodeModeOutOfScope(c.pats[0], in) != "" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%.24q", in), func(t *testing.T) {
+					r := newCapRunnerFrom(t, ovl, c.pats, in)
+					defer r.Close()
+					if f := r.inst.GetFunc(r.store, "cap_match_all"); len(f.Type(r.store).Params()) != 3 {
+						t.Fatalf("match_all takes %d params: not the out_ptr form a Backtracking member needs", len(f.Type(r.store).Params()))
+					}
+					checkCapsAgainstOracle(t, r, c.pats, in)
+					g := newCapRunnerFrom(t, gated, c.pats, in)
+					defer g.Close()
+					got, want := driveGatedCaps(t, g, in), gatedOracle(c.pats, in)
+					sortMatches(got)
+					sortMatches(want)
+					if fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Fatalf("gated find:\n  got  %v\n  want %v", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestAnchoredPairBacktrackingGivesUp: a probe that cannot finish — the
+// module capped by max_memory, so its frame stack and memo cannot grow over a
+// long input — makes match_any and match_all answer -2, "unknown", never -1
+// or a count; and a short input still answers.
+func TestAnchoredPairBacktrackingGivesUp(t *testing.T) {
+	for _, c := range anchoredBTSets {
+		t.Run(c.name, func(t *testing.T) {
+			long := strings.Repeat("ab", 1<<17) + "x"
+			if c.unicode {
+				long = strings.Repeat("аб", 1<<16) + "x"
+			}
+			plain, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, config.MemorySize{}, c.maxUnion)
+			store, _, mem, release, err := instantiate(plain)
+			if err != nil {
+				release()
+				t.Fatal(err)
+			}
+			pages := mem.Size(store)
+			release()
+			// Room for the input and three pages of working memory: enough for
+			// a short search's frame stack, far short of the long one's memo.
+			inPages := uint64(len(long)+8+65535) / 65536
+			memCap, err := config.ParseMemorySize(fmt.Sprintf("%dKiB", (pages+inPages+3)*64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, _ := compileAnchoredBTSet(t, c.pats, c.unicode, false, memCap, c.maxUnion)
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := int32(mem.Size(store) * 65536)
+			if _, err := mem.Grow(store, inPages); err != nil {
+				t.Fatalf("grow for the input: %v", err)
+			}
+			// What a stub does: the search's working memory starts above what
+			// the host wrote, so a call reuses it instead of taking fresh pages.
+			if err := setScratchBase(store, inst, base+int32(inPages*65536)); err != nil {
+				t.Fatal(err)
+			}
+			call := func(fn, in string) int32 {
+				copy(mem.UnsafeData(store)[base:], in)
+				args := []interface{}{base, int32(len(in))}
+				if fn == "cap_match_all" {
+					args = append(args, base+int32(len(in))) // bitmap after the input
+					clear(mem.UnsafeData(store)[base+int32(len(in)) : base+int32(len(in))+8])
+				}
+				res, err := inst.GetFunc(store, fn).Call(store, args...)
+				if err != nil {
+					t.Fatalf("%s: %v", fn, err)
+				}
+				return res.(int32)
+			}
+			for _, fn := range []string{"cap_match_any", "cap_match_all"} {
+				if got := call(fn, long); got != -2 {
+					t.Errorf("%s over %d bytes under max_memory = %d, want -2 (unknown)", fn, len(long), got)
+				}
+			}
+			// A short input still answers definitely after a give-up.
+			if got := call("cap_match_any", c.inputs[3]); got < 0 {
+				t.Errorf("match_any(%q) = %d after a give-up", c.inputs[3], got)
+			}
+		})
+	}
 }
 
 // TestSetWideAllBitmap exercises the >64-pattern form of match_all/scan_all,
@@ -779,18 +1457,18 @@ func TestSetWideAllBitmap(t *testing.T) {
 	const n = 70
 	pats := make([]string, n)
 	names := make([]string, n)
-	entries := make([]config.RegexEntry, n)
+	entries := make([]config.PatternEntry, n)
 	for i := range pats {
 		pats[i] = fmt.Sprintf("kw%02dX", i)
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: pats[i]}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: pats[i]}
 	}
 	sets := []config.SetConfig{{
 		Name: "s", MatchAll: "cap_match_all", ScanAll: "cap_scan_all",
 		Find: "cap_find", Overlapping: true,
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -865,19 +1543,20 @@ func TestSetWideAllBitmap(t *testing.T) {
 // compileGatedSet compiles pats into a standalone module whose `find` is the
 // default gated body (no `overlapping:` key).
 func compileGatedSet(pats []string) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:     "s",
 		Find:     "gated_find",
 		Patterns: config.PatternSelector{Names: names},
+		Unicode:  setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, err
 	})
 }
@@ -894,6 +1573,9 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	t.Helper()
 	w, err := compileGatedSet(pats)
 	if err != nil {
+		if isResourceCeiling(err) {
+			t.Skip("resource ceiling")
+		}
 		t.Fatalf("compile %v: %v", pats, err)
 	}
 	store, inst, mem, release, err := instantiate(w)
@@ -977,32 +1659,36 @@ func runGatedFind(t *testing.T, pats []string, input string) gatedRun {
 	return run
 }
 
-// gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
-// runGatedFindBlocks is runGatedFind handing the set's search blocks over the
+// runGatedDriveBlocks is runGatedFind handing the set's search blocks over the
 // way mode says, through the shared helper (internal/searchblock), as a
-// generated iterator does. switched reports whether block 0 — a counted sparse
-// bucket's drive state — recorded the handover to the split companion.
-func runGatedFindBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode) (matches []setMatch, switched bool) {
-	t.Helper()
-	return runGatedDriveBlocks(t, pats, input, mode, 0)
-}
-
-// runGatedDriveBlocks is runGatedFindBlocks for a set that may batch: with
-// batchCap > 0 the set is compiled with `hints: [batch-find]` and the BATCH
-// entry is driven at that capacity, cursor handed back as a stub does; with
-// batchCap < 0 the set batches and its `find` is driven.
+// generated iterator does, for a set that may batch. switched reports whether
+// block 0 — a counted sparse bucket's drive state — recorded the handover to
+// the split companion. With batchCap > 0 the set is compiled with
+// `hints: [batch-find]` and the BATCH entry is driven at that capacity, cursor
+// handed back as a stub does; with batchCap < 0 the set batches and its `find`
+// is driven.
 func runGatedDriveBlocks(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32) (matches []setMatch, switched bool) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	return runGatedDriveBlocksWith(t, pats, input, mode, batchCap, nil)
+}
+
+// runGatedDriveBlocksWith is runGatedDriveBlocks with the set's config passed
+// through setCfg first (a hint, the set's mode), when it is not nil.
+func runGatedDriveBlocksWith(t *testing.T, pats []string, input string, mode searchblock.Mode, batchCap int32, setCfg func(*config.SetConfig)) (matches []setMatch, switched bool) {
+	t.Helper()
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
-	cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+	cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", Find: "gated_find", Patterns: config.PatternSelector{Names: names}}}}
 	if batchCap != 0 {
 		cfg.Sets[0].Hints = []string{"batch-find"}
+	}
+	if setCfg != nil {
+		setCfg(&cfg.Sets[0])
 	}
 	w, _, diags, err := compile.CompileFileDiag(cfg, "")
 	if err != nil {
@@ -1189,6 +1875,276 @@ func TestSparseCounterHandoverMatchesGo(t *testing.T) {
 	}
 }
 
+// TestSparseMemberCharSkipMatchesGo drives a Unicode-mode prefer-match set
+// whose one sparse bucket's member states loop over whole characters — 40
+// members `union[ \t]+kNN[^;]+`, the member skip's CHARACTER sets
+// (buildMemberSets) — over tails of 2-, 3- and 4-byte characters, mixed with
+// ASCII, cut by the skip's 16-byte chunks at every offset, ending at the
+// input's end or at a `;`. Valid UTF-8 is judged against Go; over invalid
+// UTF-8 (a stray 0xFF, a stray continuation, an overlong form, a sequence cut
+// at the end), where Go's answers differ from Unicode mode's by design, the
+// hinted build must answer exactly as the neutral one does, which has no skip.
+func TestSparseMemberCharSkipMatchesGo(t *testing.T) {
+	pats := make([]string, 40)
+	for i := range pats {
+		pats[i] = fmt.Sprintf(`union[ \t]+k%02d[^;]+`, i)
+	}
+	on := true
+	hinted := func(sc *config.SetConfig) { sc.Unicode = &on; sc.Hints = []string{"prefer-match"} }
+	neutral := func(sc *config.SetConfig) { sc.Unicode = &on }
+
+	// Not vacuous: the bucket must carry character sets.
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names}}
+	hinted(&sc)
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chars := 0
+	for _, b := range diags[0].Buckets {
+		chars += b.MemberSkipCharStates
+	}
+	if chars == 0 {
+		t.Fatal("no member state strides whole characters: the character skip went unexercised")
+	}
+
+	rng := rand.New(rand.NewSource(124))
+	alphabets := []string{"абвгдежзиклмнопрстуфхцчшщыэюя", "日本語文字列検索", "😀🎉🚀𝄞", "aé ж日😀x\t", "abc def"}
+	tail := func(n int) string {
+		var sb strings.Builder
+		alpha := []rune(alphabets[rng.Intn(len(alphabets))])
+		for sb.Len() < n {
+			sb.WriteRune(alpha[rng.Intn(len(alpha))])
+		}
+		return sb.String()
+	}
+	var valid []string
+	for i := 0; i < 24; i++ {
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("x", rng.Intn(16))) // shifts the chunks against the characters
+		for r := rng.Intn(5) + 1; r > 0; r-- {
+			sb.WriteString(fmt.Sprintf("union%sk%02d%s", []string{" ", "\t", "  "}[rng.Intn(3)], rng.Intn(40), tail(rng.Intn(120)+1)))
+			if rng.Intn(4) > 0 {
+				sb.WriteString("; ")
+			}
+		}
+		valid = append(valid, sb.String())
+	}
+	valid = append(valid, "union k07"+strings.Repeat("ж", 200), "union k01ж;union k02日;union k03😀", "union k00"+strings.Repeat("日x", 50)+";")
+	invalid := []string{
+		"union k05" + strings.Repeat("ж", 20) + "\xff" + strings.Repeat("ж", 20) + ";",
+		"union k05" + strings.Repeat("ж", 20) + "\x80" + strings.Repeat("日", 20),
+		"union k05" + strings.Repeat("ж", 20) + "\xc0\xaf" + strings.Repeat("ж", 20),
+		"union k05" + strings.Repeat("ж", 30) + "\xd0",
+		"union k05" + strings.Repeat("ж", 7) + "\xe6\x97" + strings.Repeat("a", 30),
+	}
+	for i, in := range valid {
+		t.Run(fmt.Sprintf("valid/%d", i), func(t *testing.T) {
+			want := gatedOracle(pats, in)
+			sortMatches(want)
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				got, _ := runGatedDriveBlocksWith(t, pats, in, mode, 0, hinted)
+				sortMatches(got)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s over %q:\n  got  %v\n  want %v", mode, in, got, want)
+				}
+			}
+		})
+	}
+	for i, in := range invalid {
+		t.Run(fmt.Sprintf("invalid/%d", i), func(t *testing.T) {
+			want, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, neutral)
+			got, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, hinted)
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("over %q:\n  hinted  %v\n  neutral %v", in, got, want)
+			}
+		})
+	}
+}
+
+// TestSetDroppedTablesChangeNoAnswer is TestDroppedTablesChangeNoAnswer for
+// set-bearing modules: every capability, compiled with the assembler's table
+// drop and without it (CompileSetOptions.KeepUnreadTables), answers alike from
+// every start — the set's bucket layouts carry first-byte and word tables of
+// their own.
+func TestSetDroppedTablesChangeNoAnswer(t *testing.T) {
+	sets := [][]string{
+		{`\bfoo\b`, `bar\d+`, `^start`, `x\B[a-z]+`},
+		{`\bword\w*`, `\d+\b`, `(?m)^key=\w+`, `[a-z]+@[a-z]+`},
+		{`alpha|beta`, `gamma[0-9]{2}`, `\Bmid\B`, `end$`},
+	}
+	inputs := []string{"", "foo bar12 start", "start foo xabc word123 4 5", "key=v\nkey=w a@b alpha gamma12 amidb end",
+		"subfoo foobar xx bar7 wordy 99", "жж foo ёё bar1 \xff"}
+	differed := 0
+	on := true
+	for _, pats := range sets {
+		for _, overlapping := range []bool{false, true} {
+			for _, uni := range []*bool{nil, &on} {
+				for _, hints := range [][]string{nil, {"prefer-match"}, {"prefer-no-match"}} {
+					entries := make([]config.PatternEntry, len(pats))
+					names := make([]string, len(pats))
+					for i, p := range pats {
+						names[i] = fmt.Sprintf("p%d", i)
+						entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+					}
+					cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
+						Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
+						ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
+						Patterns: config.PatternSelector{Names: names}, Unicode: uni, Hints: hints}}}
+					wKeep, _, _, errK := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{KeepUnreadTables: true})
+					wDrop, _, _, errD := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{})
+					if errK != nil || errD != nil {
+						t.Fatalf("%q: %v / %v", pats, errK, errD)
+					}
+					if bytes.Equal(wKeep, wDrop) {
+						continue
+					}
+					differed++
+					for _, in := range inputs {
+						if a, b := setAnswers(t, wKeep, pats, in), setAnswers(t, wDrop, pats, in); a != b {
+							t.Errorf("%q (overlapping %v, unicode %v, hints %v) over %q:\n  every table %s\n  dropped     %s",
+								pats, overlapping, uni != nil, hints, in, a, b)
+						}
+					}
+				}
+			}
+		}
+	}
+	if differed == 0 {
+		t.Fatal("no set module lost a table: the drop went unexercised")
+	}
+}
+
+// setAnswers renders every capability's answer over in, from every start.
+func setAnswers(t *testing.T, w []byte, pats []string, in string) string {
+	t.Helper()
+	r := newCapRunnerFrom(t, w, pats, in)
+	defer r.Close()
+	n := int32(len(in))
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "any=%v all=%v ", r.call(t, "cap_match_any", r.inBase, n), r.allIDs(t, "cap_match_all", r.inBase, n))
+	for f := int32(0); f <= n; f++ {
+		fmt.Fprintf(&sb, "|%d sa=%v sl=%v", f, r.call(t, "cap_scan_any", r.inBase, n, f), r.allIDs(t, "cap_scan_all", r.inBase, n, f))
+		r.resetGates()
+		total := int(r.call(t, "cap_find", r.inBase, n, f, r.scratchPtr(), r.outPtr, int32(r.npat)).(int32))
+		buf := r.mem.UnsafeData(r.store)
+		fmt.Fprintf(&sb, " f=%d", total)
+		for i := 0; i < total && i < r.npat; i++ {
+			base := int(r.outPtr) + i*12
+			fmt.Fprintf(&sb, " %d", buf[base:base+12])
+		}
+	}
+	return sb.String()
+}
+
+// TestSetCharLoopSkipMatchesGo drives a Unicode set whose members walk a loop
+// over SOME characters (a letter class) under prefer-match: the bucket bodies'
+// character skip, gated on the next byte and with the structural validity
+// test, against Go over valid text — values of every length, the chunks
+// shifted against the characters — and against the unhinted build over
+// invalid text.
+func TestSetCharLoopSkipMatchesGo(t *testing.T) {
+	var pats []string
+	for i := 0; i < 8; i++ {
+		pats = append(pats, fmt.Sprintf(`ключ%d=\p{Cyrillic}+;`, i))
+	}
+	pats = append(pats, `val:\pL+=\pL+`)
+	on := true
+	hinted := func(sc *config.SetConfig) { sc.Unicode = &on; sc.Hints = []string{"prefer-match"} }
+	neutral := func(sc *config.SetConfig) { sc.Unicode = &on }
+
+	// Not vacuous: the hinted module carries the structural test (its lead
+	// mask, chunk >= 0xC0), the unhinted one does not.
+	sig := append(append([]byte{0xFD, 0x0C}, bytes.Repeat([]byte{0xC0}, 16)...), 0xFD, 0x2C)
+	for _, c := range []struct {
+		cfg  func(*config.SetConfig)
+		want bool
+	}{{hinted, true}, {neutral, false}} {
+		entries := make([]config.PatternEntry, len(pats))
+		names := make([]string, len(pats))
+		for i, p := range pats {
+			names[i] = fmt.Sprintf("p%d", i)
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+		}
+		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names}}
+		c.cfg(&sc)
+		w, _, _, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Contains(w, sig); got != c.want {
+			t.Fatalf("hints %v: the structural test emitted = %v, want %v", sc.Hints, got, c.want)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(1015))
+	word := func(n int) string {
+		alpha := []rune("абвгдежзиклмнопрстуфхцчшщыэюяёіѣӭ")
+		var sb strings.Builder
+		for ; n > 0; n-- {
+			sb.WriteRune(alpha[rng.Intn(len(alpha))])
+		}
+		return sb.String()
+	}
+	var valid []string
+	for i := 0; i < 24; i++ {
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("x", rng.Intn(16)))
+		for r := rng.Intn(6) + 1; r > 0; r-- {
+			n := []int{1, 2, 3, rng.Intn(40) + 1}[rng.Intn(4)]
+			switch rng.Intn(3) {
+			case 0:
+				sb.WriteString(fmt.Sprintf("ключ%d=%s; ", rng.Intn(8), word(n)))
+			case 1:
+				sb.WriteString(fmt.Sprintf("val:%s=%s ", word(n), []string{"ab", word(rng.Intn(5) + 1), "ж"}[rng.Intn(3)]))
+			default:
+				sb.WriteString(word(n) + " ")
+			}
+		}
+		valid = append(valid, sb.String())
+	}
+	valid = append(valid, "ключ1="+strings.Repeat("ж", 200)+";", "ключ2=ж;ключ3=жж;", "val:a=b val:ж=ё val:"+word(30)+"="+word(30))
+	invalid := []string{
+		"ключ5=" + strings.Repeat("ж", 20) + "\xd0\xd0" + strings.Repeat("ж", 20) + ";",
+		"ключ5=" + strings.Repeat("ж", 20) + "\x80" + strings.Repeat("ж", 20) + ";",
+		"ключ5=" + strings.Repeat("ж", 7) + "\xd0;",
+		"val:" + strings.Repeat("ж", 9) + "\xe6\x97=" + strings.Repeat("ж", 9),
+	}
+	for i, in := range valid {
+		t.Run(fmt.Sprintf("valid/%d", i), func(t *testing.T) {
+			want := gatedOracle(pats, in)
+			sortMatches(want)
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				got, _ := runGatedDriveBlocksWith(t, pats, in, mode, 0, hinted)
+				sortMatches(got)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("%s over %q:\n  got  %v\n  want %v", mode, in, got, want)
+				}
+			}
+		})
+	}
+	for i, in := range invalid {
+		t.Run(fmt.Sprintf("invalid/%d", i), func(t *testing.T) {
+			want, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, neutral)
+			got, _ := runGatedDriveBlocksWith(t, pats, in, searchblock.Off, 0, hinted)
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("over %q:\n  hinted  %v\n  neutral %v", in, got, want)
+			}
+		})
+	}
+}
+
+// gatedOracle is the union of Go FindAllIndex, tagged with the pattern id.
 func gatedOracle(pats []string, input string) []setMatch {
 	var out []setMatch
 	for k, p := range pats {
@@ -1540,11 +2496,11 @@ func TestGatedLadderFuel(t *testing.T) {
 // bodies over shared suffix functions, which is also what makes declaring both
 // worth testing: the shared functions must serve either caller.
 func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -1552,9 +2508,10 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Hints:       []string{"batch-find"},
 		Overlapping: overlapping,
 		Patterns:    config.PatternSelector{Names: names},
+		Unicode:     setModeKey(),
 	}}
 	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 		return w, err
 	})
 }
@@ -1636,7 +2593,14 @@ func newBatchRunner(t *testing.T, pats []string, input string, overlapping bool)
 	if err != nil {
 		t.Fatalf("parse data section: %v", err)
 	}
-	cacheLen, cacheStride := overlapCacheFor(input, pats)
+	// A gated set has no answer cache, so nothing to size: the header is the
+	// region every drive declines with. Sizing it would recompile the set as
+	// an OVERLAPPING one (overlapSizingCfg) — seconds for a large Unicode set,
+	// which ran a fuzz input past the worker's deadline.
+	cacheLen, cacheStride := int32(config.SetOverlapCheckpointHeaderBytes), int32(1)
+	if overlapping {
+		cacheLen, cacheStride = overlapCacheFor(input, pats)
+	}
 	needed := uint64((int64(cachePtr) + int64(cacheLen) + 2*pageSize - 1) / pageSize)
 	if cur := mem.Size(store); needed > cur {
 		if _, err := mem.Grow(store, needed-cur); err != nil {
@@ -1871,7 +2835,9 @@ func FuzzFindBatch(f *testing.F) {
 	f.Add(`(?m:^)a`, `a`, "a\nba\nb")
 	f.Add(`(?:)`, `a`, "aa")
 
+	unicodeSetSeeds(f)
 	f.Fuzz(func(t *testing.T, pat1, pat2, input string) {
+		beginFuzzInput()
 		if len(input) > 48 {
 			t.Skip("input too long: the capacity-1 sweep is one WASM call per match")
 		}
@@ -1879,9 +2845,6 @@ func FuzzFindBatch(f *testing.F) {
 		for _, p := range pats {
 			if reason := skipPattern(p, input); reason != "" {
 				t.Skip(reason)
-			}
-			if regexp.MustCompile(p).NumSubexp() > 0 {
-				t.Skip("capture-bearing patterns are dropped from sets by design")
 			}
 		}
 		checkBatch(t, pats, input)
@@ -2006,15 +2969,15 @@ func TestFindBatchZeroCap(t *testing.T) {
 // gating — but they reach the sentinel through different arms.
 func TestBatchZeroCapTerminates(t *testing.T) {
 	pats := []string{`ab`, `b`}
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	for _, overlapping := range []bool{false, true} {
 		t.Run(fmt.Sprintf("overlapping=%v", overlapping), func(t *testing.T) {
-			cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 				Overlapping: overlapping,
 				Patterns:    config.PatternSelector{Names: names},
@@ -2127,18 +3090,18 @@ func sparsePats(gen func(int) string, n int) []string {
 // never firing, so every case below asserts the packing it meant to exercise.
 func bucketTypes(t *testing.T, pats []string) (find []string) {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all",
 		ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find",
 		Patterns: config.PatternSelector{Names: names},
 	}}
-	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: sets}, "")
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -2355,14 +3318,14 @@ func TestSparseSetABIMatrixValidates(t *testing.T) {
 			pats := sparsePats(gen, n)
 			for _, c := range caps {
 				t.Run(fmt.Sprintf("%s/n=%d/%s", shapeName, n, c.name), func(t *testing.T) {
-					entries := make([]config.RegexEntry, len(pats))
+					entries := make([]config.PatternEntry, len(pats))
 					for i, p := range pats {
-						entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+						entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 					}
 					sc := c.set
 					sc.Name = "g"
 					sc.Patterns = config.PatternSelector{All: true}
-					cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{sc}}
+					cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}
 					w, _, diags, err := compile.CompileFileDiag(cfg, "")
 					if err != nil {
 						t.Fatalf("compile: %v", err)
@@ -2477,13 +3440,13 @@ func TestSparseGatedBatchDeliversEveryPattern(t *testing.T) {
 				// so any loss shows up directly as a count.
 				pats[i] = fmt.Sprintf(`(?:(?:)|a%d)*`, i)
 			}
-			entries := make([]config.RegexEntry, n)
+			entries := make([]config.PatternEntry, n)
 			names := make([]string, n)
 			for i, p := range pats {
 				names[i] = fmt.Sprintf("p%d", i)
-				entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+				entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 			}
-			cfg := config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "set_find", Hints: []string{"batch-find"},
 				Patterns: config.PatternSelector{Names: names},
 			}}}
@@ -2725,9 +3688,9 @@ func compileSetBothModes(t *testing.T, pat string, caps func(*config.SetConfig))
 		}
 		caps(&sc)
 		cfg := config.BuildConfig{
-			Regexps: []config.RegexEntry{{Name: "p0", Pattern: pat}},
-			Sets:    []config.SetConfig{sc},
-			Output:  output,
+			Patterns: []config.PatternEntry{{Name: "p0", Regexp: pat}},
+			Sets:     []config.SetConfig{sc},
+			Output:   output,
 		}
 		w, _, err := compile.CompileFile(cfg, "")
 		if err != nil {
@@ -2865,9 +3828,9 @@ func TestSetEmbeddedBacktrackingMemberLeavesHostMemoryAlone(t *testing.T) {
 	pats := []string{`(?:a|bc){1,30}?x`, `(?:etc|proc)/(?:passwd|self)\b`}
 	inputs := []string{"zzz bcbcax", ";cat /etc/passwd", "none here", "proc/self ax"}
 	cfg := config.BuildConfig{
-		Output:            "merged.wasm", // embedded: memory 0 is imported
-		MaxFallbackStates: 1,             // every member's suffix DFA is over it: Backtracking
-		Regexps:           []config.RegexEntry{{Name: "p0", Pattern: pats[0]}, {Name: "p1", Pattern: pats[1]}},
+		Output:       "merged.wasm", // embedded: memory 0 is imported
+		MaxDFAStates: 1,             // every member's suffix DFA is over it: Backtracking
+		Patterns:     []config.PatternEntry{{Name: "p0", Regexp: pats[0]}, {Name: "p1", Regexp: pats[1]}},
 		Sets: []config.SetConfig{{Name: "s", ScanAny: "s_scan",
 			Patterns: config.PatternSelector{Names: []string{"p0", "p1"}}}},
 	}
@@ -3182,11 +4145,11 @@ func shuftiPatterns(n int) []string {
 // compileCapsShufti is compileCaps with AC forced out of budget.
 func compileCapsShufti(t *testing.T, pats []string, overlapping bool) []byte {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -3199,7 +4162,7 @@ func compileCapsShufti(t *testing.T, pats []string, overlapping bool) []byte {
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	w, _, diags, err := compile.CompileFileOpts(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		config.BuildConfig{Patterns: entries, Sets: sets}, "",
 		compile.CompileSetOptions{ACBudgetBytes: 1})
 	if err != nil {
 		t.Fatalf("compile shufti set: %v", err)
@@ -3273,11 +4236,11 @@ func wideUnionPatterns(n int) []string {
 // LikelyNoMatch, and only since the selection ceiling was raised.
 func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -3291,7 +4254,7 @@ func compileCapsWideUnion(t *testing.T, pats []string, overlapping bool) []byte 
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	w, _, diags, err := compile.CompileFileOpts(
-		config.BuildConfig{Regexps: entries, Sets: sets}, "",
+		config.BuildConfig{Patterns: entries, Sets: sets}, "",
 		compile.CompileSetOptions{ACBudgetBytes: 1})
 	if err != nil {
 		t.Fatalf("compile wide-union set: %v", err)
@@ -3436,11 +4399,11 @@ func itoa2(n int) string {
 // naturally-dropped population is tiny, so forcing the path is the only way to
 // get real coverage of it.
 func compileSetBT(pats []string, maxFallback int) ([]byte, map[int]bool, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	sets := []config.SetConfig{{
 		Name:        "s",
@@ -3449,9 +4412,9 @@ func compileSetBT(pats []string, maxFallback int) ([]byte, map[int]bool, error) 
 		Patterns:    config.PatternSelector{Names: names},
 	}}
 	cfg := config.BuildConfig{
-		Regexps:           entries,
-		Sets:              sets,
-		MaxFallbackStates: maxFallback,
+		Patterns:     entries,
+		Sets:         sets,
+		MaxDFAStates: config.Limit(maxFallback),
 	}
 	w, _, diags, err := compile.CompileFileDiag(cfg, "")
 	return w, droppedFromSet(diags), err
@@ -3551,23 +4514,24 @@ func TestSetBTMatchesGo(t *testing.T) {
 // the second frame has to grow memory — and the work budget is off, so there
 // is no fallback to hand over to: an answer needing a second frame comes from
 // a stack that grew. p0 is kept on a Backtracking bucket (a frame per greedy
-// iteration, up to 30), p1 split out onto the Backtracking find (a frame per
-// letter before `aX`). Each alone first, where memory must grow during the
+// iteration, up to 30: the loop's exit, `[bx]`, can start with the same
+// letter, so the first-byte dispatch still pushes it), p1 split out onto the
+// Backtracking find (a frame per letter before `aX`). Each alone first, where memory must grow during the
 // call; then all three, overlapping `find` with every other capability and
 // gated `find`, each against Go.
 func TestSetBTStackGrows(t *testing.T) {
-	pats := []string{`(?:a|bc){1,30}x`, `[a-z]+aX`, `zz`}
+	pats := []string{`(?:a|bc){1,30}[bx]`, `[a-z]+aX`, `zz`}
 	inputs := []string{"", "zz", strings.Repeat("bc", 25) + "x", strings.Repeat("b", 600) + "aX zz",
 		"q" + strings.Repeat("bc", 29) + "ax " + strings.Repeat("ab", 300) + "aX"}
 	build := func(t *testing.T, pats []string, overlapping bool, start int) ([]byte, []compile.SetDiag) {
 		t.Helper()
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
-		cfg := config.BuildConfig{MaxFallbackStates: 1, Regexps: entries, Sets: []config.SetConfig{{
+		cfg := config.BuildConfig{MaxDFAStates: 1, Patterns: entries, Sets: []config.SetConfig{{
 			Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 			ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 			Patterns: config.PatternSelector{Names: names},
@@ -3844,15 +4808,15 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 			for _, mf := range []int{0, 1} {
 				name := fmt.Sprintf("%s/%s/mf=%d", shapeName, c.name, mf)
 				t.Run(name, func(t *testing.T) {
-					entries := make([]config.RegexEntry, len(pats))
+					entries := make([]config.PatternEntry, len(pats))
 					for i, p := range pats {
-						entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+						entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 					}
 					sc := c.set
 					sc.Name = "g"
 					sc.Patterns = config.PatternSelector{All: true}
 					cfg := config.BuildConfig{
-						Regexps: entries, MaxFallbackStates: mf,
+						Patterns: entries, MaxDFAStates: config.Limit(mf),
 						Sets: []config.SetConfig{sc},
 					}
 					w, _, diags, err := compile.CompileFileDiag(cfg, "")
@@ -3868,6 +4832,8 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 						}
 						// Split out onto the Backtracking find: Backtracking too.
 						nBT += len(d.SplitBacktracking)
+						// And an anchored pair's Backtracking probes.
+						nBT += len(d.AnchoredBacktracking)
 					}
 					// The stub side must agree with what was emitted, since a
 					// disagreement there is a wrong signature rather than a
@@ -3908,15 +4874,15 @@ func TestBTSetABIMatrixValidates(t *testing.T) {
 // Backtracking engine. Returns the module and how many BT buckets it holds, so
 // a test cannot silently pass by exercising the DFA path instead.
 func compileBTBatchSet(pats []string, maxFallback int) ([]byte, int, error) {
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps:           entries,
-		MaxFallbackStates: maxFallback,
+		Patterns:     entries,
+		MaxDFAStates: config.Limit(maxFallback),
 		Sets: []config.SetConfig{{
 			Name:        "s",
 			Find:        "set_find",
@@ -4098,8 +5064,8 @@ func TestAnchoredBatchDoesNotRepeat(t *testing.T) {
 		{`\A`, "abc"},
 		{`\Aab*`, "abbabb"},
 	} {
-		w, _, err := compile.Compile([]config.RegexEntry{{
-			Pattern: c.pat, FindFunc: "find", Hints: []string{"batch-find"},
+		w, _, err := compile.Compile([]config.PatternEntry{{
+			Regexp: c.pat, FindFunc: "find", Hints: []string{"batch-find"},
 		}}, pathsTableBase, true)
 		if err != nil {
 			t.Fatalf("%q compile: %v", c.pat, err)
@@ -4289,13 +5255,13 @@ var splitInputs = []string{
 // splitDiag compiles pats as a gated set and returns its split member ids.
 func splitDiag(t *testing.T, pats []string) []int {
 	t.Helper()
-	entries := make([]config.RegexEntry, len(pats))
+	entries := make([]config.PatternEntry, len(pats))
 	names := make([]string, len(pats))
 	for i, p := range pats {
 		names[i] = fmt.Sprintf("p%d", i)
-		entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
-	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+	_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", Find: "f", Patterns: config.PatternSelector{Names: names},
 	}}}, "")
 	if err != nil {
@@ -4357,13 +5323,13 @@ func TestSetSplitMembersAgainstOracle(t *testing.T) {
 	// member) — by the merge wrappers.
 	direct, merged := 0, 0
 	for _, pats := range splitCases {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		names := make([]string, len(pats))
 		for i, p := range pats {
 			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.RegexEntry{Name: names[i], Pattern: p}
+			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 		}
-		_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+		_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 			Name: "s", Find: "f", ScanAny: "sa", ScanAll: "sl", Patterns: config.PatternSelector{Names: names},
 		}}}, "")
 		if err != nil {
@@ -4426,11 +5392,11 @@ func TestSetSplitMembersAgainstOracle(t *testing.T) {
 func TestSetSplitBatchAgainstOracle(t *testing.T) {
 	for _, pats := range splitCases {
 		for _, ov := range []bool{false, true} {
-			entries := make([]config.RegexEntry, len(pats))
+			entries := make([]config.PatternEntry, len(pats))
 			for i, p := range pats {
-				entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+				entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 			}
-			_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{{
+			_, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{{
 				Name: "s", Find: "f", Overlapping: ov, Hints: []string{"batch-find"}, Patterns: config.PatternSelector{All: true},
 			}}}, "")
 			if err != nil {
@@ -4580,12 +5546,12 @@ func TestSetCountersLinear(t *testing.T) {
 	cfg.SetWasmSIMD(true)
 	engine := wasmtime.NewEngineWithConfig(cfg)
 	build := func(pats []string, set config.SetConfig) ([]byte, compile.SetDiag) {
-		entries := make([]config.RegexEntry, len(pats))
+		entries := make([]config.PatternEntry, len(pats))
 		for i, p := range pats {
-			entries[i] = config.RegexEntry{Name: fmt.Sprintf("p%d", i), Pattern: p}
+			entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
 		}
 		set.Name, set.Patterns = "s", config.PatternSelector{All: true}
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Regexps: entries, Sets: []config.SetConfig{set}}, "")
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}, "")
 		if err != nil {
 			t.Fatal(err)
 		}

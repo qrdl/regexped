@@ -25,8 +25,8 @@ They're mutually exclusive — a pattern can't set both.
 ## Setting the hint
 
 ```yaml
-regexps:
-  - pattern: 'AKIA[A-Z0-9]{16}'
+patterns:
+  - regexp: 'AKIA[A-Z0-9]{16}'
     match_func: aws_key_match
     hints: [prefer-match]
 
@@ -37,7 +37,7 @@ sets:
     hints: [prefer-no-match]
 ```
 
-A `regexps:` entry's hint governs that pattern's own compiled body
+A `patterns:` entry's hint governs that pattern's own compiled body
 (`match_func`/`find_func`/`groups_func`). A `sets:`
 entry's hint governs that set's own frontend and suffix-body choices — it is
 not inherited by member patterns' own directly-exported bodies. There's no
@@ -64,6 +64,15 @@ set a hint or not.
   SIMD skip through that run a single pattern gets. Worth setting when your
   inputs are match-dense with long bodies; short bodies neither gain nor
   lose much, because the skip turns itself off once it stops paying.
+- In **Unicode mode**, a run over a letter class — `\p{Cyrillic}+`, `\pL+`
+  between delimiters, captures such as `(\pL+)=(\pL+)`, set members such as
+  `key=\p{Cyrillic}+;` — strides over whole letters 16 bytes at a time
+  instead of walking them. Long words gain most (−54% to −66% fuel against
+  the unhinted build), ordinary Russian prose −32%. Words of one or two
+  letters cost a little more than unhinted (+2% to +7%; a text made only of
+  one-letter words up to +9%), because each word still pays for checking
+  whether a stride could start; no-match text costs nothing more. Modules
+  grow, by up to a fifth (`\p{Cyrillic}+`: 6.3 → 7.4 KB).
 
 **`prefer-no-match` targets:**
 - A first-byte set of roughly 17–64 distinct bytes in `find_func` mode (or
@@ -72,6 +81,12 @@ set a hint or not.
   SIMD-driven scan that pays off when most of the input isn't in that byte
   class, with a runtime fallback if the input turns out to be dense in it
   anyway (so it doesn't cost much even when your intuition is wrong).
+  It does not cost nothing, though: on no-match text dense in those bytes
+  the hinted build still spends more fuel per `find` call than the unhinted
+  one — 6 more when the text starts with one of those bytes, 37 more when
+  it starts with another (`[a-zA-Z]{20,}` over lines beginning `; `). The
+  cost is per call, not per byte: in the worse case 0.25% of a 64-byte
+  line and 0.003% of a 5 KB one.
 - A fixed-count single-class literal-anchor prefix, count ≤ 16 — e.g.
   `[0-9]{16}INFO:[^\n]+`. Gets a SIMD chunk-verify instead of a scalar
   reverse walk on the anchor.
@@ -109,17 +124,35 @@ provably linear — see
 If your pattern doesn't match one of these shapes, the hint is harmless but
 won't change anything.
 
+In Unicode mode the other shapes above mostly stop applying, because a class
+with multi-byte members is a cycle of several states rather than one
+self-loop. Measured over four more Unicode shapes (fuel against the unhinted
+build): `key=[^;]+;` over Cyrillic compiles to the same module under either
+hint; `привет\s+\pL+` and a `\pL{12,}` run cost the same under
+`prefer-match`, and `\pL{12,}` costs **+7%** under `prefer-no-match` on
+matching text; a set over four scripts driven through `scan_all` costs the
+same under either hint on matching text and **−92%** under
+`prefer-no-match` on text holding none of its scripts. Measure before
+hinting a Unicode pattern.
+
 ## The optimisations, briefly
 
 - **Counted-chain SIMD verifier** — verifies a fixed-count character class
   run (`{N}`/`{N,M}`) in SIMD chunks instead of a scalar loop.
 - **Dominant-self-loop bulk-skip** — for patterns dominated by one
   "consume anything except a delimiter" state, skips through the run in SIMD
-  chunks instead of one byte at a time.
+  chunks instead of one byte at a time. Under `prefer-match` it also serves a
+  run that is NOT itself a match yet (`<([a-z]+)>`, whose `[a-z]+` needs the
+  `>` after it), and that is a trade: measured on short tag-and-text lines,
+  lines under 17 bytes cost +8..9% fuel against the unhinted build, 20–64
+  byte lines −16..−21%, long runs −84%. A call that cannot use the skip pays
+  ~13 fuel the first time it enters the state and 1 per byte walked after.
 - **Shufti / SIMD prefix scan** — a nibble-table SIMD technique for
   detecting "any byte in this set" over a first-byte set too big for a
   handful of direct SIMD compares but too small to be worth a scalar
-  byte-class table lookup.
+  byte-class table lookup. A set of one or two contiguous byte ranges
+  (`[a-z]`, `[A-Z]`, `[a-zA-Z]`) is tested with two SIMD range compares per
+  range instead: same answer, half the instructions.
 - **Lit-anchor class-prefix SIMD verify** — same SIMD-chunk idea applied to
   the backward verification step of a literal-anchored find.
 - **Union-scan run skip** — for a set with no literal to filter on, strides
@@ -137,6 +170,15 @@ won't change anything.
   than a proportional one. Applies to any repeated run, however wide the
   character class, and only to sets large enough to pack into a sparse
   bucket.
+
+  **In Unicode mode it strides over whole characters** where every
+  multi-byte character keeps the walk in the run — a class holding every
+  non-ASCII character, `[^;]+`, `.+`: 16 bytes at a time over valid UTF-8,
+  stopping on a character boundary. Measured on 40 members of the shape
+  `union[ \t]+kNN[^;]+` over 64 KB records, against the unhinted build:
+  −80% fuel with 100–400-byte Cyrillic tails, −89% with ASCII ones, −28% /
+  −35% with 2–12-byte tails. A class that keeps only SOME characters
+  (`\pL+`, `\p{Cyrillic}+`) still strides over its ASCII bytes alone.
 
 Each of the SIMD skips above turns itself off for the rest of a call once it
 has failed to skip anything several times in a row, so a hint that turns out

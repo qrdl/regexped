@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -29,7 +30,7 @@ func hasSetExports(cfg config.BuildConfig) bool {
 // helper nothing calls. Before regions existed the question could not arise,
 // because _w and _resize were used by every shape.
 func hasSuspendableExports(cfg config.BuildConfig) bool {
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.FindFunc != "" || re.GroupsFunc != "" {
 			return true
 		}
@@ -46,7 +47,7 @@ func hasSuspendableExports(cfg config.BuildConfig) bool {
 // suspend, and so stages into the transient area above the bump (_stage)
 // instead of reserving. Same emission-gating reason as hasSuspendableExports.
 func hasOneShotExports(cfg config.BuildConfig) bool {
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" {
 			return true
 		}
@@ -59,14 +60,37 @@ func hasOneShotExports(cfg config.BuildConfig) bool {
 	return false
 }
 
-// hasEmitNameMap reports whether any set has emit_name_map: true.
-func hasEmitNameMap(cfg config.BuildConfig) bool {
+// nameMapSets returns the sets with emit_name_map: true, in config order.
+// Each gets its own lookup (config.SetPatternNameFunc): a set's inline
+// regexps are numbered per set, so one lookup for the whole file could not
+// tell two sets' id 4 apart.
+func nameMapSets(cfg config.BuildConfig) []config.SetConfig {
+	var out []config.SetConfig
 	for _, s := range cfg.Sets {
 		if s.EmitNameMap {
-			return true
+			out = append(out, s)
 		}
 	}
-	return false
+	return out
+}
+
+// namedMembers returns the members of s that have a `name:`, in member order:
+// the cases of the set's lookup. Every other id — an unnamed member, an inline
+// regexp, an id the set does not hold — answers "".
+func namedMembers(s config.SetConfig, cfg config.BuildConfig) []config.SetMember {
+	var out []config.SetMember
+	for _, m := range s.Members(cfg) {
+		if m.Entry.Name != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// nameMapDoc is the one-line description every language's lookup carries.
+func nameMapDoc(s config.SetConfig) string {
+	return fmt.Sprintf("returns the name of set %q's pattern with the given id: "+
+		"its `name:`, or \"\" for an unnamed pattern, an inline regexp or an id the set does not hold.", s.Name)
 }
 
 // patternsInSet returns the number of patterns in s — a safe upper bound on
@@ -74,8 +98,9 @@ func hasEmitNameMap(cfg config.BuildConfig) bool {
 // emits at most once per start), and therefore the size of the tuple buffer.
 // Emitted as the public <SET>_PATTERN_COUNT constant.
 //
-// It is NOT a bound on pattern id VALUES: ids are global indices into
-// `regexps:`, so a set holding two patterns can report id 69. Anything indexed
+// It is NOT a bound on pattern id VALUES: ids index the top-level `patterns:`
+// (a set's own `regexps:` after them), so a set holding two patterns can report
+// id 69. Anything indexed
 // by a pattern id — gate arrays, `_all` bitmasks and bitmaps — must be sized
 // with idSpaceSize instead.
 func patternsInSet(s config.SetConfig, cfg config.BuildConfig) int {
@@ -484,13 +509,12 @@ func namespaced(cfg config.BuildConfig, name string) string {
 // A name listed here that is never emitted is not harmless: config-side
 // validation denies it as a user export name for nothing.
 var sharedSymbols = map[string][]string{
-	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch", "PatternName",
+	"go": {"Span", "ErrBacktrackOverflow", "ErrMalformedCache", "ErrOutOfOrder", "SetMatch",
 		"searchBlock", "searchNotes", "searchBTMemo", "ffi_regexped_search"},
-	"js": {"patternName"},
-	"ts": {"SetMatch", "patternName"},
-	"as": {"SetMatch", "patternName", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
+	"ts": {"SetMatch"},
+	"as": {"SetMatch", "RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ITER_ERROR"},
 	"c": {
-		"rx_match_t", "rx_group_t", "rx_set_match_t", "pattern_name",
+		"rx_match_t", "rx_group_t", "rx_set_match_t",
 		"RX_ERR_BT_OVERFLOW", "RX_ERR_MALFORMED_CACHE", "RX_ERR_OUT_OF_ORDER", "RX_ERR_NULL_ARG", "RX_ERR_RANGE",
 		"REGEXPED_TYPES_DEFINED", "rx_search_set_",
 	},
@@ -531,7 +555,7 @@ func anyStubExport(cfg config.BuildConfig) bool {
 	if hasSetExports(cfg) {
 		return true
 	}
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" || re.FindFunc != "" || re.GroupsFunc != "" {
 			return true
 		}

@@ -270,7 +270,8 @@ for pattern_id in all_secret_kinds(input)? {
 
 The iterator owns one reusable buffer of `<SET>_PATTERN_COUNT` tuples and a
 zeroed gate array of `<SET>_ID_SPACE` entries — the gate array is indexed by
-global pattern id, so the two lengths differ for a named subset. Both overlap
+pattern id, so the two lengths differ for a named subset and for a set with
+regexps of its own. Both overlap
 policies take the array; see [sets.md](sets.md) for what the overlapping body
 keeps in it. It refills at each matching position
 and yields that position's matches
@@ -296,8 +297,11 @@ a direct call inside one module with no boundary to amortise. There is no
 `find_batch` function and no `SetTuple` type; `find` is the whole positional
 surface. See [sets.md](sets.md) for the measurements behind that.
 
-`pattern_name(id)` is emitted once per config when any set sets
-`emit_name_map: true`.
+`<set>_pattern_name(id: i32) -> &'static str` — `secrets_pattern_name` for a set
+named `secrets` — is emitted for each set that sets `emit_name_map: true`.
+It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
+`regexps:`, or an id the set does not hold. It is per set because a set's own
+regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
 
 ## Notes
 

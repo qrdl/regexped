@@ -108,8 +108,45 @@ func dominantWalkStates(t *dfaTable) []dominantWalkState {
 // defensible in the abstract — but it would flip futureOff from 0 to non-zero
 // on sets that have no wide-self-loop state at all, changing the liveness and preflight emission
 // far outside the inverted skip's remit, which is a skip, not a re-gate.
+//
+// A state looping over whole UTF-8 characters counts as well (utf8LoopState).
+// In Unicode mode a class holding every non-ASCII character, `[^,]` say,
+// leaves its state on every lead byte and comes back a character later, so it
+// self-loops on the ASCII bytes alone and dominantWalkStates never sees it —
+// and an overlapping set built on such a member went without the preflight
+// that retires a member matching nowhere: {`[^,]+;`, `\p{Cyrillic}+!`} over
+// Russian text holding no `;` or `!` cost 1,509 fuel/byte, and 53 with it.
 func hasNeverDyingState(t *dfaTable) bool {
-	return len(dominantWalkStates(t)) > 0
+	return len(dominantWalkStates(t)) > 0 || utf8LoopState(t)
+}
+
+// utf8LoopState reports whether t has a state that leaves on at most
+// dominantMaxExceptions ASCII bytes and loops over every valid multi-byte
+// character through live states — the shape the character skip serves
+// (utf8SelfLoopExits), asked here of the table. It is structural, so it needs
+// no mode: a byte-mode automaton has such a state only for a pattern that
+// spells the UTF-8 sequences out byte by byte, and a walk can then last just
+// as long.
+func utf8LoopState(t *dfaTable) bool {
+	if t == nil {
+		return false
+	}
+	step := func(s, c int) int { return t.transitions[s*256+c] }
+	for s := 0; s < t.numStates; s++ {
+		exits := 0
+		for c := 0; c < 0x80; c++ {
+			if step(s, c) != s {
+				exits++
+			}
+		}
+		if exits > dominantMaxExceptions {
+			continue
+		}
+		if loopsOverUTF8(s, step, func(q int) bool { return q >= 0 && q != s }) {
+			return true
+		}
+	}
+	return false
 }
 
 const (

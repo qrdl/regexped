@@ -50,15 +50,42 @@ import (
 // reserved words, which the caller zeroes to start a drive.
 //
 // The sweep runs only once a member's ordinary searches have walked past
-// 4 × len + 64 bytes in the drive (sweepWorkBound), so ordinary text, which
-// never gets there, pays for the counter alone.
+// k × len + 64 bytes in the drive (setSweep.emitWorkBound), so ordinary text,
+// which never gets there, pays for the counter alone. k is 4 in byte mode. In
+// Unicode mode a lowered class gives a column thousands of roots wide, and a
+// sweep that costs tens of thousands of fuel per byte must not be bought at the
+// first 4 × len walked bytes: k is the sweep's estimated cost per byte over a
+// walk's, so the walks spend what the sweep would before it runs — never more
+// than twice the cheaper of the two.
 
 // sweepMaxRoots bounds a set's columns (every swept member's roots together),
 // and sweepMaxItems the closure items the column step emits: past either the
-// member keeps its ordinary search.
+// member keeps its ordinary search. The Unicode-mode bounds are larger because
+// a lowered class multiplies both (sweepLimits).
 const (
-	sweepMaxRoots = 4096
-	sweepMaxItems = 1 << 16
+	sweepMaxRoots        = 4096
+	sweepMaxItems        = 1 << 16
+	sweepMaxRootsUnicode = 1 << 16
+	sweepMaxItemsUnicode = 1 << 20
+)
+
+// sweepLimits is sweepMaxRoots and sweepMaxItems for a program of the mode.
+func sweepLimits(unicode bool) (roots, items int) {
+	if unicode {
+		return sweepMaxRootsUnicode, sweepMaxItemsUnicode
+	}
+	return sweepMaxRoots, sweepMaxItems
+}
+
+// The Unicode-mode trigger's two costs (setSweep.workK), calibrated on an
+// 8-member set of lowered letter classes (`\pL+\p{Greek}` …) over 16 KB of
+// Cyrillic letters: its column step was 505,193 bytes of code and swept at
+// 82,350 fuel per input byte, one fuel per sweepCodePerFuel bytes; its members'
+// searches, never swept, spent 9.0×10^9 fuel on about 1.3×10^8 charged bytes,
+// sweepWalkFuelPerByte each.
+const (
+	sweepCodePerFuel     = 6
+	sweepWalkFuelPerByte = 64
 )
 
 // The program sweep's state, in the cache header's reserved words (see
@@ -84,12 +111,15 @@ type sweepProg struct {
 	// byteTab is each consuming pc's 257-byte membership table (entry 256,
 	// for "no byte", always 0), by its address in the table memory.
 	byteTab map[int]int32
+	// utf8Start: the member's empty match can sit inside a character
+	// (PatternInfo.utf8StartFind), so its answer at such a position is -1.
+	utf8Start bool
 }
 
 // planSweepProg is pattern's program sweep, nil when the member keeps its
 // ordinary search (over the size bounds).
-func planSweepProg(pattern string) *sweepProg {
-	prog := compileBTProg(pattern)
+func planSweepProg(pattern resolvedPattern) *sweepProg {
+	prog := compileBTProg(pattern).prog
 	if prog == nil {
 		return nil
 	}
@@ -116,7 +146,8 @@ func planSweepProg(pattern string) *sweepProg {
 			sp.flags = append(sp.flags, f)
 		}
 	}
-	if len(sp.roots) > sweepMaxRoots {
+	maxRoots, maxItems := sweepLimits(pattern.unicode())
+	if len(sp.roots) > maxRoots {
 		return nil
 	}
 	combos := 1 << len(sp.flags)
@@ -127,7 +158,7 @@ func planSweepProg(pattern string) *sweepProg {
 		for ctx := 0; ctx < combos; ctx++ {
 			sp.lists[r][ctx] = sp.closure(pc, sp.ctxOps(ctx))
 			items += len(sp.lists[r][ctx])
-			if items > sweepMaxItems {
+			if items > maxItems {
 				return nil
 			}
 		}
@@ -205,7 +236,11 @@ type setSweep struct {
 	roots   int          // every member's roots together: the column width
 	swept   int          // how many members have one: the row is 4 × swept bytes
 	slot    map[int]int  // split index -> its answer's slot in a row
-	colA    int32        // the two working columns, in the table memory
+	// unicode: the set is in Unicode mode; workK is the trigger's multiplier
+	// (emitWorkBound).
+	unicode bool
+	workK   int64
+	colA    int32 // the two working columns, in the table memory
 	colB    int32
 }
 
@@ -216,12 +251,15 @@ func placeProgramSweeps(full SetSpec, split []splitCand, ra *regionAlloc) (*setS
 	if !full.Overlapping || full.Find == "" {
 		return nil, nil, 0
 	}
-	sw := &setSweep{members: make([]*sweepProg, len(split)), slot: map[int]int{}}
+	sw := &setSweep{members: make([]*sweepProg, len(split)), slot: map[int]int{}, workK: 4}
 	for k, c := range split {
-		sp := planSweepProg(full.Patterns[c.idx].fullPattern)
-		if sp == nil || sw.roots+len(sp.roots) > sweepMaxRoots {
+		rp := full.Patterns[c.idx].rp
+		sp := planSweepProg(rp)
+		if maxRoots, _ := sweepLimits(rp.unicode()); sp == nil || sw.roots+len(sp.roots) > maxRoots {
 			continue
 		}
+		sw.unicode = rp.unicode()
+		sp.utf8Start = full.Patterns[c.idx].utf8StartFind
 		sp.base = sw.roots
 		sw.roots += len(sp.roots)
 		sw.slot[k] = sw.swept
@@ -264,6 +302,7 @@ func placeProgramSweeps(full SetSpec, split []splitCand, ra *regionAlloc) (*setS
 	ra.Commit(end)
 	data = append(data, appendDataSegment(nil, end-1, []byte{0})...)
 	segs++
+	sw.setWorkK()
 	return sw, data, segs
 }
 
@@ -273,14 +312,29 @@ func (sw *setSweep) cells() int     { return sw.roots }
 func (sw *setSweep) rowBytes() int  { return 4 * sw.swept }
 func (sw *setSweep) cellBytes() int { return 4*sw.roots + 4 }
 
-// sweepWorkBound is the work past which a drive's swept members get their
-// sweep: abi's search rule, over the whole input, as a pattern's notes arm.
-func emitSweepWorkBound(b []byte, pLen byte) []byte {
+// emitWorkBound is the work past which a drive's swept members get their
+// sweep: workK × len + 64 — abi's search rule (k = 4) over the whole input, as
+// a pattern's notes arm, or in Unicode mode the walk bytes that cost what the
+// sweep would.
+func (sw *setSweep) emitWorkBound(b []byte, pLen byte) []byte {
 	b = append(b, 0x20, pLen, 0xAD) // (u64) len
-	b = i64c(b, 4)
-	b = append(b, 0x7E) // × 4
+	b = i64c(b, sw.workK)
+	b = append(b, 0x7E) // × k
 	b = i64c(b, 64)
 	return append(b, 0x7C) // + 64
+}
+
+// setWorkK sets the Unicode-mode trigger: the sweep's estimated fuel per
+// position (its column step's code over sweepCodePerFuel) in charged walk
+// bytes, never below byte mode's 4. The walks then spend what the sweep would
+// before it runs. Called once the byte tables and columns are placed, since
+// the step addresses them.
+func (sw *setSweep) setWorkK() {
+	if !sw.unicode {
+		return
+	}
+	step := len(sw.emitColumnStep(nil, 0, sweepLocals{}))
+	sw.workK = max(4, int64(step/sweepCodePerFuel/sweepWalkFuelPerByte))
 }
 
 // sweepLocals is what the column step reads and writes.
@@ -486,16 +540,44 @@ func equalInts(a, b []int) bool {
 	return true
 }
 
+// utf8Start reports whether some swept member's answers need the Unicode
+// start check (sweepProg.utf8Start).
+func (sw *setSweep) utf8Start() bool {
+	for _, sp := range sw.members {
+		if sp != nil && sp.utf8Start {
+			return true
+		}
+	}
+	return false
+}
+
 // emitWriteRow stores every swept member's answer at p — its start root's
 // value — into the block buffer's row for p. rowAddr pushes the row's address.
-func (sw *setSweep) emitWriteRow(b []byte, tm int, l sweepLocals, rowAddr func([]byte) []byte) []byte {
+// With u8 (sw.utf8Start), a member whose empty match can sit inside a
+// character answers -1 at a position inside one, where no match starts; inside
+// is the i32 local that check leaves 1 or 0 in.
+func (sw *setSweep) emitWriteRow(b []byte, tm int, l sweepLocals, u8 *utf8StartLocals, inside uint32, rowAddr func([]byte) []byte) []byte {
+	if u8 != nil {
+		b = i32c(b, 0)
+		b = lset(b, inside)
+		b = lget(b, l.p)
+		b = lset(b, u8.pos)
+		b = emitUTF8Start(b, *u8, func(b []byte) []byte { return lset(i32c(b, 1), inside) })
+	}
 	for k, sp := range sw.members {
 		if sp == nil {
 			continue
 		}
 		b = rowAddr(b)
+		if u8 != nil && sp.utf8Start {
+			b = i32c(b, -1)
+		}
 		b = lget(b, l.cur)
-		b = appendTableLoad32(b, tm, uint32(4*sp.base))  //nolint:gosec // a column offset
+		b = appendTableLoad32(b, tm, uint32(4*sp.base)) //nolint:gosec // a column offset
+		if u8 != nil && sp.utf8Start {
+			b = lget(b, inside)
+			b = append(b, 0x1B) // select: -1 inside a character
+		}
 		b = append(b, 0x36, 0x02)                        // i32.store (the caller's region)
 		b = utils.AppendULEB128(b, uint32(4*sw.slot[k])) //nolint:gosec // a row offset
 	}
@@ -596,6 +678,12 @@ func (cs *compiledSet) emitSweepFnBody(tm int) []byte {
 	g.area, g.k, g.rows, g.cacheB, g.nb = i32(), i32(), i32(), i32(), i32()
 	lLo, lJ, lCk := i32(), i32(), i32() // lCk: 1 in the pass, which checkpoints
 	g.m64, g.k64, g.b64 = i64(), i64(), i64()
+	var u8 *utf8StartLocals
+	var lInside uint32
+	if sw.utf8Start() {
+		u8 = &utf8StartLocals{ptr: pPtr, len: pLen, pos: i32(), c: i32(), k: i32(), n: i32()}
+		lInside = i32()
+	}
 	var b []byte
 	b = a.EmitDecls(b)
 	b = cs.emitSweepArea(b, pLen, g)
@@ -656,7 +744,7 @@ func (cs *compiledSet) emitSweepFnBody(tm int) []byte {
 	b = append(b, 0x0B)
 	b = append(b, 0x02, 0x40, 0x03, 0x40) // block, loop
 	b = sw.emitColumnStep(b, tm, l)
-	b = sw.emitWriteRow(b, tm, l, func(b []byte) []byte {
+	b = sw.emitWriteRow(b, tm, l, u8, lInside, func(b []byte) []byte {
 		b = lget(b, g.rows)
 		b = lget(b, l.p)
 		b = lget(b, g.k)
@@ -802,7 +890,7 @@ func (cs *compiledSet) emitSweptMember(b []byte, k int, x sweepMerge, none func(
 			b = st64(b, sweepHdrWork)
 			b = append(b, 0x20, x.lRegion, 0x29, 0x03)
 			b = utils.AppendULEB128(b, sweepHdrWork)
-			b = emitSweepWorkBound(b, x.pLen)
+			b = sw.emitWorkBound(b, x.pLen)
 			b = append(b, 0x56, 0x04, 0x40) // work > bound: if
 			b = cs.emitSweepArea(b, x.pLen, x.g)
 			// …and the region holds the sweep: cacheB + bytes <= its length.

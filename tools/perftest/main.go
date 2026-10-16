@@ -406,16 +406,15 @@ var tests = []testCase{
 		},
 	},
 
-	// ── Phase 0 new patterns — compatibility baseline coverage ────────────────
+	// ── Compatibility baseline coverage ───────────────────────────────────────
 	// These four patterns extend the baseline corpus to cover engine paths that
-	// the pattern-grouping work touches.
-	// "Phase 0 — Perftest expansion and baseline capture".
+	// pattern grouping touches.
 
 	{
 		// 0.1: word-boundary pattern.
 		// \bERROR\b exercises the doubled DFA state space caused by the
 		// prevWasWord context bit (CLAUDE.md "Word Boundaries in DFA").
-		// The Phase 1 BFS-relabel work touches this state-numbering path.
+		// BFS relabelling of DFA states touches this state-numbering path.
 		name:    "word-boundary",
 		pattern: `\bERROR\b`,
 		mode:    find,
@@ -491,13 +490,13 @@ var tests = []testCase{
 	// These three patterns surface the wins (or absence thereof) of recent
 	// shipping work on a realistic-scale perftest.
 	{
-		// Phase 5 amplifier: mid-accept dominant body with a multi-byte exit
+		// Amplifier for the multi-byte-exit bulk skip: mid-accept dominant body with a multi-byte exit
 		// set. Pattern matches URLs delimited by whitespace, comma, or
 		// semicolon. Body `[^\s,;]+` is mid-accept (every byte while in
 		// it is a valid match end) and has 8-byte exit set
-		// (\t\n\v\f\r space , ;) → triggers Phase 5's Shufti-style nibble-
-		// table SIMD bulk-skip in `emitDominantBulkSkip`. Without Phase 5
-		// the body would scan byte-by-byte at DFA per-byte cost.
+		// (\t\n\v\f\r space , ;) → triggers the Shufti-style nibble-
+		// table SIMD bulk-skip in `emitDominantBulkSkip`. Without it the
+		// body would scan byte-by-byte at DFA per-byte cost.
 		name:    "phase5-url-find-100kb",
 		pattern: `http://[^\s,;]+`,
 		mode:    find,
@@ -583,6 +582,74 @@ var tests = []testCase{
 // secretBaseInput returns a ~10KB environment/config file with many 'e', 'g', 'A'
 // characters (common prefix chars for JWT, GitHub, AWS patterns) but no secrets.
 // insertAt controls where the secret is spliced in (use -1 for no secret).
+// unicodeTests replace tests under -unicode: patterns a Unicode-mode compile
+// is for — letter classes, scripts, non-ASCII literals, codepoint `.`, folding
+// across Unicode — over mixed-script text, against the regex crate, whose
+// classes are Unicode by default as these are. A byte-mode run cannot compile
+// them, which is why they are a table of their own and not rows of tests.
+var unicodeTests = []testCase{
+	{name: "u-letters", pattern: `\pL+`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, "")},
+		{"no-letter ~10KB", strings.Repeat("0123456789 ,.;:!?-+ ", 512)},
+	}},
+	{name: "u-cyrillic-word", pattern: `\p{Cyrillic}{4,}`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, "")},
+	}},
+	{name: "u-intl-email", pattern: `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}`, mode: find, inputs: []namedInput{
+		{"no-email ~10KB", unicodeText(10<<10, "")},
+		{"with-email ~10KB", unicodeText(10<<10, " пользователь@пример.рф ")},
+	}},
+	{name: "u-literal", pattern: `привет\s+\pL+`, mode: find, inputs: []namedInput{
+		{"absent ~10KB", unicodeText(10<<10, "")},
+		{"present ~10KB", unicodeText(10<<10, " привет мир ")},
+	}},
+	{name: "u-fold", pattern: `(?i)straße|ΣΟΦΙΑ`, mode: find, inputs: []namedInput{
+		{"absent ~10KB", unicodeText(10<<10, "")},
+		{"present ~10KB", unicodeText(10<<10, " STRASSE Straße σοφια ")},
+	}},
+	{name: "u-dot-count", pattern: `x.{3}y`, mode: find, inputs: []namedInput{
+		{"mixed ~10KB", unicodeText(10<<10, " xé日😀y ")},
+	}},
+	{name: "u-greek-anchored", pattern: `\p{Greek}+(?:\s\p{Greek}+)*`, mode: anchored, inputs: []namedInput{
+		{"match", "Ωμέγα αλφα βήτα γάμμα δέλτα"},
+		{"no-match", "Grüße aus Köln"},
+	}},
+	{name: "u-groups", pattern: `(\pL+)\s(\pN+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "Straße 42"},
+		{"no-match", "42 Straße"},
+		{"long match", strings.Repeat("Straße", 50) + " 42"},
+	}},
+	{name: "u-tag-groups", pattern: `<([^>]+)>`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "<" + unicodeText(300, "") + ">"},
+	}},
+	{name: "u-field-groups", pattern: `([^,]+),`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", strings.ReplaceAll(unicodeText(300, ""), ",", ";") + ","},
+	}},
+	{name: "u-email-groups", pattern: `(\pL+)@(\pL+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "пользователь@пример"},
+	}},
+	{name: "u-dot-groups", pattern: `(.+)=(.+)`, mode: anchoredGroups, inputs: []namedInput{
+		{"match", "название=значение"},
+		{"long match", strings.Repeat("ключ", 40) + "=" + strings.Repeat("значение", 20)},
+	}},
+}
+
+// unicodeText is n bytes of mixed-script prose, with needle once in the
+// middle when it is not empty.
+func unicodeText(n int, needle string) string {
+	const block = "Grüße aus Köln, здравствуй мир! 東京タワー abc x 12 Ωμέγα. Gassen und Plätze; " +
+		"съешь же ещё этих мягких французских булок, да выпей чаю. 日本語のテキスト 2024年. "
+	var b strings.Builder
+	for b.Len() < n/2 {
+		b.WriteString(block)
+	}
+	b.WriteString(needle)
+	for b.Len() < n {
+		b.WriteString(block)
+	}
+	return b.String()
+}
+
 func secretBaseInput(secret string) string {
 	// Realistic env file block — high density of 'e', 'g', 'A' characters.
 	const block = `# Application Configuration
@@ -762,12 +829,8 @@ func sourceCodeInput(singleLine, blockComments []string) string {
 	}
 
 	all := make([]string, 0, len(singleLine)+len(blockComments))
-	for _, c := range singleLine {
-		all = append(all, c)
-	}
-	for _, c := range blockComments {
-		all = append(all, c)
-	}
+	all = append(all, singleLine...)
+	all = append(all, blockComments...)
 
 	result := []byte(base)
 	step := len(result) / (len(all) + 1)
@@ -1169,7 +1232,7 @@ func regexpedEngineName(tc testCase) string {
 		// Captures are stripped for anchored/find modes; engine is always DFA.
 		return "DFA"
 	}
-	opts := compile.CompileOptions{MaxDFAStates: 100000}
+	opts := withMode(compile.CompileOptions{MaxDFAStates: 100000})
 	et, err := compile.SelectEngine(tc.pattern, opts)
 	if err != nil {
 		return "?"
@@ -1182,7 +1245,7 @@ func regexpedEngineName(tc testCase) string {
 // imports the regexped function and loops benchIters times internally — only
 // one CGo crossing for the entire measurement.
 func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) benchResult {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	var fnExport string
 	switch tc.mode {
 	case anchored:
@@ -1195,7 +1258,7 @@ func benchRegexped(tc testCase, input string, engine *wasmtime.Engine, pct int) 
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, compile.CompileOptions{})
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  regexped compile(%s): %v\n", tc.name, err)
 		return benchResult{}
@@ -1592,7 +1655,7 @@ type fuelInputResult struct {
 // measFuelRegexped compiles tc.pattern, instantiates the module with a fuel-enabled
 // store, then measures fuel consumed by a single exported function call.
 func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (uint64, bool) {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	var fnExport string
 	switch tc.mode {
 	case anchored:
@@ -1605,7 +1668,7 @@ func measFuelRegexped(tc testCase, input string, fuelEngine *wasmtime.Engine) (u
 		re.GroupsFunc = "groups"
 		fnExport = "groups"
 	}
-	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.RegexEntry{re}, tableBase, true, 0, compile.CompileOptions{})
+	wasmBytes, _, searchSizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, withMode(compile.CompileOptions{}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  fuel regexped compile(%s): %v\n", tc.name, err)
 		return 0, false
@@ -1792,7 +1855,7 @@ func tcModeStr(tc testCase) string {
 }
 
 func compileTestWasm(tc testCase) ([]byte, error) {
-	re := config.RegexEntry{Pattern: tc.pattern}
+	re := config.PatternEntry{Regexp: tc.pattern}
 	switch tc.mode {
 	case anchored:
 		re.MatchFunc = "match"
@@ -1801,7 +1864,7 @@ func compileTestWasm(tc testCase) ([]byte, error) {
 	case anchoredGroups:
 		re.GroupsFunc = "groups"
 	}
-	wasmBytes, _, err := compile.Compile([]config.RegexEntry{re}, tableBase, true)
+	wasmBytes, _, err := compile.Compile([]config.PatternEntry{re}, tableBase, true)
 	return wasmBytes, err
 }
 
@@ -2388,12 +2451,12 @@ func benchRegexSet(sc setTestCase, input string, regexWasmBytes []byte, engine *
 // against a regex crate that crosses once per pass. Rows measured before
 // 2026-09-26 are not comparable with rows after it.
 func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct int) benchResult {
-	entries := make([]config.RegexEntry, len(sc.patterns))
+	entries := make([]config.PatternEntry, len(sc.patterns))
 	for i, p := range sc.patterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2521,23 +2584,17 @@ func benchRegexpedSet(sc setTestCase, input string, engine *wasmtime.Engine, pct
 	return benchResult{avgExec: computeStat(buf[timingsBase:timingsBase+timingsBytes], pct), wasmSize: len(wasmBytes)}
 }
 
-// exhaustSetFind drives a set `find` export to exhaustion, the way a generated
-// iterator does: zero the gate array, then call
+// exhaustSetFindBlocks drives a set `find` export to exhaustion, the way a
+// generated iterator does: zero the gate array, then call
 //
 //	find(ptr, len, from, gate_ptr, out_ptr, out_cap) -> total at that position
 //
 // advancing `from` to start+1 each time. Every tuple in one call shares a
-// start, so reading the first tuple is enough to resume.
-// gatePtr points at the gate array; the SCRATCH DESCRIPTOR the export actually
-// takes is built immediately above it (internal/abi), so one argument still
-// describes all of the caller's scratch.
-func exhaustSetFind(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
-	inBase, inLen, gatePtr, outBase, outCap int32) int {
-	return exhaustSetFindBlocks(store, mem, findFn, inBase, inLen, gatePtr, outBase, outCap, nil)
-}
-
-// exhaustSetFindBlocks is exhaustSetFind handing the set's split members their
-// search blocks, as a generated iterator does (sb nil: none).
+// start, so reading the first tuple is enough to resume. gatePtr points at the
+// gate array; the SCRATCH DESCRIPTOR the export actually takes is built
+// immediately above it (internal/abi), so one argument still describes all of
+// the caller's scratch. The set's split members get their search blocks as a
+// generated iterator hands them over (sb nil: none).
 func exhaustSetFindBlocks(store *wasmtime.Store, mem *wasmtime.Memory, findFn *wasmtime.Func,
 	inBase, inLen, gatePtr, outBase, outCap int32, sb *searchblock.Blocks) int {
 	buf := mem.UnsafeData(store)
@@ -2578,12 +2635,12 @@ func exhaustSetFindBlocks(store *wasmtime.Store, mem *wasmtime.Memory, findFn *w
 // benchRegexpedSetFuel measures WASM fuel consumed by one complete `find` exhaustion
 // pass over the input using a fuel-enabled wasmtime engine.
 func benchRegexpedSetFuel(sc setTestCase, input string, fuelEngine *wasmtime.Engine) uint64 {
-	entries := make([]config.RegexEntry, len(sc.patterns))
+	entries := make([]config.PatternEntry, len(sc.patterns))
 	for i, p := range sc.patterns {
-		entries[i] = config.RegexEntry{Pattern: p}
+		entries[i] = config.PatternEntry{Regexp: p}
 	}
 	cfg := config.BuildConfig{
-		Regexps: entries,
+		Patterns: entries,
 		Sets: []config.SetConfig{
 			{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 		},
@@ -2892,12 +2949,12 @@ func parseSetSizeBaseline(path string) (map[string]int, error) {
 // runSizeOnlySets prints WASM module sizes for all set test cases and exits.
 func runSizeOnlySets() {
 	for _, sc := range setTests {
-		entries := make([]config.RegexEntry, len(sc.patterns))
+		entries := make([]config.PatternEntry, len(sc.patterns))
 		for i, p := range sc.patterns {
-			entries[i] = config.RegexEntry{Pattern: p}
+			entries[i] = config.PatternEntry{Regexp: p}
 		}
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},
@@ -2997,12 +3054,12 @@ func runCompareSetSize(baselinePath string) bool {
 			fmt.Fprintf(os.Stderr, "  compare-sets-size: no baseline for %q\n", sc.name)
 			continue
 		}
-		entries := make([]config.RegexEntry, len(sc.patterns))
+		entries := make([]config.PatternEntry, len(sc.patterns))
 		for i, p := range sc.patterns {
-			entries[i] = config.RegexEntry{Pattern: p}
+			entries[i] = config.PatternEntry{Regexp: p}
 		}
 		cfg := config.BuildConfig{
-			Regexps: entries,
+			Patterns: entries,
 			Sets: []config.SetConfig{
 				{Name: "bench_set", Find: "set_find", Patterns: config.PatternSelector{All: true}},
 			},
@@ -3029,6 +3086,21 @@ func runCompareSetSize(baselinePath string) bool {
 // --------------------------------------------------------------------------
 // Main
 
+// unicodeFlag puts every compile of this run in Unicode mode
+// (CompileOptions.Unicode); without it every compile is forced to byte mode
+// (ForceByteMode), so no run is ever in a mode it did not ask for.
+var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileOptions.Unicode); without it, byte mode (ForceByteMode)")
+
+// withMode sets the mode -unicode asks for on o.
+func withMode(o compile.CompileOptions) compile.CompileOptions {
+	if *unicodeFlag {
+		o.Unicode = true
+	} else {
+		o.ForceByteMode = true
+	}
+	return o
+}
+
 func main() {
 	// Silence library log output — only the benchmark table goes to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -3047,6 +3119,9 @@ func main() {
 	compareFuel := flag.String("compare-fuel", "", "compare fuel counts against baseline file; exit 1 if outside ±20% (TDFA non-determinism budget)")
 	compareSize := flag.String("compare-size", "", "compare WASM sizes against baseline file; exit 1 if outside ±5%")
 	flag.Parse()
+	if *unicodeFlag {
+		tests = unicodeTests
+	}
 
 	// PERFTEST_FILTER (debugging env var, mirrors likelytest's LIKELYTEST_FILTER):
 	// comma-separated substrings; only test cases whose name contains one of

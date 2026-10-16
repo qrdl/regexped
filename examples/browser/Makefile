@@ -1,30 +1,21 @@
-# regexped must be built first: run `make` in the repo root.
-REGEXPED    := ../../regexped
-REGEX_WASMS := regexps.wasm
-JS_STUB     := regexp.js
+# Two browser examples, served together:
+#   validate/   email and URL validation
+#   homoglyph/  lookalike letters, invisible and text-direction characters
+#               (Unicode-mode patterns)
+# Each directory also builds and serves on its own.
+EXAMPLES := validate homoglyph
+PORT     ?= 8080
 
-.PHONY: all build run clean
+.PHONY: all run clean
 
-all: build
+all:
+	@set -e; for d in $(EXAMPLES); do $(MAKE) -C $$d; done
 
-# Step 1 – compile regexp patterns to WASM
-# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
-# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
-# Without it a rebuild after a compiler change keeps the stale .wasm and the
-# merge fails with an import/export type mismatch.
-$(REGEX_WASMS): regexped.yaml $(REGEXPED)
-	$(REGEXPED) compile --config=regexped.yaml
-
-# Step 2 – generate JS ES module stub
-$(JS_STUB): regexped.yaml $(REGEX_WASMS) $(REGEXPED)
-	$(REGEXPED) generate --config=regexped.yaml
-
-build: $(JS_STUB)
-
-# Step 3 – serve locally (requires Python 3)
-run: build
-	@echo "Open http://localhost:8080 in your browser"
-	python3 -m http.server 8080
+# Serves this directory, so index.html links to both pages. It runs until you
+# stop it, which is why `browser` is the last example in ../Makefile.
+run: all
+	@echo "Open http://localhost:$(PORT) in your browser"
+	python3 -m http.server $(PORT)
 
 clean:
-	rm -f $(REGEX_WASMS) $(JS_STUB)
+	@for d in $(EXAMPLES); do $(MAKE) -C $$d clean; done

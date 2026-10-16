@@ -1,11 +1,11 @@
 # Members split out of the buckets, and a start-anywhere union over EVERY
 # member that serves the scan pair on its own: the scan bodies are the union
 # walk, and only `find` is a merge wrapper.
-regexps:
+patterns:
   - name: p0
-    pattern: '[a-z]+0[0-9]+'
+    regexp: '[a-z]+0[0-9]+'
   - name: p1
-    pattern: 'foo'
+    regexp: 'foo'
 sets:
   - name: s
     find: s_find

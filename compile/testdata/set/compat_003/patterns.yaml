@@ -1,9 +1,9 @@
 # compat_003: compatible_class_partitions
 # 4 patterns with compatible byte-class structures for suffix merge.
 patterns:
-  - pattern: 'foo\d+'
-  - pattern: 'bar\d+'
-  - pattern: 'baz\d+'
-  - pattern: 'qux\d+'
+  - regexp: 'foo\d+'
+  - regexp: 'bar\d+'
+  - regexp: 'baz\d+'
+  - regexp: 'qux\d+'
 expect:
   bucket_count: 1

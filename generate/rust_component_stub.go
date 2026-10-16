@@ -193,7 +193,7 @@ func nestPackage(witText string) string {
 // genRustComponentInner renders the per-entry wrappers, in config order.
 func genRustComponentInner(cfg config.BuildConfig, names map[string]string) (string, error) {
 	var b strings.Builder
-	for _, re := range cfg.Regexps {
+	for _, re := range cfg.Patterns {
 		if re.MatchFunc != "" {
 			b.WriteString(genRustComponentMatch(re.MatchFunc, rustWitFuncName(names[re.MatchFunc])))
 		}
@@ -201,9 +201,9 @@ func genRustComponentInner(cfg config.BuildConfig, names map[string]string) (str
 			b.WriteString(genRustComponentFind(re.FindFunc, rustResourceType(names[re.FindFunc])))
 		}
 		if re.GroupsFunc != "" {
-			numGroups, namedGroups, err := extractGroupInfo(re.Pattern)
+			numGroups, namedGroups, err := extractGroupInfo(re.Regexp)
 			if err != nil {
-				return "", fmt.Errorf("regexp %q: %w", re.Pattern, err)
+				return "", fmt.Errorf("regexp %q: %w", re.Regexp, err)
 			}
 			b.WriteString(genRustComponentGroups(re.GroupsFunc, rustResourceType(names[re.GroupsFunc]), numGroups))
 			b.WriteString(genRustGroupIndexConsts(re.GroupsFunc, numGroups, namedGroups))

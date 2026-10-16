@@ -1,0 +1,31 @@
+# regexped must be built first: run `make` in the repo root.
+REGEXPED    := ../../../regexped
+REGEX_WASMS := regexps.wasm
+JS_STUB     := regexp.js
+
+.PHONY: all build run clean
+
+all: build
+
+# Step 1 – compile regexp patterns to WASM
+# $(REGEXPED) is a prerequisite of every rule below that runs it: the generated
+# stubs and the compiled .wasm depend on the COMPILER as much as on the config.
+# Without it a rebuild after a compiler change keeps the stale .wasm and the
+# merge fails with an import/export type mismatch.
+$(REGEX_WASMS): regexped.yaml $(REGEXPED)
+	$(REGEXPED) compile --config=regexped.yaml
+
+# Step 2 – generate JS ES module stub
+$(JS_STUB): regexped.yaml $(REGEX_WASMS) $(REGEXPED)
+	$(REGEXPED) generate --config=regexped.yaml
+
+build: $(JS_STUB)
+
+# Step 3 – serve this page alone (requires Python 3). `make run` one directory
+# up serves it together with the other browser example.
+run: build
+	@echo "Open http://localhost:8080 in your browser"
+	python3 -m http.server 8080
+
+clean:
+	rm -f $(REGEX_WASMS) $(JS_STUB)
