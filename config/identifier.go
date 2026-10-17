@@ -179,12 +179,7 @@ func init() {
 func exportNameRefs(cfg *BuildConfig) []exportRef {
 	var refs []exportRef
 	for _, re := range cfg.Patterns {
-		owner := "pattern"
-		if re.Name != "" {
-			owner = fmt.Sprintf("pattern %q", re.Name)
-		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Written())
-		}
+		owner := re.Owner()
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
@@ -277,12 +272,7 @@ func ValidateConfig(cfg *BuildConfig) error {
 	var problems []string
 
 	for _, re := range cfg.Patterns {
-		owner := "pattern"
-		if re.Name != "" {
-			owner = fmt.Sprintf("pattern %q", re.Name)
-		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Written())
-		}
+		owner := re.Owner()
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},
@@ -663,12 +653,7 @@ type exportRef struct {
 func allExportRefs(cfg *BuildConfig) []exportRef {
 	var refs []exportRef
 	for _, re := range cfg.Patterns {
-		owner := "pattern"
-		if re.Name != "" {
-			owner = fmt.Sprintf("pattern %q", re.Name)
-		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Written())
-		}
+		owner := re.Owner()
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
 			{"find_func", re.FindFunc},

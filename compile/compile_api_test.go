@@ -4086,6 +4086,80 @@ func TestReferencesVerbose(t *testing.T) {
 	(&Reporter{}).Expanded("x") // no scope open
 }
 
+// A pattern written with references is named as written wherever the set
+// path names one: a mode conflict, a member that does not parse, a pattern's
+// owner label.
+func TestReferencesNamedAsWrittenInSets(t *testing.T) {
+	yes := true
+	cfg := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{
+			{Name: "ascii", Regexp: `[a-z]+`},
+			{Regexp: `(?&ascii)`, Unicode: &yes},
+			{Name: "b", Regexp: `x`, ByteMode: true},
+		},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{All: true}}}}
+	if err := config.ExpandReferences(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := CompileFile(cfg, "")
+	if err == nil || !strings.Contains(err.Error(), `member "(?&ascii)" asks for Unicode mode`) || strings.Contains(err.Error(), `(?:[a-z]+)`) {
+		t.Errorf("mode conflict: err = %v, want the member named as written", err)
+	}
+
+	// A member whose expanded text does not parse — only a config built in
+	// code can carry one: ExpandReferences parses every piece first.
+	bad := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Regexps: []string{`(`},
+			Expansions: []*config.Expansion{{Source: `(?&p)(`}}}}}
+	_, _, err = CompileFile(bad, "")
+	if err == nil || !strings.Contains(err.Error(), `analyzePattern: parse "(?&p)("`) {
+		t.Errorf("parse error: err = %v, want the member named as written", err)
+	}
+
+	p, err := compilePattern(config.PatternEntry{Regexp: `a+`, FindFunc: "f", Expanded: &config.Expansion{Source: `(?&p)`}},
+		0, 0, CompileOptions{globals: &moduleGlobals{}})
+	if err != nil || p.label != `(?&p)` {
+		t.Errorf("owner label = %q (%v), want the pattern as written", p.label, err)
+	}
+}
+
+// A set's own regexps are listed in the mode the set runs them in, not the
+// one they would pick alone: `.` alone is byte mode.
+func TestVerboseSetRegexpsInSetMode(t *testing.T) {
+	yes := true
+	for _, c := range []struct {
+		name string
+		cfg  config.BuildConfig
+		want string
+	}{
+		{"unicode key", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Unicode: &yes, Regexps: []string{`.`}}}}, "unicode"},
+		{"a Unicode member", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "letters", Regexp: `\pL+`}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"letters"}}, Regexps: []string{`a.c`}}}}, "unicode"},
+		{"byte set", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Regexps: []string{`a.c`}}}}, "byte"},
+	} {
+		rep := &Reporter{}
+		_, _, diags, err := compileFileDiagReport(c.cfg, "", CompileSetOptions{}, rep)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var b bytes.Buffer
+		rep.Render(&b)
+		if want := "  s: regexps[0]        " + c.cfg.Sets[0].Regexps[0] + "\n    mode:   " + c.want + "\n"; !strings.Contains(b.String(), want) {
+			t.Errorf("%s: render missing\n%s\n--- got ---\n%s", c.name, want, b.String())
+		}
+		// --diag-json reports the same mode for the set.
+		if len(diags) != 1 || diags[0].Mode != c.want {
+			t.Errorf("%s: diag mode = %+v, want %q like the verbose line", c.name, diags, c.want)
+		}
+	}
+}
+
 // A refusal whose cause is in a piece names the piece; one whose cause is in
 // the pattern's own text names the pattern as written.
 func TestReferencesRuneGateNamesPiece(t *testing.T) {
@@ -4110,6 +4184,14 @@ func TestReferencesRuneGateNamesPiece(t *testing.T) {
 			t.Errorf("sets=%v: err = %v\nwant %s", sets != nil, err, want)
 		}
 	}
+	// A hand-written pattern is named the same way with a set as without.
+	for _, sets := range [][]config.SetConfig{nil, set} {
+		cfg := load([]config.PatternEntry{{Regexp: `user=а`, ByteMode: true, FindFunc: "f"}}, sets)
+		_, _, err := CompileFile(cfg, "")
+		if want := `compile pattern "user=а": pattern contains the rune U+0430`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("hand-written, sets=%v: err = %v\nwant %s…", sets != nil, err, want)
+		}
+	}
 	// The rune is the pattern's own: it is named as written.
 	cfg := load([]config.PatternEntry{
 		{Name: "ascii", Regexp: `[a-z]+`},
@@ -4118,6 +4200,26 @@ func TestReferencesRuneGateNamesPiece(t *testing.T) {
 	_, _, err := CompileFile(cfg, "")
 	if want := `compile pattern "user=(?&ascii)а": ` + gate; err == nil || err.Error() != want {
 		t.Errorf("own rune: err = %v\nwant %s", err, want)
+	}
+	// The piece blamed is the one holding the REPORTED rune: not one the
+	// pattern cut away, which still fails alone for a rune of its own, and none
+	// when the rune is the pattern's own.
+	cfg = load([]config.PatternEntry{
+		{Name: "unused", Regexp: `[а-я]`},
+		{Name: "greek", Regexp: `[α-ω]`},
+		{Name: "p", Regexp: `(?&unused){0}(?&greek)`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err = CompileFile(cfg, "")
+	if want := `compile pattern "p", piece "greek" (used by "p"): pattern contains the rune U+03B1, above U+00FF`; err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("cut-away piece: err = %v\nwant %s…", err, want)
+	}
+	cfg = load([]config.PatternEntry{
+		{Name: "greek", Regexp: `[α-ω]`},
+		{Name: "p", Regexp: `ж(?&greek)`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err = CompileFile(cfg, "")
+	if want := `compile pattern "ж(?&greek)": pattern contains the rune U+0436, above U+00FF`; err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("the pattern's own rune: err = %v\nwant %s…", err, want)
 	}
 	// An unnamed pattern whose cause is in a piece is named as written.
 	cfg = load([]config.PatternEntry{
@@ -4133,7 +4235,7 @@ func TestReferencesRuneGateNamesPiece(t *testing.T) {
 	if pe.Error() != `piece "p" (used by "u"): boom` || pe.Unwrap().Error() != "boom" {
 		t.Errorf("pieceError = %q", pe.Error())
 	}
-	if err := pieceWithRune(nil, true, pe.err); err != pe.err {
+	if err := pieceWithRune(nil, true, 'а', pe.err); err != pe.err {
 		t.Errorf("pieceWithRune with no expansion = %v", err)
 	}
 }

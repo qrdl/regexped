@@ -275,23 +275,17 @@ func (m setMode) member(src string) resolvedPattern {
 // mode; failing that the set-level key decides; with neither, byte mode. An
 // entry's own exports do not follow it: they resolve as a single pattern.
 func resolveSetMode(sc config.SetConfig, members []config.SetMember) (setMode, error) {
-	label := func(re config.PatternEntry) string {
-		if re.Name != "" {
-			return re.Name
-		}
-		return re.Regexp
-	}
 	var byteMember, unicodeMember string
 	for _, m := range members {
 		re := m.Entry
 		switch {
 		case re.IsByteMode():
 			if byteMember == "" {
-				byteMember = label(re)
+				byteMember = re.DisplayName()
 			}
 		case re.Unicode != nil && *re.Unicode, detectUnicodeRune(re.Regexp) >= 0:
 			if unicodeMember == "" {
-				unicodeMember = label(re)
+				unicodeMember = re.DisplayName()
 			}
 		}
 	}

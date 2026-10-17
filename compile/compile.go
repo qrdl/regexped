@@ -1472,10 +1472,7 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	if err != nil || p == nil {
 		return p, err
 	}
-	p.label = re.Name
-	if p.label == "" {
-		p.label = re.Regexp
-	}
+	p.label = re.DisplayName()
 	p.startRule = startRuleFor(rp)
 	// What a search of a Unicode-mode pattern keeps per input byte, so the
 	// cost is visible before it is paid (the Backtracking memo is recorded
@@ -1540,7 +1537,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		if parsed, perr := rp.parse(); perr == nil {
 			if prog, cerr := compileProg(parsed); cerr == nil {
 				if bad := unsupportedRuneIn(re.Regexp, prog.prog, buildOpts.ByteMode); bad >= 0 {
-					err := pieceWithRune(re.Expanded, buildOpts.ByteMode, unsupportedRuneError(bad))
+					err := pieceWithRune(re.Expanded, buildOpts.ByteMode, bad, unsupportedRuneError(bad))
 					buildOpts.report().Reason("refused — " + err.Error())
 					return nil, err
 				}
@@ -4386,12 +4383,15 @@ type pieceError struct {
 func (e *pieceError) Error() string { return e.use.Describe() + ": " + e.err.Error() }
 func (e *pieceError) Unwrap() error { return e.err }
 
-// pieceWithRune names the piece whose own text holds the rune the byte gate
-// refused, when the refused pattern was written with references: each piece
-// is checked alone, in the pattern's mode, deepest first, so the first one
-// that fails is the one that wrote the rune. err is returned unchanged when
-// the pattern used no reference, or the rune is in its own text.
-func pieceWithRune(x *config.Expansion, byteMode bool, err error) error {
+// pieceWithRune names the piece whose own text holds bad, the rune the byte
+// gate refused, when the refused pattern was written with references: each
+// piece is checked alone, in the pattern's mode, deepest first, and the first
+// one whose own refusal is that SAME rune is the one that wrote it. Failing for
+// some other rune is not enough: a piece the pattern cut away (`(?&cyr){0}`)
+// still fails alone, and the rune may be the pattern's own (`ж(?&greek)`).
+// err is returned unchanged when the pattern used no reference, or no piece
+// refuses bad.
+func pieceWithRune(x *config.Expansion, byteMode bool, bad rune, err error) error {
 	if x == nil {
 		return err
 	}
@@ -4401,7 +4401,7 @@ func pieceWithRune(x *config.Expansion, byteMode bool, err error) error {
 		// does not carry.
 		rp, _ := resolvePattern(u.Text, nil, &CompileOptions{ForceByteMode: true})
 		if parsed, perr := rp.parse(); perr == nil {
-			if prog, cerr := compileProg(parsed); cerr == nil && unsupportedRuneIn(u.Text, prog.prog, byteMode) >= 0 {
+			if prog, cerr := compileProg(parsed); cerr == nil && unsupportedRuneIn(u.Text, prog.prog, byteMode) == bad {
 				return &pieceError{use: u, err: err}
 			}
 		}
@@ -4416,11 +4416,7 @@ func pieceWithRune(x *config.Expansion, byteMode bool, err error) error {
 func patternError(re config.PatternEntry, err error) error {
 	var pe *pieceError
 	if errors.As(err, &pe) {
-		label := re.Name
-		if label == "" {
-			label = re.Written()
-		}
-		return fmt.Errorf("compile pattern %q, %s: %w", label, pe.use.Describe(), pe.err)
+		return fmt.Errorf("compile pattern %q, %s: %w", re.DisplayName(), pe.use.Describe(), pe.err)
 	}
 	return fmt.Errorf("compile pattern %q: %w", re.Written(), err)
 }

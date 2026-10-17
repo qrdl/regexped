@@ -114,6 +114,25 @@ func (r PatternEntry) Written() string {
 	return r.Regexp
 }
 
+// DisplayName names the entry in a message: its name, else its regexp as
+// written.
+func (r PatternEntry) DisplayName() string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return r.Written()
+}
+
+// Owner names the entry as the subject of a message: `pattern "url"`, or
+// `pattern "<its regexp as written>"`; plain "pattern" for an entry with
+// neither, which the empty-regexp check refuses at load.
+func (r PatternEntry) Owner() string {
+	if r.Name == "" && r.Regexp == "" {
+		return "pattern"
+	}
+	return fmt.Sprintf("pattern %q", r.DisplayName())
+}
+
 // referenceName is the rule for a name a reference can use: Go's rule for a
 // capture group name, since `(?<&name>)` makes one of it.
 func referenceNameByte(c byte) bool {
@@ -212,7 +231,8 @@ func readReference(s string, i int, names map[string]int) (refToken, error) {
 		return refToken{start: i, end: k + len(closer), name: name, capture: capture}, nil
 	}
 	// Malformed. What the user meant decides the message: a pattern whose
-	// name a reference cannot spell, a missing name, or a body after one.
+	// name a reference cannot spell, a missing name, a missing `>`, no
+	// closer at all, or a body after the name.
 	rest := s[j:]
 	if end := strings.IndexByte(rest, closer[0]); end >= 0 {
 		rest = rest[:end]
@@ -225,6 +245,12 @@ func readReference(s string, i int, names map[string]int) (refToken, error) {
 			return refToken{}, fmt.Errorf("reference %s%s has no name", open, closer)
 		}
 		return refToken{}, fmt.Errorf("invalid reference name %q: a name in (?&…) or (?<&…>) is ASCII letters, digits and _ only", rest)
+	}
+	if capture && strings.HasPrefix(s[k:], ")") {
+		return refToken{}, fmt.Errorf("reference %s%s) is missing \">\": write %s%s>)", open, name, open, name)
+	}
+	if strings.IndexByte(s[k:], closer[0]) < 0 {
+		return refToken{}, fmt.Errorf("reference %s%s is not closed: expected %q", open, name, closer)
 	}
 	return refToken{}, fmt.Errorf("reference %s%s… must end right after the name: a reference takes no body; "+
 		"to capture more than the piece, give it a group of its own: (?<group>(?&%s)…)", open, name, name)

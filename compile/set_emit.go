@@ -2198,10 +2198,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	for _, re := range cfg.Patterns {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
-			if re.Expanded != nil {
-				return nil, 0, nil, patternError(re, err)
-			}
-			return nil, 0, nil, err
+			return nil, 0, nil, patternError(re, err)
 		}
 		// Batch find/groups export trigger — same
 		// trigger compileAll applies; see compileAll's comment for the
@@ -2288,13 +2285,29 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	}
 	// A set's own regexps go through the per-pattern step a `patterns:` entry
 	// with no function goes through, so `--verbose` lists them as it lists
-	// patterns. Such an entry emits no code and takes no table space. After
-	// the sets, which report any error in them first, as they always have.
-	for _, sc := range cfg.Sets {
-		for k := range sc.Regexps {
-			re := sc.InlineEntry(k)
-			if _, err := compilePattern(re, tableBase, 0, opts); err != nil {
-				return nil, 0, nil, fmt.Errorf("set %q: regexp %q: %w", sc.Name, re.Written(), err)
+	// patterns. Such an entry emits no code and takes no table space, and the
+	// set above has already parsed and checked every one of them in its own
+	// mode, so the step has no effect but the report: it runs only for one.
+	// After the sets, which report any error in them first, as they always
+	// have.
+	//
+	// In the set's MODE: a regexp of a Unicode-mode set is matched in Unicode
+	// mode, whatever it would pick alone (`.` would pick byte mode). A
+	// byte-mode set's own regexps need nothing: one naming a rune above U+007F
+	// asks for Unicode mode, which a byte-mode set refuses before this point,
+	// so alone they pick byte mode too.
+	if rep != nil {
+		for _, sc := range cfg.Sets {
+			inlineOpts := opts
+			// The set compiled above, so its mode resolves.
+			if mode, err := resolveSetMode(sc, sc.Members(cfg)); err == nil && mode.member("").unicode() {
+				inlineOpts.Unicode = true
+			}
+			for k := range sc.Regexps {
+				re := sc.InlineEntry(k)
+				if _, err := compilePattern(re, tableBase, 0, inlineOpts); err != nil {
+					return nil, 0, nil, fmt.Errorf("set %q: regexp %q: %w", sc.Name, re.Written(), err)
+				}
 			}
 		}
 	}

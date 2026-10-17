@@ -573,9 +573,11 @@ func TestSetMembersInlineRegexps(t *testing.T) {
 			t.Errorf("%s: IDSpaceSize = %d, want %d", sc.Name, got, w.idSp)
 		}
 	}
-	// An inline member carries only its regexp.
-	if m := cfg.Sets[1].Members(cfg)[1]; !reflect.DeepEqual(m.Entry, PatternEntry{Regexp: "x+"}) {
-		t.Errorf("inline member entry = %+v, want only Regexp", m.Entry)
+	// An inline member carries only its regexp and its --verbose label: the
+	// entry InlineEntry builds.
+	wantInline := PatternEntry{Regexp: "x+", Label: "mixed: regexps[0]"}
+	if m := cfg.Sets[1].Members(cfg)[1]; !reflect.DeepEqual(m.Entry, wantInline) || !reflect.DeepEqual(m.Entry, cfg.Sets[1].InlineEntry(0)) {
+		t.Errorf("inline member entry = %+v, want %+v", m.Entry, wantInline)
 	}
 	if err := ValidateSets(&cfg); err != nil {
 		t.Errorf("ValidateSets: %v", err)

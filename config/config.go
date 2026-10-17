@@ -333,8 +333,8 @@ func (s SetConfig) Members(cfg BuildConfig) []SetMember {
 			}
 		}
 	}
-	for k, r := range s.Regexps {
-		out = append(out, SetMember{Entry: PatternEntry{Regexp: r, Expanded: s.expansion(k)}, ID: len(cfg.Patterns) + k, Inline: true})
+	for k := range s.Regexps {
+		out = append(out, SetMember{Entry: s.InlineEntry(k), ID: len(cfg.Patterns) + k, Inline: true})
 	}
 	return out
 }
@@ -637,10 +637,7 @@ func validateHintList(hints []string) error {
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
 	for _, re := range cfg.Patterns {
-		label := re.Name
-		if label == "" {
-			label = re.Written()
-		}
+		label := re.DisplayName()
 		if err := validateHintList(re.Hints); err != nil {
 			return fmt.Errorf("pattern %q: hints: %w", label, err)
 		}
@@ -694,12 +691,7 @@ func ValidateSets(cfg *BuildConfig) error {
 	exportNames := make(map[string]string) // export name → owner ("set X" or "pattern Y")
 	// Seed with per-pattern export names so set exports can't collide with them.
 	for _, re := range cfg.Patterns {
-		owner := "pattern"
-		if re.Name != "" {
-			owner = fmt.Sprintf("pattern %q", re.Name)
-		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Written())
-		}
+		owner := re.Owner()
 		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
 			if name == "" {
 				continue
@@ -995,10 +987,7 @@ func validateModeKeys(cfg *BuildConfig, byteModeSet []bool) error {
 		if re.Unicode == nil {
 			continue
 		}
-		label := re.Name
-		if label == "" {
-			label = re.Written()
-		}
+		label := re.DisplayName()
 		explicit := i < len(byteModeSet) && byteModeSet[i]
 		switch {
 		case *re.Unicode && re.ByteMode:

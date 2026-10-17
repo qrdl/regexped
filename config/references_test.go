@@ -224,9 +224,13 @@ func TestExpandReferencesErrors(t *testing.T) {
 		{"body, capturing", `  - {name: u, regexp: 'x(?<&domain>(?::\d+)?)', find_func: f}`,
 			`reference (?<&domain… must end right after the name: a reference takes no body`},
 		{"capturing, no >", "  - {name: u, regexp: 'x(?<&domain)', find_func: f}",
-			`reference (?<&domain… must end right after the name`},
+			`pattern "u": reference (?<&domain) is missing ">": write (?<&domain>)`},
 		{"cut short", "  - {name: u, regexp: 'x(?&domain', find_func: f}",
-			`reference (?&domain… must end right after the name`},
+			`pattern "u": reference (?&domain is not closed: expected ")"`},
+		{"no closer anywhere", "  - {name: u, regexp: 'x(?&domain abc', find_func: f}",
+			`pattern "u": reference (?&domain is not closed: expected ")"`},
+		{"cut short, capturing", "  - {name: u, regexp: 'x(?<&domain', find_func: f}",
+			`pattern "u": reference (?<&domain is not closed: expected ">)"`},
 		{"cycle", "  - {name: a, regexp: 'a(?&b)'}\n  - {name: b, regexp: 'b(?&a)'}",
 			`pattern "a" (used by "b", used by "a"): reference cycle: "a" → "b" → "a"`},
 		{"self", "  - {name: a, regexp: 'a(?&a)', find_func: f}",
@@ -357,5 +361,27 @@ sets:
 	}
 	if u := cfg.Patterns[1]; u.ByteMode || u.Regexp != `X(?:[\x80-\xff]+)` {
 		t.Errorf("u = %+v", u)
+	}
+}
+
+// DisplayName and Owner name an entry in every message: by its name, else by
+// its regexp as written.
+func TestPatternEntryNames(t *testing.T) {
+	refs := PatternEntry{Regexp: `x(?:q)`, Expanded: &Expansion{Source: `x(?&p)`}}
+	for _, c := range []struct {
+		e              PatternEntry
+		display, owner string
+	}{
+		{PatternEntry{Name: "url", Regexp: `x`}, "url", `pattern "url"`},
+		{PatternEntry{Regexp: `a+`}, "a+", `pattern "a+"`},
+		{refs, `x(?&p)`, `pattern "x(?&p)"`},
+		{PatternEntry{}, "", "pattern"},
+	} {
+		if got := c.e.DisplayName(); got != c.display {
+			t.Errorf("%+v: DisplayName = %q, want %q", c.e, got, c.display)
+		}
+		if got := c.e.Owner(); got != c.owner {
+			t.Errorf("%+v: Owner = %q, want %q", c.e, got, c.owner)
+		}
 	}
 }
