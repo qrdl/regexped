@@ -56,7 +56,8 @@ max_memory: 100MB          # optional; the most memory the module may ever use (
 # A REGEXP is a bare expression; a PATTERN is a regexp plus optional metadata.
 patterns:                  # optional when every regexp lives inside sets (their regexps: key)
   - regexp: 'https?://...' # required: the RE2 regexp itself
-    name: "my_pattern"      # optional; required to select it by name from a set's patterns: list
+    name: "my_pattern"      # optional; required to select it by name from a set's patterns: list,
+                            #   and to use it in another regexp as (?&my_pattern) — see references.md
 
     # One or more func fields — only those set are compiled and stubbed.
     # The func name becomes both the WASM export name and the generated function name.
@@ -187,7 +188,7 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | An export must not collide with a symbol DERIVED from another export (`<func>_index`, `<func>_names`, `<func>_count`, `<func>_indices`, `<func>_iter`, in the base name's own casing style) | all | `groups_func: parse` emits `parse_index` and friends; a second export literally named `parse_index` duplicates the symbol. |
 | `namespace:` must be a valid identifier and not a reserved word | all | It is interpolated verbatim into generated identifiers in Go/JS/TS/AS/C. |
 | An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
-| Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
+| Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?<a>x)(?<a>y)` and `(?<host>x)(?<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
 | Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
 | A `groups_func` pattern must have a capture group that can take part in a match | all | `a*`, or `(?:(a){0})b`, whose only group simplification removes, has no groups to report: it would compile to no groups export while every stub calls one. `compile` and `generate` refuse it too. Use `find_func` for the match's span. |
 
@@ -557,7 +558,8 @@ introduce. Don't set `batch-find` expecting a Rust/Go/C/AS speedup.
 
 ### Pattern support
 
-Regexped uses RE2 syntax. Backreferences are not supported by design.
+Regexped uses RE2 syntax, and accepts every spelling Go's `regexp` package
+accepts. Backreferences are not supported by design.
 
 | Feature | Supported |
 |---|---|
@@ -570,6 +572,8 @@ Regexped uses RE2 syntax. Backreferences are not supported by design.
 | Word boundaries `\b`, `\B` | Yes |
 | Capture groups (TDFA engine — O(n)) | Yes |
 | Capture groups (Backtracking engine) | Yes |
+| Named groups `(?<name>…)`; Python's `(?P<name>…)` is accepted too, but not the preferred spelling | Yes |
+| References to other patterns, `(?&name)` and `(?<&name>)` | Yes — [references.md](references.md) |
 | Backreferences `\1` | No |
 | Lookahead / lookbehind | No |
 | Unicode: characters above U+007F, `\p{..}` classes, `(?i)` across Unicode | Yes — [Unicode mode](#unicode--codepoint-mode) |
@@ -850,8 +854,8 @@ sets:
 | `scan_all` | At least one | Non-anchored: every pattern matching somewhere |
 | `find` | At least one | Non-anchored: every match at the next matching position — the only capability reporting positions and extents |
 | `overlapping` | No | `false` (default) = per-pattern non-overlapping; `true` = every start position. Affects `find` only, and is silently ignored on a set without it |
-| `patterns` | One of these two | Top-level patterns this set holds: `"all"` (every top-level pattern, named or not) or a list of their `name:` values |
-| `regexps` | One of these two | Bare regexps of this set's own. Private to it: `patterns: all` in another set never includes them |
+| `patterns` | One of these two | Top-level patterns this set holds: `"all"` (every top-level pattern, named or not — pieces other regexps only [reference](references.md) included) or a list of their `name:` values |
+| `regexps` | One of these two | Bare regexps of this set's own. Private to it: `patterns: all` in another set never includes them. They may use [references](references.md) to named top-level patterns |
 | `emit_name_map` | No | Emit this set's own name lookup in generated stubs (`<set>_pattern_name(id)` in each language's spelling): a member's `name:`, or `""` for an unnamed pattern, an inline regexp or an id the set does not hold |
 | `hints` | No | `[prefer-match]` or `[prefer-no-match]` (per-set LikelyMode default), and/or `[batch-find]`, which requires `find` — see [`hints:`](#hints--likelymode-and-batch-find-compile-hints) above |
 

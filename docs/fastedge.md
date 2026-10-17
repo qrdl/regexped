@@ -12,15 +12,21 @@ import_module: "regexps"       # Rust module name in generated stubs
 stub_file:     "stubs.rs"      # generated Rust FFI stubs
 
 patterns:
-  - regexp:    '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
+  - name: hostname             # used by both patterns below
+    regexp: '[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  - regexp:    '^([a-zA-Z0-9._%+-]+@(?&hostname))$'
     match_func: "match_email"
 
-  - regexp:    '^https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?$'
+  - regexp:    '^https?://(?&hostname)(/[^\s]*)?$'
     match_func: "url_match"
 
   - regexp:    '(?i)(?:<\s*(?:script|iframe|...)\b[^>]*>|\bon\w+=|javascript\s*:)'
     find_func:  "find_xss"
 ```
+
+`(?&hostname)` inserts the regexp of the pattern named `hostname`, so both
+patterns share one host-name definition ([references.md](references.md)).
 
 The `output` field puts regexped into embedded mode: the regexp WASM imports memory from a `"main"` host module instead of owning it. `regexped merge` combines both into `final.wasm`.
 

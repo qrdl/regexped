@@ -183,7 +183,7 @@ func exportNameRefs(cfg *BuildConfig) []exportRef {
 		if re.Name != "" {
 			owner = fmt.Sprintf("pattern %q", re.Name)
 		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Regexp)
+			owner = fmt.Sprintf("pattern %q", re.Written())
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
@@ -281,7 +281,7 @@ func ValidateConfig(cfg *BuildConfig) error {
 		if re.Name != "" {
 			owner = fmt.Sprintf("pattern %q", re.Name)
 		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Regexp)
+			owner = fmt.Sprintf("pattern %q", re.Written())
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},
@@ -296,7 +296,7 @@ func ValidateConfig(cfg *BuildConfig) error {
 			}
 		}
 		if re.GroupsFunc != "" {
-			for _, problem := range captureNameProblems(re.Regexp) {
+			for _, problem := range captureNameProblems(re.Regexp, re.Expanded) {
 				problems = append(problems, fmt.Sprintf("%s: %s", owner, problem))
 			}
 			if re.GroupsWithoutCaptures() {
@@ -392,7 +392,7 @@ func ValidateConfig(cfg *BuildConfig) error {
 // duplicateCaptureNames returns, in sorted order, the capture-group names that
 // appear more than once in pattern.
 //
-// regexp/syntax accepts duplicate names — `(?P<a>x)(?P<a>y)` parses without
+// regexp/syntax accepts duplicate names — `(?<a>x)(?<a>y)` parses without
 // error — but generate.collectNamedGroups builds a name→slot map, so a repeated
 // name silently resolves to whichever group is visited last. That only changes
 // observable output where the NAMES are used — the generated index constants
@@ -403,7 +403,10 @@ func ValidateConfig(cfg *BuildConfig) error {
 //
 // A pattern that fails to parse yields no duplicates: reporting the syntax
 // error is compile's job, and doing it here too would double up the message.
-func captureNameProblems(pattern string) []string {
+//
+// x is the pattern's reference expansion, nil when it used none: a problem
+// with a group a reference brought in says where each copy came from.
+func captureNameProblems(pattern string, x *Expansion) []string {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -427,7 +430,7 @@ func captureNameProblems(pattern string) []string {
 	var problems []string
 
 	// 1. Exact duplicates. regexp/syntax ACCEPTS these — verified: it parses
-	//    `(?P<a>x)(?P<a>y)` with a nil error — so nothing upstream catches it.
+	//    `(?<a>x)(?<a>y)` with a nil error — so nothing upstream catches it.
 	var duplicates []string
 	for name, n := range seen {
 		if n > 1 {
@@ -437,18 +440,18 @@ func captureNameProblems(pattern string) []string {
 	sort.Strings(duplicates)
 	for _, name := range duplicates {
 		problems = append(problems, fmt.Sprintf("capture group name %q is used more than once; "+
-			"group names become generated constants and a name→index lookup, so only one group of that name would be reachable", name))
+			"group names become generated constants and a name→index lookup, so only one group of that name would be reachable%s", name, fromNote("it", x.groupOrigins(name))))
 	}
 
 	// NOT checked: reserved words. A group name never stands alone as an
 	// identifier — every language prefixes it with the function's name
 	// (`url_groups_type`) or uses it as a JS/TS object KEY, where a reserved
-	// word is legal. An earlier version of this check rejected `(?P<type>…)`,
+	// word is legal. An earlier version of this check rejected `(?<type>…)`,
 	// which is a perfectly good group name and is used by one of this repo's
 	// own examples.
 	//
 	// Nor the character set: regexp/syntax already refuses anything that is
-	// not a word character — verified, `(?P<a b>x)` and `(?P<a-b>x)` are parse
+	// not a word character — verified, `(?<a b>x)` and `(?<a-b>x)` are parse
 	// errors — and a leading digit is fine once prefixed. A DIGIT-LEADING name
 	// used to be a JS/TS hazard for the second reason above (`{ 1a: 3 }` is a
 	// SyntaxError, not a legal key); the generators now quote every key, so
@@ -470,7 +473,7 @@ func captureNameProblems(pattern string) []string {
 	sort.Strings(reservedSuffix)
 	for _, name := range reservedSuffix {
 		problems = append(problems, fmt.Sprintf("capture group name %q is one of the suffixes the stub generators derive from the groups_func name "+
-			"(<func>_index, <func>_names, <func>_count, <func>_indices, <func>_iter), so its constant would collide with the generated helper of the same name", name))
+			"(<func>_index, <func>_names, <func>_count, <func>_indices, <func>_iter), so its constant would collide with the generated helper of the same name%s", name, fromNote("it", x.groupOrigins(name))))
 	}
 
 	// 3. Names that COLLIDE after sanitising. `host` and `Host` are two
@@ -491,10 +494,23 @@ func captureNameProblems(pattern string) []string {
 	for _, stem := range collided {
 		group := append([]string(nil), stems[stem]...)
 		sort.Strings(group)
-		problems = append(problems, fmt.Sprintf("capture group names %s differ only in case and collapse to one generated constant stem %q",
-			strings.Join(quoteAll(group), " and "), stem))
+		var from string
+		for _, name := range group {
+			from += fromNote(fmt.Sprintf("%q", name), x.groupOrigins(name))
+		}
+		problems = append(problems, fmt.Sprintf("capture group names %s differ only in case and collapse to one generated constant stem %q%s",
+			strings.Join(quoteAll(group), " and "), stem, from))
 	}
 	return problems
+}
+
+// fromNote appends where a group came from to a message about it: `; it comes
+// from piece "hostport"`. Empty when there is nothing to say.
+func fromNote(subject, origins string) string {
+	if origins == "" {
+		return ""
+	}
+	return "; " + subject + " comes from " + origins
 }
 
 // quoteAll quotes each name for an error message.
@@ -651,7 +667,7 @@ func allExportRefs(cfg *BuildConfig) []exportRef {
 		if re.Name != "" {
 			owner = fmt.Sprintf("pattern %q", re.Name)
 		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Regexp)
+			owner = fmt.Sprintf("pattern %q", re.Written())
 		}
 		for _, f := range []struct{ field, name string }{
 			{"match_func", re.MatchFunc},

@@ -35,7 +35,7 @@ differences.
 
 ## Configuration
 
-A simplified illustrative config (see [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) below for the actual, more elaborate example this is based on):
+A simplified illustrative config (see [`rust/url-validate/`](../examples/wasmtime/rust/url-validate/) below for the actual, more elaborate example this is based on):
 
 ```yaml
 # regexped.yaml
@@ -168,7 +168,7 @@ Per-language wasmtime examples live under [`examples/wasmtime/`](../examples/was
 
 | Language | Example | Engine | Demonstrates |
 |---|---|---|---|
-| Rust | [`rust/url-ipv6/`](../examples/wasmtime/rust/url-ipv6/) | DFA | Anchored match — validate IPv6 URLs |
+| Rust | [`rust/url-validate/`](../examples/wasmtime/rust/url-validate/) | DFA | Anchored match — validate HTTP(S) URLs with an IPv4, IPv6 or host-name host; the regexp built from references |
 | Rust | [`rust/secrets/`](../examples/wasmtime/rust/secrets/) 🧩 | DFA find | Three-pattern credential scan (GitHub PAT, JWT, AWS) as a **component**: a wasip2 guest composed with `wac` |
 | Rust | [`rust/secret-scanner/`](../examples/wasmtime/rust/secret-scanner/) 🧩 | Set `find` | Multi-pattern secret detection from a native host, loading the set as a module (the WASM export called directly, gate array and all) and as a component |
 | Go | [`go/csv/`](../examples/wasmtime/go/csv/) | TDFA named groups | CSV parse + email validation |

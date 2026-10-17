@@ -43,7 +43,7 @@ func genStubsForIsolation(t *testing.T, ext string, batch bool) string {
 		Patterns: []config.PatternEntry{
 			{Name: "w", Regexp: `[a-z]+`, FindFunc: "findWords"},
 			{Name: "n", Regexp: `[0-9]+`, MatchFunc: "matchNums"},
-			{Name: "g", Regexp: `(?P<a>[a-z])(?P<b>[0-9])`, GroupsFunc: "grp"},
+			{Name: "g", Regexp: `(?<a>[a-z])(?<b>[0-9])`, GroupsFunc: "grp"},
 		},
 		Sets:     []config.SetConfig{sc},
 		StubFile: "out." + ext,
@@ -203,7 +203,7 @@ func isolationConfig(batch bool) config.BuildConfig {
 		Patterns: []config.PatternEntry{
 			{Name: "words", Regexp: `[a-z]+`, FindFunc: "findWords"},
 			{Name: "nums", Regexp: `[0-9]+`, FindFunc: "findNums"},
-			{Name: "pairs", Regexp: `(?P<letter>[a-z])(?P<digit>[0-9])`, GroupsFunc: "findPairs"},
+			{Name: "pairs", Regexp: `(?<letter>[a-z])(?<digit>[0-9])`, GroupsFunc: "findPairs"},
 		},
 		Sets:     []config.SetConfig{set},
 		StubFile: "stubs.js",

@@ -1,6 +1,8 @@
-# url-ipv6 — IPv6 URL validation
+# url-validate — URL validation
 
-Validates that the input is an HTTP/HTTPS URL whose host is an IPv6 address in bracket notation (`[2001:db8::1]`). Uses **DFA anchored match**.
+Validates that the whole input is an HTTP or HTTPS URL whose host is an IPv4 address, an IPv6 address in brackets (`[2001:db8::1]`) or a host name, with an optional user, port, path, query and fragment. Uses **DFA anchored match**.
+
+The regexp is built from named pieces — `octet`, `ipv4`, `h16`, `ipv6`, `label`, `hostname`, `port` — each written once in `regexped.yaml` and used by reference, `(?&name)`; see [docs/references.md](../../../../docs/references.md).
 
 ## Prerequisites
 
@@ -20,7 +22,7 @@ What each target needs:
 | `make` | builds `final.wasm` — the steps below | `regexped`, Rust, `wasm-merge` |
 | `make generate` | generates the Rust stub `stub.rs` | `regexped` |
 | `make build` | generates the stub if needed, then `cargo build --target wasm32-wasip1` | `regexped`, Rust |
-| `make compile` | compiles the pattern to `url_ipv6.wasm` | `regexped` |
+| `make compile` | compiles the pattern to `url_validate.wasm` | `regexped` |
 | `make merge` | merges the two into `final.wasm` — the same as `make` | `regexped`, Rust, `wasm-merge` |
 | `make run` | builds if needed, then runs `final.wasm` under wasmtime on five inputs | all of the above, plus `wasmtime` |
 | `make clean` | removes the build outputs | — |
@@ -37,19 +39,19 @@ make run   # run it
 Expected output of `make run`:
 ```
 === not a URL ===
-Not a valid IPv6 URL
+Not a valid URL
 
-=== IPv4 URL (not matched) ===
-Not a valid IPv6 URL
+=== host name ===
+Valid URL (matched 24 bytes)
 
 === IPv6 URL, no port ===
-Valid IPv6 URL (matched 25 bytes)
+Valid URL (matched 25 bytes)
 
 === IPv6 URL with port ===
-Valid IPv6 URL (matched 25 bytes)
+Valid URL (matched 25 bytes)
 
-=== IPv6 loopback, path and query ===
-Valid IPv6 URL (matched 29 bytes)
+=== IPv6 link-local, path and query ===
+Valid URL (matched 29 bytes)
 ```
 
 ## Build pipeline

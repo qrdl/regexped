@@ -132,7 +132,7 @@ func TestComponentAdaptersSelection(t *testing.T) {
 	entries := []config.PatternEntry{
 		{Regexp: `abc`, MatchFunc: "m"},
 		{Regexp: `def`, FindFunc: "f"},
-		{Regexp: `(?P<g>x)y`, GroupsFunc: "g"},
+		{Regexp: `(?<g>x)y`, GroupsFunc: "g"},
 		{Regexp: `zzz`}, // no _func: contributes nothing
 	}
 	compiled := compileForTest(t, entries)
@@ -173,7 +173,7 @@ func TestComponentModuleAssemblesAndValidates(t *testing.T) {
 	entries := []config.PatternEntry{
 		{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Regexp: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
+		{Regexp: `(?<opt>x)?(?<tail>y+)`, GroupsFunc: "opt_groups"},
 	}
 	wasm, _, err := Compile(entries, 0, true, componentOpts(entries))
 	if err != nil {
@@ -803,7 +803,7 @@ func TestComponentPatternResourcesAssembleAndValidate(t *testing.T) {
 	entries := []config.PatternEntry{
 		{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Regexp: `(?P<opt>x)?(?P<tail>y+)`, GroupsFunc: "opt_groups"},
+		{Regexp: `(?<opt>x)?(?<tail>y+)`, GroupsFunc: "opt_groups"},
 	}
 	wasm, _, err := Compile(entries, 0, true, CompileOptions{
 		Component:                 true,
@@ -928,7 +928,7 @@ func TestPatRepSize(t *testing.T) {
 func TestOrderedPatternResources(t *testing.T) {
 	entries := []config.PatternEntry{
 		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
-		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
+		{Regexp: `(?<opt>x)?y`, GroupsFunc: "opt_groups"},
 	}
 	compiled := compileForTest(t, entries)
 	if got := orderedPatternResources(compiled, nil, 0); got != nil {

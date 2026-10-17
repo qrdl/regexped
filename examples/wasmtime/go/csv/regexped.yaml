@@ -12,5 +12,5 @@ patterns:
   # Parses rows that also have a valid email address; extracts named capture groups.
   # Named groups reach the stub as generated index constants — see the
   # parse_csv_row_id / _name / _email uses in main.go.
-  - regexp:      '(?P<id>"?[0-9]+"?),(?P<name>[^,\n]+),(?P<email>[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'
+  - regexp:      '(?<id>"?[0-9]+"?),(?<name>[^,\n]+),(?<email>[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'
     groups_func:  "parse_csv_row"

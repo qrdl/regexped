@@ -150,7 +150,7 @@ no line anchors, no word boundaries, no ambiguous alternations). Each test case
 verifies both the match end position and all capture slot positions.
 
 Examples of patterns handled by TDFA:
-- `(?P<scheme>https?)://(?P<host>[^/:?#]+)...` — disjoint scheme alternatives
+- `(?<scheme>https?)://(?<host>[^/:?#]+)...` — disjoint scheme alternatives
 - `(\d{4})-(\d{2})-(\d{2})` — date capture with fixed delimiters
 - `([a-z]+)(er)([a-z]+)` — a quantifier loop whose exit overlaps its own
   class no longer disqualifies TDFA on its own (2026-08-01); see

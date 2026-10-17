@@ -2,8 +2,8 @@
 REGEXPED    := ../../../../regexped
 WASM_TARGET := wasm32-wasip1
 
-MAIN_WASM  := target/$(WASM_TARGET)/release/url_ipv6.wasm
-REGEX_WASM := url_ipv6.wasm
+MAIN_WASM  := target/$(WASM_TARGET)/release/url_validate.wasm
+REGEX_WASM := url_validate.wasm
 FINAL_WASM := final.wasm
 
 .PHONY: all generate compile build merge run clean
@@ -43,7 +43,7 @@ run: $(FINAL_WASM)
 	@echo "=== not a URL ==="
 	wasmtime run $(FINAL_WASM) "hello world"
 	@echo ""
-	@echo "=== IPv4 URL (not matched) ==="
+	@echo "=== host name ==="
 	wasmtime run $(FINAL_WASM) "https://example.com/page"
 	@echo ""
 	@echo "=== IPv6 URL, no port ==="
@@ -52,7 +52,7 @@ run: $(FINAL_WASM)
 	@echo "=== IPv6 URL with port ==="
 	wasmtime run $(FINAL_WASM) "https://[::1]:8080/health"
 	@echo ""
-	@echo "=== IPv6 loopback, path and query ==="
+	@echo "=== IPv6 link-local, path and query ==="
 	wasmtime run $(FINAL_WASM) "http://[fe80::1]/index?page=1"
 
 clean:

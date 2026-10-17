@@ -734,7 +734,7 @@ func TestComponentAdaptersOverTheRealABI(t *testing.T) {
 	entries := []config.PatternEntry{
 		{Regexp: `[a-z]+`, MatchFunc: "m"},
 		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
-		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
+		{Regexp: `(?<opt>x)?y`, GroupsFunc: "g"},
 	}
 	w, names, res := componentWasm(t, entries, compile.CompileOptions{})
 	// instantiateCore, not instantiate: every find and groups resource imports a
@@ -1904,7 +1904,7 @@ func TestComponentPatternFindResource(t *testing.T) {
 // empty list that means the scan is finished.
 func TestComponentPatternGroupsResource(t *testing.T) {
 	h, res := newPatternResourceHarness(t, []config.PatternEntry{
-		{Regexp: `(?P<opt>x)?y`, GroupsFunc: "g"},
+		{Regexp: `(?<opt>x)?y`, GroupsFunc: "g"},
 	})
 	n := res["g"]
 	if !n.Groups {

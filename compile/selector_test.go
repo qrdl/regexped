@@ -470,7 +470,7 @@ func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
 		why      string
 	}{
 		{`([0-9]{4})-([0-9]{2})-([0-9]{2})`, true, "plain greedy captures"},
-		{`(?P<scheme>https?)://(?P<host>[^/:?#]+)`, true, "named captures"},
+		{`(?<scheme>https?)://(?<host>[^/:?#]+)`, true, "named captures"},
 		{`(a*)(a*)b`, true, "adjacent greedy stars are still TDFA-eligible"},
 		{`^([^,]*),([^,]*)$`, false, "line anchors excluded from TDFA"},
 		{`\b(\w+)@(\w+)\b`, false, "word boundary excluded from TDFA"},

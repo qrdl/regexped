@@ -2198,6 +2198,9 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	for _, re := range cfg.Patterns {
 		p, err := compilePattern(re, tableBase, 0, opts)
 		if err != nil {
+			if re.Expanded != nil {
+				return nil, 0, nil, patternError(re, err)
+			}
 			return nil, 0, nil, err
 		}
 		// Batch find/groups export trigger — same
@@ -2281,6 +2284,18 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		// set's tables on top of this one's.
 		if top := cs.dataTop(); top > setTableBase {
 			setTableBase = top
+		}
+	}
+	// A set's own regexps go through the per-pattern step a `patterns:` entry
+	// with no function goes through, so `--verbose` lists them as it lists
+	// patterns. Such an entry emits no code and takes no table space. After
+	// the sets, which report any error in them first, as they always have.
+	for _, sc := range cfg.Sets {
+		for k := range sc.Regexps {
+			re := sc.InlineEntry(k)
+			if _, err := compilePattern(re, tableBase, 0, opts); err != nil {
+				return nil, 0, nil, fmt.Errorf("set %q: regexp %q: %w", sc.Name, re.Written(), err)
+			}
 		}
 	}
 

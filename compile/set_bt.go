@@ -102,7 +102,7 @@ func setPatternInfos(sc config.SetConfig, members []config.SetMember, cfg config
 		if err != nil {
 			kind, patLabel := "pattern", re.Name
 			if patLabel == "" {
-				patLabel = re.Regexp
+				patLabel = re.Written()
 			}
 			if m.Inline {
 				kind = "regexp"

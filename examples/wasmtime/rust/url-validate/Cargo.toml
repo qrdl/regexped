@@ -1,8 +1,8 @@
 [package]
-name = "url-ipv6"
+name = "url-validate"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "url_ipv6"
+name = "url_validate"
 path = "main.rs"

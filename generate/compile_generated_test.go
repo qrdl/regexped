@@ -29,9 +29,12 @@ import (
 // predicted.
 //
 // TOOLCHAINS. Only Go is guaranteed — these tests are written in it. Every
-// other language is SKIPPED when its compiler is not on PATH, so this is a
-// stronger check on a developer machine than in a bare CI container and never
-// a false failure. Skipped in -short.
+// other language's COMPILE step is SKIPPED when its compiler is not on PATH,
+// so this is a stronger check on a developer machine than in a bare CI
+// container and never a false failure. The stub is GENERATED first either
+// way: the generator runs, and is covered, without the toolchain — a stub
+// shape only this test reaches (the AssemblyScript set iterator's sweep and
+// memo arms) went uncovered wherever asc was missing. Skipped in -short.
 func TestGeneratedStubsCompile(t *testing.T) {
 	if testing.Short() {
 		t.Skip("compiling generated stubs is slow; skipped in -short")
@@ -46,7 +49,7 @@ func TestGeneratedStubsCompile(t *testing.T) {
 		Patterns: []config.PatternEntry{
 			{
 				Name:       "url",
-				Regexp:     `(?P<scheme>https?)://(?P<host>[a-z.]+)/([a-z/]*)`,
+				Regexp:     `(?<scheme>https?)://(?<host>[a-z.]+)/([a-z/]*)`,
 				MatchFunc:  "url_match",
 				FindFunc:   "url_find",
 				GroupsFunc: "url_groups",
@@ -247,17 +250,17 @@ func TestGeneratedStubsCompile(t *testing.T) {
 			{"ts", "stubs.ts", tsStub, "tsc", compileTS},
 		} {
 			t.Run(lang.name+variant.suffix, func(t *testing.T) {
-				if lang.compiler != "" {
-					if _, err := exec.LookPath(lang.compiler); err != nil {
-						t.Skipf("%s not on PATH; this check is a no-op here", lang.compiler)
-					}
-				}
 				dir := t.TempDir()
 				path := filepath.Join(dir, lang.file)
 				cfg := variant.cfg
 				cfg.StubFile = lang.file
 				if err := lang.write(cfg, path); err != nil {
 					t.Fatalf("generate %s stub: %v", lang.name, err)
+				}
+				if lang.compiler != "" {
+					if _, err := exec.LookPath(lang.compiler); err != nil {
+						t.Skipf("%s not on PATH: the stub was generated, not compiled", lang.compiler)
+					}
 				}
 				lang.compile(t, dir, path)
 			})

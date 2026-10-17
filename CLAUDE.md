@@ -23,11 +23,14 @@ When `cfg.Sets` is non-empty, `CompileFile` (in `compile/set_emit.go`) replaces 
 ```
 regexped/
 ├── README.md                  # Project page: features, capabilities, performance, install, usage
+├── LICENSE                    # EUPL-1.2, the text verbatim (so GitHub and pkg.go.dev detect it)
+├── LICENSE-EXCEPTION          # Copyright notice + the exception: regexped's OUTPUT is free of the EUPL
 ├── main.go                    # CLI entry point: generate, compile, merge
 ├── config/
 │   ├── config.go              # YAML configuration parsing
 │   ├── format.go              # wasm_format rules: what a component config may declare
 │   ├── identifier.go          # Export-name shape and per-language reserved-word validation
+│   ├── references.go          # Pattern references, (?&name) / (?<&name>): expanded at LOAD
 │   └── names.go               # Derived names: kebab-casing, WIT package and world, module names
 ├── compile/
 │   ├── compile.go             # Public API: Compile, CompileForced, SelectEngine, assembleModule, CmdCompile, CmdWriteDiagJSON
@@ -739,6 +742,7 @@ regexped/
 │   ├── re2.md                 # RE2 test coverage
 │   ├── wasm.md                # WASM interface, memory layout, table formats
 │   ├── sets.md                # Set composition: five capabilities, YAML schema, gate array, output formats
+│   ├── references.md          # Pattern references: (?&name), (?<&name>), what a reference ignores
 │   ├── performance.md         # regexped vs the regex crate and regex-automata: averages + tables (README links)
 │   ├── complexity.md          # Every mechanism against quadratic time and unbounded memory — engines,
 │   │                          #   find switch, notes, Backtracking budget/memo, set split, sparse counter,
@@ -764,7 +768,7 @@ regexped/
     │                          #   European alphabets they fit (Unicode sets)
     └── wasmtime/
         ├── rust/
-        │   ├── url-ipv6/      # DFA anchored match: validate IPv6 URLs (Rust)
+        │   ├── url-validate/  # DFA anchored match: validate HTTP(S) URLs, regexp built from references (Rust)
         │   ├── secrets/       # DFA find: scan text for GitHub/JWT/AWS secrets (Rust)
         │   └── secret-scanner/ # native Rust host embedding a set, as a module and as a component
         ├── go/
@@ -844,8 +848,9 @@ max_memory:     100MB                # optional; declared as the module memory's
 # `regexps:` / `pattern:` were the old names of `patterns:` / `regexp:` and are
 # load errors now (strict decoding).
 patterns:                            # optional when every regexp lives in a set's regexps:
-  - regexp: '(?P<scheme>https?)://(?P<host>[^/:?#]+)...'   # required
-    name: url                        # optional; selects it from a set's patterns: list
+  - regexp: '(?<scheme>https?)://(?<host>[^/:?#]+)...'   # required
+    name: url                        # optional; selects it from a set's patterns: list, and lets
+                                     #   another regexp use it as (?&url) / (?<&url>) (references)
 
     # All func fields are optional; an entry with only 'regexp' is silently skipped.
     # Each func name becomes the WASM export name AND the generated function name.
@@ -871,6 +876,8 @@ sets:
 **`byte_mode:` and the unsupported-rune gate.** In BYTE mode — `.` consumes one byte, classes are byte classes, `\b` is ASCII — a rune above U+007F has no byte to be. A pattern naming one asks for UNICODE mode instead (`compile/utf8_lower.go`: `resolvePattern` decides a pattern's mode once and the program is lowered to UTF-8 byte ranges; a SET has one mode for all its members, `resolveSetMode`, and in Unicode mode keeps no match or empty match inside a character at four sites — the per-position walk's candidate skip, the answer cache's sweep, the program sweep's rows and the split merge's search position — all keyed off `setStartNeeds`, since only an EMPTY match can sit inside a character). In byte mode — `byte_mode: true`, `unicode: false`, or a harness's `CompileOptions.ForceByteMode` — `compile/compile.go`'s `unsupportedRune` rejects a rune past the limit, with a message that names it (and points at `byte_mode: true` for one up to U+00FF); a rune above U+00FF is rejected under `byte_mode` too, with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). A literal carrying them is extracted like an ASCII one (`literalBytes`, `compile/mandatory_lit.go`); until 2026-10-12 every literal extractor refused a rune above 0x7F in byte mode, so such a set walked a fallback bucket and such a pattern lost its literal-anchored find. The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
 
 TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` and `CompileOptions.ForceByteMode` are how a caller (every harness, and `CompileForced`) states a pattern's mode instead of letting `resolvePattern` decide it.
+
+**References (`config/references.go`).** A regexp — top-level or a set's own — may use a NAMED top-level pattern: `(?&name)` inserts its `regexp:` as `(?:…)`, `(?<&name>)` as `(?<name>…)`; Go's parser rejects both spellings, so no existing regexp changes meaning, and text Go reads otherwise (`[...]`, `\Q…\E`, after `\`) is never one. `config.ExpandReferences` rewrites them in `LoadConfig` BEFORE every other check, so compile, generate and merge see only expanded text, and a pattern written with references compiles to the module the hand-expanded one does (`TestReferencesCompileByteIdentical`); a config built in code calls it itself. The entry keeps what was written and the pieces used (`PatternEntry.Expanded`, `SetConfig.Expansions`; `Written()` names it in messages). Only the referenced `regexp:` is used — its mode keys, hints and `_func`s are ignored, the USING pattern's mode decides (its keys, or the guess over the expanded text). A reference takes no body; a name is `[A-Za-z0-9_]+`; a cycle is an error; each piece parses on its own first so its syntax error names it and its users; a piece's own groups come along, a duplicate name names the references (`captureNameProblems`); a byte-gate refusal caused by a piece's text names the piece (`pieceWithRune`, `patternError`). A piece is an ordinary top-level pattern, so `patterns: all` holds it. `compile --verbose` prints `expanded:` under such a pattern, and lists a set's own regexps with the patterns (`SetConfig.InlineEntry`, `<set>: regexps[<i>]`), through the per-pattern step a no-`_func` entry takes, which emits no code. Named groups are documented as `(?<name>…)`; Python's `(?P<name>…)` stays accepted — regexped accepts every spelling Go accepts. See `docs/references.md`.
 
 Setting `groups_func` triggers capture-tracking compilation (TDFA or Backtracking engine).
 A `groups_func` on a pattern with no capture group that can take part in a match (`a*`, `(?:(a){0})b`) is REFUSED — at config load (`config.PatternEntry.GroupsWithoutCaptures`), by `compile` (`compile.ErrNoCaptureGroup`) and by `generate` — because it used to compile to a module with no groups export while every stub called one.
@@ -974,6 +981,8 @@ Uses WASM SIMD (simd128): `v128.load`, `i8x16.splat`, `i8x16.swizzle`, `i8x16.eq
 - `appendDataSegment(out, offset, data)` — active data segment at fixed memory offset
 
 ### 3. Code Generation (`generate/`)
+
+**Every generated file opens with two comment lines** (`generate/generate.go`, `lineCommentHeader` / `blockCommentHeader` — every generator and the WIT writers use them): `Auto-generated by regexped. Do not edit.` and the licence notice that the file may be used under terms of the user's choice (`LICENSE-EXCEPTION`), so the permission travels with the file, as Bison's does in its skeletons.
 
 **WASM export names = func names.** The value of `match_func`, `find_func` or `groups_func` is used directly as the WASM export name. This ensures unique export names in merged WASMs.
 
@@ -1816,9 +1825,9 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-15
+**Last Updated:** 2026-10-17
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
-**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs)
+**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs), `docs/references.md` (pattern references)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity — in Unicode mode, first CHARACTERS; when every literal begins with a non-ASCII character — or, in byte mode, a `byte_mode` byte 0xC2-0xF4 — its root prefilter probes two byte columns, not the lead byte, and verifies a hit against the literals sharing its most varied byte before the trie walk, jumping straight to the literal's node), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.

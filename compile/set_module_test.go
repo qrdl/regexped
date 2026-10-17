@@ -805,7 +805,7 @@ func TestSetWithIndividualFuncs(t *testing.T) {
 	cfg := config.BuildConfig{
 		Patterns: []config.PatternEntry{
 			{Name: "p1", Regexp: `foo\d+`, MatchFunc: "p1_match", FindFunc: "p1_find"},
-			{Name: "p2", Regexp: `(?P<n>bar)(?P<m>\d+)`, GroupsFunc: "p2_groups"},
+			{Name: "p2", Regexp: `(?<n>bar)(?<m>\d+)`, GroupsFunc: "p2_groups"},
 			{Name: "p3", Regexp: `baz\w+`},
 		},
 		Sets: []config.SetConfig{
@@ -1970,12 +1970,12 @@ func setMatrixCases() []setMatrixCase {
 		},
 		{
 			name: "set-plus-groups", selects: "a groups wrapper beside a set — capture patterns are dropped FROM the set but keep their own export",
-			patterns: []string{`(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, `plain[0-9]+`},
+			patterns: []string{`(?<user>[a-z]+)@(?<host>[a-z.]+)`, `plain[0-9]+`},
 			caps:     capsAll, perPattern: perPatternExports{groups: true, find: true},
 		},
 		{
 			name: "set-plus-batch-groups", selects: "the per-pattern BATCH groups wrapper beside a set",
-			patterns: []string{`(?P<a>[a-z])(?P<b>[0-9])`, `lit[0-9]+`},
+			patterns: []string{`(?<a>[a-z])(?<b>[0-9])`, `lit[0-9]+`},
 			caps:     capsFind, perPattern: perPatternExports{groups: true, find: true, batch: true},
 		},
 		{
@@ -1985,7 +1985,7 @@ func setMatrixCases() []setMatrixCase {
 		},
 		{
 			name: "set-plus-everything", selects: "match, find, groups and batching per pattern, all beside a set",
-			patterns: []string{`(?P<w>[a-z]+)@(?P<h>[a-z.]+)`, `[a-z]+@example\.com`},
+			patterns: []string{`(?<w>[a-z]+)@(?<h>[a-z.]+)`, `[a-z]+@example\.com`},
 			caps:     capsAll, perPattern: perPatternExports{match: true, find: true, groups: true, batch: true},
 		},
 	}
