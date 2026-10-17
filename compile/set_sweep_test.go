@@ -921,7 +921,7 @@ func TestSetOverlapCacheShapeIneligible(t *testing.T) {
 // read as "no cache needed".
 func TestSetOverlapCacheShapeCompileError(t *testing.T) {
 	cfg := config.BuildConfig{
-		Patterns: []config.PatternEntry{{Name: "bad", Regexp: `(?P<x>`}},
+		Patterns: []config.PatternEntry{{Name: "bad", Regexp: `(?<x>`}},
 	}
 	sc := config.SetConfig{
 		Name: "s", Find: "s_find", Overlapping: true,
@@ -1046,7 +1046,7 @@ func sweepPatterns() []string {
 func sweepCapturePatterns() []string {
 	base := []string{
 		`(a+)(b+)`, `(a+?)(b+)`, `(\w+)`, `([^,]+),`, `(a|b)*c`, `((a)(b))`,
-		`(?P<x>[0-9]{2})-(?P<y>[0-9]{2})`, `(a)(b)(c)(d)(e)`, `(.*?)END`,
+		`(?<x>[0-9]{2})-(?<y>[0-9]{2})`, `(a)(b)(c)(d)(e)`, `(.*?)END`,
 		`\b(\w+)\b`, `(?m:^)(\w+)(?m:$)`, `(a{2,4})b`, `((?:ab)+)c`,
 		`ghp_([A-Za-z0-9]{24,32})`, `x([a-z]{24,30})`, `\A(\w+)\z`,
 		`\B(\w+)\B`, `<([^>]+)>`, `(?s)(.*)`, `((a|b)+)(c|d)`,

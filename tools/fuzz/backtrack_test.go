@@ -858,7 +858,7 @@ func btMemoCall(t *testing.T, wasmBytes []byte, export, input string, extraArgs 
 // The memo used to be a compile-time region with a length ceiling — for
 // htmlTags a 41,942-byte extent, which the lengths below straddle. The
 // fallback sizes its memo from the input, so every length must now be answered.
-const htmlTagsPattern = `<(?P<tag>\w+)(?:\s*(?P<attr>\w+)?(?:="(?P<val>[^"]*)")?)*?>`
+const htmlTagsPattern = `<(?<tag>\w+)(?:\s*(?<attr>\w+)?(?:="(?<val>[^"]*)")?)*?>`
 
 func TestBTMemoOverflowIsGuarded(t *testing.T) {
 	squeezed := compile.CompileOptions{MaxDFAStates: 1}

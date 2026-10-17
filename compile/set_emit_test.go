@@ -155,7 +155,7 @@ func TestSetEmitEmbeddedModuleWithPerPatternExports(t *testing.T) {
 		// body is ANCHORED, which selects the other batch-groups wrapper —
 		// the native lit-chain one, with no find body to compose.
 		{
-			Name: "lit_chain", Regexp: `ghp_(?P<id>[A-Za-z0-9]{36})`,
+			Name: "lit_chain", Regexp: `ghp_(?<id>[A-Za-z0-9]{36})`,
 			GroupsFunc: "lit_chain_groups",
 			Hints:      []string{"batch-find"},
 		},
@@ -259,7 +259,7 @@ func TestSetEmitOverlapPreflightIDSpaceExceedsMembers(t *testing.T) {
 	// Declared last, dropped from the set, and its index is what IDSpaceSize
 	// is computed from.
 	entries = append(entries, config.PatternEntry{
-		Name: "dropped", Regexp: `(?P<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
+		Name: "dropped", Regexp: `(?<g>[^\n]*[6-8])`, GroupsFunc: "dropped_groups",
 	})
 	cfg := config.BuildConfig{
 		Patterns: entries,

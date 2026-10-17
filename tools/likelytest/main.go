@@ -249,7 +249,7 @@ var tests = []testCase{
 		// Group offsets must account for the prefix (group d at 0..8, group
 		// k at 12..48 after the K=4 ghp_ literal).
 		name:    "mixed-prefix-groups",
-		pattern: `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+		pattern: `(?<digits>[0-9]{8})ghp_(?<key>[A-Za-z0-9]{36})`,
 		mode:    modeGroups,
 		notes:   "mixed-prefix shape with captures",
 		matchInput: configInput([]string{

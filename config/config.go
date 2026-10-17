@@ -182,6 +182,10 @@ type SetConfig struct {
 	// member from the two together.
 	Patterns PatternSelector `yaml:"patterns"`
 	Regexps  []string        `yaml:"regexps"`
+	// Expansions parallels Regexps once ExpandReferences has run: the record
+	// of a regexp that used a reference, nil for one that did not, and nil
+	// as a whole when none did. Not a config key.
+	Expansions []*Expansion `yaml:"-"`
 	// EmitNameMap generates this set's own name lookup in the stubs,
 	// <set>_pattern_name(id) in each language's spelling: the `name:` of a
 	// named top-level member, "" for an unnamed one and for an inline regexp.
@@ -330,9 +334,25 @@ func (s SetConfig) Members(cfg BuildConfig) []SetMember {
 		}
 	}
 	for k, r := range s.Regexps {
-		out = append(out, SetMember{Entry: PatternEntry{Regexp: r}, ID: len(cfg.Patterns) + k, Inline: true})
+		out = append(out, SetMember{Entry: PatternEntry{Regexp: r, Expanded: s.expansion(k)}, ID: len(cfg.Patterns) + k, Inline: true})
 	}
 	return out
+}
+
+// expansion is the record of the set's own regexp k, nil when it used no
+// reference.
+func (s SetConfig) expansion(k int) *Expansion {
+	if k < len(s.Expansions) {
+		return s.Expansions[k]
+	}
+	return nil
+}
+
+// InlineEntry is the set's own regexp k as an entry, labelled for
+// `compile --verbose` (`s: regexps[0]`): what the compiler runs through the
+// per-pattern step a `patterns:` entry with no function goes through.
+func (s SetConfig) InlineEntry(k int) PatternEntry {
+	return PatternEntry{Regexp: s.Regexps[k], Expanded: s.expansion(k), Label: fmt.Sprintf("%s: regexps[%d]", s.Name, k)}
 }
 
 // patternNameIndex maps each named top-level pattern to its index; the first
@@ -619,7 +639,7 @@ func validateHints(cfg *BuildConfig) error {
 	for _, re := range cfg.Patterns {
 		label := re.Name
 		if label == "" {
-			label = re.Regexp
+			label = re.Written()
 		}
 		if err := validateHintList(re.Hints); err != nil {
 			return fmt.Errorf("pattern %q: hints: %w", label, err)
@@ -678,7 +698,7 @@ func ValidateSets(cfg *BuildConfig) error {
 		if re.Name != "" {
 			owner = fmt.Sprintf("pattern %q", re.Name)
 		} else if re.Regexp != "" {
-			owner = fmt.Sprintf("pattern %q", re.Regexp)
+			owner = fmt.Sprintf("pattern %q", re.Written())
 		}
 		for _, name := range []string{re.MatchFunc, re.FindFunc, re.GroupsFunc} {
 			if name == "" {
@@ -803,9 +823,9 @@ func (m SetMember) label() string {
 	case m.Entry.Name != "":
 		return fmt.Sprintf("pattern %q", m.Entry.Name)
 	case m.Inline:
-		return "regexp '" + m.Entry.Regexp + "'"
+		return "regexp '" + m.Entry.Written() + "'"
 	}
-	return "pattern '" + m.Entry.Regexp + "'"
+	return "pattern '" + m.Entry.Written() + "'"
 }
 
 // EquivalentMembers returns the first two members, in member order, that
@@ -913,6 +933,14 @@ type PatternEntry struct {
 	// export for this pattern's find_func/groups_func, consumed only by the
 	// JS and TS generators (a no-op for Rust/Go/C/AS stubs).
 	Hints []string `yaml:"hints"`
+
+	// Expanded is set by ExpandReferences when the regexp used a reference:
+	// Regexp then holds the expanded text, and Expanded the text as written
+	// and the patterns it used. Nil otherwise. Not a config key.
+	Expanded *Expansion `yaml:"-"`
+	// Label names the entry in `compile --verbose` when it has no name of
+	// its own to go by: a set's own regexp, `s: regexps[0]`. Not a config key.
+	Label string `yaml:"-"`
 }
 
 // CaptureStubsRequested reports whether any capture-returning stub is requested.
@@ -969,7 +997,7 @@ func validateModeKeys(cfg *BuildConfig, byteModeSet []bool) error {
 		}
 		label := re.Name
 		if label == "" {
-			label = re.Regexp
+			label = re.Written()
 		}
 		explicit := i < len(byteModeSet) && byteModeSet[i]
 		switch {
@@ -1036,6 +1064,11 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 			}
 			return BuildConfig{}, fmt.Errorf("config %s: pattern %s has an empty regexp", configPath, label)
 		}
+	}
+
+	// References first: every check below reads the expanded regexps.
+	if err := ExpandReferences(&cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 
 	// Resolve all paths relative to the config file's directory.

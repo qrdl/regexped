@@ -14,5 +14,5 @@ patterns:
     find_func: "token_find"
   - regexp: 'AKIA[A-Z0-9]{4}'
     find_func: "aws_find"
-  - regexp: '(?P<opt>x)?(?P<tail>y+)'
+  - regexp: '(?<opt>x)?(?<tail>y+)'
     groups_func: "opt_groups"

@@ -129,7 +129,7 @@ func <groups_func>_names() []string                 // aligned with indices
 
 The constants cover a name known at compile time at no cost; `_index` is for one chosen at runtime. An **empty** name is never found: a pattern may hold several unnamed groups, so `""` identifies nothing. `_names` follows `regexp.SubexpNames` — entry *i* names the group at index *i* and is `""` where it has none, index 0 included.
 
-Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated constant.
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?<a>x)(?<a>y)` and `(?<host>x)(?<Host>y)`, but both would collapse to one generated constant.
 
 ---
 

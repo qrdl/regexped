@@ -5,7 +5,7 @@ find-mode patterns, compiled into a single **Component Model component** and
 consumed through a **regexped-generated Rust stub**.
 
 This is the component-format example. Every other Rust example here uses the
-default module format — `wasm-merge` instead of `wac` — and `../url-ipv6` is the
+default module format — `wasm-merge` instead of `wac` — and `../url-validate` is the
 one to read for that.
 
 | Pattern | Example match |

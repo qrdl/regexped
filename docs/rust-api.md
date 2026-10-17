@@ -198,7 +198,7 @@ The constants cover a name known at compile time at no cost; `_index` is for one
 
 These names follow **your** config's casing, not Rust's: `groups_func: url_groups` yields `url_groups_host`, `groups_func: urlGroups` yields `urlGroupsHost`. A lowercase `const` draws a `non_upper_case_globals` warning, so the generator suppresses the lint rather than renaming your symbol.
 
-Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated constant.
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?<a>x)(?<a>y)` and `(?<host>x)(?<Host>y)`, but both would collapse to one generated constant.
 
 ---
 

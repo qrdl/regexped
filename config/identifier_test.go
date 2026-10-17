@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -152,7 +153,7 @@ func TestValidateConfig_GroupsWithoutCaptures(t *testing.T) {
 		{`(?:(a){0})b`, true}, // the only group is simplified away
 		{`(?:a|b)+`, true},
 		{`(a)*`, false},
-		{`(?P<x>a)b`, false},
+		{`(?<x>a)b`, false},
 		{`(`, false}, // does not parse: reported elsewhere
 	} {
 		re := PatternEntry{Regexp: c.pattern, GroupsFunc: "g"}
@@ -211,7 +212,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 	// visits last — so named_groups_func would silently expose only one of them.
 	t.Run("rejected_for_groups_func", func(t *testing.T) {
 		cfg := BuildConfig{Patterns: []PatternEntry{
-			{Regexp: `(?P<a>x)(?P<a>y)`, GroupsFunc: "ng"},
+			{Regexp: `(?<a>x)(?<a>y)`, GroupsFunc: "ng"},
 		}}
 		err := ValidateConfig(&cfg)
 		if err == nil {
@@ -222,14 +223,26 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 		}
 	})
 
+	// Python's spelling, (?P<name>…), is the one Go accepted first and still
+	// accepts. It is not the documented one, but it must keep working: a
+	// duplicate across the two spellings is the same duplicate.
+	t.Run("old_spelling", func(t *testing.T) {
+		cfg := BuildConfig{Patterns: []PatternEntry{
+			{Regexp: `(?P<a>x)(?<a>y)`, GroupsFunc: "ng"},
+		}}
+		if err := ValidateConfig(&cfg); err == nil || !strings.Contains(err.Error(), `capture group name "a" is used more than once`) {
+			t.Errorf("ValidateConfig = %v, want the duplicate across spellings refused", err)
+		}
+	})
+
 	// match_func and find_func report no captures at all, so a repeated group
 	// name is unambiguous for them and stays legal. groups_func is now the one
 	// that turns names into symbols (named_groups_func was retired),
 	// so it is the one that rejects.
 	t.Run("allowed_without_groups_func", func(t *testing.T) {
 		cfg := BuildConfig{Patterns: []PatternEntry{
-			{Regexp: `(?P<a>x)(?P<a>y)`, MatchFunc: "m"},
-			{Regexp: `(?P<a>x)(?P<a>y)`, FindFunc: "f"},
+			{Regexp: `(?<a>x)(?<a>y)`, MatchFunc: "m"},
+			{Regexp: `(?<a>x)(?<a>y)`, FindFunc: "f"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
 			t.Fatalf("ValidateConfig = %v, want nil (only groups_func resolves by name)", err)
@@ -238,7 +251,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 
 	t.Run("distinct_names_accepted", func(t *testing.T) {
 		cfg := BuildConfig{Patterns: []PatternEntry{
-			{Regexp: `(?P<a>x)(?P<b>y)`, GroupsFunc: "ng"},
+			{Regexp: `(?<a>x)(?<b>y)`, GroupsFunc: "ng"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
 			t.Fatalf("ValidateConfig = %v, want nil", err)
@@ -248,7 +261,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 	// A syntax error is compile's to report; ValidateConfig must not duplicate it.
 	t.Run("unparseable_pattern_ignored", func(t *testing.T) {
 		cfg := BuildConfig{Patterns: []PatternEntry{
-			{Regexp: `(?P<a>x`, GroupsFunc: "ng"},
+			{Regexp: `(?<a>x`, GroupsFunc: "ng"},
 		}}
 		if err := ValidateConfig(&cfg); err != nil {
 			t.Fatalf("ValidateConfig = %v, want nil (parse errors are reported by compile)", err)
@@ -257,7 +270,7 @@ func TestValidateConfig_DuplicateCaptureNames(t *testing.T) {
 
 	t.Run("multiple_duplicates_sorted", func(t *testing.T) {
 		cfg := BuildConfig{Patterns: []PatternEntry{
-			{Regexp: `(?P<z>1)(?P<z>2)(?P<a>3)(?P<a>4)`, GroupsFunc: "ng"},
+			{Regexp: `(?<z>1)(?<z>2)(?<a>3)(?<a>4)`, GroupsFunc: "ng"},
 		}}
 		err := ValidateConfig(&cfg)
 		if err == nil {
@@ -602,11 +615,11 @@ func TestPascalCaseMatchesGenerators(t *testing.T) {
 //
 // Every language prefixes it with the function's name (`parse_sqli_type`) or
 // uses it as a JS/TS object KEY, where reserved words are legal. An earlier
-// version of the check rejected `(?P<type>…)` and broke
+// version of the check rejected `(?<type>…)` and broke
 // examples/wasmtime/go/sql-injection, which had used that name for years.
 func TestCaptureGroupNameMayBeAReservedWord(t *testing.T) {
 	cfg := BuildConfig{Patterns: []PatternEntry{
-		{Regexp: `(?P<type>a)(?P<match>b)(?P<class>c)`, GroupsFunc: "parse"},
+		{Regexp: `(?<type>a)(?<match>b)(?<class>c)`, GroupsFunc: "parse"},
 	}}
 	if err := ValidateConfig(&cfg); err != nil {
 		t.Fatalf("ValidateConfig = %v, want nil: group names are always prefixed or used as object keys", err)
@@ -617,7 +630,7 @@ func TestCaptureGroupNameMayBeAReservedWord(t *testing.T) {
 // that differ only in case reach one generated constant stem.
 func TestCaptureGroupNamesCollidingOnCase(t *testing.T) {
 	cfg := BuildConfig{Patterns: []PatternEntry{
-		{Regexp: `(?P<host>x)(?P<Host>y)`, GroupsFunc: "parse"},
+		{Regexp: `(?<host>x)(?<Host>y)`, GroupsFunc: "parse"},
 	}}
 	err := ValidateConfig(&cfg)
 	if err == nil {
@@ -661,7 +674,7 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	cfg := &BuildConfig{
 		StubType: "go", ImportModule: "m",
 		Patterns: []PatternEntry{
-			{Name: "a", Regexp: "(?P<x>a)", GroupsFunc: "parse"},
+			{Name: "a", Regexp: "(?<x>a)", GroupsFunc: "parse"},
 			{Name: "b", Regexp: "b", MatchFunc: "parse_index"},
 		},
 	}
@@ -672,7 +685,7 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	cfg = &BuildConfig{
 		StubType: "ts", ImportModule: "m",
 		Patterns: []PatternEntry{
-			{Name: "a", Regexp: "(?P<x>a)", GroupsFunc: "parseIt"},
+			{Name: "a", Regexp: "(?<x>a)", GroupsFunc: "parseIt"},
 			{Name: "b", Regexp: "b", MatchFunc: "parseItIndices"},
 		},
 	}
@@ -683,7 +696,7 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	cfg = &BuildConfig{
 		StubType: "go", ImportModule: "m",
 		Patterns: []PatternEntry{
-			{Name: "a", Regexp: "(?P<x>a)", GroupsFunc: "parse"},
+			{Name: "a", Regexp: "(?<x>a)", GroupsFunc: "parse"},
 			{Name: "b", Regexp: "b", MatchFunc: "other"},
 		},
 	}
@@ -694,7 +707,7 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	// the helper of the same name within ONE entry.
 	cfg = &BuildConfig{
 		StubType: "go", ImportModule: "m",
-		Patterns: []PatternEntry{{Name: "a", Regexp: "(?P<index>a)", GroupsFunc: "parse"}},
+		Patterns: []PatternEntry{{Name: "a", Regexp: "(?<index>a)", GroupsFunc: "parse"}},
 	}
 	if err := ValidateConfig(cfg); err == nil {
 		t.Error("accepted a capture group named \"index\", want error")
@@ -1450,5 +1463,23 @@ func TestValidateConfigRejectsMalformedSetCapabilityName(t *testing.T) {
 		if !strings.Contains(err.Error(), c.field) {
 			t.Errorf("error does not name the offending capability %s: %v", c.field, err)
 		}
+	}
+}
+
+// A config written with Python's named-group spelling, (?P<name>…), loads to
+// the same entries as the documented (?<name>…) one, apart from the text.
+func TestNamedGroupOldSpellingLoads(t *testing.T) {
+	const body = "patterns:\n  - regexp: '(?P<user>[a-z]+)@(?P<host>[a-z.]+)'\n    groups_func: email_groups\n"
+	old, err := loadCfgSrc(t, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := loadCfgSrc(t, strings.ReplaceAll(body, "(?P<", "(?<"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Patterns[0].Regexp = cur.Patterns[0].Regexp
+	if !reflect.DeepEqual(old.Patterns, cur.Patterns) {
+		t.Errorf("old spelling loads to %+v, new to %+v", old.Patterns, cur.Patterns)
 	}
 }

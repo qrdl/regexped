@@ -2072,7 +2072,7 @@ var groupsFromShapes = []struct {
 	engine           compile.EngineType // 0 = let the selector choose
 }{
 	{name: "tdfa_simple", pat: `(\d{2})-(\d{2})`, input: "aa 11-22 bb 33-44 cc"},
-	{name: "tdfa_named", pat: `(?P<h>[a-z]+)@(?P<d>[a-z]+)\.com`, input: "x ab@cd.com y ef@gh.com"},
+	{name: "tdfa_named", pat: `(?<h>[a-z]+)@(?<d>[a-z]+)\.com`, input: "x ab@cd.com y ef@gh.com"},
 	{name: "tdfa_optional", pat: `(a)(b)?(c)`, input: "ac abc ac"},
 	{name: "bt_nongreedy", pat: `(a.*?b)(c+)`, input: "aXbcc aYbc"},
 	{name: "bt_forced", pat: `(\w+)-(\w+)`, input: "aa-bb cc-dd", engine: compile.EngineBacktrack},
@@ -2083,7 +2083,7 @@ var groupsFromShapes = []struct {
 		input: "foo0123456789012345678901234567 q foo98765432109876543210987654"},
 	{name: "alt_groups", pat: `AKIA([A-Z0-9]{24})|ghp_([A-Za-z0-9]{24})`,
 		input: "AKIA0123456789ABCDEF01234567 ghp_abcdefghij0123456789abcd"},
-	{name: "gap_e_groups", pat: `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+	{name: "gap_e_groups", pat: `(?<digits>[0-9]{8})ghp_(?<key>[A-Za-z0-9]{36})`,
 		input: "01234567ghp_abcdefghijklmnopqrstuvwxyz0123456789 tail"},
 	{name: "word_boundary_groups", pat: `\b(cat)\b`, input: "cat concat cat"},
 	{name: "line_anchor_groups", pat: `(?m:^)(ERR):(.*)(?m:$)`, input: "ERR:one\nok\nERR:two"},
@@ -2409,7 +2409,7 @@ func TestGroupsFromIterationMatchesGo(t *testing.T) {
 func TestBatchGroupsMatchesGo(t *testing.T) {
 	const outBase, outCap = int32(128 * 1024), int32(64)
 	for _, c := range []struct{ pat, input string }{
-		{`https?://(?P<host>[a-z.]+)`, "see http://example.com and http://foo.org here"},
+		{`https?://(?<host>[a-z.]+)`, "see http://example.com and http://foo.org here"},
 		{`(a)(b)`, "abXab"},
 		{`\b(foo)`, "foofoo"},
 		{`(a*)`, "bab"},

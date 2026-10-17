@@ -872,7 +872,7 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		// stubs called the SAME WASM export — so `groups_func` plus the
 		// generated name→index constants replaces it, and C and AS gain named
 		// access they never had.
-		{"named_groups_func", "named_groups_func", "patterns:\n  - regexp: '(?P<a>x)'\n    named_groups_func: ng\n"},
+		{"named_groups_func", "named_groups_func", "patterns:\n  - regexp: '(?<a>x)'\n    named_groups_func: ng\n"},
 		{"typo", "mach_func", "patterns:\n  - regexp: 'foo'\n    mach_func: m\n"},
 	}
 	for _, c := range cases {
@@ -1185,7 +1185,7 @@ max_split_table_size: 8MB
 max_union_states: 16384
 patterns:
   - name: url
-    regexp: '(?P<scheme>https?)://(?P<host>[a-z.]+)'
+    regexp: '(?<scheme>https?)://(?<host>[a-z.]+)'
     match_func: url_match
     find_func: url_find
     groups_func: url_groups

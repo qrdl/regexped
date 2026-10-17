@@ -90,6 +90,11 @@ two together:
   outside the set sees them: `patterns: all` in another set never includes
   them. They take the set's own `unicode:` and `hints:`.
 
+Any regexp, a set's own included, can use a named top-level pattern through a
+[reference](references.md), `(?&name)`. A pattern that exists only to be
+referenced is still a top-level pattern, so `patterns: all` holds it as a
+member: list the names instead when the config has such pieces.
+
 ```yaml
 patterns:
   - name: aws_key

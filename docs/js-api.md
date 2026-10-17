@@ -145,7 +145,7 @@ The `_indices` suffix is required, not decorative: the object is the only derive
 
 The name follows **your** config's casing — `groups_func: parse_url` yields `parse_url_indices`, `groups_func: parseUrl` yields `parseUrlIndices`.
 
-Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?P<a>x)(?P<a>y)` and `(?P<host>x)(?P<Host>y)`, but both would collapse to one generated key.
+Duplicate or colliding group names are rejected at **config load**: `regexp/syntax` accepts `(?<a>x)(?<a>y)` and `(?<host>x)(?<Host>y)`, but both would collapse to one generated key.
 
 ---
 
