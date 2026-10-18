@@ -100,10 +100,7 @@ func setPatternInfos(sc config.SetConfig, members []config.SetMember, cfg config
 		re := m.Entry
 		info, err := analyzeSetMember(re, mode.member(re.Regexp), prefixPool, suffixPool)
 		if err != nil {
-			kind, patLabel := "pattern", re.Name
-			if patLabel == "" {
-				patLabel = re.Regexp
-			}
+			kind, patLabel := "pattern", re.DisplayName()
 			if m.Inline {
 				kind = "regexp"
 			}

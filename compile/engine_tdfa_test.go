@@ -47,7 +47,7 @@ func TestTDFAStats(t *testing.T) {
 		// Simple capture: TDFA-eligible.
 		{"(a+)", true},
 		// Named capture.
-		{"(?P<x>foo)+", true},
+		{"(?<x>foo)+", true},
 		// Patterns with non-greedy return ok=true from tdfaStats (it builds the table
 		// regardless); use SelectEngine to check what engine is actually used.
 		// Here we just verify ok=true for eligible patterns.
@@ -348,8 +348,8 @@ func TestTDFAEpsCapOps(t *testing.T) {
 	})
 
 	t.Run("nested captures", func(t *testing.T) {
-		// ((?P<x>a)) has nested capture groups — multiple captureOps
-		prog := compile("((?P<x>a))")
+		// ((?<x>a)) has nested capture groups — multiple captureOps
+		prog := compile("((?<x>a))")
 		pc, ops := tdfaEpsCapOps(prog, prog.Start, make(map[int]bool))
 		_ = pc
 		if len(ops) < 2 {
@@ -365,9 +365,9 @@ func TestTDFACompileDeterminism(t *testing.T) {
 	// url-parse is a 6-group TDFA pattern with non-trivial register operations.
 	// It was observed to produce different WASM sizes across runs before the fix.
 	re := config.PatternEntry{
-		Regexp: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
-			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
-			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
+		Regexp: `(?<scheme>https?)://(?<host>[^/:?#]+)` +
+			`(?::(?<port>[0-9]+))?(?<path>/[^?#]*)?` +
+			`(?:\?(?<query>[^#]*))?(?:#(?<fragment>.*))?`,
 		GroupsFunc: "groups",
 	}
 	first, _, err := Compile([]config.PatternEntry{re}, 0, true)
@@ -399,14 +399,14 @@ func TestTDFARegisterMinimizationDegreeSort(t *testing.T) {
 	}{
 		// Two sequential groups: a then b. Open-tags don't overlap, close-tags can share.
 		// rawTags=6 (3 groups × 2 tags incl. group 0), minimised to 4.
-		{"seq-2-groups", `(?P<a>\d+)-(?P<b>\d+)`, 4, 6},
+		{"seq-2-groups", `(?<a>\d+)-(?<b>\d+)`, 4, 6},
 		// Three sequential groups.
 		// rawTags=8 (4 groups × 2), minimised to 6.
-		{"seq-3-groups", `(?P<a>\d+)-(?P<b>\d+)-(?P<c>\d+)`, 6, 8},
+		{"seq-3-groups", `(?<a>\d+)-(?<b>\d+)-(?<c>\d+)`, 6, 8},
 		// Nested groups: b inside a. Open-tags are simultaneously live → can't share.
 		// Close-tags are NOT simultaneously live → can share (one colour).
 		// rawTags=6, minimised to 4.
-		{"nested-2-groups", `(?P<a>a+(?P<b>b+))`, 4, 6},
+		{"nested-2-groups", `(?<a>a+(?<b>b+))`, 4, 6},
 	}
 
 	for _, tc := range cases {

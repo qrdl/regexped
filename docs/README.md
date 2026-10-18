@@ -1,6 +1,7 @@
 # Regexped documentation
 
 - [CLI reference](cli.md) — commands, flags, config schema, pattern support
+- [Pattern references](references.md) — `(?&name)` / `(?<&name>)`: build a regexp from named patterns
 
 **Languages**
 - [Rust API](rust-api.md) — generated Rust stubs

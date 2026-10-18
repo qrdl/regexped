@@ -328,7 +328,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"non_lit_chain_with_groups",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<scheme>https?)://(?P<host>[^/]+)`,
+				Regexp:     `(?<scheme>https?)://(?<host>[^/]+)`,
 				GroupsFunc: "url_groups",
 			}},
 		},
@@ -492,7 +492,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_named_ghp",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				Regexp:     `(?<key>ghp_[A-Za-z0-9]{36})`,
 				GroupsFunc: "ghp_named_groups",
 			}},
 		},
@@ -506,14 +506,14 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_prefixed_named",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				Regexp:     `(?<digits>[0-9]{8})ghp_(?<key>[A-Za-z0-9]{36})`,
 				GroupsFunc: "prefixed_named_groups",
 			}},
 		},
 		{
 			"capture_strict_alt_named_only",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<aws>AKIA[A-Z0-9]{16})|(?P<gh>ghp_[A-Za-z0-9]{36})`,
+				Regexp:     `(?<aws>AKIA[A-Z0-9]{16})|(?<gh>ghp_[A-Za-z0-9]{36})`,
 				GroupsFunc: "strict_alt_named_only",
 			}},
 		},
@@ -528,7 +528,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"capture_range_named_groups",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<key>secret_[A-Za-z0-9]{24,40})`,
+				Regexp:     `(?<key>secret_[A-Za-z0-9]{24,40})`,
 				GroupsFunc: "secret_range_named",
 			}},
 		},
@@ -545,7 +545,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_ghp",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<key>ghp_[A-Za-z0-9]{36})`,
+				Regexp:     `(?<key>ghp_[A-Za-z0-9]{36})`,
 				FindFunc:   "ghp_find_cap",
 				GroupsFunc: "ghp_named_groups_cap",
 			}},
@@ -561,7 +561,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_prefixed_named_groups",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<digits>[0-9]{8})ghp_(?P<key>[A-Za-z0-9]{36})`,
+				Regexp:     `(?<digits>[0-9]{8})ghp_(?<key>[A-Za-z0-9]{36})`,
 				FindFunc:   "prefixed_find_cap",
 				GroupsFunc: "prefixed_named_groups_cap",
 			}},
@@ -607,7 +607,7 @@ func TestCompileLikelyMatch(t *testing.T) {
 		{
 			"find_with_named_groups_lenient_alt",
 			[]config.PatternEntry{{
-				Regexp:     `(?P<gh>ghp_[A-Za-z0-9]{36})|(?P<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
+				Regexp:     `(?<gh>ghp_[A-Za-z0-9]{36})|(?<aws>aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40})`,
 				FindFunc:   "lenient_alt_find_named_cap",
 				GroupsFunc: "lenient_alt_groups_named_cap",
 			}},
@@ -866,7 +866,7 @@ func TestCompileLMEmbeddedAndEmpty(t *testing.T) {
 		wasm, _, err := Compile([]config.PatternEntry{
 			{Regexp: `abc`, MatchFunc: "m"},
 			{Regexp: `.*foo.*`, FindFunc: "f"},
-			{Regexp: `(?P<x>a)(b)`, GroupsFunc: "g"},
+			{Regexp: `(?<x>a)(b)`, GroupsFunc: "g"},
 		}, 0, false)
 		if err != nil {
 			t.Fatalf("Compile: %v", err)
@@ -1618,7 +1618,7 @@ func singleCases() []singleCase {
 		// ---- capture paths: TDFA, and Backtracking when TDFA is refused ---
 		{
 			name: "groups-tdfa", selects: "engine_tdfa.go — tagged DFA with register ops",
-			pattern: `(?P<scheme>https?)://(?P<host>[a-z.]+)/(?P<path>[a-z/]*)`, groups: true,
+			pattern: `(?<scheme>https?)://(?<host>[a-z.]+)/(?<path>[a-z/]*)`, groups: true,
 		},
 		{
 			name: "groups-simple", selects: "the TDFA register minimiser on a small tag set",
@@ -1881,7 +1881,7 @@ func singleCases() []singleCase {
 		},
 		{
 			name: "lit-chain-groups-range-two-caps", selects: "a captured literal as well as a captured range",
-			pattern: `(?P<lead>x)([a-z]{24,30})`, groups: true,
+			pattern: `(?<lead>x)([a-z]{24,30})`, groups: true,
 		},
 		{
 			name: "lit-chain-groups-range-all", selects: "the same emitter with match, find and groups at once",
@@ -2395,7 +2395,7 @@ func TestPatternCrossProductCompiles(t *testing.T) {
 func captureCrossProduct() []string {
 	bodies := []string{
 		`(a+)(b+)`, `(a+?)(b+)`, `(\w+)`, `([^,]+),`, `(a|b)*c`, `((a)(b))`,
-		`(?P<x>[0-9]{2})-(?P<y>[0-9]{2})`, `(a)(b)(c)(d)(e)`, `(.*?)END`,
+		`(?<x>[0-9]{2})-(?<y>[0-9]{2})`, `(a)(b)(c)(d)(e)`, `(.*?)END`,
 		`\b(\w+)\b`, `(?m:^)(\w+)(?m:$)`, `(a{2,4})b`, `((?:ab)+)c`,
 	}
 	wrappers := []string{"%s", `x%s`, `%sy`, `(?:%s)+`, `(?:%s)?`}

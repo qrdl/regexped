@@ -110,7 +110,7 @@ func TestExtractGroupInfo(t *testing.T) {
 		wantNamed  map[string]int
 	}{
 		{"(a)(b)", 3, map[string]int{}},
-		{"(?P<x>a)(?P<y>b)", 3, map[string]int{"x": 1, "y": 2}},
+		{"(?<x>a)(?<y>b)", 3, map[string]int{"x": 1, "y": 2}},
 		{"abc", 1, map[string]int{}},
 	}
 	for _, c := range cases {
@@ -175,7 +175,7 @@ func TestGenJSStubFile(t *testing.T) {
 		StubFile: "regexp.js",
 		Patterns: []config.PatternEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", Regexp: "(?P<first>a)(b)"},
+			{GroupsFunc: "tok_groups", Regexp: "(?<first>a)(b)"},
 		},
 	}
 	out, err := genJSStubFile(cfg)
@@ -199,7 +199,7 @@ func TestGenTSStubFile(t *testing.T) {
 		StubFile: "regexp.ts",
 		Patterns: []config.PatternEntry{
 			{MatchFunc: "url_match", FindFunc: "url_find"},
-			{GroupsFunc: "tok_groups", Regexp: "(?P<first>a)(b)"},
+			{GroupsFunc: "tok_groups", Regexp: "(?<first>a)(b)"},
 		},
 	}
 	out, err := genTSStubFile(cfg)
@@ -328,7 +328,7 @@ func TestGenGoStubFileFull(t *testing.T) {
 	entries := []config.PatternEntry{
 		{MatchFunc: "url_match", FindFunc: "url_find",
 			GroupsFunc: "url_groups",
-			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)"},
+			Regexp:     "(?<scheme>https?)://(?<host>[^/]+)"},
 	}
 	out, err := genGoStubFile(entries, "url", "url")
 	if err != nil {
@@ -353,7 +353,7 @@ func TestGenGoStubFileFull(t *testing.T) {
 func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
 	entries := []config.PatternEntry{{
 		GroupsFunc: "url_groups",
-		Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
+		Regexp:     "(?<scheme>https?)://(?<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -374,7 +374,7 @@ func TestGenRustStubFileGroupsAndNamed(t *testing.T) {
 func TestGenRustStubFileNamedOnly(t *testing.T) {
 	entries := []config.PatternEntry{{
 		GroupsFunc: "url_groups",
-		Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
+		Regexp:     "(?<scheme>https?)://(?<host>[^/]+)",
 	}}
 	out, err := genRustStubFile(entries, "url")
 	if err != nil {
@@ -502,7 +502,7 @@ func TestGenCStubFilesSingle(t *testing.T) {
 // named access it never had, through index constants.
 func TestGenCStubFilesNamedGroupIndices(t *testing.T) {
 	entries := []config.PatternEntry{
-		{GroupsFunc: "url_groups", Regexp: "(?P<scheme>https?)://(?P<host>[^/]+)"},
+		{GroupsFunc: "url_groups", Regexp: "(?<scheme>https?)://(?<host>[^/]+)"},
 	}
 	h, _, err := genCStubFiles(entries, "mymod", "stub.h", false)
 	if err != nil {
@@ -521,7 +521,7 @@ func TestGenJSStubFileWithNamedPattern(t *testing.T) {
 		StubFile: "regexp.js",
 		Patterns: []config.PatternEntry{{
 			GroupsFunc: "url_groups",
-			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
+			Regexp:     "(?<scheme>https?)://(?<host>[^/]+)",
 		}},
 	}
 	out, err := genJSStubFile(cfg)
@@ -541,7 +541,7 @@ func TestGenTSStubFileWithNamedPattern(t *testing.T) {
 		StubFile: "regexp.ts",
 		Patterns: []config.PatternEntry{{
 			GroupsFunc: "url_groups",
-			Regexp:     "(?P<scheme>https?)://(?P<host>[^/]+)",
+			Regexp:     "(?<scheme>https?)://(?<host>[^/]+)",
 		}},
 	}
 	out, err := genTSStubFile(cfg)
@@ -719,7 +719,7 @@ func TestGenASGroupsStub(t *testing.T) {
 
 func TestGenASStubFileGroupsFunc(t *testing.T) {
 	entries := []config.PatternEntry{
-		{GroupsFunc: "find_email", Regexp: "(?P<user>[^@]+)@(?P<domain>.+)"},
+		{GroupsFunc: "find_email", Regexp: "(?<user>[^@]+)@(?<domain>.+)"},
 	}
 	out, err := genASStubFile(config.BuildConfig{Patterns: entries, ImportModule: "mymod"})
 	if err != nil {
@@ -1480,7 +1480,7 @@ func TestNamespacePrefixesOnlySharedSymbols(t *testing.T) {
 		Namespace:    "acme",
 		StubFile:     "stubs.go",
 		Patterns: []config.PatternEntry{
-			{Name: "u", Regexp: `(?P<host>[a-z.]+)`, GroupsFunc: "url_groups"},
+			{Name: "u", Regexp: `(?<host>[a-z.]+)`, GroupsFunc: "url_groups"},
 		},
 		Sets: []config.SetConfig{
 			{Name: "sec", Find: "scan_secrets", Patterns: config.PatternSelector{All: true}, EmitNameMap: true},
@@ -2134,7 +2134,7 @@ func TestComponentStubsRejectUnparseablePattern(t *testing.T) {
 		WasmFormat:   "component",
 		ImportModule: "m",
 		WasmFile:     "m.wasm",
-		Patterns:     []config.PatternEntry{{Regexp: "(?P<a>", GroupsFunc: "g"}},
+		Patterns:     []config.PatternEntry{{Regexp: "(?<a>", GroupsFunc: "g"}},
 	}
 	if _, _, err := genCComponentStubFiles(cfg, "stub.h"); err == nil {
 		t.Error("genCComponentStubFiles accepted an unparseable pattern")
@@ -2767,7 +2767,7 @@ func manyEntries(n int) []config.PatternEntry {
 
 func stubShapes() []stubShape {
 	base := []config.PatternEntry{
-		entry("url", `(?P<scheme>https?)://(?P<host>[a-z.]+)/`, true, true, true),
+		entry("url", `(?<scheme>https?)://(?<host>[a-z.]+)/`, true, true, true),
 		entry("num", `[0-9]+`, true, true, false),
 	}
 	return []stubShape{
@@ -2936,4 +2936,39 @@ func readIfPresent(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// Python's named-group spelling, (?P<name>…), generates the same stubs as the
+// documented (?<name>…), in every language: the names come from Go's parse,
+// which reads both alike.
+func TestNamedGroupOldSpellingGeneratesIdentically(t *testing.T) {
+	gen := func(open, stubType string) map[string]string {
+		dir := t.TempDir()
+		ext := map[string]string{"rust": "rs", "go": "go", "js": "js", "ts": "ts", "c": "h", "as": "ts"}[stubType]
+		cfg := config.BuildConfig{ImportModule: "emails", StubType: stubType, Patterns: []config.PatternEntry{
+			{Regexp: open + "user>[a-z]+)@" + open + "host>[a-z.]+)", GroupsFunc: "email_groups", FindFunc: "email_find"},
+		}}
+		if err := CmdGenerateStub(cfg, filepath.Join(dir, "stub."+ext)); err != nil {
+			t.Fatalf("%s: %v", stubType, err)
+		}
+		files := map[string]string{}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files[e.Name()] = string(b)
+		}
+		return files
+	}
+	for _, stubType := range []string{"rust", "go", "js", "ts", "c", "as"} {
+		old, cur := gen("(?P<", stubType), gen("(?<", stubType)
+		if len(old) == 0 || fmt.Sprint(old) != fmt.Sprint(cur) {
+			t.Errorf("%s: the two spellings generate different stubs", stubType)
+		}
+	}
 }

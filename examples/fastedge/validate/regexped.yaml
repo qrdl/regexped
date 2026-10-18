@@ -4,10 +4,16 @@ import_module: "regexps"
 stub_file:     "stubs.rs"
 
 patterns:
-  - regexp:   '^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$'
+  # An e-mail address and a URL both carry a host name: written once, and
+  # used by both through a reference, (?&hostname). With no *_func it
+  # compiles to nothing of its own.
+  - name: hostname
+    regexp: '[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  - regexp:   '^([a-zA-Z0-9._%+-]+@(?&hostname))$'
     match_func: "match_email"
 
-  - regexp:    '^https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?$'
+  - regexp:    '^https?://(?&hostname)(/[^\s]*)?$'
     match_func: "url_match"
 
   - regexp: |-

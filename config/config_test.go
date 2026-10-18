@@ -573,9 +573,11 @@ func TestSetMembersInlineRegexps(t *testing.T) {
 			t.Errorf("%s: IDSpaceSize = %d, want %d", sc.Name, got, w.idSp)
 		}
 	}
-	// An inline member carries only its regexp.
-	if m := cfg.Sets[1].Members(cfg)[1]; !reflect.DeepEqual(m.Entry, PatternEntry{Regexp: "x+"}) {
-		t.Errorf("inline member entry = %+v, want only Regexp", m.Entry)
+	// An inline member carries only its regexp and its --verbose label: the
+	// entry InlineEntry builds.
+	wantInline := PatternEntry{Regexp: "x+", Label: "mixed: regexps[0]"}
+	if m := cfg.Sets[1].Members(cfg)[1]; !reflect.DeepEqual(m.Entry, wantInline) || !reflect.DeepEqual(m.Entry, cfg.Sets[1].InlineEntry(0)) {
+		t.Errorf("inline member entry = %+v, want %+v", m.Entry, wantInline)
 	}
 	if err := ValidateSets(&cfg); err != nil {
 		t.Errorf("ValidateSets: %v", err)
@@ -872,7 +874,7 @@ func TestLoadConfig_RetiredSetKeysAreUnknownFields(t *testing.T) {
 		// stubs called the SAME WASM export — so `groups_func` plus the
 		// generated name→index constants replaces it, and C and AS gain named
 		// access they never had.
-		{"named_groups_func", "named_groups_func", "patterns:\n  - regexp: '(?P<a>x)'\n    named_groups_func: ng\n"},
+		{"named_groups_func", "named_groups_func", "patterns:\n  - regexp: '(?<a>x)'\n    named_groups_func: ng\n"},
 		{"typo", "mach_func", "patterns:\n  - regexp: 'foo'\n    mach_func: m\n"},
 	}
 	for _, c := range cases {
@@ -1185,7 +1187,7 @@ max_split_table_size: 8MB
 max_union_states: 16384
 patterns:
   - name: url
-    regexp: '(?P<scheme>https?)://(?P<host>[a-z.]+)'
+    regexp: '(?<scheme>https?)://(?<host>[a-z.]+)'
     match_func: url_match
     find_func: url_find
     groups_func: url_groups

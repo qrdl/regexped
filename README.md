@@ -142,4 +142,8 @@ The external tools it shells out to — `wasm-merge`, `wasm-tools` and `wac` —
 
 ## License
 
-See [LICENSE](LICENSE).
+regexped is licensed under the [EUPL v. 1.2 only](LICENSE), with an
+[exception](LICENSE-EXCEPTION) for its output: the code regexped generates —
+WASM modules, stubs and WIT files, including the parts of regexped's own source
+copied into them — is yours to use, modify and distribute under terms of your
+choice, without the EUPL applying to it.

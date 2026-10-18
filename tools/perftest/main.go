@@ -239,9 +239,9 @@ var tests = []testCase{
 		// against regex crate's capture group extraction.
 		// Credentials omitted: [^@]+ and [^/:+] overlap making it non-one-pass.
 		name: "url-parse",
-		pattern: `(?P<scheme>https?)://(?P<host>[^/:?#]+)` +
-			`(?::(?P<port>[0-9]+))?(?P<path>/[^?#]*)?` +
-			`(?:\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?`,
+		pattern: `(?<scheme>https?)://(?<host>[^/:?#]+)` +
+			`(?::(?<port>[0-9]+))?(?<path>/[^?#]*)?` +
+			`(?:\?(?<query>[^#]*))?(?:#(?<fragment>.*))?`,
 		mode: anchoredGroups,
 		inputs: []namedInput{
 			{"full URL", "https://example.com:8080/path/to/page?q=1&r=2#section"},
@@ -253,7 +253,7 @@ var tests = []testCase{
 		// Non-anchored groups: find URLs anywhere in 10KB prose and capture host.
 		// This exercises the wrapper's internal find_internal scan over a large buffer.
 		name:    "url-domains-10k",
-		pattern: `https?://(?P<host>[^/:?#\s]+)`,
+		pattern: `https?://(?<host>[^/:?#\s]+)`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
 			{"no-url 10KB", urlProseInputSmall(nil)},
@@ -353,7 +353,7 @@ var tests = []testCase{
 		// "attr-tags": same '<' count; each opening tag requires multiple lazy
 		// iterations to step past attributes, adding BT work atop zeroing overhead.
 		name:    "html-tags",
-		pattern: `<(?P<tag>\w+)(?:\s*(?P<attr>\w+)?(?:="(?P<val>[^"]*)")?)*?>`,
+		pattern: `<(?<tag>\w+)(?:\s*(?<attr>\w+)?(?:="(?<val>[^"]*)")?)*?>`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
 			{"bare-tags", htmlTagInput(false)},
@@ -447,7 +447,7 @@ var tests = []testCase{
 		// can prove each quantifier-loop alternation is deterministic → TDFA.
 		// Stresses register allocation (20 register slots) and tag-op emission.
 		name:    "log-fields-10g",
-		pattern: `(?P<y>\d+)-(?P<mo>\d+)-(?P<d>\d+) (?P<H>\d+):(?P<mi>\d+):(?P<s>\d+) (?P<lv>[A-Z]+) (?P<comp>[a-z]+) (?P<msg>[a-z]+) (?P<dur>\d+)`,
+		pattern: `(?<y>\d+)-(?<mo>\d+)-(?<d>\d+) (?<H>\d+):(?<mi>\d+):(?<s>\d+) (?<lv>[A-Z]+) (?<comp>[a-z]+) (?<msg>[a-z]+) (?<dur>\d+)`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
 			{"match", "2026-01-15 14:30:00 INFO worker completed 350"},
@@ -461,7 +461,7 @@ var tests = []testCase{
 		// Verified: SelectEngine returns Backtracking with default options,
 		// TDFA with MaxTDFARegs=100 (confirming the cause is register count).
 		name:    "deep-captures",
-		pattern: `(?P<l1>(?P<l2>(?P<l3>(?P<l4>(?P<l5>(?P<l6>(?P<l7>(?P<l8>(?P<l9>(?P<l10>(?P<l11>(?P<l12>(?P<l13>(?P<l14>(?P<l15>(?P<l16>(?P<l17>.+)))))))))))))))))`,
+		pattern: `(?<l1>(?<l2>(?<l3>(?<l4>(?<l5>(?<l6>(?<l7>(?<l8>(?<l9>(?<l10>(?<l11>(?<l12>(?<l13>(?<l14>(?<l15>(?<l16>(?<l17>.+)))))))))))))))))`,
 		mode:    anchoredGroups,
 		inputs: []namedInput{
 			{"short match", "hello world"},

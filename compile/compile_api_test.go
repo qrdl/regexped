@@ -48,7 +48,7 @@ func TestStripCaptures(t *testing.T) {
 		pattern string
 	}{
 		{"(a)(b)"},
-		{"(?P<x>foo)(?P<y>bar)"},
+		{"(?<x>foo)(?<y>bar)"},
 		{"(a|(b|c))"},
 		{"abc"}, // no captures — should be a no-op
 	}
@@ -67,9 +67,9 @@ func TestExtractGroupNames(t *testing.T) {
 		want    []string
 	}{
 		// Named groups: first slot is group 0 (unnamed whole match).
-		{"(?P<x>a)(?P<y>b)", []string{"x", "y"}},
+		{"(?<x>a)(?<y>b)", []string{"x", "y"}},
 		// Mix of named and unnamed.
-		{"(a)(?P<z>b)(c)", []string{"", "z", ""}},
+		{"(a)(?<z>b)(c)", []string{"", "z", ""}},
 		// No captures.
 		{"abc", nil},
 	}
@@ -207,7 +207,7 @@ func TestCompileIntegrationTDFA(t *testing.T) {
 		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a)(b)", GroupsFunc: "g"}})
 	})
 	t.Run("named_groups", func(t *testing.T) {
-		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}})
+		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(?<x>a)(?<y>b)", GroupsFunc: "g"}})
 	})
 	t.Run("find_and_groups", func(t *testing.T) {
 		mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a+)(b+)", FindFunc: "f", GroupsFunc: "g"}})
@@ -232,7 +232,7 @@ func TestCompileIntegrationBacktrack(t *testing.T) {
 	})
 	t.Run("named_groups_forced", func(t *testing.T) {
 		_, _, err := CompileForced(
-			[]config.PatternEntry{{Regexp: "(?P<x>a)(?P<y>b)", GroupsFunc: "g"}},
+			[]config.PatternEntry{{Regexp: "(?<x>a)(?<y>b)", GroupsFunc: "g"}},
 			0, true, EngineBacktrack,
 		)
 		if err != nil {
@@ -436,9 +436,9 @@ func TestCompileEmbeddedMode(t *testing.T) {
 
 func TestCompileInvalidPattern(t *testing.T) {
 	cases := []string{
-		"[invalid",  // unclosed character class
-		"(?P<>foo)", // empty group name
-		"(?Pfoo)",   // malformed named group
+		"[invalid", // unclosed character class
+		"(?<>foo)", // empty group name
+		"(?Pfoo)",  // malformed named group
 	}
 	for _, pat := range cases {
 		_, _, err := Compile([]config.PatternEntry{{Regexp: pat, MatchFunc: "m"}}, 0, true)
@@ -2568,7 +2568,7 @@ func TestGroupsWrapperValidWithoutCaptureBody(t *testing.T) {
 			t.Errorf("%-12q compile: %v, want ErrNoCaptureGroup", pat, err)
 		}
 	}
-	pats := []string{`(a)`, `\A(a)(b)`, `\b(?P<x>a)`}
+	pats := []string{`(a)`, `\A(a)(b)`, `\b(?<x>a)`}
 	validated := 0
 	for _, pat := range pats {
 		w, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, 65536, true)
@@ -3345,7 +3345,7 @@ func TestOddShapesValidate(t *testing.T) {
 		`ab{3}\A|cd{3}`, `ab{2,3}\A|cd{2,3}`, `(?m:^)ab{3}|cd{3}`, `ab{2,5}?|cd{2,5}?`, `ab{2,5}?x|cd{2,5}?y`,
 		`a1{3}|b2{3}|c3{3}|d4{3}|e5{3}|f6{3}|g7{3}|h8{3}|i9{3}`,
 		`a1{2,4}|b2{2,4}|c3{2,4}|d4{2,4}|e5{2,4}|f6{2,4}|g7{2,4}|h8{2,4}|i9{2,4}`,
-		`[0-9]{8}ghp_[a-z]{3,5}`, `(?P<d>[0-9]{8})ghp_(?P<k>[a-z]{3,5})`,
+		`[0-9]{8}ghp_[a-z]{3,5}`, `(?<d>[0-9]{8})ghp_(?<k>[a-z]{3,5})`,
 		`ab[a-z]{3}|cd[a-z]{3}`, `a[a-z]{3}|b[b-z]{3}`, `ab[b-z]{3}`,
 		`x{3}abc\w*z|y{3}ghi\w*z|z{3}jkl\w*q`, `\w{3}abc\w*z|\d{3}ghi\w*z`, `[^a]{3}abc\w*z|[^b]{3}ghi\w*z`,
 		`abc|abd|x+`, `\b`, `\B`, `a?\b`, `\b|x`, `(?:\B|y)`, `\bx?`, `(?:\b|\B)a`,
@@ -3990,5 +3990,273 @@ func TestSearchSizes(t *testing.T) {
 	validateWASM(t, w)
 	if m["overrun_find"].NotesBytes == 0 || !m["bt_find"].BTBudget || m["plain_find"].Block() {
 		t.Errorf("CompileWithSearchSizes = %+v", m)
+	}
+}
+
+// ── Pattern references ─────────────────────────────────────────────────────
+//
+// config.ExpandReferences rewrites a regexp written with references into the
+// regexp it stands for. The compiler sees only that, so the module must be
+// byte for byte the module of the same config written out by hand.
+
+// refsConfig is a config written with references, and handConfig the same
+// config written out by hand.
+func refsConfig(t *testing.T, withSet bool) (refs, hand config.BuildConfig) {
+	t.Helper()
+	pieces := []config.PatternEntry{
+		{Name: "scheme", Regexp: `[a-zA-Z][a-zA-Z0-9+.-]*`},
+		{Name: "hostname", Regexp: `[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*`},
+		{Name: "path", Regexp: `[^?#\s]*`},
+	}
+	refs = config.BuildConfig{ImportModule: "m", Patterns: append(slices.Clone(pieces),
+		config.PatternEntry{Name: "url", Regexp: `(?&scheme)://(?<&hostname>)(?:/(?&path))?`, GroupsFunc: "url_groups", FindFunc: "url_find"},
+		config.PatternEntry{Name: "email", Regexp: `[a-z.]+@(?&hostname)`, MatchFunc: "email_match"},
+	)}
+	hand = config.BuildConfig{ImportModule: "m", Patterns: append(slices.Clone(pieces),
+		config.PatternEntry{Name: "url", Regexp: `(?:[a-zA-Z][a-zA-Z0-9+.-]*)://(?<hostname>[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)(?:/(?:[^?#\s]*))?`, GroupsFunc: "url_groups", FindFunc: "url_find"},
+		config.PatternEntry{Name: "email", Regexp: `[a-z.]+@(?:[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)`, MatchFunc: "email_match"},
+	)}
+	if withSet {
+		refs.Sets = []config.SetConfig{{Name: "links", Find: "links_find", Patterns: config.PatternSelector{Names: []string{"url"}},
+			Regexps: []string{`ftp://(?&hostname)`, `mailto:[a-z]+`}}}
+		hand.Sets = []config.SetConfig{{Name: "links", Find: "links_find", Patterns: config.PatternSelector{Names: []string{"url"}},
+			Regexps: []string{`ftp://(?:[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)`, `mailto:[a-z]+`}}}
+	}
+	if err := config.ExpandReferences(&refs); err != nil {
+		t.Fatal(err)
+	}
+	return refs, hand
+}
+
+func TestReferencesCompileByteIdentical(t *testing.T) {
+	for _, withSet := range []bool{false, true} {
+		refs, hand := refsConfig(t, withSet)
+		a, _, err := CompileFile(refs, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _, err := CompileFile(hand, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(a, b) {
+			t.Errorf("withSet=%v: references compile to %d bytes, the same config by hand to %d — not identical", withSet, len(a), len(b))
+		}
+	}
+}
+
+// `--verbose` shows what a pattern written with references stands for, and
+// lists a set's own regexps the way it lists patterns.
+func TestReferencesVerbose(t *testing.T) {
+	refs, _ := refsConfig(t, true)
+	// A piece's byte_mode is its own: the pattern using it decides its mode.
+	refs.Patterns = append(refs.Patterns,
+		config.PatternEntry{Name: "high", Regexp: `[\x80-\xff]+`, ByteMode: true},
+		config.PatternEntry{Name: "blob", Regexp: `X(?&high)`, FindFunc: "blob_find"})
+	refs.Patterns[3].Regexp, refs.Patterns[3].Expanded = `(?&scheme)://(?<&hostname>)(?:/(?&path))?`, nil
+	refs.Patterns[4].Regexp, refs.Patterns[4].Expanded = `[a-z.]+@(?&hostname)`, nil
+	refs.Sets[0].Regexps, refs.Sets[0].Expansions = []string{`ftp://(?&hostname)`, `mailto:[a-z]+`}, nil
+	if err := config.ExpandReferences(&refs); err != nil {
+		t.Fatal(err)
+	}
+	rep := &Reporter{}
+	if _, _, _, err := compileFileDiagReport(refs, "", CompileSetOptions{}, rep); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Render(&b)
+	out := b.String()
+	for _, want := range []string{
+		"  url                  (?&scheme)://(?<&hostname>)(?:/(?&path))?\n" +
+			`    expanded: (?:[a-zA-Z][a-zA-Z0-9+.-]*)://(?<hostname>[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)(?:/(?:[^?#\s]*))?` + "\n",
+		"  links: regexps[0]    ftp://(?&hostname)\n    expanded: ftp://(?:[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)*)\n    mode:   byte\n    engine: none",
+		"  links: regexps[1]    mailto:[a-z]+\n    mode:   byte\n",
+		"  blob                 X(?&high)\n    expanded: X(?:[\\x80-\\xff]+)\n    mode:   unicode\n",
+		"  hostname             [a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)*\n    mode:   byte\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render missing\n%s\n--- got ---\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "expanded:") != 4 {
+		t.Errorf("want 4 expanded lines (url, email, blob, links: regexps[0])\n%s", out)
+	}
+	var nilRep *Reporter
+	nilRep.Expanded("x")
+	(&Reporter{}).Expanded("x") // no scope open
+}
+
+// A pattern written with references is named as written wherever the set
+// path names one: a mode conflict, a member that does not parse, a pattern's
+// owner label.
+func TestReferencesNamedAsWrittenInSets(t *testing.T) {
+	yes := true
+	cfg := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{
+			{Name: "ascii", Regexp: `[a-z]+`},
+			{Regexp: `(?&ascii)`, Unicode: &yes},
+			{Name: "b", Regexp: `x`, ByteMode: true},
+		},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{All: true}}}}
+	if err := config.ExpandReferences(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := CompileFile(cfg, "")
+	if err == nil || !strings.Contains(err.Error(), `member "(?&ascii)" asks for Unicode mode`) || strings.Contains(err.Error(), `(?:[a-z]+)`) {
+		t.Errorf("mode conflict: err = %v, want the member named as written", err)
+	}
+
+	// A member whose expanded text does not parse — only a config built in
+	// code can carry one: ExpandReferences parses every piece first.
+	bad := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Regexps: []string{`(`},
+			Expansions: []*config.Expansion{{Source: `(?&p)(`}}}}}
+	_, _, err = CompileFile(bad, "")
+	if err == nil || !strings.Contains(err.Error(), `analyzePattern: parse "(?&p)("`) {
+		t.Errorf("parse error: err = %v, want the member named as written", err)
+	}
+
+	p, err := compilePattern(config.PatternEntry{Regexp: `a+`, FindFunc: "f", Expanded: &config.Expansion{Source: `(?&p)`}},
+		0, 0, CompileOptions{globals: &moduleGlobals{}})
+	if err != nil || p.label != `(?&p)` {
+		t.Errorf("owner label = %q (%v), want the pattern as written", p.label, err)
+	}
+}
+
+// A set's own regexps are listed in the mode the set runs them in, not the
+// one they would pick alone: `.` alone is byte mode.
+func TestVerboseSetRegexpsInSetMode(t *testing.T) {
+	yes := true
+	for _, c := range []struct {
+		name string
+		cfg  config.BuildConfig
+		want string
+	}{
+		{"unicode key", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Unicode: &yes, Regexps: []string{`.`}}}}, "unicode"},
+		{"a Unicode member", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "letters", Regexp: `\pL+`}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"letters"}}, Regexps: []string{`a.c`}}}}, "unicode"},
+		{"byte set", config.BuildConfig{ImportModule: "m",
+			Patterns: []config.PatternEntry{{Name: "u", Regexp: `x`, FindFunc: "f"}},
+			Sets:     []config.SetConfig{{Name: "s", Find: "sf", Regexps: []string{`a.c`}}}}, "byte"},
+	} {
+		rep := &Reporter{}
+		_, _, diags, err := compileFileDiagReport(c.cfg, "", CompileSetOptions{}, rep)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var b bytes.Buffer
+		rep.Render(&b)
+		if want := "  s: regexps[0]        " + c.cfg.Sets[0].Regexps[0] + "\n    mode:   " + c.want + "\n"; !strings.Contains(b.String(), want) {
+			t.Errorf("%s: render missing\n%s\n--- got ---\n%s", c.name, want, b.String())
+		}
+		// --diag-json reports the same mode for the set.
+		if len(diags) != 1 || diags[0].Mode != c.want {
+			t.Errorf("%s: diag mode = %+v, want %q like the verbose line", c.name, diags, c.want)
+		}
+	}
+}
+
+// A refusal whose cause is in a piece names the piece; one whose cause is in
+// the pattern's own text names the pattern as written.
+func TestReferencesRuneGateNamesPiece(t *testing.T) {
+	load := func(patterns []config.PatternEntry, sets []config.SetConfig) config.BuildConfig {
+		cfg := config.BuildConfig{ImportModule: "m", Patterns: patterns, Sets: sets}
+		if err := config.ExpandReferences(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	const gate = "pattern contains the rune U+0430, above U+00FF, which byte mode cannot match; without byte mode the pattern compiles in Unicode mode"
+	set := []config.SetConfig{{Name: "s", Find: "sf", Regexps: []string{`zz`}}}
+	for _, sets := range [][]config.SetConfig{nil, set} {
+		cfg := load([]config.PatternEntry{
+			{Name: "cyrname", Regexp: `[а-я]+`},
+			{Name: "word", Regexp: `w(?&cyrname)`},
+			{Name: "login", Regexp: `user=(?&word)`, ByteMode: true, FindFunc: "f"},
+		}, sets)
+		_, _, err := CompileFile(cfg, "")
+		want := `compile pattern "login", piece "cyrname" (used by "word", used by "login"): ` + gate
+		if err == nil || err.Error() != want {
+			t.Errorf("sets=%v: err = %v\nwant %s", sets != nil, err, want)
+		}
+	}
+	// A hand-written pattern is named the same way with a set as without.
+	for _, sets := range [][]config.SetConfig{nil, set} {
+		cfg := load([]config.PatternEntry{{Regexp: `user=а`, ByteMode: true, FindFunc: "f"}}, sets)
+		_, _, err := CompileFile(cfg, "")
+		if want := `compile pattern "user=а": pattern contains the rune U+0430`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("hand-written, sets=%v: err = %v\nwant %s…", sets != nil, err, want)
+		}
+	}
+	// The rune is the pattern's own: it is named as written.
+	cfg := load([]config.PatternEntry{
+		{Name: "ascii", Regexp: `[a-z]+`},
+		{Regexp: `user=(?&ascii)а`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err := CompileFile(cfg, "")
+	if want := `compile pattern "user=(?&ascii)а": ` + gate; err == nil || err.Error() != want {
+		t.Errorf("own rune: err = %v\nwant %s", err, want)
+	}
+	// The piece blamed is the one holding the REPORTED rune: not one the
+	// pattern cut away, which still fails alone for a rune of its own, and none
+	// when the rune is the pattern's own.
+	cfg = load([]config.PatternEntry{
+		{Name: "unused", Regexp: `[а-я]`},
+		{Name: "greek", Regexp: `[α-ω]`},
+		{Name: "p", Regexp: `(?&unused){0}(?&greek)`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err = CompileFile(cfg, "")
+	if want := `compile pattern "p", piece "greek" (used by "p"): pattern contains the rune U+03B1, above U+00FF`; err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("cut-away piece: err = %v\nwant %s…", err, want)
+	}
+	cfg = load([]config.PatternEntry{
+		{Name: "greek", Regexp: `[α-ω]`},
+		{Name: "p", Regexp: `ж(?&greek)`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err = CompileFile(cfg, "")
+	if want := `compile pattern "ж(?&greek)": pattern contains the rune U+0436, above U+00FF`; err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("the pattern's own rune: err = %v\nwant %s…", err, want)
+	}
+	// An unnamed pattern whose cause is in a piece is named as written.
+	cfg = load([]config.PatternEntry{
+		{Name: "cyrname", Regexp: `[а-я]+`},
+		{Regexp: `user=(?&cyrname)`, ByteMode: true, FindFunc: "f"},
+	}, nil)
+	_, _, err = CompileFile(cfg, "")
+	if want := `compile pattern "user=(?&cyrname)", piece "cyrname" (used by pattern "user=(?&cyrname)"): ` + gate; err == nil || err.Error() != want {
+		t.Errorf("unnamed: err = %v\nwant %s", err, want)
+	}
+	// The error reads the same unwrapped, as the verbose refusal shows it.
+	pe := &pieceError{use: config.PieceUse{Name: "p", UsedBy: []string{`"u"`}}, err: errors.New("boom")}
+	if pe.Error() != `piece "p" (used by "u"): boom` || pe.Unwrap().Error() != "boom" {
+		t.Errorf("pieceError = %q", pe.Error())
+	}
+	if err := pieceWithRune(nil, true, 'а', pe.err); err != pe.err {
+		t.Errorf("pieceWithRune with no expansion = %v", err)
+	}
+}
+
+// Python's named-group spelling, (?P<name>…), compiles to the same module as
+// the documented (?<name>…): Go parses both to one tree.
+func TestNamedGroupOldSpellingCompilesIdentically(t *testing.T) {
+	entries := func(open string) []config.PatternEntry {
+		return []config.PatternEntry{
+			{Name: "e", Regexp: open + "user>[a-z]+)@" + open + "host>[a-z.]+)", GroupsFunc: "g", FindFunc: "f", MatchFunc: "m"},
+		}
+	}
+	old, _, err := Compile(entries("(?P<"), 0, true, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _, err := Compile(entries("(?<"), 0, true, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(old, cur) {
+		t.Errorf("(?P<name>…) compiles to %d bytes, (?<name>…) to %d — not identical", len(old), len(cur))
 	}
 }

@@ -22,7 +22,7 @@ func rustComponentCfg() config.BuildConfig {
 		WasmFile:     "/somewhere/secrets.wasm",
 		Patterns: []config.PatternEntry{
 			{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "find_github_token"},
-			{Regexp: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mail_groups"},
+			{Regexp: `(?<user>[a-z]+)@(?<host>[a-z.]+)`, GroupsFunc: "mail_groups"},
 			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 		},
 		// A SET too, so the parity check covers every capability and the find
@@ -83,7 +83,7 @@ func rustParityCfg() config.BuildConfig {
 		WasmFile:     "parity.wasm",
 		Patterns: []config.PatternEntry{
 			{Name: "tok", Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "findAwsKey", MatchFunc: "matchToken"},
-			{Name: "mail", Regexp: `(?P<user>[a-z]+)@(?P<host>[a-z.]+)`, GroupsFunc: "mailGroups"},
+			{Name: "mail", Regexp: `(?<user>[a-z]+)@(?<host>[a-z.]+)`, GroupsFunc: "mailGroups"},
 			{Name: "lower", Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 			{Name: "digits", Regexp: `[0-9]+`},
 		},
@@ -398,7 +398,7 @@ func cComponentCfg() config.BuildConfig {
 		ImportModule: "urlparts",
 		WasmFile:     "/somewhere/urlparts.wasm",
 		Patterns: []config.PatternEntry{
-			{Regexp: `(?P<scheme>https?)://(?P<host>[^/:?#\s]+)`, GroupsFunc: "parse_url"},
+			{Regexp: `(?<scheme>https?)://(?<host>[^/:?#\s]+)`, GroupsFunc: "parse_url"},
 			{Regexp: `AKIA[A-Z0-9]{16}`, FindFunc: "find_aws_key"},
 			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
 			{Name: "lower", Regexp: `[a-z]+`},

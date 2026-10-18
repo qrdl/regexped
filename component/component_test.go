@@ -54,7 +54,7 @@ func findCfg(name string) config.BuildConfig {
 		Patterns: []config.PatternEntry{
 			{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "token_find"},
 			{Regexp: `[a-z]+`, MatchFunc: "lower_match"},
-			{Regexp: `(?P<opt>x)?y`, GroupsFunc: "opt_groups"},
+			{Regexp: `(?<opt>x)?y`, GroupsFunc: "opt_groups"},
 		},
 	}
 }

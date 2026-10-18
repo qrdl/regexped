@@ -22,5 +22,5 @@ import_module: "url_parts"
 stub_file:     "component/stub.h"
 
 patterns:
-  - regexp:          '(?P<scheme>https?)://(?P<host>[^/:?#\s]+)(?::(?P<port>[0-9]+))?(?P<path>/[^?#\s]*)?(?:\?(?P<query>[^#\s]*))?(?:#(?P<fragment>[^\s]*))?'
+  - regexp:          '(?<scheme>https?)://(?<host>[^/:?#\s]+)(?::(?<port>[0-9]+))?(?<path>/[^?#\s]*)?(?:\?(?<query>[^#\s]*))?(?:#(?<fragment>[^\s]*))?'
     groups_func: "parse_url"

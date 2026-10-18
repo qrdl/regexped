@@ -21,7 +21,7 @@ max_memory: 1MiB
 
 patterns:
   - regexp: |-
-      (?i)(?P<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?P<payload>[^\n]*)
+      (?i)(?<type>union\s+(?:all\s+)?select|or\s+'1'='1|drop\s+table|insert\s+into|delete\s+from|exec\s*\()(?<payload>[^\n]*)
     match_func:  "is_sqli"
     find_func:   "find_sqli"
     groups_func: "parse_sqli"

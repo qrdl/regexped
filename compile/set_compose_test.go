@@ -121,9 +121,9 @@ func TestSplitAtPath_Concat(t *testing.T) {
 
 func TestSplitAtPath_Capture(t *testing.T) {
 	t.Run("capture_around_concat", func(t *testing.T) {
-		// (?P<x>\d{3}foo\w+) — capture wrapping a concat
-		re := mustParse(t, `(?P<x>\d{3}foo\w+)`)
-		path, ok := findPath(t, `(?P<x>\d{3}foo\w+)`)
+		// (?<x>\d{3}foo\w+) — capture wrapping a concat
+		re := mustParse(t, `(?<x>\d{3}foo\w+)`)
+		path, ok := findPath(t, `(?<x>\d{3}foo\w+)`)
 		if !ok {
 			t.Fatal("no mandatory lit found")
 		}
@@ -138,9 +138,9 @@ func TestSplitAtPath_Capture(t *testing.T) {
 }
 
 func TestSplitAtPath_NestedCaptureConcat(t *testing.T) {
-	// (?P<outer>\d{3}(?P<inner>foo)\w+) — nested captures
-	re := mustParse(t, `(?P<outer>\d{3}(?P<inner>foo)\w+)`)
-	path, ok := findPath(t, `(?P<outer>\d{3}(?P<inner>foo)\w+)`)
+	// (?<outer>\d{3}(?<inner>foo)\w+) — nested captures
+	re := mustParse(t, `(?<outer>\d{3}(?<inner>foo)\w+)`)
+	path, ok := findPath(t, `(?<outer>\d{3}(?<inner>foo)\w+)`)
 	if !ok {
 		t.Fatal("no mandatory lit found")
 	}

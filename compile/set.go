@@ -363,14 +363,14 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 	pattern := rp.src
 	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
-		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Regexp, err)
+		return nil, fmt.Errorf("analyzePattern: parse %q: %w", re.Written(), err)
 	}
 	stripCaptures(parsed)
 
 	info := &PatternInfo{
 		fullPattern:    pattern,
 		rp:             rp,
-		displayPattern: re.Regexp,
+		displayPattern: re.Written(),
 		byteMode:       re.IsByteMode(),
 		prefixID:       -1,
 		suffixID:       -1,

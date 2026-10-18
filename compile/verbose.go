@@ -35,6 +35,9 @@ import (
 type PatternReport struct {
 	Name    string
 	Pattern string
+	// Expanded is the regexp a pattern written with references stands for,
+	// in full; "" for one that used none (config.ExpandReferences).
+	Expanded string
 	// Mode is "byte" or "unicode": the mode the pattern was compiled in, or
 	// asked for when it was refused for it.
 	Mode   string
@@ -114,6 +117,14 @@ func (r *Reporter) Begin(name, pattern string) {
 	} else {
 		r.progressSubject("pattern %q", truncate(pattern, 40))
 	}
+}
+
+// Expanded records the full text a pattern written with references expands to.
+func (r *Reporter) Expanded(text string) {
+	if r == nil || r.cur == nil {
+		return
+	}
+	r.cur.Expanded = text
 }
 
 // Mode records the pattern's mode.
@@ -215,6 +226,9 @@ func (r *Reporter) Render(w io.Writer) {
 				name = "(unnamed)"
 			}
 			fmt.Fprintf(w, "  %-20s %s\n", name, truncate(p.Pattern, 60))
+			if p.Expanded != "" {
+				fmt.Fprintln(w, "    expanded: "+p.Expanded)
+			}
 			if p.Mode != "" {
 				fmt.Fprintln(w, "    mode:   "+p.Mode)
 			}

@@ -11,7 +11,7 @@ import_module: "urls"
 stub_file:     "regexp.ts"    # .ts → TypeScript stub; use .js for plain JS
 
 patterns:
-  - regexp:           'https?://(?P<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
+  - regexp:           'https?://(?<host>[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?'
     groups_func:       "extract_domain"
 ```
 

@@ -20,7 +20,7 @@ time and case-folded across Unicode: `fastedge/script-detect` and
 
 | Use case | Environment | Language | Patterns | Format (target) | Directory |
 |---|---|---|---|---|---|
-| IPv6 URL validation | wasmtime | Rust | individual | module (wasip1) | [wasmtime/rust/url-ipv6](wasmtime/rust/url-ipv6) |
+| URL validation (IPv4, IPv6, host names), regexp built from references | wasmtime | Rust | individual | module (wasip1) | [wasmtime/rust/url-validate](wasmtime/rust/url-validate) |
 | Credential detection | wasmtime | Rust | individual | **component 🧩** (wasip2) | [wasmtime/rust/secrets](wasmtime/rust/secrets) |
 | Multi-pattern secret scanning (native host) 🧩 | native Rust + wasmtime crate | Rust | set | **module AND component**[^native] | [wasmtime/rust/secret-scanner](wasmtime/rust/secret-scanner) |
 | URL parsing into components | wasmtime | C | individual | **module (wasip1) + component 🧩 (wasip1, wasip2)** | [wasmtime/c/url-parts](wasmtime/c/url-parts) |

@@ -20,12 +20,20 @@ stub_file:     "regexp.js"       # generated JS module
 import_module: "regexps"        # module name used in generated stubs
 
 patterns:
-  - regexp:    '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+  - name: hostname              # used by both patterns below
+    regexp: '[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  - regexp:    '[a-zA-Z0-9._%+\-]+@(?&hostname)'
     match_func: "email_match"
 
-  - regexp:    'https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/[^\s]*)?'
+  - regexp:    'https?://(?&hostname)(/[^\s]*)?'
     match_func: "url_match"
 ```
+
+`(?&hostname)` is a reference: it inserts the regexp of the pattern named
+`hostname`, so the host name is written once and both patterns use it. A
+pattern with no `*_func`, like `hostname`, compiles to nothing of its own. See
+[references.md](references.md).
 
 No `output` field means standalone mode: the compiled WASM owns its own memory and can be loaded directly in JS without merging.
 

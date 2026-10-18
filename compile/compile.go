@@ -1472,10 +1472,7 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	if err != nil || p == nil {
 		return p, err
 	}
-	p.label = re.Name
-	if p.label == "" {
-		p.label = re.Regexp
-	}
+	p.label = re.DisplayName()
 	p.startRule = startRuleFor(rp)
 	// What a search of a Unicode-mode pattern keeps per input byte, so the
 	// cost is visible before it is paid (the Backtracking memo is recorded
@@ -1512,7 +1509,14 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	// compilePattern closes. Nil-safe, and End is idempotent. Opened before
 	// the mode is resolved, so that a pattern refused for its mode is reported
 	// with it.
-	buildOpts.report().Begin(re.Name, re.Regexp)
+	label := re.Name
+	if re.Label != "" {
+		label = re.Label
+	}
+	buildOpts.report().Begin(label, re.Written())
+	if re.Expanded != nil {
+		buildOpts.report().Expanded(re.Regexp)
+	}
 	// The pattern's mode is decided here, once: every tree and program built
 	// for it below comes from rp, and buildOpts.Unicode records it for the
 	// options derived from buildOpts.
@@ -1533,8 +1537,9 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		if parsed, perr := rp.parse(); perr == nil {
 			if prog, cerr := compileProg(parsed); cerr == nil {
 				if bad := unsupportedRuneIn(re.Regexp, prog.prog, buildOpts.ByteMode); bad >= 0 {
-					buildOpts.report().Reason("refused — " + unsupportedRuneError(bad).Error())
-					return nil, unsupportedRuneError(bad)
+					err := pieceWithRune(re.Expanded, buildOpts.ByteMode, bad, unsupportedRuneError(bad))
+					buildOpts.report().Reason("refused — " + err.Error())
+					return nil, err
 				}
 			}
 		}
@@ -3581,7 +3586,7 @@ func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool
 	for _, re := range patterns {
 		p, err := compilePattern(re, cur, forceGroupsEngine, opts)
 		if err != nil {
-			return nil, 0, fmt.Errorf("compile pattern %q: %w", re.Regexp, err)
+			return nil, 0, patternError(re, err)
 		}
 		// Batch find/groups export trigger. Sole
 		// trigger for batchFindExport/batchGroupsExport — independent of
@@ -4366,6 +4371,54 @@ func unsupportedRuneError(r rune) error {
 	}
 	return fmt.Errorf("pattern contains the rune U+%04X, above U+00FF, which byte mode cannot "+
 		"match; without byte mode the pattern compiles in Unicode mode", r)
+}
+
+// pieceError is a refusal whose cause is in the text of a pattern the refused
+// one used by reference.
+type pieceError struct {
+	use config.PieceUse
+	err error
+}
+
+func (e *pieceError) Error() string { return e.use.Describe() + ": " + e.err.Error() }
+func (e *pieceError) Unwrap() error { return e.err }
+
+// pieceWithRune names the piece whose own text holds bad, the rune the byte
+// gate refused, when the refused pattern was written with references: each
+// piece is checked alone, in the pattern's mode, deepest first, and the first
+// one whose own refusal is that SAME rune is the one that wrote it. Failing for
+// some other rune is not enough: a piece the pattern cut away (`(?&cyr){0}`)
+// still fails alone, and the rune may be the pattern's own (`ж(?&greek)`).
+// err is returned unchanged when the pattern used no reference, or no piece
+// refuses bad.
+func pieceWithRune(x *config.Expansion, byteMode bool, bad rune, err error) error {
+	if x == nil {
+		return err
+	}
+	for _, u := range x.Pieces {
+		// Every piece parsed when the config loaded (config.ExpandReferences);
+		// resolvePattern's error arm is the unicode key, which a piece's text
+		// does not carry.
+		rp, _ := resolvePattern(u.Text, nil, &CompileOptions{ForceByteMode: true})
+		if parsed, perr := rp.parse(); perr == nil {
+			if prog, cerr := compileProg(parsed); cerr == nil && unsupportedRuneIn(u.Text, prog.prog, byteMode) == bad {
+				return &pieceError{use: u, err: err}
+			}
+		}
+	}
+	return err
+}
+
+// patternError names the pattern a compile error belongs to. A pattern
+// written with references is named as written, and an error whose cause is in
+// a piece names the piece too: `compile pattern "login", piece "cyrname"
+// (used by "login"): …`.
+func patternError(re config.PatternEntry, err error) error {
+	var pe *pieceError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("compile pattern %q, %s: %w", re.DisplayName(), pe.use.Describe(), pe.err)
+	}
+	return fmt.Errorf("compile pattern %q: %w", re.Written(), err)
 }
 
 // needsUnicodeSupport reports whether prog names a rune the byte gate refuses
