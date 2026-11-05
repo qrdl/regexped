@@ -32,7 +32,9 @@ patterns:
     regexp: 'ghu_[0-9a-zA-Z]{36}'
 
   - name: jwt
-    regexp: 'eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]*'
+    # The shortest header a JWT library accepts is {"alg":"none"}: eyJ and 16
+    # more characters. The payload can be as short as {}, `e30`.
+    regexp: 'eyJ[0-9a-zA-Z_\-]{16,}\.[0-9a-zA-Z_\-]+\.[0-9a-zA-Z_\-]*'
 
   - name: slack_token
     regexp: 'xox[baprs]-[0-9a-zA-Z\-]{10,}'
@@ -49,9 +51,4 @@ patterns:
 sets:
   - name: secrets
     find: find_secrets
-    # Every match at every start position, not each pattern's matches one
-    # after another: in `sk_live_<24 letters>sk_live_<24 letters>` the first
-    # match takes the second token's `sk`, and a per-pattern scan would then
-    # never report the second token. src/index.js joins overlapping matches.
-    overlapping: true
     patterns: all

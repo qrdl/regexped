@@ -38,19 +38,27 @@ app always asks for, scans and answers the whole body.
 
 | Origin response | Answer |
 |---|---|
-| A text type — `text/*`, `application/json`, `application/javascript`, `application/xml`, `application/x-www-form-urlencoded`, `*+json`, `*+xml` — or no type at all | the same status and headers, every secret replaced by `[REDACTED <pattern>]`, and `x-redacted: <count>` |
+| A text type — `text/*`, `application/json`, `application/javascript`, `application/xml`, `application/x-www-form-urlencoded`, `*+json`, `*+xml` — or no type at all | the same status and headers, every secret replaced by `[REDACTED <pattern>]`, and `x-redacted: <count>`. When anything was masked, the origin's digests (`Content-Digest`, `Repr-Digest`, `Digest`, `Content-MD5`) are removed and a strong `ETag` is made weak (`W/"…"`): they describe the origin's bytes, and a weak one still lets a client revalidate |
 | Any other type | passed through unchanged |
 | A response with no body — to a `HEAD` request, or a `101`, `103`, `204`, `205` or `304` | passed through unchanged |
 | A text type that is compressed (`content-encoding` other than `identity`) | `502`: it cannot be scanned, so it is not passed on. The app asks for `accept-encoding: identity`, so an origin that honours it never sends one |
 | A text type in a charset that does not write ASCII as ASCII bytes — anything but none given, UTF-8, US-ASCII, ISO-8859-*, Latin-1 and windows-125* — or a body starting with a UTF-16 byte-order mark, or a body containing a 0x00 byte (UTF-16 or UTF-32 that declares neither, which XML and JSON may) | `502`: the patterns are ASCII, so they would miss every secret in it |
 | A scan that fails | `502` — fail closed |
-| No answer from the origin | `502` |
+| No answer from the origin, or a body that cannot be read to its end | `502` |
 
-The set reports every match at every start position (`overlapping: true`), so
-matches can overlap: two patterns over the same text — an AWS key inside an
-`aws_secret_access_key = …` line — or a token running straight into the next
-(`sk_live_…sk_live_…`, where the first match takes the second token's `sk`).
-Overlapping matches are masked once, named after the first.
+Two patterns can match overlapping text — an AWS key inside an
+`aws_secret_access_key = …` line — and overlapping matches are masked once,
+named after the first.
+
+Each pattern's matches follow one another, so a secret written straight after
+another of its kind, with nothing between them, is not found whole: in
+`sk_live_<key>sk_live_<key>` the first match takes the second key's `sk`, and
+the rest of the second key goes out unmasked. Only Stripe keys and JWTs, whose
+length has no upper limit, can do this; any separator — a space, a quote, a
+comma, `=`, a new line — keeps the two apart. `overlapping: true` on the set
+would find the second key too, at a cost measured for this set: every scan
+reserves 44 bytes per byte of body, up to 64 MiB, and a body of `eyJ` repeated
+costs six times as much to scan.
 
 The AWS secret key is also found with its `/`, `+` and `=` escaped the way a
 form body writes them (`%2F`, `%2B`, `%3D`) and its `/` the way some JSON
@@ -81,8 +89,8 @@ What each target needs:
 ## How it works
 
 1. [`regexped.yaml`](regexped.yaml) declares the ten patterns and one set,
-   `secrets`, with the `find` capability and `overlapping: true`: every match
-   at every start position, with its pattern's id and its position.
+   `secrets`, with the `find` capability: every match, with its pattern's id
+   and its position.
 2. `fastedge-build --component regexped:secrets/sets=secrets.wasm` reads the
    interface from the component, generates the JavaScript bindings and
    composes the component into the output. It also writes

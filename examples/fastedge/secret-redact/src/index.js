@@ -29,10 +29,9 @@ const NO_BODY = new Set([101, 103, 204, 205, 304]);
 const encoder = new TextEncoder();
 
 // The secrets in `body` as [start, end, name] byte ranges, in order and not
-// overlapping. The set reports every match at every start position, so
-// matches can overlap — an AWS key inside an `aws_secret_access_key = …` line,
-// or a token running straight into the next one — and overlapping matches are
-// joined and keep the first one's name.
+// overlapping. The set reports each pattern's matches; two patterns can match
+// overlapping text (an AWS key inside an `aws_secret_access_key = …` line), so
+// overlapping matches are joined and keep the first one's name.
 function secretRanges(body) {
   const ranges = [];
   const scanner = new FindSecrets(body, 0);
@@ -122,7 +121,13 @@ async function handler(event) {
   if (charset && !ASCII_CHARSET.test(charset)) {
     return new Response(`cannot scan a ${charset} response\n`, { status: 502 });
   }
-  const body = new Uint8Array(await upstream.arrayBuffer());
+  let body;
+  try {
+    body = new Uint8Array(await upstream.arrayBuffer());
+  } catch (err) {
+    console.error(`cannot read the origin's response: ${err}`);
+    return new Response("cannot read the origin's response\n", { status: 502 });
+  }
   if (body.length >= 2 && ((body[0] === 0xFE && body[1] === 0xFF) || (body[0] === 0xFF && body[1] === 0xFE))) {
     return new Response('cannot scan a UTF-16 response\n', { status: 502 });
   }
@@ -143,6 +148,14 @@ async function handler(event) {
   const out = new Headers(upstream.headers);
   out.delete('content-length');
   out.set('x-redacted', String(ranges.length));
+  if (ranges.length > 0) {
+    // The origin's digests and strong validator describe bytes the client no
+    // longer gets. A weak validator still lets a client revalidate: the
+    // origin compares If-None-Match weakly and answers 304 while unchanged.
+    for (const name of ['content-digest', 'repr-digest', 'digest', 'content-md5']) out.delete(name);
+    const etag = out.get('etag');
+    if (etag && !etag.startsWith('W/')) out.set('etag', `W/${etag}`);
+  }
   return new Response(ranges.length > 0 ? redact(body, ranges) : body, {
     status: upstream.status,
     statusText: upstream.statusText,

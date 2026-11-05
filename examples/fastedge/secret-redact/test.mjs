@@ -22,6 +22,10 @@ const AWS_KEY = 'AKIAIOSFODNN7EXAMPLE';
 const GITHUB = 'ghp_abc123456789012345678901234567890xyz';
 const STRIPE = 'sk_live_AbCdEfGhIjKlMnOpQrStUvWx';
 const AWS_SECRET = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+// Short JWTs: no `typ` and small claims (HS256 with the key "secret"), and an
+// unsigned one, the shortest a JWT library accepts.
+const SHORT_JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.M11_c_Mkz5wKz70TPIkcPwzBTd5M-3ZW69WFmxuEnHk';
+const UNSIGNED_JWT = 'eyJhbGciOiJub25lIn0.e30.';
 const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
   + '.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ'
   + '.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
@@ -59,14 +63,21 @@ const pages = {
   '/utf32.json': [200, { 'content-type': 'application/json' }, utf32le(JSON.stringify({ token: GITHUB }))],
   // No type: scanned as text.
   '/untyped': [200, {}, `token ${GITHUB}\n`],
-  // A token running straight into the next one: the first match takes the
-  // second token's `sk`.
+  // A key written straight after another of its kind: the first match takes
+  // the second key's `sk`, and the rest of the second key is not found.
   '/chain.txt': [200, { 'content-type': 'text/plain' }, `sk_live_${'A'.repeat(24)}sk_live_${'B'.repeat(24)}\n`],
   // An AWS secret key with its `/` escaped, by a form and by a JSON writer.
   '/form': [200, { 'content-type': 'application/x-www-form-urlencoded' },
     `aws_secret_access_key=${encodeURIComponent(AWS_SECRET)}`],
   '/escaped.json': [200, { 'content-type': 'application/json' },
     `{"env":"aws_secret_access_key = ${AWS_SECRET.replaceAll('/', '\\/')}"}`],
+  '/short-jwt.txt': [200, { 'content-type': 'text/plain' }, `token ${SHORT_JWT} or ${UNSIGNED_JWT} end\n`],
+  // Validators and digests of the origin's bytes.
+  '/tagged.txt': [200, {
+    'content-type': 'text/plain', etag: '"v1"', 'content-digest': 'sha-256=:AAAA:', digest: 'SHA-256=AAAA',
+  }, `token ${GITHUB}\n`],
+  '/tagged-clean.txt': [200, { 'content-type': 'text/plain', etag: '"v1"', 'content-digest': 'sha-256=:AAAA:' },
+    'nothing to hide\n'],
   // Statuses with no body, typed as text.
   '/no-content': [204, { 'content-type': 'text/plain' }, ''],
   '/not-modified': [304, { 'content-type': 'text/plain' }, ''],
@@ -81,6 +92,13 @@ const origin = createServer((req, res) => {
     if (req.url === '/echo') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end(Buffer.concat(chunks));
+      return;
+    }
+    // The connection drops in the middle of the body.
+    if (req.url === '/truncated') {
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '100000' });
+      res.write(`token ${GITHUB.slice(0, 10)}`);
+      setTimeout(() => res.socket.destroy(), 50);
       return;
     }
     const [status, headers, body] = pages[req.url] ?? [404, { 'content-type': 'text/plain' }, `not found: ${req.url}\n`];
@@ -202,10 +220,32 @@ const tests = [
     assertHttpHeader(r, 'x-redacted', '1');
     expectBody(r, 'token [REDACTED github_pat]\n');
   }],
-  ['masks a token running straight into the next one', async (runner) => {
+  // A known limit: the second key's tail goes out unmasked.
+  ['masks only the first of two keys written back to back', async (runner) => {
     const r = await fetchPath(runner, '/chain.txt');
     assertHttpHeader(r, 'x-redacted', '1');
-    expectBody(r, '[REDACTED stripe_live]\n');
+    expectBody(r, `[REDACTED stripe_live]_live_${'B'.repeat(24)}\n`);
+  }],
+  ['masks short JWTs', async (runner) => {
+    const r = await fetchPath(runner, '/short-jwt.txt');
+    assertHttpHeader(r, 'x-redacted', '2');
+    expectBody(r, 'token [REDACTED jwt] or [REDACTED jwt] end\n');
+  }],
+  ['refuses a response whose body cannot be read', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/truncated'), 502);
+  }],
+  ['drops digests and weakens the ETag of a masked response', async (runner) => {
+    const r = await fetchPath(runner, '/tagged.txt');
+    assertHttpHeader(r, 'x-redacted', '1');
+    assertHttpHeader(r, 'etag', 'W/"v1"');
+    assertHttpNoHeader(r, 'content-digest');
+    assertHttpNoHeader(r, 'digest');
+  }],
+  ['keeps the ETag and digests of an unchanged response', async (runner) => {
+    const r = await fetchPath(runner, '/tagged-clean.txt');
+    assertHttpHeader(r, 'x-redacted', '0');
+    assertHttpHeader(r, 'etag', '"v1"');
+    assertHttpHeader(r, 'content-digest', 'sha-256=:AAAA:');
   }],
   ['masks an AWS secret key in a form body', async (runner) => {
     const r = await fetchPath(runner, '/form');
