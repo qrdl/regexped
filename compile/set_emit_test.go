@@ -1634,6 +1634,25 @@ func TestSetEmitScanAnyCapabilityArms(t *testing.T) {
 		t.Errorf("the capScanAny union body is empty or unterminated (%d bytes)", len(body))
 	}
 
+	// scan_all's early exit reasons in the buckets' mask, which the
+	// automaton's ids are a subset of whenever no member is dropped. A mask
+	// narrower than the automaton's ids — a member answered by nothing — is
+	// ANDed before the compare, and an empty one has no early exit at all:
+	// exiting on acc == 0 would answer "all present" for nothing found.
+	full := compiled.fullIDMask()
+	if full&(full-1) == 0 {
+		t.Fatalf("full mask %b: the fixture needs two or more ids", full)
+	}
+	plain := emitUnionScanBody(compiled.unionScan, capScanAll, full, 0, false)
+	narrow := emitUnionScanBody(compiled.unionScan, capScanAll, full&^1, 0, false)
+	none := emitUnionScanBody(compiled.unionScan, capScanAll, 0, 0, false)
+	if len(narrow) <= len(plain) {
+		t.Errorf("a narrower mask: %d bytes, not more than the full mask's %d", len(narrow), len(plain))
+	}
+	if len(none) >= len(plain) {
+		t.Errorf("an empty mask: %d bytes, not fewer than the full mask's %d", len(none), len(plain))
+	}
+
 	ctx := newSetFindCtx(compiled, 0, 0, 0, capScanAny, 0)
 	if got := ctx.emitRecordProbe(nil, 0); len(got) == 0 {
 		t.Error("emitRecordProbe emitted nothing for capScanAny")

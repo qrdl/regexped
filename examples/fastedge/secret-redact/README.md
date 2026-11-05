@@ -30,13 +30,19 @@ and every input; JavaScript's `RegExp` engine backtracks.
 ## What it answers
 
 The origin is the URL in the `ORIGIN` environment variable; every request is
-forwarded to it, method, headers and body, with its path and query.
+forwarded to it, method, headers and body, with its path and query. The path
+is set on the origin's URL rather than resolved against it, so a path such as
+`//elsewhere.example/` stays on the origin. `Range` and `If-Range` are not
+forwarded: a secret split across two ranges would match in neither, so the
+app always asks for, scans and answers the whole body.
 
 | Origin response | Answer |
 |---|---|
 | A text type — `text/*`, `application/json`, `application/javascript`, `application/xml`, `application/x-www-form-urlencoded`, `*+json`, `*+xml` | the same status and headers, every secret replaced by `[REDACTED <pattern>]`, and `x-redacted: <count>` |
 | Any other type | passed through unchanged |
+| A response with no body — to a `HEAD` request, or a `101`, `103`, `204`, `205` or `304` | passed through unchanged |
 | A text type that is compressed (`content-encoding` other than `identity`) | `502`: it cannot be scanned, so it is not passed on. The app asks for `accept-encoding: identity`, so an origin that honours it never sends one |
+| A text type in a charset that does not write ASCII as ASCII bytes — anything but none given, UTF-8, US-ASCII, ISO-8859-*, Latin-1 and windows-125* — or a body starting with a UTF-16 byte-order mark | `502`: the patterns are ASCII, so they would miss every secret in it |
 | A scan that fails | `502` — fail closed |
 | No answer from the origin | `502` |
 

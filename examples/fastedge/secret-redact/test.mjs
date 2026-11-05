@@ -43,8 +43,18 @@ const pages = {
   '/compressed.txt': [200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' },
     gzipSync(`token ${GITHUB}\n`)],
   '/large.txt': [200, { 'content-type': 'text/plain' }, large],
+  // ASCII written as ASCII bytes: scanned.
+  '/latin1.txt': [200, { 'content-type': 'text/plain; charset="ISO-8859-1"' }, `token ${GITHUB}\n`],
+  // ASCII not written as ASCII bytes: refused.
+  '/utf16.txt': [200, { 'content-type': 'text/plain; charset=utf-16le' }, Buffer.from(`token ${GITHUB}\n`, 'utf16le')],
+  '/bom.txt': [200, { 'content-type': 'text/plain' }, Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from(`token ${GITHUB}\n`, 'utf16le')])],
+  // Statuses with no body, typed as text.
+  '/no-content': [204, { 'content-type': 'text/plain' }, ''],
+  '/not-modified': [304, { 'content-type': 'text/plain' }, ''],
 };
 
+// The origin answers a `Range: bytes=a-b` request with that part alone, as a
+// real one does, so a range the app forwarded would come back as 206.
 const origin = createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
@@ -54,9 +64,16 @@ const origin = createServer((req, res) => {
       res.end(Buffer.concat(chunks));
       return;
     }
-    const [status, headers, body] = pages[req.url] ?? [404, { 'content-type': 'text/plain' }, 'not found\n'];
+    const [status, headers, body] = pages[req.url] ?? [404, { 'content-type': 'text/plain' }, `not found: ${req.url}\n`];
+    const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range ?? '');
+    if (range && status === 200) {
+      const [from, to] = [Number(range[1]), Number(range[2])];
+      res.writeHead(206, { ...headers, 'content-range': `bytes ${from}-${to}/${Buffer.byteLength(body)}` });
+      res.end(Buffer.from(body).subarray(from, to + 1));
+      return;
+    }
     res.writeHead(status, headers);
-    res.end(body);
+    res.end(req.method === 'HEAD' ? undefined : body);
   });
 });
 await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
@@ -128,6 +145,45 @@ const tests = [
   ['forwards the request body', async (runner) => {
     const r = await fetchPath(runner, '/echo', { method: 'POST', body: `echo ${STRIPE}` });
     expectBody(r, 'echo [REDACTED stripe_live]');
+  }],
+  // Bytes 0-19 end inside the AWS key: forwarded, the range would come back
+  // as "deploy with key=AKIA", which no pattern matches.
+  ['scans the whole body when a range is asked for', async (runner) => {
+    const r = await fetchPath(runner, '/notes.txt', { headers: { range: 'bytes=0-19' } });
+    assertHttpStatus(r, 200);
+    expectBody(r, 'deploy with key=[REDACTED aws_key] and token [REDACTED github_pat]\n');
+  }],
+  ['keeps a path that looks like a host on the origin', async (runner) => {
+    const r = await fetchPath(runner, '//elsewhere.example/notes.txt');
+    assertHttpStatus(r, 404);
+    expectBody(r, 'not found: //elsewhere.example/notes.txt\n');
+  }],
+  ['scans a charset that writes ASCII as ASCII', async (runner) => {
+    const r = await fetchPath(runner, '/latin1.txt');
+    assertHttpHeader(r, 'x-redacted', '1');
+    expectBody(r, 'token [REDACTED github_pat]\n');
+  }],
+  ['refuses a UTF-16 response', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/utf16.txt'), 502);
+  }],
+  ['refuses a response starting with a UTF-16 byte-order mark', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/bom.txt'), 502);
+  }],
+  ['passes a 204 through', async (runner) => {
+    const r = await fetchPath(runner, '/no-content');
+    assertHttpStatus(r, 204);
+    assertHttpNoHeader(r, 'x-redacted');
+  }],
+  ['passes a 304 through', async (runner) => {
+    const r = await fetchPath(runner, '/not-modified');
+    assertHttpStatus(r, 304);
+    assertHttpNoHeader(r, 'x-redacted');
+  }],
+  ['passes a HEAD response through', async (runner) => {
+    const r = await fetchPath(runner, '/notes.txt', { method: 'HEAD' });
+    assertHttpStatus(r, 200);
+    assertHttpNoHeader(r, 'x-redacted');
+    expectBody(r, '');
   }],
 ];
 

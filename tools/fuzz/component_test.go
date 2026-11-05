@@ -353,7 +353,7 @@ func TestComponentSetScannerReclaimsItsState(t *testing.T) {
 func TestComponentSetScannerReleasesItsStateWhenFinished(t *testing.T) {
 	for _, c := range []struct {
 		name, cfg, text string
-		want           int
+		want            int
 	}{
 		{"narrow", narrowSetCfg, strings.Repeat("x", 64<<10) + " ghp_ab12", 1},
 		{"overlapping", overlapSetCfg, strings.Repeat("-", 64<<10), 0},

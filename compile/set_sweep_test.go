@@ -577,6 +577,52 @@ func TestDFAWalksNest(t *testing.T) {
 	}
 }
 
+// TestSweepReachabilityOverAHandBuiltTable: the reachability helpers the sweep
+// plans with, over a table with what a merged automaton rarely shows them at
+// once — a state accepting only through a >64-pattern accept list, a state no
+// root reaches, an empty W-dominant entry and a live NW-dominant one.
+//
+//	0 (every root) --a--> 1 --a, space--> 1     2 --z--> 0, never reached
+func TestSweepReachabilityOverAHandBuiltTable(t *testing.T) {
+	trans := make([]int, 3*256)
+	for i := range trans {
+		trans[i] = -1
+	}
+	trans[0*256+'a'] = 1
+	trans[1*256+'a'] = 1
+	trans[1*256+' '] = 1
+	trans[2*256+'z'] = 0
+	tb := &dfaTable{
+		numStates: 3, transitions: trans, hasWordBoundary: true,
+		midStartState: 0, midStartWordState: -1, midStartNewlineState: -1,
+		acceptWide:                map[int][]uint16{1: {70}},
+		midAcceptWStatesDominant:  map[int]uint64{0: 0},
+		midAcceptNWStatesDominant: map[int]uint64{1: 1},
+	}
+	reach, co := dfaReachCo(tb)
+	if want := []bool{true, true, false}; fmt.Sprint(reach) != fmt.Sprint(want) {
+		t.Errorf("reach %v, want %v", reach, want)
+	}
+	if want := []bool{true, true, false}; fmt.Sprint(co) != fmt.Sprint(want) {
+		t.Errorf("co-reach %v, want %v: state 1 accepts through its wide list", co, want)
+	}
+	// State 1 is NW-dominant, and its non-word byte leads back to an accept.
+	if !dominanceDecides(tb) {
+		t.Error("an NW-dominant accept followed by an accepting walk does not decide")
+	}
+	// A walk started at 0 and one started a byte later meet in 1 on `a` and
+	// both stay alive: walks nest.
+	if !dfaWalksNest(tb) {
+		t.Error("walks meeting in a self-looping accepting state do not nest")
+	}
+	// The wide list is part of the state's identity.
+	without := *tb
+	without.acceptWide = map[int][]uint16{1: {71}}
+	if dfaFingerprint(tb) == dfaFingerprint(&without) {
+		t.Error("two tables differing only in a wide accept list share a fingerprint")
+	}
+}
+
 // TestWholeSetSweepShapes compiles the overlapping sets the answer cache
 // sweeps over a WHOLE-SET automaton — word-boundary and newline channels, and
 // an automaton past 255 states (16-bit ids) — and pins that each gets one. The
