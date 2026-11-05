@@ -621,7 +621,7 @@ func TestSetAdapterBodyFraming(t *testing.T) {
 		// shapes are checked: the arithmetic is emitted only when the set has a
 		// sweep, and an empty or malformed body would be invisible otherwise.
 		{"constructor (with cache)", buildSetScannerCtorBody(setScannerCtor{reallocIdx: 9, callListGlobal: 1, idSpace: 12, cells: 33, pats: 3})},
-		{"next", buildSetScannerNextBodyBlocks(9, 3, 12, nil, 0, 0)},
+		{"next", buildSetScannerNextBodyBlocks(9, 10, 3, 12, nil, 0, 0)},
 		{"dtor", buildSetScannerDtorBodyBlocks(10, nil)},
 	} {
 		if len(c.body) == 0 {

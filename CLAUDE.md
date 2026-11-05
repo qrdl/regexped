@@ -513,7 +513,14 @@ regexped/
 │   │                          #   the per-call chain's head, and DETACHES its blocks from
 │   │                          #   the allocator's per-call chain: a resource
 │   │                          #   outlives the call that made it, so the dtor frees them
-│   │                          #   instead. It also calls the IMPORTED [resource-new] builtin
+│   │                          #   instead — or `next`, the moment the drive ends or errors
+│   │                          #   (emitSetReleaseFinished; component.go's emitPatRelease-
+│   │                          #   Finished for find/groups): input, gate array, cache, notes
+│   │                          #   and memos, each pointer zeroed so the dtor skips it. A JS
+│   │                          #   guest never runs the finalizer that drops a forgotten
+│   │                          #   handle, so a scan run to its end without a dispose held
+│   │                          #   its input until the request ended (3,000 × 64 KB crashed
+│   │                          #   FastEdge's 128 MiB). It also calls the IMPORTED [resource-new] builtin
 │   │                          #   and returns a HANDLE — returning the representation builds
 │   │                          #   fine and traps with "unknown handle index" — and that
 │   │                          #   import is why a set-bearing component offsets every
@@ -573,7 +580,9 @@ regexped/
 │   │                          #   (inline per arm it made `^(\pL+)=(\pL+)` 8.3 MB, over the
 │   │                          #   function cap), and a match under 16 bytes runs a copy of the
 │   │                          #   capture body without it (tdfaCaptureBodies, the capture slot's
-│   │                          #   second function)
+│   │                          #   second function; the groups wrapper picks it by the match's
+│   │                          #   length). A loop no ASCII byte stays in (`\p{Han}+`) learns the
+│   │                          #   ops a run fires from its first character
 │   ├── verbose.go             # --verbose compile reporting
 │   ├── whole_capture.go       # Single-capture shortcuts: group 1 is group 0, or group 0
 │   │                          #   less a plain literal prefix/suffix (`([^,]+),`, `<([^>]*)>`)
@@ -764,8 +773,10 @@ regexped/
     ├── fastedge/
     │   ├── validate/          # FastEdge CDN app: email, URL, XSS validation via regexped WASM stubs
     │   ├── url-guard/         # FastEdge: OWASP URL attack detection
-    │   └── script-detect/     # FastEdge wasi:http component: scripts by letters, narrowed to the
-    │                          #   European alphabets they fit (Unicode sets)
+    │   ├── script-detect/     # FastEdge wasi:http component: scripts by letters, narrowed to the
+    │   │                      #   European alphabets they fit (Unicode sets)
+    │   └── secret-redact/     # FastEdge JS app (FastEdge JS SDK `--component`): masks secrets in
+    │                          #   origin responses with one set `find`; tested under fastedge-run
     └── wasmtime/
         ├── rust/
         │   ├── url-validate/  # DFA anchored match: validate HTTP(S) URLs, regexp built from references (Rust)
@@ -1825,7 +1836,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 ---
 
-**Last Updated:** 2026-10-17
+**Last Updated:** 2026-10-19
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs), `docs/references.md` (pattern references)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.

@@ -681,10 +681,48 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 // its notes and a tripped Backtracking block its memo after a call that matched
 // — allocated from cabi_realloc and detached from the call, as the pattern
 // resources do (emitResourceNotes, emitResourceBTMemo).
-func buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount int, blocks []SearchSize, callListGlobal, heapGlobal uint32) []byte {
+// emitSetReleaseFinished frees what a FINISHED set scanner will never read
+// again — the input, the gate array, the answer cache, and the notes and memos
+// its search blocks were given — and zeroes each pointer, so the destructor
+// frees only what is left. The search-block array itself stays until the
+// destructor. Emitted where `next` records the end of the drive or an error;
+// see emitPatReleaseFinished for why.
+func emitSetReleaseFinished(b []byte, pRep byte, freeIdx int, blocks []SearchSize, lTmp byte) []byte {
+	release := func(b []byte, base func([]byte) []byte, at int) []byte {
+		b = base(b)
+		b = loadI32(b, at)
+		b = append(b, 0x22, lTmp, 0x04, 0x40) // if it is still held
+		b = append(b, 0x20, lTmp, 0x10)
+		b = utils.AppendULEB128(b, uint32(freeIdx))
+		b = base(b)
+		b = append(b, 0x41, 0x00)
+		b = storeI32(b, at)
+		return append(b, 0x0B)
+	}
+	rep := func(b []byte) []byte { return append(b, 0x20, pRep) }
+	for _, off := range []int{repInput, repGate, repCache} {
+		b = release(b, rep, off)
+	}
+	blockArray := func(b []byte) []byte {
+		b = append(b, 0x20, pRep)
+		return loadI32(b, repBlocks)
+	}
+	for k, sz := range blocks {
+		if sz.NotesBytes > 0 {
+			b = release(b, blockArray, k*abi.SearchBlockBytes+abi.SearchNotesOff)
+		}
+		if sz.BTMemoBytes > 0 {
+			b = release(b, blockArray, k*abi.SearchBlockBytes+abi.SearchBTMemoOff)
+		}
+	}
+	return b
+}
+
+func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount int, blocks []SearchSize, callListGlobal, heapGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	lRet, lOut, lN := alloc.I32(), alloc.I32(), alloc.I32()
+	lTmp := alloc.I32()
 	var lBlk, lSz, lP, lChain, lSz64, lNeed byte
 	if len(blocks) > 0 {
 		lBlk, lSz, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
@@ -772,6 +810,7 @@ func buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount int, blocks
 	b = append(b, 0x21, lN)
 	b = append(b, 0x20, pRep, 0x20, lN, 0x41, 0x02, 0x6A)
 	b = storeI32(b, repDone)
+	b = emitSetReleaseFinished(b, pRep, freeIdx, blocks, lTmp)
 	b = storeDisc(b, lRet, 0, 1)
 	b = append(b, 0x20, lRet)
 	b = append(b, 0x20, lN)
@@ -785,6 +824,7 @@ func buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount int, blocks
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep, 0x41, 0x01)
 	b = storeI32(b, repDone)
+	b = emitSetReleaseFinished(b, pRep, freeIdx, blocks, lTmp)
 	b = append(b, 0x20, lRet, 0x20, lOut)
 	b = storeI32(b, 4)
 	b = append(b, 0x20, lRet, 0x41, 0x00)
@@ -847,9 +887,11 @@ func buildSetScannerNextBodyBlocks(reallocIdx, findIdx, patternCount int, blocks
 
 // buildSetScannerDtorBodyBlocks emits `[dtor]<res>`: (rep) → ().
 //
-// It frees exactly what the constructor detached from the call chain — the input
-// copy, the gate array, the answer cache and the representation itself. Everything a `next` call
-// allocated was freed by that call's post-return.
+// It frees exactly what the constructor detached from the call chain and a
+// finished `next` has not already released (emitSetReleaseFinished zeroes what
+// it frees) — the input copy, the gate array, the answer cache and the
+// representation itself. Everything a `next` call allocated was freed by that
+// call's post-return.
 //
 // An absent dtor is not a compile error: dropping the handle traps instead.
 // It also frees a scanner's search blocks (blocks non-nil) and whatever notes
@@ -885,9 +927,10 @@ func buildSetScannerDtorBodyBlocks(freeIdx int, blocks []SearchSize) []byte {
 		b = utils.AppendULEB128(b, uint32(freeIdx))
 	}
 
-	// The input block and the gate array are ALWAYS present; the answer cache
-	// may not be — a set with no sweep, or a region over budget, leaves it null
-	// — so it is the one slot that needs a guard.
+	// The input block, the gate array and the answer cache can each be null: a
+	// finished scanner released all three (emitSetReleaseFinished), and the cache
+	// is null from the start for a set with no sweep or a region over budget. So
+	// every one of them needs a guard.
 	//
 	// cm_free reads the block's class out of the word BELOW the pointer, so
 	// handing it null reads address -8 and traps. It faulted on the first drive
@@ -895,8 +938,12 @@ func buildSetScannerDtorBodyBlocks(freeIdx int, blocks []SearchSize) []byte {
 	for _, off := range []int{repInput, repGate} {
 		b = append(b, 0x20, pRep)
 		b = loadI32(b, off)
+		b = append(b, 0x04, 0x40)
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, off)
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(freeIdx))
+		b = append(b, 0x0B)
 	}
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, repCache)
@@ -1100,7 +1147,7 @@ func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal, 
 			sweepCells: a.sweepCells, sweepRow: a.sweepRow,
 		})
 	case setAdapterNext:
-		return buildSetScannerNextBodyBlocks(reallocIdx, a.innerFunc, a.count, a.blocks, callListGlobal, heapGlobal)
+		return buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, a.innerFunc, a.count, a.blocks, callListGlobal, heapGlobal)
 	case setAdapterDtor:
 		return buildSetScannerDtorBodyBlocks(freeIdx, a.blocks)
 	}

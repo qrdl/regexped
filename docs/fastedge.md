@@ -1,6 +1,6 @@
 # Using Regexped in Gcore FastEdge
 
-FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI, and HTTP applications built as `wasi:http` components. For the first, regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host — and most of this page covers that route. The last section covers a component application.
+FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI, and HTTP applications built as `wasi:http` components, in Rust or in JavaScript. For the first, regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host — and most of this page covers that route. The last two sections cover component applications: one in Rust, and one in JavaScript built with the FastEdge JS SDK.
 
 ## Configuration
 
@@ -177,3 +177,73 @@ let names: Vec<&str> = ids.into_iter().map(scriptdetect::latin_pattern_name).col
 
 The calls are the ones a module build makes; see
 [component.md](component.md) for what changes under `wasm_format: component`.
+
+## JavaScript HTTP apps: the FastEdge JS SDK
+
+The FastEdge JS SDK, `@gcoredev/fastedge-sdk-js` 2.7.0 or later, imports Wasm
+components into a JavaScript HTTP app, and a regexped component
+(`wasm_format: component`) is one. `fastedge-build` reads the interface from the
+component, generates the JavaScript bindings and composes the component into the
+app, so there is no stub to generate and no `regexped merge` step:
+
+```bash
+# 1. Compile the patterns into a component (and its sibling .wit)
+regexped compile --config=regexped.yaml          # → secrets.wasm
+
+# 2. Bundle the app, bind it to the component's interface, compose the two
+npx fastedge-build --input src/index.js --output app.wasm \
+  --component regexped:secrets/sets=secrets.wasm # → app.wasm
+```
+
+The interface is `regexped:<wit_package>/matcher` for single patterns and
+`regexped:<wit_package>/sets` for sets; `wit_package` defaults to the
+kebab-cased `import_module`. A config-driven build names it in the `components`
+field of `.fastedge/build-config.js` instead of `--component`. The build also
+writes `fastedge-components.d.ts` beside the input, with the interface's
+TypeScript declarations:
+
+| Config | JavaScript |
+|---|---|
+| `match_func: email_match` | `emailMatch(input): number \| undefined` — the end of the match |
+| `find_func: email_find` | `new EmailFind(input, start)`, then `next(): [start, end] \| undefined` |
+| `groups_func: kv_groups` | `new KvGroups(input, start)`, then `next()`: one `[start, end]` or `undefined` per group; empty when finished |
+| a set's `find: find_secrets` | `new FindSecrets(input, start)`, then `next(): Array<{ id, start, end }>` — the matches at the next position; empty when finished |
+| a set's `match_any` / `scan_any` | `f(input)` / `f(input, start)`, returning a matching pattern's id or `undefined` |
+| a set's `match_all` / `scan_all` | `f(input)` / `f(input, start)`, returning a `Uint32Array` of every matching pattern's id |
+
+Inputs are `Uint8Array`s and positions are byte offsets into them. An error —
+the Backtracking engine out of memory, for example — is thrown as an `Error`
+whose `message` and `payload` are the WIT error code (`'backtrack-overflow'`).
+
+```js
+import { FindSecrets } from 'regexped:secrets/sets';
+
+const scanner = new FindSecrets(body, 0);   // body: Uint8Array
+try {
+  for (let ms = scanner.next(); ms.length > 0; ms = scanner.next()) {
+    for (const { id, start, end } of ms) { /* id: the pattern's index in the set */ }
+  }
+} finally {
+  scanner[Symbol.dispose]();
+}
+```
+
+What SDK 2.7.0 requires of an app:
+
+- **Dispose every scanner** in a `finally`. The bindings register a
+  `FinalizationRegistry` to drop forgotten handles, but FastEdge's JavaScript
+  engine never runs its callbacks, so an abandoned scanner holds its input until
+  the request ends. A scan run to its end has already released its input and
+  working memory, so only a scan that stops early holds anything. A `using`
+  declaration does the same, but `fastedge-build` checks the syntax with the
+  Node it runs on, and Node 22 rejects `using`; Node 24 accepts it.
+- **Pass large data once.** Every call that passes data to a component leaves the
+  bindings' copy of that data allocated until the request ends. Construct one
+  scanner over the whole body and call `next()`, which passes nothing, rather
+  than calling a component once per line or per word of a large body.
+
+[`examples/fastedge/secret-redact/`](../examples/fastedge/secret-redact/) is a
+complete app: it proxies an origin and masks AWS, GitHub, Slack, Stripe and
+Google keys and JWTs in the text responses, with one set `find` over each body.
+`make test` runs it under FastEdge's own runtime, `fastedge-run`, through
+`@gcoredev/fastedge-test`.

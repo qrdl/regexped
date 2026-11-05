@@ -295,9 +295,9 @@ func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callLi
 		return buildPatternScannerCtorBody(reallocIdx, a.resNewImport, callListGlobal,
 			a.numGroups > 0, a.numGroups, a.notes)
 	case adapterPatFindNext:
-		return buildPatternFindNextBody(reallocIdx, a.funcIdx, a.notes, callListGlobal)
+		return buildPatternFindNextBody(reallocIdx, freeIdx, a.funcIdx, a.notes, callListGlobal)
 	case adapterPatGroupsNext:
-		return buildPatternGroupsNextBody(reallocIdx, a.funcIdx, a.numGroups, a.notes, callListGlobal)
+		return buildPatternGroupsNextBody(reallocIdx, freeIdx, a.funcIdx, a.numGroups, a.notes, callListGlobal)
 	case adapterPatDtor:
 		return buildPatternScannerDtorBody(freeIdx, a.numGroups, a.notes)
 	}
@@ -1185,11 +1185,42 @@ func buildPatternScannerCtorBody(reallocIdx, resNewIdx int, callListGlobal uint3
 	return b
 }
 
+// emitPatReleaseFinished frees what a FINISHED scanner will never read again —
+// its input block, and the notes and memo its search was given — and zeroes each
+// pointer, so the destructor frees only what is left. Emitted where `next`
+// records the end of the scan or an error: from then on `next` answers from the
+// state alone and never calls the body.
+//
+// It exists because a dropped handle is the only other thing that frees them,
+// and a JS guest does not reliably drop one: the engine FastEdge runs never
+// calls the FinalizationRegistry its bindings register, so a scan run to its end
+// without an explicit dispose held its whole input until the request ended.
+func emitPatReleaseFinished(b []byte, pRep byte, freeIdx, numGroups int, notes resourceNotes, lTmp byte) []byte {
+	release := func(b []byte, at int) []byte {
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, at)
+		b = append(b, 0x22, lTmp, 0x04, 0x40) // if it is still held
+		b = append(b, 0x20, lTmp, 0x10)
+		b = utils.AppendULEB128(b, uint32(freeIdx))
+		b = append(b, 0x20, pRep, 0x41, 0x00)
+		b = storeI32(b, at)
+		return append(b, 0x0B)
+	}
+	b = release(b, patRepInput)
+	if notes.on() {
+		for _, off := range []int{abi.SearchNotesOff, abi.SearchBTMemoOff} {
+			b = release(b, int(patRepBlockOff(numGroups))+off)
+		}
+	}
+	return b
+}
+
 // buildPatternScannerDtorBody emits `[dtor]<res>`: (rep) → ().
 //
-// It frees exactly what the constructor detached from the call chain: the input
-// block and the representation. Everything a `next` allocated was freed by that
-// call's post-return.
+// It frees exactly what the constructor detached from the call chain and a
+// finished `next` has not already released (emitPatReleaseFinished zeroes what
+// it frees): the input block and the representation. Everything a `next`
+// allocated was freed by that call's post-return.
 func buildPatternScannerDtorBody(freeIdx, numGroups int, notes resourceNotes) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
@@ -1212,10 +1243,16 @@ func buildPatternScannerDtorBody(freeIdx, numGroups int, notes resourceNotes) []
 		}
 	}
 
+	// The input, unless the scan finished and released it. cm_free reads the
+	// block's class from the word below the pointer, so it must not see null.
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, patRepInput)
+	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, patRepInput)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(freeIdx))
+	b = append(b, 0x0B)
 	b = append(b, 0x20, pRep)
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(freeIdx))
@@ -1238,12 +1275,13 @@ func buildPatternScannerDtorBody(freeIdx, numGroups int, notes resourceNotes) []
 // consumer stub, where the module-format stubs also keep it: it is a reporting
 // rule rather than a scanning one, and moving it here would make the raw
 // resource answer differently from the raw module export.
-func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, callListGlobal uint32) []byte {
+func buildPatternFindNextBody(reallocIdx, freeIdx, innerIdx int, notes resourceNotes, callListGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	lRet := alloc.I32()
 	lR := alloc.I64()
 	lStart, lEnd, lState := alloc.I32(), alloc.I32(), alloc.I32()
+	lTmp := alloc.I32()
 	var lBlk, lN, lP, lChain, lSz64, lNeed byte
 	if notes.on() {
 		lBlk, lN, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
@@ -1296,6 +1334,7 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, cal
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep, 0x41, 0x02)
 	b = storeI32(b, patRepDone)
+	b = emitPatReleaseFinished(b, pRep, freeIdx, 0, notes, lTmp)
 	b = storeDisc(b, lRet, 0, 1)
 	b = storeDisc(b, lRet, 4, 0) // enum index 0: backtrack-overflow
 	b = append(b, 0x20, lRet, 0x0F)
@@ -1307,6 +1346,7 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, cal
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep, 0x41, 0x01)
 	b = storeI32(b, patRepDone)
+	b = emitPatReleaseFinished(b, pRep, freeIdx, 0, notes, lTmp)
 	b = storeDisc(b, lRet, 4, 0) // none
 	b = append(b, 0x20, lRet, 0x0F)
 	b = append(b, 0x0B)
@@ -1356,7 +1396,7 @@ func buildPatternFindNextBody(reallocIdx, innerIdx int, notes resourceNotes, cal
 // participated. The per-group copy is unrolled: numGroups is a compile-time
 // constant, so a loop would cost a counter and a bounds test per group to save
 // nothing.
-func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resourceNotes, callListGlobal uint32) []byte {
+func buildPatternGroupsNextBody(reallocIdx, freeIdx, innerIdx, numGroups int, notes resourceNotes, callListGlobal uint32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	var (
@@ -1367,6 +1407,7 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 		lStart = alloc.I32()
 		lEnd   = alloc.I32()
 		lState = alloc.I32()
+		lTmp   = alloc.I32()
 	)
 	var lBlk, lN, lP, lChain, lSz64, lNeed byte
 	if notes.on() {
@@ -1426,6 +1467,7 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep, 0x41, 0x02)
 	b = storeI32(b, patRepDone)
+	b = emitPatReleaseFinished(b, pRep, freeIdx, numGroups, notes, lTmp)
 	b = storeDisc(b, lRet, 0, 1)
 	b = storeDisc(b, lRet, 4, 0)
 	b = append(b, 0x20, lRet, 0x0F)
@@ -1437,6 +1479,7 @@ func buildPatternGroupsNextBody(reallocIdx, innerIdx, numGroups int, notes resou
 	b = append(b, 0x04, 0x40)
 	b = append(b, 0x20, pRep, 0x41, 0x01)
 	b = storeI32(b, patRepDone)
+	b = emitPatReleaseFinished(b, pRep, freeIdx, numGroups, notes, lTmp)
 	b = append(b, 0x20, lRet, 0x41, 0x00)
 	b = storeI32(b, 4)
 	b = append(b, 0x20, lRet, 0x41, 0x00)

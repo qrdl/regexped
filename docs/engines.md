@@ -972,18 +972,23 @@ state (262 a loop for `(\pL+)=(\pL+)`), the skip is emitted ONCE per loop,
 after the tag-op dispatch, and each entering arm branches to it — inline in
 every arm it made `^(\pL+)=(\pL+)`'s capture body 8.3 MB, over WebAssembly's
 function size cap — and a capture call whose window (the match) is under 16
-bytes runs a second copy of the capture body without these skips.
+bytes runs a second copy of the capture body without these skips, which the
+groups wrapper picks from the match's length for 5 fuel a match. The TDFA
+learns the tag ops a run fires once at its end from an ASCII byte that stays
+in the loop, or, in a loop no ASCII byte stays in (`(\p{Cyrillic}+)`,
+`(\p{Han}+)`), from its first character.
 
 Measured in fuel, prefer-match against the unhinted build, over Russian text:
 `\p{Cyrillic}+` find over 13-14-letter words −66.0%, over prose −32.4%, over
-words of one and two letters +5.0%; `(\p{Cyrillic}+)\s(\d*)` groups −25.0% /
-+4.2% (long / short words); `(\pL+)=(\pL+)` groups −54.0% / +6.6%; a set of
+words of one and two letters +5.0%; `(\p{Cyrillic}+)\s(\d*)` groups −57.5% /
++5.1% (long / short words); `(\pL+)=(\pL+)` groups −53.9% / +6.2%; a set of
 `ключN=\p{Cyrillic}+;` members −54% to −55% over long values and +1.9% over
 values of one or two letters; no-match text unchanged. Per word, against the
 unhinted find: a one-letter word +16, a two-letter one +4, from three letters
 on less (−58 at three). Without the gate, the structural test and the copy,
 the short-word rows cost +27.6%, +7.5% (sets) and +15.8%. Modules grow:
-`\p{Cyrillic}+` 6.3 → 7.4 KB, `(\pL+)=(\pL+)` 1.74 → 1.80 MB.
+`\p{Cyrillic}+` 6.3 → 7.4 KB, `(\p{Cyrillic}+)\s(\d*)` 29.1 → 34.7 KB,
+`(\pL+)=(\pL+)` 1.74 → 1.80 MB.
 
 **Run skips in the set probes and the lenient match.** A set's scan probes
 (`scan_any`, `scan_all`), its anchored probes (`match_any`, `match_all`) and a

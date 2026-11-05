@@ -1,0 +1,13 @@
+{
+  "name": "secret-redact",
+  "private": true,
+  "type": "module",
+  "description": "A FastEdge JS app that masks secrets in origin responses with a regexped component",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "@gcoredev/fastedge-sdk-js": "^2.7.0",
+    "@gcoredev/fastedge-test": "^0.2.6"
+  }
+}

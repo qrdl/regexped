@@ -1687,10 +1687,273 @@ func TestEmitterGuardsFire(t *testing.T) {
 			infos, _, _ := analyzed(t, `a+b`)
 			planBTRegions([]*bucket{newBTBucket(infos[0])}, nil)
 		}},
+		{"a marked copy beside a Backtracking fallback", "both a marked copy and a Backtracking fallback", func(*testing.T) {
+			(&compiledPattern{findFallbackBody: []byte{0}, findMarkedBody: []byte{0}}).appendFindBodyWithTwin(nil, 0)
+		}},
+		{"a default search state on a legacy find", "default search state on a", func(*testing.T) {
+			buildFindFromWrapperBody(0, ffLegacyNarrow, 0, &defaultSearch{}, nil)
+		}},
+		{"a neutral-twin route on a legacy find", "neutral-twin route on a", func(*testing.T) {
+			emitFindCallFromPos(nil, 0, ffLegacyNarrow, 0, 0, &twinRoute{})
+		}},
+		{"a default search state on an anchored-only groups wrapper", "anchored-only groups wrapper", func(*testing.T) {
+			buildGroupsFromWrapperBody(0, true, &defaultSearch{})
+		}},
+		{"a UTF-8 bulk skip without its error-lanes local", "no error-lanes local", func(*testing.T) {
+			emitUTF8BulkSkip(nil, dominantInfo{}, false, 1, 2, 3, 4, 5, 6, 0, nil)
+		}},
+		{"a gated anchored verify over a newline pre-accept table", "newline pre-accept table built for a full-consumption caller", func(*testing.T) {
+			emitInlineAnchoredDFAVerifyGated(nil, &dfaLayout{midAcceptNLBytes: []byte{1}}, 1, 2, 3, 4, 5, 6, 0, 0, inlineVerifySkip{})
+		}},
+		{"a full-consumption anchored verify over a newline pre-accept table", "newline pre-accept table built for a full-consumption caller", func(*testing.T) {
+			emitInlineAnchoredDFAVerify(nil, &dfaLayout{midAcceptNLBytes: []byte{1}}, 1, 2, 3, 4, 5, 6, 0, 0, true)
+		}},
+		{"a word-boundary pre-accept check without a word table", "without its wordCharTable", func(*testing.T) {
+			emitInlineAnchoredDFAVerify(nil, &dfaLayout{noWordCharTable: true}, 1, 2, 3, 4, 5, 6, 0, 0, false)
+		}},
+		{"the parameter count of an unknown set function type", "setTypeParams for set function type", func(*testing.T) {
+			setTypeParams(0xFF)
+		}},
+		{"a set's default given two code entries", "not one code entry", func(*testing.T) {
+			(&compiledSet{def: &setDefault{}}).withDefault([]byte{0x05, 0x00}, capFind)
+		}},
+		{"a set's default given a truncated locals vector", "malformed locals vector", func(*testing.T) {
+			(&compiledSet{def: &setDefault{}}).withDefault([]byte{0x01, 0x80}, capFind)
+		}},
+		{"a set's default given a truncated local group", "malformed local group", func(*testing.T) {
+			(&compiledSet{def: &setDefault{}}).withDefault([]byte{0x02, 0x01, 0x80}, capFind)
+		}},
+		{"an anchored Backtracking probe in a narrow match_all", "narrow match_all", func(*testing.T) {
+			emitAnchoredBTProbes(nil, &compiledSet{anchoredBTIDs: []int{0}}, capMatchAll, false, 0, 0, 1, 2, nil)
+		}},
+		{"an anchored union's Backtracking probe in a narrow match_all", "narrow match_all", func(*testing.T) {
+			emitAnchoredUnionBody(&anchoredUnion{}, capMatchAll, false, 0, 0, []int{0})
+		}},
+		{"an unprojected sweep column over a word-boundary automaton", "needs the projected column", func(*testing.T) {
+			newCkptEmit(&compiledSet{sweepDone: true, sweep: &overlapSweep{
+				dp: overlapDPTables{l: &dfaLayout{useU8: true}, hasWordChar: true}}}, 0, 0)
+		}},
+		{"a wide preflight on an overlapping find", "wide find preflight emitted for a narrow-only path", func(*testing.T) {
+			cs := &compiledSet{patternIDs: [][]int{{0}}, overlapping: true, unionScan: &unionScanDFA{maskWords: 2}}
+			emitFindPreflight(nil, cs, 8, 9, 10, 3, 1, 2, 13, 0, false, 11, 12, 14)
+		}},
+		{"a projected column too wide for u16 offsets", "past what a u16 offset can address", func(*testing.T) {
+			(&compiledSet{sweepDone: true, sweep: &overlapSweep{
+				dp: overlapDPTables{numWASM: 1}, proj: &overlapProj{cells: 0x4000}}}).overlapProjTabBytes()
+		}},
+		{"a twin route whose neutral twin is not next to its find body", "not laid out right after", func(*testing.T) {
+			p := &compiledPattern{findBody: []byte{0}, findTwinRoute: &twinRoute{}}
+			p.twinRouteFor(p.slotIndex(slotFind))
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			mustPanic(t, c.want, func() { c.fn(t) })
 		})
+	}
+}
+
+// TestDegenerateInputsTakeTheSafeSide pins what the planners and detectors
+// answer for input they are not given in a valid build — no patterns, no
+// automaton, an unparseable source, an id outside the spec. Each answer is
+// the conservative one for its caller: no optimisation, no prefilter, "may
+// cross unboundedly" rather than "cannot".
+func TestDegenerateInputsTakeTheSafeSide(t *testing.T) {
+	unparseable := resolvedPattern{src: `(`, pm: progModeByte}
+	yes := true
+	var pool dfaPool
+
+	if err := checkBTMemoryBudget(maxWasmMemoryBytes, 1); err != ErrBTStackTooLarge {
+		t.Errorf("tables past 4 GiB: %v, want ErrBTStackTooLarge", err)
+	}
+	if _, err := analyzePattern(config.PatternEntry{Regexp: `a`, Unicode: &yes, ByteMode: true}, &pool, &pool); err == nil {
+		t.Error("a member declaring both unicode and byte_mode was analysed")
+	}
+	if _, err := mergeSuffixDFAWidth(nil, 32); err == nil {
+		t.Error("an empty bucket merged")
+	}
+	if u := buildAnchoredUnionDFA(SetSpec{}, 0, false, false); u != nil {
+		t.Error("an anchored union automaton built for no patterns")
+	}
+	if dfaWalksNest(nil) {
+		t.Error("no automaton reported nesting walks")
+	}
+	if btSearchFor(nil) != nil {
+		t.Error("a Backtracking search state without options")
+	}
+	if r, n := allocAnchoredBTRegions(nil, nil, 0, nil); r != nil || n != 0 {
+		t.Errorf("no anchored Backtracking buckets: regions %v, %d functions", r, n)
+	}
+	if utf8StructOK(nil) {
+		t.Error("no allow set passed the structural UTF-8 test")
+	}
+	if planACVerify(nil, nil, [][]byte{{}}) != nil {
+		t.Error("an Aho-Corasick verify planned over an empty literal")
+	}
+	if livenessCanFire(&dfaTable{}) {
+		t.Error("liveness can fire over an empty automaton")
+	}
+	if off := (&compiledSet{}).sweepFnOffset(); off != -1 {
+		t.Errorf("a set with no program sweep: sweep function at %d", off)
+	}
+	if off := (&compiledSet{}).scanSwitchFnOffset(capScanAny); off != -1 {
+		t.Errorf("a set with no scan switch: switch function at %d", off)
+	}
+	if !sparseMemberUnbounded(&bucket{}, &PatternInfo{rp: unparseable}) {
+		t.Error("an unparseable sparse member was taken as bounded")
+	}
+	if setMemberNeedsSplit(&PatternInfo{fullPattern: `(`}, CompileSetOptions{}) {
+		t.Error("an unparseable member was split")
+	}
+	for _, src := range []string{`(`, `abc`, `éx|bz`} {
+		rp, err := resolvePattern(src, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lenientAltLiteralFence(rp) {
+			t.Errorf("%q has a lenient alternation literal fence", src)
+		}
+	}
+	if _, ok := buildStartAnywherePasses(unparseable, CompileOptions{}, 0, align8, nil); ok {
+		t.Error("start-anywhere passes built for an unparseable pattern")
+	}
+	if _, _, ok := buildAbsenceLits(SetSpec{Patterns: []*PatternInfo{{}}}); ok {
+		t.Error("absence literals built for a member with no id")
+	}
+	if _, _, ok := buildAbsenceLits(SetSpec{Patterns: []*PatternInfo{{fullPattern: `(`}}, PatternIDs: []int{0}}); ok {
+		t.Error("absence literals built for an unparseable member")
+	}
+	for _, op := range []syntax.Op{syntax.OpCapture, syntax.OpPlus} {
+		if lit := findAbsenceLit(&syntax.Regexp{Op: op}, false); lit != nil {
+			t.Errorf("%v with no operand: absence literal %q", op, lit)
+		}
+	}
+	if n := setTypeParams(setTypeI32I32ToI32); n != 2 {
+		t.Errorf("(i32, i32) → i32 takes %d parameters, want 2", n)
+	}
+	if off := (&compiledSet{}).overlapBlockFnOffset(); off != -1 {
+		t.Errorf("a set with no sweep: block function at %d", off)
+	}
+	if off := (&compiledPattern{}).todayFindOff(); off != -1 {
+		t.Errorf("a pattern with no find: find body at %d", off)
+	}
+	if b := emitStartAnchorCheck([]byte{0xAA}, anchorNone, 0, 1, 2, 3); !bytes.Equal(b, []byte{0xAA}) {
+		t.Errorf("no start anchor emitted % x", b[1:])
+	}
+	if b := emitEndAnchorCheck([]byte{0xAA}, anchorNone, 1, 2, 0, 3, 4); !bytes.Equal(b, []byte{0xAA}) {
+		t.Errorf("no end anchor emitted % x", b[1:])
+	}
+	// detectEOFSkipSafe leaves a layout it cannot analyse unmarked.
+	for _, l := range []*dfaLayout{
+		{numWASM: 1},
+		{numWASM: 3, wasmMidStart: 0},
+		{numWASM: 3, wasmMidStart: 1, wasmStart: 7},
+	} {
+		detectEOFSkipSafe(l)
+		if l.eofSkipSafe {
+			t.Errorf("layout %+v marked EOF-skip safe", *l)
+		}
+	}
+	// Go's parser stores a folded literal in upper case; a lower-case one
+	// built by hand folds the same way.
+	folded := &syntax.Regexp{Op: syntax.OpPlus, Sub: []*syntax.Regexp{{Op: syntax.OpLiteral, Rune: []rune{'k'}, Flags: syntax.FoldCase}}}
+	if set, ok := leadingRepeatBytes(folded, false); !ok || !set['k'] || !set['K'] {
+		t.Errorf("(?i)k+ leads with k: %v, K: %v (ok %v)", set['k'], set['K'], ok)
+	}
+	// A byte-mode pattern naming a rune it has no byte for.
+	if _, ok := buildStartAnywherePasses(resolvedPattern{src: `xé+`, pm: progModeByte}, CompileOptions{}, 0, align8, nil); ok {
+		t.Error("start-anywhere passes built over a rune byte mode cannot read")
+	}
+	// An automaton over its build cap is assumed to cross unboundedly.
+	wide, err := resolvePattern(`[ab]*a[ab]{11}`, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wideTree, err := wide.parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexpCrossesLiteralUnboundedly(wideTree, []byte("x")) {
+		t.Error("a pattern over the DFA build cap was taken as crossing its literal boundedly")
+	}
+	if !sparseMemberUnbounded(&bucket{literal: "x"}, &PatternInfo{rp: wide}) {
+		t.Error("a sparse member over the DFA build cap was taken as bounded")
+	}
+	// Union automata over their state limit are refused.
+	var prefixPool, suffixPool dfaPool
+	info, err := analyzePattern(config.PatternEntry{Regexp: `ab+c`}, &prefixPool, &suffixPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tight := SetSpec{Patterns: []*PatternInfo{info}, PatternIDs: []int{0}, IDSpaceSize: 1, MaxUnionStates: 1}
+	if buildUnionScanDFA(tight, 0, false) != nil {
+		t.Error("a scan union automaton built past its state limit")
+	}
+	if buildAnchoredUnionDFA(tight, 0, false, false) != nil {
+		t.Error("an anchored union automaton built past its state limit")
+	}
+	// A whole-set sweep is planned over members it can merge: none for
+	// buckets holding nothing, none over a member that does not parse.
+	ovl := SetSpec{Find: "f", Overlapping: true}
+	if planWholeSetSweep(ovl, []*bucket{{}, {}}, [][]int{nil, nil}, CompileSetOptions{}, false, false) != nil {
+		t.Error("a whole-set sweep planned over empty buckets")
+	}
+	if planWholeSetSweep(ovl, []*bucket{{patterns: []*PatternInfo{{rp: unparseable}}}, {}}, [][]int{{0}, nil}, CompileSetOptions{}, false, false) != nil {
+		t.Error("a whole-set sweep planned over an unparseable member")
+	}
+	// An unparseable pattern keeps today's find and has no handover.
+	if s, why := (&compiledPattern{}).chooseFindStrategy(unparseable, nil, nil, nil, nil, false, CompileOptions{}); s != findToday || why != "unparseable" {
+		t.Errorf("an unparseable pattern's find strategy: %v (%s)", s, why)
+	}
+	if (&compiledPattern{}).buildSwitchHandover(unparseable, 0, nil, nil, CompileOptions{}, nil) {
+		t.Error("a switch handover built for an unparseable pattern without the module's globals")
+	}
+	// A member-skip table sized for fewer WASM states than the automaton
+	// has stops at the last state it can hold.
+	if ids, _, _ := buildMemberSets(&dfaTable{numStates: 2, transitions: make([]int, 2*256)}, 1, false); len(ids) > 1 {
+		t.Errorf("member ids for %d states, over a 1-state layout", len(ids))
+	}
+	// A set compiled outside a module build allocates its globals itself.
+	infos, ids, pp, sp := setEmitCovInfos(t, []string{`ab+c`})
+	if cs := compileSetWith(SetSpec{Name: "s", Find: "f", Patterns: infos, PatternIDs: ids, DeclaredPatternCount: 1, IDSpaceSize: 1},
+		pp, sp, CompileSetOptions{}, nil, false); cs == nil {
+		t.Error("a set compiled with no global allocator")
+	}
+}
+
+// emitStop's endAdd puts a noted tail's end past the stop position: pos +
+// endAdd, with nothing added when it is 0 (the one caller today).
+func TestNotesStopEndOffset(t *testing.T) {
+	c := &notesCtx{}
+	at := c.emitStop(nil, 0, 0)
+	past := c.emitStop(nil, 0, 3)
+	if want := append(append([]byte{0x20, nPos}, nConst(nil, 3)...), 0x6A, 0x21, c.lEnd()); !bytes.HasPrefix(past, want) {
+		t.Errorf("endAdd 3: % x, want it to start % x", past[:len(want)], want)
+	}
+	if !bytes.HasPrefix(at, []byte{0x20, nPos, 0x21, c.lEnd()}) {
+		t.Errorf("endAdd 0: % x, want pos stored as it is", at[:4])
+	}
+}
+
+// The bounds-exit hook of the bulk skips: run before the skip leaves through
+// its bounds check, and nowhere else. Only the UTF-8 byte-run skip takes one
+// in a build today (the hysteresis channel's); the byte and character-loop
+// skips accept one on the same terms, and a nil hook leaves their bytes as
+// they were.
+func TestBulkSkipBoundsExitHook(t *testing.T) {
+	hook := func(b []byte) []byte { return append(b, 0x01) } // nop
+	plain := emitBulkSkipBoundsExit(nil, 1, 2, nil)
+	hooked := emitBulkSkipBoundsExit(nil, 1, 2, hook)
+	if !bytes.HasSuffix(plain, []byte{0x0D, 0x01}) {
+		t.Errorf("no hook: exit % x, want a br_if 1", plain)
+	}
+	if want := append(append([]byte(nil), plain[:len(plain)-2]...), 0x04, 0x40, 0x01, 0x0C, 0x02, 0x0B); !bytes.Equal(hooked, want) {
+		t.Errorf("hooked exit % x, want % x", hooked, want)
+	}
+	info := dominantInfo{utf8: true, allowSet: []byte{'a'}}
+	without := emitUTF8CharLoopSkip(nil, info, false, 1, 2, 0, 3, 4, 5, 6, nil)
+	with := emitUTF8CharLoopSkip(nil, info, false, 1, 2, 0, 3, 4, 5, 6, hook)
+	if len(with) != len(without)+1 || !bytes.Contains(with, append(without[:0:0], 0x01)) {
+		t.Errorf("the character-loop skip's hook: %d bytes with, %d without", len(with), len(without))
 	}
 }
 

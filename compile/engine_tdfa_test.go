@@ -226,6 +226,36 @@ func TestMinimizeTDFARegistersLowRegs(t *testing.T) {
 	}
 }
 
+// TestMinimizeTDFARegistersPartialTables: a table whose per-state slices stop
+// short of numStates — a state with no accept map, transitions and tag ops
+// for the first state only — is read as "nothing there", not indexed past its
+// end. Register 0 is read at the
+// accept, so its write survives; register 1 is written and never read, so
+// minimisation drops it.
+func TestMinimizeTDFARegistersPartialTables(t *testing.T) {
+	trans := make([]int, 256)
+	for i := range trans {
+		trans[i] = -1
+	}
+	trans['a'] = 1
+	ops := make([][]tdfaTagOp, 256)
+	ops['a'] = []tdfaTagOp{{dst: 0, src: -1}, {dst: 1, src: -1}}
+	tt := &tdfaTable{
+		dfaTable:     &dfaTable{numStates: 2, transitions: trans, acceptStates: map[int]uint64{1: 1}},
+		tagOps:       ops,
+		acceptRegMap: [][]int{nil, {0, -1}},
+		numRegs:      2,
+		numGroups:    1,
+	}
+	got := minimizeTDFARegisters(tt)
+	if got.numRegs != 1 {
+		t.Fatalf("numRegs %d after minimisation, want 1", got.numRegs)
+	}
+	if got.acceptRegMap[0] != nil {
+		t.Errorf("state 0's missing accept map became %v", got.acceptRegMap[0])
+	}
+}
+
 func TestMinimizeTDFARegisters(t *testing.T) {
 	t.Run("applies coloring when improvement possible", func(t *testing.T) {
 		// (a)|(b) has two separate accept states: one where group1 regs are live
@@ -1328,5 +1358,14 @@ func TestTDFAWriteCapturesAcceptOps(t *testing.T) {
 	without := emitTDFAWriteCaptures(tt([][]tdfaTagOp{nil}), nil, 3, 4, 8, -1)
 	if op := emitTDFATagOp(tdfaTagOp{dst: 0, src: -1}, nil, 4, 8); !bytes.Contains(with, op) || len(with) <= len(without) {
 		t.Errorf("accept ops not emitted:\nwith    % x\nwithout % x", with, without)
+	}
+
+	// An accept map covering group 0 only writes group 0, however many
+	// groups the table declares: the groups past the map are not read.
+	short := tt([][]tdfaTagOp{nil})
+	two := *short
+	two.numGroups = 2
+	if a, b := emitTDFAWriteCaptures(short, nil, 3, 4, 8, -1), emitTDFAWriteCaptures(&two, nil, 3, 4, 8, -1); !bytes.Equal(a, b) {
+		t.Errorf("a group past the accept map was written:\none group  % x\ntwo groups % x", a, b)
 	}
 }

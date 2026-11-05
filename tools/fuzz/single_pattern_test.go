@@ -1402,7 +1402,10 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 	// `^(\pL+)=(\pL+)` IS its groups export: its capture body walks the
 	// whole input, not a match the find has already found valid, so only it
 	// reaches the capture body's validity test with invalid bytes.
-	for _, pat := range []string{`(\p{Cyrillic}+)\s(\d*)`, `(\pL+)=(\pL+)`, `<(\p{Han}+)>`, `^(\pL+)=(\pL+)`, `(\d)([^\d,]+)`} {
+	// The last three loop on no ASCII byte: the capture body's skip takes its
+	// batch from a character (detectTDFAUTF8Skip).
+	for _, pat := range []string{`(\p{Cyrillic}+)\s(\d*)`, `(\pL+)=(\pL+)`, `<(\p{Han}+)>`, `^(\pL+)=(\pL+)`, `(\d)([^\d,]+)`,
+		`(\p{Han}+)=(\p{Han}+)`, `([\x{0800}-\x{FFFF}]+)=(\d+)`, `([\x{40000}-\x{FFFFF}]+)=(\d+)`} {
 		t.Run("groups "+pat, func(t *testing.T) {
 			w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, pathsTableBase, true, lm)
 			if err != nil {
@@ -1411,7 +1414,12 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 			re := regexp.MustCompile(noReplacement(t, pat))
 			// Windows on both sides of tdfaShortMatchBytes (16): a shorter match
 			// runs the capture body's copy without the character skips.
-			pairs := []string{"жжжж=жжж", "жжжж=жжжa", "жжжж=жжжж", "независимость=правительство", "я=он"}
+			pairs := []string{"жжжж=жжж", "жжжж=жжжa", "жжжж=жжжж", "независимость=правительство", "я=он",
+				// Long runs on both sides of '=', over 3- and 4-byte characters,
+				// with invalid bytes inside them.
+				strings.Repeat("東語", 9) + "=" + strings.Repeat("語", 20) + "。", strings.Repeat("東語", 9) + "=123",
+				strings.Repeat("東", 5) + "\xe6\x97" + strings.Repeat("語", 5) + "=1", strings.Repeat("\U00050000", 6) + "=42",
+				strings.Repeat("\U00050000", 5) + "\xf1\x80" + "\U00050000=9", "東語東語東語=東語東語東語", "東語=東語", "\U00050000=7"}
 			for _, in := range append(append(inputs, "ж ж12 "+strings.Repeat("ё", 40)+" 7", "a=b ж=ё", "<東語>"), pairs...) {
 				got, ok := runGroupsIter(t, w, in, re.NumSubexp()+1)
 				if !ok {

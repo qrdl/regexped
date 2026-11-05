@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -335,6 +336,63 @@ func TestComponentSetScannerReclaimsItsState(t *testing.T) {
 	if after := len(h.mem.UnsafeData(h.store)); after != before {
 		t.Errorf("memory grew over 5000 scanner lifecycles: %d → %d bytes (+%d)",
 			before, after, after-before)
+	}
+}
+
+// TestComponentSetScannerReleasesItsStateWhenFinished: a scanner whose drive has
+// ended gives back its input, gate array and answer cache AT ONCE, without
+// waiting for the destructor. A JS guest under FastEdge never runs the finalizer
+// its bindings register to drop a forgotten handle, so a drive that ended without
+// an explicit dispose used to hold its whole input until the request ended.
+//
+// 300 undisposed drives over 64 KB inputs would hold about 19 MB; released, what
+// stays is each scanner's representation. The released pointers must be zeroed,
+// or the destructor would free them a second time — so the handles are dropped
+// at the end, which must not trap. The overlapping set has an answer cache to
+// release as well.
+func TestComponentSetScannerReleasesItsStateWhenFinished(t *testing.T) {
+	for _, c := range []struct {
+		name, cfg, text string
+		want            int
+	}{
+		{"narrow", narrowSetCfg, strings.Repeat("x", 64<<10) + " ghp_ab12", 1},
+		{"overlapping", overlapSetCfg, strings.Repeat("-", 64<<10), 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newSetHarness(t, c.cfg)
+			scan := func() int32 {
+				ptr, n := h.writeInput(c.text)
+				handle := h.call(h.pkg+"#[constructor]scan-it", ptr, n, int32(0))
+				if c.name == "overlapping" && h.u32(handle+20) == 0 {
+					t.Fatal("the constructor reserved no answer cache, so there is none to release")
+				}
+				if got := h.driveHandle(handle); len(got) != c.want {
+					t.Fatalf("drive reported %v, want %d matches", got, c.want)
+				}
+				// repInput, repGate and repCache (compile/component_sets.go).
+				for _, off := range []int32{0, 12, 20} {
+					if p := h.u32(handle + off); p != 0 {
+						t.Fatalf("a finished scanner still holds the block at representation offset %d (%#x)", off, p)
+					}
+				}
+				return handle
+			}
+			for i := 0; i < 5; i++ { // let the classes fill
+				h.call(h.pkg+"#[dtor]scan-it", scan())
+			}
+			before := len(h.mem.UnsafeData(h.store))
+			handles := make([]int32, 0, 300)
+			for i := 0; i < 300; i++ {
+				handles = append(handles, scan())
+			}
+			if grew := len(h.mem.UnsafeData(h.store)) - before; grew > 1<<20 {
+				t.Errorf("300 finished, undisposed scanners over %d-byte inputs grew memory by %d bytes: "+
+					"their inputs were not released", len(c.text), grew)
+			}
+			for _, handle := range handles {
+				h.call(h.pkg+"#[dtor]scan-it", handle)
+			}
+		})
 	}
 }
 
@@ -1190,16 +1248,23 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 // The -2 sentinel means the answer is UNKNOWN, and must lift to
 // err(backtrack-overflow) rather than to a definite ok(none). Reaching it needs
 // the same squeeze tools/fuzz uses elsewhere: Backtracking forced by a tiny
-// MaxDFAStates, and an input long enough to exhaust the frame stack. The
-// pattern must have no zero-width cycle — such a program has no ordinary body
-// in any build, and only the ordinary body has a static ceiling to hit.
+// MaxDFAStates, an input long enough to fill the frame stack, and memory that
+// cannot grow. The pattern must have no zero-width cycle — such a program has no
+// ordinary body in any build.
 func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 	entries := []config.PatternEntry{{Regexp: btNoCapturePattern, FindFunc: "f"}}
-	// BTWorkBudgetOff: with the budget on, a body past its static stack hands
-	// the call to its fallback, which sizes its memory from the input and
-	// answers — so -2 would need memory that cannot grow. Off, the body keeps
-	// answering -2 at its static ceiling, which is the arm under test.
-	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxDFAStates: 2, BTWorkBudget: compile.BTWorkBudgetOff})
+	// BTWorkBudgetOff keeps the call in the ordinary body, whose frame stack
+	// grows at call time; capping the memory at the size the uncapped build
+	// instantiates to stops that growth, and the body answers -2.
+	opts := compile.CompileOptions{MaxDFAStates: 2, BTWorkBudget: compile.BTWorkBudgetOff}
+	plain, _, _ := componentWasm(t, entries, opts)
+	plainStore, _, plainMem := instantiateCore(t, plain)
+	memCap, err := config.ParseMemorySize(strconv.FormatUint(plainMem.Size(plainStore)*65536, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.MaxMemory = memCap
+	w, _, res := componentWasm(t, entries, opts)
 
 	store, inst, mem := instantiateCore(t, w)
 	f := res["f"]
@@ -1263,6 +1328,20 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 		if buf[ret+4] != 0 {
 			t.Errorf("next %d: error enum index = %d, want 0 (backtrack-overflow)", call, buf[ret+4])
 		}
+	}
+
+	// An errored scanner never calls the body again, so it releases its input at
+	// once (patRepInput, offset 0 — the handle is the representation here), and
+	// the destructor must then free only what is left.
+	if p := binary.LittleEndian.Uint32(mem.UnsafeData(store)[handle:]); p != 0 {
+		t.Errorf("an errored scanner still holds its input block (%#x)", p)
+	}
+	dtor := inst.GetFunc(store, f.Dtor)
+	if dtor == nil {
+		t.Fatal("missing resource export: dtor")
+	}
+	if _, err := dtor.Call(store, any(handle)); err != nil {
+		t.Fatalf("dtor after an error: %v", err)
 	}
 }
 
@@ -1436,13 +1515,22 @@ func TestComponentOverlapCacheAnswersCorrectly(t *testing.T) {
 	sc := h.call(h.pkg+"#[constructor]scan-it", p, n, int32(0))
 	defer h.call(h.pkg+"#[dtor]scan-it", sc)
 
+	// A correct answer is no evidence that the cache produced it — the walk
+	// answers identically. `ready` says which engine did. It is read DURING the
+	// drive: a scanner that has finished releases its cache at once.
+	cachePtr := int32(h.u32(sc + 20))
+	if cachePtr == 0 {
+		t.Fatal("the constructor reserved no answer cache for a 4 KB overlapping drive")
+	}
 	var starts []uint32
+	ready := int32(0)
 	for i := 0; i < len(text)+8; i++ {
 		got, _ := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc))
 		if len(got) == 0 {
 			break
 		}
 		starts = append(starts, got[0][1])
+		ready = int32(h.u32(cachePtr + config.SetOverlapHdrReadyOff))
 	}
 	if len(starts) != len(text) {
 		t.Fatalf("reported %d positions over %d bytes; an overlapping drive reports every start",
@@ -1453,14 +1541,11 @@ func TestComponentOverlapCacheAnswersCorrectly(t *testing.T) {
 			t.Fatalf("position %d reported start %d: the enumeration is not in order", i, s)
 		}
 	}
-	// A correct answer is no evidence that the cache produced it — the walk
-	// answers identically. `ready` says which engine did.
-	cachePtr := int32(h.u32(sc + 20))
-	if cachePtr == 0 {
-		t.Fatal("the constructor reserved no answer cache for a 4 KB overlapping drive")
+	if ready != 1 {
+		t.Fatalf("the cache header's ready is %d at the last position: it walked", ready)
 	}
-	if ready := int32(h.u32(cachePtr + config.SetOverlapHdrReadyOff)); ready != 1 {
-		t.Fatalf("the cache header's ready is %d after the drive: it walked", ready)
+	if p := h.u32(sc + 20); p != 0 {
+		t.Fatalf("the finished scanner still holds its answer cache (%#x)", p)
 	}
 }
 
@@ -1589,8 +1674,14 @@ func TestComponentScannerRepeatsItsError(t *testing.T) {
 			t.Fatalf("call %d reported error-code %d, the first reported %d", i+2, again, code)
 		}
 	}
-	// And the dtor still works on an errored scanner: it owns an input copy, a
-	// gate array, a cache and the representation, whatever state it stopped in.
+	// An errored scanner never calls the body again, so it has already released
+	// its input, gate array and cache (repInput, repGate, repCache)...
+	for _, off := range []int32{0, 12, 20} {
+		if p := h.u32(sc + off); p != 0 {
+			t.Errorf("an errored scanner still holds the block at representation offset %d (%#x)", off, p)
+		}
+	}
+	// ...and the dtor still works on it, freeing only what is left.
 	h.call(h.pkg+"#[dtor]scan-it", sc)
 }
 
@@ -1995,6 +2086,101 @@ func TestComponentPatternScannersAreIndependent(t *testing.T) {
 	}
 	h.call(n.Dtor, a)
 	h.call(n.Dtor, b)
+}
+
+// TestComponentPatternScannersReleaseTheirStateWhenFinished is
+// TestComponentSetScannerReleasesItsStateWhenFinished for the single-pattern
+// resources: a find or groups scanner that has reported the end of its scan
+// gives back its input — and the notes its search was given, when it armed —
+// without waiting for the destructor, and zeroes the pointers so the destructor
+// does not free them again.
+func TestComponentPatternScannersReleaseTheirStateWhenFinished(t *testing.T) {
+	h, res := newPatternResourceHarness(t, []config.PatternEntry{
+		{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"},
+		{Regexp: `(?<key>[a-z]+)=(?<value>[0-9]*)`, GroupsFunc: "g"},
+		// Every call reads to the end before settling for the short branch, so a
+		// drive over a run of `a` arms the search and is given notes.
+		{Regexp: `a*b|a`, FindFunc: "rr"},
+	})
+	// The representation's search block follows its 16 header bytes, 8-aligned
+	// (compile.patRepBlockOff), for a find resource. Only a pattern that keeps
+	// per-search notes has one — here "rr" — so only its block is read.
+	const findBlockOff = 16
+
+	// drive runs a scanner to its end without dropping it, and reports whether
+	// its search was ever given notes.
+	drive := func(n generate.PatternResourceNames, text string, wantMatches int, hasBlock bool) (handle int32, hadNotes bool) {
+		ptr, length := h.writeInput(text)
+		handle = h.call(n.Constructor, ptr, length, int32(0))
+		matches := 0
+		for {
+			ret := h.call(n.Next, handle)
+			data := h.mem.UnsafeData(h.store)
+			if data[ret] == 1 {
+				t.Fatalf("%s.next reported an error", n.Next)
+			}
+			finished := data[ret+4] == 0 // find: none
+			if n.Groups {
+				finished = h.u32(ret+8) == 0 // groups: an empty list
+			}
+			h.call("cabi_post_"+n.Next, ret)
+			if hasBlock && h.u32(handle+findBlockOff+abi.SearchNotesOff) != 0 {
+				hadNotes = true
+			}
+			if finished {
+				break
+			}
+			matches++
+		}
+		if matches != wantMatches {
+			t.Fatalf("%s found %d matches, want %d", n.Next, matches, wantMatches)
+		}
+		if p := h.u32(handle); p != 0 { // patRepInput
+			t.Fatalf("%s: a finished scanner still holds its input block (%#x)", n.Next, p)
+		}
+		if hasBlock {
+			for _, off := range []int32{abi.SearchNotesOff, abi.SearchBTMemoOff} {
+				if p := h.u32(handle + findBlockOff + off); p != 0 {
+					t.Fatalf("%s: a finished scanner still holds search memory at block offset %d (%#x)", n.Next, off, p)
+				}
+			}
+		}
+		return handle, hadNotes
+	}
+
+	for _, c := range []struct {
+		fn, text string
+		want     int
+	}{
+		{"f", strings.Repeat("x", 64<<10) + " ghp_ab12", 1},
+		{"g", strings.Repeat(" ", 64<<10) + " key=42", 1},
+	} {
+		n := res[c.fn]
+		for i := 0; i < 5; i++ { // let the classes fill
+			handle, _ := drive(n, c.text, c.want, false)
+			h.call(n.Dtor, handle)
+		}
+		before := len(h.mem.UnsafeData(h.store))
+		handles := make([]int32, 0, 300)
+		for i := 0; i < 300; i++ {
+			handle, _ := drive(n, c.text, c.want, false)
+			handles = append(handles, handle)
+		}
+		if grew := len(h.mem.UnsafeData(h.store)) - before; grew > 1<<20 {
+			t.Errorf("%s: 300 finished, undisposed scanners over %d-byte inputs grew memory by %d bytes: "+
+				"their inputs were not released", c.fn, len(c.text), grew)
+		}
+		for _, handle := range handles {
+			h.call(n.Dtor, handle)
+		}
+	}
+
+	// The notes: released with the input, and the destructor still works after.
+	handle, hadNotes := drive(res["rr"], strings.Repeat("a", 4096), 4096, true)
+	if !hadNotes {
+		t.Fatal("the a*b|a drive never armed, so this proves nothing about releasing notes")
+	}
+	h.call(res["rr"].Dtor, handle)
 }
 
 // TestComponentSplitSet drives a set whose members are split out of the
