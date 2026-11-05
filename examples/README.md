@@ -4,14 +4,16 @@ The **Format (target)** column is the `wasm_format:` each example builds —
 `module` is the core WASM module, `component` is a WASM Component Model component
 with a generated WIT interface — and, in brackets, the WASI target its WASM guest
 is compiled for. Examples whose host is JavaScript or TypeScript have no WASI
-target. Component examples are marked **🧩**. `url-parts` builds BOTH kinds from
+target; in `fastedge/secret-redact` the JavaScript is the guest, which the
+FastEdge JS SDK builds into a wasip2 component. Component examples are marked **🧩**. `url-parts` builds BOTH kinds from
 one unchanged source — and the component kind by two different routes
 (`make run`, `make component-run`, `make wasip2-run`).
 
 FastEdge runs two kinds of application. A **CDN app** is a proxy-wasm filter on
 traffic passing through the CDN, built as a core module: `fastedge/validate`
 and `fastedge/url-guard`. An **HTTP app** answers requests itself and is a
-`wasi:http` component built for wasip2: `fastedge/script-detect`.
+`wasi:http` component built for wasip2: `fastedge/script-detect` in Rust, and
+`fastedge/secret-redact` in JavaScript, built with the FastEdge JS SDK.
 
 Two examples have patterns that compile in **Unicode mode** — script classes
 such as `\p{Latin}` and letters such as `ä`, matched a whole character at a
@@ -30,6 +32,7 @@ time and case-folded across Unicode: `fastedge/script-detect` and
 | Email, URL, XSS validation | FastEdge CDN app (proxy-wasm) | Rust | individual | module (wasip1) | [fastedge/validate](fastedge/validate) |
 | URL guard | FastEdge CDN app (proxy-wasm) | Rust | set | module (wasip1) | [fastedge/url-guard](fastedge/url-guard) |
 | Script detection by letters, narrowed to the alphabets that fit | FastEdge HTTP app (wasi:http) | Rust | 3 sets, **Unicode** | **component 🧩** (wasip2) | [fastedge/script-detect](fastedge/script-detect) |
+| Secret masking in origin responses | FastEdge HTTP app (wasi:http, FastEdge JS SDK) | JavaScript | set | **component 🧩** (wasip2) | [fastedge/secret-redact](fastedge/secret-redact) |
 | Email and URL validation | Browser | JavaScript | individual | module | [browser/validate](browser/validate) |
 | Homoglyph and hidden-character detection | Browser | JavaScript | set, **Unicode** | module | [browser/homoglyph](browser/homoglyph) |
 | Domain extraction from URLs | Node.js | TypeScript | individual | module | [node/domain-extract](node/domain-extract) |
@@ -44,7 +47,10 @@ default route that way, and gives the other routes their own targets. `workers`,
 `fastedge/validate` and `fastedge/url-guard` have nothing to run locally, so
 their `make run` only says why; `fastedge/script-detect` is a `wasi:http`
 component, which `wasmtime serve` runs, so its `make run` serves it on port 8080
-for the length of a few requests.
+for the length of a few requests; `fastedge/secret-redact` imports FastEdge
+interfaces `wasmtime serve` does not provide, so its `make run` runs it under
+FastEdge's own runtime, in front of a local origin, and needs `npm install` in
+its directory first — as its `make` does, for the SDK.
 `make`, `make run` and `make clean` in this directory run the same target in
 every example. `browser` comes last, because its `make run` serves its two
 pages until you press Ctrl-C.
@@ -87,6 +93,12 @@ module-format version by the module name and one comment: switching
 `wasm_format` does not change calling code. `stub_type: rust` and `wit` are the
 component stub types; see [../docs/component.md](../docs/component.md) for what
 each `stub_type` does under `component`.
+
+`fastedge/secret-redact` 🧩 consumes a component from **JavaScript**, with no
+stub: the FastEdge JS SDK's `fastedge-build --component` reads the interface
+from the component, generates the bindings and composes the component into the
+app itself, so there is no `regexped merge` step either. See
+[../docs/fastedge.md](../docs/fastedge.md).
 
 [^native]: No target: the host is a native Rust binary that loads the regexp
     module or component at run time with the `wasmtime` crate, so nothing is

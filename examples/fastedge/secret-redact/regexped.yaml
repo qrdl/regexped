@@ -1,0 +1,50 @@
+# Secrets to mask in origin responses: the ten patterns of the secret-scanner
+# examples, in ONE set whose `find` reports every match with its position. The
+# JWT pattern also takes the signature, since the whole token is masked.
+#
+# A component (`wasm_format: component`), because the FastEdge JS SDK imports
+# components: `fastedge-build --component regexped:secrets/sets=secrets.wasm`
+# reads the interface from secrets.wasm, generates the JavaScript bindings and
+# composes the two. No stub is generated — the SDK writes the bindings.
+#
+# A match's id is the pattern's index below; src/index.js names them in the
+# same order.
+wasm_format:   component
+import_module: "secrets"
+wasm_file:     "secrets.wasm"
+
+patterns:
+  - name: aws_key
+    regexp: 'AKIA[0-9A-Z]{16}'
+
+  - name: aws_secret
+    regexp: 'aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}'
+
+  - name: github_pat
+    regexp: 'ghp_[0-9a-zA-Z]{36}'
+
+  - name: github_oauth
+    regexp: 'gho_[0-9a-zA-Z]{36}'
+
+  - name: github_app
+    regexp: 'ghu_[0-9a-zA-Z]{36}'
+
+  - name: jwt
+    regexp: 'eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]*'
+
+  - name: slack_token
+    regexp: 'xox[baprs]-[0-9a-zA-Z\-]{10,}'
+
+  - name: stripe_live
+    regexp: 'sk_live_[0-9a-zA-Z]{24,}'
+
+  - name: stripe_test
+    regexp: 'sk_test_[0-9a-zA-Z]{24,}'
+
+  - name: google_api
+    regexp: 'AIza[0-9A-Za-z\-_]{35}'
+
+sets:
+  - name: secrets
+    find: find_secrets
+    patterns: all

@@ -85,7 +85,8 @@ call reads to the end before settling for a short match) also keeps a 128-byte
 **search block** in its representation, hands it to the core module before each
 `next`, and — once the module reports that the scan has started re-reading —
 allocates the scan's notes through the component's own allocator, detached from
-the call like the input block, so `[dtor]` frees them. That keeps a scan over any
+the call like the input block, so they are freed with it: when the scan ends, or
+by `[dtor]` if the handle is dropped first. That keeps a scan over any
 input linear (see [wasm.md](wasm.md), "The search block"); the consumer's API
 does not change. A Backtracking pattern's resource uses the same block for its
 work budget, which then lasts the scan, and allocates the fallback's memo the same
@@ -454,8 +455,10 @@ resource <find-name> {
 `next` answers the matches at ONE position — they all share a start — and an
 empty list means the scan is finished. The input crosses into the component
 ONCE, through the canonical ABI's own lowering, and the constructor takes over the
-block it was lowered into rather than copying it again: the input is held for the
-scanner's lifetime and released by `[dtor]`. That single crossing is the point —
+block it was lowered into rather than copying it again. The input is held until
+the scan is over: the `next` that reports the end — or an error — releases it,
+with everything else the scan allocated, and `[dtor]` releases whatever is still
+held when the handle is dropped first. That single crossing is the point —
 a stateless per-position export would copy the whole input on every call, and
 measurement put that at 2800 ns against 230-400 ns for a resource `next` on a
 4 KB input.
@@ -463,20 +466,30 @@ measurement put that at 2800 ns against 230-400 ns for a resource `next` on a
 Two scans can be in flight at once, each with its own handle and its own state —
 the same property the module-format C scanner has.
 
-**Dropping the handle is what frees the scan.** Rust hides that entirely: the
-iterator owns the handle and drops it. C cannot, because its scanner has no
-destructor to hang the drop on — which is why `<func>_free` exists in BOTH
-formats: for a module it frees an overlapping scanner's answer cache, if it
-owns one, and here it drops the handle, which is mandatory. See
+**Dropping the handle frees the scanner.** A scan run to its end has already
+given its input back, so what is left is the scanner's small representation; a
+scan abandoned midway still holds its input until the handle is dropped. Rust
+hides that entirely: the iterator owns the handle and drops it. C cannot, because
+its scanner has no destructor to hang the drop on — which is why `<func>_free`
+exists in BOTH formats: for a module it frees an overlapping scanner's answer
+cache, if it owns one, and here it drops the handle, which is mandatory. See
 [c-api.md](c-api.md#sets).
+
+A JavaScript guest composed with a regexped component through FastEdge's
+`fastedge-build --component` gets a class per resource that implements
+`Disposable`, and must call `scanner[Symbol.dispose]()` on a scan it abandons:
+the bindings register a `FinalizationRegistry` to drop forgotten handles, but
+FastEdge's JavaScript engine never runs its callbacks (SDK 2.7.0), so an
+abandoned scanner's input stays held until the request ends.
 
 ### What a set costs here
 
 - `overlapping: true` sets get the ANSWER CACHE here as everywhere else, so an
   overlapping drive is linear rather than quadratic. A component consumer has no
   pointer to hand in and nothing to free, so the `find` resource's CONSTRUCTOR
-  reserves the region and `[dtor]` releases it with the input block and the
-  gates. You never see it.
+  reserves the region, and the end of the drive (or `[dtor]`, if the handle is
+  dropped first) releases it with the input block and the gates. You never see
+  it.
 
   It is sized from the input length at construction: linear in it up to a 64 MiB
   budget, and the square root of it above that — a few hundred kilobytes for a

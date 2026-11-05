@@ -958,6 +958,18 @@ func (p *compiledPattern) funcLayout() []funcSlot {
 }
 
 // slotIndex returns the sub-index of the first slot of kind k, or -1.
+// shortCaptureFuncIdx is the function index, with the pattern's functions
+// starting at base, of a TDFA capture body's copy without its character
+// skips (tdfaCaptureBodies) — which the groups wrapper calls itself for a
+// short match — or -1 when the body has no such copy. A Backtracking capture
+// body's second function is its fallback, not a copy.
+func (p *compiledPattern) shortCaptureFuncIdx(base int) int {
+	if !p.isTDFA || p.captureFallbackBody == nil {
+		return -1
+	}
+	return base + p.slotIndex(slotCaptureFallback)
+}
+
 func (p *compiledPattern) slotIndex(k funcSlotKind) int {
 	for i, s := range p.funcLayout() {
 		if s.kind == k {
@@ -3435,7 +3447,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
+				cs = appendWrapperCodeEntry(cs, base+findOff, base+captureOff, p.shortCaptureFuncIdx(base), p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		// LNM non-mid bulk-skip helper body append was here —
@@ -4451,7 +4463,13 @@ func (p resolvedProg) refusedByByteGate() bool {
 // \b/\B, \A, \z, (?m:^) and (?m:$), and returns slot values already relative
 // to ptr — so this wrapper adds nothing to them. See buildBacktrackBody in
 // engine_backtrack.go for the reading side.
-func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
+//
+// shortFuncIdx >= 0 (a TDFA capture body with character-loop skips, outside
+// window mode) is the body's copy without them (tdfaCaptureBodies), which this
+// wrapper calls itself for a match under tdfaShortMatchBytes: a length test
+// here costs a match 5 fuel, where the body's own test and second call cost a
+// short one 9. The body keeps its own test, for the batch-groups wrapper.
+func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, shortFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
 	var b []byte
 	b = append(b, 0x02)
 	b = append(b, 0x03, 0x7F) // 3 × i32
@@ -4503,6 +4521,28 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 
 		b = append(b, 0x20, 0x00)
 		b = append(b, 0x20, 0x01)
+	} else if shortFuncIdx >= 0 {
+		// n = end - start into local 5 (the slot pass's scratch, free until
+		// then); n < tdfaShortMatchBytes calls the copy, else the body.
+		b = append(b, 0x20, 0x06)
+		b = append(b, 0xA7)
+		b = append(b, 0x20, 0x03)
+		b = append(b, 0x6B)
+		b = append(b, 0x22, 0x05) // local.tee n
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(tdfaShortMatchBytes))
+		b = append(b, 0x49, 0x04, 0x7F) // i32.lt_u; if (result i32)
+		for i, fn := range []int{shortFuncIdx, captureFuncIdx} {
+			if i == 1 {
+				b = append(b, 0x05) // else
+			}
+			b = append(b, 0x20, 0x00, 0x20, 0x03, 0x6A) // ptr + start
+			b = append(b, 0x20, 0x05)                   // n
+			b = append(b, 0x20, 0x02)                   // out_ptr
+			b = append(b, 0x10)
+			b = utils.AppendULEB128(b, uint32(fn))
+		}
+		b = append(b, 0x0B)
 	} else {
 		b = append(b, 0x20, 0x00)
 		b = append(b, 0x20, 0x03)
@@ -4512,9 +4552,11 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 		b = append(b, 0x20, 0x03)
 		b = append(b, 0x6B)
 	}
-	b = append(b, 0x20, 0x02)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	if winGlobal >= 0 || shortFuncIdx < 0 {
+		b = append(b, 0x20, 0x02)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(captureFuncIdx))
+	}
 	b = append(b, 0x22, 0x04)
 	// Same rule as the find result above: forward the capture body's own
 	// negative verbatim so a BT captureBody's abi.BTStackOverflow survives to
@@ -4569,8 +4611,8 @@ func buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx 
 }
 
 // appendWrapperCodeEntry appends a size-prefixed groups wrapper body to cs.
-func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
-	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal, route)
+func appendWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, shortFuncIdx, numGroups, tableMemIdx int, winGlobal int32, capStartGlobal int32, route *twinRoute) []byte {
+	body := buildGroupsWrapperBody(findFuncIdx, captureFuncIdx, shortFuncIdx, numGroups, tableMemIdx, winGlobal, capStartGlobal, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

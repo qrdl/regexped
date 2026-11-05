@@ -1222,7 +1222,10 @@ const tdfaShortMatchBytes = 16
 // loop for `(\pL+)=(\pL+)`, whose words of one or two letters cost +15.8%
 // without the copy and +6.6% with it. The call costs a short window about
 // ten fuel. nil second when there is nothing to hand over: no such skip, or
-// the body is the anchored export, whose window is the whole input.
+// the body is the anchored export, whose window is the whole input. The
+// groups wrapper makes the same choice itself, for 5 fuel a match
+// (buildGroupsWrapperBody's shortFuncIdx), so the body's own test hands a
+// call on only for the batch-groups wrapper.
 func tdfaCaptureBodies(tt, plain *tdfaTable, l *dfaLayout, tableMemIdx int, nativeAnchored bool, capStartGlobal int32) (body, second []byte, callOffs []int) {
 	has := false
 	for _, info := range tt.utf8Skip {

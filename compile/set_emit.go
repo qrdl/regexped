@@ -3009,7 +3009,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
+				cs_bytes = appendWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.shortCaptureFuncIdx(base), p.numGroups, wrapperTableMemIdx, winOff, p.capStartGlobal(), p.twinRouteFor(findOff))
 			}
 		}
 		if p.batchFindExport != "" {

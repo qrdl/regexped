@@ -306,8 +306,9 @@ const (
 // charLoops (prefer-match) also takes a loop over only SOME characters — a
 // letter class, `(\pL+)` — judged per lead byte: a lead byte all of whose
 // characters satisfy the above joins the allowSet, the rest are exits, and the
-// ASCII exits are not capped. A loop that qualifies without it is reported
-// exactly as without it.
+// ASCII exits are not capped, and a loop no ASCII byte stays in
+// (`\p{Cyrillic}+`, `\p{Han}+`) takes its batch from its first character
+// instead. A loop that qualifies without it is reported exactly as without it.
 func detectTDFAUTF8Skip(tt *tdfaTable, charLoops bool) []tdfaUTF8SkipInfo {
 	at := func(s, c int) (int, []tdfaTagOp) {
 		idx := s*256 + c
@@ -368,6 +369,31 @@ func detectTDFAUTF8Skip(tt *tdfaTable, charLoops bool) []tdfaUTF8SkipInfo {
 				ops, haveOps = o, true
 			default:
 				ok = tdfaTagOpsEqual(ops, o)
+			}
+		}
+		if ok && !haveOps && charLoops {
+			// No ASCII byte stays in the loop (`\p{Cyrillic}+`, `\p{Han}+`):
+			// learn the batch from the first valid character that leads back
+			// into it, its last byte's ops. leadOK below still requires every
+			// lead byte's characters to fire exactly that batch, so a lead
+			// byte that disagrees becomes an exit, and a batch that agrees
+			// with no lead byte builds no skip. Without charLoops a loop
+			// keeps all but 8 ASCII bytes, so it always has one.
+		learn:
+			for _, seq := range utf8Sequences {
+				for lead := int(seq[0][0]); lead <= int(seq[0][1]); lead++ {
+					s, o := at(gs, lead)
+					for _, r := range seq[1:] {
+						if s < 0 {
+							break
+						}
+						s, o = at(s, int(r[0]))
+					}
+					if s >= 0 && loop[s] {
+						ops, haveOps = o, true
+						break learn
+					}
+				}
 			}
 		}
 		if !ok || !haveOps {

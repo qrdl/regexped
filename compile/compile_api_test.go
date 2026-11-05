@@ -3402,15 +3402,17 @@ func TestUnicodeCharLoopSkipsValidate(t *testing.T) {
 			}
 		}
 	}
-	// A capture loop with no ASCII byte in it (`\p{Han}+`) takes no skip:
-	// detectTDFAUTF8Skip learns the loop's ops from an ASCII byte.
+	// A capture loop with no ASCII byte in it (`\p{Han}+`) takes the skip
+	// too: detectTDFAUTF8Skip learns its batch from its first character. The
+	// shapes reach a TDFA capture body (a single capture that is group 0 less
+	// a literal affix would take the single-capture shortcut instead).
 	for _, c := range []struct {
 		pat  string
 		skip bool
 	}{
 		{`(\pL+)=(\pL+)`, true}, {`^(\pL+)=(\pL+)`, true}, {`(\d)([^\d,]+)`, true},
-		{`(\p{Cyrillic}+)\s(\d*)`, false}, {`<(\p{Han}+)>`, false},
-		{`([\x{0800}-\x{FFFF}]+);`, false}, {`([\x{40000}-\x{FFFFF}]+);`, false},
+		{`(\p{Cyrillic}+)\s(\d*)`, true}, {`(\p{Han}+)=(\p{Han}+)`, true},
+		{`([\x{0800}-\x{FFFF}]+)=(\d+)`, true}, {`([\x{40000}-\x{FFFFF}]+)=(\d+)`, true},
 	} {
 		pat := c.pat
 		w, _, err := Compile([]config.PatternEntry{{Regexp: pat, GroupsFunc: "g"}}, 0, true, lm)
