@@ -1,6 +1,8 @@
 # Secrets to mask in origin responses: the ten patterns of the secret-scanner
 # examples, in ONE set whose `find` reports every match with its position. The
-# JWT pattern also takes the signature, since the whole token is masked.
+# JWT pattern also takes the signature, since the whole token is masked, and
+# the AWS secret key is also found where the response escapes its `/`, `+` or
+# `=` (a form body writes `%2F`, `%2B`, `%3D`; some JSON writers write `\/`).
 #
 # A component (`wasm_format: component`), because the FastEdge JS SDK imports
 # components: `fastedge-build --component regexped:secrets/sets=secrets.wasm`
@@ -18,7 +20,7 @@ patterns:
     regexp: 'AKIA[0-9A-Z]{16}'
 
   - name: aws_secret
-    regexp: 'aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}'
+    regexp: 'aws_secret_access_key\s*(?:=|%3[Dd])\s*(?:[0-9a-zA-Z/+]|%2[FfBb]|\\/){40}'
 
   - name: github_pat
     regexp: 'ghp_[0-9a-zA-Z]{36}'
@@ -47,4 +49,9 @@ patterns:
 sets:
   - name: secrets
     find: find_secrets
+    # Every match at every start position, not each pattern's matches one
+    # after another: in `sk_live_<24 letters>sk_live_<24 letters>` the first
+    # match takes the second token's `sk`, and a per-pattern scan would then
+    # never report the second token. src/index.js joins overlapping matches.
+    overlapping: true
     patterns: all

@@ -21,9 +21,14 @@ const PRINT = process.argv.includes('--print');
 const AWS_KEY = 'AKIAIOSFODNN7EXAMPLE';
 const GITHUB = 'ghp_abc123456789012345678901234567890xyz';
 const STRIPE = 'sk_live_AbCdEfGhIjKlMnOpQrStUvWx';
+const AWS_SECRET = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
   + '.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ'
   + '.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+
+// ASCII text in UTF-32LE, which Node cannot encode.
+const utf32le = (s) => Buffer.from([...s].flatMap((c) => [c.charCodeAt(0), 0, 0, 0]));
+const xml = `<?xml version="1.0" encoding="UTF-16"?><k>${GITHUB}</k>`;
 
 const large = Array.from({ length: 16 }, (_, i) => `${'lorem ipsum '.repeat(5461)}token ${GITHUB} #${i}\n`).join('');
 
@@ -48,6 +53,20 @@ const pages = {
   // ASCII not written as ASCII bytes: refused.
   '/utf16.txt': [200, { 'content-type': 'text/plain; charset=utf-16le' }, Buffer.from(`token ${GITHUB}\n`, 'utf16le')],
   '/bom.txt': [200, { 'content-type': 'text/plain' }, Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from(`token ${GITHUB}\n`, 'utf16le')])],
+  // UTF-16 and UTF-32 with no byte-order mark and no charset: refused.
+  '/utf16le.xml': [200, { 'content-type': 'application/xml' }, Buffer.from(xml, 'utf16le')],
+  '/utf16be.xml': [200, { 'content-type': 'application/xml' }, Buffer.from(xml, 'utf16le').swap16()],
+  '/utf32.json': [200, { 'content-type': 'application/json' }, utf32le(JSON.stringify({ token: GITHUB }))],
+  // No type: scanned as text.
+  '/untyped': [200, {}, `token ${GITHUB}\n`],
+  // A token running straight into the next one: the first match takes the
+  // second token's `sk`.
+  '/chain.txt': [200, { 'content-type': 'text/plain' }, `sk_live_${'A'.repeat(24)}sk_live_${'B'.repeat(24)}\n`],
+  // An AWS secret key with its `/` escaped, by a form and by a JSON writer.
+  '/form': [200, { 'content-type': 'application/x-www-form-urlencoded' },
+    `aws_secret_access_key=${encodeURIComponent(AWS_SECRET)}`],
+  '/escaped.json': [200, { 'content-type': 'application/json' },
+    `{"env":"aws_secret_access_key = ${AWS_SECRET.replaceAll('/', '\\/')}"}`],
   // Statuses with no body, typed as text.
   '/no-content': [204, { 'content-type': 'text/plain' }, ''],
   '/not-modified': [304, { 'content-type': 'text/plain' }, ''],
@@ -168,6 +187,35 @@ const tests = [
   }],
   ['refuses a response starting with a UTF-16 byte-order mark', async (runner) => {
     assertHttpStatus(await fetchPath(runner, '/bom.txt'), 502);
+  }],
+  ['refuses UTF-16LE XML with no byte-order mark', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/utf16le.xml'), 502);
+  }],
+  ['refuses UTF-16BE XML with no byte-order mark', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/utf16be.xml'), 502);
+  }],
+  ['refuses UTF-32 JSON', async (runner) => {
+    assertHttpStatus(await fetchPath(runner, '/utf32.json'), 502);
+  }],
+  ['scans a response with no type', async (runner) => {
+    const r = await fetchPath(runner, '/untyped');
+    assertHttpHeader(r, 'x-redacted', '1');
+    expectBody(r, 'token [REDACTED github_pat]\n');
+  }],
+  ['masks a token running straight into the next one', async (runner) => {
+    const r = await fetchPath(runner, '/chain.txt');
+    assertHttpHeader(r, 'x-redacted', '1');
+    expectBody(r, '[REDACTED stripe_live]\n');
+  }],
+  ['masks an AWS secret key in a form body', async (runner) => {
+    const r = await fetchPath(runner, '/form');
+    assertHttpHeader(r, 'x-redacted', '1');
+    expectBody(r, '[REDACTED aws_secret]');
+  }],
+  ['masks an AWS secret key escaped by a JSON writer', async (runner) => {
+    const r = await fetchPath(runner, '/escaped.json');
+    assertHttpHeader(r, 'x-redacted', '1');
+    expectBody(r, '{"env":"[REDACTED aws_secret]"}');
   }],
   ['passes a 204 through', async (runner) => {
     const r = await fetchPath(runner, '/no-content');

@@ -16,7 +16,8 @@ const NAMES = [
   'jwt', 'slack_token', 'stripe_live', 'stripe_test', 'google_api',
 ];
 
-// Responses scanned; any other content type passes through unchanged.
+// Responses scanned, with responses that have no type; any other content type
+// passes through unchanged.
 const TEXT = /^\s*(?:text\/|application\/(?:json|javascript|xml|x-www-form-urlencoded)\b|[^;]*\+(?:json|xml)\b)/i;
 
 // Charsets that write every ASCII character as its own byte.
@@ -28,9 +29,10 @@ const NO_BODY = new Set([101, 103, 204, 205, 304]);
 const encoder = new TextEncoder();
 
 // The secrets in `body` as [start, end, name] byte ranges, in order and not
-// overlapping. The set reports each pattern's matches; two patterns can match
-// overlapping text (an AWS key inside an `aws_secret_access_key = …` line), so
-// overlapping matches are joined and keep the first one's name.
+// overlapping. The set reports every match at every start position, so
+// matches can overlap — an AWS key inside an `aws_secret_access_key = …` line,
+// or a token running straight into the next one — and overlapping matches are
+// joined and keep the first one's name.
 function secretRanges(body) {
   const ranges = [];
   const scanner = new FindSecrets(body, 0);
@@ -104,8 +106,9 @@ async function handler(event) {
   // No body, nothing to scan.
   if (request.method === 'HEAD' || NO_BODY.has(upstream.status)) return upstream;
 
+  // A response with no type is scanned too: a client may display it as text.
   const contentType = upstream.headers.get('content-type') ?? '';
-  if (!TEXT.test(contentType)) return upstream;
+  if (contentType.trim() !== '' && !TEXT.test(contentType)) return upstream;
 
   // Fail closed: a text response that cannot be scanned is not passed on.
   const encoding = upstream.headers.get('content-encoding');
@@ -122,6 +125,12 @@ async function handler(event) {
   const body = new Uint8Array(await upstream.arrayBuffer());
   if (body.length >= 2 && ((body[0] === 0xFE && body[1] === 0xFF) || (body[0] === 0xFF && body[1] === 0xFE))) {
     return new Response('cannot scan a UTF-16 response\n', { status: 502 });
+  }
+  // Nor does a body declare every UTF-16 or UTF-32 text: XML and JSON can be
+  // UTF-16 with no mark and no charset. Every ASCII character there comes with
+  // a 0x00 byte, and text in a charset that writes ASCII as ASCII has none.
+  if (body.includes(0)) {
+    return new Response('cannot scan a response containing 0x00 bytes\n', { status: 502 });
   }
   let ranges;
   try {
