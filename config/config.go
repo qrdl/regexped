@@ -636,8 +636,30 @@ func validateHintList(hints []string) error {
 // validateHints checks the hints fields of every pattern and set entry in
 // cfg. Returns an error naming the first offending entry and problem found.
 func validateHints(cfg *BuildConfig) error {
-	for _, re := range cfg.Patterns {
+	// The top-level patterns a SCANNING set selects: a set's find and scan
+	// pair scan for a member's literal as a pattern's find does. The anchored
+	// pair walks the whole input from byte 0 and scans for nothing, so a set
+	// declaring only match_any / match_all does not count.
+	inSet := make(map[int]bool)
+	for _, sc := range cfg.Sets {
+		if sc.Find == "" && sc.ScanAny == "" && sc.ScanAll == "" {
+			continue
+		}
+		for _, m := range sc.Members(*cfg) {
+			if !m.Inline {
+				inSet[m.ID] = true
+			}
+		}
+	}
+	for i, re := range cfg.Patterns {
 		label := re.DisplayName()
+		// anchor_literal chooses what a find scans for. On an entry nothing
+		// scans for — no find, no groups, in no set with find, scan_any or
+		// scan_all — it would be accepted and do nothing, which is the same
+		// silent no-op batch-find refuses.
+		if re.AnchorLiteral != "" && re.FindFunc == "" && re.GroupsFunc == "" && !inSet[i] {
+			return fmt.Errorf("pattern %q: anchor_literal requires find_func or groups_func on the same entry, or a set with find, scan_any or scan_all that selects the pattern", label)
+		}
 		if err := validateHintList(re.Hints); err != nil {
 			return fmt.Errorf("pattern %q: hints: %w", label, err)
 		}
@@ -925,6 +947,18 @@ type PatternEntry struct {
 	// export for this pattern's find_func/groups_func, consumed only by the
 	// JS and TS generators (a no-op for Rust/Go/C/AS stubs).
 	Hints []string `yaml:"hints"`
+
+	// AnchorLiteral names one of the pattern's own literals for its find to
+	// scan for, instead of the first one in the pattern: `/api/v1/` in
+	// `https?://[^/ ]+/api/v1/[a-z]+`, where every URL carries the `http` the
+	// find would otherwise stop at. Which literal is rare depends on the
+	// traffic, which the compiler cannot see. It changes no answer, only
+	// which literal the literal-anchored find and the mandatory-literal scan
+	// look for, and a literal they cannot use is reported by `compile
+	// --verbose` and not taken. Empty means unset. Its bytes are read in the
+	// pattern's mode (compile's literalBytes), so config checks only that an
+	// entry carrying it has a find to scan with.
+	AnchorLiteral string `yaml:"anchor_literal"`
 
 	// Expanded is set by ExpandReferences when the regexp used a reference:
 	// Regexp then holds the expanded text, and Expanded the text as written

@@ -67,6 +67,7 @@ patterns:                  # optional when every regexp lives inside sets (their
     groups_func:       "url_groups"        # match iterator; each item is that match's capture groups
 
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
+    anchor_literal: '/api/v1/' # optional; the literal the find scans for — see "anchor_literal:" below
     byte_mode: false           # optional; see "byte_mode:" below
     unicode: false             # optional; see "unicode:" below
 
@@ -556,6 +557,46 @@ the JS↔WASM boundary crossing the batching amortises — there is no
 projected win to justify the static-import decidability problems it would
 introduce. Don't set `batch-find` expecting a Rust/Go/C/AS speedup.
 
+### `anchor_literal:` — which literal the find scans for
+
+A find with a literal in it scans for that literal and only then walks the
+pattern around it. It takes the FIRST literal in the pattern, and patterns are
+usually written general-to-specific, so the first literal is often the common
+one: `https?://[^/ ]+/api/v1/[a-z]+` scans for `http`, which every URL carries,
+and pays a walk over the host at every URL before `/api/v1/` fails.
+`anchor_literal:` names the literal to scan for instead:
+
+```yaml
+patterns:
+  - regexp: 'https?://[^/ ]+/api/v1/[a-z]+'
+    find_func: api_find
+    anchor_literal: '/api/v1/'
+```
+
+Answers never change, only which literal the find stops at. Which literal is
+rare depends on your traffic, which the compiler cannot see, so measure it (see
+[prefer-hints.md](prefer-hints.md#choosing-the-anchor-literal)): a literal that
+is in fact common makes every hit pay a walk backwards over the part before it.
+
+- The value is the literal as written: in a Unicode-mode pattern its UTF-8
+  bytes, in a byte-mode one each character up to U+00FF is that byte.
+- It must be exactly one of the pattern's top-level literals — not part of a
+  longer literal, not inside an alternation, an optional or repeated part, and
+  not case-insensitive. `/api/v1/` qualifies in the pattern above; `v1` and
+  `api` do not.
+- It applies to `find_func` and `groups_func` (the search a groups export
+  makes), and to the pattern's membership in a set declaring `find`,
+  `scan_any` or `scan_all`, where it is the literal the member's bucket keys
+  on. An entry with none of them is a load error: nothing would scan. A set
+  declaring only `match_any` / `match_all` does not count — the anchored pair
+  walks the whole input from its first byte and scans for no literal.
+- A literal the find cannot use is not taken, and the module is the one you
+  would get without the key. `compile --verbose` says which: `anchor literal
+  "/api/v1/": taken — the literal-anchored find scans for it`, or `anchor
+  literal "v1" not taken — …` with the reason. In a set, `--diag-json`'s bucket
+  `literal` shows it; a set keys a bucket on it only when the part before it
+  has a fixed length.
+
 ### Pattern support
 
 Regexped uses RE2 syntax, and accepts every spelling Go's `regexp` package
@@ -633,7 +674,7 @@ Generates a stub file (Rust, JS, TypeScript, Go, C, AssemblyScript, or WIT) from
 | `wasm_format` | Accepted | Refused |
 |---|---|---|
 | `module` (default) | `rust`, `js`, `ts`, `go`, `c`, `as` | `wit` — "stub_type \"wit\" requires wasm_format: component" |
-| `component` | `wit`, `rust`, `c` | `go`, `as`, `js`, `ts` — "… is not supported for wasm_format: component", with no "yet": none is a component target. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component, so a JS/TS consumer needs `jco transpile`, which lands on the core module the `module` format already produces. |
+| `component` | `wit`, `rust`, `c` | `go`, `as`, `js`, `ts` — "… is not supported for wasm_format: component", with no "yet": none is a component target. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo (a Go app consumes a component through `stub_type: wit` and componentize-go instead — see [go-api.md](go-api.md#component-format-go-with-componentize-go)); AssemblyScript has no planned route; and no JavaScript runtime loads a component, so a JS/TS consumer needs `jco transpile`, which lands on the core module the `module` format already produces. |
 
 Under `component`, `stub_type: rust` and `stub_type: c` generate stubs whose public API is identical to the module-format ones; `wit` emits the interface alone, for a consumer that binds against it directly (a host using `wasmtime::component::bindgen!`, for instance).
 

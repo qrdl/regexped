@@ -1488,6 +1488,51 @@ func TestFindLitAnchorPoint_ParseError(t *testing.T) {
 	}
 }
 
+// TestFindHintedLitAnchorPoint: an anchor_literal hint splits the pattern at
+// the first top-level child whose literal set is exactly the hint, and nowhere
+// else — not inside a longer literal, not at an alternation that holds it, not
+// on a one-byte hint — and a hint equal to the literal findLitAnchorPoint takes
+// gives that same split.
+func TestFindHintedLitAnchorPoint(t *testing.T) {
+	const url = `https?://[^/ ]+/api/v1/[a-z]+`
+	for _, c := range []struct {
+		pat, hint string
+		unicode   bool
+		prefix    string // the split's prefix, as syntax prints it; "" = refused
+		why       string // the refusal
+	}{
+		{url, "/api/v1/", false, `https?://[^ /]+`, ""},
+		{url, "http", false, `(?:)`, ""},
+		{url, "v1", false, "", hintNotALiteral},
+		{`x(?:/api/v1/|/api/v2/)y`, "/api/v1/", false, "", hintNotALiteral},
+		{`x(?i:ab)y[0-9]`, "ab", false, "", hintNotALiteral},
+		{url, "/", false, "", "it takes a literal of two bytes or more"},
+		{`(\w+)(=>)(\w+)`, "=>", false, `([0-9A-Z_a-z]+)`, ""}, // the literal under a capture
+		{`[a-z]+ле[0-9]`, "ле", true, `[a-z]+`, ""},            // UTF-8 bytes in Unicode mode
+		{`[`, "ab", false, "", hintNotALiteral},
+		{`ab`, "ab", false, "", hintNotALiteral},         // not a concat: no split
+		{`(x[a-z]+yz[0-9])`, "yz", false, `x[a-z]+`, ""}, // under an outer capture
+	} {
+		lit, _ := literalBytes([]rune(c.hint), c.unicode)
+		lap, why := findHintedLitAnchorPoint(c.pat, c.unicode, lit)
+		switch {
+		case c.prefix == "" && (lap != nil || why != c.why):
+			t.Errorf("%q hint %q: lap %v, why %q; want refused: %q", c.pat, c.hint, lap, why, c.why)
+		case c.prefix != "" && lap == nil:
+			t.Errorf("%q hint %q: refused (%s)", c.pat, c.hint, why)
+		case c.prefix != "" && (lap.prefixRe.String() != c.prefix || len(lap.litSet) != 1 || string(lap.litSet[0]) != string(lit)):
+			t.Errorf("%q hint %q: prefix %s lits %q, want prefix %s", c.pat, c.hint, lap.prefixRe, lap.litSet, c.prefix)
+		}
+	}
+	// The hint equal to today's literal is today's split, field for field.
+	today := findLitAnchorPoint(url, false)
+	hinted, _ := findHintedLitAnchorPoint(url, false, []byte("http"))
+	if today.prefixRe.String() != hinted.prefixRe.String() || today.suffixRe.String() != hinted.suffixRe.String() ||
+		today.anchored != hinted.anchored || string(today.litSet[0]) != string(hinted.litSet[0]) {
+		t.Errorf("hint = first literal: %+v, today %+v", hinted, today)
+	}
+}
+
 // TestFindLitAnchorPointOneByte pins when a ONE-byte inner literal anchors
 // the find: only failing a longer literal, and only behind a leading repeat of
 // a class common in prose (wideLeadingRepeat). Where the first bytes are

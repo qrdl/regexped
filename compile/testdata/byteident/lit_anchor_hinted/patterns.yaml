@@ -1,0 +1,8 @@
+# The literal-anchored find split at the literal `anchor_literal:` names
+# rather than the first one: the SIMD scan looks for `/api/v1/` and the
+# backward DFA walks `https?://[^/ ]+` from it. The parts around it cannot
+# contain it, so the find is today's, provably linear, with no counter.
+patterns:
+  - regexp: 'https?://[^/ ]+/api/v1/[a-z]+'
+    find_func: la_hinted_find
+    anchor_literal: '/api/v1/'

@@ -1590,6 +1590,18 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	if buildOpts.LikelyMode != LikelyNeutral {
 		buildOpts.report().Note("LikelyMode " + buildOpts.LikelyMode.String())
 	}
+	// `anchor_literal:` — the literal the find scans for (anchorHint). Only a
+	// find or groups export scans; a match-only entry carries it for a set,
+	// which reads it from the entry itself (analyzeSetMember). The extractors
+	// record their verdicts, and the note is written once every body is
+	// decided, which is when this function returns.
+	var hint *anchorHint
+	if needFind || needGroups {
+		hint = newAnchorHint(re.AnchorLiteral, rp.unicode())
+	}
+	if hint != nil {
+		defer func() { buildOpts.report().Note(hint.note()) }()
+	}
 
 	// Counted-chain SIMD verifier, default-on for every
 	// LikelyMode (promoted 2026-07-10 after a clean broad sweep).
@@ -2235,7 +2247,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			utf8Text:             rp.unicode(),
 		})
 	}
-	patMandLit := findMandatoryLit(rp)
+	patMandLit := findHintedMandatoryLit(rp, hint)
 	if patMandLit != nil {
 		buildOpts.report().Note("mandatory literal extracted")
 	}
@@ -2279,6 +2291,15 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
 			parts, err := buildBTFindParts(rp, table, patMandLit, cur, &buildOpts)
+			if hint != nil {
+				// It reads the mandatory literal failing a prefix of two
+				// bytes or more (buildBTFindParts' scan strategy).
+				var pre []byte
+				if table != nil {
+					pre = computePrefix(table)
+				}
+				hint.settle(len(pre) < 2, pre)
+			}
 			if tl := (*btTooLarge)(nil); errors.As(err, &tl) {
 				switch {
 				case dfaStateLimitExceeded || table.numStates > maxStates:
@@ -2313,6 +2334,16 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			dataMark, segMark := len(p.dataBytes), p.dataSegCount
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Regexp, rp.unicode())
+			// An anchor_literal hint chooses the split; one no top-level part
+			// holds keeps today's, reported.
+			hintedLap := false
+			if hint.bytes() != nil {
+				if hlap, why := findHintedLitAnchorPoint(re.Regexp, rp.unicode(), hint.bytes()); hlap != nil {
+					lap, hintedLap = hlap, true
+				} else {
+					hint.litAnchor = why
+				}
+			}
 			// Reject prefixes containing `\b`/`\B` explicitly. The
 			// reversed-prefix DFA doesn't evaluate word boundaries backward,
 			// and the lit-anchor find body doesn't verify them at candidate
@@ -2335,155 +2366,187 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// premature, and the forward continuation is already newline-aware
 			// (its third step picks wasmMidStartNewline; the forward loop emits
 			// emitNLPreAcceptCheck). See lineAnchoredPrefixSafe.
-			lineAnchorOK := false
-			if lap != nil {
-				lineAnchorOK = (!table.hasNewlineBoundary && !prefixContainsLineAnchor(lap.prefixRe)) ||
-					lineAnchoredPrefixSafe(lap.prefixRe)
-			}
-			// Tables past 256 states (u16 ids) are taken in Unicode mode, where
-			// a lowered letter class alone makes them common: the e-mail-like
-			// `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}` has a 1,219-state forward
-			// DFA. Byte mode keeps the u8 tables it had.
-			if lap != nil && (l.useU8 || rp.unicode()) && !table.hasWordBoundary && lineAnchorOK &&
-				!prefixContainsWordBoundary(lap.prefixRe) {
-				// Compile the reversed prefix DFA for the backward scan.
-				revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
-				if revCompErr == nil && !revProg.refusedByByteGate() {
-					revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
-					var revTable *dfaTable
-					if revOk {
-						revTable = dfaTableFrom(revDFA)
-					}
-					if revOk && (revTable.numStates+1 <= 256 || rp.unicode()) &&
-						(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
-							revTable.midAcceptStates[revTable.startState] == 0)) {
-						revTableBase := utils.PageAlign(l.tableEnd)
-						revL := buildDFALayout(dfaLayoutParams{
-							t:                    revTable,
-							tableBase:            revTableBase,
-							sharedWordTable:      buildOpts.wordTable,
-							needFind:             true,
-							leftmostFirst:        false,
-							compiledDFAThreshold: 0,
-							useAcceptSideTable:   false,
-							lmBareShufti:         false,
-							lmNonMidShufti:       false,
-							lmWideShufti:         false,
-						})
-						bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true, false)
-						// When the prefix is a bare `[class]{M}` (M<=16),
-						// a single SIMD chunk verify replaces the scalar reverse
-						// walk above with no runtime trade-off. LikelyNoMatch-gated
-						// for this initial landing (see buildSimplePrefixCheckBody's
-						// doc comment); the unused reverse-DFA table bytes computed
-						// above are harmless dead weight when this fires, not wired
-						// into anything the WASM module executes.
-						if buildOpts.LikelyMode == LikelyNoMatch {
-							if tlo, count, ok := simpleClassPrefix(lap.prefixRe); ok {
-								bsBody = buildSimplePrefixCheckBody(tlo, count)
-							}
-						}
-
-						var litFirstBytes []byte
-						var litFirstByteFlags [256]byte
-						for _, lit := range lap.litSet {
-							b0 := lit[0]
-							if litFirstByteFlags[b0] == 0 {
-								litFirstByteFlags[b0] = 1
-								litFirstBytes = append(litFirstBytes, b0)
-							}
-						}
-
-						litFirstByteOff := int32(revL.tableEnd)
-						litTeddyLoOff := litFirstByteOff + 256
-						litTeddyHiOff := litTeddyLoOff + 16
-						var litTeddyLoBytes, litTeddyHiBytes []byte
-						var litTeddyT1LoOff, litTeddyT1HiOff int32
-						var litTeddyT1LoBytes, litTeddyT1HiBytes []byte
-
-						if len(litFirstBytes) <= 8 {
-							litTeddyLoBytes = make([]byte, 16)
-							litTeddyHiBytes = make([]byte, 16)
-							for i, fb := range litFirstBytes {
-								litTeddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
-								litTeddyHiBytes[fb>>4] |= byte(1 << uint(i))
-							}
-							// The two-byte tables need every literal's second byte. A
-							// one-byte inner literal is a SINGLE literal, which the
-							// find scans for with the prefix scan and never reads
-							// these tables for.
-							if len(lap.litSet[0]) >= 2 {
-								t1Lo := make([]byte, 16)
-								t1Hi := make([]byte, 16)
-								fbToBit := make(map[byte]int)
-								for i, fb := range litFirstBytes {
-									fbToBit[fb] = i
-								}
-								for _, lit := range lap.litSet {
-									// lit[0] is guaranteed present: fbToBit was built from
-									// litFirstBytes, which was deduped from this same litSet.
-									bit := fbToBit[lit[0]]
-									t1Lo[lit[1]&0x0F] |= byte(1 << uint(bit))
-									t1Hi[lit[1]>>4] |= byte(1 << uint(bit))
-								}
-								litTeddyT1LoOff = litTeddyHiOff + 16
-								litTeddyT1HiOff = litTeddyT1LoOff + 16
-								litTeddyT1LoBytes = t1Lo
-								litTeddyT1HiBytes = t1Hi
-							}
-						}
-
-						revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
-						var litSegs segAccum
-						litSegs.add(litFirstByteOff, litFirstByteFlags[:])
-						if litTeddyLoBytes != nil {
-							litSegs.add(litTeddyLoOff, litTeddyLoBytes)
-							litSegs.add(litTeddyHiOff, litTeddyHiBytes)
-							if litTeddyT1LoBytes != nil {
-								litSegs.add(litTeddyT1LoOff, litTeddyT1LoBytes)
-								litSegs.add(litTeddyT1HiOff, litTeddyT1HiBytes)
-							}
-						}
-
-						buildOpts.report().Note("literal-anchored find (SIMD literal scan + backward DFA)")
-						p.litAnchorBackScanBody = bsBody
-						p.litAnchorRevL, p.litAnchorRevTable = revL, revTable
-						// findFromMode is deliberately NOT set here. This
-						// pair's find half is built at assembleModule time and
-						// records its own mode there. Leaving the field at its
-						// invalid zero value keeps the "missed emitter is a
-						// build failure" property: a placeholder would instead
-						// wrap a native body in a narrowing wrapper.
-						p.litAnchorFindLayout = l
-						p.litAnchorFindTable = table
-						p.litAnchorFirstByteOff = litFirstByteOff
-						p.litAnchorFirstByteFlags = litFirstByteFlags
-						p.litAnchorFirstBytes = litFirstBytes
-						p.litAnchorTeddyLoOff = litTeddyLoOff
-						p.litAnchorTeddyHiOff = litTeddyHiOff
-						p.litAnchorTeddyLoBytes = litTeddyLoBytes
-						p.litAnchorTeddyHiBytes = litTeddyHiBytes
-						p.litAnchorTeddyT1LoOff = litTeddyT1LoOff
-						p.litAnchorTeddyT1HiOff = litTeddyT1HiOff
-						p.litAnchorTeddyT1LoBytes = litTeddyT1LoBytes
-						p.litAnchorTeddyT1HiBytes = litTeddyT1HiBytes
-						p.litAnchorLitSet = lap.litSet
-						p.dataBytes = append(p.dataBytes, revRawData...)
-						p.dataSegCount += revSegCnt
-						p.dataBytes = append(p.dataBytes, litSegs.bytes...)
-						p.dataSegCount += litSegs.count
-						// Derived from the segments actually appended, not from
-						// litTeddyT1HiOff: that offset is only assigned when
-						// len(litFirstBytes) <= 8, and while litAnchorPoint.litSet
-						// is hard-capped at 8 literals in lit_anchor.go, nothing
-						// links that invariant to this arithmetic. If it ever broke,
-						// tableEnd would silently collapse to 16 and the next
-						// pattern's tables would overwrite this one's. Every lit
-						// segment sits at or above revL.tableEnd (litFirstByteOff is
-						// exactly revL.tableEnd), so the reverse DFA is covered too.
-						p.tableEnd = litSegs.end
-					}
+			// buildLitAnchor builds the literal-anchored find over lap into p,
+			// and answers "" when it did, else why not — which only an
+			// anchor_literal hint reports. A refusal changes nothing, so a refused
+			// hinted split can be followed by today's.
+			buildLitAnchor := func(lap *litAnchorPoint) string {
+				lineAnchorOK := false
+				if lap != nil {
+					lineAnchorOK = (!table.hasNewlineBoundary && !prefixContainsLineAnchor(lap.prefixRe)) ||
+						lineAnchoredPrefixSafe(lap.prefixRe)
 				}
+				// Tables past 256 states (u16 ids) are taken in Unicode mode, where
+				// a lowered letter class alone makes them common: the e-mail-like
+				// `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}` has a 1,219-state forward
+				// DFA. Byte mode keeps the u8 tables it had.
+				if lap != nil && (l.useU8 || rp.unicode()) && !table.hasWordBoundary && lineAnchorOK &&
+					!prefixContainsWordBoundary(lap.prefixRe) {
+					// Compile the reversed prefix DFA for the backward scan.
+					revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
+					if revCompErr == nil && !revProg.refusedByByteGate() {
+						revDFA, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
+						var revTable *dfaTable
+						if revOk {
+							revTable = dfaTableFrom(revDFA)
+						}
+						if revOk && (revTable.numStates+1 <= 256 || rp.unicode()) &&
+							(lap.anchored || (revTable.acceptStates[revTable.startState] == 0 &&
+								revTable.midAcceptStates[revTable.startState] == 0)) {
+							revTableBase := utils.PageAlign(l.tableEnd)
+							revL := buildDFALayout(dfaLayoutParams{
+								t:                    revTable,
+								tableBase:            revTableBase,
+								sharedWordTable:      buildOpts.wordTable,
+								needFind:             true,
+								leftmostFirst:        false,
+								compiledDFAThreshold: 0,
+								useAcceptSideTable:   false,
+								lmBareShufti:         false,
+								lmNonMidShufti:       false,
+								lmWideShufti:         false,
+							})
+							bsBody := buildLitAnchorBackScanBody(revL, revTable, buildOpts.tableMemIdx, true, false)
+							// When the prefix is a bare `[class]{M}` (M<=16),
+							// a single SIMD chunk verify replaces the scalar reverse
+							// walk above with no runtime trade-off. LikelyNoMatch-gated
+							// for this initial landing (see buildSimplePrefixCheckBody's
+							// doc comment); the unused reverse-DFA table bytes computed
+							// above are harmless dead weight when this fires, not wired
+							// into anything the WASM module executes.
+							if buildOpts.LikelyMode == LikelyNoMatch {
+								if tlo, count, ok := simpleClassPrefix(lap.prefixRe); ok {
+									bsBody = buildSimplePrefixCheckBody(tlo, count)
+								}
+							}
+
+							var litFirstBytes []byte
+							var litFirstByteFlags [256]byte
+							for _, lit := range lap.litSet {
+								b0 := lit[0]
+								if litFirstByteFlags[b0] == 0 {
+									litFirstByteFlags[b0] = 1
+									litFirstBytes = append(litFirstBytes, b0)
+								}
+							}
+
+							litFirstByteOff := int32(revL.tableEnd)
+							litTeddyLoOff := litFirstByteOff + 256
+							litTeddyHiOff := litTeddyLoOff + 16
+							var litTeddyLoBytes, litTeddyHiBytes []byte
+							var litTeddyT1LoOff, litTeddyT1HiOff int32
+							var litTeddyT1LoBytes, litTeddyT1HiBytes []byte
+
+							if len(litFirstBytes) <= 8 {
+								litTeddyLoBytes = make([]byte, 16)
+								litTeddyHiBytes = make([]byte, 16)
+								for i, fb := range litFirstBytes {
+									litTeddyLoBytes[fb&0x0F] |= byte(1 << uint(i))
+									litTeddyHiBytes[fb>>4] |= byte(1 << uint(i))
+								}
+								// The two-byte tables need every literal's second byte. A
+								// one-byte inner literal is a SINGLE literal, which the
+								// find scans for with the prefix scan and never reads
+								// these tables for.
+								if len(lap.litSet[0]) >= 2 {
+									t1Lo := make([]byte, 16)
+									t1Hi := make([]byte, 16)
+									fbToBit := make(map[byte]int)
+									for i, fb := range litFirstBytes {
+										fbToBit[fb] = i
+									}
+									for _, lit := range lap.litSet {
+										// lit[0] is guaranteed present: fbToBit was built from
+										// litFirstBytes, which was deduped from this same litSet.
+										bit := fbToBit[lit[0]]
+										t1Lo[lit[1]&0x0F] |= byte(1 << uint(bit))
+										t1Hi[lit[1]>>4] |= byte(1 << uint(bit))
+									}
+									litTeddyT1LoOff = litTeddyHiOff + 16
+									litTeddyT1HiOff = litTeddyT1LoOff + 16
+									litTeddyT1LoBytes = t1Lo
+									litTeddyT1HiBytes = t1Hi
+								}
+							}
+
+							revRawData, revSegCnt := stripSegCount(dfaDataSegments(revL, true, false))
+							var litSegs segAccum
+							litSegs.add(litFirstByteOff, litFirstByteFlags[:])
+							if litTeddyLoBytes != nil {
+								litSegs.add(litTeddyLoOff, litTeddyLoBytes)
+								litSegs.add(litTeddyHiOff, litTeddyHiBytes)
+								if litTeddyT1LoBytes != nil {
+									litSegs.add(litTeddyT1LoOff, litTeddyT1LoBytes)
+									litSegs.add(litTeddyT1HiOff, litTeddyT1HiBytes)
+								}
+							}
+
+							buildOpts.report().Note("literal-anchored find (SIMD literal scan + backward DFA)")
+							p.litAnchorBackScanBody = bsBody
+							p.litAnchorRevL, p.litAnchorRevTable = revL, revTable
+							// findFromMode is deliberately NOT set here. This
+							// pair's find half is built at assembleModule time and
+							// records its own mode there. Leaving the field at its
+							// invalid zero value keeps the "missed emitter is a
+							// build failure" property: a placeholder would instead
+							// wrap a native body in a narrowing wrapper.
+							p.litAnchorFindLayout = l
+							p.litAnchorFindTable = table
+							p.litAnchorFirstByteOff = litFirstByteOff
+							p.litAnchorFirstByteFlags = litFirstByteFlags
+							p.litAnchorFirstBytes = litFirstBytes
+							p.litAnchorTeddyLoOff = litTeddyLoOff
+							p.litAnchorTeddyHiOff = litTeddyHiOff
+							p.litAnchorTeddyLoBytes = litTeddyLoBytes
+							p.litAnchorTeddyHiBytes = litTeddyHiBytes
+							p.litAnchorTeddyT1LoOff = litTeddyT1LoOff
+							p.litAnchorTeddyT1HiOff = litTeddyT1HiOff
+							p.litAnchorTeddyT1LoBytes = litTeddyT1LoBytes
+							p.litAnchorTeddyT1HiBytes = litTeddyT1HiBytes
+							p.litAnchorLitSet = lap.litSet
+							p.dataBytes = append(p.dataBytes, revRawData...)
+							p.dataSegCount += revSegCnt
+							p.dataBytes = append(p.dataBytes, litSegs.bytes...)
+							p.dataSegCount += litSegs.count
+							// Derived from the segments actually appended, not from
+							// litTeddyT1HiOff: that offset is only assigned when
+							// len(litFirstBytes) <= 8, and while litAnchorPoint.litSet
+							// is hard-capped at 8 literals in lit_anchor.go, nothing
+							// links that invariant to this arithmetic. If it ever broke,
+							// tableEnd would silently collapse to 16 and the next
+							// pattern's tables would overwrite this one's. Every lit
+							// segment sits at or above revL.tableEnd (litFirstByteOff is
+							// exactly revL.tableEnd), so the reverse DFA is covered too.
+							p.tableEnd = litSegs.end
+							return ""
+						}
+						if !revOk || (revTable.numStates+1 > 256 && !rp.unicode()) {
+							return "the backward DFA over the part before it is too large"
+						}
+						if lap.prefixRe.Op == syntax.OpEmptyMatch {
+							return "it begins the pattern"
+						}
+						return "the part before it can match the empty string"
+					}
+					return "the part before it cannot be compiled reversed"
+				}
+				switch {
+				case lap == nil:
+					return hintNotALiteral
+				case !(l.useU8 || rp.unicode()):
+					return "the pattern's DFA has more than 256 states"
+				case table.hasWordBoundary || prefixContainsWordBoundary(lap.prefixRe):
+					return "the pattern has a word boundary (\\b or \\B)"
+				default:
+					return "a line anchor comes before it"
+				}
+			}
+			if why := buildLitAnchor(lap); hintedLap && why != "" {
+				hint.litAnchor = why
+				lap = findLitAnchorPoint(re.Regexp, rp.unicode())
+				buildLitAnchor(lap)
+			} else if hintedLap {
+				hint.litAnchor = hintTaken
 			}
 
 			// Alternation lit-anchor — only tried
@@ -2551,6 +2614,15 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				}
 			}
 			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
+			if p.startAnywhere && hint != nil && hint.litAnchor == hintTaken {
+				hint.litAnchor = "the find is the start-anywhere search, which scans for no literal"
+			}
+			// Only today's DFA find body reads the mandatory literal, and only
+			// with no literal prefix to scan for (buildFindBody's
+			// useMandatoryLit).
+			if !p.startAnywhere && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil && !isAnchoredFind(table) {
+				hint.settle(len(l.prefix) == 0, l.prefix)
+			}
 			if !p.startAnywhere {
 				// Dominant-self-loop SIMD bulk-skip. Default-on for all
 				// modes, mid-accept and non-mid-accept alike (2026-07-05).

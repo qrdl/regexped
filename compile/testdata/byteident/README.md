@@ -48,6 +48,7 @@ add a fixture for it.
 | `one_byte_lit_anchor` | `\w+@\w+` | a ONE-byte inner literal behind a wide leading repeat: the literal-anchored find with the start-anywhere switch's counter charging every failed candidate | Compiled DFA |
 | `find_switch` | `a*b` | today's general find WITH the work counter at its failed-attempt exits, the start-anywhere find beside it, and the dispatcher every caller of the find reaches. Its automaton has a cycle state, so it also pins the PER-SEARCH NOTES pair (`search_notes.go`): the ordinary copy's waste counter and the marked copy, with the `regexped:search` export | Compiled DFA |
 | `lit_anchor_switch` | `\w+abc\d` | the literal-anchored find with the counter; its backward walker stamps where it stopped, so a FAILED backward walk is charged too | Compiled DFA |
+| `lit_anchor_hinted` | `https?://[^/ ]+/api/v1/[a-z]+` + `anchor_literal: '/api/v1/'` | the literal-anchored find split at the literal the hint names instead of the first one (`http`): the SIMD scan looks for `/api/v1/`, the backward DFA walks the scheme and host. The parts around it cannot contain it, so the find is today's with no counter, where the unhinted pattern takes the switch | Compiled DFA |
 | `alt_lit_switch` | `x{3}abc\w*z\|y{3}ghi\w*z` | the alternation literal-anchored find with the counter; each branch's backward walker and forward verifier stamp where they stopped | Compiled DFA |
 
 ## Set fixtures

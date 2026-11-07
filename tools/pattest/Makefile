@@ -1,4 +1,4 @@
-.PHONY: run example-lm example-lnm example-combined examples clean
+.PHONY: run example-lm example-lnm example-combined example-anchor examples clean
 
 # Run against an arbitrary pattern/mode/input file, e.g.:
 #   make run ARGS="-pattern '[a-z]+' -mode find -inputs myinputs.txt -detailed"
@@ -42,7 +42,16 @@ example-lnm:
 example-combined:
 	go run . -pattern '[A-Z]{8,}' -mode find -inputs examples/lm_lnm_combined_inputs.txt $(ARGS)
 
-examples: example-lm example-lnm example-combined
+# `anchor_literal:` — run twice, without the hint and with it, over two lines
+# of 120 URLs (one with no `/api/v1/`, one with every fourth path under it).
+# Without it the find scans for `http`, which every URL carries; with it, for
+# `/api/v1/`. The no-match line is where the hint pays; the first call on the
+# matching line shows what each hit costs instead.
+example-anchor:
+	go run . -pattern 'https?://[^/ ]+/api/v1/[a-z]+' -mode find -inputs examples/anchor_literal_inputs.txt $(ARGS)
+	go run . -pattern 'https?://[^/ ]+/api/v1/[a-z]+' -mode find -inputs examples/anchor_literal_inputs.txt -anchor-literal '/api/v1/' $(ARGS)
+
+examples: example-lm example-lnm example-combined example-anchor
 
 clean:
 	rm -f pattest

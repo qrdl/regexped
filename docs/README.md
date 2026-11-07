@@ -2,10 +2,11 @@
 
 - [CLI reference](cli.md) — commands, flags, config schema, pattern support
 - [Pattern references](references.md) — `(?&name)` / `(?<&name>)`: build a regexp from named patterns
+- [Compile hints](prefer-hints.md) — `prefer-match` / `prefer-no-match` and `anchor_literal:`: which shapes each changes, and how to measure whether it helps your traffic
 
 **Languages**
 - [Rust API](rust-api.md) — generated Rust stubs
-- [Go API](go-api.md) — generated Go stubs
+- [Go API](go-api.md) — generated Go stubs (wasip1), and Go consuming a component through componentize-go, with no stub
 - [JavaScript API](js-api.md) — generated JS ES module and generator functions
 - [TypeScript API](ts-api.md) — generated TS ES module with typed generator functions
 - [AssemblyScript API](as-api.md) — generated AS module with typed iterator classes
@@ -16,7 +17,7 @@
 - [Node.js](node.md) — standalone WASM, TypeScript stub, `readFileSync` + `init()`
 - [wasmtime](wasmtime.md) — embedded WASM merged with a Rust/Go/C/AssemblyScript host, or a component composed with its guest, run via the `wasmtime` CLI or any wasmtime embedding
 - [Cloudflare Workers](workers.md) — standalone WASM, JS module import, isolate-level init
-- [Gcore FastEdge](fastedge.md) — embedded WASM, Rust stubs, merge workflow
+- [Gcore FastEdge](fastedge.md) — CDN apps (embedded WASM, Rust stubs, merge workflow) and HTTP apps as components, in Rust, Go (componentize-go) and JavaScript (FastEdge JS SDK)
 
 **Component Model**
 - [Components](component.md) — `wasm_format: component`: the WIT interface, naming, versioning, stubs and costs
