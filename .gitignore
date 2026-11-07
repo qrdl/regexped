@@ -54,11 +54,11 @@ examples/fastedge/script-detect/.serve.log
 examples/fastedge/secret-redact/secrets.wit
 # The Go component example: `regexped compile` writes uaparser.wit, `make
 # bindings` copies it into wit/deps, and `componentize-go bindings` writes
-# go.mod and the generated packages at the module root.
+# the generated packages at the module root. go.mod and go.sum are NOT
+# ignored: componentize-go rewrites go.mod and `go mod tidy` puts it back, and
+# without them the directory would belong to the repository's own module.
 examples/fastedge/ua-parser/uaparser.wit
 examples/fastedge/ua-parser/wit/deps/regexped-uaparser/
-examples/fastedge/ua-parser/go.mod
-examples/fastedge/ua-parser/go.sum
 examples/fastedge/ua-parser/wit_exports.go
 examples/fastedge/ua-parser/regexped_uaparser_*/
 examples/fastedge/ua-parser/wasi_*/

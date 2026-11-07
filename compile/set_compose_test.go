@@ -3369,13 +3369,14 @@ func TestSetMemberAnchorLiteral(t *testing.T) {
 			t.Errorf("%s hint %q: buckets %s, want %s", c.re, c.hint, got, c.want)
 		}
 	}
-	// The retry leaves today's analysis, the hint's verdict recorded.
+	// The retry leaves today's analysis, and keeps the hint for a split
+	// member's find.
 	var prefixPool, suffixPool dfaPool
 	info, err := analyzePattern(config.PatternEntry{Regexp: `user=[a-z]{1,8};role=admin`, AnchorLiteral: ";role=admin"}, &prefixPool, &suffixPool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(info.mandLit.bytes) != "user=" || !info.splittable || !strings.HasPrefix(info.anchorLit.mand, "the set cannot key a bucket on it") {
-		t.Errorf("retry: literal %q splittable %v verdict %q", info.mandLit.bytes, info.splittable, info.anchorLit.mand)
+	if string(info.mandLit.bytes) != "user=" || !info.splittable || string(info.anchorLit.bytes()) != ";role=admin" {
+		t.Errorf("retry: literal %q splittable %v hint %q", info.mandLit.bytes, info.splittable, info.anchorLit.bytes())
 	}
 }

@@ -38,7 +38,10 @@ type PatternInfo struct {
 	// anchorLit is the member's `anchor_literal:` in the set's mode, nil for
 	// none: the literal its bucket keys on when the walk reaches it
 	// (hintedMandatoryLitRec), and the one a split member's Backtracking find
-	// scans for.
+	// scans for. Its verdict fields are `compile --verbose`'s for a pattern's
+	// own find and are not reported for a set member, whose choice shows as
+	// its bucket's literal in --diag-json; analyzePattern reads mand only to
+	// learn whether the pass it is in took the hint.
 	anchorLit *anchorHint
 
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
@@ -464,7 +467,6 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 		if hint == nil || hint.mand != hintTaken {
 			return false
 		}
-		hint.mand = "the set cannot key a bucket on it: the part before it must have a fixed length and no \\b, \\B or end assertion"
 		*info, hint = saved, nil
 		return true
 	}

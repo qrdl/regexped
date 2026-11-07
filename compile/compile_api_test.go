@@ -3657,6 +3657,15 @@ func TestAnchorLiteralHint(t *testing.T) {
 			"mandatory literal: " + bound},
 		{e: find(`ab[a-z]+(?m:^)cd[0-9]`, "cd"), note: `anchor literal "cd" not taken — literal-anchored find: a line anchor comes before it; ` +
 			"mandatory literal: " + bound},
+		// A multi-line anchor after the literal refuses the split too, and the
+		// note names that guard, not the one before it.
+		{e: find(`[a-z]+foo[a-z]*(?m:$)`, "foo"), note: `anchor literal "foo" not taken — literal-anchored find: ` +
+			"a multi-line anchor, (?m:^) or (?m:$), comes after it; mandatory literal: " + bound},
+		// A one-byte hint is refused, but where the pattern's own one-byte
+		// rule anchors the find on that byte the find scans for it.
+		{e: find(`[\w.]+@[\w.]+`, "@"), note: `anchor literal "@": taken — the literal-anchored find scans for it`},
+		{e: find(`[a-z]+@[a-z]+\.example\.com`, "@"), note: `anchor literal "@" not taken — literal-anchored find: ` +
+			"it takes a literal of two bytes or more; mandatory literal: " + bound},
 		// The mandatory literal takes it, but the find is today's
 		// literal-anchored one, which scans for zz.
 		{e: find(`[0-9]{2}zz(?:a|b){9}a(?:a|b){0,6}yy[0-9]`, "yy"), note: `anchor literal "yy" not taken — literal-anchored find: ` +

@@ -224,6 +224,10 @@ an English text (`\p{Han}+x`: 4.06 fuel/byte against 2.13).
 - a qualifying literal exists: length ≥ 2 and at most 8 alternates, or the
   one-byte case above; bytes in byte mode (0x80–0xFF under `byte_mode: true`),
   UTF-8 in Unicode mode
+- no line anchor in the part before the literal and no `(?m:^)` or `(?m:$)`
+  after it, unless that part is line-scoped: led by `^`, `\A` or `(?m:^)`,
+  with nothing after the lead in it that can match a newline or is another
+  line anchor
 - the reversed-prefix DFA has ≤ 256 states in byte mode
 - for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
 - the split keeps match-start order (`litAnchorMissesLeftmost`, below)
@@ -283,13 +287,18 @@ FIRST top-level literal, which is often the common one —
 `https?://[^/ ]+/api/v1/[a-z]+` scans for `http`, which every URL carries. A
 pattern's `anchor_literal:` names a later one to split at instead
 ([cli.md](cli.md#anchor_literal--which-literal-the-find-scans-for)). It is taken
-when it is exactly one of the pattern's top-level literals — its literal set is
-that literal alone, so not part of a longer literal, not inside an alternation,
-an optional or repeated part, and not case-insensitive — and the split it gives
-passes the conditions above: the part before it cannot match the empty string
-and its reversed DFA builds within the limit, the pattern has no word boundary,
-no line anchor comes before the literal, and the split keeps match-start
-order — a hint can name a literal the part before it can also hold. Otherwise the find splits where it would without the
+when it is two bytes or more and exactly one of the pattern's top-level
+literals — its literal set is that literal alone, so not part of a longer
+literal, not inside an alternation, an optional or repeated part, and not
+case-insensitive — and the split it gives passes the conditions above: the part
+before it cannot match the empty string and its reversed DFA builds within the
+limit, the pattern has no word boundary, no line anchor comes before the
+literal and no `(?m:^)` or `(?m:$)` after it (unless the part before it is
+line-scoped, as above),
+and the split keeps match-start order — a hint can name a literal the part
+before it can also hold. A one-byte hint is not taken; where the one-byte rule
+above already anchors the find on that byte, `--verbose` reports it taken,
+since the find scans for it. Otherwise the find splits where it would without the
 hint, and the module is the one an unhinted config compiles to. `compile
 --verbose` says which: `anchor literal "/api/v1/": taken — the literal-anchored
 find scans for it`, or `not taken — …` with the guard that refused it. On that

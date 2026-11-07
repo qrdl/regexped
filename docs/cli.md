@@ -580,6 +580,12 @@ is in fact common makes every hit pay a walk backwards over the part before it.
 
 - The value is the literal as written: in a Unicode-mode pattern its UTF-8
   bytes, in a byte-mode one each character up to U+00FF is that byte.
+- It must be two bytes or more. A one-byte literal stops the scan at every
+  occurrence of its byte, and bytes like `@`, `=` or `-` are common in most
+  text. A find anchors on one byte by its own rule in one shape only — a
+  pattern that begins with a repeat of a wide class and has no longer literal
+  ([engines.md](engines.md#literal-anchored-find)) — and there a hint naming
+  that byte is reported taken, since the find scans for it.
 - It must be exactly one of the pattern's top-level literals — not part of a
   longer literal, not inside an alternation, an optional or repeated part, and
   not case-insensitive. `/api/v1/` qualifies in the pattern above; `v1` and

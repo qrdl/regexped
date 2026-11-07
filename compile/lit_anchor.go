@@ -706,7 +706,7 @@ const litAnchorOrderReason = "the part before it can hold an earlier occurrence 
 // keeping it would cost answers.
 func litAnchorMissesLeftmost(pattern resolvedPattern, lap *litAnchorPoint) bool {
 	pre := lap.prefixRe
-	if leadingBeginText(pre) || lineAnchoredPrefixSafe(pre) {
+	if topLevelBeginAnchorKind(pre) == beginAnchorText || lineAnchoredPrefixSafe(pre) {
 		return false
 	}
 	// One fixed length: every hit's start is the hit less that length, so
@@ -766,7 +766,9 @@ func (p prefixAutomaton) runsIntoLiteral(l1 []byte, m int) bool {
 // canHoldLiteral is the conservative answer: some prefix match can hold an
 // occurrence of a literal, wholly or running on into the match's own.
 func (p prefixAutomaton) canHoldLiteral() bool {
-	// Every state the subset construction made is reachable from the start.
+	// Every state counts, including those only the mid-input starts reach
+	// (midStart, midStartWord): a match can begin at any position, and
+	// counting a state no match uses only makes the answer more conservative.
 	for q := 0; q < p.t.numStates; q++ {
 		for _, l1 := range p.lits {
 			if p.walk(q, l1) >= 0 {
@@ -898,18 +900,6 @@ func (p prefixAutomaton) hitInsideMatch() bool {
 				queue = append(queue, y)
 			}
 		}
-	}
-	return false
-}
-
-// leadingBeginText reports whether re starts with `\A` (or `^` outside
-// multi-line mode), through captures and concatenations.
-func leadingBeginText(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpBeginText:
-		return true
-	case syntax.OpCapture, syntax.OpConcat:
-		return len(re.Sub) > 0 && leadingBeginText(re.Sub[0])
 	}
 	return false
 }

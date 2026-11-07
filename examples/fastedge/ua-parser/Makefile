@@ -48,7 +48,11 @@ compile: $(COMPONENT)
 
 # Step 2 – generate the Go bindings for wit/world.wit, whose imports are the
 # component's interfaces: its .wit goes into wit/deps first. componentize-go
-# writes go.mod too; `go mod tidy` fetches the runtime package it names.
+# rewrites go.mod too; `go mod tidy` fetches the runtime package it names and
+# puts go.mod back as committed. go.mod and go.sum are committed because
+# without them this directory would belong to the repository's own module,
+# and a `go mod tidy` at the repository root would take on this example's
+# dependency and Go version.
 $(WIT_DEP): $(WIT)
 	mkdir -p $(dir $@)
 	cp $(WIT) $@
@@ -105,5 +109,5 @@ test: $(FINAL)
 	npm test
 
 clean:
-	rm -f $(COMPONENT) $(WIT) $(GUEST) $(FINAL) $(BINDINGS) go.mod go.sum .serve.log
+	rm -f $(COMPONENT) $(WIT) $(GUEST) $(FINAL) $(BINDINGS) .serve.log
 	rm -rf regexped_uaparser_*/ wasi_*/ $(dir $(WIT_DEP))
