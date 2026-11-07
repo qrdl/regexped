@@ -35,6 +35,12 @@ type PatternInfo struct {
 	mandLit    *mandatoryLit  // from findMandatoryLitRec
 	splittable bool           // false when splitAtPath rejects the path (routes to fallback)
 
+	// anchorLit is the member's `anchor_literal:` in the set's mode, nil for
+	// none: the literal its bucket keys on when the walk reaches it
+	// (hintedMandatoryLitRec), and the one a split member's Backtracking find
+	// scans for.
+	anchorLit *anchorHint
+
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
@@ -372,6 +378,7 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 		rp:             rp,
 		displayPattern: re.Written(),
 		byteMode:       re.IsByteMode(),
+		anchorLit:      newAnchorHint(re.AnchorLiteral, rp.unicode()),
 		prefixID:       -1,
 		suffixID:       -1,
 	}
@@ -433,147 +440,6 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 		return info, nil
 	}
 
-	lit, path := findMandatoryLitRec(rp.tree(parsed), 0, 0)
-	info.mandLit = lit
-
-	if lit != nil {
-		prefixAST, suffixAST, ok := splitAtPath(parsed, path)
-		info.splittable = ok
-		if ok {
-			// Zero-length prefix: only strip if it consists purely of begin-anchors (^, \A).
-			// Mixed prefixes (e.g. ^$, \b) or non-begin zero-length assertions route to fallback.
-			if prefixAST != nil {
-				if _, maxLen := rp.tree(prefixAST).minMaxLen(); maxLen == 0 {
-					if isOnlyBeginAnchors(prefixAST) {
-						switch strippedAnchorKind(prefixAST) {
-						case beginAnchorLine:
-							info.lineAnchor = true
-						default:
-							info.startAnchor = true
-						}
-						prefixAST = nil
-					} else {
-						// Non-begin or mixed zero-length prefix: route to fallback.
-						info.splittable = false
-					}
-				}
-			}
-			// Begin-anchors in the suffix (e.g. a^) can't fire after the literal has
-			// been consumed. Route to fallback so the full-pattern DFA handles it correctly.
-			if suffixAST != nil && hasBeginAnchor(suffixAST) {
-				info.splittable = false
-			}
-			// Keep the split ONLY if it survived every rejection above.
-			// Retaining prefixAST after a rejection is one of the two
-			// mechanisms behind the \b-in-a-set defect: a `\b` prefix is
-			// zero-length and not an only-begin-anchor, so the split is
-			// rejected — but the retained prefixAST still made the pattern
-			// look split, so it got a backward "prefix DFA" for a bare
-			// assertion (which accepts nothing) and a suffix DFA for a
-			// fragment rather than the whole pattern. The result was a
-			// pattern that silently never matched.
-			if info.splittable {
-				info.prefixAST = prefixAST
-				info.suffixAST = suffixAST
-			}
-		}
-		// Fallback patterns: only truly anchored if the begin-anchor is at the
-		// mandatory top level (not inside *, ?, etc.).
-		if !info.splittable {
-			info.setTopLevelAnchor(parsed)
-		}
-	}
-
-	// Variable-length prefixes route to fallback.
-	//
-	// The split representation prefix.literal.suffix answers "where does a
-	// match starting at s end?" by finding a literal occurrence and walking
-	// the backward prefix DFA to recover s. That is exact only while each
-	// match start maps to exactly ONE literal position — i.e. while the
-	// prefix has a fixed length. With a variable-length prefix one start has
-	// several candidate literal positions with DIFFERENT extents, and which
-	// one RE2 picks depends on the prefix's greedy structure, which a
-	// backward DFA cannot express. Two failures follow directly, both
-	// observed on `a?a` over "aa":
-	//
-	//   - the backward DFA reports the LEFTMOST start it can reach, so the
-	//     match at start 1 is never generated at all (only 0-2 is);
-	//   - the same start is reported twice with different extents (0-1 from
-	//     the empty-prefix candidate, 0-2 from the one-char-prefix
-	//     candidate), where RE2 has exactly one answer, 0-2.
-	//
-	// This is the root cause behind the back-dated-tuple defect.
-	// Routing to fallback runs the whole pattern's DFA anchored at each
-	// position, which is the only construction that gets the extent right —
-	// and it is also what drain class B says such a set must do, since a
-	// literal arbitrarily far to the right can serve a match starting here so
-	// nothing can be skipped anyway. The cost is the literal frontend, which
-	// a class-B set could not have used regardless.
-	if info.prefixAST != nil {
-		if minLen, maxLen := rp.tree(info.prefixAST).minMaxLen(); minLen != maxLen {
-			info.splittable = false
-			info.prefixAST = nil
-			info.suffixAST = nil
-			info.setTopLevelAnchor(parsed)
-		}
-	}
-
-	// A prefix containing \b or \B routes to fallback for the same reason,
-	// by a different mechanism.
-	//
-	// The prefix is verified by walking a REVERSED DFA leftward from the
-	// literal (buildLitAnchorBackScanBody). That walk carries no word-boundary
-	// context: it has no prevWasWord bit and never reads the wordChar table,
-	// because a backward scan cannot see the byte at input[start-1] that a
-	// boundary sitting at the prefix's LEFT EDGE depends on. Emitting it
-	// anyway silently loses matches — `\B.0` over "000" splits into prefix
-	// `\B.` + literal "0" and returned NOTHING, where [1,3) is a real match.
-	//
-	// The forward suffix walk is unaffected and needs no guard: it threads
-	// exactly that context through midAcceptNW/midAcceptW, which is what
-	// they were built for. Only the backward prefix scan is blind, so only a
-	// prefix boundary disqualifies the split.
-	if info.prefixAST != nil && regexpHasWordBoundary(info.prefixAST) {
-		info.splittable = false
-		info.prefixAST = nil
-		info.suffixAST = nil
-		info.setTopLevelAnchor(parsed)
-	}
-
-	// A prefix containing `$`, `\z` or `(?m:$)` routes to fallback, for the
-	// third instance of the same blindness.
-	//
-	// The backward prefix DFA is a plain byte automaton over the reversed
-	// prefix. End-of-text is not a byte, so reverseRegexp/newDFA simply drop
-	// the assertion, and the walk then accepts a prefix the pattern forbids.
-	// Unlike the `\b` case this does not lose matches — it INVENTS them, and
-	// the invention can be total: `.$0` cannot match anything at all (nothing
-	// follows end-of-text), yet the split reported [0,2) on "00" because the
-	// prefix check saw only `.`.
-	//
-	// Begin-anchors need no such guard and must not get one: `^`/`\A`/`(?m:^)`
-	// are modelled positively by startAnchor/lineAnchor and the eligibility
-	// masks built from them, which is why `^a0` is already correct.
-	//
-	// The suffix side is likewise fine — an end-assertion AFTER the literal is
-	// exactly what the forward suffix DFA's ecEnd channel expresses, so `0$`
-	// keeps its split and its literal frontend.
-	if info.prefixAST != nil && regexpHasEndAssertion(info.prefixAST) {
-		info.splittable = false
-		info.prefixAST = nil
-		info.suffixAST = nil
-		info.setTopLevelAnchor(parsed)
-	}
-
-	info.trivialPrefix = info.prefixAST == nil
-	if !info.trivialPrefix && info.prefixAST != nil {
-		// Only the MAX is kept: a variable-length prefix is fallback-routed
-		// above, so min == max here, and prefixMinLen was a field written and
-		// never read.
-		_, maxLen := rp.tree(info.prefixAST).minMaxLen()
-		info.prefixMaxLen = maxLen
-	}
-
 	// A pattern whose own automaton cannot be built goes to the fallback
 	// packer whole, which gives it Backtracking (noOwnDFA) — not an error that
 	// fails the set's compile, since the same pattern compiles alone. Nothing
@@ -588,17 +454,182 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 		return info, nil
 	}
 
-	// Build prefix DFA (reversed prefix AST). It joins its pool only once the
-	// suffix DFA is built too.
-	var prefixTable *dfaTable
-	if !info.trivialPrefix {
-		// syntax.Compile never returns a non-nil error (see its stdlib source).
-		revProg, _ := compileProg(rp.tree(info.prefixAST).reversed())
-		revD, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
-		if !revOk {
-			return noOwnDFA()
+	// An anchor_literal hint keys the bucket only where the split it gives can
+	// — a fixed-length part before it, free of the assertions a backward walk
+	// cannot judge, with a backward DFA that builds. Where it cannot, the
+	// member is analysed again with today's literal, so a hint never costs a
+	// member the bucket it had: retry reports whether to.
+	saved, hint := *info, info.anchorLit
+	retry := func() bool {
+		if hint == nil || hint.mand != hintTaken {
+			return false
 		}
-		prefixTable = dfaTableFromCanonical(revD)
+		hint.mand = "the set cannot key a bucket on it: the part before it must have a fixed length and no \\b, \\B or end assertion"
+		*info, hint = saved, nil
+		return true
+	}
+	var prefixTable *dfaTable
+	for {
+		lit, path := hintedMandatoryLitRec(rp.tree(parsed), hint)
+		info.mandLit = lit
+
+		if lit != nil {
+			prefixAST, suffixAST, ok := splitAtPath(parsed, path)
+			info.splittable = ok
+			if ok {
+				// Zero-length prefix: only strip if it consists purely of begin-anchors (^, \A).
+				// Mixed prefixes (e.g. ^$, \b) or non-begin zero-length assertions route to fallback.
+				if prefixAST != nil {
+					if _, maxLen := rp.tree(prefixAST).minMaxLen(); maxLen == 0 {
+						if isOnlyBeginAnchors(prefixAST) {
+							switch strippedAnchorKind(prefixAST) {
+							case beginAnchorLine:
+								info.lineAnchor = true
+							default:
+								info.startAnchor = true
+							}
+							prefixAST = nil
+						} else {
+							// Non-begin or mixed zero-length prefix: route to fallback.
+							info.splittable = false
+						}
+					}
+				}
+				// Begin-anchors in the suffix (e.g. a^) can't fire after the literal has
+				// been consumed. Route to fallback so the full-pattern DFA handles it correctly.
+				if suffixAST != nil && hasBeginAnchor(suffixAST) {
+					info.splittable = false
+				}
+				// Keep the split ONLY if it survived every rejection above.
+				// Retaining prefixAST after a rejection is one of the two
+				// mechanisms behind the \b-in-a-set defect: a `\b` prefix is
+				// zero-length and not an only-begin-anchor, so the split is
+				// rejected — but the retained prefixAST still made the pattern
+				// look split, so it got a backward "prefix DFA" for a bare
+				// assertion (which accepts nothing) and a suffix DFA for a
+				// fragment rather than the whole pattern. The result was a
+				// pattern that silently never matched.
+				if info.splittable {
+					info.prefixAST = prefixAST
+					info.suffixAST = suffixAST
+				}
+			}
+			// Fallback patterns: only truly anchored if the begin-anchor is at the
+			// mandatory top level (not inside *, ?, etc.).
+			if !info.splittable {
+				info.setTopLevelAnchor(parsed)
+			}
+		}
+
+		// Variable-length prefixes route to fallback.
+		//
+		// The split representation prefix.literal.suffix answers "where does a
+		// match starting at s end?" by finding a literal occurrence and walking
+		// the backward prefix DFA to recover s. That is exact only while each
+		// match start maps to exactly ONE literal position — i.e. while the
+		// prefix has a fixed length. With a variable-length prefix one start has
+		// several candidate literal positions with DIFFERENT extents, and which
+		// one RE2 picks depends on the prefix's greedy structure, which a
+		// backward DFA cannot express. Two failures follow directly, both
+		// observed on `a?a` over "aa":
+		//
+		//   - the backward DFA reports the LEFTMOST start it can reach, so the
+		//     match at start 1 is never generated at all (only 0-2 is);
+		//   - the same start is reported twice with different extents (0-1 from
+		//     the empty-prefix candidate, 0-2 from the one-char-prefix
+		//     candidate), where RE2 has exactly one answer, 0-2.
+		//
+		// This is the root cause behind the back-dated-tuple defect.
+		// Routing to fallback runs the whole pattern's DFA anchored at each
+		// position, which is the only construction that gets the extent right —
+		// and it is also what drain class B says such a set must do, since a
+		// literal arbitrarily far to the right can serve a match starting here so
+		// nothing can be skipped anyway. The cost is the literal frontend, which
+		// a class-B set could not have used regardless.
+		if info.prefixAST != nil {
+			if minLen, maxLen := rp.tree(info.prefixAST).minMaxLen(); minLen != maxLen {
+				info.splittable = false
+				info.prefixAST = nil
+				info.suffixAST = nil
+				info.setTopLevelAnchor(parsed)
+			}
+		}
+
+		// A prefix containing \b or \B routes to fallback for the same reason,
+		// by a different mechanism.
+		//
+		// The prefix is verified by walking a REVERSED DFA leftward from the
+		// literal (buildLitAnchorBackScanBody). That walk carries no word-boundary
+		// context: it has no prevWasWord bit and never reads the wordChar table,
+		// because a backward scan cannot see the byte at input[start-1] that a
+		// boundary sitting at the prefix's LEFT EDGE depends on. Emitting it
+		// anyway silently loses matches — `\B.0` over "000" splits into prefix
+		// `\B.` + literal "0" and returned NOTHING, where [1,3) is a real match.
+		//
+		// The forward suffix walk is unaffected and needs no guard: it threads
+		// exactly that context through midAcceptNW/midAcceptW, which is what
+		// they were built for. Only the backward prefix scan is blind, so only a
+		// prefix boundary disqualifies the split.
+		if info.prefixAST != nil && regexpHasWordBoundary(info.prefixAST) {
+			info.splittable = false
+			info.prefixAST = nil
+			info.suffixAST = nil
+			info.setTopLevelAnchor(parsed)
+		}
+
+		// A prefix containing `$`, `\z` or `(?m:$)` routes to fallback, for the
+		// third instance of the same blindness.
+		//
+		// The backward prefix DFA is a plain byte automaton over the reversed
+		// prefix. End-of-text is not a byte, so reverseRegexp/newDFA simply drop
+		// the assertion, and the walk then accepts a prefix the pattern forbids.
+		// Unlike the `\b` case this does not lose matches — it INVENTS them, and
+		// the invention can be total: `.$0` cannot match anything at all (nothing
+		// follows end-of-text), yet the split reported [0,2) on "00" because the
+		// prefix check saw only `.`.
+		//
+		// Begin-anchors need no such guard and must not get one: `^`/`\A`/`(?m:^)`
+		// are modelled positively by startAnchor/lineAnchor and the eligibility
+		// masks built from them, which is why `^a0` is already correct.
+		//
+		// The suffix side is likewise fine — an end-assertion AFTER the literal is
+		// exactly what the forward suffix DFA's ecEnd channel expresses, so `0$`
+		// keeps its split and its literal frontend.
+		if info.prefixAST != nil && regexpHasEndAssertion(info.prefixAST) {
+			info.splittable = false
+			info.prefixAST = nil
+			info.suffixAST = nil
+			info.setTopLevelAnchor(parsed)
+		}
+
+		info.trivialPrefix = info.prefixAST == nil
+		if !info.trivialPrefix && info.prefixAST != nil {
+			// Only the MAX is kept: a variable-length prefix is fallback-routed
+			// above, so min == max here, and prefixMinLen was a field written and
+			// never read.
+			_, maxLen := rp.tree(info.prefixAST).minMaxLen()
+			info.prefixMaxLen = maxLen
+		}
+
+		if !info.splittable && retry() {
+			continue
+		}
+
+		// Build prefix DFA (reversed prefix AST). It joins its pool only once the
+		// suffix DFA is built too.
+		if !info.trivialPrefix {
+			// syntax.Compile never returns a non-nil error (see its stdlib source).
+			revProg, _ := compileProg(rp.tree(info.prefixAST).reversed())
+			revD, revOk := newDFA(revProg, false, revProg.dfaBuildCap())
+			if !revOk {
+				if retry() {
+					continue
+				}
+				return noOwnDFA()
+			}
+			prefixTable = dfaTableFromCanonical(revD)
+		}
+		break
 	}
 
 	// Build suffix DFA (suffix AST, or full pattern when no split).

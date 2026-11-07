@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"regexp/syntax"
 	"unicode"
 	"unicode/utf8"
@@ -71,6 +72,60 @@ func findMandatoryLit(pattern resolvedPattern) *mandatoryLit {
 	return lit
 }
 
+// findHintedMandatoryLit is findMandatoryLit for a pattern carrying an
+// `anchor_literal:`: the hint when the walk reaches it, today's literal
+// otherwise, the verdict recorded in h.
+func findHintedMandatoryLit(pattern resolvedPattern, h *anchorHint) *mandatoryLit {
+	if h == nil {
+		return findMandatoryLit(pattern)
+	}
+	t, err := pattern.parse()
+	if err != nil {
+		return nil
+	}
+	lit, _ := hintedMandatoryLitRec(t, h)
+	return lit
+}
+
+// hintedMandatoryLitRec is findMandatoryLitRec(t, 0, 0) preferring the hint
+// in h (nil-safe), for the callers that need the split path as well.
+func hintedMandatoryLitRec(t resolvedTree, h *anchorHint) (*mandatoryLit, []splitFrame) {
+	if hint := h.bytes(); hint != nil {
+		if lit, path := findMandatoryLitAt(t, 0, 0, hint); lit != nil {
+			h.mand = hintTaken
+			return lit, path
+		}
+		if litOnSpine(t, hint) {
+			h.mand = "it can start more than 256 bytes into a match, or after a part of unbounded length"
+		} else {
+			h.mand = hintNotALiteral
+		}
+	}
+	return findMandatoryLitRec(t, 0, 0)
+}
+
+// litOnSpine reports whether findMandatoryLitAt's walk passes a literal equal
+// to hint when the offset bound is ignored: whether a refusal is the bound's.
+func litOnSpine(t resolvedTree, hint []byte) bool {
+	re := t.re
+	switch re.Op {
+	case syntax.OpLiteral:
+		bs, ok := literalBytes(re.Rune, t.unicode())
+		return re.Flags&syntax.FoldCase == 0 && ok && bytes.Equal(bs, hint)
+	case syntax.OpCapture, syntax.OpPlus:
+		return len(re.Sub) == 1 && litOnSpine(t.tree(re.Sub[0]), hint)
+	case syntax.OpRepeat:
+		return re.Min >= 1 && len(re.Sub) == 1 && litOnSpine(t.tree(re.Sub[0]), hint)
+	case syntax.OpConcat:
+		for _, sub := range re.Sub {
+			if litOnSpine(t.tree(sub), hint) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // literalBytes is the byte sequence a literal's runes stand for in a program
 // of the given mode, and false when the mode cannot take them as bytes. ASCII
 // in either mode. In Unicode mode a non-ASCII rune is its UTF-8 encoding — the
@@ -108,6 +163,15 @@ func literalBytes(rs []rune, unicode bool) ([]byte, bool) {
 // AST path from t.re to the literal node (path[0] is the frame at t.re's
 // level). Returns (nil, nil) when no mandatory literal is found.
 func findMandatoryLitRec(t resolvedTree, minOff, maxOff int32) (*mandatoryLit, []splitFrame) {
+	return findMandatoryLitAt(t, minOff, maxOff, nil)
+}
+
+// findMandatoryLitAt is findMandatoryLitRec taking only the literal hint when
+// hint is non-nil (anchorHint): any other literal on the way is walked past
+// like any other part, its length added to the offsets, so the hint's offsets
+// are the ones the scan and the backward DFA need. The offset bound still
+// applies, so a hint after an unbounded part is not reached.
+func findMandatoryLitAt(t resolvedTree, minOff, maxOff int32, hint []byte) (*mandatoryLit, []splitFrame) {
 	re := t.re
 	if maxOff < 0 || maxOff > 256 {
 		return nil, nil
@@ -119,14 +183,14 @@ func findMandatoryLitRec(t resolvedTree, minOff, maxOff int32) (*mandatoryLit, [
 			return nil, nil
 		}
 		bs, ok := literalBytes(re.Rune, t.unicode())
-		if !ok || len(bs) == 0 {
+		if !ok || len(bs) == 0 || (hint != nil && !bytes.Equal(bs, hint)) {
 			return nil, nil
 		}
 		return &mandatoryLit{bytes: bs, minOff: minOff, maxOff: maxOff}, nil
 
 	case syntax.OpCapture:
 		if len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(t.tree(re.Sub[0]), minOff, maxOff)
+			lit, path := findMandatoryLitAt(t.tree(re.Sub[0]), minOff, maxOff, hint)
 			if lit == nil {
 				return nil, nil
 			}
@@ -137,7 +201,7 @@ func findMandatoryLitRec(t resolvedTree, minOff, maxOff int32) (*mandatoryLit, [
 	case syntax.OpPlus:
 		// re+ executes body at least once, so we can recurse into body.
 		if len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(t.tree(re.Sub[0]), minOff, maxOff)
+			lit, path := findMandatoryLitAt(t.tree(re.Sub[0]), minOff, maxOff, hint)
 			if lit == nil {
 				return nil, nil
 			}
@@ -148,7 +212,7 @@ func findMandatoryLitRec(t resolvedTree, minOff, maxOff int32) (*mandatoryLit, [
 	case syntax.OpRepeat:
 		// re{min,max} with min >= 1: body executes at least once.
 		if re.Min >= 1 && len(re.Sub) == 1 {
-			lit, path := findMandatoryLitRec(t.tree(re.Sub[0]), minOff, maxOff)
+			lit, path := findMandatoryLitAt(t.tree(re.Sub[0]), minOff, maxOff, hint)
 			if lit == nil {
 				return nil, nil
 			}
@@ -162,7 +226,7 @@ func findMandatoryLitRec(t resolvedTree, minOff, maxOff int32) (*mandatoryLit, [
 		curMin := minOff
 		curMax := maxOff
 		for i, sub := range re.Sub {
-			if lit, path := findMandatoryLitRec(t.tree(sub), curMin, curMax); lit != nil {
+			if lit, path := findMandatoryLitAt(t.tree(sub), curMin, curMax, hint); lit != nil {
 				return lit, append([]splitFrame{{op: syntax.OpConcat, index: i}}, path...)
 			}
 			childMin, childMax := t.tree(sub).minMaxLen()

@@ -24,9 +24,9 @@ root `Makefile` wraps the ones used as gates.
 
 | Tool | Use it to | Run |
 |---|---|---|
-| [`pattest`](pattest/) | Try one pattern under each hint, on your own inputs | `make -C tools/pattest run ARGS="-pattern '[a-z]+' -mode find -inputs inputs.txt"` |
+| [`pattest`](pattest/) | Try one pattern under each hint, on your own inputs; `-anchor-literal <lit>` sets its `anchor_literal:` for the run (`make -C tools/pattest example-anchor` runs without and with it) | `make -C tools/pattest run ARGS="-pattern '[a-z]+' -mode find -inputs inputs.txt"` |
 | [`settest`](settest/) | The same for one set, taken from a YAML config | `make -C tools/settest run ARGS="-config set.yaml -cap find -inputs inputs.txt"` |
-| [`advbench`](advbench/) | Check whether one pattern or set stays linear on an input shape you choose | `make -C tools/advbench run ARGS="-pattern 'a*b\|a' -fn find -gen rep:a"` |
+| [`advbench`](advbench/) | Check whether one pattern or set stays linear on an input shape you choose; `-anchor-literal <lit>` sets a single pattern's `anchor_literal:`, and `-gen file:<path>` drives it over your own input | `make -C tools/advbench run ARGS="-pattern 'a*b\|a' -fn find -gen rep:a"` |
 
 ## Notes
 

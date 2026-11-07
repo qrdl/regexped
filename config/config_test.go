@@ -1366,6 +1366,72 @@ func TestValidateHintsRejectsPointlessBatchFind(t *testing.T) {
 	})
 }
 
+// TestValidateHintsAnchorLiteral: anchor_literal chooses what a find scans
+// for, so an entry nothing scans for refuses it, by name — a set declaring
+// only the anchored pair included, since that pair scans for nothing; every
+// entry that does scan — find_func, groups_func, a set with find, scan_any or
+// scan_all selecting it by name or by `all` — accepts it, and it combines
+// with `hints:`.
+func TestValidateHintsAnchorLiteral(t *testing.T) {
+	const want = `pattern "p": anchor_literal requires find_func or groups_func on the same entry, or a set with find, scan_any or scan_all that selects the pattern`
+	byName := func(sc SetConfig) BuildConfig {
+		sc.Name, sc.Patterns = "s", PatternSelector{Names: []string{"p"}}
+		return BuildConfig{Patterns: []PatternEntry{{Name: "p", Regexp: "ab", AnchorLiteral: "ab"}}, Sets: []SetConfig{sc}}
+	}
+	for _, c := range []struct {
+		name    string
+		cfg     BuildConfig
+		refused bool
+	}{
+		{"match_func only", BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "ab", MatchFunc: "m", AnchorLiteral: "ab"}}}, true},
+		{"no function", BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "ab", AnchorLiteral: "ab"}}}, true},
+		{"only a set's own regexp beside it", BuildConfig{
+			Patterns: []PatternEntry{{Name: "p", Regexp: "ab", AnchorLiteral: "ab"}, {Name: "q", Regexp: "cd"}},
+			Sets:     []SetConfig{{Name: "s", Find: "f", Patterns: PatternSelector{Names: []string{"q"}}, Regexps: []string{"ab"}}}}, true},
+		{"find_func", BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "ab", FindFunc: "f", AnchorLiteral: "ab", Hints: []string{"prefer-no-match"}}}}, false},
+		{"groups_func", BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "(a)b", GroupsFunc: "g", AnchorLiteral: "ab"}}}, false},
+		{"set with match_any only", byName(SetConfig{MatchAny: "m"}), true},
+		{"set with match_all only", byName(SetConfig{MatchAll: "m"}), true},
+		{"set with both anchored", byName(SetConfig{MatchAny: "m", MatchAll: "n"}), true},
+		{"anchored set beside a scanning set selecting another", BuildConfig{
+			Patterns: []PatternEntry{{Name: "p", Regexp: "ab", AnchorLiteral: "ab"}, {Name: "q", Regexp: "cd"}},
+			Sets: []SetConfig{{Name: "s", MatchAny: "m", Patterns: PatternSelector{Names: []string{"p"}}},
+				{Name: "t", Find: "f", Patterns: PatternSelector{Names: []string{"q"}}}}}, true},
+		{"set with find by name", byName(SetConfig{Find: "f"}), false},
+		{"set with scan_any by name", byName(SetConfig{ScanAny: "a"}), false},
+		{"set with scan_all by name", byName(SetConfig{ScanAll: "a"}), false},
+		{"set with match_any and find", byName(SetConfig{MatchAny: "m", Find: "f"}), false},
+		{"set by all", BuildConfig{
+			Patterns: []PatternEntry{{Name: "p", Regexp: "ab", MatchFunc: "m", AnchorLiteral: "ab"}},
+			Sets:     []SetConfig{{Name: "s", Find: "f", Patterns: PatternSelector{All: true}}}}, false},
+		{"unset", BuildConfig{Patterns: []PatternEntry{
+			{Name: "p", Regexp: "ab", MatchFunc: "m"}}}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateHints(&c.cfg)
+			switch {
+			case c.refused && (err == nil || err.Error() != want):
+				t.Errorf("got %v, want %q", err, want)
+			case !c.refused && err != nil:
+				t.Errorf("refused: %v", err)
+			}
+		})
+	}
+	// Through LoadConfig: the key decodes (strict YAML refuses an undeclared
+	// one) and the refusal names the config.
+	if err := loadYAML(t, "import_module: m\npatterns:\n  - regexp: 'a/b/c'\n    find_func: f\n    anchor_literal: '/b/'\n"); err != nil {
+		t.Errorf("a find with anchor_literal: %v", err)
+	}
+	if err := loadYAML(t, "import_module: m\npatterns:\n  - name: p\n    regexp: 'a/b/c'\n    match_func: m\n    anchor_literal: '/b/'\n"); err == nil ||
+		!strings.Contains(err.Error(), want) {
+		t.Errorf("match_func only: got %v", err)
+	}
+}
+
 // TestSetBatchPatternCount covers SetCursorMaxPatterns' bound without building
 // a slice of 16,777,217 names — see setBatchPatternCount's doc comment.
 func TestSetBatchPatternCount(t *testing.T) {

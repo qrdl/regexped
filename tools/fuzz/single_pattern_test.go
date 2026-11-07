@@ -649,7 +649,15 @@ var findFromShapes = []struct{ name, pat, input string }{
 		"abcAKIA0123456789ABCDEF01234567 q 123ghp_abcdefghij0123456789abcd"},
 	{"bt_find_fallback", `(?:alpha|beta|gamma)[0-9a-f]{8}`,
 		"xx alpha0123abcd yy beta4567ef01 zz gamma89abcdef"},
+	// The literal-anchored find split at an anchor_literal hint rather than
+	// at the first literal (findFromAnchorLit): near misses on every side of
+	// the hinted literal, and one with no host before it.
+	{"lit_anchor_hinted", `https?://[^/ ]+/api/v1/[a-z]+`,
+		"http://a.io/x https://b.io/api/v1/users http://c.io/api/v2/x http:///api/v1/q /api/v1/z http://d/api/v1/ab"},
 }
+
+// findFromAnchorLit names the shapes compiled with an anchor_literal hint.
+var findFromAnchorLit = map[string]string{"lit_anchor_hinted": "/api/v1/"}
 
 // findFromMaxStates forces a DFA state ceiling for shapes that need one.
 // buildBTFindBody is the fallback taken when a find pattern's DFA is too large,
@@ -676,6 +684,14 @@ func compileFindShape(name, pat string) ([]byte, error) {
 // compileFindShapeSized is compileFindShape plus what the find export's
 // searches keep.
 func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error) {
+	if lit, ok := findFromAnchorLit[name]; ok {
+		return cachedCompileSized("findhint\x00"+lit+"\x00"+pat, func() ([]byte, []searchblock.Size, error) {
+			entry := config.PatternEntry{Regexp: pat, FindFunc: "find", AnchorLiteral: lit}
+			w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{entry}, pathsTableBase, true, 0,
+				withMode(compile.CompileOptions{}))
+			return w, searchblock.Of(sizes["find"]), err
+		})
+	}
 	if findFromLNM[name] {
 		return compileFindOpts("findlnm\x00"+pat, pat, pathsTableBase,
 			compile.CompileOptions{LikelyMode: compile.LikelyNoMatch})
@@ -3894,6 +3910,179 @@ func TestFindStrategiesLinear(t *testing.T) {
 					t.Errorf("fuel grew %.1f× for a 4× longer worst-case run (%d → %d): quadratic", ratio, small, large)
 				}
 			})
+		}
+	}
+}
+
+// anchorURLLine is the anchor_literal benchmark's input
+// (tools/pattest/examples/anchor_literal_inputs.txt): 120 space-separated
+// `http://<host>/<path>` URLs over four hosts and six paths, cut to 3,695
+// bytes. The dense line has every fourth path `api/v1/<users|orders|items>`.
+func anchorURLLine(dense bool) string {
+	hosts := []string{"example.com", "cdn.example.net", "shop.example.org", "img.example.io"}
+	paths := []string{"index.html", "app.js", "logo.png", "blog/post", "settings", "docs/start"}
+	api := []string{"users", "orders", "items"}
+	urls := make([]string, 0, 120)
+	for i := range 120 {
+		p := paths[i%6]
+		if dense && i%4 == 3 {
+			p = "api/v1/" + api[(i/4)%3]
+		}
+		urls = append(urls, "http://"+hosts[i%4]+"/"+p)
+	}
+	return strings.Join(urls, " ")[:3695]
+}
+
+// TestAnchorLiteralSavesFuel is the anchor_literal hint's gain, kept: over
+// URLs none of which carries `/api/v1/`, the find anchored on `/api/v1/` must
+// cost at most 60% of the find anchored on `http`, which every URL carries
+// (49.4% when the hint was added). Both answer no match. A failure here is a
+// lost gain, or a change that moved one side of the ratio — whoever makes it
+// decides which.
+func TestAnchorLiteralSavesFuel(t *testing.T) {
+	const pat = `https?://[^/ ]+/api/v1/[a-z]+`
+	cfg := wasmtime.NewConfig()
+	cfg.SetConsumeFuel(true)
+	cfg.SetWasmSIMD(true)
+	engine := wasmtime.NewEngineWithConfig(cfg)
+	in := anchorURLLine(false)
+	if regexp.MustCompile(pat).MatchString(in) {
+		t.Fatal("the no-match line matches")
+	}
+	fuel := func(hint string) uint64 {
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, FindFunc: "find", AnchorLiteral: hint}}, pathsTableBase, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mod, err := wasmtime.NewModule(engine, w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mod.Close()
+		st := wasmtime.NewStore(engine)
+		defer st.Close()
+		st.SetFuel(1 << 62)
+		inst, err := wasmtime.NewInstance(st, mod, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(inst.GetExport(st, "memory").Memory().UnsafeData(st)[pathsInputBase:], in)
+		v, err := inst.GetFunc(st, "find").Call(st, pathsInputBase, int32(len(in)), int32(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := v.(int64); r != -1 {
+			t.Fatalf("hint %q: find answered %#x, want no match", hint, r)
+		}
+		left, _ := st.GetFuel()
+		return uint64(1<<62) - left
+	}
+	plain, hinted := fuel(""), fuel("/api/v1/")
+	if float64(hinted) > 0.6*float64(plain) {
+		t.Errorf("anchor_literal /api/v1/: %d fuel against %d without it (%.1f%%), want at most 60%%",
+			hinted, plain, 100*float64(hinted)/float64(plain))
+	}
+	t.Logf("fuel %d → %d (%.1f%%)", plain, hinted, 100*float64(hinted)/float64(plain))
+}
+
+// TestLitAnchorKeepsLeftmost: a literal-anchored find walks back from each
+// literal hit to the earliest start it reaches, which is the leftmost match
+// only when no match's prefix holds an earlier occurrence the walk cannot
+// start from (compile's litAnchorMissesLeftmost). Before that check the find
+// answered `(?:a.{0,3}z|b)yy` over "abyyzyy" with [1,4) — the `byy` — where
+// the leftmost match [0,7) holds that `yy` in its `.{0,3}`; an `anchor_literal:`
+// exposed the same on more patterns. Brute force: every input up to 7 bytes
+// over the patterns' own letters, the first match from 0 against Go, for
+// shapes that went wrong and shapes beside them that must keep the find. Then
+// the reported cases as whole drives.
+func TestLitAnchorKeepsLeftmost(t *testing.T) {
+	patterns := []string{
+		// Answered a later match before the check.
+		`(?:a.{0,3}z|b)yy`, `(?:a.{0,3}z|b)ya`, `(?:a[^z]*z|b)yy`, `(?:a[^z]*z|b)ya1`,
+		// Prefixes that can contain the literal yet keep the order, a
+		// self-overlapping literal among them.
+		`[a-z]+yy`, `(?:ab|b)yy`, `y?ayy`, `[ay]+aba`, `(?:yab|b)aba`, `a(?:yy)?byy`,
+	}
+	_, wd := sharedEngine()
+	alphabet := []byte("abyz1")
+	anchored := 0
+	for _, pat := range patterns {
+		r := &compile.Reporter{}
+		w, _, err := compile.Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "find"}}, pathsTableBase, true,
+			compile.CompileOptions{Report: r})
+		if err != nil {
+			t.Fatalf("%s: %v", pat, err)
+		}
+		r.End()
+		for _, n := range r.Patterns[0].Notes {
+			if strings.HasPrefix(n, "literal-anchored find (") {
+				anchored++
+			}
+		}
+		store, inst, mem, release, err := instantiate(w)
+		if err != nil {
+			t.Fatalf("%s: %v", pat, err)
+		}
+		find := inst.GetFunc(store, "find")
+		re := regexp.MustCompile(pat)
+		buf := make([]byte, 7)
+		calls := 0
+		var walk func(n int) bool
+		walk = func(n int) bool {
+			in := buf[:n]
+			// Alternate the input's address, so no call reads as the
+			// continuation of the one before (the module's default state).
+			ptr := int32(calls&1) * 64
+			calls++
+			copy(mem.UnsafeData(store)[ptr:], in)
+			wd.Arm(store)
+			v, err := find.Call(store, ptr, int32(n), int32(0))
+			wd.Disarm()
+			if err != nil {
+				t.Fatalf("%s over %q: %v", pat, in, err)
+			}
+			got := "none"
+			if x := v.(int64); x >= 0 {
+				got = fmt.Sprintf("[%d %d]", uint32(x>>32), uint32(x))
+			}
+			want := "none"
+			if m := re.FindIndex(in); m != nil {
+				want = fmt.Sprintf("[%d %d]", m[0], m[1])
+			}
+			if got != want {
+				t.Errorf("%s over %q: first match %s, Go %s", pat, in, got, want)
+				return false
+			}
+			if n < len(buf) {
+				for _, c := range alphabet {
+					buf[n] = c
+					if !walk(n + 1) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		walk(0)
+		release()
+	}
+	if anchored < len(patterns)/2 {
+		t.Errorf("only %d of %d patterns kept the literal-anchored find: the check refuses too much, or the brute force no longer reaches that body", anchored, len(patterns))
+	}
+	// The reported cases, whole drives, hinted and not.
+	for _, c := range []struct{ pat, hint, in string }{
+		{`xx(?:a.{0,20}z|b)yy[0-9]`, "yy", "xxaxxbyy1zyy2"},
+		{`(?:a.{0,20}z|b)yy[0-9]`, "", "axxbyy1zyy2"},
+		{`x(?:a[a-z]*z|b)yy`, "", "xaxbyyzyy"},
+		{`x(?:a[a-z]*z|b)yy`, "", "xaxbyyzyy xbyy xaqzyy"},
+	} {
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find", AnchorLiteral: c.hint}}, pathsTableBase, true)
+		if err != nil {
+			t.Fatalf("%s: %v", c.pat, err)
+		}
+		got, ok := wasmFindIter(t, w, c.in)
+		if want := goFindAll(regexp.MustCompile(c.pat), c.in); !ok || fmtSpans(got) != fmtSpans(want) {
+			t.Errorf("%s hint %q over %q: %s, Go %s", c.pat, c.hint, c.in, fmtSpans(got), fmtSpans(want))
 		}
 	}
 }

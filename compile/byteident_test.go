@@ -335,6 +335,7 @@ func TestByteIdenticalFindStrategyFixtures(t *testing.T) {
 		"one_byte_lit_anchor": {"find: switch", "literal-anchored find"},
 		"find_switch":         {"find: switch"},
 		"lit_anchor_switch":   {"find: switch", "literal-anchored find"},
+		"lit_anchor_hinted":   {"find: today", "literal-anchored find", `anchor literal "/api/v1/": taken`},
 		"alt_lit_switch":      {"find: switch", "alternation literal-anchored find"},
 		"case_folded":         {"find: switch"},
 	}

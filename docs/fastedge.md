@@ -1,6 +1,6 @@
 # Using Regexped in Gcore FastEdge
 
-FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI, and HTTP applications built as `wasi:http` components, in Rust or in JavaScript. For the first, regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host — and most of this page covers that route. The last two sections cover component applications: one in Rust, and one in JavaScript built with the FastEdge JS SDK.
+FastEdge runs Rust-based WASM applications using the `proxy-wasm` ABI, and HTTP applications built as `wasi:http` components, in Rust, Go or JavaScript. For the first, regexped is embedded as a separate WASM module that is merged into the final binary — the same workflow as any Rust host — and most of this page covers that route. The last three sections cover component applications: one in Rust, one in Go built with componentize-go, and one in JavaScript built with the FastEdge JS SDK.
 
 ## Configuration
 
@@ -177,6 +177,58 @@ let names: Vec<&str> = ids.into_iter().map(scriptdetect::latin_pattern_name).col
 
 The calls are the ones a module build makes; see
 [component.md](component.md) for what changes under `wasm_format: component`.
+
+## Go HTTP apps: componentize-go
+
+`go build` cannot produce a component, but
+[componentize-go](https://github.com/bytecodealliance/componentize-go) can: it
+builds a stock-Go program (Go 1.27.1 or later) for `wasip1` and turns it into
+one, generating the Go bindings for the app's WIT world as it goes. A regexped
+component (`wasm_format: component`) plugs into that world through the `.wit`
+regexped writes beside it, and regexped generates no Go code on this route:
+
+```bash
+# 1. Compile the patterns into a component and its sibling .wit
+regexped compile --config=regexped.yaml               # → uaparser.wasm, uaparser.wit
+mkdir -p wit/deps/regexped-uaparser
+cp uaparser.wit wit/deps/regexped-uaparser/
+
+# 2. Generate the bindings for the app's world, which imports the
+#    component's interfaces beside wasi:http/proxy@0.2.0
+componentize-go -d wit -w ua-parser bindings && go mod tidy
+
+# 3. Build the app, then compose it with the regexp component
+componentize-go -d wit -w ua-parser build -o main.wasm
+regexped merge --config=regexped.yaml --main=main.wasm uaparser.wasm   # → ua-parser.wasm
+```
+
+The app is a package `export_wasi_http_incoming_handler` with a `Handle`
+function, which componentize-go's generated glue calls once per request, and it
+calls the regexped component through the generated packages
+(`regexped_<wit_package>_matcher`, `regexped_<wit_package>_sets`): a set's
+`scan_all` is `Classify(input, 0)`, returning `witTypes.Result[[]uint32,
+ErrorCode]`; a `groups_func` is a resource, `MakeEdgeVersion(input, 0)`, whose
+`Next()` returns the next match's groups. [go-api.md](go-api.md#component-format-go-with-componentize-go)
+has the whole mapping.
+
+[`examples/fastedge/ua-parser/`](../examples/fastedge/ua-parser/) is a complete
+app: it parses a User-Agent string — the request's own on `GET`, the body on
+`POST` — into browser, OS, device type and bot, with one set `scan_all` over 23
+patterns and a `groups_func` per pattern for the version. `make test` runs it
+under FastEdge's own runtime, `fastedge-run`, through `@gcoredev/fastedge-test`.
+
+**Local test runs are slow; FastEdge is not.** `fastedge-run` compiles the
+module for every request, where FastEdge compiles it once when the app is
+deployed, and a stock-Go component takes far longer to compile than a Rust one
+— it carries the Go runtime. Measured on one machine (componentize-go 0.5.3, Go
+1.27.3):
+
+| App | Code | `wasmtime compile` | A request under `fastedge-run` | A request under `wasmtime serve` |
+|---|---|---|---|---|
+| Go (`ua-parser`) | 1.74 MB | 1.29 s | 1.16–1.31 s | 1.3–2.0 ms |
+| Rust (`script-detect`) | 0.26 MB | 0.20 s | 0.21–0.23 s | 0.5–1.3 ms |
+
+The last column is what a request costs once the module is compiled.
 
 ## JavaScript HTTP apps: the FastEdge JS SDK
 

@@ -3,6 +3,7 @@ package compile
 import (
 	"bytes"
 	"regexp/syntax"
+	"strings"
 	"testing"
 
 	"github.com/qrdl/regexped/config"
@@ -1485,6 +1486,116 @@ func TestFindLitAnchorPoint_ParseError(t *testing.T) {
 	}
 	if got := findLitAnchorPoint("[a-z]", false); got != nil {
 		t.Errorf("findLitAnchorPoint([a-z]) = %+v, want nil", got)
+	}
+}
+
+// TestFindHintedLitAnchorPoint: an anchor_literal hint splits the pattern at
+// the first top-level child whose literal set is exactly the hint, and nowhere
+// else — not inside a longer literal, not at an alternation that holds it, not
+// on a one-byte hint — and a hint equal to the literal findLitAnchorPoint takes
+// gives that same split.
+func TestFindHintedLitAnchorPoint(t *testing.T) {
+	const url = `https?://[^/ ]+/api/v1/[a-z]+`
+	for _, c := range []struct {
+		pat, hint string
+		unicode   bool
+		prefix    string // the split's prefix, as syntax prints it; "" = refused
+		why       string // the refusal
+	}{
+		{url, "/api/v1/", false, `https?://[^ /]+`, ""},
+		{url, "http", false, `(?:)`, ""},
+		{url, "v1", false, "", hintNotALiteral},
+		{`x(?:/api/v1/|/api/v2/)y`, "/api/v1/", false, "", hintNotALiteral},
+		{`x(?i:ab)y[0-9]`, "ab", false, "", hintNotALiteral},
+		{url, "/", false, "", "it takes a literal of two bytes or more"},
+		{`(\w+)(=>)(\w+)`, "=>", false, `([0-9A-Z_a-z]+)`, ""}, // the literal under a capture
+		{`[a-z]+ле[0-9]`, "ле", true, `[a-z]+`, ""},            // UTF-8 bytes in Unicode mode
+		{`[`, "ab", false, "", hintNotALiteral},
+		{`ab`, "ab", false, "", hintNotALiteral},         // not a concat: no split
+		{`(x[a-z]+yz[0-9])`, "yz", false, `x[a-z]+`, ""}, // under an outer capture
+	} {
+		lit, _ := literalBytes([]rune(c.hint), c.unicode)
+		lap, why := findHintedLitAnchorPoint(c.pat, c.unicode, lit)
+		switch {
+		case c.prefix == "" && (lap != nil || why != c.why):
+			t.Errorf("%q hint %q: lap %v, why %q; want refused: %q", c.pat, c.hint, lap, why, c.why)
+		case c.prefix != "" && lap == nil:
+			t.Errorf("%q hint %q: refused (%s)", c.pat, c.hint, why)
+		case c.prefix != "" && (lap.prefixRe.String() != c.prefix || len(lap.litSet) != 1 || string(lap.litSet[0]) != string(lit)):
+			t.Errorf("%q hint %q: prefix %s lits %q, want prefix %s", c.pat, c.hint, lap.prefixRe, lap.litSet, c.prefix)
+		}
+	}
+	// The hint equal to today's literal is today's split, field for field.
+	today := findLitAnchorPoint(url, false)
+	hinted, _ := findHintedLitAnchorPoint(url, false, []byte("http"))
+	if today.prefixRe.String() != hinted.prefixRe.String() || today.suffixRe.String() != hinted.suffixRe.String() ||
+		today.anchored != hinted.anchored || string(today.litSet[0]) != string(hinted.litSet[0]) {
+		t.Errorf("hint = first literal: %+v, today %+v", hinted, today)
+	}
+}
+
+// TestLitAnchorMissesLeftmost pins which splits a literal-anchored find must
+// refuse: those where a match's prefix can hold an earlier occurrence of the
+// literal that the backward walk cannot start from, so the find would answer a
+// later match than the leftmost one. Each refused case is a shape that
+// answered wrong before the check (tools/fuzz TestLitAnchorKeepsLeftmost
+// drives them); each kept one is a common shape whose prefix CAN contain the
+// literal yet keeps the order, and lost its find to the conservative check
+// alone — email-domain-find and log-capture by +5,132% and +1,171% fuel.
+func TestLitAnchorMissesLeftmost(t *testing.T) {
+	for _, c := range []struct {
+		pat, hint string
+		unicode   bool
+		misses    bool
+	}{
+		// Refused.
+		{`(?:a.{0,20}z|b)yy[0-9]`, "", false, true}, // "axxbyy1zyy2": [3,7), not [0,11)
+		{`x(?:a[a-z]*z|b)yy`, "", false, true},      // "xaxbyyzyy": [2,6), not [0,9)
+		{`xx(?:a.{0,20}z|b)yy[0-9]`, "yy", false, true},
+		{`(?:a.{0,3}z|b)ya`, "", false, true},
+		{`[a-z]\B[a-z]*yy`, "", false, true},          // an assertion: can it hold the literal at all
+		{`[0-9]\B[0-9]*(a)aa`, "", false, true},       // …running on into the match's own literal
+		{`[ab]*a[ab]{12}zz`, "", false, true},         // a prefix DFA over the build cap: the safe answer
+		{`x(?:a.{0,4}z|b)(?:yy|ww)`, "", false, true}, // a literal set: any literal's hit counts
+		{`(?:xba|b)aa`, "", false, true},              // "xbaaa": the "aa" at 2 runs into the match's own; [1,4), not [0,5)
+		{`(?:a[ab]{17}|c)yy`, "", false, true},        // past the search's bound: the safe answer
+		// Kept.
+		{`[a-zA-Z0-9_%+\-]+(?:\.[a-zA-Z0-9_%+\-]+)*@(foo|bar)\.com`, "", false, false},
+		{`(?m:^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) .*(ERROR|WARNING|FATAL): (.+)$)`, "", false, false},
+		{`([a-z]+)(error)([a-z]+)`, "", false, false},
+		{`\A[a-z]*yy`, "", false, false},
+		{`https?://[^/ ]+/api/v1/[a-z]+`, "/api/v1/", false, false},
+		{`\pL+мир`, "", true, false},
+		{`[ab]{4}XY[0-9]{24}`, "", false, false}, // one fixed length: start order is hit order
+		{`[0-9]\B[0-9]*yy`, "", false, false},    // an assertion, and no way to hold it
+		{`(?:xbz|b)zq`, "", false, false},        // "xb" then "z" is a prefix match, but "zq" does not run on into "zq"
+		{`(?:xbq|b)zz`, "", false, false},        // a suffix that is a prefix match, and no hit where it ends
+		{`a[ab]{17}yy`, "", false, false},        // one fixed length, however long
+	} {
+		rp, err := resolvePattern(c.pat, nil, &CompileOptions{Unicode: c.unicode, ForceByteMode: !c.unicode})
+		if err != nil {
+			t.Fatalf("%q: %v", c.pat, err)
+		}
+		lap := findLitAnchorPoint(c.pat, c.unicode)
+		if c.hint != "" {
+			lap, _ = findHintedLitAnchorPoint(c.pat, c.unicode, []byte(c.hint))
+		}
+		if lap == nil {
+			t.Fatalf("%q hint %q: no split", c.pat, c.hint)
+		}
+		if got := litAnchorMissesLeftmost(rp, lap); got != c.misses {
+			t.Errorf("%q hint %q (prefix %s, literals %q): misses %v, want %v", c.pat, c.hint, lap.prefixRe, lap.litSet, got, c.misses)
+		}
+	}
+	// The verdict reaches the note a refused hint carries.
+	r := &Reporter{}
+	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `xx(?:a.{0,20}z|b)yy[0-9]`, FindFunc: "f", AnchorLiteral: "yy"}},
+		0, true, CompileOptions{Report: r}); err != nil {
+		t.Fatal(err)
+	}
+	r.End()
+	if notes := strings.Join(r.Patterns[0].Notes, "\n"); !strings.Contains(notes, litAnchorOrderReason) {
+		t.Errorf("a split refused for order: notes\n%s\nlack %q", notes, litAnchorOrderReason)
 	}
 }
 

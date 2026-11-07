@@ -860,6 +860,58 @@ func TestFindMandatoryLit(t *testing.T) {
 	}
 }
 
+// TestFindMandatoryLitHinted: with an anchor_literal hint the walk takes only
+// that literal, at the offsets the scan and the backward DFA need, walking past
+// earlier literals as it walks past any part; where the hint cannot be reached
+// the answer is today's literal, and the verdict says whether the offset bound
+// or the pattern's shape refused it.
+func TestFindMandatoryLitHinted(t *testing.T) {
+	const bound = "it can start more than 256 bytes into a match, or after a part of unbounded length"
+	for _, c := range []struct {
+		pattern, hint    string
+		wantLit          string
+		wantMin, wantMax int32
+		verdict          string
+	}{
+		{"GET /[a-z]{1,8} HTTP", " HTTP", " HTTP", 6, 13, hintTaken},
+		{"a(bc)+d", "bc", "bc", 1, 1, hintTaken},           // through OpPlus and OpCapture
+		{"(?:zz){2}[a-z]+qq", "zz", "zz", 0, 0, hintTaken}, // through OpRepeat
+		{"ab{0,2}cd", "cd", "cd", 1, 3, hintTaken},
+		{`https?://[^/ ]+/api/v1/[a-z]+`, "/api/v1/", "http", 0, 0, bound},
+		{"[a-z]+(?:qq){2}x", "qq", "x", 0, 0, ""}, // no literal is reachable: nil
+		{"x(?:ab|cd)y", "ab", "x", 0, 0, hintNotALiteral},
+		{"x[a-z]+(?i:qq)", "qq", "x", 0, 0, hintNotALiteral},
+	} {
+		h := newAnchorHint(c.hint, false)
+		got := findHintedMandatoryLit(bytePat(c.pattern), h)
+		want := c.verdict
+		if want == "" {
+			want = bound
+		}
+		switch {
+		case h.mand != want:
+			t.Errorf("%q hint %q: verdict %q, want %q", c.pattern, c.hint, h.mand, want)
+		case c.verdict == "" && got != nil:
+			t.Errorf("%q hint %q: %+v, want nil", c.pattern, c.hint, got)
+		case c.verdict != "" && (got == nil || string(got.bytes) != c.wantLit || got.minOff != c.wantMin || got.maxOff != c.wantMax):
+			t.Errorf("%q hint %q: %+v, want %q at [%d, %d]", c.pattern, c.hint, got, c.wantLit, c.wantMin, c.wantMax)
+		}
+	}
+	// No hint is findMandatoryLit, and a parse error is nil either way.
+	if got := findHintedMandatoryLit(bytePat("foo.*bar"), nil); got == nil || string(got.bytes) != "foo" {
+		t.Errorf("no hint: %+v", got)
+	}
+	if got := findHintedMandatoryLit(bytePat("["), newAnchorHint("ab", false)); got != nil {
+		t.Errorf("unparseable: %+v", got)
+	}
+	// The split path follows the hint: the concat child it names.
+	if t0, err := bytePat("GET /[a-z]{1,8} HTTP").parse(); err != nil {
+		t.Fatal(err)
+	} else if _, path := hintedMandatoryLitRec(t0, newAnchorHint(" HTTP", false)); len(path) != 1 || path[0].index != 2 {
+		t.Errorf("split path %+v, want concat child 2", path)
+	}
+}
+
 func TestHasMandatoryLit(t *testing.T) {
 	cases := []struct {
 		pattern string

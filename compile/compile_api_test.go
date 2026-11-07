@@ -3604,6 +3604,89 @@ func TestRareSinglePatternPaths(t *testing.T) {
 	}
 }
 
+// TestAnchorLiteralHint: a find's `anchor_literal:` reaches both extractors,
+// and the one verbose note says what each did with it. A hint either takes
+// effect or leaves the module exactly as it was without one — named a literal
+// no top-level part is, refused by a guard of the literal-anchored find (which
+// then builds today's split), or equal to the literal already chosen.
+func TestAnchorLiteralHint(t *testing.T) {
+	const url = `https?://[^/ ]+/api/v1/[a-z]+`
+	find := func(re, hint string) config.PatternEntry {
+		return config.PatternEntry{Name: "p", Regexp: re, FindFunc: "f", AnchorLiteral: hint}
+	}
+	build := func(e config.PatternEntry, o CompileOptions) ([]byte, string) {
+		t.Helper()
+		r := &Reporter{}
+		o.Report = r
+		w, _, err := Compile([]config.PatternEntry{e}, 0, true, o)
+		if err != nil {
+			t.Fatalf("%s: %v", e.Regexp, err)
+		}
+		validateWASM(t, w)
+		r.End()
+		for _, n := range r.Patterns[0].Notes {
+			if strings.HasPrefix(n, "anchor literal") {
+				return w, n
+			}
+		}
+		return w, ""
+	}
+	const bound = "it can start more than 256 bytes into a match, or after a part of unbounded length"
+	for _, c := range []struct {
+		e       config.PatternEntry
+		o       CompileOptions
+		note    string // the whole note; "" = none
+		changed bool   // the module differs from the one without the hint
+	}{
+		{e: find(url, "/api/v1/"), changed: true, note: `anchor literal "/api/v1/": taken — the literal-anchored find scans for it`},
+		{e: find(url, "http"), note: `anchor literal "http": taken — it begins the pattern, and the find's prefix scan looks for it`},
+		{e: find(url, "v1"), note: `anchor literal "v1" not taken — literal-anchored find: ` + hintNotALiteral + "; mandatory literal: " + hintNotALiteral},
+		// The mandatory-literal scan, read by a find with no literal prefix:
+		// today's DFA find, and the Backtracking find past max_dfa_states.
+		{e: find(`\b[A-Z]{3} /[a-z]{1,8} HTTP`, " HTTP"), changed: true,
+			note: `anchor literal " HTTP": taken — the find's mandatory-literal scan looks for it`},
+		{e: find(`[A-Z]{3} /[a-z]{1,8} HTTP`, " HTTP"), o: CompileOptions{MaxDFAStates: 4}, changed: true,
+			note: `anchor literal " HTTP": taken — the find's mandatory-literal scan looks for it`},
+		{e: find(`\bGET /[a-z]{1,8} HTTP`, " HTTP"), note: `anchor literal " HTTP" not taken — literal-anchored find: the pattern has a word boundary ` +
+			"(\\b or \\B); mandatory literal: the find scans for the literal the pattern begins with instead"},
+		// Guards of the literal-anchored find: each refuses the hinted split,
+		// and today's is built or refused as without the hint.
+		{e: find(`zz(?:a|b){9}a(?:a|b)*yy[0-9]+`, "yy"), note: `anchor literal "yy" not taken — literal-anchored find: ` +
+			"the backward DFA over the part before it is too large; mandatory literal: " + bound},
+		{e: find(`x*ab[0-9]`, "ab"), note: `anchor literal "ab" not taken — literal-anchored find: the part before it can match the empty string; ` +
+			"mandatory literal: " + bound},
+		{e: find(`ab[a-z]+(?m:^)cd[0-9]`, "cd"), note: `anchor literal "cd" not taken — literal-anchored find: a line anchor comes before it; ` +
+			"mandatory literal: " + bound},
+		// The mandatory literal takes it, but the find is today's
+		// literal-anchored one, which scans for zz.
+		{e: find(`[0-9]{2}zz(?:a|b){9}a(?:a|b){0,6}yy[0-9]`, "yy"), note: `anchor literal "yy" not taken — literal-anchored find: ` +
+			"the backward DFA over the part before it is too large; mandatory literal: the find does not scan for one"},
+		// A body that returns before either extractor runs: the prefixed
+		// literal chain scans for the literal its shape fixes.
+		{e: find(`[a-z]{3}AKIA[A-Z0-9]{24}`, "AKIA"), note: `anchor literal "AKIA" not taken — ` +
+			"the find body this pattern compiles to scans for what its own shape decides, not a chosen literal"},
+		{e: find(`zz(?:a|b)*a(?:a|b){8}yy`, "yy"), note: `anchor literal "yy" not taken — literal-anchored find: the pattern's DFA has more than 256 states; ` +
+			"mandatory literal: " + bound},
+		{e: find(url, "/api/v1/"), o: CompileOptions{StartAnywhereFind: true}, note: `anchor literal "/api/v1/" not taken — literal-anchored find: ` +
+			"the find is the start-anywhere search, which scans for no literal; mandatory literal: " + bound},
+		// A byte-mode pattern cannot hold a rune above U+00FF.
+		{e: find(`ab[a-z]+cd`, "αβ"), note: `anchor literal "αβ" not taken — it holds a character above U+00FF, which a byte-mode pattern cannot contain`},
+		// No find: nothing scans, so no note.
+		{e: config.PatternEntry{Name: "p", Regexp: url, MatchFunc: "m", AnchorLiteral: "/api/v1/"}},
+	} {
+		hinted, note := build(c.e, c.o)
+		plain := c.e
+		plain.AnchorLiteral = ""
+		want, _ := build(plain, c.o)
+		if note != c.note {
+			t.Errorf("%s hint %q: note\n  %q\nwant\n  %q", c.e.Regexp, c.e.AnchorLiteral, note, c.note)
+		}
+		if changed := !bytes.Equal(hinted, want); changed != c.changed {
+			t.Errorf("%s hint %q: module changed %v, want %v", c.e.Regexp, c.e.AnchorLiteral, changed, c.changed)
+		}
+	}
+}
+
 // TestCompileRejectsTablesPastTwoGiB: tables are laid out with int32
 // addresses, so a table base past 2 GiB — or tables that grow past it — used
 // to wrap and compile without an error into a module whose memory did not hold

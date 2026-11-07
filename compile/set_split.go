@@ -961,7 +961,7 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 			// in the member's own block, as a pattern's find keeps it.
 			o := CompileOptions{ByteMode: p.byteMode, LikelyMode: opts.LikelyMode, BTWorkBudget: opts.BTWorkBudget, BTStackStart: opts.BTStackStart,
 				tableMemIdx: opts.TableMemIdx, globals: opts.globals, btDrive: drive}
-			bt, err := buildBTFindParts(p.rp, nil, findMandatoryLit(p.rp), int64(base), &o)
+			bt, err := buildBTFindParts(p.rp, nil, findHintedMandatoryLit(p.rp, p.anchorLit), int64(base), &o)
 			if err != nil {
 				panic("compile: a split member Backtracking was classified to take refused it: " + err.Error())
 			}
