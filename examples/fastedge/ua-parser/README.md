@@ -139,9 +139,32 @@ Compared with the Go **module** stub ([docs/go-api.md](../../../docs/go-api.md))
   (the Backtracking engine gave up), which the app returns as 500, not as "no
   match".
 
-`wit/deps/` holds the WASI 0.2.0 WIT the app's world includes, vendored from
-componentize-go v0.5.3's `wasip2` example; `make bindings` adds the regexped
-component's own `uaparser.wit` beside it.
+## The WIT files
+
+componentize-go generates bindings FROM WIT: it reads the app's world,
+[`wit/world.wit`](wit/world.wit), and every package that world names, all
+from `wit/`. Nothing generates the WASI ones, so they are part of the example:
+
+| Path | What it defines | Where it comes from | In git |
+|---|---|---|---|
+| `wit/world.wit` | the app's world: `include wasi:http/proxy@0.2.0`, plus imports of the regexped component's `matcher` and `sets` interfaces | written for this example | yes |
+| `wit/deps/wasi-http-0.2.0/` | `wasi:http` — the request, response, headers and body types, and the `incoming-handler` the app exports | vendored, see below | yes |
+| `wit/deps/wasi-io-0.2.0/` | `wasi:io` — the streams a body is read from and written to, and pollables | vendored | yes |
+| `wit/deps/wasi-clocks-0.2.0/`, `wasi-random-0.2.0/`, `wasi-cli-0.2.0/` | the wall and monotonic clocks, randomness, and stdin/stdout/stderr the `wasi:http/proxy` world imports | vendored | yes |
+| `wit/deps/regexped-uaparser/uaparser.wit` | the regexped component's interface | written by `regexped compile`, copied here by `make bindings` | no |
+
+The WASI files are WASI 0.2.0 as published in
+[`WebAssembly/wasi-http`](https://github.com/WebAssembly/wasi-http), tag
+`v0.2.0` (its `wit/` directory and `wit/deps/`; the WebAssembly package
+registry serves the same packages, `wkg get wasi:http@0.2.0`). They are
+copied from componentize-go v0.5.3's
+[`examples/wasip2`](https://github.com/bytecodealliance/componentize-go/tree/v0.5.3/examples/wasip2),
+which condenses each package into one `package.wit` and leaves out
+`wasi:filesystem` and `wasi:sockets`, which the `wasi:http/proxy` world does
+not include. The WASI WIT is published by the WebAssembly Community Group
+under the W3C Community Contributor License Agreement — see the
+[`LICENSE.md`](https://github.com/WebAssembly/wasi-http/blob/main/LICENSE.md)
+of `WebAssembly/wasi-http`.
 
 ## Deploying
 
