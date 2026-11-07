@@ -583,7 +583,11 @@ is in fact common makes every hit pay a walk backwards over the part before it.
 - It must be exactly one of the pattern's top-level literals — not part of a
   longer literal, not inside an alternation, an optional or repeated part, and
   not case-insensitive. `/api/v1/` qualifies in the pattern above; `v1` and
-  `api` do not.
+  `api` do not. That is the literal-anchored find's rule. A find with no
+  literal prefix of its own scans for a mandatory literal instead, and that
+  scan also takes the hint inside a part repeated at least once — `(?:xyz)+`
+  or `(?:xyz){2}`, not `(?:xyz)*` — when it starts at most 256 bytes into a
+  match, after bounded parts only.
 - It applies to `find_func` and `groups_func` (the search a groups export
   makes), and to the pattern's membership in a set declaring `find`,
   `scan_any` or `scan_all`, where it is the literal the member's bucket keys
@@ -593,7 +597,11 @@ is in fact common makes every hit pay a walk backwards over the part before it.
 - A literal the find cannot use is not taken, and the module is the one you
   would get without the key. `compile --verbose` says which: `anchor literal
   "/api/v1/": taken — the literal-anchored find scans for it`, or `anchor
-  literal "v1" not taken — …` with the reason. In a set, `--diag-json`'s bucket
+  literal "v1" not taken — …` with the reason. One reason is specific to a
+  hint: a literal the part before it can also hold, where scanning for it could
+  answer a later match than the leftmost (`xx(?:a.{0,20}z|b)yy[0-9]` hinted
+  `yy` over `xxaxxbyy1zyy2` would answer `[3,9)`, not `[0,13)`) — "the part
+  before it can hold an earlier occurrence of it". In a set, `--diag-json`'s bucket
   `literal` shows it; a set keys a bucket on it only when the part before it
   has a fixed length.
 

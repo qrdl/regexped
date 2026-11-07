@@ -83,6 +83,16 @@ await runAndExit(defineTestSuite({
       },
     },
     {
+      // 5,083 bytes of JSON: more than the 4,096 one blocking-write-and-flush
+      // may carry, so the answer has to go out in pieces.
+      name: 'an answer over 4 KB arrives whole',
+      async run(runner) {
+        const version = '1'.repeat(5000);
+        check(await runHttpRequest(runner, { path: '/', method: 'POST', body: `Chrome/${version}` }),
+          ['', named('Chrome', version), null, 'unknown', null]);
+      },
+    },
+    {
       name: 'a body over 8 KB is refused with 413',
       async run(runner) {
         assertHttpStatus(await runHttpRequest(runner, { path: '/', method: 'POST', body: 'x'.repeat(9000) }), 413);

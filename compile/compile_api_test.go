@@ -3604,11 +3604,6 @@ func TestRareSinglePatternPaths(t *testing.T) {
 	}
 }
 
-// TestCompileRejectsTablesPastTwoGiB: tables are laid out with int32
-// addresses, so a table base past 2 GiB — or tables that grow past it — used
-// to wrap and compile without an error into a module whose memory did not hold
-// its own tables. Each such base must now be refused, naming the address; a
-// base whose tables fit must still compile.
 // TestAnchorLiteralHint: a find's `anchor_literal:` reaches both extractors,
 // and the one verbose note says what each did with it. A hint either takes
 // effect or leaves the module exactly as it was without one — named a literal
@@ -3692,6 +3687,11 @@ func TestAnchorLiteralHint(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsTablesPastTwoGiB: tables are laid out with int32
+// addresses, so a table base past 2 GiB — or tables that grow past it — used
+// to wrap and compile without an error into a module whose memory did not hold
+// its own tables. Each such base must now be refused, naming the address; a
+// base whose tables fit must still compile.
 func TestCompileRejectsTablesPastTwoGiB(t *testing.T) {
 	entry := config.PatternEntry{Regexp: `[a-z]+@example\.com`, FindFunc: "f"}
 	for _, c := range []struct {

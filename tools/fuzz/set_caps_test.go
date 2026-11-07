@@ -584,6 +584,79 @@ func TestSetInlineRegexps(t *testing.T) {
 	}
 }
 
+// TestSetAnchorLiteralAgainstOracle: a member's `anchor_literal:` re-keys its
+// bucket on the hinted literal where the part before it has one length
+// (`user=[a-z]{8};role=admin` on `;role=admin`), and where it does not the
+// member is analysed again with today's literal (`user=[a-z]{1,8};role=root`
+// keeps `user=`). Both change which bodies answer, so every capability is
+// driven against Go: the anchored pair, the scan pair and overlapping `find`
+// from every position, and gated `find` as a whole drive from every position.
+func TestSetAnchorLiteralAgainstOracle(t *testing.T) {
+	members := []config.PatternEntry{
+		{Name: "admin", Regexp: `user=[a-z]{8};role=admin`, AnchorLiteral: ";role=admin"}, // taken
+		{Name: "guest", Regexp: `user=[0-9]{1,8};role=guest`},
+		{Name: "root", Regexp: `user=[a-z]{1,8};role=root`, AnchorLiteral: ";role=root"}, // retried
+		{Name: "id", Regexp: `id=[0-9]+;`},
+	}
+	pats := make([]string, len(members))
+	names := make([]string, len(members))
+	for i, m := range members {
+		pats[i], names[i] = m.Regexp, m.Name
+	}
+	build := func(s config.SetConfig) ([]byte, compile.SetDiag) {
+		t.Helper()
+		s.Name, s.Patterns = "s", config.PatternSelector{Names: names}
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: members, Sets: []config.SetConfig{s}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, diags[0]
+	}
+	all, diag := build(config.SetConfig{MatchAny: "cap_match_any", MatchAll: "cap_match_all",
+		ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true})
+	// The two routes are what the test is for: the taken hint keys a bucket of
+	// its own, the retried one keeps today's.
+	keyed := map[string][]int{}
+	for _, b := range diag.Buckets {
+		for _, p := range b.Patterns {
+			keyed[b.Literal] = append(keyed[b.Literal], p.ID)
+		}
+	}
+	if !containsInt(keyed[";role=admin"], 0) || !containsInt(keyed["user="], 2) {
+		t.Fatalf("buckets %v: want admin (0) keyed on ;role=admin and root (2) on user=", keyed)
+	}
+	gated, _ := build(config.SetConfig{Find: "gated_find"})
+	inputs := []string{
+		"",
+		"user=abcdefgh;role=admin",
+		"user=123;role=guest user=abc;role=root",
+		"user=abcdefgh;role=root", // eight letters: root's, not admin's
+		"user=user=abcdefgh;role=admin;role=admin", // a second start inside the first
+		"xuser=abcdefgh;role=adminuser=12;role=guestid=7;",
+		"user=abcdefghi;role=admin user=;role=root id=;", // one letter too many; empty fields
+		"id=1;id=22;user=zzzzzzzz;role=admin",
+	}
+	for _, input := range inputs {
+		r := newCapRunnerFrom(t, all, pats, input)
+		checkCapsAgainstOracle(t, r, pats, input)
+		r.Close()
+		for from := 0; from <= len(input); from++ {
+			var want []setMatch
+			for k, p := range pats {
+				for _, x := range regexp.MustCompile(p).FindAllStringIndex(input[from:], -1) {
+					want = append(want, setMatch{PatternID: k, Start: x[0] + from, End: x[1] + from})
+				}
+			}
+			got := runUnionPreflightFind(t, gated, pats, input, int32(from))
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(want) != fmt.Sprint(got) {
+				t.Errorf("gated find over %q from %d: %v, want %v", input, from, got, want)
+			}
+		}
+	}
+}
+
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's

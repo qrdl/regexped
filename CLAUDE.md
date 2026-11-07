@@ -241,7 +241,15 @@ regexped/
 │   │                          #   child whose literal set IS the hint (findHintedLitAnchorPoint), the
 │   │                          #   mandatory literal past earlier ones (findHintedMandatoryLit); a guard
 │   │                          #   or a set packer that refuses it gets today's literal, and one verbose
-│   │                          #   note says what the find's body scans for. −53% fuel, no-match URLs
+│   │                          #   note says what the find's body scans for. −53% fuel, no-match URLs.
+│   │                          #   litAnchorMissesLeftmost: EVERY split (hinted or not) is refused when a
+│   │                          #   match's prefix can hold an earlier literal occurrence the backward walk
+│   │                          #   cannot start from — the walk returns ONE start per hit, the earliest it
+│   │                          #   reaches, so `x(?:a[a-z]*z|b)yy` over "xaxbyyzyy" answered [2,6) not
+│   │                          #   [0,9). Exact by a search over (prefix-DFA state of x, states of x's
+│   │                          #   proper suffixes); conservative (can the prefix hold the literal) with
+│   │                          #   an assertion. Refuses none of the 2,898 corpus patterns with this find;
+│   │                          #   the conservative check ALONE refused 87 (email-domain-find +5,132%)
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan). A Unicode-mode literal that
 │   │                          #   begins with a non-ASCII character is checked a whole character at a
 │   │                          #   time on a first-byte hit (UTF8Text / charProbe). emitShuftiMask, the
@@ -1355,8 +1363,8 @@ It compares ANSWERS rather than global indices, because a wrong renumbering by
 make byteident   # from repo root
 ```
 
-Forty-three single-pattern configs, one per code path (the `unicode_` ones in
-Unicode mode), plus twenty-six SET configs spanning four frontends, both
+Forty-six single-pattern configs, one per code path (the `unicode_` ones in
+Unicode mode), plus thirty-one SET configs spanning four frontends, both
 accept representations, all five capabilities and Unicode mode — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is

@@ -190,6 +190,7 @@ regexped writes beside it, and regexped generates no Go code on this route:
 ```bash
 # 1. Compile the patterns into a component and its sibling .wit
 regexped compile --config=regexped.yaml               # → uaparser.wasm, uaparser.wit
+mkdir -p wit/deps/regexped-uaparser
 cp uaparser.wit wit/deps/regexped-uaparser/
 
 # 2. Generate the bindings for the app's world, which imports the

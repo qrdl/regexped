@@ -46,8 +46,12 @@ every User-Agent parser's is. Two known blind spots: Windows 11 still says
 `Windows NT 10.0`, so it answers `10`; and Safari on iPadOS asks for desktop
 sites by default, sending a macOS User-Agent string.
 
-`POST` takes at most 8 KB (413 above that); a method other than `GET` and
-`POST` answers 405.
+`POST` takes at most 8 KB (413 above that), and a body that cannot be read
+whole — a client that sends less than its `Content-Length` and hangs up —
+answers 400 rather than a guess from what arrived; a method other than `GET`
+and `POST` answers 405. (FastEdge reads the body before the app runs, so on
+FastEdge such a request never reaches it; `wasmtime serve` streams the body,
+and there the app answers 400.)
 
 ## Prerequisites
 
@@ -75,7 +79,7 @@ What each target needs:
 | `make compose` | composes the two into `ua-parser.wasm` — the same as `make` | the `make` tools |
 | `make run` | serves the app on `127.0.0.1:8080` in the background, POSTs five sample User-Agent strings, stops the server | the above, `wasmtime`, `curl` |
 | `make serve` | serves the app until Ctrl-C, for your own `curl` | the above, `wasmtime` |
-| `make test` | runs `ua-parser.wasm` under the FastEdge runtime itself (`fastedge-run`, through `@gcoredev/fastedge-test`) and checks 16 User-Agent strings, `GET`, the 405 and the 413 — [`test.mjs`](test.mjs) | the `make` tools, Node.js, `npm install` |
+| `make test` | runs `ua-parser.wasm` under the FastEdge runtime itself (`fastedge-run`, through `@gcoredev/fastedge-test`) and checks 16 User-Agent strings, `GET`, an answer over 4 KB (written in pieces: one write takes at most 4,096 bytes), the 405 and the 413 — [`test.mjs`](test.mjs) | the `make` tools, Node.js, `npm install` |
 | `make clean` | removes the build outputs and the generated Go files | — |
 
 `make test` takes about a second per request: the local runner compiles the

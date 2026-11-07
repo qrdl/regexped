@@ -226,6 +226,25 @@ an English text (`\p{Han}+x`: 4.06 fuel/byte against 2.13).
   UTF-8 in Unicode mode
 - the reversed-prefix DFA has ≤ 256 states in byte mode
 - for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
+- the split keeps match-start order (`litAnchorMissesLeftmost`, below)
+
+**Match-start order.** At each literal hit the backward walk returns ONE
+start, the earliest it reaches, and the find verifies from it. That is the
+leftmost match unless some match's prefix holds an EARLIER occurrence of the
+literal that the walk cannot start from: `x(?:a[a-z]*z|b)yy` over `xaxbyyzyy`
+walked back from the first `yy` to 2 and answered `[2,6)`, where the leftmost
+match `[0,9)` holds that `yy` inside its `[a-z]*`. Such a split is refused and
+the pattern takes the ordinary find instead. The check is
+exact for a prefix without assertions — a search over the prefix's DFA for a
+match `x·y` with a literal occurrence at `|x|`, `x` not a prefix match, and a
+proper suffix of `x` one — and for one with an assertion it asks only whether
+the prefix can hold the literal at all, unless the prefix is led by `\A` or
+by a `(?m:^)` nothing after can cross a newline past. A prefix of one fixed
+length is never refused: its starts follow its hits in order, which is also
+why set buckets and the alternation find, which both require one, are not
+affected. Over the RE2 corpus and every other pattern corpus in the
+repository the check refuses none of the 2,898 patterns that take this find;
+it refuses the shapes above, which answered a later match than Go before it.
 
 **Three-phase runtime execution:**
 
@@ -269,7 +288,8 @@ that literal alone, so not part of a longer literal, not inside an alternation,
 an optional or repeated part, and not case-insensitive — and the split it gives
 passes the conditions above: the part before it cannot match the empty string
 and its reversed DFA builds within the limit, the pattern has no word boundary,
-and no line anchor comes before the literal. Otherwise the find splits where it would without the
+no line anchor comes before the literal, and the split keeps match-start
+order — a hint can name a literal the part before it can also hold. Otherwise the find splits where it would without the
 hint, and the module is the one an unhinted config compiles to. `compile
 --verbose` says which: `anchor literal "/api/v1/": taken — the literal-anchored
 find scans for it`, or `not taken — …` with the guard that refused it. On that

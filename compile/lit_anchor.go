@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp/syntax"
+	"sort"
 	"strings"
 )
 
@@ -671,6 +672,246 @@ func lineAnchoredPrefixSafe(re *syntax.Regexp) bool {
 		return false
 	}
 	return !prefixContainsLineAnchor(rest) && !canConsumeNewline(rest)
+}
+
+// litAnchorOrderReason is the verbose note's reason when litAnchorMissesLeftmost
+// refuses a split.
+const litAnchorOrderReason = "the part before it can hold an earlier occurrence of it, " +
+	"so its first occurrence need not give the leftmost match"
+
+// litAnchorMissesLeftmost reports whether a literal-anchored find over lap can
+// return a match that starts AFTER the leftmost one.
+//
+// The find scans for the literal and, at each hit h in turn, walks backward
+// over the prefix to the EARLIEST start s it reaches, then verifies from s.
+// That is the leftmost match exactly when the leftmost match's own literal is
+// the first hit its start can be reached from. It is not when some match of
+// the prefix, w = x·y, holds an earlier hit at |x| — an occurrence of a
+// literal starting inside w, possibly running on into the match's own
+// literal — where x itself is NOT a prefix match but a proper non-empty
+// suffix of x IS: the walk from that hit then stops inside x, never at x's
+// start, and its verified match beats the real one.
+// `x(?:a[a-z]*z|b)yy` over "xaxbyyzyy": the hit at 4 walks back to 2 and
+// answers [2,6), where the leftmost match [0,9) holds that `yy` in its
+// `[a-z]*`. A prefix of one fixed length is never affected (no proper suffix
+// of x has that length), which is also why set buckets and the alternation
+// find, both of which require one, keep match-start order.
+//
+// Decided over the prefix's DFA by a search over (state of x, states of x's
+// proper suffixes). A prefix with an assertion is decided conservatively —
+// can it hold the literal at all — unless it is led by `\A`, where every
+// start is the same, or by a `(?m:^)` that nothing after can cross a '\n'
+// past, where every start a hit reaches is that hit's line start.
+// Undecidable within bounds answers true: refusing the find costs speed,
+// keeping it would cost answers.
+func litAnchorMissesLeftmost(pattern resolvedPattern, lap *litAnchorPoint) bool {
+	pre := lap.prefixRe
+	if leadingBeginText(pre) || lineAnchoredPrefixSafe(pre) {
+		return false
+	}
+	// One fixed length: every hit's start is the hit less that length, so
+	// starts follow hits — decided here rather than left to the search's
+	// bound, which a long one could reach.
+	if lo, hi := pattern.tree(pre).minMaxLen(); lo == hi && hi >= 0 {
+		return false
+	}
+	prog, _ := compileProg(pattern.tree(pre))
+	d, ok := newDFA(prog, false, prog.dfaBuildCap())
+	if !ok {
+		return true
+	}
+	p := prefixAutomaton{t: dfaTableFrom(d), lits: lap.litSet}
+	if hasEmptyWidthAssertion(pre) {
+		return p.canHoldLiteral()
+	}
+	return p.hitInsideMatch()
+}
+
+// prefixAutomaton is the prefix's DFA, with the literal set, for
+// litAnchorMissesLeftmost.
+type prefixAutomaton struct {
+	t    *dfaTable
+	lits [][]byte
+}
+
+// step is one transition from a live state q; -1 is the dead state.
+func (p prefixAutomaton) step(q int, c byte) int {
+	return int(p.t.transitions[q*256+int(c)])
+}
+
+func (p prefixAutomaton) walk(q int, s []byte) int {
+	for _, c := range s {
+		if q = p.step(q, c); q < 0 {
+			return -1
+		}
+	}
+	return q
+}
+
+func (p prefixAutomaton) accepts(q int) bool { return q >= 0 && p.t.acceptStates[q] != 0 }
+
+// runsIntoLiteral: a literal occurrence l1 cut after its first m bytes, at
+// the end of a prefix match, continues into the match's own literal — or
+// covers one and runs on into the suffix, which can supply the rest.
+func (p prefixAutomaton) runsIntoLiteral(l1 []byte, m int) bool {
+	rest := l1[m:]
+	for _, l2 := range p.lits {
+		if bytes.HasPrefix(l2, rest) || bytes.HasPrefix(rest, l2) {
+			return true
+		}
+	}
+	return false
+}
+
+// canHoldLiteral is the conservative answer: some prefix match can hold an
+// occurrence of a literal, wholly or running on into the match's own.
+func (p prefixAutomaton) canHoldLiteral() bool {
+	// Every state the subset construction made is reachable from the start.
+	for q := 0; q < p.t.numStates; q++ {
+		for _, l1 := range p.lits {
+			if p.walk(q, l1) >= 0 {
+				return true
+			}
+			for m := 1; m < len(l1); m++ {
+				if p.accepts(p.walk(q, l1[:m])) && p.runsIntoLiteral(l1, m) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// maxPrefixSearch bounds hitInsideMatch's search; past it the answer is the
+// safe one.
+const maxPrefixSearch = 1 << 16
+
+// hitInsideMatch is the exact answer for a prefix without assertions: is
+// there a prefix match w = x·y (|x|, |y| >= 1) with a literal occurrence at
+// |x|, x not a prefix match, and some proper non-empty suffix of x one?
+func (p prefixAutomaton) hitInsideMatch() bool {
+	n := p.t.numStates
+	// toAccept[q]: an accepting state is reachable from q, q included.
+	toAccept := make([]bool, n)
+	for changed := true; changed; {
+		changed = false
+		for q := 0; q < n; q++ {
+			if toAccept[q] {
+				continue
+			}
+			ok := p.accepts(q)
+			for c := 0; !ok && c < 256; c++ {
+				if r := p.step(q, byte(c)); r >= 0 && toAccept[r] {
+					ok = true
+				}
+			}
+			if ok {
+				toAccept[q], changed = true, true
+			}
+		}
+	}
+	// hitAt: from x's state, a y exists with x·y a prefix match and a literal
+	// occurrence starting at |x|.
+	hitAt := func(q int) bool {
+		for _, l1 := range p.lits {
+			if r := p.walk(q, l1); r >= 0 && toAccept[r] {
+				return true // y begins with the literal
+			}
+			for m := 1; m < len(l1); m++ {
+				if p.accepts(p.walk(q, l1[:m])) && p.runsIntoLiteral(l1, m) {
+					return true // y is the literal's first m bytes
+				}
+			}
+		}
+		return false
+	}
+	// A node is x: its state, and the set of states its proper non-empty
+	// suffixes reach, as a sorted key.
+	type node struct {
+		q        int
+		suffixes string
+		nonEmpty bool
+	}
+	encode := func(set map[int]bool) string {
+		ids := make([]int, 0, len(set))
+		for q := range set {
+			ids = append(ids, q)
+		}
+		sort.Ints(ids)
+		var b strings.Builder
+		for _, q := range ids {
+			fmt.Fprintf(&b, "%d,", q)
+		}
+		return b.String()
+	}
+	decode := func(key string) []int {
+		var out []int
+		for _, f := range strings.Split(strings.TrimSuffix(key, ","), ",") {
+			if f == "" {
+				continue
+			}
+			var q int
+			fmt.Sscan(f, &q)
+			out = append(out, q)
+		}
+		return out
+	}
+	start := node{q: p.t.startState}
+	seen := map[node]bool{start: true}
+	queue := []node{start}
+	for len(queue) > 0 {
+		x := queue[0]
+		queue = queue[1:]
+		suffixes := decode(x.suffixes)
+		if x.nonEmpty && !p.accepts(x.q) {
+			for _, s := range suffixes {
+				if p.accepts(s) {
+					if hitAt(x.q) {
+						return true
+					}
+					break
+				}
+			}
+		}
+		for c := 0; c < 256; c++ {
+			q := p.step(x.q, byte(c))
+			if q < 0 || !toAccept[q] {
+				continue // x must stay the start of some prefix match
+			}
+			next := map[int]bool{}
+			for _, s := range suffixes {
+				if r := p.step(s, byte(c)); r >= 0 {
+					next[r] = true
+				}
+			}
+			if x.nonEmpty { // the suffix that starts at the old end of x
+				if r := p.step(p.t.startState, byte(c)); r >= 0 {
+					next[r] = true
+				}
+			}
+			y := node{q: q, suffixes: encode(next), nonEmpty: true}
+			if !seen[y] {
+				if len(seen) >= maxPrefixSearch {
+					return true
+				}
+				seen[y] = true
+				queue = append(queue, y)
+			}
+		}
+	}
+	return false
+}
+
+// leadingBeginText reports whether re starts with `\A` (or `^` outside
+// multi-line mode), through captures and concatenations.
+func leadingBeginText(re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpBeginText:
+		return true
+	case syntax.OpCapture, syntax.OpConcat:
+		return len(re.Sub) > 0 && leadingBeginText(re.Sub[0])
+	}
+	return false
 }
 
 // altLitAnchorBranch pairs one alternation branch's litAnchorPoint with the

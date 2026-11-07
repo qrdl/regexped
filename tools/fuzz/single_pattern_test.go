@@ -3985,6 +3985,108 @@ func TestAnchorLiteralSavesFuel(t *testing.T) {
 	t.Logf("fuel %d → %d (%.1f%%)", plain, hinted, 100*float64(hinted)/float64(plain))
 }
 
+// TestLitAnchorKeepsLeftmost: a literal-anchored find walks back from each
+// literal hit to the earliest start it reaches, which is the leftmost match
+// only when no match's prefix holds an earlier occurrence the walk cannot
+// start from (compile's litAnchorMissesLeftmost). Before that check the find
+// answered `(?:a.{0,3}z|b)yy` over "abyyzyy" with [1,4) — the `byy` — where
+// the leftmost match [0,7) holds that `yy` in its `.{0,3}`; an `anchor_literal:`
+// exposed the same on more patterns. Brute force: every input up to 7 bytes
+// over the patterns' own letters, the first match from 0 against Go, for
+// shapes that went wrong and shapes beside them that must keep the find. Then
+// the reported cases as whole drives.
+func TestLitAnchorKeepsLeftmost(t *testing.T) {
+	patterns := []string{
+		// Answered a later match before the check.
+		`(?:a.{0,3}z|b)yy`, `(?:a.{0,3}z|b)ya`, `(?:a[^z]*z|b)yy`, `(?:a[^z]*z|b)ya1`,
+		// Prefixes that can contain the literal yet keep the order, a
+		// self-overlapping literal among them.
+		`[a-z]+yy`, `(?:ab|b)yy`, `y?ayy`, `[ay]+aba`, `(?:yab|b)aba`, `a(?:yy)?byy`,
+	}
+	_, wd := sharedEngine()
+	alphabet := []byte("abyz1")
+	anchored := 0
+	for _, pat := range patterns {
+		r := &compile.Reporter{}
+		w, _, err := compile.Compile([]config.PatternEntry{{Name: "p", Regexp: pat, FindFunc: "find"}}, pathsTableBase, true,
+			compile.CompileOptions{Report: r})
+		if err != nil {
+			t.Fatalf("%s: %v", pat, err)
+		}
+		r.End()
+		for _, n := range r.Patterns[0].Notes {
+			if strings.HasPrefix(n, "literal-anchored find (") {
+				anchored++
+			}
+		}
+		store, inst, mem, release, err := instantiate(w)
+		if err != nil {
+			t.Fatalf("%s: %v", pat, err)
+		}
+		find := inst.GetFunc(store, "find")
+		re := regexp.MustCompile(pat)
+		buf := make([]byte, 7)
+		calls := 0
+		var walk func(n int) bool
+		walk = func(n int) bool {
+			in := buf[:n]
+			// Alternate the input's address, so no call reads as the
+			// continuation of the one before (the module's default state).
+			ptr := int32(calls&1) * 64
+			calls++
+			copy(mem.UnsafeData(store)[ptr:], in)
+			wd.Arm(store)
+			v, err := find.Call(store, ptr, int32(n), int32(0))
+			wd.Disarm()
+			if err != nil {
+				t.Fatalf("%s over %q: %v", pat, in, err)
+			}
+			got := "none"
+			if x := v.(int64); x >= 0 {
+				got = fmt.Sprintf("[%d %d]", uint32(x>>32), uint32(x))
+			}
+			want := "none"
+			if m := re.FindIndex(in); m != nil {
+				want = fmt.Sprintf("[%d %d]", m[0], m[1])
+			}
+			if got != want {
+				t.Errorf("%s over %q: first match %s, Go %s", pat, in, got, want)
+				return false
+			}
+			if n < len(buf) {
+				for _, c := range alphabet {
+					buf[n] = c
+					if !walk(n + 1) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		walk(0)
+		release()
+	}
+	if anchored < len(patterns)/2 {
+		t.Errorf("only %d of %d patterns kept the literal-anchored find: the check refuses too much, or the brute force no longer reaches that body", anchored, len(patterns))
+	}
+	// The reported cases, whole drives, hinted and not.
+	for _, c := range []struct{ pat, hint, in string }{
+		{`xx(?:a.{0,20}z|b)yy[0-9]`, "yy", "xxaxxbyy1zyy2"},
+		{`(?:a.{0,20}z|b)yy[0-9]`, "", "axxbyy1zyy2"},
+		{`x(?:a[a-z]*z|b)yy`, "", "xaxbyyzyy"},
+		{`x(?:a[a-z]*z|b)yy`, "", "xaxbyyzyy xbyy xaqzyy"},
+	} {
+		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: c.pat, FindFunc: "find", AnchorLiteral: c.hint}}, pathsTableBase, true)
+		if err != nil {
+			t.Fatalf("%s: %v", c.pat, err)
+		}
+		got, ok := wasmFindIter(t, w, c.in)
+		if want := goFindAll(regexp.MustCompile(c.pat), c.in); !ok || fmtSpans(got) != fmtSpans(want) {
+			t.Errorf("%s hint %q over %q: %s, Go %s", c.pat, c.hint, c.in, fmtSpans(got), fmtSpans(want))
+		}
+	}
+}
+
 // TestNeutralTwinRouteMatchesGo drives every caller that can take a
 // prefer-no-match body's route to its neutral twin — a caller tests the byte at
 // `from` and calls the twin itself when the body's first test would hand off —

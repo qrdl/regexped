@@ -2382,6 +2382,12 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				// DFA. Byte mode keeps the u8 tables it had.
 				if lap != nil && (l.useU8 || rp.unicode()) && !table.hasWordBoundary && lineAnchorOK &&
 					!prefixContainsWordBoundary(lap.prefixRe) {
+					// A split that passes every other guard must also keep
+					// match-start order, or the find answers a later match than
+					// the leftmost one (litAnchorMissesLeftmost).
+					if litAnchorMissesLeftmost(rp, lap) {
+						return litAnchorOrderReason
+					}
 					// Compile the reversed prefix DFA for the backward scan.
 					revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
 					if revCompErr == nil && !revProg.refusedByByteGate() {
