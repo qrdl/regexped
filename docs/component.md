@@ -531,7 +531,7 @@ Neither of these is a gap waiting to be filled.
 | | Status |
 |---|---|
 | Batch exports (`hints: [batch-find]`, on a set or a `patterns:` entry) | Refused at load, by design. Batching exists for one reason — to save host↔WASM crossings — and only the JS and TS stubs ever generate it, because every other stub is itself compiled to WASM and calls the body directly, with no crossing to save. JS and TS are not component targets, so under `component` there is no host batching could help. It is refused rather than ignored because the user asked for a second entry point. |
-| `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo; AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
+| `go` / `as` / `js` / `ts` stubs | Not component targets, permanently. Stock Go has no wasip2 target, so a Go component stub would have to be TinyGo — but a Go app can still consume a component with NO regexped stub: componentize-go builds it from stock Go and generates the bindings from the `.wit` (`stub_type: wit`), see [go-api.md](go-api.md#component-format-go-with-componentize-go); AssemblyScript has no planned route; and no JavaScript runtime loads a component — `WebAssembly.instantiate` accepts core modules only — so a JS consumer needs `jco transpile`, whose output is a core module plus glue, i.e. where `wasm_format: module` already starts. |
 
 ## How it is built
 

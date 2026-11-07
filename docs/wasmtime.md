@@ -29,7 +29,7 @@ differences.
 - [`wasmtime`](https://wasmtime.dev) CLI
 - Toolchain for the host language:
   - **Rust** — `rustup target add wasm32-wasip1` (`wasm32-wasip2` for a component guest)
-  - **Go** — Go 1.23+ (compile with `GOOS=wasip1`)
+  - **Go** — Go 1.23+ (compile with `GOOS=wasip1`); for a component guest, Go 1.27.1+ and [componentize-go](https://github.com/bytecodealliance/componentize-go) — see [Go components](#go-components-componentize-go)
   - **C** — `clang` with `wasm-ld` (`clang-19` works without a WASI sysroot)
   - **AssemblyScript** — Node.js 16+ with npm 7+; `npm install` in your project fetches `assemblyscript` and `@assemblyscript/wasi-shim`
 
@@ -94,6 +94,38 @@ echo "input" | wasmtime run final.wasm        # pipe stdin
 Regexped does not require any custom imports beyond the host language's own
 WASI surface — anything `wasmtime` supports for plain WASI modules works for a
 merged regexp module.
+
+## Go components: componentize-go
+
+There is no Go stub for `wasm_format: component`, but a Go guest can still be a
+component: [componentize-go](https://github.com/bytecodealliance/componentize-go)
+builds a stock-Go program (Go 1.27.1 or later) and turns it into a component,
+generating the Go bindings for its WIT world — which imports the regexped
+component's interfaces, from the `.wit` regexped writes beside it.
+[go-api.md](go-api.md#component-format-go-with-componentize-go) has the steps and
+the generated API; `regexped merge` composes the guest with the regexp component
+as for any component.
+
+wasmtime runs the result by its world's export:
+
+```bash
+# A command: the world exports wasi:cli/run (package export_wasi_cli_run, func Run)
+wasmtime run composed.wasm
+
+# A wasi:http app: the world includes wasi:http/proxy (package
+# export_wasi_http_incoming_handler, func Handle). -Scli grants the wasi:cli
+# imports the Go runtime brings in.
+wasmtime serve -Scli --addr 127.0.0.1:8080 composed.wasm
+```
+
+Whatever WASI version the app's own world names, the composed component also
+imports WASI 0.2.12 interfaces (environment, stdio, terminal, clocks,
+filesystem, random) for the Go runtime, through the adapter componentize-go
+0.5.3 embeds. wasmtime 49.0.2 provides them.
+
+[`examples/fastedge/ua-parser`](../examples/fastedge/ua-parser) is a `wasi:http`
+one: `make run` serves it with `wasmtime serve` and POSTs five User-Agent
+strings.
 
 ## Embedding wasmtime as a library
 
@@ -190,6 +222,11 @@ embeds wasmtime as a library and loads the regexp output directly — the module
 with `make run`, the component with `make component-run` — the pattern described
 in [Embedding wasmtime as a library](#embedding-wasmtime-as-a-library) above.
 Each example's README lists the tools it needs.
+
+A Go **component** example lives with the FastEdge ones:
+[`fastedge/ua-parser/`](../examples/fastedge/ua-parser/), built with
+componentize-go and served by `wasmtime serve` — see
+[Go components](#go-components-componentize-go).
 
 ## Related
 

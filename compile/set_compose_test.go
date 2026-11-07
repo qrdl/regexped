@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
+	"sort"
 	"strings"
 	"testing"
 
@@ -3325,5 +3326,57 @@ func TestAnchoredBacktrackingForcesWideAll(t *testing.T) {
 	}
 	if cs, admits := inspect(t, `abc`, `[a-c]+`); cs.wideAll() || admits || len(cs.anchoredBT) != 0 {
 		t.Fatalf("without the member: wideAll %v, admits %v, %d anchored Backtracking buckets", cs.wideAll(), admits, len(cs.anchoredBT))
+	}
+}
+
+// TestSetMemberAnchorLiteral: a set member's anchor_literal is the literal its
+// bucket keys on where the split it gives can key one — the walk reaches it,
+// and the part before it has a fixed length — and today's literal otherwise,
+// so a hint never costs a member the bucket it had.
+func TestSetMemberAnchorLiteral(t *testing.T) {
+	bucketLits := func(t *testing.T, entries ...config.PatternEntry) string {
+		t.Helper()
+		sc := config.SetConfig{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}
+		_, _, diags, err := CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{sc}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string][]int{}
+		for _, b := range diags[0].Buckets {
+			for _, p := range b.Patterns {
+				out[b.Literal] = append(out[b.Literal], p.ID)
+			}
+		}
+		for _, ids := range out {
+			sort.Ints(ids)
+		}
+		return fmt.Sprint(out)
+	}
+	guest := config.PatternEntry{Name: "guest", Regexp: `user=[0-9]{1,8};role=guest`}
+	for _, c := range []struct {
+		re, hint, want string
+	}{
+		{`user=[a-z]{8};role=admin`, "", "map[user=:[0 1]]"},
+		{`user=[a-z]{8};role=admin`, ";role=admin", "map[;role=admin:[0] user=:[1]]"},
+		// A variable-length part before it: the backward walk cannot recover
+		// the start, so the member keeps user= rather than go to fallback.
+		{`user=[a-z]{1,8};role=admin`, ";role=admin", "map[user=:[0 1]]"},
+		// After an unbounded part the walk does not reach it.
+		{`user=[a-z]+ role=admin`, " role=admin", "map[user=:[0 1]]"},
+	} {
+		admin := config.PatternEntry{Name: "admin", Regexp: c.re, AnchorLiteral: c.hint}
+		if got := bucketLits(t, admin, guest); got != c.want {
+			t.Errorf("%s hint %q: buckets %s, want %s", c.re, c.hint, got, c.want)
+		}
+	}
+	// The retry leaves today's analysis, and keeps the hint for a split
+	// member's find.
+	var prefixPool, suffixPool dfaPool
+	info, err := analyzePattern(config.PatternEntry{Regexp: `user=[a-z]{1,8};role=admin`, AnchorLiteral: ";role=admin"}, &prefixPool, &suffixPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(info.mandLit.bytes) != "user=" || !info.splittable || string(info.anchorLit.bytes()) != ";role=admin" {
+		t.Errorf("retry: literal %q splittable %v hint %q", info.mandLit.bytes, info.splittable, info.anchorLit.bytes())
 	}
 }

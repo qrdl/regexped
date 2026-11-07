@@ -873,6 +873,23 @@ literal occurrence by subtracting one fixed prefix length, so a prefix with
 several possible lengths would silently lose the matches that use any length
 but the longest.
 
+**A member's `anchor_literal:` chooses its bucket literal.** A member is keyed
+on the first mandatory literal the extraction finds; a top-level pattern's
+[`anchor_literal:`](cli.md#anchor_literal--which-literal-the-find-scans-for)
+names a later one. The set takes it only where a bucket can use the split it
+gives — the part before the literal has ONE length (the rule above) and carries
+no `\b`, `\B` or end assertion. Otherwise the member is analysed again without
+the hint and keys on the literal it has without it: a hint never sends a member
+to a fallback bucket. With `user=[0-9]{1,8};role=guest` beside it,
+`user=[a-z]{8};role=admin` hinted `;role=admin` gets a bucket of its own keyed
+on `;role=admin` (both share `user=` without the hint), while
+`user=[a-z]{1,8};role=admin` keeps `user=`, since the part before `;role=admin`
+varies in length. `--diag-json`'s bucket `literal` shows which literal each
+bucket keys on. The hint counts only for a set declaring `find`, `scan_any` or
+`scan_all`: `match_any` and `match_all` walk the whole input from its first
+byte and scan for no literal, so a hinted pattern that only such sets select
+is a load error.
+
 Under the set's own `hints: [prefer-match]`, two patterns that are each
 individually eligible for the single-pattern counted-class-chain
 optimisation (e.g. `[0-9]{8}`-style bounded class runs) are never merged

@@ -1,0 +1,10 @@
+// The app's world: a wasi:http handler that imports the regexped component's
+// two interfaces. wit/deps holds WASI 0.2.0 (vendored) and, once `make
+// bindings` has run, the regexped component's own WIT, regexped-uaparser/.
+package local:ua-parser;
+
+world ua-parser {
+  include wasi:http/proxy@0.2.0;
+  import regexped:uaparser/matcher;
+  import regexped:uaparser/sets;
+}

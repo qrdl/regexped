@@ -48,6 +48,7 @@ var (
 	fuelMax  = flag.Uint64("fuelmax", 20_000_000_000, "fuel budget per size; exceeding it aborts the size")
 	timeout  = flag.Duration("timeout", 60*time.Second, "wall timeout per size")
 	byteMode = flag.Bool("bytemode", false, "byte_mode")
+	anchLit  = flag.String("anchor-literal", "", "a single pattern's anchor_literal: the literal its find scans for")
 	drive    = flag.Bool("drive", true, "drive with the stub advance rule (false: one call from 0)")
 	forceBT  = flag.Bool("bt", false, "force Backtracking for groups")
 	maxDFA   = flag.Int("maxdfa", 0, "MaxDFAStates override")
@@ -77,6 +78,8 @@ type spec struct {
 	ByteMode bool
 	OneCall  bool
 	NoBlock  bool
+	// AnchorLiteral is the single pattern's `anchor_literal:`, "" for none.
+	AnchorLiteral string
 }
 
 // sizeResult is one input size of a drive.
@@ -133,6 +136,7 @@ func main() {
 		Pattern: *pattern, Config: *cfgPath, Set: *setName, Fn: *fn, Gen: *gen,
 		NoCache: !*cache, Cap: *outCap, MaxDFA: *maxDFA, BT: *forceBT,
 		NGroups: *ngroups, ByteMode: *byteMode, OneCall: !*drive, NoBlock: *noBlock,
+		AnchorLiteral: *anchLit,
 	}
 	for _, s := range strings.Split(*sizes, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(s))
@@ -244,7 +248,7 @@ func runSpec(sp spec) ([]sizeResult, string, error) {
 			sizes, err = compile.SearchSizes(cfg)
 		}
 	} else {
-		e := config.PatternEntry{Regexp: sp.Pattern, ByteMode: sp.ByteMode}
+		e := config.PatternEntry{Regexp: sp.Pattern, ByteMode: sp.ByteMode, AnchorLiteral: sp.AnchorLiteral}
 		switch sp.Fn {
 		case "find":
 			e.FindFunc = "find"

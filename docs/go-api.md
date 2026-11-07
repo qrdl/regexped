@@ -13,7 +13,7 @@ A stub file carries a `//go:build wasip1` constraint and a `package` declaration
 
 That name is `go_package`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name — while `package` needs a Go identifier: `url_ipv6` is a fine wire name and a package name every linter flags, and a wire name that happens to be a Go keyword cannot be a package at all. The `//go:wasmimport` lines keep using `import_module` either way.
 
-> **Component format:** Go is **not** a component target. `stub_type: go` under `wasm_format: component` is refused permanently, not "yet": stock Go has no wasip2 target (`go tool dist list` offers `wasip1/wasm` only), so a component stub would have to be TinyGo. See [component.md](component.md).
+> **Component format:** there is no Go **stub** for components. `stub_type: go` under `wasm_format: component` is refused permanently, not "yet": stock Go has no wasip2 target (`go tool dist list` offers `wasip1/wasm` only), so a component stub would have to be TinyGo. A Go app can still use a regexped component, with no regexped stub at all: [componentize-go](https://github.com/bytecodealliance/componentize-go) generates the bindings from the `.wit` regexped writes — see [Component format: Go with componentize-go](#component-format-go-with-componentize-go) below, and [component.md](component.md).
 
 ```
 myapp/
@@ -237,6 +237,94 @@ the scan advances, so a step is not a call. Requires Go 1.23+ for `iter`.
 It returns the member's `name:`, or `""` for an unnamed pattern, one of the set's own
 `regexps:`, or an id the set does not hold. It is per set because a set's own
 regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-constants)).
+
+## Component format: Go with componentize-go
+
+Everything above is the MODULE route: a stub, `wasip1`, `wasm-merge`. A Go app
+can also consume a regexped **component** (`wasm_format: component`), and on
+that route regexped generates no Go code at all.
+[componentize-go](https://github.com/bytecodealliance/componentize-go) builds
+a stock-Go program for `wasip1`, turns it into a component, and generates the
+Go bindings for the component's imports from WIT — and the WIT is the `.wit`
+regexped writes beside the component.
+
+[`examples/fastedge/ua-parser`](../examples/fastedge/ua-parser) is a complete
+one: a FastEdge HTTP app, with a Makefile for every step.
+
+### Requirements
+
+- Go 1.27.1 or later (componentize-go's floor; `GOTOOLCHAIN=go1.27.3` has an
+  older `go` command fetch one)
+- componentize-go 0.5 on `PATH`
+- `wasm-tools` (regexped's component build) and `wac` (`regexped merge`)
+
+### Steps
+
+1. **The regexped component.** `wasm_format: component` in the config;
+   `stub_type: wit` makes `regexped generate` write the same `.wit` that
+   `regexped compile` writes beside the component.
+2. **The app's world.** A WIT world that imports the component's interfaces
+   beside what the app itself needs:
+
+   ```wit
+   package local:ua-parser;
+
+   world ua-parser {
+     include wasi:http/proxy@0.2.0;   // a wasi:http app; a CLI one exports wasi:cli/run
+     import regexped:uaparser/matcher;
+     import regexped:uaparser/sets;
+   }
+   ```
+
+   Put regexped's `.wit` under `wit/deps/`, with the WASI WIT the world
+   includes.
+3. **Bindings.** `componentize-go -d wit -w ua-parser bindings` writes one
+   package per imported interface — `regexped_uaparser_matcher`,
+   `regexped_uaparser_sets`, the `wasi_*` ones — plus `wit_exports.go` and
+   `go.mod`, at the module root. Run `go mod tidy` after it: the generated code
+   needs `go.bytecodealliance.org/pkg`.
+4. **The app.** The world's export is a package componentize-go's glue calls:
+   `export_wasi_http_incoming_handler` with `func Handle(…)` for a `wasi:http`
+   app, `export_wasi_cli_run` with `func Run()` for a command.
+5. **Build and compose.** `componentize-go -d wit -w ua-parser build -o
+   main.wasm`, then `regexped merge --config=regexped.yaml --main=main.wasm
+   <component>.wasm` — `wac` under the hood, as for any component.
+
+### What the bindings look like
+
+The API is the WIT's, in Go: every call returns a `witTypes.Result`, and
+`ErrorCode` is the engine's "answer unknown"
+([Backtracking stack overflow](#backtracking-stack-overflow)), never "no
+match". For a pattern with `match_func: is_url`, `find_func: find_urls`,
+`groups_func: url_parts`, and a set `s` declaring every capability:
+
+| Config | Generated Go |
+|---|---|
+| `match_func` | `IsUrl(input []uint8) witTypes.Result[witTypes.Option[uint32], ErrorCode]` — `Some(end)` on a match |
+| `find_func` | `f := MakeFindUrls(input, start)`; `f.Next()` → `witTypes.Result[witTypes.Option[witTypes.Tuple2[uint32, uint32]], ErrorCode]`, `None` when finished; `f.Drop()` |
+| `groups_func` | `g := MakeUrlParts(input, start)`; `g.Next()` → `witTypes.Result[[]witTypes.Option[witTypes.Tuple2[uint32, uint32]], ErrorCode]` — index 0 the whole match, an unset group `None`, an empty list when finished; `g.Drop()` |
+| set `match_any` / `scan_any` | `SMatchAny(input)` / `SScanAny(input, start)` → `witTypes.Result[witTypes.Option[uint32], ErrorCode]` |
+| set `match_all` / `scan_all` | `SMatchAll(input)` / `SScanAll(input, start)` → `witTypes.Result[[]uint32, ErrorCode]`, ascending |
+| set `find` | `s := MakeSFind(input, start)`; `s.Next()` → `witTypes.Result[[]SetMatch, ErrorCode]` — the matches at one position, an empty list when finished; `s.Drop()` |
+
+Against the module stub:
+
+- **No iterators.** `Next()` in a loop, where the stub gives `Matches()` and
+  `Err()`.
+- **Groups and set members by position only.** The WIT carries no names, so
+  there is no `<groups>_index` / `<groups>_names` and no `emit_name_map`
+  lookup: a group is its index, a set member its id (its index in `patterns:`,
+  then the set's own `regexps:`).
+- **A scan is a resource.** `Drop()` releases it, and the input it holds.
+- **The input is copied.** A component is its own instance with its own
+  memory, so the input crosses into it — copied — once per call, or once per
+  scan for a resource; a merged module reads the host's memory directly. See
+  [component.md](component.md).
+
+A stock-Go component carries the Go runtime: componentize-go 0.5.3's own
+hello-world `wasi:http` app, built with Go 1.27.3, has 1.58 MB of code.
+`encoding/json` took the `ua-parser` example's from 1.74 MB to 3.09 MB, which
+is why it writes its JSON by hand.
 
 ## Notes
 

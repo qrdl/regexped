@@ -7,7 +7,11 @@
 //
 // Usage:
 //
-//	pattest -pattern <regex> -mode match|find -inputs <file> [-detailed]
+//	pattest -pattern <regex> -mode match|find -inputs <file> [-detailed] [-anchor-literal <lit>]
+//
+// -anchor-literal sets the pattern's `anchor_literal:` for every compile of
+// the run, so whether naming that literal pays is two runs, one with it and
+// one without; the run prints whether the compiler took it, or why not.
 //
 // -inputs points to a text file with one candidate input per line (no
 // embedded newlines within a single input). Bucket classification uses Go's
@@ -26,6 +30,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
@@ -69,6 +74,14 @@ var unicodeFlag = flag.Bool("unicode", false, "compile in Unicode mode (CompileO
 // its fuel — is measured here rather than guessed.
 var maxDFAStatesFlag = flag.Int("max-dfa-states", 0, "max_dfa_states for every compile (0 = the mode's default)")
 
+// anchorLiteralFlag is the pattern's `anchor_literal:` for every compile of
+// this run (config.PatternEntry.AnchorLiteral), "" for none.
+var anchorLiteralFlag = flag.String("anchor-literal", "", "the pattern's anchor_literal: the literal its find scans for (find mode only)")
+
+// anchorNotes is, per compiled module, the `anchor literal` verbose note its
+// compile wrote: whether it took -anchor-literal, or why not.
+var anchorNotes = map[string]string{}
+
 // isASCII reports whether s has no byte above 0x7F.
 func isASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
@@ -101,11 +114,17 @@ func main() {
 	flag.Parse()
 
 	if *patternFlag == "" || *modeFlag == "" || *inputsFlag == "" {
-		fmt.Fprintln(os.Stderr, "usage: pattest -pattern <regex> -mode match|find -inputs <file> [-detailed]")
+		fmt.Fprintln(os.Stderr, "usage: pattest -pattern <regex> -mode match|find -inputs <file> [-detailed] [-anchor-literal <lit>]")
 		os.Exit(2)
 	}
 	if *modeFlag != "match" && *modeFlag != "find" {
 		fmt.Fprintln(os.Stderr, "error: -mode must be 'match' or 'find'")
+		os.Exit(2)
+	}
+	// An anchored match scans for no literal, and the config refuses the key
+	// on an entry with no find.
+	if *anchorLiteralFlag != "" && *modeFlag != "find" {
+		fmt.Fprintln(os.Stderr, "error: -anchor-literal needs -mode find: an anchored match scans for no literal")
 		os.Exit(2)
 	}
 
@@ -185,6 +204,9 @@ func main() {
 
 	fmt.Printf("pattern: %s\n", *patternFlag)
 	fmt.Printf("mode: %s\n", *modeFlag)
+	if *anchorLiteralFlag != "" {
+		printAnchorNotes(wasmByMode)
+	}
 	fmt.Printf("inputs: %d matching, %d non-matching\n\n", len(matching), len(nonMatching))
 
 	if *detailed {
@@ -235,19 +257,51 @@ func classifierRegexp(pattern, mode string) (*regexp.Regexp, error) {
 // compilePattern compiles pattern as a standalone WASM module exporting
 // match_func or find_func (named after the mode) under the given LikelyMode.
 func compilePattern(pattern, mode string, likely compile.LikelyMode) ([]byte, error) {
-	re := config.PatternEntry{Regexp: pattern}
+	re := config.PatternEntry{Regexp: pattern, AnchorLiteral: *anchorLiteralFlag}
 	switch mode {
 	case "match":
 		re.MatchFunc = "match"
 	case "find":
 		re.FindFunc = "find"
 	}
-	opts := withMode(compile.CompileOptions{LikelyMode: likely, MaxDFAStates: *maxDFAStatesFlag})
+	rep := &compile.Reporter{}
+	opts := withMode(compile.CompileOptions{LikelyMode: likely, MaxDFAStates: *maxDFAStatesFlag, Report: rep})
 	wasm, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{re}, tableBase, true, 0, opts)
 	if err == nil {
 		searchSizesOf[string(wasm)] = searchblock.Of(sizes[re.FindFunc])
+		anchorNotes[string(wasm)] = anchorNote(rep)
 	}
 	return wasm, err
+}
+
+// anchorNote is the `anchor literal` note a compile wrote, "" for none.
+func anchorNote(rep *compile.Reporter) string {
+	for _, pr := range rep.Patterns {
+		for _, n := range pr.Notes {
+			if strings.HasPrefix(n, "anchor literal") {
+				return n
+			}
+		}
+	}
+	return ""
+}
+
+// printAnchorNotes prints what the compiler did with -anchor-literal: once
+// when every mode agrees, per mode otherwise, since a mode can build another
+// find.
+func printAnchorNotes(wasmByMode map[compile.LikelyMode][]byte) {
+	first := anchorNotes[string(wasmByMode[likelyModes[0]])]
+	same := true
+	for _, m := range likelyModes[1:] {
+		same = same && anchorNotes[string(wasmByMode[m])] == first
+	}
+	if same {
+		fmt.Println(first)
+		return
+	}
+	for i, m := range likelyModes {
+		fmt.Printf("%s: %s\n", likelyModeNames[i], anchorNotes[string(wasmByMode[m])])
+	}
 }
 
 // searchSizesOf is, per compiled module, what its find export's searches keep

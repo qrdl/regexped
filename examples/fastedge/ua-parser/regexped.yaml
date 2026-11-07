@@ -1,0 +1,100 @@
+# A User-Agent parser: browser and version, OS and version, device type, bot.
+#
+#   1. `classify` (scan_all): ONE pass over the User-Agent string answers which
+#      of the patterns below occur anywhere in it.
+#   2. The app takes, per category, the FIRST pattern that occurred, in the
+#      order written here. Order is priority: an Edge User-Agent also carries
+#      `Chrome/` and `Safari/`, an Android one carries `Linux`, so the more
+#      specific pattern comes first.
+#   3. For the winners, the pattern's own groups export pulls out the version
+#      (or a bot's name) through its named group.
+#
+# The app refers to the patterns by POSITION — a set member's id is its index
+# in `patterns:` — so the table in export_wasi_http_incoming_handler/ua.go
+# must follow this order.
+wasm_format:   component
+import_module: "uaparser"
+wasm_file:     "uaparser.wasm"
+output:        "ua-parser.wasm"
+stub_type:     wit
+stub_file:     "uaparser.wit"
+max_memory:    16MiB
+
+patterns:
+  # Browsers (ids 0-11)
+  - name: edge
+    regexp: 'Edg(?:e|A|iOS)?/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: edge_version
+  - name: opera
+    regexp: '(?:OPR|OPT)/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: opera_version
+  - name: samsung
+    regexp: 'SamsungBrowser/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: samsung_version
+  - name: yandex
+    regexp: 'YaBrowser/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: yandex_version
+  - name: vivaldi
+    regexp: 'Vivaldi/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: vivaldi_version
+  - name: ucbrowser
+    regexp: 'UCBrowser/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: uc_version
+  - name: duckduckgo
+    regexp: 'DuckDuckGo/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: duckduckgo_version
+  - name: firefox
+    regexp: '(?:Firefox|FxiOS)/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: firefox_version
+  - name: chrome
+    regexp: '(?:Chrome|CriOS)/(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: chrome_version
+  - name: safari
+    regexp: 'Version/(?<version>[0-9]+(?:\.[0-9]+)*)(?: Mobile/[0-9A-Za-z]+)? Safari/'
+    groups_func: safari_version
+  - name: ie
+    regexp: 'MSIE (?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: ie_version
+  - name: ie11
+    regexp: 'Trident/[0-9.]+;(?:[^)]*;)? rv:(?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: ie11_version
+
+  # Operating systems (ids 12-17)
+  - name: ios
+    regexp: '(?:iPhone|iPad|iPod)[^)]* OS (?<version>[0-9]+(?:_[0-9]+)*) like Mac OS X'
+    groups_func: ios_version
+  - name: android
+    regexp: 'Android (?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: android_version
+  - name: chromeos
+    regexp: 'CrOS [0-9A-Za-z_]+ (?<version>[0-9]+(?:\.[0-9]+)*)'
+    groups_func: chromeos_version
+  - name: windows
+    regexp: 'Windows NT (?<version>[0-9]+\.[0-9]+)'
+    groups_func: windows_version
+  - name: macos
+    regexp: 'Mac OS X (?<version>[0-9]+(?:[._][0-9]+)*)'
+    groups_func: macos_version
+  - name: linux
+    regexp: 'Linux'
+
+  # Device type (ids 18-19); an Android one with neither is a tablet
+  - name: tablet
+    regexp: 'iPad|Tablet|Kindle|Silk/'
+  - name: mobile
+    regexp: 'Mobi|iPhone|iPod'
+
+  # Bots (ids 20-22)
+  - name: crawler
+    regexp: '(?i)(?<name>googlebot|bingbot|duckduckbot|baiduspider|yandexbot|applebot|slurp|facebookexternalhit|twitterbot|linkedinbot|ahrefsbot|semrushbot|gptbot|claudebot|perplexitybot)(?:/(?<version>[0-9]+(?:\.[0-9]+)*))?'
+    groups_func: crawler_name
+  - name: tool
+    regexp: '^(?<name>curl|Wget|python-requests|Go-http-client|okhttp|PostmanRuntime|axios|node-fetch|HTTPie)/(?<version>[0-9][0-9A-Za-z.\-]*)'
+    groups_func: tool_name
+  - name: other_bot
+    regexp: '(?i)bot\b|crawler|spider|scrapy|headless'
+
+sets:
+  - name: classify
+    scan_all: classify
+    patterns: all

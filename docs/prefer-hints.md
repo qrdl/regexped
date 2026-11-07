@@ -236,3 +236,43 @@ otherwise invisible.
 `make example-lnm` and `make example-shufti` (from `tools/settest`) run
 pre-built demonstrations of a real `prefer-no-match` win — one with no
 literal frontend at all, one where the hint changes which frontend ships.
+
+## Choosing the anchor literal
+
+`anchor_literal:` is a different kind of hint: it names the literal a find
+scans for (see [`anchor_literal:`](cli.md#anchor_literal--which-literal-the-find-scans-for)
+in the CLI reference). Like the two above it never changes an answer, and like
+them it is a bet on your traffic: the compiler scans for the pattern's FIRST
+literal, and only you know whether a later one is rarer in your input.
+
+Measured on `https?://[^/ ]+/api/v1/[a-z]+` over two 3,695-byte lines of 120
+space-separated URLs (`tools/pattest/examples/anchor_literal_inputs.txt`),
+fuel:
+
+| input | scans for `http` (no hint) | `anchor_literal: '/api/v1/'` | Δ |
+|---|---|---|---|
+| no URL under `/api/v1/`, one call | 83,534 | 38,995 | −53.3% |
+| 28 of them under `/api/v1/`, the whole drive (29 calls) | 71,117 | 76,650 | +7.8% |
+
+The first row is the win: without the hint every URL is a candidate that pays a
+walk over its host before `/api/v1/` fails. The second is what the hint costs
+when the literal does occur: each hit walks back over the scheme and host, which
+the unhinted find walked forward. Both are bounded, and the hint also made this
+find provably linear (`compile --verbose`: `find: today — linear`, against
+`find: switch — not provably linear` without it).
+
+Measure it on your own inputs with `tools/pattest`, once without the hint and
+once with it:
+
+```bash
+cd tools/pattest
+make run ARGS="-pattern '<your pattern>' -mode find -inputs your_inputs.txt"
+make run ARGS="-pattern '<your pattern>' -mode find -inputs your_inputs.txt -anchor-literal '<literal>'"
+```
+
+The second run prints whether the compiler took the literal, or why not — a
+literal it cannot use leaves the module exactly as it is without the hint, so
+an unchanged number with "not taken" means the hint did nothing, not that it
+does not pay. `make example-anchor` runs the measurement above. pattest times
+one call per input, so on a matching line it shows the cost up to the first
+match, not a whole drive.

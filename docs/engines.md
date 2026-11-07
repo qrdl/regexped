@@ -186,7 +186,7 @@ on no-match text dense in those bytes is per call: 6 fuel above the unhinted
 build when the text starts with such a byte, 37 when it starts with another
 (one probe and one failed walk before the hand-off; `[a-zA-Z]{20,}`).
 
-**2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start.
+**2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start. A body reads the mandatory literal only when the pattern has no literal prefix of its own to scan for. A pattern's `anchor_literal:` makes the extraction walk past earlier literals to the named one, when that one starts at most 256 bytes into a match and only bounded parts come before it; otherwise the extraction keeps the literal it finds without the hint.
 
 Both mechanisms use WASM SIMD (simd128).
 
@@ -224,8 +224,31 @@ an English text (`\p{Han}+x`: 4.06 fuel/byte against 2.13).
 - a qualifying literal exists: length ≥ 2 and at most 8 alternates, or the
   one-byte case above; bytes in byte mode (0x80–0xFF under `byte_mode: true`),
   UTF-8 in Unicode mode
+- no line anchor in the part before the literal and no `(?m:^)` or `(?m:$)`
+  after it, unless that part is line-scoped: led by `^`, `\A` or `(?m:^)`,
+  with nothing after the lead in it that can match a newline or is another
+  line anchor
 - the reversed-prefix DFA has ≤ 256 states in byte mode
 - for non-anchored patterns: the reversed-prefix DFA start state does not accept the empty string
+- the split keeps match-start order (`litAnchorMissesLeftmost`, below)
+
+**Match-start order.** At each literal hit the backward walk returns ONE
+start, the earliest it reaches, and the find verifies from it. That is the
+leftmost match unless some match's prefix holds an EARLIER occurrence of the
+literal that the walk cannot start from: `x(?:a[a-z]*z|b)yy` over `xaxbyyzyy`
+walked back from the first `yy` to 2 and answered `[2,6)`, where the leftmost
+match `[0,9)` holds that `yy` inside its `[a-z]*`. Such a split is refused and
+the pattern takes the ordinary find instead. The check is
+exact for a prefix without assertions — a search over the prefix's DFA for a
+match `x·y` with a literal occurrence at `|x|`, `x` not a prefix match, and a
+proper suffix of `x` one — and for one with an assertion it asks only whether
+the prefix can hold the literal at all, unless the prefix is led by `\A` or
+by a `(?m:^)` nothing after can cross a newline past. A prefix of one fixed
+length is never refused: its starts follow its hits in order, which is also
+why set buckets and the alternation find, which both require one, are not
+affected. Over the RE2 corpus and every other pattern corpus in the
+repository the check refuses none of the 2,898 patterns that take this find;
+it refuses the shapes above, which answered a later match than Go before it.
 
 **Three-phase runtime execution:**
 
@@ -258,6 +281,30 @@ The SIMD scan in Phase 1 typically eliminates ≥ 99% of input positions before 
 ```
 [main LF DFA table] → [reversed-prefix DFA table] → [literal SIMD tables (firstByteFlags / Teddy T0 / Teddy T1)]
 ```
+
+**Choosing the literal: `anchor_literal:`.** The find splits at the pattern's
+FIRST top-level literal, which is often the common one —
+`https?://[^/ ]+/api/v1/[a-z]+` scans for `http`, which every URL carries. A
+pattern's `anchor_literal:` names a later one to split at instead
+([cli.md](cli.md#anchor_literal--which-literal-the-find-scans-for)). It is taken
+when it is two bytes or more and exactly one of the pattern's top-level
+literals — its literal set is that literal alone, so not part of a longer
+literal, not inside an alternation, an optional or repeated part, and not
+case-insensitive — and the split it gives passes the conditions above: the part
+before it cannot match the empty string and its reversed DFA builds within the
+limit, the pattern has no word boundary, no line anchor comes before the
+literal and no `(?m:^)` or `(?m:$)` after it (unless the part before it is
+line-scoped, as above),
+and the split keeps match-start order — a hint can name a literal the part
+before it can also hold. A one-byte hint is not taken; where the one-byte rule
+above already anchors the find on that byte, `--verbose` reports it taken,
+since the find scans for it. Otherwise the find splits where it would without the
+hint, and the module is the one an unhinted config compiles to. `compile
+--verbose` says which: `anchor literal "/api/v1/": taken — the literal-anchored
+find scans for it`, or `not taken — …` with the guard that refused it. On that
+pattern the hint costs −53.3% fuel on input with no `/api/v1/` URL and +7.8%
+on a drive over 28 matches — each hit walks back over the host
+([prefer-hints.md](prefer-hints.md#choosing-the-anchor-literal)).
 
 ### Which find a pattern gets: linear on every input
 

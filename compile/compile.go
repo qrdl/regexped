@@ -1590,6 +1590,18 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	if buildOpts.LikelyMode != LikelyNeutral {
 		buildOpts.report().Note("LikelyMode " + buildOpts.LikelyMode.String())
 	}
+	// `anchor_literal:` — the literal the find scans for (anchorHint). Only a
+	// find or groups export scans; a match-only entry carries it for a set,
+	// which reads it from the entry itself (analyzeSetMember). The extractors
+	// record their verdicts, and the note is written once every body is
+	// decided, which is when this function returns.
+	var hint *anchorHint
+	if needFind || needGroups {
+		hint = newAnchorHint(re.AnchorLiteral, rp.unicode())
+	}
+	if hint != nil {
+		defer func() { buildOpts.report().Note(hint.note()) }()
+	}
 
 	// Counted-chain SIMD verifier, default-on for every
 	// LikelyMode (promoted 2026-07-10 after a clean broad sweep).
@@ -2235,7 +2247,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			utf8Text:             rp.unicode(),
 		})
 	}
-	patMandLit := findMandatoryLit(rp)
+	patMandLit := findHintedMandatoryLit(rp, hint)
 	if patMandLit != nil {
 		buildOpts.report().Note("mandatory literal extracted")
 	}
@@ -2279,6 +2291,15 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		if dfaTooLarge {
 			// DFA too large — fall back to Backtracking find.
 			parts, err := buildBTFindParts(rp, table, patMandLit, cur, &buildOpts)
+			if hint != nil {
+				// It reads the mandatory literal failing a prefix of two
+				// bytes or more (buildBTFindParts' scan strategy).
+				var pre []byte
+				if table != nil {
+					pre = computePrefix(table)
+				}
+				hint.settle(len(pre) < 2, pre)
+			}
 			if tl := (*btTooLarge)(nil); errors.As(err, &tl) {
 				switch {
 				case dfaStateLimitExceeded || table.numStates > maxStates:
@@ -2313,6 +2334,16 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			dataMark, segMark := len(p.dataBytes), p.dataSegCount
 			// DFA find path: check for lit-anchor optimisation first.
 			lap := findLitAnchorPoint(re.Regexp, rp.unicode())
+			// An anchor_literal hint chooses the split; one no top-level part
+			// holds keeps today's, reported.
+			hintedLap := false
+			if hint.bytes() != nil {
+				if hlap, why := findHintedLitAnchorPoint(re.Regexp, rp.unicode(), hint.bytes()); hlap != nil {
+					lap, hintedLap = hlap, true
+				} else {
+					hint.litAnchor = why
+				}
+			}
 			// Reject prefixes containing `\b`/`\B` explicitly. The
 			// reversed-prefix DFA doesn't evaluate word boundaries backward,
 			// and the lit-anchor find body doesn't verify them at candidate
@@ -2335,17 +2366,40 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// premature, and the forward continuation is already newline-aware
 			// (its third step picks wasmMidStartNewline; the forward loop emits
 			// emitNLPreAcceptCheck). See lineAnchoredPrefixSafe.
-			lineAnchorOK := false
-			if lap != nil {
-				lineAnchorOK = (!table.hasNewlineBoundary && !prefixContainsLineAnchor(lap.prefixRe)) ||
-					lineAnchoredPrefixSafe(lap.prefixRe)
-			}
-			// Tables past 256 states (u16 ids) are taken in Unicode mode, where
-			// a lowered letter class alone makes them common: the e-mail-like
-			// `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}` has a 1,219-state forward
-			// DFA. Byte mode keeps the u8 tables it had.
-			if lap != nil && (l.useU8 || rp.unicode()) && !table.hasWordBoundary && lineAnchorOK &&
-				!prefixContainsWordBoundary(lap.prefixRe) {
+			// buildLitAnchor builds the literal-anchored find over lap into p,
+			// and answers "" when it did, else why not — which only an
+			// anchor_literal hint reports. A refusal changes nothing, so a refused
+			// hinted split can be followed by today's.
+			buildLitAnchor := func(lap *litAnchorPoint) string {
+				// Each guard answers its own reason, so a note cannot name a
+				// different guard from the one that refused.
+				if lap == nil {
+					return hintNotALiteral
+				}
+				// Tables past 256 states (u16 ids) are taken in Unicode mode, where
+				// a lowered letter class alone makes them common: the e-mail-like
+				// `[\pL\pN._%+-]+@[\pL\pN-]+\.\pL{2,}` has a 1,219-state forward
+				// DFA. Byte mode keeps the u8 tables it had.
+				if !l.useU8 && !rp.unicode() {
+					return "the pattern's DFA has more than 256 states"
+				}
+				if table.hasWordBoundary || prefixContainsWordBoundary(lap.prefixRe) {
+					return "the pattern has a word boundary (\\b or \\B)"
+				}
+				if !lineAnchoredPrefixSafe(lap.prefixRe) {
+					if prefixContainsLineAnchor(lap.prefixRe) {
+						return "a line anchor comes before it"
+					}
+					if table.hasNewlineBoundary {
+						return "a multi-line anchor, (?m:^) or (?m:$), comes after it"
+					}
+				}
+				// A split that passes every other guard must also keep
+				// match-start order, or the find answers a later match than
+				// the leftmost one (litAnchorMissesLeftmost).
+				if litAnchorMissesLeftmost(rp, lap) {
+					return litAnchorOrderReason
+				}
 				// Compile the reversed prefix DFA for the backward scan.
 				revProg, revCompErr := compileProg(rp.tree(lap.prefixRe).reversed())
 				if revCompErr == nil && !revProg.refusedByByteGate() {
@@ -2482,8 +2536,32 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 						// segment sits at or above revL.tableEnd (litFirstByteOff is
 						// exactly revL.tableEnd), so the reverse DFA is covered too.
 						p.tableEnd = litSegs.end
+						return ""
 					}
+					if !revOk || (revTable.numStates+1 > 256 && !rp.unicode()) {
+						return "the backward DFA over the part before it is too large"
+					}
+					if lap.prefixRe.Op == syntax.OpEmptyMatch {
+						return "it begins the pattern"
+					}
+					return "the part before it can match the empty string"
 				}
+				return "the part before it cannot be compiled reversed"
+			}
+			if why := buildLitAnchor(lap); hintedLap && why != "" {
+				hint.litAnchor = why
+				lap = findLitAnchorPoint(re.Regexp, rp.unicode())
+				buildLitAnchor(lap)
+			} else if hintedLap {
+				hint.litAnchor = hintTaken
+			}
+			// A hint the hinted split could not take can still be the one
+			// literal today's split scans for — a one-byte hint the pattern's
+			// own one-byte rule picks (`[\w.]+@[\w.]+` hinted `@`) — and the
+			// note must say the find scans for it.
+			if h := hint.bytes(); h != nil && p.litAnchorBackScanBody != nil &&
+				len(p.litAnchorLitSet) == 1 && string(p.litAnchorLitSet[0]) == string(h) {
+				hint.litAnchor = hintTaken
 			}
 
 			// Alternation lit-anchor — only tried
@@ -2551,6 +2629,15 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				}
 			}
 			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
+			if p.startAnywhere && hint != nil && hint.litAnchor == hintTaken {
+				hint.litAnchor = "the find is the start-anywhere search, which scans for no literal"
+			}
+			// Only today's DFA find body reads the mandatory literal, and only
+			// with no literal prefix to scan for (buildFindBody's
+			// useMandatoryLit).
+			if !p.startAnywhere && p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil && !isAnchoredFind(table) {
+				hint.settle(len(l.prefix) == 0, l.prefix)
+			}
 			if !p.startAnywhere {
 				// Dominant-self-loop SIMD bulk-skip. Default-on for all
 				// modes, mid-accept and non-mid-accept alike (2026-07-05).

@@ -236,7 +236,20 @@ regexped/
 │   │                          #   oneByteInnerLiteral) — (wideLeadingRepeat: the shapes otherwise sent to
 │   │                          #   start-anywhere for want of a literal), and such a find always takes
 │   │                          #   the switch, charging EVERY failed candidate walk + 40
-│   │                          #   (emitFindSwitchChargeEvery). u16 tables in Unicode mode only
+│   │                          #   (emitFindSwitchChargeEvery). u16 tables in Unicode mode only.
+│   │                          #   anchorHint: a pattern's `anchor_literal:` — the split at the top-level
+│   │                          #   child whose literal set IS the hint (findHintedLitAnchorPoint), the
+│   │                          #   mandatory literal past earlier ones (findHintedMandatoryLit); a guard
+│   │                          #   or a set packer that refuses it gets today's literal, and one verbose
+│   │                          #   note says what the find's body scans for. −53% fuel, no-match URLs.
+│   │                          #   litAnchorMissesLeftmost: EVERY split (hinted or not) is refused when a
+│   │                          #   match's prefix can hold an earlier literal occurrence the backward walk
+│   │                          #   cannot start from — the walk returns ONE start per hit, the earliest it
+│   │                          #   reaches, so `x(?:a[a-z]*z|b)yy` over "xaxbyyzyy" answered [2,6) not
+│   │                          #   [0,9). Exact by a search over (prefix-DFA state of x, states of x's
+│   │                          #   proper suffixes); conservative (can the prefix hold the literal) with
+│   │                          #   an assertion. Refuses none of the 2,898 corpus patterns with this find;
+│   │                          #   the conservative check ALONE refused 87 (email-domain-find +5,132%)
 │   ├── prefix_scan.go         # Shared SIMD prefix scan (EmitPrefixScan). A Unicode-mode literal that
 │   │                          #   begins with a non-ASCII character is checked a whole character at a
 │   │                          #   time on a first-byte hit (UTF8Text / charProbe). emitShuftiMask, the
@@ -760,7 +773,8 @@ regexped/
 │   └── prefer-hints.md        # THE hints doc: the `hints:` values prefer-match /
 │                              #   prefer-no-match, which pattern and SET shapes each one
 │                              #   actually changes, and how to measure whether it helps
-│                              #   YOUR traffic before shipping it
+│                              #   YOUR traffic before shipping it; also "Choosing the
+│                              #   anchor literal" (`anchor_literal:`, measured)
 └── examples/
     ├── Makefile
     ├── browser/               # Two browser demos, served together by `make run`:
@@ -775,6 +789,9 @@ regexped/
     │   ├── url-guard/         # FastEdge: OWASP URL attack detection
     │   ├── script-detect/     # FastEdge wasi:http component: scripts by letters, narrowed to the
     │   │                      #   European alphabets they fit (Unicode sets)
+    │   ├── ua-parser/         # FastEdge wasi:http component in GO (componentize-go, Go 1.27.1+):
+    │   │                      #   User-Agent → browser/OS/device/bot; NO regexped Go stub — the app
+    │   │                      #   calls bindings componentize-go generates from the component's .wit
     │   └── secret-redact/     # FastEdge JS app (FastEdge JS SDK `--component`): masks secrets in
     │                          #   origin responses with one set `find`; tested under fastedge-run
     └── wasmtime/
@@ -868,6 +885,12 @@ patterns:                            # optional when every regexp lives in a set
     match_func:        "url_match"         # anchored match → Result<Option<usize>> / number|null (JS)
     find_func:         "url_find"          # non-anchored find → FindIter / generator (JS)
     groups_func:       "url_groups"        # captures, searched from an offset (not anchored) → GroupsIter / generator (JS)
+    anchor_literal:    "/api/v1/"          # optional; the top-level literal the find scans for instead of
+                                           #   the first one (compile/lit_anchor.go anchorHint): taken by the
+                                           #   literal-anchored find and the mandatory literal (a set's bucket
+                                           #   literal), or reported by --verbose and not taken — the module is
+                                           #   then the unhinted one. Load error with no find/groups, and in
+                                           #   no set with find/scan_any/scan_all (match_any/match_all scan nothing)
     byte_mode:         false               # optional; runes 0x80-0xFF mean those BYTES
  # `named_groups_func:` is RETIRED and is a load error. It was
     # never a separate capability — both stubs called the SAME WASM export — so
@@ -1340,8 +1363,8 @@ It compares ANSWERS rather than global indices, because a wrong renumbering by
 make byteident   # from repo root
 ```
 
-Forty-two single-pattern configs, one per code path (the `unicode_` ones in
-Unicode mode), plus twenty-six SET configs spanning four frontends, both
+Forty-six single-pattern configs, one per code path (the `unicode_` ones in
+Unicode mode), plus thirty-one SET configs spanning four frontends, both
 accept representations, all five capabilities and Unicode mode — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is
@@ -1493,6 +1516,9 @@ measurement) and average wall-clock time (100,000 iterations) per mode per bucke
 this for quick, targeted investigation of a specific pattern shape rather than
 `likelytest`'s fixed curated set. `make example-lm` / `make example-lnm` /
 `make example-combined` run pre-built demonstration patterns.
+
+`-anchor-literal <lit>` sets the pattern's `anchor_literal:` for every compile of the run and
+prints whether it was taken; the effect is two runs, with and without it (`make example-anchor`).
 
 ### Single-set ad-hoc hint benchmarking (`tools/settest/`)
 
@@ -1838,7 +1864,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 
 **Last Updated:** 2026-10-19
 **CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
-**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs), `docs/references.md` (pattern references)
+**Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints and `anchor_literal:`), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs), `docs/references.md` (pattern references)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 
 **Set literal frontends:** packed-pair (<=16 literals with a narrow two-column probe window; two v128 loads + i8x16.eq per 32-byte block), Teddy (<=64 literals, nibble tables), Aho-Corasick (>16 literals, low first-byte diversity — in Unicode mode, first CHARACTERS; when every literal begins with a non-ASCII character — or, in byte mode, a `byte_mode` byte 0xC2-0xF4 — its root prefilter probes two byte columns, not the lead byte, and verifies a hit against the literals sharing its most varied byte before the trie walk, jumping straight to the literal's node), Shufti (SIMD first-byte prefilter over the scalar body; reachable ONLY from the scalar branch, i.e. after AC declines over its 512 KB budget — first-byte union 17..64, or up to 128 under set-level `prefer-no-match`), scalar. The crossovers between them were re-measured on a match-dense corpus in 2026-08-31 and did NOT move: the chooser picks the winning frontend in all 20 rows of both corpora, so none of them is hint-conditional. `CompileSetOptions.WithForcedFrontend` + `setperf -force-frontend` are the test-only knobs that ask the question again.

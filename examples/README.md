@@ -12,7 +12,8 @@ one unchanged source — and the component kind by two different routes
 FastEdge runs two kinds of application. A **CDN app** is a proxy-wasm filter on
 traffic passing through the CDN, built as a core module: `fastedge/validate`
 and `fastedge/url-guard`. An **HTTP app** answers requests itself and is a
-`wasi:http` component built for wasip2: `fastedge/script-detect` in Rust, and
+`wasi:http` component built for wasip2: `fastedge/script-detect` in Rust,
+`fastedge/ua-parser` in Go, built with componentize-go, and
 `fastedge/secret-redact` in JavaScript, built with the FastEdge JS SDK.
 
 Two examples have patterns that compile in **Unicode mode** — script classes
@@ -32,6 +33,7 @@ time and case-folded across Unicode: `fastedge/script-detect` and
 | Email, URL, XSS validation | FastEdge CDN app (proxy-wasm) | Rust | individual | module (wasip1) | [fastedge/validate](fastedge/validate) |
 | URL guard | FastEdge CDN app (proxy-wasm) | Rust | set | module (wasip1) | [fastedge/url-guard](fastedge/url-guard) |
 | Script detection by letters, narrowed to the alphabets that fit | FastEdge HTTP app (wasi:http) | Rust | 3 sets, **Unicode** | **component 🧩** (wasip2) | [fastedge/script-detect](fastedge/script-detect) |
+| User-Agent parsing: browser, OS, device, bot | FastEdge HTTP app (wasi:http, componentize-go) | Go | set + individual | **component 🧩** (wasip2) | [fastedge/ua-parser](fastedge/ua-parser) |
 | Secret masking in origin responses | FastEdge HTTP app (wasi:http, FastEdge JS SDK) | JavaScript | set | **component 🧩** (wasip2) | [fastedge/secret-redact](fastedge/secret-redact) |
 | Email and URL validation | Browser | JavaScript | individual | module | [browser/validate](browser/validate) |
 | Homoglyph and hidden-character detection | Browser | JavaScript | set, **Unicode** | module | [browser/homoglyph](browser/homoglyph) |
@@ -45,9 +47,9 @@ In any example directory, `make` builds the example and `make run` builds it if
 needed and runs it. An example with several build routes builds and runs its
 default route that way, and gives the other routes their own targets. `workers`,
 `fastedge/validate` and `fastedge/url-guard` have nothing to run locally, so
-their `make run` only says why; `fastedge/script-detect` is a `wasi:http`
-component, which `wasmtime serve` runs, so its `make run` serves it on port 8080
-for the length of a few requests; `fastedge/secret-redact` imports FastEdge
+their `make run` only says why; `fastedge/script-detect` and
+`fastedge/ua-parser` are `wasi:http` components, which `wasmtime serve` runs, so
+their `make run` serves them on port 8080 for the length of a few requests; `fastedge/secret-redact` imports FastEdge
 interfaces `wasmtime serve` does not provide, so its `make run` runs it under
 FastEdge's own runtime, in front of a local origin, and needs `npm install` in
 its directory first — as its `make` does, for the SDK.
@@ -93,6 +95,12 @@ module-format version by the module name and one comment: switching
 `wasm_format` does not change calling code. `stub_type: rust` and `wit` are the
 component stub types; see [../docs/component.md](../docs/component.md) for what
 each `stub_type` does under `component`.
+
+`fastedge/ua-parser` 🧩 consumes a component from **Go**, with no regexped
+stub: componentize-go generates Go bindings from the `.wit` regexped writes,
+and the app calls them directly, with WIT's types — a `witTypes.Result` per
+call, capture groups and set members by position. `regexped merge` composes
+the two, as for Rust. See [../docs/go-api.md](../docs/go-api.md).
 
 `fastedge/secret-redact` 🧩 consumes a component from **JavaScript**, with no
 stub: the FastEdge JS SDK's `fastedge-build --component` reads the interface
