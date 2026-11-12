@@ -3220,9 +3220,24 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		// without consuming further bytes (any-position accept, or an
 		// EOF/anchor accept — either way, requiring a further live
 		// transition out of gs is unsound: the true match may be shorter
-		// than the tier being built)..
+		// than the tier being built).
+		//
+		// That includes an accept the NEXT byte decides — \b/\B (the NW/W
+		// channels) and (?m:$) (the NL channel). The byte such an accept
+		// looks at lies outside the match, so a tier that demanded one more
+		// live byte there dropped the candidate once the SIMD loop ran (17+
+		// bytes): `[ab]+\B` over "ab" + 17 x's found nothing, Go [0,2), and
+		// in Unicode mode `[а-я]{1,3}\b` over "ж" + 17 x's. No failure
+		// through the NL channel was found (`[ab]+(?m:$)` over "a\n" + 17
+		// x's is right without it); it is here because the rule is the same.
 		stateCanAcceptHere := func(gs int) bool {
-			return t.midAcceptStates[gs] != 0 || t.acceptStates[gs] != 0
+			if t.midAcceptStates[gs] != 0 || t.acceptStates[gs] != 0 {
+				return true
+			}
+			if t.hasWordBoundary && (t.midAcceptNWStates[gs] != 0 || t.midAcceptWStates[gs] != 0) {
+				return true
+			}
+			return t.hasNewlineBoundary && t.midAcceptNLStates[gs] != 0
 		}
 		if len(l.firstBytes) <= 8 {
 			l.teddyLoOff = l.firstByteOff + 256
@@ -6189,18 +6204,10 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 		b = appendTableLoad8u(b, tableMemIdx)
 		b = append(b, 0x22, lByteClass) // local.tee lByteClass (reused as tmp)
 		b = append(b, 0x04, 0x40)       // if (midAccept != 0)
-		for _, info := range l.dominantStates {
-			if !info.isMidAccept {
-				continue
-			}
-			b = append(b, 0x20, lByteClass)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(info.encodedByte))
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (encoded byte match)
+		b = emitMidDominantDispatch(b, lByteClass, l.dominantStates, func(b []byte, info dominantInfo, extraDepth int) []byte {
 			// Nesting here is block $done / loop $main / if midAccept!=0 /
-			// if encoded-match, so $done is br depth 3.
-			b = emitDominantLivenessGuard(b, info, 3)
+			// the dispatch, so $done is br depth 3 + extraDepth.
+			b = emitDominantLivenessGuard(b, info, byte(3+extraDepth))
 			b = emitDominantBulkSkip(b, info, false,
 				lScanPos, paramLen, 0x00, paramPtr,
 				lBulkChunk, lByteClass, lUTF8Err)
@@ -6216,8 +6223,8 @@ func buildSetSuffixBody(p setSuffixParams) []byte {
 				b = append(b, 0x20, lScanPos, 0x41, 0x01, 0x6A, 0x21, endPosK(k)) // endPos_k = scanPos+1
 				b = append(b, 0x0B)
 			}
-			b = append(b, 0x0B) // end if encoded byte match
-		}
+			return b
+		})
 		b = append(b, 0x0B) // end if midAccept != 0
 
 		// Non-mid-accept dominant dispatch, default-on for every LikelyMode
@@ -7260,6 +7267,71 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 	return b
 }
 
+// emitMidDominantDispatch emits the mid-accept dominant dispatch: ONE br_table
+// on valLocal — the cached midAcceptBytes[state] — to the code of the
+// mid-accept dominant whose encoding it holds, or past them all. Non-mid
+// entries of dominants are ignored. body emits a dominant's code; extraDepth is
+// how many labels the dispatch puts around it beyond the one an `if` would, for
+// a body that branches to an enclosing label.
+//
+// It must run AT MOST ONE skip. The skips take valLocal as scratch and leave
+// their 16-lane stop mask in it, and a mask is a small integer like the
+// encodings (2..253), so the independent `if val == enc_k` tests this replaced
+// ran a later dominant's skip whenever the first one's mask equalled that
+// dominant's encoding — from where the first stopped, the walk still in the
+// first state, striding over the byte that should have left it:
+// `[^ ]+(?: [^\n]*)?` over "a  \n" + 13 z's found [0,17), Go [0,3). The
+// br_table reads val once, before any skip runs. It was measured the cheapest
+// exclusive form in fuel — url-parse groups 3,559 against 3,659 for an
+// if/else-if chain and 3,755 for tests on the state local — for a table of
+// max-encoding + 1 entries, ~250 bytes once a Shufti-encoded dominant is in it.
+func emitMidDominantDispatch(b []byte, valLocal byte, dominants []dominantInfo,
+	body func(b []byte, info dominantInfo, extraDepth int) []byte) []byte {
+	var mid []dominantInfo
+	maxEnc := 0
+	for _, info := range dominants {
+		if info.isMidAccept {
+			mid = append(mid, info)
+			maxEnc = max(maxEnc, int(info.encodedByte))
+		}
+	}
+	n := len(mid)
+	if n == 0 {
+		return b
+	}
+	// block $end around n nested blocks, the innermost holding the br_table.
+	// Label k, counted out from the br_table, ends block k, after which
+	// mid[k]'s code runs; label n is $end.
+	b = append(b, 0x02, 0x40) // block $end
+	for range mid {
+		b = append(b, 0x02, 0x40) // block
+	}
+	b = append(b, 0x20, valLocal, 0x0E) // local.get val; br_table
+	b = utils.AppendULEB128(b, uint32(maxEnc+1))
+	for v := 0; v <= maxEnc; v++ {
+		target := n
+		for k, info := range mid {
+			if int(info.encodedByte) == v {
+				target = k
+				break
+			}
+		}
+		b = utils.AppendULEB128(b, uint32(target))
+	}
+	b = utils.AppendULEB128(b, uint32(n)) // default: no dominant -> $end
+	for k, info := range mid {
+		b = append(b, 0x0B) // end block k
+		// Enclosing now: blocks k+1..n-1 and $end, n-k labels where an `if`
+		// would be one.
+		b = body(b, info, n-k-1)
+		if k < n-1 {
+			b = append(b, 0x0C)
+			b = utils.AppendULEB128(b, uint32(n-k-1)) // br $end
+		}
+	}
+	return append(b, 0x0B) // end $end
+}
+
 // emitFindMidAcceptDispatch emits the find-scan-loop midAccept block shared
 // by buildFindBody's u8 paths: the last_accept update plus both dominant
 // dispatch channels, all fed by ONE midAcceptBytes[state] load:
@@ -7268,7 +7340,7 @@ func emitNonMidValDispatch(b []byte, nonMid []dominantInfo,
 //	if val != 0:
 //	  if val < 254:                  ; only when non-mid values are in the table
 //	    last_accept = pos + 1
-//	    [mid dominant dispatch — per-entry val==enc compares]
+//	    [mid dominant dispatch — one br_table on val, emitMidDominantDispatch]
 //	  else:                          ; val is a reserved 254+ non-mid encoding
 //	    [non-mid dispatch — emitNonMidValDispatch + hysteresis; NO last_accept]
 //
@@ -7309,18 +7381,11 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 		return nc.emitAcceptHook(b, stateLocal)
 	}
 	emitMidChain := func(b []byte) []byte {
-		for _, info := range mid {
-			b = append(b, 0x20, valLocal)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(info.encodedByte))
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, true,
+		return emitMidDominantDispatch(b, valLocal, mid, func(b []byte, info dominantInfo, _ int) []byte {
+			return emitDominantBulkSkip(b, info, true,
 				posLocal, lenLocal, lastAcceptLocal, ptrLocal,
 				chunkLocal, valLocal, errLocal)
-			b = append(b, 0x0B) // end if (per-dominant gate)
-		}
-		return b
+		})
 	}
 
 	// A sole mid-accept dominant that is the only nonzero value in the table
@@ -7388,7 +7453,7 @@ func emitFindMidAcceptDispatch(b []byte, dominantStates []dominantInfo,
 //
 //	val = midAcceptBytes[state]
 //	if val != 0:
-//	  if val < 254:  [mid dispatch — per-entry val==enc compares]
+//	  if val < 254:  [mid dispatch — one br_table on val, emitMidDominantDispatch]
 //	  else:          [non-mid dispatch — emitNonMidValDispatch + hysteresis]
 //
 // The val < 254 split exists only when both channels are present; with a
@@ -7455,18 +7520,11 @@ func emitMatchBulkSkipDispatch(b []byte, dominantStates []dominantInfo,
 	}
 	errLocal := matchUTF8ErrLocal(dominantStates)
 	emitMidChain := func(b []byte) []byte {
-		for _, info := range mid {
-			b = append(b, 0x20, tmpLocal)
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, int32(info.encodedByte))
-			b = append(b, 0x46)       // i32.eq
-			b = append(b, 0x04, 0x40) // if (void)
-			b = emitDominantBulkSkip(b, info, false,
+		return emitMidDominantDispatch(b, tmpLocal, mid, func(b []byte, info dominantInfo, _ int) []byte {
+			return emitDominantBulkSkip(b, info, false,
 				posLocal, lenLocal /*lastAccept=*/, 0x00, ptrLocal,
 				chunkLocal, tmpLocal, errLocal)
-			b = append(b, 0x0B) // end if (per-dominant gate)
-		}
-		return b
+		})
 	}
 	// A sole mid-accept dominant that is the only nonzero value in the table
 	// identifies itself by being nonzero — no cached value, no compare. See
@@ -10210,20 +10268,11 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			b = mnc.emitAcceptHook(b, locState)
 		}
 		if hasMidDom {
-			for _, info := range l.dominantStates {
-				if !info.isMidAccept {
-					continue
-				}
-				b = append(b, 0x20, locSimdOrClass)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(info.encodedByte))
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, true,
+			b = emitMidDominantDispatch(b, locSimdOrClass, l.dominantStates, func(b []byte, info dominantInfo, _ int) []byte {
+				return emitDominantBulkSkip(b, info, true,
 					locPos, locLen, locLastAccept, locPtr,
 					locChunk, locSimdOrClass, locUTF8Err)
-				b = append(b, 0x0B) // end if (per-dominant gate)
-			}
+			})
 		}
 		b = append(b, 0x0B) // end if midAccept
 		if hasNonMidDom {
@@ -10546,20 +10595,11 @@ func buildAltLitAnchorForwardVerifyBodyNotes(t *dfaTable, l *dfaLayout, tableMem
 		b = append(b, 0x21, locLastAccept)
 		b = mnc.emitAcceptHook(b, locState)
 		if hasMidDom {
-			for _, info := range l.dominantStates {
-				if !info.isMidAccept {
-					continue
-				}
-				b = append(b, 0x20, locSimdOrClass)
-				b = append(b, 0x41)
-				b = utils.AppendSLEB128(b, int32(info.encodedByte))
-				b = append(b, 0x46)       // i32.eq
-				b = append(b, 0x04, 0x40) // if (void)
-				b = emitDominantBulkSkip(b, info, true,
+			b = emitMidDominantDispatch(b, locSimdOrClass, l.dominantStates, func(b []byte, info dominantInfo, _ int) []byte {
+				return emitDominantBulkSkip(b, info, true,
 					locPos, locLen, locLastAccept, locPtr,
 					locChunk, locSimdOrClass, locUTF8Err)
-				b = append(b, 0x0B) // end if (per-dominant gate)
-			}
+			})
 		}
 		b = append(b, 0x0B) // end if midAccept
 		if hasNonMidDom {
