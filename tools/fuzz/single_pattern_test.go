@@ -685,12 +685,9 @@ func compileFindShape(name, pat string) ([]byte, error) {
 // searches keep.
 func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error) {
 	if lit, ok := findFromAnchorLit[name]; ok {
-		return cachedCompileSized("findhint\x00"+lit+"\x00"+pat, func() ([]byte, []searchblock.Size, error) {
-			entry := config.PatternEntry{Regexp: pat, FindFunc: "find", AnchorLiteral: lit}
-			w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{entry}, pathsTableBase, true, 0,
-				withMode(compile.CompileOptions{}))
-			return w, searchblock.Of(sizes["find"]), err
-		})
+		return cachedCompileSized("findhint\x00"+lit+"\x00"+pat, compileJob{Kind: jobSized,
+			Entries: []config.PatternEntry{{Regexp: pat, FindFunc: "find", AnchorLiteral: lit}}, Base: pathsTableBase,
+			Opts: toJobOpts(withMode(compile.CompileOptions{})), Export: "find"})
 	}
 	if findFromLNM[name] {
 		return compileFindOpts("findlnm\x00"+pat, pat, pathsTableBase,

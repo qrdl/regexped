@@ -1,10 +1,14 @@
 package fuzz
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"sync"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
@@ -68,20 +72,9 @@ func overlapCacheFor(input string, pats []string) (length, stride int32) {
 // learned once per pattern list: it recompiles the set, and a test driving one
 // set many times sized every drive by recompiling it again.
 func cachedOverlapShape(pats []string) (compile.OverlapCacheShape, error) {
-	key := setKey(pats)
-	if v, ok := overlapShapeMemo.Load(key); ok {
-		return v.(compile.OverlapCacheShape), nil
-	}
 	cfg := overlapSizingCfg(pats)
-	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
-	if err != nil {
-		return sh, err
-	}
-	overlapShapeMemo.Store(key, sh)
-	return sh, nil
+	return cachedShape("sizing\x00"+setKey(pats), cfg.Sets[0], cfg)
 }
-
-var overlapShapeMemo sync.Map
 
 // overlapCacheForK sizes a region for a CHOSEN stride rather than the formula's.
 //
@@ -174,15 +167,8 @@ func compileCacheDriveSet(pats []string, batch bool, sweepBudget int64) ([]byte,
 	if batch {
 		set.Hints = []string{"batch-find"}
 	}
-	return cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", batch, sweepBudget, setKey(pats)), func() ([]byte, error) {
-		cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}
-		if sweepBudget > 0 {
-			w, _, _, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{}.WithSweepBudget(sweepBudget))
-			return w, err
-		}
-		w, _, err := compile.CompileFile(cfg, "")
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", batch, sweepBudget, setKey(pats)), compileJob{
+		Kind: jobFile, Config: config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}, SweepBudget: sweepBudget})
 }
 
 func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *cacheDrive {
@@ -322,5 +308,235 @@ func TestSetCacheReturnsThePatternsOwnModule(t *testing.T) {
 	if string(first) == string(second) {
 		t.Fatal(`compileCaps([" ", ""]) and compileCaps(["", " "]) returned the same module: ` +
 			`the cache key does not separate them, so one set is answering with the other's pattern ids`)
+	}
+}
+
+// TestCompileChildMatchesInProcess runs every kind of compile job both ways —
+// in this process (compileJob.run) and through the compile child — and
+// requires the same result: the module's bytes, the search blocks, the drops,
+// the engine, the shape, and an error with the same message that matches the
+// same compile sentinels. A field the job did not carry across the pipe would
+// make the child compile a different module, which every budgeted fuzz input
+// would then test instead of the one it asked for.
+func TestCompileChildMatchesInProcess(t *testing.T) {
+	byteOpts := toJobOpts(compile.CompileOptions{ForceByteMode: true})
+	uniOpts := toJobOpts(compile.CompileOptions{Unicode: true})
+	f, tr := false, true
+	set := func(uni *bool, overlapping bool, hints ...string) config.BuildConfig {
+		return config.BuildConfig{
+			Patterns: []config.PatternEntry{{Name: "p0", Regexp: `foo\w+`}, {Name: "p1", Regexp: `a[a-z]*?z`}},
+			Sets: []config.SetConfig{{Name: "s", Find: "set_find", Overlapping: overlapping, Hints: hints,
+				Patterns: config.PatternSelector{All: true}, Unicode: uni}},
+		}
+	}
+	shapeCfg := set(&f, true)
+	for _, c := range []struct {
+		name string
+		j    compileJob
+		is   error // the sentinel the compile fails with, nil when it succeeds
+	}{
+		{"sized/find with notes", compileJob{Kind: jobSized, Entries: []config.PatternEntry{{Regexp: `a*b|a`, FindFunc: "find"}},
+			Base: tableBase, Opts: byteOpts, Export: "find"}, nil},
+		{"sized/unicode", compileJob{Kind: jobSized, Entries: []config.PatternEntry{{Regexp: `\pL+x`, FindFunc: "find"}},
+			Base: pathsTableBase, Opts: uniOpts, Export: "find"}, nil},
+		{"compile/match", compileJob{Kind: jobCompile, Entries: []config.PatternEntry{{Regexp: `ab+c`, MatchFunc: "match"}},
+			Base: pathsTableBase, Opts: byteOpts}, nil},
+		{"compile/no options", compileJob{Kind: jobCompile,
+			Entries: []config.PatternEntry{{Regexp: `[\x80-\xff]+`, FindFunc: "find", ByteMode: true}}, Base: tableBase, NoOpts: true}, nil},
+		{"compile/no capture group", compileJob{Kind: jobCompile, Entries: []config.PatternEntry{{Regexp: `a*`, GroupsFunc: "groups"}},
+			Base: pathsTableBase, Opts: byteOpts}, compile.ErrNoCaptureGroup},
+		{"forced/tdfa", compileJob{Kind: jobForced, Entries: []config.PatternEntry{{Regexp: `(a)(b+)`, GroupsFunc: "groups"}},
+			Base: pathsTableBase, Engine: compile.EngineTDFA, Opts: byteOpts}, nil},
+		{"forced/fallback only", compileJob{Kind: jobForced, Entries: []config.PatternEntry{{Regexp: `(a|ab)(c|bcd)(d*)`, GroupsFunc: "groups"}},
+			Base: pathsTableBase, Engine: compile.EngineBacktrack,
+			Opts: toJobOpts(compile.CompileOptions{ForceByteMode: true, BTWorkBudget: compile.BTWorkBudgetForceFallback})}, nil},
+		{"forced/over the instruction limit", compileJob{Kind: jobForced, Entries: []config.PatternEntry{{Regexp: `(a+b+c+d+e+)`, GroupsFunc: "groups"}},
+			Base: pathsTableBase, Engine: compile.EngineBacktrack, Opts: toJobOpts(compile.CompileOptions{ForceByteMode: true, MaxDFAStates: -1, MaxBTInstructions: 3})},
+			compile.ErrBTProgramTooLarge},
+		{"file/byte mode", compileJob{Kind: jobFile, Config: set(&f, false)}, nil},
+		{"file/sweep budget", compileJob{Kind: jobFile, Config: set(&tr, true, "batch-find"), SweepBudget: 64}, nil},
+		{"file diag", compileJob{Kind: jobFileDiag, Config: set(&f, true)}, nil},
+		{"select", compileJob{Kind: jobSelect, Pattern: `(a|ab)(c|bcd)(d*)`, Opts: uniOpts}, nil},
+		{"shape", compileJob{Kind: jobShape, Set: shapeCfg.Sets[0], Config: shapeCfg}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			want, wantErr := c.j.run()
+			if c.is == nil && wantErr != nil || c.is != nil && !errors.Is(wantErr, c.is) {
+				t.Fatalf("in-process: %v, want %v", wantErr, c.is)
+			}
+			got, gotErr := childRun(c.j, time.Minute)
+			if (wantErr == nil) != (gotErr == nil) || wantErr != nil && wantErr.Error() != gotErr.Error() {
+				t.Fatalf("error: in-process %v, child %v", wantErr, gotErr)
+			}
+			for _, s := range compileSentinels {
+				if errors.Is(wantErr, s) != errors.Is(gotErr, s) {
+					t.Errorf("errors.Is(%v): in-process %v, child %v", s, errors.Is(wantErr, s), errors.Is(gotErr, s))
+				}
+			}
+			if !bytes.Equal(want.Wasm, got.Wasm) {
+				t.Errorf("module: in-process %d bytes, child %d bytes, not equal", len(want.Wasm), len(got.Wasm))
+			}
+			if !reflect.DeepEqual(want.Sizes, got.Sizes) || !reflect.DeepEqual(want.drops(), got.drops()) ||
+				want.Engine != got.Engine || want.Shape != got.Shape {
+				t.Errorf("in-process %+v %+v %v %+v, child %+v %+v %v %+v",
+					want.Sizes, want.drops(), want.Engine, want.Shape, got.Sizes, got.drops(), got.Engine, got.Shape)
+			}
+		})
+	}
+}
+
+// TestCompileChildBuildsTheModule: the wasmtime build the child returns
+// serialized loads in this process and answers as a module built here does,
+// for a compile job (Warm) and for a module alone (jobWarm).
+func TestCompileChildBuildsTheModule(t *testing.T) {
+	j := compileJob{Kind: jobSized, Entries: []config.PatternEntry{{Regexp: `[a-z]+@[a-z]+\.com`, FindFunc: "find"}},
+		Base: tableBase, Opts: toJobOpts(compile.CompileOptions{ForceByteMode: true}), Export: "find", Warm: true}
+	r, err := childRun(j, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := childRun(compileJob{Kind: jobWarm, Wasm: r.Wasm, Warm: true}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Wasm != nil {
+		t.Error("a warm job sent the module's bytes back")
+	}
+	engine, _ := sharedEngine()
+	for name, ser := range map[string][]byte{"compile": r.Module, "warm": w.Module} {
+		if ser == nil {
+			t.Fatalf("%s: no module came back", name)
+		}
+		mod, err := wasmtime.NewModuleDeserialize(engine, ser)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		store := wasmtime.NewStore(engine)
+		store.SetEpochDeadline(1)
+		inst, err := wasmtime.NewInstance(store, mod, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		input := "mail bob@example.com now"
+		copy(inst.GetExport(store, "memory").Memory().UnsafeData(store), input)
+		res, err := inst.GetFunc(store, "find").Call(store, int32(0), int32(len(input)), int32(0))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := res.(int64); got != 5<<32|20 {
+			t.Errorf("%s: find = [%d,%d), want [5,20)", name, got>>32, got&0xffffffff)
+		}
+		store.Close()
+		mod.Close()
+	}
+}
+
+// TestCompileChildKilledPastDeadline: a job that does not answer within the
+// wait is KILLED — its CPU is not spent — and is errCompileTooSlow, and the
+// next job starts a new child.
+func TestCompileChildKilledPastDeadline(t *testing.T) {
+	if _, err := childRun(compileJob{Kind: jobSelect, Pattern: `ab`, Opts: toJobOpts(compile.CompileOptions{})}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	childMu.Lock()
+	old := theChild
+	childMu.Unlock()
+	// Engine selection for this pattern in Unicode mode builds a TDFA it
+	// rejects: about 1.4 s.
+	slow := compileJob{Kind: jobSelect, Pattern: `[0]+0()00.{31}`, Opts: toJobOpts(compile.CompileOptions{Unicode: true})}
+	start := time.Now()
+	_, err := childRun(slow, 100*time.Millisecond)
+	if !errors.Is(err, errCompileTooSlow) {
+		t.Fatalf("err = %v, want errCompileTooSlow", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("returned after %v: the child was waited for, not killed", d)
+	}
+	if st := old.cmd.ProcessState; st == nil || st.Exited() {
+		t.Errorf("the child was not killed: %v", st)
+	}
+	if r, err := childRun(compileJob{Kind: jobSelect, Pattern: `(a)`, Opts: toJobOpts(compile.CompileOptions{})}, time.Minute); err != nil || r.Engine == 0 {
+		t.Fatalf("the job after a kill: %v %v", r.Engine, err)
+	}
+}
+
+// TestCompileChildDeathIsAFailure: a child that dies by itself — a regexped
+// panic in it — is reported with the child's own output, never as a compile
+// that was too slow, which would skip the input and hide the panic.
+func TestCompileChildDeathIsAFailure(t *testing.T) {
+	func() {
+		defer func() {
+			msg := fmt.Sprint(recover())
+			if !strings.Contains(msg, "compile child died") || !strings.Contains(msg, "jobCrash, a compile child that dies by itself") {
+				t.Fatalf("recovered %q", msg)
+			}
+		}()
+		childRun(compileJob{Kind: jobCrash}, time.Minute)
+	}()
+	if _, err := childRun(compileJob{Kind: jobSelect, Pattern: `ab`, Opts: toJobOpts(compile.CompileOptions{})}, time.Minute); err != nil {
+		t.Fatalf("the job after a death: %v", err)
+	}
+}
+
+// TestCompileJobRefusesWhatItCannotCarry: an option jobOpts does not carry, or
+// a config field JSON loses, panics instead of compiling something else.
+func TestCompileJobRefusesWhatItCannotCarry(t *testing.T) {
+	mustPanic := func(name string, f func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: no panic", name)
+			}
+		}()
+		f()
+	}
+	mustPanic("Report", func() { toJobOpts(compile.CompileOptions{Report: &compile.Reporter{}}) })
+	mustPanic("component names", func() { toJobOpts(compile.CompileOptions{ComponentExportNames: map[string]string{"a": "b"}}) })
+	mem, err := config.ParseMemorySize("1MB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustPanic("max_memory", func() { encodeJob(compileJob{Kind: jobFile, Config: config.BuildConfig{MaxMemory: mem}}) })
+}
+
+// TestBudgetedCompileKeepsOnlyItsOwnSlowness: a budgeted compile killed after
+// the whole of slowCompileDeadline is kept as too slow, so the same compile is
+// skipped at once next time; one killed because the INPUT's budget ran out is
+// not, since given its own deadline it may finish.
+func TestBudgetedCompileKeepsOnlyItsOwnSlowness(t *testing.T) {
+	defer func(b, u bool) { budgetForTest, *unicodeMode = b, u }(budgetForTest, *unicodeMode)
+	budgetForTest, *unicodeMode = true, true
+	// Engine selection alone takes about 6 s here, past slowCompileDeadline.
+	pat := `0*(0000{520}000{520}0)`
+	key := "budgettest\x00" + pat
+	j := compileJob{Kind: jobCompile, Entries: []config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}},
+		Base: pathsTableBase, Opts: toJobOpts(runOpts())}
+	cached := func() bool {
+		modCacheMu.Lock()
+		defer modCacheMu.Unlock()
+		_, ok := modCacheIdx[key]
+		return ok
+	}
+	slowCompileMu.Lock()
+	inputDeadline = time.Now().Add(200 * time.Millisecond)
+	slowCompileMu.Unlock()
+	if _, err := cachedCompile(key, j); !errors.Is(err, errCompileTooSlow) {
+		t.Fatalf("with 200 ms of the input's budget left: %v, want errCompileTooSlow", err)
+	}
+	if cached() {
+		t.Fatal("a compile cut short by the input's budget was kept as too slow")
+	}
+	slowCompileMu.Lock()
+	inputDeadline = time.Time{}
+	slowCompileMu.Unlock()
+	if _, err := cachedCompile(key, j); !errors.Is(err, errCompileTooSlow) {
+		t.Fatalf("with the whole deadline: %v, want errCompileTooSlow", err)
+	}
+	if !cached() {
+		t.Fatal("a compile killed after the whole deadline was not kept")
+	}
+	start := time.Now()
+	if _, err := cachedCompile(key, j); !errors.Is(err, errCompileTooSlow) || time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("again: %v after %v, want errCompileTooSlow at once", err, time.Since(start))
 	}
 }

@@ -354,10 +354,8 @@ func newLongInstance(t *testing.T, mod *wasmtime.Module, sizes []searchblock.Siz
 // compile is errCompileTooSlow, and the input is skipped).
 func longCompile(e config.PatternEntry, export, pat string, opts compile.CompileOptions) ([]byte, []searchblock.Size, error) {
 	key := fmt.Sprintf("long\x00%d\x00%v\x00%s\x00%s", opts.LikelyMode, opts.Unicode, export, pat)
-	return cachedCompileSized(key, func() ([]byte, []searchblock.Size, error) {
-		w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{e}, pathsTableBase, true, 0, opts)
-		return w, searchblock.Of(sizes[export]), err
-	})
+	return cachedCompileSized(key, compileJob{Kind: jobSized, Entries: []config.PatternEntry{e}, Base: pathsTableBase,
+		Opts: toJobOpts(opts), Export: export})
 }
 
 // longModule is w built once for a whole leg's inputs — the module the

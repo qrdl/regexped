@@ -727,7 +727,14 @@ regexped/
 │   │                          #   reach the SIMD skips (byte-mutated inputs never did: four wrong-answer bugs shipped
 │   │                          #   past every other target); FuzzSetRoutes — a set through every route
 │   │                          #   `find` answers by, each against Go. `make fuzz-long-input` /
-│   │                          #   `fuzz-set-routes`, 5 min, FUZZTIME= to extend, one worker
+│   │                          #   `fuzz-set-routes`, 5 min, FUZZTIME= to extend, one worker.
+│   │                          #   A fuzzing run's budgeted compiles (Unicode mode; FuzzSetRoutes in
+│   │                          #   both modes) run in a COMPILE CHILD (compilechild.go) — the test
+│   │                          #   binary again, one per worker, reused — KILLED past 4 s per compile
+│   │                          #   or 5 s per input: a goroutine given up on kept compiling, a 36 s set
+│   │                          #   compile costing 36 s of CPU. A job is the compile as data, run() the
+│   │                          #   one place each kind's call is written; JSON, since gob turns a set's
+│   │                          #   `Unicode: &false` into nil. A child that dies by itself is a failure
 │   ├── setperf/
 │   │   ├── main.go            # Cross-engine set comparison vs regex-automata (see Testing);
 │   │   │                      #   drives find AND its batch entry, and cross-checks the two

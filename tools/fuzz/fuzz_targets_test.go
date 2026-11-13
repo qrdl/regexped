@@ -467,10 +467,8 @@ func namedRuneCeiling(pat string, parsed *syntax.Regexp) rune {
 // naming code points in 0x80..0xFF — the half of the rune gate the plain
 // targets cannot reach.
 func compileFindByteMode(pat string) ([]byte, error) {
-	return cachedCompile("findbyte\x00"+pat, func() ([]byte, error) {
-		w, _, err := compile.Compile([]config.PatternEntry{{Regexp: pat, FindFunc: "find", ByteMode: true}}, tableBase, true)
-		return w, err
-	})
+	return cachedCompile("findbyte\x00"+pat, compileJob{Kind: jobCompile,
+		Entries: []config.PatternEntry{{Regexp: pat, FindFunc: "find", ByteMode: true}}, Base: tableBase, NoOpts: true})
 }
 
 func fmtGoIndex(m []int) string {

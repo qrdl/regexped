@@ -74,21 +74,15 @@ func runOpts() compile.CompileOptions { return withMode(compile.CompileOptions{}
 // anchored match function. No captures, so this exercises the DFA /
 // CompiledDFA / lit-chain match bodies.
 func compileMatch(pat string) ([]byte, error) {
-	return cachedCompile("match\x00"+pat, func() ([]byte, error) {
-		entry := config.PatternEntry{Regexp: pat, MatchFunc: "match"}
-		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
-		return w, err
-	})
+	return cachedCompile("match\x00"+pat, compileJob{Kind: jobCompile,
+		Entries: []config.PatternEntry{{Regexp: pat, MatchFunc: "match"}}, Base: pathsTableBase, Opts: toJobOpts(runOpts())})
 }
 
 // compileGroups compiles pat with a groups export, letting the selector pick
 // the engine (TDFA when eligible, Backtracking otherwise).
 func compileGroups(pat string) ([]byte, error) {
-	return cachedCompile("groups\x00"+pat, func() ([]byte, error) {
-		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
-		w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true, runOpts())
-		return w, err
-	})
+	return cachedCompile("groups\x00"+pat, compileJob{Kind: jobCompile,
+		Entries: []config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, Base: pathsTableBase, Opts: toJobOpts(runOpts())})
 }
 
 // compileGroupsForced compiles pat with a groups export on a specific engine,
@@ -96,54 +90,46 @@ func compileGroups(pat string) ([]byte, error) {
 // this, whichever engine the selector prefers is the only one the fuzzer ever
 // sees for a given pattern shape, and the other backend stays dark.
 func compileGroupsForced(pat string, eng compile.EngineType) ([]byte, error) {
-	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), func() ([]byte, error) {
-		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true, eng, runOpts())
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("groupsforced\x00%d\x00%s", eng, pat), compileJob{Kind: jobForced,
+		Entries: []config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, Base: pathsTableBase, Engine: eng,
+		Opts: toJobOpts(runOpts())})
 }
 
 // compileGroupsBudget compiles pat with a groups export forced onto
 // Backtracking under a given compile.CompileOptions.BTWorkBudget, so the fast
 // body and its fallback can each be run alone.
 func compileGroupsBudget(pat string, budget int) ([]byte, error) {
-	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), func() ([]byte, error) {
-		entry := config.PatternEntry{Regexp: pat, GroupsFunc: "groups"}
-		w, _, err := compile.CompileForced([]config.PatternEntry{entry}, pathsTableBase, true,
-			compile.EngineBacktrack, withMode(compile.CompileOptions{BTWorkBudget: budget}))
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("groupsbudget\x00%d\x00%s", budget, pat), compileJob{Kind: jobForced,
+		Entries: []config.PatternEntry{{Regexp: pat, GroupsFunc: "groups"}}, Base: pathsTableBase,
+		Engine: compile.EngineBacktrack, Opts: toJobOpts(withMode(compile.CompileOptions{BTWorkBudget: budget}))})
 }
 
 // compileSet compiles pats as one set exporting find_all. Patterns are named
 // p0..pN-1 so the set selector can reference them; the pattern ID reported by
 // the WASM is the index into pats.
 func compileSet(pats []string) ([]byte, map[int]bool, error) {
-	w, drops, err := cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), func() ([]byte, setDrops, error) {
-		entries := make([]config.PatternEntry, len(pats))
-		names := make([]string, len(pats))
-		for i, p := range pats {
-			names[i] = fmt.Sprintf("p%d", i)
-			entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
-		}
-		sets := []config.SetConfig{{
-			Name: "s",
-			Find: "set_find",
-			// Ungated body: every start position is enumerated, which is what
-			// allStartPositionMatches models.
-			Overlapping: true,
-			Patterns:    config.PatternSelector{Names: names},
-			Unicode:     setModeKey(),
-		}}
-		// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
-		// tables always start at address 0 and the input CANNOT live at offset 0
-		// the way it does for the single-pattern paths. cfg.Output == "" selects
-		// standalone. runWasmSetFindAll therefore derives its layout from the
-		// emitted data section rather than using pathsInputBase.
-		cfg := config.BuildConfig{Patterns: entries, Sets: sets}
-		w, _, diags, err := compile.CompileFileDiag(cfg, "")
-		return w, dropsFromSet(diags), err
-	})
+	entries := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	sets := []config.SetConfig{{
+		Name: "s",
+		Find: "set_find",
+		// Ungated body: every start position is enumerated, which is what
+		// allStartPositionMatches models.
+		Overlapping: true,
+		Patterns:    config.PatternSelector{Names: names},
+		Unicode:     setModeKey(),
+	}}
+	// CompileFile hard-codes tableBase = 0 for the sets path, so a set's
+	// tables always start at address 0 and the input CANNOT live at offset 0
+	// the way it does for the single-pattern paths. cfg.Output == "" selects
+	// standalone. runWasmSetFindAll therefore derives its layout from the
+	// emitted data section rather than using pathsInputBase.
+	w, drops, err := cachedCompileSet(fmt.Sprintf("set\x00%s", setKey(pats)), compileJob{Kind: jobFileDiag,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 	// compileSet's callers drive `find` only, so the anchored-only scope has
 	// nothing to say to them.
 	return w, drops.all, err

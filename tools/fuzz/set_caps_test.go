@@ -54,10 +54,8 @@ func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 		Patterns:    config.PatternSelector{Names: names},
 		Unicode:     setModeKey(),
 	}}
-	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, dropsFromSet(diags), err
-	})
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), compileJob{Kind: jobFileDiag,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // capRunner holds an instantiated capability module plus its memory layout.
@@ -1725,10 +1723,8 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Patterns: config.PatternSelector{Names: names},
 		Unicode:  setModeKey(),
 	}}
-	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), compileJob{Kind: jobFile,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // gatedRun drives the gated find to exhaustion with a zeroed gate array, the
@@ -2680,10 +2676,8 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Patterns:    config.PatternSelector{Names: names},
 		Unicode:     setModeKey(),
 	}}
-	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), compileJob{Kind: jobFile,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // runBatchFind drives find_batch to exhaustion with the given buffer capacity,

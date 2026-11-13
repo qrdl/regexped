@@ -2,6 +2,7 @@ package fuzz
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -1263,9 +1264,27 @@ func TestOverlapCacheRefusesWrappedLayout(t *testing.T) {
 }
 
 // overlapShapeOf is what a stub generator learns about a set: the sweep
-// column's width and the bucket's pattern count.
+// column's width and the bucket's pattern count. Learned once per set
+// (cachedShape): it recompiles the set, and a FuzzSetRoutes input learned it
+// again on every cache drive that swept. Within a budgeted input, a shape too
+// slow to learn skips the input.
 func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 	t.Helper()
+	sh, err := overlapShapeFor(pats)
+	if errors.Is(err, errCompileTooSlow) {
+		t.Skip("the overlapping cache's shape: ", err)
+	}
+	if err != nil {
+		t.Fatalf("shape: %v", err)
+	}
+	if !sh.Eligible {
+		t.Fatal("the set is not cache-eligible, so this test would drive the walk")
+	}
+	return sh
+}
+
+// overlapShapeFor is overlapShapeOf's shape, or the error learning it.
+func overlapShapeFor(pats []string) (compile.OverlapCacheShape, error) {
 	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
 		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
@@ -1275,16 +1294,9 @@ func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 		Patterns: config.PatternSelector{All: true}, Overlapping: true,
 		Unicode: setModeKey(),
 	}
-	sh, err := compile.SetOverlapCacheShape(sc, config.BuildConfig{
+	return cachedShape("shapeof\x00"+setKey(pats), sc, config.BuildConfig{
 		Patterns: entries, Sets: []config.SetConfig{sc},
 	})
-	if err != nil {
-		t.Fatalf("shape: %v", err)
-	}
-	if !sh.Eligible {
-		t.Fatal("the set is not cache-eligible, so this test would drive the walk")
-	}
-	return sh
 }
 
 // canonByPosition sorts the tuples of each POSITION by pattern id and leaves

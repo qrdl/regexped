@@ -21,6 +21,7 @@ package fuzz
 //	make -C tools/fuzz fuzz-set-routes FUZZTIME=8h
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -43,6 +44,10 @@ func FuzzSetRoutes(f *testing.F) {
 		// Each module is built once and serves every route (keepModules).
 		defer func(v bool) { keepModules = v }(keepModules)
 		keepModules = true
+		// Byte-mode inputs are budgeted too: one ran to 16 s, past the
+		// worker's 10 s, and was reported as a hang (budgetByteMode).
+		defer func(v bool) { budgetByteMode = v }(budgetByteMode)
+		budgetByteMode = true
 		beginFuzzInput()
 		g := longGen{r: rand.New(rand.NewSource(seed)), uni: uni}
 		pats, parsed := routeMembers(g)
@@ -122,13 +127,22 @@ const routesBigModule = 1 << 20
 // the drivers' own cached builders, so each compiles once: a set over a
 // documented construction ceiling, or a compile past the fuzz harness's
 // deadline, is no defect, and the drivers treat a compile error as a failure.
-// batch is false when the batch entry's routes are left out (routesBigModule).
+// It learns the overlapping cache's two shapes here too (cachedOverlapShape,
+// overlapShapeFor), so a shape too slow for the input's budget skips the
+// input before any drive rather than in the middle of one. batch is false
+// when the batch entry's routes are left out (routesBigModule).
 func routesCompile(pats []string) (batch, ok bool) {
 	w, err := compileCacheDriveSet(pats, false, 0)
 	if err != nil {
 		return false, false
 	}
 	if _, err := compileGatedSet(pats); err != nil {
+		return false, false
+	}
+	if _, err := cachedOverlapShape(pats); errors.Is(err, errCompileTooSlow) {
+		return false, false
+	}
+	if _, err := overlapShapeFor(pats); errors.Is(err, errCompileTooSlow) {
 		return false, false
 	}
 	if len(w) > routesBigModule {
