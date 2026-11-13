@@ -657,6 +657,103 @@ func TestSetAnchorLiteralAgainstOracle(t *testing.T) {
 	}
 }
 
+// TestSetWordGuardMembersAgainstOracle: a member whose part before its literal
+// is a bare \b or \B keeps its LITERAL bucket, the boundary judged at each
+// candidate from the bytes on either side of the literal's start, instead of
+// walking a fallback bucket at every position. Members sharing one literal
+// with different guards (`\bab`, `\Bab`, `ab`) sit in one bucket; a literal
+// starting with a non-word byte (`\b-x`) flips which neighbour satisfies \b.
+// Every capability, against Go, with the neighbour a word byte, a non-word
+// byte and absent (position 0).
+func TestSetWordGuardMembersAgainstOracle(t *testing.T) {
+	pats := []string{`\bselect\b`, `\bfrom\b`, `\Bing\b`, `\b-x`, `union`, `\bab`, `\Bab`, `ab`}
+	members := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		members[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	build := func(s config.SetConfig) ([]byte, compile.SetDiag) {
+		t.Helper()
+		s.Name, s.Patterns = "s", config.PatternSelector{Names: names}
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: members, Sets: []config.SetConfig{s}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, diags[0]
+	}
+	all, diag := build(config.SetConfig{MatchAny: "cap_match_any", MatchAll: "cap_match_all",
+		ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true})
+	keyed := map[string][]int{}
+	for _, b := range diag.Buckets {
+		for _, p := range b.Patterns {
+			keyed[b.Literal] = append(keyed[b.Literal], p.ID)
+		}
+	}
+	for lit, ids := range map[string][]int{"select": {0}, "from": {1}, "ing": {2}, "-x": {3}, "ab": {5, 6, 7}} {
+		for _, id := range ids {
+			if !containsInt(keyed[lit], id) {
+				t.Errorf("member %d (%s) not in a %q literal bucket: %v", id, pats[id], lit, keyed)
+			}
+		}
+	}
+	gated, _ := build(config.SetConfig{Find: "gated_find"})
+	inputs := []string{
+		"", "select", "xselect", "select_", "a select from b", "selectfrom from_ (from)",
+		"singing ring ing", "-x a-x  -x_x", "ab xab abx _ab", "union select ab-x",
+		"9select 9from from9 sing9 ab9ab",
+	}
+	for _, input := range inputs {
+		r := newCapRunnerFrom(t, all, pats, input)
+		checkCapsAgainstOracle(t, r, pats, input)
+		r.Close()
+		for from := 0; from <= len(input); from++ {
+			want := gatedOracleFrom(pats, input, from)
+			got := runUnionPreflightFind(t, gated, pats, input, int32(from))
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(want) != fmt.Sprint(got) {
+				t.Errorf("gated find over %q from %d: %v, want %v", input, from, got, want)
+			}
+		}
+	}
+}
+
+// gatedOracleFrom is each pattern's Go FindAll drive over the WHOLE input,
+// begun at from: the leftmost match starting at or after the cursor, found by
+// anchored probes (anchoredExtent) so that \b, \B and (?m:^) judge the real
+// byte before it — slicing the input at from would make position from look
+// like the start of text. An empty match adjacent to the previous one is
+// skipped, as Go does.
+func gatedOracleFrom(pats []string, input string, from int) []setMatch {
+	var out []setMatch
+	for k, pat := range pats {
+		pos, prevEnd := from, -1
+		for pos <= len(input) {
+			s, e := -1, -1
+			for p := pos; p <= len(input); p++ {
+				if x := anchoredExtent(pat, input, p); x >= 0 {
+					s, e = p, x
+					break
+				}
+			}
+			if s < 0 {
+				break
+			}
+			if !(s == e && s == prevEnd) {
+				out = append(out, setMatch{PatternID: k, Start: s, End: e})
+				prevEnd = e
+			}
+			if e > s {
+				pos = e
+			} else {
+				pos = s + 1
+			}
+		}
+	}
+	return out
+}
+
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's
@@ -3848,6 +3945,15 @@ func TestSetMergedModeAssertions(t *testing.T) {
 		{`a\Bb`, "ab"},
 		{`\Bfoo`, "xfoo"},
 		{`\Bfoo`, " foo"},
+		// a bare \b / \B before the literal is a word guard on the literal
+		// bucket, read from the input around the candidate — position 0
+		// included, and a literal whose first byte is not a word byte
+		{`\bfoo\b`, "foo"},
+		{`\bfoo\b`, "afoo"},
+		{`\Bfoo`, "foo"},
+		{`\b-x`, "a-x"},
+		{`\b-x`, " -x"},
+		{`\b-x`, "-x"},
 		// line anchors, both directions
 		{`(?m:^)bar`, "x\nbar"},
 		{`(?m:^)bar`, "xbar"},

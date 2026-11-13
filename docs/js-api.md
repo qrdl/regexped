@@ -78,8 +78,8 @@ for (const [start, end] of find_token(text)) {
     console.log('match:', text.slice(start, end));
 }
 
-// First match only:
-const first = find_token(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = find_token(text);
 if (first) {
     const [start, end] = first;
     console.log('first match:', text.slice(start, end));
@@ -108,8 +108,8 @@ for (const groups of parse_groups(text)) {
     }
 }
 
-// First match only:
-const first = parse_groups(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = parse_groups(text);
 if (first && first[1] !== null) {
     const [s, e] = first[1];
     console.log('group 1:', text.slice(s, e));
@@ -206,6 +206,20 @@ Each live generator owns its input and scratch region for its whole lifetime,
 which is the same guarantee the Rust and Go stubs get from passing a host
 pointer. A generator that exits early — `break`, `return`, or a thrown error —
 releases its region on the way out, so nothing leaks.
+
+**A generator you step by hand must be finished or closed.** `for…of` and
+destructuring (`const [first] = find_token(text)`) close the generator
+themselves; `find_token(text).next()` on its own does not, and a generator that
+is neither run to its end nor `return()`ed keeps its region — input × 3 bytes
+for a string — for as long as the instance lives. It keeps only its own: every
+other generator still gives its region back when it finishes. Close one you
+stepped by hand with `it.return()`.
+
+*Until 2026-11-12* one such generator kept EVERY later generator's region too
+(the stub counted live generators, and the count never returned to zero), so
+under `max_memory` the instance soon failed every call with `RangeError`. The
+docs' own first-match example was `find_token(text).next().value`, which did
+exactly that.
 
 *This was not always true.* Until 2026-08-25 every call staged its input at one
 shared address, so an interleaved call left a suspended generator scanning

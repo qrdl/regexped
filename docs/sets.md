@@ -447,8 +447,8 @@ the member's searches have walked more than `4 × len + 64` bytes in the drive
 (in Unicode mode `k × len + 64`, where k is the sweep's estimated cost per
 input byte counted in walked bytes: a lowered class makes the sweep thousands of
 times dearer per byte, and it must not be bought before the walks have spent
-as much), so ordinary text pays for the counter alone; its answers live in the same
-caller's region, after the cache, checkpointed exactly as the cache is. It
+as much), so ordinary text pays for the counter alone; its answers live at the end of
+the same caller's region, after the cache, checkpointed exactly as the cache is. It
 supports every assertion (`\b`, `\B`, `^`, `$`, `(?m)`) and zero-width cycles.
 Measured over `{foo\w+, a[a-z]*?z}` and `a`×N + `z`: 131,456 → 795
 instructions per byte; with `(?:a|b)*a(?:a|b){12}c`, a Backtracking member,
@@ -860,7 +860,7 @@ packings: patterns sharing a mandatory literal, literal-less patterns in a
 fallback bucket, and the anchored automata behind `match_any` / `match_all`.
 The promotion is conservative and is declined when the merged DFA misses the
 state or byte budget above, when any pattern carries a non-trivial prefix, or
-when any pattern is `\A`- or `(?m:^)`-anchored. `--diag-json` reports such a
+when any pattern is `\A`- or `(?m:^)`-anchored or carries a word guard (below). `--diag-json` reports such a
 bucket with `"type": "sparse-set"`, so whether it happened is never a guess.
 
 Patterns that cannot be merged route to fallback buckets that scan every input
@@ -872,6 +872,19 @@ rather than a budget: the split representation recovers a match start from a
 literal occurrence by subtracting one fixed prefix length, so a prefix with
 several possible lengths would silently lose the matches that use any length
 but the longest.
+
+**A bare `\b` or `\B` before the literal keeps the literal bucket.** In
+`\bselect\b` the part before `select` is only a word boundary, which no
+prefix walk can judge (it never sees the byte before the match), so such a
+member used to go to a fallback bucket — a keyword list wrapped in `\b…\b`
+cost 12x-42x the fuel of the same words without it. It now keeps its literal
+bucket with a word GUARD: at each literal hit the bucket tests the boundary
+between the byte before the hit (none at position 0) and the literal's first
+byte, so `\b-x` holds after a word byte and `\bselect` after a non-word one.
+Over 3 × 10 KB of prose, sets of 5, 50 and 500 `\bkeyword\b` members cost
+0%, +0.7% and +0.2% fuel against the same words without `\b`. Anything more
+before the literal than a single `\b` or `\B` (`^\bfoo`, `\b.foo`) still
+routes to fallback. A guarded member is never promoted into a sparse bucket.
 
 **A member's `anchor_literal:` chooses its bucket literal.** A member is keyed
 on the first mandatory literal the extraction finds; a top-level pattern's

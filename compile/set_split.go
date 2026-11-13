@@ -1196,7 +1196,7 @@ func (cs *compiledSet) extraFnTypes() []byte {
 		out = append(out, setTypeI32I32ToI32, setTypeI32I32ToI32)
 	}
 	if cs.progSweep != nil {
-		out = append(out, setTypeI32x4ToI32)
+		out = append(out, setTypeI32x5ToI32)
 	}
 	return out
 }
@@ -1273,8 +1273,8 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	var swGeo sweepGeo
 	if cs.progSweep != nil {
 		lSwRegion, lSwRegionLen, lSwLocated = a.I32(), a.I32(), a.I32()
-		swGeo = sweepGeo{region: lSwRegion}
-		swGeo.area, swGeo.k, swGeo.rows, swGeo.cacheB, swGeo.nb = uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
+		swGeo = sweepGeo{region: lSwRegion, regionLen: lSwRegionLen}
+		swGeo.area, swGeo.k, swGeo.rows, swGeo.off, swGeo.nb = uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
 		swGeo.m64, swGeo.k64, swGeo.b64 = uint32(a.I64()), uint32(a.I64()), uint32(a.I64())
 	}
 	swIdx := cs.sweepIdx

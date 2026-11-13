@@ -1696,6 +1696,15 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		{`[sS\577]`, true, true, "ſ spelled as an octal escape"},
 		{`(?i)[sſ]`, true, true, "(?i) or not, the byte engine cannot match the ſ written"},
 		{`[åÅ\x{212B}]`, true, true, "byte mode: å's orbit by hand"},
+		// A folded LITERAL is stored as the lowest rune of its orbit, so the
+		// program of `(?i)ſ` names only `S`: the written rune is refused from
+		// the text, or byte mode would never match the character written.
+		{`(?i)ſ`, true, true, "folded literal stored as S; ſ never matched"},
+		{`(?i)\x{17F}`, true, true, "the same, by escape"},
+		{"(?i)\u212A", true, true, "the Kelvin sign as a folded literal, stored as K"},
+		{`(?i)\x{212A}`, true, true, "the same, by escape"},
+		{"(?i)\u212Aelvin", true, true, "a word starting with the Kelvin sign"},
+		{`(?i)ſtraße`, true, true, "ſ refused under byte_mode too, whatever ß does"},
 		// ...while ASCII text that merely LOOKS like such a spelling stays
 		// legal, and so do (?i) artifacts the parser merged into a class
 		// without the FoldCase flag.
@@ -1718,6 +1727,11 @@ func TestUnsupportedRuneRejection(t *testing.T) {
 		e := config.PatternEntry{Regexp: c.pattern, FindFunc: "find"}
 		if _, _, err := Compile([]config.PatternEntry{e}, 65536, true, CompileOptions{}); err != nil {
 			t.Errorf("resolved %q: %v, want it compiled", c.pattern, err)
+		}
+		// Detection and refusal are one predicate: what byte mode refuses
+		// asks for Unicode mode when left to resolve.
+		if need, err := NeedsUnicodeSupport(c.pattern); err != nil || need != c.rejectDef {
+			t.Errorf("NeedsUnicodeSupport(%q) = %v, %v; want %v (%s)", c.pattern, need, err, c.rejectDef, c.why)
 		}
 		if err := compileWith(c.pattern, false); (err != nil) != c.rejectDef {
 			t.Errorf("byte mode %q: rejected=%v, want %v (%s) [%v]",

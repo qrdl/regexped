@@ -2606,11 +2606,6 @@ type dfaLayout struct {
 	// the shared hysteresis).
 	lmWideShufti bool
 
-	// lmClassChain enables the chain-start SIMD verify (see
-	// detectClassChainPrefix). LikelyMatch only, and set from the same
-	// buildOpts.LikelyMode as its siblings above.
-	lmClassChain bool
-
 	// lmCharLoop lets detectShuftiSelfLoop (and the set probes) take a
 	// Unicode-mode loop over only SOME characters — a letter class, `\pL+` —
 	// as a utf8 dominant with an allowSet. LikelyMatch only: the chunk test
@@ -2824,7 +2819,6 @@ type dfaLayoutParams struct {
 	lmBareShufti         bool
 	lmNonMidShufti       bool
 	lmWideShufti         bool
-	lmClassChain         bool
 	lmCharLoop           bool
 	forceWordChar        bool
 	// noWordCharTable keeps the \b/\B accept channels forceWordChar or
@@ -2870,7 +2864,6 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	l.lmBareShufti = lmBareShufti
 	l.lmNonMidShufti = lmNonMidShufti
 	l.lmWideShufti = lmWideShufti
-	l.lmClassChain = p.lmClassChain
 	l.lmCharLoop = p.lmCharLoop
 	l.numWASM = t.numStates + 1
 	l.wasmStart = uint32(t.startState + 1)
@@ -4218,11 +4211,16 @@ func detectDominantSelfLoop(l *dfaLayout) {
 		// different skipper (skipSafeOnDead's is the inter-attempt advance; this is the
 		// intra-attempt SIMD skip).
 		//
-		// The word channels get the same treatment defensively. They are
-		// structurally hard to reach here — prevWasWord state-doubling caps
-		// a same-class self-loop well below the 240-byte threshold — but
-		// the gate costs nothing and removes the need to re-derive that
-		// argument whenever the threshold moves.
+		// The word channels get the same carve, which does NOT protect them:
+		// \B accepts between two word bytes, inside a run, and carving '\n'
+		// changes nothing there (detectShuftiSelfLoop, whose 9..64-byte loops
+		// do reach the word channels, refuses such states instead). What
+		// keeps this skip right is that it is structurally hard to reach —
+		// prevWasWord state-doubling caps a same-class self-loop well below
+		// the 240-byte threshold, and no failing input is known. Refusing
+		// here as well was measured: every state that also accepts
+		// unconditionally carries the word channels, so it took the skip from
+		// `ERR\b[^\n]*`'s `[^\n]*` loop — a log-levels set +629% fuel.
 		needsBoundaryExit := (int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0) ||
 			(int(state) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0) ||
 			(int(state) < len(l.midAcceptWBytes) && l.midAcceptWBytes[state] != 0)
@@ -4650,9 +4648,21 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 		// pre-accept check. Carve '\n' out of the self-loop set so the skip
 		// stops there; if that drops the set below the minimum width the
 		// state simply isn't worth accelerating.
-		if int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 ||
-			int(state) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0 ||
+		//
+		// The word channels (\b/\B) take no skip at all. Carving '\n' does
+		// nothing for them: a 9..64-byte loop holds word bytes, and \B
+		// accepts BETWEEN two of them, inside the run, which the skip strides
+		// over — `key=[a-z]+\B` over "key=" + 18 a's + "  \n..." found no
+		// match under prefer-match, Go [0,21). (\b fires only at a run's exit
+		// byte, but the channel arrays cannot tell the two apart.) A state
+		// that also accepts unconditionally carries the word channels too, so
+		// this costs such states their skip under prefer-match — measured as
+		// no change in perftest, its sets or likelytest.
+		if int(state) < len(l.midAcceptNWBytes) && l.midAcceptNWBytes[state] != 0 ||
 			int(state) < len(l.midAcceptWBytes) && l.midAcceptWBytes[state] != 0 {
+			continue
+		}
+		if int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 {
 			filtered := selfSet[:0]
 			for _, b := range selfSet {
 				if b != '\n' {
@@ -4744,16 +4754,14 @@ func applyDominantStateEncoding(l *dfaLayout, encodeNonMid bool) {
 
 // classChainFor returns the chain-start probe description for l, or nil.
 //
-// Gated on prefer-match: the probe verifies a WHOLE 16-byte chunk before the
-// walk begins, which is the right bet when the caller has said matches are
-// expected and a wasted one on input made of short runs. Whether NEUTRAL
-// should also carry it is a separate measurement with a different balance —
-// it would move every fixture in this family — and is deliberately not asked
-// here.
+// In every hint mode. It was gated on prefer-match, on the argument that the
+// probe verifies a WHOLE 16-byte chunk before the walk begins, which a wasted
+// verify on input made of short runs pays for. Measured in neutral and
+// prefer-no-match it pays everywhere it changes anything: base64/hex/long-word
+// finds −40% (perftest shufti-hex-find) to −97% (likelytest
+// printable-run-dense-harm, no-match), the dense-harm row included; the cost
+// is +6 fuel per call on input with no run and +1-5% module size.
 func classChainFor(l *dfaLayout, t *dfaTable) *classChainPrefix {
-	if !l.lmClassChain {
-		return nil
-	}
 	cc, ok := detectClassChainPrefix(l, t)
 	if !ok {
 		return nil

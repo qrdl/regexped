@@ -78,8 +78,8 @@ for (const [start, end] of find_token(text)) {
     console.log('match:', text.slice(start, end));
 }
 
-// First match only:
-const first = find_token(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = find_token(text);
 if (first) {
     const [start, end] = first;
     console.log('first match:', text.slice(start, end));
@@ -109,8 +109,8 @@ for (const groups of parse_groups(text)) {
     }
 }
 
-// First match only:
-const first = parse_groups(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = parse_groups(text);
 if (first) {
     const g = first[1];
     if (g !== null) console.log('group 1:', text.slice(g[0], g[1]));
@@ -203,6 +203,15 @@ and Go get from passing a host pointer — and releases it on any exit, includin
 an early `break`. Until 2026-08-25 this was not true: one shared staging address
 meant an interleaved call left a suspended generator scanning another string's
 bytes, silently.
+
+**A generator you step by hand must be finished or closed.** `for…of` and
+destructuring (`const [first] = find_token(text)`) close it themselves;
+`find_token(text).next()` on its own does not, and a generator neither run to
+its end nor `return()`ed keeps its region (input × 3 bytes for a string) for the
+instance's lifetime — its own only: every other generator still gives its region
+back. Close one you stepped by hand with `it.return()`. Until 2026-11-12 one
+such generator kept every later generator's region too, and under `max_memory`
+the instance soon failed every call with `RangeError`.
 
 `<set>PatternName(id: number): string` — `secretsPatternName` for a set named
 `secrets` — is emitted for each set that sets `emit_name_map: true`.

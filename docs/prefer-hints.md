@@ -46,8 +46,8 @@ enclosing-set or global fallback: each entry that wants a hint sets its own.
 ## Which shapes actually benefit
 
 A lot of what used to require a hint is now unconditional — every pattern
-gets the dominant-self-loop bulk-skip and the counted-chain SIMD verifier
-regardless of what you set. Setting a hint only matters for the narrower set
+gets the dominant-self-loop bulk-skip, the counted-chain SIMD verifier and the
+chain-start probe regardless of what you set. Setting a hint only matters for the narrower set
 of shapes below; everything else compiles to byte-identical WASM whether you
 set a hint or not.
 
@@ -139,6 +139,13 @@ hinting a Unicode pattern.
 
 - **Counted-chain SIMD verifier** — verifies a fixed-count character class
   run (`{N}`/`{N,M}`) in SIMD chunks instead of a scalar loop.
+- **Chain-start probe** — a find that opens with a run of one class
+  (`[0-9a-f]{32,}`, `[A-Za-z0-9+/]{40,}`, `[A-Z]{8,}`) tests the next 16 bytes
+  in one SIMD step instead of walking them, and a run that turns out too short
+  rules out every start inside it at once. It was a `prefer-match` feature
+  until 2026-11-12; in every hint mode it measured −40% fuel on hex finds and
+  up to −97% on long-word scans over input without matches, for +6 fuel per
+  call on input with no run at all and modules 1–5% larger.
 - **Dominant-self-loop bulk-skip** — for patterns dominated by one
   "consume anything except a delimiter" state, skips through the run in SIMD
   chunks instead of one byte at a time. Under `prefer-match` it also serves a

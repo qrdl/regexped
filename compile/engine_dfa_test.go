@@ -1557,6 +1557,46 @@ func TestDFALayoutDetectorGuards(t *testing.T) {
 	})
 }
 
+// TestShuftiSelfLoopBoundaryChannels: detectShuftiSelfLoop gives no skip to a
+// state a \b/\B channel can accept from — \B accepts between two bytes of the
+// run, which the skip strides over (`key=[a-z]+\B` lost its matches under
+// prefer-match) — and keeps carving only '\n' for the (?m:$) channel.
+// tools/re2test's Category 44 and S-WordBoundaryPreferMatch run it end to end.
+func TestShuftiSelfLoopBoundaryChannels(t *testing.T) {
+	const numWASM = 5
+	layout := dfaLayoutCovSynthLayout(numWASM, 30) // bytes 0..29 loop, '\n' among them
+	layout.lmBareShufti = true
+	layout.midAcceptNWBytes = make([]byte, numWASM)
+	layout.midAcceptWBytes = make([]byte, numWASM)
+	layout.midAcceptNLBytes = make([]byte, numWASM)
+	for state := 1; state < numWASM; state++ {
+		layout.midAcceptBytes[state] = 1
+	}
+	layout.midAcceptWBytes[1] = 1  // \B-style channel
+	layout.midAcceptNWBytes[2] = 1 // \b-style channel
+	layout.midAcceptNLBytes[3] = 1 // (?m:$) channel
+	detectShuftiSelfLoop(layout)
+	got := map[int32][]byte{}
+	for _, info := range layout.dominantStates {
+		got[info.state] = info.selfLoopSet
+	}
+	for _, s := range []int32{1, 2} {
+		if _, ok := got[s]; ok {
+			t.Errorf("state %d has a word-boundary channel but got a Shufti skip", s)
+		}
+	}
+	nl, ok := got[3]
+	if !ok {
+		t.Fatal("state 3 ((?m:$) channel) lost its skip; only '\\n' should leave the loop set")
+	}
+	if len(nl) != 29 || bytes.IndexByte(nl, '\n') >= 0 {
+		t.Errorf("state 3 loop set = %v, want bytes 0..29 without '\\n'", nl)
+	}
+	if s4, ok := got[4]; !ok || len(s4) != 30 {
+		t.Errorf("state 4 (no boundary channel) loop set = %v, want all 30 bytes", s4)
+	}
+}
+
 // TestDFALayoutDataSegmentsRowDedupWithCompression covers dfaDataSegments'
 // handling of a layout carrying BOTH byte-class compression and row dedup.
 // buildDFALayout never produces one — compression is u8-only and dedup is

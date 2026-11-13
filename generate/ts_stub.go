@@ -44,9 +44,10 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("let _mem: Uint8Array;\n")
 	sb.WriteString("let _staticTop = 0; // first byte after the module's own table pages\n")
 	sb.WriteString("let _bump = 0;      // next free byte; regions are carved from here up\n")
-	// Only generators keep a refcount; a stub with none would declare it unused.
+	// Only generators keep regions; a stub with none would declare it unused.
+	// See the JS generator's "Regions" note for the allocator.
 	if hasSuspendableExports(cfg) {
-		sb.WriteString("let _live = 0;      // live iterator regions\n")
+		sb.WriteString("const _regs: { at: number; top: number; free: boolean }[] = []; // live iterator regions, in allocation order\n")
 	}
 	sb.WriteString("const _enc = new TextEncoder();\n")
 	sb.WriteString("\n")
@@ -137,7 +138,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
     // its scratch. Release with _close() from a finally.
     //
     // Nothing is reserved until every grow has succeeded. A grow that throws
-    // leaves _bump and _live as they were, so the instance stays usable; when
+    // leaves _bump and _regs as they were, so the instance stays usable; when
     // _bump moved first, a grow refused under a memory ceiling left it past the
     // end of memory with no iterator alive to reset it, and every later call
     // threw.
@@ -148,7 +149,10 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
     // grow only DECLINES the cache: a zero-length cache is the documented
     // "walk" signal, so the drive is slower instead of failing.
     const at = _bump, out = _align(at + _inCap(input));
-    const top = out + (outBytes > 0 ? outBytes : 65536);
+    // outBytes is what the iterator writes there — a batch buffer, a groups
+    // call's slots, a set's gates and tuples — and nothing more: a find that
+    // writes nothing reserves nothing.
+    const top = out + outBytes;
     _grow(top);
     const len = _write(input, at);
     let k = 0, cache = 0;
@@ -159,12 +163,18 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
         }
     }
     _bump = top + cache;
-    _live++;
+    _regs.push({ at, top: _bump, free: false });
     return [at, out, len, cache, k];
 }
 
 `)
-		sb.WriteString("function _close(): void { if (--_live === 0) _bump = _staticTop; }\n\n")
+		sb.WriteString("function _close(at: number): void {\n" +
+			"    // Frees the region _open placed at `at`, then gives back every free\n" +
+			"    // region at the top of the stack.\n" +
+			"    for (let i = _regs.length - 1; i >= 0; i--) if (_regs[i]!.at === at) { _regs[i]!.free = true; break; }\n" +
+			"    while (_regs.length > 0 && _regs[_regs.length - 1]!.free) _regs.pop();\n" +
+			"    _bump = _regs.length > 0 ? _regs[_regs.length - 1]!.top : _staticTop;\n" +
+			"}\n\n")
 		// Generic over the view type rather than typed as a union: _att must hand
 		// back the SAME kind of array it was given, or every indexed read after a
 		// re-attach would widen to Int32Array | Uint32Array.
@@ -409,7 +419,7 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
         }
         pos = next;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 `, s.Find, plainCachePre, plainCacheDest, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
@@ -496,7 +506,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
         if (done || n === 0) break;
         cursor = packed;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", cachePre, cacheDest, batchGateRegion, cacheReserve,
@@ -599,7 +609,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         }
         off += relEnd > relStart ? relEnd : relStart + 1;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
 `, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
@@ -624,7 +634,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     const _batched = typeof _exp['%[1]s_batch'] === 'function';
     // One region for whichever path runs, held for this iterator's lifetime so
     // an interleaved stub call cannot overwrite the staged input mid-scan.
-    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : %[9]d);
     try {
     if (_batched) {
         let outBuf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, %[2]d * %[3]d);
@@ -697,10 +707,10 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         prevEnd = absEnd;
         yield result;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
-`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName), (slotCount*4+7)&^7)
 }
 
 // genTSGroupIndices emits the name→index object for a groups function.

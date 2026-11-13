@@ -307,6 +307,15 @@ type compiledSet struct {
 	// at position 0 and at any position whose preceding byte is a newline.
 	lineAnchorMasks []uint32
 
+	// wordGuardMasks[bi] / noWordGuardMasks[bi]: bitmasks of patterns whose
+	// prefix is a bare \b / \B (PatternInfo.wordGuard) — eligible where the
+	// word-ness of input[pos-1] (none at 0) and input[pos] differs / agrees.
+	// wordGuardOff is the 256-byte word table they read, or -1 when no bucket
+	// carries a guard (every such set stays byte-identical).
+	wordGuardMasks   []uint32
+	noWordGuardMasks []uint32
+	wordGuardOff     int32
+
 	// prefixFixedLens[bi][k]: fixed prefix length for pattern k (minLen==maxLen>0); else 0.
 	// Used for compile-time match start adjustment.
 	prefixFixedLens [][]int
@@ -956,6 +965,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	trivialPrefixMasks := make([]uint32, len(buckets))
 	startAnchorMasks := make([]uint32, len(buckets))
 	lineAnchorMasks := make([]uint32, len(buckets))
+	wordGuardMasks := make([]uint32, len(buckets))
+	noWordGuardMasks := make([]uint32, len(buckets))
 
 	var prefixFnBodies [][]byte
 	var prefixDataBytes []byte
@@ -967,7 +978,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	for bi, bkt := range buckets {
 		idxes := make([]int, len(bkt.patterns))
 		pml := make([]int, len(bkt.patterns))
-		var tm, sam, lam uint32
+		var tm, sam, lam, wgm, nwgm uint32
 		for j, p := range bkt.patterns {
 			if j >= bucketMaskBits {
 				idxes[j] = -1
@@ -978,6 +989,12 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			}
 			if p.lineAnchor {
 				lam |= uint32(1) << uint(j)
+			}
+			switch p.wordGuard {
+			case wordGuardBoundary:
+				wgm |= uint32(1) << uint(j)
+			case wordGuardNoBoundary:
+				nwgm |= uint32(1) << uint(j)
 			}
 			if p.trivialPrefix || p.prefixDFA == nil {
 				idxes[j] = -1
@@ -995,6 +1012,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		trivialPrefixMasks[bi] = tm
 		startAnchorMasks[bi] = sam
 		lineAnchorMasks[bi] = lam
+		wordGuardMasks[bi] = wgm
+		noWordGuardMasks[bi] = nwgm
 	}
 
 	// Build suffix DFA function bodies, one per bucket.
@@ -1685,6 +1704,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		trivialPrefixMasks:  trivialPrefixMasks,
 		startAnchorMasks:    startAnchorMasks,
 		lineAnchorMasks:     lineAnchorMasks,
+		wordGuardMasks:      wordGuardMasks,
+		noWordGuardMasks:    noWordGuardMasks,
+		wordGuardOff:        -1,
 		prefixFixedLens:     prefixFixedLens,
 		buckets:             buckets,
 		patternIDs:          patternIDs,
@@ -2012,6 +2034,25 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 				appendDataSegment(nil, cs.overlapSuccOff, make([]byte, ns))...)
 			cs.startableDataSegs++
 		}
+	}
+
+	// The word guards' table (PatternInfo.wordGuard): 1 for a word byte.
+	// Placed like the startable tables, and only when some bucket has a guard.
+	for bi := range buckets {
+		if cs.wordGuardMasks[bi]|cs.noWordGuardMasks[bi] == 0 {
+			continue
+		}
+		var tab [256]byte
+		for c := range tab {
+			if isWordCharByte(byte(c)) {
+				tab[c] = 1
+			}
+		}
+		cs.wordGuardOff = ra.Bump("word-guard", 256, 1)
+		cs.startableDataBytes = append(cs.startableDataBytes,
+			appendDataSegment(nil, cs.wordGuardOff, tab[:])...)
+		cs.startableDataSegs++
+		break
 	}
 
 	// First-position routing data, derived from the finished bucket list.

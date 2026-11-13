@@ -568,7 +568,7 @@ var stubSharedSymbols = map[string][]string{
 // is added later, the churn this whole file exists to prevent.
 var stubPrivateHelpers = map[string][]string{
 	"js": {
-		"init", "_exp", "_mem", "_staticTop", "_bump", "_live", "_enc",
+		"init", "_exp", "_mem", "_staticTop", "_bump", "_regs", "_enc",
 		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
 		"_att", "_notes", "_btmemo",
 	},

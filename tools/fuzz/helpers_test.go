@@ -90,14 +90,25 @@ var overlapShapeMemo sync.Map
 // per position, which for a 4 KB input is three times the single-block region.
 // Sizing it the other way made the sweep refuse, the drive walk, and the test
 // compare the walk with itself at every stride below 5.
+//
+// A split member's program sweep keeps its part in the same region, so the
+// region holds the cache's bytes for THIS stride, 8-aligned, and then the
+// sweep's, as a caller that writes its own stride sizes it.
 func overlapCacheForK(input string, pats []string, k int32) int32 {
-	cfg := overlapSizingCfg(pats)
-	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
-	if err != nil || !sh.Eligible {
+	sh, err := cachedOverlapShape(pats)
+	if err != nil {
 		return int32(config.SetOverlapCheckpointHeaderBytes)
 	}
-	return int32(config.SetOverlapCheckpointBytesForStride(
-		len(input), sh.Cells, sh.Patterns, int(k)))
+	n := config.SetOverlapCheckpointHeaderBytes
+	if sh.Eligible {
+		n = config.SetOverlapCheckpointBytesForStride(len(input), sh.Cells, sh.Patterns, int(k))
+	}
+	if sh.SweepCells > 0 {
+		if sb, _ := config.SetOverlapCheckpointSizingRow(len(input), sh.SweepCells, sh.SweepRow); sb <= config.SetOverlapCacheMaxBytes {
+			n = (n+7)&^7 + sb
+		}
+	}
+	return int32(n)
 }
 
 // overlapSizingCfg is the set overlapCacheFor and overlapCacheForK size a region
@@ -148,8 +159,9 @@ type cacheDrive struct {
 
 func (d *cacheDrive) buf() []byte { return d.mem.UnsafeData(d.store) }
 
-func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *cacheDrive {
-	t.Helper()
+// compileCacheDriveSet is the overlapping set a cache drive runs, compiled
+// once per pattern list, batch flag and sweep budget.
+func compileCacheDriveSet(pats []string, batch bool, sweepBudget int64) ([]byte, error) {
 	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
 		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
@@ -159,20 +171,27 @@ func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *
 		Patterns: config.PatternSelector{All: true}, Overlapping: true,
 		Unicode: setModeKey(),
 	}
-	export := "set_find"
-	if lay.batch {
+	if batch {
 		set.Hints = []string{"batch-find"}
-		export = "set_find_batch"
 	}
-	w, err := cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", lay.batch, lay.sweepBudget, setKey(pats)), func() ([]byte, error) {
+	return cachedCompile(fmt.Sprintf("cachedrive\x00%v\x00%d\x00%s", batch, sweepBudget, setKey(pats)), func() ([]byte, error) {
 		cfg := config.BuildConfig{Patterns: entries, Sets: []config.SetConfig{set}}
-		if lay.sweepBudget > 0 {
-			w, _, _, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{}.WithSweepBudget(lay.sweepBudget))
+		if sweepBudget > 0 {
+			w, _, _, err := compile.CompileFileOpts(cfg, "", compile.CompileSetOptions{}.WithSweepBudget(sweepBudget))
 			return w, err
 		}
 		w, _, err := compile.CompileFile(cfg, "")
 		return w, err
 	})
+}
+
+func newCacheDrive(t *testing.T, pats []string, input string, lay cacheLayout) *cacheDrive {
+	t.Helper()
+	export := "set_find"
+	if lay.batch {
+		export = "set_find_batch"
+	}
+	w, err := compileCacheDriveSet(pats, lay.batch, lay.sweepBudget)
 	if err != nil {
 		t.Fatalf("compile %v: %v", pats, err)
 	}

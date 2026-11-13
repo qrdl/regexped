@@ -252,7 +252,7 @@ matches.
   the member's searches have walked `4 × len + 64` bytes — in Unicode mode
   `k × len + 64`, k the sweep's estimated cost per byte in walk bytes, since a
   lowered class makes a column thousands of roots wide — lives in the same
-  region after the cache, and is checkpointed the same way. Measured:
+  region, at its end past the cache, and is checkpointed the same way. Measured:
   131,456 → 795 instructions per byte (non-greedy), 124,939 → 1,052
   (Backtracking).
 
@@ -269,7 +269,7 @@ cannot have it.
 | Backtracking frame stack (every body, set members included) | starts at 64 KB, doubles by `memory.grow`; one scratch for the whole module | as a search deepens |
 | fallback stack and bitset | sized from the input | when the fallback runs |
 | answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | reserved by the stub per drive; filled only if the drive sweeps |
-| program sweep | 4 bytes per position per swept member, checkpointed the same way | after the cache, same region |
+| program sweep | 4 bytes per position per swept member, checkpointed the same way | the end of the same region, after the cache |
 | default state (standalone, raw callers) | what a stub would allocate | grown on first use, reused, regrown to at least twice the size only when a drive needs more |
 
 - **Call-time growth.** The fallback's memory and every frame stack are placed

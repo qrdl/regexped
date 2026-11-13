@@ -267,7 +267,12 @@ regexped/
 │   │                          #   ordering stay per-packer on purpose: the anchored one packs in
 │   │                          #   DECLARATION order (a bucket's bit k must map to a stable global
 │   │                          #   id) and merges with leftmost-first OFF, which is why the two
-│   │                          #   packers were never merged
+│   │                          #   packers were never merged. A member whose prefix is a bare \b or
+│   │                          #   \B keeps its LITERAL bucket with a WORD GUARD (PatternInfo.wordGuard):
+│   │                          #   the trivial-prefix group's mask tests the boundary between
+│   │                          #   input[pos-1] and input[pos] through a 256-byte word table
+│   │                          #   (set_find.go emitGroupMask). It went to a fallback bucket before:
+│   │                          #   `\bkeyword\b` sets 12x-42x the fuel of plain words, now +0-0.7%
 │   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
 │   │                          #   These bodies serve `find` AND the scan pair — setFindCtx.mode picks what
 │   │                          #   each records at a matching position. Scan work belongs HERE + set_find.go.
@@ -360,8 +365,11 @@ regexped/
 │   │                          #   its static CLOSURE (DFS over epsilon edges, each pc once — Go's
 │   │                          #   drop-the-second-arrival rule, which also ends zero-width cycles) whose
 │   │                          #   continuation succeeds; closures are precomputed per assertion context.
-│   │                          #   Answers live in the caller's cache region AFTER the cache (8-aligned),
-│   │                          #   checkpointed like it (emitCkptSizingBudget); state in the cache
+│   │                          #   Answers live at the END of the caller's cache region, past the cache
+│   │                          #   (its last bytes, start 8-aligned down): a raw caller may write any
+│   │                          #   stride, and placing it after the FORMULA's cache overwrote a larger
+│   │                          #   layout's. It runs only when clear of the header stride's layout, and is
+│   │                          #   checkpointed like the cache (emitCkptSizingBudget); state in the cache
 │   │                          #   header's reserved words 0, 4, 32. Runs once the member's walks pass
 │   │                          #   4 × len + 64 (Unicode mode: k × len + 64, k = the sweep's estimated
 │   │                          #   fuel per byte in walk bytes, setWorkK). Limits: 4,096 roots per set,
@@ -563,7 +571,8 @@ regexped/
 │   ├── alt_lit_anchor.go      # Literal-anchored find over an alternation's branches, one shared frontend
 │   ├── blockstack.go          # WASM branch-depth bookkeeping for hand-written emitters
 │   ├── byte_rarity.go         # Byte-rarity classes: route a 17..64-byte first-byte set to Shufti or scalar
-│   ├── class_chain_prefix.go  # Chain-start SIMD verify for `[class]{N,}` patterns
+│   ├── class_chain_prefix.go  # Chain-start SIMD verify for `[class]{N,}` patterns — every hint
+│                              #   mode (prefer-match only until 2026-11-12: neutral hex finds −40%)
 │   ├── counted_chain.go       # Counted linear class-chain detection
 │   ├── dominant_walk.go       # Dominant-walk-state detection for the anchored set probe, and
 │   │                          #   hasNeverDyingState — a byte self-loop OR a loop over whole UTF-8
@@ -604,7 +613,11 @@ regexped/
 │   ├── generate.go            # Stub generation orchestration (ResolveStubType, CmdGenerateStub)
 │   ├── rust_stub.go           # Rust FFI stub generator (iterators)
 │   ├── go_stub.go             # Go (wasip1) stub generator (//go:wasmimport, iter.Seq2)
-│   ├── js_stub.go             # JS ES module stub generator
+│   ├── js_stub.go             # JS ES module stub generator. Each generator owns a REGION of
+│                              #   memory for its lifetime (input, out area, search state), kept
+│                              #   on a stack: a finished one is freed and free regions at the top
+│                              #   are given back, so one never finished keeps only its own (a
+│                              #   live-iterator COUNT made it keep every later one's too)
 │   ├── ts_stub.go             # TypeScript ES module stub generator
 │   ├── as_stub.go             # AssemblyScript stub generator
 │   ├── c_stub.go              # C header stub generator (WASM imports, caller-owned scanners and arrays)
@@ -656,8 +669,9 @@ regexped/
 │                              #   in compile/ because it needs generate/'s WIT, and generate/
 │                              #   already imports compile/ — this package sits above both
 ├── merge/
-│   └── merge.go               # Link: wasm-merge for modules, wac plug (after a duplicate-export
-│                              #   pre-check) for components
+│   └── merge.go               # Link: wasm-merge for modules (each must import main.memory — a
+│                              #   STANDALONE module is refused, it would read its own memory),
+│                              #   wac plug (after a duplicate-export pre-check) for components
 ├── internal/
 │   ├── abi/
 │   │   └── abi.go             # The numeric return-value contract shared by compile/ and generate/
@@ -706,7 +720,14 @@ regexped/
 │   ├── README.md              # What each tool checks or measures, and how to run it
 │   ├── advbench/              # Adversarial DRIVES: fuel per input doubling, ×2 linear / ×4
 │   │                          #   quadratic; `make adversary` runs rows.go's table (see Testing)
-│   ├── fuzz/                  # Correctness fuzzer and property tests: compiled WASM against Go regexp
+│   ├── fuzz/                  # Correctness fuzzer and property tests: compiled WASM against Go regexp.
+│   │                          #   Two GENERATOR targets build their cases from a seed (the fuzz engine
+│   │                          #   supplies only the seed and the mode): FuzzLongInput — a pattern from a
+│   │                          #   small realistic grammar and 17-250-byte inputs that WALK it, so runs
+│   │                          #   reach the SIMD skips (byte-mutated inputs never did: four wrong-answer bugs shipped
+│   │                          #   past every other target); FuzzSetRoutes — a set through every route
+│   │                          #   `find` answers by, each against Go. `make fuzz-long-input` /
+│   │                          #   `fuzz-set-routes`, 5 min, FUZZTIME= to extend, one worker
 │   ├── setperf/
 │   │   ├── main.go            # Cross-engine set comparison vs regex-automata (see Testing);
 │   │   │                      #   drives find AND its batch entry, and cross-checks the two
@@ -909,7 +930,7 @@ sets:
 
 **`byte_mode:` and the unsupported-rune gate.** In BYTE mode — `.` consumes one byte, classes are byte classes, `\b` is ASCII — a rune above U+007F has no byte to be. A pattern naming one asks for UNICODE mode instead (`compile/utf8_lower.go`: `resolvePattern` decides a pattern's mode once and the program is lowered to UTF-8 byte ranges; a SET has one mode for all its members, `resolveSetMode`, and in Unicode mode keeps no match or empty match inside a character at four sites — the per-position walk's candidate skip, the answer cache's sweep, the program sweep's rows and the split merge's search position — all keyed off `setStartNeeds`, since only an EMPTY match can sit inside a character). In byte mode — `byte_mode: true`, `unicode: false`, or a harness's `CompileOptions.ForceByteMode` — `compile/compile.go`'s `unsupportedRune` rejects a rune past the limit, with a message that names it (and points at `byte_mode: true` for one up to U+00FF); a rune above U+00FF is rejected under `byte_mode` too, with a message that does not suggest a flag which cannot help. `byte_mode: true` moves the limit to 0xFF and declares those runes to mean exactly those bytes, which is a capability that did not exist before 2026-09-01 (`[\x80-\xff]+` was rejected outright). A literal carrying them is extracted like an ASCII one (`literalBytes`, `compile/mandatory_lit.go`); until 2026-10-12 every literal extractor refused a rune above 0x7F in byte mode, so such a set walked a fallback bucket and such a pattern lost its literal-anchored find. The gate sits at the TOP of `compilePattern`, before any fast path — `compile()` alone missed the lit-chain family, lit-anchor and the alternation shapes, so acceptability would have depended on which emitter a pattern qualified for — and it therefore covers SET members too, since `CompileFile` calls `compilePattern` for every entry.
 
-TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` and `CompileOptions.ForceByteMode` are how a caller (every harness, and `CompileForced`) states a pattern's mode instead of letting `resolvePattern` decide it.
+TWO things stay byte-semantic by declaration, because no rule separates them from ordinary ASCII patterns: `.`/negated classes consume one byte, and case folding stays inside the byte range. The second one is not obvious: Go's parser expands `(?i)` over a class EAGERLY, so `(?i:[a-z])` arrives carrying U+017F and U+212A — runes manufactured from its own ASCII `s` and `k`. A rune above the limit is therefore tolerated when it is a SimpleFold partner of an ASCII rune the same instruction names — also when the parser merged two such runes into one range (U+212A..U+212B under byte_mode), and also as a HOLE: Go complements a class after expanding `(?i)`, so `(?i)[^a-z]` and `(?i)\W` arrive with their tail cut at exactly those runes, and a hole whose whole fold orbit is left out is an artifact too (`[^ſ]`, which keeps `s`, is not). A rune the pattern WRITES is never an artifact: `[sSſ]`, `[^sSſ]` and `(?i)[sſ]` compile to the same instructions as `(?i)s` / `(?i)[^s]`, so the gate also reads the SOURCE text (`writtenFoldRunes`: literal characters, `\x{…}` and octal escapes, `\Q…\E`) and withdraws the tolerance for those runes — and refuses a written rune even where the program does not name it, since Go stores a folded LITERAL as the lowest rune of its orbit (`(?i)ſ` is `S` with FoldCase, `(?i)` + Kelvin sign is `K`): until 2026-11-12 such a pattern compiled in byte mode and never matched the character written. Not the parse tree's `FoldCase` flag: Go merges `[0-9]|(?i)k` into one class carrying only one sub's flags, which would refuse a pattern that wrote nothing above ASCII. Until 2026-10-03 the holes were refused, and nothing saw it: the RE2 corpus has no `(?i)` pattern, re2test counted the refusal as a skip, and `tools/fuzz` skipped whatever the gate itself refused — both now judge a pattern by the runes it NAMES. Without that tolerance the gate rejects `(?i:[a-z]+)` and `(?i)^\s*SELECT\b`: measured over all four corpora, 8 rows of working, tested patterns. `CompileOptions.Unicode` and `CompileOptions.ForceByteMode` are how a caller (every harness, and `CompileForced`) states a pattern's mode instead of letting `resolvePattern` decide it.
 
 **References (`config/references.go`).** A regexp — top-level or a set's own — may use a NAMED top-level pattern: `(?&name)` inserts its `regexp:` as `(?:…)`, `(?<&name>)` as `(?<name>…)`; Go's parser rejects both spellings, so no existing regexp changes meaning, and text Go reads otherwise (`[...]`, `\Q…\E`, after `\`) is never one. `config.ExpandReferences` rewrites them in `LoadConfig` BEFORE every other check, so compile, generate and merge see only expanded text, and a pattern written with references compiles to the module the hand-expanded one does (`TestReferencesCompileByteIdentical`); a config built in code calls it itself. The entry keeps what was written and the pieces used (`PatternEntry.Expanded`, `SetConfig.Expansions`; `Written()`, and `DisplayName()` / `Owner()` — the name, else the written text — name it in every message). Only the referenced `regexp:` is used — its mode keys, hints and `_func`s are ignored, the USING pattern's mode decides (its keys, or the guess over the expanded text). A reference takes no body; a name is `[A-Za-z0-9_]+`; a cycle is an error; each piece parses on its own first so its syntax error names it and its users; a piece's own groups come along, a duplicate name names the references (`captureNameProblems`); a byte-gate refusal caused by a piece's text names the piece (`pieceWithRune`, `patternError`). A piece is an ordinary top-level pattern, so `patterns: all` holds it. `compile --verbose` prints `expanded:` under such a pattern, and lists a set's own regexps with the patterns (`SetConfig.InlineEntry`, `<set>: regexps[<i>]`), through the per-pattern step a no-`_func` entry takes, which emits no code. Named groups are documented as `(?<name>…)`; Python's `(?P<name>…)` stays accepted — regexped accepts every spelling Go accepts. See `docs/references.md`.
 
@@ -1060,7 +1081,7 @@ Generated as a single ES module. `init()` takes the WASM bytes (or a compiled `W
 | `groups_func` | `function* <func>(input)` | generator of `Array<[start,end]\|null>` |
 
 
-Input `string` or `Uint8Array`. Capture slot buffer placed at memory offset 1024.
+Input `string` or `Uint8Array`. Each generator copies its input into a region of its own, held until it finishes (a `finally` frees it); the docs' first-match idiom is `const [first] = find(text)`, which closes the generator — `find(text).next().value` does not.
 
 **C stubs** (`generate/c_stub.go`):
 
@@ -1082,7 +1103,7 @@ on the output kind — and each arm is a thin wrapper around one external tool,
 resolved identically by `internal/tools.Resolve` (the config's `*_path` key, else
 `$PATH`; no environment variable is read).
 
-`module` → `mergeModules`, `wasm-merge`:
+`module` → `mergeModules`, `wasm-merge`, after refusing any regexp module that does not import the host's memory as `main`.`memory` (`utils.ImportsMemory`): a STANDALONE module (config without `output:`) reads its own memory, and merged it answered -1 where the answer was 5:
 
 ```
 wasm-merge --enable-multimemory --enable-simd --enable-bulk-memory --enable-bulk-memory-opt \
@@ -1364,7 +1385,7 @@ make byteident   # from repo root
 ```
 
 Forty-six single-pattern configs, one per code path (the `unicode_` ones in
-Unicode mode), plus thirty-one SET configs spanning four frontends, both
+Unicode mode), plus thirty-two SET configs spanning four frontends, both
 accept representations, all five capabilities and Unicode mode — each checked in with the exact bytes it compiles to and
 compared byte for byte. This is the regression
 net for any change that touches a shared emitter: single-pattern output is

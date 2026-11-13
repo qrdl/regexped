@@ -2406,6 +2406,54 @@ func TestProgramSweepCheckpointsMatchGo(t *testing.T) {
 	}
 }
 
+// TestProgramSweepAtForcedStrides: a caller may write any stride it sized the
+// cache for, not only the formula's, and a split member's program sweep keeps
+// its part in the same region. The sweep's part was placed after where the
+// cache would end at the FORMULA's stride: at strides 1 and 3 the cache's
+// layout is larger, the sweep wrote its answers over the cache's, and the
+// drive returned starts before `from` and lost tuples with no -4; at stride 7
+// it is smaller, and the sweep refused for want of room the region had
+// (10,469 against 1,080 fuel per byte). Each region here is sized for its
+// stride plus the sweep's part, as such a caller sizes it; every drive must
+// equal Go, and the sweep must have run. The sweep judges its room against the
+// cache's layout in the header once the cache has swept and against the
+// caller's stride before then: the first two inputs engage the cache too, the
+// last never does (no `foo`), so there only the caller's stride decides.
+func TestProgramSweepAtForcedStrides(t *testing.T) {
+	for _, c := range []struct {
+		pats  []string
+		input string
+	}{
+		{[]string{`foo\w+`, `k[a-z]+?z`}, strings.Repeat("kfoo", 150) + "z"},
+		{[]string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("afoo", 150) + "z"},
+		{[]string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+	} {
+		want := overlapOracleCtx(t, c.pats, c.input)
+		for _, k := range []int32{1, 3, 7} {
+			name := fmt.Sprintf("%v/k%d", c.pats, k)
+			scratch := overlapCacheForK(c.input, c.pats, k)
+			stride := k
+			opt := &cacheDriveOpt{stride: &stride}
+			got := driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, scratch, engageAny, opt)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s find: got %v\nwant %v", name, got, want)
+			}
+			if opt.header[0] != 1 {
+				t.Errorf("%s: the program sweep never ran (header word 0 = %d)", name, opt.header[0])
+			}
+			if kept := int32(opt.header[2]) == 1; kept != strings.Contains(c.input, "foo") {
+				t.Errorf("%s: the kept members' cache swept = %v", name, kept)
+			}
+			for _, cp := range []int32{1, 2} {
+				lay := cacheLayout{batch: true, scratchLen: scratch, offer: true, stride: k}
+				if got := driveOverlapCacheLay(t, c.pats, c.input, 0, cp, engageAny, lay); fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("%s batch cap %d: got %v\nwant %v", name, cp, got, want)
+				}
+			}
+		}
+	}
+}
+
 // overlapOracleCtx is overlapOracle with each start's LEFT CONTEXT: the probe
 // is anchored at position s of the whole input (\A(?s:.{s})), so \b, \B and
 // (?m:^) judge the byte before s rather than a slice's edge. Go caps a

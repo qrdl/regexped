@@ -127,10 +127,9 @@ type setFindCtx struct {
 	// skipped with Teddy.
 	mode        setCapKind
 	probeFnBase int
-	// tableMemIdx is the memory holding this set's tables. Only the bodies
-	// that read a table through setFindCtx set it — today the scalar body, for
-	// the first-byte eligibility masks. Bodies that never do leave it 0, which is
-	// harmless because the features that use it are gated off for them.
+	// tableMemIdx is the memory holding this set's tables, read through the
+	// ctx by the scalar body's first-byte eligibility masks and by every
+	// body's word guards (emitGroupMask).
 	tableMemIdx int
 	// anyProbeBase / useAnyProbe route `scan` and `scan_any` to a bucket's
 	// first-hit-exit probe where one was emitted.
@@ -308,10 +307,33 @@ func (c *setFindCtx) emitGroupMask(b []byte, bi int, g prefixLenGroup, posLocal 
 	}
 	sam := cs.startAnchorMasks[bi] & g.mask
 	lam := cs.lineAnchorMasks[bi] & g.mask
-	base := g.mask & cs.trivialPrefixMasks[bi] &^ (sam | lam)
+	wgm, nwgm := c.wordGuardMasks(bi, g)
+	base := g.mask & cs.trivialPrefixMasks[bi] &^ (sam | lam | wgm | nwgm)
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(base))
 	b = append(b, 0x21, c.lValidMask)
+	if wgm|nwgm != 0 {
+		// lValidMask |= boundary ? wgm : nwgm, where boundary is whether the
+		// word-ness of input[pos-1] (non-word before position 0) differs from
+		// input[pos]'s, the literal's first byte — present, since a literal
+		// sits there.
+		b = append(b, 0x20, c.lValidMask)
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(wgm))
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(nwgm))
+		b = append(b, 0x20, c.pInPtr, 0x20, posLocal, 0x6A)
+		b = appendInputLoad8u(b)
+		b = appendTableLoad8uAt(b, cs.wordGuardOff, c.tableMemIdx)
+		b = append(b, 0x20, posLocal, 0x04, 0x7F) // if posLocal != 0 (result i32)
+		b = append(b, 0x20, c.pInPtr, 0x20, posLocal, 0x6A, 0x41, 0x01, 0x6B)
+		b = appendInputLoad8u(b)
+		b = appendTableLoad8uAt(b, cs.wordGuardOff, c.tableMemIdx)
+		b = append(b, 0x05, 0x41, 0x00, 0x0B) // else 0 end
+		b = append(b, 0x73)                   // i32.xor: boundary
+		b = append(b, 0x1B)                   // select
+		b = append(b, 0x72, 0x21, c.lValidMask)
+	}
 	if sam != 0 {
 		b = append(b, 0x20, posLocal, 0x45, 0x04, 0x40) // if posLocal == 0
 		b = append(b, 0x20, c.lValidMask, 0x41)
@@ -795,7 +817,15 @@ func (c *setFindCtx) maskEmptyFromAnchors(bi int, g prefixLenGroup) bool {
 	}
 	sam := c.cs.startAnchorMasks[bi] & g.mask
 	lam := c.cs.lineAnchorMasks[bi] & g.mask
-	return g.mask&c.cs.trivialPrefixMasks[bi]&^(sam|lam) == 0
+	wgm, nwgm := c.wordGuardMasks(bi, g)
+	return g.mask&c.cs.trivialPrefixMasks[bi]&^(sam|lam|wgm|nwgm) == 0
+}
+
+// wordGuardMasks returns trivial-prefix group g's \b- and \B-guarded patterns
+// in bucket bi (PatternInfo.wordGuard). Only an L == 0 group can hold one: a
+// guard is a stripped prefix, so both callers ask only about such a group.
+func (c *setFindCtx) wordGuardMasks(bi int, g prefixLenGroup) (wgm, nwgm uint32) {
+	return c.cs.wordGuardMasks[bi] & g.mask, c.cs.noWordGuardMasks[bi] & g.mask
 }
 
 // emitGateSkipSingle is the fused gate test for a group holding exactly ONE
@@ -1907,6 +1937,9 @@ func newSetFindCtx(cs *compiledSet, suffixFnBase, prefixFnBaseIdx, drainSlack in
 		batch:   batch,
 		hasSkip: hasSkip,
 		pInPtr:  0, pInLen: 1, pFrom: 2,
+		// The set's own; the scalar body sets the same value again. A body
+		// that reads no table through the ctx never uses it.
+		tableMemIdx: cs.tableMemIdx,
 	}
 	switch {
 	case mode != capFind:

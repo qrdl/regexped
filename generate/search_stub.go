@@ -234,16 +234,19 @@ func jsWithSearch(src, funcName string, sz compile.SearchSize, ts, groups bool, 
 	}
 	lines := strings.Split(src, "\n")
 	indentOf := func(s string) string { return s[:len(s)-len(strings.TrimLeft(s, " "))] }
+	plainOut := " : 0);"
+	if groups {
+		plainOut = fmt.Sprintf(" : %d);", (slotBytes+7)&^7)
+	}
 	var out []string
 	found := map[string]bool{}
 	for i, ln := range lines {
 		t := strings.TrimSpace(ln)
 		switch {
-		case strings.HasPrefix(t, "const [_inBase, _outBase, len] = _open(input, _batched ? ") && strings.HasSuffix(t, " : 0);"):
+		case strings.HasPrefix(t, "const [_inBase, _outBase, len] = _open(input, _batched ? ") && strings.HasSuffix(t, plainOut):
+			// The out area's size is already in the template: 0 for a find,
+			// the slots for a groups call. The block goes after it.
 			expr := strings.TrimSuffix(strings.TrimPrefix(t, "const [_inBase, _outBase, len] = _open(input, "), ");")
-			if groups {
-				expr = strings.TrimSuffix(expr, " : 0") + fmt.Sprintf(" : %d", (slotBytes+7)&^7)
-			}
 			p := jsSearch(funcName, sz, expr, ts)
 			out = append(out, indentOf(ln)+"const [_inBase, _outBase, len] = _open(input, ("+expr+")"+p.open+");")
 			out = append(out, strings.Split(strings.TrimSuffix(p.decl, "\n"), "\n")...)

@@ -222,6 +222,27 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 // The spread is checked rather than asserted in a comment: a fixture set that
 // silently collapsed onto one frontend would still pass the byte comparison
 // while defending nothing.
+// TestByteIdenticalWordGuardFixture: set_word_guard's members, every one with
+// a bare \b or \B before its literal but one, all sit in LITERAL buckets —
+// the word guard, not a fallback walk. A guard that stopped qualifying would
+// regenerate the fixture onto a fallback bucket while its name claimed this.
+func TestByteIdenticalWordGuardFixture(t *testing.T) {
+	_, _, diags, err := CompileFileDiag(loadByteIdentConfig(t, "set_word_guard"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, b := range diags[0].Buckets {
+		if b.Literal == "" {
+			t.Errorf("set_word_guard: a fallback bucket holds %v", b.Patterns)
+		}
+		n += len(b.Patterns)
+	}
+	if n != 6 {
+		t.Errorf("set_word_guard: %d members in buckets, want 6", n)
+	}
+}
+
 func TestByteIdenticalSetShapesAreDistinct(t *testing.T) {
 	frontends := map[string][]string{}
 	acceptKinds := map[string]int{}

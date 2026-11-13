@@ -2242,7 +2242,6 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			lmNonMidShufti:       buildOpts.LikelyMode == LikelyMatch,
 			lmWideShufti:         buildOpts.LikelyMode == LikelyMatch,
 			lmCharLoop:           buildOpts.LikelyMode == LikelyMatch,
-			lmClassChain:         buildOpts.LikelyMode == LikelyMatch,
 			startRule:            startRuleFor(rp),
 			utf8Text:             rp.unicode(),
 		})
@@ -4253,7 +4252,22 @@ func unsupportedRuneWritten(prog *syntax.Prog, byteMode bool, written map[rune]b
 			return limit + 1
 		}
 	}
-	return -1
+	// A rune the text WROTE is refused even when the program does not name
+	// it. Go stores a folded LITERAL as the lowest member of its fold orbit
+	// (`(?i)ſ` is literal `S` with FoldCase, `(?i)K` with the Kelvin sign is
+	// `K`), so the program names only ASCII and the loop above saw nothing —
+	// and in byte mode, where folding stays inside the byte range, the very
+	// character written could never match: `(?i)ſ` over "ſ" found nothing,
+	// Go [0,2). Every rune in written lies above the limit (writtenFoldRunes),
+	// so this is the same refusal a class naming it gets, and through
+	// detectUnicodeRune the same request for Unicode mode.
+	low := rune(-1)
+	for r := range written {
+		if low < 0 || r < low {
+			low = r
+		}
+	}
+	return low
 }
 
 // maxFoldArtifactRun bounds how many consecutive runes above the limit a class

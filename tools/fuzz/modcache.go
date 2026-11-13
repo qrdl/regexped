@@ -376,10 +376,19 @@ var (
 	fuzzModuleOrder [][32]byte
 )
 
+// keepModules makes the module cache serve a target outside a fuzz run under
+// -unicode too: FuzzSetRoutes drives each of its few modules through a dozen
+// routes, and a wasmtime build of 0.5-2 s per route put one input past the fuzz
+// worker's 10 s deadline. Set for the duration of such a target only.
+var keepModules bool
+
+// modulesKept reports whether compiled modules are warmed and reused.
+func modulesKept() bool { return keepModules || fuzzingUnicode() }
+
 // warmModule compiles wasm with the shared engine and keeps it for
-// instantiate. A no-op outside a fuzz run under -unicode.
+// instantiate. A no-op unless modulesKept.
 func warmModule(wasm []byte) {
-	if !fuzzingUnicode() || len(wasm) == 0 {
+	if !modulesKept() || len(wasm) == 0 {
 		return
 	}
 	key := sha256.Sum256(wasm)
@@ -412,7 +421,15 @@ func warmModule(wasm []byte) {
 // -unicode, compiling it under the deadline when the module cache let it go;
 // false when that compile ran past it.
 func ensureWarm(wasm []byte, err error) bool {
-	if !fuzzingUnicode() || err != nil || warmedModule(wasm) != nil {
+	if !modulesKept() || err != nil || warmedModule(wasm) != nil {
+		return true
+	}
+	if !fuzzingUnicode() {
+		// Waited for, as a compile is (keepModules in byte mode): the deadline
+		// and the running flag belong to the -unicode inputs, and a byte-mode
+		// input after one met that input's spent budget and reported its own
+		// cached module as a compile past the deadline.
+		warmModule(wasm)
 		return true
 	}
 	return runWithDeadline(func() { warmModule(wasm) })
@@ -420,7 +437,7 @@ func ensureWarm(wasm []byte, err error) bool {
 
 // warmedModule is the module warmModule compiled for wasm, or nil.
 func warmedModule(wasm []byte) *wasmtime.Module {
-	if !fuzzingUnicode() {
+	if !modulesKept() {
 		return nil
 	}
 	key := sha256.Sum256(wasm)

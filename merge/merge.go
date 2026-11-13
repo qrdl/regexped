@@ -186,6 +186,9 @@ func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []
 	// import of that name against one of them only.
 	seen := map[string]string{"main": mainWasm}
 	for _, path := range regexWasms {
+		if err := checkEmbedded(path); err != nil {
+			return err
+		}
 		module := moduleNameForWasm(cfg, path)
 		if prev, dup := seen[module]; dup {
 			return fmt.Errorf("merge: %s and %s are both named %q: give each config its own import_module", prev, path, module)
@@ -207,6 +210,23 @@ func mergeModules(cfg config.BuildConfig, mainWasm, output string, regexWasms []
 		return fmt.Errorf("stat output: %w", err)
 	}
 	slog.Info("Merged", "output", output, "bytes", info.Size())
+	return nil
+}
+
+// checkEmbedded refuses a regexp module that does not import the host's memory
+// as `main`.`memory`. Only an EMBEDDED module (compiled from a config with
+// `output:`) reads its input from the host; a STANDALONE one reads it from its
+// own memory, so linked into a host it reads the wrong memory and answers
+// wrong — -1 where the answer is 5 — with no error at any step.
+func checkEmbedded(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("merge: %w", err)
+	}
+	if !utils.ImportsMemory(raw, "main", "memory") {
+		return fmt.Errorf("merge: %s does not import the host's memory (main.memory): it was compiled as a "+
+			"standalone module; add `output:` to the config it was compiled from and compile it again", path)
+	}
 	return nil
 }
 

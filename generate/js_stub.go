@@ -252,7 +252,7 @@ export function %s(input, from = 0) {
         }
         pos = next;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 `, gateDoc, s.Find, plainCachePre, plainCacheDest, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
@@ -341,7 +341,7 @@ export function %s(input, from = 0) {
         if (done || n === 0) break;
         cursor = packed;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", gateDoc, s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", cachePre, cacheDest, batchGateRegion, cacheReserve,
@@ -404,9 +404,9 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("let _exp, _mem;\n")
 	sb.WriteString("let _staticTop = 0; // first byte after the module's own table pages\n")
 	sb.WriteString("let _bump = 0;      // next free byte; regions are carved from here up\n")
-	// Only generators keep a refcount; a stub with none would declare it unused.
+	// Only generators keep regions; a stub with none would declare it unused.
 	if hasSuspendableExports(cfg) {
-		sb.WriteString("let _live = 0;      // live iterator regions\n")
+		sb.WriteString("const _regs = [];   // live iterator regions, in allocation order\n")
 	}
 	sb.WriteString("const _enc = new TextEncoder();\n")
 	sb.WriteString("\n")
@@ -445,10 +445,15 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	// every call carves its OWN region and keeps it, which gives JS the same
 	// contract with a copy still in the middle.
 	//
-	// A bump allocator with a live-iterator refcount is enough. There is no
-	// free list because there is nothing to reclaim piecemeal: when the last
-	// iterator finishes the whole arena resets, which for ordinary code is
-	// between every loop.
+	// A bump allocator over a STACK of regions, one per live iterator. A
+	// finished iterator marks its region free, and every free region at the
+	// top is given back, so the arena resets when the last iterator finishes —
+	// between every loop, for ordinary code. An iterator that is never
+	// finished (started with next() and dropped, neither run to its end nor
+	// return()ed) keeps ITS region and nothing else: the ones above it are
+	// still given back as they finish. A live-iterator COUNT was used before,
+	// and one such iterator kept the count above zero for good, so every later
+	// iterator's region leaked too and, under max_memory, the instance died.
 	sb.WriteString("function _align(x) { return (x + 7) & ~7; }\n\n")
 	sb.WriteString(jsGrowFunc(false))
 	sb.WriteString("function _inCap(input) {\n")
@@ -487,7 +492,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
     // its scratch. Release with _close() from a finally.
     //
     // Nothing is reserved until every grow has succeeded. A grow that throws
-    // leaves _bump and _live as they were, so the instance stays usable; when
+    // leaves _bump and _regs as they were, so the instance stays usable; when
     // _bump moved first, a grow refused under a memory ceiling left it past the
     // end of memory with no iterator alive to reset it, and every later call
     // threw.
@@ -498,7 +503,10 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
     // grow only DECLINES the cache: a zero-length cache is the documented
     // "walk" signal, so the drive is slower instead of failing.
     const at = _bump, out = _align(at + _inCap(input));
-    const top = out + (outBytes > 0 ? outBytes : 65536);
+    // outBytes is what the iterator writes there — a batch buffer, a groups
+    // call's slots, a set's gates and tuples — and nothing more: a find that
+    // writes nothing reserves nothing.
+    const top = out + outBytes;
     _grow(top);
     const len = _write(input, at);
     let k = 0, cache = 0;
@@ -509,12 +517,18 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
         }
     }
     _bump = top + cache;
-    _live++;
+    _regs.push({ at, top: _bump, free: false });
     return [at, out, len, cache, k];
 }
 
 `)
-		sb.WriteString("function _close() { if (--_live === 0) _bump = _staticTop; }\n\n")
+		sb.WriteString("function _close(at) {\n" +
+			"    // Frees the region _open placed at `at`, then gives back every free\n" +
+			"    // region at the top of the stack.\n" +
+			"    for (let i = _regs.length - 1; i >= 0; i--) if (_regs[i].at === at) { _regs[i].free = true; break; }\n" +
+			"    while (_regs.length > 0 && _regs[_regs.length - 1].free) _regs.pop();\n" +
+			"    _bump = _regs.length > 0 ? _regs[_regs.length - 1].top : _staticTop;\n" +
+			"}\n\n")
 		sb.WriteString("function _att(view, Ctor, at, len) {\n")
 		sb.WriteString("    // A view survives its own iterator's lifetime EXCEPT across a grow, which\n")
 		sb.WriteString("    // detaches every view in the module no matter whose region it points at —\n")
@@ -671,7 +685,7 @@ export function* %[1]s(input, offset = 0) {
         }
         off += relEnd > relStart ? relEnd : relStart + 1;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
 `, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
@@ -697,7 +711,7 @@ export function* %[1]s(input, offset = 0) {
     const _batched = typeof _exp['%[1]s_batch'] === 'function';
     // One region for whichever path runs, held for this iterator's lifetime so
     // an interleaved stub call cannot overwrite the staged input mid-scan.
-    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : %[9]d);
     try {
     if (_batched) {
         let outBuf = new Int32Array(_exp.memory.buffer, _outBase, %[2]d * %[3]d);
@@ -770,10 +784,10 @@ export function* %[1]s(input, offset = 0) {
         prevEnd = absEnd;
         yield result;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
-`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName), (slotCount*4+7)&^7)
 }
 
 // genJSGroupIndices emits the name→index object for a groups function.

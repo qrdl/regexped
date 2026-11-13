@@ -2013,7 +2013,6 @@ func ccpLayout(t *testing.T, pattern string) (*dfaLayout, *dfaTable) {
 		// The LikelyMatch flags are what put dominants in the layout at all,
 		// and dominants are what overload midAcceptBytes below.
 		lmBareShufti: true, lmNonMidShufti: true, lmWideShufti: true,
-		lmClassChain: true,
 	})
 	applyDominantStateEncoding(l, true)
 	return l, table

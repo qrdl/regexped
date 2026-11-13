@@ -921,6 +921,14 @@ members passes the bare 48-byte header as the cache part. The sweep keeps its
 state in the header's words at offsets 0, 4 and 32, which the zeroing already
 covers; its stride is its own business, not a header field.
 
+The sweep's part is the region's LAST `sbytes`, its start rounded down to a
+multiple of 8 — for a region sized as above, right after the cache. A caller
+that writes a stride of its own sizes the cache part for that stride instead
+(`48 + blocks * cell + 4 + stride * row`), rounds it up to a multiple of 8 and
+adds `sbytes`. The sweep runs only where its part clears the cache's layout for
+the stride in the header; otherwise the split member searches on its own,
+which gives the same answer more slowly.
+
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
 rebuilt, and the drive costs what it did before any of this. Below the 64 MiB

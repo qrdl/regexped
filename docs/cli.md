@@ -178,7 +178,7 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
 | `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
-| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_live`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_regs`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
 | Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
 | Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
 | Export names must not collide with a generator helper (`SetMatch`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
@@ -421,6 +421,9 @@ byte mode:
   mode, negated or not, and under `(?i)` too: `[^ſ]`, `[sſ]`, `[sSſ]`,
   `[^sSſ]` and `(?i)[sſ]` all write `ſ`, as a character, a `\x{17F}` escape or
   the octal `\577`; under `byte_mode` they are refused, since no byte is `ſ`.
+  The same holds for a folded literal: `(?i)ſ` and `(?i)Kelvin` written with
+  the Kelvin sign (U+212A) ask for Unicode mode and are refused under
+  `byte_mode`, although Go stores such a literal as `S` / `K`.
   The consequence is that in byte mode `(?i)k` does not match a Kelvin sign
   and `(?i:[a-z]+)` does not match a long s: folding stays within the bytes.
   `unicode: true` folds across Unicode, as Go does.
@@ -953,6 +956,8 @@ Links the host main WASM with one or more regexp WASM artifacts into a single bi
 | `component` | `wac plug` | composes the components. `--main` is the **socket** (the component with the unsatisfied import); each positional is a **plug** |
 
 A component config that ran `merge` before this dispatch existed invoked `wasm-merge` on a component binary, which Binaryen cannot parse.
+
+**Only an embedded module can be merged.** A regexp module compiled from a config WITH `output:` imports the host's memory (`main`.`memory`) and reads its input from there; one compiled from a config WITHOUT `output:` is standalone and reads its own memory, so linked into a host it would read the wrong memory and answer wrong with no error. `merge` therefore refuses a module that does not import `main`.`memory`, naming it: add `output:` to the config it was compiled from and compile it again.
 
 You may invoke either tool directly. For modules:
 

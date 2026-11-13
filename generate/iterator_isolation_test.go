@@ -90,7 +90,7 @@ func TestGeneratorsOwnTheirRegions(t *testing.T) {
 				// Every generator must reserve and release.
 				// "= _open(" so the helper's own definition is not counted as a use.
 				nOpen := strings.Count(src, "= _open(input")
-				nFinally := strings.Count(src, "finally { _close(); }")
+				nFinally := strings.Count(src, "finally { _close(_inBase); }")
 				if nOpen == 0 {
 					t.Fatalf("generated %s opens no regions; generators are unprotected", ext)
 				}
@@ -266,6 +266,99 @@ func TestJSIteratorIsolationAtRuntime(t *testing.T) {
 				t.Fatalf("driver ran too few checks (%q): a vacuous pass", got)
 			}
 		})
+	}
+}
+
+// TestJSUnfinishedIteratorKeepsOnlyItsRegion: a generator that is started and
+// never finished (neither run to its end nor return()ed) keeps its own region,
+// and only that. The allocator used to count live iterators, so one such
+// generator kept the count above zero for good and every later generator's
+// region leaked too: under max_memory: 4MiB, with a 1 KB input, the instance
+// died at the 60th call. Here one is left unfinished, then the documented
+// first-match idiom `const [first] = find(text)` runs 10,000 times and memory
+// must not move; and two groups generators interleave, each writing its slots
+// into its own region (a groups region reserves its slots, now that an
+// iterator reserves only what it writes).
+func TestJSUnfinishedIteratorKeepsOnlyItsRegion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	maxMem, err := config.ParseMemorySize("4MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BuildConfig{
+		ImportModule: "regions",
+		MaxMemory:    maxMem,
+		Patterns: []config.PatternEntry{
+			{Name: "words", Regexp: `[a-z]+`, FindFunc: "words"},
+			{Name: "pairs", Regexp: `([a-z])([a-z]*)`, GroupsFunc: "pairs"},
+		},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+let mem;
+const instantiate = WebAssembly.instantiate;
+WebAssembly.instantiate = async (...a) => { const r = await instantiate(...a); mem = (r.instance ?? r).exports.memory; return r; };
+const stubs = await import('./stubs.js');
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const fail = (m) => { console.error(m); process.exit(1); };
+const text = 'lorem ipsum dolor sit amet '.repeat(40).slice(0, 1024);
+// Left unfinished on purpose: started, then dropped.
+const dropped = stubs.words(text);
+if (dropped.next().value[0] !== 0) fail('first word');
+let checks = 0, size = -1;
+for (let i = 0; i < 10000; i++) {
+    const [first] = stubs.words(text);
+    if (first[0] !== 0 || first[1] !== 5) fail('call ' + i + ': ' + first);
+    let n = 0;
+    for (const g of stubs.pairs(text)) { if (++n === 2) break; }
+    if (i === 10) size = mem.buffer.byteLength;
+    checks++;
+}
+if (mem.buffer.byteLength !== size) fail('memory grew from ' + size + ' to ' + mem.buffer.byteLength);
+// Two groups generators in step: each must read its own slots.
+const a = 'ab cd ef', b = 'gh ijk';
+const want = (s) => [...s.matchAll(/([a-z])([a-z]*)/dg)].map(m => JSON.stringify(m.indices));
+const wa = want(a), wb = want(b);
+const ga = stubs.pairs(a), gb = stubs.pairs(b);
+for (let i = 0; i < Math.max(wa.length, wb.length); i++) {
+    const x = ga.next(), y = gb.next();
+    if (i < wa.length && JSON.stringify(x.value) !== wa[i]) fail('a ' + i + ': ' + JSON.stringify(x.value) + ' want ' + wa[i]);
+    if (i < wb.length && JSON.stringify(y.value) !== wb[i]) fail('b ' + i + ': ' + JSON.stringify(y.value) + ' want ' + wb[i]);
+    checks++;
+}
+console.log('OK ' + checks);
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "OK 10003" {
+		t.Fatalf("node: %v\n%s", err, out)
 	}
 }
 

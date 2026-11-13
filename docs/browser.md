@@ -82,7 +82,7 @@ for (const [start, end] of url_find(text)) {
 }
 
 // First match only:
-const first = url_find(text).next().value;  // [start, end] or undefined
+const [first] = url_find(text);  // [start, end] or undefined; destructuring closes the generator
 ```
 
 Returns a generator that yields `[start, end]` absolute byte positions for each non-overlapping match.

@@ -3102,6 +3102,12 @@ patterns:
     regexp: 'a.c'
     unicode: true
     find_func: find_dot
+  - name: longs
+    regexp: '(?i)ſ'
+    find_func: find_longs
+  - name: kelvin
+    regexp: '(?i)\x{212A}elvin'
+    find_func: find_kelvin
 `
 	path := filepath.Join(t.TempDir(), "uni.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
@@ -3142,6 +3148,11 @@ patterns:
 		{"find_prefix", `(?:ü|ö)xyz`, []string{"üxyz", "aöxyz üxyz", "xyz", "uxyz"}},
 		{"find_alt", `[à-ÿ]foo|[α-ω]bar`, []string{"àfoo", "αbar", "ÿfoo ωbar àbaz", "afoo", "日foo"}},
 		{"find_dot", `a.c`, []string{"aéc a日c abc a😀c axyc", "ac"}},
+		// A folded literal writing ſ / the Kelvin sign: Go stores it as the
+		// orbit's lowest rune (S, K), and these compiled in byte mode, where
+		// the character written never matched.
+		{"find_longs", `(?i)ſ`, []string{"ſ", "s S ſ", "x"}},
+		{"find_kelvin", `(?i)\x{212A}elvin`, []string{"\u212Aelvin", "kelvin KELVIN", "a \u212AELVIN b"}},
 	} {
 		re := regexp.MustCompile(c.pat)
 		f := inst.GetFunc(store, c.fn)
@@ -3626,6 +3637,28 @@ func TestTDFARegisterCoalescingOrdering(t *testing.T) {
 		{pattern: `(b+){3}c`, input: "bbbbc", desc: "rep3"},
 		{pattern: `x(a+){2}y`, input: "xaaay", desc: "prefixed"},
 	})
+}
+
+// A TDFA state's identity includes its threads' PRIORITY order, not only
+// their pcs and registers: a state reached later with the same threads in
+// another order picks a different winner. Without it the second state reused
+// the first one's order, and the last iteration of a captured repeat over a
+// counted repeat with min >= 2 came out wrong — `(a{2,3})+x` over "aaaaaax"
+// gave group 1 = [4,6), Go [3,6). Every spelling of the shape is here, since
+// `{2,3}` simplifies to `aaa?` before the TDFA sees it.
+func TestTDFACountedRepeatLastIteration(t *testing.T) {
+	var cases []tdfaCase
+	for _, p := range []string{`(a{2,3})+x`, `(a{2,3})*x`, `(aaa?)+x`, `(a{2,4})+x`,
+		`(a{3,5})+x`, `(a{2,3}b?)+x`, `(a{2,3}){2,}x`, `((a{2,3}))+x`} {
+		for n := 2; n <= 13; n++ {
+			cases = append(cases, tdfaCase{pattern: p, input: strings.Repeat("a", n) + "x",
+				desc: fmt.Sprintf("%s/%d", p, n)})
+		}
+	}
+	for _, in := range []string{"abcdefg=", "abcdefgh=", "abcdefghij=", "ab="} {
+		cases = append(cases, tdfaCase{pattern: `(\w{2,4})+=`, input: in, desc: `w24/` + in})
+	}
+	checkTDFAGroups(t, cases)
 }
 
 // The TDFA body hand-rolls its transition load instead of using the shared
@@ -4189,6 +4222,10 @@ func TestUnicodeModeSelectedGroupsMatchGo(t *testing.T) {
 		{`((?i:é)|(É))`, []string{"É", "é", "e", "xÉ"}},
 		{`(\pL+)(\pL)`, []string{"Straße", "日本", "é", "ab"}},
 		{`([\pL\pN]+)@(\pL+)\.(\pL{2,})`, []string{"пользователь@пример.рф", "a1@b.cd", "x@y.z", "é@ж.日本"}},
+		// The last iteration of a captured repeat over a counted repeat
+		// (TestTDFACountedRepeatLastIteration), over whole characters.
+		{`(ж{2,3})+x`, []string{"жжx", "жжжжx", "жжжжжx", "жжжжжжx", "жжжжжжжжx"}},
+		{`(\pL{2,4})+=`, []string{"абвгдеж=", "абвгдежз=", "ab=", "абвгдежзий="}},
 	}
 	for _, c := range cases {
 		eng, err := compile.SelectEngine(c.pat, compile.CompileOptions{Unicode: true})

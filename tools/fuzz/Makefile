@@ -2,7 +2,8 @@
         seed-match seed-groups seed-engines seed-bodies seed-set \
         seed-caps seed-batch seed-iteration \
         fuzz-match fuzz-groups fuzz-engines fuzz-bodies fuzz-set \
-        seed-unicode fuzz-unicode fuzz-unicode-groups fuzz-unicode-set
+        seed-unicode fuzz-unicode fuzz-unicode-groups fuzz-unicode-set \
+        seed-long seed-set-routes fuzz-long-input fuzz-set-routes
 
 # ---------------------------------------------------------------------------
 # Layer 1: the original no-capture DFA/CompiledDFA find body.
@@ -28,7 +29,8 @@ fuzz-long:
 # The seed-* goals have no such restriction and are what CI should run.
 
 # Replay every Layer-2 target's seed corpus.
-seed-all: seed seed-match seed-groups seed-engines seed-bodies seed-set seed-caps seed-batch seed-iteration
+seed-all: seed seed-match seed-groups seed-engines seed-bodies seed-set seed-caps seed-batch seed-iteration \
+          seed-long seed-set-routes
 
 seed-match:                     ## anchored match (full-consumption oracle)
 	go test -run=FuzzMatch .
@@ -46,6 +48,10 @@ seed-batch:                     ## set find through the batch entry, capacity 1
 	go test -run='FuzzFindBatch$$' .
 seed-iteration:                 ## find iterated from successive offsets
 	go test -run='FuzzFindIteration$$' .
+seed-long:                      ## built patterns + long witness inputs, byte and Unicode mode
+	go test -run='FuzzLongInput$$' .
+seed-set-routes:                ## built sets + long inputs, every route of find agreeing with Go
+	go test -run='FuzzSetRoutes$$' .
 
 # Each fuzz-* goal pairs -fuzz with a matching -run. Without the -run filter,
 # `go test -fuzz=X` still replays EVERY other target's seed corpus first, so one
@@ -61,6 +67,16 @@ fuzz-bodies:
 	go test -run=FuzzGroupsBothBodies -fuzz=FuzzGroupsBothBodies -fuzztime=10m .
 fuzz-set:
 	go test -run='FuzzSet$$' -fuzz='FuzzSet$$' -fuzztime=10m .
+
+# The generator-driven targets: the fuzz engine supplies only a seed (and the
+# mode), the target BUILDS the pattern or set and its long inputs. One worker
+# (-parallel=1), so a run stays inside one process's memory; FUZZTIME sets the
+# length, 5 minutes unless given: `make fuzz-long-input FUZZTIME=8h`.
+FUZZTIME ?= 5m
+fuzz-long-input:
+	go test -run='FuzzLongInput$$' -fuzz='FuzzLongInput$$' -fuzztime=$(FUZZTIME) -parallel=1 .
+fuzz-set-routes:
+	go test -run='FuzzSetRoutes$$' -fuzz='FuzzSetRoutes$$' -fuzztime=$(FUZZTIME) -parallel=1 .
 
 # ---------------------------------------------------------------------------
 # Unicode mode: the same targets with every pattern compiled in Unicode mode
