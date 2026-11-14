@@ -298,6 +298,12 @@ member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
 
+### When the answer cache is allocated
+
+The iterator holds the cache's 48-byte header alone until the drive asks for
+the region — at the call where it would sweep, which most drives never reach —
+and allocates it then.
+
 ### The overlapping answer cache's header
 
 An `overlapping: true` set's `find` reads a caller-owned region — the answer

@@ -96,6 +96,32 @@ const (
 	// means the same thing in every language, so a new code takes the next
 	// value no layer uses.
 	OverlapCacheOutOfOrder = -6
+
+	// OverlapCacheWanted is returned by an overlapping `find` handed a LAZY
+	// answer cache — a header alone, its lazy word holding OverlapCacheLazy —
+	// when the drive has reached the point where it would use the cache: the
+	// caller allocates the whole region now (fallibly, where its language
+	// can), copies the 48-byte header into it, clears the lazy word, and
+	// calls again with the same arguments. Nothing was delivered by the call
+	// that returned it. A caller that cannot allocate clears the lazy word in
+	// the header it has and calls again: the region is then merely too
+	// small, and the drive walks, as it does with no cache.
+	//
+	// It exists so a stub need not reserve the cache — 12 or more bytes per
+	// input byte — for a drive that never uses it: a first-match drive over
+	// 5 MB took 61 MB up front, and under a memory limit aborted the process.
+	// A caller that does not write the lazy word never sees it.
+	OverlapCacheWanted = -7
+
+	// OverlapCacheLazy is what a caller writes into the header's lazy word
+	// (config.SetOverlapHdrLazyOff) to hand a lazy cache over; "RXLZ" in
+	// little-endian bytes. The module turns it into OverlapCacheWantedMark
+	// when the drive wants the region, and answers OverlapCacheWanted at the
+	// next call's start.
+	OverlapCacheLazy = 0x5A4C5852
+	// OverlapCacheWantedMark is the lazy word once the drive wants the
+	// region; "RXLW". Read by the module only.
+	OverlapCacheWantedMark = 0x574C5852
 )
 
 // --- the `find` scratch descriptor -----------------------------------------

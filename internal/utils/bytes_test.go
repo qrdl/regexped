@@ -236,7 +236,7 @@ func TestImportsMemory(t *testing.T) {
 		return out
 	}
 	others := [][]byte{
-		entry("env", "f", 0x00, 0x00),                  // func, type 0
+		entry("env", "f", 0x00, 0x00),                   // func, type 0
 		entry("env", "t", 0x01, 0x70, 0x01, 0x01, 0x02), // table funcref, min 1 max 2
 		entry("env", "g", 0x03, 0x7f, 0x00),             // global i32 const
 		entry("env", "e", 0x04, 0x00, 0x00),             // tag

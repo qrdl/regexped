@@ -104,6 +104,11 @@ type BuildConfig struct {
 	// declared as the WASM memory's maximum, so the engine refuses every grow
 	// past it. Unset means no cap. See MemorySize for the spelling.
 	MaxMemory MemorySize `yaml:"max_memory"`
+	// MaxRegexpSize caps every regexp's size once its references expand
+	// (references.go): a chain where each pattern uses the one before it twice
+	// doubles with every line, and 20 lines took past 2 GB at load. Unset is
+	// DefaultMaxRegexpSize. See MemorySize for the spelling; no page rounding.
+	MaxRegexpSize MemorySize `yaml:"max_regexp_size"`
 	// MaxSetBucketSize caps one set BUCKET's table — the automaton several
 	// members share, so the input is walked once for all of them. A member
 	// that would push a bucket past it goes to another bucket, or one of its
@@ -541,6 +546,12 @@ const SetCursorMalformedPos = 0xFFFFFFFD
 // anything. Like the other two it must be tested BEFORE the 0xFFFFFFFF done
 // test, and detection is best effort exactly as it is for `find`.
 const SetCursorOutOfOrderPos = 0xFFFFFFFC
+
+// SetCursorCacheWantedPos is the FOURTH reserved resume-position word: the
+// batch form of abi.OverlapCacheWanted. Its count field is zero and no tuples
+// were written by the call. Tested, like the others, before the 0xFFFFFFFF done
+// test; a caller that never hands a lazy cache over never sees it.
+const SetCursorCacheWantedPos = 0xFFFFFFFB
 
 // SetOverlapCacheMaxBytes is the ceiling a GENERATED STUB puts on that
 // allocation before it declines to offer a cache at all.
@@ -1292,8 +1303,36 @@ func (l *Limit) UnmarshalYAML(node ast.Node) error {
 	return nil
 }
 
+// DefaultMaxRegexpSize is max_regexp_size unset: 1 MiB, 65 times the largest
+// regexp in the repository's configs (15.7 KB, waf/waf.yaml).
+const DefaultMaxRegexpSize = 1 << 20
+
+// RegexpSizeCap is the most bytes a regexp may take after its references
+// expand: max_regexp_size, or DefaultMaxRegexpSize when it is unset.
+func (c BuildConfig) RegexpSizeCap() uint64 {
+	if c.MaxRegexpSize.IsSet() {
+		return c.MaxRegexpSize.Bytes()
+	}
+	return DefaultMaxRegexpSize
+}
+
+// regexpSizeProblem is the message for a regexp of n bytes over the cap, or
+// "" when it fits.
+func (c BuildConfig) regexpSizeProblem(owner string, n uint64) string {
+	limit := c.RegexpSizeCap()
+	if n <= limit {
+		return ""
+	}
+	set := "the default"
+	if c.MaxRegexpSize.IsSet() {
+		set = c.MaxRegexpSize.String()
+	}
+	return fmt.Sprintf("%s: is %d bytes once its references expand, over max_regexp_size (%s, %d bytes); raise max_regexp_size to at least %d",
+		owner, n, set, limit, n)
+}
+
 // MemorySize is a size in the config — `max_memory:`, `max_set_bucket_size:`,
-// `max_split_table_size:` — a number, fractions allowed, optionally
+// `max_split_table_size:`, `max_regexp_size:` — a number, fractions allowed, optionally
 // followed by a unit — KB, MB, GB (powers of 1,000) or KiB, MiB, GiB (powers
 // of 1,024), in any letter case, with or without a space before it. A bare
 // number is bytes. Anything else is a load error.
@@ -1429,6 +1468,11 @@ const (
 	SetOverlapHdrReadyOff  = 8
 	SetOverlapHdrWorkOff   = 12
 	SetOverlapHdrStrideOff = 16
+	// SetOverlapHdrLazyOff is the LAZY word: a caller that hands the header
+	// alone writes abi.OverlapCacheLazy here and is answered
+	// abi.OverlapCacheWanted when the drive would use the region. Zero — what
+	// zeroing the header leaves — is an ordinary region.
+	SetOverlapHdrLazyOff = 44
 )
 
 // SetOverlapRowMaskOff is where a row's shape starts, stated once: the mask at

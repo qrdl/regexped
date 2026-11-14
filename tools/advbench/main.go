@@ -44,6 +44,7 @@ var (
 	gen      = flag.String("gen", "rep:a", "input generator: segments pre:P, rep:STR, suf:S joined by |, or file:PATH")
 	sizes    = flag.String("sizes", "4096,8192,16384", "input sizes, comma-separated")
 	cache    = flag.Bool("cache", true, "offer the overlapping answer cache (sets)")
+	eager    = flag.Bool("eagercache", false, "hand the answer cache over whole up front, not lazily as the stubs do")
 	outCap   = flag.Int("cap", 0, "set find out_cap (0 = pattern count)")
 	fuelMax  = flag.Uint64("fuelmax", 20_000_000_000, "fuel budget per size; exceeding it aborts the size")
 	timeout  = flag.Duration("timeout", 60*time.Second, "wall timeout per size")
@@ -95,6 +96,7 @@ type sizeResult struct {
 	Err        string
 	Note       string
 	Armed      bool // the search armed (its notes were allocated)
+	Wanted     int  // times the module asked for the answer cache's region
 }
 
 func (r sizeResult) fuelPerByte() float64 { return float64(r.Fuel) / float64(max(r.N, 1)) }
@@ -388,9 +390,18 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 		if cacheBytes > 0 {
 			offered = int32(cachePtr)
 		}
-		abi.WriteFindScratch(buf, int32(scratchPtr), int32(gatePtr), offered, int32(cacheBytes))
+		// LAZILY, as every generated stub hands it over: the header alone,
+		// its lazy word set, and the region when the module asks for it
+		// (abi.OverlapCacheWanted). The region is laid out already; granting
+		// it is the descriptor's length.
+		offeredLen := int32(cacheBytes)
+		if cacheBytes > 0 && !*eager {
+			offeredLen = config.SetOverlapCheckpointHeaderBytes
+			putU32(buf, cachePtr+config.SetOverlapHdrLazyOff, abi.OverlapCacheLazy)
+		}
+		abi.WriteFindScratch(buf, int32(scratchPtr), int32(gatePtr), offered, offeredLen)
 		if len(setBlocks) > 0 {
-			abi.WriteFindScratchBlocks(buf, int32(scratchPtr), int32(gatePtr), offered, int32(cacheBytes),
+			abi.WriteFindScratchBlocks(buf, int32(scratchPtr), int32(gatePtr), offered, offeredLen,
 				int32(blocksPtr), int32(len(setBlocks)))
 		}
 	} else {
@@ -455,6 +466,14 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 		}
 	}
 	afterCall := func() error { return blocks.After(data) }
+	// grantCache is a stub's answer to the module asking for the answer
+	// cache's region: the whole of it, as an allocation that succeeds.
+	grantCache := func() {
+		b := mem.UnsafeData(store)
+		putU32(b, cachePtr+config.SetOverlapHdrLazyOff, 0)
+		putU32(b, scratchPtr+abi.FindScratchCacheLenOff, uint32(cacheBytes))
+		r.Wanted++
+	}
 
 	var name string
 	if isSet {
@@ -619,6 +638,10 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 				break
 			}
 			v := res.(int32)
+			if v == abi.OverlapCacheWanted && cacheBytes > 0 {
+				grantCache()
+				continue
+			}
 			if v <= 0 {
 				if v != 0 {
 					r.Err = fmt.Sprintf(" BAD: ret %d", v)
@@ -669,7 +692,11 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 			}
 			v := res.(int64)
 			pos := uint32(v >> 32)
-			if pos >= 0xFFFFFFFC && pos != 0xFFFFFFFF {
+			if pos == config.SetCursorCacheWantedPos && cacheBytes > 0 {
+				grantCache() // nothing delivered: the same cursor again
+				continue
+			}
+			if pos >= config.SetCursorCacheWantedPos && pos != 0xFFFFFFFF {
 				r.Err = fmt.Sprintf(" BAD: pos word %x", pos)
 				break
 			}
@@ -742,6 +769,10 @@ func driveOnce(engine *wasmtime.Engine, mod *wasmtime.Module, sp spec, isSet boo
 	if cacheBytes > 0 {
 		buf = mem.UnsafeData(store)
 		r.Note = fmt.Sprintf(" cache=%dB ready=%d", cacheBytes, int32(getU32(buf, cachePtr+config.SetOverlapHdrReadyOff)))
+		if r.Wanted > 1 {
+			// Granted, the lazy word is cleared: a second ask is a module bug.
+			r.Err += fmt.Sprintf(" BAD: the module asked for the cache %d times", r.Wanted)
+		}
 	}
 	return r, nil
 }

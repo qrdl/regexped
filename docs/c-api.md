@@ -354,13 +354,14 @@ typedef struct {
     unsigned gates[<SET>_ID_SPACE];        /* every set with find, either policy */
     unsigned scratch[4];                   /* the descriptor the export takes    */
     unsigned *cache;                       /* a cache-eligible overlapping set:  */
-    size_t cache_words;                    /*   its answer cache, and whether    */
-    int cache_own;                         /*   _init allocated it               */
+    size_t cache_words;                    /*   its answer cache, whether the    */
+    int cache_own;                         /*   scanner allocated it, and the    */
+    unsigned cache_hdr[12];                /*   header it holds until then       */
 } rx_<set>_scanner_t;
 
 int <find>_init(rx_<set>_scanner_t *s, const char *input, size_t len, size_t offset);
 int <find>(rx_<set>_scanner_t *s, rx_set_match_t *buf, size_t cap);
-void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache _init allocated */
+void <find>_free(rx_<set>_scanner_t *s);   /* frees the answer cache the scanner allocated */
 
 /* the answer cache in your own memory: bytes needed (0 = none), and the handover */
 size_t <find>_cache_bytes(size_t len);
@@ -585,7 +586,7 @@ has nothing. So the feature is DETECTED rather than demanded:
 
 | your build | behaviour |
 |---|---|
-| with a sysroot (`wasi-sdk`, a host compiler) | `<find>_init` reserves the cache, an overlapping drive is **linear**, and `<find>_free` releases it |
+| with a sysroot (`wasi-sdk`, a host compiler) | `<find>` allocates the cache when the drive asks for it, an overlapping drive is **linear**, and `<find>_free` releases it |
 | freestanding (`-nostdlib`, no sysroot) | no cache of the stub's own: the drive **walks** — same answers, quadratic — unless you hand one over (below) |
 
 Define `RX_SET_CACHE` yourself to force it either way.
@@ -612,8 +613,8 @@ if (need && need <= sizeof mem)
 - `<find>_set_cache` goes after `<find>_init` and before the first `<find>`. It
   returns 0 (also when no buffer is needed, and then `buf` is not used),
   `RX_ERR_RANGE` when `bytes` is below what the input needs, or
-  `RX_ERR_NULL_ARG`; on an error the scanner is unchanged. A cache `_init`
-  allocated itself is freed and replaced by yours.
+  `RX_ERR_NULL_ARG`; on an error the scanner is unchanged. A cache the
+  scanner allocated itself is freed and replaced by yours.
 - The buffer is yours: `<find>_free` never frees it, and `<find>_init` forgets
   it, so a restarted scan hands it over again. One buffer serves ONE scanner at
   a time. Any alignment works.
@@ -637,6 +638,14 @@ than you expect, check which of the two you got.
 `<find>_init` only writes the struct, so a scanner that owns a cache and is
 initialised again without `<find>_free` leaks it: call `<find>_free` first,
 whether or not a cache is in play. A second `<find>_free` is a no-op.
+
+### When the answer cache is allocated
+
+With the allocator, the scanner holds the cache's 48-byte header alone — inside
+the struct, `cache_hdr` — until the drive asks for the region, at the call
+where it would sweep, which most drives never reach. `<find>` then `malloc`s it;
+a `malloc` that returns `NULL` leaves the scan walking, with the same answers,
+slower. A buffer handed over with `<find>_set_cache` is whole from the start.
 
 ### The overlapping answer cache's header
 

@@ -346,7 +346,9 @@ func main() {
 	compareSize := flag.String("compare-size", "", "compare module sizes against a baseline file; exit 1 on any change")
 	hints := flag.String("hints", "", "set-level LikelyMode hint applied to every case: prefer-match, prefer-no-match, or empty for neutral")
 	forceFE := flag.String("force-frontend", "", "TEST-ONLY: pin the literal frontend for every case (teddy, ac, scalar, packed-pair); empty lets the chooser decide")
+	eager := flag.Bool("eager-cache", false, "hand the overlapping answer cache over whole up front, not lazily as every generated stub does")
 	flag.Parse()
+	eagerCache = *eager
 
 	if *forceFE != "" {
 		if _, ok := validFrontends[*forceFE]; !ok {
@@ -1074,6 +1076,13 @@ func (r *rxInstance) writeScratch(cache, batch bool) {
 		// The stride is the one header field the CALLER fills. Everything else
 		// is zero, which is what "this drive has not swept yet" means.
 		binary.LittleEndian.PutUint32(buf[cachePtr+config.SetOverlapHdrStrideOff:], uint32(r.cacheStride))
+		// LAZILY, as every generated stub hands it over: the header alone, its
+		// lazy word set, and the region when the module asks for it
+		// (grantCache).
+		if cachePtr != 0 && !eagerCache {
+			binary.LittleEndian.PutUint32(buf[cachePtr+config.SetOverlapHdrLazyOff:], abi.OverlapCacheLazy)
+			cacheLen = config.SetOverlapCheckpointHeaderBytes
+		}
 	}
 	abi.WriteFindScratch(buf, r.scratchPtr, r.gatePtr, cachePtr, cacheLen)
 	begin := r.blocks.Begin
@@ -1088,6 +1097,20 @@ func (r *rxInstance) writeScratch(cache, batch bool) {
 }
 
 func (r *rxInstance) data() []byte { return r.mem.UnsafeData(r.store) }
+
+// eagerCache hands the answer cache over whole when a drive starts (-eager-cache).
+var eagerCache bool
+
+// grantCache is a stub's answer to the module asking for the answer cache's
+// region (abi.OverlapCacheWanted, or the batch entry's reserved cursor): the
+// whole of it, as an allocation that succeeds. The region is laid out already,
+// so granting it is the descriptor's length and the lazy word cleared.
+func (r *rxInstance) grantCache() {
+	buf := r.mem.UnsafeData(r.store)
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrLazyOff:], 0)
+	binary.LittleEndian.PutUint32(buf[r.scratchPtr+abi.FindScratchCacheLenOff:], uint32(r.cacheLen))
+	runtime.KeepAlive(r.store)
+}
 
 // giveNotes runs after a find call, as a generated iterator does: a split
 // member whose search armed during it gets its notes, one whose Backtracking
@@ -1236,6 +1259,10 @@ func (r *rxInstance) exhaustFind(fn *wasmtime.Func, gated bool) (int, error) {
 		if err != nil {
 			return calls, err
 		}
+		if res.(int32) == abi.OverlapCacheWanted {
+			r.grantCache()
+			continue
+		}
 		if res.(int32) <= 0 {
 			return calls, nil
 		}
@@ -1269,6 +1296,10 @@ func (r *rxInstance) exhaustFindBatch(fn *wasmtime.Func, gated bool) (int, error
 		packed := res.(int64)
 		if uint32(packed>>32) == 0xFFFFFFFF {
 			return calls, nil
+		}
+		if uint32(packed>>32) == config.SetCursorCacheWantedPos {
+			r.grantCache() // nothing delivered: the same cursor again
+			continue
 		}
 		r.giveNotes()
 		// A cursor that does not advance is a hang, not a slow row, and this
@@ -2538,6 +2569,10 @@ func rxCollectFind(r *rxInstance, cache bool) []setTuple {
 			return out
 		}
 		n := res.(int32)
+		if n == abi.OverlapCacheWanted {
+			r.grantCache()
+			continue
+		}
 		if n <= 0 {
 			return out
 		}
@@ -2582,6 +2617,10 @@ func rxCollectFindBatch(r *rxInstance) []setTuple {
 			return out
 		}
 		packed := res.(int64)
+		if uint32(packed>>32) == config.SetCursorCacheWantedPos {
+			r.grantCache() // nothing delivered: the same cursor again
+			continue
+		}
 		n := int32(packed & countMask)
 		buf := r.mem.UnsafeData(r.store)
 		for i := int32(0); i < n; i++ {

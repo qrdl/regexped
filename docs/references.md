@@ -45,6 +45,12 @@ The spelling borrows PCRE's subroutine call, `(?&name)`, but not its meaning.
 In PCRE it calls a group defined inside the same regexp and may recurse. Here
 the piece is another pattern of the config, and a reference cycle is an error.
 
+**Size.** Each use pastes the piece's whole text, so a pattern that uses the
+one before it twice doubles with every level: 16 levels of `ab` make 655 KB.
+A regexp over [`max_regexp_size`](cli.md) once expanded (1 MiB unless set) is
+a load error that names it, its size and the size to raise the key to; the
+text is never built.
+
 Go's own parser rejects both `(?&` and `(?<&`, so no regexp that compiles
 without references changes meaning. For the same reason, text that Go reads as
 something else is never a reference: inside a character class (`[(?&x)]` is a

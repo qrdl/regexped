@@ -577,9 +577,9 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil, nil)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil, nil)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil, nil)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, -1, ffNative, -1, nil, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, -1, ffNative, capGlobal, nil, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, winGlobal, ffNative, -1, nil, nil)
 
 	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
 		if len(body) == 0 {
@@ -618,12 +618,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil, nil)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, numGroups+2, 0, -1, ffNative, -1, nil, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil, nil)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, numGroups+2, 0, -1, ffNative, capGlobal, nil, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -1615,7 +1615,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{}, nil)
 		}},
 		{"batch groups over an anchored capture body", "batch groups", func(*testing.T) {
-			buildBatchLitChainGroupsWrapperBody(0, 1, findFromMode(0))
+			buildBatchLitChainGroupsWrapperBody(0, 1, 1, findFromMode(0))
 		}},
 		{"a fallback body never called", "never calls it", func(*testing.T) {
 			patchBTFallbackCall([]byte{0x01, 0x0B}, nil, 1)
@@ -1697,7 +1697,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			emitFindCallFromPos(nil, 0, ffLegacyNarrow, 0, 0, &twinRoute{})
 		}},
 		{"a default search state on an anchored-only groups wrapper", "anchored-only groups wrapper", func(*testing.T) {
-			buildGroupsFromWrapperBody(0, true, &defaultSearch{})
+			buildGroupsFromWrapperBody(0, true, &defaultSearch{}, 1, 1)
 		}},
 		{"a UTF-8 bulk skip without its error-lanes local", "no error-lanes local", func(*testing.T) {
 			emitUTF8BulkSkip(nil, dominantInfo{}, false, 1, 2, 3, 4, 5, 6, 0, nil)

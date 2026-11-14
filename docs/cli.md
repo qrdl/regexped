@@ -52,6 +52,8 @@ max_union_states: 4096     # optional; max states while building a SET's union a
 max_memory: 100MB          # optional; the most memory the module may ever use (default: no cap).
                            #   KB/MB/GB = powers of 1,000, KiB/MiB/GiB = powers of 1,024, any case,
                            #   fractions allowed; a bare number is bytes. See "max_memory:" below
+max_regexp_size: 4MiB      # optional; the most bytes any regexp may take once its pattern
+                           #   references expand (default 1 MiB). A size, spelled like max_memory
 
 # A REGEXP is a bare expression; a PATTERN is a regexp plus optional metadata.
 patterns:                  # optional when every regexp lives inside sets (their regexps: key)
@@ -178,10 +180,12 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
 | `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
-| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_regs`, `_enc`, `_align`, `_grow`, `_inCap`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_regs`, `_enc`, `_align`, `_grow`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
 | Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
 | Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
 | Export names must not collide with a generator helper (`SetMatch`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
+| Export names must not collide with a package the stub imports (`errors`, `iter`, `unsafe`) | `go` | `func errors` beside `import "errors"` is a redeclaration, so the file does not build. |
+| Export names must not collide with a name from `<stddef.h>` (`size_t`, `ptrdiff_t`, `wchar_t`, `max_align_t`, `NULL`, `offsetof`) or `<stdlib.h>` (`malloc`, `calloc`, `realloc`, `free`, `exit`, `abort`, `qsort`, … every function, type and macro it declares) | `c` | The header includes `<stddef.h>` always and `<stdlib.h>` when the answer cache is enabled; refused either way, so adding an overlapping set later does not break a config that builds today. |
 | Export names must not collide with a symbol DERIVED from a set's name: its pattern-count, id-space and batch-size constants and its name lookup — for a set `scanner`, `SCANNER_PATTERN_COUNT` / `scanner_pattern_name` in Rust, `SCANNER_PATTERN_COUNT` / `rx_scanner_pattern_name` in C, `ScannerPatternCount` / `ScannerPatternName` in Go, `scannerPatternCount` / `scannerPatternName` in JS and TS, `SCANNER_PATTERN_COUNT` / `scannerPatternName` in AssemblyScript | all | The generator declares them beside the set's exports. All are reserved whether or not the set asks for batching or `emit_name_map`, so turning either on never breaks a working config. |
 | Export names must not start with `ffi_` | `rust`, `go`, `c` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
@@ -218,7 +222,8 @@ is ever left out of `find` or the scan pair to make a build succeed.
 | `max_set_bucket_size` | 128 bytes per `max_dfa_states` state | one set bucket's table | the member goes to another bucket (more buckets, a dearer walk) |
 | `max_split_table_size` | 4 MB (64 MB in Unicode mode) | the tables of one set's split members, in total | the rest of them take the Backtracking search |
 | `max_union_states` | 4,096 (16,384 in Unicode mode) | a set's union automata, while being built | a slower scan / probe route |
-| `max_memory` | none | the module's whole memory | a search answers `-2`; tables over it are a compile error |
+| `max_memory` | none | the module's whole memory | a search answers `-2`; tables over it, or no page left for the Backtracking stack, is a compile error |
+| `max_regexp_size` | 1 MiB | every regexp, once its [references](references.md) expand | a load error naming the regexp, its size and the size to raise the key to |
 
 **`0` means off** for the two count limits: `max_dfa_states: 0` puts every
 pattern and set member on Backtracking, and `max_bt_instructions: 0` forbids
@@ -304,6 +309,11 @@ the tables and the search's working memory only.
   the cap and the size. Backtracking reserves nothing there: its frame stacks
   are claimed when a search runs. A value below 64 KiB rounds
   down to 0 pages and always gets it.
+- A module that carries Backtracking code needs one page more than its tables
+  for the frame stack's first allocation, and a standalone module one more for
+  the default search state. A cap below that is a **compile error** naming the
+  size to raise it to: there, every Backtracking call that pushed a frame
+  would answer `-2`, even on a 2-byte input. (Until 2026-11-13 it compiled.)
 - A 32-bit WebAssembly memory holds at most 4 GiB. A larger value is treated as
   4 GiB, with a compile warning saying so.
 

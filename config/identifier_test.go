@@ -393,6 +393,19 @@ func TestValidateExports_HelperCollisions(t *testing.T) {
 		{"c", "ffi_x__res_new", true},
 		{"c", "ffi_url", true},
 		{"js", "url_match", false},
+		// Names the generated file brings into scope without declaring them:
+		// Go's imports, the C header's standard headers. The same names are
+		// free in a language whose stub does not use them.
+		{"go", "errors", true},
+		{"go", "iter", true},
+		{"go", "unsafe", true},
+		{"c", "free", true},
+		{"c", "malloc", true},
+		{"c", "size_t", true},
+		{"c", "exit", true},
+		{"c", "errors", false},
+		{"rust", "free", false},
+		{"js", "errors", false},
 	}
 	for _, c := range cases {
 		t.Run(c.stubType+"/"+c.funcName, func(t *testing.T) {

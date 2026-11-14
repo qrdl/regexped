@@ -972,6 +972,15 @@ func (cs *compiledSet) emitSweptMember(b []byte, k int, x sweepMerge, none func(
 			b = append(b, 0x1A)
 			b = append(b, 0x20, x.lRegion, 0x41, 0x01)
 			b = st32(b, sweepHdrReady)
+			// It does not fit: a LAZY header has no region behind it yet.
+			// Mark it wanted; the next call's start asks the caller for it
+			// (abi.OverlapCacheWanted), and this one goes on with the
+			// member's own search.
+			b = append(b, 0x05, 0x20, x.lRegionLen, 0x41)
+			b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+			b = append(b, 0x4E, 0x04, 0x40) // len >= header: if
+			b = emitMarkWantedIfLazy(b, x.lRegion)
+			b = append(b, 0x0B)
 			b = append(b, 0x0B, 0x0B, 0x0B)
 			return b
 		}

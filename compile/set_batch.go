@@ -262,7 +262,7 @@ func emitSetFindWrapperBody(cs *compiledSet, innerIdx, dpIdx, blkIdx int) []byte
 		emitSweepAndServe = func(b []byte) []byte {
 			b = cache.emitEntrySweep(b, func(b []byte) []byte {
 				return append(b, 0x20, pFrom)
-			})
+			}, nil)
 
 			b = append(b, 0x20, lReady)
 			b = append(b, 0x41, 0x00)
@@ -665,13 +665,11 @@ func (cs *compiledSet) emitBatchCacheServe(b []byte, cache overlapCacheCtx, x ba
 	// With the guard the mid-position call simply walks: it finishes the
 	// position, and the walk-path trigger — which fires only once k is back to
 	// 0 — hands the drive over cleanly on the call after.
-	b = append(b, 0x20, x.lCacheSkip)
-	b = append(b, 0x45)       // i32.eqz -> at a position boundary
-	b = append(b, 0x04, 0x40) // if
 	b = cache.emitEntrySweep(b, func(b []byte) []byte {
 		return append(b, 0x20, x.lResumePos)
+	}, func(b []byte) []byte {
+		return append(b, 0x20, x.lCacheSkip, 0x45) // k == 0: at a position boundary
 	})
-	b = append(b, 0x0B) // end if k == 0
 
 	b = append(b, 0x20, x.lReady)
 	b = append(b, 0x41, 0x00)
@@ -973,17 +971,18 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = utils.AppendULEB128(b, uint32(selfIdx)) //nolint:gosec // a function index
 		b = append(b, 0x22, x.lV64)                 // local.tee
 		// A RESERVED position word — overflow, a malformed header, a resume
-		// below the floor — carries a zero count by contract, so the tuples
-		// already delivered cannot ride in it: return them under the ordinary
-		// resume cursor instead (br $exit, as the overflow guard below does),
-		// with x.lPos where it is. The next call re-enters there and reports
-		// the error with nothing delivered. The three words are the three
-		// below 0xFFFFFFFF, the done word, which carries a count.
+		// below the floor, a lazy cache wanted — carries a zero count by
+		// contract, so the tuples already delivered cannot ride in it: return
+		// them under the ordinary resume cursor instead (br $exit, as the
+		// overflow guard below does), with x.lPos where it is. The next call
+		// re-enters there and reports it with nothing delivered. The four
+		// words are the four below 0xFFFFFFFF, the done word, which carries a
+		// count.
 		b = append(b, 0x42, 0x20, 0x88, 0xA7) // (i32)(v >> 32)
-		lowest := uint32(config.SetCursorOutOfOrderPos)
+		lowest := uint32(config.SetCursorCacheWantedPos)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(lowest))       //nolint:gosec // a reserved bit pattern
-		b = append(b, 0x6B, 0x41, 0x03, 0x49)           // - lowest reserved; u< 3
+		b = append(b, 0x6B, 0x41, 0x04, 0x49)           // - lowest reserved; u< 4
 		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A) // count > 0
 		b = append(b, 0x71, 0x04, 0x40)                 // and; if
 		// br 3: 0 = this if, 1 = the counter's if, 2 = loop $L, 3 = block $exit.
@@ -1013,10 +1012,10 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		// A reserved position word with tuples already delivered: return them
 		// under the ordinary resume cursor, as above (br 3 = block $exit).
 		b = append(b, 0x42, 0x20, 0x88, 0xA7)
-		lowest := uint32(config.SetCursorOutOfOrderPos)
+		lowest := uint32(config.SetCursorCacheWantedPos)
 		b = append(b, 0x41)
 		b = utils.AppendSLEB128(b, int32(lowest)) //nolint:gosec // a reserved bit pattern
-		b = append(b, 0x6B, 0x41, 0x03, 0x49)
+		b = append(b, 0x6B, 0x41, 0x04, 0x49)
 		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A)
 		b = append(b, 0x71, 0x04, 0x40)
 		b = append(b, 0x0C, 0x03, 0x0B)
@@ -1071,6 +1070,22 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x42, 0x20, 0x86) // << 32
 		b = append(b, 0x0F)             // return
 		b = append(b, 0x0B)
+	}
+
+	// The worker answers abi.OverlapCacheWanted when it is a split set's merge
+	// (or calls the kept members' cache-reading `find`) and the drive's lazy
+	// header was marked wanted: with tuples in hand this call returns them
+	// under the ordinary cursor, as for the overflow above, and the next one
+	// starts here and asks; with none it asks now.
+	if cs.progSweep != nil || cs.keptCache != nil {
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+		b = append(b, 0x46, 0x04, 0x40)                 // i32.eq; if
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A) // count > 0
+		b = append(b, 0x04, 0x40, 0x0C, 0x03, 0x0B)     // br 3 = block $exit
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, wantedCursor())
+		b = append(b, 0x0F, 0x0B) // return; end if
 	}
 
 	// The WALK's extent for this position, charged before any exit below: a
@@ -1176,6 +1191,16 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x20, cache.lSweepRet, 0x41)
 		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
 		b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+		b = cache.emitStoreWork(b)
+		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86)
+		b = append(b, 0x20, x.lCount, 0xAD, 0x84)
+		b = append(b, 0x0F, 0x0B) // return (x.lPos << 32) | count; end if
+		// A LAZY header has no region yet: mark it wanted and return what
+		// this call delivered — the next call's start asks for the region
+		// (emitWantedCheck) with nothing delivered.
+		b = emitLazyIs(b, cache.pCache, abi.OverlapCacheLazy)
+		b = append(b, 0x04, 0x40)
+		b = emitMarkWantedIfLazy(b, cache.pCache)
 		b = cache.emitStoreWork(b)
 		b = append(b, 0x20, x.lPos, 0xAD, 0x42, 0x20, 0x86)
 		b = append(b, 0x20, x.lCount, 0xAD, 0x84)

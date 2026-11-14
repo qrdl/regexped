@@ -265,6 +265,9 @@ type setCapStats struct {
 	// region (-1). Legitimate — the answer is identical, only slower — but it
 	// must be visible rather than inferred from a count that does not move.
 	refusedCache int
+	// cacheWanted counts drives whose module asked for the region it was
+	// handed lazily (--set-cache-handover lazy or decline).
+	cacheWanted int
 	// forcedSwept / forcedDeclined count the forced-sweep legs by what `ready`
 	// said afterwards. A declined one is not a failure — a drive whose
 	// preflight retired every pattern has nothing to sweep — but a count that
@@ -402,6 +405,8 @@ func (s *setCapStats) report() {
 		fmt.Printf("  find cache legs that SWEPT: %d (refused the region: %d)\n",
 			s.engagedCache, s.refusedCache)
 	}
+	fmt.Printf("  answer cache handed over %s; drives whose module asked for the region: %d\n",
+		setCacheHandover, s.cacheWanted)
 	if s.forcedSwept > 0 || s.forcedDeclined > 0 {
 		fmt.Printf("  forced-sweep legs: swept %d, did not sweep %d\n", s.forcedSwept, s.forcedDeclined)
 	}
@@ -846,6 +851,8 @@ type setRunner struct {
 	// allocation; this harness is that init's stand-in, and leaving it zero is
 	// a malformed header the sweep reports rather than guesses at.
 	cacheStride int32
+	// cacheAsked counts the module's asks for the region in the current drive.
+	cacheAsked int
 	// forceSweep pre-arms the cache header's work counter when a drive starts,
 	// so the FIRST call sweeps: the forced-sweep leg. The corpus's inputs are
 	// a few bytes long and the adaptive trigger almost never fires on them, so
@@ -995,7 +1002,40 @@ func (r *setRunner) startCacheDrive() {
 		// spent everything would have left there.
 		binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrWorkOff:], 0x7FFFFFFF)
 	}
-	r.offerCache(r.cachePtr, r.cacheLen)
+	if setCacheHandover == "eager" {
+		r.offerCache(r.cachePtr, r.cacheLen)
+		return
+	}
+	// The header alone, its lazy word set: the region is handed over when the
+	// module asks for it (answerCacheWanted).
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrLazyOff:], abi.OverlapCacheLazy)
+	r.offerCache(r.cachePtr, config.SetOverlapCheckpointHeaderBytes)
+	r.cacheAsked = 0
+}
+
+// setCacheHandover is --set-cache-handover: lazy, decline or eager.
+var setCacheHandover = "lazy"
+
+// answerCacheWanted is a stub's answer to the module asking for the answer
+// cache's region (abi.OverlapCacheWanted, or the batch entry's reserved
+// cursor), which delivered nothing: the whole region — laid out already, so
+// it is the descriptor's length — or, under --set-cache-handover=decline, none.
+// The lazy word is cleared either way. An ask the harness never invited, or a
+// second one, is a module bug.
+func (r *setRunner) answerCacheWanted() error {
+	if setCacheHandover == "eager" || r.cachePtr == 0 {
+		return fmt.Errorf("the module asked for an answer cache region it was not offered lazily")
+	}
+	if r.cacheAsked++; r.cacheAsked > 1 {
+		return fmt.Errorf("the module asked for the answer cache region twice in one drive")
+	}
+	buf := r.buf()
+	binary.LittleEndian.PutUint32(buf[r.cachePtr+config.SetOverlapHdrLazyOff:], 0)
+	if setCacheHandover == "lazy" {
+		binary.LittleEndian.PutUint32(buf[r.scratchPtr+abi.FindScratchCacheLenOff:], uint32(r.cacheLen))
+	}
+	setStats.cacheWanted++
+	return nil
 }
 
 // zeroBitmap clears the wide `_all` output. The module only ORs bits in and
@@ -1909,6 +1949,12 @@ func (r *setRunner) driveFind(fn *wasmtime.Func, text string, overlapping, withC
 			return nil, hang, err
 		}
 		count := res.(int32)
+		if count == abi.OverlapCacheWanted {
+			if err := r.answerCacheWanted(); err != nil {
+				return nil, false, err
+			}
+			continue
+		}
 		// BEFORE the <= 0 test. abi.BTStackOverflow is "I don't know", not
 		// "the scan finished": folding it in scores an engine that gives up
 		// as a PASS, which is the masking direction. tools/fuzz already
@@ -2029,6 +2075,17 @@ func (r *setRunner) driveFindBatch(fn *wasmtime.Func, text string, overlapping b
 			return nil, hang, err
 		}
 		packed := res.(int64)
+		// A reserved word with nothing delivered: the module asks for the
+		// answer cache's region, and the call is made again with this cursor.
+		if uint32(packed>>32) == config.SetCursorCacheWantedPos {
+			if packed&countMask != 0 {
+				return nil, false, fmt.Errorf("find_batch asked for the answer cache with %d tuples delivered", packed&countMask)
+			}
+			if err := r.answerCacheWanted(); err != nil {
+				return nil, false, err
+			}
+			continue
+		}
 		// The reserved position word means the Backtracking engine gave up;
 		// the count is zero and nothing was written. Read as "done" it scores
 		// a give-up as a completed scan.

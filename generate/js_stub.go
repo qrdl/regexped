@@ -3,6 +3,7 @@ package generate
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/qrdl/regexped/compile"
@@ -46,6 +47,9 @@ func genJSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
 	out.WriteString("// the same guarantee the Rust and Go stubs get from passing a host pointer.\n")
 	out.WriteString("\n")
 	shapes := newSetShapes(cfg)
+	if shapes.anyWantsCache() {
+		out.WriteString(jsLazyFunc(false))
+	}
 	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
@@ -229,7 +233,7 @@ export function %s(input, from = 0) {
         // The buffer is sized at the set's pattern count, the exact worst case
         // for a single position, so n can never exceed it.
         const n = _exp['%s'](%s);
-        // -2 is UNKNOWN, not a count: a Backtracking member gave up here. It
+%s        // -2 is UNKNOWN, not a count: a Backtracking member gave up here. It
         // has to be tested before the break below, which reads every
         // non-positive n as a clean end of scan.
         if (n === %d) throw new Error("%s");
@@ -252,16 +256,17 @@ export function %s(input, from = 0) {
         }
         pos = next;
     }
-    } finally { _close(_inBase); }
+    } finally { %s_close(_inBase); }
 }
 `, gateDoc, s.Find, plainCachePre, plainCacheDest, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
 						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
+					jsLazyWanted(plainCacheArgs, "n === "+strconv.Itoa(abi.OverlapCacheWanted)),
 					btOverflow, btOverflowMsg(s.Find),
 					malformedCache, malformedCacheMsg(s.Find),
-					outOfOrder, outOfOrderMsg(s.Find), konst, konst)
+					outOfOrder, outOfOrderMsg(s.Find), konst, konst, jsLazyFinally(plainCacheArgs))
 			} else {
 				// `hints: [batch-find]`: the same matches in the same order,
 				// but batchSize positions of work per host crossing. That is
@@ -298,7 +303,14 @@ export function %s(input, from = 0) {
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
     new Uint32Array(_exp.memory.buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, batchScratchBase, abi.FindScratchMagic, cacheArgs)
-				cacheArgs = ""
+				batchFinally := jsLazyFinally(cacheArgs)
+				// The wanted word comes back with nothing delivered and is not a
+				// cursor: the call is made again with the cursor it was given.
+				if w := jsLazyWanted(cacheArgs, fmt.Sprintf("(BigInt.asUintN(64, packed) >> 32n) === 0x%Xn", config.SetCursorCacheWantedPos)); w != "" {
+					cacheArgs = "\n" + strings.TrimSuffix(w, "\n")
+				} else {
+					cacheArgs = ""
+				}
 				fmt.Fprintf(&out, `// -> Generator yielding { patternId, start, end }
 //
 // batchSize is how many tuples one WASM call may fill: 1 is a call per
@@ -341,7 +353,7 @@ export function %s(input, from = 0) {
         if (done || n === 0) break;
         cursor = packed;
     }
-    } finally { _close(_inBase); }
+    } finally { %s_close(_inBase); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", gateDoc, s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", cachePre, cacheDest, batchGateRegion, cacheReserve,
@@ -349,7 +361,7 @@ export function %s(input, from = 0) {
 					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
 					config.SetCursorOverflowPos, config.SetCursorOverflowPos, btOverflowMsg(s.Find),
 					config.SetCursorMalformedPos, config.SetCursorMalformedPos, malformedCacheMsg(s.Find),
-					config.SetCursorOutOfOrderPos, config.SetCursorOutOfOrderPos, outOfOrderMsg(s.Find))
+					config.SetCursorOutOfOrderPos, config.SetCursorOutOfOrderPos, outOfOrderMsg(s.Find), batchFinally)
 			}
 		}
 		out.WriteString("\n")
@@ -456,20 +468,35 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	// iterator's region leaked too and, under max_memory, the instance died.
 	sb.WriteString("function _align(x) { return (x + 7) & ~7; }\n\n")
 	sb.WriteString(jsGrowFunc(false))
-	sb.WriteString("function _inCap(input) {\n")
-	sb.WriteString("    // Worst-case UTF-8 expansion of a JS string is 3 bytes per UTF-16 code\n")
-	sb.WriteString("    // unit (an astral char is 2 units and encodes to 4, so 3x still bounds\n")
-	sb.WriteString("    // it), so encodeInto cannot truncate inside the reservation.\n")
-	sb.WriteString("    return typeof input === 'string' ? input.length * 3 : input.length;\n")
-	sb.WriteString("}\n\n")
-	sb.WriteString("function _write(input, at) {\n")
-	sb.WriteString("    // encodeInto writes straight into WASM memory, avoiding both the\n")
-	sb.WriteString("    // intermediate array TextEncoder.encode allocates and the second copy\n")
-	sb.WriteString("    // _mem.set would then make.\n")
-	sb.WriteString("    if (typeof input === 'string') return _enc.encodeInto(input, _mem.subarray(at)).written;\n")
-	sb.WriteString("    _mem.set(input, at);\n")
-	sb.WriteString("    return input.length;\n")
-	sb.WriteString("}\n\n")
+	// lib.dom.d.ts declares TextEncoderEncodeIntoResult.read/written as
+	// optional, so strict TypeScript needs the non-null assertions; both are
+	// always present at runtime per the Encoding spec.
+	sb.WriteString(`function _write(input, at) {
+    // Writes the input at ` + "`at`" + `, growing memory for it as it goes, and
+    // returns the bytes it took. encodeInto writes straight into WASM memory,
+    // avoiding both the array TextEncoder.encode allocates and the copy
+    // _mem.set would then make. A string reserves its length in UTF-16 units —
+    // every ASCII string's exact size — and grows by the worst case of what is
+    // left (3 bytes a unit) only when that did not fit: reserving 3 per unit
+    // up front refused, under max_memory, a 1.5 MB ASCII string whose bytes fit.
+    if (typeof input !== 'string') {
+        _grow(at + input.length);
+        _mem.set(input, at);
+        return input.length;
+    }
+    _grow(at + input.length);
+    const r = _enc.encodeInto(input, _mem.subarray(at));
+    let written = r.written;
+    if (r.read < input.length) {
+        // encodeInto never splits a surrogate pair, so the rest starts on one.
+        const rest = input.slice(r.read);
+        _grow(at + written + rest.length * 3);
+        written += _enc.encodeInto(rest, _mem.subarray(at + written)).written;
+    }
+    return written;
+}
+
+`)
 	// Emitted only when something uses them: a stub is a file the caller
 	// compiles, and TypeScript under --noUnusedLocals rejects a declared
 	// helper nothing calls. A match-only config has no generator, and a
@@ -480,11 +507,12 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("    // else can allocate, so they may reuse the space above the bump without\n")
 		sb.WriteString("    // reserving it — which is what stops a one-shot call inside a loop over a\n")
 		sb.WriteString("    // live iterator from allocating a region per iteration.\n")
-		sb.WriteString("    const at = _bump, out = _align(at + _inCap(input));\n")
+		sb.WriteString("    const at = _bump, len = _write(input, at), out = _align(at + len);\n")
 		sb.WriteString("    _grow(out + (outBytes > 0 ? outBytes : 65536));\n")
-		sb.WriteString("    return [at, out, _write(input, at)];\n")
+		sb.WriteString("    return [at, out, len];\n")
 		sb.WriteString("}\n\n")
 	}
+	hdrBytes := strconv.Itoa(config.SetOverlapCheckpointHeaderBytes)
 	if hasSuspendableExports(cfg) {
 		sb.WriteString(`function _open(input, outBytes, cacheFor) {
     // For generators, which DO suspend. The region is reserved for the
@@ -498,25 +526,25 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
     // threw.
     //
     // The answer cache is sized by cacheFor from the bytes the input actually
-    // took — a string reserves three per UTF-16 unit, which is no measure of
-    // the cache it needs — and grown for separately. Under a ceiling that
-    // grow only DECLINES the cache: a zero-length cache is the documented
-    // "walk" signal, so the drive is slower instead of failing.
-    const at = _bump, out = _align(at + _inCap(input));
+    // took, and only its HEADER is reserved here: the region itself is
+    // reserved by _lazy when the module asks for it, and most scans never do.
+    // Under a ceiling a refused grow only DECLINES the cache: a zero-length
+    // cache is the documented "walk" signal, so the drive is slower instead of
+    // failing. The size returned is the whole region's.
+    const at = _bump, len = _write(input, at), out = _align(at + len);
     // outBytes is what the iterator writes there — a batch buffer, a groups
     // call's slots, a set's gates and tuples — and nothing more: a find that
     // writes nothing reserves nothing.
     const top = out + outBytes;
     _grow(top);
-    const len = _write(input, at);
     let k = 0, cache = 0;
     if (cacheFor) {
         [k, cache] = cacheFor(len);
         if (cache > 0) {
-            try { _grow(top + cache); } catch (e) { if (!(e instanceof RangeError)) throw e; cache = 0; }
+            try { _grow(top + ` + hdrBytes + `); } catch (e) { if (!(e instanceof RangeError)) throw e; cache = 0; }
         }
     }
-    _bump = top + cache;
+    _bump = top + (cache > 0 ? ` + hdrBytes + ` : 0);
     _regs.push({ at, top: _bump, free: false });
     return [at, out, len, cache, k];
 }
@@ -921,20 +949,85 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
     };
 `, k.Hdr, k.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
 	}
-	// _open returns the cache it could actually reserve — 0 when a memory
-	// ceiling refused the grow — and the stride it was sized with.
+	// _open returns the region's size — 0 when a memory ceiling refused even
+	// its header — and the stride it was sized with.
 	dest = ", cacheBytes, _k"
 	reserve = ", _cacheFor"
 	// The header is zeroed and then the STRIDE written into it: it is the one
 	// field the caller owns, because the caller is what sized the allocation
-	// from it.
+	// from it. And the LAZY word: the descriptor carries the header alone until
+	// the module asks for the region (_lazy).
+	pre += "    let _cacheAt = 0;\n"
 	post = fmt.Sprintf(`    const cacheBase = cacheBytes > 0 ? gateBase + %d : 0;
     if (cacheBase !== 0) {
         const _hdr = new Uint32Array(_exp.memory.buffer, cacheBase, %d);
         _hdr.fill(0);
         _hdr[%d] = _k;
+        _hdr[%d] = %d;
     }
-`, gateRegion, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrStrideOff/4)
-	args = "cacheBase, cacheBytes"
+`, gateRegion, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrStrideOff/4,
+		config.SetOverlapHdrLazyOff/4, uint32(abi.OverlapCacheLazy))
+	args = fmt.Sprintf("cacheBase, cacheBase !== 0 ? %d : 0", config.SetOverlapCheckpointHeaderBytes)
 	return pre, dest, reserve, post, args
+}
+
+// jsLazyArgs is what jsOverlapCacheBlock returns as a cache-carrying
+// descriptor's arguments; anything else carries no cache.
+var jsLazyArgs = fmt.Sprintf("cacheBase, cacheBase !== 0 ? %d : 0", config.SetOverlapCheckpointHeaderBytes)
+
+// jsLazyWanted is a find shape's answer to the module asking for the answer
+// cache's region — test is the shape's own spelling of "it asked" — or "" for
+// a find that carries no cache (args from jsOverlapCacheBlock).
+func jsLazyWanted(args, test string) string {
+	if args != jsLazyArgs {
+		return ""
+	}
+	return fmt.Sprintf(`        // The module would start using the answer cache now and delivered
+        // nothing: hand the region over, or none, and call again. It never
+        // asks twice.
+        if (%s) { _cacheAt = _lazy(cacheBase, cacheBytes, scratchBase); continue; }
+`, test)
+}
+
+// jsLazyFinally frees the region _lazy reserved, before the iterator's own.
+func jsLazyFinally(args string) string {
+	if args != jsLazyArgs {
+		return ""
+	}
+	return "if (_cacheAt) _close(_cacheAt); "
+}
+
+// jsLazyFunc is `_lazy`, which reserves the answer cache's region when the
+// module asks for it: a region of its own on the stack _open keeps, freed by
+// the iterator's finally. The header is copied over, its lazy word cleared,
+// and the descriptor pointed at it. A grow refused under a memory ceiling
+// clears the lazy word in place instead, and the module walks.
+func jsLazyFunc(ts bool) string {
+	sig, mem := "function _lazy(hdr, bytes, desc) {", "_exp.memory.buffer"
+	if ts {
+		sig, mem = "function _lazy(hdr: number, bytes: number, desc: number): number {", "(_exp.memory as WebAssembly.Memory).buffer"
+	}
+	return fmt.Sprintf(`%[1]s
+    // The module asks for the answer cache's region: reserve it as a region of
+    // its own, copy the header over and point the descriptor at it. A grow
+    // refused under a memory ceiling hands none over — the lazy word is
+    // cleared, and the module walks: the same answers, slower.
+    const at = _align(_bump);
+    try {
+        _grow(at + bytes);
+    } catch (e) {
+        if (!(e instanceof RangeError)) throw e;
+        new Uint32Array(%[2]s, hdr, %[3]d)[%[4]d] = 0;
+        return 0;
+    }
+    _bump = at + bytes;
+    _regs.push({ at, top: _bump, free: false });
+    const c = new Uint32Array(%[2]s, at, %[3]d);
+    c.set(new Uint32Array(%[2]s, hdr, %[3]d));
+    c[%[4]d] = 0;
+    new Uint32Array(%[2]s, desc + %[5]d, 2).set([at, bytes]);
+    return at;
+}
+
+`, sig, mem, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrLazyOff/4, abi.FindScratchCacheOff)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -2650,6 +2651,105 @@ func TestGoStubPackageNameFromOutputPath(t *testing.T) {
 				t.Errorf("stub does not mention the set export %q", c.setFind)
 			}
 		})
+	}
+}
+
+// TestGoStubExplicitGoPackageIsVerbatim: a go_package the config states is the
+// package, wherever the stub is written. It used to become `main` unless the
+// stub's directory shared its name — silently, with the package the user named
+// nowhere in the output.
+func TestGoStubExplicitGoPackageIsVerbatim(t *testing.T) {
+	for _, dirName := range []string{"matchers", "cmd", "internal"} {
+		dir := filepath.Join(t.TempDir(), dirName)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(dir, "stubs.go")
+		cfg := config.BuildConfig{ImportModule: "rx", GoPackage: "matchers", StubFile: out,
+			Patterns: []config.PatternEntry{{Regexp: `[a-z]+`, MatchFunc: "Match"}}}
+		if err := goStub(cfg, out); err != nil {
+			t.Fatalf("goStub: %v", err)
+		}
+		src, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "package matchers\n") {
+			t.Errorf("stub in directory %q is not in package matchers", dirName)
+		}
+	}
+}
+
+// TestGoStubIteratorResumesAfterBreak builds a Go guest with the stub, merges
+// it and runs it: ranging Matches() again after a break must CONTINUE — Go's
+// FindAllIndex answer for `a*` over "ab" is [0 1] [2 2]. The iterators used to
+// store their resume point after yield and keep prevEnd in Matches, so the
+// second range repeated [0 1] (find) or dropped the adjacent-empty rule
+// (groups).
+func TestGoStubIteratorResumesAfterBreak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("rx.yaml", "import_module: rx\nwasm_file: rx.wasm\noutput: merged.wasm\nstub_file: stubs.go\n"+
+		"wasm_merge_path: '"+merge+"'\npatterns:\n  - regexp: 'a*'\n    find_func: f\n  - regexp: '(a*)'\n    groups_func: g\n")
+	write("go.mod", "module guest\n\ngo 1.23\n")
+	write("main.go", `//go:build wasip1
+
+package main
+
+import "fmt"
+
+func main() {
+	in := []byte("ab")
+	fi := f(in, 0)
+	for s, e := range fi.Matches() {
+		fmt.Printf("f %d-%d;", s, e)
+		break
+	}
+	for s, e := range fi.Matches() {
+		fmt.Printf("f %d-%d;", s, e)
+	}
+	gi := g(in, 0)
+	for m := range gi.Matches() {
+		fmt.Printf("g %d-%d;", m[1].Start, m[1].End)
+		break
+	}
+	for m := range gi.Matches() {
+		fmt.Printf("g %d-%d;", m[1].Start, m[1].End)
+	}
+	fmt.Println()
+}
+`)
+	run(t, dir, nil, bin, "compile", "--config=rx.yaml")
+	run(t, dir, nil, bin, "generate", "--config=rx.yaml")
+	run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "-o", "guest.wasm", ".")
+	run(t, dir, nil, bin, "merge", "--config=rx.yaml", "--main=guest.wasm", "rx.wasm")
+	cmd := exec.Command("wasmtime", "run", "merged.wasm")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s", err, out)
+	}
+	if got, want := strings.TrimSpace(string(out)), "f 0-1;f 2-2;g 0-1;g 2-2;"; got != want {
+		t.Errorf("break and range again = %q, want %q", got, want)
 	}
 }
 

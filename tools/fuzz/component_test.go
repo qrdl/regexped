@@ -411,11 +411,16 @@ func TestComponentSetWideAll(t *testing.T) {
 	cfg += "sets:\n  - name: s\n    patterns: all\n    match_all: all_matches\n    scan_all: all_hits\n    find: scan_it\n"
 	h := newSetHarness(t, cfg)
 
+	// Every call lowers its input anew, as a host does: the post-return frees
+	// the lowered block with the rest of the call's chain, so reusing it in a
+	// later call reads freed memory — which a block given back to the heap top
+	// (cm_free) is handed out again.
 	const text = "kw003xy and kw041pq and kw069zz"
 	ptr, n := h.writeInput(text)
 	if got, _ := h.list(h.call(h.pkg+"#all-hits", ptr, n, int32(0))); fmt.Sprint(got) != "[3 41 69]" {
 		t.Errorf("wide scan_all = %v, want [3 41 69]", got)
 	}
+	ptr, n = h.writeInput(text)
 	if got, _ := h.list(h.call(h.pkg+"#all-hits", ptr, n, int32(12))); fmt.Sprint(got) != "[41 69]" {
 		t.Errorf("wide scan_all(from=12) = %v, want [41 69]", got)
 	}
@@ -427,11 +432,13 @@ func TestComponentSetWideAll(t *testing.T) {
 
 	// Alternate the answers: a bitmap not zeroed per call would accumulate.
 	for i := 0; i < 300; i++ {
+		one, oneN = h.writeInput("kw069zz")
 		r1 := h.call(h.pkg+"#all-hits", one, oneN, int32(0))
 		if got, _ := h.list(r1); fmt.Sprint(got) != "[69]" {
 			t.Fatalf("iteration %d: %v, want [69] — a stale bitmap?", i, got)
 		}
 		h.call("cabi_post_"+h.pkg+"#all-hits", r1)
+		ptr, n = h.writeInput(text)
 		r2 := h.call(h.pkg+"#all-hits", ptr, n, int32(0))
 		if got, _ := h.list(r2); fmt.Sprint(got) != "[3 41 69]" {
 			t.Fatalf("iteration %d: %v, want [3 41 69]", i, got)
@@ -695,6 +702,93 @@ func TestComponentAllocSurvivesMixedSizes(t *testing.T) {
 		}
 		h.freeAll()
 	}
+}
+
+// TestComponentAllocTrimsAFinishedDrive: under max_memory, one instance that
+// served a smaller drive serves a bigger one as a fresh instance does. Freed
+// blocks only ever went onto their own class's list, so after a 40,000-byte
+// Backtracking drive the 64 KB-class blocks stayed below the heap top, and the
+// 80,000-byte drive — 128 KB-class blocks and the Backtracking scratch above
+// the top — ran out of room after 21 matches and answered backtrack-overflow.
+// A block that ends at the heap top now goes back to the bump when freed.
+//
+// The cap is ONE PAGE above the least at which a fresh instance answers the
+// big drive, and before the trim the history needed three. The page left is
+// the input a finished scan releases at once (emitPatReleaseFinished): its
+// representation, allocated after it, is still alive above it then, so the
+// input goes onto its class's list and stays below the heap top — the trim
+// does not cascade into blocks already on a list.
+func TestComponentAllocTrimsAFinishedDrive(t *testing.T) {
+	const pat = `((?:a|b)*a(?:a|b){12}c|a)`
+	drive := func(w []byte, res map[string]generate.PatternResourceNames, sizes ...int) []string {
+		t.Helper()
+		f := res["fb"]
+		store, inst, mem := instantiateCore(t, w)
+		realloc := inst.GetFunc(store, "cabi_realloc")
+		post := inst.GetFunc(store, "cabi_post_"+f.Next)
+		var out []string
+		for _, n := range sizes {
+			r, err := realloc.Call(store, int32(0), int32(0), int32(1), int32(n))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := r.(int32)
+			copy(mem.UnsafeData(store)[p:], strings.Repeat("a", n))
+			h, err := inst.GetFunc(store, f.Constructor).Call(store, p, int32(n), int32(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches, status := 0, "ok"
+			for {
+				rr, err := inst.GetFunc(store, f.Next).Call(store, h)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ret := uint32(rr.(int32))
+				b := mem.UnsafeData(store)
+				isErr, some := b[ret] == 1, b[ret+4] == 1
+				if _, err := post.Call(store, int32(ret)); err != nil {
+					t.Fatal(err)
+				}
+				if isErr {
+					status = "err"
+					break
+				}
+				if !some {
+					break
+				}
+				matches++
+			}
+			if _, err := inst.GetFunc(store, f.Dtor).Call(store, h); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, fmt.Sprintf("%d: %d %s", n, matches, status))
+		}
+		return out
+	}
+	build := func(pages int) ([]byte, map[string]generate.PatternResourceNames) {
+		memCap, err := config.ParseMemorySize(strconv.Itoa(pages * 65536))
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, _, res := componentWasm(t, []config.PatternEntry{{Regexp: pat, FindFunc: "fb"}}, compile.CompileOptions{MaxMemory: memCap})
+		return w, res
+	}
+	for pages := 16; pages <= 40; pages++ {
+		w, res := build(pages)
+		if got := drive(w, res, 80000); got[0] != "80000: 80000 ok" {
+			continue // a fresh instance does not answer it at this cap
+		}
+		w, res = build(pages + 1)
+		for _, first := range []int{20000, 40000, 60000} {
+			got := drive(w, res, first, 80000)
+			if want := fmt.Sprintf("%d: %d ok", first, first); got[0] != want || got[1] != "80000: 80000 ok" {
+				t.Errorf("cap %d pages, %d then 80000: %v, want every drive answered", pages+1, first, got)
+			}
+		}
+		return
+	}
+	t.Fatal("no cap up to 40 pages lets a fresh instance answer the 80,000-byte drive")
 }
 
 // TestCabiReallocTrapsOnHugeSizes: a size the size classes cannot represent
@@ -1245,6 +1339,43 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 	}
 }
 
+// TestComponentGroupsListsRemovedGroups: the groups resource's `next` returns
+// one element per group the pattern declares, a group Simplify removed
+// (`(b){0}`) included as none. It returned the simplified program's count, two
+// here, and the Rust component stub's Vec — documented to hold every group —
+// was then one short, so indexing group 2 with its generated constant
+// panicked.
+func TestComponentGroupsListsRemovedGroups(t *testing.T) {
+	w, _, res := componentWasm(t, []config.PatternEntry{{Regexp: `(a)(b){0}c`, GroupsFunc: "g"}}, compile.CompileOptions{})
+	store, inst, mem := instantiateCore(t, w)
+	g := res["g"]
+	u32 := func(addr uint32) uint32 { return binary.LittleEndian.Uint32(mem.UnsafeData(store)[addr:]) }
+	copy(mem.UnsafeData(store)[pathsInputBase:], "xac")
+	h, err := inst.GetFunc(store, g.Constructor).Call(store, int32(pathsInputBase), int32(3), int32(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := inst.GetFunc(store, g.Next).Call(store, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ret := uint32(r.(int32))
+	if mem.UnsafeData(store)[ret] == 1 {
+		t.Fatal("next errored")
+	}
+	ptr, n := u32(ret+4), u32(ret+8)
+	if n != 3 {
+		t.Fatalf("next returned %d groups, want 3: `(a)(b){0}c` declares three", n)
+	}
+	b := mem.UnsafeData(store)
+	if b[ptr] != 1 || u32(ptr+4) != 1 || u32(ptr+8) != 3 || b[ptr+12] != 1 || u32(ptr+16) != 1 || u32(ptr+20) != 2 {
+		t.Errorf("groups 0 and 1 = %v, want some((1,3)), some((1,2))", b[ptr:ptr+24])
+	}
+	if b[ptr+24] != 0 {
+		t.Errorf("group 2's discriminant = %d, want 0 (none)", b[ptr+24])
+	}
+}
+
 // The -2 sentinel means the answer is UNKNOWN, and must lift to
 // err(backtrack-overflow) rather than to a definite ok(none). Reaching it needs
 // the same squeeze tools/fuzz uses elsewhere: Backtracking forced by a tiny
@@ -1254,12 +1385,14 @@ func TestUnicodeModeOutputKinds(t *testing.T) {
 func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 	entries := []config.PatternEntry{{Regexp: btNoCapturePattern, FindFunc: "f"}}
 	// BTWorkBudgetOff keeps the call in the ordinary body, whose frame stack
-	// grows at call time; capping the memory at the size the uncapped build
-	// instantiates to stops that growth, and the body answers -2.
+	// grows at call time; capping the memory at the least size the module
+	// compiles under — one page above what the uncapped build instantiates
+	// to, for the stack's first allocation — and growing it to that cap before
+	// the call stops that growth, and the body answers -2.
 	opts := compile.CompileOptions{MaxDFAStates: 2, BTWorkBudget: compile.BTWorkBudgetOff}
 	plain, _, _ := componentWasm(t, entries, opts)
 	plainStore, _, plainMem := instantiateCore(t, plain)
-	memCap, err := config.ParseMemorySize(strconv.FormatUint(plainMem.Size(plainStore)*65536, 10))
+	memCap, err := config.ParseMemorySize(strconv.FormatUint((plainMem.Size(plainStore)+1)*65536, 10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1267,6 +1400,11 @@ func TestComponentAdapterLiftsBacktrackOverflow(t *testing.T) {
 	w, _, res := componentWasm(t, entries, opts)
 
 	store, inst, mem := instantiateCore(t, w)
+	if ok, max := mem.Type(store).Maximum(); ok && max > mem.Size(store) {
+		if _, err := mem.Grow(store, max-mem.Size(store)); err != nil {
+			t.Fatalf("grow to the cap: %v", err)
+		}
+	}
 	f := res["f"]
 	ctor := inst.GetFunc(store, f.Constructor)
 	next := inst.GetFunc(store, f.Next)
@@ -1500,6 +1638,27 @@ sets:
     find: scan_it
 `
 
+// checkLazyHeader requires what a set scanner's constructor hands over for an
+// overlapping drive: the answer cache's HEADER alone (representation +20, its
+// length at +24), zeroed but for the stride and the lazy word, and the whole
+// region's size at +28 for `next` to reserve when the module asks.
+func checkLazyHeader(t *testing.T, h *setHarness, sc int32) {
+	t.Helper()
+	hdr := int32(h.u32(sc + 20))
+	if hdr == 0 {
+		t.Fatal("the constructor handed over no answer cache header")
+	}
+	if n := h.u32(sc + 24); n != config.SetOverlapCheckpointHeaderBytes {
+		t.Fatalf("the constructor handed over %d bytes, want the %d-byte header alone", n, config.SetOverlapCheckpointHeaderBytes)
+	}
+	if w := h.u32(hdr + config.SetOverlapHdrLazyOff); w != abi.OverlapCacheLazy {
+		t.Fatalf("the header's lazy word is %#x, want %#x", w, abi.OverlapCacheLazy)
+	}
+	if full := h.u32(sc + 28); full <= config.SetOverlapCheckpointHeaderBytes {
+		t.Fatalf("the region's size is %d", full)
+	}
+}
+
 // TestComponentOverlapCacheAnswersCorrectly drives the resource to exhaustion
 // over an input long enough for the cache to engage, and checks the answer
 // against the enumeration the contract promises: every start position, in
@@ -1518,19 +1677,26 @@ func TestComponentOverlapCacheAnswersCorrectly(t *testing.T) {
 	// A correct answer is no evidence that the cache produced it — the walk
 	// answers identically. `ready` says which engine did. It is read DURING the
 	// drive: a scanner that has finished releases its cache at once.
-	cachePtr := int32(h.u32(sc + 20))
-	if cachePtr == 0 {
-		t.Fatal("the constructor reserved no answer cache for a 4 KB overlapping drive")
-	}
+	//
+	// The constructor hands the header over alone, its lazy word set; `next`
+	// reserves the region when the module asks for it, and the representation
+	// then points at the region instead.
+	checkLazyHeader(t, h, sc)
 	var starts []uint32
 	ready := int32(0)
+	granted := false
 	for i := 0; i < len(text)+8; i++ {
 		got, _ := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc))
 		if len(got) == 0 {
 			break
 		}
 		starts = append(starts, got[0][1])
+		cachePtr := int32(h.u32(sc + 20))
 		ready = int32(h.u32(cachePtr + config.SetOverlapHdrReadyOff))
+		granted = granted || h.u32(sc+24) == h.u32(sc+28)
+	}
+	if !granted {
+		t.Fatal("the region was never handed over")
 	}
 	if len(starts) != len(text) {
 		t.Fatalf("reported %d positions over %d bytes; an overlapping drive reports every start",
@@ -1576,12 +1742,10 @@ func TestComponentOverlapCacheCrossesTheGate(t *testing.T) {
 	defer h.call(h.pkg+"#[dtor]scan-it", sc)
 
 	// The handle IS the representation here (see newSetHarness), so the
-	// descriptor is readable: cache pointer at +20, its length at +24.
-	cachePtr := int32(h.u32(sc + 20))
-	cacheLen := h.u32(sc + 24)
-	if cachePtr == 0 {
-		t.Fatal("the constructor reserved no cache for a 4.5 MB input")
-	}
+	// descriptor is readable: cache pointer at +20, its length at +24, and the
+	// region's size, reserved when the module asks for it, at +28.
+	checkLazyHeader(t, h, sc)
+	cacheLen := h.u32(sc + 28)
 	sh, err := compile.SetOverlapCacheShape(overlapSetCfgSet(t), overlapSetCfgBuild(t))
 	if err != nil || !sh.Eligible {
 		t.Fatalf("shape: %v %+v", err, sh)
@@ -1608,7 +1772,10 @@ func TestComponentOverlapCacheCrossesTheGate(t *testing.T) {
 	}
 	// And it engaged: `ready` is the one header field a caller may read, and
 	// without this the test passes on a drive that quietly walked.
-	if ready := int32(h.u32(cachePtr + 8)); ready != 1 {
+	if got := h.u32(sc + 24); got != want {
+		t.Fatalf("the region handed over is %d bytes, want %d", got, want)
+	}
+	if ready := int32(h.u32(int32(h.u32(sc+20)) + 8)); ready != 1 {
 		t.Fatalf("ready = %d after 100 positions of a quadratic drive, want 1", ready)
 	}
 }
@@ -1635,14 +1802,14 @@ func TestComponentScannerRepeatsItsError(t *testing.T) {
 	p, ln := h.writeInput(text)
 	sc := h.call(h.pkg+"#[constructor]scan-it", p, ln, int32(0))
 
-	cachePtr := int32(h.u32(sc + 20))
-	if cachePtr == 0 {
-		t.Fatal("the constructor reserved no cache, so there is no header to corrupt")
-	}
+	checkLazyHeader(t, h, sc)
+	var cachePtr int32
 	for i := 0; i < 200; i++ {
 		if _, errored := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc)); errored {
 			t.Fatalf("position %d errored before the header was touched", i)
 		}
+		// The region, once the module asked for it.
+		cachePtr = int32(h.u32(sc + 20))
 		if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) == 1 {
 			break
 		}
@@ -1729,14 +1896,14 @@ func TestComponentScannerReportsOutOfOrder(t *testing.T) {
 	p, ln := h.writeInput(text)
 	sc := h.call(h.pkg+"#[constructor]scan-it", p, ln, int32(0))
 
-	cachePtr := int32(h.u32(sc + 20))
-	if cachePtr == 0 {
-		t.Fatal("the constructor reserved no cache, so there is no floor to fall below")
-	}
+	checkLazyHeader(t, h, sc)
+	var cachePtr int32
 	for i := 0; i < 200; i++ {
 		if _, errored := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc)); errored {
 			t.Fatalf("position %d errored before the position was touched", i)
 		}
+		// The region, once the module asked for it.
+		cachePtr = int32(h.u32(sc + 20))
 		if int32(h.u32(cachePtr+config.SetOverlapHdrReadyOff)) == 1 {
 			break
 		}
@@ -1803,7 +1970,7 @@ func TestComponentCacheGeometryMatchesConfig(t *testing.T) {
 	for _, n := range []int{100, 1000, 4096} {
 		p, l := h.writeInput(strings.Repeat("x1y4", n/4))
 		sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
-		cachePtr, cacheLen := int32(h.u32(sc+20)), int(h.u32(sc+24))
+		cachePtr, cacheLen := int32(h.u32(sc+20)), int(h.u32(sc+28))
 		if cachePtr == 0 {
 			t.Errorf("len %d: the constructor reserved no cache", l)
 		} else {
@@ -1843,7 +2010,7 @@ func TestComponentWideOverlapCache(t *testing.T) {
 		text := strings.Repeat(strings.Repeat("abcdefghij", 8)+"0 ", 8)
 		p, l := h.writeInput(text)
 		sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
-		cachePtr, cacheLen := int32(h.u32(sc+20)), int(h.u32(sc+24))
+		cachePtr, cacheLen := int32(h.u32(sc+20)), int(h.u32(sc+28))
 		if cachePtr == 0 {
 			t.Fatalf("%d members: the constructor reserved no cache", n)
 		}
@@ -1874,7 +2041,7 @@ func TestComponentWideOverlapCache(t *testing.T) {
 		long := strings.Repeat("a", 8000) + "0"
 		p, l = h.writeInput(long)
 		sc = h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
-		cachePtr = int32(h.u32(sc + 20))
+		ready := int32(0)
 		for i := 0; i <= len(long); i++ {
 			ms, errored := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc))
 			if errored {
@@ -1883,8 +2050,10 @@ func TestComponentWideOverlapCache(t *testing.T) {
 			if len(ms) == 0 {
 				break
 			}
+			// Read during the drive: a finished scanner releases the region.
+			ready = int32(h.u32(int32(h.u32(sc+20)) + config.SetOverlapHdrReadyOff))
 		}
-		if ready := int32(h.u32(cachePtr + config.SetOverlapHdrReadyOff)); ready != 1 {
+		if ready != 1 {
 			t.Errorf("%d members: the cache header's ready is %d after the long drive: it walked", n, ready)
 		}
 		h.call(h.pkg+"#[dtor]scan-it", sc)
@@ -2267,9 +2436,10 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 		text := strings.Repeat("abcdefgh", 1024)
 		p, n := h.writeInput(text)
 		sc := h.call(h.pkg+"#[constructor]scan-it", p, n, int32(0))
-		if cachePtr := h.u32(sc + 20); cachePtr != 0 {
-			t.Fatalf("a cache was reserved (at %d) under a max_memory it cannot fit", cachePtr)
-		}
+		// The header alone, until the module asks for the region; `next` then
+		// finds the allocator cannot serve it and clears the lazy word instead.
+		checkLazyHeader(t, h, sc)
+		asked := false
 		starts := 0
 		for i := 0; i <= len(text); i++ {
 			ret := h.call(h.pkg+"#[method]scan-it.next", sc)
@@ -2280,6 +2450,10 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 			if len(ms) == 0 {
 				break
 			}
+			if got := h.u32(sc + 24); got != config.SetOverlapCheckpointHeaderBytes {
+				t.Fatalf("a region of %d bytes was reserved under a max_memory it cannot fit", got)
+			}
+			asked = asked || h.u32(int32(h.u32(sc+20))+config.SetOverlapHdrLazyOff) == 0
 			if int(ms[0][1]) != starts {
 				t.Fatalf("position %d reported start %d", starts, ms[0][1])
 			}
@@ -2290,6 +2464,9 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 		}
 		if starts != len(text) {
 			t.Errorf("reported %d positions over %d bytes: an overlapping drive reports every start", starts, len(text))
+		}
+		if !asked {
+			t.Error("the module never asked for the region, so nothing was declined")
 		}
 		h.call(h.pkg+"#[dtor]scan-it", sc)
 	})
@@ -2336,5 +2513,68 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 			t.Errorf("found %d matches over %d bytes", got, len(text))
 		}
 		h.call(names.Dtor, handle)
+	})
+
+	// A freed block of the right size serves the reserve check. Three pages
+	// hold two 32 KB inputs (32 KB class each) and ONE scanner's notes (2
+	// bytes per position, a 64 KB class), not two. Scanner A gets notes; B opens above them; A finishes, and its
+	// notes go onto their class's list (B is above, so they cannot go back to
+	// the bump); B then arms, and its notes can only come from that list. The
+	// check used to ignore the lists and ask for room above the heap top,
+	// declining memory a freed block stood ready to give.
+	t.Run("a freed block serves the reserve", func(t *testing.T) {
+		yml := tight("wasm_format: component\nimport_module: t\nwit_package: t\npatterns:\n  - name: ov\n    regexp: 'a*b|a'\n    find_func: ov_find\n", 3)
+		var cfg config.BuildConfig
+		if err := yaml.Unmarshal([]byte(yml), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		_, _, resources, _, _, err := generate.ComponentArtifactsWithSets(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		core, _, err := component.Core(cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, inst, mem := instantiateCore(t, core)
+		h := &setHarness{t: t, store: store, inst: inst, mem: mem, pkg: "regexped:t/matcher"}
+		names := resources["ov_find"]
+		text := strings.Repeat("a", 32000)
+		// The find resource's search block is at offset 16 of its handle's
+		// representation; its notes pointer at the block's SearchNotesOff.
+		notes := func(handle int32) uint32 { return h.u32(handle + 16 + abi.SearchNotesOff) }
+		step := func(handle int32) bool {
+			ret := h.call(names.Next, handle)
+			_, _, some, errored := h.spans(ret)
+			if errored {
+				t.Fatal("next reported an error")
+			}
+			h.call("cabi_post_"+names.Next, ret)
+			return some
+		}
+		open := func() int32 {
+			p, n := h.writeInput(text)
+			return h.call(names.Constructor, p, n, int32(0))
+		}
+		a := open()
+		for i := 0; notes(a) == 0 && i < 2000; i++ {
+			step(a)
+		}
+		if notes(a) == 0 {
+			t.Fatal("scanner A was never given notes under three pages: the setup no longer holds")
+		}
+		b := open()
+		for step(a) {
+		}
+		h.call(names.Dtor, a)
+		for i := 0; notes(b) == 0 && i < 2000; i++ {
+			if !step(b) {
+				break
+			}
+		}
+		if notes(b) == 0 {
+			t.Error("scanner B was declined notes that A's freed block could give")
+		}
+		h.call(names.Dtor, b)
 	})
 }

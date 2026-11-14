@@ -2522,6 +2522,83 @@ func (r batchGroupsRecord) String() string {
 	return fmt.Sprintf("[%d,%d) slots=%v", r.start, r.end, r.slots)
 }
 
+// TestRemovedGroupSlotsAreWritten: a group Go's Simplify removes — `(b){0}`,
+// which can never take part — still counts in Go's NumSubexp and in every
+// stub's group count, so the groups export writes its slots as -1 and the
+// batch export's records are laid out for it. The module used to count groups
+// from the SIMPLIFIED program: the slots kept whatever the buffer held (the
+// stubs pre-fill, a raw caller read garbage) and a batch record was a group
+// short, so the stubs read every record after the first misaligned. Over a
+// buffer pre-filled with 0x5A, on TDFA, Backtracking and a group removed
+// inside an alternation.
+func TestRemovedGroupSlotsAreWritten(t *testing.T) {
+	for _, c := range []struct{ pat, input string }{
+		{`(a)(b){0}c`, "ac xac"},
+		{`(a+?)(b){0}c`, "ac xaac"},
+		{`x(a|(b){0})`, "xa yxa"},
+	} {
+		t.Run(c.pat, func(t *testing.T) {
+			entry := config.PatternEntry{Regexp: c.pat, GroupsFunc: "groups", Hints: []string{"batch-find"}}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatalf("instantiate: %v", err)
+			}
+			if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+				t.Fatal(err)
+			}
+			re := regexp.MustCompile(c.pat)
+			numGroups := re.NumSubexp() + 1
+			copy(mem.UnsafeData(store)[pathsInputBase:], c.input)
+			rd := func(o int) int32 { return int32(binary.LittleEndian.Uint32(mem.UnsafeData(store)[o:])) }
+			fill := func(at, n int) {
+				buf := mem.UnsafeData(store)
+				for i := 0; i < n; i++ {
+					buf[at+i] = 0x5A
+				}
+			}
+
+			fill(int(pathsOutBase), numGroups*8)
+			if _, err := inst.GetFunc(store, "groups").Call(store, pathsInputBase, int32(len(c.input)), pathsOutBase, int32(0)); err != nil {
+				t.Fatal(err)
+			}
+			want := re.FindStringSubmatchIndex(c.input)
+			for s := range want {
+				if got := rd(int(pathsOutBase) + 4*s); got != int32(want[s]) {
+					t.Errorf("groups: slot %d = %#x, want %d (Go: %v)", s, got, want[s], want)
+				}
+			}
+
+			batchOut := int(pathsOutBase) + 1024
+			recordSize := 8 + numGroups*8
+			fill(batchOut, 4*recordSize)
+			res, err := inst.GetFunc(store, "groups_batch").Call(store, pathsInputBase, int32(len(c.input)), int32(batchOut), int32(4), int32(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			all := re.FindAllStringSubmatchIndex(c.input, -1)
+			if n := int(res.(int32)); n != len(all) {
+				t.Fatalf("groups_batch: %d records, want %d", n, len(all))
+			}
+			for i, m := range all {
+				base := batchOut + i*recordSize
+				if rd(base) != int32(m[0]) || rd(base+4) != int32(m[1]) {
+					t.Errorf("record %d extent = [%d,%d), want [%d,%d)", i, rd(base), rd(base+4), m[0], m[1])
+				}
+				for s := range m {
+					if got := rd(base + 8 + 4*s); got != int32(m[s]) {
+						t.Errorf("record %d slot %d = %#x, want %d (Go: %v)", i, s, got, m[s], m)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall(t *testing.T) {
 	const input = "xx a@b yy c@d"
 

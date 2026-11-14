@@ -540,8 +540,9 @@ func genCComponentGroups(importModule, funcName, witFunc string, numGroups int, 
         iter->offset = (end > start) ? end : start + 1;
         for (unsigned int i = 0; i < %[4]s_GROUPS; i++) {
             if (i >= n) {
-                /* Shorter list than the pattern's group count cannot happen, but
-                   a caller's array must never be left uninitialised. */
+                /* The component returns every group the pattern declares, those
+                   Simplify removed, such as (b){0}, as unset; a shorter list is not
+                   expected, but a caller's array is never left uninitialised. */
                 out_groups[i].start = -1;
                 out_groups[i].end   = -1;
                 continue;

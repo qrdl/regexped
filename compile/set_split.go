@@ -1436,6 +1436,16 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = ld32(b, abi.FindScratchCacheOff)
 		b = append(b, 0x05, 0x41, 0x00, 0x0B)
 		b = append(b, 0x21, lSwRegion)
+		// A lazy header marked wanted — a program sweep asked for the region
+		// it does not have yet (emitSweptMember) — is answered at the start
+		// of the call, with nothing delivered (abi.OverlapCacheWanted).
+		b = append(b, 0x20, lSwRegion, 0x20, lSwRegionLen, 0x41)
+		b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+		b = append(b, 0x4E, 0x71, 0x04, 0x40) // region && len >= header: if
+		b = emitLazyIs(b, lSwRegion, abi.OverlapCacheWantedMark)
+		b = append(b, 0x04, 0x40, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+		b = append(b, 0x0F, 0x0B, 0x0B)
 	}
 	callComp := func(b []byte) []byte {
 		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pFrom, 0x20, pDesc, 0x20, pOut, 0x20, pCap, 0x10)

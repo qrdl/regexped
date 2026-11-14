@@ -1032,7 +1032,7 @@ func anyGroupsExport(patterns []*compiledPattern) bool {
 //
 // def, when non-nil, is the export's default search state (default_search.go);
 // an anchored-only wrapper, one call per drive, has none.
-func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
+func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaultSearch, numGroups, outGroups int) []byte {
 	var b []byte
 	if def != nil {
 		if anchoredOnly {
@@ -1045,6 +1045,7 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 		b = append(b, 0x04, 0x40, 0x41, 0x7F, 0x0F, 0x0B)
 		b = def.emitEnter(b, 0, 1, 3, l)
 		b = emitFindFromSet(b, 0x03)
+		b = emitRemovedGroupSlots(b, 0x02, 0, numGroups, outGroups)
 		b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02) // ptr, len, out_ptr
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(innerFuncIdx))
@@ -1076,6 +1077,8 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 		// start. This is the ONLY writer of the channel on the groups path.
 		b = emitFindFromSet(b, 0x03)
 	}
+	// The slots of the groups Simplify removed: no capture body writes them.
+	b = emitRemovedGroupSlots(b, 0x02, 0, numGroups, outGroups)
 
 	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02) // ptr, len, out_ptr
 	b = append(b, 0x10)
@@ -1085,8 +1088,8 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 }
 
 // appendGroupsFromWrapperCodeEntry appends a size-prefixed groups-from wrapper.
-func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
-	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly, def)
+func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool, def *defaultSearch, numGroups, outGroups int) []byte {
+	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly, def, numGroups, outGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

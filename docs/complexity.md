@@ -154,7 +154,10 @@ memo, set blocks and cache, grown in its own memory on first use and reused
 ([wasm.md](wasm.md#the-search-block)). The state carries over only while each
 call continues the previous one — the same text, `from` inside the last
 answer's window (a set: the same gate array, `from` advanced) — and is reset
-otherwise. `a*b|a` over `a`×8 K costs 474 instructions per byte that way,
+otherwise. A set's new drive over the same buffer, gate array zeroed, at a
+larger `from` therefore reads the old text's state: a raw caller restarts at an
+offset no greater than the last one, or with another gate array or text
+address ([sets.md](sets.md)). `a*b|a` over `a`×8 K costs 474 instructions per byte that way,
 against 135,303 before. A caller that does hand its state over pays ~1-9
 instructions per call for the check.
 
@@ -268,7 +271,7 @@ cannot have it.
 | Backtracking memo | `(len + 1) × ⌈instructions / 8⌉` | once a search trips (per call in the fallback otherwise) |
 | Backtracking frame stack (every body, set members included) | starts at 64 KB, doubles by `memory.grow`; one scratch for the whole module | as a search deepens |
 | fallback stack and bitset | sized from the input | when the fallback runs |
-| answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | reserved by the stub per drive; filled only if the drive sweeps |
+| answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | allocated by the stub only when the drive asks for it — the call where it would sweep; a drive that never sweeps holds the 48-byte header alone |
 | program sweep | 4 bytes per position per swept member, checkpointed the same way | the end of the same region, after the cache |
 | default state (standalone, raw callers) | what a stub would allocate | grown on first use, reused, regrown to at least twice the size only when a drive needs more |
 

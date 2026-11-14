@@ -1544,6 +1544,66 @@ func (c overlapCacheCtx) emitPastEndCheck(b []byte, posLocal byte) []byte {
 	return b
 }
 
+// ckptHdrLazy is the header's lazy word (config.SetOverlapHdrLazyOff): zero
+// for an ordinary region, abi.OverlapCacheLazy for a header handed over alone,
+// abi.OverlapCacheWantedMark once the drive wants the region.
+const ckptHdrLazy = config.SetOverlapHdrLazyOff
+
+// emitLazyIs pushes 1 when the lazy word of the header at local region is
+// mark. The region must be non-zero.
+func emitLazyIs(b []byte, region byte, mark int64) []byte {
+	b = append(b, 0x20, region)
+	b = hdrLoadOp(b, ckptHdrLazy)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(mark)) //nolint:gosec // a 32-bit marker
+	return append(b, 0x46)                  // i32.eq
+}
+
+// emitMarkWantedIfLazy turns a LAZY header's word into the wanted mark: the
+// drive has reached the point where it would use a region the caller has not
+// allocated yet, and the next call's start answers abi.OverlapCacheWanted
+// (emitWantedCheck). An ordinary header is left alone.
+func emitMarkWantedIfLazy(b []byte, region byte) []byte {
+	b = emitLazyIs(b, region, abi.OverlapCacheLazy)
+	b = append(b, 0x04, 0x40, 0x20, region, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWantedMark)) //nolint:gosec // a 32-bit marker
+	b = hdrStoreOp(b, ckptHdrLazy)
+	return append(b, 0x0B)
+}
+
+// emitWantedNow returns abi.OverlapCacheWanted in the entry's shape: the batch
+// entry's is a reserved resume-position word with a zero count.
+func (c overlapCacheCtx) emitWantedNow(b []byte) []byte {
+	if c.i64Ret {
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, wantedCursor())
+	} else {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+	}
+	return append(b, 0x0F)
+}
+
+// wantedCursor is the packed i64 the batch entry returns for
+// abi.OverlapCacheWanted: the reserved position word on top, a zero count.
+func wantedCursor() int64 {
+	var w uint64 = config.SetCursorCacheWantedPos
+	return int64(w << 32) //nolint:gosec // a reserved bit pattern, not a count
+}
+
+// emitWantedCheck answers abi.OverlapCacheWanted at a call's START when the
+// header (c.pCache, non-zero) carries the wanted mark: a part of the module
+// that cannot return mid-call — the batch worker's sweep, a split member's
+// program sweep — marked it, and the call that follows asks before it does
+// anything else. Emitted by emitEntrySweep, behind its `ready == 0`: the mark
+// is only ever set before the drive has swept.
+func (c overlapCacheCtx) emitWantedCheck(b []byte) []byte {
+	b = emitLazyIs(b, c.pCache, abi.OverlapCacheWantedMark)
+	b = append(b, 0x04, 0x40)
+	b = c.emitWantedNow(b)
+	return append(b, 0x0B)
+}
+
 // emitMarkRefused records that this drive must not ask again.
 func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
@@ -1589,20 +1649,43 @@ func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
 // the cache path read a tuple INDEX. Lever B retired the index form — rows are
 // addressed by position — so the two halves mean the same thing on both paths
 // and there is nothing left to tell apart.
-func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte) []byte {
+//
+// The two halves are NESTED, not and-ed: a drive the cache serves — whose
+// calls are the cheapest there are — tests `ready` and nothing else, and the
+// lazy header's wanted mark (emitWantedCheck) is tested behind the same test
+// at no cost to it. boundary, when not nil, pushes one more condition for the
+// sweep itself (the batch entry's position boundary); the wanted check does not
+// wait for it.
+func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom, boundary func([]byte) []byte) []byte {
 	b = append(b, 0x20, c.lReady)
 	b = append(b, 0x45)
+	b = append(b, 0x04, 0x40) // if not swept yet
+	b = c.emitWantedCheck(b)
 	b = c.emitWorkExceedsSweep(b)
-	b = append(b, 0x71) // i32.and
+	if boundary != nil {
+		b = boundary(b)
+		b = append(b, 0x71) // i32.and
+	}
 	b = append(b, 0x04, 0x40)
 	b = c.emitSweepCall(b, pushFrom)
 	b = append(b, 0x04, 0x40)
 	b = c.emitMalformedReturn(b, c.i64Ret)
+	// A LAZY header: the region it stands for is not allocated yet. Ask for
+	// it — this is a call's start, nothing is delivered — instead of
+	// refusing for good.
+	b = emitLazyIs(b, c.pCache, abi.OverlapCacheLazy)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, c.pCache, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWantedMark)) //nolint:gosec // a 32-bit marker
+	b = hdrStoreOp(b, ckptHdrLazy)
+	b = c.emitWantedNow(b)
+	b = append(b, 0x0B)
 	b = c.emitMarkRefused(b)
 	b = append(b, 0x0B) // end if the sweep did not deliver
 	b = append(b, 0x20, c.pCache)
 	b = hdrLoadOp(b, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
+	b = append(b, 0x0B) // end if the walk has cost more than the sweep would
 	b = append(b, 0x0B) // end if not swept yet
 	return b
 }

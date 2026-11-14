@@ -271,6 +271,22 @@ func validateWITNames(cfg *BuildConfig, rustBindings bool) []string {
 func ValidateConfig(cfg *BuildConfig) error {
 	var problems []string
 
+	// Every regexp's size, references or not: expansion refuses one it would
+	// build past the cap (references.go), and a regexp WRITTEN that long is
+	// refused here.
+	for _, re := range cfg.Patterns {
+		if p := cfg.regexpSizeProblem(re.Owner(), uint64(len(re.Regexp))); p != "" {
+			problems = append(problems, p)
+		}
+	}
+	for _, s := range cfg.Sets {
+		for k, r := range s.Regexps {
+			if p := cfg.regexpSizeProblem(fmt.Sprintf("set %q regexps[%d]", s.Name, k), uint64(len(r))); p != "" {
+				problems = append(problems, p)
+			}
+		}
+	}
+
 	for _, re := range cfg.Patterns {
 		owner := re.Owner()
 		for _, f := range []struct{ field, name string }{
@@ -569,7 +585,7 @@ var stubSharedSymbols = map[string][]string{
 var stubPrivateHelpers = map[string][]string{
 	"js": {
 		"init", "_exp", "_mem", "_staticTop", "_bump", "_regs", "_enc",
-		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
+		"_align", "_grow", "_write", "_stage", "_open", "_close",
 		"_att", "_notes", "_btmemo",
 	},
 	// Go declares no private helpers of its own, but `init` is reserved by the
@@ -589,6 +605,42 @@ var stubPrivateHelpers = map[string][]string{
 }
 
 func init() { stubPrivateHelpers["ts"] = stubPrivateHelpers["js"] }
+
+// stubScopeNames are names a generated file brings into scope WITHOUT
+// declaring them itself — Go's imported packages, the C header's standard
+// headers — each with what it is, for the message. An export of the same name
+// passed validation and gave a file that does not build: `find_func: errors`
+// declares `func errors` beside `import "errors"`, and `match_func: free`
+// clashes with <stdlib.h>, which the C header includes when the answer cache
+// is enabled. Denied unconditionally, like the helpers: the C list does not
+// depend on whether this config has an overlapping set today.
+var stubScopeNames = map[string]map[string]string{
+	"go": {
+		"errors": `the "errors" package the Go stub imports`,
+		"iter":   `the "iter" package the Go stub imports`,
+		"unsafe": `the "unsafe" package the Go stub imports`,
+	},
+	"c": cHeaderScopeNames(),
+}
+
+// cHeaderScopeNames is every name <stddef.h> and <stdlib.h> declare (C11).
+func cHeaderScopeNames() map[string]string {
+	out := map[string]string{}
+	for _, n := range []string{"size_t", "ptrdiff_t", "wchar_t", "max_align_t", "NULL", "offsetof"} {
+		out[n] = "<stddef.h>'s " + n + ", which the C header includes"
+	}
+	for _, n := range []string{
+		"malloc", "calloc", "realloc", "free", "aligned_alloc",
+		"abort", "exit", "_Exit", "quick_exit", "at_quick_exit", "atexit", "getenv", "system",
+		"bsearch", "qsort", "abs", "labs", "llabs", "div", "ldiv", "lldiv", "rand", "srand",
+		"atof", "atoi", "atol", "atoll", "strtod", "strtof", "strtold", "strtol", "strtoll", "strtoul", "strtoull",
+		"mblen", "mbtowc", "wctomb", "mbstowcs", "wcstombs",
+		"div_t", "ldiv_t", "lldiv_t", "EXIT_SUCCESS", "EXIT_FAILURE", "RAND_MAX", "MB_CUR_MAX",
+	} {
+		out[n] = "<stdlib.h>'s " + n + ", which the C header includes when the answer cache is enabled"
+	}
+	return out
+}
 
 // stubHelperNames is every module-scope name stubType's generator declares for
 // itself: the shared symbols plus the private helpers.
@@ -796,6 +848,12 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 			if deny[r.name] {
 				problems = append(problems, fmt.Sprintf("%s: %s %q collides with a name the %s stub generator emits itself; pick another name",
 					r.owner, r.field, r.name, stubType))
+			}
+		}
+		for _, r := range refs {
+			if what, ok := stubScopeNames[stubType][r.name]; ok {
+				problems = append(problems, fmt.Sprintf("%s: %s %q collides with %s, so the generated file would not build; pick another name",
+					r.owner, r.field, r.name, what))
 			}
 		}
 	}

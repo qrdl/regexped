@@ -366,7 +366,7 @@ func genCStubFilesWithSets(cfg config.BuildConfig, hBasename string) (hContent, 
 			// an INITIALISED scanner is not sanctioned any more — with an owned
 			// cache it double-frees — and the header says so.
 			cacheSet := "s->scratch[2] = 0, s->scratch[3] = 0"
-			cacheField, cacheAlloc, cacheFree := "", "", ""
+			cacheField, cacheAlloc, cacheFree, cacheWanted := "", "", "", ""
 			cacheAPI := cSetNoCacheAPI(s.Find, scannerType)
 			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
@@ -433,30 +433,56 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
 `, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
 					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes,
 					config.SetOverlapHdrStrideOff, s.Find, cCachePart(sh, consts), cSweepPart(sh, consts), scannerType)
+				// LAZY: _init hands over the header alone, inside the scanner,
+				// its lazy word set, and the module answers
+				// abi.OverlapCacheWanted, delivering nothing, at the call where
+				// it would start using the region. Most drives never get there,
+				// and an eager region was 12 bytes per input byte for every
+				// overlapping scan.
 				cacheAlloc = fmt.Sprintf(`    /* Writes only: a scanner that owns a cache must be _free'd before it is
        initialised again, so nothing here reads what the struct held. */
     s->cache = 0; s->cache_words = 0; s->cache_own = 0;
 #if RX_SET_CACHE
     {
+        /* The header alone, its lazy word set: the region is allocated when
+           the module asks for it, and most scans never do. */
         unsigned k;
-        size_t bytes = rx_%[1]s_cache_plan_(len, &k);
-        if (bytes) {
-            s->cache = (unsigned *)malloc(bytes);
-            if (s->cache) {
-                rx_%[1]s_cache_head_(s->cache, k);
-                s->cache_words = bytes / 4;
-                s->cache_own = 1;
-            }
+        if (rx_%[1]s_cache_plan_(len, &k)) {
+            rx_%[1]s_cache_head_(s->cache_hdr, k);
+            s->cache_hdr[%[2]d] = %[3]du;
+            s->cache_words = %[4]d;
         }
     }
 #endif
-`, s.Find)
+`, s.Find, config.SetOverlapHdrLazyOff/4, uint32(abi.OverlapCacheLazy), config.SetOverlapCheckpointHeaderBytes/4)
+				// The region, from malloc: one that cannot be had leaves the
+				// header alone with its lazy word cleared, and the module then
+				// walks — the same answers, slower. The call is made again
+				// either way, and the module never asks twice.
+				cacheWanted = fmt.Sprintf(`#if RX_SET_CACHE
+        if (got == %[2]d) {
+            /* The module would start using the answer cache now and delivered
+               nothing: hand the whole region over, header first, or none. */
+            unsigned k;
+            size_t bytes = rx_%[1]s_cache_plan_(s->len, &k);
+            unsigned *c = bytes ? (unsigned *)malloc(bytes) : 0;
+            if (c) {
+                for (int w = 0; w < %[4]d; w++) c[w] = s->cache_hdr[w];
+                c[%[3]d] = 0;
+                s->cache = c; s->cache_words = bytes / 4; s->cache_own = 1;
+            } else {
+                s->cache_hdr[%[3]d] = 0;
+            }
+            continue;
+        }
+#endif
+`, s.Find, abi.OverlapCacheWanted, config.SetOverlapHdrLazyOff/4, config.SetOverlapCheckpointHeaderBytes/4)
 				cacheFree = `#if RX_SET_CACHE
     if (s->cache_own) free(s->cache);
 #endif
     s->cache = 0; s->cache_words = 0; s->cache_own = 0;
 `
-				cacheSet = "s->scratch[2] = (unsigned)(size_t)s->cache, " +
+				cacheSet = "s->scratch[2] = (unsigned)(size_t)(s->cache ? s->cache : s->cache_words ? s->cache_hdr : 0), " +
 					"s->scratch[3] = (unsigned)(s->cache_words * 4)"
 			}
 			cb.WriteString(cacheAPI)
@@ -522,6 +548,13 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
 			// than fit records no gate and writes no complete answer, and the
 			// scan cannot step past it. PATTERN_COUNT is that worst case
 			// exactly — one match per pattern at one start.
+			call := fmt.Sprintf("    int got = ffi_%s(s->input, (int)s->len, (int)s->offset, %s(int *)buf, (int)cap);\n", s.Find, gateArg)
+			if cacheWanted != "" {
+				// A loop, because the descriptor is built in the call's own
+				// argument list and the second call must carry the region.
+				call = fmt.Sprintf("    int got;\n    for (;;) {\n        got = ffi_%s(s->input, (int)s->len, (int)s->offset, %s(int *)buf, (int)cap);\n%s        break;\n    }\n",
+					s.Find, gateArg, cacheWanted)
+			}
 			hb.WriteString(cSetScannerDecls(s.Find, konst, gateField, scannerType))
 			fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
     if (!s) return RX_ERR_NULL_ARG;
@@ -540,8 +573,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
        format, whose scan cannot re-ask a position. One rule for both. */
     if (cap < (size_t)%[6]s) return RX_ERR_RANGE;
 %[9]s    if (s->done) return 0;
-    int got = ffi_%[1]s(s->input, (int)s->len, (int)s->offset, %[4]s(int *)buf, (int)cap);
-    /* Negative is RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or
+%[10]s    /* Negative is RX_ERR_BT_OVERFLOW, RX_ERR_MALFORMED_CACHE or
        RX_ERR_OUT_OF_ORDER, not a count: a Backtracking member exhausted its
        frame budget, the answer cache's header contradicts itself, or the
        offset went below where that cache was built. Either way what remains is
@@ -575,7 +607,7 @@ int %[1]s(%[2]s *s, rx_set_match_t *buf, size_t cap) {
 void %[1]s_free(%[2]s *s) {
     if (!s) return;
 %[5]s}
-`, s.Find, scannerType, gateInit, gateArg, cacheFree, konst, blockNotes, ownZero, pendingCheck)
+`, s.Find, scannerType, gateInit, gateArg, cacheFree, konst, blockNotes, ownZero, pendingCheck, call)
 		}
 	}
 	hb.WriteString(cPatternNameDecls(cfg))
@@ -1261,9 +1293,12 @@ func cSetGateField(idKonst string, nblocks int) string {
 
 // cSetCacheFields is the answer-cache fields of a cache-eligible overlapping
 // set's scanner, shared by the module and component headers so the two stay
-// identical: the region, its size, and whether the scanner allocated it (a
-// buffer handed over through `<find>_set_cache` is the caller's to free).
-const cSetCacheFields = "    unsigned *cache;\n    size_t cache_words;\n    int cache_own;\n"
+// identical: the region, its size, whether the scanner allocated it (a buffer
+// handed over through `<find>_set_cache` is the caller's to free), and the
+// header the scanner hands over LAZILY until the module asks for the region —
+// in use while `cache` is null and `cache_words` is not.
+var cSetCacheFields = fmt.Sprintf("    unsigned *cache;\n    size_t cache_words;\n    int cache_own;\n    unsigned cache_hdr[%d];\n",
+	config.SetOverlapCheckpointHeaderBytes/4)
 
 // cSetNoCacheAPI is `<find>_cache_bytes` / `<find>_set_cache` for a scanner
 // that takes no buffer from its caller — a set with no answer cache, and every

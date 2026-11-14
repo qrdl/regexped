@@ -2760,6 +2760,66 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 	})
 }
 
+// TestMaxMemoryLeavesRoomForTheBacktrackingStack: a module with Backtracking
+// code needs a page above its static size for the frame stack, and a
+// standalone one a page more for its default search state. A cap that fit the
+// tables but not that used to compile, and every Backtracking call that pushed
+// a frame then answered -2, even on "ab". Now it is a compile error naming the
+// size to raise the cap to.
+func TestMaxMemoryLeavesRoomForTheBacktrackingStack(t *testing.T) {
+	entries := []config.PatternEntry{{Regexp: `(a|aa)*(b)`, GroupsFunc: "g"}}
+	at := func(pages uint64) config.MemorySize { return mustMemorySize(t, itoa(pages*65536)) }
+	for _, c := range []struct {
+		name       string
+		standalone bool
+		component  bool
+		run        uint64 // pages above the static size
+	}{
+		{"embedded", false, false, 1},
+		{"standalone", true, false, 2},
+		{"component", true, true, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			opts := CompileOptions{ForceByteMode: true}
+			if c.component {
+				opts = componentOpts(entries)
+				opts.ForceByteMode = true
+			}
+			w, _, err := CompileForced(entries, 0, c.standalone, EngineBacktrack, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			static, _, _ := testMemoryLimits(t, w)
+			opts.MaxMemory = at(static + c.run - 1)
+			_, _, err = CompileForced(entries, 0, c.standalone, EngineBacktrack, opts)
+			if !errors.Is(err, ErrMemoryCapTooSmall) || !strings.Contains(err.Error(), "Backtracking frame stack") ||
+				!strings.Contains(err.Error(), itoa((static+c.run)*65536)) {
+				t.Fatalf("a cap one page short of the stack: err = %v", err)
+			}
+			opts.MaxMemory = at(static + c.run)
+			if _, _, err := CompileForced(entries, 0, c.standalone, EngineBacktrack, opts); err != nil {
+				t.Fatalf("a cap with room for the stack: %v", err)
+			}
+		})
+	}
+	// A set member on Backtracking: the same rule through CompileFile. (That
+	// the module then answers is tools/fuzz's to run.)
+	cfg := config.BuildConfig{
+		MaxDFAStates: config.Limit(1),
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: `(a|aa)*b`}, {Name: "b", Regexp: `x+`}},
+		Sets:         []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+	}
+	w, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	static, _, _ := testMemoryLimits(t, w)
+	cfg.MaxMemory = at(static)
+	if _, _, err := CompileFile(cfg, ""); !errors.Is(err, ErrMemoryCapTooSmall) {
+		t.Errorf("set at its static size: err = %v, want ErrMemoryCapTooSmall", err)
+	}
+}
+
 // TestMaxMemoryAbove4GiBWarns: past what a 32-bit memory holds the cap is 4
 // GiB, declared as such, with a warning that says so.
 func TestMaxMemoryAbove4GiBWarns(t *testing.T) {

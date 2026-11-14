@@ -362,6 +362,77 @@ console.log('OK ' + checks);
 	}
 }
 
+// TestJSStringInputTakesOnlyItsBytes: under max_memory: 4MiB a 1.5 MB ASCII
+// STRING is searched like the same bytes as a Uint8Array. The stubs used to
+// reserve 3 bytes per UTF-16 unit before encoding — 4.5 MB here — and threw
+// RangeError. A non-ASCII string that runs past the end of memory mid-encode
+// grows and continues, and still gives every match. The JS stub runs here; the
+// TS stub is the same text with types, which tsc checks elsewhere.
+func TestJSStringInputTakesOnlyItsBytes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	maxMem, err := config.ParseMemorySize("4MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BuildConfig{
+		ImportModule: "strin", MaxMemory: maxMem,
+		Patterns: []config.PatternEntry{{Name: "w", Regexp: `\pL+`, FindFunc: "words", MatchFunc: "word"}},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+const stubs = await import('./stubs.js');
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const fail = (m) => { console.error(m); process.exit(1); };
+// Cyrillic FIRST, on a fresh instance: memory then ends right after the
+// length reservation (400,000 units), the 700,000 bytes do not fit, and the
+// encode must grow and continue. Every word found, the last one in place.
+const cyr = 'жук '.repeat(100000);
+let n = 0, last;
+for (const m of stubs.words(cyr)) { n++; last = m; }
+if (n !== 100000 || last[0] !== 99999 * 7 || last[1] !== 99999 * 7 + 6) fail('cyrillic: ' + n + ' words, last ' + last);
+if (stubs.word('жук') !== 6) fail('one-shot cyrillic');
+// 1.5 MB of ASCII: 3 bytes per unit reserved would be 4.5 MB, over the cap.
+const ascii = 'ab '.repeat(500000);
+n = 0;
+for (const _ of stubs.words(ascii)) n++;
+if (n !== 500000) fail('ascii: ' + n + ' words');
+if (stubs.word('ab') !== 2) fail('one-shot ascii');
+console.log('OK');
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "OK" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
 // isolationDriver is the node side. It is deliberately dependency-free and
 // exits non-zero with a message on the first disagreement.
 const isolationDriver = `import { readFile } from 'node:fs/promises';

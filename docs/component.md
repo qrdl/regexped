@@ -512,16 +512,23 @@ abandoned scanner's input stays held until the request ends.
 - A few allocations per call, each freed by the post-return or the destructor:
   the result area alone for `match`, `find` and the `any` pair; three for
   `groups` (the area, the slots and the element list); two for a narrow `_all`
-  and three for a wide one, whose bitmap is allocated too; two for `next`; and
-  two or three for the constructor — its state and gate array, plus the cache
-  when one is offered — with one more, a copy of the input, only when it cannot
-  take over the lowered block. Negligible against a scan of any real length.
+  and three for a wide one, whose bitmap is allocated too; two for `next`, and
+  one more — the answer cache's region — on the one call where the drive asks
+  for it; and two or three for the constructor — its state and gate array, plus
+  the cache's header when the set has a cache — with one more, a copy of the
+  input, only when it cannot take over the lowered block. Negligible against a
+  scan of any real length.
 - Memory grows to fit a large input and is never given back to the OS —
   `memory.grow` is one-way. It IS reused: the allocator keeps per-size-class free
   lists, and the post-return returns the call's blocks to them, so a repeated
   call does not grow the component at all. A block is reused only for a request
   of its own power-of-two class, which bounds the waste at 2x per allocation and
-  is what makes repeated calls flat.
+  is what makes repeated calls flat. A freed block that ends at the top of the
+  heap goes back to the top instead, so a finished scan's memory also serves a
+  BIGGER request: under `max_memory`, an instance that served a 40,000-byte scan
+  answers an 80,000-byte one within one page of what a fresh instance needs
+  (three pages more until 2026-11-13). The page left is the input a scan frees
+  the moment it finishes, below its still-live scanner.
 - The component is roughly 2 KB larger than the core module it wraps.
 
 ## Deliberately not offered

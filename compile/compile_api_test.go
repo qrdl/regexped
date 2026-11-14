@@ -2919,6 +2919,12 @@ func TestUnicodeModeLimits(t *testing.T) {
 		{"match", config.PatternEntry{Name: "p", Regexp: `\pL{25}`, MatchFunc: "m"},
 			[]string{"the match body went to Backtracking", "needs 7251 states, over 1024 (max_dfa_states; raise it",
 				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23302"}},
+		// groups_func alone: the body that finds where a match starts is named
+		// for what the config declared, not as a find it never declared.
+		{"groups", config.PatternEntry{Name: "p", Regexp: `\pL{25}(x)`, GroupsFunc: "g"},
+			[]string{"the groups_func search body (the part that finds where a match starts) went to Backtracking " +
+				"because its search DFA needs 7252 states, over 1024 (max_dfa_states; raise it",
+				"over max_bt_instructions (20000); raise max_bt_instructions to at least 23303"}},
 	} {
 		r, err := compileReport(c.re, CompileOptions{MaxDFAStates: 1024})
 		if !errors.Is(err, ErrBTProgramTooLarge) {

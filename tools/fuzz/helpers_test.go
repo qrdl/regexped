@@ -134,6 +134,8 @@ type cacheLayout struct {
 	canaryBelow int32 // bytes of 0xA5 immediately below the region, on a page of their own
 	canaryAbove int32 // bytes of 0xA5 immediately above it
 	sweepBudget int64 // > 0: the program sweep checkpoints past this many bytes
+	lazy        int   // hand the region over lazily: lazyGrant or lazyDecline (driveOverlapCacheLay)
+	wantedOut   *int  // when set, receives how many times the module asked for the region
 }
 
 // cacheDrive is one overlapping set compiled, instantiated and laid out for a

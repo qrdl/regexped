@@ -484,7 +484,7 @@ func goWithSearch(src, funcName, ffi string, sz compile.SearchSize, groups bool)
 	}
 	set := "\t\t\tffi_regexped_search(unsafe.Pointer(&iter.search))\n"
 	if !groups {
-		rep("\tdone bool\n}\n", "\tdone bool\n"+fields+"}\n")
+		rep("\tdone bool\n", "\tdone bool\n"+fields)
 		rep("\t\t\tpacked := "+ffi+"(", set+"\t\t\tpacked := "+ffi+"(")
 		rep("\t\t\tstart := int(uint64(packed) >> 32)\n", notes+"\t\t\tstart := int(uint64(packed) >> 32)\n")
 		return src
@@ -852,6 +852,8 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 			}
 		}
 		body = body[:e] + setup + pre + body[e:]
+		// The answer cache's region goes into the descriptor the calls carry.
+		body = strings.Replace(body, "_lazy(cacheBase, cacheBytes, scratchBase)", "_lazy(cacheBase, cacheBytes, _sd)", 1)
 		if batch {
 			// The arguments only: JS calls `_exp['…'](`, TypeScript
 			// `(_exp['…'] as Function)(`.

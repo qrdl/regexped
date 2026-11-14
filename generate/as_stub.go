@@ -267,6 +267,7 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 			// Written before EACH call: field 1 is the address of a managed
 			// array, and a descriptor written once could outlive a compaction.
 			cacheSet := "this.scratch[2] = 0, this.scratch[3] = 0"
+			cacheWanted := ""
 			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
 				// The CHECKPOINTED answer cache, allocated once with the
@@ -283,7 +284,9 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
 				// INITIALISER rather than an else-branch assignment: asc's
 				// definite-assignment analysis does not see through the
 				// conditional below and rejects the class outright (TS2564).
-				gateField += "    cache: StaticArray<u32> = new StaticArray<u32>(0);\n"
+				gateField += "    cache: StaticArray<u32> = new StaticArray<u32>(0);\n" +
+					"    /** The region's size, handed over when the module asks for it. */\n" +
+					"    private cacheBytes: u64 = 0;\n"
 				gateInit += "        {\n            const m: u64 = <u64>input.byteLength + 1;\n"
 				if sh.Eligible {
 					gateInit += fmt.Sprintf(`            const row: u64 = %[5]d;
@@ -318,11 +321,29 @@ export function %s(input: ArrayBuffer, offset: u32): Array<i32> | null {
                 if (sb <= %[2]d) bytes = ((bytes + 7) & ~(<u64>7)) + sb;
 `, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
 				}
-				gateInit += fmt.Sprintf(`                this.cache = new StaticArray<u32>(<i32>((bytes + 3) / 4));
+				// LAZY: the header alone, its lazy word set. The module answers
+				// abi.OverlapCacheWanted, delivering nothing, at the call where
+				// it would start using the region, and most drives never get
+				// there.
+				gateInit += fmt.Sprintf(`                this.cacheBytes = bytes;
+                this.cache = new StaticArray<u32>(%[2]d);
                 this.cache[%[1]d] = <u32>k;
+                this.cache[%[3]d] = %[4]d;
             }
         }
-`, config.SetOverlapHdrStrideOff/4)
+`, config.SetOverlapHdrStrideOff/4, config.SetOverlapCheckpointHeaderBytes/4,
+					config.SetOverlapHdrLazyOff/4, uint32(abi.OverlapCacheLazy))
+				cacheWanted = fmt.Sprintf(`            // %[1]d: the module would start using the answer cache now and
+            // delivered nothing. Hand the whole region over, header first, and
+            // call again; it never asks twice.
+            if (got == %[1]d) {
+                const c = new StaticArray<u32>(<i32>((this.cacheBytes + 3) / 4));
+                for (let w = 0; w < %[2]d; w++) c[w] = this.cache[w];
+                c[%[3]d] = 0;
+                this.cache = c;
+                continue;
+            }
+`, abi.OverlapCacheWanted, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrLazyOff/4)
 				cacheSet = "this.scratch[2] = (this.cache.length == 0 ? 0 : changetype<usize>(this.cache) as u32), " +
 					"this.scratch[3] = <u32>(this.cache.length * 4)"
 			}
@@ -363,7 +384,7 @@ export class %[1]s {
             if (this.done) return null;
             const got = ffi_%[5]s(changetype<usize>(this.input), this.input.byteLength, this.from,
                 %[6]schangetype<usize>(this.buf), %[3]s);
-            // Before the "no more matches" test: the sentinel means the engine
+%[11]s            // Before the "no more matches" test: the sentinel means the engine
             // gave up, so ending the iteration here would report a finished
             // scan when the rest of the input was never answered. It is
             // RECORDED rather than thrown — asc cannot catch — and read back
@@ -394,7 +415,7 @@ export class %[1]s {
 export function %[5]s(input: ArrayBuffer, offset: u32): %[1]s {
     return new %[1]s(input, offset);
 }
-`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, malformedCache, outOfOrder, blockNotes)
+`, iterName, gateField, konst, gateInit, s.Find, gateArg, btOverflow, malformedCache, outOfOrder, blockNotes, cacheWanted)
 		}
 		out.WriteString("\n")
 	}

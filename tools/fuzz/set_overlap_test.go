@@ -535,11 +535,15 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
 	var buf []byte
+	if lay.lazy != 0 {
+		lazyStart(t, d, lay.scratchLen)
+	}
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
 
 	var out [][3]int
+	wanted := 0
 	cursor := int64(offset) << 32
 	for calls := 0; ; calls++ {
 		if calls > 4*(len(input)+2)*len(pats)+16 {
@@ -557,6 +561,14 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			t.Fatalf("find_batch reported a malformed answer-cache header; this test writes "+
 				"that header (stride %d), so this is a bug in the harness", stride)
 		}
+		if uint32(ret>>32) == config.SetCursorCacheWantedPos {
+			if lay.lazy == 0 || ret&countMask != 0 {
+				t.Fatalf("find_batch answered the wanted cursor %#x to a caller that handed no lazy region", ret)
+			}
+			wanted++
+			lazyAnswer(d, lay.scratchLen, lay.lazy == lazyGrant)
+			continue
+		}
 		n := int32(ret & countMask)
 		buf = mem.UnsafeData(store)
 		for i := int32(0); i < n; i++ {
@@ -568,6 +580,12 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			})
 		}
 		if uint32(ret>>32) == 0xFFFFFFFF {
+			if wanted > 1 {
+				t.Fatalf("a lazy drive asked for its region %d times; the module never asks twice", wanted)
+			}
+			if lay.wantedOut != nil {
+				*lay.wantedOut = wanted
+			}
 			// The guard against a VACUOUS pass in BOTH directions. A drive
 			// that quietly fell back to the walk still matches Go — the walk
 			// is correct too — so "the answer was right" is no evidence about
@@ -588,6 +606,35 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			return out
 		}
 		cursor = ret
+	}
+}
+
+const (
+	lazyGrant   = 1
+	lazyDecline = 2
+)
+
+// lazyStart turns a laid-out drive's region into a LAZY one: the descriptor
+// hands the header alone, its lazy word set; the bytes behind it stay where
+// the layout put them, so granting is a length change.
+func lazyStart(t *testing.T, d *cacheDrive, scratchLen int32) {
+	t.Helper()
+	if scratchLen < config.SetOverlapCheckpointHeaderBytes {
+		t.Fatalf("a lazy drive needs a header at least: %d bytes", scratchLen)
+	}
+	buf := d.buf()
+	binary.LittleEndian.PutUint32(buf[d.scratchPtr+config.SetOverlapHdrLazyOff:], abi.OverlapCacheLazy)
+	binary.LittleEndian.PutUint32(buf[d.desc+abi.FindScratchCacheLenOff:], config.SetOverlapCheckpointHeaderBytes)
+}
+
+// lazyAnswer is what a stub does on abi.OverlapCacheWanted: hand the whole
+// region over with the header it has, or — the allocation failed — keep the
+// header alone; the lazy word is cleared either way.
+func lazyAnswer(d *cacheDrive, scratchLen int32, grant bool) {
+	buf := d.buf()
+	binary.LittleEndian.PutUint32(buf[d.scratchPtr+config.SetOverlapHdrLazyOff:], 0)
+	if grant {
+		binary.LittleEndian.PutUint32(buf[d.desc+abi.FindScratchCacheLenOff:], uint32(scratchLen))
 	}
 }
 
@@ -682,8 +729,13 @@ type cacheDriveOpt struct {
 	canaryBytes int32 // bytes of 0xA5 to lay down immediately BELOW the region
 	canaryAfter int32 // and immediately ABOVE it
 	sweepBudget int64 // > 0: compile with the program sweep checkpointing past it
+	// lazy hands the region over LAZILY (abi.OverlapCacheWanted): the header
+	// alone with its lazy word set, and the rest only when the module asks.
+	// lazyGrant answers the ask with the whole region, lazyDecline with none.
+	lazy int
 
 	// Filled in by the drive.
+	wanted     int   // how many times the module asked for a lazy region
 	lastResult int32 // the raw return of the LAST call, negative codes included
 	region     int32
 	header     []uint32
@@ -723,6 +775,9 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
 	opt.region = scratchPtr
+	if opt.lazy != 0 {
+		lazyStart(t, d, scratchLen)
+	}
 	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	var out [][3]int
@@ -737,6 +792,14 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 		}
 		n := res.(int32)
 		opt.lastResult = n
+		if n == abi.OverlapCacheWanted {
+			if opt.lazy == 0 || opt.wanted > 0 && readU32(mem.UnsafeData(store), int(scratchPtr)+config.SetOverlapHdrLazyOff) == 0 {
+				t.Fatalf("find answered OverlapCacheWanted to a caller that handed no lazy region")
+			}
+			opt.wanted++
+			lazyAnswer(d, scratchLen, opt.lazy == lazyGrant)
+			continue
+		}
 		if n <= 0 {
 			break
 		}
@@ -2415,6 +2478,58 @@ func TestProgramSweepCheckpointsMatchGo(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestOverlapCacheLazyRegion: a caller may hand the answer cache over LAZILY
+// — the header alone, its lazy word set — and is answered
+// abi.OverlapCacheWanted (the batch entry: its reserved cursor) when the drive
+// would use the region, with nothing delivered; it then hands the whole region
+// over, or none. Either way the drive equals Go, and the region was asked for
+// once. Granted, the drive swept as a full region's does; declined, it walked.
+// Over shapes the answer cache serves and over split sets whose members'
+// program sweep asks for it — from inside a call, by marking the header, and
+// answered at the next call's start — through `find` and the batch entry.
+func TestOverlapCacheLazyRegion(t *testing.T) {
+	cases := []struct {
+		name  string
+		pats  []string
+		input string
+	}{
+		{"kept cache", []string{`a+`, `[^\n]*ERROR`, `x?y`}, strings.Repeat("a", 1000)},
+		{"split, non-greedy member", []string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+		{"split, kept and member", []string{`foo\w+`, `k[a-z]+?z`}, strings.Repeat("kfoo", 150) + "z"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			oracle := canonCache(overlapOracleCtx(t, c.pats, c.input))
+			full, stride := overlapCacheFor(c.input, c.pats)
+			for _, mode := range []int{lazyGrant, lazyDecline} {
+				opt := &cacheDriveOpt{lazy: mode}
+				got := canonCache(driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, full, engageAny, opt))
+				if fmt.Sprint(got) != fmt.Sprint(oracle) {
+					t.Errorf("find, lazy mode %d: %d tuples, want %d", mode, len(got), len(oracle))
+				}
+				if opt.wanted != 1 {
+					t.Errorf("find, lazy mode %d: the region was asked for %d times, want once", mode, opt.wanted)
+				}
+				ready := int32(opt.header[config.SetOverlapHdrReadyOff/4])
+				if mode == lazyGrant && len(c.pats) == 3 && ready != 1 {
+					t.Errorf("granted, the drive never swept (ready %d)", ready)
+				}
+				for _, capacity := range []int32{1, int32(len(c.pats))} {
+					wanted := 0
+					lay := cacheLayout{batch: true, scratchLen: full, offer: true, stride: stride, lazy: mode, wantedOut: &wanted}
+					got := canonCache(driveOverlapCacheLay(t, c.pats, c.input, 0, capacity, engageAny, lay))
+					if fmt.Sprint(got) != fmt.Sprint(oracle) {
+						t.Errorf("batch at capacity %d, lazy mode %d: %d tuples, want %d", capacity, mode, len(got), len(oracle))
+					}
+					if wanted != 1 {
+						t.Errorf("batch at capacity %d, lazy mode %d: the region was asked for %d times, want once", capacity, mode, wanted)
+					}
+				}
+			}
+		})
 	}
 }
 

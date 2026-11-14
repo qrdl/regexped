@@ -200,6 +200,15 @@ func checkSetRoutes(t *testing.T, pats []string, input string, batch bool) {
 	}
 	compare("cache, region too small",
 		tuples(driveCacheFind(t, pats, input, 0, p, true, int32(config.SetOverlapCheckpointHeaderBytes), engageAny)))
+	// The region handed over LAZILY, as every generated stub hands it: the
+	// header alone until the module asks, then the whole of it or none.
+	lazyName := map[int]string{lazyGrant: "granted", lazyDecline: "declined"}
+	for _, mode := range []int{lazyGrant, lazyDecline} {
+		compare("cache, lazy region "+lazyName[mode],
+			tuples(driveCacheFindOpt(t, pats, input, 0, p, true, full, engageAny, &cacheDriveOpt{lazy: mode})))
+		compare("cache, lazy region "+lazyName[mode]+", forced first-call sweep",
+			tuples(driveCacheFindOpt(t, pats, input, 0, p, true, full, engageAny, &cacheDriveOpt{lazy: mode, preArmWork: true})))
+	}
 	// The gated drive through `find`.
 	checkGated(t, pats, input)
 	if !batch {
@@ -209,6 +218,14 @@ func checkSetRoutes(t *testing.T, pats []string, input string, batch bool) {
 		for _, withCache := range []bool{false, true} {
 			compare(fmt.Sprintf("batch, capacity %d, cache %v", outCap, withCache),
 				runBatchFind(t, pats, input, outCap, true, withCache))
+		}
+	}
+	lazyFull, lazyStride := overlapCacheFor(input, pats)
+	for _, mode := range []int{lazyGrant, lazyDecline} {
+		for _, outCap := range []int32{1, p} {
+			compare(fmt.Sprintf("batch, capacity %d, lazy region %s", outCap, lazyName[mode]),
+				tuples(driveOverlapCacheLay(t, pats, input, 0, outCap, engageAny, cacheLayout{
+					batch: true, scratchLen: lazyFull, offer: true, stride: lazyStride, lazy: mode})))
 		}
 	}
 	// The gated batch entry at five capacities.

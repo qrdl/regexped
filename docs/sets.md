@@ -155,7 +155,7 @@ differences are in the interface, not in what you call:
 | `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
 | `<find>_free` in C | frees the scanner's answer cache, if it owns one | MANDATORY — it drops the handle |
 | `hints: [batch-find]` | a second entry point | refused at load |
-| `overlapping: true` answer cache | read by both find entries; every generated stub reserves one | reserved by the `find` resource's constructor and freed with the handle |
+| `overlapping: true` answer cache | read by both find entries; every generated stub hands one over, allocating the region only when the drive asks for it | its header handed over by the `find` resource's constructor, the region reserved by `next` when the drive asks for it, and freed with the handle |
 
 See [component.md](component.md#sets).
 
@@ -535,7 +535,13 @@ of gates. One signature, whatever the patterns turn out to compile to.
 - **All zeros means a clean scan.** That is the only operation a caller ever
   performs on it: the encoding is opaque and will change.
 - WASM reads and writes it. Zeroing it restarts a scan; keeping it across calls
-  continues one.
+  continues one. One exception: a raw caller of a **standalone** module that
+  hands no search state over (a stub always does) is served from the module's
+  own state, which takes the same text address, length and gate array with a
+  larger `from` as a continuation whatever the array holds. A new text written
+  into the same buffer must then start at an offset no greater than the
+  previous drive's last `from` (0 always works), or use another gate array or
+  text address; see [wasm.md](wasm.md) "Handing the block over".
 - An **overflowing call reports no match as delivered** — if the return value
   exceeds `out_cap`, no gate is recorded for the position, so growing the
   buffer and calling again with the same `from` returns the same total and the

@@ -849,8 +849,10 @@ func TestCComponentInitReadsNoPriorState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// _init hands the cache over lazily — the header alone, in the struct —
+	// and the scan allocates the region when the module asks for it.
 	minit := cFunctionBody(t, mc, "int scan_ov_init(")
-	if !strings.Contains(minit, "malloc(") {
+	if !strings.Contains(minit, "s->cache_hdr") || !strings.Contains(cFunctionBody(t, mc, "int scan_ov("), "malloc(") {
 		t.Fatalf("the module scanner reserves no cache, so this checks nothing:\n%s", minit)
 	}
 	for _, banned := range []string{"free(", "s->scratch[0] =="} {

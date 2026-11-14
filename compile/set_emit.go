@@ -2375,7 +2375,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			diags = append(diags, *cs.diag)
 		}
 	}
-	maxPages, err := memoryMaxPages(cfg.MaxMemory, moduleDeclPages(memPages, comp.Component))
+	maxPages, err := memoryMaxPages(cfg.MaxMemory, moduleDeclPages(memPages, comp.Component),
+		btRunPages(globals, over.BTStackStart, standalone, comp.Component))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -3058,7 +3059,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
-				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups, p.captureFromMode)
+				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups, p.outGroups(), p.captureFromMode)
 			} else {
 				batchTableMemIdx := 0
 				if !standalone {
@@ -3068,7 +3069,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, p.outGroups(), batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3088,7 +3089,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				anchoredOnly = p.captureFromMode == ffAnchoredZeroOnly
 			}
 			assertGroupsFromWrapperMode(p, anchoredOnly)
-			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly, p.defGroups)
+			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly, p.defGroups, p.numGroups, p.outGroups())
 		}
 	}
 	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns, prefix DFA fns.
@@ -3325,7 +3326,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	opts.owners.mark(len(cs_bytes), "")
 	if opts.Component {
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
-		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(heapGlobal, classHeadsBase))
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentPostBody(callListGlobal, freeIdx))
 		for _, a := range patAdapters {
 			switch a.kind {
@@ -3336,11 +3337,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			case adapterGroups:
 				cs_bytes = appendCodeEntry(cs_bytes, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
 			default:
-				cs_bytes = appendCodeEntry(cs_bytes, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal))
+				cs_bytes = appendCodeEntry(cs_bytes, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal, classHeadsBase))
 			}
 		}
 		for _, a := range setAdapters {
-			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal))
+			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal, classHeadsBase))
 		}
 	}
 	if searchSetterIdx >= 0 {
