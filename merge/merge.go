@@ -3,6 +3,7 @@ package merge
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -43,11 +44,45 @@ func resolveWac(cfg config.BuildConfig) (string, error) {
 // and the call between them goes through the canonical ABI, where wasm-merge
 // produces a single module whose regexp code reads the host's memory directly.
 // The command is the same; the cost model is not. See docs/component.md.
+//
+// output "-" writes the result to stdout: the tool writes a temporary file,
+// which is copied there and removed — neither tool takes "-" for stdout
+// (wasm-merge creates a file named "-").
 func CmdMerge(cfg config.BuildConfig, mainWasm, output string, regexWasms []string) error {
+	if output == "-" {
+		return toStdout(func(tmp string) error { return CmdMerge(cfg, mainWasm, tmp, regexWasms) })
+	}
 	if cfg.Component() {
 		return composeComponents(cfg, mainWasm, output, regexWasms)
 	}
 	return mergeModules(cfg, mainWasm, output, regexWasms)
+}
+
+// stdout is where toStdout copies; a variable so a test can catch it.
+var stdout io.Writer = os.Stdout
+
+// toStdout runs merge into a file in a new temporary directory and copies the
+// file to stdout. The ownership fix and the size report that merge does on
+// its output only touch the temporary file.
+func toStdout(merge func(tmp string) error) error {
+	dir, err := os.MkdirTemp("", "regexped-merge-")
+	if err != nil {
+		return fmt.Errorf("merge: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	tmp := filepath.Join(dir, "out.wasm")
+	if err := merge(tmp); err != nil {
+		return err
+	}
+	f, err := os.Open(tmp) //nolint:gosec // our own temporary file
+	if err != nil {
+		return fmt.Errorf("merge: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(stdout, f); err != nil {
+		return fmt.Errorf("write stdout: %w", err)
+	}
+	return nil
 }
 
 // composeComponents is `wac plug` — the component-format arm of CmdMerge.

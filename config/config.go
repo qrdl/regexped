@@ -13,9 +13,12 @@ import (
 	"regexp/syntax"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
+	"github.com/goccy/go-yaml/token"
 )
 
 // BuildConfig is the top-level structure of the YAML config file.
@@ -94,7 +97,7 @@ type BuildConfig struct {
 	// mode's default (1,024; 16,384 in Unicode mode); 0 means always
 	// Backtracking. See Limit for how the YAML value decodes.
 	MaxDFAStates Limit `yaml:"max_dfa_states"`
-	MaxTDFARegs  int   `yaml:"max_tdfa_regs"` // 0 = default (32)
+	MaxTDFARegs  Count `yaml:"max_tdfa_regs"` // unset = default (32)
 	// MaxBTInstructions caps a Backtracking program, in instructions — the
 	// size its emitted body grows with. Unset is 20,000; 0 means never
 	// Backtracking, so a pattern or set member that needs it does not compile.
@@ -128,7 +131,7 @@ type BuildConfig struct {
 	// of their own, both dearer per byte. A larger cap costs compile time and
 	// compiler memory, not correctness. The default follows the set's mode:
 	// 16,384 in Unicode mode, where a letter class costs hundreds of states.
-	MaxUnionStates int            `yaml:"max_union_states"` // 0 = default (4096; 16384 for a Unicode-mode set)
+	MaxUnionStates Count          `yaml:"max_union_states"` // unset = default (4096; 16384 for a Unicode-mode set)
 	Patterns       []PatternEntry `yaml:"patterns"`
 	Sets           []SetConfig    `yaml:"sets"` // optional set composition entries
 }
@@ -175,9 +178,10 @@ type SetConfig struct {
 	// Overlapping selects which `find` body is emitted. Absent or false
 	// (the DEFAULT) emits the gated body:
 	// per-pattern non-overlapping output matching Go FindAllIndex's rule.
-	// True emits the ungated body, which reports every start position and
-	// carries no gate-array parameter. It is a load error on a set without
-	// `find:`, since no other capability gates.
+	// True emits the ungated body, which reports every start position; it
+	// takes the same scratch descriptor, whose gate array it uses for its
+	// preflight verdicts. On a set without `find:` it changes nothing — no
+	// other capability gates — and loads.
 	Overlapping bool `yaml:"overlapping"`
 
 	// Patterns selects members from the top-level `patterns:` list: "all", or
@@ -201,8 +205,8 @@ type SetConfig struct {
 	// when they reach the set's suffix DFA body. Accepted values: nil/empty
 	// (no hint), ["prefer-match"], or ["prefer-no-match"] — mutually
 	// exclusive with each other.
-	// "batch-find" is NOT accepted here — it is a
-	// per-pattern, JS/TS-only hint and is a load-time error on a sets: entry.
+	// "batch-find" is accepted too, on a set that declares `find`: it adds
+	// the batch entry beside `find` (validateHints refuses it without).
 	Hints []string `yaml:"hints"`
 	// Unicode states the set's mode: true for Unicode mode, false for byte
 	// mode. Unset, the set takes its mode from its members. A set runs in ONE
@@ -576,31 +580,32 @@ type PatternSelector struct {
 	Names []string // pattern names when All is false
 }
 
-// UnmarshalYAML implements yaml.InterfaceUnmarshaler for PatternSelector.
-// Accepts either the scalar string "all" or a sequence of strings.
-func (p *PatternSelector) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var raw interface{}
-	if err := unmarshal(&raw); err != nil {
-		return err
+// UnmarshalYAML implements yaml.NodeUnmarshaler for PatternSelector.
+// Accepts either the scalar string "all" or a sequence of strings. It takes
+// the node so that a refusal carries its token — a line-numbered error like
+// every other load error; as an InterfaceUnmarshaler its errors had no line.
+func (p *PatternSelector) UnmarshalYAML(node ast.Node) error {
+	refuse := func(n ast.Node, msg string) error {
+		return &yaml.SyntaxError{Message: msg, Token: n.GetToken()}
 	}
-	switch v := raw.(type) {
-	case string:
-		if v == "all" {
+	switch n := node.(type) {
+	case *ast.StringNode:
+		if n.Value == "all" {
 			p.All = true
 			return nil
 		}
-		return fmt.Errorf("patterns: expected \"all\" or a list of pattern names, got %q", v)
-	case []interface{}:
-		for _, item := range v {
-			s, ok := item.(string)
+		return refuse(n, fmt.Sprintf("patterns: expected \"all\" or a list of pattern names, got %q", n.Value))
+	case *ast.SequenceNode:
+		for _, item := range n.Values {
+			s, ok := item.(*ast.StringNode)
 			if !ok {
-				return fmt.Errorf("patterns: list items must be strings")
+				return refuse(item, "patterns: list items must be pattern names (strings)")
 			}
-			p.Names = append(p.Names, s)
+			p.Names = append(p.Names, s.Value)
 		}
 		return nil
 	}
-	return fmt.Errorf("patterns: expected \"all\" or a list of pattern names")
+	return refuse(node, "patterns: expected \"all\" or a list of pattern names")
 }
 
 // ValidHints reports whether hints is a valid `hints:` list for a pattern
@@ -1013,8 +1018,6 @@ func (r PatternEntry) GroupsExportName() string {
 	return r.GroupsFunc
 }
 
-// LoadConfig reads and parses the YAML config at configPath.
-// If configPath is empty it looks for regexped.yaml in the current directory.
 // IsByteMode reports whether the entry is explicitly byte-oriented:
 // `byte_mode: true`, or `unicode: false`, which means the same.
 func (e PatternEntry) IsByteMode() bool {
@@ -1057,6 +1060,8 @@ func anyInlineRegexp(cfg BuildConfig) bool {
 	return false
 }
 
+// LoadConfig reads and parses the YAML config at configPath.
+// If configPath is empty it looks for regexped.yaml in the current directory.
 func LoadConfig(configPath string) (BuildConfig, error) {
 	if configPath == "" {
 		configPath = "regexped.yaml"
@@ -1070,6 +1075,9 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	raw, err := os.ReadFile(absConfig)
 	if err != nil {
 		return BuildConfig{}, fmt.Errorf("read config %s: %w", configPath, err)
+	}
+	if err := checkUTF8(raw); err != nil {
+		return BuildConfig{}, fmt.Errorf("config %s:%w", configPath, err)
 	}
 	// Strict decoding: every unknown YAML key
 	// anywhere in the file is a line-numbered load error. That catches the
@@ -1103,6 +1111,9 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 	// References first: every check below reads the expanded regexps.
 	if err := ExpandReferences(&cfg); err != nil {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
+	}
+	if err := checkRegexpSyntax(raw, &cfg); err != nil {
+		return BuildConfig{}, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
 
 	// Resolve all paths relative to the config file's directory.
@@ -1300,6 +1311,35 @@ func (l *Limit) UnmarshalYAML(node ast.Node) error {
 		return nil
 	}
 	*l = Limit(v)
+	return nil
+}
+
+// Count is a limit key that only bounds: max_tdfa_regs, max_union_states.
+// Unset (0) means the key's default; a written value is a whole number of 1
+// or more. A negative value, 0, a fraction or a string is a line-numbered load
+// error: `max_tdfa_regs: -5` used to load and turn TDFA off for every pattern,
+// and `1.5` and `"1"` decoded to 1. (0 is refused rather than read as "off",
+// as max_dfa_states and max_bt_instructions read it: neither key has an off.)
+type Count int
+
+// UnmarshalYAML implements yaml.NodeUnmarshaler; see MemorySize.UnmarshalYAML
+// for why it takes the node.
+func (c *Count) UnmarshalYAML(node ast.Node) error {
+	n, ok := node.(*ast.IntegerNode)
+	if !ok {
+		return &yaml.SyntaxError{
+			Message: "want a whole number, 1 or more, got " + node.Type().String(),
+			Token:   node.GetToken(),
+		}
+	}
+	v, err := strconv.ParseInt(n.GetToken().Value, 0, 64)
+	if err != nil || v < 1 || v > math.MaxInt32 {
+		return &yaml.SyntaxError{
+			Message: fmt.Sprintf("want a whole number from 1 to %d, got %s", math.MaxInt32, n.GetToken().Value),
+			Token:   node.GetToken(),
+		}
+	}
+	*c = Count(v)
 	return nil
 }
 
@@ -1629,4 +1669,76 @@ func SetOverlapCheckpointBytes(inputLen, cells, patterns int) int {
 		nb*(cells*4+4) + // checkpoints, plus one cumulative count each
 		4 + // the final cum[nb] total
 		k*SetOverlapBlockRowBytes(patterns)
+}
+
+// checkUTF8 refuses a config that is not UTF-8. YAML is UTF-8 text, and the
+// decoder replaced an invalid byte with U+FFFD silently: `ab<0xFF>+` compiled
+// as `ab\uFFFD+`, in Unicode mode, a pattern nobody wrote. The error names
+// the line and the byte, and how to write a byte in a regexp.
+func checkUTF8(raw []byte) error {
+	line, col := 1, 1
+	for i := 0; i < len(raw); {
+		r, n := utf8.DecodeRune(raw[i:])
+		if r == utf8.RuneError && n <= 1 {
+			return fmt.Errorf("%d:%d: byte 0x%02X is not valid UTF-8, and a config is UTF-8 text; "+
+				"in a regexp write the byte as \\x%02x (with byte_mode: true, a pattern's \\x80-\\xff mean those bytes)",
+				line, col, raw[i], raw[i])
+		}
+		if r == '\n' {
+			line, col = line+1, 1
+		} else {
+			col++
+		}
+		i += n
+	}
+	return nil
+}
+
+// checkRegexpSyntax parses every regexp — top-level and each set's own — as
+// the compiler will, so a syntax error is a load error at its line, for every
+// command: `generate` accepted a config `compile` refused, and a pattern with
+// no _func compiled to an empty module and exit 0. raw is the file, for the
+// position. A regexp written with references was parsed as written by
+// ExpandReferences already (references.go, parseOwn) — and its expanded text,
+// which can be large, is not parsed again here.
+func checkRegexpSyntax(raw []byte, cfg *BuildConfig) error {
+	at := func(path *yaml.Path) *token.Token {
+		file, err := parser.ParseBytes(raw, 0)
+		if err != nil {
+			return nil
+		}
+		n, err := path.FilterFile(file)
+		if err != nil || n == nil {
+			return nil
+		}
+		return n.GetToken()
+	}
+	fail := func(path *yaml.Path, owner string, err error) error {
+		msg := owner + ": " + err.Error()
+		if tok := at(path); tok != nil {
+			return &yaml.SyntaxError{Message: msg, Token: tok}
+		}
+		return errors.New(msg)
+	}
+	for i, p := range cfg.Patterns {
+		if p.Expanded != nil {
+			continue
+		}
+		if _, err := syntax.Parse(p.Regexp, syntax.Perl); err != nil {
+			path := (&yaml.PathBuilder{}).Root().Child("patterns").Index(uint(i)).Child("regexp").Build() //nolint:gosec // an index
+			return fail(path, "pattern "+strconv.Quote(p.DisplayName()), err)
+		}
+	}
+	for j, s := range cfg.Sets {
+		for k, re := range s.Regexps {
+			if k < len(s.Expansions) && s.Expansions[k] != nil {
+				continue
+			}
+			if _, err := syntax.Parse(re, syntax.Perl); err != nil {
+				path := (&yaml.PathBuilder{}).Root().Child("sets").Index(uint(j)).Child("regexps").Index(uint(k)).Build() //nolint:gosec // indices
+				return fail(path, fmt.Sprintf("set %q: regexps[%d]", s.Name, k), err)
+			}
+		}
+	}
+	return nil
 }

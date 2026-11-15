@@ -1479,7 +1479,9 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 	})
 	t.Run("write_file_failure", func(t *testing.T) {
 		cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: "abc", MatchFunc: "m"}}}
-		badPath := filepath.Join(t.TempDir(), "nonexistent-dir", "out.wasm")
+		// A missing directory is made now; an output that IS a directory
+		// still cannot be written.
+		badPath := t.TempDir()
 		if err := CmdCompile(cfg, badPath); err == nil {
 			t.Fatal("expected os.WriteFile error, got nil")
 		}
@@ -3097,12 +3099,14 @@ func TestFindClassifierVerdicts(t *testing.T) {
 		{`a*b`, []string{"prefer-no-match"}, "switch"},
 		{`[a-zA-Z][^;]*[;,]`, []string{"prefer-no-match"}, "switch"}, // with a neutral twin
 		// Empty-width assertions: classified like any pattern, the accept
-		// conditions taken into account. `\b\w+@\w+\b` and `a+$` / `a+\b`
-		// (every attempt over `a`×N then `b` walks the run and fails) get the
-		// switch; `(?m:^)ERROR:.*(?m:$)` and `\bfoo\w*\b` are linear — their
-		// loops can only end where the condition holds.
+		// conditions taken into account. `\b\w+@\w+\b` and `a+\b` (every
+		// attempt over `a`×N then `b` walks the run and fails) get the switch;
+		// `a+$`, whose every match ends at the end of the input, the suffix
+		// find (one backward pass from there); `(?m:^)ERROR:.*(?m:$)` and
+		// `\bfoo\w*\b` are linear — their loops can only end where the
+		// condition holds.
 		{`\b\w+@\w+\b`, nil, "switch"},
-		{`a+$`, nil, "switch"},
+		{`a+$`, nil, "suffix"},
 		{`a+\b`, nil, "switch"},
 		{`(?m:^)ERROR:.*(?m:$)`, nil, "today"},
 		{`\bfoo\w*\b`, nil, "today"},
@@ -3389,6 +3393,51 @@ func TestOddShapesValidate(t *testing.T) {
 	}
 }
 
+// TestVerboseSkipNoteFollowsTheEmitter: --verbose says "SIMD bulk skip" only
+// when a body emitted one, not when the layout merely detected a dominant
+// state. The u16 find path detected and encoded its skip and never ran it, and
+// the report said it did: `[^,]+,\pL` 86.7 fuel/byte where its u8 sibling
+// runs 14.1. It runs it now, and the note is set by the emitter.
+func TestVerboseSkipNoteFollowsTheEmitter(t *testing.T) {
+	rep := &Reporter{}
+	e := config.PatternEntry{Name: "p", Regexp: `[^,]+,\pL`, FindFunc: "f"}
+	if _, _, err := Compile([]config.PatternEntry{e}, 0, true, CompileOptions{Unicode: true, Report: rep}); err != nil {
+		t.Fatal(err)
+	}
+	rep.End()
+	var sb strings.Builder
+	rep.Render(&sb)
+	if !strings.Contains(sb.String(), "u16 state ids") || !strings.Contains(sb.String(), "SIMD bulk skip") {
+		t.Errorf("the u16 find reports no skip:\n%s", sb.String())
+	}
+
+	// The flag itself: detection leaves it clear, an emitted skip sets it.
+	parsed, err := syntax.Parse(`[^,]+,`, syntax.Perl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := syntax.Compile(parsed.Simplify())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := newDFA(byteProg(prog), true, maxHelperDFAStates)
+	if !ok {
+		t.Fatal("newDFA: state limit exceeded")
+	}
+	tbl := dfaTableFrom(d)
+	l := buildDFALayout(dfaLayoutParams{t: tbl, needFind: true, leftmostFirst: true})
+	if len(l.dominantStates) == 0 {
+		t.Fatal("no dominant state detected for [^,]+,")
+	}
+	if l.skipEmitted {
+		t.Error("skipEmitted set by detection alone")
+	}
+	emitDominantBulkSkip(nil, l.dominantStates[0], true, 3, 1, 5, 0, 7, 6, 8)
+	if !l.skipEmitted {
+		t.Error("an emitted skip did not set skipEmitted")
+	}
+}
+
 // TestUnicodeCharLoopSkipsValidate compiles prefer-match's character skips in
 // Unicode mode — the find and match bodies' loop over SOME characters (a
 // letter class, charLoopAllowSet), the TDFA capture body's copy of it, a set
@@ -3417,8 +3466,15 @@ func TestUnicodeCharLoopSkipsValidate(t *testing.T) {
 			rep.End()
 			var sb strings.Builder
 			rep.Render(&sb)
-			if e.FindFunc != "" && !strings.Contains(sb.String(), "SIMD bulk skip") {
-				t.Errorf("%s: find takes no skip under prefer-match:\n%s", pat, sb.String())
+			// The note comes from the emitter (dominantInfo.emitted). Two of
+			// these finds run no skip — their literal-anchored and
+			// start-anywhere bodies over 16-bit tables do not take one:
+			// measured 39.8 and 53.6 fuel/byte over a 32 KB Cyrillic run
+			// against 4.3 for their match bodies — and the layout-based note
+			// used to say they did.
+			noFindSkip := pat == `\pL{3,}1` || pat == `(?m:\pL+$)`
+			if e.FindFunc != "" && strings.Contains(sb.String(), "SIMD bulk skip") == noFindSkip {
+				t.Errorf("%s: find skip reported %v, want %v:\n%s", pat, !noFindSkip, noFindSkip, sb.String())
 			}
 		}
 	}
@@ -4372,5 +4428,216 @@ func TestNamedGroupOldSpellingCompilesIdentically(t *testing.T) {
 	}
 	if !bytes.Equal(old, cur) {
 		t.Errorf("(?P<name>…) compiles to %d bytes, (?<name>…) to %d — not identical", len(old), len(cur))
+	}
+}
+
+// TestNotesOverflowWarningNamesThePattern: the warning for a find automaton
+// with more cycle states than notes cover names the pattern as written, and
+// for a pattern with groups_func alone calls the body what it is to it — the
+// search that finds where a match starts — not a find the config never
+// declared.
+func TestNotesOverflowWarningNamesThePattern(t *testing.T) {
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	const pat = `(?:a|b)*a(?:a|b){10}c|a`
+	for _, c := range []struct {
+		entry config.PatternEntry
+		want  string
+	}{
+		{config.PatternEntry{Name: "big", Regexp: pat, FindFunc: "f"}, "its find automaton has more cycle states"},
+		{config.PatternEntry{Name: "big", Regexp: `(?:a|b)*a(?:a|b){10}c|(a)`, GroupsFunc: "g"}, "groups_func search (the part that finds where a match starts)"},
+	} {
+		var log bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		if _, _, err := Compile([]config.PatternEntry{c.entry}, 0, true, CompileOptions{MaxDFAStates: 20000}); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(log.String(), c.want) || !strings.Contains(log.String(), "pattern=big") {
+			t.Errorf("%+v: warning %q, want %q naming pattern=big", c.entry, log.String(), c.want)
+		}
+	}
+}
+
+// TestVerboseFuncLessMemberInSetMode: a top-level entry with no function is
+// compiled only inside the sets that hold it, so --verbose reports their mode
+// — and says so when sets of both modes hold it.
+func TestVerboseFuncLessMemberInSetMode(t *testing.T) {
+	yes := true
+	cfg := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{{Name: "u", Regexp: `ab+`}, {Name: "v", Regexp: `cd+`}, {Name: "w", Regexp: `ef+`}},
+		Sets: []config.SetConfig{
+			{Name: "s", Find: "sf", Unicode: &yes, Patterns: config.PatternSelector{Names: []string{"u", "v"}}},
+			{Name: "t", Find: "tf", Patterns: config.PatternSelector{Names: []string{"v", "w"}}},
+			{Name: "x", Find: "xf", Unicode: &yes, Patterns: config.PatternSelector{Names: []string{"u"}}},
+		}}
+	rep := &Reporter{}
+	if _, _, _, err := compileFileDiagReport(cfg, "", CompileSetOptions{}, rep); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Render(&b)
+	for _, want := range []string{"  u                    ab+\n    mode:   unicode\n", "  v                    cd+\n    mode:   byte or unicode, by set\n",
+		"  w                    ef+\n    mode:   byte\n"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("render missing\n%s\n--- got ---\n%s", want, b.String())
+		}
+	}
+	(*Reporter)(nil).setLastMode("x") // no reporter: nothing to change
+}
+
+// TestVerboseNamesTheSingleCaptureShortcut: a groups_func pattern the
+// single-capture shortcut serves has one capture, read off the match, and the
+// report says so instead of "no captures".
+func TestVerboseNamesTheSingleCaptureShortcut(t *testing.T) {
+	for _, c := range []struct{ pat, want string }{
+		{`<([^>]+)>`, "one capture, the match less its literal affixes (no capture pass)"},
+		{`(abc+)`, "one capture, the whole match (no capture pass)"},
+	} {
+		rep := &Reporter{}
+		if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: c.pat, GroupsFunc: "g"}}, 0, true, CompileOptions{Report: rep}); err != nil {
+			t.Fatal(err)
+		}
+		var b bytes.Buffer
+		rep.Render(&b)
+		if r := b.String(); !strings.Contains(r, c.want) || strings.Contains(r, "no captures") {
+			t.Errorf("%s: report\n%s\nwant %q", c.pat, r, c.want)
+		}
+	}
+}
+
+// TestCmdCompileCreatesTheOutputDirectory: a module `compile` makes the
+// directory its output names, as `generate` and a component compile do.
+func TestCmdCompileCreatesTheOutputDirectory(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "build", "wasm", "out.wasm")
+	cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
+	if err := CmdCompileVerbose(cfg, out, nil); err != nil {
+		t.Fatalf("CmdCompileVerbose: %v", err)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatal(err)
+	}
+	// A directory that cannot be made is the error, named.
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CmdCompileVerbose(cfg, filepath.Join(blocker, "sub", "out.wasm"), nil); err == nil || !strings.Contains(err.Error(), "mkdir") {
+		t.Errorf("an output under a file: err = %v, want the mkdir error", err)
+	}
+}
+
+// TestCharLoopPairsDecideTheSkip: under prefer-match a Unicode letter loop
+// that takes no lead byte whole gets the character skip through partial
+// two-byte leads — one or two ranges a lead, four in all — and none when a
+// lead the loop takes cannot be carried or a three-byte character loops.
+func TestCharLoopPairsDecideTheSkip(t *testing.T) {
+	for _, c := range []struct {
+		pat  string
+		skip bool
+	}{
+		{`[а-я]+`, true},              // D0 B0-BF, D1 80-8F
+		{`[а-яё]+`, true},             // D1 80-8F and 91: two ranges
+		{`x[а-я]*,`, true},            // behind a literal, a match body too
+		{`\p{Ll}+`, false},            // D1 alternates case: no range holds it
+		{`[а-я東]+`, false},            // a three-byte character loops
+		{`[агеи]+`, false},            // four ranges under D0
+		{`[а-бд-ер-сф-хα-β]+`, false}, // five ranges in all
+	} {
+		rep := &Reporter{}
+		yes := true
+		w, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: c.pat, FindFunc: "f", MatchFunc: "m", Unicode: &yes}}, 0, true,
+			CompileOptions{Unicode: true, LikelyMode: LikelyMatch, Report: rep})
+		if err != nil {
+			t.Fatalf("%s: %v", c.pat, err)
+		}
+		validateWASM(t, w)
+		var b bytes.Buffer
+		rep.Render(&b)
+		if got := strings.Contains(b.String(), "over whole UTF-8 characters"); got != c.skip {
+			t.Errorf("%s: character skip %v, want %v\n%s", c.pat, got, c.skip, b.String())
+		}
+	}
+}
+
+// TestReporterSummary: one line per pattern and set, as `regexped check`
+// prints them.
+func TestReporterSummary(t *testing.T) {
+	cfg := config.BuildConfig{ImportModule: "m",
+		Patterns: []config.PatternEntry{{Name: "url", Regexp: `https?://[a-z]+`, FindFunc: "f"}, {Regexp: `(\d+)-(\d+)`, GroupsFunc: "g"},
+			{Regexp: `abc`}},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"url"}}}}}
+	rep := &Reporter{}
+	if _, err := CompileModule(cfg, rep); err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	rep.Summary(&b, map[string]int{"s": 1})
+	for _, want := range []string{"pattern url: Compiled DFA, byte mode\n", "pattern (\\d+)-(\\d+): TDFA, byte mode\n",
+		"pattern abc: none — set member only, or declares no *_func, byte mode\n", "set s: find; 1 members; frontend "} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("summary missing %q:\n%s", want, b.String())
+		}
+	}
+	(*Reporter)(nil).Summary(&b, nil)
+	rep.Summary(nil, nil)
+	r := &Reporter{}
+	r.Begin("p", "x")
+	r.setLastMode("unicode")
+	r.Engine(EngineDFA, "")
+	var c bytes.Buffer
+	r.Summary(&c, nil)
+	if c.String() != "pattern p: DFA, unicode mode\n" {
+		t.Errorf("an open scope's mode: %q", c.String())
+	}
+	r = &Reporter{}
+	r.Begin("", "abc")
+	c.Reset()
+	r.Summary(&c, nil)
+	if c.String() != "pattern abc: no export\n" {
+		t.Errorf("an unnamed pattern with no engine: %q", c.String())
+	}
+}
+
+// TestLitAltACShapes: a keyword list the Aho-Corasick find takes in its
+// compressed layout when the plain one is over budget, and the shapes it
+// refuses — a product past the literal cap, a class of every byte, a budget
+// no layout fits, too few first bytes — which keep the find they had.
+func TestLitAltACShapes(t *testing.T) {
+	var words []string
+	for i := 0; i < 3000; i++ {
+		words = append(words, fmt.Sprintf("%c%c%c%c", 'a'+i%16, 'a'+(i/16)%16, 'a'+(i/256)%16, 'q'+i%8))
+	}
+	words = append(words, words[0]) // a repeated literal: the later copy never wins
+	rep := &Reporter{}
+	w, _, err := Compile([]config.PatternEntry{{Name: "k", Regexp: `\b(?:` + strings.Join(words, "|") + `)\b`, FindFunc: "f"}}, 0, true,
+		CompileOptions{Report: rep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateWASM(t, w)
+	var b bytes.Buffer
+	rep.Render(&b)
+	if !strings.Contains(b.String(), "Aho-Corasick over 3000 literals") || !strings.Contains(b.String(), "byte-class compressed") {
+		t.Errorf("3,000 words: not the compressed Aho-Corasick find:\n%s", b.String())
+	}
+	keywords := `(?:abc|bcd|cde|def|efg|fgh|ghi|hij|ijk)`
+	for _, c := range []struct {
+		pat    string
+		budget int
+		take   bool
+	}{
+		{keywords + `x??`, litAltACBudget, true},                   // a lazy optional tail
+		{keywords + `[a-z][a-z][a-z][a-z]`, litAltACBudget, false}, // 9 × 26^4 literals
+		{`(?:a.c|bcd|cde|def|efg|fgh|ghi|hij|ijk)`, litAltACBudget, false},
+		{keywords, 1, false},
+		{`(?:abc|abd|abe)`, litAltACBudget, false}, // one first byte
+	} {
+		rp, err := resolvePattern(c.pat, nil, &CompileOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := analyseLitAltAC(rp, "", c.budget) != nil; got != c.take {
+			t.Errorf("%s (budget %d): taken %v, want %v", c.pat, c.budget, got, c.take)
+		}
 	}
 }

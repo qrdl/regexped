@@ -3,6 +3,7 @@ package generate
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -115,7 +116,14 @@ export function %s(input) {
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, args("match_all"), btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
@@ -132,7 +140,15 @@ export function %s(input) {
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, s.MatchAll, args("match_all"), idKonst)
@@ -164,7 +180,14 @@ export function %s(input, from = 0) {
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array(_exp.memory.buffer, bitmapBase, (%s+7)>>3);
     const out = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, args("scan_all"), btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
@@ -179,7 +202,15 @@ export function %s(input, from = 0) {
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, s.ScanAll, args("scan_all"), idKonst)
@@ -551,9 +582,10 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 
 `)
 		sb.WriteString("function _close(at) {\n" +
-			"    // Frees the region _open placed at `at`, then gives back every free\n" +
-			"    // region at the top of the stack.\n" +
-			"    for (let i = _regs.length - 1; i >= 0; i--) if (_regs[i].at === at) { _regs[i].free = true; break; }\n" +
+			"    // Frees the region _open placed at `at` and every region carved for\n" +
+			"    // that iterator later (its notes, memo, set descriptor: owner === at),\n" +
+			"    // then gives back every free region at the top of the stack.\n" +
+			"    for (const r of _regs) if (r.at === at || r.owner === at) r.free = true;\n" +
 			"    while (_regs.length > 0 && _regs[_regs.length - 1].free) _regs.pop();\n" +
 			"    _bump = _regs.length > 0 ? _regs[_regs.length - 1].top : _staticTop;\n" +
 			"}\n\n")
@@ -593,7 +625,7 @@ func genJSStubFile(cfg config.BuildConfig) (string, error) {
 	}
 
 	sb.WriteString(genJSSetSection(cfg, sizes))
-	return sb.String(), nil
+	return addOffsetChecks(sb.String(), false), nil
 }
 
 // jsGrowFunc emits `_grow`, shared by the JS and TS stubs (ts adds the casts).
@@ -1030,4 +1062,32 @@ func jsLazyFunc(ts bool) string {
 }
 
 `, sig, mem, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrLazyOff/4, abi.FindScratchCacheOff)
+}
+
+// offsetEntry is the head of a JS/TS export that takes a start position:
+// `export function[*] name(input[: T], offset|from[: number] = 0[, …])[: R] {`.
+var offsetEntry = regexp.MustCompile(`(?m)^export function\*? (\w+)\(input(?:: [^,]+)?, (offset|from)(?:: number)? = 0[^)]*\)[^{\n]*\{\n`)
+
+// addOffsetChecks makes every export that takes a start position refuse one
+// that is not a whole number of 0 or more with a RangeError naming it: a
+// negative offset found nothing anywhere, a fraction was truncated by every
+// generator but the batching set one, which threw a BigInt conversion error.
+// The helper is emitted only when some export calls it (TypeScript refuses an
+// unused one).
+func addOffsetChecks(src string, ts bool) string {
+	if !offsetEntry.MatchString(src) {
+		return src
+	}
+	src = offsetEntry.ReplaceAllString(src, "${0}    _offset('${1}', ${2});\n")
+	helper := "function _offset(name, v) {\n"
+	if ts {
+		helper = "function _offset(name: string, v: number): void {\n"
+	}
+	helper += "    if (!Number.isInteger(v) || v < 0) throw new RangeError('regexped: ' + name + ': the start offset must be a whole number of 0 or more, got ' + v);\n}\n\n"
+	// After the module's mutable state, before the first function.
+	at := strings.Index(src, "\nfunction ")
+	if at < 0 {
+		at = strings.Index(src, "\nexport ")
+	}
+	return src[:at+1] + helper + src[at+1:]
 }

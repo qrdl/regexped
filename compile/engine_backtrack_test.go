@@ -1528,7 +1528,7 @@ func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
 		{`^(aa|a)*b`, false}, // every iteration consumes a byte
 		{`(a.*?b)(c+)`, false},
 		{`([a-zA-Z]+?)\d`, false},
-		{`x{3}(y|z)`, false},
+		{`x{3}(yy|z)`, false}, // `y|z` alone is a class: no Alt
 	} {
 		re, err := syntax.Parse(c.pattern, syntax.Perl)
 		if err != nil {
@@ -1555,6 +1555,27 @@ func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
 		}
 		if !c.cycle && (plan.force || plan.fallback) {
 			t.Errorf("%s under BTWorkBudgetOff: plan = %+v, want neither", c.pattern, plan)
+		}
+	}
+	// A program with no Alt pushes no frame, so it can never trip: no budget
+	// and no fallback body, whatever the budget.
+	for _, pat := range []string{`x{3}(y)`, `\b(\d\d):(\d\d)\b`, `(a)\b(b)`, `x{3}(y|z)`} {
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bt := newBacktrack(byteProg(prog))
+		for _, budget := range []int{0, 8, BTWorkBudgetOff} {
+			if plan := planBT(bt, budget); plan != (btPlan{}) {
+				t.Errorf("%s budget %d: plan = %+v, want none: the program has no Alt", pat, budget, plan)
+			}
+		}
+		if plan := planBT(bt, BTWorkBudgetForceFallback); !plan.force {
+			t.Errorf("%s under BTWorkBudgetForceFallback: plan = %+v, want the fallback alone", pat, plan)
 		}
 	}
 }
@@ -2171,11 +2192,11 @@ var forcedBTPatterns = []string{
 	`[0]+0()00.{31}`,
 	`((.(1)*)11){11}`,
 	// Ordinary shapes, so the invariant is not pinned by pathological patterns
-	// alone. Each is documented as Backtracking's territory: an inverted class
-	// reads as an ambiguous capture, `(?m:$)` is a line anchor, `\b` is a word
-	// boundary, and `*?` is a non-greedy quantifier.
-	`<([^>]+)>`,
-	`([^,]+),`,
+	// alone. Each is documented as Backtracking's territory: alternatives that
+	// can start with the same byte are an ambiguous capture, `(?m:$)` is a line
+	// anchor, `\b` is a word boundary, and `*?` is a non-greedy quantifier.
+	`((a)|(ab))c`,
+	`(([a-z]+)|(x))=`,
 	`(?m:(foo)$)`,
 	`(\b\w+\b)`,
 	`(a*?)*?b`,

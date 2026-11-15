@@ -1933,3 +1933,81 @@ int refusals(void) {
     return 0;
 }
 `
+
+// TestCInitAcceptsNullEmptyInput: (NULL, 0) is C's usual spelling of an empty
+// buffer, and every _init takes it as the empty input — a find, a find with
+// search notes, a groups scan and a set scanner — while NULL with a length is
+// still RX_ERR_NULL_ARG.
+func TestCInitAcceptsNullEmptyInput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `import_module: nulls
+wasm_file: re.wasm
+output: merged.wasm
+stub_file: stubs.h
+wasm_merge_path: '`+merge+`'
+patterns:
+  - {name: star, regexp: 'a*', find_func: star_find}
+  - {name: overrun, regexp: 'a*b|a', find_func: ov_find}
+  - {name: grp, regexp: '(a*)', groups_func: grp}
+sets:
+  - {name: s, patterns: [star], find: scan_s}
+`)
+	write("guest.c", `#include "stubs.h"
+__attribute__((export_name("nulls")))
+int nulls(void) {
+    rx_star_find_iter_t a; rx_ov_find_iter_t b; rx_grp_iter_t g; rx_s_scanner_t s;
+    rx_match_t m; rx_group_t gs[GRP_GROUPS]; rx_set_match_t sm[4];
+    if (star_find_init(&a, 0, 0, 0) != 0) return 1;
+    if (star_find_next(&a, &m) != 1 || m.start != 0 || m.end != 0) return 2;
+    if (ov_find_init(&b, 0, 0, 0) != 0) return 3;
+    if (ov_find_next(&b, &m) != 0) return 4;
+    ov_find_free(&b);
+    if (grp_init(&g, 0, 0, 0) != 0) return 5;
+    if (grp_next(&g, gs) != 1 || gs[1].start != 0) return 6;
+    if (scan_s_init(&s, 0, 0, 0) != 0) return 7;
+    if (scan_s(&s, sm, 4) != 1) return 8;
+    scan_s_free(&s);
+    if (star_find_init(&a, 0, 3, 0) != RX_ERR_NULL_ARG) return 9;
+    if (scan_s_init(&s, 0, 3, 0) != RX_ERR_NULL_ARG) return 10;
+    return 0;
+}
+`)
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=0", "-o", "guest.wasm", "guest.c", "stubs.c")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	cmd := exec.Command("wasmtime", "run", "--invoke", "nulls", "merged.wasm")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "0" {
+		t.Errorf("nulls = %s, want 0 (the failing step's number otherwise)", got)
+	}
+}

@@ -558,7 +558,7 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
 			hb.WriteString(cSetScannerDecls(s.Find, konst, gateField, scannerType))
 			fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
     if (!s) return RX_ERR_NULL_ARG;
-%[8]s    if (!input) return RX_ERR_NULL_ARG;
+%[8]s    if (!input && len > 0) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     /* The FFI imports are i32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     s->input = input; s->len = len; s->offset = offset; s->done = 0;
@@ -706,7 +706,8 @@ func genCFindHPart(funcName string) string {
 			"       zero. Never read or write it. */\n"+
 			"    unsigned scratch[2];\n"+
 			"} %[2]s;\n\n"+
-			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG. It only WRITES the\n"+
+			"/* Starts a scan at offset. Returns 0, or RX_ERR_NULL_ARG (iter NULL, or input\n"+
+			"   NULL with len > 0: (NULL, 0) is the empty input). It only WRITES the\n"+
 			"   struct, so it may be uninitialised; an iterator already started must be\n"+
 			"   passed to %[1]s_free first. */\n"+
 			"int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset);\n\n"+
@@ -750,7 +751,7 @@ func genCFindCPart(importModule, funcName string) string {
 	fmt.Fprintf(&sb, "extern long long %s(const unsigned char *ptr, unsigned int len, unsigned int from);\n\n", ffi)
 
 	fmt.Fprintf(&sb, `int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
-    if (!iter || !input) return RX_ERR_NULL_ARG;
+    if (!iter || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     iter->input = input;
     iter->len = len;
     iter->offset = offset;
@@ -967,7 +968,7 @@ func genCGroupsStubParts(importModule, funcName, exportName string, numGroups in
 	// keeps its frame stack and memo in the module's one run-time scratch
 	// region (compile/bt_scratch.go). Claim re-entrancy, not thread-safety.
 	fmt.Fprintf(&cb, `int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
-    if (!iter || !input) return RX_ERR_NULL_ARG;
+    if (!iter || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     iter->input = input;
     iter->len = len;
     iter->offset = offset;
@@ -1120,10 +1121,10 @@ func cSetScannerDecls(find, konst, gateField, scannerType string) string {
    _free followed by _init restarts a scan.
 
    NOT COPYABLE once initialised. For an overlapping set the scanner OWNS a
-   heap region, so a copy plus two _free calls frees it twice; and the
-   descriptor it builds holds a pointer INTO itself, so a copy left behind by a
-   move would drive the original's gate array. Declare it where it lives, pass
-   its ADDRESS, and let _free end it.
+   heap region, so a copy plus two _free calls frees it twice. (A moved one
+   drives its own gate array: every call rebuilds the descriptor from the
+   struct it is given.) Declare it where it lives, pass its ADDRESS, and let
+   _free end it.
 
    The scanner holds the INPUT as well as the position: the
    input never changes during a scan while the position changes every step, so
@@ -1153,7 +1154,8 @@ typedef struct {
 %[3]s} %[4]s;
 
 /* 0 on success, a negative RX_ERR_* otherwise. An EMPTY input is legitimate
-   (a*, (?:), x?, \\A\\z all match it) and offset > len is not an error either
+   (a*, (?:), x?, \\A\\z all match it), (NULL, 0) among its spellings, and
+   offset > len is not an error either
    — the ABI defines it as "nothing found". It only WRITES the struct, so it may
    be uninitialised; a scanner already started must be passed to _free first. */
 int %[1]s_init(%[4]s *s, const char *input, size_t len, size_t offset);

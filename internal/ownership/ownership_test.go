@@ -324,11 +324,20 @@ func TestAFailedChownIsNotFatal(t *testing.T) {
 func TestAnUnreadableDirectoryLeavesTheOutputAlone(t *testing.T) {
 	calls := asRoot(t)
 	dirOwner = func(string) (int, int, bool) { return 0, 0, false }
+	out := filepath.Join(t.TempDir(), "out.wasm")
+	if err := os.WriteFile(out, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	Fix(filepath.Join(t.TempDir(), "out.wasm"))
+	Fix(out)
 
 	if len(*calls) != 0 {
 		t.Fatalf("chowned without knowing the directory's owner: %v", *calls)
+	}
+	// chown itself stats first: a path gone since (a race) warns, chowns nothing.
+	chown(filepath.Join(t.TempDir(), "gone"), 1, 1)
+	if len(*calls) != 0 {
+		t.Fatalf("chowned a path that is not there: %v", *calls)
 	}
 }
 
@@ -437,5 +446,38 @@ func TestMissingLevelsNeverReportsTheTop(t *testing.T) {
 	wantRel := []string{"wit", filepath.Join("wit", "deps")}
 	if !reflect.DeepEqual(rel, wantRel) {
 		t.Fatalf("relative: got %v, want %v", rel, wantRel)
+	}
+}
+
+// A symlinked output was written through: the TARGET is corrected, to the
+// owner of the target's directory, not of the link's — which handed one
+// user's file to another.
+func TestFixFollowsASymlinkToItsTargetsDirectory(t *testing.T) {
+	linkDir, targetDir := t.TempDir(), t.TempDir()
+	target := filepath.Join(targetDir, "theirs.wasm")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(linkDir, "out.wasm")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	calls := asRoot(t)
+	realTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirOwner = func(d string) (int, int, bool) {
+		if d == filepath.Dir(realTarget) {
+			return 5151, 5252, true
+		}
+		return stubUID, stubGID, true
+	}
+
+	Fix(link)
+
+	want := []chownCall{{realTarget, 5151, 5252}}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("got %v, want %v", *calls, want)
 	}
 }

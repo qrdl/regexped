@@ -510,14 +510,16 @@ abandoned scanner's input stays held until the request ends.
   today; it is not true of the Rust/Go/C embedded path, which shares the host's
   memory.
 - A few allocations per call, each freed by the post-return or the destructor:
-  the result area alone for `match`, `find` and the `any` pair; three for
-  `groups` (the area, the slots and the element list); two for a narrow `_all`
-  and three for a wide one, whose bitmap is allocated too; two for `next`, and
+  the result area alone for `match` and the `any` pair; two for a narrow `_all`
+  and three for a wide one, whose bitmap is allocated too. A single pattern's
+  `find` and `groups` are resources: the constructor allocates one (its state,
+  the capture slots inside it), plus a copy of the input only when it cannot
+  take over the lowered block; `find`'s `next` one (its result area), `groups`'
+  `next` two (the area and the element list). A set's `find` constructor
+  allocates two or three — its state and gate array, plus the cache's header
+  when the set has a cache — with the same copy fallback; its `next` two, and
   one more — the answer cache's region — on the one call where the drive asks
-  for it; and two or three for the constructor — its state and gate array, plus
-  the cache's header when the set has a cache — with one more, a copy of the
-  input, only when it cannot take over the lowered block. Negligible against a
-  scan of any real length.
+  for it. Negligible against a scan of any real length.
 - Memory grows to fit a large input and is never given back to the OS —
   `memory.grow` is one-way. It IS reused: the allocator keeps per-size-class free
   lists, and the post-return returns the call's blocks to them, so a repeated
@@ -529,7 +531,12 @@ abandoned scanner's input stays held until the request ends.
   answers an 80,000-byte one within one page of what a fresh instance needs
   (three pages more until 2026-11-13). The page left is the input a scan frees
   the moment it finishes, below its still-live scanner.
-- The component is roughly 2 KB larger than the core module it wraps.
+- The component carries two overheads over the module build of the same
+  config: the adapters appended to the core module (allocator, post-return,
+  one adapter or resource trio per export) and the component wrapping
+  `wasm-tools` adds around it. Measured: 3 patterns, module 18,215 B → core
+  20,126 (+1,911) → component 24,119 (+3,993 wrap, +5,904 in all); sets of 80
+  members, 198,103 → 201,579 (+3,476) → 206,177 (+4,598, +8,074).
 
 ## Deliberately not offered
 

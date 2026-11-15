@@ -287,7 +287,7 @@ func TestGenGoGroupIndexConsts(t *testing.T) {
 	for _, sub := range []string{
 		"const url_groups_count = 4",
 		"url_groups_scheme = 1",
-		"url_groups_host = 2",
+		"url_groups_host   = 2", // aligned with url_groups_scheme, as gofmt aligns a const block
 		"func url_groups_index(name string) (int, bool)",
 		`case "scheme":`,
 		"func url_groups_names() []string",
@@ -1219,7 +1219,7 @@ func allDecodeBody(out, fn string) (string, bool) {
 // cannot collide with one, and a reservation that does not match what is
 // actually emitted protects nothing: too narrow and the collision still ships,
 // too wide and it rejects names no generator uses. The batch config is used
-// because it emits all four.
+// because it emits all of them.
 func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 	cfg := setBatchTestCfg()
 	set := cfg.Sets[0]
@@ -1236,8 +1236,12 @@ func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 		{"c", hStub + cStub},
 	} {
 		names := config.SetDerivedNamesForValidation(set, lang.name)
-		if len(names) != 4 {
-			t.Errorf("%s: reserved %d names, want 4 (pattern count, id space, batch size limit, name lookup)", lang.name, len(names))
+		want := 4 // pattern count, id space, batch size limit, name lookup
+		if lang.name == "c" {
+			want = 5 // and the scanner type
+		}
+		if len(names) != want {
+			t.Errorf("%s: reserved %d names, want %d", lang.name, len(names), want)
 		}
 		for _, n := range names {
 			// The batch-size limit is reserved in every language but EMITTED
@@ -3070,5 +3074,62 @@ func TestNamedGroupOldSpellingGeneratesIdentically(t *testing.T) {
 		if len(old) == 0 || fmt.Sprint(old) != fmt.Sprint(cur) {
 			t.Errorf("%s: the two spellings generate different stubs", stubType)
 		}
+	}
+}
+
+// TestForOutput: stub_type decides when set; otherwise the extension of the
+// path written — `-o` when given, else stub_file — and the export names are
+// checked for that language.
+func TestForOutput(t *testing.T) {
+	base := config.BuildConfig{ImportModule: "m", StubFile: "s.rs",
+		Patterns: []config.PatternEntry{{Regexp: "a", MatchFunc: "func"}}}
+	typeOf := func(cfg config.BuildConfig) string {
+		typ, err := ResolveStubType(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return typ
+	}
+	for _, out := range []string{"", "-", "s.rs"} {
+		got, err := ForOutput(base, out)
+		if err != nil || typeOf(got) != "rust" {
+			t.Errorf("-o %q: %s, %v; want the stub_file's rust", out, typeOf(got), err)
+		}
+	}
+	typed := base
+	typed.StubType = "rust"
+	typed.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "m"}}
+	if got, err := ForOutput(typed, "x.go"); err != nil || typeOf(got) != "rust" {
+		t.Errorf("stub_type rust with -o x.go: %s, %v; want rust", typeOf(got), err)
+	}
+	ok := base
+	ok.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "m"}}
+	if got, err := ForOutput(ok, "x.go"); err != nil || typeOf(got) != "go" || got.StubFile != "x.go" {
+		t.Errorf("-o x.go: %s %q, %v; want go", typeOf(got), got.StubFile, err)
+	}
+	if _, err := ForOutput(ok, "x.txt"); err == nil || !strings.Contains(err.Error(), "cannot infer stub type") {
+		t.Errorf("-o x.txt: err = %v, want the stub_type error", err)
+	}
+	// `func` is a Go keyword and not a Rust one: valid for s.rs, refused for x.go.
+	if _, err := ForOutput(base, "x.go"); err == nil || !strings.Contains(err.Error(), "func") {
+		t.Errorf("-o x.go with match_func func: err = %v, want a reserved-word error", err)
+	}
+}
+
+// TestCmdGenerateStubNeedsAModuleName: a module stub that imports by module
+// name needs import_module, and a Rust component stub its module identifier —
+// refused by the generator itself, so `regexped check` refuses it too.
+func TestCmdGenerateStubNeedsAModuleName(t *testing.T) {
+	dir := t.TempDir()
+	pats := []config.PatternEntry{{Regexp: "abc", FindFunc: "f"}}
+	for _, ext := range []string{"rs", "go", "h"} {
+		err := CmdGenerateStub(config.BuildConfig{StubFile: "s." + ext, Patterns: pats}, filepath.Join(dir, "s."+ext))
+		if err == nil || !strings.Contains(err.Error(), "import_module is required") {
+			t.Errorf("%s with no import_module: err = %v", ext, err)
+		}
+	}
+	err := CmdGenerateStub(config.BuildConfig{WasmFormat: "component", WitPackage: "p", StubFile: "s.rs", Patterns: pats}, filepath.Join(dir, "c.rs"))
+	if err == nil || !strings.Contains(err.Error(), "rust_module") {
+		t.Errorf("a Rust component stub with no module name: err = %v", err)
 	}
 }

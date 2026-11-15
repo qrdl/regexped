@@ -12,7 +12,7 @@ The stub is a single `.ts` ES module file. Import it directly:
 import { init, url_match, find_token } from './regexp.ts';
 ```
 
-The stub requires the merged WASM file (produced by `regexped merge`) to be loaded at startup via `init()`. The module exports one `init` function plus one function per configured `_func` field.
+The stub loads the module `regexped compile` writes — a STANDALONE module (the config has no `output:` key), which owns its memory and needs no `regexped merge` — at startup via `init()`. The stub exports one `init` function plus one function per configured `_func` field.
 
 ---
 
@@ -26,14 +26,14 @@ Must be called once before any matcher function. Accepts a `BufferSource` (e.g. 
 
 ```ts
 // Browser
-await init(await fetch('./merged.wasm').then(r => r.arrayBuffer()));
+await init(await fetch('./patterns.wasm').then(r => r.arrayBuffer()));
 
 // Node.js
 import { readFileSync } from 'node:fs';
-await init(readFileSync('./merged.wasm'));
+await init(readFileSync('./patterns.wasm'));
 
 // Cloudflare Workers
-import wasm from './merged.wasm';
+import wasm from './patterns.wasm';
 await init(wasm);
 ```
 

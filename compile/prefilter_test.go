@@ -636,20 +636,12 @@ func TestEmitOverlapDPTransitionRowDedup(t *testing.T) {
 		t.Error("compression did not change the emitted stride")
 	}
 
-	// 16-bit ids read two-byte entries (i32.load16_u) at row*512 + byte*2, with
-	// or without a rowMap; an 8-bit read of such a table takes half an id.
-	for _, wide := range []*dfaLayout{
-		{tableOff: 4096},
-		{tableOff: 4096, useRowDedup: true, rowMapOff: 2048},
-	} {
-		w := emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: wide}, 0, 3, 4, 5)
-		if !bytes.Contains(w, []byte{0x2F, 0x01}) { // i32.load16_u align=1
-			t.Errorf("a 16-bit table (rowDedup=%v) was not read with i32.load16_u", wide.useRowDedup)
-		}
-		if bytes.Contains(w, rowMapConst) != wide.useRowDedup {
-			t.Errorf("a 16-bit table (rowDedup=%v) loaded its rowMap %v", wide.useRowDedup, !wide.useRowDedup)
-		}
-	}
+	// 16-bit ids are never transitioned at run time by the sweep: only the
+	// unprojected step calls this, and newCkptEmit gives a 16-bit table the
+	// projected one, which reads the step table instead.
+	mustPanic(t, "only the projected step reads one", func() {
+		emitOverlapDPTransition(nil, overlapDPTables{ok: true, l: &dfaLayout{tableOff: 4096}}, 0, 3, 4, 5)
+	})
 }
 
 // shuftiPrefixPlan is the frontend chooser for the first-byte prefilter. The

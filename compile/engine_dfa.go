@@ -544,7 +544,7 @@ func nfaExpandWithWB(prog *syntax.Prog, closedSet []uint32, wbCtx int, leftmostF
 // source, but that function is shared by both the DFA and TDFA engines
 // across every \b/\B/(?m:$) pattern — too broad a surface to change without
 // the kind of fuel/correctness regression sweep this codebase's history
-// warns about (see CLAUDE.md's "Load-bearing engine-selection gates"). This
+// warns about (see CLAUDE.md's "Engine selection by first sets"). This
 // detector instead identifies the narrow set of patterns where the defect is
 // live, so dfaHasAmbiguousBoundaryTarget can route them to Backtracking,
 // which resolves priority via genuine backtracking and has no equivalent
@@ -2047,6 +2047,97 @@ func reorderAcceptFirst(t *dfaTable) {
 	applyStateRemap(t, oldToNew)
 }
 
+// splitASCIIRunStates gives a Unicode-mode find automaton's ASCII run states a
+// twin the skip never runs in. A state qualifies when it accepts, loops on 9
+// to 64 ASCII bytes (the byte self-loop skip's set, detectShuftiSelfLoop) and
+// its run also continues through multi-byte characters — `\pL+` after `#`,
+// `name=`, `привет\s+`. That skip strides ASCII bytes only, so over Cyrillic,
+// Greek or CJK words the state was entered after every letter and the skip
+// stopped at once: ~42 fuel per letter, `#\pL+` over Cyrillic hashtags
+// 366,964 → 535,664 fuel. The twin is entered from every byte >= 0x80 (the
+// end of a multi-byte character) and has the same row and the same accept
+// flags, so the automaton matches exactly as before, but it has no self-loop
+// and so no skip: a non-ASCII letter never enters the skip, an ASCII letter
+// still does. Measured (fuel, every match over 9,900 bytes): Cyrillic
+// hashtags 383,053, Greek +4.5%, CJK +3.4%, ASCII hashtags 391,840 → 246,547,
+// long ASCII words 376,228 → 106,421; what remains, ~4 fuel per letter, is
+// the dispatch telling the two apart. A guard testing the next byte before
+// the skip kept +24% on Cyrillic: it is a second table step.
+//
+// Not under prefer-match, whose character skip (charLoopAllowSet) needs every
+// letter to lead back to the state itself; not with a boundary channel. The
+// caller applies it to a u16 table only (numStates >= 256), where the skip is
+// a mid-accept dispatch; the twin can push a table at the edge over the limit,
+// so it runs after the limit checks.
+func splitASCIIRunStates(t *dfaTable) {
+	if t.hasWordBoundary || t.hasNewlineBoundary {
+		return
+	}
+	n0 := t.numStates
+	for st := 0; st < n0; st++ {
+		if t.midAcceptStates[st] == 0 || t.immediateAcceptStates[st] != 0 {
+			continue
+		}
+		if st == t.startState || st == t.midStartState || st == t.midStartWordState || st == t.midStartNewlineState {
+			continue
+		}
+		loops := 0
+		for c := 0; c < 0x80; c++ {
+			if t.transitions[st*256+c] == st {
+				loops++
+			}
+		}
+		if loops < 9 || loops > 64 {
+			continue
+		}
+		crosses := false
+		for c := 0xC2; c <= 0xF4 && !crosses; c++ {
+			crosses = t.transitions[st*256+c] >= 0
+		}
+		if !crosses {
+			continue
+		}
+		into := false
+		for s2 := 0; s2 < t.numStates && !into; s2++ {
+			for c := 0x80; c < 0x100; c++ {
+				if t.transitions[s2*256+c] == st {
+					into = true
+					break
+				}
+			}
+		}
+		if !into {
+			continue
+		}
+		twin := t.numStates
+		t.numStates++
+		t.transitions = append(t.transitions, t.transitions[st*256:st*256+256]...)
+		for s2 := 0; s2 < t.numStates; s2++ {
+			for c := 0x80; c < 0x100; c++ {
+				if t.transitions[s2*256+c] == st {
+					t.transitions[s2*256+c] = twin
+				}
+			}
+		}
+		for _, m := range []map[int]uint64{t.acceptStates, t.midAcceptStates,
+			t.midAcceptNWStates, t.midAcceptWStates, t.midAcceptNLStates,
+			t.midAcceptNWStatesDominant, t.midAcceptWStatesDominant, t.midAcceptNLStatesDominant,
+			t.midAcceptNWStatesOutranked, t.midAcceptWStatesOutranked, t.midAcceptNLStatesOutranked} {
+			if v := m[st]; v != 0 {
+				m[twin] = v
+			}
+		}
+		for _, mp := range t.wideMaps() {
+			if v, ok := (*mp)[st]; ok {
+				(*mp)[twin] = v
+			}
+		}
+	}
+	if t.numStates != n0 {
+		reorderAcceptFirst(t)
+	}
+}
+
 // applyStateRemap rewrites every state-ID reference inside t using oldToNew.
 // oldToNew must be a permutation of [0, t.numStates).
 func applyStateRemap(t *dfaTable, oldToNew []int) {
@@ -2613,7 +2704,13 @@ type dfaLayout struct {
 	lmCharLoop bool
 
 	// Fast-skip / SIMD (find mode only)
-	prefix         []byte
+	prefix []byte
+	// foldPrefix is a case-insensitive literal every match begins with, for
+	// a find with no exact prefix (computeFoldPrefix): the bytes, lowercase
+	// where foldLetter is set. The scan finds candidates with it; the
+	// automaton then reads the literal itself.
+	foldPrefix     []byte
+	foldLetter     []bool
 	firstByteOff   int32
 	firstByteFlags [256]byte
 	firstBytes     []byte
@@ -2660,11 +2757,14 @@ type dfaLayout struct {
 	// copy a waste counter (search_notes.go); notesSearch is the module's
 	// search global the bodies read the block address from.
 	notes       *notesRows
-	notesSearch uint32
+	notesSearch searchRef
 
 	// useHybridDispatch is true when the hybrid path is chosen: table-driven
 	// state transitions combined with compiled self-loop inner blocks.
 	useHybridDispatch bool
+	// skipEmitted: some body over this layout emitted a dominant state's bulk
+	// skip (dominantInfo.emitted).
+	skipEmitted bool
 
 	// Dominant self-loop SIMD bulk-skip detection.
 	//
@@ -2754,6 +2854,9 @@ type dfaLayout struct {
 // archive) along with the filter conditionals in the dispatch loops
 // (Sections 7-8).
 type dominantInfo struct {
+	// emitted, when set, is the layout's skipEmitted flag: emitDominantBulkSkip
+	// sets it, so the report names only skips some body carries.
+	emitted   *bool
 	state     int32  // WASM state ID (> 0)
 	exitBytes []byte // 1..8 exit bytes (Shufti cap); mutually exclusive with selfLoopSet
 	// selfLoopSet: 9..64 bytes — the self-loop
@@ -2781,7 +2884,12 @@ type dominantInfo struct {
 	// character start, so the skip stops on a boundary. nil for a loop over
 	// every character, whose exits are exitBytes. LikelyMatch only
 	// (dfaLayout.lmCharLoop); see (*dfaLayout).charLoopAllowSet.
-	allowSet    []byte
+	allowSet []byte
+	// pairs: two-byte leads the loop keeps for only ONE range of their
+	// continuation bytes (`[а-я]`: D0 with B0-BF, D1 with 80-8F); the lead is
+	// in allowSet and the skip stops at it when its continuation is outside
+	// the range (charLoopPairs, emitUTF8CharLoopSkip).
+	pairs       []leadRange
 	encodedByte byte // the value stored in midAcceptBytes[state] (mid) or nonMidDominantBytes[state] (non-mid)
 	isMidAccept bool // true → encodedByte in midAcceptBytes; false → in nonMidDominantBytes
 }
@@ -2841,7 +2949,21 @@ type dfaLayoutParams struct {
 	startRule startRule
 	// utf8Text: the pattern runs in Unicode mode (dfaLayout.utf8Text).
 	utf8Text bool
+	// sweepClasses gives a 16-bit table a byte-class map where that at least
+	// halves it (≤ 128 classes): for the overlapping sweep's WHOLE-SET
+	// automaton (genSweepTables) alone. Its step table is cells × classes, so
+	// the map narrows the one table the sweep reads at run time, at one class
+	// load per position (+0.05% fuel). A 16-bit table a WALK reads stays
+	// uncompressed: a class load per byte there cost Unicode walks up to +7.9%.
+	sweepClasses bool
+	// skipFlag, when set, is the pattern's flag the layout's dominant states
+	// report an emitted skip to (CompileOptions.skipFlag); nil: the layout's own.
+	skipFlag *bool
 }
+
+// sweepClassesMax is the most byte classes a sweepClasses table may have: a
+// map of more would not halve the 256 columns it replaces.
+const sweepClassesMax = 128
 
 func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	// Destructured once so the body below reads exactly as it did when these
@@ -2890,8 +3012,14 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	// l.acceptOff (useAcceptSideTable=true).
 	l.useU8 = l.numWASM <= 256
 	l.useAcceptSideTable = useAcceptSideTable
-	// Byte-class compression applies when the u8 table would exceed 32 KB.
+	// Byte-class compression applies when the u8 table would exceed 32 KB, and
+	// to a 16-bit sweep-only table it at least halves (sweepClasses).
 	l.useCompression = l.useU8 && l.numWASM*256 > 32*1024
+	if !l.useU8 && p.sweepClasses {
+		if _, _, n := computeByteClasses(t); n <= sweepClassesMax {
+			l.useCompression = true
+		}
+	}
 
 	// Hybrid dispatch (compiled-DFA chain): active for the u8 path.
 	if l.useU8 && compiledDFAThreshold > 0 && l.numWASM <= compiledDFAThreshold {
@@ -2932,13 +3060,22 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 		l.classMapOff = int32(tableBase) + wordCharTableSize
 		l.tableOff = int32(tableBase) + wordCharTableSize + 256
 		l.classMap, l.classRep, l.numClasses = computeByteClasses(t)
-		l.tableBytes = make([]byte, l.numWASM*l.numClasses)
+		width := 2
+		if l.useU8 {
+			width = 1
+		}
+		l.tableBytes = make([]byte, l.numWASM*l.numClasses*width)
 		for gs := 0; gs < t.numStates; gs++ {
 			ws := gs + 1
 			for c, rep := range l.classRep {
 				next := t.transitions[gs*256+rep]
-				if next >= 0 {
-					l.tableBytes[ws*l.numClasses+c] = byte(next + 1)
+				if next < 0 {
+					continue
+				}
+				if at := ws*l.numClasses + c; l.useU8 {
+					l.tableBytes[at] = byte(next + 1)
+				} else {
+					binary.LittleEndian.PutUint16(l.tableBytes[at*2:], uint16(next+1)) //nolint:gosec // a state id past u8
 				}
 			}
 		}
@@ -2977,7 +3114,7 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	// typically L1-resident, so the extra indirection would hurt more than it helps.
 	// rowMap is u8 (1 byte per state → row index), so we only dedup when uniqueRows ≤ 255.
 	if !l.useU8 {
-		const rowWidth = 512 // 256 entries × 2 bytes (u16)
+		rowWidth := 2 * l.cellsPerRow() // u16 entries, one per byte or class
 		seen := make(map[string]int, l.numWASM)
 		rowOf := make([]int, l.numWASM)
 		var uniqueRows [][]byte
@@ -3129,6 +3266,14 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	// Capped before anything reads it, so the scan, the resume states walked
 	// from it below and --verbose all see the same prefix.
 	l.prefix = scanPrefixCap(computePrefix(t), l.utf8Text)
+	// A case-folded literal longer than an exact prefix of under two bytes
+	// replaces it: `(?i)привет`'s exact prefix is the lead byte D0 alone,
+	// which begins half the Cyrillic alphabet.
+	if needFind && len(l.prefix) < 2 {
+		if fp, fl := computeFoldPrefix(t); len(fp) > len(l.prefix) {
+			l.prefix, l.foldPrefix, l.foldLetter = nil, fp, fl
+		}
+	}
 	if needFind && len(l.prefix) == 0 {
 		l.firstByteOff = l.midAcceptOff + int32(l.numWASM) + immAcceptSize + wbAcceptSize + nlAcceptSize
 		wbAcceptNWMid := t.hasWordBoundary && t.midAcceptNWStates[t.midStartState] != 0
@@ -3526,6 +3671,10 @@ func buildDFALayout(p dfaLayoutParams) *dfaLayout {
 	// above (states it claims are skipped by detectShuftiSelfLoop); also
 	// unconditional and cheap, appends into the same l.dominantStates.
 	detectShuftiSelfLoop(l)
+	// Each detected state reports back to the layout when a body EMITS its
+	// skip (dominantInfo.emitted), which is what --verbose reports: detection
+	// alone said "SIMD bulk skip" for find bodies that never ran one.
+	pointSkipsAt(l, p.skipFlag)
 
 	// dead-state skip safety analysis. Sets l.skipSafeOnDead.
 	// Only meaningful in find mode (needFind=true); for non-find layouts
@@ -4437,6 +4586,133 @@ func (l *dfaLayout) charLoopAllowSet(state int32) ([]byte, bool) {
 	return allow, true
 }
 
+// longCharLoops reports whether some character of three or four bytes leads
+// from state back to it: the pair skip carries two-byte leads only, so such a
+// character would stop every run (charLoopPairs).
+func (l *dfaLayout) longCharLoops(state int32) bool {
+	for lead := 0xE0; lead <= 0xF4; lead++ {
+		level := map[int]bool{int(l.transitionOn(int(state), lead)): true}
+		n := 2
+		if lead >= 0xF0 {
+			n = 3
+		}
+		for i := 0; i < n; i++ {
+			next := map[int]bool{}
+			for s := range level {
+				if s <= 0 || s >= l.numWASM {
+					continue
+				}
+				for c := 0x80; c <= 0xBF; c++ {
+					next[int(l.transitionOn(s, c))] = true
+				}
+			}
+			level = next
+		}
+		if level[int(state)] {
+			return true
+		}
+	}
+	return false
+}
+
+// leadRange is a two-byte lead and a continuation range a character loop keeps
+// for it (dominantInfo.pairs); a lead with two ranges has two entries, next to
+// each other.
+type leadRange struct{ lead, lo, hi byte }
+
+// charLoopPairs is charLoopAllowSet for the find and match bodies' character
+// skip, which also takes, for a loop that set refuses, PARTIAL two-byte leads:
+// a lead whose looping continuation bytes form one range, every other
+// continuation leaving the loop. Lowercase Cyrillic shares its lead bytes with uppercase, so
+// `[а-я]+` had no lead the plain set accepts and no skip at all under
+// prefer-match: 32.7 fuel/byte, against 6.7 for `\p{Cyrillic}+`.
+func (l *dfaLayout) charLoopPairs(state int32) ([]byte, []leadRange, bool) {
+	// A loop the plain set serves keeps exactly that skip.
+	if allow, ok := l.charLoopAllowSet(state); ok {
+		return allow, nil, true
+	}
+	var allow []byte
+	in := map[byte]bool{}
+	for _, ch := range [][]byte{l.midAcceptNWBytes, l.midAcceptWBytes} {
+		if int(state) < len(ch) && ch[state] != 0 {
+			return nil, nil, false
+		}
+	}
+	quiet := func(s int) bool {
+		if s <= 0 || s == int(state) || s >= l.numWASM {
+			return false
+		}
+		for _, ch := range [][]byte{l.midAcceptBytes, l.midAcceptNLBytes, l.midAcceptNWBytes, l.midAcceptWBytes} {
+			if s < len(ch) && ch[s] != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	var pairs []leadRange
+	for lead := 0xC2; lead <= 0xDF; lead++ {
+		if in[byte(lead)] {
+			continue
+		}
+		mid := int(l.transitionOn(int(state), lead))
+		if !quiet(mid) {
+			continue
+		}
+		var ranges []leadRange
+		for c := 0x80; c <= 0xBF; c++ {
+			if int(l.transitionOn(mid, c)) != int(state) {
+				continue
+			}
+			if n := len(ranges); n > 0 && int(ranges[n-1].hi)+1 == c {
+				ranges[n-1].hi = byte(c)
+			} else {
+				ranges = append(ranges, leadRange{byte(lead), byte(c), byte(c)})
+			}
+		}
+		if len(ranges) > charLoopMaxLeadRanges {
+			// A lead the loop takes characters of but the skip cannot
+			// carry stops every run at its first such character: `\p{Ll}+`,
+			// whose D1 alternates case past U+045F, cost 31.9 → 51.3
+			// fuel/byte over lowercase Russian with the skip.
+			return nil, nil, false
+		}
+		pairs = append(pairs, ranges...)
+	}
+	if len(pairs) == 0 || len(pairs) > charLoopMaxPairs || l.longCharLoops(state) {
+		return nil, nil, false
+	}
+	// The ASCII members, and every continuation byte, as the plain set
+	// carries them.
+	for c := 0; c < 0x80; c++ {
+		if l.transitionOn(int(state), c) == state {
+			in[byte(c)] = true
+		}
+	}
+	if int(state) < len(l.midAcceptNLBytes) && l.midAcceptNLBytes[state] != 0 {
+		delete(in, '\n')
+	}
+	for c := 0x80; c < 0xC0; c++ {
+		in[byte(c)] = true
+	}
+	for _, pr := range pairs {
+		in[pr.lead] = true
+	}
+	for c := 0; c < 256; c++ {
+		if in[byte(c)] {
+			allow = append(allow, byte(c))
+		}
+	}
+	return allow, pairs, true
+}
+
+// charLoopMaxPairs caps the continuation ranges one skip checks, each a load
+// and four SIMD instructions per chunk; charLoopMaxLeadRanges caps them per
+// lead (`[а-яё]`: D1 80-8F and 91).
+const (
+	charLoopMaxPairs      = 4
+	charLoopMaxLeadRanges = 2
+)
+
 // leadLoops reports whether every valid character with lead byte lead (one
 // of seq's) read from state leads back to it, every state inside it being
 // one inside admits: loopsOverUTF8 for one lead byte.
@@ -4608,8 +4884,8 @@ func detectShuftiSelfLoop(l *dfaLayout) {
 			}
 		}
 		if charLoops && (!isMid || idx < maxStates) {
-			if allow, ok := l.charLoopAllowSet(state); ok {
-				info := dominantInfo{state: state, utf8: true, allowSet: allow, isMidAccept: isMid}
+			if allow, pairs, ok := l.charLoopPairs(state); ok {
+				info := dominantInfo{state: state, utf8: true, allowSet: allow, pairs: pairs, isMidAccept: isMid}
 				if isMid {
 					info.encodedByte = byte(128 + idx)
 					idx++
@@ -5384,8 +5660,8 @@ func genSuffixWASMWalkEndCtr(ctr *sparseCounter, walkEnd int32, t *dfaTable, tab
 		scratch := planSparseScratch(idMapOff+int32(len(idMap)), len(patternIDs), staleStates)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
-		// One zero byte at the top of the scratch so utils.WasmMemTop and the
-		// harnesses see the reservation: they derive "where free memory starts"
+		// One zero byte at the top of the scratch so the harnesses (utils.ParseDataSectionBytes)
+		// see the reservation: they derive "where free memory starts"
 		// from the DATA SEGMENTS, and a region nothing declares gets the
 		// caller's input written straight on top of it.
 		dataBytes = append(dataBytes, appendDataSegment(nil, scratch.end-1, []byte{0})...)
@@ -6663,6 +6939,8 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 			plainMidDelta:         plainMidDeltaOf(l),
 			firstByteOff:          l.firstByteOff,
 			prefix:                l.prefix,
+			foldPrefix:            l.foldPrefix,
+			foldLetter:            l.foldLetter,
 			classMapOff:           l.classMapOff,
 			numClasses:            l.numClasses,
 			useU8:                 l.useU8,
@@ -6702,6 +6980,7 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 			switchN:               l.switchN,
 			startRule:             l.startRule,
 			utf8Text:              l.utf8Text,
+			lineStart:             isLineStartFind(t),
 		}
 		build = func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int) {
 			bp := fp
@@ -7831,8 +8110,13 @@ func emitUTF8CharLoopSkip(b []byte, info dominantInfo, updateLastAccept bool,
 		declined = 2
 		b = append(b, 0x02, 0x40) // block $declined
 	}
-	bounds := func(b []byte, depth byte) []byte { // pos + 17 > len: br_if depth
-		return append(b, 0x20, pos, 0x41, 0x11, 0x6A, 0x20, lenL, 0x4B, 0x0D, depth)
+	// A pair check reads the byte after each lane, one more than the chunk.
+	reach := byte(0x11)
+	if len(info.pairs) > 0 {
+		reach = 0x12
+	}
+	bounds := func(b []byte, depth byte) []byte { // pos + reach > len: br_if depth
+		return append(b, 0x20, pos, 0x41, reach, 0x6A, 0x20, lenL, 0x4B, 0x0D, depth)
 	}
 	b = append(b, 0x02, 0x40) // block $done
 	b = append(b, 0x02, 0x40) // block $tail
@@ -7841,6 +8125,7 @@ func emitUTF8CharLoopSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	b = append(b, 0x03, 0x40)                                                      // loop $outer
 	b = append(b, 0x20, ptr, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x01, 0x21, chunk) // chunk = v128.load(ptr + pos + 1)
 	b = emitCharExitMask(b, nil, info.allowSet, chunk)
+	b = emitCharPairExits(b, info.pairs, ptr, pos, chunk)
 	b = append(b, 0x21, tmp) // tmp = exit lanes
 	if hasASCII {
 		// An all-ASCII chunk: the byte skip's step.
@@ -7872,9 +8157,13 @@ func emitUTF8CharLoopSkip(b []byte, info dominantInfo, updateLastAccept bool,
 	}
 	// The end-of-input form is reached from the main loop too, after pos has
 	// moved, so its declines leave through $done, past last_accept's update.
-	b = append(b, 0x20, pos, 0x41, 1+charSkipTailMin, 0x6A, 0x20, lenL, 0x4B, 0x0D, 0x00)
-	b = emitCharLoopGate(b, info.allowSet, ptr, pos, 1, 0)
-	b = emitUTF8SkipTail(b, nil, info.allowSet, pos, lenL, ptr, chunk, tmp, errL, true, 0)
+	// A loop with partial leads has none: its pair check needs the byte after
+	// each lane, and the walk reads the last bytes itself.
+	if len(info.pairs) == 0 {
+		b = append(b, 0x20, pos, 0x41, 1+charSkipTailMin, 0x6A, 0x20, lenL, 0x4B, 0x0D, 0x00)
+		b = emitCharLoopGate(b, info.allowSet, ptr, pos, 1, 0)
+		b = emitUTF8SkipTail(b, nil, info.allowSet, pos, lenL, ptr, chunk, tmp, errL, true, 0)
+	}
 	b = append(b, 0x0B) // end $done
 	if updateLastAccept {
 		b = append(b, 0x20, pos, 0x41, 0x01, 0x6A, 0x21, lastAccept)
@@ -8242,6 +8531,9 @@ func emitDominantBulkSkipHooked(b []byte, info dominantInfo, updateLastAccept bo
 	posLocal, lenLocal, lastAcceptLocal,
 	ptrLocal, chunkLocal, tmpLocal, errLocal byte,
 	onBoundsExit func([]byte) []byte) []byte {
+	if info.emitted != nil {
+		*info.emitted = true
+	}
 	if info.utf8 {
 		return emitUTF8BulkSkip(b, info, updateLastAccept,
 			posLocal, lenLocal, lastAcceptLocal, ptrLocal, chunkLocal, tmpLocal, errLocal, onBoundsExit)
@@ -9134,6 +9426,37 @@ func dfaHasAmbiguousBoundaryTarget(t *dfaTable) bool {
 // lookups return 0, so checking a flavor a pattern never populates is free and
 // can only make the answer more conservative.
 func isAnchoredFind(t *dfaTable) bool {
+	seeds := []int{t.midStartState}
+	if t.hasNewlineBoundary {
+		seeds = append(seeds, t.midStartNewlineState)
+	}
+	if t.hasWordBoundary {
+		seeds = append(seeds, t.midStartWordState)
+	}
+	return !acceptReachableFrom(t, seeds)
+}
+
+// isLineStartFind reports whether every match of the DFA begins at a line
+// start — position 0 or just past a '\n' — as for a pattern led by `(?m)^`:
+// no state reachable from a mid-start state whose preceding byte is NOT a
+// newline (midStartState, and midStartWordState for a word-boundary pattern)
+// accepts in any flavor. Such a find need only try the positions after each
+// '\n', which a SIMD scan finds 16 bytes at a time (prefixScanParams.LineStart):
+// `(?m)^[^,\n]*,` tried every byte at 95 fuel/byte.
+func isLineStartFind(t *dfaTable) bool {
+	if !t.hasNewlineBoundary {
+		return false
+	}
+	seeds := []int{t.midStartState}
+	if t.hasWordBoundary {
+		seeds = append(seeds, t.midStartWordState)
+	}
+	return !acceptReachableFrom(t, seeds)
+}
+
+// acceptReachableFrom reports whether a state reachable from seeds accepts in
+// any flavor (isAnchoredFind, isLineStartFind).
+func acceptReachableFrom(t *dfaTable, seeds []int) bool {
 	visited := make([]bool, t.numStates)
 	stack := make([]int, 0, t.numStates)
 
@@ -9144,38 +9467,33 @@ func isAnchoredFind(t *dfaTable) bool {
 		}
 	}
 
-	// Seed from the mid-start states that actually exist. midStartWordState /
-	// midStartNewlineState are only assigned when the pattern has the
-	// corresponding boundary kind; otherwise they hold their zero value, which
-	// is a valid but unrelated state ID and must not be walked.
-	push(t.midStartState)
-	if t.hasNewlineBoundary {
-		push(t.midStartNewlineState)
-	}
-	if t.hasWordBoundary {
-		push(t.midStartWordState)
+	// The callers seed only the mid-start states that exist: midStartWordState
+	// / midStartNewlineState are assigned only when the pattern has that
+	// boundary kind, and otherwise hold a valid but unrelated state ID.
+	for _, seed := range seeds {
+		push(seed)
 	}
 
 	for len(stack) > 0 {
 		s := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		// Accepting in any flavor at a state reachable from a mid-start state
-		// means the pattern can match starting at some position > 0.
+		// Accepting in any flavor at a state reachable from a seed means a
+		// match can begin where that seed's context holds.
 		if t.acceptStates[s] != 0 ||
 			t.midAcceptStates[s] != 0 ||
 			t.immediateAcceptStates[s] != 0 ||
 			t.midAcceptNWStates[s] != 0 ||
 			t.midAcceptWStates[s] != 0 ||
 			t.midAcceptNLStates[s] != 0 {
-			return false
+			return true
 		}
 
 		for b := 0; b < 256; b++ {
 			push(t.transitions[s*256+b])
 		}
 	}
-	return true
+	return false
 }
 
 // buildAnchoredFindBody returns the WASM function body for anchored find mode.
@@ -10424,7 +10742,7 @@ func buildAltLitAnchorForwardVerifyBodyStamped(t *dfaTable, l *dfaLayout, tableM
 // marked walk, 0 for the plain one.
 type verifyNotes struct {
 	rows   *notesRows
-	search uint32
+	search searchRef
 	marked uint32
 	end    uint32 // the plain walk stores where it stopped here
 }
@@ -10988,6 +11306,9 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 // positional parameters — long runs of same-typed int32 offsets and bools that
 // no reviewer could check by eye. See dfaLayoutParams.
 type findBodyParams struct {
+	// lineStart: every match begins at a line start (isLineStartFind), so a
+	// find with no literal to scan for scans for the next '\n' instead.
+	lineStart             bool
 	startState            uint32
 	midStartState         uint32
 	midStartWordState     uint32
@@ -11001,6 +11322,8 @@ type findBodyParams struct {
 	plainMidDelta         int32 // the plain midAccept copy's offset - midAcceptOff, 0 = none (plainMidDeltaOf)
 	firstByteOff          int32
 	prefix                []byte
+	foldPrefix            []byte
+	foldLetter            []bool
 	classMapOff           int32
 	numClasses            int
 	useU8                 bool
@@ -11245,6 +11568,14 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	}
 	if len(dominantStates) > 0 && numV128ForScan == 0 {
 		numV128ForScan = 1 // dominant bulk-skip needs its own `chunk` register
+	}
+	// A line-start find with no literal and a first-byte set too wide for
+	// Teddy or multi-eq scans for the next '\n' instead (prefixScanParams.
+	// LineStart), which needs `chunk`. Not under prefer-no-match: that hint's
+	// Shufti and its neutral twin stay as they are.
+	lineStartScan := p.lineStart && len(prefix) == 0 && !useMandatoryLit && len(firstBytes) > 16 && !lnmAction5
+	if lineStartScan && numV128ForScan == 0 {
+		numV128ForScan = 1
 	}
 	// needsDenseSwitch: this pattern got Shufti from a LikelyNoMatch
 	// assertion the static rarity model would not have made on its own —
@@ -11535,6 +11866,9 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 		lenForScan := byte(1) // raw len param
 		params := prefixScanParams{
 			Prefix:           prefix,
+			FoldPrefix:       p.foldPrefix,
+			FoldLetter:       p.foldLetter,
+			LineStart:        lineStartScan,
 			UTF8Text:         p.utf8Text,
 			FirstByteSet:     firstBytes,
 			FirstByteFlags:   firstByteFlags,
@@ -12443,36 +12777,19 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 	b = append(b, 0x0B) // end if
 	b = nc.emitArrivalTest(b)
 
-	// if midAccept[state]: last_accept = pos + 1
-	// The u16 path emits no dominant dispatch, but when non-mid entries
-	// exist the table carries their reserved 254+ encodings,
-	// which must NOT be treated as accepting: `(val-1) u< 253` accepts
-	// exactly the 1..253 range in a single unsigned compare.
-	hasNonMidU16 := false
-	for _, info := range dominantStates {
-		if !info.isMidAccept {
-			hasNonMidU16 = true
-		}
-	}
-	b = append(b, 0x41)
-	b = utils.AppendSLEB128(b, midAcceptOff)
-	b = append(b, 0x20, 0x02) // local.get state
-	b = append(b, 0x6A)
-	b = appendTableLoad8u(b, tableMemIdx) // midAccept[state]
-	if hasNonMidU16 {
-		b = append(b, 0x41, 0x01)
-		b = append(b, 0x6B) // i32.sub (val - 1)
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, 253)
-		b = append(b, 0x49) // i32.lt_u — true iff val in 1..253
-	}
-	b = append(b, 0x04, 0x40) // if (void)
-	b = append(b, 0x20, 0x03) // local.get pos
-	b = append(b, 0x41, 0x01)
-	b = append(b, 0x6A)
-	b = append(b, 0x21, 0x05) // local.set last_accept
-	b = nc.emitAcceptHook(b, 0x02)
-	b = append(b, 0x0B) // end if
+	// One midAccept[state] load feeds the accept update and both dominant
+	// channels, as on the u8 paths (emitFindMidAcceptDispatch). The byte
+	// local (6) is dead once the transition has read it and serves as the
+	// value and the skip's scratch, as the compressed path's class local does.
+	// Until 2026-11-15 this path ran no skip at all although the layout
+	// detected and encoded one: `[^,]+,\pL` 49.8 fuel/byte against 5.2 for
+	// `[^,]+,`, byte-mode `[^;]+;x{0,300}` 37.0 against 1.6.
+	b = emitFindMidAcceptDispatch(b, dominantStates, useMandatoryLit,
+		midAcceptOff, tableMemIdx,
+		/*state=*/ 0x02 /*pos=*/, 0x03 /*len=*/, 0x01,
+		/*lastAccept=*/ 0x05 /*ptr=*/, 0x00,
+		chunkLocal /*val+tmp=*/, 0x06, utf8ErrLocal,
+		bulkHystCounterLocal, bulkHystPosLocal, soleMid, nc, bulkHystDeltaLocal, p.plainMidDelta)
 
 	b = emitImmAcceptCheckFindMid(b, immAcceptLimit, hasImmAccept, 0x02, 0x03, tableMemIdx)
 
@@ -17843,4 +18160,156 @@ var wordCharTableBytes = func() (t [256]byte) {
 func patternHasWordBoundary(pattern string) bool {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	return err == nil && regexpHasWordBoundary(re)
+}
+
+// pointSkipsAt makes l's dominant states report an emitted skip to flag, or to
+// l.skipEmitted when flag is nil (dominantInfo.emitted).
+func pointSkipsAt(l *dfaLayout, flag *bool) {
+	if flag == nil {
+		flag = &l.skipEmitted
+	}
+	for i := range l.dominantStates {
+		l.dominantStates[i].emitted = flag
+	}
+}
+
+// pointLenAltSkipsAt is pointSkipsAt over a lenient alternation's DFA branches.
+func pointLenAltSkipsAt(altp *lenAltPattern, flag *bool) {
+	for i := range altp.branches {
+		if l := altp.branches[i].dfaLayout; l != nil {
+			pointSkipsAt(l, flag)
+		}
+	}
+}
+
+// computeFoldPrefix is computePrefix for a literal that may be case-folded:
+// the longest run of bytes every match begins with, where a step is either one
+// live byte or two bytes that differ only in bit 0x20 leading to one state —
+// an ASCII letter in both cases, and the last byte of many UTF-8 case pairs
+// (`П` D0 9F, `п` D0 BF). `(?i)select` and `(?i)привет` have no exact prefix
+// and this one. It is a CANDIDATE filter only: the scan
+// finds positions where the folded literal occurs and the automaton starts
+// there from its own start state, reading the literal itself, so the walk need
+// not end in any particular state.
+//
+// Every start state a match can begin from is walked — mid-start, and the
+// word, newline and position-0 variants — and the common run kept; a variant
+// with no live byte at all begins no match and is left out. A variant that
+// accepts before consuming a byte (an empty match) makes every prefix unsound:
+// nil. So is a run without a single folded letter, which computePrefix would
+// have found exact, or one under two bytes.
+func computeFoldPrefix(t *dfaTable) ([]byte, []bool) {
+	if t.startBeginAccept {
+		return nil, nil
+	}
+	starts := []int{t.midStartState}
+	if t.hasWordBoundary {
+		starts = append(starts, t.midStartWordState)
+	}
+	if t.hasNewlineBoundary {
+		starts = append(starts, t.midStartNewlineState)
+	}
+	if t.startState != t.midStartState {
+		starts = append(starts, t.startState)
+	}
+	var bytes []byte
+	var letter []bool
+	walked := false
+	for _, st := range starts {
+		if stateAcceptsAny(t, st) {
+			return nil, nil
+		}
+		bs, ls, live := foldPrefixWalk(t, st)
+		if !live {
+			continue
+		}
+		if !walked {
+			bytes, letter, walked = bs, ls, true
+			continue
+		}
+		n := 0
+		for n < len(bytes) && n < len(bs) && bytes[n] == bs[n] && letter[n] == ls[n] {
+			n++
+		}
+		bytes, letter = bytes[:n], letter[:n]
+	}
+	folded := false
+	for _, f := range letter {
+		folded = folded || f
+	}
+	if len(bytes) < 2 || !folded {
+		return nil, nil
+	}
+	return bytes, letter
+}
+
+// foldPrefixWalk walks from start while a step is one live byte or a pair
+// {x, x|0x20} into one state; live is false when start has no live byte.
+func foldPrefixWalk(t *dfaTable, start int) (bytes []byte, letter []bool, live bool) {
+	state := start
+	visited := map[int]bool{state: true}
+	for {
+		var lb []int
+		for b := 0; b < 256 && len(lb) <= 2; b++ {
+			if t.transitions[state*256+b] >= 0 {
+				lb = append(lb, b)
+			}
+		}
+		if len(lb) > 0 {
+			live = true
+		}
+		var next int
+		switch {
+		case len(lb) == 1:
+			bytes, letter = append(bytes, byte(lb[0])), append(letter, false)
+			next = t.transitions[state*256+lb[0]]
+		case len(lb) == 2 && lb[0]&0x20 == 0 && lb[0]|0x20 == lb[1] &&
+			t.transitions[state*256+lb[0]] == t.transitions[state*256+lb[1]]:
+			bytes, letter = append(bytes, byte(lb[1])), append(letter, true)
+			next = t.transitions[state*256+lb[1]]
+		default:
+			return bytes, letter, live
+		}
+		if visited[next] || stateAcceptsAny(t, next) {
+			return bytes, letter, live
+		}
+		visited[next] = true
+		state = next
+	}
+}
+
+// emitCharPairExits ORs into the exit mask on the stack the lanes of the
+// chunk at ptr + pos + 1 that hold a partial lead (dominantInfo.pairs) whose
+// next byte is outside its range: the skip stops AT the lead, so it never ends
+// inside a character. The next bytes are the chunk at ptr + pos + 2, which the
+// caller's bounds check covers.
+func emitCharPairExits(b []byte, pairs []leadRange, ptr, pos, chunk byte) []byte {
+	if len(pairs) == 0 {
+		return b
+	}
+	for i := 0; i < len(pairs); {
+		lead := pairs[i].lead
+		b = append(b, 0x20, chunk, 0x41)
+		b = utils.AppendSLEB128(b, int32(lead))
+		b = append(b, 0xFD, 0x0F, 0xFD, 0x23) // lane == lead
+		for j := i; j < len(pairs) && pairs[j].lead == lead; j++ {
+			pr := pairs[j]
+			b = append(b, 0x20, ptr, 0x20, pos, 0x6A, 0xFD, 0x00, 0x00, 0x02) // next bytes
+			b = append(b, 0x41)
+			b = utils.AppendSLEB128(b, int32(pr.lo))
+			b = append(b, 0xFD, 0x0F, 0xFD, 0x71, 0x41) // - lo
+			b = utils.AppendSLEB128(b, int32(pr.hi-pr.lo)+1)
+			b = append(b, 0xFD, 0x0F, 0xFD, 0x26) // u< hi - lo + 1: in range
+			if j > i {
+				b = append(b, 0xFD, 0x50) // or
+			}
+		}
+		b = append(b, 0xFD, 0x4F) // lead and in none of its ranges
+		if i > 0 {
+			b = append(b, 0xFD, 0x50) // or
+		}
+		for i++; i < len(pairs) && pairs[i].lead == lead; i++ {
+		}
+	}
+	return append(b, 0xFD, 0x64, 0x72) // bitmask; or into the exit lanes
 }

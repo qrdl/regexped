@@ -1494,7 +1494,7 @@ func compileAnchoredBTSet(t *testing.T, pats []string, unicode, overlapping bool
 		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	mode := unicode
-	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Patterns: entries, Sets: []config.SetConfig{{
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: config.Count(maxUnion), Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 		Patterns: config.PatternSelector{Names: names}, Unicode: &mode,

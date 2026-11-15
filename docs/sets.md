@@ -396,9 +396,14 @@ the input in one pass and answers the remaining calls out of the result. A
 sixteenth, not all: at the full cost a wide set walked up to two sweeps' worth
 first, quadratically up to that point (96 members over `a`×N switched only at
 16 KB, 281,595 instructions per byte; now 108,705 from 2 KB), while
-match-heavy drives moved −36% to +2.3% and ordinary text still never switches —
-its work per byte stays 11 to 134 times under the line. A drive whose walk would
-have ended just past the line pays a sweep it did not need. The allowance —
+match-heavy drives moved −36% to +2.3%. Ordinary text does NOT always stay
+under the line: a SMALL set (under 32 cells) whose members walk word classes —
+`{[a-z]+ing\b, [a-z]+ed\b, \w+@\w+\.com}` — crosses it on word-heavy text, and
+there the sweep measured 5% to 49% dearer than walking (English prose 734 vs
+616 instructions per byte, random words 834-1110 vs 746-803). Raising the line
+fixes that and makes match-dense and hostile drives dearer instead (+12% to
++83% measured), so it stays. A drive whose walk would have ended just past the
+line pays a sweep it did not need. The allowance —
 eight bytes of sweeping at the FULL rate — is what keeps an input of a few
 bytes on the walk, where starting a sweep costs more than the whole walk does;
 on inputs of 13-19 bytes with many matches the line can be crossed, and there
@@ -593,8 +598,12 @@ Declaring less emits less:
 
 A set that does not declare `find` emits no tuple-writing suffix functions at
 all — just the DFA tables, which the cheap bitmask probes share. An
-anchored-only set additionally emits no literal frontend: the
-packed-pair/Teddy/AC/Shufti tables and skip loop could never execute for it.
+anchored-only set additionally emits no literal frontend and no scan buckets:
+the anchored pair has a packing of its own, so the packed-pair/Teddy/AC/Shufti
+tables, the skip loop and the buckets' DFA tables could never be read, and
+`--diag-json` reports `"frontend": "none"` and no buckets for it. The
+`match_any`-only SQL validator example is 6,204 bytes (40,775 when it still
+carried them).
 
 Measured on a 100KB no-match corpus with eight literal-prefixed patterns:
 `match_any`/`match_all` 84 fuel, `scan_all` 219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
@@ -602,6 +611,11 @@ the scan trio is frontend-bound, like `find`, because it shares `find`'s
 frontend. (An earlier draft gave the scan trio a scalar position-by-position
 scan instead, and measured 17x worse — the literal frontend is what makes
 these cheap, not the absence of extent tracking.)
+
+A record that DOES keep the anchored pair walking — an input that is one long
+match — is walked four bytes per loop trip while four are left, the bounds
+test and the advance paid once per four transitions: `match_any` over 8 KB of
+an `overlap-shape-3` match 196,630 → 145,434 fuel (−26%), no set slower.
 
 Do not use `scan_any` as a locate step for `find` — calling both at the same
 position duplicates one position's work. Pick one.
@@ -648,7 +662,7 @@ before. When one is not:
 | Capability | What the set does |
 |---|---|
 | `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own linear search, and `find` merges their answers with the buckets' |
-| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller of a merged build, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary |
+| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller of a merged build, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary. The companion carries no second copy of a table the set already emitted: a bucket table, or a split member's passes, whose bytes at the first copy's address would be the same is named at that address (url-guard as an overlapping set 1,753,575 → 1,021,772 bytes) |
 | `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find`. The members kept become an internal set of their own, never exported, that the merge reads for the buckets' part — so when THEY qualify for the answer cache, the drive keeps it (`{foo\w+, a[a-z]*?z}` over `foo`×N: 90,354 → 542 instructions per byte), and the split members get the program sweep (see "Overlap policy") |
 | `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks — the single-pattern rule: only a walk that recorded nothing new and walked more than 32 bytes is charged, the budget `4 × bytes advanced + 64` is checked before the walk is added, and the probe's hits are recorded first — that hands the call to a start-anywhere union automaton over the set |
 | `scan_any`, `scan_all`, where no union automaton can be built | split out. When the set's `find` is `overlapping: true` and served by the answer cache, only the scan pair is split: it lives in a split copy of the set compiled beside it, never exported, to which the set's two scan exports forward — so `find` keeps its cache. (Splitting the whole set for its scan pair's sake made that `find` quadratic again on long overlapping matches: 90,441 fuel/byte at 8 KB against 1,342.) |

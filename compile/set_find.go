@@ -755,7 +755,7 @@ func (c *setFindCtx) emitEmptyMaskSkip(b []byte, bi int, mask uint32) []byte {
 // individual group has been exhausted long enough to matter. Group retirement
 // would only pay on a skewed corpus where some groups saturate early while
 // others never hit — a workload no benchmark here has, and inventing one to
-// justify the code would be backwards. CLAUDE.md's load-bearing gates section is this lesson.
+// justify the code would be backwards. CLAUDE.md's "Engine selection by first sets" section is this lesson.
 //
 // A second, finer form was built and measured on 2026-09-17: clear each
 // recorded pattern's bit from lValidMask (one shift of the accumulator or one

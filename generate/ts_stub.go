@@ -48,7 +48,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	// Only generators keep regions; a stub with none would declare it unused.
 	// See the JS generator's "Regions" note for the allocator.
 	if hasSuspendableExports(cfg) {
-		sb.WriteString("const _regs: { at: number; top: number; free: boolean }[] = []; // live iterator regions, in allocation order\n")
+		sb.WriteString("const _regs: { at: number; top: number; free: boolean; owner?: number }[] = []; // live iterator regions, in allocation order\n")
 	}
 	sb.WriteString("const _enc = new TextEncoder();\n")
 	sb.WriteString("\n")
@@ -183,9 +183,10 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 
 `)
 		sb.WriteString("function _close(at: number): void {\n" +
-			"    // Frees the region _open placed at `at`, then gives back every free\n" +
-			"    // region at the top of the stack.\n" +
-			"    for (let i = _regs.length - 1; i >= 0; i--) if (_regs[i]!.at === at) { _regs[i]!.free = true; break; }\n" +
+			"    // Frees the region _open placed at `at` and every region carved for\n" +
+			"    // that iterator later (its notes, memo, set descriptor: owner === at),\n" +
+			"    // then gives back every free region at the top of the stack.\n" +
+			"    for (const r of _regs) if (r.at === at || r.owner === at) r.free = true;\n" +
 			"    while (_regs.length > 0 && _regs[_regs.length - 1]!.free) _regs.pop();\n" +
 			"    _bump = _regs.length > 0 ? _regs[_regs.length - 1]!.top : _staticTop;\n" +
 			"}\n\n")
@@ -230,7 +231,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	}
 
 	sb.WriteString(genTSSetSection(cfg, sizes))
-	return sb.String(), nil
+	return addOffsetChecks(sb.String(), true), nil
 }
 
 // genTSSetSection generates TypeScript set wrappers.
@@ -310,7 +311,14 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]!; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, args("match_all"), btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
@@ -330,7 +338,15 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, s.MatchAll, args("match_all"), idKonst)
@@ -359,7 +375,14 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]!; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, args("scan_all"), btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
@@ -375,7 +398,15 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, s.ScanAll, args("scan_all"), idKonst)
@@ -427,12 +458,12 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
         if (n <= 0) break;
         buf = _att(buf, Int32Array, _outBase, 3*%s);
         // Every tuple in one call shares a start; resume one past it.
-        const next = buf[1] + 1;
+        const next = buf[1]! + 1;
         for (let i = 0; i < n; i++) {
             // Re-checked each step: the yield below hands control back, and
             // whatever runs there may grow memory and detach this view.
             buf = _att(buf, Int32Array, _outBase, 3*%s);
-            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+            yield { patternId: buf[i*3]!, start: buf[i*3+1]!, end: buf[i*3+2]! };
         }
         pos = next;
     }
@@ -525,7 +556,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
             // Re-checked each step: the yield hands control back, and whatever
             // runs there may grow memory and detach this view.
             buf = _att(buf, Int32Array, _outBase, 3*batchSize);
-            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+            yield { patternId: buf[i*3]!, start: buf[i*3+1]!, end: buf[i*3+2]! };
         }
         // A call reports at least one match unless the scan is over.
         if (done || n === 0) break;
@@ -601,7 +632,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 // Re-attached each step: the yield below hands control back,
                 // and a grow there detaches every view in the module.
                 outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
-                const s = outBuf[i * 2], e = outBuf[i * 2 + 1];
+                const s = outBuf[i * 2]!, e = outBuf[i * 2 + 1]!;
                 // Go's FindAllIndex rule: suppress an EMPTY match beginning
                 // exactly where the previous reported match ended.
                 if (s === e && s === prevEnd) continue;
@@ -610,7 +641,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             }
             if (n < %[2]d) break;
             outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
-            const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
+            const lastStart = outBuf[(n - 1) * 2]!, lastEnd = outBuf[(n - 1) * 2 + 1]!;
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
@@ -678,12 +709,12 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 // and a grow there detaches every view in the module.
                 outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
                 const base = i * %[3]d;
-                const ms = outBuf[base], me = outBuf[base + 1];
+                const ms = outBuf[base]!, me = outBuf[base + 1]!;
                 if (ms === me && ms === prevEnd) continue;
                 prevEnd = me;
                 const result: Array<[number, number] | null> = [];
                 for (let g = 0; g < %[5]d; g++) {
-                    const s = outBuf[base + 2 + g * 2], e = outBuf[base + 2 + g * 2 + 1];
+                    const s = outBuf[base + 2 + g * 2]!, e = outBuf[base + 2 + g * 2 + 1]!;
                     result.push(s < 0 ? null : [s, e]);
                 }
                 yield result;
@@ -691,7 +722,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             if (n < %[2]d) break;
             outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
             const lastBase = (n - 1) * %[3]d;
-            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            const lastStart = outBuf[lastBase]!, lastEnd = outBuf[lastBase + 1]!;
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
@@ -717,13 +748,13 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             // remaining byte.
             break;
         }
-        const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
+        const matchEnd = slots[1]! >= 0 ? slots[1]! : slots[0]!;
         const result: Array<[number, number] | null> = [];
         for (let i = 0; i < %[5]d; i++) {
-            const s = slots[i * 2], e = slots[i * 2 + 1];
+            const s = slots[i * 2]!, e = slots[i * 2 + 1]!;
             result.push(s < 0 ? null : [s, e]); // absolute already
         }
-        const absStart = slots[0], absEnd = matchEnd;
+        const absStart = slots[0]!, absEnd = matchEnd;
         off = absEnd > absStart ? absEnd : absStart + 1;
         // Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
         // exactly where the previous reported match ended. The advance above

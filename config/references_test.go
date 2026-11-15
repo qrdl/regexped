@@ -151,11 +151,16 @@ func TestExpandReferencesLeavesOrdinaryText(t *testing.T) {
 			t.Errorf("%s was rewritten: %q %+v / %q %v", re, p.Regexp, p.Expanded, s.Regexps[0], s.Expansions)
 		}
 	}
-	// An unterminated class runs to the end, as Go reads it: no reference,
-	// and the syntax error is compile's to report, as for any pattern.
-	cfg0, err := loadCfgSrc(t, "patterns:\n  - {name: x, regexp: 'q'}\n  - {regexp: '[a(?&x)', find_func: f}\n")
-	if err != nil || cfg0.Patterns[1].Expanded != nil {
+	// An unterminated class runs to the end, as Go reads it: no reference is
+	// expanded, and the syntax error is a load error at its line, as for any
+	// pattern.
+	cfg0 := BuildConfig{Patterns: []PatternEntry{{Name: "x", Regexp: "q"}, {Regexp: "[a(?&x)", FindFunc: "f"}}}
+	if err := ExpandReferences(&cfg0); err != nil || cfg0.Patterns[1].Expanded != nil {
 		t.Errorf("unterminated class: %v %+v", err, cfg0.Patterns[1])
+	}
+	if _, err := loadCfgSrc(t, "patterns:\n  - {name: x, regexp: 'q'}\n  - {regexp: '[a(?&x)', find_func: f}\n"); err == nil ||
+		!strings.Contains(err.Error(), "missing closing ]") || !strings.Contains(err.Error(), "[3:") {
+		t.Errorf("unterminated class: err = %v, want the syntax error at line 3", err)
 	}
 	// No "(?&" anywhere: nothing is even scanned.
 	cfg := BuildConfig{Patterns: []PatternEntry{{Name: "a", Regexp: "(?i)a"}}}

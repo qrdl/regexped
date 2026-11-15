@@ -417,7 +417,7 @@ __attribute__((__import_module__("%[3]s"), __import_name__("[resource-drop]%[4]s
 extern void %[6]s(int handle);
 
 int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
-    if (!iter || !input) return RX_ERR_NULL_ARG;
+    if (!iter || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     /* Writes only: a live iterator must be _free'd before it is initialised

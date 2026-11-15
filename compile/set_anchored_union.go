@@ -335,6 +335,10 @@ func buildAnchoredUnionDFA(spec SetSpec, tableBase int32, wantAll, forceWideAll 
 	return au
 }
 
+// anchoredUnionUnroll is how many bytes the anchored union walk takes per
+// loop trip while that many are left (emitAnchoredUnionBody).
+const anchoredUnionUnroll = 4
+
 // emitAnchoredUnionBody emits one anchored capability over the union automaton.
 //
 //	match_any (ptr, len)           -> i32   a global id, or -1
@@ -405,9 +409,27 @@ func emitAnchoredUnionBody(u *anchoredUnion, kind setCapKind, wideAll bool, tabl
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, int32(u.startState))
 	b = append(b, 0x21, lState)
-	b = append(b, 0x41, 0x00, 0x21, lPos)
+	// lPos starts at 0 as every declared local does: setting it would cost
+	// the two instructions the unrolled bounds test adds to a walk that dies
+	// at once (every no-match row's 30 fuel).
 
 	b = append(b, 0x02, 0x40) // block $done
+	// Four bytes per trip while four are left: the bounds test, the advance
+	// and the branch are paid once per four transitions (24 → 18 fuel per byte
+	// over a walk that lives; overlap-shape-3 match_any at 8 KB 196,630 →
+	// 145,434). A dead state leaves at once: nothing after the walk reads the
+	// position.
+	b = append(b, 0x02, 0x40) // block $tail
+	b = append(b, 0x03, 0x40) // loop $quad
+	b = append(b, 0x20, lPos, 0x41, anchoredUnionUnroll, 0x6A, 0x20, pInLen, 0x4B, 0x0D, 0x01)
+	for k := byte(0); k < anchoredUnionUnroll; k++ {
+		b = emitUnionTransitionOffset(b, &u.unionScanDFA, pInPtr, lPos, lState, k, tableMemIdx)
+		b = append(b, 0x20, lState, 0x45, 0x0D, 0x02) // dead: leave, state 0 answers "nothing"
+	}
+	b = append(b, 0x20, lPos, 0x41, anchoredUnionUnroll, 0x6A, 0x21, lPos)
+	b = append(b, 0x0C, 0x00)
+	b = append(b, 0x0B)       // end loop $quad
+	b = append(b, 0x0B)       // end block $tail: fewer than four bytes left
 	b = append(b, 0x03, 0x40) // loop $scan
 	b = append(b, 0x20, lPos, 0x20, pInLen, 0x4F, 0x0D, 0x01)
 	b = emitUnionTransitionOffset(b, &u.unionScanDFA, pInPtr, lPos, lState, 0, tableMemIdx)

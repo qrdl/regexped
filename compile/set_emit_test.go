@@ -580,7 +580,7 @@ func TestSetEmitUnionScanRefusals(t *testing.T) {
 		maxUnion int
 		used     bool
 	}{{0, true}, {2, false}} {
-		cfg.MaxUnionStates = c.maxUnion
+		cfg.MaxUnionStates = config.Count(c.maxUnion)
 		_, _, diags, err := CompileFileDiag(cfg, "")
 		if err != nil || len(diags) != 1 || diags[0].UnionScan == nil || diags[0].UnionScan.Used != c.used {
 			t.Errorf("max_union_states %d: diags %+v, err %v; want the union used = %v", c.maxUnion, diags, err, c.used)

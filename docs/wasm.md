@@ -706,7 +706,7 @@ gate-array pointer in the same position, and both find entries take it:
 | +0 | `magic` | `0x52584653` ("RXFS"). The module compares it and executes `unreachable` otherwise |
 | +4 | `gate_ptr` | the gate array, `ID_SPACE` u32s, zeroed to start a drive — exactly as before |
 | +8 | `cache_ptr` | the overlapping answer cache, or 0 to decline |
-| +12 | `cache_len` | its length in bytes |
+| +12 | `cache_len` | its length in bytes: 0 with no cache, otherwise at least 48 (the header); a non-zero `cache_ptr` with less returns −4 |
 
 **Why a descriptor.** The answer cache is what makes an overlapping drive linear
 instead of quadratic, and it has to live in caller-owned memory for the same
@@ -882,9 +882,12 @@ SQUARE ROOT.
 | Descriptor field | Meaning |
 |---|---|
 | `cache_ptr` | Caller-owned region, or **0 to decline** |
-| `cache_len` | Its size in bytes |
+| `cache_len` | Its size in bytes: **at least 48**, the header (the header alone when handing it over lazily); 0 when `cache_ptr` is 0 |
 
-**Header: 48 bytes at `cache_ptr`.** Zero it to start a drive, then write the
+**Header: 48 bytes at `cache_ptr`, so `cache_len` is at least 48.** A non-zero
+`cache_ptr` with a `cache_len` below 48 is a malformed cache: every call
+answers **−4** (the reserved position word for −4 from the batch entry), as for
+a header that contradicts itself. Zero the header to start a drive, then write the
 STRIDE into the word at offset 16. Everything else is the engine's but the lazy
 word at offset 44 (below). The stride is the one field you own because it is
 what you sized the allocation from, and the engine validates rather than
@@ -984,10 +987,18 @@ The rules:
 - **Zero the 48-byte header** before the first call of a drive, exactly as you
   zero the gate array, then write the stride. The rest of the region needs no
   zeroing: it is written before it is read.
-- **Too small is not an error.** The sweep refuses a region it cannot fill and
-  the drive falls back to walking. The answer is identical, only slower. This
-  is the same rule `out_cap` underflow has.
-- **A header that contradicts itself IS an error.** A stride below 1 — or, on a
+- **Too small is not an error — but it is QUADRATIC.** The sweep refuses a
+  region it cannot fill and the drive falls back to walking: the answers are
+  identical, the same rule `out_cap` underflow has, but the walk is the very
+  drive the cache exists to avoid — measured ×3.98 per input doubling on an
+  overlapping set over 4 KB (45,339 fuel/byte against 621 with a region of the
+  right size, and 649 for a standalone module handed no region at all, which
+  then uses its own). Size the region from the formula with the compiler's
+  inputs — the sweep column's width and the pattern count a generated stub
+  carries, `--diag-json`'s `cache_bytes_per_byte`, or
+  `compile.SetOverlapCacheSizing` — never from a guess.
+- **A header that contradicts itself IS an error.** A `cache_len` below the
+  48-byte header, a stride below 1 — or, on a
   later call, a header no sweep could have written (a floor past the input, a
   block count other than the one the input length, floor and stride imply, a
   block buffer the declared `cache_len` cannot hold) — returns **`-4`** rather than degrading

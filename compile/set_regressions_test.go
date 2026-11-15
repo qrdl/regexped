@@ -316,13 +316,13 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	// The CHECKPOINT PASS, which is what the whole-drive sweep became: it holds
 	// the same hazard, since its working columns live in TABLE memory while the
 	// cache it writes is the CALLER's.
-	body := emitCkptPassBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
+	body := emitCkptPassBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff, -1)
 
 	// Count memory-0 i32 loads/stores. The row writer and the header writer
 	// legitimately use them — they address the CALLER's scratch — so the test
 	// is a bound, pinned against the standalone body which uses memory 0 for
 	// everything.
-	standalone := emitCkptPassBody(cs, 0, cs.overlapDPColOff)
+	standalone := emitCkptPassBody(cs, 0, cs.overlapDPColOff, -1)
 	if got, want := countMem0Access(body), countMem0Access(standalone); got >= want {
 		t.Errorf("the embedded sweep body makes %d memory-0 i32 accesses and the standalone one %d: "+
 			"the column loads/stores are still going to memory 0, i.e. to the host's heap", got, want)
@@ -338,7 +338,7 @@ func TestOverlapDPColumnsUseTableMemory(t *testing.T) {
 	// into the caller's region, so dst is 0 and src the table; the load is the
 	// reverse. BOTH bodies are checked, because the pass writes checkpoints and
 	// the block materialiser reads them.
-	block := emitCkptBlockBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff)
+	block := emitCkptBlockBody(cs, 1 /* tableMemIdx */, cs.overlapDPColOff, -1)
 	for _, tc := range []struct {
 		name string
 		body []byte
@@ -706,5 +706,55 @@ func TestSetMemberCornerShapes(t *testing.T) {
 			}
 			validateWASM(t, wasm)
 		})
+	}
+}
+
+// TestSetTablesSharedAcrossSets compiles an overlapping set whose no-cache
+// companion keeps the same buckets: their suffix tables are named at the
+// main set's addresses (moduleGlobals.suffixShare), so no table of 1 KB or
+// more appears twice in the module. Before, the companion emitted 21,248 of
+// its bytes again (11,008 + 6,656 + 3,584).
+func TestSetTablesSharedAcrossSets(t *testing.T) {
+	pats := []string{`AKIA[0-9A-Z]{16}`, `aws_secret_access_key\s*=\s*[0-9a-zA-Z/+]{40}`, `ghp_[0-9a-zA-Z]{36}`,
+		`gho_[0-9a-zA-Z]{36}`, `ghu_[0-9a-zA-Z]{36}`, `eyJ[0-9a-zA-Z_\-]{20,}\.[0-9a-zA-Z_\-]{20,}\.`,
+		`xox[baprs]-[0-9a-zA-Z\-]{10,}`, `sk_live_[0-9a-zA-Z]{24,}`, `sk_test_[0-9a-zA-Z]{24,}`, `AIza[0-9A-Za-z\-_]{35}`}
+	cfg := config.BuildConfig{ImportModule: "m"}
+	for i, p := range pats {
+		cfg.Patterns = append(cfg.Patterns, config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p})
+	}
+	cfg.Sets = []config.SetConfig{{Name: "s", Find: "f", Overlapping: true, Patterns: config.PatternSelector{All: true}}}
+	w, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var segs []dataSegment
+	for off := 8; off < len(w); {
+		id := w[off]
+		size, n, err := utils.DecodeULEB128(w[off+1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := w[off+1+n : off+1+n+int(size)]
+		if id == 11 {
+			_, m, err := utils.DecodeULEB128(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			segs = parseDataSegments(body[m:])
+		}
+		off += 1 + n + int(size)
+	}
+	if len(segs) == 0 {
+		t.Fatal("no data segments found")
+	}
+	seen := map[string]int32{}
+	for _, s := range segs {
+		if len(s.data) < 1024 {
+			continue
+		}
+		if at, ok := seen[string(s.data)]; ok {
+			t.Errorf("a %d-byte table at %d repeats the one at %d", len(s.data), s.offset, at)
+		}
+		seen[string(s.data)] = s.offset
 	}
 }

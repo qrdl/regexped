@@ -258,12 +258,11 @@ func TestIsAlternationDeterministicQuantifierLoop(t *testing.T) {
 		// loop is still a separate InstAlt, checked in full (non-quantifier
 		// path) — must remain unaffected by the quantifier-loop relaxation.
 		{`(cat|car)+`, EngineTDFA, "nested user alternation inside a loop, no captures inside it"},
-		// CLAUDE.md "Load-bearing engine-selection gates": an inverted
-		// class wider than 256 codepoints inside a quantifier loop still has an
-		// INDETERMINATE (empty) first-rune-set for getFirstRuneSet, so it must
-		// remain ambiguous → Backtracking, even though it's a quantifier loop.
-		// This must NOT be relaxed — see CLAUDE.md's explicit warning.
-		{`<([^>]+)>`, EngineBacktrack, "inverted-class gate: indeterminate branch inside quantifier loop stays ambiguous"},
+		// An inverted class inside a quantifier loop has a computable first
+		// set (ranges clipped to bytes), so the loop is deterministic → TDFA.
+		// It was Backtracking until 2026-11-15 (the inverted-class gate, see
+		// CLAUDE.md "Load-bearing engine-selection gates").
+		{`<([^>]+)>`, EngineTDFA, "inverted class inside a quantifier loop: computable first set"},
 	}
 	for _, c := range cases {
 		got, err := SelectEngine(c.pattern, CompileOptions{})
@@ -475,7 +474,8 @@ func TestSelectBestEngineWithTDFA_TableReuse(t *testing.T) {
 		{`^([^,]*),([^,]*)$`, false, "line anchors excluded from TDFA"},
 		{`\b(\w+)@(\w+)\b`, false, "word boundary excluded from TDFA"},
 		{`<(.+?)>`, false, "non-greedy excluded from TDFA"},
-		{`([^,]+),`, false, "inverted-class ambiguity → Backtracking (CLAUDE.md load-bearing gate)"},
+		{`([^,]+),`, true, "inverted class: a computable first set (byte ranges)"},
+		{`(([a-z])|(a))`, false, "overlapping alternation branches → Backtracking"},
 		{`[a-z]+`, false, "no captures at all — DFA path"},
 	}
 	for _, c := range cases {
@@ -1057,16 +1057,17 @@ func TestCountedChainEmission(t *testing.T) {
 // TestSelectEngineAnalysesTheUnloweredProgram: the selector judges a
 // pattern's structure on the program as written, and only builds its TDFA on
 // the lowered one. In byte mode the two are one program, so these byte-mode
-// answers are today's, pinned (CLAUDE.md's load-bearing selector gates); in
-// Unicode mode a pattern of Unicode classes still selects and compiles.
+// answers are today's, pinned; in Unicode mode a pattern of Unicode classes
+// still selects and compiles.
 func TestSelectEngineAnalysesTheUnloweredProgram(t *testing.T) {
 	for _, c := range []struct {
 		pat  string
 		want EngineType
 	}{
-		{`<([^>]+)>`, EngineBacktrack},
-		{`([^,]+),`, EngineBacktrack},
-		{`KEY=([^&]+)&`, EngineBacktrack},
+		{`<([^>]+)>`, EngineTDFA},
+		{`([^,]+),`, EngineTDFA},
+		{`KEY=([^&]+)&`, EngineTDFA},
+		{`(([a-z])|(a))`, EngineBacktrack},
 		{`(a+)(b+)`, EngineTDFA},
 	} {
 		if got, err := SelectEngine(c.pat, CompileOptions{}); err != nil || got != c.want {
@@ -1084,12 +1085,11 @@ func TestSelectEngineAnalysesTheUnloweredProgram(t *testing.T) {
 	}
 }
 
-// TestSelectEngineUnicodeComputesWideFirstSets pins the one selection rule
-// that differs by mode: in Unicode mode a class of any width, `.` and a folded
-// literal have a computable first set, so a capture pattern over them is not
-// ambiguous for that reason alone and takes a TDFA — while byte mode keeps the
-// inverted-class protection, and an alternation whose branches really overlap
-// stays on Backtracking in both.
+// TestSelectEngineUnicodeComputesWideFirstSets pins the first-set rule in both
+// modes: a class of any width, `.` and a folded literal have a computable
+// first set — codepoint ranges, clipped to bytes in byte mode — so a capture
+// pattern over them is not ambiguous for that reason alone and takes a TDFA,
+// while an alternation whose branches really overlap stays on Backtracking.
 func TestSelectEngineUnicodeComputesWideFirstSets(t *testing.T) {
 	for _, c := range []struct {
 		pat           string
@@ -1097,9 +1097,12 @@ func TestSelectEngineUnicodeComputesWideFirstSets(t *testing.T) {
 	}{
 		{`(\pL+)\s(\pN+)`, EngineTDFA, 0},
 		{`(\pL+)@(\pL+)`, EngineTDFA, 0},
-		{`<([^>]+)>`, EngineTDFA, EngineBacktrack},
-		{`([^,]+),`, EngineTDFA, EngineBacktrack},
-		{`(.+)=(.+)`, EngineTDFA, EngineBacktrack},
+		{`<([^>]+)>`, EngineTDFA, EngineTDFA},
+		{`([^,]+),`, EngineTDFA, EngineTDFA},
+		{`(.+)=(.+)`, EngineTDFA, EngineTDFA},
+		{`([^,\n]+),([^,\n]+)`, EngineTDFA, EngineTDFA},
+		{`(\S+)\s+(\S+)`, EngineTDFA, EngineTDFA},
+		{`(([a-z])|(a))`, EngineBacktrack, EngineBacktrack},
 		{`((\pL)|(\pN))`, EngineTDFA, 0},
 		{`((\pL)|(a))`, EngineBacktrack, 0},
 		{`((?i:é)|(É))`, EngineBacktrack, 0},
@@ -1184,6 +1187,14 @@ func TestFirstRuneRanges(t *testing.T) {
 	}
 	if !rangesOverlap([]rune{'a', 'c'}, []rune{'c', 'd'}) || rangesOverlap([]rune{'a', 'b', 'x', 'y'}, []rune{'c', 'w', 'z', 'z'}) {
 		t.Error("rangesOverlap: wrong answer on touching or interleaved ranges")
+	}
+	// Byte mode clips to what a byte can be: a negated class's tail is cut at
+	// 0xFF and a range wholly past it (a fold orbit's Kelvin sign) goes.
+	if got := clipToByteRanges([]rune{0, ',' - 1, ',' + 1, 0x10FFFF}); !slices.Equal(got, []rune{0, ',' - 1, ',' + 1, 0xFF}) {
+		t.Errorf("clipToByteRanges([^,]) = %v, want [0 43 45 255]", got)
+	}
+	if got := clipToByteRanges([]rune{'K', 'K', 'k', 'k', 0x212A, 0x212A}); !slices.Equal(got, []rune{'K', 'K', 'k', 'k'}) {
+		t.Errorf("clipToByteRanges((?i)k) = %v, want [K K k k]", got)
 	}
 	// An unknowable first set keeps an alternation ambiguous in Unicode mode
 	// too: here one branch is a Fail.

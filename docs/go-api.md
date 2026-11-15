@@ -158,7 +158,7 @@ stub passes the whole input on every call and the WASM export takes the
 position as an argument, so a leading `\b`, `\B`, `^` or `(?m:^)` at
 `offset > 0` is judged against the real preceding byte.
 
-This holds for `find`, `groups` and `named_groups` alike, and for every engine
+This holds for `find` and `groups` alike, and for every engine
 — the conversion is complete, so there is no longer a shape whose left context
 is judged against a slice edge.
 
@@ -196,7 +196,7 @@ func (iter *<find>Iter) Matches() iter.Seq[SetMatch]
 func (iter *<find>Iter) Err() error
 ```
 
-`<MatchAll>` and `<ScanAll>` are iterators rather than slices: the ABI hands
+`<match_all>` and `<scan_all>` are iterators rather than slices: the ABI hands
 back a bitmask whose set bits can be yielded lazily with nothing materialised,
 so a caller who stops early allocates nothing. `slices.Collect` gives you a
 slice when you want one.
@@ -224,8 +224,8 @@ for patternID := range kindSeq {
 }
 ```
 
-The iterator owns one reusable tuple buffer sized from `<set>_pattern_count`
-and a zeroed gate array sized from `<set>_id_space` — the gate array is indexed by
+The iterator owns one reusable tuple buffer sized from `<Set>PatternCount`
+and a zeroed gate array sized from `<Set>IDSpace` — the gate array is indexed by
 pattern id, so the two lengths differ for a named subset and for a set with
 regexps of its own. Both overlap
 policies take the array; see [sets.md](sets.md) for what the overlapping body

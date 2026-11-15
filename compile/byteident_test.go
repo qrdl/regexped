@@ -198,7 +198,7 @@ func TestByteIdenticalUnicodeSetFixtures(t *testing.T) {
 		d := diags[0]
 		union := d.UnionScan != nil && d.UnionScan.Used
 		if d.Mode != "unicode" || union != c.union || (len(d.SplitMembers) > 0) != c.split ||
-			(d.CacheBytesPerByte > 0) != c.cache || (d.Frontend != "scalar") != c.literal {
+			(d.CacheBytesPerByte > 0) != c.cache || (d.Frontend != "scalar" && d.Frontend != "none") != c.literal {
 			t.Errorf("%s: mode %s, union scan %v, split %v, cache %d B/byte, frontend %s — not the shape it is named for",
 				c.name, d.Mode, union, d.SplitMembers, d.CacheBytesPerByte, d.Frontend)
 		}

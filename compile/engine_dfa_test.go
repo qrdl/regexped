@@ -2850,3 +2850,54 @@ func TestUnionSortedU16(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitASCIIRunStates: the twin a Unicode find automaton's ASCII run state
+// gets (splitASCIIRunStates) changes no answer — every position's accept flags
+// along a walk are the same with and without it, and the twin carries every
+// accept list — and only the shape it is for gets one.
+func TestSplitASCIIRunStates(t *testing.T) {
+	walk := func(tb *dfaTable, in string) string {
+		var sb strings.Builder
+		st := tb.startState
+		for i := 0; i < len(in); i++ {
+			if st = tb.transitions[st*256+int(in[i])]; st < 0 {
+				return sb.String() + "x"
+			}
+			fmt.Fprintf(&sb, "%v%v,", tb.midAcceptStates[st] != 0, tb.acceptStates[st] != 0)
+		}
+		return sb.String()
+	}
+	for _, tc := range []struct {
+		pat   string
+		twins int
+	}{
+		{`#\pL+`, 1},
+		{`name=\pL+`, 1},
+		{`\b#\pL+`, 0},      // a boundary channel
+		{`#[a-z]+`, 0},      // its run crosses no multi-byte character
+		{`#\pL`, 0},         // no run
+		{`#[^\n]+`, 0},      // a run over more than 64 ASCII bytes
+		{`#[a-zA-Z]+é?`, 0}, // nothing enters the run from a multi-byte character
+		{`\pL*`, 0},         // the run state is the start state
+		{`#\pL+?`, 0},       // it accepts at once: the walk stops there
+	} {
+		before := compileTestDFAMode(t, tc.pat, true)
+		after := compileTestDFAMode(t, tc.pat, true)
+		after.midAcceptWide = map[int][]uint16{}
+		for st := range after.midAcceptStates {
+			after.midAcceptWide[st] = []uint16{uint16(st)} //nolint:gosec // a test table's state
+		}
+		splitASCIIRunStates(after)
+		if got := after.numStates - before.numStates; got != tc.twins {
+			t.Errorf("%s: %d twins, want %d", tc.pat, got, tc.twins)
+		}
+		if len(after.midAcceptWide) != len(after.midAcceptStates) {
+			t.Errorf("%s: %d accept lists for %d accepting states", tc.pat, len(after.midAcceptWide), len(after.midAcceptStates))
+		}
+		for _, in := range []string{"#привет #hello #straße", "name=Иван name=John", "#東京#a", "жж#ж", "#a\xd0\xb6b", "#\xd0"} {
+			if b, a := walk(before, in), walk(after, in); b != a {
+				t.Errorf("%s over %q: accepts %s, with the twin %s", tc.pat, in, b, a)
+			}
+		}
+	}
+}

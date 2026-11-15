@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -731,3 +732,57 @@ patterns:
 		}
 	}
 }
+
+// TestCmdMergeToStdout: `-o -` merges into a temporary file and copies it to
+// stdout, for modules and components alike (both tools write files), and
+// leaves no file named "-" behind.
+func TestCmdMergeToStdout(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGEXPED_MOCK_WASM_MERGE", "1")
+	dir := t.TempDir()
+	mainWasm := filepath.Join(dir, "main.wasm")
+	regexWasm := filepath.Join(dir, "regexp.wasm")
+	if err := os.WriteFile(mainWasm, []byte("mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(regexWasm, embeddedModule(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	t.Chdir(dir)
+	if err := CmdMerge(config.BuildConfig{WasmMergePath: exe}, mainWasm, "-", []string{regexWasm}); err != nil {
+		t.Fatalf("CmdMerge: %v", err)
+	}
+	if buf.String() != "mock" {
+		t.Errorf("stdout = %q, want the merged module", buf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "-")); err == nil {
+		t.Error(`a file named "-" was written`)
+	}
+
+	// A merge that fails reports its own error; one that writes nothing, and a
+	// stdout that refuses the bytes, are errors too.
+	if err := CmdMerge(config.BuildConfig{WasmMergePath: filepath.Join(dir, "missing")}, mainWasm, "-", []string{regexWasm}); err == nil {
+		t.Error("a failed merge to stdout reported success")
+	}
+	if err := toStdout(func(string) error { return nil }); err == nil {
+		t.Error("a merge that wrote no file reported success")
+	}
+	stdout = failingWriter{}
+	if err := toStdout(func(tmp string) error { return os.WriteFile(tmp, []byte("x"), 0o644) }); err == nil || !strings.Contains(err.Error(), "write stdout") {
+		t.Errorf("a refused stdout: err = %v", err)
+	}
+	t.Setenv("TMPDIR", filepath.Join(dir, "no-such-dir"))
+	if err := toStdout(func(string) error { return nil }); err == nil {
+		t.Error("a temporary directory that cannot be made reported success")
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, os.ErrClosed }

@@ -88,6 +88,9 @@ func searchKeeps(sizes map[string]compile.SearchSize) (notes, btMemo bool) {
 func jsSearchHelpers(ts bool, sizes map[string]compile.SearchSize) string {
 	notes, btMemo := searchKeeps(sizes)
 	out := ""
+	if notes || btMemo {
+		out += jsU32Helper(ts)
+	}
 	if notes {
 		out += jsNotesHelper(ts)
 	}
@@ -97,14 +100,38 @@ func jsSearchHelpers(ts bool, sizes map[string]compile.SearchSize) string {
 	return out
 }
 
+// jsU32Helper is the JS/TS helper the notes and memo helpers read a block's
+// words with. They run after every call that found a match, and a DataView
+// made per call to read one word was an allocation per call per block; this
+// reads through _mem, re-attached only when a grow inside the call detached it.
+func jsU32Helper(ts bool) string {
+	sig := "function _u32(at) {"
+	mem := "_exp.memory.buffer"
+	if ts {
+		sig = "function _u32(at: number): number {"
+		mem = "(_exp.memory as WebAssembly.Memory).buffer"
+	}
+	idx := func(k string) string {
+		if ts {
+			return "_mem[at" + k + "]!"
+		}
+		return "_mem[at" + k + "]"
+	}
+	return sig + "\n" +
+		"    const b = " + mem + ";\n" +
+		"    if (_mem.buffer !== b) _mem = new Uint8Array(b);\n" +
+		"    return (" + idx("") + " | " + idx(" + 1") + " << 8 | " + idx(" + 2") + " << 16 | " + idx(" + 3") + " << 24) >>> 0;\n" +
+		"}\n\n"
+}
+
 // jsNotesHelper is the JS/TS helper that allocates a search's notes once the
 // module has armed it — or, with pre, at once: a BATCHING iterator's one call
 // runs many finds, and notes handed over only between calls would leave a
 // call as large as the input without any (one call, ×4 per doubling).
 func jsNotesHelper(ts bool) string {
-	sig := "function _notes(blk, len, nb, name, pre) {"
+	sig := "function _notes(owner, blk, len, nb, name, pre) {"
 	if ts {
-		sig = "function _notes(blk: number, len: number, nb: number, name: string, pre?: boolean): Error | null {"
+		sig = "function _notes(owner: number, blk: number, len: number, nb: number, name: string, pre?: boolean): Error | null {"
 	}
 	mem := "_exp.memory.buffer"
 	if ts {
@@ -114,13 +141,12 @@ func jsNotesHelper(ts bool) string {
     // A search the module has marked armed — it read past its matches often
     // enough to go quadratic — gets its notes, which the module then reads and
     // writes on every later call of this search (docs/wasm.md, "The search
-    // block"). Carved from the bump like a region, so they live as long as
-    // the iterators do. No memory is RETURNED, not thrown: the match the
+    // block"). A region of the iterator's own (owner), freed with it. No
+    // memory is RETURNED, not thrown: the match the
     // caller just got is right, and the iterator delivers it first. A batching
     // iterator asks up front (pre): the module uses them from the call after
     // the one that arms, which may be the next find inside the same call.
-    const dv = new DataView(%[2]s);
-    if ((!pre && dv.getUint32(blk + %[3]d, true) === 0) || dv.getUint32(blk + %[4]d, true) !== 0) return null;
+    if ((!pre && _u32(blk + %[3]d) === 0) || _u32(blk + %[4]d) !== 0) return null;
     const n = (len + 1) * nb, at = _align(_bump);
     try {
         _grow(at + n);
@@ -129,6 +155,10 @@ func jsNotesHelper(ts bool) string {
         throw e;
     }
     _bump = at + n;
+    // A region of the iterator's own, freed with it (_close): left unrecorded,
+    // another iterator finishing first set _bump back below it, and the next
+    // one opened wrote its input over these.
+    _regs.push({ at, top: _bump, free: false, owner });
     _mem.fill(0, at, at + n);
     const dw = new DataView(%[2]s);
     dw.setUint32(blk + %[4]d, at, true);
@@ -142,18 +172,17 @@ func jsNotesHelper(ts bool) string {
 // jsBTMemoHelper is the JS/TS helper that gives a Backtracking search that
 // TRIPPED its memo (bt_search.go in compile/).
 func jsBTMemoHelper(ts bool) string {
-	sig := "function _btmemo(blk, len, nb, name) {"
+	sig := "function _btmemo(owner, blk, len, nb, name) {"
 	mem := "_exp.memory.buffer"
 	if ts {
-		sig = "function _btmemo(blk: number, len: number, nb: number, name: string): Error | null {"
+		sig = "function _btmemo(owner: number, blk: number, len: number, nb: number, name: string): Error | null {"
 		mem = "(_exp.memory as WebAssembly.Memory).buffer"
 	}
 	return fmt.Sprintf(`%[1]s
     // A Backtracking search whose work budget ran out gets the memo its
     // fallback then keeps for the rest of the search, so a (state, position)
     // one call ruled out stays ruled out in the next.
-    const dv = new DataView(%[2]s);
-    if (dv.getUint32(blk + %[3]d, true) !== %[6]d || dv.getUint32(blk + %[4]d, true) !== 0) return null;
+    if (_u32(blk + %[3]d) !== %[6]d || _u32(blk + %[4]d) !== 0) return null;
     const n = (len + 1) * nb, at = _align(_bump);
     try {
         _grow(at + n);
@@ -162,6 +191,10 @@ func jsBTMemoHelper(ts bool) string {
         throw e;
     }
     _bump = at + n;
+    // A region of the iterator's own, freed with it (_close): left unrecorded,
+    // another iterator finishing first set _bump back below it, and the next
+    // one opened wrote its input over these.
+    _regs.push({ at, top: _bump, free: false, owner });
     _mem.fill(0, at, at + n);
     const dw = new DataView(%[2]s);
     dw.setUint32(blk + %[4]d, at, true);
@@ -212,10 +245,10 @@ func jsSearch(funcName string, sz compile.SearchSize, outBytes string, ts bool) 
 func jsAfterCall(funcName string, sz compile.SearchSize) string {
 	var parts []string
 	if sz.NotesBytes > 0 {
-		parts = append(parts, fmt.Sprintf("_fail = _fail || _notes(_blk, len, %d, '%s');", sz.NotesBytes, funcName))
+		parts = append(parts, fmt.Sprintf("_fail = _fail || _notes(_inBase, _blk, len, %d, '%s');", sz.NotesBytes, funcName))
 	}
 	if sz.BTMemoBytes > 0 {
-		parts = append(parts, fmt.Sprintf("_fail = _fail || _btmemo(_blk, len, %d, '%s');", sz.BTMemoBytes, funcName))
+		parts = append(parts, fmt.Sprintf("_fail = _fail || _btmemo(_inBase, _blk, len, %d, '%s');", sz.BTMemoBytes, funcName))
 	}
 	return strings.Join(parts, " ")
 }
@@ -252,7 +285,7 @@ func jsWithSearch(src, funcName string, sz compile.SearchSize, ts, groups bool, 
 			out = append(out, strings.Split(strings.TrimSuffix(p.decl, "\n"), "\n")...)
 			if sz.NotesBytes > 0 {
 				// The batch export runs many finds per call: notes up front.
-				out = append(out, indentOf(ln)+fmt.Sprintf("if (_batched) _fail = _notes(_blk, len, %d, '%s', true);", sz.NotesBytes, funcName))
+				out = append(out, indentOf(ln)+fmt.Sprintf("if (_batched) _fail = _notes(_inBase, _blk, len, %d, '%s', true);", sz.NotesBytes, funcName))
 			}
 			found["open"] = true
 			continue
@@ -623,11 +656,11 @@ func cWithSearch(h, c, funcName, iterType, ffi string, sz compile.SearchSize, gr
 			"    int pending;\n} "+iterType+";")
 	// Zeroed FIRST, before any argument check can return: a later _free of an
 	// iterator whose _init failed must find nothing to free.
-	rep(&c, "    if (!iter || !input) return RX_ERR_NULL_ARG;\n",
+	rep(&c, "    if (!iter || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */\n",
 		fmt.Sprintf("    if (!iter) return RX_ERR_NULL_ARG;\n"+
 			"    for (int w = 0; w < %d; w++) iter->search[w] = 0;\n"+
 			"    iter->notes = 0;\n    iter->btmemo = 0;\n    iter->given = 0;\n    iter->pending = 0;\n"+
-			"    if (!input) return RX_ERR_NULL_ARG;\n", abi.SearchBlockBytes/8))
+			"    if (!input && len > 0) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */\n", abi.SearchBlockBytes/8))
 	pendingCheck := "    if (iter->pending) { int e = iter->pending; iter->pending = 0; iter->done = 1; return e; }\n"
 	rep(&c, "    if (!iter) return;\n    iter->done = 1;\n}",
 		"    if (!iter) return;\n    iter->done = 1;\n#if RX_SEARCH_NOTES\n"+
@@ -777,10 +810,10 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 		var b strings.Builder
 		for k, sz := range blocks {
 			if sz.NotesBytes > 0 {
-				fmt.Fprintf(&b, "%s_fail = _fail || _notes(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
+				fmt.Fprintf(&b, "%s_fail = _fail || _notes(_inBase, _sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
 			}
 			if sz.BTMemoBytes > 0 {
-				fmt.Fprintf(&b, "%s_fail = _fail || _btmemo(_sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.BTMemoBytes, find)
+				fmt.Fprintf(&b, "%s_fail = _fail || _btmemo(_inBase, _sd + %d, len, %d, '%s');\n", indent, setBlocksAt+k*abi.SearchBlockBytes, sz.BTMemoBytes, find)
 			}
 		}
 		return b.String()
@@ -800,10 +833,14 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
         throw e;
     }
     _bump = _sdEnd;
+    _regs.push({ at: _sd, top: _bump, free: false, owner: _inBase }); // freed with the iterator (_close)
     _mem.fill(0, _sd, _sdEnd);
     {
-        const _d = new Uint32Array(%[3]s, scratchBase, 4);
-        new Uint32Array(%[3]s, _sd, 6).set([%[4]d, _d[1], _d[2], _d[3], _sd + %[5]d, %[6]d]);
+        // The ordinary descriptor's four fields, then this one's magic and
+        // blocks over them: written by index, read by none.
+        const _v = new Uint32Array(%[3]s, _sd, 6);
+        _v.set(new Uint32Array(%[3]s, scratchBase, 4));
+        _v[0] = %[4]d; _v[4] = _sd + %[5]d; _v[5] = %[6]d;
     }
     // A block's notes or memo that could not be had: thrown at the NEXT call,
     // so the matches of the call that asked for them are delivered.
@@ -847,7 +884,7 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 			// block gets its notes up front, not when it arms.
 			for k, sz := range blocks {
 				if sz.NotesBytes > 0 {
-					pre += fmt.Sprintf("    _fail = _fail || _notes(_sd + %d, len, %d, '%s', true);\n", setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
+					pre += fmt.Sprintf("    _fail = _fail || _notes(_inBase, _sd + %d, len, %d, '%s', true);\n", setBlocksAt+k*abi.SearchBlockBytes, sz.NotesBytes, find)
 				}
 			}
 		}

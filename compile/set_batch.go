@@ -1086,6 +1086,17 @@ func (cs *compiledSet) emitBatchWalk(b []byte, cache overlapCacheCtx, x batchWal
 		b = append(b, 0x42)
 		b = utils.AppendSLEB128_64(b, wantedCursor())
 		b = append(b, 0x0F, 0x0B) // return; end if
+		// And abi.OverlapCacheMalformed when the cache is shorter than its
+		// header: the merge reports it at the start of every call, before
+		// anything is delivered, so with tuples in hand they go back first.
+		b = append(b, 0x20, x.lTotal, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+		b = append(b, 0x46, 0x04, 0x40)                 // i32.eq; if
+		b = append(b, 0x20, x.lCount, 0x41, 0x00, 0x4A) // count > 0
+		b = append(b, 0x04, 0x40, 0x0C, 0x03, 0x0B)     // br 3 = block $exit
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, malformedCursor())
+		b = append(b, 0x0F, 0x0B) // return; end if
 	}
 
 	// The WALK's extent for this position, charged before any exit below: a

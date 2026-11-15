@@ -33,7 +33,8 @@ import (
 
 // btSearch is a Backtracking body's view of the search block.
 type btSearch struct {
-	g uint32 // the module's search global
+	g       uint32 // the module's search global
+	epochP1 uint32 // the arm epoch + 1, bumped when a search trips (searchRef)
 }
 
 // btSearchFor is the search context for a Backtracking body compiled under o,
@@ -44,7 +45,8 @@ func btSearchFor(o *CompileOptions) *btSearch {
 	if o == nil || o.globals == nil {
 		return nil
 	}
-	return &btSearch{g: o.globals.Search()}
+	r := o.globals.SearchRef()
+	return &btSearch{g: r.g, epochP1: r.epochP1}
 }
 
 func (c *btSearch) blk(b []byte) []byte { return appendGlobalGet(b, c.g) }
@@ -138,6 +140,7 @@ func (c *btSearch) emitFindTripped(b []byte, blk uint32) []byte {
 	b = btLocalGet(b, blk)
 	b = append(b, 0x41, abi.SearchBTTripped)
 	b = c.store32(b, btSearchState)
+	b = emitBumpEpoch(b, c.epochP1)
 	return append(b, 0x0B)
 }
 

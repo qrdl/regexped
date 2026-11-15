@@ -3,6 +3,7 @@ package generate
 import (
 	"bytes"
 	"fmt"
+	"go/format"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -385,8 +386,20 @@ func compileRust(t *testing.T, dir, path string) {
 // compileGo builds for wasip1, the only target the stub's build tag admits.
 // It needs a module and a main function: the stub is `package main` and would
 // otherwise fail to link rather than to compile.
-func compileGo(t *testing.T, dir, _ string) {
+func compileGo(t *testing.T, dir, path string) {
 	t.Helper()
+	// gofmt-clean, as Go code is expected to be: the stub sits in the user's
+	// package, where `gofmt -l` in CI reports it. The templates are written
+	// formatted; nothing formats them at generate time.
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if formatted, err := format.Source(src); err != nil {
+		t.Errorf("the Go stub does not parse: %v", err)
+	} else if !bytes.Equal(formatted, src) {
+		t.Errorf("the Go stub is not gofmt-clean:\n%s", lineDiff(string(src), string(formatted)))
+	}
 	write := func(name, content string) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -551,8 +564,9 @@ func writeESMPackageJSON(t *testing.T, dir string) {
 
 // compileTS type-checks with the global `tsc` under the options the Node
 // examples build with — strict, and no unused locals or parameters — so this arm
-// and the examples check the same thing. The stub's own documentation promises it
-// compiles under exactly those flags.
+// and the examples check the same thing, plus noUncheckedIndexedAccess, a
+// common strictness flag outside `strict` that a stub compiled under the
+// user's tsconfig must survive (it gave 89 errors).
 func compileTS(t *testing.T, dir, path string) {
 	t.Helper()
 	writeESMPackageJSON(t, dir)
@@ -564,6 +578,7 @@ func compileTS(t *testing.T, dir, path string) {
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
     "noEmit": true
   },
   "files": ["` + filepath.Base(path) + `"]
@@ -660,4 +675,35 @@ func TestGeneratedCComponentBuildsWithItsOwnRecipe(t *testing.T) {
 	args := append(append([]string{}, flags...), "-o", filepath.Join(dir, "core.wasm"),
 		filepath.Join(dir, "main.c"), filepath.Join(dir, "stubs.c"))
 	run(t, dir, nil, clang, args...)
+}
+
+// lineDiff lists the lines of a that b changes, as `-`/`+` pairs, for a
+// failure message: enough to see which template a gofmt hunk comes from.
+func lineDiff(a, b string) string {
+	al, bl := strings.Split(a, "\n"), strings.Split(b, "\n")
+	var out strings.Builder
+	i, j := 0, 0
+	for i < len(al) && j < len(bl) && out.Len() < 8000 {
+		if al[i] == bl[j] {
+			i, j = i+1, j+1
+			continue
+		}
+		fmt.Fprintf(&out, "line %d:\n- %q\n+ %q\n", i+1, al[i], bl[j])
+		// Resynchronise on the next equal line, either side.
+		k := 1
+		for ; k < 6; k++ {
+			if i+k < len(al) && al[i+k] == bl[j] {
+				i += k
+				break
+			}
+			if j+k < len(bl) && al[i] == bl[j+k] {
+				j += k
+				break
+			}
+		}
+		if k == 6 {
+			i, j = i+1, j+1
+		}
+	}
+	return out.String()
 }

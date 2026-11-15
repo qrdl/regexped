@@ -74,7 +74,9 @@ func goStub(cfg config.BuildConfig, out string) error {
 	sb.WriteString(singleBody)
 	sb.WriteString(setBody)
 	warnUnexportedGoNames(cfg, pkgName)
-	combined := applyNamespace(cfg, "go", sb.String())
+	// One newline at the end, as gofmt leaves a file: the sections each end
+	// with a blank line before the next.
+	combined := strings.TrimRight(applyNamespace(cfg, "go", sb.String()), "\n") + "\n"
 
 	if out == "-" {
 		_, err := fmt.Print(combined)
@@ -135,8 +137,12 @@ func %s(input []byte) (id int, ok bool, err error) {
 	// Tested EXACTLY, not as "negative": -1 is a real answer (nothing matched)
 	// and the sentinel means the engine gave up. Folding the two — which this
 	// did — turns "unknown" into a confident "no".
-	if result == %d { return 0, false, ErrBacktrackOverflow }
-	if result < 0 { return 0, false, nil }
+	if result == %d {
+		return 0, false, ErrBacktrackOverflow
+	}
+	if result < 0 {
+		return 0, false, nil
+	}
 	return int(result), true, nil
 }
 
@@ -167,7 +173,9 @@ func %s(input []byte) (iter.Seq[int], error) {
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
 			if bits[patternID/8]&(1<<uint(patternID%%8)) != 0 {
-				if !yield(patternID) { return }
+				if !yield(patternID) {
+					return
+				}
 			}
 		}
 	}, nil
@@ -189,7 +197,9 @@ func %s(input []byte) (iter.Seq[int], error) {
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
 			if mask&(1<<uint(patternID)) != 0 {
-				if !yield(patternID) { return }
+				if !yield(patternID) {
+					return
+				}
 			}
 		}
 	}, nil
@@ -208,8 +218,12 @@ func %s(input []byte, offset uint) (id int, ok bool, err error) {
 	result := ffi_%s(unsafe.Pointer(unsafe.SliceData(input)), int32(len(input)), int32(offset))
 	// Tested exactly, not as "negative": -1 is a real answer (no pattern
 	// matched), the sentinel means the engine gave up and the answer is unknown.
-	if result == %d { return 0, false, ErrBacktrackOverflow }
-	if result < 0 { return 0, false, nil }
+	if result == %d {
+		return 0, false, ErrBacktrackOverflow
+	}
+	if result < 0 {
+		return 0, false, nil
+	}
 	return int(result), true, nil
 }
 
@@ -231,7 +245,9 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
 			if bits[patternID/8]&(1<<uint(patternID%%8)) != 0 {
-				if !yield(patternID) { return }
+				if !yield(patternID) {
+					return
+				}
 			}
 		}
 	}, nil
@@ -252,7 +268,9 @@ func %s(input []byte, offset uint) (iter.Seq[int], error) {
 	return func(yield func(int) bool) {
 		for patternID := 0; patternID < %s; patternID++ {
 			if mask&(1<<uint(patternID)) != 0 {
-				if !yield(patternID) { return }
+				if !yield(patternID) {
+					return
+				}
 			}
 		}
 	}, nil
@@ -405,7 +423,8 @@ type %[1]sIter struct {
 	// before each call, because field 1 is the address of the gates slice.
 	scratch [4]uint32
 %[10]s
-	buf     [][3]int32
+	// The tuples the last call returned, not yet yielded.
+	buf [][3]int32
 	// tuples still owed at iter.offset, and how many of them were consumed.
 	pending  int32
 	consumed int32
@@ -562,9 +581,9 @@ func %[3]s(ptr unsafe.Pointer, length uint32, from uint32) int64
 // (start, end). Check it: an unchecked Err() means a silently truncated match
 // list.
 type %[1]sIter struct {
-	input   []byte
-	offset  uint
-	err     error
+	input  []byte
+	offset uint
+	err    error
 	// Set once iteration has finished, whether by exhausting the input or by
 	// recording an error. Without it a caller who ignores Err() and ranges
 	// again re-runs the identical failing call forever — the overflow is
@@ -911,11 +930,18 @@ const %s = %d
 	out.WriteString("// Index of each NAMED capture group. Index 0 is the whole match; unnamed\n" +
 		"// groups have no constant and are addressed by number.\n")
 	out.WriteString("const (\n")
+	// Aligned on the `=`, as gofmt aligns a const block.
+	width := 0
+	for _, name := range names {
+		if name != "" {
+			width = max(width, len(derivedConstName(funcName, name)))
+		}
+	}
 	for idx, name := range names {
 		if name == "" {
 			continue
 		}
-		fmt.Fprintf(&out, "\t%s = %d\n", derivedConstName(funcName, name), idx)
+		fmt.Fprintf(&out, "\t%-*s = %d\n", width, derivedConstName(funcName, name), idx)
 	}
 	out.WriteString(")\n\n")
 

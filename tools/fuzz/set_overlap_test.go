@@ -1511,6 +1511,42 @@ func TestOverlapCacheMalformedHeaderIsReported(t *testing.T) {
 	}
 }
 
+// TestOverlapCacheShorterThanItsHeaderIsMalformed: a non-zero cache_ptr with a
+// cache_len under the 48-byte header answers -4 from the first call — `find`,
+// the batch entry, and a split set's merge, which reads the header itself
+// (PR #43 review). Every field an entry reads is in the header, and a 40-byte
+// region was read at +44, past its end. The header alone (48) is a cache.
+func TestOverlapCacheShorterThanItsHeaderIsMalformed(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		pats  []string
+		input string
+	}{
+		{"kept cache", []string{`a+`, `[^\n]*ERROR`, `x?y`}, strings.Repeat("a", 1000)},
+		{"split, non-greedy member", []string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, stride := overlapCacheFor(c.input, c.pats)
+			for _, n := range []int32{1, 40, config.SetOverlapCheckpointHeaderBytes - 1} {
+				opt := &cacheDriveOpt{stride: &stride}
+				driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, n, engageAny, opt)
+				if opt.lastResult != abi.OverlapCacheMalformed {
+					t.Errorf("find, cache_len %d: returned %d, want %d", n, opt.lastResult, abi.OverlapCacheMalformed)
+				}
+				pos, count := driveBatchMalformed(t, c.pats, c.input, n, stride, false)
+				if pos != config.SetCursorMalformedPos || count != 0 {
+					t.Errorf("batch, cache_len %d: resume word 0x%X count %d, want the malformed sentinel", n, pos, count)
+				}
+			}
+			opt := &cacheDriveOpt{stride: &stride}
+			driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, config.SetOverlapCheckpointHeaderBytes, engageAny, opt)
+			if opt.lastResult == abi.OverlapCacheMalformed {
+				t.Error("find: the 48-byte header alone was reported as malformed")
+			}
+		})
+	}
+}
+
 // driveStride runs a `find` drive with a caller-chosen stride and returns what
 // the LAST call reported — which for a malformed header is the error itself.
 //
@@ -1555,11 +1591,13 @@ func TestOverlapCacheLaterCallValidatesHeader(t *testing.T) {
 		})
 	}
 
-	// And a region too small for even the header is a REFUSAL, not an error:
-	// the drive walks and the answer is identical.
-	if got := driveStride(t, pats, input, 40, stride); got < 0 {
-		t.Fatalf("a 40-byte region returned %d; too small to hold the header is a "+
-			"fallback to the walk, not an error", got)
+	// And a region too small for even the header is malformed too: every
+	// field read here is in the header, which a 40-byte region was read past
+	// (TestOverlapCacheShorterThanItsHeaderIsMalformed). It used to be a
+	// refusal, so the drive walked.
+	if got := driveStride(t, pats, input, 40, stride); got != abi.OverlapCacheMalformed {
+		t.Fatalf("a 40-byte region returned %d, want %d: shorter than the header is a malformed cache",
+			got, abi.OverlapCacheMalformed)
 	}
 }
 
@@ -2504,9 +2542,25 @@ func TestOverlapCacheLazyRegion(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			oracle := canonCache(overlapOracleCtx(t, c.pats, c.input))
 			full, stride := overlapCacheFor(c.input, c.pats)
+			// The region handed over whole: what the granted drive must match.
+			eager := &cacheDriveOpt{}
+			driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, full, engageAny, eager)
 			for _, mode := range []int{lazyGrant, lazyDecline} {
 				opt := &cacheDriveOpt{lazy: mode}
 				got := canonCache(driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, full, engageAny, opt))
+				// Granted, a split member's program sweep runs about when it
+				// does with the whole region — the work its own search charges
+				// stays near the eager drive's, not the quadratic walk's. The
+				// call that asks for the region was never answered at the start
+				// of the next call, and the sweep ran at the drive's end.
+				if mode == lazyGrant && eager.header[0] == 1 {
+					if opt.header[0] != 1 {
+						t.Errorf("granted, the program sweep never ran")
+					}
+					if w, e := opt.header[8], eager.header[8]; w > 2*e+64 {
+						t.Errorf("granted, the split member's search charged %d, the eager drive %d: the sweep ran late", w, e)
+					}
+				}
 				if fmt.Sprint(got) != fmt.Sprint(oracle) {
 					t.Errorf("find, lazy mode %d: %d tuples, want %d", mode, len(got), len(oracle))
 				}
@@ -2605,4 +2659,72 @@ func overlapOracleCtx(t *testing.T, pats []string, input string) [][3]int {
 		}
 	}
 	return out
+}
+
+// TestDefaultStateRestartContract is the raw-ABI contract a caller that hands
+// a standalone set no state over relies on, over a buffer it rewrites in place
+// (docs/complexity.md, "Callers that hand nothing over"): the module's default
+// state carries over while each call continues the drive, and a NEW drive —
+// the text rewritten, the gate array zeroed — that restarts at an offset no
+// greater than the last one is a new drive, whatever the old text left behind:
+// its answer cache (overlapping, swept on the first text) must not answer the
+// second. The neighbouring routes — the region too small, offered lazily —
+// are FuzzSetRoutes'; merge's refusal of a standalone module is merge's own
+// test.
+func TestDefaultStateRestartContract(t *testing.T) {
+	pats := []string{`foo\w+`, `bar\w+`}
+	a, b := strings.Repeat("foo", 100), strings.Repeat("bar", 100)
+	d := newCacheDrive(t, pats, a, cacheLayout{offer: false})
+	defer d.release()
+	drive := func(from int32, calls int) [][3]int {
+		var out [][3]int
+		for k := 0; calls < 0 || k < calls; k++ {
+			res, err := d.fn.Call(d.store, d.inBase, int32(len(a)), from, d.desc, d.outPtr, int32(len(pats)))
+			if err != nil {
+				t.Fatalf("set_find: %v", err)
+			}
+			n := res.(int32)
+			if n <= 0 {
+				break
+			}
+			buf := d.buf()
+			for i := int32(0); i < n; i++ {
+				base := int(d.outPtr) + int(i)*12
+				out = append(out, [3]int{int(int32(readU32(buf, base))), int(int32(readU32(buf, base+4))), int(int32(readU32(buf, base+8)))})
+			}
+			from = int32(readU32(buf, int(d.outPtr)+4)) + 1
+			if k > 4*len(a) {
+				t.Fatal("the drive did not terminate")
+			}
+		}
+		return out
+	}
+	// Far enough into A for its drive to have swept and cached A's answers.
+	first := drive(0, 40)
+	if len(first) == 0 {
+		t.Fatal("text A answered nothing")
+	}
+	for _, from := range []int32{0, 40} {
+		buf := d.buf()
+		copy(buf[d.inBase:], b)
+		for i := int32(0); i < 4*int32(len(pats)); i++ {
+			buf[d.gatePtr+i] = 0
+		}
+		got := canonCache(drive(from, -1))
+		var want [][3]int
+		for _, m := range overlapCacheOracle(pats, b) {
+			if m[1] >= int(from) {
+				want = append(want, m)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(canonCache(want)) {
+			t.Errorf("text B from %d after A's drive: %d tuples, Go %d\n got  %v\n want %v", from, len(got), len(want), got, want)
+		}
+		// And back to A for the next round, from 0: a new drive again.
+		copy(d.buf()[d.inBase:], a)
+		for i := int32(0); i < 4*int32(len(pats)); i++ {
+			d.buf()[d.gatePtr+i] = 0
+		}
+		drive(0, 40)
+	}
 }

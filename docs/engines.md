@@ -8,6 +8,7 @@ Regexped implements four engines: **Compiled DFA**, **DFA**, **TDFA**, and **Bac
 
 Selection priority (highest first):
 
+0. **No capture pass** — a capture pattern whose ONE group is the whole match, or the match less a literal prefix and suffix (`(a+)$`, `<([^>]+)>`, `([^,]+),`): the find locates the match and the group is read off it, with no capture engine at all (`compile/whole_capture.go`)
 1. **TDFA** — pattern has capture groups AND qualifies for tagged-DFA (no non-greedy quantifiers, no line anchors, no word boundaries, no ambiguous alternations) AND TDFA has ≤ `MaxDFAStates` states AND ≤ `MaxTDFARegs` registers
 2. **Backtracking** — pattern has capture groups but fails the TDFA check
 3. **Compiled DFA** — no captures; minimised DFA has ≤ 256 states (default threshold)
@@ -16,7 +17,7 @@ Selection priority (highest first):
 
 A pattern qualifies for TDFA if it has no:
 - Non-greedy quantifiers (`*?`, `+?`, `??`) anywhere in the pattern
-- Line anchors (`^`, `$`) anywhere in the pattern
+- Line anchors (`(?m)^`, `(?m)$`) or an end-of-text `$`/`\z` anywhere in the pattern (a beginning-of-text `^` is fine: `^(a+)b` takes a TDFA, `(a+)(b)$` Backtracking)
 - Word boundaries (`\b`, `\B`) anywhere in the pattern
 - Ambiguous alternations — see below
 
@@ -41,20 +42,27 @@ to select Backtracking before this fix, which also corrected a real
 register-copy-ordering bug that this pattern shape had been triggering (see
 [Register minimization and copy ordering](#register-minimization-and-copy-ordering)
 below). The one case that still disqualifies a quantifier loop regardless
-of overlap, in byte mode: either branch's first-byte set is *indeterminate* —
-e.g. an inverted class wider than 256 codepoints (`[^>]`, `.`). Such a
-pattern's path is deterministic in practice, and Backtracking checks a wide
-class with a few inline compares, which measured cheaper than a TDFA.
+of overlap: a branch with no computable first set — one that can reach the
+end of the match without consuming a byte.
 
-If a pattern has captures but fails the TDFA check (e.g. `<([^>]+)>`,
-`([^,]+),`, `(.*)(foo)` in byte mode — all disqualified by the
-indeterminate-branch rule above, not by mere overlap), the Backtracking
-engine is used automatically.
+First sets are codepoint ranges in both modes — a class of any width, `.` and
+a folded literal (its case-fold orbit) included, cut to 0x00-0xFF in byte
+mode — so a negated class is no obstacle: `<([^>]+)>`, `([^,]+),`,
+`(.*)(foo)`, `([^,\n]+),([^,\n]+)` and `(\S+)\s+(\S+)` all take a TDFA. Only
+an alternation whose branches really overlap — `(([a-z])|(a))`,
+`((a)|(ab))`, `((cat)|(car))`, `((\pL)|(a))` and `((?i:é)|(É))` in Unicode
+mode — goes to Backtracking, as do the shapes in the list above (`(a+?)b`,
+`\b(\w+)\b`, `(?m)^(a+)`).
 
-In Unicode mode no first set is indeterminate for its width: a class of any
-width, `.` and a folded literal (its case-fold orbit) are computed as
-codepoint ranges, and only an alternation whose branches really overlap
-(`((\pL)|(a))`, `((?i:é)|(É))`) goes to Backtracking. A lowered wide class is
+Until 2026-11-15 byte mode treated a class wider than 256 codepoints as having
+no first set and sent every such loop to Backtracking, which once measured
+cheaper there. It no longer is: over 54 capture patterns and six realistic
+inputs the TDFA cost 0% to −83% fuel per byte, none more (CSV
+`([^,\n]+),([^,\n]+)` 119.2 → 74.7 per byte; `<([^>]+)>` and `([^,]+),`
+themselves take the single-capture shortcut and run neither engine's capture
+body).
+
+In Unicode mode the same holds for a lowered wide class. A lowered wide class is
 a trie over the bytes of its UTF-8 sequences, with one arm per distinct lead
 byte range at the top (`\pL`: 34), which Backtracking still tries arm by arm,
 pushing a frame for each, so there the TDFA is the cheaper engine:
@@ -163,6 +171,16 @@ In find mode, a compile-time-selected fast-skip prologue avoids testing every by
 | **Teddy (1/2/3/4-byte tiers)** | 1–8 first-byte candidates; tier picked by how many leading bytes are jointly selective (nibble-table SIMD lookup per tier) |
 | **Shufti** | 9–16 first-byte candidates (unconditional), or 17–64 (only when a byte-rarity heuristic predicts it beats scalar, or the pattern was compiled with `hints: [prefer-no-match]`, which forces it regardless of the heuristic) — nibble-table SIMD set-membership test over the candidate set itself, not per-candidate comparisons. A set that is one or two contiguous byte ranges (`[a-z]`, `[a-zA-Z]`, `[!-~]`) is tested with two SIMD range compares per range instead of the nibble tables: same answer, half the instructions |
 | **Scalar** | 0 first-byte candidates, > 64 candidates, or a 17–64-candidate set the rarity heuristic predicts scalar wins for |
+| **Pair probe** | a literal prefix of 2+ bytes whose first byte is common in text: the chunk is tested at the prefix's two RAREST bytes (byte-rarity rank ≥ 240), each lane where both agree verified in full, while 64 or more bytes are left. `http` over URLs 4.67 → 1.81 fuel/byte, `Authorization` 18 → 1.81, `union select` 8.33 → 1.84; `ERROR`, whose first byte is already rare, keeps the hybrid prefix (1.44). The loop runs over pointers with the probe bytes as constants, 21 instructions per 16 bytes against the hybrid prefix's 23, so text that never holds the first byte costs no more: `secret` over 100 KB with no `s` 147,240 → 134,473 fuel, English prose 590,383 → 134,473. What it costs is its setup, once per call: a 64-byte input with no `s` 132 → 157, and a drive whose matches lie ~22 bytes apart (`the` over prose) +19% |
+| **Case-folded prefix** | a `(?i)` literal prefix: each byte is tested as the pair {x, x \| 0x20}, and in Unicode mode each two-byte case pair as one character (`(?i)привет`), used where the pattern's exact literal prefix is shorter than two bytes. `(?i)select` 5.88-6.23 → 2.0-2.9 fuel/byte, `(?i)привет` 20.4 → 3.26, `(?i)мир` 20.4 → 2.34. In Unicode mode an ASCII letter whose fold orbit leaves ASCII (`s` and `ſ`, `k` and K) keeps the walk |
+| **Line starts** | a find whose every match starts at the input's start or after a `\n` (`(?m)^…`): a SIMD scan for `\n`, with only line starts tried. `(?m)^[^,\n]*,` 99.4 → 8.5 fuel/byte, `(?m)^\w+=` 80.4 → 6.65 |
+
+**Short inputs.** The prefix scans read 16-byte chunks; with fewer than 16
+bytes left after the start, but at least eight starts to try and the bytes to
+read in memory, one masked chunk compares the prefix at every remaining start
+at once rather than walking them: `ERROR` over 15 bytes 234 → 138 fuel; under
+eight starts the walk is cheaper and is kept (`ERROR` over 5 bytes 54 fuel,
+60 with the probe).
 
 Every Teddy tier promotion (1-byte → 2-byte → 3-byte → 4-byte) additionally
 requires that **no** first-byte candidate's next byte lead to a
@@ -189,6 +207,25 @@ build when the text starts with such a byte, 37 when it starts with another
 **2. Mandatory literal extraction** (applied when the prefix is noisy but a selective literal exists deeper in the pattern): `FindMandatoryLit` analyzes the pattern's syntax tree to find the best fixed byte sequence that must appear in every match (e.g. `://` in `[a-zA-Z]{2,8}://[^\s]+`). The SIMD scan searches for that literal instead; a two-level outer loop (`$lit_outer` / `$outer`) adjusts candidate start positions using the literal's known min/max offset from the match start. A body reads the mandatory literal only when the pattern has no literal prefix of its own to scan for. A pattern's `anchor_literal:` makes the extraction walk past earlier literals to the named one, when that one starts at most 256 bytes into a match and only bounded parts come before it; otherwise the extraction keeps the literal it finds without the hint.
 
 Both mechanisms use WASM SIMD (simd128).
+
+### Keyword lists: a find over many literals
+
+A `find_func` whose pattern is a list of plain literals — `(?:select|insert|drop|…)`,
+optionally with a `\b` before and after — and whose words start with more than
+eight different bytes gets its own find: an Aho-Corasick automaton of the words
+(the one the set compiler's literal frontend builds), with a SIMD skip at its
+root that passes over 16 positions at a time where no word can begin (up to 64
+words). The general find's prefilter takes at most eight first bytes; past that
+it tried the DFA at nearly every letter, and past `max_dfa_states` (about 200
+words) the pattern fell to Backtracking.
+
+The answer is the alternation's: the leftmost start, and there the word listed
+first. Measured over 100 KB of English prose: 25 words 47-51 → 10 fuel per
+byte, 50 words 75-85 → 14-15, 500 words 110-125 (Backtracking) → 32. The
+module grows with the automaton (50 words: 7 KB → 139 KB; 500 words 416 KB →
+175 KB, byte-class compressed). `match_func` and `groups_func` on the same
+pattern keep their engines. A list that is case-insensitive (`(?i)`), holds a
+class repeat, or names an `anchor_literal:` keeps the general find.
 
 ### Literal-anchored find
 
@@ -313,6 +350,12 @@ ordinary text, but some shapes make it **quadratic** on a long run of bytes
 that keeps an attempt alive without ever matching: `a*b` over `a`×N (every
 attempt walks to the end), `\w+@\w+` over one long word, `\w+abc\d` over
 `abc`×N. At 64 KB that is billions of instructions for a single `find`.
+
+A pattern whose every match ENDS at the end of the input (`\.(?:exe|dll|bat)$`,
+`admin.*$`, `x\z`) gets the **suffix find**: no forward pass at all — the
+backward pass of the start-anywhere find below runs once from the end of the
+input and gives the match's start, or proves there is none. Over 100 KB that
+matches nowhere, it costs 78 fuel in all, against a pass over every byte.
 
 The fix is a second find, the **start-anywhere find** (RE2's method), which is
 linear on every input:
@@ -456,9 +499,9 @@ TDFA implements Laurikari's tagged DFA algorithm. The NFA is extended with "tag"
 
 Capture slot values are reconstructed from registers at match acceptance time. The WASM function signature is `(ptr i32, len i32, out_ptr i32) → i32`; output slots are written as `[start0, end0, start1, end1, ...]` at `out_ptr`.
 
-**TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no line anchors (`^`/`$`), no word boundaries, and no ambiguous alternations — see [Engine Selection](#engine-selection) above for what "ambiguous" actually excludes (it's narrower than "any alternation with overlapping branches"). Patterns that fail any of these checks use the Backtracking engine instead.
+**TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no `(?m)` line anchors and no end-of-text `$`/`\z` (a beginning-of-text `^` is fine), no word boundaries, and no ambiguous alternations — see [Engine Selection](#engine-selection) above for what "ambiguous" actually excludes (it's narrower than "any alternation with overlapping branches"). Patterns that fail any of these checks use the Backtracking engine instead.
 
-**Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), both TDFA and Backtracking skip re-walking the capture body after the scan — the single group's bounds are just the match's own start/end, so no tag ops or capture-tracking NFA pass are needed at all.
+**Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), no capture engine runs: the single group's bounds are just the match's own start/end, so the module carries the find and a trivial capture body, and no tag ops or capture-tracking NFA pass at all. `--verbose` reports the find's engine and "one capture, the whole match (no capture pass)".
 
 **Literal-affix single-capture shortcut:** the same holds when the only capture group is wrapped in plain literals — a literal before it, after it, or both, and nothing else (`([^,]+),`, `<([^>]*)>`, `key=(\w+)`). The literals have a fixed byte length, so group 1 is the match's start plus the prefix's length to its end minus the suffix's length, and the capture pass is skipped. A case-folded literal does not qualify: under `(?i)` a folded character can be a different number of bytes than the one written. In Unicode mode the lengths are the literals' UTF-8 lengths. This matters most where the find pass is cheap and the capture pass is not: over a 487-byte mostly non-ASCII field, `([^,]+),` costs 16,243 fuel against 75,182 with the capture pass.
 
@@ -615,7 +658,8 @@ overlapping branches in a loop whose body always consumes — took 238 ms over
 popped as the search goes, so it is never exhausted.
 
 **How it is bounded.** Every Backtracking program is emitted as TWO functions
-(with one exception, below):
+(with two exceptions: a program with a zero-width cycle, below, and one with NO
+alternation instruction at all):
 
 1. **The fast body** is the ordinary body plus one `i64` counter, set to
    `(span + 1) × numInstructions` and decremented on every frame POP — and,
@@ -715,6 +759,15 @@ fallback alone would cost (measured at the old multiplier of 8; at 1 the burn
 is an eighth of that). A call that fills the fast body's stack instead hands
 over as soon as it does, so its extra cost is the depth it reached — the 132
 fuel/byte row is the fast body's descent plus the fallback's whole run.
+
+**No alternation, no budget.** A frame is pushed only at an alternation, the
+budget is charged only on a pop, and the stack overflows only at a push — so a
+program with no alternation instruction (no `?`, `*`, `+`, `|`, no `{n,m}`
+range: a date, a time, a fixed field behind `\b` or `$`, which reach
+Backtracking through the assertion) can never trip. It gets the ordinary body
+alone, with no counter, no fallback and no search block for the caller to hand
+over: `\b(\d{4})-(\d{2})-(\d{2})\b` with `find_func` and `groups_func` 8,093 →
+6,626 bytes, `(a)\b(b)` 2,926 → 2,159.
 
 #### Per search
 
@@ -1036,6 +1089,37 @@ on less (−58 at three). Without the gate, the structural test and the copy,
 the short-word rows cost +27.6%, +7.5% (sets) and +15.8%. Modules grow:
 `\p{Cyrillic}+` 6.3 → 7.4 KB, `(\p{Cyrillic}+)\s(\d*)` 29.1 → 34.7 KB,
 `(\pL+)=(\pL+)` 1.74 → 1.80 MB.
+
+A loop that takes no lead byte whole — lowercase Cyrillic, whose lead bytes
+D0 and D1 also start uppercase letters — gets the find and match bodies'
+skip through PARTIAL two-byte leads instead: a lead whose looping second
+bytes form one or two ranges (`[а-я]`: D0 B0-BF and D1 80-8F; `[а-яё]` adds
+D1 91), checked against the byte after each lane, at most four ranges in all.
+A loop with a lead whose looping second bytes the ranges cannot hold, or with
+a looping character of three or four bytes, gets none: every run would stop
+at its first such character (`\p{Ll}+` over Russian, whose D1 alternates case
+past U+045F, measured 31.9 → 51.3 fuel/byte with it). Measured (find,
+fuel/byte): `[а-я]+` over 20-40-letter lowercase words 32.66 → 9.52, over one
+long word 31.01 → 5.75, over Russian prose 38.58 → 25.57; `[а-яё]+` 32.66 →
+10.26; `\p{Ll}+` unchanged.
+
+Not every find body runs these skips. A literal-anchored find over a 16-bit
+table (`\pL{3,}1`, 39.8 fuel/byte over a Cyrillic run) and the start-anywhere
+find of `(?m:\pL+$)` (53.6) walk the run, against 4.3 for their match bodies;
+`--verbose` reports a skip only where a body emits one.
+
+A Unicode find over a 16-bit table skips a run of ASCII letters in an
+accepting state (`\pL+` after `#`, `name=` or `привет\s+`), but that state's
+run also continues through multi-byte letters, which the skip cannot cross:
+over Cyrillic, Greek or CJK words the walk entered it after every letter and
+the skip stopped at once, ~42 fuel a letter. Such a state gets a TWIN, entered
+after every multi-byte character, with the same transitions and accepts and
+no skip, so only an ASCII letter enters the skip. Measured (fuel, every match
+over 9,900 bytes, without the 16-bit skip / with it / with the twin): `#\pL+`
+over Cyrillic hashtags 366,964 / 535,664 / 383,053, Greek 364,767 / 537,783 /
+381,264, CJK 368,854 / 472,676 / 381,229, ASCII hashtags 391,840 / 242,278 /
+246,547, long ASCII words 376,228 / 104,738 / 106,421. Not under prefer-match,
+whose character skip strides those letters itself.
 
 **Run skips in the set probes and the lenient match.** A set's scan probes
 (`scan_any`, `scan_all`), its anchored probes (`match_any`, `match_all`) and a

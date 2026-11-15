@@ -3,6 +3,9 @@
 ## Configuration File
 
 Regexped is driven by a YAML config file (default: `regexped.yaml` in the current directory).
+The file is UTF-8 text: a byte that is not valid UTF-8 is a load error naming its line and
+column — the decoder used to turn it into U+FFFD silently, a different regexp in another mode.
+Write a byte in a regexp as `\xff` (with `byte_mode: true` for `\x80`-`\xff` to mean bytes).
 
 ```yaml
 wasm_format: "module"      # optional; "module" (default) or "component" — see "Output kinds" below
@@ -20,7 +23,8 @@ wasm_file: "regexps.wasm"  # output path for the compile command; overridable wi
 import_module: "mymod"     # the WASM import-module name — a WIRE string, and the default for the
                            #   three source-identifier keys below
 rust_module: "mymod"       # optional; the Rust `pub mod` name.   Defaults to import_module
-go_package:  "mymod"       # optional; the Go `package` name.     Defaults to import_module
+go_package:  "mymod"       # optional; the Go `package` name, used as written. Unset: import_module
+                           #   when the stub sits in a directory of that name, else main
 wit_package: "my-mod"      # optional; the WIT package name.      Defaults to kebab(import_module)
 wit_world:   "my-mod"      # optional; the WIT world name.        Defaults to wit_package
 wit_version: "1.2.0"       # optional; component only. UNSET MEANS NO VERSION — see "Versioning" below
@@ -57,7 +61,7 @@ max_regexp_size: 4MiB      # optional; the most bytes any regexp may take once i
 
 # A REGEXP is a bare expression; a PATTERN is a regexp plus optional metadata.
 patterns:                  # optional when every regexp lives inside sets (their regexps: key)
-  - regexp: 'https?://...' # required: the RE2 regexp itself
+  - regexp: '(https?)://([a-z.]+)/api/v1/(\w+)' # required: the RE2 regexp itself
     name: "my_pattern"      # optional; required to select it by name from a set's patterns: list,
                             #   and to use it in another regexp as (?&my_pattern) — see references.md
 
@@ -71,7 +75,7 @@ patterns:                  # optional when every regexp lives inside sets (their
     hints: [prefer-match, batch-find]   # optional; see "hints:" below
     anchor_literal: '/api/v1/' # optional; the literal the find scans for — see "anchor_literal:" below
     byte_mode: false           # optional; see "byte_mode:" below
-    unicode: false             # optional; see "unicode:" below
+    # unicode: true            # optional (one or the other of these two); see "unicode:" below
 
 sets:
   - name: "my_set"             # unique set name
@@ -180,28 +184,33 @@ compile-only config (no `stub_type` and no `stub_file`), which generates no sour
 | The **effective Go package name** must be a valid identifier and not a Go keyword | `go` | Emitted as `package <name>`. The name is `go_package`, falling back to `import_module`, with the same escape hatch. |
 | `import_module` must not contain `"`, `\`, or control characters | `c`, `as` | Emitted only inside a quoted import attribute; a `"` closes the string early. This is the ONLY rule that applies to `import_module` itself: it is a wire string, so a keyword or a hyphen in it is fine. |
 | `wit_package` / `wit_world` must be WIT identifiers — `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*` | every `wasm_format: component` config, and `stub_type: wit` | Emitted as the WIT package and world. Unset, they derive from `import_module` by kebab-casing; a name that cannot be represented (`_x`, `x__y`, `9x`, `my.mod`) is an error telling you to set `wit_package`, never a silent rename. |
-| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_regs`, `_enc`, `_align`, `_grow`, `_write`, `_stage`, `_open`, `_close`, `_att`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
+| Export names must not collide with a generator helper (`init`, `_exp`, `_mem`, `_staticTop`, `_bump`, `_regs`, `_enc`, `_align`, `_grow`, `_write`, `_stage`, `_open`, `_close`, `_att`, `_notes`, `_btmemo`, `_lazy`, `_offset`, `_u32`, plus `SetMatch` and `SetAnchor` for TS) | `js`, `ts` | These are declared by the generated module itself; a collision is a duplicate declaration. |
 | Export names must not collide with a generator helper (`Span`, `ErrBacktrackOverflow`, `ErrMalformedCache`, `ErrOutOfOrder`, `SetMatch`, `init`) | `go` | Same reason. `init` is reserved by the LANGUAGE: `func init` takes no arguments and returns nothing, so a stub function named `init` does not compile. |
-| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
+| Export names must not collide with a generator helper (`rx_match_t`, `rx_group_t`, `rx_set_match_t`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ERR_NULL_ARG`, `RX_ERR_RANGE`, `REGEXPED_TYPES_DEFINED`, and the component stub's `cabi_realloc`, `regexped_cabi_mark`, `regexped_cabi_release`, `regexped_cabi_foreign_allocator`, `rx_cabi_heap`, `rx_cabi_used`, `rx_cabi_copy`, `rx_cabi_u32`, `RX_CABI_EXPECT_OURS`, and the header's `rx_sqrt_` macro) | `c` | Same reason. The component stub's allocator helpers are deliberately NOT namespaced: every regexped stub in one guest shares them by name. |
 | Export names must not collide with a generator helper (`SetMatch`, `RX_ERR_BT_OVERFLOW`, `RX_ERR_MALFORMED_CACHE`, `RX_ERR_OUT_OF_ORDER`, `RX_ITER_ERROR`, `Span`) | `as` | Same reason. |
 | Export names must not collide with a package the stub imports (`errors`, `iter`, `unsafe`) | `go` | `func errors` beside `import "errors"` is a redeclaration, so the file does not build. |
 | Export names must not collide with a name from `<stddef.h>` (`size_t`, `ptrdiff_t`, `wchar_t`, `max_align_t`, `NULL`, `offsetof`) or `<stdlib.h>` (`malloc`, `calloc`, `realloc`, `free`, `exit`, `abort`, `qsort`, … every function, type and macro it declares) | `c` | The header includes `<stddef.h>` always and `<stdlib.h>` when the answer cache is enabled; refused either way, so adding an overlapping set later does not break a config that builds today. |
-| Export names must not collide with a symbol DERIVED from a set's name: its pattern-count, id-space and batch-size constants and its name lookup — for a set `scanner`, `SCANNER_PATTERN_COUNT` / `scanner_pattern_name` in Rust, `SCANNER_PATTERN_COUNT` / `rx_scanner_pattern_name` in C, `ScannerPatternCount` / `ScannerPatternName` in Go, `scannerPatternCount` / `scannerPatternName` in JS and TS, `SCANNER_PATTERN_COUNT` / `scannerPatternName` in AssemblyScript | all | The generator declares them beside the set's exports. All are reserved whether or not the set asks for batching or `emit_name_map`, so turning either on never breaks a working config. |
+| Export names must not collide with a symbol DERIVED from a set's name: its pattern-count, id-space and batch-size constants and its name lookup — for a set `scanner`, `SCANNER_PATTERN_COUNT` / `scanner_pattern_name` in Rust, `SCANNER_PATTERN_COUNT` / `rx_scanner_pattern_name` / `rx_scanner_scanner_t` in C, `ScannerPatternCount` / `ScannerPatternName` in Go, `scannerPatternCount` / `scannerPatternName` in JS and TS, `SCANNER_PATTERN_COUNT` / `scannerPatternName` in AssemblyScript | all | The generator declares them beside the set's exports. All are reserved whether or not the set asks for batching or `emit_name_map`, or (C's scanner type) declares `find`, so turning any of them on never breaks a working config. |
 | Export names must not start with `ffi_` | `rust`, `go`, `c` | `ffi_<export>` is the generated private FFI binding, so `ffi_x` collides with the shim for an export named `x`. |
 | Export names must not collide after the snake_case → PascalCase transform | `rust` | `url_match` and `urlMatch` are distinct WASM exports but generate the same Rust iterator TYPE. Go dropped out of this rule: its names are now emitted verbatim, so nothing there transforms. |
 | An export must not be named `<X>Iter` for another find/groups export `X` | `go`, `as` | Every find or groups export declares an iterator type of that name. This is Go's real collision surface, where the PascalCase rule above is not. |
 | An export must not collide with a symbol DERIVED from another export (`<func>_index`, `<func>_names`, `<func>_count`, `<func>_indices`, `<func>_iter`, in the base name's own casing style) | all | `groups_func: parse` emits `parse_index` and friends; a second export literally named `parse_index` duplicates the symbol. |
+| An export must not collide with a group-index constant: `<groups_func>_<group>` for each named capture group, in the `groups_func` name's casing style (`kv` + `k` → `kv_k`, `kvParse` + `k` → `kvParseK`) | `c`, `rust`, `go`, `as` | Each named group gets an index constant beside the exports. JS and TS key the groups' names in one object instead, so they declare none. |
+| An export must not collide with a helper named after another export: `_ffi_<func>` for every `match_func`, `find_func` and `groups_func`; `<func>_init`, `_next`, `_free`, `_notes_bytes`, `_set_notes` and `rx_<func>_iter_t` for every `find_func` and `groups_func`; `<FUNC>_GROUPS` for every `groups_func`; `<find>_init`, `_free`, `_notes_bytes`, `_set_notes`, `_cache_bytes`, `_set_cache`, `rx_<find>_cache_plan_`, `rx_<find>_cache_head_`, `rx_<find>_given_at_` for a set's `find` | `c` | The C stub declares them beside the exports, with these affixes whatever the name's casing. |
+| An export must not be named `rx_<find>_cache_plan_` for a set's `find` | `rust` | The Rust stub's answer-cache sizing function. |
+| An export must not collide with an import: `_ffi_<func>` for every `match_func`, `find_func` and `groups_func`, `ffi_<cap>` for every set capability | `as` | The AssemblyScript stub declares each import under that name beside the export. |
 | `namespace:` must be a valid identifier and not a reserved word | all | It is interpolated verbatim into generated identifiers in Go/JS/TS/AS/C. |
 | An export must not be the blank identifier `_` | all | Shape-legal, but `pub fn _` is invalid Rust and `func _()` is invalid Go. |
 | Capture group names must be usable as identifiers, unique, and not collide after sanitising | all, when `groups_func` is set | Group names become generated constants and a name→index lookup. `regexp/syntax` accepts `(?<a>x)(?<a>y)` and `(?<host>x)(?<Host>y)`; both would collapse to one generated symbol, so this check is ours. |
-| Capture group names must not be `index`, `names`, `count` or `indices` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name, so a group of that name produces the same symbol twice in one file. |
+| Capture group names must not be `index`, `names`, `count`, `indices`, `iter`, `init`, `next`, `free`, `notes_bytes` or `set_notes` | all, when `groups_func` is set | Those are the suffixes the generators derive from the `groups_func` name (the last five the C stub's), so a group of that name produces the same symbol twice in one file. Refused in every language, so changing `stub_type` never changes which group names are valid. |
 | A `groups_func` pattern must have a capture group that can take part in a match | all | `a*`, or `(?:(a){0})b`, whose only group simplification removes, has no groups to report: it would compile to no groups export while every stub calls one. `compile` and `generate` refuse it too. Use `find_func` for the match's span. |
 
 ### Engine selection
 
 Setting `groups_func` triggers capture-tracking compilation:
-- **TDFA engine** — used when the pattern has no non-greedy quantifiers, no line anchors, no word boundaries, and no ambiguous alternations (Laurikari's tagged DFA, O(n))
-- **Backtracking engine** — used automatically as a fallback for patterns that are not TDFA-eligible (e.g. `(a|ab)`, `(a*)(a*)`)
+- **No capture pass** — a pattern whose one capture group is the whole match, or the match less a literal prefix and suffix, reads the group off the match the find reports: `(a+)$`, `<([^>]+)>`, `\b(\w+)\b`, `(a+?)b`. `--verbose` says "one capture … (no capture pass)"
+- **TDFA engine** — used when the pattern has no non-greedy quantifiers, no `(?m)` line anchors or end-of-text `$`/`\z`, no word boundaries, and no ambiguous alternations (Laurikari's tagged DFA, O(n)): `(a*)(a*)`, `(\S+)\s+(\S+)`, `(.*)(foo)`, `^(a+)b`
+- **Backtracking engine** — used automatically for patterns that are not TDFA-eligible (e.g. `((a)|(ab))`, `(a+?)(b+)`, `\b(\w+)=(\w+)`, `(a+)(b)$`); see [engines.md](engines.md#engine-selection)
 
 Setting only `match_func` and/or `find_func` uses the **DFA engine**. Capture groups are stripped from the pattern before compilation.
 
@@ -225,12 +234,15 @@ is ever left out of `find` or the scan pair to make a build succeed.
 | `max_memory` | none | the module's whole memory | a search answers `-2`; tables over it, or no page left for the Backtracking stack, is a compile error |
 | `max_regexp_size` | 1 MiB | every regexp, once its [references](references.md) expand | a load error naming the regexp, its size and the size to raise the key to |
 
-**`0` means off** for the two count limits: `max_dfa_states: 0` puts every
-pattern and set member on Backtracking, and `max_bt_instructions: 0` forbids
-Backtracking, so a pattern or member that needs it fails the compile. Leaving
-a key out means its default; a negative value is a load error. For the two
-sizes, `0` is a real 0: no two members share a bucket, or no split member gets
-the table-driven search.
+**`0` means off** for `max_dfa_states` and `max_bt_instructions`:
+`max_dfa_states: 0` puts every pattern and set member on Backtracking, and
+`max_bt_instructions: 0` forbids Backtracking, so a pattern or member that
+needs it fails the compile. `max_tdfa_regs` and `max_union_states` have no
+off: they take a whole number of 1 or more, and `0` is a load error. Leaving a
+key out means its default; a negative value, a fraction or a quoted number is
+a line-numbered load error for every count key. For the two sizes, `0` is a
+real 0: no two members share a bucket, or no split member gets the
+table-driven search.
 
 **How far an automaton is built.** A DFA is built up to the larger of
 `max_dfa_states` and a construction cap — 2,048 states in byte mode, 16,384 in
@@ -570,6 +582,13 @@ the JS↔WASM boundary crossing the batching amortises — there is no
 projected win to justify the static-import decidability problems it would
 introduce. Don't set `batch-find` expecting a Rust/Go/C/AS speedup.
 
+What the batch export saves is host crossings — wall time — not instructions:
+inside the module it does per match the bookkeeping a stub does per call, so
+it executes somewhat MORE than one call per match. For `groups_func` the
+margin is small where the pattern cannot match empty (no empty-match test, and
+the position kept absolute): `(a)(b?)` 313,236 instructions against 278,133
+for one `groups` call per match, `(\w+)=(\w+)` 359,824 against 348,838.
+
 ### `anchor_literal:` — which literal the find scans for
 
 A find with a literal in it scans for that literal and only then walks the
@@ -654,14 +673,20 @@ These flags must appear before the subcommand name.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--debug` | off | Enable debug logging. By default only warnings are printed. |
+| `--debug` | off | Print every log record, structured (`time=… level=… msg=… key=value`). |
+| `--version` | — | Print the version and exit: the module version Go stamped into the binary (`go install …@v1.2.3`, a release build), or `(devel)` and the commit for a local build. |
 
 ```bash
 regexped --debug compile --config=regexped.yaml
+regexped --version
 ```
 
-Errors are always printed regardless of `--debug`; the flag only controls the
-diagnostic chatter below warning level.
+Without `--debug`, errors and warnings are plain text on stderr — an error as
+`regexped: <message>`, a warning as `regexped: warning: <message>` with each of
+its details on an indented line below — and a message that spans lines (a
+YAML excerpt with its caret, a list of names) arrives as written. A warning
+printed once is not printed again in the same run. `--debug` adds the records
+below warning level and prints every record in slog's structured form.
 
 ---
 
@@ -683,6 +708,35 @@ missing is `3`, while a config file that is present but invalid is `2`.
 ## Commands
 
 All commands validate their required options and config fields before doing any work.
+A command takes no positional arguments (`merge` takes its regexp modules), so
+`regexped compile other.yaml` is a usage error naming `other.yaml`, not a
+compile of `regexped.yaml`; the config is `--config=other.yaml`.
+
+`regexped help` prints the command list, and `regexped help <command>` a
+command's flags — the same as `regexped <command> -h`, on stdout.
+
+### `check` — Check a config, writing nothing
+
+```
+regexped [--debug] check [--config=<file>]
+```
+
+Runs every test `compile` and `generate` make — the config loaded, every
+pattern and set compiled in memory (for `wasm_format: component`, the core
+module and its WIT, so no `wasm-tools` is needed), the stub generated into a
+temporary directory that is removed — and writes nothing. It prints one line
+per pattern and per set, then what was checked:
+
+```
+$ regexped check
+pattern url: Compiled DFA, byte mode
+pattern (\d+)-(\d+): TDFA, byte mode
+set s: find; 1 members; frontend packed-pair
+ok: 2 patterns, 1 set; module 22845 bytes, rust stub; nothing written
+```
+
+Exit codes are `compile`'s and `generate`'s: 2 for anything either would
+refuse. `compile --verbose` gives the full report.
 
 ### `generate` — Generate language stubs
 
@@ -692,8 +746,8 @@ regexped [--debug] generate [--config=<file>] [--output=<file>|-]
 
 Generates a stub file (Rust, JS, TypeScript, Go, C, AssemblyScript, or WIT) from the config. The stub type is determined by:
 
-1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`, `as`, `wit`)
-2. Extension of `stub_file` in YAML (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c, `.wit` → wit)
+1. `stub_type` field in YAML (`rust`, `js`, `ts`, `go`, `c`, `as`, `wit`), whenever it is set
+2. Otherwise the extension of the file written (`.rs` → rust, `.js` → js, `.ts` → ts, `.go` → go, `.h` → c, `.wit` → wit): `--output` when it is given, else `stub_file`. `--output=-` names no file, so `stub_file`'s extension decides. The export names are checked for the language this resolves to
 3. Error if neither resolves to a known type
 
 **Which types are available depends on `wasm_format`**, which is why the output kind is a config key rather than a flag — `generate` has to make the same choice `compile` did:
@@ -808,10 +862,12 @@ also gives C and AssemblyScript named access, which they never had.
 ### `compile` — Compile patterns to WASM
 
 ```
-regexped [--debug] compile [--config=<file>] [--output=<file>|-]
+regexped [--debug] compile [--config=<file>] [--output=<file>|-] [--verbose] [--diag-json=<file>|-]
 ```
 
-Compiles each regexp pattern to a single WASM module, or to a Component Model component.
+Compiles each regexp pattern to a single WASM module, or to a Component Model component. A
+directory the output names that does not exist yet is created. A regexp that does not parse —
+top-level or a set's own — is a load error at its line, for every command.
 
 A compile can take minutes — a Unicode-mode set's union automaton, a large
 TDFA — and that is the price of a faster module. Any automaton construction
@@ -955,7 +1011,7 @@ See [sets.md](sets.md) for full pipeline details and output tuple formats.
 ### `merge` — Link your binary with regexped's
 
 ```
-regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>] <regex1.wasm> ...
+regexped [--debug] merge [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
 ```
 
 Links the host main WASM with one or more regexp WASM artifacts into a single binary. **The command does not depend on the output kind** — it dispatches on `wasm_format` and runs the right tool:
@@ -994,13 +1050,13 @@ wac plug --plug <regexp1.wasm> --plug <regexp2.wasm> -o output.wasm <main.wasm>
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--main` | — | Host main WASM file **(required)** |
-| `--output`, `-o` | config `output` | Output WASM file (must be a path; `-` is not accepted) |
+| `--output`, `-o` | config `output` | Output WASM file; `-` writes it to stdout |
 
 **Positional arguments:** one or more regexp WASM files (at least one required).
 
-Unlike `generate` and `compile`, `merge` does not accept `-` for stdout: the
-value is handed straight to the external tool, which would create a file
-literally named `-`.
+`--output=-` writes the merged artifact to stdout. Neither tool takes `-` for
+stdout (wasm-merge would create a file named `-`), so `merge` has the tool
+write a temporary file, copies it to stdout and removes it.
 
 **Config fields:**
 

@@ -161,6 +161,15 @@ address ([sets.md](sets.md)). `a*b|a` over `a`×8 K costs 474 instructions per b
 against 135,303 before. A caller that does hand its state over pays ~1-9
 instructions per call for the check.
 
+What a stub does between calls — notes for a search that armed, a memo for one
+that tripped — the default state does at the next call's start, and only when
+something changed: a module-wide **arm epoch**, bumped where a search arms or
+trips, is compared with the one the default last acted on, so a call where
+nothing armed costs one compare instead of a test of every block. A 96-member
+overlapping set's drive by a raw caller went 718,735 → 412,766 instructions
+(the caller handing its own blocks: 409,755), and its batch entry at
+capacity 1 7,134,606 → 3,407,023.
+
 ## Sets
 
 A set runs its members through shared bucket bodies, which is where shapes
@@ -226,14 +235,18 @@ matches.
   rest of the drive from it ([wasm.md](wasm.md#the-overlapping-answer-cache)).
   It engages ADAPTIVELY: the drive walks, counting bytes matched and walked,
   and sweeps once that passes a sixteenth of a sweep's per-byte cost plus a
-  start-up allowance of eight bytes at the full rate — ordinary text stays
-  11-134× under the line, a wide set no longer walks two sweeps' worth first
-  (96 members: 281,595 → 108,705 instructions per byte), and inputs of a few
-  bytes stay on the walk. An **in-call counter** does the same inside the one
+  start-up allowance of eight bytes at the full rate — a wide set no longer
+  walks two sweeps' worth first (96 members: 281,595 → 108,705 instructions
+  per byte), and inputs of a few bytes stay on the walk. Most ordinary text
+  stays under the line; a small set whose members walk word classes crosses it
+  on word-heavy text and pays 5-49% more than walking would have (linear
+  either way). An **in-call counter** does the same inside the one
   call a no-match input makes.
 - **The column**, narrowed: union states whose per-member behaviour is the
   same share a cell (a Moore partition): 1.7-3.3× fewer cells measured, the
-  ratio growing with the state count.
+  ratio growing with the state count. Each position updates every cell with
+  one read of a compile-time step table (cell × byte class → the successor's
+  cell), so no per-state work runs per byte.
 - **The whole-set automaton.** A set the sweep cannot run over directly
   (literal or several buckets) is swept over an automaton of every member,
   built only where a drive can have arbitrarily many walks alive at once —
@@ -310,6 +323,13 @@ cannot have it.
   quadratic over the drive on the shapes above. A C build with
   `-DRX_SET_CACHE=0` is in the same place until it hands buffers over with
   `<find>_set_cache` and `<func>_set_notes` ([c-api.md](c-api.md)).
+- **An answer cache offered too small.** A raw caller that hands an
+  overlapping set a cache region below what its input needs gets the walk the
+  cache exists to avoid: ×3.98 per doubling, 45,339 fuel/byte at 4 KB against
+  621 with a region of the right size — worse than handing none, which a
+  standalone module then answers from a region of its own (649). The size comes
+  from the compiler ([wasm.md](wasm.md#the-overlapping-answer-cache)); a generated stub
+  always gets it right.
 - **Interleaved raw drives over one standalone instance.** One default state
   serves one drive at a time; two drives alternating calls keep resetting it.
   The answers are right; each call starts fresh.

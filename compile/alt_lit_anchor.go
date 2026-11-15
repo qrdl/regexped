@@ -77,6 +77,7 @@ func compileAltLitAnchorBranches(rp resolvedPattern, branches []altLitAnchorBran
 		}
 
 		l := buildDFALayout(dfaLayoutParams{
+			skipFlag:             buildOpts.skipFlag,
 			t:                    table,
 			tableBase:            cur,
 			needFind:             true,
@@ -116,6 +117,7 @@ func compileAltLitAnchorBranches(rp resolvedPattern, branches []altLitAnchorBran
 
 		revTableBase := utils.PageAlign(l.tableEnd)
 		revL := buildDFALayout(dfaLayoutParams{
+			skipFlag:             buildOpts.skipFlag,
 			t:                    revTable,
 			tableBase:            revTableBase,
 			needFind:             true,

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp/syntax"
 	"strconv"
 	"strings"
@@ -504,6 +505,10 @@ type CompileOptions struct {
 	// wordTable is the pattern's one word table (patternWordTable), reserved by
 	// compilePattern and shared by every layout built for the pattern.
 	wordTable *patternWordTable
+	// skipFlag is the pattern's "a body emitted a bulk skip" flag
+	// (dominantInfo.emitted), which --verbose reports: set by compilePattern
+	// and handed to every layout the pattern builds (pointSkipsAt).
+	skipFlag *bool
 
 	// searchSizes, when non-nil, receives each export's SearchSize: what a
 	// generated stub allocates for its searches (SearchSizes).
@@ -689,6 +694,9 @@ type compiledPattern struct {
 	// empty-width assertion, and the backward one takes (ptr, len, end), laid
 	// out in slotSARevCtx.
 	saCtx bool
+	// saSuffix: the find is the backward pass alone, run from the end of the
+	// input (findSuffix); the forward pass is built but never called.
+	saSuffix bool
 	// saNotes is the start-anywhere forward pass's per-search notes rows, nil
 	// for none (search_notes.go).
 	saNotes *notesRows
@@ -1364,7 +1372,9 @@ func buildBTFindParts(pattern resolvedPattern, table *dfaTable, mandLit *mandato
 		parts.callOffs = offs
 	}
 	parts.end = btBase
-	if bt.search != nil {
+	// A program with no budget and no fallback reads no block (planBT: no
+	// Alt), so its callers hand it none.
+	if bt.search != nil && (plan.k > 0 || plan.fallback) {
 		parts.search, parts.searchG = true, bt.search.g
 		// Every output kind: an embedded build keeps it through its second
 		// fallback.
@@ -1511,6 +1521,7 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	// the body builds and then discards (the switch's start-anywhere trial
 	// truncates the pattern's data back to a mark) can neither own it nor
 	// take its data along.
+	buildOpts.skipFlag = new(bool)
 	var wt *patternWordTable
 	if (re.FindFunc != "" || re.GroupsFunc != "") && patternHasWordBoundary(re.Regexp) {
 		wt = &patternWordTable{off: int32(tableBase)} //nolint:gosec // a table address
@@ -1693,6 +1704,28 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		defer func() { buildOpts.report().Note(hint.note()) }()
 	}
 
+	// A find over a literal alternation walks an Aho-Corasick automaton of
+	// its literals (lit_alt_ac.go).
+	if needFind && !needGroups {
+		if a := analyseLitAltAC(rp, re.AnchorLiteral, litAltACBudget); a != nil {
+			return compileLitAltACFind(re, rp, a, tableBase, forceGroupsEngine, buildOpts)
+		}
+	}
+	return compilePatternBodies(re, rp, tableBase, forceGroupsEngine, buildOpts, hint)
+}
+
+// litAltACBudget is the literal alternation's automaton budget: the set
+// literal frontend's default (CompileSetOptions.acBudgetBytes).
+const litAltACBudget = 512 * 1024
+
+// compilePatternBodies builds an entry's bodies once compilePatternBody has
+// settled its mode, hints and anchor hint.
+func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase int64,
+	forceGroupsEngine EngineType, buildOpts CompileOptions, hint *anchorHint) (*compiledPattern, error) {
+	needMatch := re.MatchFunc != ""
+	needFind := re.FindFunc != ""
+	needGroups := re.CaptureStubsRequested()
+
 	// Counted-chain SIMD verifier, default-on for every
 	// LikelyMode (promoted 2026-07-10 after a clean broad sweep).
 	// Replaces the DFA match/find bodies
@@ -1827,6 +1860,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 
 							// Lenient-alt data + find body.
 							lenLayout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
+							pointLenAltSkipsAt(lenAltp, buildOpts.skipFlag)
 							lenData, lenSeg := buildLenAltDataSegments(lenAltp, lenLayout)
 							if needFind {
 								p.findExport = re.FindFunc
@@ -1842,6 +1876,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 							// TDFA capture body placed after lenient-alt tables.
 							tdfaBase := utils.PageAlign(lenLayout.tableEnd)
 							tdfaLayout := buildDFALayout(dfaLayoutParams{
+								skipFlag:             buildOpts.skipFlag,
 								t:                    tt.dfaTable,
 								tableBase:            tdfaBase,
 								needFind:             false,
@@ -1965,6 +2000,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, false); ok {
 				layout := planLenAltLayout(lenAltp, tableBase, false, buildOpts.wordTable)
+				pointLenAltSkipsAt(lenAltp, buildOpts.skipFlag)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				p := &compiledPattern{
 					matchExport:  re.MatchFunc,
@@ -2043,6 +2079,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// pattern takes the ordinary find, which gets the switch.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
 				layout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
+				pointLenAltSkipsAt(lenAltp, buildOpts.skipFlag)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
 				body, ffMode := buildLitChainAltLenientFindBody(lenAltp, layout, buildOpts.tableMemIdx)
 				var findBody []byte
@@ -2130,6 +2167,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			matchEnd = cur
 		} else {
 			lm := buildDFALayout(dfaLayoutParams{
+				skipFlag:             buildOpts.skipFlag,
 				t:                    llTable,
 				tableBase:            cur,
 				sharedWordTable:      buildOpts.wordTable,
@@ -2232,8 +2270,16 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	notesOverflow := !dfaTooLarge && needFindBody && !anchored && buildOpts.globals != nil && notesRowsOverflow(table)
 	if notesOverflow {
 		dfaTooLarge = true
-		slog.Warn("Pattern runs on Backtracking: its find automaton has more cycle states than per-search notes can cover",
-			"pattern", re.Regexp, "cycle_states", countCycleStates(table), "limit", maxNotesBytesPerPos*8,
+		// Named as written (DisplayName), and, for a pattern with groups_func
+		// and no find_func, by what the body is to it: the search groups_func
+		// runs to find where a match starts.
+		what := "Pattern runs on Backtracking: its find automaton has more cycle states than per-search notes can cover"
+		if re.FindFunc == "" {
+			what = "Pattern's groups_func search (the part that finds where a match starts) runs on Backtracking: " +
+				"its automaton has more cycle states than per-search notes can cover"
+		}
+		slog.Warn(what,
+			"pattern", re.DisplayName(), "cycle_states", countCycleStates(table), "limit", maxNotesBytesPerPos*8,
 			"effect", "linear on every input, about 2.5x the cost on ordinary text",
 			"hint", "lower max_dfa_states or simplify the pattern to keep it on a DFA with notes")
 	}
@@ -2274,6 +2320,10 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	// emitted.
 	var saReplaced bool
 	var layoutNotes int
+	// What the report says of the captures: a groups_func pattern the
+	// single-capture shortcut serves has one, read off the match the find
+	// reports (whole_capture.go), and used to be reported as having none.
+	captures := "no captures"
 	if !dfaTooLarge {
 		defer func() {
 			rep := buildOpts.report()
@@ -2282,15 +2332,15 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			}
 			if saReplaced {
 				if !rep.HasEngine() {
-					rep.Engine(EngineDFA, "no captures; start-anywhere find — a forward and a backward DFA pass")
+					rep.Engine(EngineDFA, captures+"; start-anywhere find — a forward and a backward DFA pass")
 				}
 				return
 			}
 			if !rep.HasEngine() {
 				if l.useHybridDispatch {
-					rep.Engine(EngineCompiledDFA, "no captures; promoted to direct-index dispatch")
+					rep.Engine(EngineCompiledDFA, captures+"; promoted to direct-index dispatch")
 				} else {
-					rep.Engine(EngineDFA, "no captures; table-driven DFA")
+					rep.Engine(EngineDFA, captures+"; table-driven DFA")
 				}
 			}
 			// Read back off the layout rather than re-deriving: these fields
@@ -2307,7 +2357,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			if l.useRowDedup {
 				rep.Note("u16 row dedup")
 			}
-			if len(l.dominantStates) > 0 {
+			if len(l.dominantStates) > 0 && (l.skipEmitted || buildOpts.skipFlag != nil && *buildOpts.skipFlag) {
 				note := fmt.Sprintf("SIMD bulk skip (%d dominant state(s))", len(l.dominantStates))
 				if n := countUTF8Dominants(l.dominantStates); n > 0 {
 					note += fmt.Sprintf(", %d over whole UTF-8 characters", n)
@@ -2318,8 +2368,12 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				rep.Note("skip-safe-on-dead")
 			}
 		}()
+		if needFindBody && rp.unicode() && buildOpts.LikelyMode != LikelyMatch && table.numStates >= 256 {
+			splitASCIIRunStates(table)
+		}
 		layoutNotes = buildOpts.report().noteMark()
 		l = buildDFALayout(dfaLayoutParams{
+			skipFlag:             buildOpts.skipFlag,
 			report:               buildOpts.report(),
 			t:                    table,
 			tableBase:            cur,
@@ -2502,6 +2556,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 							revTable.midAcceptStates[revTable.startState] == 0)) {
 						revTableBase := utils.PageAlign(l.tableEnd)
 						revL := buildDFALayout(dfaLayoutParams{
+							skipFlag:             buildOpts.skipFlag,
 							t:                    revTable,
 							tableBase:            revTableBase,
 							sharedWordTable:      buildOpts.wordTable,
@@ -2693,10 +2748,12 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			// today's body is known, before it is built — because the
 			// classifier's proofs are about that body.
 			strategy, why := p.chooseFindStrategy(rp, table, l, lap, patMandLit, anchored, buildOpts)
-			if strategy == findNewSearch {
+			if strategy == findNewSearch || strategy == findSuffix {
 				trial := &compiledPattern{}
 				var nr *walkNotesReq
-				if buildOpts.globals != nil {
+				// The suffix find never runs the forward pass, whose notes
+				// are the only ones a start-anywhere find keeps.
+				if buildOpts.globals != nil && strategy == findNewSearch {
 					nr = &walkNotesReq{globals: buildOpts.globals, checkResume: true}
 				}
 				if trial.buildStartAnywhereFind(rp, cur, buildOpts, nr) {
@@ -2705,9 +2762,10 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 					p.clearLitAnchor()
 					p.saFwdBody, p.saRevBody, p.saCtx = trial.saFwdBody, trial.saRevBody, trial.saCtx
 					if trial.saNotes != nil {
-						p.notes = &notesPlan{walk: trial.saNotes, search: buildOpts.globals.Search()}
+						p.notes = &notesPlan{walk: trial.saNotes, search: buildOpts.globals.SearchRef()}
 					}
 					p.startAnywhere = true
+					p.saSuffix = strategy == findSuffix
 					p.tableEnd = trial.tableEnd
 					saReplaced = true
 					buildOpts.report().truncateNotes(layoutNotes)
@@ -2791,7 +2849,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 				if p.litAnchorBackScanBody == nil && p.altLitAnchorBranches == nil &&
 					!isAnchoredFind(table) && buildOpts.globals != nil {
 					if l.notes = newNotesRows(table, l); l.notes != nil {
-						l.notesSearch = buildOpts.globals.Search()
+						l.notesSearch = buildOpts.globals.SearchRef()
 					}
 				}
 				// A switch builds the start-anywhere find FIRST, above today's
@@ -2831,7 +2889,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 					}
 					if sw != nil && sw.saNotes != nil {
 						if p.notes == nil {
-							p.notes = &notesPlan{search: buildOpts.globals.Search()}
+							p.notes = &notesPlan{search: buildOpts.globals.SearchRef()}
 						}
 						p.notes.walk = sw.saNotes
 					}
@@ -2874,7 +2932,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 						p.switchN = switchNFor(buildOpts)
 						if sw.saNotes != nil {
 							if p.notes == nil {
-								p.notes = &notesPlan{search: buildOpts.globals.Search()}
+								p.notes = &notesPlan{search: buildOpts.globals.SearchRef()}
 							}
 							p.notes.walk = sw.saNotes
 							p.notes.setStride()
@@ -2956,6 +3014,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	// Falling through to normal TDFA/BT capture construction is always
 	// correct regardless of anchoring, just without this fast path.
 	if !dfaStateLimitExceeded && !anchored && isWholePatternSingleCapture(parsed) {
+		captures = "one capture, the whole match (no capture pass)"
 		p.numGroups = 2
 		p.captureBody = appendTrivialSingleCaptureCodeEntry(nil)
 		// winGlobal must be an explicit -1 here: the field's zero value
@@ -2977,6 +3036,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 	// offset by the literals' bytes (affixSingleCapture).
 	if !dfaStateLimitExceeded && !anchored {
 		if pre, suf, ok := affixSingleCapture(parsed, rp.unicode()); ok {
+			captures = "one capture, the match less its literal affixes (no capture pass)"
 			p.numGroups = 2
 			p.captureBody = appendAffixSingleCaptureCodeEntry(nil, pre, suf)
 			return p, nil
@@ -3025,6 +3085,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			tt = tdfaWithCharLoops(tt, mp, buildOpts.LikelyMode)
 			tdfaBase := utils.PageAlign(p.tableEnd)
 			tdfaLayout := buildDFALayout(dfaLayoutParams{
+				skipFlag:             buildOpts.skipFlag,
 				t:                    tt.dfaTable,
 				tableBase:            tdfaBase,
 				needFind:             false,
@@ -3133,7 +3194,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 			}
 			bt.search = btSearchFor(&buildOpts)
 			p.captureBody, p.captureFallbackCallOffs = appendBacktrackCodeEntry(nil, bt, int32(frameSize), anchored, buildOpts.tableMemIdx, winGlobal, p.capStartGlobal(), plan.k, plan.fallback, nil, nil, false, growth)
-			if bt.search != nil {
+			if bt.search != nil && (plan.k > 0 || plan.fallback) {
 				p.btSearch, p.btSearchG = true, bt.search.g
 			}
 			bt.search = nil
@@ -3645,7 +3706,7 @@ func assembleModule(patterns []*compiledPattern, memPages int32, standalone bool
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, p.outGroups(), batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
+				cs = appendBatchGroupsWrapperCodeEntry(cs, base+findOff, base+captureOff, p.numGroups, p.outGroups(), batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.minLen, p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3761,7 +3822,7 @@ func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool
 	// One allocator per module, created before the loop so every pattern draws
 	// from the same counter and the assembler below declares exactly what they
 	// allocated.
-	globals := &moduleGlobals{}
+	globals := &moduleGlobals{wantEpoch: standalone && !opts.Component}
 	opts.globals = globals
 	var compiled []*compiledPattern
 	// A base past int32 loses its high bits outright (8 GiB lays the tables
@@ -3835,6 +3896,43 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 	return CmdCompileVerbose(cfg, output, nil)
 }
 
+// CompileModule compiles cfg to the module `compile` writes, in memory: the
+// standalone or embedded module its `output:` key selects, with the import
+// module section an embedded one carries. rep (non-nil) records what was
+// decided, for --verbose and `regexped check`.
+func CompileModule(cfg config.BuildConfig, rep *Reporter) ([]byte, error) {
+	var wasmBytes []byte
+	if len(cfg.Sets) > 0 {
+		var err error
+		var diags []SetDiag
+		wasmBytes, _, diags, err = compileFileDiagReport(cfg, cfg.Output, CompileSetOptions{}, rep)
+		if err != nil {
+			return nil, fmt.Errorf("compile: %w", err)
+		}
+		rep.Sets = diags
+	} else {
+		compOpts := CompileOptions{
+			MaxDFAStates:      int(cfg.MaxDFAStates),
+			MaxBTInstructions: int(cfg.MaxBTInstructions),
+			MaxTDFARegs:       int(cfg.MaxTDFARegs),
+			MaxMemory:         cfg.MaxMemory,
+			Report:            rep,
+		}
+		standalone := cfg.Output == ""
+		var err error
+		wasmBytes, _, err = Compile(cfg.Patterns, 0, standalone, compOpts)
+		if err != nil {
+			return nil, fmt.Errorf("compile: %w", err)
+		}
+	}
+	// An embedded module records the module name its stubs import from, which
+	// is what `regexped merge` names it by (abi.ImportModuleSection).
+	if cfg.Output != "" && cfg.ImportModule != "" {
+		wasmBytes = appendImportModuleSection(wasmBytes, cfg.ImportModule)
+	}
+	return wasmBytes, nil
+}
+
 // CmdCompileVerbose is CmdCompile that, when report is non-nil, writes a
 // human-readable account of what the compiler decided to it.
 //
@@ -3843,6 +3941,13 @@ func CmdCompile(cfg config.BuildConfig, output string) error {
 // two outcomes a user must act on are otherwise silent — a pattern demoted to
 // Backtracking by a state limit, and a pattern dropped from a set.
 func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) error {
+	if output != "-" {
+		// As `generate` and a component compile do: a build that names a
+		// directory not made yet should not fail at its last step.
+		if err := ownership.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(output), err)
+		}
+	}
 	outPath := output
 	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "output", outPath)
 
@@ -3850,42 +3955,14 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 	// the compile found. It is rendered only under --verbose. Progress lines
 	// from a long construction go to stderr whatever the flags (progress.go).
 	rep := &Reporter{Progress: os.Stderr}
-
-	var wasmBytes []byte
-	if len(cfg.Sets) > 0 {
-		var err error
-		var diags []SetDiag
-		wasmBytes, _, diags, err = compileFileDiagReport(cfg, output, CompileSetOptions{}, rep)
-		if err != nil {
-			// What was decided before the error — a refused pattern's mode
-			// among it — is worth showing.
-			rep.Render(report)
-			return fmt.Errorf("compile: %w", err)
-		}
-		rep.Sets = diags
-	} else {
-		compOpts := CompileOptions{
-			MaxDFAStates:      int(cfg.MaxDFAStates),
-			MaxBTInstructions: int(cfg.MaxBTInstructions),
-			MaxTDFARegs:       cfg.MaxTDFARegs,
-			MaxMemory:         cfg.MaxMemory,
-			Report:            rep,
-		}
-		standalone := cfg.Output == ""
-		var err error
-		wasmBytes, _, err = Compile(cfg.Patterns, 0, standalone, compOpts)
-		if err != nil {
-			rep.Render(report)
-			return fmt.Errorf("compile: %w", err)
-		}
-	}
+	wasmBytes, err := CompileModule(cfg, rep)
 	rep.Render(report)
-	WarnUnboundedMemory(cfg, rep)
-	// An embedded module records the module name its stubs import from, which
-	// is what `regexped merge` names it by (abi.ImportModuleSection).
-	if cfg.Output != "" && cfg.ImportModule != "" {
-		wasmBytes = appendImportModuleSection(wasmBytes, cfg.ImportModule)
+	if err != nil {
+		// What was decided before the error — a refused pattern's mode
+		// among it — is worth showing, and was.
+		return err
 	}
+	WarnUnboundedMemory(cfg, rep)
 
 	if outPath == "-" {
 		if _, err := os.Stdout.Write(wasmBytes); err != nil {
@@ -5056,7 +5133,7 @@ func appendBatchFindWrapperCodeEntry(cs []byte, findFuncIdx int, mode findFromMo
 // Locals (beyond params 0-4): 5=pos i32, 6=count i32, 7=r i64,
 // 8=relStart i32, 9=relEnd i32, 10=absStart i32, 11=matchLen i32,
 // 12=recBase i32, 13=capRes i32, 14=adj i32, 15=slotVal i32.
-func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
+func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal, minLen int32, def *defaultSearch, route *twinRoute) []byte {
 	// The `mode` parameter is what decides how this wrapper hands the find
 	// body its position: emitFindCallFromPos seeds the find-from channel for
 	// an ffNative body and narrows for an ffLegacyNarrow one. A comment here
@@ -5082,10 +5159,12 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 		b = append(b, 0x03, 0x7F, 0x02, 0x7E)
 	}
 
-	// pos = start_pos; count = 0; prevEnd = -1
+	// pos = start_pos; count = 0 (as every local starts); prevEnd = -1, read
+	// only where a match can be empty.
 	b = append(b, 0x20, 0x04, 0x21, 0x05)
-	b = append(b, 0x41, 0x00, 0x21, 0x06)
-	b = append(b, 0x41, 0x7F, 0x21, 0x10)
+	if minLen == 0 {
+		b = append(b, 0x41, 0x7F, 0x21, 0x10)
+	}
 	if def != nil {
 		b = def.emitEnter(b, 0, 1, 4, dl)
 	}
@@ -5108,17 +5187,37 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 	// if r < 0: br $done
 	b = append(b, 0x20, 0x07, 0x42, 0x00, 0x53, 0x0D, 0x01)
 
-	// relStart, relEnd — relative to pos whichever way the body reported them
-	b = emitUnpackRelative(b, mode, 0x07, 0x05, 0x08, 0x09)
+	// Locals 8 and 9 hold the match's start and end: ABSOLUTE for a body that
+	// reports them so (mode.native()), which saves re-adding pos at every use
+	// below, else relative to pos. absStart / absEnd push them absolute.
+	abs := mode.native()
+	if abs {
+		b = append(b, 0x20, 0x07, 0x42, 0x20, 0x88, 0xA7, 0x21, 0x08) // start = wrap(r >> 32)
+		b = append(b, 0x20, 0x07, 0xA7, 0x21, 0x09)                   // end = wrap(r)
+	} else {
+		b = emitUnpackRelative(b, mode, 0x07, 0x05, 0x08, 0x09)
+	}
+	absStart := func(b []byte) []byte {
+		if abs {
+			return append(b, 0x20, 0x08)
+		}
+		return append(b, 0x20, 0x05, 0x20, 0x08, 0x6A)
+	}
+	absEnd := func(b []byte) []byte {
+		if abs {
+			return append(b, 0x20, 0x09)
+		}
+		return append(b, 0x20, 0x05, 0x20, 0x09, 0x6A)
+	}
 
 	if winGlobal >= 0 {
 		// Window mode: the capture body gets the caller's real (ptr,len)
 		// and this match's extent out of band — see buildGroupsWrapperBody.
 		// adj = pos + relStart (window start, also the slot rebase that
 		// window mode makes unnecessary below)
-		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+		b = append(absStart(b), 0x21, 0x0E)
 		// matchLen local reused as the window end = pos + relEnd
-		b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A, 0x21, 0x0B)
+		b = append(absEnd(b), 0x21, 0x0B)
 		b = append(b, 0x20, 0x0E)
 		b = append(b, 0x24)
 		b = utils.AppendULEB128(b, uint32(winGlobal))
@@ -5127,7 +5226,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 		b = utils.AppendULEB128(b, uint32(winGlobal+1))
 	} else {
 		// absStart = ptr + pos + relStart
-		b = append(b, 0x20, 0x00, 0x20, 0x05, 0x6A, 0x20, 0x08, 0x6A, 0x21, 0x0A)
+		b = append(absStart(append(b, 0x20, 0x00)), 0x6A, 0x21, 0x0A)
 		// matchLen = relEnd - relStart
 		b = append(b, 0x20, 0x09, 0x20, 0x08, 0x6B, 0x21, 0x0B)
 		if capStartGlobal >= 0 {
@@ -5136,7 +5235,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 			// is computed only for the rebasing pass, which absolute slots do
 			// not need — so a body with the channel computes it HERE and one
 			// without computes it THERE, and neither pays for the other.
-			b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x22, 0x0E)
+			b = append(absStart(b), 0x22, 0x0E)
 			b = append(b, 0x24)
 			b = utils.AppendULEB128(b, uint32(capStartGlobal))
 		}
@@ -5170,7 +5269,7 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 	// (window mode already computed it, and its slots need no adjusting;
 	// so did the absolute-slot channel, above the call, for the same reason)
 	if winGlobal < 0 && capStartGlobal < 0 {
-		b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x21, 0x0E)
+		b = append(absStart(b), 0x21, 0x0E)
 	}
 
 	// Adjust each of numGroups*2 slot ints at recBase+8+g*4 by +adj (skip
@@ -5206,25 +5305,35 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 	// from count, so the next match overwrites the slots just written. As in
 	// the find wrapper, this cannot truncate the batch — the loop still exits
 	// only on a full buffer or an exhausted input.
-	b = append(b, 0x20, 0x08, 0x20, 0x09, 0x46) // relStart == relEnd
-	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A) // absStart = pos + relStart
-	b = append(b, 0x20, 0x10, 0x46)             // == prevEnd
-	b = append(b, 0x71)                         // and
-	b = append(b, 0x45)                         // eqz → report it
-	b = append(b, 0x04, 0x40)                   // if (void)
-	// count += 1; prevEnd = pos + relEnd
-	b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
-	b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A, 0x21, 0x10)
-	b = append(b, 0x0B) // end if
+	//
+	// A pattern that cannot match empty (minLen > 0) has nothing to suppress
+	// and always advances to the match's end: the test and the choice were
+	// ~26 of the ~105 instructions a record cost, which made a batch 23% dearer
+	// per match than one groups call per match (`(a)(b?)` 278 vs 342 fuel).
+	if minLen > 0 {
+		b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06) // count += 1
+		b = append(absEnd(b), 0x21, 0x05)                       // pos = the match's end
+	} else {
+		b = append(b, 0x20, 0x08, 0x20, 0x09, 0x46) // relStart == relEnd
+		b = absStart(b)
+		b = append(b, 0x20, 0x10, 0x46) // == prevEnd
+		b = append(b, 0x71)             // and
+		b = append(b, 0x45)             // eqz → report it
+		b = append(b, 0x04, 0x40)       // if (void)
+		// count += 1; prevEnd = pos + relEnd
+		b = append(b, 0x20, 0x06, 0x41, 0x01, 0x6A, 0x21, 0x06)
+		b = append(absEnd(b), 0x21, 0x10)
+		b = append(b, 0x0B) // end if
 
-	// pos = relEnd > relStart ? pos+relEnd : pos+relStart+1
-	b = append(b, 0x20, 0x09, 0x20, 0x08, 0x4B)
-	b = append(b, 0x04, 0x7F)
-	b = append(b, 0x20, 0x05, 0x20, 0x09, 0x6A)
-	b = append(b, 0x05)
-	b = append(b, 0x20, 0x05, 0x20, 0x08, 0x6A, 0x41, 0x01, 0x6A)
-	b = append(b, 0x0B)
-	b = append(b, 0x21, 0x05)
+		// pos = relEnd > relStart ? pos+relEnd : pos+relStart+1
+		b = append(b, 0x20, 0x09, 0x20, 0x08, 0x4B)
+		b = append(b, 0x04, 0x7F)
+		b = absEnd(b)
+		b = append(b, 0x05)
+		b = append(absStart(b), 0x41, 0x01, 0x6A)
+		b = append(b, 0x0B)
+		b = append(b, 0x21, 0x05)
+	}
 
 	b = append(b, 0x0C, 0x00) // br $L (continue)
 	b = append(b, 0x0B)       // end loop
@@ -5239,8 +5348,8 @@ func buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGrou
 }
 
 // appendBatchGroupsWrapperCodeEntry appends a size-prefixed batch groups wrapper body to cs.
-func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal int32, def *defaultSearch, route *twinRoute) []byte {
-	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx, winGlobal, mode, capStartGlobal, def, route)
+func appendBatchGroupsWrapperCodeEntry(cs []byte, findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx int, winGlobal int32, mode findFromMode, capStartGlobal, minLen int32, def *defaultSearch, route *twinRoute) []byte {
+	body := buildBatchGroupsWrapperBody(findFuncIdx, captureFuncIdx, numGroups, outGroups, tableMemIdx, winGlobal, mode, capStartGlobal, minLen, def, route)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

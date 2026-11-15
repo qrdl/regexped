@@ -207,12 +207,17 @@ typedef struct {
     size_t len, offset, prev_end;
     int done;
     unsigned scratch[2];   /* opaque: the component build's resource handle */
+    /* A pattern whose search keeps notes or a Backtracking memo adds members
+       of its own (its search block, the regions handed over): all opaque. */
 } rx_<func>_iter_t;
 
 int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
 int <func>_next(rx_<func>_iter_t *iter, rx_match_t *out_match);
 void <func>_free(rx_<func>_iter_t *iter);
 ```
+
+`_init` returns `RX_ERR_NULL_ARG` for a NULL `iter`, or a NULL `input` with
+`len > 0`; `(NULL, 0)` is the empty input, as everywhere in C.
 
 Scans for non-overlapping matches at or after `offset`. The whole input stays visible to the engine — `offset` bounds where the search starts, it does not truncate the left context a leading `\b`, `\B` or `(?m:^)` is judged against. Positions are absolute.
 
@@ -249,6 +254,8 @@ typedef struct {
     size_t len, offset, prev_end;
     int done;
     unsigned scratch[2];   /* opaque: the component build's resource handle */
+    /* A pattern whose search keeps notes or a Backtracking memo adds members
+       of its own (its search block, the regions handed over): all opaque. */
 } rx_<func>_iter_t;
 
 int <func>_init(rx_<func>_iter_t *iter, const char *input, size_t len, size_t offset);
@@ -336,14 +343,14 @@ When the config has a `sets:` block, the generator also emits, per set (see
 #define <SET>_ID_SPACE      12   /* largest reportable pattern id + 1 */
 
 /* anchored: the pattern must match the WHOLE input */
-int <match_any>(const char *in, size_t len);                         /* id or -1 */
+int <match_any>(const char *in, size_t len);                /* id, -1, or RX_ERR_BT_OVERFLOW */
 int <match_all>(const char *in, size_t len,
-                int patterns[static <SET>_PATTERN_COUNT]);           /* count    */
+                int patterns[static <SET>_PATTERN_COUNT]);  /* count, or RX_ERR_BT_OVERFLOW  */
 
 /* non-anchored: each takes an offset bounding the search */
-int <scan_any>(const char *in, size_t len, size_t offset);           /* id or -1 */
+int <scan_any>(const char *in, size_t len, size_t offset);  /* id, -1, or RX_ERR_BT_OVERFLOW */
 int <scan_all>(const char *in, size_t len, size_t offset,
-               int patterns[static <SET>_PATTERN_COUNT]);            /* count    */
+               int patterns[static <SET>_PATTERN_COUNT]);   /* count, or RX_ERR_BT_OVERFLOW  */
 
 /* find: a caller-owned scanner struct — reentrant, header-only. It holds the
    INPUT as well as the position; you pass the buffer per call. */

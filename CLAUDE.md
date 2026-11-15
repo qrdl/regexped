@@ -25,7 +25,14 @@ regexped/
 ├── README.md                  # Project page: features, capabilities, performance, install, usage
 ├── LICENSE                    # EUPL-1.2, the text verbatim (so GitHub and pkg.go.dev detect it)
 ├── LICENSE-EXCEPTION          # Copyright notice + the exception: regexped's OUTPUT is free of the EUPL
-├── main.go                    # CLI entry point: generate, compile, merge
+├── main.go                    # CLI entry point: generate, compile, merge, check, help, --version.
+│                              #   Logs through internal/clilog (plain text) unless --debug.
+│                              #   A command with a positional argument it does not take is a
+│                              #   usage error (they were ignored: `compile other.yaml`)
+├── check/
+│   └── check.go               # `regexped check`: compile in memory (a component's CORE module,
+│                              #   no wasm-tools), generate into a removed temp dir, one summary
+│                              #   line per pattern/set (Reporter.Summary), nothing written
 ├── config/
 │   ├── config.go              # YAML configuration parsing
 │   ├── format.go              # wasm_format rules: what a component config may declare
@@ -49,6 +56,12 @@ regexped/
 │   │                          #   byte starts a letter of the loop (charLoopGate), with a structural
 │   │                          #   validity test (utf8StructOK) — a run costs about two walked
 │   │                          #   letters, so ungated it cost one-letter words +84 fuel each
+│   │                          #   A Unicode find over a u16 table gives an accepting run state that
+│   │                          #   loops on 9-64 ASCII bytes and whose run crosses multi-byte letters
+│   │                          #   (`#\pL+`) a TWIN entered after every multi-byte character, same row
+│   │                          #   and accepts, no skip (splitASCIIRunStates): the ASCII skip stopped
+│   │                          #   at once after every Cyrillic letter (#\pL+ 366,964 → 535,664 fuel;
+│   │                          #   with the twin 383,053). Not under prefer-match
 │   ├── engine_compiled_dfa.go # Compiled DFA: direct-index dispatch, literal-chain prefix
 │   ├── engine_tdfa.go         # TDFA (Laurikari tagged DFA): subset construction, register ops, WASM emission
 │   ├── engine_backtrack.go    # Backtracking engine: hybrid DFA+NFA, br_table dispatch, explicit stack, WASM emission.
@@ -74,7 +87,9 @@ regexped/
 │   │                          #   two compile-time limits that only counted them (so a set member
 │   │                          #   they made Backtracking refuse is now ADMITTED, not dropped).
 │   │                          #   In a SET, a member's budget, fallback region and visited set last
-│   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate
+│   │                          #   one HOST call (btDriveMember, bt_scratch.go), not one candidate.
+│   │                          #   A program with NO Alt (progHasAlt) gets btPlan{}: no budget, no
+│   │                          #   fallback, no search block — it pushes no frame, so it cannot trip
 │   ├── bt_dispatch.go         # FIRST-BYTE DISPATCH at the head of an alternation chain (>= 3 arms,
 │   │                          #   Go's Alt(Alt(a, b), c) flattened): one br_table on the byte to the
 │   │                          #   arms it can start, frames pushed only for those, in order; inner
@@ -169,7 +184,9 @@ regexped/
 │   │                          #   byte below each position, the floor included. Where the
 │   │                          #   start-anywhere find cannot be built (over the limits, or
 │   │                          #   an ambiguous boundary target) the switch hands over to
-│   │                          #   the BACKTRACKING find (buildBTFindParts) instead
+│   │                          #   the BACKTRACKING find (buildBTFindParts) instead. A pattern whose
+│   │                          #   every match ends at the input's end (suffixOnlyFind) gets findSuffix:
+│   │                          #   the backward pass alone, once, from the end
 │   ├── find_from.go           # The find-from channel: a module-level mutable i32 GLOBAL
 │   │                          #   carrying an exported find's `from` position to the body,
 │   │                          #   the (ptr,len,from) wrapper that fronts every find, and
@@ -228,7 +245,13 @@ regexped/
 │   │                          #   LOOP per run of blocks with equal sizes (emitBlockRun): unrolled, a
 │   │                          #   128-member no-cache companion's blocks cost ovl128 +33 KB. ~1-9 fuel per call for a
 │   │                          #   caller that hands its own state over. Embedded builds get none: a
-│   │                          #   second copy of every state-reading body measured +10% to +43% size
+│   │                          #   second copy of every state-reading body measured +10% to +43% size.
+│   │                          #   The notes/memo ensure runs only when the ARM EPOCH moved (or a new
+│   │                          #   drive): a module-wide global (moduleGlobals.wantEpoch, standalone
+│   │                          #   non-component only) every body bumps where a block arms (emitJudge)
+│   │                          #   or trips (emitFindTripped, the fallback-only tail) — searchRef carries
+│   │                          #   it to the notes contexts. Per block per call it was ~12 fuel: a
+│   │                          #   96-member set's raw drive 718,735 → 412,766
 │   ├── lit_anchor.go          # Literal-anchored find: SIMD lit scan + backward DFA to find match start.
 │   │                          #   A ONE-byte inner literal only behind a leading repeat of a wide,
 │   │                          #   space-free class — in Unicode mode also one holding a character above
@@ -257,7 +280,14 @@ regexped/
 │   │                          #   general (buildShuftiPairs, at most two pairs for any set), a range
 │   │                          #   compare (i8x16.sub + unsigned compare, 8 instructions per range
 │   │                          #   against 16 per pair) for a set of 1-2 contiguous ranges
-│   │                          #   (contiguousRanges) — up to −28.6% fuel where it sits on a hot path
+│   │                          #   (contiguousRanges) — up to −28.6% fuel where it sits on a hot path.
+│   │                          #   Also: the PAIR probe (a prefix's two rarest bytes, byteRank ≥ 240,
+│   │                          #   with ≥ 64 bytes left; a loop over POINTERS with v128.const probes, no
+│   │                          #   locals: 21 instructions per 16 bytes against the hybrid's 23, so
+│   │                          #   text without the first byte costs no more), the CASE-FOLDED prefix ({x, x|0x20}; UTF-8 case
+│   │                          #   pairs per character), the LINE-START scan for `(?m)^…` finds
+│   │                          #   (isLineStartFind), and one masked chunk for a SHORT remainder (≥ 8
+│   │                          #   starts, emitShortInputProbe)
 │   ├── aho_corasick.go        # Aho-Corasick automaton (set frontend, >16 literals, 512 KB table budget)
 │   ├── byte_rank.go           # Packed-pair set frontend: byte-rarity ranks, two-column probe selection (<=16 literals)
 │   ├── set.go                 # Set composition: analyzePattern, CompileSet, frontend selection, anchored buckets.
@@ -276,6 +306,12 @@ regexped/
 │   ├── set_emit.go            # Set WASM emission (CompileFile, the four frontend bodies: AC/Teddy/Shufti/scalar).
 │   │                          #   These bodies serve `find` AND the scan pair — setFindCtx.mode picks what
 │   │                          #   each records at a matching position. Scan work belongs HERE + set_find.go.
+│   │                          #   Suffix tables are shared MODULE-wide (moduleGlobals.suffixShare; split
+│   │                          #   members' passes, splitShare, in set_split.go): a later set — the no-cache
+│   │                          #   companion, a scan copy — names an earlier identical table's address, taken
+│   │                          #   only when the data emitted there is byte-identical (a trial on a globals
+│   │                          #   clone, adopt()). url-guard overlapping −42%. An anchored-only set packs no
+│   │                          #   scan buckets at all (diag frontend "none")
 │   ├── set_find.go            # Shared per-candidate machinery for every non-anchored capability: setFindCtx,
 │   │                          #   first-position drain, gate mask/jump/write-back,
 │   │                          #   eligibility masks, probe recording
@@ -392,7 +428,17 @@ regexped/
 │   │                          #   function of the (mid, eof) output sequence, so equivalent
 │   │                          #   states hold equal cells. It is NOT that a pattern's classes
 │   │                          #   number its minimized single-pattern DFA's states — measured
-│   │                          #   false, and must not be asserted
+│   │                          #   false, and must not be asserted.
+│   │                          #   The projected STEP reads one table (overlapStepTabBytes, in
+│   │                          #   set_overlap_dp.go): cell × byte class → the byte offset of the cell
+│   │                          #   its representative's successor lands in, built at compile time, so
+│   │                          #   no per-state loop runs per byte (−20% to −52% sweep fuel). The
+│   │                          #   whole-set automaton's own tables are then unread and DROPPABLE
+│   │                          #   (genSweepTables), and a 16-bit one gets a class map (sweepClasses)
+│   │                          #   to narrow the step table. A column of 64+ cells keeps its update
+│   │                          #   in ONE function the pass and block body call
+│   │                          #   (overlapAdvanceFnMinCells): three unrolled copies were most of a
+│   │                          #   wide module
 │   ├── set_union_scan.go      # Start-anywhere union automaton: one pass over the whole input.
 │   │                          #   Under set-level prefer-no-match, emitUnionSkip strides 32
 │   │                          #   bytes at a time (16 for the last stretch, which is also what
@@ -569,6 +615,14 @@ regexped/
 │   ├── diag.go                # Diagnostics structures (set composition diagnostics JSON)
 │   ├── absence_lit.go         # Literal-existence absence prefilter for the set preflights
 │   ├── alt_lit_anchor.go      # Literal-anchored find over an alternation's branches, one shared frontend
+│   ├── lit_alt_ac.go          # A FIND over an alternation of plain literals (a keyword list, optionally
+│   │                          #   `\b…\b`) with more than 8 distinct first bytes: an Aho-Corasick walk
+│   │                          #   of the literals (the set frontend's buildAC) with a Teddy skip at the
+│   │                          #   root (≤ 64 literals), keeping the earliest start and, there, the lowest
+│   │                          #   alternative, stopping once no later-ending literal can start earlier.
+│   │                          #   50 words 75-85 → 14-15 fuel/byte; 500 words left Backtracking: 110-125
+│   │                          #   → 32. match_func/groups_func keep their engines (compilePatternBodies
+│   │                          #   builds the match without the find)
 │   ├── blockstack.go          # WASM branch-depth bookkeeping for hand-written emitters
 │   ├── byte_rarity.go         # Byte-rarity classes: route a 17..64-byte first-byte set to Shufti or scalar
 │   ├── class_chain_prefix.go  # Chain-start SIMD verify for `[class]{N,}` patterns — every hint
@@ -673,6 +727,10 @@ regexped/
 │                              #   STANDALONE module is refused, it would read its own memory),
 │                              #   wac plug (after a duplicate-export pre-check) for components
 ├── internal/
+│   ├── clilog/                # The CLI's slog handler without --debug: `regexped: <msg>` /
+│   │                          #   `regexped: warning: <msg>`, each attribute on an indented line,
+│   │                          #   a multi-line message as written, each record printed once (the
+│   │                          #   --diag-json and generate recompiles repeated every warning)
 │   ├── abi/
 │   │   └── abi.go             # The numeric return-value contract shared by compile/ and generate/
 │   ├── benchshim/             # WASM shims the benchmark harnesses time exports from inside
@@ -774,6 +832,7 @@ regexped/
 │                              #   directory, since it only wants one copy on PATH
 ├── docs/
 │   ├── README.md              # Documentation index: every doc below, grouped
+│   ├── quickstart.md          # One regexped.yaml, then its use from JS, Rust and Go (run as shown)
 │   ├── cli.md                 # CLI reference: commands, flags, config schema
 │   ├── rust-api.md            # Generated Rust API: function signatures, iterators
 │   ├── go-api.md              # Generated Go API: wasip1 stubs, iter.Seq2, iter.Seq
@@ -879,7 +938,9 @@ max_dfa_states: 1024                 # optional; max states of ANY DFA/TDFA — 
                                      #   to -1); unset = default; negative = load error. Every automaton is
                                      #   BUILT up to max(mode cap 2,048 / 16,384, it) — the limits travel with
                                      #   the pattern (compile/limits.go). `max_fallback_states:` is RETIRED
-max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32)
+max_tdfa_regs:  32                   # optional; max TDFA registers before falling back (default 32).
+                                     #   config.Count: a whole number >= 1; 0, negative, fraction, string
+                                     #   are line-numbered load errors (as for max_union_states)
 max_bt_instructions: 20000           # optional; max Backtracking program, in instructions. 0 = never
                                      #   Backtracking (a pattern or member that needs it fails to compile)
 max_set_bucket_size: 2MB             # optional; one set bucket's table (default 128 B per max_dfa_states
@@ -1598,6 +1659,8 @@ budget) say nothing about bytes the NEXT call reads again — so this tool measu
 drive: fuel at doubling input sizes, whose ratio is ×2 when the drive is linear and ×4
 when it is quadratic. Fuel is exact, so the verdict does not depend on machine load.
 
+`make adversary` runs the table twice, in byte mode and in Unicode mode
+(`adversary-unicode`, every compile `-unicode`: 83 rows, 0 failed).
 `rows.go` is the table: rows expected LINEAR fail the run when the last ratio exceeds
 2.5, or when a ratio RISES past 2.1 (a quadratic share climbs; fixed costs only fade),
 and a row marked `Arms` fails when its drive never armed or tripped at the largest size;
@@ -1762,76 +1825,53 @@ TDFA uses the same DFA table layout as the DFA engine (u8 or u16 state IDs, opti
 - **RE2/Perl semantics only.** All engines implement leftmost-first (Perl/RE2) match semantics. POSIX leftmost-longest is not supported and must not be introduced.
 - **Runtime over compile time.** Pattern compilation happens once and its cost is irrelevant. Every design and implementation decision should minimise the runtime cost of matching — prefer larger tables, more WASM locals, additional compile-time passes, or any other compile-time complexity if it makes the generated code faster.
 
-## Load-bearing engine-selection gates — DO NOT relax without measurement
+## Engine selection by first sets — measure before moving patterns between engines
 
-Some engine-selection checks in `compile/selector.go` *look* overly
-conservative ("the detector is wrong, this pattern is clearly
-deterministic, it should reach TDFA"). They are deliberately kept.
-Relaxing them has been tried and **caused measurable performance
-regressions**. Always measure per-byte fuel on representative patterns
-before removing or weakening any gate. The full diagnosis is below.
+`hasAmbiguousCaptures` in [compile/selector.go](compile/selector.go) sends a
+capture pattern to Backtracking when an alternation's branches can start
+with the same character. Its first sets are codepoint RANGES
+(`firstRuneRanges`) in both modes — a class of any width, `.` and a folded
+literal's fold orbit included — clipped to 0x00-0xFF in byte mode
+(`clipToByteRanges`), so only a genuinely overlapping alternation stays on
+Backtracking. `TestSelectEngineUnicodeComputesWideFirstSets` pins both modes.
 
-### `hasAmbiguousCaptures` / `getFirstRuneSet` for inverted classes
+**The history is the lesson: engine class is not a substitute for
+measurement.** Until 2026-11-15 byte mode kept an "inverted-class gate":
+a class wider than 256 codepoints (`[^>]`, `[^,]`, `\S`) had no first set,
+so every capture pattern looping over one went to Backtracking. It was
+justified on 2026-06-24 by `<([^>]+)>`, `([^,]+),`, `KEY=([^&]+)&`: Backtracking
+~40 fuel/byte there against ~77 for the TDFA of that day (`<([^>]+)>` neutral
++73%, prefer-match +466%, module +69%), because a deterministic greedy loop
+never backtracks and Backtracking's NFA switch beat the TDFA's table walk plus
+tag-op dispatch.
 
-`getFirstRuneSet` in [compile/selector.go](compile/selector.go) returns
-false on InstRune instructions whose Unicode range exceeds 256
-codepoints. For inverted byte classes (`[^>]`, `[^,]`, `\S`, `[^\n]`,
-etc.) syntax.Prog encodes the class as such a wide range. The detector
-treats them as ambiguous and routes the patterns to Backtracking.
+It was lifted when the premise stopped holding, in two steps:
 
-**This is correct behaviour, not a bug.** Investigated and reverted
-2026-06-24:
+- **Unicode mode, 2026-10-06.** A LOWERED wide class is an alternation of
+  byte sequences Backtracking walks branch by branch (`\pL` was an 800-way
+  chain; the lowering is now a 34-arm prefix trie and the TDFA still wins
+  2.9×-5.6×). Measured (perftest `-unicode`, fuel; module bytes):
+  `(\pL+)\s(\pN+)` over "Straße 42" 101,299 → 2,470, module 189,793 → 46,979;
+  `(\pL+)@(\pL+)` 214,332 → 5,299; `(.+)=(.+)` 16,912 → 3,917. It became
+  affordable after two TDFA-construction fixes that change no output: a
+  memoised whole-walk `epsWalker` and a per-state transition memo
+  (`^(\pL)(\pL{6})` 2 min 16 s → 1.5 s to compile).
+- **Byte mode, 2026-11-15.** The patterns the gate was measured on now take the
+  single-capture shortcut (`whole_capture.go`) and reach neither engine, and on
+  the multi-capture and non-affix shapes that still did, the TDFA had become
+  the cheaper engine: over 54 patterns and six 16 KB inputs (CSV, key=value,
+  logs, prose, HTML), 30 patterns moved and every row cost 0% to −83% fuel per
+  byte, none more — CSV `([^,\n]+),([^,\n]+)` 119.2 → 74.7, prose
+  `(\S+)\s+(\S+)` 163.9 → 101.4, `([^=&]+)=([^&]*)&?` 122.1 → 75.7,
+  `([^,]+),\s*` over long fields 70.3 → 12.2; no-match inputs equal; modules
+  −5% to +27%. perftest moved only `bt-find-mand-lit` (−2.4% fuel, module
+  33,178 → 55,056) and `bt-find-prefix` (fuel equal, +10% module); likelytest
+  and the byteident fixtures were identical.
 
-- **Before:** patterns like `<([^>]+)>`, `([^,]+),`, `KEY=([^&]+)&`
-  compile to BT. BT captureBody costs ~40 fuel/byte for these
-  patterns (deterministic in practice, no actual backtracking).
-- **After the relaxation was applied:** patterns reach TDFA cleanly, captures
-  correct under re2 `--validate-groups`. TDFA captureBody costs ~77
-  fuel/byte. Measured regressions: `<([^>]+)>` neutral +73%, LM +466%,
-  WASM size +69%.
-
-**The lesson.** TDFA is not intrinsically faster than BT. TDFA wins
-only when BT actually backtracks. For clean greedy patterns whose
-runtime path is deterministic, BT's tight NFA switch is *faster* than
-TDFA's table-driven transition + `br_table` tag-op dispatch +
-accept-side-table lookup per byte. Engine class is not a substitute for
-measurement.
-
-**Constraints on revisiting.** Do not re-attempt to relax this gate
-unless TDFA captureBody per-byte cost is *first* reduced below BT's on
-the affected pattern family. That requires (at minimum) replacing
-`br_table` tag-op dispatch with state-ID compare for dominant groups,
-eliminating the TDFA accept side-table, and inlining single-tag-op
-register writes. Even then, the change must be measured on
-representative patterns (`<([^>]+)>`, `([^,]+),`, etc.) and the new
-TDFA fuel cost confirmed at parity or better before any detector
-relaxation.
-
-The same per-byte-cost concern applies to any future plan that moves
-capture-tracking patterns from BT to TDFA on correctness grounds
-alone. Always measure first.
-
-**Unicode mode is the measured exception (2026-10-06).** There the gate is
-lifted: `hasAmbiguousCaptures(prog, unicode)` computes a class of any width,
-`.` and a folded literal's fold orbit as codepoint RANGES
-(`firstRuneRanges`) and checks real overlap, so only a genuinely overlapping
-alternation stays on BT. The premise above — BT checks a wide class with a
-few inline compares — is false once the class is LOWERED: `\pL` was an
-800-way Alt chain that BT walked branch by branch, pushing and popping a
-frame per branch, on every character it rejects. (The lowering is now a
-prefix trie, one arm per distinct lead byte range — 34 for `\pL` — and BT on
-the rows below costs 7,192 and 27,720 rather than 101,299 and 214,332: still
-2.9x and 5.6x the TDFA, so the routing stands.) Measured (perftest
-`-unicode`, fuel; module bytes): `(\pL+)\s(\pN+)` over "Straße 42" 101,299 →
-2,470 (−97.6%), 353 B 189,793 → 46,979; `(\pL+)@(\pL+)` 214,332 → 5,299;
-`(.+)=(.+)` 16,912 → 3,917, 641 B 280,024 → 73,473; `<([^>]+)>` 78,134 →
-75,236; `([^,]+),` 78,288 → 75,182; modules 1.30 MB → 0.76 MB and 2.19 MB →
-1.23 MB (`(\pL+)\s(\pN+)`, `(\pL+)@(\pL+)`). Byte mode is untouched:
-`hasAmbiguousCaptures(prog, false)` is the old code path, and
-`TestSelectEngineUnicodeComputesWideFirstSets` pins both modes. It became
-affordable only after two TDFA-construction fixes that change no output
-(`make byteident`): a memoised whole-walk `epsWalker` and a per-state memo
-of transitions by input-map entry — `^(\pL)(\pL{6})` 2 min 16 s → 1.5 s.
+**Constraint.** Any change that moves capture patterns between engines — in
+either direction, on performance or correctness grounds — is measured first:
+per-byte fuel on representative inputs (the shapes above), perftest and
+likelytest, and re2test `--validate-groups`.
 
 ## Technical Decisions
 
@@ -1897,7 +1937,7 @@ compile — only to merge; a `component` build cannot finish without wasm-tools.
 ---
 
 **Last Updated:** 2026-10-19
-**CLI commands:** `generate` (stubs, including `stub_type: wit`), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`), `merge`. Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
+**CLI commands:** `generate` (stubs, including `stub_type: wit`; the language is `stub_type`, else the extension of the path written — `-o`, else `stub_file`, generate.ForOutput), `compile` (a module, or a component + sibling `.wit` under `wasm_format: component`; makes the output directory), `merge` (`-o -` through a temp file), `check` (everything, nothing written), `help [<command>]`, `--version` (debug.ReadBuildInfo). The config load also checks UTF-8 and every regexp's syntax at its line (config.checkUTF8 / checkRegexpSyntax). Set-composition diagnostics are written by `compile --diag-json=<path>` (`-` for stdout), which calls `CmdWriteDiagJSON` — there is no separate `diag` subcommand. That function RE-RUNS `CompileSet` rather than threading the real compile's diagnostics out, so it must be given the same options: it omitted the set's `LikelyMode` until 2026-09-02 and therefore reported the NEUTRAL frontend, union-scan body and member-skip counts whatever the config's `hints:` said.
 **Docs:** `docs/README.md` (the index), `docs/cli.md` (CLI reference), `docs/rust-api.md` (Rust API), `docs/go-api.md` (Go API), `docs/js-api.md` (JS API), `docs/ts-api.md` (TS API), `docs/as-api.md` (AssemblyScript API), `docs/c-api.md` (C API), `docs/browser.md` (browser embedding), `docs/engines.md` (engine details), `docs/re2.md` (RE2 test coverage), `docs/wasm.md` (WASM internals), `docs/sets.md` (set composition), `docs/prefer-hints.md` (the `prefer-match` / `prefer-no-match` compile hints and `anchor_literal:`), `docs/complexity.md` (every anti-quadratic and memory-bounding mechanism), `docs/performance.md` (the speed comparison against `regex` and `regex-automata`), `docs/component.md` (the Component Model output kind: WIT, naming, versioning, costs), `docs/references.md` (pattern references)
 **Set capabilities:** `match_any` / `match_all` (anchored, whole input, over dedicated non-leftmost-first automata), `scan_any` / `scan_all` (non-anchored; `scan_any` returns a bare pattern id and NO position, which is what lets it compile to a single union-automaton pass — 27 fuel/byte against 78; that pass serves any literal-less set up to 256 ids, in a narrow i64-accumulator form to 64 and a wide per-state-row form above it), `find` (positions and extents; gated per-pattern non-overlapping by default, `overlapping: true` for every-start enumeration — one signature, both take the gate array). Batching is `hints: [batch-find]` on the set, not a capability.
 

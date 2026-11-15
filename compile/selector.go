@@ -437,11 +437,9 @@ func hasUnsafeBeginText(prog *syntax.Prog) bool {
 // Quantifier-loop Alts (Out < PC for the backward loop body, Arg >= PC for the
 // forward exit — the same test hasNonLoopAlternations/hasNestedQuantifiers
 // use) get a narrower version of the check: isAlternationDeterministic still
-// rejects an INDETERMINATE branch (empty first-rune set, e.g. an inverted
-// class wider than 256 codepoints — this is the inverted-class protection, see
-// CLAUDE.md "Load-bearing engine-selection gates", and must not be relaxed
-// here). It only skips the disjoint-ness requirement once both branches are
-// computable, since TDFA's LeftmostFirst priority always prefers the loop
+// rejects an INDETERMINATE branch (no computable first set: a branch that can
+// reach Match without consuming, or a malformed instruction). It only skips
+// the disjoint-ness requirement once both branches are computable, since TDFA's LeftmostFirst priority always prefers the loop
 // body over the exit — "does this byte continue the loop or start the exit"
 // resolves correctly even when the exit's first-byte set overlaps the loop's
 // own class (e.g. X([a-zA-Z]+)Y, where Y is itself a class member).
@@ -454,16 +452,20 @@ func hasUnsafeBeginText(prog *syntax.Prog) bool {
 // nested inside a loop body (e.g. (?:cat|car)+), are a separate InstAlt
 // instruction and are still checked in full.
 //
-// unicode is true when the program runs LOWERED (Unicode mode); prog is still
-// the program as written. There the inverted-class protection is lifted: a
-// class of any width, `.` and a folded literal have a computable first set
-// (firstRuneRanges). The protection exists because Backtracking checks a wide
-// class with a few inline compares and is cheaper than a TDFA there — in byte
-// mode. Lowered, a wide class is an alternation of byte sequences that
-// Backtracking walks branch by branch on every character it rejects: `\pL` is
-// an 800-way chain, and `(\pL+)\s(\pN+)` over "Straße 42" cost 101,299 fuel
-// on Backtracking against 2,470 on a TDFA. On every capture pattern measured
-// the TDFA was the cheaper engine and its module no larger.
+// In both modes a class of any width, `.` and a folded literal have a
+// computable first set (firstRuneRanges), clipped to 0x00-0xFF in byte mode;
+// unicode is true when the program runs LOWERED (Unicode mode), prog still the
+// program as written. A wide class used to be "indeterminate" — the
+// inverted-class gate, which sent `([^,\n]+),([^,\n]+)` and `(\S+)\s+(\S+)` to
+// Backtracking on the premise that Backtracking checks a wide class with a few
+// compares and beats a TDFA there. Lifted in Unicode mode first (2026-10-06:
+// lowered, `\pL` is an 800-way chain Backtracking walks branch by branch;
+// `(\pL+)\s(\pN+)` over "Straße 42" 101,299 → 2,470 fuel), then in byte mode
+// (2026-11-15): the patterns that premise was measured on, `<([^>]+)>` and
+// `([^,]+),`, take the single-capture shortcut and reach neither engine, and on
+// the multi-capture ones that still did the TDFA cost 0% to −83% fuel per byte
+// over 54 patterns and six inputs (CSV `([^,\n]+),([^,\n]+)` 119.2 → 74.7,
+// prose `(\S+)\s+(\S+)` 163.9 → 101.4), no row dearer; modules −5% to +27%.
 func hasAmbiguousCaptures(prog *syntax.Prog, unicode bool) bool {
 	for pc, inst := range prog.Inst {
 		switch inst.Op {
@@ -700,12 +702,11 @@ func isEpsilonAccept(prog *syntax.Prog, pc int) bool {
 //
 // quantifierLoop is true when altPC is a quantifier-loop Alt (see
 // hasAmbiguousCaptures' doc comment). For those, an INDETERMINATE branch
-// (empty first-rune set — the inverted-class signal, CLAUDE.md
-// "Load-bearing engine-selection gates") is still treated as ambiguous; only
+// (no computable first set) is still treated as ambiguous; only
 // the disjoint-ness requirement between two otherwise-computable branches is
 // skipped, since TDFA's LeftmostFirst priority resolves that case
-// correctly regardless of overlap. unicode computes the first sets as
-// codepoint ranges of any width (hasAmbiguousCaptures).
+// correctly regardless of overlap. The first sets are codepoint ranges of any
+// width, clipped to bytes when unicode is false (hasAmbiguousCaptures).
 func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop, unicode bool) bool {
 	if altPC >= len(prog.Inst) {
 		return false
@@ -728,40 +729,34 @@ func isAlternationDeterministic(prog *syntax.Prog, altPC int, quantifierLoop, un
 		return true // one epsilon, one byte-consuming = always disjoint
 	}
 
-	if unicode {
-		left, okL := firstRuneRanges(prog, int(alt.Out))
-		right, okR := firstRuneRanges(prog, int(alt.Arg))
-		if !okL || !okR || len(left) == 0 || len(right) == 0 {
-			return false
-		}
-		return quantifierLoop || !rangesOverlap(left, right)
+	left, okL := firstRuneRanges(prog, int(alt.Out))
+	right, okR := firstRuneRanges(prog, int(alt.Arg))
+	if !unicode {
+		// Byte mode reads bytes: a range past 0xFF names nothing it can see.
+		left, right = clipToByteRanges(left), clipToByteRanges(right)
 	}
-
-	leftRunes := getFirstRuneSet(prog, int(alt.Out))
-	rightRunes := getFirstRuneSet(prog, int(alt.Arg))
-
-	if len(leftRunes) == 0 || len(rightRunes) == 0 {
-		return false // can't determine first chars for at least one branch — ambiguous even for quantifier loops
+	if !okL || !okR || len(left) == 0 || len(right) == 0 {
+		return false
 	}
+	return quantifierLoop || !rangesOverlap(left, right)
+}
 
-	if quantifierLoop {
-		return true // both sides computable; overlap alone doesn't matter for a greedy loop
+// clipToByteRanges cuts sorted, merged codepoint ranges to 0x00-0xFF: the
+// first set a BYTE-mode program can actually start with. A fold orbit's
+// Kelvin sign or long s, and a negated class's tail, fall away.
+func clipToByteRanges(r []rune) []rune {
+	var out []rune
+	for i := 0; i+1 < len(r) && r[i] <= 0xFF; i += 2 {
+		out = append(out, r[i], min(r[i+1], 0xFF))
 	}
-
-	for r := range leftRunes {
-		if rightRunes[r] {
-			return false
-		}
-	}
-
-	return true
+	return out
 }
 
 // firstRuneRanges is getFirstRuneSet as sorted, merged codepoint ranges
 // (lo, hi pairs) with no width limit: a class of any width, `.` and a folded
 // literal (its SimpleFold orbit) all have one. ok is false where the set
 // cannot be known — the branch can reach Match without consuming, or an
-// instruction is malformed. Unicode mode only (hasAmbiguousCaptures).
+// instruction is malformed. Byte mode clips the result (clipToByteRanges).
 func firstRuneRanges(prog *syntax.Prog, pc int) (ranges []rune, ok bool) {
 	visited := make(map[int]bool)
 	var collect func(int) bool
