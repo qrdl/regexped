@@ -1035,7 +1035,7 @@ func TestStubRuntimeDifferential(t *testing.T) {
 			if err != nil {
 				t.Fatalf("wasmtime --invoke %s: %v\n%s", expr, err, out)
 			}
-			v, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+			v, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
 			if err != nil {
 				t.Fatalf("wasmtime --invoke %s printed %q", expr, out)
 			}
