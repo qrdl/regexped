@@ -510,6 +510,12 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 			prefixAST, suffixAST, ok := splitAtPath(parsed, path)
 			info.splittable = ok
 			if ok {
+				// guard is set on info only once the split survives every
+				// rejection below: a fallback member walks its whole pattern,
+				// which judges the boundary itself, and a guard left on it is
+				// tested at EOF too, reading input[len] (`\bfoo\n(?m:^)x`
+				// trapped when the input ended at the end of memory).
+				guard := wordGuardNone
 				// Zero-length prefix: strip it if it consists purely of begin-anchors (^, \A),
 				// or is a single \b / \B (a word guard). Mixed prefixes (e.g. ^$, ^\b) or
 				// other zero-length assertions route to fallback.
@@ -526,7 +532,7 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 						} else if g := wordGuardOf(prefixAST); g != wordGuardNone {
 							// A bare \b / \B: a test at each candidate
 							// (PatternInfo.wordGuard), not a prefix walk.
-							info.wordGuard = g
+							guard = g
 							prefixAST = nil
 						} else {
 							// Non-begin or mixed zero-length prefix: route to fallback.
@@ -551,6 +557,7 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 				if info.splittable {
 					info.prefixAST = prefixAST
 					info.suffixAST = suffixAST
+					info.wordGuard = guard
 				}
 			}
 			// Fallback patterns: only truly anchored if the begin-anchor is at the

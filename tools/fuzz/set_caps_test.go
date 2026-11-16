@@ -752,6 +752,80 @@ func gatedOracleFrom(pats []string, input string, from int) []setMatch {
 	return out
 }
 
+// TestSetWordGuardOnAFallbackMemberAtTheMemoryEdge: a \b member whose split is
+// rejected after its guard was stripped (a begin anchor after the literal)
+// goes to a FALLBACK bucket, which is visited at EOF too. With the guard left
+// on it, that visit read input[len], and an input ending at the end of memory
+// trapped. The input sits there, and the drive answers as Go does.
+func TestSetWordGuardOnAFallbackMemberAtTheMemoryEdge(t *testing.T) {
+	pats := []string{`\bfoo\n(?m:^)x`, `\Bfoo^`, `zz`}
+	members := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		members[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	w, _, err := compile.CompileFile(config.BuildConfig{Patterns: members, Sets: []config.SetConfig{{
+		Name: "s", Patterns: config.PatternSelector{Names: names}, Find: "gated_find"}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{"a foo", "foo\nx", "xfoo\nx", "zz foo\nx w", "foo\nxfoo"} {
+		store, inst, mem, release, err := instantiate(w)
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		const pageSize = 65536
+		dataTop, err := utils.ParseDataSectionBytes(w)
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		gatePtr := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+		outPtr := gatePtr + 4096
+		if need, cur := uint64(gatePtr/pageSize)+2, mem.Size(store); need > cur {
+			if _, err := mem.Grow(store, need-cur); err != nil {
+				release()
+				t.Fatal(err)
+			}
+		}
+		inBase := int32(mem.Size(store)*pageSize) - int32(len(input)) // input[len-1] is memory's last byte
+		buf := mem.UnsafeData(store)
+		copy(buf[inBase:], input)
+		for i := int32(0); i < int32(4*len(pats)); i++ {
+			buf[gatePtr+i] = 0
+		}
+		scratch := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
+		fn := inst.GetFunc(store, "gated_find")
+		var got []setMatch
+		for pos := int32(0); pos <= int32(len(input)); {
+			res, err := fn.Call(store, inBase, int32(len(input)), pos, scratch, outPtr, int32(len(pats)))
+			if err != nil {
+				t.Fatalf("gated find over %q ending at the memory edge, from %d: %v", input, pos, err)
+			}
+			n := int(res.(int32))
+			if n <= 0 {
+				break
+			}
+			buf = mem.UnsafeData(store)
+			rd := func(o int32) int { return int(int32(binary.LittleEndian.Uint32(buf[o:]))) }
+			for i := int32(0); i < int32(n); i++ {
+				base := outPtr + i*12 // docs/wasm.md "find tuple layout"
+				got = append(got, setMatch{PatternID: rd(base), Start: rd(base + 4), End: rd(base + 8)})
+			}
+			pos = int32(got[len(got)-1].Start + 1)
+		}
+		release()
+		want := gatedOracleFrom(pats, input, 0)
+		sortMatches(want)
+		sortMatches(got)
+		if fmt.Sprint(want) != fmt.Sprint(got) {
+			t.Errorf("gated find over %q at the memory edge: %v, want %v", input, got, want)
+		}
+	}
+}
+
 // TestSetMemberWithoutAnOwnDFA: a member whose own DFA cannot be built —
 // 2^13 suffix states against the 2,048-state helper limit — is served on
 // Backtracking, as the same pattern is alone, instead of failing the set's

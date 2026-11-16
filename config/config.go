@@ -1173,7 +1173,7 @@ func LoadConfig(configPath string) (BuildConfig, error) {
 		return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 	}
 	if stubType, err := ResolveStubType(cfg); err == nil {
-		if err := validateStubTypeForFormat(&cfg, stubType); err != nil {
+		if err := ValidateStubTypeForFormat(&cfg, stubType); err != nil {
 			return BuildConfig{}, fmt.Errorf("config %s: %w", configPath, err)
 		}
 	}

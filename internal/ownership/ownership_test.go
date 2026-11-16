@@ -235,11 +235,17 @@ func TestFixHandsTheOutputToTheOwnerOfItsDirectory(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Fix chowns the resolved path, and the temp dir may sit behind a symlink
+	// (macOS: /var is /private/var).
+	resolved, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		t.Fatal(err)
+	}
 	calls := asRoot(t)
 
 	Fix(file)
 
-	want := []chownCall{{file, stubUID, stubGID}}
+	want := []chownCall{{resolved, stubUID, stubGID}}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("got %v, want %v", *calls, want)
 	}

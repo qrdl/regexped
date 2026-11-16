@@ -1692,7 +1692,7 @@ that same core module into a Component Model component:
   `wit`, `rust` and `c`; `go`, `as`, `js` and `ts` are refused PERMANENTLY (no
   wasip2 target in stock Go, no planned AssemblyScript route, and no JS runtime
   loads a component natively). Nothing is refused "yet" any more, which is why
-  `validateStubTypeForFormat` has ONE message and not two.
+  `ValidateStubTypeForFormat` has ONE message and not two.
 - **`sets:` are supported**, in a SECOND interface `sets` beside `matcher`, and
   the raw set ABI does not cross the boundary. `match_all`/`scan_all` return a
   `list<u32>` of ids for BOTH widths — measured faster than handing the bitmap

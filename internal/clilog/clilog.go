@@ -28,8 +28,16 @@ type Handler struct {
 	mu     *sync.Mutex
 	seen   map[string]bool // every record written, as written
 	w      io.Writer
-	attrs  []slog.Attr
+	attrs  []boundAttr
 	prefix string // the groups WithGroup opened, as "a.b."
+}
+
+// boundAttr is an attribute WithAttrs bound, with the groups open when it was
+// bound: it is printed through the same walk as a record's own, so an
+// anonymous group inlines and an empty attribute is dropped the same way.
+type boundAttr struct {
+	prefix string
+	attr   slog.Attr
 }
 
 // New is a Handler writing to w.
@@ -72,7 +80,7 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 		write(prefix+a.Key, v)
 	}
 	for _, a := range h.attrs {
-		walk("", a)
+		walk(a.prefix, a.attr)
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		walk(h.prefix, a)
@@ -91,10 +99,9 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 // WithAttrs returns a Handler that prints attrs with every record.
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	c := *h
-	c.attrs = append([]slog.Attr(nil), h.attrs...)
+	c.attrs = append([]boundAttr(nil), h.attrs...)
 	for _, a := range attrs {
-		a.Key = h.prefix + a.Key
-		c.attrs = append(c.attrs, a)
+		c.attrs = append(c.attrs, boundAttr{h.prefix, a})
 	}
 	return &c
 }

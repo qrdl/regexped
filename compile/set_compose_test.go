@@ -1828,6 +1828,11 @@ func TestAnalyzePattern_WordGuardPrefix(t *testing.T) {
 		{`^\bfoo`, wordGuardNone, false},
 		{`\b\Bfoo`, wordGuardNone, false},
 		{`\b.foo`, wordGuardNone, false}, // a prefix walk, which cannot see the boundary
+		// A guard whose split is rejected later (a begin anchor after the
+		// literal) does not survive onto the fallback member: it would be
+		// tested at EOF and read input[len].
+		{`\bfoo\n(?m:^)x`, wordGuardNone, false},
+		{`\Bfoo^`, wordGuardNone, false},
 	} {
 		var pp, sp dfaPool
 		info, err := analyzePattern(config.PatternEntry{Regexp: c.pat}, &pp, &sp)

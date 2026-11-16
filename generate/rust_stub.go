@@ -308,7 +308,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// asks for the region.
 				// Its lines were spelled for the iterator's initialiser, eight
 				// columns deeper than a function body.
-				cachePlan, cacheInit = strings.ReplaceAll(cacheInit, "\n            ", "\n    "), ""
+				cachePlan = strings.ReplaceAll(cacheInit, "\n            ", "\n    ")
 				// LAZY: the iterator starts with the header alone, its lazy
 				// word set, and the module answers abi.OverlapCacheWanted, with
 				// nothing delivered, at the call where it would start using the

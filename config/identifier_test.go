@@ -1156,14 +1156,14 @@ func TestWitVersionUnderModuleWarnsAndProceeds(t *testing.T) {
 func TestStubTypeForFormat(t *testing.T) {
 	component := &BuildConfig{WasmFormat: "component", ImportModule: "regexps"}
 	for _, st := range []string{"rust", "c", "wit"} {
-		if err := validateStubTypeForFormat(component, st); err != nil {
+		if err := ValidateStubTypeForFormat(component, st); err != nil {
 			t.Errorf("%s is a supported component stub type: %v", st, err)
 		}
 	}
 	// js and ts sit with go and as: no JS runtime loads a component, and the
 	// module format already serves a JS user without a transpiler.
 	for _, st := range []string{"go", "as", "js", "ts"} {
-		err := validateStubTypeForFormat(component, st)
+		err := ValidateStubTypeForFormat(component, st)
 		if err == nil {
 			t.Fatalf("stub %s under component: want an error", st)
 		}
@@ -1171,16 +1171,16 @@ func TestStubTypeForFormat(t *testing.T) {
 			t.Errorf("stub %s is not a component target; its message must not say \"yet\": %v", st, err)
 		}
 	}
-	if err := validateStubTypeForFormat(component, "wit"); err != nil {
+	if err := ValidateStubTypeForFormat(component, "wit"); err != nil {
 		t.Errorf("wit under component: %v", err)
 	}
 	// And wit is meaningless without a component.
 	module := &BuildConfig{ImportModule: "regexps"}
-	if err := validateStubTypeForFormat(module, "wit"); err == nil {
+	if err := ValidateStubTypeForFormat(module, "wit"); err == nil {
 		t.Error("wit under module: want an error")
 	}
 	for _, st := range []string{"rust", "js", "ts", "go", "c", "as"} {
-		if err := validateStubTypeForFormat(module, st); err != nil {
+		if err := ValidateStubTypeForFormat(module, st); err != nil {
 			t.Errorf("stub %s under module must stay valid: %v", st, err)
 		}
 	}

@@ -105,7 +105,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 	return nil
 }
 
-// validateStubTypeForFormat rejects the stub types that cannot be generated
+// ValidateStubTypeForFormat rejects the stub types that cannot be generated
 // for the configured output kind.
 //
 // ONE message, not two. There used to be a second one ending in "yet",
@@ -130,7 +130,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 // format only), so a transpiler is mandatory, and `jco transpile` produces a
 // core module plus glue — which is exactly where `wasm_format: module` starts.
 // A JS user would pay a tool and a build step to arrive where they already are.
-func validateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
+func ValidateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
 	if !cfg.Component() {
 		if stubType == "wit" {
 			return fmt.Errorf("stub_type %q requires wasm_format: %s", stubType, formatComponent)

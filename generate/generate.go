@@ -41,14 +41,21 @@ func ResolveStubType(cfg config.BuildConfig) (string, error) {
 // out when given, else stub_file ("-" names no file, so stub_file's). The
 // export names are checked again for that language when it is not the one
 // the config was loaded for: `-o x.go` with `stub_file: s.rs` used to write
-// Rust into x.go.
+// Rust into x.go. So is the language against wasm_format, as LoadConfig checks
+// stub_file's: `-o s.js` under a component config wrote a JS loader for a
+// module the build does not produce, and `-o x.wit` under a module config a
+// WIT for a component it does not.
 func ForOutput(cfg config.BuildConfig, out string) (config.BuildConfig, error) {
 	if out == "" || out == "-" || cfg.StubType != "" || out == cfg.StubFile {
 		return cfg, nil
 	}
 	c := cfg
 	c.StubFile = out
-	if _, err := ResolveStubType(c); err != nil {
+	stubType, err := ResolveStubType(c)
+	if err != nil {
+		return cfg, err
+	}
+	if err := config.ValidateStubTypeForFormat(&c, stubType); err != nil {
 		return cfg, err
 	}
 	if err := config.ValidateConfig(&c); err != nil {

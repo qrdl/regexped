@@ -18,10 +18,14 @@ func TestHandler(t *testing.T) {
 	l.Warn("Set member runs on Backtracking", "pattern", "bt0", "id", 0, "effect", "line one\nline two") // once only
 	l.Error("config c.yaml:3: bad regexp\n   3 | - regexp: 'a('\n     |           ^")
 	l.With("set", "s").WithGroup("g").With("k", 1).WithGroup("").Warn("grouped", "x", true, slog.Group("inner", "y", "z"), slog.Group("", "flat", 2), "", "skipped")
+	// Bound attributes as a record's own: an anonymous group inlines, an
+	// empty attribute is dropped (they printed `g..bflat` and `g.: <nil>`).
+	l.WithGroup("g").With(slog.Group("", "bflat", 3), slog.Attr{}, slog.Group("bin", "y", "z")).Warn("bound")
 	want := "regexped: warning: Set member runs on Backtracking\n" +
 		"    pattern: bt0\n    id: 0\n    effect: line one\n      line two\n" +
 		"regexped: config c.yaml:3: bad regexp\n   3 | - regexp: 'a('\n     |           ^\n" +
-		"regexped: warning: grouped\n    set: s\n    g.k: 1\n    g.x: true\n    g.inner.y: z\n    g.flat: 2\n"
+		"regexped: warning: grouped\n    set: s\n    g.k: 1\n    g.x: true\n    g.inner.y: z\n    g.flat: 2\n" +
+		"regexped: warning: bound\n    g.bflat: 3\n    g.bin.y: z\n"
 	if buf.String() != want {
 		t.Errorf("got:\n%s\nwant:\n%s", buf.String(), want)
 	}

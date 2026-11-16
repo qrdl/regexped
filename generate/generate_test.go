@@ -3114,6 +3114,24 @@ func TestForOutput(t *testing.T) {
 	if _, err := ForOutput(base, "x.go"); err == nil || !strings.Contains(err.Error(), "func") {
 		t.Errorf("-o x.go with match_func func: err = %v, want a reserved-word error", err)
 	}
+	// The language is checked against wasm_format as stub_file's is at load:
+	// no JS/TS/Go stub for a component, no WIT for a module (AS has no
+	// extension of its own: stub_type, which load checks, names it).
+	comp := ok
+	comp.WasmFormat = "component"
+	for _, out := range []string{"x.js", "x.ts", "x.go"} {
+		if _, err := ForOutput(comp, out); err == nil || !strings.Contains(err.Error(), "not supported for wasm_format: component") {
+			t.Errorf("component -o %s: err = %v, want the format error", out, err)
+		}
+	}
+	for _, out := range []string{"x.h", "x.wit"} {
+		if _, err := ForOutput(comp, out); err != nil {
+			t.Errorf("component -o %s: %v", out, err)
+		}
+	}
+	if _, err := ForOutput(ok, "x.wit"); err == nil || !strings.Contains(err.Error(), "requires wasm_format: component") {
+		t.Errorf("module -o x.wit: err = %v, want the format error", err)
+	}
 }
 
 // TestCmdGenerateStubNeedsAModuleName: a module stub that imports by module
