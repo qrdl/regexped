@@ -12,7 +12,7 @@
 # resumes fuzzing with whatever time budget remains.
 #
 # Usage:
-#   [UNICODE=1] [PARALLEL=N] ./fuzz-budget.sh [TIME] [MAX_ERRORS] [TARGET]
+#   [UNICODE=1] [PARALLEL=N] [FRESH=1] ./fuzz-budget.sh [TIME] [MAX_ERRORS] [TARGET]
 #   TIME        total wall-clock budget as a sequence of <number><unit>
 #               chunks (h/m/s), e.g. 10m, 1h30m, 45s. Default: 10m.
 #   MAX_ERRORS  stop after this many distinct crashers. Default: 5.
@@ -25,6 +25,13 @@
 #               4 workers; on a many-core machine prefer several targets at
 #               8 or so each over one target on every core, since contended
 #               workers stretch every call towards Go's 10-second hang limit.
+#   FRESH=1     start from the target's seeds only, not from the inputs saved
+#               by earlier runs: go test re-runs every saved input before it
+#               fuzzes anything new, and that grows with each run (FuzzSetCaps
+#               under -unicode: 4,096 inputs, 4.5 minutes). The run gets an
+#               empty cache directory of its own, kept across relaunches and
+#               deleted at the end; the saved inputs are left as they are.
+#               Default: off.
 #
 # Only TARGET runs: -run selects it alone, so neither a relaunch nor the first
 # launch replays the package's other tests and seed corpora first (`make
@@ -86,6 +93,18 @@ if [[ "${UNICODE:-}" == "1" ]]; then
 	TEST_ARGS=(-args -unicode)
 elif [[ -n "${UNICODE:-}" ]]; then
 	echo "UNICODE must be 1 or unset, got: $UNICODE" >&2
+	exit 2
+fi
+if [[ "${FRESH:-}" == "1" ]]; then
+	fresh_dir=$(mktemp -d)
+	trap 'rm -rf "${fresh_dir:?}"' EXIT
+	if [[ ${#TEST_ARGS[@]} -eq 0 ]]; then
+		TEST_ARGS=(-args)
+	fi
+	# go test passes its own -test.fuzzcachedir first; the last one wins.
+	TEST_ARGS+=(-test.fuzzcachedir="$fresh_dir")
+elif [[ -n "${FRESH:-}" ]]; then
+	echo "FRESH must be 1 or unset, got: $FRESH" >&2
 	exit 2
 fi
 PARALLEL_FLAG=()

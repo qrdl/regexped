@@ -122,6 +122,9 @@ type resourceNotes struct {
 	// before the notes or memo are allocated (emitTryReserve); set at
 	// emission (buildPatternAdapterBody).
 	heap uint32
+	// heads is where the allocator's free-list heads live, which the reserve
+	// check reads too.
+	heads int32
 }
 
 func (n resourceNotes) on() bool { return n.bytesPerPos > 0 || n.bt }
@@ -214,7 +217,7 @@ func componentAdapters(patterns []*compiledPattern, names map[string]string,
 			if name, ok := names[p.groupsExport]; ok {
 				inner := base + p.groupsFromWrapperOffsets()
 				out = append(out, componentAdapter{
-					kind: adapterGroups, funcIdx: inner, export: name, numGroups: p.numGroups,
+					kind: adapterGroups, funcIdx: inner, export: name, numGroups: p.outGroups(),
 				})
 			}
 		}
@@ -278,7 +281,7 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 			if r, ok := resources[p.groupsExport]; ok && r.Groups {
 				out = append(out, patternResource{
 					funcName: p.groupsExport, res: r,
-					inner: base + p.groupsFromWrapperOffsets(), numGroups: p.numGroups, notes: p.patternResource(),
+					inner: base + p.groupsFromWrapperOffsets(), numGroups: p.outGroups(), notes: p.patternResource(),
 				})
 			}
 		}
@@ -288,8 +291,8 @@ func orderedPatternResources(patterns []*compiledPattern, resources map[string]C
 
 // buildPatternAdapterBody dispatches to the body emitter for one resource
 // adapter. The function-shaped kinds are the caller's own business.
-func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32) []byte {
-	a.notes.heap = heapGlobal
+func buildPatternAdapterBody(a componentAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32, classHeadsBase int32) []byte {
+	a.notes.heap, a.notes.heads = heapGlobal, classHeadsBase
 	switch a.kind {
 	case adapterPatCtor:
 		return buildPatternScannerCtorBody(reallocIdx, a.resNewImport, callListGlobal,
@@ -352,6 +355,9 @@ func patternBaseIndices(patterns []*compiledPattern) ([]int, int) {
 // of its own class. That is exactly what makes a repeated identical call FLAT
 // in memory — the property this allocator exists to have — and it bounds the
 // waste at 2x per allocation instead of trading it for unbounded fragmentation.
+// What it does do is give a block that ends at the heap top back to the bump
+// when it is freed (cm_free), so the memory of a finished drive serves a
+// bigger request too.
 
 const (
 	// classHeadsBytes is the free-list head array: one i32 head per size class,
@@ -554,19 +560,45 @@ func appendMemBytes(b []byte) []byte {
 
 // buildComponentFreeBody emits cm_free: (ptr i32) → ().
 //
-// It returns one block to its class's free list. A separate function rather than
-// code inlined in the post-return because a `resource`'s destructor frees the
-// same way — the state a handle owns is freed when the handle is dropped, not
-// when a call ends — and two copies of a free list's update is two places for it
-// to be wrong.
+// It returns one block: to the bump, when the block ends at the heap top, and
+// to its class's free list otherwise. A separate function rather than code
+// inlined in the post-return because a `resource`'s destructor frees the same
+// way — the state a handle owns is freed when the handle is dropped, not when a
+// call ends — and two copies of a free list's update is two places for it to be
+// wrong.
 //
+//	if ptr-8 + (1 << class) == heap { heap = ptr-8 ; return }
 //	*(ptr-4) = classHeads[class] ; classHeads[class] = ptr
-func buildComponentFreeBody(classHeadsBase int32) []byte {
+//
+// TRIM TO TOP. A free list holds blocks of one size class only, so blocks
+// freed onto it can serve nothing bigger: a long-lived instance that served a
+// 40 KB drive kept its 64 KB-class blocks below the heap top, and under
+// max_memory the next 80 KB drive — needing 128 KB-class blocks and the
+// Backtracking scratch above the top — ran out of room after 21 matches, where
+// a fresh instance answered all 80,000. A finished drive's blocks are the
+// topmost ones, and the post-return frees a call's chain newest first, so each
+// free in turn finds its block at the top: the drive's memory goes back to the
+// bump block by block, with no search for what lies below. A block freed while
+// a younger one is still alive goes onto its list as before.
+func buildComponentFreeBody(heapGlobal uint32, classHeadsBase int32) []byte {
 	const pP = 0x00 // param 0: the block
 	alloc := newLocalAlloc(1)
 	lHead := alloc.I32() // &classHeads[class]
 	var b []byte
 	b = alloc.EmitDecls(b)
+
+	// A block that ends at the heap top gives its bytes back to the bump.
+	b = appendAddrMinus(b, pP, 8)
+	b = append(b, 0x41, 0x01)
+	b = appendLoadMinus(b, pP, 8)
+	b = append(b, 0x74, 0x6A) // i32.shl; i32.add — the block's end
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+	b = appendAddrMinus(b, pP, 8)
+	b = append(b, 0x24)
+	b = utils.AppendULEB128(b, heapGlobal)
+	b = append(b, 0x0F, 0x0B) // return; end
 
 	b = append(b, 0x41)
 	b = utils.AppendSLEB128(b, classHeadsBase)
@@ -678,19 +710,31 @@ func callReallocDyn(b []byte, reallocIdx int, align int32, sizeLocal byte) []byt
 // a grow the engine refuses (`max_memory`). A search's OPTIONAL memory — its
 // notes, its Backtracking memo, a set's answer cache — asks first, so a refusal
 // leaves its pointer 0 and the module runs without it, as a module build does;
-// calling the allocator straight would trap the whole call. A fresh carve is a
-// power-of-two size class, at most 2 × (size + 8) bytes above the heap top,
-// which is what is reserved. needLocal is an i64 scratch local.
-func emitTryReserve(b []byte, heapGlobal uint32, sizeLocal, needLocal byte) []byte {
+// calling the allocator straight would trap the whole call. The request's size
+// class is computed as cabi_realloc computes it: a freed block on that class's
+// list serves it outright, and otherwise exactly one block of the class,
+// 1 << class bytes, must fit above the heap top. It used to ignore the free
+// lists and reserve 2 × (size + 8), so it declined memory a freed block of
+// the right size stood ready to give. needLocal is an i64 scratch local.
+func emitTryReserve(b []byte, heapGlobal uint32, classHeadsBase int32, sizeLocal, needLocal byte) []byte {
 	b = append(b, 0x20, sizeLocal, 0x42)
 	b = utils.AppendSLEB128_64(b, 0x7FFFFFF0)
 	b = append(b, 0x56, 0x04, 0x7F) // i64.gt_u; if (result i32): a size the allocator traps on
 	b = append(b, 0x41, 0x00)
 	b = append(b, 0x05)
-	// need = heap + 2 × (size + 8)
+	// need = class = max(64 - clz(size + 7), minClassShift)
+	b = append(b, 0x42, 0xC0, 0x00, 0x20, sizeLocal, 0x42, 0x07, 0x7C, 0x79, 0x7D, 0x22, needLocal) // 64 - clz64
+	b = append(b, 0x42, minClassShift, 0x54, 0x04, 0x40)                                            // i64.lt_u; if
+	b = append(b, 0x42, minClassShift, 0x21, needLocal, 0x0B)
+	// classHeads[class] != 0: a freed block of the class serves it.
+	b = append(b, 0x20, needLocal, 0xA7, 0x41, 0x02, 0x74) // wrap; << 2
+	b = append(b, 0x28, 0x02)
+	b = utils.AppendULEB128(b, uint32(classHeadsBase)) //nolint:gosec // a static address
+	b = append(b, 0x04, 0x7F, 0x41, 0x01, 0x05)        // if (result i32) 1 else
+	// need = heap + (1 << class)
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, heapGlobal)
-	b = append(b, 0xAD, 0x20, sizeLocal, 0x42, 0x08, 0x7C, 0x42, 0x01, 0x86, 0x7C, 0x22, needLocal)
+	b = append(b, 0xAD, 0x42, 0x01, 0x20, needLocal, 0x86, 0x7C, 0x22, needLocal)
 	b = append(b, 0x3F, 0x00, 0xAD, 0x42, 0x10, 0x86) // memory.size × 64 KiB, in i64
 	b = append(b, 0x58, 0x04, 0x7F)                   // i64.le_u; if (result i32): it fits
 	b = append(b, 0x41, 0x01)
@@ -700,7 +744,7 @@ func emitTryReserve(b []byte, heapGlobal uint32, sizeLocal, needLocal byte) []by
 	b = utils.AppendSLEB128_64(b, 0xFFFF)
 	b = append(b, 0x7C, 0x42, 0x10, 0x88, 0xA7) // + 0xFFFF; >> 16; wrap
 	b = append(b, 0x40, 0x00, 0x41, 0x7F, 0x47) // memory.grow; != -1
-	return append(b, 0x0B, 0x0B)
+	return append(b, 0x0B, 0x0B, 0x0B)
 }
 
 // emitGiveSearchMemory gives a search block its optional memory: (len + 1) ×
@@ -710,12 +754,12 @@ func emitTryReserve(b []byte, heapGlobal uint32, sizeLocal, needLocal byte) []by
 // runs that search without it. lenPush pushes the text length (i32); the block
 // is in lBlk. lSz, lP, lChain are i32 locals; lSz64, lNeed i64.
 func emitGiveSearchMemory(b []byte, lenPush func([]byte) []byte, nb int32, ptrOff, capOff, reallocIdx int,
-	heapGlobal, callListGlobal uint32, lBlk, lSz, lP, lChain, lSz64, lNeed byte) []byte {
+	heapGlobal uint32, classHeadsBase int32, callListGlobal uint32, lBlk, lSz, lP, lChain, lSz64, lNeed byte) []byte {
 	b = lenPush(b)
 	b = append(b, 0xAD, 0x42, 0x01, 0x7C, 0x42) // i64: len + 1
 	b = utils.AppendSLEB128_64(b, int64(nb))
 	b = append(b, 0x7E, 0x21, lSz64) // × nb
-	b = emitTryReserve(b, heapGlobal, lSz64, lNeed)
+	b = emitTryReserve(b, heapGlobal, classHeadsBase, lSz64, lNeed)
 	b = append(b, 0x04, 0x40) // if the allocator can serve it
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, callListGlobal)
@@ -1078,7 +1122,7 @@ func emitResourceNotes(b []byte, notes resourceNotes, pRep byte, numGroups, real
 		b = append(b, 0x20, pRep)
 		return loadI32(b, patRepLen)
 	}, notes.bytesPerPos, abi.SearchNotesOff, abi.SearchNotesCapOff, reallocIdx,
-		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+		notes.heap, notes.heads, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	return append(b, 0x0B, 0x0B)
 }
 
@@ -1224,40 +1268,45 @@ func emitPatReleaseFinished(b []byte, pRep byte, freeIdx, numGroups int, notes r
 func buildPatternScannerDtorBody(freeIdx, numGroups int, notes resourceNotes) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
-	var lNotes byte
+	lIn := alloc.I32()
+	var lHi, lLo byte
 	if notes.on() {
-		lNotes = alloc.I32()
+		lHi, lLo = alloc.I32(), alloc.I32()
 	}
 	var b []byte
 	b = alloc.EmitDecls(b)
-	if notes.on() {
-		// The notes a search that armed was given, and the memo one that
-		// tripped was, detached like the input.
-		for _, off := range []int{abi.SearchNotesOff, abi.SearchBTMemoOff} {
-			b = append(b, 0x20, pRep)
-			b = loadI32(b, int(patRepBlockOff(numGroups))+off)
-			b = append(b, 0x22, lNotes, 0x04, 0x40)
-			b = append(b, 0x20, lNotes, 0x10)
-			b = utils.AppendULEB128(b, uint32(freeIdx))
-			b = append(b, 0x0B)
-		}
+	free := func(b []byte, l byte) []byte {
+		// cm_free reads the block's class from the word below the pointer,
+		// so it must not see null.
+		b = append(b, 0x20, l, 0x04, 0x40, 0x20, l, 0x10)
+		b = utils.AppendULEB128(b, uint32(freeIdx))
+		return append(b, 0x0B)
 	}
-
-	// The input, unless the scan finished and released it. cm_free reads the
-	// block's class from the word below the pointer, so it must not see null.
+	// Newest first, so each block is at the heap top when it is freed and
+	// goes back to the bump (cm_free): the notes and memo a search was given
+	// — the higher of the two first — then the representation, then the
+	// input, which the host lowered before the constructor ran. Freeing the
+	// input first left it on a free list below the representation.
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, patRepInput)
-	b = append(b, 0x04, 0x40)
-	b = append(b, 0x20, pRep)
-	b = loadI32(b, patRepInput)
-	b = append(b, 0x10)
+	b = append(b, 0x21, lIn)
+	if notes.on() {
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, int(patRepBlockOff(numGroups))+abi.SearchNotesOff)
+		b = append(b, 0x21, lHi)
+		b = append(b, 0x20, pRep)
+		b = loadI32(b, int(patRepBlockOff(numGroups))+abi.SearchBTMemoOff)
+		b = append(b, 0x21, lLo)
+		b = append(b, 0x20, lHi, 0x20, lLo, 0x49, 0x04, 0x40) // hi < lo: swap
+		b = append(b, 0x20, lHi, 0x20, lLo, 0x21, lHi, 0x21, lLo)
+		b = append(b, 0x0B)
+		b = free(b, lHi)
+		b = free(b, lLo)
+	}
+	b = append(b, 0x20, pRep, 0x10)
 	b = utils.AppendULEB128(b, uint32(freeIdx))
-	b = append(b, 0x0B)
-	b = append(b, 0x20, pRep)
-	b = append(b, 0x10)
-	b = utils.AppendULEB128(b, uint32(freeIdx))
-	b = append(b, 0x0B)
-	return b
+	b = free(b, lIn)
+	return append(b, 0x0B)
 }
 
 // buildPatternFindNextBody emits `[method]<res>.next` for a find resource:
@@ -1560,6 +1609,6 @@ func emitResourceBTMemo(b []byte, notes resourceNotes, pRep byte, numGroups, rea
 		b = append(b, 0x20, pRep)
 		return loadI32(b, patRepLen)
 	}, notes.btMemoBytes, abi.SearchBTMemoOff, abi.SearchBTMemoCapOff, reallocIdx,
-		notes.heap, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
+		notes.heap, notes.heads, callListGlobal, lBlk, lN, lP, lChain, lSz64, lNeed)
 	return append(b, 0x0B, 0x0B)
 }

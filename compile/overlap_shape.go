@@ -161,7 +161,9 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 // sizes many drives of one set learns the shape once and asks this per input.
 //
 // A program sweep's part follows the cache's, 8-aligned, when it fits the
-// budget; the stride is the cache's, the one header field a caller writes.
+// budget — the sweep keeps it at the region's end, which for this size is
+// right after the cache; the stride is the cache's, the one header field a
+// caller writes.
 func (sh OverlapCacheShape) Sizing(inputLen int) (bytes, stride int) {
 	bytes, stride = config.SetOverlapCheckpointHeaderBytes, 1
 	if sh.Eligible {

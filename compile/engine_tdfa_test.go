@@ -536,6 +536,28 @@ func TestTDFAStartThreadOffMainEntry(t *testing.T) {
 	mustCompileEntries(t, []config.PatternEntry{{Regexp: "(a*)(b*)", GroupsFunc: "g"}})
 }
 
+// TestTDFAStateKeyIncludesPriorityOrder: two thread sets with equal pcs and
+// registers but different priority orders are different TDFA states. Merged,
+// the later one reused the first one's priorities and picked the wrong winner
+// — `(a{2,3})+x` group 1 one iteration off (tools/fuzz
+// TestTDFACountedRepeatLastIteration runs that end to end).
+func TestTDFAStateKeyIncludesPriorityOrder(t *testing.T) {
+	threads := []tdfaThread{{pc: 3, regMap: []int{0, -1}}, {pc: 7, regMap: []int{1, -1}}}
+	a := tdfaStateKey{threads: threads, order: []int{3, 7}}
+	b := tdfaStateKey{threads: threads, order: []int{7, 3}}
+	c := tdfaStateKey{threads: threads, order: []int{3, 7}}
+	if a.keyString() == b.keyString() {
+		t.Fatalf("orders 3,7 and 7,3 share key %q", a.keyString())
+	}
+	if a.keyString() != c.keyString() {
+		t.Fatalf("equal keys serialise differently: %q vs %q", a.keyString(), c.keyString())
+	}
+	w := tdfaStateKey{threads: threads, order: []int{3, 7}, prevWasWord: true}
+	if w.keyString() == a.keyString() {
+		t.Fatalf("prevWasWord not part of the key: %q", w.keyString())
+	}
+}
+
 func newTDFAForPattern(t *testing.T, pattern string) *tdfaTable {
 	t.Helper()
 	re, err := syntax.Parse(pattern, syntax.Perl)

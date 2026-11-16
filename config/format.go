@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"os"
+	"log/slog"
 	"strconv"
 	"strings"
 )
@@ -32,7 +32,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 		// since adding a version is a breaking change for consumers they would
 		// otherwise learn the truth from downstream.
 		if !cfg.Component() {
-			warnf("warning: wit_version %q is ignored for wasm_format: %s (it only applies to components)",
+			warnf("wit_version %q is ignored for wasm_format: %s (it only applies to components)",
 				cfg.WitVersion, formatModule)
 		}
 	}
@@ -44,7 +44,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 			{"wit_world", cfg.WitWorld},
 		} {
 			if k.value != "" {
-				warnf("warning: %s %q is ignored for wasm_format: %s (it only applies to components)",
+				warnf("%s %q is ignored for wasm_format: %s (it only applies to components)",
 					k.field, k.value, formatModule)
 			}
 		}
@@ -105,7 +105,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 	return nil
 }
 
-// validateStubTypeForFormat rejects the stub types that cannot be generated
+// ValidateStubTypeForFormat rejects the stub types that cannot be generated
 // for the configured output kind.
 //
 // ONE message, not two. There used to be a second one ending in "yet",
@@ -130,7 +130,7 @@ func validateFormat(cfg *BuildConfig, warnf func(string, ...any)) error {
 // format only), so a transpiler is mandatory, and `jco transpile` produces a
 // core module plus glue — which is exactly where `wasm_format: module` starts.
 // A JS user would pay a tool and a build step to arrive where they already are.
-func validateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
+func ValidateStubTypeForFormat(cfg *BuildConfig, stubType string) error {
 	if !cfg.Component() {
 		if stubType == "wit" {
 			return fmt.Errorf("stub_type %q requires wasm_format: %s", stubType, formatComponent)
@@ -171,5 +171,7 @@ func validateSemver(v string) error {
 
 // warnToStderr is LoadConfig's warnf.
 func warnToStderr(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	// Through slog, so the command prints it the way it prints every other
+	// warning (`regexped: warning: …`, structured under --debug).
+	slog.Warn(fmt.Sprintf(format, args...))
 }

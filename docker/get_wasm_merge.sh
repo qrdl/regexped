@@ -33,7 +33,9 @@ fi
 LOCATION=$(curl -sI https://github.com/WebAssembly/binaryen/releases/latest \
     | grep -i '^location:' \
     | tr -d '\r' \
-    | awk '{print $2}')
+    | awk '{print $2}' || true)
+# `|| true`: under pipefail a grep that finds no Location header (rate limit,
+# proxy, offline) failed the assignment and exited before the message below.
 
 if [ -z "$LOCATION" ]; then
     echo "error: could not determine latest Binaryen release" >&2

@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"regexp/syntax"
@@ -732,6 +733,21 @@ func dfaCrossesLiteralUnboundedly(t *dfaTable, lit []byte, throughAccepts bool) 
 
 // splitPassOpts is the CompileOptions a split member's two passes are built
 // under: the set's state ceiling, and the member's own byte mode.
+// splitShareKey names a split member's start-anywhere passes as
+// splitPassOpts builds them (moduleGlobals.splitShare).
+type splitShareKey struct {
+	p      *PatternInfo
+	states int
+	mem    int
+	notes  bool
+}
+
+// sharedSplit is one emitted split member's passes: their base and data.
+type sharedSplit struct {
+	base int32
+	data []byte
+}
+
 func splitPassOpts(p *PatternInfo, opts CompileSetOptions) CompileOptions {
 	return CompileOptions{MaxDFAStates: opts.dfaStatesOption(), ByteMode: p.byteMode, tableMemIdx: opts.TableMemIdx}
 }
@@ -806,6 +822,18 @@ func (g *moduleGlobals) clone() *moduleGlobals {
 		c.inits = make(map[uint32]int32, len(g.inits))
 		for k, v := range g.inits {
 			c.inits[k] = v
+		}
+	}
+	if g.suffixShare != nil {
+		c.suffixShare = make(map[uint64][]sharedSuffix, len(g.suffixShare))
+		for k, v := range g.suffixShare {
+			c.suffixShare[k] = append([]sharedSuffix(nil), v...)
+		}
+	}
+	if g.splitShare != nil {
+		c.splitShare = make(map[splitShareKey][]sharedSplit, len(g.splitShare))
+		for k, v := range g.splitShare {
+			c.splitShare[k] = append([]sharedSplit(nil), v...)
 		}
 	}
 	if g.i64 != nil {
@@ -979,15 +1007,47 @@ func (cs *compiledSet) buildSplitMembers(full SetSpec, split []splitCand, ra *re
 		if opts.globals != nil {
 			nr = &walkNotesReq{globals: opts.globals}
 		}
-		sa, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), int64(base), align8, nr)
-		if !ok {
-			panic("compile: a split member's start-anywhere find was classified buildable and then refused")
+		// Another set of the module may have split this member already — the
+		// no-cache companion and a scan-only split copy both do: its passes
+		// are then named at that set's base, when the data they would emit
+		// there is the data already there (moduleGlobals.splitShare). url-guard
+		// as an overlapping set carried one 491,008-byte forward table twice.
+		key := splitShareKey{p: p, states: opts.dfaStatesOption(), mem: opts.TableMemIdx, notes: nr != nil}
+		var sa startAnywherePasses
+		reused := false
+		if nr != nil {
+			for _, sh := range opts.globals.splitShare[key] {
+				g := opts.globals.clone()
+				s2, ok := buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), int64(sh.base), align8, &walkNotesReq{globals: g})
+				if ok && bytes.Equal(s2.data, sh.data) {
+					opts.globals.adopt(g)
+					sa, reused = s2, true
+					break
+				}
+			}
 		}
-		ra.Commit(int32(sa.end)) //nolint:gosec // table addresses fit in i32
+		if reused {
+			ra.Skip()
+		} else {
+			var ok bool
+			sa, ok = buildStartAnywherePasses(p.rp, splitPassOpts(p, opts), int64(base), align8, nr)
+			if !ok {
+				panic("compile: a split member's start-anywhere find was classified buildable and then refused")
+			}
+			ra.Commit(int32(sa.end)) //nolint:gosec // table addresses fit in i32
+			if nr != nil {
+				if opts.globals.splitShare == nil {
+					opts.globals.splitShare = map[splitShareKey][]sharedSplit{}
+				}
+				opts.globals.splitShare[key] = append(opts.globals.splitShare[key], sharedSplit{base: base, data: sa.data})
+			}
+		}
 		cs.split = append(cs.split, splitMember{id: full.PatternIDs[c.idx], name: patternRefFor(p).Name, fwdBody: sa.fwdBody, revBody: sa.revBody, ctx: sa.ctx, notes: sa.fwdNotes,
 			roundFrom: startRuleFor(p.rp) != startRuleNone})
-		cs.splitData = append(cs.splitData, sa.data...)
-		cs.splitSegs += sa.segs
+		if !reused {
+			cs.splitData = append(cs.splitData, sa.data...)
+			cs.splitSegs += sa.segs
+		}
 	}
 	// Each member's overlapping answers in one backward pass, once its
 	// searches have shown the drive needs them (program_sweep.go). Not in the
@@ -1196,7 +1256,7 @@ func (cs *compiledSet) extraFnTypes() []byte {
 		out = append(out, setTypeI32I32ToI32, setTypeI32I32ToI32)
 	}
 	if cs.progSweep != nil {
-		out = append(out, setTypeI32x4ToI32)
+		out = append(out, setTypeI32x5ToI32)
 	}
 	return out
 }
@@ -1273,8 +1333,8 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 	var swGeo sweepGeo
 	if cs.progSweep != nil {
 		lSwRegion, lSwRegionLen, lSwLocated = a.I32(), a.I32(), a.I32()
-		swGeo = sweepGeo{region: lSwRegion}
-		swGeo.area, swGeo.k, swGeo.rows, swGeo.cacheB, swGeo.nb = uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
+		swGeo = sweepGeo{region: lSwRegion, regionLen: lSwRegionLen}
+		swGeo.area, swGeo.k, swGeo.rows, swGeo.off, swGeo.nb = uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32()), uint32(a.I32())
 		swGeo.m64, swGeo.k64, swGeo.b64 = uint32(a.I64()), uint32(a.I64()), uint32(a.I64())
 	}
 	swIdx := cs.sweepIdx
@@ -1436,6 +1496,21 @@ func emitSplitFindBody(cs *compiledSet, keptIdx int, fwd, rev []int, worker bool
 		b = ld32(b, abi.FindScratchCacheOff)
 		b = append(b, 0x05, 0x41, 0x00, 0x0B)
 		b = append(b, 0x21, lSwRegion)
+		// A cache shorter than its 48-byte header is malformed (-4), as in
+		// the kept members' find. A lazy header marked wanted — a program
+		// sweep asked for the region it does not have yet (emitSweptMember) —
+		// is answered at the start of the call, with nothing delivered
+		// (abi.OverlapCacheWanted).
+		b = append(b, 0x20, lSwRegion, 0x04, 0x40) // region != 0: if
+		b = append(b, 0x20, lSwRegionLen, 0x41)
+		b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+		b = append(b, 0x49, 0x04, 0x40, 0x41) // len < header: if
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheMalformed))
+		b = append(b, 0x0F, 0x0B)
+		b = emitLazyIs(b, lSwRegion, abi.OverlapCacheWantedMark)
+		b = append(b, 0x04, 0x40, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+		b = append(b, 0x0F, 0x0B, 0x0B)
 	}
 	callComp := func(b []byte) []byte {
 		b = append(b, 0x20, pPtr, 0x20, pLen, 0x20, pFrom, 0x20, pDesc, 0x20, pOut, 0x20, pCap, 0x10)

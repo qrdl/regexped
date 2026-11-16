@@ -155,7 +155,7 @@ differences are in the interface, not in what you call:
 | `find` | a caller-owned scanner plus the gate array below | a `resource`: the state lives inside the regexp component behind a handle |
 | `<find>_free` in C | frees the scanner's answer cache, if it owns one | MANDATORY — it drops the handle |
 | `hints: [batch-find]` | a second entry point | refused at load |
-| `overlapping: true` answer cache | read by both find entries; every generated stub reserves one | reserved by the `find` resource's constructor and freed with the handle |
+| `overlapping: true` answer cache | read by both find entries; every generated stub hands one over, allocating the region only when the drive asks for it | its header handed over by the `find` resource's constructor, the region reserved by `next` when the drive asks for it, and freed with the handle |
 
 See [component.md](component.md#sets).
 
@@ -396,9 +396,14 @@ the input in one pass and answers the remaining calls out of the result. A
 sixteenth, not all: at the full cost a wide set walked up to two sweeps' worth
 first, quadratically up to that point (96 members over `a`×N switched only at
 16 KB, 281,595 instructions per byte; now 108,705 from 2 KB), while
-match-heavy drives moved −36% to +2.3% and ordinary text still never switches —
-its work per byte stays 11 to 134 times under the line. A drive whose walk would
-have ended just past the line pays a sweep it did not need. The allowance —
+match-heavy drives moved −36% to +2.3%. Ordinary text does NOT always stay
+under the line: a SMALL set (under 32 cells) whose members walk word classes —
+`{[a-z]+ing\b, [a-z]+ed\b, \w+@\w+\.com}` — crosses it on word-heavy text, and
+there the sweep measured 5% to 49% dearer than walking (English prose 734 vs
+616 instructions per byte, random words 834-1110 vs 746-803). Raising the line
+fixes that and makes match-dense and hostile drives dearer instead (+12% to
++83% measured), so it stays. A drive whose walk would have ended just past the
+line pays a sweep it did not need. The allowance —
 eight bytes of sweeping at the FULL rate — is what keeps an input of a few
 bytes on the walk, where starting a sweep costs more than the whole walk does;
 on inputs of 13-19 bytes with many matches the line can be crossed, and there
@@ -447,8 +452,8 @@ the member's searches have walked more than `4 × len + 64` bytes in the drive
 (in Unicode mode `k × len + 64`, where k is the sweep's estimated cost per
 input byte counted in walked bytes: a lowered class makes the sweep thousands of
 times dearer per byte, and it must not be bought before the walks have spent
-as much), so ordinary text pays for the counter alone; its answers live in the same
-caller's region, after the cache, checkpointed exactly as the cache is. It
+as much), so ordinary text pays for the counter alone; its answers live at the end of
+the same caller's region, after the cache, checkpointed exactly as the cache is. It
 supports every assertion (`\b`, `\B`, `^`, `$`, `(?m)`) and zero-width cycles.
 Measured over `{foo\w+, a[a-z]*?z}` and `a`×N + `z`: 131,456 → 795
 instructions per byte; with `(?:a|b)*a(?:a|b){12}c`, a Backtracking member,
@@ -535,7 +540,13 @@ of gates. One signature, whatever the patterns turn out to compile to.
 - **All zeros means a clean scan.** That is the only operation a caller ever
   performs on it: the encoding is opaque and will change.
 - WASM reads and writes it. Zeroing it restarts a scan; keeping it across calls
-  continues one.
+  continues one. One exception: a raw caller of a **standalone** module that
+  hands no search state over (a stub always does) is served from the module's
+  own state, which takes the same text address, length and gate array with a
+  larger `from` as a continuation whatever the array holds. A new text written
+  into the same buffer must then start at an offset no greater than the
+  previous drive's last `from` (0 always works), or use another gate array or
+  text address; see [wasm.md](wasm.md) "Handing the block over".
 - An **overflowing call reports no match as delivered** — if the return value
   exceeds `out_cap`, no gate is recorded for the position, so growing the
   buffer and calling again with the same `from` returns the same total and the
@@ -587,8 +598,12 @@ Declaring less emits less:
 
 A set that does not declare `find` emits no tuple-writing suffix functions at
 all — just the DFA tables, which the cheap bitmask probes share. An
-anchored-only set additionally emits no literal frontend: the
-packed-pair/Teddy/AC/Shufti tables and skip loop could never execute for it.
+anchored-only set additionally emits no literal frontend and no scan buckets:
+the anchored pair has a packing of its own, so the packed-pair/Teddy/AC/Shufti
+tables, the skip loop and the buckets' DFA tables could never be read, and
+`--diag-json` reports `"frontend": "none"` and no buckets for it. The
+`match_any`-only SQL validator example is 6,204 bytes (40,775 when it still
+carried them).
 
 Measured on a 100KB no-match corpus with eight literal-prefixed patterns:
 `match_any`/`match_all` 84 fuel, `scan_all` 219K, `find` 219K. The anchored trio dies within a byte or two of position 0;
@@ -596,6 +611,11 @@ the scan trio is frontend-bound, like `find`, because it shares `find`'s
 frontend. (An earlier draft gave the scan trio a scalar position-by-position
 scan instead, and measured 17x worse — the literal frontend is what makes
 these cheap, not the absence of extent tracking.)
+
+A record that DOES keep the anchored pair walking — an input that is one long
+match — is walked four bytes per loop trip while four are left, the bounds
+test and the advance paid once per four transitions: `match_any` over 8 KB of
+an `overlap-shape-3` match 196,630 → 145,434 fuel (−26%), no set slower.
 
 Do not use `scan_any` as a locate step for `find` — calling both at the same
 position duplicates one position's work. Pick one.
@@ -642,7 +662,7 @@ before. When one is not:
 | Capability | What the set does |
 |---|---|
 | `find`, default (gated) | the members that are not provably linear are **split out**: each is served by its own linear search, and `find` merges their answers with the buckets' |
-| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller of a merged build, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary |
+| `find`, `overlapping: true`, answer cache available | an **in-call counter**: once the call's walks have cost what the answer cache's sweep would, the call sweeps and answers from the cache — the between-calls trigger alone cannot fire inside the ONE call a no-match input makes. And a **no-cache companion**: the same set with those members split out, compiled beside it and never exported, to which `find` and its batch entry hand a drive with no usable cache — none offered (a raw caller of a merged build, a C build with `-DRX_SET_CACHE=0`, a component whose region was declined) or one the sweep refuses. A batch drive whose cache is refused part-way changes over at the next position boundary. The companion carries no second copy of a table the set already emitted: a bucket table, or a split member's passes, whose bytes at the first copy's address would be the same is named at that address (url-guard as an overlapping set 1,753,575 → 1,021,772 bytes) |
 | `find`, `overlapping: true`, no answer cache for this set | split out, as for gated `find`. The members kept become an internal set of their own, never exported, that the merge reads for the buckets' part — so when THEY qualify for the answer cache, the drive keeps it (`{foo\w+, a[a-z]*?z}` over `foo`×N: 90,354 → 542 instructions per byte), and the split members get the program sweep (see "Overlap policy") |
 | `scan_any`, `scan_all`, literal frontend | a **work counter** over the probes' walks — the single-pattern rule: only a walk that recorded nothing new and walked more than 32 bytes is charged, the budget `4 × bytes advanced + 64` is checked before the walk is added, and the probe's hits are recorded first — that hands the call to a start-anywhere union automaton over the set |
 | `scan_any`, `scan_all`, where no union automaton can be built | split out. When the set's `find` is `overlapping: true` and served by the answer cache, only the scan pair is split: it lives in a split copy of the set compiled beside it, never exported, to which the set's two scan exports forward — so `find` keeps its cache. (Splitting the whole set for its scan pair's sake made that `find` quadratic again on long overlapping matches: 90,441 fuel/byte at 8 KB against 1,342.) |
@@ -860,7 +880,7 @@ packings: patterns sharing a mandatory literal, literal-less patterns in a
 fallback bucket, and the anchored automata behind `match_any` / `match_all`.
 The promotion is conservative and is declined when the merged DFA misses the
 state or byte budget above, when any pattern carries a non-trivial prefix, or
-when any pattern is `\A`- or `(?m:^)`-anchored. `--diag-json` reports such a
+when any pattern is `\A`- or `(?m:^)`-anchored or carries a word guard (below). `--diag-json` reports such a
 bucket with `"type": "sparse-set"`, so whether it happened is never a guess.
 
 Patterns that cannot be merged route to fallback buckets that scan every input
@@ -872,6 +892,19 @@ rather than a budget: the split representation recovers a match start from a
 literal occurrence by subtracting one fixed prefix length, so a prefix with
 several possible lengths would silently lose the matches that use any length
 but the longest.
+
+**A bare `\b` or `\B` before the literal keeps the literal bucket.** In
+`\bselect\b` the part before `select` is only a word boundary, which no
+prefix walk can judge (it never sees the byte before the match), so such a
+member used to go to a fallback bucket — a keyword list wrapped in `\b…\b`
+cost 12x-42x the fuel of the same words without it. It now keeps its literal
+bucket with a word GUARD: at each literal hit the bucket tests the boundary
+between the byte before the hit (none at position 0) and the literal's first
+byte, so `\b-x` holds after a word byte and `\bselect` after a non-word one.
+Over 3 × 10 KB of prose, sets of 5, 50 and 500 `\bkeyword\b` members cost
+0%, +0.7% and +0.2% fuel against the same words without `\b`. Anything more
+before the literal than a single `\b` or `\B` (`^\bfoo`, `\b.foo`) still
+routes to fallback. A guarded member is never promoted into a sparse bucket.
 
 **A member's `anchor_literal:` chooses its bucket literal.** A member is keyed
 on the first mandatory literal the extraction finds; a top-level pattern's

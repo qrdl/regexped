@@ -510,7 +510,7 @@ func TestOverlapSweepGateMatchesTheRowMask(t *testing.T) {
 	}
 	// The emitter builds a wide row's mask an i64 word at a time.
 	cs := mk(bucketMaskBits + 1)
-	if e := newCkptEmit(cs, 0, 0); !e.maskWide() {
+	if e := newCkptEmit(cs, 0, 0, -1); !e.maskWide() {
 		t.Errorf("a %d-pattern sweep's row mask is not wide", bucketMaskBits+1)
 	}
 }
@@ -577,11 +577,24 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// global.set N — how either channel is handed to the capture body.
 	globalSet := func(idx byte) []byte { return []byte{0x24, idx} }
 
-	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, -1, nil, nil)
-	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, -1, ffNative, capGlobal, nil, nil)
-	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, 0, winGlobal, ffNative, -1, nil, nil)
+	rebase := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, -1, ffNative, -1, 0, nil, nil)
+	absolute := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, -1, ffNative, capGlobal, 0, nil, nil)
+	window := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, winGlobal, ffNative, -1, 0, nil, nil)
 
-	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window} {
+	// A body that reports positions relative to the call's start (the
+	// legacy-narrow mode) keeps them relative and re-adds pos where it needs
+	// absolute ones; a pattern that cannot match empty skips the suppression
+	// test either way, so its body is smaller.
+	narrow := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, winGlobal, ffLegacyNarrow, -1, 0, nil, nil)
+	narrowNonEmpty := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups, numGroups, 0, winGlobal, ffLegacyNarrow, -1, 1, nil, nil)
+	if len(narrowNonEmpty) >= len(narrow) {
+		t.Errorf("minLen > 0 did not drop the empty-match test: %d vs %d bytes", len(narrowNonEmpty), len(narrow))
+	}
+	if len(narrow) <= len(window) {
+		t.Errorf("relative positions cost no re-adds: %d vs %d bytes", len(narrow), len(window))
+	}
+
+	for name, body := range map[string][]byte{"rebase": rebase, "absolute": absolute, "window": window, "narrow": narrow, "narrowNonEmpty": narrowNonEmpty} {
 		if len(body) == 0 {
 			t.Fatalf("%s: emitted nothing", name)
 		}
@@ -618,12 +631,12 @@ func TestBuildBatchGroupsWrapperBodyChannelShapes(t *testing.T) {
 	// A pattern with more groups walks more slots, but only in the rebasing
 	// shape — which is what shows the loop is driven by numGroups and not
 	// emitted unconditionally.
-	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, -1, nil, nil)
+	wider := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, numGroups+2, 0, -1, ffNative, -1, 0, nil, nil)
 	if len(wider) <= len(rebase) {
 		t.Errorf("two more groups produced %d bytes against %d; the per-slot pass does "+
 			"not scale with the group count", len(wider), len(rebase))
 	}
-	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, 0, -1, ffNative, capGlobal, nil, nil)
+	widerAbs := buildBatchGroupsWrapperBody(findIdx, captureIdx, numGroups+2, numGroups+2, 0, -1, ffNative, capGlobal, 0, nil, nil)
 	if len(widerAbs) != len(absolute) {
 		t.Errorf("the absolute shape grew from %d to %d bytes with two more groups; it "+
 			"emits no per-slot code, so it must not depend on the count",
@@ -1615,7 +1628,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			injectBTDrivePrologue([]byte{0x05, 0x00}, btDrive{}, nil)
 		}},
 		{"batch groups over an anchored capture body", "batch groups", func(*testing.T) {
-			buildBatchLitChainGroupsWrapperBody(0, 1, findFromMode(0))
+			buildBatchLitChainGroupsWrapperBody(0, 1, 1, findFromMode(0))
 		}},
 		{"a fallback body never called", "never calls it", func(*testing.T) {
 			patchBTFallbackCall([]byte{0x01, 0x0B}, nil, 1)
@@ -1650,7 +1663,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			emitUnionAliveMask(nil, wideUnion, 0, 0, 0, 0, 0, 0, nil)
 		}},
 		{"a checkpoint emitter for a set with no sweep", "no sweep", func(*testing.T) {
-			newCkptEmit(&compiledSet{sweepDone: true}, 0, 0)
+			newCkptEmit(&compiledSet{sweepDone: true}, 0, 0, -1)
 		}},
 		{"a twin beside a Backtracking fallback", "both a neutral twin and a Backtracking fallback", func(*testing.T) {
 			(&compiledPattern{findFallbackBody: []byte{0}, findNeutralBody: []byte{0}}).appendFindBodyWithTwin(nil, 0)
@@ -1697,7 +1710,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 			emitFindCallFromPos(nil, 0, ffLegacyNarrow, 0, 0, &twinRoute{})
 		}},
 		{"a default search state on an anchored-only groups wrapper", "anchored-only groups wrapper", func(*testing.T) {
-			buildGroupsFromWrapperBody(0, true, &defaultSearch{})
+			buildGroupsFromWrapperBody(0, true, &defaultSearch{}, 1, 1)
 		}},
 		{"a UTF-8 bulk skip without its error-lanes local", "no error-lanes local", func(*testing.T) {
 			emitUTF8BulkSkip(nil, dominantInfo{}, false, 1, 2, 3, 4, 5, 6, 0, nil)
@@ -1731,7 +1744,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 		}},
 		{"an unprojected sweep column over a word-boundary automaton", "needs the projected column", func(*testing.T) {
 			newCkptEmit(&compiledSet{sweepDone: true, sweep: &overlapSweep{
-				dp: overlapDPTables{l: &dfaLayout{useU8: true}, hasWordChar: true}}}, 0, 0)
+				dp: overlapDPTables{l: &dfaLayout{useU8: true}, hasWordChar: true}}}, 0, 0, -1)
 		}},
 		{"a wide preflight on an overlapping find", "wide find preflight emitted for a narrow-only path", func(*testing.T) {
 			cs := &compiledSet{patternIDs: [][]int{{0}}, overlapping: true, unionScan: &unionScanDFA{maskWords: 2}}
@@ -1739,7 +1752,7 @@ func TestEmitterGuardsFire(t *testing.T) {
 		}},
 		{"a projected column too wide for u16 offsets", "past what a u16 offset can address", func(*testing.T) {
 			(&compiledSet{sweepDone: true, sweep: &overlapSweep{
-				dp: overlapDPTables{numWASM: 1}, proj: &overlapProj{cells: 0x4000}}}).overlapProjTabBytes()
+				dp: overlapDPTables{numWASM: 1}, proj: &overlapProj{cells: 0x4000}}}).overlapStepTabBytes()
 		}},
 		{"a twin route whose neutral twin is not next to its find body", "not laid out right after", func(*testing.T) {
 			p := &compiledPattern{findBody: []byte{0}, findTwinRoute: &twinRoute{}}

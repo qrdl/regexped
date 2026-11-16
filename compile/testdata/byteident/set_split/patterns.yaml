@@ -3,7 +3,10 @@
 # (compile/set_split.go), and `find`, `scan_any` and `scan_all` become merge
 # wrappers over the buckets' bodies and theirs. The `\b` member keeps a union
 # automaton from serving the scan pair, which is what puts the MERGED scan
-# wrappers (the kept body plus one forward pass per split member) here.
+# wrappers (the kept body plus one forward pass per split member) here. It is
+# `\b.bar`, not `\bbar`: a bare `\b` before a literal is a word guard on the
+# literal bucket (set_word_guard), which would put this set on a literal
+# frontend; `\b.` is a prefix walk, which keeps it on a fallback bucket.
 patterns:
   - name: p0
     regexp: '[a-z]+0[0-9]+'
@@ -12,7 +15,7 @@ patterns:
   - name: p2
     regexp: 'foo'
   - name: p3
-    regexp: '\bbar'
+    regexp: '\b.bar'
 sets:
   - name: s
     find: s_find

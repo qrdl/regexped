@@ -2073,7 +2073,7 @@ func (c singleCase) build() config.BuildConfig {
 	return config.BuildConfig{
 		Patterns:     []config.PatternEntry{entry},
 		MaxDFAStates: config.Limit(c.maxDFAStates),
-		MaxTDFARegs:  c.maxTDFARegs,
+		MaxTDFARegs:  config.Count(c.maxTDFARegs),
 	}
 }
 
@@ -2437,7 +2437,7 @@ func TestCaptureCrossProductCompiles(t *testing.T) {
 						{Name: "p", Regexp: pat, GroupsFunc: "p_groups"},
 					},
 					MaxDFAStates: config.Limit(b.states),
-					MaxTDFARegs:  b.regs,
+					MaxTDFARegs:  config.Count(b.regs),
 				}, "")
 				if err != nil {
 					continue // a documented ceiling

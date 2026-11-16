@@ -12,6 +12,7 @@ import (
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v48"
 	"github.com/qrdl/regexped/compile"
+	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/internal/searchblock"
 )
 
@@ -57,16 +58,15 @@ var (
 	modCacheIdx map[string]*list.Element
 )
 
-// cachedCompile returns the module for key, compiling it with build on a miss.
+// cachedCompile returns the module for key, running j on a miss — in this
+// process, or in the compile child within the input's budget (budgeted).
 //
 // Compile ERRORS are cached too. They are deterministic for a given key, and
 // the expensive ones are exactly the resource ceilings a slow pattern hits, so
-// not caching them would leave the worst case uncached.
-func cachedCompile(key string, build func() ([]byte, error)) ([]byte, error) {
-	wasm, _, err := cachedCompileSized(key, func() ([]byte, []searchblock.Size, error) {
-		w, err := build()
-		return w, nil, err
-	})
+// not caching them would leave the worst case uncached. So is a compile killed
+// for being too slow, when it had the whole of slowCompileDeadline.
+func cachedCompile(key string, j compileJob) ([]byte, error) {
+	wasm, _, err := cachedCompileSized(key, j)
 	return wasm, err
 }
 
@@ -74,17 +74,19 @@ func cachedCompile(key string, build func() ([]byte, error)) ([]byte, error) {
 // slowCompileDeadline. A resource ceiling of the harness, not of regexped.
 var errCompileTooSlow = errors.New("compile ran past the fuzz harness's deadline")
 
-// slowCompileDeadline bounds how long a fuzzing run under -unicode waits for
-// one compile. Go's fuzz worker reports any input that takes over 10s as a
-// crasher, and in Unicode mode the instruction-count cap (maxNFAInsts, which
-// is calibrated in byte mode) cannot bound compile time: a lowered class
-// makes every TDFA state dear, so `[0]+0()00.{31}` — about 40 instructions —
-// builds a 4,004-state TDFA it then rejects for its registers in 16.8s alone,
-// more in a worker. Only the clock bounds that. A compile past the deadline
-// is skipped (errCompileTooSlow) and finishes in the background into the
-// cache; while it runs, every compile the cache does not hold is skipped too,
-// so slow compiles cannot pile up. Byte mode, and any run that is not
-// fuzzing, waits for every compile as before.
+// slowCompileDeadline bounds one budgeted compile (budgeted). Go's fuzz
+// worker reports any input that takes over 10s as a crasher, and in Unicode
+// mode the instruction-count cap (maxNFAInsts, which is calibrated in byte
+// mode) cannot bound compile time: a lowered class makes every TDFA state
+// dear, so `[0]+0()00.{31}` — about 40 instructions — builds a 4,004-state
+// TDFA it then rejects for its registers in 16.8s alone, more in a worker.
+// Only the clock bounds that. A budgeted compile runs in the compile child
+// (compilechild.go), which is KILLED when the deadline passes: the input is
+// skipped (errCompileTooSlow), and the CPU is not spent. It used to run in a
+// goroutine that went on compiling in the background — a 36 s set compile
+// cost 36 s however early it was given up, every input meanwhile skipped.
+// An unbudgeted compile — byte mode outside FuzzSetRoutes, or any run that
+// is not fuzzing — runs in this process and is waited for.
 const slowCompileDeadline = 4 * time.Second
 
 // fuzzInputCompileBudget is how long ALL the compiles of one fuzz input may
@@ -97,18 +99,24 @@ const slowCompileDeadline = 4 * time.Second
 const fuzzInputCompileBudget = 5 * time.Second
 
 var (
-	slowCompileMu      sync.Mutex
-	slowCompileRunning bool
+	slowCompileMu sync.Mutex
 	// inputDeadline is the current fuzz input's compile budget's end, zero
 	// outside a target that set one (beginFuzzInput).
 	inputDeadline time.Time
+	// budgetByteMode puts a target's byte-mode compiles under the budget too:
+	// FuzzSetRoutes, whose byte-mode inputs ran to 16 s and were reported as
+	// hangs. Set for the duration of such a target only.
+	budgetByteMode bool
+	// budgetForTest makes budgeted true outside a fuzz run, for the tests of
+	// the budget itself.
+	budgetForTest bool
 )
 
-// beginFuzzInput starts the compile budget of one fuzz input: every compile
-// runWithDeadline waits for during it shares fuzzInputCompileBudget. A no-op
-// outside a fuzz run under -unicode.
+// beginFuzzInput starts the compile budget of one fuzz input: every budgeted
+// compile during it shares fuzzInputCompileBudget. A no-op when the input's
+// compiles are not budgeted.
 func beginFuzzInput() {
-	if !fuzzingUnicode() {
+	if !budgeted() {
 		return
 	}
 	slowCompileMu.Lock()
@@ -116,34 +124,62 @@ func beginFuzzInput() {
 	slowCompileMu.Unlock()
 }
 
-// fuzzingUnicode reports whether this process is a fuzz run under -unicode.
-func fuzzingUnicode() bool {
+// fuzzing reports whether this process is a fuzz run.
+func fuzzing() bool {
 	f := flag.Lookup("test.fuzz")
-	return *unicodeMode && f != nil && f.Value.String() != ""
+	return f != nil && f.Value.String() != ""
 }
 
-// selectEngineWithinBudget is compile.SelectEngine in the run's mode, waited
-// for within the fuzz input's compile budget like a compile (runWithDeadline):
+// fuzzingUnicode reports whether this process is a fuzz run under -unicode.
+func fuzzingUnicode() bool { return *unicodeMode && fuzzing() }
+
+// budgeted reports whether this input's compiles run under the budget, in
+// the compile child: a fuzz run's Unicode-mode inputs, and the byte-mode ones
+// of a target that set budgetByteMode.
+func budgeted() bool {
+	return budgetForTest || fuzzing() && (*unicodeMode || budgetByteMode)
+}
+
+// runBudgeted runs j in the compile child, within slowCompileDeadline and
+// what is left of the input's budget. errCompileTooSlow when the child was
+// killed; full reports whether j had the whole slowCompileDeadline, so that
+// "too slow" is the job's own and not the input's leftover.
+func runBudgeted(j compileJob) (r compileResult, full bool, err error) {
+	slowCompileMu.Lock()
+	wait := slowCompileDeadline
+	if !inputDeadline.IsZero() {
+		wait = min(wait, time.Until(inputDeadline))
+	}
+	slowCompileMu.Unlock()
+	if wait <= 0 {
+		return r, false, errCompileTooSlow
+	}
+	r, err = childRun(j, wait)
+	return r, wait >= slowCompileDeadline, err
+}
+
+// selectEngineWithinBudget is compile.SelectEngine in the run's mode, run
+// within the fuzz input's compile budget like a compile (runBudgeted):
 // choosing the engine builds the TDFA, which for `0*(0000{520}000{520}0)` took
 // 5.1 s on its own, before the budget's builds had begun. false when it ran
-// past the budget; outside a fuzz run under -unicode it is waited for.
+// past the budget; an unbudgeted one is waited for.
 func selectEngineWithinBudget(pat string) (compile.EngineType, bool) {
-	opts := withMode(compile.CompileOptions{})
-	if !fuzzingUnicode() {
-		eng, _ := compile.SelectEngine(pat, opts)
-		return eng, true
+	j := compileJob{Kind: jobSelect, Pattern: pat, Opts: toJobOpts(withMode(compile.CompileOptions{}))}
+	if !budgeted() {
+		r, _ := j.run()
+		return r.Engine, true
 	}
-	var eng compile.EngineType
-	if !runWithDeadline(func() { eng, _ = compile.SelectEngine(pat, opts) }) {
+	r, _, err := runBudgeted(j)
+	if errors.Is(err, errCompileTooSlow) {
 		return 0, false
 	}
-	return eng, true
+	return r.Engine, true // SelectEngine's own error is ignored, as in-process
 }
 
 // cachedCompileSized is cachedCompile for a compile that also reports what its
 // find export's searches keep (searchblock.Of), which a drive handing the
 // per-search block over needs.
-func cachedCompileSized(key string, build func() ([]byte, []searchblock.Size, error)) ([]byte, []searchblock.Size, error) {
+func cachedCompileSized(key string, j compileJob) ([]byte, []searchblock.Size, error) {
 	modCacheMu.Lock()
 	if modCacheIdx == nil {
 		modCacheLRU, modCacheIdx = list.New(), map[string]*list.Element{}
@@ -159,74 +195,38 @@ func cachedCompileSized(key string, build func() ([]byte, []searchblock.Size, er
 	}
 	modCacheMu.Unlock()
 
-	if fuzzingUnicode() {
-		return compileWithDeadline(key, build)
+	if !budgeted() {
+		// Compiled OUTSIDE the lock: a compile can take seconds, and holding
+		// the lock across it would serialise workers that share a process.
+		r, err := j.run()
+		return storeCompiled(key, r.Wasm, r.Sizes, err)
 	}
-	// Compiled OUTSIDE the lock: a compile can take seconds, and holding the
-	// lock across it would serialise workers that share a process.
-	wasm, sizes, err := build()
-	return storeCompiled(key, wasm, sizes, err)
-}
-
-// compileWithDeadline is the compile of a fuzz run under -unicode: see
-// slowCompileDeadline.
-func compileWithDeadline(key string, build func() ([]byte, []searchblock.Size, error)) ([]byte, []searchblock.Size, error) {
-	var (
-		wasm  []byte
-		sizes []searchblock.Size
-		err   error
-	)
-	if !runWithDeadline(func() {
-		wasm, sizes, err = build()
-		if err == nil {
-			warmModule(wasm)
+	r, err := runBudgetedCompile(j)
+	if errors.Is(err, errCompileTooSlow) {
+		if r.full {
+			storeCompiled(key, nil, nil, errCompileTooSlow)
 		}
-		storeCompiled(key, wasm, sizes, err)
-	}) {
 		return nil, nil, errCompileTooSlow
 	}
-	return wasm, sizes, err
+	return storeCompiled(key, r.Wasm, r.Sizes, err)
 }
 
-// runWithDeadline runs build, waiting at most slowCompileDeadline, and reports
-// whether it finished; one that did not finishes in the background (and
-// stores what it built), and until it does every other call reports false at
-// once, so slow compiles cannot pile up. Whether build finished and whether a
-// slow compile is running are decided under one lock, so a build that ends as
-// the deadline fires cannot leave the flag set.
-func runWithDeadline(build func()) bool {
-	slowCompileMu.Lock()
-	wait := slowCompileDeadline
-	if !inputDeadline.IsZero() {
-		wait = min(wait, time.Until(inputDeadline))
+// budgetedResult is a budgeted compile's result and whether it had the whole
+// slowCompileDeadline (runBudgeted).
+type budgetedResult struct {
+	compileResult
+	full bool
+}
+
+// runBudgetedCompile runs j in the compile child, with the wasmtime build
+// when modules are kept, and keeps the built module.
+func runBudgetedCompile(j compileJob) (budgetedResult, error) {
+	j.Warm = modulesKept()
+	r, full, err := runBudgeted(j)
+	if err == nil && r.Module != nil {
+		keepSerialized(r.Wasm, r.Module)
 	}
-	if slowCompileRunning || wait <= 0 {
-		slowCompileMu.Unlock()
-		return false
-	}
-	slowCompileMu.Unlock()
-	done := make(chan struct{})
-	finished := false
-	go func() {
-		build()
-		slowCompileMu.Lock()
-		finished = true
-		slowCompileRunning = false
-		slowCompileMu.Unlock()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(wait):
-		slowCompileMu.Lock()
-		defer slowCompileMu.Unlock()
-		if finished {
-			return true
-		}
-		slowCompileRunning = true
-		return false
-	}
+	return budgetedResult{r, full}, err
 }
 
 // storeCompiled caches a compile's result under key and returns the entry
@@ -271,7 +271,7 @@ var (
 // is TDFA construction inside engine selection), and FuzzSetCaps compiles TWO
 // patterns into every capability body on each call. The returned maps are shared, so callers must not write to them —
 // none does; dropsFromSet builds them fresh and they are only ever read.
-func cachedCompileSet(key string, build func() ([]byte, setDrops, error)) ([]byte, setDrops, error) {
+func cachedCompileSet(key string, j compileJob) ([]byte, setDrops, error) {
 	setCacheMu.Lock()
 	if setCacheIdx == nil {
 		setCacheLRU, setCacheIdx = list.New(), map[string]*list.Element{}
@@ -287,25 +287,18 @@ func cachedCompileSet(key string, build func() ([]byte, setDrops, error)) ([]byt
 	}
 	setCacheMu.Unlock()
 
-	if fuzzingUnicode() {
-		var (
-			wasm  []byte
-			drops setDrops
-			err   error
-		)
-		if !runWithDeadline(func() {
-			wasm, drops, err = build()
-			if err == nil {
-				warmModule(wasm)
-			}
-			storeCompiledSet(key, wasm, drops, err)
-		}) {
-			return nil, setDrops{}, errCompileTooSlow
-		}
-		return wasm, drops, err
+	if !budgeted() {
+		r, err := j.run()
+		return storeCompiledSet(key, r.Wasm, r.drops(), err)
 	}
-	wasm, drops, err := build()
-	return storeCompiledSet(key, wasm, drops, err)
+	r, err := runBudgetedCompile(j)
+	if errors.Is(err, errCompileTooSlow) {
+		if r.full {
+			storeCompiledSet(key, nil, setDrops{}, errCompileTooSlow)
+		}
+		return nil, setDrops{}, errCompileTooSlow
+	}
+	return storeCompiledSet(key, r.Wasm, r.drops(), err)
 }
 
 // storeCompiledSet caches a set compile's result under key and returns the
@@ -328,6 +321,48 @@ func storeCompiledSet(key string, wasm []byte, drops setDrops, err error) ([]byt
 	}
 	return wasm, drops, err
 }
+
+// cachedShape is compile.SetOverlapCacheShape for sc in cfg, learned once per
+// key — within the budget when the input is budgeted. The shape is learned by
+// RECOMPILING the set, and when every cache drive of a FuzzSetRoutes input
+// learned it again, that cost more than all the input's module compiles
+// together. A shape is kept, and so is a compile killed after the whole of
+// slowCompileDeadline; any other error is returned and not kept.
+func cachedShape(key string, sc config.SetConfig, cfg config.BuildConfig) (compile.OverlapCacheShape, error) {
+	shapeMu.Lock()
+	e, ok := shapeMemo[key]
+	shapeMu.Unlock()
+	if ok {
+		return e.shape, e.err
+	}
+	j := compileJob{Kind: jobShape, Set: sc, Config: cfg}
+	var (
+		r    compileResult
+		full bool
+		err  error
+	)
+	if budgeted() {
+		r, full, err = runBudgeted(j)
+	} else {
+		r, err = j.run()
+	}
+	if err == nil || full && errors.Is(err, errCompileTooSlow) {
+		shapeMu.Lock()
+		shapeMemo[key] = shapeEntry{r.Shape, err}
+		shapeMu.Unlock()
+	}
+	return r.Shape, err
+}
+
+type shapeEntry struct {
+	shape compile.OverlapCacheShape
+	err   error
+}
+
+var (
+	shapeMu   sync.Mutex
+	shapeMemo = map[string]shapeEntry{}
+)
 
 // setKeyOf maps a list element back to its key, so eviction can drop the index
 // entry. The single-pattern cache stores the key inside its entry instead;
@@ -364,29 +399,34 @@ func setKey(pats []string) string {
 // Under -unicode a module's own compile by wasmtime can take as long as
 // regexped's — a lowered `.{1,700}` on Backtracking is one 4 MB dispatch
 // function Cranelift needs 16-19s for — and instantiate is outside every
-// compile deadline. So a fuzz run under -unicode compiles the wasmtime module
-// INSIDE the deadline-guarded build (warmModule) and instantiate takes it from
-// here: a module too slow to compile is then the same resource ceiling a slow
-// regexped compile is.
+// compile deadline. So a budgeted compile has the compile child build the
+// wasmtime module too, inside the same deadline, and hand it back serialized
+// (keepSerialized); instantiate takes it from here. A module too slow to
+// build is then the same resource ceiling a slow regexped compile is.
 const fuzzModuleCacheSize = 4
 
 var (
 	fuzzModuleMu    sync.Mutex
 	fuzzModules     = map[[32]byte]*wasmtime.Module{}
 	fuzzModuleOrder [][32]byte
+	// tooSlowWarm is the modules whose wasmtime build was killed after the
+	// whole of slowCompileDeadline: one is skipped at once when it comes back.
+	tooSlowWarm = map[[32]byte]bool{}
 )
 
-// warmModule compiles wasm with the shared engine and keeps it for
-// instantiate. A no-op outside a fuzz run under -unicode.
+// keepModules makes the module cache serve a target outside a fuzz run under
+// -unicode too: FuzzSetRoutes drives each of its few modules through a dozen
+// routes, and a wasmtime build of 0.5-2 s per route put one input past the fuzz
+// worker's 10 s deadline. Set for the duration of such a target only.
+var keepModules bool
+
+// modulesKept reports whether compiled modules are warmed and reused.
+func modulesKept() bool { return keepModules || fuzzingUnicode() }
+
+// warmModule compiles wasm with the shared engine, in this process, and keeps
+// it for instantiate. A no-op unless modulesKept.
 func warmModule(wasm []byte) {
-	if !fuzzingUnicode() || len(wasm) == 0 {
-		return
-	}
-	key := sha256.Sum256(wasm)
-	fuzzModuleMu.Lock()
-	_, ok := fuzzModules[key]
-	fuzzModuleMu.Unlock()
-	if ok {
+	if !modulesKept() || len(wasm) == 0 || warmedModule(wasm) != nil {
 		return
 	}
 	engine, _ := sharedEngine()
@@ -394,6 +434,27 @@ func warmModule(wasm []byte) {
 	if err != nil {
 		return // instantiate compiles it again and reports the error
 	}
+	keepModule(wasm, mod)
+}
+
+// keepSerialized keeps the module the compile child built for wasm.
+func keepSerialized(wasm, serialized []byte) {
+	if !modulesKept() || warmedModule(wasm) != nil {
+		return
+	}
+	engine, _ := sharedEngine()
+	mod, err := wasmtime.NewModuleDeserialize(engine, serialized)
+	if err != nil {
+		// The child's engine is this one's, from the same binary, so this is
+		// the harness's defect and not a compile's ceiling.
+		panic("tools/fuzz: a module the compile child built does not load: " + err.Error())
+	}
+	keepModule(wasm, mod)
+}
+
+// keepModule keeps mod as wasm's module for instantiate.
+func keepModule(wasm []byte, mod *wasmtime.Module) {
+	key := sha256.Sum256(wasm)
 	fuzzModuleMu.Lock()
 	defer fuzzModuleMu.Unlock()
 	if _, ok := fuzzModules[key]; ok {
@@ -408,19 +469,43 @@ func warmModule(wasm []byte) {
 	}
 }
 
-// ensureWarm makes sure a cached compile's module is warm in a fuzz run under
-// -unicode, compiling it under the deadline when the module cache let it go;
-// false when that compile ran past it.
+// ensureWarm makes sure a cached compile's module is warm when modules are
+// kept, building it when the module cache let it go: within the budget in the
+// compile child when the input is budgeted, waited for otherwise. false when
+// that build ran past the budget.
 func ensureWarm(wasm []byte, err error) bool {
-	if !fuzzingUnicode() || err != nil || warmedModule(wasm) != nil {
+	if !modulesKept() || err != nil || len(wasm) == 0 || warmedModule(wasm) != nil {
 		return true
 	}
-	return runWithDeadline(func() { warmModule(wasm) })
+	if !budgeted() {
+		warmModule(wasm)
+		return true
+	}
+	key := sha256.Sum256(wasm)
+	fuzzModuleMu.Lock()
+	slow := tooSlowWarm[key]
+	fuzzModuleMu.Unlock()
+	if slow {
+		return false
+	}
+	r, full, err := runBudgeted(compileJob{Kind: jobWarm, Wasm: wasm, Warm: true})
+	if errors.Is(err, errCompileTooSlow) {
+		if full {
+			fuzzModuleMu.Lock()
+			tooSlowWarm[key] = true
+			fuzzModuleMu.Unlock()
+		}
+		return false
+	}
+	if r.Module != nil {
+		keepSerialized(wasm, r.Module)
+	}
+	return true
 }
 
-// warmedModule is the module warmModule compiled for wasm, or nil.
+// warmedModule is the module kept for wasm, or nil.
 func warmedModule(wasm []byte) *wasmtime.Module {
-	if !fuzzingUnicode() {
+	if !modulesKept() {
 		return nil
 	}
 	key := sha256.Sum256(wasm)

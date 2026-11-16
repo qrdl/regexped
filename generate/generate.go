@@ -1,6 +1,7 @@
 package generate
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -35,6 +36,34 @@ func ResolveStubType(cfg config.BuildConfig) (string, error) {
 	return config.ResolveStubType(cfg)
 }
 
+// ForOutput is cfg as `generate -o out` generates it. stub_type, when set,
+// decides the language; otherwise the extension of the path written does —
+// out when given, else stub_file ("-" names no file, so stub_file's). The
+// export names are checked again for that language when it is not the one
+// the config was loaded for: `-o x.go` with `stub_file: s.rs` used to write
+// Rust into x.go. So is the language against wasm_format, as LoadConfig checks
+// stub_file's: `-o s.js` under a component config wrote a JS loader for a
+// module the build does not produce, and `-o x.wit` under a module config a
+// WIT for a component it does not.
+func ForOutput(cfg config.BuildConfig, out string) (config.BuildConfig, error) {
+	if out == "" || out == "-" || cfg.StubType != "" || out == cfg.StubFile {
+		return cfg, nil
+	}
+	c := cfg
+	c.StubFile = out
+	stubType, err := ResolveStubType(c)
+	if err != nil {
+		return cfg, err
+	}
+	if err := config.ValidateStubTypeForFormat(&c, stubType); err != nil {
+		return cfg, err
+	}
+	if err := config.ValidateConfig(&c); err != nil {
+		return cfg, err
+	}
+	return c, nil
+}
+
 // CmdGenerateStub generates a stub file of the appropriate type for cfg.
 // out is the full output path or "-" for stdout.
 func CmdGenerateStub(cfg config.BuildConfig, out string) error {
@@ -48,6 +77,24 @@ func CmdGenerateStub(cfg config.BuildConfig, out string) error {
 	stubType, err := ResolveStubType(cfg)
 	if err != nil {
 		return err
+	}
+	// A stub that declares WASM imports needs a name to import FROM, and a
+	// Rust or Go stub needs one for its `pub mod` / `package`.
+	//
+	// MODULE format only. A component imports nothing by module name: its
+	// imports are the WIT interface `regexped:<wit_package>/...`, which
+	// config.LoadConfig already requires — from `import_module` OR from
+	// `wit_package`, so demanding `import_module` here would reject a
+	// wit_package-only config that compiles fine. The one name a component
+	// stub still needs is Rust's module identifier, which has its own key.
+	// Here, not in the command, so `regexped check` makes the same test.
+	switch {
+	case !cfg.Component():
+		if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
+			return errors.New("generate: import_module is required in config for Rust, Go, C, and AS stubs")
+		}
+	case stubType == "rust" && cfg.RustModuleName() == "":
+		return errors.New("generate: rust_module (or import_module) is required in config for Rust stubs: it names the generated `pub mod`")
 	}
 	return generateStub(cfg, stubType, out)
 }

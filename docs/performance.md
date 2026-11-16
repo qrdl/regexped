@@ -17,7 +17,7 @@ instructions executed the same averages are 5.5× and 10.6×.
 
 **DFA/TDFA matching:** O(n) time, O(1) runtime stack — no worst-case blowup.
 
-**Backtracking:** LeftmostFirst (RE2/Perl) semantics for non-deterministic capture patterns. BitState memoization bounds runtime to O(n × numStates) for patterns with zero-matchable loops; stack overflow guard prevents memory corruption on deeply nested patterns.
+**Backtracking:** LeftmostFirst (RE2/Perl) semantics for non-deterministic capture patterns. Every search has a work budget of one step per instruction per input byte; once it is spent, a memoised body that tries each (instruction, position) pair at most once answers the rest of the search, so a search is O(instructions × n) on every input. Its frame stack and memo grow with the input, up to `max_memory` (see [complexity.md](complexity.md)).
 
 **SIMD prefix scan:** First-byte and two-byte Teddy algorithm skips non-matching positions in bulk using WASM SIMD instructions, reducing DFA transitions on typical inputs.
 
@@ -63,6 +63,9 @@ instructions executed the same averages are 5.5× and 10.6×.
 | Is a 100 KB input one of 4–32 formats? (rejected within a few bytes) | `match_any`, `match_all` | regex-automata | 3.6–142× | too short to time |
 
 ## How these are measured
+
+The figures on this page were measured on 2026-10-16, at commit `4dd86d3`;
+later changes are measured against them by the same tools before they land.
 
 `tools/perftest` runs each pattern over each input in both engines, inside
 wasmtime, and reports the median of many timed runs and the exact number of

@@ -224,6 +224,27 @@ func (g *moduleGlobals) Search() uint32 {
 	return g.searchP1 - 1
 }
 
+// searchRef is what a body that arms a search block needs of the module: the
+// search global, and the arm epoch + 1 it bumps when it arms (0: none).
+type searchRef struct{ g, epochP1 uint32 }
+
+// SearchRef is Search with the arm epoch.
+func (g *moduleGlobals) SearchRef() searchRef {
+	return searchRef{g: g.Search(), epochP1: g.armEpochP1()}
+}
+
+// emitBumpEpoch bumps the arm epoch (epochP1 - 1), when the module has one:
+// a body arming or tripping a search block tells the defaults their blocks
+// may need notes or a memo (default_search.go).
+func emitBumpEpoch(b []byte, epochP1 uint32) []byte {
+	if epochP1 == 0 {
+		return b
+	}
+	b = appendGlobalGet(b, epochP1-1)
+	b = append(b, 0x41, 0x01, 0x6A) // i32.const 1; i32.add
+	return appendGlobalSet(b, epochP1-1)
+}
+
 // searchGlobal reports the search global, if some body allocated it.
 func (g *moduleGlobals) searchGlobal() (uint32, bool) {
 	if g == nil || g.searchP1 == 0 {
@@ -269,6 +290,7 @@ type notesCtx struct {
 	copy        notesCopy
 	tableMemIdx int
 	search      uint32 // the search global
+	epochP1     uint32 // the arm epoch + 1 (searchRef)
 	// sw is the switch counter of the body, if it has one: a stop at a note
 	// charges it, since notes make failed walks shorter than the counter's
 	// switchShortWalk and would otherwise starve it.
@@ -320,8 +342,8 @@ const (
 )
 
 // newBodyNotes is the notes context of one copy of the general find body.
-func newBodyNotes(rows *notesRows, l *dfaLayout, copy notesCopy, tableMemIdx int, search uint32) *notesCtx {
-	return &notesCtx{rows: rows, l: l, copy: copy, tableMemIdx: tableMemIdx, search: search, callOff: -1,
+func newBodyNotes(rows *notesRows, l *dfaLayout, copy notesCopy, tableMemIdx int, search searchRef) *notesCtx {
+	return &notesCtx{rows: rows, l: l, copy: copy, tableMemIdx: tableMemIdx, search: search.g, epochP1: search.epochP1, callOff: -1,
 		ptr: nPtr, ln: nLen, st: nState, pos: nPos, start: nStart, last: nLast, bias: noBias}
 }
 
@@ -475,7 +497,17 @@ func (c *notesCtx) emitStop(b []byte, extra byte, endAdd int32) []byte {
 		b = append(b, 0x6A)
 	}
 	b = append(b, 0x21, c.lEnd())
-	b = c.emitRecord(b)
+	if c.marked() {
+		// A tail of ONE position — the walk accepted where it stopped — is not
+		// recorded: the only note it could add is that accept's own point, and
+		// a later walk that misses it reads one more byte, to the note that
+		// stopped this one. That is never a different answer, and the record's
+		// entry cost was most of a call that stops one byte in: `x[^y]*y|x`
+		// over x×N 267 → 240 fuel/byte, other armed drives −3% to −8%.
+		b = append(b, 0x20, nLast, 0x20, c.lEnd(), 0x47, 0x04, 0x40) // last != end: if
+		b = c.emitRecord(b)
+		b = append(b, 0x0B)
+	}
 	b = append(b, 0x20, nLast)
 	b = nConst(b, 0)
 	b = append(b, 0x4E, 0x0D, 2+extra) // ge_s → $found
@@ -569,6 +601,7 @@ func (c *notesCtx) emitJudge(b []byte) []byte {
 	b = append(b, 0x7C, 0x56, 0x04, 0x40) // i64.add; i64.gt_u; if
 	b = c.stConst(b, blkArmed, 1)
 	b = c.stConst(b, blkSeen, 0)
+	b = emitBumpEpoch(b, c.epochP1)
 	return append(b, 0x0B)
 }
 
@@ -763,7 +796,7 @@ type notesPlan struct {
 	altMarked uint32
 	// altEnd: where a branch's plain verify stopped, for the dispatcher's lFar.
 	altEnd uint32
-	search uint32 // the module's search global
+	search searchRef // the module's search global
 }
 
 // altRows is any of the alternation branches' rows — they share the record
@@ -796,7 +829,7 @@ func (n *notesPlan) resource() resourceNotes {
 	if n.bytesPerPos() == 0 {
 		return resourceNotes{}
 	}
-	return resourceNotes{search: n.search, bytesPerPos: n.bytesPerPos()}
+	return resourceNotes{search: n.search.g, bytesPerPos: n.bytesPerPos()}
 }
 
 // patternResource is p's resources' search state: its notes and its
@@ -978,9 +1011,9 @@ func fillSearchSizes(patterns []*compiledPattern, into map[string]SearchSize) {
 // newWalkNotes is the notes context of a walker whose locals are ptr, ln, st,
 // pos and last, and whose positions are local + bias (noBias: absolute).
 // base is the first of walkNotesLocals i32 locals it declares.
-func newWalkNotes(rows *notesRows, l *dfaLayout, tableMemIdx int, search uint32,
+func newWalkNotes(rows *notesRows, l *dfaLayout, tableMemIdx int, search searchRef,
 	ptr, ln, st, pos, last, bias, base byte) *notesCtx {
-	return &notesCtx{rows: rows, l: l, copy: notesMarked, tableMemIdx: tableMemIdx, search: search, callOff: -1,
+	return &notesCtx{rows: rows, l: l, copy: notesMarked, tableMemIdx: tableMemIdx, search: search.g, epochP1: search.epochP1, callOff: -1,
 		ptr: ptr, ln: ln, st: st, pos: pos, start: 0xFF, last: last, bias: bias, base: base}
 }
 
@@ -1157,7 +1190,7 @@ func (n *notesPlan) resumeGlobal() *uint32 {
 	if n.bytesPerPos() == 0 {
 		return nil
 	}
-	g := n.search
+	g := n.search.g
 	return &g
 }
 
@@ -1191,7 +1224,7 @@ func (p *compiledPattern) buildLitNotes(table *dfaTable, l *dfaLayout, opts Comp
 	if n.bytesPerPos() == 0 {
 		return
 	}
-	n.search = opts.globals.Search()
+	n.search = opts.globals.SearchRef()
 	if n.alt != nil {
 		n.altMarked = opts.globals.Alloc()
 		n.altEnd = opts.globals.Alloc()

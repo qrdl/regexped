@@ -129,14 +129,15 @@ type ckptEmit struct {
 	utf8Start bool
 
 	// proj is the column's projection, or nil when the column stays one cell per
-	// (state, pattern). When set, the column is indexed by CELL and a runtime
-	// successor table stands between the state loop and the update.
+	// (state, pattern). When set, the column is indexed by CELL and the step
+	// reads the step table (overlapStepTabBytes) at stepOff: one entry per cell
+	// and byte class.
 	proj    *overlapProj
-	projOff int32 // data-segment offset of projTab: P*numWASM u16 byte offsets
-	// succOff is the scratch array's offset in TABLE memory, one byte per
-	// state. No local holds its base: every access is at a compile-time
-	// constant address, which is what the full unroll buys.
-	succOff int32
+	stepOff int32
+
+	// advFn is the index of the column-update function the pass and the block
+	// body call (overlapAdvanceFnMinCells), or -1 to emit the update inline.
+	advFn int
 }
 
 // colBytes is one working column: cells when projected, states x patterns
@@ -159,7 +160,9 @@ func (e *ckptEmit) colBytes() int32 {
 func (e *ckptEmit) rowBytesB() int32 { return int32(config.SetOverlapBlockRowBytes(e.numPat)) }
 
 // newCkptEmit derives the geometry from the set's sweep source.
-func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
+//
+// advFn is the column-update function's index, -1 for an inline update.
+func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32, advFn int) *ckptEmit {
 	sw := cs.sweepSrc()
 	if sw == nil {
 		panic("compile: newCkptEmit called for a set with no sweep")
@@ -178,8 +181,8 @@ func newCkptEmit(cs *compiledSet, tableMemIdx int, colOff int32) *ckptEmit {
 		e.utf8Start = e.utf8Start || bkt.utf8StartCheck(capFind)
 	}
 	e.proj = cs.overlapProjFor()
-	e.projOff = cs.overlapProjTabOff
-	e.succOff = cs.overlapSuccOff
+	e.stepOff = cs.overlapStepTabOff
+	e.advFn = advFn
 	e.colA = colOff
 	e.colB = colOff + e.colBytes()
 	// The boundary channels and 16-bit ids are carried by the PROJECTED step
@@ -360,6 +363,23 @@ func (e *ckptEmit) emitEOFColumn(b []byte) []byte {
 // This is set_overlap_dp.go's recurrence, unchanged, and it is the reason both
 // bodies below can exist without a second copy of the semantics.
 func (e *ckptEmit) emitAdvance(b []byte) []byte {
+	if e.advFn >= 0 {
+		// The update lives in its own function (emitCkptAdvanceBody), which
+		// swaps its copies of the columns itself: swap ours to match.
+		b = e.get(b, e.pPtr)
+		b = e.get(b, e.lPos)
+		b = e.get(b, e.lCur)
+		b = e.get(b, e.lPrev)
+		b = append(b, 0x10)
+		b = utils.AppendULEB128(b, uint32(e.advFn)) //nolint:gosec // a function index
+		b = append(b, 0x1A)                         // drop
+		b = e.get(b, e.lCur)
+		b = e.set(b, e.lSwap)
+		b = e.get(b, e.lPrev)
+		b = e.set(b, e.lCur)
+		b = e.get(b, e.lSwap)
+		return e.set(b, e.lPrev)
+	}
 	if e.proj != nil {
 		return e.emitAdvanceProj(b)
 	}
@@ -874,8 +894,8 @@ func (e *ckptEmit) emitCkptPassPrologue(b []byte, pFrom, pLen, pScratch, pScratc
 	return b
 }
 
-func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
-	e := newCkptEmit(cs, tableMemIdx, colOff)
+func emitCkptPassBody(cs *compiledSet, tableMemIdx int, colOff int32, advFn int) []byte {
+	e := newCkptEmit(cs, tableMemIdx, colOff, advFn)
 
 	const (
 		pPtr = iota
@@ -1162,8 +1182,8 @@ func (e *ckptEmit) emitPrefixSumCounts(b []byte) []byte {
 // EOF column, and a block loop written as `hi .. blockStart` with `hi` one
 // below the block's top silently drops every end-of-input match. The plan
 // carried exactly that defect until it was corrected.
-func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
-	e := newCkptEmit(cs, tableMemIdx, colOff)
+func emitCkptBlockBody(cs *compiledSet, tableMemIdx int, colOff int32, advFn int) []byte {
+	e := newCkptEmit(cs, tableMemIdx, colOff, advFn)
 
 	const (
 		pPtr = iota
@@ -1406,15 +1426,16 @@ func (e *ckptEmit) emitEOFColumnProj(b []byte) []byte {
 
 // emitAdvanceProj is one position's transition over the projected column.
 //
-// TWO PHASES, and the split is what the projection costs. First a loop over
-// STATES filling the successor scratch, because delta depends on the input byte
-// and cannot be folded; then an UNROLLED pass over CELLS, each reading its
-// representative's successor at a constant offset, the successor's cell through
-// the projection table, and the old column there.
+// One UNROLLED pass over CELLS: each reads the step table at a constant (its
+// row) plus the position's class, which names the cell its representative's
+// successor lands in, and the old column there. There is no per-state loop:
+// a cell's representative is a compile-time constant, so the step table
+// (overlapStepTabBytes) folds the transition and the projection into one
+// entry per class.
 //
-// The column is unrolled rather than looped: every address
-// bar the projection lookup is a compile-time constant, at the price of a
-// module that grows with the cell count.
+// The column is unrolled rather than looped: every address bar the step-table
+// entry is a compile-time constant, at the price of a module that grows with
+// the cell count (overlapAdvanceFnMinCells moves a wide one into a function).
 func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 	b = e.get(b, e.lCur)
 	b = e.set(b, e.lSwap)
@@ -1430,35 +1451,11 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 	b = e.set(b, e.lByte)
 	b = emitOverlapDPCell(b, e.dp, e.tableMem, e.lByte, e.lCell)
 
-	// Phase 1: succ[w] = delta(w, class) for every state.
+	// The class's offset within a step-table row, once per position.
+	b = e.get(b, e.lCell)
 	b = e.konst(b, 1)
-	b = e.set(b, e.lState)
-	b = append(b, 0x02, 0x40)
-	b = append(b, 0x03, 0x40)
-	b = e.get(b, e.lState)
-	b = e.konst(b, int32(e.numStates))
-	b = append(b, 0x4E)
-	b = append(b, 0x0D, 0x01)
-	b = e.konst(b, e.succOff)
-	b = e.get(b, e.lState)
-	if !e.dp.l.useU8 {
-		b = e.konst(b, 1)
-		b = append(b, 0x74) // i32.shl: two bytes per 16-bit id
-	}
-	b = append(b, 0x6A)
-	b = emitOverlapDPTransition(b, e.dp, e.tableMem, e.lState, e.lCell, e.lNext)
-	b = e.get(b, e.lNext)
-	if e.dp.l.useU8 {
-		b = appendTableStore8(b, e.tableMem)
-	} else {
-		b = appendTableStore16(b, e.tableMem)
-	}
-	b = e.get(b, e.lState)
-	b = e.konst(b, 1)
-	b = append(b, 0x6A)
-	b = e.set(b, e.lState)
-	b = append(b, 0x0C, 0x00)
-	b = append(b, 0x0B, 0x0B)
+	b = append(b, 0x74) // i32.shl: two bytes per entry
+	b = e.set(b, e.lNext)
 
 	// The byte's boundary classes, once per position, for the accepts below.
 	if e.dp.hasWordChar {
@@ -1475,7 +1472,8 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 		b = e.set(b, e.lIsNL)
 	}
 
-	// Phase 2: one update per CELL, unrolled.
+	// One update per CELL, unrolled.
+	cps := e.dp.cellsPerState()
 	for pat := 0; pat < e.numPat; pat++ {
 		for c := 1; c < e.proj.cells; c++ {
 			if e.proj.owner[c] != int32(pat) {
@@ -1483,16 +1481,6 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 			}
 			w := int(e.proj.rep[c])
 			b = e.get(b, e.lCur)
-
-			// w' = succ[rep], at a constant address.
-			if e.dp.l.useU8 {
-				b = e.konst(b, e.succOff+int32(w))
-				b = appendTableLoad8u(b, e.tableMem)
-			} else {
-				b = e.konst(b, e.succOff+2*int32(w))
-				b = appendTableLoad16u(b, e.tableMem)
-			}
-			b = e.set(b, e.lNext)
 
 			// A DOMINANT boundary accept is final: once its boundary holds,
 			// the answer is this position whatever the suffix says, as the
@@ -1515,14 +1503,13 @@ func (e *ckptEmit) emitAdvanceProj(b []byte) []byte {
 				b = append(b, 0x05)
 			}
 
-			// The suffix answer: prev[projTab[pat][w']]. A dead successor
+			// The suffix answer: prev[step[c][class]]. A dead successor
 			// lands on cell 0, which holds -1 permanently, so the "is it dead"
 			// branch the unprojected form needs is gone.
 			b = e.get(b, e.lPrev)
-			b = e.konst(b, e.projOff+int32(pat*e.numStates*2))
+			b = e.konst(b, e.stepOff+int32(c*cps*2))
 			b = e.get(b, e.lNext)
-			b = e.konst(b, 2)
-			b = append(b, 0x6C, 0x6A)
+			b = append(b, 0x6A)
 			b = appendTableLoad16u(b, e.tableMem)
 			b = append(b, 0x6A)
 			b = appendTableLoad32(b, e.tableMem, 0)
@@ -1679,4 +1666,55 @@ func emitCkptSizingBudget(b []byte, lenL, lM, lK, lBytes uint32, cells int, row 
 	b = utils.AppendSLEB128_64(b, row)
 	b = append(b, 0x7E, 0x7C)
 	return lset(b, lBytes)
+}
+
+// overlapAdvanceFnMinCells is the column width from which the per-position
+// column update is emitted ONCE, as its own function (emitCkptAdvanceBody),
+// and called from the three places that would otherwise each carry an
+// unrolled copy (the pass's two loops and the block body).
+//
+// The update is ~50 bytes per cell, so a wide column's three copies were most
+// of its module (765 KB of 914 KB code at 96 members). A call costs ~13 fuel
+// per POSITION, which is noise against a wide column's step and not against a
+// narrow one's. Measured over the fused step (overlapStepTabBytes): at 64+
+// cells +0.01% to +0.32% fuel and −2% to −10% module bytes (96 members
+// 3,394,506 → 3,053,701); a function for EVERY column cost the narrow ones
+// +2% to +4.1% fuel (setperf overlap-shape-3 +2.6% / +4.0%), for −1% to −4%.
+const overlapAdvanceFnMinCells = 64
+
+// overlapAdvanceFn reports whether this set's sweep carries the column-update
+// function (overlapAdvanceFnMinCells).
+func (cs *compiledSet) overlapAdvanceFn() bool {
+	return cs.usesOverlapDP() && cs.overlapCells() >= overlapAdvanceFnMinCells
+}
+
+// emitCkptAdvanceBody emits the column-update function:
+//
+//	(ptr, pos, cur, prev) -> 0
+//
+// one position's update, exactly emitAdvance's inline form: it swaps its own
+// copies of cur and prev and fills the column that ends up current. The i32
+// result is 0 and dropped by the caller; it lets the function reuse a type the
+// set already declares.
+func emitCkptAdvanceBody(cs *compiledSet, tableMemIdx int, colOff int32) []byte {
+	e := newCkptEmit(cs, tableMemIdx, colOff, -1)
+	const (
+		pPtr = iota
+		pPos
+		pCur
+		pPrev
+		nparams
+	)
+	e.pPtr, e.lPos, e.lCur, e.lPrev = pPtr, pPos, pCur, pPrev
+	a := newLocalAlloc(nparams)
+	e.lByte, e.lCell, e.lState, e.lNext, e.lVal = a.I32(), a.I32(), a.I32(), a.I32(), a.I32()
+	e.lCurRow, e.lPrevRow, e.lSwap = a.I32(), a.I32(), a.I32()
+	e.lMidMask = a.I64()
+	e.allocBoundary(a)
+	var b []byte
+	b = a.EmitDecls(b)
+	b = e.emitAdvance(b)
+	b = e.konst(b, 0)
+	b = append(b, 0x0B)
+	return append(utils.AppendULEB128(nil, uint32(len(b))), b...)
 }

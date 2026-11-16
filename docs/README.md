@@ -1,5 +1,6 @@
 # Regexped documentation
 
+- [Quick start](quickstart.md) — one config, then its matchers called from JavaScript, Rust and Go
 - [CLI reference](cli.md) — commands, flags, config schema, pattern support
 - [Pattern references](references.md) — `(?&name)` / `(?<&name>)`: build a regexp from named patterns
 - [Compile hints](prefer-hints.md) — `prefer-match` / `prefer-no-match` and `anchor_literal:`: which shapes each changes, and how to measure whether it helps your traffic

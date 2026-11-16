@@ -81,6 +81,16 @@ func appendDroppableDataSegment(out []byte, offset int32, data []byte) []byte {
 	return out
 }
 
+// markSegmentsDroppable re-encodes a run of the compiler's own segments with
+// every one droppable (appendDroppableDataSegment).
+func markSegmentsDroppable(raw []byte) []byte {
+	var out []byte
+	for _, seg := range parseDataSegments(raw) {
+		out = appendDroppableDataSegment(out, seg.offset, seg.data)
+	}
+	return out
+}
+
 // dropUnaddressedTables leaves out every droppable segment (droppableSegFlag)
 // whose offset the module's code never ADDRESSES — no `i32.const <offset>` and
 // no load or store whose offset immediate is <offset>, the two ways every
@@ -90,7 +100,7 @@ func appendDroppableDataSegment(out []byte, offset int32, data []byte) []byte {
 // which is all its readers-that-are-not would have seen.
 //
 // One byte stands in at the old top when the highest segment is dropped:
-// harnesses and utils.WasmMemTop take "where free memory starts" from the
+// the harnesses (utils.ParseDataSectionBytes) take "where free memory starts" from the
 // data segments.
 //
 // THE RULE THIS RESTS ON: a body reads such a table only through its offset as

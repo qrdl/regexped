@@ -156,8 +156,16 @@ func main() {
 	allMatches := flag.Bool("all-matches", false, "synthesise col4 (EVERY match) from a Go oracle for rows whose corpus line has no such column, so later matches are checked and not just the first. re2-exhaustive.txt has four columns, so without this only one match per row is ever verified")
 	highBytes := flag.Bool("high-bytes", false, "stop skipping corpus inputs that contain bytes above 0x7F: judge them against a Go oracle run on an ASCII twin of the input (see highbytes.go). The corpus columns come from RE2, which decodes UTF-8, and cannot judge a byte engine on such input")
 	searchBlock := flag.String("search-block", "fresh", "per-search block handed to find and groups (see internal/abi): off = none, the search global left at 0; fresh = a zeroed block per drive and notes allocated when it arms, as a generated stub does; armed = a block ARMED before the first call, so the MARKED copy of every find with notes answers every call — the comparison of the two copies over the corpus")
+	cacheHandover := flag.String("set-cache-handover", "lazy", "with --sets, how an overlapping drive's answer cache is handed over: lazy = the header alone and the region when the module asks for it, as every generated stub does; decline = the header alone, and NO region when the module asks (a refused allocation: the drive walks); eager = the whole region up front, as a raw caller may")
 	findOnly := flag.Bool("find-only", false, "compile non-capturing patterns with only find_func set (omit match_func); reaches the needFind && !needMatch call sites — the alt-prefixed find body, the alt-range find body and the strict/lenient alt find bodies — which match+find-together dispatch never exercises")
 	flag.Parse()
+	switch *cacheHandover {
+	case "lazy", "decline", "eager":
+		setCacheHandover = *cacheHandover
+	default:
+		fmt.Fprintf(os.Stderr, "--set-cache-handover: unknown value %q (want lazy, decline or eager)\n", *cacheHandover)
+		os.Exit(2)
+	}
 	// --high-bytes judges high-byte input against an ASCII twin, which is an
 	// oracle for a BYTE engine only: in Unicode mode the twin's answers are
 	// wrong, and RE2's own columns are the oracle.

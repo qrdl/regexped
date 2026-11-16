@@ -76,41 +76,14 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 	if n < 2 || numPat < 1 {
 		return nil
 	}
-	cellsPerState := 256
-	if dp.l.useCompression {
-		cellsPerState = dp.l.numClasses
-	}
+	cellsPerState := dp.cellsPerState()
 	// Unforced, a u16 table and row dedup are declined: no projection means
 	// the plain column, which is correct at every width, and it is the column
 	// such a sweep always had.
 	if !force && (dp.l.useRowDedup || !dp.l.useU8) {
 		return nil
 	}
-	// delta(w, c) over the SAME table the sweep reads, indexed as
-	// emitOverlapDPTransition indexes it. Reading one byte of a two-byte entry,
-	// or a state's row instead of its deduplicated one, would merge states
-	// that are not equivalent — a wrong answer with nothing to signal it.
-	width := 1
-	if !dp.l.useU8 {
-		width = 2
-	}
-	delta := func(w, c int) int {
-		row := w
-		if dp.l.useRowDedup {
-			row = int(dp.l.rowMapBytes[w])
-		}
-		idx := (row*cellsPerState + c) * width
-		if idx < 0 || idx+width > len(dp.l.tableBytes) {
-			// Not recoverable and not to be guessed at: returning "dead" here
-			// would turn a geometry mismatch into MISSING MATCHES, silently.
-			panic(fmt.Sprintf("overlap projection: table index %d out of %d for state %d class %d",
-				idx, len(dp.l.tableBytes), w, c))
-		}
-		if width == 2 {
-			return int(dp.l.tableBytes[idx]) | int(dp.l.tableBytes[idx+1])<<8
-		}
-		return int(dp.l.tableBytes[idx])
-	}
+	delta := dp.delta
 	// The dominant flags count only for a one-pattern automaton, which is the
 	// only kind the sweep reads them for (see overlapDPTables).
 	domToo := numPat == 1
@@ -228,4 +201,41 @@ func buildOverlapProj(dp overlapDPTables, numPat int, force bool) *overlapProj {
 		return nil
 	}
 	return p
+}
+
+// cellsPerState is how many cells one row of the sweep's transition table
+// holds: one per byte class when the layout compresses, else one per byte.
+func (dp overlapDPTables) cellsPerState() int {
+	if dp.l.useCompression {
+		return dp.l.numClasses
+	}
+	return 256
+}
+
+// delta is the transition from WASM state w on cell c, read from the SAME
+// table the sweep reads and indexed as emitOverlapDPTransition indexes it.
+// Reading one byte of a two-byte entry, or a state's row instead of its
+// deduplicated one, would merge states that are not equivalent — a wrong
+// answer with nothing to signal it. The projection and the fused step table
+// (overlapStepTabBytes) both read it.
+func (dp overlapDPTables) delta(w, c int) int {
+	width := 1
+	if !dp.l.useU8 {
+		width = 2
+	}
+	row := w
+	if dp.l.useRowDedup {
+		row = int(dp.l.rowMapBytes[w])
+	}
+	idx := (row*dp.cellsPerState() + c) * width
+	if idx < 0 || idx+width > len(dp.l.tableBytes) {
+		// Not recoverable and not to be guessed at: returning "dead" here
+		// would turn a geometry mismatch into MISSING MATCHES, silently.
+		panic(fmt.Sprintf("overlap projection: table index %d out of %d for state %d class %d",
+			idx, len(dp.l.tableBytes), w, c))
+	}
+	if width == 2 {
+		return int(dp.l.tableBytes[idx]) | int(dp.l.tableBytes[idx+1])<<8
+	}
+	return int(dp.l.tableBytes[idx])
 }

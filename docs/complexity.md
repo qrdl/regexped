@@ -154,9 +154,21 @@ memo, set blocks and cache, grown in its own memory on first use and reused
 ([wasm.md](wasm.md#the-search-block)). The state carries over only while each
 call continues the previous one — the same text, `from` inside the last
 answer's window (a set: the same gate array, `from` advanced) — and is reset
-otherwise. `a*b|a` over `a`×8 K costs 474 instructions per byte that way,
+otherwise. A set's new drive over the same buffer, gate array zeroed, at a
+larger `from` therefore reads the old text's state: a raw caller restarts at an
+offset no greater than the last one, or with another gate array or text
+address ([sets.md](sets.md)). `a*b|a` over `a`×8 K costs 474 instructions per byte that way,
 against 135,303 before. A caller that does hand its state over pays ~1-9
 instructions per call for the check.
+
+What a stub does between calls — notes for a search that armed, a memo for one
+that tripped — the default state does at the next call's start, and only when
+something changed: a module-wide **arm epoch**, bumped where a search arms or
+trips, is compared with the one the default last acted on, so a call where
+nothing armed costs one compare instead of a test of every block. A 96-member
+overlapping set's drive by a raw caller went 718,735 → 412,766 instructions
+(the caller handing its own blocks: 409,755), and its batch entry at
+capacity 1 7,134,606 → 3,407,023.
 
 ## Sets
 
@@ -223,14 +235,18 @@ matches.
   rest of the drive from it ([wasm.md](wasm.md#the-overlapping-answer-cache)).
   It engages ADAPTIVELY: the drive walks, counting bytes matched and walked,
   and sweeps once that passes a sixteenth of a sweep's per-byte cost plus a
-  start-up allowance of eight bytes at the full rate — ordinary text stays
-  11-134× under the line, a wide set no longer walks two sweeps' worth first
-  (96 members: 281,595 → 108,705 instructions per byte), and inputs of a few
-  bytes stay on the walk. An **in-call counter** does the same inside the one
+  start-up allowance of eight bytes at the full rate — a wide set no longer
+  walks two sweeps' worth first (96 members: 281,595 → 108,705 instructions
+  per byte), and inputs of a few bytes stay on the walk. Most ordinary text
+  stays under the line; a small set whose members walk word classes crosses it
+  on word-heavy text and pays 5-49% more than walking would have (linear
+  either way). An **in-call counter** does the same inside the one
   call a no-match input makes.
 - **The column**, narrowed: union states whose per-member behaviour is the
   same share a cell (a Moore partition): 1.7-3.3× fewer cells measured, the
-  ratio growing with the state count.
+  ratio growing with the state count. Each position updates every cell with
+  one read of a compile-time step table (cell × byte class → the successor's
+  cell), so no per-state work runs per byte.
 - **The whole-set automaton.** A set the sweep cannot run over directly
   (literal or several buckets) is swept over an automaton of every member,
   built only where a drive can have arbitrarily many walks alive at once —
@@ -252,7 +268,7 @@ matches.
   the member's searches have walked `4 × len + 64` bytes — in Unicode mode
   `k × len + 64`, k the sweep's estimated cost per byte in walk bytes, since a
   lowered class makes a column thousands of roots wide — lives in the same
-  region after the cache, and is checkpointed the same way. Measured:
+  region, at its end past the cache, and is checkpointed the same way. Measured:
   131,456 → 795 instructions per byte (non-greedy), 124,939 → 1,052
   (Backtracking).
 
@@ -268,8 +284,8 @@ cannot have it.
 | Backtracking memo | `(len + 1) × ⌈instructions / 8⌉` | once a search trips (per call in the fallback otherwise) |
 | Backtracking frame stack (every body, set members included) | starts at 64 KB, doubles by `memory.grow`; one scratch for the whole module | as a search deepens |
 | fallback stack and bitset | sized from the input | when the fallback runs |
-| answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | reserved by the stub per drive; filled only if the drive sweeps |
-| program sweep | 4 bytes per position per swept member, checkpointed the same way | after the cache, same region |
+| answer cache | a row per position (mask + one end per member) up to 64 MiB, then the square root of the input | allocated by the stub only when the drive asks for it — the call where it would sweep; a drive that never sweeps holds the 48-byte header alone |
+| program sweep | 4 bytes per position per swept member, checkpointed the same way | the end of the same region, after the cache |
 | default state (standalone, raw callers) | what a stub would allocate | grown on first use, reused, regrown to at least twice the size only when a drive needs more |
 
 - **Call-time growth.** The fallback's memory and every frame stack are placed
@@ -307,6 +323,13 @@ cannot have it.
   quadratic over the drive on the shapes above. A C build with
   `-DRX_SET_CACHE=0` is in the same place until it hands buffers over with
   `<find>_set_cache` and `<func>_set_notes` ([c-api.md](c-api.md)).
+- **An answer cache offered too small.** A raw caller that hands an
+  overlapping set a cache region below what its input needs gets the walk the
+  cache exists to avoid: ×3.98 per doubling, 45,339 fuel/byte at 4 KB against
+  621 with a region of the right size — worse than handing none, which a
+  standalone module then answers from a region of its own (649). The size comes
+  from the compiler ([wasm.md](wasm.md#the-overlapping-answer-cache)); a generated stub
+  always gets it right.
 - **Interleaved raw drives over one standalone instance.** One default state
   serves one drive at a time; two drives alternating calls keep resetting it.
   The answers are right; each call starts fresh.

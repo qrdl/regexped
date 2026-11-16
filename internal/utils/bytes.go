@@ -251,6 +251,100 @@ func ParseDataSectionBytes(raw []byte) (int64, error) {
 	return 0, nil
 }
 
+// ImportsMemory reports whether the complete WASM binary raw imports a memory
+// as module.field — what an EMBEDDED regexp module does with the host's
+// `main`.`memory`, and a standalone one never does. Anything that is not a
+// well-formed module, or an import section it cannot read to the end of the
+// matching entry, reads as no import.
+func ImportsMemory(raw []byte, module, field string) bool {
+	if len(raw) < 8 || string(raw[:4]) != "\x00asm" {
+		return false
+	}
+	off := 8
+	for off < len(raw) {
+		sectionID := raw[off]
+		off++
+		secSize, n, err := DecodeULEB128(raw[off:])
+		if err != nil || secSize > uint64(len(raw)-off-n) {
+			return false
+		}
+		off += n
+		sec := raw[off : off+int(secSize)]
+		off += int(secSize)
+		if sectionID == 2 {
+			return importSectionHasMemory(sec, module, field)
+		}
+	}
+	return false
+}
+
+// importSectionHasMemory walks an import section's entries for a memory
+// imported as module.field.
+func importSectionHasMemory(sec []byte, module, field string) bool {
+	count, p, err := DecodeULEB128(sec)
+	if err != nil {
+		return false
+	}
+	name := func() (string, bool) {
+		l, n, err := DecodeULEB128(sec[p:])
+		if err != nil || l > uint64(len(sec)-p-n) {
+			return "", false
+		}
+		s := string(sec[p+n : p+n+int(l)])
+		p += n + int(l)
+		return s, true
+	}
+	uleb := func() bool {
+		_, n, err := DecodeULEB128(sec[p:])
+		p += n
+		return err == nil
+	}
+	limits := func() bool { // flags, min, [max], [page size]
+		if p >= len(sec) {
+			return false
+		}
+		flags := sec[p]
+		p++
+		if !uleb() || flags&0x01 != 0 && !uleb() {
+			return false
+		}
+		return flags&0x08 == 0 || uleb()
+	}
+	for range count {
+		mod, ok1 := name()
+		fld, ok2 := name()
+		if !ok1 || !ok2 || p >= len(sec) {
+			return false
+		}
+		kind := sec[p]
+		p++
+		switch kind {
+		case 0x00: // func: type index
+			ok1 = uleb()
+		case 0x01: // table: reference type, limits
+			p++
+			ok1 = p <= len(sec) && limits()
+		case 0x02: // memory
+			if mod == module && fld == field {
+				return true
+			}
+			ok1 = limits()
+		case 0x03: // global: value type, mutability
+			p += 2
+			ok1 = p <= len(sec)
+		case 0x04: // tag: attribute, type index
+			p++
+			ok1 = p <= len(sec) && uleb()
+		default:
+			return false
+		}
+		if !ok1 {
+			return false
+		}
+	}
+	return false
+}
+
 // CustomSection returns the payload of the first custom section named name in
 // a complete WASM binary, and whether there is one. Anything that is not a
 // well-formed module, or a section that runs past the end, reads as absent.

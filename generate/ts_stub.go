@@ -3,6 +3,7 @@ package generate
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/qrdl/regexped/compile"
@@ -44,9 +45,10 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	sb.WriteString("let _mem: Uint8Array;\n")
 	sb.WriteString("let _staticTop = 0; // first byte after the module's own table pages\n")
 	sb.WriteString("let _bump = 0;      // next free byte; regions are carved from here up\n")
-	// Only generators keep a refcount; a stub with none would declare it unused.
+	// Only generators keep regions; a stub with none would declare it unused.
+	// See the JS generator's "Regions" note for the allocator.
 	if hasSuspendableExports(cfg) {
-		sb.WriteString("let _live = 0;      // live iterator regions\n")
+		sb.WriteString("const _regs: { at: number; top: number; free: boolean; owner?: number }[] = []; // live iterator regions, in allocation order\n")
 	}
 	sb.WriteString("const _enc = new TextEncoder();\n")
 	sb.WriteString("\n")
@@ -97,23 +99,35 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	// between every loop.
 	sb.WriteString("function _align(x: number): number { return (x + 7) & ~7; }\n\n")
 	sb.WriteString(jsGrowFunc(true))
-	sb.WriteString("function _inCap(input: string | Uint8Array): number {\n")
-	sb.WriteString("    // Worst-case UTF-8 expansion of a JS string is 3 bytes per UTF-16 code\n")
-	sb.WriteString("    // unit (an astral char is 2 units and encodes to 4, so 3x still bounds\n")
-	sb.WriteString("    // it), so encodeInto cannot truncate inside the reservation.\n")
-	sb.WriteString("    return typeof input === 'string' ? input.length * 3 : input.length;\n")
-	sb.WriteString("}\n\n")
-	sb.WriteString("function _write(input: string | Uint8Array, at: number): number {\n")
-	sb.WriteString("    // encodeInto writes straight into WASM memory, avoiding both the\n")
-	sb.WriteString("    // intermediate array TextEncoder.encode allocates and the second copy\n")
-	sb.WriteString("    // _mem.set would then make.\n")
-	// lib.dom.d.ts declares TextEncoderEncodeIntoResult.written as optional, so
-	// strict-mode consumers need the non-null assertion; it is always present at
-	// runtime per the Encoding spec.
-	sb.WriteString("    if (typeof input === 'string') return _enc.encodeInto(input, _mem.subarray(at)).written!;\n")
-	sb.WriteString("    _mem.set(input, at);\n")
-	sb.WriteString("    return input.length;\n")
-	sb.WriteString("}\n\n")
+	// lib.dom.d.ts declares TextEncoderEncodeIntoResult.read/written as
+	// optional, so strict TypeScript needs the non-null assertions; both are
+	// always present at runtime per the Encoding spec.
+	sb.WriteString(`function _write(input: string | Uint8Array, at: number): number {
+    // Writes the input at ` + "`at`" + `, growing memory for it as it goes, and
+    // returns the bytes it took. encodeInto writes straight into WASM memory,
+    // avoiding both the array TextEncoder.encode allocates and the copy
+    // _mem.set would then make. A string reserves its length in UTF-16 units —
+    // every ASCII string's exact size — and grows by the worst case of what is
+    // left (3 bytes a unit) only when that did not fit: reserving 3 per unit
+    // up front refused, under max_memory, a 1.5 MB ASCII string whose bytes fit.
+    if (typeof input !== 'string') {
+        _grow(at + input.length);
+        _mem.set(input, at);
+        return input.length;
+    }
+    _grow(at + input.length);
+    const r = _enc.encodeInto(input, _mem.subarray(at));
+    let written = r.written!;
+    if (r.read! < input.length) {
+        // encodeInto never splits a surrogate pair, so the rest starts on one.
+        const rest = input.slice(r.read!);
+        _grow(at + written + rest.length * 3);
+        written += _enc.encodeInto(rest, _mem.subarray(at + written)).written!;
+    }
+    return written;
+}
+
+`)
 	// Emitted only when something uses them: a stub is a file the caller
 	// compiles, and TypeScript under --noUnusedLocals rejects a declared
 	// helper nothing calls. A match-only config has no generator, and a
@@ -124,11 +138,12 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 		sb.WriteString("    // else can allocate, so they may reuse the space above the bump without\n")
 		sb.WriteString("    // reserving it — which is what stops a one-shot call inside a loop over a\n")
 		sb.WriteString("    // live iterator from allocating a region per iteration.\n")
-		sb.WriteString("    const at = _bump, out = _align(at + _inCap(input));\n")
+		sb.WriteString("    const at = _bump, len = _write(input, at), out = _align(at + len);\n")
 		sb.WriteString("    _grow(out + (outBytes > 0 ? outBytes : 65536));\n")
-		sb.WriteString("    return [at, out, _write(input, at)];\n")
+		sb.WriteString("    return [at, out, len];\n")
 		sb.WriteString("}\n\n")
 	}
+	hdrBytes := strconv.Itoa(config.SetOverlapCheckpointHeaderBytes)
 	if hasSuspendableExports(cfg) {
 		sb.WriteString(`function _open(input: string | Uint8Array, outBytes: number,
         cacheFor?: (len: number) => [number, number]): [number, number, number, number, number] {
@@ -137,34 +152,44 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
     // its scratch. Release with _close() from a finally.
     //
     // Nothing is reserved until every grow has succeeded. A grow that throws
-    // leaves _bump and _live as they were, so the instance stays usable; when
+    // leaves _bump and _regs as they were, so the instance stays usable; when
     // _bump moved first, a grow refused under a memory ceiling left it past the
     // end of memory with no iterator alive to reset it, and every later call
     // threw.
     //
     // The answer cache is sized by cacheFor from the bytes the input actually
-    // took — a string reserves three per UTF-16 unit, which is no measure of
-    // the cache it needs — and grown for separately. Under a ceiling that
-    // grow only DECLINES the cache: a zero-length cache is the documented
-    // "walk" signal, so the drive is slower instead of failing.
-    const at = _bump, out = _align(at + _inCap(input));
-    const top = out + (outBytes > 0 ? outBytes : 65536);
+    // took, and only its HEADER is reserved here: the region itself is
+    // reserved by _lazy when the module asks for it, and most scans never do.
+    // Under a ceiling a refused grow only DECLINES the cache: a zero-length
+    // cache is the documented "walk" signal, so the drive is slower instead of
+    // failing. The size returned is the whole region's.
+    const at = _bump, len = _write(input, at), out = _align(at + len);
+    // outBytes is what the iterator writes there — a batch buffer, a groups
+    // call's slots, a set's gates and tuples — and nothing more: a find that
+    // writes nothing reserves nothing.
+    const top = out + outBytes;
     _grow(top);
-    const len = _write(input, at);
     let k = 0, cache = 0;
     if (cacheFor) {
         [k, cache] = cacheFor(len);
         if (cache > 0) {
-            try { _grow(top + cache); } catch (e) { if (!(e instanceof RangeError)) throw e; cache = 0; }
+            try { _grow(top + ` + hdrBytes + `); } catch (e) { if (!(e instanceof RangeError)) throw e; cache = 0; }
         }
     }
-    _bump = top + cache;
-    _live++;
+    _bump = top + (cache > 0 ? ` + hdrBytes + ` : 0);
+    _regs.push({ at, top: _bump, free: false });
     return [at, out, len, cache, k];
 }
 
 `)
-		sb.WriteString("function _close(): void { if (--_live === 0) _bump = _staticTop; }\n\n")
+		sb.WriteString("function _close(at: number): void {\n" +
+			"    // Frees the region _open placed at `at` and every region carved for\n" +
+			"    // that iterator later (its notes, memo, set descriptor: owner === at),\n" +
+			"    // then gives back every free region at the top of the stack.\n" +
+			"    for (const r of _regs) if (r.at === at || r.owner === at) r.free = true;\n" +
+			"    while (_regs.length > 0 && _regs[_regs.length - 1]!.free) _regs.pop();\n" +
+			"    _bump = _regs.length > 0 ? _regs[_regs.length - 1]!.top : _staticTop;\n" +
+			"}\n\n")
 		// Generic over the view type rather than typed as a union: _att must hand
 		// back the SAME kind of array it was given, or every indexed read after a
 		// re-attach would widen to Int32Array | Uint32Array.
@@ -206,7 +231,7 @@ func genTSStubFile(cfg config.BuildConfig) (string, error) {
 	}
 
 	sb.WriteString(genTSSetSection(cfg, sizes))
-	return sb.String(), nil
+	return addOffsetChecks(sb.String(), true), nil
 }
 
 // genTSSetSection generates TypeScript set wrappers.
@@ -223,6 +248,9 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
 	out.WriteString("\n")
 	out.WriteString("export interface SetMatch { patternId: number; start: number; end: number; }\n")
 	shapes := newSetShapes(cfg)
+	if shapes.anyWantsCache() {
+		out.WriteString("\n" + jsLazyFunc(true))
+	}
 	for setIdx, s := range cfg.Sets {
 		n := patternsInSet(s, cfg)
 		konst := camelSet(s.Name) + "PatternCount"
@@ -283,7 +311,14 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]!; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, reserve, bitmapBase, idKonst, s.MatchAll, args("match_all"), btOverflow, btOverflowMsg(s.MatchAll), idKonst, idKonst)
@@ -303,7 +338,15 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.MatchAll, s.MatchAll, args("match_all"), idKonst)
@@ -332,7 +375,14 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     if (n === %d) throw new Error("%s");
     const bits = new Uint8Array((_exp.memory as WebAssembly.Memory).buffer, bitmapBase, (%s+7)>>3);
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if (bits[k>>3] & (1 << (k & 7))) out.push(k);
+    // Set bits only: a zero byte costs one test, not eight.
+    for (let i = 0; i < bits.length; i++) {
+        for (let m = bits[i]!; m !== 0; m &= m - 1) {
+            const k = i * 8 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, reserve, bitmapBase, idKonst, s.ScanAll, args("scan_all"), btOverflow, btOverflowMsg(s.ScanAll), idKonst, idKonst)
@@ -348,7 +398,15 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     // real sentinel cannot reach this form — a Backtracking member forces the
     // wide one.
     const out: number[] = [];
-    for (let k = 0; k < %s; k++) if ((mask >> BigInt(k)) & 1n) out.push(k);
+    // Set bits only, lowest first, over the mask's two 32-bit halves: a
+    // BigInt shift and test per id allocated ~3 BigInts an id per call.
+    for (let w = 0, m = Number(BigInt.asUintN(32, mask)); w < 2; w++, m = Number(BigInt.asUintN(32, mask >> 32n))) {
+        for (; m !== 0; m &= m - 1) {
+            const k = w * 32 + 31 - Math.clz32(m & -m);
+            if (k >= %s) break;
+            out.push(k);
+        }
+    }
     return out;
 }
 `, s.ScanAll, s.ScanAll, args("scan_all"), idKonst)
@@ -389,7 +447,7 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
     let buf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, 3*%s);
     while (true) {
         const n = (_exp['%s'] as Function)(%s) as number;
-        // Before the "scan finished" test: -2 is the engine abandoning the
+%s        // Before the "scan finished" test: -2 is the engine abandoning the
         // search, so ending the generator here would report success.
         if (n === %d) throw new Error("%s");
         // -4 says the same thing about the overlapping answer cache: its
@@ -400,25 +458,26 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
         if (n <= 0) break;
         buf = _att(buf, Int32Array, _outBase, 3*%s);
         // Every tuple in one call shares a start; resume one past it.
-        const next = buf[1] + 1;
+        const next = buf[1]! + 1;
         for (let i = 0; i < n; i++) {
             // Re-checked each step: the yield below hands control back, and
             // whatever runs there may grow memory and detach this view.
             buf = _att(buf, Int32Array, _outBase, 3*%s);
-            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+            yield { patternId: buf[i*3]!, start: buf[i*3+1]!, end: buf[i*3+2]! };
         }
         pos = next;
     }
-    } finally { _close(); }
+    } finally { %s_close(_inBase); }
 }
 `, s.Find, plainCachePre, plainCacheDest, findReserve, plainCacheReserve, gateSetup, konst, s.Find,
 					spellJSArgs(capByKind(caps, "find"), jsArgSpelling{
 						inPtr: "_inBase", inLen: "len", from: "pos",
 						gate: "scratchBase", tuple: "_outBase", outCap: konst,
 					}),
+					jsLazyWanted(plainCacheArgs, "n === "+strconv.Itoa(abi.OverlapCacheWanted)),
 					btOverflow, btOverflowMsg(s.Find),
 					malformedCache, malformedCacheMsg(s.Find),
-					outOfOrder, outOfOrderMsg(s.Find), konst, konst)
+					outOfOrder, outOfOrderMsg(s.Find), konst, konst, jsLazyFinally(plainCacheArgs))
 			} else {
 				// The BATCH entry's argument order stays spelled out here:
 				// setCapabilities describes the five DECLARED capabilities,
@@ -454,7 +513,14 @@ func genTSSetSection(cfg config.BuildConfig, sizes map[string]compile.SearchSize
 				cachePost += fmt.Sprintf(`    const scratchBase = %s;
     new Uint32Array((_exp.memory as WebAssembly.Memory).buffer, scratchBase, 4).set([%d, gateBase, %s]);
 `, batchScratchBase, abi.FindScratchMagic, cacheArgs)
-				cacheArgs = ""
+				batchFinally := jsLazyFinally(cacheArgs)
+				// The wanted word comes back with nothing delivered and is not a
+				// cursor: the call is made again with the cursor it was given.
+				if w := jsLazyWanted(cacheArgs, fmt.Sprintf("(BigInt.asUintN(64, packed) >> 32n) === 0x%Xn", config.SetCursorCacheWantedPos)); w != "" {
+					cacheArgs = "\n" + strings.TrimSuffix(w, "\n")
+				} else {
+					cacheArgs = ""
+				}
 				fmt.Fprintf(&out, `// batchSize is how many tuples one WASM call may fill: 1 is a call per
 // matching position, larger values amortise the host crossing over a
 // bufferful. The matches and their order are identical either way — the only
@@ -490,13 +556,13 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
             // Re-checked each step: the yield hands control back, and whatever
             // runs there may grow memory and detach this view.
             buf = _att(buf, Int32Array, _outBase, 3*batchSize);
-            yield { patternId: buf[i*3], start: buf[i*3+1], end: buf[i*3+2] };
+            yield { patternId: buf[i*3]!, start: buf[i*3+1]!, end: buf[i*3+2]! };
         }
         // A call reports at least one match unless the scan is over.
         if (done || n === 0) break;
         cursor = packed;
     }
-    } finally { _close(); }
+    } finally { %s_close(_inBase); }
 }
 `, camelSet(s.Name)+"BatchMaxSize", s.Find, defaultBatchCap(s, cfg),
 					camelSet(s.Name)+"BatchMaxSize", cachePre, cacheDest, batchGateRegion, cacheReserve,
@@ -504,7 +570,7 @@ export function* %s(input: string | Uint8Array, offset: number = 0, batchSize: n
 					config.SetBatchExportName(s.Find), gateArg, cacheArgs, cursorCountMask(s, cfg),
 					config.SetCursorOverflowPos, btOverflowMsg(s.Find),
 					config.SetCursorMalformedPos, malformedCacheMsg(s.Find),
-					config.SetCursorOutOfOrderPos, outOfOrderMsg(s.Find))
+					config.SetCursorOutOfOrderPos, outOfOrderMsg(s.Find), batchFinally)
 			}
 		}
 		out.WriteString("\n")
@@ -566,7 +632,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 // Re-attached each step: the yield below hands control back,
                 // and a grow there detaches every view in the module.
                 outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
-                const s = outBuf[i * 2], e = outBuf[i * 2 + 1];
+                const s = outBuf[i * 2]!, e = outBuf[i * 2 + 1]!;
                 // Go's FindAllIndex rule: suppress an EMPTY match beginning
                 // exactly where the previous reported match ended.
                 if (s === e && s === prevEnd) continue;
@@ -575,7 +641,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             }
             if (n < %[2]d) break;
             outBuf = _att(outBuf, Uint32Array, _outBase, %[2]d * 2);
-            const lastStart = outBuf[(n - 1) * 2], lastEnd = outBuf[(n - 1) * 2 + 1];
+            const lastStart = outBuf[(n - 1) * 2]!, lastEnd = outBuf[(n - 1) * 2 + 1]!;
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
@@ -599,7 +665,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         }
         off += relEnd > relStart ? relEnd : relStart + 1;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
 `, funcName, lm2BatchCap, btOverflow, btOverflowMsg(funcName))
@@ -624,7 +690,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
     const _batched = typeof _exp['%[1]s_batch'] === 'function';
     // One region for whichever path runs, held for this iterator's lifetime so
     // an interleaved stub call cannot overwrite the staged input mid-scan.
-    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : 0);
+    const [_inBase, _outBase, len] = _open(input, _batched ? %[2]d * %[4]d : %[9]d);
     try {
     if (_batched) {
         let outBuf = new Int32Array((_exp.memory as WebAssembly.Memory).buffer, _outBase, %[2]d * %[3]d);
@@ -643,12 +709,12 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
                 // and a grow there detaches every view in the module.
                 outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
                 const base = i * %[3]d;
-                const ms = outBuf[base], me = outBuf[base + 1];
+                const ms = outBuf[base]!, me = outBuf[base + 1]!;
                 if (ms === me && ms === prevEnd) continue;
                 prevEnd = me;
                 const result: Array<[number, number] | null> = [];
                 for (let g = 0; g < %[5]d; g++) {
-                    const s = outBuf[base + 2 + g * 2], e = outBuf[base + 2 + g * 2 + 1];
+                    const s = outBuf[base + 2 + g * 2]!, e = outBuf[base + 2 + g * 2 + 1]!;
                     result.push(s < 0 ? null : [s, e]);
                 }
                 yield result;
@@ -656,7 +722,7 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             if (n < %[2]d) break;
             outBuf = _att(outBuf, Int32Array, _outBase, %[2]d * %[3]d);
             const lastBase = (n - 1) * %[3]d;
-            const lastStart = outBuf[lastBase], lastEnd = outBuf[lastBase + 1];
+            const lastStart = outBuf[lastBase]!, lastEnd = outBuf[lastBase + 1]!;
             startPos = lastEnd > lastStart ? lastEnd : lastStart + 1;
         }
         return;
@@ -682,13 +748,13 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
             // remaining byte.
             break;
         }
-        const matchEnd = slots[1] >= 0 ? slots[1] : slots[0];
+        const matchEnd = slots[1]! >= 0 ? slots[1]! : slots[0]!;
         const result: Array<[number, number] | null> = [];
         for (let i = 0; i < %[5]d; i++) {
-            const s = slots[i * 2], e = slots[i * 2 + 1];
+            const s = slots[i * 2]!, e = slots[i * 2 + 1]!;
             result.push(s < 0 ? null : [s, e]); // absolute already
         }
-        const absStart = slots[0], absEnd = matchEnd;
+        const absStart = slots[0]!, absEnd = matchEnd;
         off = absEnd > absStart ? absEnd : absStart + 1;
         // Go's FindAllSubmatchIndex rule: suppress an EMPTY match beginning
         // exactly where the previous reported match ended. The advance above
@@ -697,10 +763,10 @@ export function* %[1]s(input: string | Uint8Array, offset: number = 0): Generato
         prevEnd = absEnd;
         yield result;
     }
-    } finally { _close(); }
+    } finally { _close(_inBase); }
 }
 
-`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName))
+`, funcName, lm2BatchCap, recSize, recBytes, numGroups, slotCount, btOverflow, btOverflowMsg(funcName), (slotCount*4+7)&^7)
 }
 
 // genTSGroupIndices emits the name→index object for a groups function.

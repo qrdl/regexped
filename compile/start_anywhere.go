@@ -69,6 +69,7 @@ const (
 	findToday     findStrategy = iota // today's body, nothing added
 	findNewSearch                     // the start-anywhere find alone
 	findSwitch                        // today's body + the counter + the start-anywhere find
+	findSuffix                        // the backward pass alone, from the end of the input
 )
 
 func (s findStrategy) String() string {
@@ -77,6 +78,8 @@ func (s findStrategy) String() string {
 		return "start-anywhere"
 	case findSwitch:
 		return "switch"
+	case findSuffix:
+		return "suffix"
 	}
 	return "today"
 }
@@ -288,9 +291,49 @@ const (
 )
 
 // classifyFind decides how the pattern's find is served and why.
+// suffixOnlyFind reports whether every match of t ends at the end of the
+// input — it accepts at EOF and nowhere else, `admin\d@example\.com$` — and
+// none is empty. Its find is then the start-anywhere BACKWARD pass alone, run
+// from len down to the find-from floor: the smallest start it accepts is the
+// answer, and the walk stops where the reversed automaton dies, a few bytes
+// from the end, instead of scanning the input (`\.(?:exe|dll|bat)$`: 3.7
+// instructions per byte of a no-match input). A match must end at len, so a
+// drive is one such walk, and a second call from len.
+func suffixOnlyFind(t *dfaTable) bool {
+	if t == nil || t.startBeginAccept || len(t.acceptStates) == 0 {
+		return false
+	}
+	for _, m := range []map[int]uint64{t.midAcceptStates, t.immediateAcceptStates,
+		t.midAcceptWStates, t.midAcceptNWStates, t.midAcceptNLStates} {
+		for _, v := range m {
+			if v != 0 {
+				return false
+			}
+		}
+	}
+	if t.acceptStates[t.startState] != 0 || t.acceptStates[t.midStartState] != 0 {
+		return false
+	}
+	if t.hasWordBoundary && t.acceptStates[t.midStartWordState] != 0 {
+		return false
+	}
+	if t.hasNewlineBoundary && t.acceptStates[t.midStartNewlineState] != 0 {
+		return false
+	}
+	for _, v := range t.acceptStates {
+		if v != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyFind(in findClassInput) (findStrategy, string) {
 	if in.anchor {
 		return findToday, "matches only at 0"
+	}
+	if !in.inSet && suffixOnlyFind(in.table) {
+		return findSuffix, "every match ends at the end of the input: one backward pass from there"
 	}
 	if k, ok := failedWalkBound(in.table); ok {
 		return findToday, fmt.Sprintf("linear: a failed attempt walks at most %d bytes", k)
@@ -725,6 +768,7 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 		return startAnywherePasses{}, false
 	}
 	fwdL := buildDFALayout(dfaLayoutParams{t: fwdTable, tableBase: base, needFind: true, leftmostFirst: true, utf8Text: pattern.unicode(),
+		skipFlag:        opts.skipFlag,
 		sharedWordTable: opts.wordTable,
 		lmCharLoop:      opts.LikelyMode == LikelyMatch})
 	var fwdNotes *notesRows
@@ -739,7 +783,7 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 	if revTable == nil {
 		return startAnywherePasses{}, false
 	}
-	revL := buildDFALayout(dfaLayoutParams{t: revTable, tableBase: align(fwdL.tableEnd), needFind: true, sharedWordTable: opts.wordTable})
+	revL := buildDFALayout(dfaLayoutParams{t: revTable, tableBase: align(fwdL.tableEnd), needFind: true, sharedWordTable: opts.wordTable, skipFlag: opts.skipFlag})
 
 	fwdRaw, fwdSegs := stripSegCount(dfaDataSegments(fwdL, true, false))
 	revRaw, revSegs := stripSegCount(dfaDataSegments(revL, true, false))
@@ -750,12 +794,12 @@ func buildStartAnywherePasses(pattern resolvedPattern, opts CompileOptions, base
 		ctx:      ctx,
 		fwdNotes: fwdNotes,
 	}
-	var search uint32
+	var search searchRef
 	var checkResume bool
 	if fwdNotes != nil {
 		sa.data = append(sa.data, fwdNotes.dataSegment()...)
 		sa.segs++
-		search, checkResume = nr.globals.Search(), nr.checkResume
+		search, checkResume = nr.globals.SearchRef(), nr.checkResume
 	}
 	if ctx {
 		sa.fwdBody = buildStartAnywhereForwardBodyCtx(fwdL, opts.tableMemIdx, fwdNotes, search, checkResume)
@@ -791,7 +835,7 @@ func emitWalkerTransition(b []byte, l *dfaLayout, stateLocal, ptrLocal, posLocal
 // With nr (search_notes.go) it carries the per-search notes: a marked walk
 // and the plain one, chosen at entry; nr == nil emits the plain walk alone,
 // byte for byte what it was before notes existed.
-func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int, nr *notesRows, search uint32, checkResume bool) []byte {
+func buildStartAnywhereForwardBody(l *dfaLayout, tableMemIdx int, nr *notesRows, search searchRef, checkResume bool) []byte {
 	const (
 		locPtr   = 0
 		locLen   = 1
@@ -1126,7 +1170,7 @@ func emitCtxCondAcceptHook(b []byte, l *dfaLayout, stateLocal, posLocal, lastLoc
 // assertion: (ptr, len) → i32 over the whole input from the find-from
 // global, returning the ABSOLUTE end of the leftmost-first match, or -1.
 // nr adds the per-search notes, as buildStartAnywhereForwardBody's does.
-func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int, nr *notesRows, search uint32, checkResume bool) []byte {
+func buildStartAnywhereForwardBodyCtx(l *dfaLayout, tableMemIdx int, nr *notesRows, search searchRef, checkResume bool) []byte {
 	const (
 		locPtr   = 0
 		locLen   = 1
@@ -1610,6 +1654,13 @@ func (p *compiledPattern) appendStartAnywhereBodies(cs []byte, base int) []byte 
 	if p.saCtx {
 		glue, glueMode = buildStartAnywhereFindBodyCtx(base+p.slotIndex(slotSAFwd), base+p.slotIndex(slotSARevCtx), glueResume, p.startRule)
 	}
+	if p.saSuffix {
+		rev := base + p.slotIndex(slotSARev)
+		if p.saCtx {
+			rev = base + p.slotIndex(slotSARevCtx)
+		}
+		glue, glueMode = buildSuffixFindBody(rev, p.saCtx, p.startRule)
+	}
 	cs = utils.AppendULEB128(cs, uint32(len(glue)))
 	cs = append(cs, glue...)
 	if !p.saSwitch {
@@ -1681,4 +1732,35 @@ func (p *compiledPattern) stampAltLitAnchorBranches(tableMemIdx int) {
 		br.backScanBody = buildLitAnchorBackScanBodyStamped(br.revL, br.revTable, tableMemIdx, true, false, g)
 		br.forwardVerifyBody = buildAltLitAnchorForwardVerifyBodyStamped(br.fwdTable, br.fwdL, tableMemIdx, g)
 	}
+}
+
+// buildSuffixFindBody is the find of a pattern whose every match ends at the
+// end of the input (suffixOnlyFind): the backward pass from len, (ptr, len) →
+// i64. Its floor is the find-from global, so a negative start is no match at
+// or after `from`. ctx names the context pass, (ptr, len, end), over the plain
+// one, (ptr, end - 1).
+func buildSuffixFindBody(revFuncIdx int, ctx bool, rule startRule) ([]byte, findFromMode) {
+	const (
+		locPtr = 0
+		locLen = 1
+	)
+	a := newLocalAlloc(2)
+	cur := a.ScanCursor()
+	locStart := a.I32()
+	sl := startAnywhereStartLocals(a, rule)
+	var b []byte
+	b = a.EmitDecls(b)
+	b, mode := emitStartAnywhereSeed(b, cur, rule, sl)
+	if ctx {
+		b = append(b, 0x20, locPtr, 0x20, locLen, 0x20, locLen)
+	} else {
+		b = append(b, 0x20, locPtr, 0x20, locLen, 0x41, 0x01, 0x6B) // ptr, len - 1
+	}
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(revFuncIdx))                                      //nolint:gosec // a function index
+	b = append(b, 0x22, locStart, 0x41, 0x00, 0x48, 0x04, 0x40, 0x42, 0x7F, 0x0F, 0x0B) // < 0: return -1
+	b = append(b, 0x20, locStart, 0xAD, 0x42, 0x20, 0x86)                               // i64(start) << 32
+	b = append(b, 0x20, locLen, 0xAD, 0x84)                                             // | i64(len)
+	b = append(b, 0x0B)
+	return b, mode
 }

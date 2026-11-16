@@ -560,6 +560,16 @@ type prefixScanParams struct {
 	//   len(FirstByteSet) == 0 or
 	//   len(FirstByteSet) > 16      → scalar firstByteFlags table lookup
 	Prefix []byte
+	// FoldPrefix / FoldLetter: with no Prefix, a case-insensitive literal
+	// every match begins with (computeFoldPrefix) — the scan probes it for
+	// candidates and the engine reads it again from attempt_start.
+	FoldPrefix []byte
+	FoldLetter []bool
+	// LineStart: every match begins at a line start (isLineStartFind) and
+	// there is no Prefix — the scan moves attempt_start to the next position
+	// that is 0 or follows a '\n', 16 bytes at a time, instead of testing the
+	// first-byte set at every byte.
+	LineStart bool
 	// UTF8Text: Prefix is a Unicode-mode pattern's literal text. When it
 	// begins with a whole UTF-8 character (a lead byte and a continuation
 	// byte), the hybrid scan checks that character's second byte on a
@@ -651,6 +661,21 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 	l := p.Locals
 	ed := p.EngineDepth
 
+	if len(p.Prefix) == 0 && len(p.FoldPrefix) >= 2 {
+		b = emitFoldPrefixScan(b, p.FoldPrefix, p.FoldLetter, l, ed)
+		if p.OnMatch != nil {
+			b = p.OnMatch(b)
+		}
+		return b, twinCallPatch
+	}
+	if p.LineStart && len(p.Prefix) == 0 {
+		b = emitLineStartScan(b, l, ed)
+		if p.OnMatch != nil {
+			b = p.OnMatch(b)
+		}
+		return b, twinCallPatch
+	}
+
 	if len(p.Prefix) >= 1 {
 		// ── Hybrid SIMD prefix scan ───────────────────────────────────────────
 		// Phase A: find prefix[0] in 16-byte chunks.
@@ -678,6 +703,18 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 
 		b = append(b, 0x02, 0x40) // block $prefix_matched (void)
 
+		pi, pj, pair := prefixProbePair(prefix, p.charProbe())
+		if pair {
+			// The pair loop runs while 64 bytes remain; the rest goes to the
+			// single-column scan below (or, past 16 bytes of literal, the
+			// scalar tail). Its fixed cost does not pay on less: `secret`
+			// over 64 bytes cost 231 fuel through it and 132 without (the
+			// offset form; the pointer form's setup costs 157 there).
+			b = append(b, 0x20, l.Len, 0x20, l.AttemptStart, 0x6B, 0x41, 0xC0, 0x00, 0x4E) // len - as >= 64
+			b = append(b, 0x04, 0x40)
+			b = emitPrefixPairScan(b, prefix, pi, pj, l, 1)
+			b = append(b, 0x0B)
+		}
 		if len(prefix) <= 16 {
 			step := 17 - len(prefix)
 			if step < 1 {
@@ -886,6 +923,8 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 				b = append(b, 0x21, l.AttemptStart)
 
 				b = append(b, 0x0B) // end if $tail_live
+				b = append(b, 0x05) // else: len < 16
+				b = emitShortInputProbe(b, prefix, l)
 				b = append(b, 0x0B) // end if $tail_window
 			}
 		}
@@ -1320,6 +1359,15 @@ func (p prefixScanParams) charProbe() bool {
 }
 
 func (p prefixScanParams) strategyNote() string {
+	if pi, pj, ok := prefixProbePair(p.Prefix, p.charProbe()); ok {
+		return fmt.Sprintf("prefix scan: SIMD pair probe of bytes %d and %d, %d-byte prefix", pi, pj, len(p.Prefix))
+	}
+	if len(p.Prefix) == 0 && len(p.FoldPrefix) >= 2 {
+		return fmt.Sprintf("prefix scan: SIMD pair probe of a %d-byte case-insensitive literal", len(p.FoldPrefix))
+	}
+	if p.LineStart && len(p.Prefix) == 0 {
+		return "prefix scan: line starts (SIMD '\\n' scan)"
+	}
 	if len(p.Prefix) >= 1 {
 		if len(p.Prefix) <= 16 {
 			if p.charProbe() {
@@ -1343,4 +1391,322 @@ func (p prefixScanParams) strategyNote() string {
 		return fmt.Sprintf("prefix scan: Shufti or scalar (%d first bytes)", n)
 	}
 	return fmt.Sprintf("prefix scan: scalar flag table (%d first bytes)", n)
+}
+
+// emitLineStartScan moves attempt_start to the first position at or after it
+// that is 0 or follows a '\n' — the only places a line-start find can match —
+// and branches to $no_match (ed-1 from $outer) when none is left. 16 bytes at
+// a time while a whole chunk fits, then byte by byte.
+func emitLineStartScan(b []byte, l prefixScanLocals, ed byte) []byte {
+	as := l.AttemptStart
+	b = append(b, 0x02, 0x40)                 // block $found
+	b = append(b, 0x20, as, 0x45, 0x0D, 0x00) // attempt_start == 0: br_if $found
+	b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0x41, 0x01, 0x6B)
+	b = append(b, 0x2D, 0x00, 0x00, 0x41, 0x0A, 0x46, 0x0D, 0x00)                     // input[as-1] == '\n': br_if $found
+	b = append(b, 0x02, 0x40)                                                         // block $tail
+	b = append(b, 0x03, 0x40)                                                         // loop $simd
+	b = append(b, 0x20, as, 0x41, 0x10, 0x6A, 0x20, l.Len, 0x4B, 0x0D, 0x01)          // as + 16 > len: br_if $tail
+	b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0xFD, 0x00, 0x00, 0x00)                // v128.load (input)
+	b = append(b, 0x41, 0x0A, 0xFD, 0x0F, 0xFD, 0x23, 0xFD, 0x64)                     // eq splat('\n'); bitmask
+	b = append(b, 0x22, l.SimdMask, 0x04, 0x40)                                       // tee; if
+	b = append(b, 0x20, as, 0x20, l.SimdMask, 0x68, 0x6A, 0x41, 0x01, 0x6A, 0x21, as) // as += ctz + 1
+	b = append(b, 0x0C, 0x03)                                                         // br $found
+	b = append(b, 0x0B)                                                               // end if
+	b = append(b, 0x20, as, 0x41, 0x10, 0x6A, 0x21, as)                               // as += 16
+	b = append(b, 0x0C, 0x00)                                                         // br $simd
+	b = append(b, 0x0B, 0x0B)                                                         // end loop, end block $tail
+	b = append(b, 0x03, 0x40)                                                         // loop $scalar
+	b = append(b, 0x20, as, 0x20, l.Len, 0x4F, 0x04, 0x40)                            // as >= len: if
+	b = append(b, 0x20, l.Len, 0x41, 0x01, 0x6A, 0x21, as)                            // as = len + 1 (no line start left)
+	b = append(b, 0x0C, 0x02)                                                         // br $found
+	b = append(b, 0x0B)                                                               // end if
+	b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0x2D, 0x00, 0x00)                      // input[as]
+	b = append(b, 0x20, as, 0x41, 0x01, 0x6A, 0x21, as)                               // as++
+	b = append(b, 0x41, 0x0A, 0x46, 0x0D, 0x01)                                       // was '\n': br_if $found
+	b = append(b, 0x0C, 0x00)                                                         // br $scalar
+	b = append(b, 0x0B)                                                               // end loop
+	b = append(b, 0x0B)                                                               // end block $found
+	// attempt_start > len: no line start left — $no_match (ed-1 from $outer).
+	return append(b, 0x20, as, 0x20, l.Len, 0x4B, 0x0D, ed-1)
+}
+
+// prefixProbePairMinRank is the byteRank from which a literal's first byte is
+// too common for the one-column scan: the commonest lowercase letters and the
+// space (`etaoinshrdlu `). Rarer first bytes stay on it: `ERROR` scans at 1.44
+// fuel/byte with one column and 1.81 with two, and at rank 200 (every
+// lowercase letter) perftest's `ghp_[A-Za-z0-9]{36}` cost 3.7-4.0% more.
+const prefixProbePairMinRank = 240
+
+// prefixProbePair picks the two columns of a literal prefix the scan probes
+// together, or false when the first-byte scan stays: a prefix of 2+ bytes
+// whose first byte is common (prefixProbePairMinRank), or one longer than a
+// chunk, which had no SIMD scan at all.
+// The pair is the two RAREST columns (byteRank, ties to the earlier), so a
+// candidate needs two rare bytes at their offsets rather than one common one:
+// `http://` probed `h` and found it in most chunks of prose. A Unicode
+// literal whose first character the scan checks whole (charProbe) keeps
+// that scan.
+func prefixProbePair(prefix []byte, charProbe bool) (i, j int, ok bool) {
+	if len(prefix) < 2 || charProbe || (len(prefix) <= 16 && byteRank[prefix[0]] < prefixProbePairMinRank) {
+		return 0, 0, false
+	}
+	i, j = -1, -1
+	for k, c := range prefix {
+		switch {
+		case i < 0 || byteRank[c] < byteRank[prefix[i]]:
+			i, j = k, i
+		case j < 0 || byteRank[c] < byteRank[prefix[j]]:
+			j = k
+		}
+	}
+	if i > j {
+		i, j = j, i
+	}
+	return i, j, true
+}
+
+// emitPrefixPairScan is the literal-prefix scan over a probe pair: per 16
+// start positions, one load at each probed column, one compare each, their
+// AND as the candidate mask; a candidate is verified against the whole
+// literal before the scan reports it. Positions whose second column would
+// read past len fall to the scalar tail that follows, which the caller emits.
+//
+// The loop runs over POINTERS, with no locals of its own: on entry
+// attempt_start becomes ptr + attempt_start and len becomes the end pointer
+// ptr + len − (pj + 16), and every way out puts both back. The probe bytes are
+// v128.const operands rather than splats. A 16-byte step is then 21
+// instructions where the offset form took 29 and the one-column scan 23: two
+// probes cost as much as one did, so text that never holds the literal's
+// first byte (`secret` over Russian prose, hex, numbers) is no longer the
+// pair's loss — 147,240 → 134,473 fuel at 100 KB against the one-column scan,
+// where the offset form took 185,646 — and English prose 590,383 → 134,473.
+//
+// Depths, from inside the verify block: 0=$next 1=$cands 2=if 3=$simd_outer
+// 4=$simd_exhausted, then extra constructs, then $prefix_matched.
+func emitPrefixPairScan(b []byte, prefix []byte, pi, pj int, l prefixScanLocals, extra byte) []byte {
+	as, mask, ln, ptr := l.AttemptStart, l.SimdMask, l.Len, l.Ptr
+	reach := int32(pj + 16)         //nolint:gosec // a prefix offset; the second column reads [as+pj, as+pj+16)
+	cand := func(b []byte) []byte { // attempt_start + ctz(mask), a pointer
+		return append(b, 0x20, as, 0x20, mask, 0x68, 0x6A)
+	}
+	// restore: len = len' + reach − ptr; attempt_start = attempt_start − ptr.
+	restore := func(b []byte) []byte {
+		b = utils.AppendSLEB128(append(b, 0x20, ln, 0x41), reach)
+		b = append(b, 0x6A, 0x20, ptr, 0x6B, 0x21, ln)
+		return append(b, 0x20, as, 0x20, ptr, 0x6B, 0x21, as)
+	}
+	column := func(b []byte, off int, c byte) []byte {
+		b = append(b, 0x20, as, 0xFD, 0x00, 0x00)
+		b = utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a prefix offset
+		b = append(b, 0xFD, 0x0C)               // v128.const c × 16
+		for range 16 {
+			b = append(b, c)
+		}
+		return append(b, 0xFD, 0x23) // eq
+	}
+	// The caller enters with len − attempt_start >= 64 > reach, so the end
+	// pointer cannot fall below attempt_start's.
+	b = append(b, 0x20, ptr, 0x20, as, 0x6A, 0x21, as) // attempt_start = ptr + attempt_start
+	b = utils.AppendSLEB128(append(b, 0x20, ptr, 0x20, ln, 0x6A, 0x41), reach)
+	b = append(b, 0x6B, 0x21, ln) // len = ptr + len − reach
+	b = append(b, 0x02, 0x40)     // block $simd_exhausted
+	b = append(b, 0x03, 0x40)     // loop $simd_outer
+	// attempt_start > len': the second column would read past the input.
+	b = append(b, 0x20, as, 0x20, ln, 0x4B, 0x04, 0x40) // gt_u: if
+	b = restore(b)
+	b = append(b, 0x0C, 0x02, 0x0B) // br $simd_exhausted; end if
+	b = column(b, pi, prefix[pi])
+	b = column(b, pj, prefix[pj])
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x64) // and; bitmask
+	b = append(b, 0x22, mask, 0x04, 0x40) // tee; if
+	b = append(b, 0x03, 0x40)             // loop $cands
+	b = append(b, 0x02, 0x40)             // block $next
+	// The literal must fit before the input's end (len' + reach); when it
+	// does not, neither does any later start: hand the rest to the scalar tail.
+	b = utils.AppendSLEB128(append(cand(b), 0x41), int32(len(prefix)))
+	b = utils.AppendSLEB128(append(b, 0x6A, 0x20, ln, 0x41), reach)
+	b = append(b, 0x6A, 0x4B, 0x04, 0x40) // gt_u: if
+	b = append(cand(b), 0x21, as)
+	b = restore(b)
+	b = append(b, 0x0C, 0x05, 0x0B) // br $simd_exhausted; end if
+	for k := range prefix {
+		if k == pi || k == pj {
+			continue // the probe compared these
+		}
+		b = append(cand(b), 0x2D, 0x00)
+		b = utils.AppendULEB128(b, uint32(k)) //nolint:gosec // a prefix offset
+		b = utils.AppendSLEB128(append(b, 0x41), int32(prefix[k]))
+		b = append(b, 0x47, 0x0D, 0x00) // ne: br_if $next
+	}
+	b = append(cand(b), 0x21, as)
+	b = restore(b)
+	b = append(b, 0x0C, 5+extra) // br $prefix_matched
+	b = append(b, 0x0B)          // end block $next
+	// Clear the candidate's bit; another left: verify it.
+	b = append(b, 0x20, mask, 0x20, mask, 0x41, 0x01, 0x6B, 0x71, 0x22, mask, 0x0D, 0x00)
+	b = append(b, 0x0B, 0x0B)                           // end loop $cands, end if
+	b = append(b, 0x20, as, 0x41, 0x10, 0x6A, 0x21, as) // attempt_start += 16
+	b = append(b, 0x0C, 0x00)                           // br $simd_outer
+	return append(b, 0x0B, 0x0B)                        // end loop, end block $simd_exhausted
+}
+
+// foldPairColumns picks a folded literal's two rarest columns: a folded
+// column ranks as its x|0x20 byte (for a letter, the lowercase, commoner one).
+func foldPairColumns(lit []byte) (i, j int) {
+	i, j = -1, -1
+	for k, c := range lit {
+		switch {
+		case i < 0 || byteRank[c] < byteRank[lit[i]]:
+			i, j = k, i
+		case j < 0 || byteRank[c] < byteRank[lit[j]]:
+			j = k
+		}
+	}
+	if i > j {
+		i, j = j, i
+	}
+	return i, j
+}
+
+// emitFoldPrefixScan moves attempt_start to the next position where a
+// case-insensitive literal (lowercase letters marked in letter) occurs, or
+// branches to $no_match (ed-1 from $outer) when none can: a SIMD pair probe of
+// its two rarest columns, each folded column OR-ed with 0x20 — exact for a
+// pair {x, x|0x20}: c | 0x20 == 's' holds for 's' and 'S' only — then the whole
+// literal checked the same way, byte by byte. The engine reads the literal
+// again from attempt_start, so a candidate needs no resume state.
+func emitFoldPrefixScan(b []byte, lit []byte, letter []bool, l prefixScanLocals, ed byte) []byte {
+	as, mask := l.AttemptStart, l.SimdMask
+	pi, pj := foldPairColumns(lit)
+	cand := func(b []byte) []byte { return append(b, 0x20, as, 0x20, mask, 0x68, 0x6A) }
+	column := func(b []byte, off int) []byte {
+		b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0xFD, 0x00, 0x00)
+		b = utils.AppendULEB128(b, uint32(off)) //nolint:gosec // a literal offset
+		if letter[off] {
+			b = append(b, 0x41, 0x20, 0xFD, 0x0F, 0xFD, 0x50) // | splat(0x20)
+		}
+		b = utils.AppendSLEB128(append(b, 0x41), int32(lit[off]))
+		return append(b, 0xFD, 0x0F, 0xFD, 0x23) // splat; eq
+	}
+	// verify pushes nothing and branches out by br (depth) on a mismatch of
+	// the literal at addr(), which pushes the literal's first byte's address.
+	verify := func(b []byte, addr func([]byte) []byte, depth byte, skip ...int) []byte {
+		for k := range lit {
+			if len(skip) == 2 && (k == skip[0] || k == skip[1]) {
+				continue
+			}
+			b = append(addr(b), 0x2D, 0x00)
+			b = utils.AppendULEB128(b, uint32(k)) //nolint:gosec // a literal offset
+			if letter[k] {
+				b = append(b, 0x41, 0x20, 0x72) // | 0x20
+			}
+			b = utils.AppendSLEB128(append(b, 0x41), int32(lit[k]))
+			b = append(b, 0x47, 0x0D, depth) // ne: br_if
+		}
+		return b
+	}
+	n := int32(len(lit))      //nolint:gosec // a literal length
+	b = append(b, 0x02, 0x40) // block $found
+	b = append(b, 0x02, 0x40) // block $simd_exhausted
+	b = append(b, 0x03, 0x40) // loop $simd_outer
+	b = append(b, 0x20, as, 0x41)
+	b = utils.AppendSLEB128(b, int32(pj+16))           //nolint:gosec // a literal offset
+	b = append(b, 0x6A, 0x20, l.Len, 0x4B, 0x0D, 0x01) // as + pj + 16 > len: br_if $simd_exhausted
+	b = column(b, pi)
+	b = column(b, pj)
+	b = append(b, 0xFD, 0x4E, 0xFD, 0x64) // and; bitmask
+	b = append(b, 0x22, mask, 0x04, 0x40) // tee; if
+	b = append(b, 0x03, 0x40)             // loop $cands
+	b = append(b, 0x02, 0x40)             // block $next
+	// Depths inside $next: 0=$next 1=$cands 2=if 3=$simd_outer 4=$simd_exhausted 5=$found.
+	b = append(cand(b), 0x41)
+	b = utils.AppendSLEB128(b, n)
+	b = append(b, 0x6A, 0x20, l.Len, 0x4B, 0x04, 0x40) // the literal runs past len: if
+	b = append(cand(b), 0x21, as)
+	b = append(b, 0x0C, 0x05, 0x0B) // br $simd_exhausted (the scalar tail decides); end if
+	b = verify(b, func(b []byte) []byte { return cand(append(b, 0x20, l.Ptr)) }, 0x00, pi, pj)
+	b = append(cand(b), 0x21, as)
+	b = append(b, 0x0C, 0x05) // br $found
+	b = append(b, 0x0B)       // end block $next
+	b = append(b, 0x20, mask, 0x20, mask, 0x41, 0x01, 0x6B, 0x71, 0x22, mask, 0x0D, 0x00)
+	b = append(b, 0x0B, 0x0B)                           // end loop $cands, end if
+	b = append(b, 0x20, as, 0x41, 0x10, 0x6A, 0x21, as) // as += 16
+	b = append(b, 0x0C, 0x00)                           // br $simd_outer
+	b = append(b, 0x0B, 0x0B)                           // end loop, end block $simd_exhausted
+	// Scalar tail: every remaining start that leaves room for the literal.
+	b = append(b, 0x03, 0x40) // loop $scalar
+	b = append(b, 0x02, 0x40) // block $miss
+	// Depths inside $miss: 0=$miss 1=$scalar 2=$found.
+	b = append(b, 0x20, as, 0x41)
+	b = utils.AppendSLEB128(b, n)
+	b = append(b, 0x6A, 0x20, l.Len, 0x4B, 0x04, 0x40) // as + n > len: if
+	b = append(b, 0x20, l.Len, 0x41, 0x01, 0x6A, 0x21, as)
+	b = append(b, 0x0C, 0x03, 0x0B) // br $found (no start left); end if
+	b = verify(b, func(b []byte) []byte { return append(b, 0x20, l.Ptr, 0x20, as, 0x6A) }, 0x00)
+	b = append(b, 0x0C, 0x02) // all matched: br $found
+	b = append(b, 0x0B)       // end block $miss
+	b = append(b, 0x20, as, 0x41, 0x01, 0x6A, 0x21, as)
+	b = append(b, 0x0C, 0x00)                                 // br $scalar
+	b = append(b, 0x0B)                                       // end loop $scalar
+	b = append(b, 0x0B)                                       // end block $found
+	return append(b, 0x20, as, 0x20, l.Len, 0x4B, 0x0D, ed-1) // as > len: $no_match
+}
+
+// emitShortInputProbe is the tail probe for starts a 16-byte window cannot
+// reach — an input under 16 bytes, or what a pair probe's loop leaves: one
+// chunk loaded from attempt_start when the memory holds 16 bytes there, its
+// lanes past the last start that leaves room for the literal masked off — the
+// bytes past len are whatever memory holds, so a lane is valid only by its
+// position. A candidate jumps to $prefix_matched; none advances 16, leaving
+// any later start to the scalar tail. A chunk the memory does not hold leaves
+// it all to the scalar tail. Emitted inside
+// the else of $tail_window: depths from the inner if 0=if 1=$short 2=the starts
+// check 3=$tail_window 4=$prefix_matched.
+//
+// An input under 16 bytes walked the scalar tail a byte at a time: `ERROR`
+// over 15 bytes cost 234 fuel, over 16 bytes 63.
+func emitShortInputProbe(b []byte, prefix []byte, l prefixScanLocals) []byte {
+	as, mask := l.AttemptStart, l.SimdMask
+	// At least 8 starts (a byte-wise walk of fewer is cheaper: `ERROR` over 5
+	// bytes 54 fuel, 136 through the probe) and ptr + attempt_start + 16 <=
+	// memory bytes: if $short
+	b = append(b, 0x20, l.Len, 0x20, as, 0x6B, 0x41)
+	b = utils.AppendSLEB128(b, int32(len(prefix)-1+8)) //nolint:gosec // a prefix length
+	b = append(b, 0x4E, 0x04, 0x40)                    // len - as >= len(prefix) - 1 + 8: if
+	b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0x41, 0x10, 0x6A)
+	b = append(b, 0x3F, 0x00, 0x41, 0x10, 0x74, 0x4D) // memory.size << 16; le_u
+	b = append(b, 0x04, 0x40)                         // if $short
+	b = append(b, 0x20, l.Ptr, 0x20, as, 0x6A, 0xFD, 0x00, 0x00, 0x00, 0x21, l.Chunk)
+	for k, c := range prefix {
+		b = append(b, 0x20, l.Chunk)
+		b = utils.AppendSLEB128(append(b, 0x41), int32(c))
+		b = append(b, 0xFD, 0x0F, 0xFD, 0x23, 0xFD, 0x64) // splat; eq; bitmask
+		if k > 0 {
+			b = utils.AppendSLEB128(append(b, 0x41), int32(k)) //nolint:gosec // a prefix offset
+			b = append(b, 0x76, 0x20, mask, 0x71)              // shr_u; and
+		}
+		b = append(b, 0x21, mask)
+	}
+	// Keep the first `valid` lanes, valid = len - attempt_start - len(prefix) + 1:
+	// mask &= valid >= 16 ? 0xFFFF : valid > 0 ? (1 << valid) - 1 : 0.
+	valid := func(b []byte) []byte {
+		b = append(b, 0x20, l.Len, 0x20, as, 0x6B, 0x41)
+		b = utils.AppendSLEB128(b, int32(len(prefix)-1)) //nolint:gosec // a prefix length
+		return append(b, 0x6B)
+	}
+	b = append(b, 0x20, mask)
+	b = append(b, 0x41, 0xFF, 0xFF, 0x03) // 0xFFFF: valid >= 16 keeps every lane
+	b = append(b, 0x41, 0x01)
+	b = append(valid(b), 0x74, 0x41, 0x01, 0x6B) // (1 << valid) - 1
+	b = append(b, 0x41, 0x00)
+	b = append(valid(b), 0x41, 0x00, 0x4A) // valid > 0
+	b = append(b, 0x1B)                    // select
+	b = append(valid(b), 0x41, 0x10, 0x4E) // valid >= 16
+	b = append(b, 0x1B, 0x71, 0x22, mask)  // select; and; tee
+	b = append(b, 0x04, 0x40)              // if a candidate survives
+	b = append(b, 0x20, as, 0x20, mask, 0x68, 0x6A, 0x21, as)
+	b = append(b, 0x0C, 0x04, 0x0B) // br $prefix_matched; end if
+	// None of these 16 starts: the scalar tail takes any that remain.
+	b = append(b, 0x20, as, 0x41, 0x10, 0x6A, 0x21, as)
+	return append(b, 0x0B, 0x0B) // end if $short, end if enough starts
 }

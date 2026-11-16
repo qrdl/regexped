@@ -55,7 +55,8 @@ const (
 	defHi         = defLive + 16         // i32: …up to here
 	defMemo       = defLive + 20         // i32: the memo region kept across drives
 	defMemoCap    = defLive + 24         // i32
-	defAreaBytes  = defLive + 28
+	defEpoch      = defLive + 28         // i32: the arm epoch its notes and memo were last ensured at
+	defAreaBytes  = defLive + 32
 	defPageBytes  = 1 << 16
 	defMaxGrowEnd = btScratchMaxEnd // the highest end a grown region may reach
 )
@@ -76,6 +77,41 @@ type defaultModule struct {
 	hasSearch bool   // …when some export uses a search block
 	floor     uint32 // the fallback scratch's floor global…
 	hasFloor  bool   // …when the module has one
+	epochP1   uint32 // the arm epoch + 1, 0 when no body arms or trips a block
+}
+
+// emitStaleEpoch makes the epoch word at rec+off differ from the arm epoch,
+// so the next emitEpochEnsure runs: a new drive's blocks are reset.
+func (m *defaultModule) emitStaleEpoch(b []byte, rec func([]byte) []byte, off uint32) []byte {
+	if m.epochP1 == 0 {
+		return b
+	}
+	b = rec(b)
+	b = gget(b, m.epochP1-1)
+	b = i32c(b, -1)
+	b = append(b, 0x73) // i32.xor
+	return st32(b, off)
+}
+
+// emitEpochEnsure runs ensure — the notes and memos a default's blocks get
+// between calls — only when the arm epoch moved since it last ran (a block
+// armed or tripped somewhere) or the drive is new (emitStaleEpoch). Every
+// call ran it before, over every block: ~12 fuel per block per call, +76% on
+// a 96-member overlapping set's drive whose blocks the cache route never
+// touches. Without an epoch (no body arms or trips) it runs every call.
+func (m *defaultModule) emitEpochEnsure(b []byte, rec func([]byte) []byte, off uint32, ensure func([]byte) []byte) []byte {
+	if m.epochP1 == 0 {
+		return ensure(b)
+	}
+	b = rec(b)
+	b = ld32(b, off)
+	b = gget(b, m.epochP1-1)
+	b = append(b, 0x47, 0x04, 0x40) // i32.ne; if
+	b = rec(b)
+	b = gget(b, m.epochP1-1)
+	b = st32(b, off)
+	b = ensure(b)
+	return append(b, 0x0B)
 }
 
 // newDefaultModule is the module's shared default state, nil when it gets
@@ -91,6 +127,7 @@ func newDefaultModule(globals *moduleGlobals, standalone, component bool) *defau
 	if sc, ok := globals.btScratchGlobals(); ok {
 		m.floor, m.hasFloor = sc.floor, true
 	}
+	m.epochP1 = globals.epochP1
 	return m
 }
 
@@ -374,8 +411,11 @@ func (d *defaultSearch) emitEnter(b []byte, ptrL, lenL, fromL uint32, l defLocal
 	b = area(b)
 	b = lget(b, lenL)
 	b = st32(b, defLen)
+	b = m.emitStaleEpoch(b, area, defEpoch)
 	b = append(b, 0x0B)
-	b = m.emitNotesAndMemo(b, area, lenL, l, d.notes, d.memo, d.batch, area, defMemo, defMemoCap)
+	b = m.emitEpochEnsure(b, area, defEpoch, func(b []byte) []byte {
+		return m.emitNotesAndMemo(b, area, lenL, l, d.notes, d.memo, d.batch, area, defMemo, defMemoCap)
+	})
 	b = area(b)
 	b = gset(b, m.search)
 	b = append(b, 0x0B) // (no memory for one: run without a block)
@@ -420,7 +460,7 @@ func (d *defaultSearch) emitFindWindow(b []byte, l defLocals, r uint32) []byte {
 const (
 	sdDesc     = 0  // abi's 24-byte descriptor, second form
 	sdBlocks   = 24 // blocksTotal × abi.SearchBlockBytes
-	sdRecBytes = 40 // live, ptr, len, gate, cache, cacheCap, from (i64), cacheUse
+	sdRecBytes = 40 // live, ptr, len, gate, cache, cacheCap, from (i64), cacheUse, epoch
 )
 
 // setDefault is a set's default state, for its exported find and batch entry.
@@ -484,6 +524,7 @@ const (
 	sdCacheCap = 20
 	sdFrom     = 24 // i64: the last call's `from`, or its batch cursor
 	sdCacheUse = 32 // i32: the cache bytes this drive hands over, 0 for none
+	sdEpoch    = 36 // i32: the arm epoch the blocks' notes and memos were last ensured at
 )
 
 // emitEnter goes at the very top of the set's exported find (batch false:
@@ -576,6 +617,9 @@ func (d *setDefault) emitEnter(b []byte, batch bool, l defLocals) []byte {
 	if d.hasRegion() {
 		b = d.emitCacheReset(b, rec, l)
 	}
+	if d.hasBlocks {
+		b = m.emitStaleEpoch(b, rec, sdEpoch)
+	}
 	b = append(b, 0x0B)
 	// The last call's `from`, for the next one's test.
 	b = rec(b)
@@ -645,40 +689,49 @@ func (d *setDefault) emitEnter(b []byte, batch bool, l defLocals) []byte {
 		// One loop per RUN of blocks that keep the same notes and memo: a
 		// set whose split members each have a block (128 in a 128-member
 		// no-cache companion) would otherwise carry this code once per block.
-		for k0 := 0; k0 < len(d.blocks); {
-			sz := d.blocks[k0]
-			k1 := k0 + 1
-			for k1 < len(d.blocks) && d.blocks[k1].NotesBytes == sz.NotesBytes && d.blocks[k1].BTMemoBytes == sz.BTMemoBytes {
-				k1++
-			}
-			if sz.NotesBytes != 0 || sz.BTMemoBytes != 0 {
-				b = d.emitBlockRun(b, area, l, k0, k1, func(b []byte, blk func([]byte) []byte) []byte {
-					// The block's memo record, from its address: record k is
-					// 8 × k past the first, block k 128 × k past the first.
-					memoRec := func(b []byte) []byte {
-						b = blk(b)
-						b = area(b)
-						b = append(b, 0x6B) // - area
-						b = i32c(b, sdBlocks)
-						b = append(b, 0x6B) // - sdBlocks: 128 × k
-						b = i32c(b, int32(abi.SearchBlockBytes/8))
-						b = append(b, 0x6E) // / 16: 8 × k
-						b = area(b)
-						b = append(b, 0x6A)
-						return append(i32c(b, int32(d.memoRecOff(0))), 0x6A) //nolint:gosec // a small offset
-					}
-					return m.emitNotesAndMemo(b, blk, pLen, l,
-						int32(sz.NotesBytes), int32(sz.BTMemoBytes), batch, memoRec, 0, 4) //nolint:gosec // bytes per position
-				})
-			}
-			k0 = k1
-		}
+		b = m.emitEpochEnsure(b, rec, sdEpoch, func(b []byte) []byte { return d.emitBlockEnsure(b, area, l, batch) })
 		b = append(b, 0x0B)
 	}
 	b = area(b)
 	b = lset(b, pDesc)
 	b = append(b, 0x0B) // end if there is a default
 	return append(b, 0x0B)
+}
+
+// emitBlockEnsure gives the set's default blocks their notes and memos, one
+// loop per run of blocks with equal sizes (emitBlockRun).
+func (d *setDefault) emitBlockEnsure(b []byte, area func([]byte) []byte, l defLocals, batch bool) []byte {
+	const pLen = 1
+	m := d.m
+	for k0 := 0; k0 < len(d.blocks); {
+		sz := d.blocks[k0]
+		k1 := k0 + 1
+		for k1 < len(d.blocks) && d.blocks[k1].NotesBytes == sz.NotesBytes && d.blocks[k1].BTMemoBytes == sz.BTMemoBytes {
+			k1++
+		}
+		if sz.NotesBytes != 0 || sz.BTMemoBytes != 0 {
+			b = d.emitBlockRun(b, area, l, k0, k1, func(b []byte, blk func([]byte) []byte) []byte {
+				// The block's memo record, from its address: record k is
+				// 8 × k past the first, block k 128 × k past the first.
+				memoRec := func(b []byte) []byte {
+					b = blk(b)
+					b = area(b)
+					b = append(b, 0x6B) // - area
+					b = i32c(b, sdBlocks)
+					b = append(b, 0x6B) // - sdBlocks: 128 × k
+					b = i32c(b, int32(abi.SearchBlockBytes/8))
+					b = append(b, 0x6E) // / 16: 8 × k
+					b = area(b)
+					b = append(b, 0x6A)
+					return append(i32c(b, int32(d.memoRecOff(0))), 0x6A) //nolint:gosec // a small offset
+				}
+				return m.emitNotesAndMemo(b, blk, pLen, l,
+					int32(sz.NotesBytes), int32(sz.BTMemoBytes), batch, memoRec, 0, 4) //nolint:gosec // bytes per position
+			})
+		}
+		k0 = k1
+	}
+	return b
 }
 
 // emitBlockRun emits body for blocks k0..k1-1: inline for one block, else as

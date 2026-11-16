@@ -44944,3 +44944,322 @@ regexps
 -;-;-;-;-
 -;0-1;-;-;0-1,2-3
 -;-;-;-;-
+# ============================================================
+# Two mid-accept dominant states, one of them looping on whole characters: one
+# skip per byte, not two. The skip to run was picked by comparing a cached
+# value against each state's code in independent ifs, and a skip leaves its
+# stop mask in that value; a mask equal to a later state's code ran the second
+# skip too, with the walk still in the first state, over the byte that should
+# have left it. The UTF-8 character skips leave a mask the same way.
+# ============================================================
+UniTwoMidDominants
+strings
+"ж  \nzzzzzzzzzzzzz"
+"a  \nжжжжжжжжжжжжж"
+"a  \n日日日日日日日日日日日日日日"
+"a  \nzzzzzzzzzzzzz"
+"ж b\nzzzzzzzzzzzzzzzz"
+"a  \nжж"
+regexps
+"[^ ]+(?: [^\\n]*)?"
+-;0-4;-;-;0-4,4-18
+-;0-3;-;-;0-3,3-30
+-;0-3;-;-;0-3,3-46
+-;0-3;-;-;0-3,3-17
+-;0-4;-;-;0-4,4-21
+-;0-3;-;-;0-3,3-8
+# ============================================================
+# A match that ends before a \b / \B, found by a Teddy tier. A class with 2..8
+# lead bytes ([а-я] = D0/D1, [α-ω] = CE/CF) scans with 2-byte Teddy tiers, which
+# must stop at a state that can already end a match. The test ignored an accept
+# a \b or \B decides from the next byte, so once the SIMD loop ran (17+ bytes)
+# the tier demanded one more matching byte and dropped the candidate: `[а-я]{1,3}\b`
+# over "ж" + 17 x's found nothing where Go finds [0,2). In Unicode mode every
+# non-ASCII letter is a non-word sequence, so \b after a Cyrillic or Greek letter
+# followed by a Latin letter, digit or _ is the common case.
+# ============================================================
+UniBoundaryAfterTeddyTier
+strings
+"жxxxxxxxxxxxxxxxxx"
+"жxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+"αxxxxxxxxxxxxxxxxx"
+"Жxxxxxxxxxxxxxxxxx"
+"abxxxxxxxxxxxxxxxxx"
+"ж xxxxxxxxxxxxxxxxx"
+"жx"
+regexps
+"[а-я]{1,3}\\b"
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+"[α-ω]{1,5}\\b"
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)[а-я]{1,3}\\b"
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+"[а-я]+\\b"
+-;0-2;-;-;0-2
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+"([а-я]+)\\b"
+0-2 0-2;0-2;-;-;0-2;0-2 0-2;0-2 0-2
+0-2 0-2;0-2;-;-;0-2;0-2 0-2;0-2 0-2
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+0-2 0-2;0-2;-;-;0-2;0-2 0-2;0-2 0-2
+"[ab]+\\B"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-2;-;-;0-2
+-;-;-;-;-
+-;-;-;-;-
+# ============================================================
+# The last iteration of a captured repeat over a counted repeat with a minimum
+# of 2 or more: Go splits "жжжжжжx" for `(ж{2,3})+x` as жжж|жжж, group 1 = the
+# second iteration, 6-12. A tagged DFA following the iterations reported the
+# last iteration one character late (8-12). The extent is right; Backtracking
+# answers it right.
+# ============================================================
+UniCountedRepeatCapture
+strings
+"жжx"
+"жжжx"
+"жжжжx"
+"жжжжжx"
+"жжжжжжx"
+"жжжжжжжx"
+"жжжжжжжжx"
+"аaaaaaх"
+"абвгдеж="
+"абвгдежз="
+"ab="
+"абвгдежзий="
+"к=в абвгде="
+regexps
+"(ж{2,3})+x"
+0-5 0-4;0-5;-;-;0-5;0-5 0-4;0-5 0-4
+0-7 0-6;0-7;-;-;0-7;0-7 0-6;0-7 0-6
+0-9 4-8;0-9;-;-;0-9;0-9 4-8;0-9 4-8
+0-11 6-10;0-11;-;-;0-11;0-11 6-10;0-11 6-10
+0-13 6-12;0-13;-;-;0-13;0-13 6-12;0-13 6-12
+0-15 10-14;0-15;-;-;0-15;0-15 10-14;0-15 10-14
+0-17 12-16;0-17;-;-;0-17;0-17 12-16;0-17 12-16
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+"(\\pL{2,4})+="
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+0-15 8-14;0-15;-;-;0-15;0-15 8-14;0-15 8-14
+0-17 8-16;0-17;-;-;0-17;0-17 8-16;0-17 8-16
+0-3 0-2;0-3;-;-;0-3;0-3 0-2;0-3 0-2
+0-21 16-20;0-21;-;-;0-21;0-21 16-20;0-21 16-20
+-;6-19;-;-;6-19;6-19 14-18;6-19 14-18
+"(жжж?)+x"
+0-5 0-4;0-5;-;-;0-5;0-5 0-4;0-5 0-4
+0-7 0-6;0-7;-;-;0-7;0-7 0-6;0-7 0-6
+0-9 4-8;0-9;-;-;0-9;0-9 4-8;0-9 4-8
+0-11 6-10;0-11;-;-;0-11;0-11 6-10;0-11 6-10
+0-13 6-12;0-13;-;-;0-13;0-13 6-12;0-13 6-12
+0-15 10-14;0-15;-;-;0-15;0-15 10-14;0-15 10-14
+0-17 12-16;0-17;-;-;0-17;0-17 12-16;0-17 12-16
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+"(ж{2,3})*x"
+0-5 0-4;0-5;-;-;0-5;0-5 0-4;0-5 0-4
+0-7 0-6;0-7;-;-;0-7;0-7 0-6;0-7 0-6
+0-9 4-8;0-9;-;-;0-9;0-9 4-8;0-9 4-8
+0-11 6-10;0-11;-;-;0-11;0-11 6-10;0-11 6-10
+0-13 6-12;0-13;-;-;0-13;0-13 6-12;0-13 6-12
+0-15 10-14;0-15;-;-;0-15;0-15 10-14;0-15 10-14
+0-17 12-16;0-17;-;-;0-17;0-17 12-16;0-17 12-16
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+-;-;-;-;-;-;-
+# ============================================================
+# A \B accept inside a run the prefer-match skip strides over. A looping state
+# whose loop class has 9 to 64 bytes ([a-z]) is crossed 16 bytes at a time; the
+# skip removed only `\n` from the loop set, so it strode over every \B accept in
+# a run of letters: `key=[a-z]+\B` over "key=" + 18 a's + "  \n" found nothing
+# where Go finds [0,21). Non-ASCII text around the run changes nothing. A loop
+# over whole characters (`key=[а-я]+\B`) takes a different skip and is the
+# control, as is \b.
+# ============================================================
+UniWordBoundaryInPreferMatchSkip
+strings
+"ключ key=aaaaaaaaaaaaaaaaaa  \nжжж"
+"key=aaaaaaaaaaaaaaaaaaaaж"
+"жж aaaaaaaaaaaaaaaaaaaa ж"
+"key=aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa key=aa"
+"key=аааааааааааааааааа  \nж"
+"key=aaa ж"
+regexps
+"key=[a-z]+\\B"
+-;9-30;-;-;9-30
+-;0-23;-;-;0-23
+-;-;-;-;-
+-;0-19;-;-;0-19,38-43
+-;-;-;-;-
+-;0-6;-;-;0-6
+"[a-z]{8,}\\B"
+-;13-30;-;-;13-30
+-;4-23;-;-;4-23
+-;5-24;-;-;5-24
+-;4-19;-;-;4-19,21-36
+-;-;-;-;-
+-;-;-;-;-
+"key=[а-я]+\\B"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;0-40;-;-;0-40
+-;-;-;-;-
+"key=[a-z]+\\b"
+-;9-31;-;-;9-31
+-;0-24;-;-;0-24
+-;-;-;-;-
+-;0-20;-;-;0-20,38-44
+-;-;-;-;-
+-;0-7;-;-;0-7
+# ============================================================
+# A folded LITERAL that writes a non-ASCII member of an ASCII letter's fold
+# orbit: the Kelvin sign (U+212A, k's orbit) and long s (U+017F, s's orbit).
+# Go stores such a literal as the lowest rune of its orbit — `(?i)ſ` is `S`
+# with FoldCase — so the program names only ASCII. Left to resolve, these
+# compiled in byte mode, where folding stays inside the byte range, and never
+# matched the character written: `(?i)Kelvin` (Kelvin sign) over "Kelvin"
+# found nothing. The written rune now asks for Unicode mode.
+# ============================================================
+UniFoldedLiteralWritesNonASCII
+strings
+"Kelvin"
+"kelvin"
+"KELVIN"
+"Kelvin"
+"x KELVIN y"
+"ſ"
+"s"
+"S"
+"ſtraße"
+"STRASSE"
+"straße"
+"Straße"
+regexps
+"(?i)Kelvin"
+0-8;0-8;-;-;0-8
+0-6;0-6;-;-;0-6
+0-6;0-6;-;-;0-6
+0-6;0-6;-;-;0-6
+-;2-10;-;-;2-10
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)K"
+-;0-3;-;-;0-3
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;2-5;-;-;2-5
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)\\x{212A}"
+-;0-3;-;-;0-3
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+-;2-5;-;-;2-5
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+"(?i)ſ"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;0-1;-;-;0-1,4-5,5-6
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+"(?i)\\x{17F}"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-2;0-2;-;-;0-2
+0-1;0-1;-;-;0-1
+0-1;0-1;-;-;0-1
+-;0-2;-;-;0-2
+-;0-1;-;-;0-1,4-5,5-6
+-;0-1;-;-;0-1
+-;0-1;-;-;0-1
+"(?i)ſtraße"
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+-;-;-;-;-
+0-8;0-8;-;-;0-8
+-;-;-;-;-
+0-7;0-7;-;-;0-7
+0-7;0-7;-;-;0-7

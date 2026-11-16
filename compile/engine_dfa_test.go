@@ -1557,6 +1557,46 @@ func TestDFALayoutDetectorGuards(t *testing.T) {
 	})
 }
 
+// TestShuftiSelfLoopBoundaryChannels: detectShuftiSelfLoop gives no skip to a
+// state a \b/\B channel can accept from — \B accepts between two bytes of the
+// run, which the skip strides over (`key=[a-z]+\B` lost its matches under
+// prefer-match) — and keeps carving only '\n' for the (?m:$) channel.
+// tools/re2test's Category 44 and S-WordBoundaryPreferMatch run it end to end.
+func TestShuftiSelfLoopBoundaryChannels(t *testing.T) {
+	const numWASM = 5
+	layout := dfaLayoutCovSynthLayout(numWASM, 30) // bytes 0..29 loop, '\n' among them
+	layout.lmBareShufti = true
+	layout.midAcceptNWBytes = make([]byte, numWASM)
+	layout.midAcceptWBytes = make([]byte, numWASM)
+	layout.midAcceptNLBytes = make([]byte, numWASM)
+	for state := 1; state < numWASM; state++ {
+		layout.midAcceptBytes[state] = 1
+	}
+	layout.midAcceptWBytes[1] = 1  // \B-style channel
+	layout.midAcceptNWBytes[2] = 1 // \b-style channel
+	layout.midAcceptNLBytes[3] = 1 // (?m:$) channel
+	detectShuftiSelfLoop(layout)
+	got := map[int32][]byte{}
+	for _, info := range layout.dominantStates {
+		got[info.state] = info.selfLoopSet
+	}
+	for _, s := range []int32{1, 2} {
+		if _, ok := got[s]; ok {
+			t.Errorf("state %d has a word-boundary channel but got a Shufti skip", s)
+		}
+	}
+	nl, ok := got[3]
+	if !ok {
+		t.Fatal("state 3 ((?m:$) channel) lost its skip; only '\\n' should leave the loop set")
+	}
+	if len(nl) != 29 || bytes.IndexByte(nl, '\n') >= 0 {
+		t.Errorf("state 3 loop set = %v, want bytes 0..29 without '\\n'", nl)
+	}
+	if s4, ok := got[4]; !ok || len(s4) != 30 {
+		t.Errorf("state 4 (no boundary channel) loop set = %v, want all 30 bytes", s4)
+	}
+}
+
 // TestDFALayoutDataSegmentsRowDedupWithCompression covers dfaDataSegments'
 // handling of a layout carrying BOTH byte-class compression and row dedup.
 // buildDFALayout never produces one — compression is u8-only and dedup is
@@ -2807,6 +2847,57 @@ func TestUnionSortedU16(t *testing.T) {
 	} {
 		if got := unionSortedU16(c.a, c.b); fmt.Sprint(got) != fmt.Sprint(c.want) {
 			t.Errorf("unionSortedU16(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestSplitASCIIRunStates: the twin a Unicode find automaton's ASCII run state
+// gets (splitASCIIRunStates) changes no answer — every position's accept flags
+// along a walk are the same with and without it, and the twin carries every
+// accept list — and only the shape it is for gets one.
+func TestSplitASCIIRunStates(t *testing.T) {
+	walk := func(tb *dfaTable, in string) string {
+		var sb strings.Builder
+		st := tb.startState
+		for i := 0; i < len(in); i++ {
+			if st = tb.transitions[st*256+int(in[i])]; st < 0 {
+				return sb.String() + "x"
+			}
+			fmt.Fprintf(&sb, "%v%v,", tb.midAcceptStates[st] != 0, tb.acceptStates[st] != 0)
+		}
+		return sb.String()
+	}
+	for _, tc := range []struct {
+		pat   string
+		twins int
+	}{
+		{`#\pL+`, 1},
+		{`name=\pL+`, 1},
+		{`\b#\pL+`, 0},      // a boundary channel
+		{`#[a-z]+`, 0},      // its run crosses no multi-byte character
+		{`#\pL`, 0},         // no run
+		{`#[^\n]+`, 0},      // a run over more than 64 ASCII bytes
+		{`#[a-zA-Z]+é?`, 0}, // nothing enters the run from a multi-byte character
+		{`\pL*`, 0},         // the run state is the start state
+		{`#\pL+?`, 0},       // it accepts at once: the walk stops there
+	} {
+		before := compileTestDFAMode(t, tc.pat, true)
+		after := compileTestDFAMode(t, tc.pat, true)
+		after.midAcceptWide = map[int][]uint16{}
+		for st := range after.midAcceptStates {
+			after.midAcceptWide[st] = []uint16{uint16(st)} //nolint:gosec // a test table's state
+		}
+		splitASCIIRunStates(after)
+		if got := after.numStates - before.numStates; got != tc.twins {
+			t.Errorf("%s: %d twins, want %d", tc.pat, got, tc.twins)
+		}
+		if len(after.midAcceptWide) != len(after.midAcceptStates) {
+			t.Errorf("%s: %d accept lists for %d accepting states", tc.pat, len(after.midAcceptWide), len(after.midAcceptStates))
+		}
+		for _, in := range []string{"#привет #hello #straße", "name=Иван name=John", "#東京#a", "жж#ж", "#a\xd0\xb6b", "#\xd0"} {
+			if b, a := walk(before, in), walk(after, in); b != a {
+				t.Errorf("%s over %q: accepts %s, with the twin %s", tc.pat, in, b, a)
+			}
 		}
 	}
 }

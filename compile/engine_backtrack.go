@@ -1268,8 +1268,27 @@ func planBT(bt *backtrack, budget int) btPlan {
 	if budget == BTWorkBudgetForceFallback || bt.zeroWidthCycle {
 		return btPlan{fallback: true, force: true}
 	}
+	if !progHasAlt(bt.prog) {
+		// Frames are pushed only at an Alt, the budget is charged only on a
+		// pop and an overflow happens only at a push: a program with none —
+		// a date, a time, a fixed field behind `\b` or `$` — can never trip,
+		// so its counter and fallback body were dead code (`(a)\b(b)` −32%
+		// module bytes, `\b(\d{4})-(\d{2})-(\d{2})\b` −18%).
+		return btPlan{}
+	}
 	k := btWorkK(bt, budget)
 	return btPlan{k: k, fallback: k > 0}
+}
+
+// progHasAlt reports whether prog has an alternation instruction — the only
+// place a Backtracking body pushes a frame.
+func progHasAlt(prog *syntax.Prog) bool {
+	for _, in := range prog.Inst {
+		if in.Op == syntax.InstAlt || in.Op == syntax.InstAltMatch {
+			return true
+		}
+	}
+	return false
 }
 
 // btFallbackCallPlaceholder is the immediate a fast body's call to its fallback
@@ -1366,6 +1385,7 @@ func btTailCallBodySearch(nParams int, search *btSearch) (body []byte, callOffs 
 	b = search.blk(b)
 	b = append(b, 0x41, abi.SearchBTTripped)
 	b = search.store32(b, btSearchState)
+	b = emitBumpEpoch(b, search.epochP1)
 	b = append(b, 0x0B)
 	b = emitBTFallbackCall(b, nParams, &callOffs)
 	b = append(b, 0x0B)

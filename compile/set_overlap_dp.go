@@ -50,10 +50,11 @@ import (
 //
 // ONE right-to-left sweep keeping only the CURRENT COLUMN answers every start
 // at once, in O(n * |Q|) time and O(|Q|) space, reading the SAME forward
-// transition and bitmask tables the ordinary body reads. The only tables it
-// adds are the column's projection table and a one-byte-per-state successor
-// scratch; the automaton itself is the forward body's, which is the reason a
-// second implementation of the per-position semantics is defensible at all.
+// transition and bitmask tables the ordinary body reads — the projected step
+// through its step table (overlapStepTabBytes), built from that very
+// transition table at compile time. The automaton itself is the forward
+// body's, which is the reason a second implementation of the per-position
+// semantics is defensible at all.
 //
 // WHY STAGE B FAILED, AND WHAT CHANGED. Stage B computed that sweep inside ONE
 // call and could deliver only if the WHOLE answer fitted the caller's buffer.
@@ -288,21 +289,32 @@ func wideTablePatterns(t *dfaTable) int {
 // the transition layout and the two accept tables genSuffixWASM places for a
 // fallback bucket over the same automaton, and no forward body — the walk keeps
 // the set's own buckets.
+//
+// Every one of them is DROPPABLE: a projected sweep reads none of them at run
+// time — the step table (overlapStepTabBytes) is built from the transitions at
+// compile time and the accepts are constants in the unrolled step — so only
+// the unprojected step, and the class map and word table a projected one
+// still loads, keep theirs (dropUnaddressedTables). The 358-state automaton of
+// the overlapping secret scanner was 183,808 dead bytes.
+//
+// A 16-bit table gets a byte-class map where it halves it (sweepClasses), which
+// is what narrows the step table: 498,899 → 141,898 bytes for that scanner.
 func genSweepTables(t *dfaTable, tableBase int64) (dp overlapDPTables, dataBytes []byte, dataSegCount int, next int32) {
 	l := buildDFALayout(dfaLayoutParams{
 		t:             t,
 		tableBase:     tableBase,
 		leftmostFirst: true,
 		forceWordChar: t.hasWordBoundary,
+		sweepClasses:  true,
 	})
 	midOff := int32(l.tableEnd)
 	eofOff := midOff + int32(l.numWASM)*8
 	raw, cnt := stripSegCount(dfaDataSegments(l, false, false))
 	mid := stateMaskBytes(t.midAcceptStates, l.numWASM)
 	eof := stateMaskBytes(t.acceptStates, l.numWASM)
-	dataBytes = append(dataBytes, raw...)
-	dataBytes = append(dataBytes, appendDataSegment(nil, midOff, mid)...)
-	dataBytes = append(dataBytes, appendDataSegment(nil, eofOff, eof)...)
+	dataBytes = append(dataBytes, markSegmentsDroppable(raw)...)
+	dataBytes = append(dataBytes, appendDroppableDataSegment(nil, midOff, mid)...)
+	dataBytes = append(dataBytes, appendDroppableDataSegment(nil, eofOff, eof)...)
 	dp = overlapDPTables{
 		ok:                 true,
 		l:                  l,
@@ -325,15 +337,15 @@ func genSweepTables(t *dfaTable, tableBase int64) (dp overlapDPTables, dataBytes
 // module scratch.
 //
 // It is not the per-position work any more. Lever C narrows the column to one
-// cell per projection, so a position costs `numStates` successor lookups plus
-// `cells` updates — see overlapSweepCostPerByte, which is what the adaptive
+// cell per projection, so a position costs `cells` updates, each one
+// step-table read — see overlapSweepCostPerByte, which is what the adaptive
 // trigger uses. Bounding the unprojected width is still the right gate: the
 // projection is computed after the automaton is built, and a set that would
 // need a 16 KB column before projection is one this whole path declines.
 const overlapDPMaxColumn = 4096
 
-// overlapProjMaxCells bounds the PROJECTED column: the projection table stores
-// each cell's byte offset in a u16.
+// overlapProjMaxCells bounds the PROJECTED column: the step table stores each
+// cell's byte offset in a u16.
 const overlapProjMaxCells = 0xFFFF / 4
 
 // overlapSweep is what the answer cache's sweep runs over: an automaton's
@@ -970,11 +982,16 @@ func (cs *compiledSet) overlapSweepCostPerByte() int64 {
 // members over `a`×n fired only at 16 KB (281,595 fuel/byte). Measured at
 // ÷16: that row 108,705 from 2 KB, 40 members 49,072 → 21,120, 128 members
 // 56,052 → 23,440; match-heavy drives −36% to +2.3%; setperf's overlapping
-// rows no dearer (overlap-shape-3 −27% to −34%); and ordinary text never
-// fires — its work per byte stays 11× to 134× under the line (÷64 gained only
-// 6-8% more on hostile input and left as little as 2.8×). A sweep fired on
-// ordinary text costs 30× to 250× the walk, which is why there is a line at
-// all.
+// rows no dearer (overlap-shape-3 −27% to −34%) (÷64 gained only 6-8% more on
+// hostile input). Most ordinary text stays under the line, but NOT all of it:
+// a small set (under 32 cells, where the floor of 1 applies) whose members walk
+// word classes crosses it on word-heavy text — `{[a-z]+ing\b, [a-z]+ed\b,
+// \w+@\w+\.com}` (18 cells) sweeps English prose at 734 instructions per byte
+// against 616 walking, random words 834-1110 against 746-803. Raising the line
+// fixed those (rate max(2, cells/3) or max(6, cells/16)) and cost match-dense
+// setperf rows +12% to +53% and hostile overlap rows up to +83%, so it was
+// kept (2026-11-14). A sweep fired on text the walk handles cheaply costs more
+// than walking, which is why there is a line at all.
 const overlapSweepTriggerDiv = 16
 
 // overlapSweepSetupBytes is what STARTING a sweep costs, in bytes of sweeping
@@ -1038,7 +1055,7 @@ func (cs *compiledSet) overlapCacheGeometry() (numPat int, ids []int, rowBytes i
 // overlapCells is the sweep column's WIDTH in cells: one per projection class
 // when the column is projected, one per (state, pattern) otherwise.
 //
-// ONE definition, because the column sizing, the emitted projection table, the
+// ONE definition, because the column sizing, the emitted step table, the
 // two sweep bodies, the serving validator and every stub's region arithmetic
 // must agree on it exactly — a width computed twice is a region sized for one
 // column and indexed as another.
@@ -1071,26 +1088,43 @@ func (cs *compiledSet) overlapProjFor() *overlapProj {
 	return nil
 }
 
-// overlapProjTabBytes is the emitted projection table: for each pattern, the
-// BYTE OFFSET within a column of every WASM state's cell. u16 because a
-// projected column is bounded by overlapProjMaxCells.
-func (cs *compiledSet) overlapProjTabBytes() []byte {
+// overlapStepTabBytes is the projected sweep's STEP TABLE: for each cell c and
+// each byte class (each byte, when the layout has no class map), the BYTE
+// OFFSET within a column of the cell its successor lands in —
+// cellOf[owner(c)][delta(rep(c), class)] × 4, u16, cell 0's row all zero.
+//
+// It fuses the transition and the projection. A cell's representative state
+// is a compile-time constant, so the cell its successor lands in depends on the
+// class alone: the step reads ONE entry per cell, at an address that is a
+// constant plus the position's class. Before, every position first ran a loop
+// over EVERY state filling a successor scratch, then read the successor and
+// projected it per cell: −20% to −52% sweep fuel on every drive the cache
+// serves (setperf greedy-3 −36%/−47%, a 96-member set −28%), for a table of
+// cells × classes × 2 bytes that grows most modules (+16% to +137% before the
+// whole-set automaton's own tables became unread and droppable, see
+// genSweepTables).
+//
+// u16 because a projected column is bounded by overlapProjMaxCells.
+func (cs *compiledSet) overlapStepTabBytes() []byte {
 	sw := cs.sweepSrc()
 	if sw == nil || sw.proj == nil {
 		return nil
 	}
-	p, n := sw.proj, sw.dp.numWASM
+	p := sw.proj
 	// The bound lives in vetSweep and the wrap here would be silent, pointing
 	// every state at the wrong cell.
 	if p.cells*4 > 0xFFFF {
-		panic(fmt.Sprintf("overlap projection table: a column of %d cells is %d bytes, "+
+		panic(fmt.Sprintf("overlap step table: a column of %d cells is %d bytes, "+
 			"past what a u16 offset can address", p.cells, p.cells*4))
 	}
-	out := make([]byte, 0, len(p.cellOf)*n*2)
-	for _, col := range p.cellOf {
-		for w := 0; w < n; w++ {
-			off := uint16(col[w] * 4) //nolint:gosec // bounded above
-			out = append(out, byte(off), byte(off>>8))
+	cps := sw.dp.cellsPerState()
+	out := make([]byte, p.cells*cps*2)
+	for c := 1; c < p.cells; c++ {
+		col, w := p.cellOf[p.owner[c]], int(p.rep[c])
+		for cls := 0; cls < cps; cls++ {
+			off := uint16(col[sw.dp.delta(w, cls)] * 4) //nolint:gosec // bounded above
+			at := (c*cps + cls) * 2
+			out[at], out[at+1] = byte(off), byte(off>>8)
 		}
 	}
 	return out
@@ -1105,9 +1139,10 @@ func (cs *compiledSet) overlapProjTabBytes() []byte {
 // emitOverlapDPCell computes the byte's equivalence class ONCE per position
 // and leaves it in cellLocal, which emitOverlapDPTransition then reads.
 //
-// It used to be inside the transition emitter, i.e. inside the per-STATE loop,
-// where `classMap[input[pos]]` is loop-invariant: a load and an add per state
-// per byte for a value that cannot change until the position does.
+// It used to be inside the transition emitter, i.e. inside the per-STATE loop
+// the projected step had then, where `classMap[input[pos]]` is loop-invariant:
+// a load and an add per state per byte for a value that cannot change until
+// the position does.
 func emitOverlapDPCell(b []byte, dp overlapDPTables, tableMemIdx int, byteLocal, cellLocal byte) []byte {
 	if dp.l.useCompression {
 		b = append(b, 0x20, byteLocal)
@@ -1124,23 +1159,9 @@ func emitOverlapDPCell(b []byte, dp overlapDPTables, tableMemIdx int, byteLocal,
 func emitOverlapDPTransition(b []byte, dp overlapDPTables, tableMemIdx int, stateLocal, cellLocal, dstLocal byte) []byte {
 	l := dp.l
 	if !l.useU8 {
-		// 16-bit ids, emitU16Transition's indexing: no class map, so the cell
-		// IS the byte; tableOff + row*512 + byte*2.
-		b = append(b, 0x41)
-		b = utils.AppendSLEB128(b, l.tableOff)
-		if l.useRowDedup {
-			b = append(b, 0x41)
-			b = utils.AppendSLEB128(b, l.rowMapOff)
-			b = append(b, 0x20, stateLocal, 0x6A)
-			b = appendTableLoad8u(b, tableMemIdx) // rowMap[state] -> row
-		} else {
-			b = append(b, 0x20, stateLocal)
-		}
-		b = append(b, 0x41, 0x09, 0x74, 0x6A)            // + row << 9
-		b = append(b, 0x20, cellLocal, 0x41, 0x01, 0x74) // byte << 1
-		b = append(b, 0x6A)
-		b = appendTableLoad16u(b, tableMemIdx)
-		return append(b, 0x21, dstLocal)
+		// Only the UNPROJECTED step transitions at run time, and newCkptEmit
+		// gives a 16-bit table the projected one, which reads the step table.
+		panic("compile: emitOverlapDPTransition over a 16-bit table: only the projected step reads one")
 	}
 	cellsPerState := 256
 	if l.useCompression {
@@ -1296,8 +1317,16 @@ func (c overlapCacheCtx) emitDefaults(b []byte) []byte {
 }
 
 // emitHeaderRead loads `ready` and `work` out of the cache header. Valid only
-// where the cache pointer is known non-zero.
+// where the cache pointer is known non-zero. A cache_len under the header's 48
+// bytes is a malformed cache and answers -4 first: every field this call and
+// the sweep read is in the header, and a short region was read past its end
+// (the lazy word at +44 of a 40-byte one; a trap where it ended an embedded
+// module's memory).
 func (c overlapCacheCtx) emitHeaderRead(b []byte) []byte {
+	b = utils.AppendSLEB128(append(b, 0x20, c.pCacheLen, 0x41), ckptHdrBytes)
+	b = append(b, 0x49, 0x04, 0x40) // lt_u: if
+	b = c.emitMalformedNow(b, c.i64Ret)
+	b = append(b, 0x0B)
 	b = append(b, 0x20, c.pCache)
 	b = hdrLoadOp(b, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
@@ -1544,6 +1573,66 @@ func (c overlapCacheCtx) emitPastEndCheck(b []byte, posLocal byte) []byte {
 	return b
 }
 
+// ckptHdrLazy is the header's lazy word (config.SetOverlapHdrLazyOff): zero
+// for an ordinary region, abi.OverlapCacheLazy for a header handed over alone,
+// abi.OverlapCacheWantedMark once the drive wants the region.
+const ckptHdrLazy = config.SetOverlapHdrLazyOff
+
+// emitLazyIs pushes 1 when the lazy word of the header at local region is
+// mark. The region must be non-zero.
+func emitLazyIs(b []byte, region byte, mark int64) []byte {
+	b = append(b, 0x20, region)
+	b = hdrLoadOp(b, ckptHdrLazy)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(mark)) //nolint:gosec // a 32-bit marker
+	return append(b, 0x46)                  // i32.eq
+}
+
+// emitMarkWantedIfLazy turns a LAZY header's word into the wanted mark: the
+// drive has reached the point where it would use a region the caller has not
+// allocated yet, and the next call's start answers abi.OverlapCacheWanted
+// (emitWantedCheck). An ordinary header is left alone.
+func emitMarkWantedIfLazy(b []byte, region byte) []byte {
+	b = emitLazyIs(b, region, abi.OverlapCacheLazy)
+	b = append(b, 0x04, 0x40, 0x20, region, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWantedMark)) //nolint:gosec // a 32-bit marker
+	b = hdrStoreOp(b, ckptHdrLazy)
+	return append(b, 0x0B)
+}
+
+// emitWantedNow returns abi.OverlapCacheWanted in the entry's shape: the batch
+// entry's is a reserved resume-position word with a zero count.
+func (c overlapCacheCtx) emitWantedNow(b []byte) []byte {
+	if c.i64Ret {
+		b = append(b, 0x42)
+		b = utils.AppendSLEB128_64(b, wantedCursor())
+	} else {
+		b = append(b, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+	}
+	return append(b, 0x0F)
+}
+
+// wantedCursor is the packed i64 the batch entry returns for
+// abi.OverlapCacheWanted: the reserved position word on top, a zero count.
+func wantedCursor() int64 {
+	var w uint64 = config.SetCursorCacheWantedPos
+	return int64(w << 32) //nolint:gosec // a reserved bit pattern, not a count
+}
+
+// emitWantedCheck answers abi.OverlapCacheWanted at a call's START when the
+// header (c.pCache, non-zero) carries the wanted mark: a part of the module
+// that cannot return mid-call — the batch worker's sweep, a split member's
+// program sweep — marked it, and the call that follows asks before it does
+// anything else. Emitted by emitEntrySweep, behind its `ready == 0`: the mark
+// is only ever set before the drive has swept.
+func (c overlapCacheCtx) emitWantedCheck(b []byte) []byte {
+	b = emitLazyIs(b, c.pCache, abi.OverlapCacheWantedMark)
+	b = append(b, 0x04, 0x40)
+	b = c.emitWantedNow(b)
+	return append(b, 0x0B)
+}
+
 // emitMarkRefused records that this drive must not ask again.
 func (c overlapCacheCtx) emitMarkRefused(b []byte) []byte {
 	b = append(b, 0x20, c.pCache)
@@ -1589,20 +1678,43 @@ func (c overlapCacheCtx) emitStoreWork(b []byte) []byte {
 // the cache path read a tuple INDEX. Lever B retired the index form — rows are
 // addressed by position — so the two halves mean the same thing on both paths
 // and there is nothing left to tell apart.
-func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom func([]byte) []byte) []byte {
+//
+// The two halves are NESTED, not and-ed: a drive the cache serves — whose
+// calls are the cheapest there are — tests `ready` and nothing else, and the
+// lazy header's wanted mark (emitWantedCheck) is tested behind the same test
+// at no cost to it. boundary, when not nil, pushes one more condition for the
+// sweep itself (the batch entry's position boundary); the wanted check does not
+// wait for it.
+func (c overlapCacheCtx) emitEntrySweep(b []byte, pushFrom, boundary func([]byte) []byte) []byte {
 	b = append(b, 0x20, c.lReady)
 	b = append(b, 0x45)
+	b = append(b, 0x04, 0x40) // if not swept yet
+	b = c.emitWantedCheck(b)
 	b = c.emitWorkExceedsSweep(b)
-	b = append(b, 0x71) // i32.and
+	if boundary != nil {
+		b = boundary(b)
+		b = append(b, 0x71) // i32.and
+	}
 	b = append(b, 0x04, 0x40)
 	b = c.emitSweepCall(b, pushFrom)
 	b = append(b, 0x04, 0x40)
 	b = c.emitMalformedReturn(b, c.i64Ret)
+	// A LAZY header: the region it stands for is not allocated yet. Ask for
+	// it — this is a call's start, nothing is delivered — instead of
+	// refusing for good.
+	b = emitLazyIs(b, c.pCache, abi.OverlapCacheLazy)
+	b = append(b, 0x04, 0x40)
+	b = append(b, 0x20, c.pCache, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWantedMark)) //nolint:gosec // a 32-bit marker
+	b = hdrStoreOp(b, ckptHdrLazy)
+	b = c.emitWantedNow(b)
+	b = append(b, 0x0B)
 	b = c.emitMarkRefused(b)
 	b = append(b, 0x0B) // end if the sweep did not deliver
 	b = append(b, 0x20, c.pCache)
 	b = hdrLoadOp(b, ckptHdrReady)
 	b = append(b, 0x21, c.lReady)
+	b = append(b, 0x0B) // end if the walk has cost more than the sweep would
 	b = append(b, 0x0B) // end if not swept yet
 	return b
 }

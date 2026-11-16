@@ -59,15 +59,25 @@ func enabled() bool { return isRootProcess() }
 // `wasm-tools` write their own output as children of this root process.
 //
 // "-" is the stdout sentinel the commands accept, and it owns nothing.
+//
+// A path that is a symlink was written THROUGH, so the file to correct is its
+// target, and the owner it takes is that of the TARGET's directory: taken
+// from the link's, a link in one user's directory to another user's file
+// handed that file over to the first.
 func Fix(path string) {
 	if !enabled() || path == "" || path == "-" {
 		return
 	}
-	uid, gid, ok := dirOwner(filepath.Dir(path))
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		slog.Warn("ownership: cannot resolve output", "path", path, "err", err)
+		return
+	}
+	uid, gid, ok := dirOwner(filepath.Dir(target))
 	if !ok {
 		return
 	}
-	chown(path, uid, gid)
+	chown(target, uid, gid)
 }
 
 // MkdirAll is os.MkdirAll, plus the ownership of every level it creates.

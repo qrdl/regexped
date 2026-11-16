@@ -2186,6 +2186,18 @@ func TestSetMatrixDiagnostics(t *testing.T) {
 			if len(diags) != 1 {
 				t.Fatalf("%s: expected one set diagnostic, got %d", c.name, len(diags))
 			}
+			// Only find and the scan pair read the buckets: an anchored-only
+			// set packs none and reports no frontend.
+			scans := false
+			for _, cp := range diags[0].Capabilities {
+				scans = scans || strings.HasPrefix(cp, "find") || strings.HasPrefix(cp, "scan_")
+			}
+			if !scans {
+				if len(diags[0].Buckets) != 0 || diags[0].Frontend != "none" {
+					t.Errorf("%s: an anchored-only set has %d scan buckets and frontend %q", c.name, len(diags[0].Buckets), diags[0].Frontend)
+				}
+				return
+			}
 			// A set can legitimately end up with NO buckets when every member
 			// was excluded — capture-bearing patterns are dropped from sets by
 			// design. Say which it is rather than treating both as the same

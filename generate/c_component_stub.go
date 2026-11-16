@@ -417,7 +417,7 @@ __attribute__((__import_module__("%[3]s"), __import_name__("[resource-drop]%[4]s
 extern void %[6]s(int handle);
 
 int %[1]s_init(%[2]s *iter, const char *input, size_t len, size_t offset) {
-    if (!iter || !input) return RX_ERR_NULL_ARG;
+    if (!iter || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     /* Writes only: a live iterator must be _free'd before it is initialised
@@ -540,8 +540,9 @@ func genCComponentGroups(importModule, funcName, witFunc string, numGroups int, 
         iter->offset = (end > start) ? end : start + 1;
         for (unsigned int i = 0; i < %[4]s_GROUPS; i++) {
             if (i >= n) {
-                /* Shorter list than the pattern's group count cannot happen, but
-                   a caller's array must never be left uninitialised. */
+                /* The component returns every group the pattern declares, those
+                   Simplify removed, such as (b){0}, as unset; a shorter list is not
+                   expected, but a caller's array is never left uninitialised. */
                 out_groups[i].start = -1;
                 out_groups[i].end   = -1;
                 continue;

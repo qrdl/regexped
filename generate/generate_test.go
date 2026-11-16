@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -286,7 +287,7 @@ func TestGenGoGroupIndexConsts(t *testing.T) {
 	for _, sub := range []string{
 		"const url_groups_count = 4",
 		"url_groups_scheme = 1",
-		"url_groups_host = 2",
+		"url_groups_host   = 2", // aligned with url_groups_scheme, as gofmt aligns a const block
 		"func url_groups_index(name string) (int, bool)",
 		`case "scheme":`,
 		"func url_groups_names() []string",
@@ -1218,7 +1219,7 @@ func allDecodeBody(out, fn string) (string, bool) {
 // cannot collide with one, and a reservation that does not match what is
 // actually emitted protects nothing: too narrow and the collision still ships,
 // too wide and it rejects names no generator uses. The batch config is used
-// because it emits all four.
+// because it emits all of them.
 func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 	cfg := setBatchTestCfg()
 	set := cfg.Sets[0]
@@ -1235,8 +1236,12 @@ func TestConfigSetDerivedNamesMatchGenerators(t *testing.T) {
 		{"c", hStub + cStub},
 	} {
 		names := config.SetDerivedNamesForValidation(set, lang.name)
-		if len(names) != 4 {
-			t.Errorf("%s: reserved %d names, want 4 (pattern count, id space, batch size limit, name lookup)", lang.name, len(names))
+		want := 4 // pattern count, id space, batch size limit, name lookup
+		if lang.name == "c" {
+			want = 5 // and the scanner type
+		}
+		if len(names) != want {
+			t.Errorf("%s: reserved %d names, want %d", lang.name, len(names), want)
 		}
 		for _, n := range names {
 			// The batch-size limit is reserved in every language but EMITTED
@@ -2653,6 +2658,105 @@ func TestGoStubPackageNameFromOutputPath(t *testing.T) {
 	}
 }
 
+// TestGoStubExplicitGoPackageIsVerbatim: a go_package the config states is the
+// package, wherever the stub is written. It used to become `main` unless the
+// stub's directory shared its name — silently, with the package the user named
+// nowhere in the output.
+func TestGoStubExplicitGoPackageIsVerbatim(t *testing.T) {
+	for _, dirName := range []string{"matchers", "cmd", "internal"} {
+		dir := filepath.Join(t.TempDir(), dirName)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(dir, "stubs.go")
+		cfg := config.BuildConfig{ImportModule: "rx", GoPackage: "matchers", StubFile: out,
+			Patterns: []config.PatternEntry{{Regexp: `[a-z]+`, MatchFunc: "Match"}}}
+		if err := goStub(cfg, out); err != nil {
+			t.Fatalf("goStub: %v", err)
+		}
+		src, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "package matchers\n") {
+			t.Errorf("stub in directory %q is not in package matchers", dirName)
+		}
+	}
+}
+
+// TestGoStubIteratorResumesAfterBreak builds a Go guest with the stub, merges
+// it and runs it: ranging Matches() again after a break must CONTINUE — Go's
+// FindAllIndex answer for `a*` over "ab" is [0 1] [2 2]. The iterators used to
+// store their resume point after yield and keep prevEnd in Matches, so the
+// second range repeated [0 1] (find) or dropped the adjacent-empty rule
+// (groups).
+func TestGoStubIteratorResumesAfterBreak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("rx.yaml", "import_module: rx\nwasm_file: rx.wasm\noutput: merged.wasm\nstub_file: stubs.go\n"+
+		"wasm_merge_path: '"+merge+"'\npatterns:\n  - regexp: 'a*'\n    find_func: f\n  - regexp: '(a*)'\n    groups_func: g\n")
+	write("go.mod", "module guest\n\ngo 1.23\n")
+	write("main.go", `//go:build wasip1
+
+package main
+
+import "fmt"
+
+func main() {
+	in := []byte("ab")
+	fi := f(in, 0)
+	for s, e := range fi.Matches() {
+		fmt.Printf("f %d-%d;", s, e)
+		break
+	}
+	for s, e := range fi.Matches() {
+		fmt.Printf("f %d-%d;", s, e)
+	}
+	gi := g(in, 0)
+	for m := range gi.Matches() {
+		fmt.Printf("g %d-%d;", m[1].Start, m[1].End)
+		break
+	}
+	for m := range gi.Matches() {
+		fmt.Printf("g %d-%d;", m[1].Start, m[1].End)
+	}
+	fmt.Println()
+}
+`)
+	run(t, dir, nil, bin, "compile", "--config=rx.yaml")
+	run(t, dir, nil, bin, "generate", "--config=rx.yaml")
+	run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "-o", "guest.wasm", ".")
+	run(t, dir, nil, bin, "merge", "--config=rx.yaml", "--main=guest.wasm", "rx.wasm")
+	cmd := exec.Command("wasmtime", "run", "merged.wasm")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s", err, out)
+	}
+	if got, want := strings.TrimSpace(string(out)), "f 0-1;f 2-2;g 0-1;g 2-2;"; got != want {
+		t.Errorf("break and range again = %q, want %q", got, want)
+	}
+}
+
 // TestGoStubWarnsOnlyForHiddenLibraryNames asserts the WARNING itself, which no
 // other test in this file can see: it is emitted through slog and leaves no
 // trace in the generated source. Without this, the warning could disappear
@@ -2970,5 +3074,80 @@ func TestNamedGroupOldSpellingGeneratesIdentically(t *testing.T) {
 		if len(old) == 0 || fmt.Sprint(old) != fmt.Sprint(cur) {
 			t.Errorf("%s: the two spellings generate different stubs", stubType)
 		}
+	}
+}
+
+// TestForOutput: stub_type decides when set; otherwise the extension of the
+// path written — `-o` when given, else stub_file — and the export names are
+// checked for that language.
+func TestForOutput(t *testing.T) {
+	base := config.BuildConfig{ImportModule: "m", StubFile: "s.rs",
+		Patterns: []config.PatternEntry{{Regexp: "a", MatchFunc: "func"}}}
+	typeOf := func(cfg config.BuildConfig) string {
+		typ, err := ResolveStubType(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return typ
+	}
+	for _, out := range []string{"", "-", "s.rs"} {
+		got, err := ForOutput(base, out)
+		if err != nil || typeOf(got) != "rust" {
+			t.Errorf("-o %q: %s, %v; want the stub_file's rust", out, typeOf(got), err)
+		}
+	}
+	typed := base
+	typed.StubType = "rust"
+	typed.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "m"}}
+	if got, err := ForOutput(typed, "x.go"); err != nil || typeOf(got) != "rust" {
+		t.Errorf("stub_type rust with -o x.go: %s, %v; want rust", typeOf(got), err)
+	}
+	ok := base
+	ok.Patterns = []config.PatternEntry{{Regexp: "a", MatchFunc: "m"}}
+	if got, err := ForOutput(ok, "x.go"); err != nil || typeOf(got) != "go" || got.StubFile != "x.go" {
+		t.Errorf("-o x.go: %s %q, %v; want go", typeOf(got), got.StubFile, err)
+	}
+	if _, err := ForOutput(ok, "x.txt"); err == nil || !strings.Contains(err.Error(), "cannot infer stub type") {
+		t.Errorf("-o x.txt: err = %v, want the stub_type error", err)
+	}
+	// `func` is a Go keyword and not a Rust one: valid for s.rs, refused for x.go.
+	if _, err := ForOutput(base, "x.go"); err == nil || !strings.Contains(err.Error(), "func") {
+		t.Errorf("-o x.go with match_func func: err = %v, want a reserved-word error", err)
+	}
+	// The language is checked against wasm_format as stub_file's is at load:
+	// no JS/TS/Go stub for a component, no WIT for a module (AS has no
+	// extension of its own: stub_type, which load checks, names it).
+	comp := ok
+	comp.WasmFormat = "component"
+	for _, out := range []string{"x.js", "x.ts", "x.go"} {
+		if _, err := ForOutput(comp, out); err == nil || !strings.Contains(err.Error(), "not supported for wasm_format: component") {
+			t.Errorf("component -o %s: err = %v, want the format error", out, err)
+		}
+	}
+	for _, out := range []string{"x.h", "x.wit"} {
+		if _, err := ForOutput(comp, out); err != nil {
+			t.Errorf("component -o %s: %v", out, err)
+		}
+	}
+	if _, err := ForOutput(ok, "x.wit"); err == nil || !strings.Contains(err.Error(), "requires wasm_format: component") {
+		t.Errorf("module -o x.wit: err = %v, want the format error", err)
+	}
+}
+
+// TestCmdGenerateStubNeedsAModuleName: a module stub that imports by module
+// name needs import_module, and a Rust component stub its module identifier —
+// refused by the generator itself, so `regexped check` refuses it too.
+func TestCmdGenerateStubNeedsAModuleName(t *testing.T) {
+	dir := t.TempDir()
+	pats := []config.PatternEntry{{Regexp: "abc", FindFunc: "f"}}
+	for _, ext := range []string{"rs", "go", "h"} {
+		err := CmdGenerateStub(config.BuildConfig{StubFile: "s." + ext, Patterns: pats}, filepath.Join(dir, "s."+ext))
+		if err == nil || !strings.Contains(err.Error(), "import_module is required") {
+			t.Errorf("%s with no import_module: err = %v", ext, err)
+		}
+	}
+	err := CmdGenerateStub(config.BuildConfig{WasmFormat: "component", WitPackage: "p", StubFile: "s.rs", Patterns: pats}, filepath.Join(dir, "c.rs"))
+	if err == nil || !strings.Contains(err.Error(), "rust_module") {
+		t.Errorf("a Rust component stub with no module name: err = %v", err)
 	}
 }

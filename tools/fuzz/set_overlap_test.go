@@ -2,6 +2,7 @@ package fuzz
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -534,11 +535,15 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
 	var buf []byte
+	if lay.lazy != 0 {
+		lazyStart(t, d, lay.scratchLen)
+	}
 
 	countBits := uint(config.SetCursorCountBits(len(pats)))
 	countMask := int64(1)<<countBits - 1
 
 	var out [][3]int
+	wanted := 0
 	cursor := int64(offset) << 32
 	for calls := 0; ; calls++ {
 		if calls > 4*(len(input)+2)*len(pats)+16 {
@@ -556,6 +561,14 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			t.Fatalf("find_batch reported a malformed answer-cache header; this test writes "+
 				"that header (stride %d), so this is a bug in the harness", stride)
 		}
+		if uint32(ret>>32) == config.SetCursorCacheWantedPos {
+			if lay.lazy == 0 || ret&countMask != 0 {
+				t.Fatalf("find_batch answered the wanted cursor %#x to a caller that handed no lazy region", ret)
+			}
+			wanted++
+			lazyAnswer(d, lay.scratchLen, lay.lazy == lazyGrant)
+			continue
+		}
 		n := int32(ret & countMask)
 		buf = mem.UnsafeData(store)
 		for i := int32(0); i < n; i++ {
@@ -567,6 +580,12 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			})
 		}
 		if uint32(ret>>32) == 0xFFFFFFFF {
+			if wanted > 1 {
+				t.Fatalf("a lazy drive asked for its region %d times; the module never asks twice", wanted)
+			}
+			if lay.wantedOut != nil {
+				*lay.wantedOut = wanted
+			}
 			// The guard against a VACUOUS pass in BOTH directions. A drive
 			// that quietly fell back to the walk still matches Go — the walk
 			// is correct too — so "the answer was right" is no evidence about
@@ -587,6 +606,35 @@ func driveOverlapCacheLay(t *testing.T, pats []string, input string, offset, out
 			return out
 		}
 		cursor = ret
+	}
+}
+
+const (
+	lazyGrant   = 1
+	lazyDecline = 2
+)
+
+// lazyStart turns a laid-out drive's region into a LAZY one: the descriptor
+// hands the header alone, its lazy word set; the bytes behind it stay where
+// the layout put them, so granting is a length change.
+func lazyStart(t *testing.T, d *cacheDrive, scratchLen int32) {
+	t.Helper()
+	if scratchLen < config.SetOverlapCheckpointHeaderBytes {
+		t.Fatalf("a lazy drive needs a header at least: %d bytes", scratchLen)
+	}
+	buf := d.buf()
+	binary.LittleEndian.PutUint32(buf[d.scratchPtr+config.SetOverlapHdrLazyOff:], abi.OverlapCacheLazy)
+	binary.LittleEndian.PutUint32(buf[d.desc+abi.FindScratchCacheLenOff:], config.SetOverlapCheckpointHeaderBytes)
+}
+
+// lazyAnswer is what a stub does on abi.OverlapCacheWanted: hand the whole
+// region over with the header it has, or — the allocation failed — keep the
+// header alone; the lazy word is cleared either way.
+func lazyAnswer(d *cacheDrive, scratchLen int32, grant bool) {
+	buf := d.buf()
+	binary.LittleEndian.PutUint32(buf[d.scratchPtr+config.SetOverlapHdrLazyOff:], 0)
+	if grant {
+		binary.LittleEndian.PutUint32(buf[d.desc+abi.FindScratchCacheLenOff:], uint32(scratchLen))
 	}
 }
 
@@ -681,8 +729,13 @@ type cacheDriveOpt struct {
 	canaryBytes int32 // bytes of 0xA5 to lay down immediately BELOW the region
 	canaryAfter int32 // and immediately ABOVE it
 	sweepBudget int64 // > 0: compile with the program sweep checkpointing past it
+	// lazy hands the region over LAZILY (abi.OverlapCacheWanted): the header
+	// alone with its lazy word set, and the rest only when the module asks.
+	// lazyGrant answers the ask with the whole region, lazyDecline with none.
+	lazy int
 
 	// Filled in by the drive.
+	wanted     int   // how many times the module asked for a lazy region
 	lastResult int32 // the raw return of the LAST call, negative codes included
 	region     int32
 	header     []uint32
@@ -722,6 +775,9 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 	store, mem, fn := d.store, d.mem, d.fn
 	inBase, outPtr, scratchPtr, descPtr := d.inBase, d.outPtr, d.scratchPtr, d.desc
 	opt.region = scratchPtr
+	if opt.lazy != 0 {
+		lazyStart(t, d, scratchLen)
+	}
 	var buf []byte // re-fetched after each call below: memory.grow detaches the view
 
 	var out [][3]int
@@ -736,6 +792,14 @@ func driveCacheFindOpt(t *testing.T, pats []string, input string, offset, outCap
 		}
 		n := res.(int32)
 		opt.lastResult = n
+		if n == abi.OverlapCacheWanted {
+			if opt.lazy == 0 || opt.wanted > 0 && readU32(mem.UnsafeData(store), int(scratchPtr)+config.SetOverlapHdrLazyOff) == 0 {
+				t.Fatalf("find answered OverlapCacheWanted to a caller that handed no lazy region")
+			}
+			opt.wanted++
+			lazyAnswer(d, scratchLen, opt.lazy == lazyGrant)
+			continue
+		}
 		if n <= 0 {
 			break
 		}
@@ -1263,9 +1327,27 @@ func TestOverlapCacheRefusesWrappedLayout(t *testing.T) {
 }
 
 // overlapShapeOf is what a stub generator learns about a set: the sweep
-// column's width and the bucket's pattern count.
+// column's width and the bucket's pattern count. Learned once per set
+// (cachedShape): it recompiles the set, and a FuzzSetRoutes input learned it
+// again on every cache drive that swept. Within a budgeted input, a shape too
+// slow to learn skips the input.
 func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 	t.Helper()
+	sh, err := overlapShapeFor(pats)
+	if errors.Is(err, errCompileTooSlow) {
+		t.Skip("the overlapping cache's shape: ", err)
+	}
+	if err != nil {
+		t.Fatalf("shape: %v", err)
+	}
+	if !sh.Eligible {
+		t.Fatal("the set is not cache-eligible, so this test would drive the walk")
+	}
+	return sh
+}
+
+// overlapShapeFor is overlapShapeOf's shape, or the error learning it.
+func overlapShapeFor(pats []string) (compile.OverlapCacheShape, error) {
 	entries := make([]config.PatternEntry, len(pats))
 	for i, p := range pats {
 		entries[i] = config.PatternEntry{Name: fmt.Sprintf("p%d", i), Regexp: p}
@@ -1275,16 +1357,9 @@ func overlapShapeOf(t *testing.T, pats []string) compile.OverlapCacheShape {
 		Patterns: config.PatternSelector{All: true}, Overlapping: true,
 		Unicode: setModeKey(),
 	}
-	sh, err := compile.SetOverlapCacheShape(sc, config.BuildConfig{
+	return cachedShape("shapeof\x00"+setKey(pats), sc, config.BuildConfig{
 		Patterns: entries, Sets: []config.SetConfig{sc},
 	})
-	if err != nil {
-		t.Fatalf("shape: %v", err)
-	}
-	if !sh.Eligible {
-		t.Fatal("the set is not cache-eligible, so this test would drive the walk")
-	}
-	return sh
 }
 
 // canonByPosition sorts the tuples of each POSITION by pattern id and leaves
@@ -1436,6 +1511,42 @@ func TestOverlapCacheMalformedHeaderIsReported(t *testing.T) {
 	}
 }
 
+// TestOverlapCacheShorterThanItsHeaderIsMalformed: a non-zero cache_ptr with a
+// cache_len under the 48-byte header answers -4 from the first call — `find`,
+// the batch entry, and a split set's merge, which reads the header itself
+// (PR #43 review). Every field an entry reads is in the header, and a 40-byte
+// region was read at +44, past its end. The header alone (48) is a cache.
+func TestOverlapCacheShorterThanItsHeaderIsMalformed(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		pats  []string
+		input string
+	}{
+		{"kept cache", []string{`a+`, `[^\n]*ERROR`, `x?y`}, strings.Repeat("a", 1000)},
+		{"split, non-greedy member", []string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, stride := overlapCacheFor(c.input, c.pats)
+			for _, n := range []int32{1, 40, config.SetOverlapCheckpointHeaderBytes - 1} {
+				opt := &cacheDriveOpt{stride: &stride}
+				driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, n, engageAny, opt)
+				if opt.lastResult != abi.OverlapCacheMalformed {
+					t.Errorf("find, cache_len %d: returned %d, want %d", n, opt.lastResult, abi.OverlapCacheMalformed)
+				}
+				pos, count := driveBatchMalformed(t, c.pats, c.input, n, stride, false)
+				if pos != config.SetCursorMalformedPos || count != 0 {
+					t.Errorf("batch, cache_len %d: resume word 0x%X count %d, want the malformed sentinel", n, pos, count)
+				}
+			}
+			opt := &cacheDriveOpt{stride: &stride}
+			driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, config.SetOverlapCheckpointHeaderBytes, engageAny, opt)
+			if opt.lastResult == abi.OverlapCacheMalformed {
+				t.Error("find: the 48-byte header alone was reported as malformed")
+			}
+		})
+	}
+}
+
 // driveStride runs a `find` drive with a caller-chosen stride and returns what
 // the LAST call reported — which for a malformed header is the error itself.
 //
@@ -1480,11 +1591,13 @@ func TestOverlapCacheLaterCallValidatesHeader(t *testing.T) {
 		})
 	}
 
-	// And a region too small for even the header is a REFUSAL, not an error:
-	// the drive walks and the answer is identical.
-	if got := driveStride(t, pats, input, 40, stride); got < 0 {
-		t.Fatalf("a 40-byte region returned %d; too small to hold the header is a "+
-			"fallback to the walk, not an error", got)
+	// And a region too small for even the header is malformed too: every
+	// field read here is in the header, which a 40-byte region was read past
+	// (TestOverlapCacheShorterThanItsHeaderIsMalformed). It used to be a
+	// refusal, so the drive walked.
+	if got := driveStride(t, pats, input, 40, stride); got != abi.OverlapCacheMalformed {
+		t.Fatalf("a 40-byte region returned %d, want %d: shorter than the header is a malformed cache",
+			got, abi.OverlapCacheMalformed)
 	}
 }
 
@@ -2406,6 +2519,122 @@ func TestProgramSweepCheckpointsMatchGo(t *testing.T) {
 	}
 }
 
+// TestOverlapCacheLazyRegion: a caller may hand the answer cache over LAZILY
+// — the header alone, its lazy word set — and is answered
+// abi.OverlapCacheWanted (the batch entry: its reserved cursor) when the drive
+// would use the region, with nothing delivered; it then hands the whole region
+// over, or none. Either way the drive equals Go, and the region was asked for
+// once. Granted, the drive swept as a full region's does; declined, it walked.
+// Over shapes the answer cache serves and over split sets whose members'
+// program sweep asks for it — from inside a call, by marking the header, and
+// answered at the next call's start — through `find` and the batch entry.
+func TestOverlapCacheLazyRegion(t *testing.T) {
+	cases := []struct {
+		name  string
+		pats  []string
+		input string
+	}{
+		{"kept cache", []string{`a+`, `[^\n]*ERROR`, `x?y`}, strings.Repeat("a", 1000)},
+		{"split, non-greedy member", []string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+		{"split, kept and member", []string{`foo\w+`, `k[a-z]+?z`}, strings.Repeat("kfoo", 150) + "z"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			oracle := canonCache(overlapOracleCtx(t, c.pats, c.input))
+			full, stride := overlapCacheFor(c.input, c.pats)
+			// The region handed over whole: what the granted drive must match.
+			eager := &cacheDriveOpt{}
+			driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, full, engageAny, eager)
+			for _, mode := range []int{lazyGrant, lazyDecline} {
+				opt := &cacheDriveOpt{lazy: mode}
+				got := canonCache(driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, full, engageAny, opt))
+				// Granted, a split member's program sweep runs about when it
+				// does with the whole region — the work its own search charges
+				// stays near the eager drive's, not the quadratic walk's. The
+				// call that asks for the region was never answered at the start
+				// of the next call, and the sweep ran at the drive's end.
+				if mode == lazyGrant && eager.header[0] == 1 {
+					if opt.header[0] != 1 {
+						t.Errorf("granted, the program sweep never ran")
+					}
+					if w, e := opt.header[8], eager.header[8]; w > 2*e+64 {
+						t.Errorf("granted, the split member's search charged %d, the eager drive %d: the sweep ran late", w, e)
+					}
+				}
+				if fmt.Sprint(got) != fmt.Sprint(oracle) {
+					t.Errorf("find, lazy mode %d: %d tuples, want %d", mode, len(got), len(oracle))
+				}
+				if opt.wanted != 1 {
+					t.Errorf("find, lazy mode %d: the region was asked for %d times, want once", mode, opt.wanted)
+				}
+				ready := int32(opt.header[config.SetOverlapHdrReadyOff/4])
+				if mode == lazyGrant && len(c.pats) == 3 && ready != 1 {
+					t.Errorf("granted, the drive never swept (ready %d)", ready)
+				}
+				for _, capacity := range []int32{1, int32(len(c.pats))} {
+					wanted := 0
+					lay := cacheLayout{batch: true, scratchLen: full, offer: true, stride: stride, lazy: mode, wantedOut: &wanted}
+					got := canonCache(driveOverlapCacheLay(t, c.pats, c.input, 0, capacity, engageAny, lay))
+					if fmt.Sprint(got) != fmt.Sprint(oracle) {
+						t.Errorf("batch at capacity %d, lazy mode %d: %d tuples, want %d", capacity, mode, len(got), len(oracle))
+					}
+					if wanted != 1 {
+						t.Errorf("batch at capacity %d, lazy mode %d: the region was asked for %d times, want once", capacity, mode, wanted)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestProgramSweepAtForcedStrides: a caller may write any stride it sized the
+// cache for, not only the formula's, and a split member's program sweep keeps
+// its part in the same region. The sweep's part was placed after where the
+// cache would end at the FORMULA's stride: at strides 1 and 3 the cache's
+// layout is larger, the sweep wrote its answers over the cache's, and the
+// drive returned starts before `from` and lost tuples with no -4; at stride 7
+// it is smaller, and the sweep refused for want of room the region had
+// (10,469 against 1,080 fuel per byte). Each region here is sized for its
+// stride plus the sweep's part, as such a caller sizes it; every drive must
+// equal Go, and the sweep must have run. The sweep judges its room against the
+// cache's layout in the header once the cache has swept and against the
+// caller's stride before then: the first two inputs engage the cache too, the
+// last never does (no `foo`), so there only the caller's stride decides.
+func TestProgramSweepAtForcedStrides(t *testing.T) {
+	for _, c := range []struct {
+		pats  []string
+		input string
+	}{
+		{[]string{`foo\w+`, `k[a-z]+?z`}, strings.Repeat("kfoo", 150) + "z"},
+		{[]string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("afoo", 150) + "z"},
+		{[]string{`foo\w+`, `a[a-z]*?z`}, strings.Repeat("a", 600) + "z"},
+	} {
+		want := overlapOracleCtx(t, c.pats, c.input)
+		for _, k := range []int32{1, 3, 7} {
+			name := fmt.Sprintf("%v/k%d", c.pats, k)
+			scratch := overlapCacheForK(c.input, c.pats, k)
+			stride := k
+			opt := &cacheDriveOpt{stride: &stride}
+			got := driveCacheFindOpt(t, c.pats, c.input, 0, int32(len(c.pats)), true, scratch, engageAny, opt)
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s find: got %v\nwant %v", name, got, want)
+			}
+			if opt.header[0] != 1 {
+				t.Errorf("%s: the program sweep never ran (header word 0 = %d)", name, opt.header[0])
+			}
+			if kept := int32(opt.header[2]) == 1; kept != strings.Contains(c.input, "foo") {
+				t.Errorf("%s: the kept members' cache swept = %v", name, kept)
+			}
+			for _, cp := range []int32{1, 2} {
+				lay := cacheLayout{batch: true, scratchLen: scratch, offer: true, stride: k}
+				if got := driveOverlapCacheLay(t, c.pats, c.input, 0, cp, engageAny, lay); fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("%s batch cap %d: got %v\nwant %v", name, cp, got, want)
+				}
+			}
+		}
+	}
+}
+
 // overlapOracleCtx is overlapOracle with each start's LEFT CONTEXT: the probe
 // is anchored at position s of the whole input (\A(?s:.{s})), so \b, \B and
 // (?m:^) judge the byte before s rather than a slice's edge. Go caps a
@@ -2430,4 +2659,72 @@ func overlapOracleCtx(t *testing.T, pats []string, input string) [][3]int {
 		}
 	}
 	return out
+}
+
+// TestDefaultStateRestartContract is the raw-ABI contract a caller that hands
+// a standalone set no state over relies on, over a buffer it rewrites in place
+// (docs/complexity.md, "Callers that hand nothing over"): the module's default
+// state carries over while each call continues the drive, and a NEW drive —
+// the text rewritten, the gate array zeroed — that restarts at an offset no
+// greater than the last one is a new drive, whatever the old text left behind:
+// its answer cache (overlapping, swept on the first text) must not answer the
+// second. The neighbouring routes — the region too small, offered lazily —
+// are FuzzSetRoutes'; merge's refusal of a standalone module is merge's own
+// test.
+func TestDefaultStateRestartContract(t *testing.T) {
+	pats := []string{`foo\w+`, `bar\w+`}
+	a, b := strings.Repeat("foo", 100), strings.Repeat("bar", 100)
+	d := newCacheDrive(t, pats, a, cacheLayout{offer: false})
+	defer d.release()
+	drive := func(from int32, calls int) [][3]int {
+		var out [][3]int
+		for k := 0; calls < 0 || k < calls; k++ {
+			res, err := d.fn.Call(d.store, d.inBase, int32(len(a)), from, d.desc, d.outPtr, int32(len(pats)))
+			if err != nil {
+				t.Fatalf("set_find: %v", err)
+			}
+			n := res.(int32)
+			if n <= 0 {
+				break
+			}
+			buf := d.buf()
+			for i := int32(0); i < n; i++ {
+				base := int(d.outPtr) + int(i)*12
+				out = append(out, [3]int{int(int32(readU32(buf, base))), int(int32(readU32(buf, base+4))), int(int32(readU32(buf, base+8)))})
+			}
+			from = int32(readU32(buf, int(d.outPtr)+4)) + 1
+			if k > 4*len(a) {
+				t.Fatal("the drive did not terminate")
+			}
+		}
+		return out
+	}
+	// Far enough into A for its drive to have swept and cached A's answers.
+	first := drive(0, 40)
+	if len(first) == 0 {
+		t.Fatal("text A answered nothing")
+	}
+	for _, from := range []int32{0, 40} {
+		buf := d.buf()
+		copy(buf[d.inBase:], b)
+		for i := int32(0); i < 4*int32(len(pats)); i++ {
+			buf[d.gatePtr+i] = 0
+		}
+		got := canonCache(drive(from, -1))
+		var want [][3]int
+		for _, m := range overlapCacheOracle(pats, b) {
+			if m[1] >= int(from) {
+				want = append(want, m)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(canonCache(want)) {
+			t.Errorf("text B from %d after A's drive: %d tuples, Go %d\n got  %v\n want %v", from, len(got), len(want), got, want)
+		}
+		// And back to A for the next round, from 0: a new drive again.
+		copy(d.buf()[d.inBase:], a)
+		for i := int32(0); i < 4*int32(len(pats)); i++ {
+			d.buf()[d.gatePtr+i] = 0
+		}
+		drive(0, 40)
+	}
 }

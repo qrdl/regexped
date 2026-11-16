@@ -213,11 +213,24 @@ func exportNameRefs(cfg *BuildConfig) []exportRef {
 // is. The package name becomes a module path segment the same way.
 func validateWITNames(cfg *BuildConfig, rustBindings bool) []string {
 	var problems []string
+	// Every export name is one WIT namespace: the sets interface's names may
+	// not repeat the matcher's either (generate/wit_sets.go). Two that kebab-
+	// case alike (`Find`, `find`) used to pass load and fail at compile, the
+	// first pair only.
+	claimed := map[string]exportRef{}
 	for _, r := range exportNameRefs(cfg) {
 		if ValidateIdentifier(r.name) != nil {
 			continue // already reported by its shape
 		}
 		kebab, err := KebabIdent(r.name)
+		if err == nil {
+			if prev, dup := claimed[kebab]; dup {
+				problems = append(problems, fmt.Sprintf("%s: %s %q and %s: %s %q both map to the WIT name %q: rename one of them",
+					prev.owner, prev.field, prev.name, r.owner, r.field, r.name, kebab))
+			} else {
+				claimed[kebab] = r
+			}
+		}
 		switch {
 		case err != nil:
 			problems = append(problems, fmt.Sprintf("%s: %s %q cannot be a WIT identifier (%v)", r.owner, r.field, r.name, err))
@@ -270,6 +283,22 @@ func validateWITNames(cfg *BuildConfig, rustBindings bool) []string {
 // model here is a checked-in regexped.yaml, which this placement covers.
 func ValidateConfig(cfg *BuildConfig) error {
 	var problems []string
+
+	// Every regexp's size, references or not: expansion refuses one it would
+	// build past the cap (references.go), and a regexp WRITTEN that long is
+	// refused here.
+	for _, re := range cfg.Patterns {
+		if p := cfg.regexpSizeProblem(re.Owner(), uint64(len(re.Regexp))); p != "" {
+			problems = append(problems, p)
+		}
+	}
+	for _, s := range cfg.Sets {
+		for k, r := range s.Regexps {
+			if p := cfg.regexpSizeProblem(fmt.Sprintf("set %q regexps[%d]", s.Name, k), uint64(len(r))); p != "" {
+				problems = append(problems, p)
+			}
+		}
+	}
 
 	for _, re := range cfg.Patterns {
 		owner := re.Owner()
@@ -452,18 +481,23 @@ func captureNameProblems(pattern string, x *Expansion) []string {
 	//    `url_index`, `url_names` (and `url_indices` in JS/TS) alongside one
 	//    constant per named group — so a group called `index` makes
 	//    derivedConstName("url","index") and derivedFuncName("url","index")
-	//    the same symbol, declared twice in one file.
+	//    the same symbol, declared twice in one file. The C stub also
+	//    declares `url_init`, `url_next`, `url_free`, `url_notes_bytes` and
+	//    `url_set_notes`. Refused in every language, like the others, so
+	//    changing stub_type never changes which group names are valid.
 	var reservedSuffix []string
 	for _, name := range names {
 		switch name {
-		case "index", "names", "count", "indices", "iter":
+		case "index", "names", "count", "indices", "iter",
+			"init", "next", "free", "notes_bytes", "set_notes":
 			reservedSuffix = append(reservedSuffix, name)
 		}
 	}
 	sort.Strings(reservedSuffix)
 	for _, name := range reservedSuffix {
 		problems = append(problems, fmt.Sprintf("capture group name %q is one of the suffixes the stub generators derive from the groups_func name "+
-			"(<func>_index, <func>_names, <func>_count, <func>_indices, <func>_iter), so its constant would collide with the generated helper of the same name%s", name, fromNote("it", x.groupOrigins(name))))
+			"(<func>_index, <func>_names, <func>_count, <func>_indices, <func>_iter, and C's <func>_init, <func>_next, <func>_free, "+
+			"<func>_notes_bytes, <func>_set_notes), so its constant would collide with the generated helper of the same name%s", name, fromNote("it", x.groupOrigins(name))))
 	}
 
 	// 3. Names that COLLIDE after sanitising. `host` and `Host` are two
@@ -568,9 +602,9 @@ var stubSharedSymbols = map[string][]string{
 // is added later, the churn this whole file exists to prevent.
 var stubPrivateHelpers = map[string][]string{
 	"js": {
-		"init", "_exp", "_mem", "_staticTop", "_bump", "_live", "_enc",
-		"_align", "_grow", "_inCap", "_write", "_stage", "_open", "_close",
-		"_att", "_notes", "_btmemo",
+		"init", "_exp", "_mem", "_staticTop", "_bump", "_regs", "_enc",
+		"_align", "_grow", "_write", "_stage", "_open", "_close",
+		"_att", "_notes", "_btmemo", "_lazy", "_offset", "_u32",
 	},
 	// Go declares no private helpers of its own, but `init` is reserved by the
 	// LANGUAGE: `func init(input []byte) (uint, bool, error)` is a compile
@@ -583,12 +617,51 @@ var stubPrivateHelpers = map[string][]string{
 		"cabi_realloc", "regexped_cabi_mark", "regexped_cabi_release", "regexped_cabi_foreign_allocator",
 		"rx_cabi_heap", "rx_cabi_used", "rx_cabi_copy", "rx_cabi_u32", "RX_CABI_EXPECT_OURS",
 		"rx_search_notes_", "rx_search_btmemo_",
+		// The header's square root, a macro: `match_func: rx_sqrt_` would be
+		// expanded as one.
+		"rx_sqrt_",
 	},
 	"rust": {"Span", "Error", "Result", "SetMatch", "SearchBlock", "search_notes", "search_btmemo", "ffi_regexped_search"},
 	"as":   {"Span", "_ffi_regexped_search", "_searchNotes", "_searchBTMemo"},
 }
 
 func init() { stubPrivateHelpers["ts"] = stubPrivateHelpers["js"] }
+
+// stubScopeNames are names a generated file brings into scope WITHOUT
+// declaring them itself — Go's imported packages, the C header's standard
+// headers — each with what it is, for the message. An export of the same name
+// passed validation and gave a file that does not build: `find_func: errors`
+// declares `func errors` beside `import "errors"`, and `match_func: free`
+// clashes with <stdlib.h>, which the C header includes when the answer cache
+// is enabled. Denied unconditionally, like the helpers: the C list does not
+// depend on whether this config has an overlapping set today.
+var stubScopeNames = map[string]map[string]string{
+	"go": {
+		"errors": `the "errors" package the Go stub imports`,
+		"iter":   `the "iter" package the Go stub imports`,
+		"unsafe": `the "unsafe" package the Go stub imports`,
+	},
+	"c": cHeaderScopeNames(),
+}
+
+// cHeaderScopeNames is every name <stddef.h> and <stdlib.h> declare (C11).
+func cHeaderScopeNames() map[string]string {
+	out := map[string]string{}
+	for _, n := range []string{"size_t", "ptrdiff_t", "wchar_t", "max_align_t", "NULL", "offsetof"} {
+		out[n] = "<stddef.h>'s " + n + ", which the C header includes"
+	}
+	for _, n := range []string{
+		"malloc", "calloc", "realloc", "free", "aligned_alloc",
+		"abort", "exit", "_Exit", "quick_exit", "at_quick_exit", "atexit", "getenv", "system",
+		"bsearch", "qsort", "abs", "labs", "llabs", "div", "ldiv", "lldiv", "rand", "srand",
+		"atof", "atoi", "atol", "atoll", "strtod", "strtof", "strtold", "strtol", "strtoll", "strtoul", "strtoull",
+		"mblen", "mbtowc", "wctomb", "mbstowcs", "wcstombs",
+		"div_t", "ldiv_t", "lldiv_t", "EXIT_SUCCESS", "EXIT_FAILURE", "RAND_MAX", "MB_CUR_MAX",
+	} {
+		out[n] = "<stdlib.h>'s " + n + ", which the C header includes when the answer cache is enabled"
+	}
+	return out
+}
 
 // stubHelperNames is every module-scope name stubType's generator declares for
 // itself: the shared symbols plus the private helpers.
@@ -798,6 +871,12 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 					r.owner, r.field, r.name, stubType))
 			}
 		}
+		for _, r := range refs {
+			if what, ok := stubScopeNames[stubType][r.name]; ok {
+				problems = append(problems, fmt.Sprintf("%s: %s %q collides with %s, so the generated file would not build; pick another name",
+					r.owner, r.field, r.name, what))
+			}
+		}
 	}
 
 	// (2) Collisions with the generated private FFI binding. Rust emits
@@ -899,7 +978,7 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 			// live here flagged names verbatim emission cannot collide.
 			emitted := r.name
 			if s, clash := deny[emitted]; clash {
-				problems = append(problems, fmt.Sprintf("%s: %s %q generates %s %q, which is also the name of a constant the %s stub generator derives from set %q; rename one",
+				problems = append(problems, fmt.Sprintf("%s: %s %q generates %s %q, which is also a name the %s stub generator derives from set %q; rename one",
 					r.owner, r.field, r.name, stubType, emitted, stubType, s.Name))
 			}
 		}
@@ -909,17 +988,31 @@ func validateExportsForStubType(cfg *BuildConfig, stubType string) []string {
 	// name. `groups_func: parse` emits parse_count / parse_index / parse_names
 	// (+ parse_indices in JS/TS, parse_iter in AS); a second entry with
 	// `match_func: parse_index` passes every check above and then duplicates
-	// the symbol, with no diagnostic from us.
+	// the symbol, with no diagnostic from us. Rust's per-stub `pub mod` does
+	// not isolate these: they are inside the same module.
 	//
-	// Derived from find/groups exports only — a match_func contributes no
-	// derived symbols — and skipped for Rust, whose per-stub `pub mod` does
-	// NOT isolate these (they are inside the same module) but whose derived
-	// names follow the same rule, so the same list serves.
+	// Also one INDEX CONSTANT per named capture group of a groups_func, in
+	// C, Rust, Go and AssemblyScript: `groups_func: kv` over `(?P<k>…)`
+	// declares `kv_k`.
 	{
 		deny := map[string]exportRef{}
 		for _, r := range refs {
 			for _, suf := range derivedExportSuffixes(r.field, stubType) {
 				deny[derivedName(r.name, suf)] = r
+			}
+			for _, n := range derivedHelperNames(r.field, r.name, stubType) {
+				deny[n] = r
+			}
+		}
+		if stubType == "c" || stubType == "rust" || stubType == "go" || stubType == "as" {
+			for _, re := range cfg.Patterns {
+				if re.GroupsFunc == "" {
+					continue
+				}
+				owner := exportRef{re.Owner(), "groups_func", re.GroupsFunc}
+				for _, g := range namedCaptureGroups(re.Regexp) {
+					deny[derivedName(re.GroupsFunc, g)] = owner
+				}
 			}
 		}
 		for _, r := range refs {
@@ -954,6 +1047,72 @@ func derivedExportSuffixes(field, stubType string) []string {
 		return nil
 	}
 	return nil
+}
+
+// derivedHelperNames lists the helpers a generator names after an export
+// VERBATIM — fixed affixes, whatever the export's style — unlike the
+// derivedExportSuffixes ones, which follow it. C gives every match_func,
+// find_func and groups_func its import `_ffi_<name>`, every find_func and
+// groups_func an iterator type and its functions, every groups_func its
+// `<NAME>_GROUPS` count macro, and a set's `find` its scanner functions and
+// the answer cache's sizing helpers; Rust gives a set's `find` the cache's
+// plan function; AssemblyScript names its imports `_ffi_<name>` for a pattern
+// export and `ffi_<name>` for a set capability. Each is emitted whether or not this config needs it (a set
+// with no cache, a pattern with no notes), so each is denied unconditionally,
+// as the private helpers are.
+func derivedHelperNames(field, name, stubType string) []string {
+	switch stubType {
+	case "c":
+		iter := []string{name + "_init", name + "_next", name + "_free", name + "_notes_bytes", name + "_set_notes",
+			"rx_" + name + "_iter_t", "_ffi_" + name}
+		switch field {
+		case "match_func":
+			return []string{"_ffi_" + name}
+		case "find_func":
+			return iter
+		case "groups_func":
+			return append(iter, strings.ToUpper(name)+"_GROUPS")
+		case "find":
+			return []string{name + "_init", name + "_free", name + "_notes_bytes", name + "_set_notes",
+				name + "_cache_bytes", name + "_set_cache",
+				"rx_" + name + "_cache_plan_", "rx_" + name + "_cache_head_", "rx_" + name + "_given_at_"}
+		}
+	case "rust":
+		if field == "find" {
+			return []string{"rx_" + name + "_cache_plan_"}
+		}
+	case "as":
+		switch field {
+		case "match_func", "find_func", "groups_func":
+			return []string{"_ffi_" + name}
+		case "match_any", "match_all", "scan_any", "scan_all", "find":
+			return []string{"ffi_" + name}
+		}
+	}
+	return nil
+}
+
+// namedCaptureGroups lists the names of pattern's named capture groups, each
+// once; none when it does not parse (reporting that is compile's job).
+func namedCaptureGroups(pattern string) []string {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	seen := map[string]bool{}
+	var walk func(*syntax.Regexp)
+	walk = func(r *syntax.Regexp) {
+		if r.Op == syntax.OpCapture && r.Name != "" && !seen[r.Name] {
+			seen[r.Name] = true
+			names = append(names, r.Name)
+		}
+		for _, sub := range r.Sub {
+			walk(sub)
+		}
+	}
+	walk(re)
+	return names
 }
 
 // derivedName reproduces generate.derivedFuncName: a name in the base's own
@@ -1031,8 +1190,10 @@ func CamelSetName(name string) string {
 
 // setDerivedNames returns the module-scope names stubType's generator
 // synthesizes from one set's NAME — the pattern-count and id-space constants,
-// JS/TS's batch-size limit, and the `emit_name_map: true` lookup
-// (SetPatternNameFunc).
+// JS/TS's batch-size limit, the `emit_name_map: true` lookup
+// (SetPatternNameFunc), and C's scanner type `rx_<set>_scanner_t` (declared
+// for a set with `find`, reserved for every set, so adding `find` never breaks
+// a working config).
 //
 // The lookup is reserved whether or not the set asks for it, for the same
 // reason as the batch constant: adding `emit_name_map: true` to a working
@@ -1067,11 +1228,15 @@ func setDerivedNames(s SetConfig, stubType string) []string {
 	default:
 		return nil
 	}
-	out := make([]string, len(suffixes), len(suffixes)+1)
+	out := make([]string, len(suffixes), len(suffixes)+2)
 	for i, suf := range suffixes {
 		out[i] = stem + suf
 	}
-	return append(out, SetPatternNameFunc(s.Name, stubType))
+	out = append(out, SetPatternNameFunc(s.Name, stubType))
+	if stubType == "c" {
+		out = append(out, "rx_"+SanitizeSetName(s.Name)+"_scanner_t")
+	}
+	return out
 }
 
 // SetPatternNameFunc is the name of the lookup a set with `emit_name_map:

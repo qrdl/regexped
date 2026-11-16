@@ -47,9 +47,19 @@ type PatternInfo struct {
 	prefixDFA *dfaTable // built from prefixAST (reversed); nil when trivial
 	prefixID  int       // index into dedup prefix pool; -1 = trivial
 
-	trivialPrefix    bool // true when prefixAST is nil
-	startAnchor      bool // \A / ^ : eligible only at input position 0
-	lineAnchor       bool // (?m:^): eligible at position 0 and after any newline
+	trivialPrefix bool // true when prefixAST is nil
+	startAnchor   bool // \A / ^ : eligible only at input position 0
+	lineAnchor    bool // (?m:^): eligible at position 0 and after any newline
+	// wordGuard is a prefix made ONLY of \b (wordGuardBoundary) or \B
+	// (wordGuardNoBoundary), stripped to a test at each candidate: the
+	// boundary between input[pos-1] and input[pos] (the literal's first byte),
+	// both read from the input. A backward prefix walk cannot judge it — it
+	// never sees input[start-1] — so such a member used to lose its literal
+	// bucket and walk a fallback bucket at every position: a set of
+	// `\bkeyword\b` members cost 12x-42x the fuel of the same words without
+	// the boundary. Only trivial-prefix members carry one, so it lives in the
+	// L == 0 group's mask with the begin anchors (emitGroupMask).
+	wordGuard        wordGuardKind
 	prefixMaxLen     int  // byte length of the (fixed-length) prefix; 0 = trivial
 	isolatedFallback bool // non-greedy: isolate in own fallback bucket with leftmostFirst=false DFA
 	// boundaryAmbiguous: the pattern's leftmost-first DFA loses the priority of
@@ -332,6 +342,27 @@ func isOnlyBeginAnchors(re *syntax.Regexp) bool {
 	return false
 }
 
+// wordGuardKind is a member's stripped \b / \B prefix (PatternInfo.wordGuard).
+type wordGuardKind uint8
+
+const (
+	wordGuardNone wordGuardKind = iota
+	wordGuardBoundary
+	wordGuardNoBoundary
+)
+
+// wordGuardOf reports the guard a zero-length prefix stands for when it is a
+// single \b or \B, and wordGuardNone for anything else.
+func wordGuardOf(re *syntax.Regexp) wordGuardKind {
+	switch re.Op {
+	case syntax.OpWordBoundary:
+		return wordGuardBoundary
+	case syntax.OpNoWordBoundary:
+		return wordGuardNoBoundary
+	}
+	return wordGuardNone
+}
+
 // setTopLevelAnchor records the eligibility restriction implied by a fallback
 // pattern's leading anchor. The fallback bucket's DFA models the whole pattern
 // including the assertion, so this is a pre-filter that saves a DFA run rather
@@ -451,7 +482,7 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 		info.splittable = false
 		info.prefixAST, info.suffixAST, info.prefixDFA = nil, nil, nil
 		info.prefixID, info.trivialPrefix, info.prefixMaxLen = -1, true, 0
-		info.startAnchor, info.lineAnchor = false, false
+		info.startAnchor, info.lineAnchor, info.wordGuard = false, false, wordGuardNone
 		info.setTopLevelAnchor(parsed)
 		info.noOwnDFA = true
 		return info, nil
@@ -479,8 +510,15 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 			prefixAST, suffixAST, ok := splitAtPath(parsed, path)
 			info.splittable = ok
 			if ok {
-				// Zero-length prefix: only strip if it consists purely of begin-anchors (^, \A).
-				// Mixed prefixes (e.g. ^$, \b) or non-begin zero-length assertions route to fallback.
+				// guard is set on info only once the split survives every
+				// rejection below: a fallback member walks its whole pattern,
+				// which judges the boundary itself, and a guard left on it is
+				// tested at EOF too, reading input[len] (`\bfoo\n(?m:^)x`
+				// trapped when the input ended at the end of memory).
+				guard := wordGuardNone
+				// Zero-length prefix: strip it if it consists purely of begin-anchors (^, \A),
+				// or is a single \b / \B (a word guard). Mixed prefixes (e.g. ^$, ^\b) or
+				// other zero-length assertions route to fallback.
 				if prefixAST != nil {
 					if _, maxLen := rp.tree(prefixAST).minMaxLen(); maxLen == 0 {
 						if isOnlyBeginAnchors(prefixAST) {
@@ -490,6 +528,11 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 							default:
 								info.startAnchor = true
 							}
+							prefixAST = nil
+						} else if g := wordGuardOf(prefixAST); g != wordGuardNone {
+							// A bare \b / \B: a test at each candidate
+							// (PatternInfo.wordGuard), not a prefix walk.
+							guard = g
 							prefixAST = nil
 						} else {
 							// Non-begin or mixed zero-length prefix: route to fallback.
@@ -514,6 +557,7 @@ func analyzeSetMember(re config.PatternEntry, member resolvedPattern, prefixPool
 				if info.splittable {
 					info.prefixAST = prefixAST
 					info.suffixAST = suffixAST
+					info.wordGuard = guard
 				}
 			}
 			// Fallback patterns: only truly anchored if the begin-anchor is at the
@@ -1981,7 +2025,7 @@ func promoteSparseBuckets(in []*bucket, opts CompileSetOptions, pr sparsePromoti
 			// patterns to FALLBACK buckets, and until this change fallback
 			// buckets were never promoted. Lifting it means teaching the body
 			// the position rule per pattern, not just widening a mask.
-			if (p.startAnchor || p.lineAnchor) && !pr.anchored {
+			if (p.startAnchor || p.lineAnchor || p.wordGuard != wordGuardNone) && !pr.anchored {
 				return false
 			}
 		}
@@ -2461,7 +2505,7 @@ func asNoOwnDFA(p *PatternInfo) *PatternInfo {
 	q.splittable = false
 	q.prefixAST, q.suffixAST, q.prefixDFA = nil, nil, nil
 	q.prefixID, q.trivialPrefix, q.prefixMaxLen = -1, true, 0
-	q.startAnchor, q.lineAnchor = false, false
+	q.startAnchor, q.lineAnchor, q.wordGuard = false, false, wordGuardNone
 	if full := fullPatternAST(&q); full.re != nil {
 		q.setTopLevelAnchor(full.re)
 	}

@@ -217,6 +217,65 @@ func TestCustomSection(t *testing.T) {
 	}
 }
 
+// TestImportsMemory finds a memory imported as module.field past imports of
+// every other kind, and reads anything malformed as no import — which is what
+// lets `merge` refuse a standalone regexp module.
+func TestImportsMemory(t *testing.T) {
+	str := func(s string) []byte { return append(AppendULEB128(nil, uint32(len(s))), s...) }
+	entry := func(mod, fld string, desc ...byte) []byte {
+		return append(append(str(mod), str(fld)...), desc...)
+	}
+	mod := func(entries ...[]byte) []byte {
+		sec := AppendULEB128(nil, uint32(len(entries)))
+		for _, e := range entries {
+			sec = append(sec, e...)
+		}
+		out := append([]byte("\x00asm\x01\x00\x00\x00"), 1, 1, 0) // a type section first
+		out = append(out, 2)
+		out = append(AppendULEB128(out, uint32(len(sec))), sec...)
+		return out
+	}
+	others := [][]byte{
+		entry("env", "f", 0x00, 0x00),                   // func, type 0
+		entry("env", "t", 0x01, 0x70, 0x01, 0x01, 0x02), // table funcref, min 1 max 2
+		entry("env", "g", 0x03, 0x7f, 0x00),             // global i32 const
+		entry("env", "e", 0x04, 0x00, 0x00),             // tag
+		entry("env", "m", 0x02, 0x08, 0x01, 0x10),       // memory with a page size, another name
+	}
+	want := entry("main", "memory", 0x02, 0x01, 0x01, 0x10) // min 1 max 16
+	if !ImportsMemory(mod(append(others, want)...), "main", "memory") {
+		t.Error("main.memory after imports of every kind: not found")
+	}
+	for _, c := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"standalone (no import section)", []byte("\x00asm\x01\x00\x00\x00\x01\x01\x00")},
+		{"other memories only", mod(others...)},
+		{"main.memory as a global", mod(entry("main", "memory", 0x03, 0x7f, 0x00))},
+		{"not wasm", []byte("mock")},
+		{"section past the end", append([]byte("\x00asm\x01\x00\x00\x00"), 2, 9, 1)},
+		{"bad count", append([]byte("\x00asm\x01\x00\x00\x00"), 2, 1, 0x80)},
+		{"name past the section", mod([]byte{5, 'm'})},
+		{"field past the section", mod(str("main"))},
+		{"no kind", mod(entry("main", "memory"))},
+		{"unknown kind", mod(entry("env", "x", 0x09), want)},
+		{"func index cut", mod(entry("env", "f", 0x00, 0x80))},
+		{"table cut", mod(entry("env", "t", 0x01))},
+		{"table limits cut", mod(entry("env", "t", 0x01, 0x70))},
+		{"memory min cut", mod(entry("env", "m", 0x02, 0x00, 0x80))},
+		{"memory max cut", mod(entry("env", "m", 0x02, 0x01, 0x01, 0x80))},
+		{"memory page size cut", mod(entry("env", "m", 0x02, 0x08, 0x01, 0x80))},
+		{"global cut", mod(entry("env", "g", 0x03, 0x7f))},
+		{"tag cut", mod(entry("env", "e", 0x04))},
+		{"tag index cut", mod(entry("env", "e", 0x04, 0x00, 0x80))},
+	} {
+		if ImportsMemory(c.raw, "main", "memory") {
+			t.Errorf("%s: ImportsMemory = true", c.name)
+		}
+	}
+}
+
 func TestParseDataSectionBytesNotWasm(t *testing.T) {
 	_, err := ParseDataSectionBytes([]byte("not a wasm binary"))
 	if err == nil {

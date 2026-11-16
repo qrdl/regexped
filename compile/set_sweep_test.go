@@ -763,8 +763,8 @@ func TestOverlapAccessorsWithoutSweep(t *testing.T) {
 	if got := cs.overlapProjFor(); got != nil {
 		t.Errorf("overlapProjFor() on the second call = %+v, want nil", got)
 	}
-	if got := cs.overlapProjTabBytes(); got != nil {
-		t.Errorf("overlapProjTabBytes() = %d bytes, want nil", len(got))
+	if got := cs.overlapStepTabBytes(); got != nil {
+		t.Errorf("overlapStepTabBytes() = %d bytes, want nil", len(got))
 	}
 	if got := cs.overlapDPColumnBytes(); got != 0 {
 		t.Errorf("overlapDPColumnBytes() = %d, want 0", got)
@@ -1137,7 +1137,7 @@ func TestWideSweepSinglePattern(t *testing.T) {
 				}},
 				// The set fallback limit is max_dfa_states now: a fallback
 				// of 1 is max_dfa_states 1.
-				MaxDFAStates: config.Limit(max(o.dfa, o.fallback)), MaxTDFARegs: o.tdfa,
+				MaxDFAStates: config.Limit(max(o.dfa, o.fallback)), MaxTDFARegs: config.Count(o.tdfa),
 			}, "")
 			if err != nil {
 				continue

@@ -245,7 +245,7 @@ extern int %s(const unsigned char *ptr, unsigned int len, unsigned int start);
 	b.WriteString(cComponentImportDecl(module, "[resource-drop]"+kebab, drop, "int handle"))
 
 	fmt.Fprintf(&b, `int %[1]s_init(%[2]s *s, const char *input, size_t len, size_t offset) {
-    if (!s || !input) return RX_ERR_NULL_ARG;
+    if (!s || (!input && len > 0)) return RX_ERR_NULL_ARG; /* (NULL, 0) is the empty input */
     /* The interface is u32. */
     if (len > 0x7FFFFFFF || offset > 0x7FFFFFFF) return RX_ERR_RANGE;
     /* Writes only: a live scanner must be _free'd before it is initialised

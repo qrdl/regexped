@@ -12,6 +12,7 @@
 - [Installation](#installation)
 - [Usage](#usage)
 - [Examples](#examples)
+- [Quick start](docs/quickstart.md)
 - [Documentation](docs/README.md)
 - [Dependencies](#dependencies)
 - [License](#license)
@@ -26,7 +27,7 @@ Supports RE2/Perl (leftmost-first) semantics, over bytes or — in Unicode mode,
 
 - **DFA engine** — O(n) anchored matching and non-anchored find, word boundary assertions (`\b`, `\B`), byte class compression, SIMD prefix scan (Teddy algorithm)
 - **TDFA engine** — O(n) capture group tracking via Laurikari’s tagged DFA; register-based slot updates on DFA transitions
-- **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns, BitState memoization for O(n) worst-case on zero-matchable loops
+- **Backtracking engine** — capture group tracking for non-TDFA-eligible patterns; a work budget per search that, once spent, hands over to a memoised body trying each (instruction, position) pair at most once, so the worst case is linear in the input
 - **Pattern sets** — compile multiple patterns into a single merged DFA and declare which of five questions you need answered (`match_any`/`match_all` anchored, `scan_any`/`scan_all` non-anchored, `find` for positions and extents); one call scans for all patterns simultaneously, and `find` returns `(pattern_id, start, end)` tuples; a packed-pair SIMD probe (≤16 literals with a usable two-column window), bucketed SIMD Teddy (≤64 literals, given ≥2-byte literals and ≥4 distinct first bytes), Aho-Corasick (the rest, under a 512 KB table budget — it wins where first-byte diversity is low), or a density/hint-selected SIMD Shufti prefilter keep per-byte cost near-constant in set size, with a scalar DFA fallback for sets without mandatory literals
 - Stub generation for **Rust**, **Go** (wasip1), **C**, **JavaScript**, **TypeScript**, and **AssemblyScript** — with iterator/generator support (match, find, groups, named groups) — and a **WIT** interface (`stub_type: wit`) for a component, which any language with a WIT binding generator consumes without a regexped stub: Go through componentize-go, JavaScript through the FastEdge JS SDK, a native Rust host through `wasmtime::component::bindgen!`
 - **Core WASM modules and Component Model components** — `wasm_format:` in the config selects either a core WASM module (the default), merged into a host with `regexped merge`, or a **WASM Component Model component** with a generated WIT interface, composed with its consumer by the same `regexped merge`. Single patterns and pattern sets work in both (a set's `hints: [batch-find]` is module-only); the generated Rust and C stubs have the same API in both, so switching formats changes no calling code; other languages bind to the component's WIT — Go with componentize-go ([`fastedge/ua-parser`](examples/fastedge/ua-parser)), JavaScript with the FastEdge JS SDK ([`fastedge/secret-redact`](examples/fastedge/secret-redact))
@@ -67,7 +68,7 @@ Regexped-generated code is built to withstand ReDoS — input crafted to make a 
 
 - **Linear time.** DFA and TDFA read each byte once; a Backtracking search that exhausts its work budget moves to a memoised body that tries each (instruction, position) pair at most once. Iterating `find`/`groups`, and pattern sets, stay linear over the whole scan, not just per call.
 - **Bounded memory.** `max_memory:` caps the module; a search that would need more reports "unknown", never a false "no match". `regexped compile` warns when Backtracking code has no cap.
-- **Sandboxed and tested.** Everything runs inside WebAssembly with every caller buffer size-checked; `make adversary` checks that 76 hostile input shapes stay linear.
+- **Sandboxed and tested.** Everything runs inside WebAssembly with every caller buffer size-checked; `make adversary` checks that 79 hostile input shapes stay linear.
 
 ## Installation
 
@@ -113,6 +114,7 @@ See [docker.md](docs/docker.md) for full Docker usage and workflow examples.
 
 ## Usage
 
+- **Quick start** — [quickstart.md](docs/quickstart.md): one config, then its matchers called from JavaScript, Rust and Go.
 - **CLI** — see [cli.md](docs/cli.md) for all commands, flags, and config schema.
 - **Docker** — see [docker.md](docs/docker.md); official image [`qrdl/regexped`](https://hub.docker.com/r/qrdl/regexped) includes `wasm-merge`, `wasm-tools` and `wac`.
 

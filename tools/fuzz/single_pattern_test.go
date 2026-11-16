@@ -654,6 +654,58 @@ var findFromShapes = []struct{ name, pat, input string }{
 	// the hinted literal, and one with no host before it.
 	{"lit_anchor_hinted", `https?://[^/ ]+/api/v1/[a-z]+`,
 		"http://a.io/x https://b.io/api/v1/users http://c.io/api/v2/x http:///api/v1/q /api/v1/z http://d/api/v1/ab"},
+	// The literal alternation's Aho-Corasick find (lit_alt_ac.go): more than
+	// eight first bytes. Words run together, overlap and nest; the second has
+	// a \b on each side over words with and without word neighbours, and the
+	// third pins leftmost-first priority among literals sharing a start.
+	{"lit_alt_ac", `(?:alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet)`,
+		"xx alpha bravocharlie delta-echo foxtrotgolfhotel india juliet yy alphabravo julie"},
+	{"lit_alt_ac_wb", `\b(?:exec|execute|alter|bkk|call|close|drop|from|grant|insert|union)\b`,
+		"execute exec xexec exec_ executed call. drop,from grantinsert insert alter bkk union"},
+	// The general find over a DFA past 256 states (u16 ids) in byte mode: the
+	// counted tail takes the table there, and the find runs its dominant
+	// states' skips through the u16 path's dispatch.
+	{"find_u16", `[^;]+;x{0,300}`,
+		"abc;xx de;f;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx gh;;x ij k;" + strings.Repeat("x", 40) + "q;"},
+	// A find whose every match begins at a line start, with no literal to
+	// scan for: the scan jumps to the next '\n' (prefixScanParams.LineStart).
+	// Lines longer and shorter than a SIMD chunk, empty lines, a field-less
+	// line, and input ending in a newline.
+	{"line_start", `(?m)^[^,\n]*,`,
+		"alpha,beta\nno comma on this line at all here\n\nfield,x\n,lead\n" + strings.Repeat("y", 40) + ",z\nq\n"},
+	{"line_start_word", `(?m)^\w+=`,
+		"k=v\n  x=1\nkey_name_that_is_rather_long=value\n=no\nend=\n"},
+	// Literal scans: a pair of rare columns for a literal with a common
+	// first byte and for one over 16 bytes, and a case-folded pair for a
+	// (?i) literal (prefixProbePair, computeFoldPrefix). Near misses on each
+	// column, the literal across a chunk edge, and one at the very end.
+	{"lit_pair", `http://[a-z]+`,
+		"htt http:/ https:// xhttp://ab " + strings.Repeat("h", 13) + "http://zz q http://"},
+	{"lit_pair_long", `Authorization: Bearer [a-z]+`,
+		"Authorization: Bear x Authorization: Bearer abc " + strings.Repeat("A", 20) + "Authorization: Bearer q"},
+	{"lit_fold", `(?i)select`,
+		"selec SELECT xSeLeCt sElEcT " + strings.Repeat("s", 17) + "select selecT"},
+	// A UTF-8 case pair differing in bit 0x20 of its last byte (П D0 9F,
+	// п D0 BF): Unicode mode only — byte mode refuses the runes, and the
+	// sweep skips the shape there.
+	{"lit_fold_cyrillic", `(?i)привет`,
+		"прив ПРИВЕТ xприВЕТ ПрИвЕт " + strings.Repeat("п", 9) + "привет"},
+	{"lit_fold_wb", `(?i)\bunion\s+select\b`,
+		"union select UNION   SELECT xunion select union selected Union\tSelect"},
+	// Every match ends at the end of the input: the find is the backward
+	// pass from there (findSuffix). The input ends with a match whose start
+	// moves as `from` passes it, and with a near miss before it; the context
+	// pass serves the `\b`.
+	{"suffix", `[a-z]+\.(?:exe|dll)$`, "run.exe x.dll setup.bat q.exe a.b.dll"},
+	{"suffix_z", `\d+@x\.com\z`, "1@x.com 22@x.co 333@x.com"},
+	{"suffix_wb", `\b[a-z]+_end$`, "x_end a_end foo_bar_end"},
+	{"suffix_none", `abc$`, "abc abd"},
+	// Inputs under 16 bytes probed in one masked chunk (emitShortInputProbe):
+	// the literal at the end, past it, and a near miss at the last byte.
+	{"short_lit", `ERROR`, "x ERROR yERRO"},
+	{"short_lit_pair", `secret`, "a secret secre"},
+	{"lit_alt_ac_priority", `(?:ab|abc|bc|c|d|e|f|g|h|i)`,
+		"abcabcbcxyzdefghi abc bcd cab ihgfedcba ab"},
 }
 
 // findFromAnchorLit names the shapes compiled with an anchor_literal hint.
@@ -685,12 +737,9 @@ func compileFindShape(name, pat string) ([]byte, error) {
 // searches keep.
 func compileFindShapeSized(name, pat string) ([]byte, []searchblock.Size, error) {
 	if lit, ok := findFromAnchorLit[name]; ok {
-		return cachedCompileSized("findhint\x00"+lit+"\x00"+pat, func() ([]byte, []searchblock.Size, error) {
-			entry := config.PatternEntry{Regexp: pat, FindFunc: "find", AnchorLiteral: lit}
-			w, _, sizes, err := compile.CompileWithSearchSizes([]config.PatternEntry{entry}, pathsTableBase, true, 0,
-				withMode(compile.CompileOptions{}))
-			return w, searchblock.Of(sizes["find"]), err
-		})
+		return cachedCompileSized("findhint\x00"+lit+"\x00"+pat, compileJob{Kind: jobSized,
+			Entries: []config.PatternEntry{{Regexp: pat, FindFunc: "find", AnchorLiteral: lit}}, Base: pathsTableBase,
+			Opts: toJobOpts(withMode(compile.CompileOptions{})), Export: "find"})
 	}
 	if findFromLNM[name] {
 		return compileFindOpts("findlnm\x00"+pat, pat, pathsTableBase,
@@ -816,6 +865,97 @@ func testFindFromStartsAtOrAfterFrom(t *testing.T, mode searchblock.Mode) {
 				if got != want {
 					t.Errorf("from=%d: got [%d,%d), want [%d,%d)",
 						from, got[0], got[1], want[0], want[1])
+				}
+			}
+		})
+	}
+}
+
+// TestLitAltACEveryFrom drives the literal alternation's Aho-Corasick find
+// (lit_alt_ac.go) at every start, over the shapes the corpus above is too
+// small for: more literals than the Teddy skip takes, an automaton large
+// enough to be byte-class compressed, and Unicode mode — each against Go.
+func TestLitAltACEveryFrom(t *testing.T) {
+	rng := rand.New(rand.NewSource(79))
+	words := func(n, minLen, maxLen int, alphabet []rune) []string {
+		seen := map[string]bool{}
+		var out []string
+		for len(out) < n {
+			w := make([]rune, minLen+rng.Intn(maxLen-minLen+1))
+			for i := range w {
+				w[i] = alphabet[rng.Intn(len(alphabet))]
+			}
+			if !seen[string(w)] {
+				seen[string(w)] = true
+				out = append(out, string(w))
+			}
+		}
+		return out
+	}
+	text := func(ws []string, n int, alphabet []rune) string {
+		var b strings.Builder
+		for b.Len() < n {
+			if rng.Intn(3) == 0 {
+				b.WriteString(ws[rng.Intn(len(ws))])
+			} else {
+				b.WriteRune(alphabet[rng.Intn(len(alphabet))])
+			}
+			if rng.Intn(4) == 0 {
+				b.WriteByte(' ')
+			}
+		}
+		return b.String()
+	}
+	latin := []rune("abcdefghijklmnopqrstuvwxyz")
+	greek := []rune("αβγδεζηθικλμνξοπρστυφχψω")
+	cases := []struct {
+		name    string
+		ws      []string
+		wb      bool
+		unicode bool
+		alpha   []rune
+	}{
+		{"80 literals, no Teddy skip", words(80, 2, 6, latin), false, false, latin},
+		{"80 literals, boundaries", words(80, 2, 6, latin), true, false, latin},
+		{"1500 literals, compressed", words(1500, 3, 9, latin), false, false, latin},
+		{"30 Greek literals, Unicode mode", words(30, 1, 4, greek), true, true, greek},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pat := "(?:" + strings.Join(c.ws, "|") + ")"
+			if c.wb {
+				pat = `\b` + pat + `\b`
+			}
+			opts := compile.CompileOptions{ForceByteMode: true}
+			if c.unicode {
+				opts = compile.CompileOptions{Unicode: true}
+			}
+			w, sizes, err := compileFindOpts("litaltac\x00"+c.name+"\x00"+pat, pat, pathsTableBase, opts)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			if !bytes.Contains(w, []byte("find")) {
+				t.Fatal("no find export")
+			}
+			input := text(c.ws, 300, c.alpha)
+			call, done, ok := findCallerMode(t, w, sizes, input, searchblock.Fresh, true)
+			if !ok {
+				t.Fatal("module would not instantiate")
+			}
+			defer done()
+			ends := endsAt(t, pat, input)
+			for from := 0; from <= len(input); from++ {
+				got, state := call(from)
+				want, wantOK := goFirstFrom(ends, from)
+				switch {
+				case state == findHang:
+					t.Fatalf("from=%d: watchdog fired", from)
+				case state == findNone && wantOK:
+					t.Errorf("from=%d: got -1, want [%d,%d)", from, want[0], want[1])
+				case state != findNone && !wantOK:
+					t.Errorf("from=%d: got [%d,%d), want -1", from, got[0], got[1])
+				case state != findNone && got != want:
+					t.Errorf("from=%d: got [%d,%d), want [%d,%d)", from, got[0], got[1], want[0], want[1])
 				}
 			}
 		})
@@ -1299,9 +1439,11 @@ func checkUnicodeCharacterRunMatch(t *testing.T, pat, oracle string, inputs []st
 	if err != nil {
 		t.Fatalf("compile %q: %v", pat, err)
 	}
-	// The validity check's first table, emitted once per skip site.
+	// The validity check's first table, emitted once per skip site — or,
+	// where the loop's bytes allow the structural test, its lead-byte compare.
 	sig := []byte{0xFD, 0x0C, 2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73}
-	if !bytes.Contains(w, sig) {
+	structSig := append(append([]byte{0xFD, 0x0C}, bytes.Repeat([]byte{0xC0}, 16)...), 0xFD, 0x2C)
+	if !bytes.Contains(w, sig) && !bytes.Contains(w, structSig) {
 		t.Fatalf("%q: the match body takes no skip over whole characters", pat)
 	}
 	full := regexp.MustCompile(`\A(?:` + oracle + `)\z`)
@@ -1377,10 +1519,21 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 	for k := 0; k < 6; k++ { // a run ending 0..5 bytes before the input does
 		inputs = append(inputs, strings.Repeat("x", 20+k)+"ж"+strings.Repeat("y", 5-k), strings.Repeat("x", 20+k)+"жжж")
 	}
+	// Lowercase Cyrillic runs broken by uppercase and by D1 letters past я
+	// (ѐ D1 90, ђ D1 92 beside ё D1 91): a partial lead's continuation outside
+	// its ranges, at every lane, and at the last lanes of a chunk
+	// (charLoopPairs).
+	for k := 0; k < 18; k++ {
+		inputs = append(inputs, strings.Repeat("ж", k)+"Ж"+strings.Repeat("щ", 20),
+			strings.Repeat("я", k)+"ѐ"+strings.Repeat("а", 12)+",", "x"+strings.Repeat("п", k)+"ЯЯ,",
+			strings.Repeat("ё", k)+"ђ"+strings.Repeat("ёя", 9)+",")
+	}
 	finds := []string{`\p{Cyrillic}+`, `\pL+`, `\p{Han}+`, `[\x{0400}-\x{047F}]+`, `x\p{Cyrillic}*,`, `\pL{3,}1`,
 		`[\x{0800}-\x{FFFF}]+`,   // E0 and ED among its leads: Keiser-Lemire's test, gated
 		`[\x{40000}-\x{FFFFF}]+`, // 4-byte leads only: the structural test's F0 term
-		`\pL+=\pL+`}              // two loops behind a literal anchor
+		`\pL+=\pL+`,              // two loops behind a literal anchor
+		`[а-я]+`, `x[а-я]*,`,     // partial leads: D0 with B0-BF, D1 with 80-8F
+		`[а-яё]+`} // two ranges under one lead: D1 80-8F and 91
 	for _, pat := range finds {
 		t.Run(pat, func(t *testing.T) {
 			rep := &compile.Reporter{}
@@ -1391,8 +1544,11 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 			}
 			var report strings.Builder
 			rep.Render(&report)
-			if !strings.Contains(report.String(), "SIMD bulk skip") {
-				t.Fatalf("%q takes no skip under prefer-match:\n%s", pat, report.String())
+			// The note comes from the emitter, and `\pL{3,}1`'s literal-
+			// anchored find over a 16-bit table runs no skip (39.8 fuel/byte
+			// over a Cyrillic run; see compile's TestUnicodeCharLoopSkipsValidate).
+			if wantSkip := pat != `\pL{3,}1`; strings.Contains(report.String(), "SIMD bulk skip") != wantSkip {
+				t.Fatalf("%q: skip reported %v, want %v under prefer-match:\n%s", pat, !wantSkip, wantSkip, report.String())
 			}
 			oracle := noReplacement(t, pat)
 			re := regexp.MustCompile(oracle)
@@ -1413,6 +1569,40 @@ func TestUnicodeCharLoopSkip(t *testing.T) {
 				}
 			}
 			checkUnicodeCharacterRunMatch(t, pat, oracle, inputs, lm)
+		})
+	}
+	// Neutral mode: an accepting state looping on ASCII letters whose run also
+	// crosses multi-byte letters has a twin entered after every multi-byte
+	// character (splitASCIIRunStates), which takes no skip. Words of each
+	// script, mixed within a word, at and around chunk boundaries, and with
+	// invalid bytes, through every start position and the whole iteration.
+	neutral := compile.CompileOptions{Unicode: true}
+	splitInputs := append([]string{}, inputs...)
+	for _, w := range []string{"привет", "мир", "γεια", "東京", "straße", "größe", "hello", "internationalization", "aжbжc", "жaжaж", "ж\x80a", "a\xd0b"} {
+		for k := 0; k < 18; k += 5 {
+			splitInputs = append(splitInputs, strings.Repeat("x", k)+"#"+w+" #"+w+"!", "name="+w+" name="+strings.Repeat(w, 3), "привет "+w+" "+w+"#")
+		}
+	}
+	for _, pat := range []string{`#\pL+`, `name=\pL+`, `привет\s+\pL+`, `#[a-zA-Z]+é?`, `\pL*#`, `#\pL+?`} {
+		t.Run("split "+pat, func(t *testing.T) {
+			oracle := noReplacement(t, pat)
+			re := regexp.MustCompile(oracle)
+			w, sizes, err := compileFindOpts("split\x00"+pat, pat, pathsTableBase, neutral)
+			if err != nil {
+				t.Fatal(err)
+			}
+			engine, _ := sharedEngine()
+			mod, err := wasmtime.NewModule(engine, w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mod.Close()
+			for _, mode := range []searchblock.Mode{searchblock.Off, searchblock.Fresh} {
+				for _, in := range splitInputs {
+					checkUnicodeFindFrom(t, oracle, mod, sizes, in, mode)
+					checkUnicodeFindIteration(t, re, mod, sizes, in, mode)
+				}
+			}
 		})
 	}
 	// `^(\pL+)=(\pL+)` IS its groups export: its capture body walks the
@@ -2437,6 +2627,11 @@ func TestBatchGroupsMatchesGo(t *testing.T) {
 		{`(a)(b)`, "abXab"},
 		{`\b(foo)`, "foofoo"},
 		{`(a*)`, "bab"},
+		// No empty match: the loop counts every record and advances to its
+		// end, with no suppression test.
+		{`(a)(b?)`, "ab abab b a"},
+		{`(\w+)=(\w+)`, "a=b&cc=dd&=x&y="},
+		{`(x)(?:[a-z]*y)?`, "xaxy xx xay"},
 	} {
 		t.Run(c.pat+"/"+c.input, func(t *testing.T) {
 			re := regexp.MustCompile(c.pat)
@@ -2523,6 +2718,83 @@ type batchGroupsRecord struct {
 
 func (r batchGroupsRecord) String() string {
 	return fmt.Sprintf("[%d,%d) slots=%v", r.start, r.end, r.slots)
+}
+
+// TestRemovedGroupSlotsAreWritten: a group Go's Simplify removes — `(b){0}`,
+// which can never take part — still counts in Go's NumSubexp and in every
+// stub's group count, so the groups export writes its slots as -1 and the
+// batch export's records are laid out for it. The module used to count groups
+// from the SIMPLIFIED program: the slots kept whatever the buffer held (the
+// stubs pre-fill, a raw caller read garbage) and a batch record was a group
+// short, so the stubs read every record after the first misaligned. Over a
+// buffer pre-filled with 0x5A, on TDFA, Backtracking and a group removed
+// inside an alternation.
+func TestRemovedGroupSlotsAreWritten(t *testing.T) {
+	for _, c := range []struct{ pat, input string }{
+		{`(a)(b){0}c`, "ac xac"},
+		{`(a+?)(b){0}c`, "ac xaac"},
+		{`x(a|(b){0})`, "xa yxa"},
+	} {
+		t.Run(c.pat, func(t *testing.T) {
+			entry := config.PatternEntry{Regexp: c.pat, GroupsFunc: "groups", Hints: []string{"batch-find"}}
+			w, _, err := compile.Compile([]config.PatternEntry{entry}, pathsTableBase, true)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			store, inst, mem, release, err := instantiate(w)
+			defer release()
+			if err != nil {
+				t.Fatalf("instantiate: %v", err)
+			}
+			if err := setScratchBase(store, inst, int32(pathsTableBase)); err != nil {
+				t.Fatal(err)
+			}
+			re := regexp.MustCompile(c.pat)
+			numGroups := re.NumSubexp() + 1
+			copy(mem.UnsafeData(store)[pathsInputBase:], c.input)
+			rd := func(o int) int32 { return int32(binary.LittleEndian.Uint32(mem.UnsafeData(store)[o:])) }
+			fill := func(at, n int) {
+				buf := mem.UnsafeData(store)
+				for i := 0; i < n; i++ {
+					buf[at+i] = 0x5A
+				}
+			}
+
+			fill(int(pathsOutBase), numGroups*8)
+			if _, err := inst.GetFunc(store, "groups").Call(store, pathsInputBase, int32(len(c.input)), pathsOutBase, int32(0)); err != nil {
+				t.Fatal(err)
+			}
+			want := re.FindStringSubmatchIndex(c.input)
+			for s := range want {
+				if got := rd(int(pathsOutBase) + 4*s); got != int32(want[s]) {
+					t.Errorf("groups: slot %d = %#x, want %d (Go: %v)", s, got, want[s], want)
+				}
+			}
+
+			batchOut := int(pathsOutBase) + 1024
+			recordSize := 8 + numGroups*8
+			fill(batchOut, 4*recordSize)
+			res, err := inst.GetFunc(store, "groups_batch").Call(store, pathsInputBase, int32(len(c.input)), int32(batchOut), int32(4), int32(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			all := re.FindAllStringSubmatchIndex(c.input, -1)
+			if n := int(res.(int32)); n != len(all) {
+				t.Fatalf("groups_batch: %d records, want %d", n, len(all))
+			}
+			for i, m := range all {
+				base := batchOut + i*recordSize
+				if rd(base) != int32(m[0]) || rd(base+4) != int32(m[1]) {
+					t.Errorf("record %d extent = [%d,%d), want [%d,%d)", i, rd(base), rd(base+4), m[0], m[1])
+				}
+				for s := range m {
+					if got := rd(base + 8 + 4*s); got != int32(m[s]) {
+						t.Errorf("record %d slot %d = %#x, want %d (Go: %v)", i, s, got, m[s], m)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestBatchGroupsAbsoluteSlotsSurviveAGroupsCall(t *testing.T) {
@@ -3102,6 +3374,12 @@ patterns:
     regexp: 'a.c'
     unicode: true
     find_func: find_dot
+  - name: longs
+    regexp: '(?i)ſ'
+    find_func: find_longs
+  - name: kelvin
+    regexp: '(?i)\x{212A}elvin'
+    find_func: find_kelvin
 `
 	path := filepath.Join(t.TempDir(), "uni.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
@@ -3142,6 +3420,11 @@ patterns:
 		{"find_prefix", `(?:ü|ö)xyz`, []string{"üxyz", "aöxyz üxyz", "xyz", "uxyz"}},
 		{"find_alt", `[à-ÿ]foo|[α-ω]bar`, []string{"àfoo", "αbar", "ÿfoo ωbar àbaz", "afoo", "日foo"}},
 		{"find_dot", `a.c`, []string{"aéc a日c abc a😀c axyc", "ac"}},
+		// A folded literal writing ſ / the Kelvin sign: Go stores it as the
+		// orbit's lowest rune (S, K), and these compiled in byte mode, where
+		// the character written never matched.
+		{"find_longs", `(?i)ſ`, []string{"ſ", "s S ſ", "x"}},
+		{"find_kelvin", `(?i)\x{212A}elvin`, []string{"\u212Aelvin", "kelvin KELVIN", "a \u212AELVIN b"}},
 	} {
 		re := regexp.MustCompile(c.pat)
 		f := inst.GetFunc(store, c.fn)
@@ -3626,6 +3909,28 @@ func TestTDFARegisterCoalescingOrdering(t *testing.T) {
 		{pattern: `(b+){3}c`, input: "bbbbc", desc: "rep3"},
 		{pattern: `x(a+){2}y`, input: "xaaay", desc: "prefixed"},
 	})
+}
+
+// A TDFA state's identity includes its threads' PRIORITY order, not only
+// their pcs and registers: a state reached later with the same threads in
+// another order picks a different winner. Without it the second state reused
+// the first one's order, and the last iteration of a captured repeat over a
+// counted repeat with min >= 2 came out wrong — `(a{2,3})+x` over "aaaaaax"
+// gave group 1 = [4,6), Go [3,6). Every spelling of the shape is here, since
+// `{2,3}` simplifies to `aaa?` before the TDFA sees it.
+func TestTDFACountedRepeatLastIteration(t *testing.T) {
+	var cases []tdfaCase
+	for _, p := range []string{`(a{2,3})+x`, `(a{2,3})*x`, `(aaa?)+x`, `(a{2,4})+x`,
+		`(a{3,5})+x`, `(a{2,3}b?)+x`, `(a{2,3}){2,}x`, `((a{2,3}))+x`} {
+		for n := 2; n <= 13; n++ {
+			cases = append(cases, tdfaCase{pattern: p, input: strings.Repeat("a", n) + "x",
+				desc: fmt.Sprintf("%s/%d", p, n)})
+		}
+	}
+	for _, in := range []string{"abcdefg=", "abcdefgh=", "abcdefghij=", "ab="} {
+		cases = append(cases, tdfaCase{pattern: `(\w{2,4})+=`, input: in, desc: `w24/` + in})
+	}
+	checkTDFAGroups(t, cases)
 }
 
 // The TDFA body hand-rolls its transition load instead of using the shared
@@ -4189,6 +4494,10 @@ func TestUnicodeModeSelectedGroupsMatchGo(t *testing.T) {
 		{`((?i:é)|(É))`, []string{"É", "é", "e", "xÉ"}},
 		{`(\pL+)(\pL)`, []string{"Straße", "日本", "é", "ab"}},
 		{`([\pL\pN]+)@(\pL+)\.(\pL{2,})`, []string{"пользователь@пример.рф", "a1@b.cd", "x@y.z", "é@ж.日本"}},
+		// The last iteration of a captured repeat over a counted repeat
+		// (TestTDFACountedRepeatLastIteration), over whole characters.
+		{`(ж{2,3})+x`, []string{"жжx", "жжжжx", "жжжжжx", "жжжжжжx", "жжжжжжжжx"}},
+		{`(\pL{2,4})+=`, []string{"абвгдеж=", "абвгдежз=", "ab=", "абвгдежзий="}},
 	}
 	for _, c := range cases {
 		eng, err := compile.SelectEngine(c.pat, compile.CompileOptions{Unicode: true})

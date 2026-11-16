@@ -296,6 +296,23 @@ func TestLoadConfigLimits(t *testing.T) {
 	if _, err := load(t, "max_split_table_size: -1MB\n"); err == nil {
 		t.Error("max_split_table_size: -1MB loaded, want a refusal")
 	}
+	// The two counts take a whole number of 1 or more, line-numbered
+	// otherwise: `max_tdfa_regs: -5` used to turn TDFA off silently.
+	for _, line := range []string{"max_tdfa_regs: -5\n", "max_tdfa_regs: 0\n", "max_tdfa_regs: 1.5\n", "max_tdfa_regs: \"1\"\n",
+		"max_union_states: -5\n", "max_union_states: 0\n", "max_union_states: 9999999999\n", "max_union_states: [1]\n"} {
+		_, err := load(t, line)
+		if err == nil {
+			t.Errorf("%q: loaded, want a refusal", line)
+			continue
+		}
+		if !strings.Contains(err.Error(), "[2:") {
+			t.Errorf("%q: not a line-numbered error: %v", line, err)
+		}
+	}
+	cfg, err := load(t, "max_tdfa_regs: 48\nmax_union_states: 16384\n")
+	if err != nil || cfg.MaxTDFARegs != 48 || cfg.MaxUnionStates != 16384 {
+		t.Errorf("max_tdfa_regs: 48, max_union_states: 16384: %d, %d, %v", cfg.MaxTDFARegs, cfg.MaxUnionStates, err)
+	}
 }
 
 func TestPatternSelector_UnmarshalYAML_All(t *testing.T) {
@@ -1884,5 +1901,35 @@ func TestLoadConfig_UnicodeKey(t *testing.T) {
 	// mode through IsByteMode.
 	if !(PatternEntry{Unicode: new(false)}).IsByteMode() {
 		t.Error("IsByteMode ignores unicode: false on an entry built in code")
+	}
+}
+
+// TestLoadChecksUTF8AndRegexpSyntax: a config that is not UTF-8, or a regexp
+// that does not parse — top-level or a set's own — is a load error at its line.
+func TestLoadChecksUTF8AndRegexpSyntax(t *testing.T) {
+	for _, c := range []struct{ src, want string }{
+		{"patterns:\n  - regexp: 'ab\xff+'\n    find_func: f\n", `:2:16: byte 0xFF is not valid UTF-8`},
+		{"# ok\npatterns:\n  - regexp: 'a('\n    find_func: f\n", "[3:13] pattern \"a(\": error parsing regexp: missing closing )"},
+		{"patterns:\n  - {regexp: 'x', find_func: f}\nsets:\n  - {name: s, find: g, regexps: ['y', 'z[']}\n", `[4:39] set "s": regexps[1]: error parsing regexp`},
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "c.yaml")
+		if err := os.WriteFile(path, []byte(c.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: err = %v, want %q", c.src, err, c.want)
+		}
+	}
+	if err := checkUTF8([]byte("é\nok")); err != nil {
+		t.Errorf("valid UTF-8 refused: %v", err)
+	}
+	// With no position to name (a config built in code, or text that is not
+	// YAML), the error is the plain message.
+	bad := BuildConfig{Patterns: []PatternEntry{{Regexp: "a("}}}
+	for _, raw := range []string{"", "a: ["} {
+		if err := checkRegexpSyntax([]byte(raw), &bad); err == nil || strings.Contains(err.Error(), "[") && strings.Contains(err.Error(), ":1]") {
+			t.Errorf("raw %q: err = %v, want the plain message", raw, err)
+		}
 	}
 }

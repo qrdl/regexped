@@ -1,10 +1,14 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // urlConfig is the URL pattern built from named pieces, with a set whose own
@@ -147,11 +151,16 @@ func TestExpandReferencesLeavesOrdinaryText(t *testing.T) {
 			t.Errorf("%s was rewritten: %q %+v / %q %v", re, p.Regexp, p.Expanded, s.Regexps[0], s.Expansions)
 		}
 	}
-	// An unterminated class runs to the end, as Go reads it: no reference,
-	// and the syntax error is compile's to report, as for any pattern.
-	cfg0, err := loadCfgSrc(t, "patterns:\n  - {name: x, regexp: 'q'}\n  - {regexp: '[a(?&x)', find_func: f}\n")
-	if err != nil || cfg0.Patterns[1].Expanded != nil {
+	// An unterminated class runs to the end, as Go reads it: no reference is
+	// expanded, and the syntax error is a load error at its line, as for any
+	// pattern.
+	cfg0 := BuildConfig{Patterns: []PatternEntry{{Name: "x", Regexp: "q"}, {Regexp: "[a(?&x)", FindFunc: "f"}}}
+	if err := ExpandReferences(&cfg0); err != nil || cfg0.Patterns[1].Expanded != nil {
 		t.Errorf("unterminated class: %v %+v", err, cfg0.Patterns[1])
+	}
+	if _, err := loadCfgSrc(t, "patterns:\n  - {name: x, regexp: 'q'}\n  - {regexp: '[a(?&x)', find_func: f}\n"); err == nil ||
+		!strings.Contains(err.Error(), "missing closing ]") || !strings.Contains(err.Error(), "[3:") {
+		t.Errorf("unterminated class: err = %v, want the syntax error at line 3", err)
 	}
 	// No "(?&" anywhere: nothing is even scanned.
 	cfg := BuildConfig{Patterns: []PatternEntry{{Name: "a", Regexp: "(?i)a"}}}
@@ -383,5 +392,106 @@ func TestPatternEntryNames(t *testing.T) {
 		if got := c.e.Owner(); got != c.owner {
 			t.Errorf("%+v: Owner = %q, want %q", c.e, got, c.owner)
 		}
+	}
+}
+
+// doublingChain is p0 'ab' and p_i = (?&p_{i-1})(?&p_{i-1}), the last one
+// exported: its expansion doubles with every level.
+func doublingChain(depth int, extra string) string {
+	var b strings.Builder
+	b.WriteString(extra + "patterns:\n  - {name: p0, regexp: 'ab'}\n")
+	for i := 1; i <= depth; i++ {
+		b.WriteString("  - {name: p" + itoa(i) + ", regexp: '(?&p" + itoa(i-1) + ")(?&p" + itoa(i-1) + ")'}\n")
+	}
+	b.WriteString("  - {regexp: '(?&p" + itoa(depth) + ")', find_func: f}\n")
+	return b.String()
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+// TestExpandReferencesDoublingChainIsCapped: a 24-level doubling chain is a
+// load error naming max_regexp_size, returned at once and without building
+// the text: past 20 levels it took over 2 GB. The error names the first
+// pattern past the cap and the size to raise it to.
+func TestExpandReferencesDoublingChainIsCapped(t *testing.T) {
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
+	start := time.Now()
+	_, err := loadCfgSrc(t, doublingChain(24, ""))
+	d := time.Since(start)
+	runtime.ReadMemStats(&m1)
+	if err == nil || !strings.Contains(err.Error(), "max_regexp_size") || !strings.Contains(err.Error(), `pattern "p17"`) {
+		t.Fatalf("err = %v, want the max_regexp_size error naming p17", err)
+	}
+	if d > 2*time.Second {
+		t.Errorf("took %v", d)
+	}
+	if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 64<<20 {
+		t.Errorf("allocated %d MB to refuse it", alloc>>20)
+	}
+}
+
+// TestExpandReferencesBookkeepingIsLinear: the per-use record used to double
+// with every level of a doubling chain (~1.6 KB per expanded byte, 1 GB at
+// depth 16); now a piece is recorded once per chain of users. Depth 16 is
+// 655 KB of text, under the default cap.
+func TestExpandReferencesBookkeepingIsLinear(t *testing.T) {
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
+	cfg, err := loadCfgSrc(t, doublingChain(16, ""))
+	runtime.ReadMemStats(&m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := cfg.Patterns[len(cfg.Patterns)-1]
+	if n := len(last.Regexp); n != 655356 {
+		t.Fatalf("expanded to %d bytes, want 655356", n)
+	}
+	if n := len(last.Expanded.Pieces); n != 17 {
+		t.Errorf("%d pieces recorded, want 17: p16 used directly, p0..p15 through it", n)
+	}
+	if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 64<<20 {
+		t.Errorf("allocated %d MB, was 1,027 MB", alloc>>20)
+	}
+}
+
+// TestMaxRegexpSize: the key raises the cap, lowers it, and also refuses a
+// regexp WRITTEN past it, with no reference involved.
+func TestMaxRegexpSize(t *testing.T) {
+	if _, err := loadCfgSrc(t, doublingChain(18, "max_regexp_size: 4MiB\n")); err != nil {
+		t.Errorf("depth 18 (2.6 MB) under max_regexp_size: 4MiB: %v", err)
+	}
+	_, err := loadCfgSrc(t, doublingChain(4, "max_regexp_size: 40\n"))
+	if err == nil || !strings.Contains(err.Error(), "over max_regexp_size (40, 40 bytes)") {
+		t.Errorf("depth 4 under max_regexp_size: 40: %v", err)
+	}
+	_, err = loadCfgSrc(t, "max_regexp_size: 10\npatterns:\n  - {regexp: 'abcdefghijkl', find_func: f}\n")
+	if err == nil || !strings.Contains(err.Error(), "is 12 bytes") || !strings.Contains(err.Error(), "at least 12") {
+		t.Errorf("a 12-byte regexp under max_regexp_size: 10: %v", err)
+	}
+	if _, err := loadCfgSrc(t, "max_regexp_size: lots\npatterns:\n  - {regexp: 'a', find_func: f}\n"); err == nil {
+		t.Error("max_regexp_size: lots was accepted")
+	}
+	// A set's own regexp is held to the cap too.
+	_, err = loadCfgSrc(t, "max_regexp_size: 10\nsets:\n  - {name: s, find: f, regexps: ['abcdefghijkl']}\n")
+	if err == nil || !strings.Contains(err.Error(), `set "s" regexps[0]: is 12 bytes`) {
+		t.Errorf("a set's 12-byte regexp under max_regexp_size: 10: %v", err)
+	}
+	// The size is computed BEFORE the text is built, so it must be the built
+	// size exactly: a cap of that size loads, one byte less does not, and the
+	// error states that size.
+	cfg, err := loadCfgSrc(t, doublingChain(6, "max_regexp_size: 1MiB\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := len(cfg.Patterns[len(cfg.Patterns)-1].Regexp)
+	if _, err := loadCfgSrc(t, doublingChain(6, fmt.Sprintf("max_regexp_size: %d\n", n))); err != nil {
+		t.Errorf("a cap of the expanded size %d was refused: %v", n, err)
+	}
+	_, err = loadCfgSrc(t, doublingChain(6, fmt.Sprintf("max_regexp_size: %d\n", n-1)))
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("is %d bytes", n)) {
+		t.Errorf("a cap one byte under the expanded size %d: %v", n, err)
 	}
 }

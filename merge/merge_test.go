@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,11 +63,19 @@ func TestModuleNameForWasm(t *testing.T) {
 	}
 }
 
-// recordedModule is an empty module carrying an import_module record.
+// recordedModule is an embedded module (see embeddedModule) carrying an
+// import_module record.
 func recordedModule(name string) []byte {
 	c := append([]byte{byte(len(abi.ImportModuleSection))}, abi.ImportModuleSection...)
 	c = append(c, name...)
-	return append(append([]byte("\x00asm\x01\x00\x00\x00"), 0, byte(len(c))), c...)
+	return append(embeddedModule(), append([]byte{0, byte(len(c))}, c...)...)
+}
+
+// embeddedModule is a module whose only content is the import of the host's
+// memory, main.memory, which is what merge requires of a regexp module.
+func embeddedModule() []byte {
+	imp := []byte{1, 4, 'm', 'a', 'i', 'n', 6, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, 0x01}
+	return append(append([]byte("\x00asm\x01\x00\x00\x00"), 2, byte(len(imp))), imp...)
 }
 
 // TestCmdMergeRefusesDuplicateModuleNames: two regexp modules under one name
@@ -105,7 +114,7 @@ func TestCmdMergeRefusesDuplicateModuleNames(t *testing.T) {
 		files []string
 	}{
 		{"same recorded name", []string{write("c.wasm", recordedModule("same")), write("d.wasm", recordedModule("same"))}},
-		{"no record, one config", []string{write("e.wasm", []byte("mock")), write("f.wasm", []byte("mock"))}},
+		{"no record, one config", []string{write("e.wasm", embeddedModule()), write("f.wasm", embeddedModule())}},
 		{"named main", []string{write("g.wasm", recordedModule("main"))}},
 	} {
 		if err := CmdMerge(cfg, mainWasm, out, c.files); err == nil || !strings.Contains(err.Error(), "both named") {
@@ -130,7 +139,7 @@ func TestCmdMerge(t *testing.T) {
 		if err := os.WriteFile(mainWasm, []byte("mock"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(regexWasm, []byte("mock"), 0o644); err != nil {
+		if err := os.WriteFile(regexWasm, embeddedModule(), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := CmdMerge(cfg, mainWasm, output, []string{regexWasm}); err != nil {
@@ -253,9 +262,9 @@ func TestCmdMergeReportsToolFailure(t *testing.T) {
 	// which is exactly the shape of a wasm-merge that refused its inputs.
 	cfg := config.BuildConfig{WasmMergePath: lookPath(t, "false")}
 	err := CmdMerge(cfg, filepath.Join(dir, "main.wasm"),
-		filepath.Join(dir, "out.wasm"), []string{filepath.Join(dir, "re.wasm")})
-	if err == nil {
-		t.Fatal("reported success though the merge tool exited non-zero")
+		filepath.Join(dir, "out.wasm"), []string{writeEmbedded(t, dir)})
+	if err == nil || !strings.Contains(err.Error(), "wasm-merge") {
+		t.Fatalf("err = %v; want the merge tool's non-zero exit reported", err)
 	}
 }
 
@@ -266,12 +275,68 @@ func TestCmdMergeReportsMissingOutput(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.BuildConfig{WasmMergePath: lookPath(t, "true")}
 	err := CmdMerge(cfg, filepath.Join(dir, "main.wasm"),
-		filepath.Join(dir, "out.wasm"), []string{filepath.Join(dir, "re.wasm")})
+		filepath.Join(dir, "out.wasm"), []string{writeEmbedded(t, dir)})
 	if err == nil {
 		t.Fatal("reported success though no output file was produced")
 	}
 	if !strings.Contains(err.Error(), "stat") {
 		t.Errorf("error %q does not explain that the output is missing", err)
+	}
+}
+
+// writeEmbedded writes embeddedModule to dir/re.wasm.
+func writeEmbedded(t *testing.T, dir string) string {
+	t.Helper()
+	p := filepath.Join(dir, "re.wasm")
+	if err := os.WriteFile(p, embeddedModule(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestCmdMergeRefusesStandaloneModule: a regexp module that does not import
+// the host's memory was compiled STANDALONE (its config has no `output:`) and
+// reads its input from its own memory — merged, it answered -1 where the
+// answer is 5. merge refuses it, naming the file and the fix, before
+// wasm-merge runs; a file it cannot read is an error too.
+func TestCmdMergeRefusesStandaloneModule(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGEXPED_MOCK_WASM_MERGE", "1")
+	dir := t.TempDir()
+	argv := filepath.Join(dir, "argv")
+	t.Setenv("REGEXPED_MOCK_ARGV", argv)
+	cfg := config.BuildConfig{WasmMergePath: exe, ImportModule: "re",
+		Patterns: []config.PatternEntry{{Name: "p", Regexp: `ab+c`, FindFunc: "p_find"}}}
+	standalone := filepath.Join(dir, "standalone.wasm")
+	if err := compile.CmdCompile(cfg, standalone); err != nil { // no output: → standalone
+		t.Fatalf("compile: %v", err)
+	}
+	mainWasm := filepath.Join(dir, "main.wasm")
+	if err := os.WriteFile(mainWasm, []byte("mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "out.wasm")
+	err = CmdMerge(cfg, mainWasm, out, []string{standalone})
+	if err == nil || !strings.Contains(err.Error(), standalone) || !strings.Contains(err.Error(), "output:") {
+		t.Fatalf("err = %v; want the standalone module refused, naming it and `output:`", err)
+	}
+	if _, err := os.Stat(argv); err == nil {
+		t.Error("wasm-merge ran although a module was refused")
+	}
+	if err := CmdMerge(cfg, mainWasm, out, []string{filepath.Join(dir, "missing.wasm")}); err == nil ||
+		!strings.Contains(err.Error(), "missing.wasm") {
+		t.Errorf("err = %v; want the unreadable module reported", err)
+	}
+	cfg.Output = filepath.Join(dir, "merged.wasm")
+	embedded := filepath.Join(dir, "embedded.wasm")
+	if err := compile.CmdCompile(cfg, embedded); err != nil {
+		t.Fatalf("compile embedded: %v", err)
+	}
+	if err := CmdMerge(cfg, mainWasm, out, []string{embedded}); err != nil {
+		t.Errorf("an embedded module was refused: %v", err)
 	}
 }
 
@@ -667,3 +732,57 @@ patterns:
 		}
 	}
 }
+
+// TestCmdMergeToStdout: `-o -` merges into a temporary file and copies it to
+// stdout, for modules and components alike (both tools write files), and
+// leaves no file named "-" behind.
+func TestCmdMergeToStdout(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGEXPED_MOCK_WASM_MERGE", "1")
+	dir := t.TempDir()
+	mainWasm := filepath.Join(dir, "main.wasm")
+	regexWasm := filepath.Join(dir, "regexp.wasm")
+	if err := os.WriteFile(mainWasm, []byte("mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(regexWasm, embeddedModule(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	t.Chdir(dir)
+	if err := CmdMerge(config.BuildConfig{WasmMergePath: exe}, mainWasm, "-", []string{regexWasm}); err != nil {
+		t.Fatalf("CmdMerge: %v", err)
+	}
+	if buf.String() != "mock" {
+		t.Errorf("stdout = %q, want the merged module", buf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "-")); err == nil {
+		t.Error(`a file named "-" was written`)
+	}
+
+	// A merge that fails reports its own error; one that writes nothing, and a
+	// stdout that refuses the bytes, are errors too.
+	if err := CmdMerge(config.BuildConfig{WasmMergePath: filepath.Join(dir, "missing")}, mainWasm, "-", []string{regexWasm}); err == nil {
+		t.Error("a failed merge to stdout reported success")
+	}
+	if err := toStdout(func(string) error { return nil }); err == nil {
+		t.Error("a merge that wrote no file reported success")
+	}
+	stdout = failingWriter{}
+	if err := toStdout(func(tmp string) error { return os.WriteFile(tmp, []byte("x"), 0o644) }); err == nil || !strings.Contains(err.Error(), "write stdout") {
+		t.Errorf("a refused stdout: err = %v", err)
+	}
+	t.Setenv("TMPDIR", filepath.Join(dir, "no-such-dir"))
+	if err := toStdout(func(string) error { return nil }); err == nil {
+		t.Error("a temporary directory that cannot be made reported success")
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, os.ErrClosed }

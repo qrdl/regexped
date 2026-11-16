@@ -988,8 +988,22 @@ func TestJSStubDrivesTheAnswerCache(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not on PATH; the JS cache path is not driven here")
 	}
+	for _, batch := range []bool{false, true} {
+		t.Run(map[bool]string{false: "find", true: "batch"}[batch], func(t *testing.T) { jsStubDrivesTheAnswerCache(t, batch) })
+	}
+}
+
+// jsStubDrivesTheAnswerCache is TestJSStubDrivesTheAnswerCache for one find
+// shape: the plain generator, or the batching one (`hints: [batch-find]`). The
+// region is handed over lazily, when the module asks, in both.
+func jsStubDrivesTheAnswerCache(t *testing.T, batch bool) {
 	cfg := ovSizingCfg()
 	cfg.Output = ""
+	export := "scan_ov"
+	if batch {
+		cfg.Sets[0].Hints = []string{"batch-find"}
+		export = config.SetBatchExportName("scan_ov")
+	}
 	wasm, _, err := compile.CompileFile(cfg, "")
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -1010,7 +1024,7 @@ WebAssembly.instantiate = async (w, imp) => {
     const r = await instantiate(w, imp);
     const ex = r.instance.exports;
     mem = ex.memory;
-    const wrapped = { ...ex, scan_ov: (...a) => { scratch = a[3]; return ex.scan_ov(...a); } };
+    const wrapped = { ...ex, ` + export + `: (...a) => { scratch = a[3]; return ex.` + export + `(...a); } };
     return { instance: { exports: wrapped } };
 };
 const { init, scan_ov } = await import('./stubs.js');
@@ -1067,11 +1081,21 @@ func TestJSStubSurvivesAFailedGrow(t *testing.T) {
 	}
 	writeESMPackageJSON(t, dir)
 	// A stand-in with a 20-page ceiling: 100 KB of input fits, its answer cache
-	// does not.
+	// does not. Its first call asks for the region, as the module does when
+	// it would start using it; the second requires the region declined — the
+	// descriptor still the header alone, its lazy word cleared — and answers
+	// "finished", or -2 (which the stub throws on) when it was not.
 	wat := `(module
   (memory (export "memory") 2 20)
+  (global $calls (mut i32) (i32.const 0))
   (func (export "scan_ov") (param i32 i32 i32 i32 i32 i32) (result i32)
-    i32.const -1)
+    (global.set $calls (i32.add (global.get $calls) (i32.const 1)))
+    (if (i32.eq (global.get $calls) (i32.const 1)) (then (return (i32.const -7))))
+    (if (i32.and
+          (i32.eq (i32.load offset=12 (local.get 3)) (i32.const 48))
+          (i32.eqz (i32.load offset=44 (i32.load offset=8 (local.get 3)))))
+      (then (return (i32.const -1))))
+    i32.const -2)
   (func (export "which_secret") (param i32 i32) (result i32)
     i32.const -1))
 `
@@ -1109,6 +1133,9 @@ try {
 		t.Fatalf("node: %v\n%s", err, out)
 	}
 	t.Logf("%s", out)
+	if !strings.Contains(string(out), "scan: walked, 0") {
+		t.Errorf("a refused region was not declined in the header:\n%s", out)
+	}
 	if !strings.Contains(string(out), "ONESHOT-OK") {
 		t.Fatalf("a failed grow for one iterator's cache bricked the instance:\n%s", out)
 	}
@@ -1233,7 +1260,203 @@ sets:
 		if got := invoke("refusals"); got != "0" {
 			t.Errorf("%s: set_cache's refusals check reported %s, want 0", tc.flag, got)
 		}
+		// The region is allocated only when the module asks for it, and a
+		// malloc that refuses it leaves the header alone: the drive walks,
+		// with the same answer.
+		if got := invoke("declined"); got != want {
+			t.Errorf("%s: with the region refused the C stub reported %s tuples, Go reports %s", tc.flag, got, want)
+		}
+		if got := invoke("declined_ready"); got != map[string]string{"-DRX_SET_CACHE=1": "-1", "-DRX_SET_CACHE=0": "-2"}[tc.flag] {
+			t.Errorf("%s: with the region refused the ready word is %s", tc.flag, got)
+		}
 	}
+}
+
+// TestStubsAllocateTheAnswerCacheLazily RUNS the Rust, Go and AssemblyScript
+// stubs' overlapping find over a drive that engages the answer cache. Each
+// starts with the header alone, its lazy word set, and allocates the region
+// only when the module asks for it: the answer must be Go's, and the header's
+// `ready` word 1 — a header alone cannot be swept, so 1 says the region was
+// handed over. Rust allocates fallibly, and a refused allocation is checked
+// too, by forcing the refusal in the generated source: the drive must still
+// be Go's answer, walked, with `ready` -1.
+func TestStubsAllocateTheAnswerCacheLazily(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs merged modules; skipped in -short")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	bin := filepath.Join(t.TempDir(), "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	want := strconv.Itoa(overlapOracle(t, ovSizingCfg(), cacheDriveInput()))
+	// setup writes the config for stub, compiles and generates, and returns
+	// the directory and the generated stub's text.
+	setup := func(t *testing.T, stub string) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		stubType := ""
+		if strings.HasSuffix(stub, ".ts") {
+			stubType = "stub_type: as\n"
+		}
+		cfg := `import_module: demo
+wasm_file: re.wasm
+output: merged.wasm
+` + stubType + `stub_file: ` + stub + `
+wasm_merge_path: '` + merge + `'
+patterns:
+  - name: lower
+    regexp: '[a-z]+'
+  - name: alnum
+    regexp: '[a-z0-9]+x?'
+  - name: word
+    regexp: '\w+'
+sets:
+  - name: ov
+    patterns: all
+    find: scan_ov
+    overlapping: true
+`
+		if err := os.WriteFile(filepath.Join(dir, "regexped.yaml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+		run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+		src, err := os.ReadFile(filepath.Join(dir, stub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dir, string(src)
+	}
+	patch := func(t *testing.T, src, old, new string) string {
+		t.Helper()
+		if strings.Count(src, old) != 1 {
+			t.Fatalf("the generated stub does not hold %q exactly once", old)
+		}
+		return strings.Replace(src, old, new, 1)
+	}
+	write := func(t *testing.T, dir, name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// runMerged merges guest.wasm with the regexp module and runs it, with
+	// args (an --invoke, or nothing for a command), returning stdout.
+	runMerged := func(t *testing.T, dir string, args ...string) string {
+		t.Helper()
+		run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+		cmd := exec.Command("wasmtime", append(append([]string{"run"}, args...), "merged.wasm")...)
+		cmd.Dir = dir
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("wasmtime: %v\n%s%s", err, out, stderr.String())
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	t.Run("rust", func(t *testing.T) {
+		if _, err := exec.LookPath("rustc"); err != nil {
+			t.Skip("rustc not on PATH")
+		}
+		if out, err := exec.Command("rustc", "--print", "target-libdir", "--target", "wasm32-wasip1").Output(); err != nil {
+			t.Skip("no wasm32-wasip1 target for rustc")
+		} else if _, err := os.Stat(strings.TrimSpace(string(out))); err != nil {
+			t.Skip("the wasm32-wasip1 target is not installed")
+		}
+		for _, tc := range []struct {
+			name, ready string
+			refuse      bool
+		}{{"granted", "1", false}, {"refused", "-1", true}} {
+			t.Run(tc.name, func(t *testing.T) {
+				dir, src := setup(t, "stubs.rs")
+				src = patch(t, src, "    cache: Vec<u32>,\n", "    pub cache: Vec<u32>,\n")
+				if tc.refuse {
+					src = patch(t, src, "if v.try_reserve_exact(words).is_ok() {", "if false && v.try_reserve_exact(words).is_ok() {")
+				}
+				write(t, dir, "stubs.rs", src)
+				write(t, dir, "main.rs", `include!("stubs.rs");
+fn main() {
+    let mut s = String::new();
+    for _ in 0..2000 { s.push_str(&"a".repeat(50)); s.push(' '); }
+    let mut it = demo::scan_ov(s.as_bytes(), 0);
+    let mut n = 0;
+    while let Some(m) = it.next() { m.unwrap(); n += 1; }
+    println!("{} {}", n, it.cache.get(2).map(|w| *w as i32).unwrap_or(-100));
+}
+`)
+				run(t, dir, nil, "rustc", "--edition=2021", "--target", "wasm32-wasip1", "-O", "-A", "warnings", "-o", "guest.wasm", "main.rs")
+				if got := runMerged(t, dir); got != want+" "+tc.ready {
+					t.Errorf("tuples and ready word = %q, want %q", got, want+" "+tc.ready)
+				}
+			})
+		}
+	})
+
+	t.Run("go", func(t *testing.T) {
+		dir, _ := setup(t, "stubs.go")
+		write(t, dir, "go.mod", "module guest\n\ngo 1.23\n")
+		write(t, dir, "main.go", `//go:build wasip1
+
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	in := []byte(strings.Repeat(strings.Repeat("a", 50)+" ", 2000))
+	it := scan_ov(in, 0)
+	n := 0
+	for range it.Matches() {
+		n++
+	}
+	if it.Err() != nil {
+		fmt.Println("error", it.Err())
+		return
+	}
+	fmt.Println(n, int32(it.cache[2]))
+}
+`)
+		run(t, dir, []string{"GOOS=wasip1", "GOARCH=wasm", "GOFLAGS=-mod=mod"}, "go", "build", "-o", "guest.wasm", ".")
+		if got := runMerged(t, dir); got != want+" 1" {
+			t.Errorf("tuples and ready word = %q, want %q", got, want+" 1")
+		}
+	})
+
+	t.Run("as", func(t *testing.T) {
+		if _, err := exec.LookPath("asc"); err != nil {
+			t.Skip("asc not on PATH")
+		}
+		dir, _ := setup(t, "stubs.ts")
+		write(t, dir, "guest.ts", `import { scan_ov } from "./stubs";
+
+export function tuples(): i32 {
+    let s = "";
+    for (let i = 0; i < 2000; i++) s += "a".repeat(50) + " ";
+    const it = scan_ov(String.UTF8.encode(s), 0);
+    let n = 0;
+    while (it.next() != null) n++;
+    if (it.err() != 0) return it.err();
+    // The tuple count, or -1000 less a ready word other than 1.
+    const ready = <i32>it.cache[2];
+    return ready == 1 ? n : -1000 - ready;
+}
+`)
+		run(t, dir, nil, "asc", "guest.ts", "--outFile", "guest.wasm", "--runtime", "stub", "--use", "abort=", "--exportStart", "_initialize")
+		if got := runMerged(t, dir, "--invoke", "tuples"); got != want {
+			t.Errorf("the AssemblyScript stub reported %s tuples, Go reports %s", got, want)
+		}
+	})
 }
 
 // TestCStubsMergeTwoModulesWithNotes RUNS a merged program of TWO regexp
@@ -1622,9 +1845,11 @@ const cCacheGuest = `#include "stubs.h"
 
 static unsigned char arena[8 << 20];
 static size_t used;
+/* Above it malloc refuses, as an exhausted heap does. */
+static size_t refuse_over = (size_t)-1;
 void *malloc(size_t n) {
     size_t at = (used + 7) & ~(size_t)7;
-    if (at + n > sizeof arena) return 0;
+    if (n > refuse_over || at + n > sizeof arena) return 0;
     used = at + n;
     return arena + at;
 }
@@ -1644,7 +1869,8 @@ static int drive(void) {
     rx_set_match_t buf[OV_PATTERN_COUNT];
     int total = 0, got;
     while ((got = scan_ov(&sc, buf, OV_PATTERN_COUNT)) > 0) total += got;
-    ready_word = sc.cache ? sc.cache[2] : 0xFFFFFFFEu;
+    /* The region the module asked for, else the header handed over alone. */
+    ready_word = sc.cache ? sc.cache[2] : sc.cache_words ? sc.cache_hdr[2] : 0xFFFFFFFEu;
     scan_ov_free(&sc);
     return got < 0 ? got : total;
 }
@@ -1654,6 +1880,13 @@ int run(void) { return drive(); }
 
 __attribute__((export_name("ready")))
 unsigned ready(void) { drive(); return ready_word; }
+
+/* The same drive with the region refused: the module walks. */
+__attribute__((export_name("declined")))
+int declined(void) { refuse_over = 4096; int r = drive(); refuse_over = (size_t)-1; return r; }
+
+__attribute__((export_name("declined_ready")))
+unsigned declined_ready(void) { declined(); return ready_word; }
 
 /* The caller's own buffer, handed over with _set_cache: the -nostdlib route. */
 static unsigned char cmem[4 << 20];
@@ -1700,3 +1933,81 @@ int refusals(void) {
     return 0;
 }
 `
+
+// TestCInitAcceptsNullEmptyInput: (NULL, 0) is C's usual spelling of an empty
+// buffer, and every _init takes it as the empty input — a find, a find with
+// search notes, a groups scan and a set scanner — while NULL with a length is
+// still RX_ERR_NULL_ARG.
+func TestCInitAcceptsNullEmptyInput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi")
+	}
+	if _, err := exec.LookPath("wasmtime"); err != nil {
+		t.Skip("wasmtime not on PATH")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `import_module: nulls
+wasm_file: re.wasm
+output: merged.wasm
+stub_file: stubs.h
+wasm_merge_path: '`+merge+`'
+patterns:
+  - {name: star, regexp: 'a*', find_func: star_find}
+  - {name: overrun, regexp: 'a*b|a', find_func: ov_find}
+  - {name: grp, regexp: '(a*)', groups_func: grp}
+sets:
+  - {name: s, patterns: [star], find: scan_s}
+`)
+	write("guest.c", `#include "stubs.h"
+__attribute__((export_name("nulls")))
+int nulls(void) {
+    rx_star_find_iter_t a; rx_ov_find_iter_t b; rx_grp_iter_t g; rx_s_scanner_t s;
+    rx_match_t m; rx_group_t gs[GRP_GROUPS]; rx_set_match_t sm[4];
+    if (star_find_init(&a, 0, 0, 0) != 0) return 1;
+    if (star_find_next(&a, &m) != 1 || m.start != 0 || m.end != 0) return 2;
+    if (ov_find_init(&b, 0, 0, 0) != 0) return 3;
+    if (ov_find_next(&b, &m) != 0) return 4;
+    ov_find_free(&b);
+    if (grp_init(&g, 0, 0, 0) != 0) return 5;
+    if (grp_next(&g, gs) != 1 || gs[1].start != 0) return 6;
+    if (scan_s_init(&s, 0, 0, 0) != 0) return 7;
+    if (scan_s(&s, sm, 4) != 1) return 8;
+    scan_s_free(&s);
+    if (star_find_init(&a, 0, 3, 0) != RX_ERR_NULL_ARG) return 9;
+    if (scan_s_init(&s, 0, 3, 0) != RX_ERR_NULL_ARG) return 10;
+    return 0;
+}
+`)
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=0", "-o", "guest.wasm", "guest.c", "stubs.c")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	cmd := exec.Command("wasmtime", "run", "--invoke", "nulls", "merged.wasm")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "0" {
+		t.Errorf("nulls = %s, want 0 (the failing step's number otherwise)", got)
+	}
+}

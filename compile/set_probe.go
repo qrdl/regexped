@@ -708,8 +708,8 @@ func genAnchoredWASM(t *dfaTable, tableBase int64, tableMemIdx int, patternIDs [
 		dataBytes = append(dataBytes, layoutRaw...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, tabs.midOff, tabs.data)...)
 		dataBytes = append(dataBytes, appendDataSegment(nil, idMapOff, idMap)...)
-		// One zero byte at the top of the scratch so utils.WasmMemTop and the
-		// harnesses see the reservation — see genSuffixWASM for why a region
+		// One zero byte at the top of the scratch so the harnesses (utils.ParseDataSectionBytes)
+		// see the reservation — see genSuffixWASM for why a region
 		// nothing declares gets the caller's input written over it.
 		dataBytes = append(dataBytes, appendDataSegment(nil, scratch.end-1, []byte{0})...)
 		dataSegCount = layoutCount + 3

@@ -26,7 +26,7 @@ type SetDiag struct {
 	Name string `json:"name"`
 	// Mode is the mode the set runs in, "byte" or "unicode" (resolveSetMode).
 	Mode     string `json:"mode"`
-	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"
+	Frontend string `json:"frontend"` // "packed-pair", "teddy", "ac", "shufti", "scalar"; "none" for a set with only match_any / match_all
 	// Capabilities lists the set's declared capability keys, in the
 	// canonical grid order.
 	Capabilities []string `json:"capabilities,omitempty"`

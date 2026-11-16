@@ -63,13 +63,17 @@ const (
 	// over budget.
 	repCache    = 20
 	repCacheLen = 24
+	// repCacheFull is the whole region's size. The constructor reserves the
+	// header alone, its lazy word set, and `next` reserves this much when the
+	// module asks for it (abi.OverlapCacheWanted).
+	repCacheFull = 28
 
 	// The SCRATCH DESCRIPTOR the `find` export takes in place of a bare gate
 	// pointer (internal/abi), carried INLINE here rather than allocated
 	// separately: the representation never moves — it is ours, and the handle
 	// holds it — so the gate pointer it contains cannot go stale, and the
 	// constructor can fill it once.
-	repScratch = 28
+	repScratch = 32
 	repBytes   = repScratch + abi.FindScratchBytes
 	// A set whose split members keep search blocks carries the descriptor's
 	// fifth field — the blocks, allocated by the constructor — and is that
@@ -408,10 +412,7 @@ type setScannerCtor struct {
 	reallocIdx     int
 	resNewIdx      int
 	callListGlobal uint32
-	// heapGlobal is the allocator's heap top, which the cache's reserve check
-	// reads (emitTryReserve).
-	heapGlobal uint32
-	idSpace    int
+	idSpace        int
 	// cells is the sweep column's width and pats the BUCKET's pattern count,
 	// zero when the set gets no sweep.
 	cells int32
@@ -434,17 +435,16 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	)
 	alloc := newLocalAlloc(3)
 	var (
-		lRep      = alloc.I32()
-		lGate     = alloc.I32()
-		lCopy     = alloc.I32()
-		lChain    = alloc.I32()
-		lCache    = alloc.I32()
-		lCacheLen = alloc.I32()
+		lRep   = alloc.I32()
+		lGate  = alloc.I32()
+		lCopy  = alloc.I32()
+		lChain = alloc.I32()
+		lCache = alloc.I32()
 		// i64 working values for the cache sizing.
 		lM     = alloc.I64()
 		lK     = alloc.I64()
 		lBytes = alloc.I64()
-		lNeed  = alloc.I64() // the cache's reserve check (emitTryReserve)
+		lNeed  = alloc.I64() // the region with the program sweep's part
 	)
 	var lSweepB byte // the program sweep's bytes, only when it has one
 	if c.sweepCells > 0 {
@@ -562,6 +562,8 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = storeI32(b, repCache)
 	b = append(b, 0x20, lRep, 0x41, 0x00)
 	b = storeI32(b, repCacheLen)
+	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = storeI32(b, repCacheFull)
 
 	if cells > 0 || c.sweepCells > 0 {
 		if c.sweepCells > 0 {
@@ -595,21 +597,20 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		// most the budget rather than up to twice it.
 		b = append(b, 0x20, lBytes, 0x42, 0x08, 0x7C, 0x42)
 		b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
-		b = append(b, 0x58) // i64.le_u -> within budget
-		// …and the allocator can serve it: a refused grow (max_memory)
-		// DECLINES the cache, as a module build's stub does, rather than
-		// trapping the constructor.
-		b = append(b, 0x04, 0x7F) // if (result i32)
-		b = emitTryReserve(b, c.heapGlobal, lBytes, lNeed)
-		b = append(b, 0x05, 0x41, 0x00, 0x0B)
+		b = append(b, 0x58)       // i64.le_u -> within budget
 		b = append(b, 0x04, 0x40) // if
-		b = append(b, 0x20, lBytes, 0xA7)
-		b = append(b, 0x21, lCacheLen)
-		b = callReallocDyn(b, reallocIdx, 4, lCacheLen)
+		// The HEADER alone, its lazy word set: `next` reserves the region —
+		// checking first that the allocator can serve it, so a refused grow
+		// (max_memory) declines the cache rather than trapping — when the
+		// module asks for it, and most drives never do.
+		b = append(b, 0x20, lRep, 0x20, lBytes, 0xA7)
+		b = storeI32(b, repCacheFull)
+		b = callRealloc(b, reallocIdx, 4, int32(ckptHdrBytes))
 		b = append(b, 0x21, lCache)
 		b = append(b, 0x20, lRep, 0x20, lCache)
 		b = storeI32(b, repCache)
-		b = append(b, 0x20, lRep, 0x20, lCacheLen)
+		b = append(b, 0x20, lRep, 0x41)
+		b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
 		b = storeI32(b, repCacheLen)
 		// Zero the header and stamp the stride. The allocator hands back reused
 		// memory, so a drive inheriting a stale `ready` would serve another
@@ -619,6 +620,9 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		b = append(b, 0xFC, 0x0B, 0x00) // memory.fill
 		b = append(b, 0x20, lCache, 0x20, lK, 0xA7)
 		b = storeI32(b, ckptHdrStride)
+		b = append(b, 0x20, lCache, 0x41)
+		b = utils.AppendSLEB128(b, int32(abi.OverlapCacheLazy))
+		b = storeI32(b, ckptHdrLazy)
 		b = append(b, 0x0B)
 	}
 
@@ -718,13 +722,13 @@ func emitSetReleaseFinished(b []byte, pRep byte, freeIdx int, blocks []SearchSiz
 	return b
 }
 
-func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount int, blocks []SearchSize, callListGlobal, heapGlobal uint32) []byte {
+func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount int, blocks []SearchSize, lazyCache bool, callListGlobal, heapGlobal uint32, classHeadsBase int32) []byte {
 	const pRep = 0x00
 	alloc := newLocalAlloc(1)
 	lRet, lOut, lN := alloc.I32(), alloc.I32(), alloc.I32()
 	lTmp := alloc.I32()
 	var lBlk, lSz, lP, lChain, lSz64, lNeed byte
-	if len(blocks) > 0 {
+	if len(blocks) > 0 || lazyCache {
 		lBlk, lSz, lP, lChain = alloc.I32(), alloc.I32(), alloc.I32(), alloc.I32()
 		lSz64, lNeed = alloc.I64(), alloc.I64()
 	}
@@ -764,6 +768,9 @@ func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount in
 	b = callRealloc(b, reallocIdx, 4, int32(patternCount*abi.SetMatchTupleBytes))
 	b = append(b, 0x21, lOut)
 
+	if lazyCache {
+		b = append(b, 0x03, 0x40) // loop: called again once the region is settled
+	}
 	// find(input, len, pos, gate, out, PATTERN_COUNT)
 	b = append(b, 0x20, pRep)
 	b = loadI32(b, repInput)
@@ -782,6 +789,11 @@ func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount in
 	b = append(b, 0x10)
 	b = utils.AppendULEB128(b, uint32(findIdx))
 	b = append(b, 0x21, lN)
+	if lazyCache {
+		b = emitSetScannerGrantCache(b, pRep, lN, reallocIdx, freeIdx, callListGlobal, heapGlobal, classHeadsBase,
+			lSz, lP, lChain, lSz64, lNeed)
+		b = append(b, 0x0B) // end loop
+	}
 
 	// Negative is a SENTINEL, not a count: what remains is UNKNOWN, so the scan
 	// ends AND reports an error.
@@ -856,7 +868,7 @@ func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount in
 		b = emitGiveSearchMemory(b, func(b []byte) []byte {
 			b = append(b, 0x20, pRep)
 			return loadI32(b, repLen)
-		}, int32(nb), ptrOff, capOff, reallocIdx, heapGlobal, callListGlobal, //nolint:gosec // a small size
+		}, int32(nb), ptrOff, capOff, reallocIdx, heapGlobal, classHeadsBase, callListGlobal, //nolint:gosec // a small size
 			lBlk, lSz, lP, lChain, lSz64, lNeed)
 		return append(b, 0x0B, 0x0B)
 	}
@@ -883,6 +895,61 @@ func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount in
 	b = append(b, 0x20, lRet)
 	b = append(b, 0x0B)
 	return b
+}
+
+// emitSetScannerGrantCache answers abi.OverlapCacheWanted in `next`, inside
+// the loop around the find call: the module would start using the answer
+// cache now and delivered nothing. The region the constructor sized is
+// reserved — when the allocator can serve it — and detached from the call, the
+// header is copied over with its lazy word cleared, the header block is freed,
+// and the descriptor points at the region; when it cannot be served, the lazy
+// word is cleared in place and the module walks. Either way the loop calls
+// again, and the module never asks twice.
+func emitSetScannerGrantCache(b []byte, pRep, lN byte, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32,
+	classHeadsBase int32, lSz, lP, lChain, lSz64, lNeed byte) []byte {
+	b = append(b, 0x20, lN, 0x41)
+	b = utils.AppendSLEB128(b, int32(abi.OverlapCacheWanted))
+	b = append(b, 0x46, 0x04, 0x40) // i32.eq; if
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCacheFull)
+	b = append(b, 0x22, lSz, 0xAD, 0x21, lSz64) // tee; i64.extend_i32_u
+	b = emitTryReserve(b, heapGlobal, classHeadsBase, lSz64, lNeed)
+	b = append(b, 0x04, 0x40) // if the allocator can serve it
+	b = append(b, 0x23)
+	b = utils.AppendULEB128(b, callListGlobal)
+	b = append(b, 0x21, lChain)
+	b = callReallocDyn(b, reallocIdx, 4, lSz)
+	b = append(b, 0x21, lP)
+	b = append(b, 0x20, lChain, 0x24) // detach: the scanner owns it
+	b = utils.AppendULEB128(b, callListGlobal)
+	// memory.copy(region, header, 48), then the copy's lazy word cleared.
+	b = append(b, 0x20, lP, 0x20, pRep)
+	b = loadI32(b, repCache)
+	b = append(b, 0x41)
+	b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+	b = append(b, 0xFC, 0x0A, 0x00, 0x00)
+	b = append(b, 0x20, lP, 0x41, 0x00)
+	b = storeI32(b, ckptHdrLazy)
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCache)
+	b = append(b, 0x10)
+	b = utils.AppendULEB128(b, uint32(freeIdx))
+	for _, off := range []int{repCache, repScratch + abi.FindScratchCacheOff} {
+		b = append(b, 0x20, pRep, 0x20, lP)
+		b = storeI32(b, off)
+	}
+	for _, off := range []int{repCacheLen, repScratch + abi.FindScratchCacheLenOff} {
+		b = append(b, 0x20, pRep, 0x20, lSz)
+		b = storeI32(b, off)
+	}
+	b = append(b, 0x05) // else: none — the lazy word cleared in place
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCache)
+	b = append(b, 0x41, 0x00)
+	b = storeI32(b, ckptHdrLazy)
+	b = append(b, 0x0B)
+	b = append(b, 0x0C, 0x01) // br to the loop
+	return append(b, 0x0B)
 }
 
 // buildSetScannerDtorBodyBlocks emits `[dtor]<res>`: (rep) → ().
@@ -1097,7 +1164,8 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 						cacheCells: cacheCells, cachePatterns: cachePats, sweepCells: sweepCells, sweepRow: sweepRow,
 						blocks: cs.searchBlocks()},
 					setAdapter{kind: setAdapterNext, export: n.Next, innerFunc: inner,
-						count: cs.patternCount, typeIdx: nextTypeIdx, post: true, blocks: cs.searchBlocks()},
+						count: cs.patternCount, typeIdx: nextTypeIdx, post: true, blocks: cs.searchBlocks(),
+						cacheCells: cacheCells, sweepCells: sweepCells},
 					setAdapter{kind: setAdapterDtor, export: n.Dtor, typeIdx: dtorTypeIdx, blocks: cs.searchBlocks()},
 				)
 			case capMatchAny:
@@ -1132,7 +1200,7 @@ func componentSetAdapters(sets []*compiledSet, setBase, resNewIdx []int,
 }
 
 // buildSetAdapterBody dispatches to the body emitter for one adapter.
-func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32) []byte {
+func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32, classHeadsBase int32) []byte {
 	switch a.kind {
 	case setAdapterAny:
 		return buildSetAnyAdapterBody(reallocIdx, a.innerFunc, a.nParams)
@@ -1142,12 +1210,13 @@ func buildSetAdapterBody(a setAdapter, reallocIdx, freeIdx int, callListGlobal, 
 		return buildSetAllWideAdapterBody(reallocIdx, a.innerFunc, a.nParams, a.idSpace)
 	case setAdapterCtor:
 		return buildSetScannerCtorBody(setScannerCtor{
-			reallocIdx: reallocIdx, resNewIdx: a.resNewImport, callListGlobal: callListGlobal, heapGlobal: heapGlobal,
+			reallocIdx: reallocIdx, resNewIdx: a.resNewImport, callListGlobal: callListGlobal,
 			idSpace: a.idSpace, cells: a.cacheCells, pats: a.cachePatterns, blocks: len(a.blocks),
 			sweepCells: a.sweepCells, sweepRow: a.sweepRow,
 		})
 	case setAdapterNext:
-		return buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, a.innerFunc, a.count, a.blocks, callListGlobal, heapGlobal)
+		return buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, a.innerFunc, a.count, a.blocks,
+			a.cacheCells > 0 || a.sweepCells > 0, callListGlobal, heapGlobal, classHeadsBase)
 	case setAdapterDtor:
 		return buildSetScannerDtorBodyBlocks(freeIdx, a.blocks)
 	}

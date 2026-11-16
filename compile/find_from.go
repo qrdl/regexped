@@ -587,6 +587,49 @@ type moduleGlobals struct {
 	// i64 marks the globals AllocI64 made, with their initial values. Every
 	// other global is an i32.
 	i64 map[uint32]int64
+	// wantEpoch is set for a module that keeps default search state
+	// (default_search.go): every body that arms or trips a search block then
+	// bumps the arm epoch, epochP1 - 1, which the defaults read to run their
+	// per-block work only after something changed.
+	wantEpoch bool
+	epochP1   uint32
+	// suffixShare is the module's set suffix tables by DFA fingerprint, so a
+	// set compiled later (a no-cache companion, a kept-members set, another
+	// set of the module) names an identical table's address instead of
+	// emitting it again (compileSetWith). Module-wide because addresses are:
+	// it lives here so a trial compile's clone keeps its entries to itself.
+	suffixShare map[uint64][]sharedSuffix
+	// splitShare is the same for split members' start-anywhere passes: the
+	// no-cache companion and a scan-only split copy split the same member.
+	splitShare map[splitShareKey][]sharedSplit
+}
+
+// adopt takes the allocations a build made on t, a clone of g, keeping g's
+// own share maps (t holds copies of them, which the build did not change).
+func (g *moduleGlobals) adopt(t *moduleGlobals) {
+	ss, sp := g.suffixShare, g.splitShare
+	*g = *t
+	g.suffixShare, g.splitShare = ss, sp
+}
+
+// sharedSuffix is one emitted suffix table: its automaton, its base and the
+// data segments it was emitted as there.
+type sharedSuffix struct {
+	t    *dfaTable
+	base int32
+	data []byte
+}
+
+// armEpochP1 is the arm epoch + 1, allocated on first use, or 0 for a module
+// that keeps no default state.
+func (g *moduleGlobals) armEpochP1() uint32 {
+	if g == nil || !g.wantEpoch {
+		return 0
+	}
+	if g.epochP1 == 0 {
+		g.epochP1 = g.Alloc() + 1
+	}
+	return g.epochP1
 }
 
 // btScratch names the two globals a Backtracking FALLBACK body finds its
@@ -1032,7 +1075,7 @@ func anyGroupsExport(patterns []*compiledPattern) bool {
 //
 // def, when non-nil, is the export's default search state (default_search.go);
 // an anchored-only wrapper, one call per drive, has none.
-func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
+func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaultSearch, numGroups, outGroups int) []byte {
 	var b []byte
 	if def != nil {
 		if anchoredOnly {
@@ -1045,6 +1088,7 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 		b = append(b, 0x04, 0x40, 0x41, 0x7F, 0x0F, 0x0B)
 		b = def.emitEnter(b, 0, 1, 3, l)
 		b = emitFindFromSet(b, 0x03)
+		b = emitRemovedGroupSlots(b, 0x02, 0, numGroups, outGroups)
 		b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02) // ptr, len, out_ptr
 		b = append(b, 0x10)
 		b = utils.AppendULEB128(b, uint32(innerFuncIdx))
@@ -1076,6 +1120,8 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 		// start. This is the ONLY writer of the channel on the groups path.
 		b = emitFindFromSet(b, 0x03)
 	}
+	// The slots of the groups Simplify removed: no capture body writes them.
+	b = emitRemovedGroupSlots(b, 0x02, 0, numGroups, outGroups)
 
 	b = append(b, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02) // ptr, len, out_ptr
 	b = append(b, 0x10)
@@ -1085,8 +1131,8 @@ func buildGroupsFromWrapperBody(innerFuncIdx int, anchoredOnly bool, def *defaul
 }
 
 // appendGroupsFromWrapperCodeEntry appends a size-prefixed groups-from wrapper.
-func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool, def *defaultSearch) []byte {
-	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly, def)
+func appendGroupsFromWrapperCodeEntry(cs []byte, innerFuncIdx int, anchoredOnly bool, def *defaultSearch, numGroups, outGroups int) []byte {
+	body := buildGroupsFromWrapperBody(innerFuncIdx, anchoredOnly, def, numGroups, outGroups)
 	cs = utils.AppendULEB128(cs, uint32(len(body)))
 	return append(cs, body...)
 }

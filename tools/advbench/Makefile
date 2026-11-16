@@ -1,4 +1,4 @@
-.PHONY: adversary list run clean
+.PHONY: adversary adversary-unicode list run clean
 
 # Every adversarial drive shape found so far, plus the drives already measured
 # linear. Rows expected LINEAR fail the run when their fuel ratio per input
@@ -9,6 +9,12 @@
 # but it is memory-hungry: run it alone.
 adversary:
 	go run . -suite $(ARGS)
+
+# The same rows with every compile in Unicode mode (-unicode): the lowered
+# programs, the character skips and the larger automata are different code
+# from byte mode's, and the drives must stay linear over them too.
+adversary-unicode:
+	go run . -suite -unicode $(ARGS)
 
 list:
 	go run . -suite -list

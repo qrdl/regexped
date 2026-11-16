@@ -358,19 +358,9 @@ func mayReference(cfg *BuildConfig) bool {
 }
 
 // finish turns a top-level regexp's expansion into its record. A piece used
-// twice along the same chain is listed once.
+// twice along the same chain is listed once: text records each use once.
 func finish(source string, e *expanded) *Expansion {
-	out := &Expansion{Source: source, groups: e.groups}
-	seen := make(map[string]bool, len(e.uses))
-	for _, u := range e.uses {
-		key := u.Describe()
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out.Pieces = append(out.Pieces, u)
-	}
-	return out
+	return &Expansion{Source: source, groups: e.groups, Pieces: e.uses}
 }
 
 // userLabel names top-level pattern i as a user in a chain: its quoted name,
@@ -462,11 +452,12 @@ func (x *expander) text(src, owner, user string, chain []string, self string) (*
 		return e, nil
 	}
 	inner := append([]string{user}, chain...)
-	var b strings.Builder
-	last = 0
-	for _, t := range toks {
-		b.WriteString(src[last:t.start])
-		last = t.end
+	// Every piece first, so the size is known before any of the text is
+	// built: past max_regexp_size it is refused, and nothing that size was
+	// ever allocated.
+	pieces := make([]*expanded, len(toks))
+	size := uint64(len(src))
+	for k, t := range toks {
 		j, ok := x.byName[t.name]
 		if !ok {
 			return nil, fmt.Errorf("%s: no pattern is named %q", owner, t.name)
@@ -475,6 +466,37 @@ func (x *expander) text(src, owner, user string, chain []string, self string) (*
 		if err != nil {
 			return nil, err
 		}
+		pieces[k] = p
+		wrap := uint64(len("(?:)"))
+		if t.capture {
+			wrap = uint64(len("(?<>)") + len(t.name))
+		}
+		if p.openQ {
+			wrap += uint64(len(`\E`))
+		}
+		size += uint64(len(p.text)) + wrap - uint64(t.end-t.start)
+	}
+	if problem := x.cfg.regexpSizeProblem(owner, size); problem != "" {
+		return nil, errors.New(problem)
+	}
+	// A piece used twice along the same chain is recorded once: copying every
+	// use of every piece made the list double with each level of a doubling
+	// chain, ~1.6 KB per expanded byte.
+	seen := map[string]bool{}
+	addUse := func(u PieceUse) {
+		key := u.Describe()
+		if !seen[key] {
+			seen[key] = true
+			e.uses = append(e.uses, u)
+		}
+	}
+	var b strings.Builder
+	b.Grow(int(size))
+	last = 0
+	for k, t := range toks {
+		b.WriteString(src[last:t.start])
+		last = t.end
+		p := pieces[k]
 		if t.capture {
 			b.WriteString("(?<" + t.name + ">")
 			what := fmt.Sprintf("(?<&%s>)", t.name)
@@ -493,9 +515,9 @@ func (x *expander) text(src, owner, user string, chain []string, self string) (*
 		// Its uses first, then itself: deepest first.
 		for _, u := range p.uses {
 			u.UsedBy = append(append([]string(nil), u.UsedBy...), user)
-			e.uses = append(e.uses, u)
+			addUse(u)
 		}
-		e.uses = append(e.uses, PieceUse{Name: t.name, Text: p.text, UsedBy: []string{user}})
+		addUse(PieceUse{Name: t.name, Text: p.text, UsedBy: []string{user}})
 		for _, g := range p.groups {
 			if chain != nil {
 				// This regexp is itself a piece: the group passes through it.

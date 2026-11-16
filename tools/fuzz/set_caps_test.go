@@ -54,10 +54,8 @@ func compileCaps(pats []string, overlapping bool) ([]byte, setDrops, error) {
 		Patterns:    config.PatternSelector{Names: names},
 		Unicode:     setModeKey(),
 	}}
-	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, setDrops, error) {
-		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, dropsFromSet(diags), err
-	})
+	return cachedCompileSet(fmt.Sprintf("caps\x00%v\x00%s", overlapping, setKey(pats)), compileJob{Kind: jobFileDiag,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // capRunner holds an instantiated capability module plus its memory layout.
@@ -653,6 +651,177 @@ func TestSetAnchorLiteralAgainstOracle(t *testing.T) {
 			if fmt.Sprint(want) != fmt.Sprint(got) {
 				t.Errorf("gated find over %q from %d: %v, want %v", input, from, got, want)
 			}
+		}
+	}
+}
+
+// TestSetWordGuardMembersAgainstOracle: a member whose part before its literal
+// is a bare \b or \B keeps its LITERAL bucket, the boundary judged at each
+// candidate from the bytes on either side of the literal's start, instead of
+// walking a fallback bucket at every position. Members sharing one literal
+// with different guards (`\bab`, `\Bab`, `ab`) sit in one bucket; a literal
+// starting with a non-word byte (`\b-x`) flips which neighbour satisfies \b.
+// Every capability, against Go, with the neighbour a word byte, a non-word
+// byte and absent (position 0).
+func TestSetWordGuardMembersAgainstOracle(t *testing.T) {
+	pats := []string{`\bselect\b`, `\bfrom\b`, `\Bing\b`, `\b-x`, `union`, `\bab`, `\Bab`, `ab`}
+	members := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		members[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	build := func(s config.SetConfig) ([]byte, compile.SetDiag) {
+		t.Helper()
+		s.Name, s.Patterns = "s", config.PatternSelector{Names: names}
+		w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{Patterns: members, Sets: []config.SetConfig{s}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, diags[0]
+	}
+	all, diag := build(config.SetConfig{MatchAny: "cap_match_any", MatchAll: "cap_match_all",
+		ScanAny: "cap_scan_any", ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: true})
+	keyed := map[string][]int{}
+	for _, b := range diag.Buckets {
+		for _, p := range b.Patterns {
+			keyed[b.Literal] = append(keyed[b.Literal], p.ID)
+		}
+	}
+	for lit, ids := range map[string][]int{"select": {0}, "from": {1}, "ing": {2}, "-x": {3}, "ab": {5, 6, 7}} {
+		for _, id := range ids {
+			if !containsInt(keyed[lit], id) {
+				t.Errorf("member %d (%s) not in a %q literal bucket: %v", id, pats[id], lit, keyed)
+			}
+		}
+	}
+	gated, _ := build(config.SetConfig{Find: "gated_find"})
+	inputs := []string{
+		"", "select", "xselect", "select_", "a select from b", "selectfrom from_ (from)",
+		"singing ring ing", "-x a-x  -x_x", "ab xab abx _ab", "union select ab-x",
+		"9select 9from from9 sing9 ab9ab",
+	}
+	for _, input := range inputs {
+		r := newCapRunnerFrom(t, all, pats, input)
+		checkCapsAgainstOracle(t, r, pats, input)
+		r.Close()
+		for from := 0; from <= len(input); from++ {
+			want := gatedOracleFrom(pats, input, from)
+			got := runUnionPreflightFind(t, gated, pats, input, int32(from))
+			sortMatches(want)
+			sortMatches(got)
+			if fmt.Sprint(want) != fmt.Sprint(got) {
+				t.Errorf("gated find over %q from %d: %v, want %v", input, from, got, want)
+			}
+		}
+	}
+}
+
+// gatedOracleFrom is each pattern's Go FindAll drive over the WHOLE input,
+// begun at from: the leftmost match starting at or after the cursor, found by
+// anchored probes (anchoredExtent) so that \b, \B and (?m:^) judge the real
+// byte before it — slicing the input at from would make position from look
+// like the start of text. An empty match adjacent to the previous one is
+// skipped, as Go does.
+func gatedOracleFrom(pats []string, input string, from int) []setMatch {
+	var out []setMatch
+	for k, pat := range pats {
+		pos, prevEnd := from, -1
+		for pos <= len(input) {
+			s, e := -1, -1
+			for p := pos; p <= len(input); p++ {
+				if x := anchoredExtent(pat, input, p); x >= 0 {
+					s, e = p, x
+					break
+				}
+			}
+			if s < 0 {
+				break
+			}
+			if !(s == e && s == prevEnd) {
+				out = append(out, setMatch{PatternID: k, Start: s, End: e})
+				prevEnd = e
+			}
+			if e > s {
+				pos = e
+			} else {
+				pos = s + 1
+			}
+		}
+	}
+	return out
+}
+
+// TestSetWordGuardOnAFallbackMemberAtTheMemoryEdge: a \b member whose split is
+// rejected after its guard was stripped (a begin anchor after the literal)
+// goes to a FALLBACK bucket, which is visited at EOF too. With the guard left
+// on it, that visit read input[len], and an input ending at the end of memory
+// trapped. The input sits there, and the drive answers as Go does.
+func TestSetWordGuardOnAFallbackMemberAtTheMemoryEdge(t *testing.T) {
+	pats := []string{`\bfoo\n(?m:^)x`, `\Bfoo^`, `zz`}
+	members := make([]config.PatternEntry, len(pats))
+	names := make([]string, len(pats))
+	for i, p := range pats {
+		names[i] = fmt.Sprintf("p%d", i)
+		members[i] = config.PatternEntry{Name: names[i], Regexp: p}
+	}
+	w, _, err := compile.CompileFile(config.BuildConfig{Patterns: members, Sets: []config.SetConfig{{
+		Name: "s", Patterns: config.PatternSelector{Names: names}, Find: "gated_find"}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{"a foo", "foo\nx", "xfoo\nx", "zz foo\nx w", "foo\nxfoo"} {
+		store, inst, mem, release, err := instantiate(w)
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		const pageSize = 65536
+		dataTop, err := utils.ParseDataSectionBytes(w)
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		gatePtr := int32((dataTop + pageSize - 1) / pageSize * pageSize)
+		outPtr := gatePtr + 4096
+		if need, cur := uint64(gatePtr/pageSize)+2, mem.Size(store); need > cur {
+			if _, err := mem.Grow(store, need-cur); err != nil {
+				release()
+				t.Fatal(err)
+			}
+		}
+		inBase := int32(mem.Size(store)*pageSize) - int32(len(input)) // input[len-1] is memory's last byte
+		buf := mem.UnsafeData(store)
+		copy(buf[inBase:], input)
+		for i := int32(0); i < int32(4*len(pats)); i++ {
+			buf[gatePtr+i] = 0
+		}
+		scratch := writeFindScratch(store, mem, gatePtr, int32(len(pats)), 0, 0)
+		fn := inst.GetFunc(store, "gated_find")
+		var got []setMatch
+		for pos := int32(0); pos <= int32(len(input)); {
+			res, err := fn.Call(store, inBase, int32(len(input)), pos, scratch, outPtr, int32(len(pats)))
+			if err != nil {
+				t.Fatalf("gated find over %q ending at the memory edge, from %d: %v", input, pos, err)
+			}
+			n := int(res.(int32))
+			if n <= 0 {
+				break
+			}
+			buf = mem.UnsafeData(store)
+			rd := func(o int32) int { return int(int32(binary.LittleEndian.Uint32(buf[o:]))) }
+			for i := int32(0); i < int32(n); i++ {
+				base := outPtr + i*12 // docs/wasm.md "find tuple layout"
+				got = append(got, setMatch{PatternID: rd(base), Start: rd(base + 4), End: rd(base + 8)})
+			}
+			pos = int32(got[len(got)-1].Start + 1)
+		}
+		release()
+		want := gatedOracleFrom(pats, input, 0)
+		sortMatches(want)
+		sortMatches(got)
+		if fmt.Sprint(want) != fmt.Sprint(got) {
+			t.Errorf("gated find over %q at the memory edge: %v, want %v", input, got, want)
 		}
 	}
 }
@@ -1399,7 +1568,7 @@ func compileAnchoredBTSet(t *testing.T, pats []string, unicode, overlapping bool
 		entries[i] = config.PatternEntry{Name: names[i], Regexp: p}
 	}
 	mode := unicode
-	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: maxUnion, Patterns: entries, Sets: []config.SetConfig{{
+	w, _, diags, err := compile.CompileFileDiag(config.BuildConfig{MaxMemory: maxMemory, MaxUnionStates: config.Count(maxUnion), Patterns: entries, Sets: []config.SetConfig{{
 		Name: "s", MatchAny: "cap_match_any", MatchAll: "cap_match_all", ScanAny: "cap_scan_any",
 		ScanAll: "cap_scan_all", Find: "cap_find", Overlapping: overlapping,
 		Patterns: config.PatternSelector{Names: names}, Unicode: &mode,
@@ -1628,10 +1797,8 @@ func compileGatedSet(pats []string) ([]byte, error) {
 		Patterns: config.PatternSelector{Names: names},
 		Unicode:  setModeKey(),
 	}}
-	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("gatedset\x00%s", setKey(pats)), compileJob{Kind: jobFile,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // gatedRun drives the gated find to exhaustion with a zeroed gate array, the
@@ -2583,10 +2750,8 @@ func compileBatchSet(pats []string, overlapping bool) ([]byte, error) {
 		Patterns:    config.PatternSelector{Names: names},
 		Unicode:     setModeKey(),
 	}}
-	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), func() ([]byte, error) {
-		w, _, err := compile.CompileFile(config.BuildConfig{Patterns: entries, Sets: sets}, "")
-		return w, err
-	})
+	return cachedCompile(fmt.Sprintf("batchset\x00%v\x00%s", overlapping, setKey(pats)), compileJob{Kind: jobFile,
+		Config: config.BuildConfig{Patterns: entries, Sets: sets}})
 }
 
 // runBatchFind drives find_batch to exhaustion with the given buffer capacity,
@@ -3848,6 +4013,15 @@ func TestSetMergedModeAssertions(t *testing.T) {
 		{`a\Bb`, "ab"},
 		{`\Bfoo`, "xfoo"},
 		{`\Bfoo`, " foo"},
+		// a bare \b / \B before the literal is a word guard on the literal
+		// bucket, read from the input around the candidate — position 0
+		// included, and a literal whose first byte is not a word byte
+		{`\bfoo\b`, "foo"},
+		{`\bfoo\b`, "afoo"},
+		{`\Bfoo`, "foo"},
+		{`\b-x`, "a-x"},
+		{`\b-x`, " -x"},
+		{`\b-x`, "-x"},
 		// line anchors, both directions
 		{`(?m:^)bar`, "x\nbar"},
 		{`(?m:^)bar`, "xbar"},

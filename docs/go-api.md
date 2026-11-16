@@ -9,9 +9,9 @@ Regexped generates Go stubs that call into compiled WASM regexp modules via `//g
 
 ## Including stubs in your project
 
-A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package name is inferred from the output path: if the stub lives inside a directory named after the Go package name, the package is set to that name; otherwise it defaults to `main`.
+A stub file carries a `//go:build wasip1` constraint and a `package` declaration. Place it alongside your application source. The package is `go_package` when the config sets it, used as written. Without it, the package is `import_module` when the stub lives inside a directory of that name, and `main` otherwise.
 
-That name is `go_package`, which defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name — while `package` needs a Go identifier: `url_ipv6` is a fine wire name and a package name every linter flags, and a wire name that happens to be a Go keyword cannot be a package at all. The `//go:wasmimport` lines keep using `import_module` either way.
+`go_package` defaults to `import_module`. They are separate keys because `import_module` is a *wire* string — the WASM import-module name — while `package` needs a Go identifier: `url_ipv6` is a fine wire name and a package name every linter flags, and a wire name that happens to be a Go keyword cannot be a package at all. The `//go:wasmimport` lines keep using `import_module` either way.
 
 > **Component format:** there is no Go **stub** for components. `stub_type: go` under `wasm_format: component` is refused permanently, not "yet": stock Go has no wasip2 target (`go tool dist list` offers `wasip1/wasm` only), so a component stub would have to be TinyGo. A Go app can still use a regexped component, with no regexped stub at all: [componentize-go](https://github.com/bytecodealliance/componentize-go) generates the bindings from the `.wit` regexped writes — see [Component format: Go with componentize-go](#component-format-go-with-componentize-go) below, and [component.md](component.md).
 
@@ -158,7 +158,7 @@ stub passes the whole input on every call and the WASM export takes the
 position as an argument, so a leading `\b`, `\B`, `^` or `(?m:^)` at
 `offset > 0` is judged against the real preceding byte.
 
-This holds for `find`, `groups` and `named_groups` alike, and for every engine
+This holds for `find` and `groups` alike, and for every engine
 — the conversion is complete, so there is no longer a shape whose left context
 is judged against a slice edge.
 
@@ -196,7 +196,7 @@ func (iter *<find>Iter) Matches() iter.Seq[SetMatch]
 func (iter *<find>Iter) Err() error
 ```
 
-`<MatchAll>` and `<ScanAll>` are iterators rather than slices: the ABI hands
+`<match_all>` and `<scan_all>` are iterators rather than slices: the ABI hands
 back a bitmask whose set bits can be yielded lazily with nothing materialised,
 so a caller who stops early allocates nothing. `slices.Collect` gives you a
 slice when you want one.
@@ -224,8 +224,8 @@ for patternID := range kindSeq {
 }
 ```
 
-The iterator owns one reusable tuple buffer sized from `<set>_pattern_count`
-and a zeroed gate array sized from `<set>_id_space` — the gate array is indexed by
+The iterator owns one reusable tuple buffer sized from `<Set>PatternCount`
+and a zeroed gate array sized from `<Set>IDSpace` — the gate array is indexed by
 pattern id, so the two lengths differ for a named subset and for a set with
 regexps of its own. Both overlap
 policies take the array; see [sets.md](sets.md) for what the overlapping body
@@ -378,6 +378,12 @@ Test for it with `errors.Is`. Where it appears depends on when the failure can o
 The iterators also stop for good once they record an error. That is required rather than tidy: the overflow is deterministic and the failing call does not advance the offset, so an iterator that kept going would re-run the identical call forever.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### When the answer cache is allocated
+
+The iterator holds the cache's 48-byte header alone until the drive asks for
+the region — at the call where it would sweep, which most drives never reach —
+and allocates it then.
 
 ### The overlapping answer cache's header
 

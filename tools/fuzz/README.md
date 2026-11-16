@@ -118,6 +118,23 @@ Things to know before a long run:
   corpus — minutes, not seconds, and again after each crasher. A seed that
   fails anywhere stops the script before fuzzing starts; it says so, rather
   than looping.
+- **Every run first re-runs the inputs earlier runs saved.** `go test` keeps
+  each input that found new coverage and re-runs all of them before it fuzzes
+  anything new, so a short run can spend most of its time there, and the pile
+  grows with each run (`FuzzSetCaps` under `-unicode`: 4,096 inputs, 4.5
+  minutes). `FRESH=1` starts from the target's seeds only — `make
+  fuzz-set-routes FRESH=1`, `FRESH=1 ./fuzz-budget.sh …`, `FRESH=1
+  ./fuzz_everything.sh` — with an empty cache directory of the run's own,
+  deleted at the end; the saved inputs are left as they are.
+- **A slow compile is killed and its input skipped.** In a fuzzing run, the
+  compiles of a Unicode-mode input — and of every `FuzzSetRoutes` input — run
+  in a separate compile process (`compilechild.go`), at most 4 s each and 5 s
+  for all of one input; one past either is KILLED and the input skipped, so it
+  costs no more CPU than that, and a compile that took the whole 4 s is
+  skipped at once if its pattern comes back. Byte-mode compiles of the other
+  targets, and every compile outside a fuzzing run, run in the test process
+  and are waited for. A compile process that dies by itself (a regexped panic)
+  is reported as a failure with its output, never as a slow compile.
 - **`FuzzSetCaps` skips patterns over 512 NFA instructions.** Prefix the
   command with `REGEXPED_FUZZ_MAX_CAPS_NFA_INSTS=1000` to explore larger ones.
 

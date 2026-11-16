@@ -4,10 +4,13 @@
 //
 //	regexped [--debug] generate [--config=<file>] [--output=<file>|-]
 //	regexped [--debug] compile  [--config=<file>] [--output=<file>|-] [--verbose]
-//	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>] <regex1.wasm> ...
+//	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
+//	regexped [--debug] check    [--config=<file>]
+//	regexped help [<command>]
+//	regexped --version
 //
 // The config file defaults to regexped.yaml in the current directory when not specified.
-// Global flags (--debug) must appear before the subcommand name.
+// Global flags (--debug, --version) must appear before the subcommand name.
 package main
 
 import (
@@ -19,11 +22,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 
+	"github.com/qrdl/regexped/check"
 	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/component"
 	"github.com/qrdl/regexped/config"
 	"github.com/qrdl/regexped/generate"
+	"github.com/qrdl/regexped/internal/clilog"
 	"github.com/qrdl/regexped/merge"
 )
 
@@ -47,7 +53,8 @@ const (
 // handler at level INFO, and the handler's level is WARN unless --debug — so
 // every one of those messages was silently discarded and the tool exited
 // non-zero in complete silence. slog.Error is above the WARN threshold and
-// therefore always reaches the user.
+// therefore always reaches the user — as plain text (internal/clilog), or as
+// slog's structured records under --debug.
 func failf(code int, format string, args ...any) {
 	slog.Error(fmt.Sprintf(format, args...))
 	os.Exit(code)
@@ -84,18 +91,23 @@ func parseFlags(fset *flag.FlagSet, args []string) {
 
 func main() {
 	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
-	debug := flag.Bool("debug", false, "enable debug logging")
-	flag.Usage = printUsage
+	debugFlag := flag.Bool("debug", false, "enable debug logging: every record, structured")
+	version := flag.Bool("version", false, "print the version and exit")
+	flag.Usage = func() { printUsage(os.Stderr) }
 	parseFlags(flag.CommandLine, os.Args[1:])
 
-	level := slog.LevelWarn
-	if *debug {
-		level = slog.LevelDebug
+	if *debugFlag {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	} else {
+		slog.SetDefault(slog.New(clilog.New(os.Stderr)))
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if *version {
+		fmt.Println("regexped " + versionString())
+		os.Exit(exitOK)
+	}
 
 	if flag.NArg() < 1 {
-		printUsage()
+		printUsage(os.Stderr)
 		os.Exit(exitUsage)
 	}
 
@@ -106,35 +118,112 @@ func main() {
 		runCompileCmd(flag.Args()[1:])
 	case "merge":
 		runMergeCmd(flag.Args()[1:])
+	case "check":
+		runCheckCmd(flag.Args()[1:])
+	case "help":
+		runHelpCmd(flag.Args()[1:])
 	default:
 		slog.Error(fmt.Sprintf("unknown command: %s", flag.Arg(0)))
-		printUsage()
+		printUsage(os.Stderr)
 		os.Exit(exitUsage)
 	}
 }
 
-func printUsage() {
-	fmt.Fprint(os.Stderr, `Usage: regexped [--debug] <command> [options]
+// versionString is the version the Go toolchain stamped into the binary: the
+// module version for `go install …@v1.2.3` (and a release build from a tag),
+// else "(devel)" with the VCS revision a local build records.
+func versionString() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "(unknown)"
+	}
+	v := info.Main.Version
+	if v == "" {
+		v = "(devel)"
+	}
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch {
+		case s.Key == "vcs.revision" && len(s.Value) >= 12:
+			rev = s.Value[:12]
+		case s.Key == "vcs.modified" && s.Value == "true":
+			dirty = "+dirty"
+		}
+	}
+	if rev != "" && v == "(devel)" {
+		v += " " + rev + dirty
+	}
+	return v
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `Usage: regexped [--debug] <command> [options]
 
 Global flags:
-  --debug   Enable debug logging (default: warnings only)
+  --debug     Print every log record, structured (default: warnings and errors, as plain text)
+  --version   Print the version and exit
 
 Commands:
   generate  Generate language stubs (Rust/Go/JS/TS/C/AS) or a WIT interface from a config file
   compile   Compile regexp patterns to a WASM module, or to a component plus its .wit
   merge     Link your binary with the regexp artifacts: wasm-merge for modules, wac plug for components
+  check     Check a config the way compile and generate do, and write nothing
+  help      Print this, or a command's options: regexped help <command>
 
-Run 'regexped <command> -h' for command-specific options.
+Run 'regexped help <command>' for command-specific options.
 `)
 }
 
-func runGenerateCmd(args []string) {
+// commandFlags is each command's flag set, built without running it, so that
+// `regexped help <command>` prints the same options `<command> -h` does.
+var commandFlags = map[string]func() *flag.FlagSet{
+	"generate": func() *flag.FlagSet { fs, _, _ := generateFlags(); return fs },
+	"compile":  func() *flag.FlagSet { fs, _ := compileFlags(); return fs },
+	"merge":    func() *flag.FlagSet { fs, _ := mergeFlags(); return fs },
+	"check":    func() *flag.FlagSet { fs, _ := checkFlags(); return fs },
+}
+
+// runHelpCmd prints the usage, to stdout: help was asked for.
+func runHelpCmd(args []string) {
+	switch {
+	case len(args) == 0:
+		printUsage(os.Stdout)
+	case len(args) > 1:
+		failf(exitUsage, "help: one command at most, got %d arguments", len(args))
+	default:
+		mk, ok := commandFlags[args[0]]
+		if !ok {
+			failf(exitUsage, "help: unknown command: %s", args[0])
+		}
+		fs := mk()
+		fs.SetOutput(os.Stdout)
+		fmt.Fprintf(os.Stdout, "Usage of %s:\n", args[0])
+		fs.PrintDefaults()
+	}
+}
+
+// noArgs refuses positional arguments a command does not take: they used to
+// be ignored, so `regexped compile other.yaml` compiled regexped.yaml.
+func noArgs(fset *flag.FlagSet) {
+	if fset.NArg() > 0 {
+		failf(exitUsage, "%s: unexpected argument %q (flags go before arguments; the config is --config=<file>)", fset.Name(), fset.Arg(0))
+	}
+}
+
+func generateFlags() (*flag.FlagSet, *string, *string) {
 	fset := flag.NewFlagSet("generate", flag.ContinueOnError)
 	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	var out string
-	fset.StringVar(&out, "output", "", "override stub output file from config; - writes to stdout")
-	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	out := new(string)
+	fset.StringVar(out, "output", "", "override stub output file from config; - writes to stdout. Without stub_type, its extension picks the language")
+	fset.StringVar(out, "o", "", "output file (alias for --output)")
+	return fset, configFile, out
+}
+
+func runGenerateCmd(args []string) {
+	fset, configFile, outp := generateFlags()
 	parseFlags(fset, args)
+	noArgs(fset)
+	out := *outp
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
@@ -150,45 +239,37 @@ func runGenerateCmd(args []string) {
 		failf(exitUsage, "generate: --output is required (or set stub_file in config)")
 	}
 
-	// Validate stub type before doing any work.
-	stubType, err := generate.ResolveStubType(cfg)
+	// The language: stub_type, else the extension of the path written.
+	cfg, err = generate.ForOutput(cfg, out)
 	if err != nil {
 		failf(exitCompile, "%v", err)
 	}
-
-	// A stub that declares WASM imports needs a name to import FROM, and a
-	// Rust or Go stub needs one for its `pub mod` / `package`. Config content
-	// rather than command line, hence exitCompile.
-	//
-	// MODULE format only. A component imports nothing by module name: its
-	// imports are the WIT interface `regexped:<wit_package>/...`, which
-	// config.LoadConfig already requires — from `import_module` OR from
-	// `wit_package`, so demanding `import_module` here would reject a
-	// wit_package-only config that compiles fine. The one name a component
-	// stub still needs is Rust's module identifier, which has its own key.
-	switch {
-	case !cfg.Component():
-		if (stubType == "rust" || stubType == "go" || stubType == "c" || stubType == "as") && cfg.ImportModule == "" {
-			failf(exitCompile, "generate: import_module is required in config for Rust, Go, C, and AS stubs")
-		}
-	case stubType == "rust" && cfg.RustModuleName() == "":
-		failf(exitCompile, "generate: rust_module (or import_module) is required in config for Rust stubs: it names the generated `pub mod`")
-	}
-
 	if err := generate.CmdGenerateStub(cfg, outPath); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 }
 
-func runCompileCmd(args []string) {
+type compileOpts struct {
+	configFile, diagJSON, out *string
+	verbose                   *bool
+}
+
+func compileFlags() (*flag.FlagSet, compileOpts) {
 	fset := flag.NewFlagSet("compile", flag.ContinueOnError)
-	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	diagJSON := fset.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
-	verbose := fset.Bool("verbose", false, "report what the compiler decided per pattern and per set, to stderr")
-	var out string
-	fset.StringVar(&out, "output", "", "override wasm_file from config; - writes to stdout")
-	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	o := compileOpts{out: new(string)}
+	o.configFile = fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	o.diagJSON = fset.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
+	o.verbose = fset.Bool("verbose", false, "report what the compiler decided per pattern and per set, to stderr")
+	fset.StringVar(o.out, "output", "", "override wasm_file from config; - writes to stdout")
+	fset.StringVar(o.out, "o", "", "output file (alias for --output)")
+	return fset, o
+}
+
+func runCompileCmd(args []string) {
+	fset, o := compileFlags()
 	parseFlags(fset, args)
+	noArgs(fset)
+	configFile, diagJSON, verbose, out := o.configFile, o.diagJSON, o.verbose, *o.out
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
@@ -256,17 +337,22 @@ func runCompileCmd(args []string) {
 	}
 }
 
-func runMergeCmd(args []string) {
+func mergeFlags() (*flag.FlagSet, [3]*string) {
 	fset := flag.NewFlagSet("merge", flag.ContinueOnError)
 	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
 	mainFlag := fset.String("main", "", "main WASM file to merge into (required)")
-	var out string
-	// No "- writes to stdout" here, unlike the generate and compile commands:
-	// merge shells out to wasm-merge, which is handed -o verbatim and would
-	// create a file literally named "-".
-	fset.StringVar(&out, "output", "", "override output from config (must be a file path)")
-	fset.StringVar(&out, "o", "", "output file (alias for --output)")
+	out := new(string)
+	// "-" is handled by merge.CmdMerge, which merges into a temporary file and
+	// copies it: wasm-merge, handed -o verbatim, would create a file named "-".
+	fset.StringVar(out, "output", "", "override output from config; - writes to stdout")
+	fset.StringVar(out, "o", "", "output file (alias for --output)")
+	return fset, [3]*string{configFile, mainFlag, out}
+}
+
+func runMergeCmd(args []string) {
+	fset, f := mergeFlags()
 	parseFlags(fset, args)
+	configFile, mainFlag, out := f[0], f[1], *f[2]
 
 	if *mainFlag == "" {
 		failf(exitUsage, "merge: --main=<file> is required")
@@ -292,6 +378,27 @@ func runMergeCmd(args []string) {
 	}
 
 	if err := merge.CmdMerge(cfg, *mainFlag, outPath, regexWasms); err != nil {
+		failf(exitCodeFor(err, exitCompile), "%v", err)
+	}
+}
+
+func checkFlags() (*flag.FlagSet, *string) {
+	fset := flag.NewFlagSet("check", flag.ContinueOnError)
+	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
+	return fset, configFile
+}
+
+// runCheckCmd is `regexped check`: the config loaded, compiled and its stub
+// generated in memory, one summary line per pattern and set, nothing written.
+func runCheckCmd(args []string) {
+	fset, configFile := checkFlags()
+	parseFlags(fset, args)
+	noArgs(fset)
+	cfg, err := config.LoadConfig(*configFile)
+	if err != nil {
+		failf(exitCodeFor(err, exitCompile), "%v", err)
+	}
+	if err := check.Run(cfg, os.Stdout); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 }

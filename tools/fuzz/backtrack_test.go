@@ -3,6 +3,7 @@ package fuzz
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -1444,6 +1445,52 @@ func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
 	})
 }
 
+// TestBTLeastMaxMemoryAnswers: the least max_memory a module with
+// Backtracking code compiles under leaves room for the frame stack, so the
+// module ANSWERS there. A cap at the static size used to compile too, and
+// `(a|aa)*(b)` over "ab" then answered -2 on every call.
+func TestBTLeastMaxMemoryAnswers(t *testing.T) {
+	e := []config.PatternEntry{{Regexp: `(a|aa)*(b)`, GroupsFunc: "g"}}
+	plain, _, err := compile.CompileForced(e, 65536, true, compile.EngineBacktrack, compile.CompileOptions{ForceByteMode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _, mem, release, err := instantiate(plain)
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	pages := mem.Size(store)
+	release()
+	var w []byte
+	for extra := uint64(0); w == nil; extra++ {
+		memCap, _ := config.ParseMemorySize(strconv.FormatUint((pages+extra)*65536, 10))
+		w, _, err = compile.CompileForced(e, 65536, true, compile.EngineBacktrack, compile.CompileOptions{ForceByteMode: true, MaxMemory: memCap})
+		if err != nil && !errors.Is(err, compile.ErrMemoryCapTooSmall) {
+			t.Fatal(err)
+		}
+		if extra == 2 && w == nil {
+			t.Fatalf("no cap up to 2 pages above the static %d compiles: %v", pages, err)
+		}
+		if w != nil && extra != 2 {
+			t.Errorf("compiled %d pages above the static size, want 2 (the stack's page and the default search state's)", extra)
+		}
+	}
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(mem.UnsafeData(store)[0:], "ab")
+	res, err := inst.GetFunc(store, "g").Call(store, int32(0), int32(2), int32(1024), int32(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.(int32); got != 2 {
+		t.Errorf("groups over \"ab\" = %d, want 2", got)
+	}
+}
+
 // TestBTEmptyStackOverflowAnswersUnknown: a growing frame stack can overflow
 // EMPTY — memory cannot hold even one frame at call start, max_memory reached
 // with the scratch base at the end of memory. The overflow arms the budget for
@@ -1452,10 +1499,13 @@ func TestBTCaptureMemoryCapAnswersUnknown(t *testing.T) {
 // ran: `(a|ab)(c|bcd)(d*)` over "abcd" answered -1 where Go matches [0,4). Each
 // body that grows a stack must now hand over at once, and the fallback, which
 // cannot get memory either, answers abi.BTStackOverflow. Each module is capped
-// at exactly its static size; the same module uncapped answers as Go does.
+// at the least max_memory it compiles under — a cap with no room for the stack
+// at all is a compile error now — and the host grows memory to that cap before
+// the call, which leaves the stack the same nothing; the same module uncapped
+// answers as Go does.
 func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
-	// capped compiles with no cap, then again capped at the static size the
-	// first build instantiates to.
+	// capped compiles with no cap, then again capped at the least size it
+	// compiles under, from the static size the first build instantiates to.
 	capped := func(t *testing.T, build func(compile.CompileOptions) ([]byte, error)) (plain, w []byte) {
 		t.Helper()
 		plain, err := build(compile.CompileOptions{})
@@ -1469,14 +1519,19 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 		}
 		pages := mem.Size(store)
 		release()
-		memCap, err := config.ParseMemorySize(strconv.FormatUint(pages*65536, 10))
-		if err != nil {
-			t.Fatal(err)
+		for extra := uint64(0); extra < 4; extra++ {
+			memCap, err := config.ParseMemorySize(strconv.FormatUint((pages+extra)*65536, 10))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w, err = build(compile.CompileOptions{MaxMemory: memCap}); err == nil {
+				return plain, w
+			} else if !errors.Is(err, compile.ErrMemoryCapTooSmall) {
+				t.Fatal(err)
+			}
 		}
-		if w, err = build(compile.CompileOptions{MaxMemory: memCap}); err != nil {
-			t.Fatal(err)
-		}
-		return plain, w
+		t.Fatalf("no cap up to 3 pages above the static %d compiles", pages)
+		return nil, nil
 	}
 	call := func(t *testing.T, w []byte, input, fn string, args ...interface{}) interface{} {
 		t.Helper()
@@ -1484,6 +1539,13 @@ func TestBTEmptyStackOverflowAnswersUnknown(t *testing.T) {
 		defer release()
 		if err != nil {
 			t.Fatal(err)
+		}
+		// A capped module: memory at its cap before the call, so nothing is
+		// left for the stack.
+		if ok, max := mem.Type(store).Maximum(); ok && max > mem.Size(store) {
+			if _, err := mem.Grow(store, max-mem.Size(store)); err != nil {
+				t.Fatalf("grow to the cap: %v", err)
+			}
 		}
 		copy(mem.UnsafeData(store)[0:], input) // page 0 is below the tables
 		res, err := inst.GetFunc(store, fn).Call(store, append([]interface{}{int32(0), int32(len(input))}, args...)...)

@@ -77,7 +77,17 @@ type tdfaThread struct {
 // tdfaStateKey is the canonical form of a TDFA state: sorted threads by pc,
 // each with a canonical regMap, plus the prevWasWord context bit.
 type tdfaStateKey struct {
-	threads     []tdfaThread
+	threads []tdfaThread
+	// order is the threads' pcs in leftmost-first PRIORITY order (threads
+	// is pc-sorted for hashing). It is part of the state's identity: two
+	// thread sets with equal pcs and registers but different priorities
+	// pick different winners when they reach the same pc or InstMatch, so
+	// they are different states. Without it a state reached later with a
+	// different order reused the first one's priorities and kept the wrong
+	// iteration: `(a{2,3})+x` over "aaaaaax" reported group 1 = [4,6), Go
+	// [3,6) — the extent right, the last iteration of a captured repeat
+	// over a counted repeat with min >= 2 wrong.
+	order       []int
 	prevWasWord bool
 }
 
@@ -289,7 +299,8 @@ func sequentializeCopiesRoundwise(copyOps []tdfaTagOp) []tdfaTagOp {
 // scratchRegSentinel (-2) — so DFA state ordering and every downstream
 // fuel/size baseline are unaffected.
 func (k *tdfaStateKey) keyString() string {
-	// Format: repeated "(pc:[r0,r1,...])W?" sorted by pc.
+	// Format: repeated "(pc:[r0,r1,...])" sorted by pc, then "|" and the
+	// priority order "pc,pc,...,", then "W" when prevWasWord.
 	b := make([]byte, 0, 64)
 	for _, t := range k.threads {
 		b = append(b, '(')
@@ -302,6 +313,11 @@ func (k *tdfaStateKey) keyString() string {
 			b = strconv.AppendInt(b, int64(r), 10)
 		}
 		b = append(b, ']', ')')
+	}
+	b = append(b, '|')
+	for _, pc := range k.order {
+		b = strconv.AppendInt(b, int64(pc), 10)
+		b = append(b, ',')
 	}
 	if k.prevWasWord {
 		b = append(b, 'W')
@@ -759,7 +775,11 @@ func newTDFA(mp resolvedProg, limit int) (*tdfaTable, bool) {
 			nextReg = counter
 		}
 
-		key := tdfaStateKey{threads: canonical, prevWasWord: prevWasWord}
+		order := make([]int, len(threads))
+		for i, t := range threads {
+			order[i] = t.pc
+		}
+		key := tdfaStateKey{threads: canonical, order: order, prevWasWord: prevWasWord}
 		ks := key.keyString()
 
 		if id, exists := stateMap[ks]; exists {

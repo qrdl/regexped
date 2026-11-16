@@ -12,7 +12,7 @@ The stub is a single `.js` ES module file. Import it directly from your applicat
 import { init, url_match, find_token } from './regexp.js';
 ```
 
-The stub requires the merged WASM file (produced by `regexped merge`) to be loaded at startup via `init()`. The module exports one `init` function plus one function per configured `_func` field.
+The stub loads the module `regexped compile` writes — a STANDALONE module (the config has no `output:` key), which owns its memory and needs no `regexped merge` — at startup via `init()`. The stub exports one `init` function plus one function per configured `_func` field.
 
 ---
 
@@ -26,14 +26,14 @@ Must be called once before any matcher function. Accepts a `BufferSource` (e.g. 
 
 ```js
 // Browser
-await init(await fetch('./merged.wasm').then(r => r.arrayBuffer()));
+await init(await fetch('./patterns.wasm').then(r => r.arrayBuffer()));
 
 // Node.js
 import { readFileSync } from 'node:fs';
-await init(readFileSync('./merged.wasm'));
+await init(readFileSync('./patterns.wasm'));
 
 // Cloudflare Workers
-import wasm from './merged.wasm';
+import wasm from './patterns.wasm';
 await init(wasm);
 ```
 
@@ -78,8 +78,8 @@ for (const [start, end] of find_token(text)) {
     console.log('match:', text.slice(start, end));
 }
 
-// First match only:
-const first = find_token(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = find_token(text);
 if (first) {
     const [start, end] = first;
     console.log('first match:', text.slice(start, end));
@@ -108,8 +108,8 @@ for (const groups of parse_groups(text)) {
     }
 }
 
-// First match only:
-const first = parse_groups(text).next().value;
+// First match only (destructuring closes the generator):
+const [first] = parse_groups(text);
 if (first && first[1] !== null) {
     const [s, e] = first[1];
     console.log('group 1:', text.slice(s, e));
@@ -207,6 +207,20 @@ which is the same guarantee the Rust and Go stubs get from passing a host
 pointer. A generator that exits early — `break`, `return`, or a thrown error —
 releases its region on the way out, so nothing leaks.
 
+**A generator you step by hand must be finished or closed.** `for…of` and
+destructuring (`const [first] = find_token(text)`) close the generator
+themselves; `find_token(text).next()` on its own does not, and a generator that
+is neither run to its end nor `return()`ed keeps its region — the input's
+UTF-8 bytes plus what the generator writes — for as long as the instance lives. It keeps only its own: every
+other generator still gives its region back when it finishes. Close one you
+stepped by hand with `it.return()`.
+
+*Until 2026-11-12* one such generator kept EVERY later generator's region too
+(the stub counted live generators, and the count never returned to zero), so
+under `max_memory` the instance soon failed every call with `RangeError`. The
+docs' own first-match example was `find_token(text).next().value`, which did
+exactly that.
+
 *This was not always true.* Until 2026-08-25 every call staged its input at one
 shared address, so an interleaved call left a suspended generator scanning
 another string's bytes and reporting offsets against it — silently, with no
@@ -261,8 +275,8 @@ with no boundary to amortise. The hint is a no-op there.
 - All positions are byte offsets into the UTF-8 encoding of the input, not indices into a JavaScript (UTF-16) string. A `string` input is UTF-8 encoded before matching, so for non-ASCII input `input.slice(start, end)` does NOT return the match; slice the encoded bytes instead, e.g. `new TextEncoder().encode(input).subarray(start, end)`. For ASCII input the two coincide.
 - `init()` must be awaited before calling any matcher. Calling a matcher before `init()` will throw.
 - The stub uses top-level `await` internally — it is designed for ES module environments (browser, Node.js with `"type": "module"`, Cloudflare Workers).
-- `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. Calling other stub functions while an iterator is suspended is safe: each live iterator owns its own region of the module's memory. An overlapping set's iterator reserves its answer cache in that region too — up to 64 MiB for one live iterator over a large input — and WebAssembly memory only grows, so the high-water mark stays allocated.
-- A pattern compiled to the Backtracking engine may also grow memory *inside* a call. A `groups_func` search keeps its frame stack there on every call — given a small starting size when the call starts, taken only if memory does not already have it, and doubled as it fills — and a search that outgrows its stack continues in a fallback whose frame stack and memo are sized from the input — on the order of the input length times the capture frame size. Both are placed above everything the stub has handed out and reused by later calls. The stub tells the module where its own data ends through the module's `regexped:scratch_base` global and re-reads the memory buffer after every call, so this needs nothing from you; see [wasm.md](wasm.md) "The Backtracking scratch base". Under a config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), a search that would grow past the cap throws the Backtracking error, and an input that does not fit under it by itself throws a `RangeError` before any search.
+- `init()` grows WASM memory by two pages beyond the DFA table area: one for input, one for capture group output and set result buffers. Calling other stub functions while an iterator is suspended is safe: each live iterator owns its own region of the module's memory. An overlapping set's iterator reserves its answer cache as a region of its own when the drive asks for it — the call where it would sweep, which most drives never reach — up to 64 MiB for one live iterator over a large input, and WebAssembly memory only grows, so the high-water mark stays allocated. A grow refused under `max_memory` declines the cache: the drive walks, with the same answers.
+- A pattern compiled to the Backtracking engine may also grow memory *inside* a call. A `groups_func` search keeps its frame stack there on every call — given a small starting size when the call starts, taken only if memory does not already have it, and doubled as it fills — and a search that outgrows its stack continues in a fallback whose frame stack and memo are sized from the input — on the order of the input length times the capture frame size. Both are placed above everything the stub has handed out and reused by later calls. The stub tells the module where its own data ends through the module's `regexped:scratch_base` global and re-reads the memory buffer after every call, so this needs nothing from you; see [wasm.md](wasm.md) "The Backtracking scratch base". Under a config's [`max_memory`](cli.md#max_memory--a-cap-on-the-modules-memory), a search that would grow past the cap throws the Backtracking error, and an input whose bytes do not fit under it by themselves throws a `RangeError` before any search. A string takes its UTF-8 size: memory is reserved for its length first, and grown further only for a non-ASCII string that needs more — so 1.5 MB of ASCII fits where 1.5 MB of bytes does. (Until 2026-11-13 a string reserved 3 bytes per UTF-16 unit before encoding, and that ASCII string threw under `max_memory: 4MiB`.)
 - `find_func` and `groups_func` generators automatically detect and use an internal `<func>_batch` WASM export when present, draining several matches per host↔WASM call instead of one. This export only exists when the pattern was compiled with `hints: [batch-find]` (see [`hints:`](cli.md#hints--likelymode-and-batch-find-compile-hints)); it's purely an internal performance path and doesn't change the generator's external `[start,end]` / capture-array output. Covers every `groups_func` shape, including the native lit-chain ("Path B") groups bodies.
 
   The rule about `groups_func` and `named_groups_func` *sharing* a batch export is gone with the key: one capability, one export, one name.

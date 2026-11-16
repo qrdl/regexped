@@ -203,6 +203,17 @@ func (r *Reporter) hasReason() bool {
 	return r != nil && r.cur != nil && r.cur.Reason != ""
 }
 
+// setLastMode replaces the mode of the pattern reported last.
+func (r *Reporter) setLastMode(mode string) {
+	switch {
+	case r == nil:
+	case r.cur != nil:
+		r.cur.Mode = mode
+	case len(r.Patterns) > 0:
+		r.Patterns[len(r.Patterns)-1].Mode = mode
+	}
+}
+
 // End closes the current pattern scope.
 func (r *Reporter) End() {
 	if r == nil || r.cur == nil {
@@ -210,6 +221,38 @@ func (r *Reporter) End() {
 	}
 	r.Patterns = append(r.Patterns, *r.cur)
 	r.cur = nil
+}
+
+// Summary writes one line per pattern and per set to w — what `regexped
+// check` prints: the engine (or the body that replaced one) and the mode, and
+// a set's capabilities, member count (members, by set name) and literal
+// frontend.
+func (r *Reporter) Summary(w io.Writer, members map[string]int) {
+	if r == nil || w == nil {
+		return
+	}
+	r.End()
+	for _, p := range r.Patterns {
+		name := p.Name
+		if name == "" {
+			name = truncate(p.Pattern, 40)
+		}
+		what := "no export"
+		switch {
+		case p.Engine != 0:
+			what = p.Engine.String()
+		case p.Reason != "":
+			what = p.Reason
+		}
+		mode := ""
+		if p.Mode != "" {
+			mode = ", " + p.Mode + " mode"
+		}
+		fmt.Fprintf(w, "pattern %s: %s%s\n", name, what, mode)
+	}
+	for _, d := range r.Sets {
+		fmt.Fprintf(w, "set %s: %s; %d members; frontend %s\n", d.Name, strings.Join(d.Capabilities, ", "), members[d.Name], d.Frontend)
+	}
 }
 
 // Render writes the human-readable report.

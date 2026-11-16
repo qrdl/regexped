@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -307,6 +308,15 @@ type compiledSet struct {
 	// at position 0 and at any position whose preceding byte is a newline.
 	lineAnchorMasks []uint32
 
+	// wordGuardMasks[bi] / noWordGuardMasks[bi]: bitmasks of patterns whose
+	// prefix is a bare \b / \B (PatternInfo.wordGuard) — eligible where the
+	// word-ness of input[pos-1] (none at 0) and input[pos] differs / agrees.
+	// wordGuardOff is the 256-byte word table they read, or -1 when no bucket
+	// carries a guard (every such set stays byte-identical).
+	wordGuardMasks   []uint32
+	noWordGuardMasks []uint32
+	wordGuardOff     int32
+
 	// prefixFixedLens[bi][k]: fixed prefix length for pattern k (minLen==maxLen>0); else 0.
 	// Used for compile-time match start adjustment.
 	prefixFixedLens [][]int
@@ -404,11 +414,9 @@ type compiledSet struct {
 	wholeSweep *overlapSweep
 	sweep      *overlapSweep
 	sweepDone  bool
-	// Lever C's tables: projTab (pattern x state -> cell byte offset) and the
-	// successor scratch, one entry per state (a byte, or two for 16-bit ids),
-	// the per-position step fills before updating.
-	overlapProjTabOff int32
-	overlapSuccOff    int32
+	// The projected sweep's step table (cell x class -> the successor's cell
+	// byte offset), overlapStepTabBytes.
+	overlapStepTabOff int32
 
 	// walkEndGlobal is the module global the tuple-writing suffix body stamps
 	// with the farthest position its walk reached, or -1 when no body carries
@@ -627,8 +635,12 @@ func (cs *compiledSet) hiddenFnCount() int {
 		// checkpointed cache splits what the whole-drive sweep did in one
 		// function — sweep-and-store — into sweep-and-checkpoint plus
 		// materialise-on-demand, because storing every tuple is the only
-		// reason the region was linear in the input.
+		// reason the region was linear in the input. A wide column adds its
+		// update function (overlapAdvanceFnMinCells).
 		n += 2
+		if cs.overlapAdvanceFn() {
+			n++
+		}
 	}
 	return n
 }
@@ -654,6 +666,12 @@ func (cs *compiledSet) overlapBlockFnOffset() int {
 		return off + 1
 	}
 	return -1
+}
+
+// overlapAdvanceFnOffset is the column-update function, immediately after the
+// block materialiser; only when overlapAdvanceFn.
+func (cs *compiledSet) overlapAdvanceFnOffset() int {
+	return cs.overlapDPFnOffset() + 2
 }
 
 // gatedFind reports whether this set emits the default (per-pattern
@@ -875,7 +893,16 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// escape — so it returns a COUNT and leaves the matching GLOBAL ids in the
 	// bucket's scratch, which emitRecordSparseProbe reads back.
 	opts.AllowSparseAccept = true
-	buckets := binPack(spec.Patterns, opts, diag)
+	// Only find and the scan pair read these buckets: the anchored pair has a
+	// packing of its own (compileAnchoredBuckets / the anchored union), so a
+	// set declaring neither gets none — their tables were 34,282 of a
+	// match_any-only SQL validator's 40,775 bytes, read by nothing, and
+	// --diag-json reported a literal frontend the set did not have.
+	var buckets []*bucket
+	scans := spec.HasFind() || spec.ScanAny != "" || spec.ScanAll != ""
+	if scans {
+		buckets = binPack(spec.Patterns, opts, diag)
+	}
 	// A sparse bucket whose walk can outlive its members gets a work counter
 	// that hands a gated drive over to a split copy of the set (set_sparse.go)
 	// — beside split members and in a batching set too, where the merge
@@ -956,6 +983,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	trivialPrefixMasks := make([]uint32, len(buckets))
 	startAnchorMasks := make([]uint32, len(buckets))
 	lineAnchorMasks := make([]uint32, len(buckets))
+	wordGuardMasks := make([]uint32, len(buckets))
+	noWordGuardMasks := make([]uint32, len(buckets))
 
 	var prefixFnBodies [][]byte
 	var prefixDataBytes []byte
@@ -967,7 +996,7 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	for bi, bkt := range buckets {
 		idxes := make([]int, len(bkt.patterns))
 		pml := make([]int, len(bkt.patterns))
-		var tm, sam, lam uint32
+		var tm, sam, lam, wgm, nwgm uint32
 		for j, p := range bkt.patterns {
 			if j >= bucketMaskBits {
 				idxes[j] = -1
@@ -978,6 +1007,12 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			}
 			if p.lineAnchor {
 				lam |= uint32(1) << uint(j)
+			}
+			switch p.wordGuard {
+			case wordGuardBoundary:
+				wgm |= uint32(1) << uint(j)
+			case wordGuardNoBoundary:
+				nwgm |= uint32(1) << uint(j)
 			}
 			if p.trivialPrefix || p.prefixDFA == nil {
 				idxes[j] = -1
@@ -995,6 +1030,8 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		trivialPrefixMasks[bi] = tm
 		startAnchorMasks[bi] = sam
 		lineAnchorMasks[bi] = lam
+		wordGuardMasks[bi] = wgm
+		noWordGuardMasks[bi] = nwgm
 	}
 
 	// Build suffix DFA function bodies, one per bucket.
@@ -1112,11 +1149,18 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// ids (with different pattern counts, under baked offsets that no longer
 	// match the emitted layout at all). Sparse buckets therefore never enter
 	// the pool and never reuse a base.
-	type suffixSlot struct {
-		t    *dfaTable
-		base int32
+	//
+	// The pool is the MODULE's (moduleGlobals.suffixShare), so a set compiled
+	// after this one — its no-cache companion above all, "the same set with
+	// some members split out" — names these tables too. Across sets the
+	// argument above does not hold (their options differ: a companion has
+	// `find` alone), so a reuse is taken only when the data emitted at the
+	// shared base is byte-for-byte the data already there; within a set it
+	// always is.
+	if opts.globals.suffixShare == nil {
+		opts.globals.suffixShare = map[uint64][]sharedSuffix{}
 	}
-	suffixDedup := map[uint64][]suffixSlot{}
+	suffixDedup := opts.globals.suffixShare
 	// The module global the tuple-writing bodies stamp with their walk's reach,
 	// or -1 when no bucket carries the store. ONE global: a single-bucket set's
 	// one body allocates it, and under a whole-set sweep every later bucket
@@ -1133,22 +1177,42 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			continue
 		}
 		assertBucketEmittable(bi, bkt)
-		base, reused, fp := tableOffset, false, uint64(0)
-		if bkt.suffixDFA != nil && !bkt.sparse {
-			fp = dfaFingerprint(bkt.suffixDFA)
-			for _, slot := range suffixDedup[fp] {
-				if dfaTableEqual(slot.t, bkt.suffixDFA) {
-					base, reused = slot.base, true
-					break
-				}
-			}
-		}
 		var ctr *sparseCounter
 		if bkt.sparse && sparseCycle(bkt) {
 			ctr = sparseCtr
 		}
-		art, dataBytes, dataSegs, nextOffset := genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, unicodeSet, needScanProbes, gatedFind, opts.globals, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
-			bucketLivenessExit(bkt))
+		gen := func(base int32, g *moduleGlobals) (suffixArtifacts, []byte, int, int32) {
+			return genSuffixWASMWalkEndCtr(ctr, walkEndGlobal, bkt.suffixDFA, int64(base), opts.TableMemIdx, patternIDs[bi], prefixFixedLens[bi], opts.LikelyMode, unicodeSet, needScanProbes, gatedFind, g, needBothProbes && anyProbeIdx[bi] >= 0, soleFirstHit, needLiveness, spec.suffixNeedsSkip(), !noSweep && (wantsWalkExtent(spec, buckets, bi) || wholeSet != nil), scanPlan.counter,
+				bucketLivenessExit(bkt))
+		}
+		var (
+			art        suffixArtifacts
+			dataBytes  []byte
+			dataSegs   int
+			nextOffset int32
+			reused     bool
+			fp         uint64
+		)
+		if bkt.suffixDFA != nil && !bkt.sparse {
+			fp = dfaFingerprint(bkt.suffixDFA)
+			for _, slot := range suffixDedup[fp] {
+				if !dfaTableEqual(slot.t, bkt.suffixDFA) {
+					continue
+				}
+				// Emitted at the shared base on a copy of the allocator, so a
+				// body that does not fit the data there leaves nothing behind.
+				g := opts.globals.clone()
+				a, d, n, e := gen(slot.base, g)
+				if bytes.Equal(d, slot.data) {
+					opts.globals.adopt(g)
+					art, dataBytes, dataSegs, nextOffset, reused = a, d, n, e, true
+					break
+				}
+			}
+		}
+		if !reused {
+			art, dataBytes, dataSegs, nextOffset = gen(tableOffset, opts.globals)
+		}
 		bkt.dp = art.dp
 		if art.probeWalkEndGlobal >= 0 {
 			bkt.probeWalkEndP1 = art.probeWalkEndGlobal + 1
@@ -1179,12 +1243,12 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			// duplicate them. tableOffset must NOT advance.
 			continue
 		}
+		if bkt.suffixDFA != nil && !bkt.sparse {
+			suffixDedup[fp] = append(suffixDedup[fp], sharedSuffix{bkt.suffixDFA, tableOffset, dataBytes})
+		}
 		tableOffset = nextOffset // use actual memory end, not encoded size
 		allDataBytes = append(allDataBytes, dataBytes...)
 		totalDataSegs += dataSegs
-		if bkt.suffixDFA != nil && !bkt.sparse {
-			suffixDedup[fp] = append(suffixDedup[fp], suffixSlot{bkt.suffixDFA, base})
-		}
 	}
 
 	// The whole-set automaton's tables, after every bucket's: its own layout,
@@ -1685,6 +1749,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 		trivialPrefixMasks:  trivialPrefixMasks,
 		startAnchorMasks:    startAnchorMasks,
 		lineAnchorMasks:     lineAnchorMasks,
+		wordGuardMasks:      wordGuardMasks,
+		noWordGuardMasks:    noWordGuardMasks,
+		wordGuardOff:        -1,
 		prefixFixedLens:     prefixFixedLens,
 		buckets:             buckets,
 		patternIDs:          patternIDs,
@@ -1991,27 +2058,33 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 			appendDataSegment(nil, cs.overlapDPColOff, make([]byte, n))...)
 		cs.startableDataSegs++
 
-		// Lever C's two tables, placed the same way and for the same reason.
-		if tab := cs.overlapProjTabBytes(); len(tab) > 0 {
-			cs.overlapProjTabOff = ra.Bump("overlap-proj-tab", int32(len(tab)), 2)
+		// The projected step's table (overlapStepTabBytes), Bumped like the
+		// columns.
+		if tab := cs.overlapStepTabBytes(); len(tab) > 0 {
+			cs.overlapStepTabOff = ra.Bump("overlap-step-tab", int32(len(tab)), 2)
 			cs.startableDataBytes = append(cs.startableDataBytes,
-				appendDataSegment(nil, cs.overlapProjTabOff, tab)...)
-			cs.startableDataSegs++
-
-			// One entry per state — a byte, two for 16-bit ids: delta(state,
-			// byte) for the position being swept. The projected update reads
-			// it at a CONSTANT offset per cell, which is what lets every other
-			// address in the step be a compile-time constant.
-			sw := cs.sweepSrc()
-			ns, align := int32(sw.dp.numWASM), int32(1)
-			if !sw.dp.l.useU8 {
-				ns, align = 2*ns, 2
-			}
-			cs.overlapSuccOff = ra.Bump("overlap-succ", ns, align)
-			cs.startableDataBytes = append(cs.startableDataBytes,
-				appendDataSegment(nil, cs.overlapSuccOff, make([]byte, ns))...)
+				appendDataSegment(nil, cs.overlapStepTabOff, tab)...)
 			cs.startableDataSegs++
 		}
+	}
+
+	// The word guards' table (PatternInfo.wordGuard): 1 for a word byte.
+	// Placed like the startable tables, and only when some bucket has a guard.
+	for bi := range buckets {
+		if cs.wordGuardMasks[bi]|cs.noWordGuardMasks[bi] == 0 {
+			continue
+		}
+		var tab [256]byte
+		for c := range tab {
+			if isWordCharByte(byte(c)) {
+				tab[c] = 1
+			}
+		}
+		cs.wordGuardOff = ra.Bump("word-guard", 256, 1)
+		cs.startableDataBytes = append(cs.startableDataBytes,
+			appendDataSegment(nil, cs.wordGuardOff, tab[:])...)
+		cs.startableDataSegs++
+		break
 	}
 
 	// First-position routing data, derived from the finished bucket list.
@@ -2042,6 +2115,9 @@ func compileSetWith(spec SetSpec, prefixPool, suffixPool *dfaPool, opts CompileS
 	// picked — see emittedFrontend. Recorded here rather than at selection
 	// time because it depends on the finished bucket list.
 	diag.Frontend = emittedFrontend(cs).String()
+	if !scans {
+		diag.Frontend = "none" // an anchored-only set scans nothing
+	}
 	cs.regionEnd = ra.End()
 	return cs
 }
@@ -2160,7 +2236,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		w, top, err := Compile(cfg.Patterns, 0, standalone, CompileOptions{
 			MaxDFAStates:              int(cfg.MaxDFAStates),
 			MaxBTInstructions:         int(cfg.MaxBTInstructions),
-			MaxTDFARegs:               cfg.MaxTDFARegs,
+			MaxTDFARegs:               int(cfg.MaxTDFARegs),
 			MaxMemory:                 cfg.MaxMemory,
 			Report:                    rep,
 			BTWorkBudget:              over.BTWorkBudget, // test-only overrides, as below
@@ -2182,7 +2258,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	opts := CompileOptions{
 		MaxDFAStates:      int(cfg.MaxDFAStates),
 		MaxBTInstructions: int(cfg.MaxBTInstructions),
-		MaxTDFARegs:       cfg.MaxTDFARegs,
+		MaxTDFARegs:       int(cfg.MaxTDFARegs),
 		Report:            rep,
 		// Test-only overrides (CompileFileOpts); zero everywhere else.
 		BTWorkBudget: over.BTWorkBudget,
@@ -2193,12 +2269,24 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 	}
 	// One allocator for the whole module, shared by the per-pattern entries
 	// below and by every set — the same rule compileAll follows.
-	globals := &moduleGlobals{}
+	globals := &moduleGlobals{wantEpoch: standalone && !opts.Component}
 	opts.globals = globals
-	for _, re := range cfg.Patterns {
-		p, err := compilePattern(re, tableBase, 0, opts)
+	heldIn := funcLessMemberModes(cfg)
+	for i, re := range cfg.Patterns {
+		o := opts
+		// An entry with no function is compiled only inside the sets that
+		// hold it, so --verbose reports their mode, not the one it would pick
+		// alone (`ab+` in a Unicode set said byte).
+		modes := heldIn[i]
+		if len(modes) == 1 && modes[0] {
+			o.Unicode = true
+		}
+		p, err := compilePattern(re, tableBase, 0, o)
 		if err != nil {
 			return nil, 0, nil, patternError(re, err)
+		}
+		if len(modes) > 1 {
+			rep.setLastMode("byte or unicode, by set")
 		}
 		// Batch find/groups export trigger — same
 		// trigger compileAll applies; see compileAll's comment for the
@@ -2334,7 +2422,8 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 			diags = append(diags, *cs.diag)
 		}
 	}
-	maxPages, err := memoryMaxPages(cfg.MaxMemory, moduleDeclPages(memPages, comp.Component))
+	maxPages, err := memoryMaxPages(cfg.MaxMemory, moduleDeclPages(memPages, comp.Component),
+		btRunPages(globals, over.BTStackStart, standalone, comp.Component))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -2705,11 +2794,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 			fs = append(fs, t, t)
 		}
-		// The checkpointed sweep, two functions:
+		// The checkpointed sweep, two functions, and a third for a wide column:
 		//   the pass:        (ptr, len, from, scratch, scratch_len) -> i32
 		//   materialise:     (ptr, len, scratch, block)             -> i32
+		//   column update:   (ptr, pos, cur, prev)                  -> 0
 		if cs.usesOverlapDP() {
 			fs = append(fs, byte(setTypeI32x5ToI32), byte(setTypeI32x4ToI32))
+			if cs.overlapAdvanceFn() {
+				fs = append(fs, byte(setTypeI32x4ToI32))
+			}
 		}
 		suffixType := byte(setMatchTypeSuffix)
 		if cs.gatedFind() || cs.suffixHasSkip {
@@ -3017,7 +3110,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 		}
 		if p.batchGroupsExport != "" {
 			if p.anchored {
-				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups, p.captureFromMode)
+				cs_bytes = appendBatchLitChainGroupsWrapperCodeEntry(cs_bytes, base+captureOff, p.numGroups, p.outGroups(), p.captureFromMode)
 			} else {
 				batchTableMemIdx := 0
 				if !standalone {
@@ -3027,7 +3120,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				if !p.isTDFA {
 					winOff = p.winGlobal()
 				}
-				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.defBatchGroups, p.twinRouteFor(findOff))
+				cs_bytes = appendBatchGroupsWrapperCodeEntry(cs_bytes, base+findOff, base+captureOff, p.numGroups, p.outGroups(), batchTableMemIdx, winOff, p.findFromMode, p.capStartGlobal(), p.minLen, p.defBatchGroups, p.twinRouteFor(findOff))
 			}
 		}
 		if p.hasFindFunc() {
@@ -3047,7 +3140,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 				anchoredOnly = p.captureFromMode == ffAnchoredZeroOnly
 			}
 			assertGroupsFromWrapperMode(p, anchoredOnly)
-			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly, p.defGroups)
+			cs_bytes = appendGroupsFromWrapperCodeEntry(cs_bytes, inner, anchoredOnly, p.defGroups, p.numGroups, p.outGroups())
 		}
 	}
 	// Set function bodies: find fn (if any), anchored match fn (if any), suffix DFA fns, prefix DFA fns.
@@ -3222,8 +3315,15 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			}
 		}
 		if cs.usesOverlapDP() {
-			cs_bytes = append(cs_bytes, emitCkptPassBody(cs, tableMemIdx, cs.overlapDPColOff)...)
-			cs_bytes = append(cs_bytes, emitCkptBlockBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			advFn := -1
+			if cs.overlapAdvanceFn() {
+				advFn = base + cs.overlapAdvanceFnOffset()
+			}
+			cs_bytes = append(cs_bytes, emitCkptPassBody(cs, tableMemIdx, cs.overlapDPColOff, advFn)...)
+			cs_bytes = append(cs_bytes, emitCkptBlockBody(cs, tableMemIdx, cs.overlapDPColOff, advFn)...)
+			if advFn >= 0 {
+				cs_bytes = append(cs_bytes, emitCkptAdvanceBody(cs, tableMemIdx, cs.overlapDPColOff)...)
+			}
 		}
 		// A Backtracking fallback bucket's suffix body CALLS its driver, so it
 		// can only be built here, where function indices exist. Everything
@@ -3284,7 +3384,7 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 	opts.owners.mark(len(cs_bytes), "")
 	if opts.Component {
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentReallocBody(heapGlobal, callListGlobal, classHeadsBase))
-		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(classHeadsBase))
+		cs_bytes = appendCodeEntry(cs_bytes, buildComponentFreeBody(heapGlobal, classHeadsBase))
 		cs_bytes = appendCodeEntry(cs_bytes, buildComponentPostBody(callListGlobal, freeIdx))
 		for _, a := range patAdapters {
 			switch a.kind {
@@ -3295,11 +3395,11 @@ func assembleModuleWithSets(patterns []*compiledPattern, sets []*compiledSet, me
 			case adapterGroups:
 				cs_bytes = appendCodeEntry(cs_bytes, buildGroupsAdapterBody(reallocIdx, a.funcIdx, a.numGroups))
 			default:
-				cs_bytes = appendCodeEntry(cs_bytes, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal))
+				cs_bytes = appendCodeEntry(cs_bytes, buildPatternAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal, classHeadsBase))
 			}
 		}
 		for _, a := range setAdapters {
-			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal))
+			cs_bytes = appendCodeEntry(cs_bytes, buildSetAdapterBody(a, reallocIdx, freeIdx, callListGlobal, heapGlobal, classHeadsBase))
 		}
 	}
 	if searchSetterIdx >= 0 {
@@ -5612,7 +5712,7 @@ func setSpecAndOptions(sc config.SetConfig, cfg config.BuildConfig, infos []*Pat
 		DeclaredPatternCount: sc.PatternCount(cfg),
 		Overlapping:          sc.Overlapping,
 		IDSpaceSize:          sc.IDSpaceSize(cfg),
-		MaxUnionStates:       cfg.MaxUnionStates,
+		MaxUnionStates:       int(cfg.MaxUnionStates),
 		Patterns:             infos,
 		PatternIDs:           globalIDs,
 	}
@@ -5737,4 +5837,31 @@ func emitForwardBody(n, fnIdx int) []byte {
 	b = utils.AppendULEB128(b, uint32(fnIdx)) //nolint:gosec // a function index
 	b = append(b, 0x0B)
 	return append(utils.AppendULEB128(nil, uint32(len(b))), b...)
+}
+
+// funcLessMemberModes is, for each top-level entry with no _func that some set
+// holds, the distinct modes of those sets (true = Unicode), in first-held
+// order. A set whose mode does not resolve is left out: its error comes from
+// its own compile.
+func funcLessMemberModes(cfg config.BuildConfig) map[int][]bool {
+	out := map[int][]bool{}
+	for _, sc := range cfg.Sets {
+		members := sc.Members(cfg)
+		mode, err := resolveSetMode(sc, members)
+		if err != nil {
+			continue
+		}
+		uni := mode.member("").unicode()
+		for _, m := range members {
+			e := m.Entry
+			if m.Inline || e.MatchFunc != "" || e.FindFunc != "" || e.GroupsFunc != "" {
+				continue
+			}
+			have := out[m.ID]
+			if len(have) == 0 || have[0] != uni && (len(have) == 1 || have[1] != uni) {
+				out[m.ID] = append(have, uni)
+			}
+		}
+	}
+	return out
 }

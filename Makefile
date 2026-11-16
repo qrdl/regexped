@@ -104,6 +104,7 @@ setperf-fuel-cross:
 # tools/advbench/rows.go.
 adversary:
 	$(MAKE) -C tools/advbench adversary
+	$(MAKE) -C tools/advbench adversary-unicode
 
 # Byte-identical regression net for the single-pattern paths: one fixture
 # per code path, compared byte for byte —
@@ -116,7 +117,7 @@ examples: build
 	$(MAKE) -C examples
 
 unittest:
-	go test -p 1 -timeout 20m -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component
+	go test -p 1 -timeout 20m -gcflags=all="-N -l" -coverprofile=cover.out ./compile ./config ./generate ./merge ./internal/... ./component ./check
 	@go tool cover -func=cover.out | grep "total:" | awk '{print "Test coverage: " $$3}'
 	@rm cover.out
 

@@ -1,13 +1,14 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/goccy/go-yaml"
 )
 
 func TestValidateIdentifier_Shape(t *testing.T) {
@@ -393,6 +394,19 @@ func TestValidateExports_HelperCollisions(t *testing.T) {
 		{"c", "ffi_x__res_new", true},
 		{"c", "ffi_url", true},
 		{"js", "url_match", false},
+		// Names the generated file brings into scope without declaring them:
+		// Go's imports, the C header's standard headers. The same names are
+		// free in a language whose stub does not use them.
+		{"go", "errors", true},
+		{"go", "iter", true},
+		{"go", "unsafe", true},
+		{"c", "free", true},
+		{"c", "malloc", true},
+		{"c", "size_t", true},
+		{"c", "exit", true},
+		{"c", "errors", false},
+		{"rust", "free", false},
+		{"js", "errors", false},
 	}
 	for _, c := range cases {
 		t.Run(c.stubType+"/"+c.funcName, func(t *testing.T) {
@@ -711,6 +725,99 @@ func TestValidateExports_DerivedSymbolCollisions(t *testing.T) {
 	}
 	if err := ValidateConfig(cfg); err == nil {
 		t.Error("accepted a capture group named \"index\", want error")
+	}
+	// The C stub's own per-groups_func helpers: `(?<next>…)` under
+	// `groups_func: kv` declared `#define kv_next 1` before `int kv_next(…)`.
+	for _, g := range []string{"init", "next", "free", "notes_bytes", "set_notes"} {
+		cfg = &BuildConfig{
+			StubFile: "x.h", ImportModule: "m", Output: "out.wasm",
+			Patterns: []PatternEntry{{Name: "a", Regexp: "(?<" + g + ">a)", GroupsFunc: "kv"}},
+		}
+		if err := ValidateConfig(cfg); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("capture group name %q", g)) {
+			t.Errorf("capture group named %q: err = %v, want it refused", g, err)
+		}
+	}
+}
+
+// TestValidateExports_GeneratorHelperCollisions: the helpers a generator names
+// after an iterating export verbatim (derivedHelperNames) and the JS/TS stub's
+// private helpers. Each config below passed validation and generated a stub
+// with two definitions of the name, which then did not build (PR #43 review).
+func TestValidateExports_GeneratorHelperCollisions(t *testing.T) {
+	set := []SetConfig{{Name: "s", Find: "scan", Overlapping: true, Regexps: []string{`foo\w+`, `bar\w+`}}}
+	kv := []PatternEntry{{Name: "g", Regexp: `(?P<k>\w+)=(?P<v>\d+)`, GroupsFunc: "kv"}}
+	for _, c := range []struct {
+		stub, name string
+		pats       []PatternEntry
+		sets       []SetConfig
+	}{
+		{"x.js", "_lazy", nil, set},
+		{"x.ts", "_offset", nil, set},
+		{"x.js", "_u32", nil, set},
+		{"x.rs", "rx_scan_cache_plan_", nil, set},
+		{"x.h", "rx_scan_cache_plan_", nil, set},
+		{"x.h", "rx_scan_cache_head_", nil, set},
+		{"x.h", "rx_scan_given_at_", nil, set},
+		{"x.h", "scan_init", nil, set},
+		{"x.h", "scan_free", nil, set},
+		{"x.h", "scan_cache_bytes", nil, set},
+		{"x.h", "scan_set_cache", nil, set},
+		{"x.h", "scan_notes_bytes", nil, set},
+		{"x.h", "scan_set_notes", nil, set},
+		{"x.h", "f_init", []PatternEntry{{Name: "f", Regexp: "a*b|a", FindFunc: "f"}}, nil},
+		{"x.h", "f_next", []PatternEntry{{Name: "f", Regexp: "a*b|a", FindFunc: "f"}}, nil},
+		{"x.h", "rx_f_iter_t", []PatternEntry{{Name: "f", Regexp: "a*b|a", FindFunc: "f"}}, nil},
+		{"x.h", "g_set_notes", []PatternEntry{{Name: "g", Regexp: "(a)", GroupsFunc: "g"}}, nil},
+		{"x.h", "g_free", []PatternEntry{{Name: "g", Regexp: "(a)", GroupsFunc: "g"}}, nil},
+		// The import of every pattern export, a groups_func's count macro,
+		// its group-index constants, a set's scanner type, the square root.
+		{"x.h", "_ffi_m", []PatternEntry{{Name: "m", Regexp: "a", MatchFunc: "m"}}, nil},
+		{"x.h", "_ffi_f", []PatternEntry{{Name: "f", Regexp: "a*b|a", FindFunc: "f"}}, nil},
+		{"x.h", "_ffi_kv", kv, nil},
+		{"x.h", "KV_GROUPS", kv, nil},
+		{"x.h", "kv_k", kv, nil},
+		{"x.rs", "kv_k", kv, nil},
+		{"x.go", "kv_v", kv, nil},
+		{"x.go", "kvParseK", []PatternEntry{{Name: "g", Regexp: `(?P<k>\w+)`, GroupsFunc: "kvParse"}}, nil},
+		{"x.h", "rx_s_scanner_t", nil, set},
+		{"x.h", "rx_sqrt_", nil, nil},
+		// AssemblyScript: the group-index constants, and its imports.
+		{"x.as", "kv_k", kv, nil},
+		{"x.as", "_ffi_kv", kv, nil},
+		{"x.as", "_ffi_m", []PatternEntry{{Name: "m", Regexp: "a", MatchFunc: "m"}}, nil},
+		{"x.as", "ffi_scan", nil, set},
+		{"x.as", "ffi_ova", nil, []SetConfig{{Name: "ov", MatchAny: "ova", Regexps: []string{`foo\w+`}}}},
+	} {
+		cfg := &BuildConfig{
+			ImportModule: "m", StubFile: c.stub, Output: "out.wasm",
+			Patterns: append(append([]PatternEntry{}, c.pats...), PatternEntry{Name: "clash", Regexp: "q", MatchFunc: c.name}),
+			Sets:     c.sets,
+		}
+		if c.stub == "x.as" {
+			cfg.StubFile, cfg.StubType = "x.ts", "as"
+		}
+		if c.stub != "x.rs" && c.stub != "x.h" && c.stub != "x.as" {
+			cfg.Output = ""
+		}
+		if err := ValidateConfig(cfg); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("match_func %q", c.name)) {
+			t.Errorf("%s: match_func %q, which the generator emits itself: err = %v, want it refused", c.stub, c.name, err)
+		}
+	}
+	// The same names are free in a language that does not emit them.
+	cfg := &BuildConfig{ImportModule: "m", StubFile: "x.go", Output: "out.wasm", Sets: set,
+		Patterns: []PatternEntry{{Name: "clash", Regexp: "q", MatchFunc: "scan_cache_bytes"}}}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("go: rejected scan_cache_bytes, which only C emits: %v", err)
+	}
+	// JS has no group-index constants: the groups' names are keys of one object.
+	cfg = &BuildConfig{ImportModule: "m", StubFile: "x.js",
+		Patterns: append(append([]PatternEntry{}, kv...), PatternEntry{Name: "clash", Regexp: "q", MatchFunc: "kv_k"})}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Errorf("js: rejected kv_k, which only C, Rust and Go emit: %v", err)
+	}
+	// A pattern that does not parse derives no group constants (compile reports it).
+	if got := namedCaptureGroups(`(?P<k>`); got != nil {
+		t.Errorf("namedCaptureGroups of an unparsable pattern = %v, want none", got)
 	}
 }
 
@@ -1049,14 +1156,14 @@ func TestWitVersionUnderModuleWarnsAndProceeds(t *testing.T) {
 func TestStubTypeForFormat(t *testing.T) {
 	component := &BuildConfig{WasmFormat: "component", ImportModule: "regexps"}
 	for _, st := range []string{"rust", "c", "wit"} {
-		if err := validateStubTypeForFormat(component, st); err != nil {
+		if err := ValidateStubTypeForFormat(component, st); err != nil {
 			t.Errorf("%s is a supported component stub type: %v", st, err)
 		}
 	}
 	// js and ts sit with go and as: no JS runtime loads a component, and the
 	// module format already serves a JS user without a transpiler.
 	for _, st := range []string{"go", "as", "js", "ts"} {
-		err := validateStubTypeForFormat(component, st)
+		err := ValidateStubTypeForFormat(component, st)
 		if err == nil {
 			t.Fatalf("stub %s under component: want an error", st)
 		}
@@ -1064,16 +1171,16 @@ func TestStubTypeForFormat(t *testing.T) {
 			t.Errorf("stub %s is not a component target; its message must not say \"yet\": %v", st, err)
 		}
 	}
-	if err := validateStubTypeForFormat(component, "wit"); err != nil {
+	if err := ValidateStubTypeForFormat(component, "wit"); err != nil {
 		t.Errorf("wit under component: %v", err)
 	}
 	// And wit is meaningless without a component.
 	module := &BuildConfig{ImportModule: "regexps"}
-	if err := validateStubTypeForFormat(module, "wit"); err == nil {
+	if err := ValidateStubTypeForFormat(module, "wit"); err == nil {
 		t.Error("wit under module: want an error")
 	}
 	for _, st := range []string{"rust", "js", "ts", "go", "c", "as"} {
-		if err := validateStubTypeForFormat(module, st); err != nil {
+		if err := ValidateStubTypeForFormat(module, st); err != nil {
 			t.Errorf("stub %s under module must stay valid: %v", st, err)
 		}
 	}
@@ -1228,12 +1335,27 @@ func TestValidateWitIdentDirect(t *testing.T) {
 	}
 }
 
-// PatternSelector rejects a shape it cannot interpret, rather than guessing.
+// PatternSelector rejects a shape it cannot interpret, rather than guessing,
+// with a line-numbered error.
 func TestPatternSelectorUnmarshalError(t *testing.T) {
-	var p PatternSelector
-	want := errors.New("boom")
-	if err := p.UnmarshalYAML(func(any) error { return want }); !errors.Is(err, want) {
-		t.Errorf("err = %v, want it propagated", err)
+	for _, c := range []struct{ yaml, want string }{
+		{"patterns: some\n", `got "some"`},
+		{"patterns: [a, [b]]\n", "list items must be pattern names"},
+		{"patterns: {x: 1}\n", `expected "all" or a list`},
+	} {
+		var v struct {
+			Patterns PatternSelector `yaml:"patterns"`
+		}
+		err := yaml.Unmarshal([]byte(c.yaml), &v)
+		if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "[1:") {
+			t.Errorf("%q: err = %v, want a line-numbered %q", c.yaml, err, c.want)
+		}
+	}
+	var v struct {
+		Patterns PatternSelector `yaml:"patterns"`
+	}
+	if err := yaml.Unmarshal([]byte("patterns: [a, 'b']\n"), &v); err != nil || len(v.Patterns.Names) != 2 {
+		t.Errorf("a list of names: %+v, %v", v.Patterns, err)
 	}
 }
 
@@ -1481,5 +1603,25 @@ func TestNamedGroupOldSpellingLoads(t *testing.T) {
 	old.Patterns[0].Regexp = cur.Patterns[0].Regexp
 	if !reflect.DeepEqual(old.Patterns, cur.Patterns) {
 		t.Errorf("old spelling loads to %+v, new to %+v", old.Patterns, cur.Patterns)
+	}
+}
+
+// TestComponentReportsEveryWITCollision: names that kebab-case alike collide
+// in the one WIT namespace, every pair reported at load — matcher against
+// matcher, and a set capability against a matcher function.
+func TestComponentReportsEveryWITCollision(t *testing.T) {
+	_, err := loadCfgSrc(t, "wasm_format: component\nimport_module: t\n"+
+		"patterns:\n  - {regexp: 'a', find_func: Find}\n  - {regexp: 'b', find_func: find}\n"+
+		"  - {regexp: 'c', find_func: find_x}\n  - {regexp: 'd', find_func: findX, name: d}\n"+
+		"sets:\n  - {name: s, match_any: Find_x, patterns: [d]}\n")
+	if err == nil {
+		t.Fatal("colliding WIT names loaded")
+	}
+	for _, want := range []string{`find_func "Find" and pattern "b": find_func "find" both map to the WIT name "find"`,
+		`find_func "find_x" and pattern "d": find_func "findX" both map to the WIT name "find-x"`,
+		`and set "s": match_any "Find_x" both map to the WIT name "find-x"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v\nwant it to report %s", err, want)
+		}
 	}
 }

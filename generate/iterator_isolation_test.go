@@ -90,7 +90,7 @@ func TestGeneratorsOwnTheirRegions(t *testing.T) {
 				// Every generator must reserve and release.
 				// "= _open(" so the helper's own definition is not counted as a use.
 				nOpen := strings.Count(src, "= _open(input")
-				nFinally := strings.Count(src, "finally { _close(); }")
+				nFinally := strings.Count(src, "finally { _close(_inBase); }")
 				if nOpen == 0 {
 					t.Fatalf("generated %s opens no regions; generators are unprotected", ext)
 				}
@@ -269,6 +269,170 @@ func TestJSIteratorIsolationAtRuntime(t *testing.T) {
 	}
 }
 
+// TestJSUnfinishedIteratorKeepsOnlyItsRegion: a generator that is started and
+// never finished (neither run to its end nor return()ed) keeps its own region,
+// and only that. The allocator used to count live iterators, so one such
+// generator kept the count above zero for good and every later generator's
+// region leaked too: under max_memory: 4MiB, with a 1 KB input, the instance
+// died at the 60th call. Here one is left unfinished, then the documented
+// first-match idiom `const [first] = find(text)` runs 10,000 times and memory
+// must not move; and two groups generators interleave, each writing its slots
+// into its own region (a groups region reserves its slots, now that an
+// iterator reserves only what it writes).
+func TestJSUnfinishedIteratorKeepsOnlyItsRegion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	dir := t.TempDir()
+	maxMem, err := config.ParseMemorySize("4MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BuildConfig{
+		ImportModule: "regions",
+		MaxMemory:    maxMem,
+		Patterns: []config.PatternEntry{
+			{Name: "words", Regexp: `[a-z]+`, FindFunc: "words"},
+			{Name: "pairs", Regexp: `([a-z])([a-z]*)`, GroupsFunc: "pairs"},
+		},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+let mem;
+const instantiate = WebAssembly.instantiate;
+WebAssembly.instantiate = async (...a) => { const r = await instantiate(...a); mem = (r.instance ?? r).exports.memory; return r; };
+const stubs = await import('./stubs.js');
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const fail = (m) => { console.error(m); process.exit(1); };
+const text = 'lorem ipsum dolor sit amet '.repeat(40).slice(0, 1024);
+// Left unfinished on purpose: started, then dropped.
+const dropped = stubs.words(text);
+if (dropped.next().value[0] !== 0) fail('first word');
+let checks = 0, size = -1;
+for (let i = 0; i < 10000; i++) {
+    const [first] = stubs.words(text);
+    if (first[0] !== 0 || first[1] !== 5) fail('call ' + i + ': ' + first);
+    let n = 0;
+    for (const g of stubs.pairs(text)) { if (++n === 2) break; }
+    if (i === 10) size = mem.buffer.byteLength;
+    checks++;
+}
+if (mem.buffer.byteLength !== size) fail('memory grew from ' + size + ' to ' + mem.buffer.byteLength);
+// Two groups generators in step: each must read its own slots.
+const a = 'ab cd ef', b = 'gh ijk';
+const want = (s) => [...s.matchAll(/([a-z])([a-z]*)/dg)].map(m => JSON.stringify(m.indices));
+const wa = want(a), wb = want(b);
+const ga = stubs.pairs(a), gb = stubs.pairs(b);
+for (let i = 0; i < Math.max(wa.length, wb.length); i++) {
+    const x = ga.next(), y = gb.next();
+    if (i < wa.length && JSON.stringify(x.value) !== wa[i]) fail('a ' + i + ': ' + JSON.stringify(x.value) + ' want ' + wa[i]);
+    if (i < wb.length && JSON.stringify(y.value) !== wb[i]) fail('b ' + i + ': ' + JSON.stringify(y.value) + ' want ' + wb[i]);
+    checks++;
+}
+console.log('OK ' + checks);
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "OK 10003" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+// TestJSStringInputTakesOnlyItsBytes: under max_memory: 4MiB a 1.5 MB ASCII
+// STRING is searched like the same bytes as a Uint8Array. The stubs used to
+// reserve 3 bytes per UTF-16 unit before encoding — 4.5 MB here — and threw
+// RangeError. A non-ASCII string that runs past the end of memory mid-encode
+// grows and continues, and still gives every match. The JS stub runs here; the
+// TS stub is the same text with types, which tsc checks elsewhere.
+func TestJSStringInputTakesOnlyItsBytes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	maxMem, err := config.ParseMemorySize("4MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BuildConfig{
+		ImportModule: "strin", MaxMemory: maxMem,
+		Patterns: []config.PatternEntry{{Name: "w", Regexp: `\pL+`, FindFunc: "words", MatchFunc: "word"}},
+		StubFile: "stubs.js",
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := genJSStubFile(cfg)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+const stubs = await import('./stubs.js');
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const fail = (m) => { console.error(m); process.exit(1); };
+// Cyrillic FIRST, on a fresh instance: memory then ends right after the
+// length reservation (400,000 units), the 700,000 bytes do not fit, and the
+// encode must grow and continue. Every word found, the last one in place.
+const cyr = 'жук '.repeat(100000);
+let n = 0, last;
+for (const m of stubs.words(cyr)) { n++; last = m; }
+if (n !== 100000 || last[0] !== 99999 * 7 || last[1] !== 99999 * 7 + 6) fail('cyrillic: ' + n + ' words, last ' + last);
+if (stubs.word('жук') !== 6) fail('one-shot cyrillic');
+// 1.5 MB of ASCII: 3 bytes per unit reserved would be 4.5 MB, over the cap.
+const ascii = 'ab '.repeat(500000);
+n = 0;
+for (const _ of stubs.words(ascii)) n++;
+if (n !== 500000) fail('ascii: ' + n + ' words');
+if (stubs.word('ab') !== 2) fail('one-shot ascii');
+console.log('OK');
+`
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "OK" {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
 // isolationDriver is the node side. It is deliberately dependency-free and
 // exits non-zero with a message on the first disagreement.
 const isolationDriver = `import { readFile } from 'node:fs/promises';
@@ -400,7 +564,7 @@ func TestJSSearchNotesAtRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	if !strings.Contains(src, "_notes(_blk") {
+	if !strings.Contains(src, "_notes(_inBase, _blk") {
 		t.Fatal("the stub hands no search block over: the patterns kept no notes")
 	}
 	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
@@ -556,7 +720,7 @@ func TestJSBatchNotesUpFrontAtRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	for _, want := range []string{"_notes(_sd + ", "if (_batched) _fail = _notes(_blk, len, "} {
+	for _, want := range []string{"_notes(_inBase, _sd + ", "if (_batched) _fail = _notes(_inBase, _blk, len, "} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("the stub asks for no notes up front: %q missing", want)
 		}
@@ -641,7 +805,7 @@ func TestJSBacktrackingBudgetPerSearchAtRuntime(t *testing.T) {
 	if !strings.Contains(src, "const _sd = _align(_bump)") {
 		t.Fatal("the set iterator hands no search blocks over: the Backtracking member keeps no budget per search")
 	}
-	if !strings.Contains(src, "_btmemo(_blk, len,") {
+	if !strings.Contains(src, "_btmemo(_inBase, _blk, len,") {
 		t.Fatal("the find iterator gives a tripped search no memo")
 	}
 	if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
@@ -906,3 +1070,325 @@ inputs.forEach((input, i) => {
 });
 console.log("OK " + checks);
 `
+
+// TestJSSetAllIDsAtRuntime drives the generated JS and TS `_all` exports of
+// three sets — narrow 40 and 64 ids (an i64 mask, id 63 its sign bit) and
+// wide 70 (a bitmap) — and compares the ids with Go's: they walk only the set
+// bits now (Math.clz32 over the mask's halves, zero bytes skipped), where they
+// tested every id.
+func TestJSSetAllIDsAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	lits := func(n int) []string {
+		var out []string
+		for i := 0; i < n; i++ {
+			out = append(out, fmt.Sprintf("k%02d", i))
+		}
+		return out
+	}
+	cfg := config.BuildConfig{ImportModule: "allids", StubFile: "stubs.js"}
+	sizes := []int{40, 64, 70}
+	for _, n := range sizes {
+		cfg.Sets = append(cfg.Sets, config.SetConfig{Name: fmt.Sprintf("s%d", n), Regexps: lits(n),
+			MatchAll: fmt.Sprintf("m%d", n), ScanAll: fmt.Sprintf("a%d", n)})
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	inputs := []string{"", "k00", "k31", "k32", "k63", "k69", "k01 k33 k39 k07", "k00 k31 k32 k63", "k69 k64 k01 k33 k12", "x"}
+	var want []string
+	for _, n := range sizes {
+		for _, in := range inputs {
+			whole, any := []int{}, []int{}
+			for i, l := range lits(n) {
+				if in == l {
+					whole = append(whole, i)
+				}
+				if strings.Contains(in, l) {
+					any = append(any, i)
+				}
+			}
+			w, _ := json.Marshal(whole)
+			a, _ := json.Marshal(any)
+			want = append(want, fmt.Sprintf("%d %q %s %s", n, in, w, a))
+		}
+	}
+	inJSON, _ := json.Marshal(inputs)
+	for _, ext := range []string{"js", "ts"} {
+		t.Run(ext, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			c := cfg
+			c.StubFile = "stubs." + ext
+			var src string
+			var err error
+			if ext == "js" {
+				src, err = genJSStubFile(c)
+			} else {
+				src, err = genTSStubFile(c)
+			}
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			stub := "./stubs.js"
+			if ext == "ts" {
+				js, err := transpileTS(t, dir, src)
+				if err != nil {
+					t.Skip(err)
+				}
+				src = js
+			}
+			if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var calls strings.Builder
+			for _, n := range sizes {
+				fmt.Fprintf(&calls, "for (const s of inputs) console.log(%d, JSON.stringify(s), JSON.stringify(stubs.m%d(s)), JSON.stringify(stubs.a%d(s)));\n", n, n, n)
+			}
+			driver := "import { readFile } from 'node:fs/promises';\nimport * as stubs from '" + stub + "';\n" +
+				"await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));\n" +
+				"const inputs = " + string(inJSON) + ";\n" + calls.String()
+			if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeESMPackageJSON(t, dir)
+			cmd := exec.Command("node", "drive.mjs")
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("node: %v\n%s", err, out)
+			}
+			got := strings.Split(strings.TrimSpace(string(out)), "\n")
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("ids differ:\n got:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
+// TestJSSearchStateSurvivesANeighbourClosing: an iterator's notes, its
+// Backtracking memo and a split set's descriptor are carved for it after its
+// region, and were left unrecorded — so another iterator opened above them and
+// finished first set _bump back to the first one's region top, below them, and
+// the next iterator opened there wrote its input over them (PR #43 review).
+// Each iterator here runs once alone and once beside a neighbour that opens,
+// finishes and closes, then a third that writes its input; both runs must give
+// the same matches. The search arms on its first call, so its notes exist
+// before the neighbours run.
+func TestJSSearchStateSurvivesANeighbourClosing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	cfg := config.BuildConfig{
+		ImportModule: "owned",
+		Patterns:     []config.PatternEntry{{Name: "n", Regexp: `x[^yz]*y|x`, FindFunc: "nfind"}},
+		Sets:         []config.SetConfig{{Name: "sp", Find: "spf", Regexps: []string{`a*b|a`, `zz\d+`}}},
+	}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as s from './stubs.js';
+await s.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const fail = (m) => { console.error(m); process.exit(1); };
+// Each first call walks the long branch to a byte that kills it (z, c) for a
+// one-byte match and arms; past that byte the long branch does match, so a
+// note the third iterator's bytes fake there loses the longer match.
+let checks = 0;
+for (const [name, fn, IN] of [['nfind', s.nfind, 'x'.repeat(3000) + 'z' + 'x'.repeat(3000) + 'y'],
+                              ['spf', s.spf, 'a'.repeat(3000) + 'c' + 'a'.repeat(3000) + 'b']]) {
+    const alone = JSON.stringify([...fn(IN)]);
+    const a = fn(IN);
+    const got = [a.next().value];          // armed: its notes / descriptor carved above its region
+    for (const _ of fn('xyz')) {}           // a neighbour: opened above them, finished, closed
+    const c = fn('\u07ff'.repeat(8000) + 'b'); // a third, opened where _bump now points: DF BF, nearly every note bit set
+    c.next();
+    for (const v of a) got.push(v);
+    c.return();
+    if (JSON.stringify(got) !== alone) fail(name + ': matches beside a closed neighbour differ from the run alone');
+    checks++;
+}
+console.log('OK ' + checks);
+`
+	for _, ext := range []string{"js", "ts"} {
+		t.Run(ext, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			c := cfg
+			c.StubFile = "stubs." + ext
+			var src string
+			var err error
+			if ext == "js" {
+				src, err = genJSStubFile(c)
+			} else {
+				src, err = genTSStubFile(c)
+			}
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			if !strings.Contains(src, "owner: _inBase") {
+				t.Fatal("the split set's descriptor is not an owned region: the test would not reach it")
+			}
+			if ext == "ts" {
+				if src, err = transpileTS(t, dir, src); err != nil {
+					t.Skip(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, "stubs.js"), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeESMPackageJSON(t, dir)
+			cmd := exec.Command("node", "drive.mjs")
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != "OK 2" {
+				t.Fatalf("node: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// transpileTS compiles a TS stub to JS with the global `tsc`, under the strict
+// options compileTS checks with, and returns the JS; an error when tsc is not
+// on PATH.
+func transpileTS(t *testing.T, dir, src string) (string, error) {
+	t.Helper()
+	if _, err := exec.LookPath("tsc"); err != nil {
+		return "", fmt.Errorf("tsc not on PATH")
+	}
+	tsDir := filepath.Join(dir, "ts")
+	if err := os.MkdirAll(tsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tsDir, "stubs.ts"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeESMPackageJSON(t, tsDir)
+	tsconfig := `{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "out"
+  },
+  "files": ["stubs.ts"]
+}
+`
+	if err := os.WriteFile(filepath.Join(tsDir, "tsconfig.json"), []byte(tsconfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, tsDir, nil, "tsc", "-p", ".")
+	js, err := os.ReadFile(filepath.Join(tsDir, "out", "stubs.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(js), nil
+}
+
+// TestJSOffsetRangeErrorAtRuntime: every JS/TS export that takes a start
+// position refuses a negative, fractional or non-finite one with a RangeError
+// naming it, and accepts a whole number — an offset past the input included.
+func TestJSOffsetRangeErrorAtRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node against a compiled module; skipped in -short")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not on PATH")
+	}
+	cfg := config.BuildConfig{ImportModule: "offs",
+		Patterns: []config.PatternEntry{{Name: "a", Regexp: `a+`, FindFunc: "fa"}, {Name: "g", Regexp: `(b)`, GroupsFunc: "gb"}},
+		Sets: []config.SetConfig{
+			{Name: "s", Find: "sf", ScanAny: "sany", ScanAll: "sall", Patterns: config.PatternSelector{All: true}},
+			{Name: "t", Find: "tf", Hints: []string{"batch-find"}, Patterns: config.PatternSelector{All: true}},
+		}}
+	wasm, _, err := compile.CompileFile(cfg, "")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	const driver = `import { readFile } from 'node:fs/promises';
+import * as stubs from './stubs.js';
+await stubs.init(await readFile(new URL('./m.wasm', import.meta.url)));
+const calls = {
+  fa: (o) => [...stubs.fa('xaab', o)], gb: (o) => [...stubs.gb('xab', o)],
+  sf: (o) => [...stubs.sf('aab', o)], tf: (o) => [...stubs.tf('aab', o)],
+  sany: (o) => stubs.sany('aab', o), sall: (o) => stubs.sall('aab', o),
+};
+const out = [];
+for (const [name, f] of Object.entries(calls)) {
+  for (const o of [-1, 1.5, NaN, Infinity]) {
+    try { f(o); out.push(name + ' ' + o + ' accepted'); }
+    catch (e) { out.push(name + ' ' + o + ' ' + (e instanceof RangeError && e.message.includes(name) && e.message.includes(String(o)))); }
+  }
+  try { f(1); f(99); out.push(name + ' ok'); } catch (e) { out.push(name + ' ' + e); }
+}
+console.log(out.join('\n'));
+`
+	var want []string
+	for _, name := range []string{"fa", "gb", "sf", "tf", "sany", "sall"} {
+		for _, o := range []string{"-1", "1.5", "NaN", "Infinity"} {
+			want = append(want, name+" "+o+" true")
+		}
+		want = append(want, name+" ok")
+	}
+	for _, ext := range []string{"js", "ts"} {
+		t.Run(ext, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "m.wasm"), wasm, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			c := cfg
+			c.StubFile = "stubs." + ext
+			var src string
+			if ext == "js" {
+				src, err = genJSStubFile(c)
+			} else {
+				src, err = genTSStubFile(c)
+			}
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			if ext == "ts" {
+				js, err := transpileTS(t, dir, src)
+				if err != nil {
+					t.Skip(err)
+				}
+				src = js
+			}
+			for name, body := range map[string]string{"stubs.js": src, "drive.mjs": driver} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeESMPackageJSON(t, dir)
+			cmd := exec.Command("node", "drive.mjs")
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("node: %v\n%s", err, out)
+			}
+			if got := strings.TrimSpace(string(out)); got != strings.Join(want, "\n") {
+				t.Errorf("got:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+			}
+		})
+	}
+}

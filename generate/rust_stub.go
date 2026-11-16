@@ -238,7 +238,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 					gateInit += fmt.Sprintf(" btmemos: vec![Vec::new(); %d],", len(blocks))
 				}
 			}
-			cacheField, cacheInit := "", ""
+			cacheField, cacheInit, cachePlan, cacheWanted := "", "", "", ""
 			cacheArgs := "0, 0"
 			if sh := shapes.cacheShape(setIdx); sh.Offered() {
 				consts := overlapCacheConstsFor(sh)
@@ -259,7 +259,8 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// sweep validates the stride it is handed and reports a header
 				// it cannot make sense of.
 				cacheField = "    cache: Vec<u32>,\n"
-				cacheInit = " cache: {\n            let m = (input.len() + 1) as u64;\n"
+				planFn := fmt.Sprintf("rx_%s_cache_plan_", s.Find)
+				cacheInit = fmt.Sprintf("#[allow(non_snake_case)]\nfn %s(input: &[u8]) -> (u64, u64) {\n            let m = (input.len() + 1) as u64;\n", planFn)
 				if sh.Eligible {
 					cacheInit += fmt.Sprintf(`            let row = %[5]d as u64;
             let cell = %[6]d as u64;
@@ -301,14 +302,52 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
             };
 `, consts.Hdr, consts.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
 				}
-				cacheInit += fmt.Sprintf(`            if %[2]s {
+				cacheInit += fmt.Sprintf("            if %s { (0, 0) } else { (bytes, k) }\n}\n\n", fits)
+				// The plan is a function of its own because it is spelled twice
+				// over: the iterator's construction, and the moment the module
+				// asks for the region.
+				// Its lines were spelled for the iterator's initialiser, eight
+				// columns deeper than a function body.
+				cachePlan = strings.ReplaceAll(cacheInit, "\n            ", "\n    ")
+				// LAZY: the iterator starts with the header alone, its lazy
+				// word set, and the module answers abi.OverlapCacheWanted, with
+				// nothing delivered, at the call where it would start using the
+				// region. Most drives never get there, and an eager region was
+				// 12 bytes per input byte allocated — infallibly — for every
+				// overlapping scan.
+				cacheInit = fmt.Sprintf(` cache: {
+            let (bytes, k) = %[1]s(input);
+            if bytes == 0 {
                 Vec::new()
             } else {
-                let mut v = vec![0u32; (bytes as usize).div_ceil(4)];
-                v[%[1]d] = k as u32;
+                let mut v = vec![0u32; %[2]d];
+                v[%[3]d] = k as u32;
+                v[%[4]d] = %[5]d;
                 v
             }
-        },`, config.SetOverlapHdrStrideOff/4, fits)
+        },`, planFn, config.SetOverlapCheckpointHeaderBytes/4, config.SetOverlapHdrStrideOff/4,
+					config.SetOverlapHdrLazyOff/4, uint32(abi.OverlapCacheLazy))
+				// The region, allocated FALLIBLY: one that cannot be had leaves
+				// the header alone with its lazy word cleared, and the module
+				// then walks — the same answers, slower — where an infallible
+				// allocation aborted the program. Either way the call is made
+				// again, and the module never asks twice.
+				cacheWanted = fmt.Sprintf(`            // %[1]d: the module would start using the answer cache now and
+            // delivered nothing; hand the whole region over, or none.
+            if n == %[1]d {
+                let words = (%[2]s(self.input).0 as usize).div_ceil(4);
+                let mut v: Vec<u32> = Vec::new();
+                if v.try_reserve_exact(words).is_ok() {
+                    v.extend_from_slice(&self.cache);
+                    v.resize(words, 0);
+                    v[%[3]d] = 0;
+                    self.cache = v;
+                } else {
+                    self.cache[%[3]d] = 0;
+                }
+                continue;
+            }
+`, abi.OverlapCacheWanted, planFn, config.SetOverlapHdrLazyOff/4)
 				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
 					"(self.cache.len() * 4) as u32"
 			}
@@ -340,6 +379,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				}
 			}
 			gateDoc := " and a zeroed gate array"
+			out.WriteString(cachePlan)
 			fmt.Fprintf(&out, `/// Iterator over the set's matches. It owns a reusable tuple buffer%s,
 /// refills at each matching position and yields that position's matches one
 /// at a time before advancing. Dropping and re-creating it restarts the scan.
@@ -369,7 +409,7 @@ impl<'a> Iterator for %s<'a> {
                 ffi_%s(self.input.as_ptr(), self.input.len() as i32, self.from,
                     %sself.buf.as_mut_ptr() as *mut i32, %s as i32)
             };
-            // Before the scan-finished test: -2 means the engine gave up and
+%s            // Before the scan-finished test: -2 means the engine gave up and
             // does not know, so ending iteration here would report success.
             if n == %d { self.done = true; return Some(Err(Error::BacktrackOverflow)); }
             // And -4 the same way: the answer cache's header is malformed, so
@@ -389,7 +429,7 @@ impl<'a> Iterator for %s<'a> {
 }
 
 `, gateDoc, allocDoc, iterName, gateField, bufField, iterName, failCheck, s.Find, gateArg, konst,
-				btOverflow, malformedCache, outOfOrder, afterCall)
+				cacheWanted, btOverflow, malformedCache, outOfOrder, afterCall)
 			fmt.Fprintf(&out, "impl std::iter::FusedIterator for %s<'_> {}\n\n", iterName)
 			fmt.Fprintf(&out, "/// Starts a scan at `offset`. Each step yields one match.\n"+
 				"///\n"+

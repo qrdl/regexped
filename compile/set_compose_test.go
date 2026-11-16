@@ -1812,6 +1812,42 @@ func TestAnalyzePattern_NonBeginZeroLenPrefix(t *testing.T) {
 	}
 }
 
+// TestAnalyzePattern_WordGuardPrefix: a prefix that is a single \b or \B is
+// stripped to a word guard, keeping the member's literal bucket; anything
+// mixed with it still routes to fallback.
+func TestAnalyzePattern_WordGuardPrefix(t *testing.T) {
+	for _, c := range []struct {
+		pat   string
+		guard wordGuardKind
+		split bool
+	}{
+		{`\bselect\b`, wordGuardBoundary, true},
+		{`\Bing`, wordGuardNoBoundary, true},
+		{`\b-x`, wordGuardBoundary, true},
+		{`(\b)from`, wordGuardBoundary, true}, // captures are stripped first
+		{`^\bfoo`, wordGuardNone, false},
+		{`\b\Bfoo`, wordGuardNone, false},
+		{`\b.foo`, wordGuardNone, false}, // a prefix walk, which cannot see the boundary
+		// A guard whose split is rejected later (a begin anchor after the
+		// literal) does not survive onto the fallback member: it would be
+		// tested at EOF and read input[len].
+		{`\bfoo\n(?m:^)x`, wordGuardNone, false},
+		{`\Bfoo^`, wordGuardNone, false},
+	} {
+		var pp, sp dfaPool
+		info, err := analyzePattern(config.PatternEntry{Regexp: c.pat}, &pp, &sp)
+		if err != nil {
+			t.Fatalf("analyzePattern %q: %v", c.pat, err)
+		}
+		if info.wordGuard != c.guard || info.splittable != c.split {
+			t.Errorf("%q: wordGuard=%d splittable=%v, want %d/%v", c.pat, info.wordGuard, info.splittable, c.guard, c.split)
+		}
+		if c.split && (!info.trivialPrefix || info.prefixAST != nil) {
+			t.Errorf("%q: guard kept a prefix walk (trivialPrefix=%v)", c.pat, info.trivialPrefix)
+		}
+	}
+}
+
 func TestAnalyzePattern_BeginSuffixFallback(t *testing.T) {
 	// Pattern whose suffix contains a begin-anchor (a^): routes to fallback.
 	re := config.PatternEntry{Regexp: `a^`}

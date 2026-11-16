@@ -15,6 +15,8 @@ Each regexp WASM module exports one or more functions depending on which `_func`
 (func $find (param $ptr i32) (param $len i32) (param $from i32) (result i64))
 
 ;; Anchored groups: writes numGroups*2 i32 slots to out_ptr, returns end position or -1.
+;; numGroups is the pattern's group count as written (MaxCap + 1): a group Go's
+;; Simplify removes, such as `(b){0}`, can never take part and is written -1.
 ;; Slots layout: [start0, end0, start1, end1, ...]  (group 0 = full match)
 (func $groups (param $ptr i32) (param $len i32) (param $out_ptr i32) (param $from i32) (result i32))
 
@@ -222,7 +224,12 @@ then depends on the output kind:
   default serves one drive at a time: two drives interleaved over one instance
   keep resetting each other (correct, but each call starts fresh), and a caller
   that rewrites its text in place and resumes inside the window reads the old
-  text's state. Regions are grown on first use and reused, grown again to at
+  text's state. **A set's new drive over the same buffer** must therefore not
+  look like a continuation: zeroing the gate array is not enough here, since
+  the module does not see it. Start the new drive at an offset no greater than
+  the previous drive's last `from` (0 always works), or use a different gate
+  array or text address, or hand your own state over as the stubs do —
+  otherwise every answer of the new drive can come from the old text. Regions are grown on first use and reused, grown again to at
   least twice the size only when a drive needs more, so an instance holds at
   most about twice its largest drive's state. A caller that hands its own state
   over pays ~1-9 fuel per call for the check;
@@ -280,7 +287,7 @@ below):
 
 | Export | Signature | Role |
 |---|---|---|
-| `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; segregated free lists by power-of-two size class, growing memory when a class is empty and no space is left, and trapping if growth fails or the alignment exceeds 8 |
+| `cabi_realloc` | `(i32, i32, i32, i32) → i32` | `(old_ptr, old_size, align, new_size)`; segregated free lists by power-of-two size class, growing memory when a class is empty and no space is left, and trapping if growth fails or the alignment exceeds 8. A block freed at the heap top goes back to the top, not to its list |
 | `cabi_post_<canonical>` | `(i32) → ()` | post-return; returns every block THIS call allocated to its class's free list. One shared function, exported under one name per adapter that returns a result area — a set's constructor and destructor have none |
 | `…/matcher#<kebab>` | `(ptr, len) → retptr` | `match_func` only: the end position, -1 or -2 lifted to `result<option<u32>, error-code>` |
 | `…/matcher#[constructor]` / `[method]….next` / `[dtor]` | see below | the resource trio for each `find_func` and `groups_func` |
@@ -314,8 +321,8 @@ their indices are `0..n-1` and only the set imports shift.
 |---|---|
 | `…/sets#<kebab>` | `match_any` / `scan_any`: the raw id or -1 becomes `option<u32>` |
 | `…/sets#<kebab>` | `match_all` / `scan_all`: the i64 bitmask, or the count plus a bitmap the adapter allocates AND ZEROES, becomes `list<u32>` of ids. The scan uses `i64.ctz` + `v &= v-1`, so it runs once per HIT — a bit-by-bit scan measured up to 11x the whole call at 4096 patterns |
-| `…/sets#[constructor]<res>` | the `find` resource: allocates the scanner state, TAKES OVER the block the input was lowered into (copying it only when that block is not the newest on the per-call chain), zeroes the gate array, reserves the answer cache when the set has one, and returns a handle from the imported `[resource-new]` builtin |
-| `…/sets#[method]<res>.next` | one position per call, into a `PATTERN_COUNT`-tuple buffer — the exact worst case for one start, so the raw ABI's transactional overflow cannot fire |
+| `…/sets#[constructor]<res>` | the `find` resource: allocates the scanner state, TAKES OVER the block the input was lowered into (copying it only when that block is not the newest on the per-call chain), zeroes the gate array, hands over the answer cache's 48-byte header when the set has a cache — lazily, the region's size kept beside it — and returns a handle from the imported `[resource-new]` builtin |
+| `…/sets#[method]<res>.next` | one position per call, into a `PATTERN_COUNT`-tuple buffer — the exact worst case for one start, so the raw ABI's transactional overflow cannot fire. When the module asks for the answer cache's region (`-7`) it reserves it — where the allocator can serve it, else declines — and calls again |
 | `…/sets#[dtor]<res>` | frees the input block, the gate array, the answer cache and the state. Not in the WIT: `component new` binds it by name, and a component without it TRAPS when a handle is dropped |
 
 A set-bearing component therefore has a function IMPORT — `[resource-new]<res>`
@@ -364,7 +371,8 @@ element option<tuple<u32,u32>>                           size 12, align 4
 
 The `-1`, `-2`, `-4` and `-6` sentinels are translated here: `-1` becomes
 `ok(none)`, `-2` becomes `err(backtrack-overflow)`, and `-4` and `-6` — which
-only a set `find` returns — become `err(malformed-cache)` and `err(out-of-order)`. A group is unset iff its
+only a set `find` returns — become `err(malformed-cache)` and `err(out-of-order)`; `-7`, the set `find` asking
+for its answer cache's region, never reaches the consumer: `next` answers it and calls again. A group is unset iff its
 START slot is negative, which is the same test the generated stubs apply, so all
 six languages and the component agree on which groups participated.
 
@@ -698,7 +706,7 @@ gate-array pointer in the same position, and both find entries take it:
 | +0 | `magic` | `0x52584653` ("RXFS"). The module compares it and executes `unreachable` otherwise |
 | +4 | `gate_ptr` | the gate array, `ID_SPACE` u32s, zeroed to start a drive — exactly as before |
 | +8 | `cache_ptr` | the overlapping answer cache, or 0 to decline |
-| +12 | `cache_len` | its length in bytes |
+| +12 | `cache_len` | its length in bytes: 0 with no cache, otherwise at least 48 (the header); a non-zero `cache_ptr` with less returns −4 |
 
 **Why a descriptor.** The answer cache is what makes an overlapping drive linear
 instead of quadratic, and it has to live in caller-owned memory for the same
@@ -777,12 +785,13 @@ The returned `i64` is both the answer and the resume token:
 
 | Bits | Field | Public? |
 |---|---|---|
-| 63..32 | resume position, or one of the three reserved words below | only the sentinels |
+| 63..32 | resume position, or one of the reserved words below | only the sentinels |
 | 31..`countBits` | `k`, the intra-position resume index | no — opaque |
 | `countBits`-1..0 | `count` — valid tuples in the buffer | yes |
 
-THREE values of the position word are reserved, and all three have the high bit
-set — so a decoder must test them BEFORE it decides the scan finished:
+FOUR values of the position word are reserved besides the done word, and all
+of them have the high bit set — so a decoder must test them BEFORE it decides
+the scan finished:
 
 | word | meaning | `count` |
 |---|---|---|
@@ -790,8 +799,9 @@ set — so a decoder must test them BEFORE it decides the scan finished:
 | `0xFFFFFFFE` | UNKNOWN: a Backtracking member ran out of frames | 0, nothing written |
 | `0xFFFFFFFD` | UNKNOWN: the answer cache's header is malformed | 0; tuples for earlier positions may already be in the buffer, and the call's whole output is unknown |
 | `0xFFFFFFFC` | UNKNOWN: the resume position is below where the answer cache was built — the scan went backwards (best-effort detection; see "The rules" below) | 0, nothing written |
+| `0xFFFFFFFB` | not an answer: the module asks for the answer cache's region, handed over lazily (see "Handing the region over lazily" below); call again with the SAME cursor | 0, nothing written |
 
-The two error words live in the POSITION field rather than in the return value
+The error words live in the POSITION field rather than in the return value
 as a whole because there is nowhere else: every done return already has bit 63
 set, so "negative means unknown" cannot work, and `count` is `countBits` wide
 and MASKED by every decoder — a negative packed into it reads back as a large
@@ -872,12 +882,33 @@ SQUARE ROOT.
 | Descriptor field | Meaning |
 |---|---|
 | `cache_ptr` | Caller-owned region, or **0 to decline** |
-| `cache_len` | Its size in bytes |
+| `cache_len` | Its size in bytes: **at least 48**, the header (the header alone when handing it over lazily); 0 when `cache_ptr` is 0 |
 
-**Header: 48 bytes at `cache_ptr`.** Zero it to start a drive, then write the
-STRIDE into the word at offset 16. Everything else is the engine's. The stride
-is the one field you own because it is what you sized the allocation from, and
-the engine validates rather than trusts it.
+**Header: 48 bytes at `cache_ptr`, so `cache_len` is at least 48.** A non-zero
+`cache_ptr` with a `cache_len` below 48 is a malformed cache: every call
+answers **−4** (the reserved position word for −4 from the batch entry), as for
+a header that contradicts itself. Zero the header to start a drive, then write the
+STRIDE into the word at offset 16. Everything else is the engine's but the lazy
+word at offset 44 (below). The stride is the one field you own because it is
+what you sized the allocation from, and the engine validates rather than
+trusts it.
+
+**Handing the region over lazily.** Most drives never sweep, so a caller need
+not allocate the region until the drive asks for it — and no generated stub
+does. Hand over the 48-byte header alone (`cache_len = 48`), with the stride
+written and `0x5A4C5852` ("RXLZ") in the word at offset 44. When the drive
+reaches the point where it would use the region, the call returns, with
+nothing delivered, **`-7`** from `find` or the reserved position word
+`0xFFFFFFFB` from the batch entry (count 0). Then either
+
+- hand the region over: copy the 48-byte header to its start, set the word at
+  offset 44 to 0 there, and point `cache_ptr` / `cache_len` at it; or
+- decline (the allocation failed): set the word at offset 44 to 0 in place and
+  leave the descriptor alone — the drive walks, with the same answers, slower,
+
+and make the same call again — same `from`, or the same cursor. The engine asks
+at most once per drive. The word at offset 44 must be 0 in a region handed over
+whole; a caller that never writes it is unaffected.
 
 **Sizing.** The arithmetic below, which every generated `init` embeds. There is
 no exported sizing function to call — the column width is a compile-time
@@ -921,6 +952,14 @@ members passes the bare 48-byte header as the cache part. The sweep keeps its
 state in the header's words at offsets 0, 4 and 32, which the zeroing already
 covers; its stride is its own business, not a header field.
 
+The sweep's part is the region's LAST `sbytes`, its start rounded down to a
+multiple of 8 — for a region sized as above, right after the cache. A caller
+that writes a stride of its own sizes the cache part for that stride instead
+(`48 + blocks * cell + 4 + stride * row`), rounds it up to a multiple of 8 and
+adds `sbytes`. The sweep runs only where its part clears the cache's layout for
+the stride in the header; otherwise the split member searches on its own,
+which gives the same answer more slowly.
+
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
 rebuilt, and the drive costs what it did before any of this. Below the 64 MiB
@@ -937,7 +976,8 @@ Measured region sizes, for shapes the sweep accepts:
 
 The rules:
 
-- **It is optional.** `cache_len = 0` is legal. In an embedded module the
+- **It is optional.** `cache_len = 0` is legal, and so is a header handed over
+  lazily that the caller then declines. In an embedded module the
   drive then walks position by position. A standalone module instead uses a
   region of its own, grown in its memory on first need and reused by later
   drives (see "Handing the block over" above): a raw caller gets the linear
@@ -947,10 +987,18 @@ The rules:
 - **Zero the 48-byte header** before the first call of a drive, exactly as you
   zero the gate array, then write the stride. The rest of the region needs no
   zeroing: it is written before it is read.
-- **Too small is not an error.** The sweep refuses a region it cannot fill and
-  the drive falls back to walking. The answer is identical, only slower. This
-  is the same rule `out_cap` underflow has.
-- **A header that contradicts itself IS an error.** A stride below 1 — or, on a
+- **Too small is not an error — but it is QUADRATIC.** The sweep refuses a
+  region it cannot fill and the drive falls back to walking: the answers are
+  identical, the same rule `out_cap` underflow has, but the walk is the very
+  drive the cache exists to avoid — measured ×3.98 per input doubling on an
+  overlapping set over 4 KB (45,339 fuel/byte against 621 with a region of the
+  right size, and 649 for a standalone module handed no region at all, which
+  then uses its own). Size the region from the formula with the compiler's
+  inputs — the sweep column's width and the pattern count a generated stub
+  carries, `--diag-json`'s `cache_bytes_per_byte`, or
+  `compile.SetOverlapCacheSizing` — never from a guess.
+- **A header that contradicts itself IS an error.** A `cache_len` below the
+  48-byte header, a stride below 1 — or, on a
   later call, a header no sweep could have written (a floor past the input, a
   block count other than the one the input length, floor and stride imply, a
   block buffer the declared `cache_len` cannot hold) — returns **`-4`** rather than degrading

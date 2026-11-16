@@ -41,8 +41,8 @@ import (
 // of the assertions the program tests (\b, \B, ^, $, (?m)), which are judged
 // per column from the bytes either side of p.
 //
-// The answers live in the caller's cache region, after the cache itself, and
-// are CHECKPOINTED exactly as the cache is (set_overlap_ckpt.go, the same
+// The answers live in the caller's cache region, at its end, past the cache
+// (emitSweepArea, emitSweepFits), and are CHECKPOINTED exactly as the cache is (set_overlap_ckpt.go, the same
 // sizing formula, emitCkptSizing): a column snapshot every `stride` positions
 // and one block of answers materialised at a time, so above the 64 MiB budget
 // the region is the square root of the input. The sweep's own state — swept,
@@ -586,44 +586,46 @@ func (sw *setSweep) emitWriteRow(b []byte, tm int, l sweepLocals, u8 *utf8StartL
 
 // sweepGeo is the locals a sweep's region arithmetic fills.
 type sweepGeo struct {
-	region        byte   // i32 param/local: the caller's cache region
-	area, k, rows uint32 // i32: the sweep's part of it, its stride, its block buffer
-	m64, k64, b64 uint32 // i64 scratch for emitCkptSizing
-	cacheB, nb    uint32 // i32 scratch
+	region, regionLen  byte   // i32 params/locals: the caller's cache region and its length
+	area, k, rows, off uint32 // i32: the sweep's part, its stride, its block buffer, area - region
+	m64, k64, b64      uint32 // i64 scratch for emitCkptSizing
+	nb                 uint32 // i32 scratch
 }
 
-// emitArea computes, for an input of the i32 local pLen bytes, where the
-// sweep's part of the caller's region starts — past the cache (its bytes from
-// the same formula the caller sized it by, 8-aligned) — and the sweep's stride
-// and block buffer, from emitCkptSizing over the sweep's own geometry; and
-// leaves 1 on the stack when the region holds it all, 0 when it does not (no
-// region, or one sized without the sweep's part).
+// emitSweepArea computes, for an input of the i32 local pLen bytes, where the
+// sweep's part of the caller's region starts and the sweep's stride and block
+// buffer, from emitCkptSizing over the sweep's own geometry; b64 is left
+// holding the part's bytes, for emitSweepFits.
+//
+// The part is the region's LAST bytes, its start rounded down to a multiple of
+// 8: a function of the input's and the region's lengths alone, so every call
+// of a drive finds it in the same place. For a region sized by the formula —
+// the cache's bytes, 8-aligned, then the sweep's — that is right after the
+// cache. It used to be placed after the cache's bytes at the FORMULA's stride,
+// and a caller may write any stride it sized the cache for: at one whose
+// layout is larger the sweep wrote its answers over the cache's, and at one
+// whose layout is smaller it refused for want of room the region had. Nor can
+// it follow the stride in the header, which the cache's pass clamps when it
+// engages late: the part would then move between calls.
 func (cs *compiledSet) emitSweepArea(b []byte, pLen byte, g sweepGeo) []byte {
 	sw := cs.progSweep
-	// The cache's bytes: the kept members' set's when it has one, else the
-	// nominal header a set with no cache is handed.
-	if kc := cs.keptCache; kc != nil && kc.usesOverlapDP() {
-		_, _, rowBytes, _ := kc.overlapCacheGeometry()
-		b = emitCkptSizing(b, uint32(pLen), g.m64, g.k64, g.b64, kc.overlapCells(), int64(rowBytes))
-		b = lget(b, g.b64)
-		b = append(b, 0xA7) // i32.wrap_i64
-	} else {
-		b = i32c(b, ckptHdrBytes)
-	}
-	b = i32c(b, 7)
-	b = append(b, 0x6A)
-	b = i32c(b, -8)
-	b = append(b, 0x71) // align8
-	b = lset(b, g.cacheB)
-	b = append(b, 0x20, g.region)
-	b = lget(b, g.cacheB)
-	b = append(b, 0x6A)
-	b = lset(b, g.area)
 	// The sweep's stride and bytes.
 	b = emitCkptSizingBudget(b, uint32(pLen), g.m64, g.k64, g.b64, sw.cells(), int64(sw.rowBytes()), cs.sweepBudgetBytes())
 	b = lget(b, g.k64)
 	b = append(b, 0xA7)
 	b = lset(b, g.k)
+	// off = (regionLen - bytes) & -8, area = region + off. Wraps on a region
+	// shorter than the part, which emitSweepFits refuses before anything reads it.
+	b = append(b, 0x20, g.regionLen)
+	b = lget(b, g.b64)
+	b = append(b, 0xA7, 0x6B) // i32.wrap_i64; i32.sub
+	b = i32c(b, -8)
+	b = append(b, 0x71) // i32.and
+	b = lset(b, g.off)
+	b = append(b, 0x20, g.region)
+	b = lget(b, g.off)
+	b = append(b, 0x6A)
+	b = lset(b, g.area)
 	// nb = ceil(m / k); rows = area + HDR + nb × cell + 4.
 	b = lget(b, g.m64)
 	b = lget(b, g.k64)
@@ -638,12 +640,83 @@ func (cs *compiledSet) emitSweepArea(b []byte, pLen byte, g sweepGeo) []byte {
 	b = i32c(b, int32(sw.cellBytes())) //nolint:gosec // bounded by sweepMaxRoots
 	b = append(b, 0x6C, 0x6A)
 	b = lset(b, g.rows)
-	// Holds it: cacheB + bytes <= the region's length, and the sweep within the
-	// budget (emitCkptSizing's bytes are then what the stub reserved).
+	return b
+}
+
+// emitSweepFits leaves 1 on the stack when the region emitSweepArea just
+// measured holds the sweep, 0 when it does not: the sweep within the budget
+// (emitCkptSizing's bytes are then what the stub reserved), and its part clear
+// of the cache's — at or past the furthest byte the kept members' cache can
+// lay out in this drive, 8-aligned. That is the header's own layout once the
+// cache has swept (ready = 1: its stride and block count), and before then
+// the layout over the whole input at the stride the caller wrote, which bounds
+// every one a later pass can make: a pass engaging at `from` sweeps fewer
+// positions at a stride no wider. A set whose kept members have no cache has
+// the bare header. Clobbers k64 and nb.
+func (cs *compiledSet) emitSweepFits(b []byte, g sweepGeo) []byte {
 	b = lget(b, g.b64)
 	b = i64c(b, overlapCacheMaxBytes)
 	b = append(b, 0x58) // le_u
-	return b
+	// The cache's extent past its header and its first count.
+	if kc := cs.keptCache; kc != nil && kc.usesOverlapDP() {
+		_, _, rowBytes, _ := kc.overlapCacheGeometry()
+		cell := int64(kc.overlapCells())*4 + 4 // a column snapshot and its count
+		// nb × cell + stride × row, from the header or the caller's stride.
+		b = append(b, 0x20, g.region)
+		b = ld32(b, ckptHdrReady)
+		b = i32c(b, 1)
+		b = append(b, 0x46, 0x04, 0x7E) // eq; if (result i64): swept
+		b = append(b, 0x20, g.region)
+		b = ld32(b, ckptHdrNumBlocks)
+		b = append(b, 0xAD) // i64.extend_i32_u
+		b = i64c(b, cell)
+		b = append(b, 0x7E) // i64.mul
+		b = append(b, 0x20, g.region)
+		b = ld32(b, ckptHdrStride)
+		b = append(b, 0xAD)
+		b = i64c(b, int64(rowBytes))
+		b = append(b, 0x7E, 0x7C) // i64.mul; i64.add
+		b = append(b, 0x05)       // else: the caller's stride
+		b = append(b, 0x20, g.region)
+		b = ld32(b, ckptHdrStride)
+		b = lset(b, g.nb) // (scratch)
+		b = lget(b, g.nb)
+		b = i32c(b, 1)
+		b = append(b, 0x48, 0x04, 0x7E) // < 1, malformed (the cache answers -4): if (result i64)
+		b = i64c(b, 1<<40)              // past any region
+		b = append(b, 0x05)
+		b = lget(b, g.nb)
+		b = append(b, 0xAD)
+		b = lset(b, g.k64)
+		b = lget(b, g.k64)
+		b = lget(b, g.m64)
+		b = append(b, 0x56, 0x04, 0x40) // k > m: if
+		b = lget(b, g.m64)
+		b = lset(b, g.k64)
+		b = append(b, 0x0B)
+		b = lget(b, g.m64)
+		b = lget(b, g.k64)
+		b = append(b, 0x7C, 0x42, 0x01, 0x7D) // m + k - 1
+		b = lget(b, g.k64)
+		b = append(b, 0x80) // div_u: nb
+		b = i64c(b, cell)
+		b = append(b, 0x7E)
+		b = lget(b, g.k64)
+		b = i64c(b, int64(rowBytes))
+		b = append(b, 0x7E, 0x7C)
+		b = append(b, 0x0B, 0x0B)
+		b = i64c(b, ckptHdrBytes+4+7)
+		b = append(b, 0x7C) // + HDR + 4, + 7
+	} else {
+		b = i64c(b, ckptHdrBytes+7)
+	}
+	b = i64c(b, -8)
+	b = append(b, 0x83) // i64.and: the extent, 8-aligned
+	b = lget(b, g.b64)
+	b = append(b, 0x7C) // + the sweep's bytes
+	b = append(b, 0x20, g.regionLen)
+	b = append(b, 0xAD, 0x58) // <= the region's length (le_u)
+	return append(b, 0x71)    // and
 }
 
 // sweepBudgetBytes is the size past which the sweep checkpoints.
@@ -654,8 +727,8 @@ func (cs *compiledSet) sweepBudgetBytes() int64 {
 	return overlapCacheMaxBytes
 }
 
-// emitSweepFnBody is the sweep's ONE function, (ptr, len, region, arg) →
-// i32 0, in two modes chosen by arg's sign:
+// emitSweepFnBody is the sweep's ONE function, (ptr, len, region, regionLen,
+// arg) → i32 0, in two modes chosen by arg's sign:
 //
 //   - arg = from ≥ 0, the PASS: every swept member's column from position len
 //     down to from, a checkpoint every stride positions and the answers into
@@ -668,14 +741,14 @@ func (cs *compiledSet) sweepBudgetBytes() int64 {
 // and it is emitted once. The caller has checked the region holds the sweep.
 func (cs *compiledSet) emitSweepFnBody(tm int) []byte {
 	sw := cs.progSweep
-	const pPtr, pLen, pRegion, pArg = 0, 1, 2, 3
-	a := newLocalAlloc(4)
+	const pPtr, pLen, pRegion, pRegionLen, pArg = 0, 1, 2, 3, 4
+	a := newLocalAlloc(5)
 	l := sweepLocals{pPtr: pPtr, pLen: pLen}
 	i32 := func() uint32 { return uint32(a.I32()) }
 	i64 := func() uint32 { return uint32(a.I64()) }
 	l.p, l.byteIdx, l.ctx, l.cur, l.nxt, l.v, l.prev, l.next = i32(), i32(), i32(), i32(), i32(), i32(), i32(), i32()
-	g := sweepGeo{region: pRegion}
-	g.area, g.k, g.rows, g.cacheB, g.nb = i32(), i32(), i32(), i32(), i32()
+	g := sweepGeo{region: pRegion, regionLen: pRegionLen}
+	g.area, g.k, g.rows, g.off, g.nb = i32(), i32(), i32(), i32(), i32()
 	lLo, lJ, lCk := i32(), i32(), i32() // lCk: 1 in the pass, which checkpoints
 	g.m64, g.k64, g.b64 = i64(), i64(), i64()
 	var u8 *utf8StartLocals
@@ -686,8 +759,7 @@ func (cs *compiledSet) emitSweepFnBody(tm int) []byte {
 	}
 	var b []byte
 	b = a.EmitDecls(b)
-	b = cs.emitSweepArea(b, pLen, g)
-	b = append(b, 0x1A) // drop: the caller checked
+	b = cs.emitSweepArea(b, pLen, g) // the caller checked it fits
 	b = i32c(b, sw.colA)
 	b = lset(b, l.cur)
 	b = i32c(b, sw.colB)
@@ -836,8 +908,7 @@ func (cs *compiledSet) emitSweptMember(b []byte, k int, x sweepMerge, none func(
 	locate := func(b []byte) []byte {
 		// Once per call: where the sweep's part of the region is.
 		b = append(b, 0x20, x.lLocated, 0x45, 0x04, 0x40)
-		b = cs.emitSweepArea(b, x.pLen, x.g)
-		b = append(b, 0x1A) // drop: the caller checked when it swept
+		b = cs.emitSweepArea(b, x.pLen, x.g) // the caller checked it fits when it swept
 		b = append(b, 0x41, 0x01, 0x21, x.lLocated)
 		return append(b, 0x0B)
 	}
@@ -859,7 +930,7 @@ func (cs *compiledSet) emitSweptMember(b []byte, k int, x sweepMerge, none func(
 	b = append(b, 0x20, x.lRegion)
 	b = ld32(b, sweepHdrCurBlock)
 	b = append(b, 0x20, x.lTmp, 0x41, 0x01, 0x6A, 0x47, 0x04, 0x40) // != j + 1: if
-	b = append(b, 0x20, x.pPtr, 0x20, x.pLen, 0x20, x.lRegion)
+	b = append(b, 0x20, x.pPtr, 0x20, x.pLen, 0x20, x.lRegion, 0x20, x.lRegionLen)
 	b = append(b, 0x41, 0x7F, 0x20, x.lTmp, 0x6B, 0x10) // -1 - j: block j
 	b = utils.AppendULEB128(b, uint32(x.sweepIdx))      //nolint:gosec // a function index
 	b = append(b, 0x1A, 0x0B)
@@ -893,19 +964,23 @@ func (cs *compiledSet) emitSweptMember(b []byte, k int, x sweepMerge, none func(
 			b = sw.emitWorkBound(b, x.pLen)
 			b = append(b, 0x56, 0x04, 0x40) // work > bound: if
 			b = cs.emitSweepArea(b, x.pLen, x.g)
-			// …and the region holds the sweep: cacheB + bytes <= its length.
-			b = lget(b, x.g.cacheB)
-			b = append(b, 0xAD)
-			b = lget(b, x.g.b64)
-			b = append(b, 0x7C)
-			b = append(b, 0x20, x.lRegionLen, 0xAD, 0x58, 0x71) // le_u; and
+			b = cs.emitSweepFits(b, x.g) // …and the region holds the sweep
 			b = append(b, 0x04, 0x40)
 			b = append(b, 0x41, 0x01, 0x21, x.lLocated)
-			b = append(b, 0x20, x.pPtr, 0x20, x.pLen, 0x20, x.lRegion, 0x20, x.lQ, 0x10)
+			b = append(b, 0x20, x.pPtr, 0x20, x.pLen, 0x20, x.lRegion, 0x20, x.lRegionLen, 0x20, x.lQ, 0x10)
 			b = utils.AppendULEB128(b, uint32(x.sweepIdx)) //nolint:gosec // a function index
 			b = append(b, 0x1A)
 			b = append(b, 0x20, x.lRegion, 0x41, 0x01)
 			b = st32(b, sweepHdrReady)
+			// It does not fit: a LAZY header has no region behind it yet.
+			// Mark it wanted; the next call's start asks the caller for it
+			// (abi.OverlapCacheWanted), and this one goes on with the
+			// member's own search.
+			b = append(b, 0x05, 0x20, x.lRegionLen, 0x41)
+			b = utils.AppendSLEB128(b, int32(ckptHdrBytes))
+			b = append(b, 0x4E, 0x04, 0x40) // len >= header: if
+			b = emitMarkWantedIfLazy(b, x.lRegion)
+			b = append(b, 0x0B)
 			b = append(b, 0x0B, 0x0B, 0x0B)
 			return b
 		}

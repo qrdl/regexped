@@ -774,13 +774,19 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 	// drive's `ready` would serve the next input out of the last one's blocks.
 	// Only the 48-byte header — the region below it is written before it is
 	// read, and zeroing megabytes would land in every timed pass.
+	//
+	// And LAZILY, as the stub hands it over: the header alone, its lazy word
+	// set, and the region — laid out already — when the module asks for it.
+	offeredLen := p.cacheLen
 	if p.cachePtr != 0 {
 		r.zero(p.cachePtr, config.SetOverlapCheckpointHeaderBytes)
 		buf := r.mem.UnsafeData(r.store)
 		binary.LittleEndian.PutUint32(buf[p.cachePtr+config.SetOverlapHdrStrideOff:], uint32(p.cacheStride))
+		binary.LittleEndian.PutUint32(buf[p.cachePtr+config.SetOverlapHdrLazyOff:], abi.OverlapCacheLazy)
 		runtime.KeepAlive(r.store)
+		offeredLen = config.SetOverlapCheckpointHeaderBytes
 	}
-	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, p.cacheLen)
+	abi.WriteFindScratch(r.mem.UnsafeData(r.store), p.scratchPtr, p.gatePtr, p.cachePtr, offeredLen)
 	if err := p.blocks.Begin(r.data, int(inputLen)); err != nil {
 		return false, err
 	}
@@ -790,6 +796,14 @@ func (r *runner) exhaustFind(inputLen int32) (bool, error) {
 		n, err := wcall(r.fn, r.store, p.inputBase, inputLen, from, p.scratchPtr, p.outBase, r.outCap)
 		if err != nil {
 			return found, err
+		}
+		if n.(int32) == abi.OverlapCacheWanted && p.cachePtr != 0 {
+			// Nothing delivered: the region handed over, the call made again.
+			buf := r.mem.UnsafeData(r.store)
+			binary.LittleEndian.PutUint32(buf[p.cachePtr+config.SetOverlapHdrLazyOff:], 0)
+			binary.LittleEndian.PutUint32(buf[p.scratchPtr+abi.FindScratchCacheLenOff:], uint32(p.cacheLen))
+			runtime.KeepAlive(r.store)
+			continue
 		}
 		if n.(int32) <= 0 {
 			return found, nil

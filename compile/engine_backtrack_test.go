@@ -1528,7 +1528,7 @@ func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
 		{`^(aa|a)*b`, false}, // every iteration consumes a byte
 		{`(a.*?b)(c+)`, false},
 		{`([a-zA-Z]+?)\d`, false},
-		{`x{3}(y|z)`, false},
+		{`x{3}(yy|z)`, false}, // `y|z` alone is a class: no Alt
 	} {
 		re, err := syntax.Parse(c.pattern, syntax.Perl)
 		if err != nil {
@@ -1555,6 +1555,27 @@ func TestProgHasZeroWidthCycleRoutesToFallback(t *testing.T) {
 		}
 		if !c.cycle && (plan.force || plan.fallback) {
 			t.Errorf("%s under BTWorkBudgetOff: plan = %+v, want neither", c.pattern, plan)
+		}
+	}
+	// A program with no Alt pushes no frame, so it can never trip: no budget
+	// and no fallback body, whatever the budget.
+	for _, pat := range []string{`x{3}(y)`, `\b(\d\d):(\d\d)\b`, `(a)\b(b)`, `x{3}(y|z)`} {
+		re, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prog, err := syntax.Compile(re.Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bt := newBacktrack(byteProg(prog))
+		for _, budget := range []int{0, 8, BTWorkBudgetOff} {
+			if plan := planBT(bt, budget); plan != (btPlan{}) {
+				t.Errorf("%s budget %d: plan = %+v, want none: the program has no Alt", pat, budget, plan)
+			}
+		}
+		if plan := planBT(bt, BTWorkBudgetForceFallback); !plan.force {
+			t.Errorf("%s under BTWorkBudgetForceFallback: plan = %+v, want the fallback alone", pat, plan)
 		}
 	}
 }
@@ -2171,11 +2192,11 @@ var forcedBTPatterns = []string{
 	`[0]+0()00.{31}`,
 	`((.(1)*)11){11}`,
 	// Ordinary shapes, so the invariant is not pinned by pathological patterns
-	// alone. Each is documented as Backtracking's territory: an inverted class
-	// reads as an ambiguous capture, `(?m:$)` is a line anchor, `\b` is a word
-	// boundary, and `*?` is a non-greedy quantifier.
-	`<([^>]+)>`,
-	`([^,]+),`,
+	// alone. Each is documented as Backtracking's territory: alternatives that
+	// can start with the same byte are an ambiguous capture, `(?m:$)` is a line
+	// anchor, `\b` is a word boundary, and `*?` is a non-greedy quantifier.
+	`((a)|(ab))c`,
+	`(([a-z]+)|(x))=`,
 	`(?m:(foo)$)`,
 	`(\b\w+\b)`,
 	`(a*?)*?b`,
@@ -2758,6 +2779,66 @@ func TestMaxMemoryBelowStaticSizeIsCompileError(t *testing.T) {
 			t.Errorf("CompileFile: err = %v, want ErrMemoryCapTooSmall", err)
 		}
 	})
+}
+
+// TestMaxMemoryLeavesRoomForTheBacktrackingStack: a module with Backtracking
+// code needs a page above its static size for the frame stack, and a
+// standalone one a page more for its default search state. A cap that fit the
+// tables but not that used to compile, and every Backtracking call that pushed
+// a frame then answered -2, even on "ab". Now it is a compile error naming the
+// size to raise the cap to.
+func TestMaxMemoryLeavesRoomForTheBacktrackingStack(t *testing.T) {
+	entries := []config.PatternEntry{{Regexp: `(a|aa)*(b)`, GroupsFunc: "g"}}
+	at := func(pages uint64) config.MemorySize { return mustMemorySize(t, itoa(pages*65536)) }
+	for _, c := range []struct {
+		name       string
+		standalone bool
+		component  bool
+		run        uint64 // pages above the static size
+	}{
+		{"embedded", false, false, 1},
+		{"standalone", true, false, 2},
+		{"component", true, true, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			opts := CompileOptions{ForceByteMode: true}
+			if c.component {
+				opts = componentOpts(entries)
+				opts.ForceByteMode = true
+			}
+			w, _, err := CompileForced(entries, 0, c.standalone, EngineBacktrack, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			static, _, _ := testMemoryLimits(t, w)
+			opts.MaxMemory = at(static + c.run - 1)
+			_, _, err = CompileForced(entries, 0, c.standalone, EngineBacktrack, opts)
+			if !errors.Is(err, ErrMemoryCapTooSmall) || !strings.Contains(err.Error(), "Backtracking frame stack") ||
+				!strings.Contains(err.Error(), itoa((static+c.run)*65536)) {
+				t.Fatalf("a cap one page short of the stack: err = %v", err)
+			}
+			opts.MaxMemory = at(static + c.run)
+			if _, _, err := CompileForced(entries, 0, c.standalone, EngineBacktrack, opts); err != nil {
+				t.Fatalf("a cap with room for the stack: %v", err)
+			}
+		})
+	}
+	// A set member on Backtracking: the same rule through CompileFile. (That
+	// the module then answers is tools/fuzz's to run.)
+	cfg := config.BuildConfig{
+		MaxDFAStates: config.Limit(1),
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: `(a|aa)*b`}, {Name: "b", Regexp: `x+`}},
+		Sets:         []config.SetConfig{{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}}},
+	}
+	w, _, err := CompileFile(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	static, _, _ := testMemoryLimits(t, w)
+	cfg.MaxMemory = at(static)
+	if _, _, err := CompileFile(cfg, ""); !errors.Is(err, ErrMemoryCapTooSmall) {
+		t.Errorf("set at its static size: err = %v, want ErrMemoryCapTooSmall", err)
+	}
 }
 
 // TestMaxMemoryAbove4GiBWarns: past what a 32-bit memory holds the cap is 4

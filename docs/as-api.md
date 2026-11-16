@@ -58,7 +58,9 @@ export function <func>(input: ArrayBuffer): i32
 ```
 
 Tries to match the pattern at position 0 of `input`. Returns the **end position**
-(`>= 0`) if the full input matches from the start, or `-1` if no match.
+(`>= 0`) if the full input matches from the start, `-1` if no match, or
+`RX_ERR_BT_OVERFLOW` (`-2`) when a Backtracking pattern ran out of memory and
+the answer is unknown.
 
 ```ts
 import { url_match } from "./stub";
@@ -203,9 +205,9 @@ regexps are numbered per set ([sets.md](sets.md#pattern-ids-and-the-two-emitted-
 
 | Config field | Generated function | Returns |
 |---|---|---|
-| `match_func` | `<func>(input: ArrayBuffer): i32` | end position `≥ 0`, or `-1` |
-| `find_func` | `<func>(input: ArrayBuffer, offset: u32): i64` | packed `(absStart << 32 \| absEnd)`, or `-1` |
-| `groups_func` | `<func>(input: ArrayBuffer, offset: u32): u32` | `dataStart` pointer to slot buffer, or `0` |
+| `match_func` | `<func>(input: ArrayBuffer): i32` | end position `≥ 0`, `-1`, or `RX_ERR_BT_OVERFLOW` |
+| `find_func` | `<func>(input: ArrayBuffer, offset: u32): <func>_iter` | an iterator whose `next(): i64` returns packed `(absStart << 32 \| absEnd)`, `-1` when finished, or `RX_ERR_BT_OVERFLOW` |
+| `groups_func` | `<func>(input: ArrayBuffer, offset: u32): <func>_iter` | an iterator whose `next(): u32` returns the `dataStart` pointer to the slot buffer, `0` when finished, or `RX_ITER_ERROR` |
 | `groups_func` | `<FUNC>_GROUPS: i32` | how many groups the slot buffer holds, group 0 included |
 | `groups_func` | `<func>_capture(input, slots: u32, g: i32): string \| null` | the decoded text of group `g` |
 
@@ -297,6 +299,12 @@ member is compiled to the WIDE `_all` ABI, where the return is a COUNT and
 `-2` is unambiguous.
 
 This is rare: it needs a pattern that keeps an untried alternation branch live as input is consumed (for example `(?:ab|cd)*?x`), and an input long enough to pass the budget. But when it happens the honest answer is "unknown", and treating it as "no match" would be an input-length-dependent false negative. See [engines.md](engines.md) for the budget formula and which pattern shapes can reach it.
+
+### When the answer cache is allocated
+
+The iterator holds the cache's 48-byte header alone until the drive asks for
+the region — at the call where it would sweep, which most drives never reach —
+and allocates it then.
 
 ### The overlapping answer cache's header
 
