@@ -41,23 +41,32 @@ func Run(cfg config.BuildConfig, w io.Writer, level compile.VerboseLevel, format
 		return err
 	}
 	compile.WarnUnboundedMemory(cfg, rep)
-	if cfg.StubFile != "" || cfg.StubType != "" {
-		typ, err := generate.ResolveStubType(cfg)
-		if err != nil {
-			return err
-		}
-		dir, err := os.MkdirTemp("", "regexped-check-")
-		if err != nil {
-			return fmt.Errorf("check: %w", err)
-		}
-		defer os.RemoveAll(dir)
-		name := filepath.Base(cfg.StubFile)
-		if cfg.StubFile == "" {
-			name = "stub" + stubExt[typ]
-		}
-		if err := generate.CmdGenerateStub(cfg, filepath.Join(dir, name)); err != nil {
-			return err
-		}
+	if err := checkStub(cfg); err != nil {
+		// The compile succeeded, so its report is whole; the stub's error wins.
+		_ = rep.Write(w, level, format)
+		return err
 	}
 	return rep.Write(w, level, format)
+}
+
+// checkStub generates the stub the config names, if any, into a temporary
+// directory removed afterwards.
+func checkStub(cfg config.BuildConfig) error {
+	if cfg.StubFile == "" && cfg.StubType == "" {
+		return nil
+	}
+	typ, err := generate.ResolveStubType(cfg)
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "regexped-check-")
+	if err != nil {
+		return fmt.Errorf("check: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	name := filepath.Base(cfg.StubFile)
+	if cfg.StubFile == "" {
+		name = "stub" + stubExt[typ]
+	}
+	return generate.CmdGenerateStub(cfg, filepath.Join(dir, name))
 }

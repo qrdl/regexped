@@ -78,9 +78,15 @@ func TestRunErrors(t *testing.T) {
 	if err := Run(comp, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("an uncompilable component config passed")
 	}
+	// A stub that cannot be generated still leaves the report of the compile
+	// that succeeded before it.
 	bad := config.BuildConfig{ImportModule: "m", StubFile: "s.txt", Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
-	if err := Run(bad, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil || !strings.Contains(err.Error(), "stub type") {
+	var badRep bytes.Buffer
+	if err := Run(bad, &badRep, compile.VerboseBrief, compile.VerbosePlain); err == nil || !strings.Contains(err.Error(), "stub type") {
 		t.Errorf("an unknown stub type: err = %v", err)
+	}
+	if !strings.Contains(badRep.String(), "abc") {
+		t.Errorf("an unknown stub type: no report:\n%s", badRep.String())
 	}
 	gen := config.BuildConfig{ImportModule: "m", StubFile: "s.h", Patterns: []config.PatternEntry{{Regexp: `a*`, GroupsFunc: "g"}}}
 	if err := Run(gen, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {

@@ -1985,6 +1985,49 @@ func TestComponentCacheGeometryMatchesConfig(t *testing.T) {
 	}
 }
 
+// TestComponentKeepsTheSweepPartUnderEachBudget: a set whose split member
+// gets a program sweep reserves the cache's part and the sweep's when EACH is
+// within the budget, as every stub does — not only when their sum is. At 6 MB
+// of input the two are each under 64 MiB and together over it, and without the
+// sweep's part the member's drive was quadratic.
+func TestComponentKeepsTheSweepPartUnderEachBudget(t *testing.T) {
+	const src = `wasm_format: component
+import_module: t
+wit_package: t
+patterns:
+  - regexp: 'foo\w+'
+  - regexp: 'a[a-z]*?z'
+sets:
+  - name: s
+    patterns: all
+    overlapping: true
+    find: scan_it
+`
+	var cfg config.BuildConfig
+	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || !sh.Eligible || sh.SweepCells == 0 {
+		t.Fatalf("shape = %+v, %v: this set must get a cache and a program sweep", sh, err)
+	}
+	h := newSetHarness(t, src)
+	for _, n := range []int{1000, 6_000_000} {
+		cache := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+		sweep, _ := config.SetOverlapCheckpointSizingRow(n, sh.SweepCells, sh.SweepRow)
+		if n > 1000 && (cache > config.SetOverlapCacheMaxBytes || sweep > config.SetOverlapCacheMaxBytes ||
+			(cache+7)&^7+sweep <= config.SetOverlapCacheMaxBytes) {
+			t.Fatalf("len %d: cache %d, sweep %d: not each under the budget and together over it", n, cache, sweep)
+		}
+		p, l := h.writeInput(strings.Repeat("a", n-1) + "z")
+		sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
+		if want, _ := sh.Sizing(int(l)); int(h.u32(sc+28)) != want {
+			t.Errorf("len %d: region is %d bytes, Sizing computes %d (cache part %d)", l, h.u32(sc+28), want, cache)
+		}
+		h.call(h.pkg+"#[dtor]scan-it", sc)
+	}
+}
+
 // TestComponentWideOverlapCache is the constructor past 32 members, where a
 // cache row's mask widens (an i64 to 64 members, a bitmap above): the region
 // it reserves must be the one config computes, and a drive over it must give

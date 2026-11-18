@@ -993,36 +993,70 @@ func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int
 // (6 cells, 2 patterns: 66,000,092 B at 5.5 MB, 87,076 B at 5.6 MB), and by a
 // few bytes wherever a checkpointed stride steps up, which can cross a page.
 // Each stretch over which the regime and the strides hold (sizingSegment)
-// grows with the input, so within it what fits is a prefix, found by
-// bisection. Tens of thousands of stretches up to 2 GiB: about 0.2 s per set
-// with a cache, paid only when the report is built under max_memory.
+// grows with the input — and so does the cache's own part, which the callers'
+// budget is applied to — so within it what fits is a prefix, found by
+// bisection. Tens of thousands of stretches up to 2 GiB, 1.4 million for the
+// widest program sweep (65,535 cells): 40-100 ms per set with a cache, 0.9 s
+// at that width, paid only when the report is built under max_memory.
 func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCacheFit {
 	if m.maxMemory == 0 {
 		return nil
 	}
 	base := exportTotal("find", terms, m)
 	cache := memTerm{size: func(n int64) int64 { b, _ := sh.Sizing(int(n)); return int64(b) }}
+	// Every caller declines a cache whose own part is over the budget, a
+	// component counting its allocator's header (component_sets.go), so such
+	// a length has no cache whatever max_memory allows.
+	budget := int64(config.SetOverlapCacheMaxBytes)
+	if m.component {
+		budget -= 8
+	}
 	fits := func(n int64) bool {
-		return base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory
+		return int64(sh.cachePartBytes(int(n))) <= budget &&
+			base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory
 	}
 	segment := func(n int64) [3]int { return sh.sizingSegment(int(n)) }
 	out := &ReportCacheFit{Inputs: []ReportRange{}}
-	for from := int64(0); from <= maxInputSearchCap; {
-		// The stretch [from, to] keeps from's segment; each of its fields
-		// only grows, so the first length past from that differs ends it.
-		to := maxInputSearchCap
-		if r := segment(from); segment(to) != r {
-			lo, hi := from, to // segment(lo) == r, segment(hi) != r
-			for hi-lo > 1 {
-				mid := lo + (hi-lo)/2
-				if segment(mid) == r {
-					lo = mid
-				} else {
-					hi = mid
+	// segEnd is the last length of the stretch from begins: the first length
+	// past from whose segment differs ends it. Consecutive stretches differ in
+	// length by a step or two — a stride steps up every few thousand bytes, up
+	// to 1.4 million times below 2 GiB for a wide program sweep — so the
+	// previous stretch's length is tried first, a few lengths either side,
+	// and the bisection is the fallback.
+	prevLen := int64(0)
+	segEnd := func(from int64) int64 {
+		r := segment(from)
+		ends := func(e int64) bool {
+			return segment(e) == r && (e == maxInputSearchCap || segment(e+1) != r)
+		}
+		if prevLen > 0 {
+			for d := int64(0); d <= 4; d++ {
+				for _, e := range []int64{from + prevLen - 1 + d, from + prevLen - 1 - d} {
+					if e >= from && e <= maxInputSearchCap && ends(e) {
+						return e
+					}
 				}
 			}
-			to = lo
 		}
+		if segment(maxInputSearchCap) == r {
+			return maxInputSearchCap
+		}
+		lo, hi := from, maxInputSearchCap // segment(lo) == r, segment(hi) != r
+		for hi-lo > 1 {
+			mid := lo + (hi-lo)/2
+			if segment(mid) == r {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		return lo
+	}
+	for from := int64(0); from <= maxInputSearchCap; {
+		// The stretch [from, to] keeps from's segment; each of its fields
+		// only grows, so it is one stretch of lengths.
+		to := segEnd(from)
+		prevLen = to - from + 1
 		if fits(from) {
 			last := to
 			if !fits(to) {

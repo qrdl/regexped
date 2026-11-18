@@ -444,7 +444,6 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		lM     = alloc.I64()
 		lK     = alloc.I64()
 		lBytes = alloc.I64()
-		lNeed  = alloc.I64() // the region with the program sweep's part
 	)
 	var lSweepB byte // the program sweep's bytes, only when it has one
 	if c.sweepCells > 0 {
@@ -550,7 +549,9 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	// CARVE, not the bytes requested: it is power-of-two size-classed, so a
 	// request of n takes 2^ceil(log2(n+8)) — a 40 MiB region carves 64 MiB, and
 	// one eight bytes under the budget would carve twice it. memory.grow is
-	// one-way, so that is a reservation the process keeps.
+	// one-way, so that is a reservation the process keeps. It applies to each
+	// PART: with a program sweep's part the region may reach twice the budget,
+	// and carve up to four times it.
 	// Seeded UNCONDITIONALLY and before anything else touches them: the
 	// allocation below is conditional twice over (a set with no sweep, or a
 	// region over budget), and every path has to leave these defined. The
@@ -581,24 +582,28 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 			b = utils.AppendSLEB128_64(b, int64(ckptHdrBytes))
 			b = append(b, 0x21, lBytes, 0x42, 0x01, 0x21, lK)
 		}
-		if c.sweepCells > 0 {
-			// The region: the cache's part 8-aligned, then the sweep's when the
-			// two still carve within the budget (the check below).
-			b = append(b, 0x20, lBytes, 0x42, 0x07, 0x7C, 0x42, 0x78, 0x83)
-			b = append(b, 0x20, lSweepB, 0x7C, 0x22, lNeed) // lNeed is free until the reserve check
-			b = append(b, 0x42, 0x08, 0x7C, 0x42)
-			b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
-			b = append(b, 0x58, 0x04, 0x40) // within: if
-			b = append(b, 0x20, lNeed, 0x21, lBytes)
-			b = append(b, 0x0B)
-		}
 
-		// bytes + 8 for the allocator's header: the carved block is then at
-		// most the budget rather than up to twice it.
+		// The CACHE's part + 8 for the allocator's header: alone, its carved
+		// block is then at most the budget rather than up to twice it.
 		b = append(b, 0x20, lBytes, 0x42, 0x08, 0x7C, 0x42)
 		b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
 		b = append(b, 0x58)       // i64.le_u -> within budget
 		b = append(b, 0x04, 0x40) // if
+		if c.sweepCells > 0 {
+			// The region: the cache's part 8-aligned, then the sweep's when it
+			// is within the budget too — each part on its own, the rule every
+			// stub and the module's default state apply, so the region may be
+			// up to twice the budget. Dropping the sweep's part where only the
+			// SUM was over left a split member's drive without its program
+			// sweep, quadratic, on inputs every other output kind serves
+			// linearly (5.6 MB - 16.8 MB for `a[a-z]*?z` beside `foo\w+`).
+			b = append(b, 0x20, lSweepB, 0x42)
+			b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
+			b = append(b, 0x58, 0x04, 0x40) // within: if
+			b = append(b, 0x20, lBytes, 0x42, 0x07, 0x7C, 0x42, 0x78, 0x83)
+			b = append(b, 0x20, lSweepB, 0x7C, 0x21, lBytes)
+			b = append(b, 0x0B)
+		}
 		// The HEADER alone, its lazy word set: `next` reserves the region —
 		// checking first that the allocator can serve it, so a refused grow
 		// (max_memory) declines the cache rather than trapping — when the

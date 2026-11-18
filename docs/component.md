@@ -494,7 +494,10 @@ abandoned scanner's input stays held until the request ends.
   It is sized from the input length at construction: linear in it up to a 64 MiB
   budget, and the square root of it above that — a few hundred kilobytes for a
   ten-megabyte scan. A region over budget is simply declined and the drive
-  walks, with identical answers.
+  walks, with identical answers. A set whose split member gets a program sweep
+  adds the sweep's part, with a 64 MiB budget of its own, as every stub does
+  ([wasm.md](wasm.md)): the region can then reach 128 MiB, which the
+  allocator's power-of-two blocks round to 256 MiB, kept once grown.
 - Every `next` is a cross-component call, but NOT a copy of the input: the input
   crossed once, when the scanner was constructed.
 - The `_all` pair allocates a list of ids per call, bounded by the number of

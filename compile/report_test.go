@@ -590,6 +590,65 @@ func TestReportAnswerCacheFit(t *testing.T) {
 			t.Fatalf("length %d: reported %v, fits %v (ranges %+v)", n, in(n), tfits(n), tfit.Inputs)
 		}
 	}
+	// fitsIn reports whether n is in one of ranges.
+	fitsIn := func(rs []ReportRange, n int64) bool {
+		for _, r := range rs {
+			if r.From <= n && n <= r.To {
+				return true
+			}
+		}
+		return false
+	}
+	// A program sweep's part over the budget is dropped, and can come back
+	// under it where its stride steps up: 65,535 cells and 252-byte rows are
+	// over at 17,043,138 bytes, under at 17,043,139, over at 17,043,200.
+	// Under a 32 MiB cap only the lengths without the part have a cache.
+	swOnly := OverlapCacheShape{SweepCells: 65535, SweepRow: 252}
+	swMem := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 32 << 20}
+	swSet := setMemReport{find: true, members: 2, idSpace: 2, cache: &swOnly}
+	swTerms := setTerms(swSet, swMem)
+	swBase := exportTotal("find", swTerms, swMem)
+	swFits := func(n int64) bool {
+		b, _ := swOnly.Sizing(int(n))
+		return swBase(n)+utils.PageAlign(int64(b)) <= swMem.maxMemory
+	}
+	if swFits(17_043_139) || !swFits(17_043_138) || !swFits(17_043_200) {
+		t.Fatal("the sweep's part does not come back under the budget at 17,043,139")
+	}
+	swFit := cacheFit(swOnly, swTerms, swMem)
+	for n := int64(17_043_139 - 100_000); n <= 17_043_139+100_000; n++ {
+		if fitsIn(swFit.Inputs, n) != swFits(n) {
+			t.Fatalf("sweep part: length %d reported %v, fits %v (ranges %+v)", n, fitsIn(swFit.Inputs, n), swFits(n), swFit.Inputs)
+		}
+	}
+	// Every caller declines a cache whose own part is over 64 MiB, whatever
+	// max_memory allows: 128 patterns and 4,096 cells over 256 MiB need about
+	// 96 MiB, under a 1 GiB cap.
+	wideSh := OverlapCacheShape{Eligible: true, Cells: 4096, Patterns: 128}
+	if b := wideSh.cachePartBytes(256 << 20); b <= config.SetOverlapCacheMaxBytes {
+		t.Fatalf("the cache at 256 MiB is %d bytes, within the budget", b)
+	}
+	for _, comp := range []bool{false, true} {
+		wm := moduleReport{standalone: true, component: comp, staticBytes: 1 << 16, maxMemory: 1 << 30}
+		ws := setMemReport{find: true, members: 128, idSpace: 128, cache: &wideSh}
+		wt := setTerms(ws, wm)
+		wf := cacheFit(wideSh, wt, wm)
+		if fitsIn(wf.Inputs, 256<<20) {
+			t.Errorf("component %v: a 256 MiB input reported with a cache: %+v", comp, wf.Inputs)
+		}
+		budget := int64(config.SetOverlapCacheMaxBytes)
+		if comp {
+			budget -= 8
+		}
+		wb := exportTotal("find", wt, wm)
+		cacheTerm := memTerm{size: func(n int64) int64 { b, _ := wideSh.Sizing(int(n)); return int64(b) }}
+		for n := int64(0); n < maxInputSearchCap; n += 1 + n/64 {
+			want := int64(wideSh.cachePartBytes(int(n))) <= budget && wb(n)+utils.PageAlign(cacheTerm.bytes(n, wm)) <= wm.maxMemory
+			if fitsIn(wf.Inputs, n) != want {
+				t.Fatalf("component %v: length %d reported %v, fits %v (ranges %+v)", comp, n, fitsIn(wf.Inputs, n), want, wf.Inputs)
+			}
+		}
+	}
 	// A program sweep's part has a regime of its own.
 	sw := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 2, SweepCells: 4, SweepRow: 4}
 	if sw.sizingRegime(0) != 0 || sw.sizingRegime(1<<30)&2 == 0 {

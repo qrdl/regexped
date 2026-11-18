@@ -160,9 +160,11 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 // sizingRegime numbers the formula Sizing takes for inputLen. It changes only
 // where one of three switches flips — the cache leaving single-block mode, the
 // program sweep's region leaving it, and that region dropping out past the
-// budget — and each flips once as the input grows. Within one regime Sizing
-// grows with the input except where a checkpointed stride steps up
-// (sizingSegment).
+// budget. The first two flip once as the input grows; the third can flip BACK
+// where the sweep's stride steps up (65,535 cells, 252-byte rows: over at
+// 17,043,072 bytes, under at 17,043,139, over at 17,043,200), and flips at
+// most once while its stride holds. Within one regime Sizing grows with the
+// input except where a checkpointed stride steps up (sizingSegment).
 func (sh OverlapCacheShape) sizingRegime(inputLen int) int {
 	r := 0
 	if sh.Eligible && config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns) != inputLen+1 {
@@ -185,17 +187,31 @@ func (sh OverlapCacheShape) sizingRegime(inputLen int) int {
 // With its stride fixed a part's region only grows with the input (one more
 // checkpoint every stride bytes), but where the stride steps up it can shrink
 // by a few bytes — 262,148 → 262,132 at 50,803,199 bytes for 6 cells and 2
-// patterns. Each field is nondecreasing in the input, so every segment is one
-// stretch of lengths.
+// patterns. The strides are nondecreasing in the input, and with them held
+// every regime bit flips at most once, so every segment is one stretch of
+// lengths. The sweep's stride is kept while its part is over the budget too:
+// that is what tells apart the stretches either side of a length where the
+// part drops back under it.
 func (sh OverlapCacheShape) sizingSegment(inputLen int) [3]int {
 	seg := [3]int{sh.sizingRegime(inputLen)}
 	if seg[0]&1 != 0 {
 		seg[1] = config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns)
 	}
-	if seg[0]&2 != 0 && seg[0]&4 == 0 {
+	if seg[0]&2 != 0 {
 		_, seg[2] = config.SetOverlapCheckpointSizingRow(inputLen, sh.SweepCells, sh.SweepRow)
 	}
 	return seg
+}
+
+// cachePartBytes is the answer cache's own part of the region Sizing gives —
+// the bare header for a set with none — which every caller declines when it is
+// over config.SetOverlapCacheMaxBytes (the program sweep's part is dropped on
+// its own, inside Sizing). A component adds its allocator's 8-byte header.
+func (sh OverlapCacheShape) cachePartBytes(inputLen int) int {
+	if !sh.Eligible {
+		return config.SetOverlapCheckpointHeaderBytes
+	}
+	return config.SetOverlapCheckpointBytes(inputLen, sh.Cells, sh.Patterns)
 }
 
 // Sizing is SetOverlapCacheSizing for a shape already in hand: a caller that

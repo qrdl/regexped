@@ -766,9 +766,9 @@ func (d *setDefault) blockFn(area func([]byte) []byte, k int) func([]byte) []byt
 // does — the answer cache (emitCkptSizing, or the bare header for a set with
 // none) and, 8-aligned after it, the program sweep's part when it fits the
 // budget — grows or reuses the region, and starts it: the header zeroed and the
-// stride written. A cache too large for config.SetOverlapCacheMaxBytes gets no
-// region (none handed over): the drive then routes as one whose caller declined
-// the cache does.
+// stride written. A cache whose part is too large for
+// config.SetOverlapCacheMaxBytes gets no region (none handed over): the drive
+// then routes as one whose caller declined the cache does.
 func (d *setDefault) emitCacheReset(b []byte, rec func([]byte) []byte, l defLocals) []byte {
 	const pLen = 1
 	maxB := int64(config.SetOverlapCacheMaxBytes)
@@ -784,6 +784,9 @@ func (d *setDefault) emitCacheReset(b []byte, rec func([]byte) []byte, l defLoca
 		b = lset(b, l.st)
 	}
 	if d.sweepCells > 0 {
+		// The cache's part, which the budget below is applied to on its own.
+		b = lget(b, l.n)
+		b = lset(b, l.n2)
 		// + the sweep's bytes, past the cache's 8-aligned, when within budget.
 		b = emitCkptSizing(b, pLen, l.m, l.k, l.b2, int(d.sweepCells), int64(d.sweepRow))
 		b = lget(b, l.b2)
@@ -799,14 +802,17 @@ func (d *setDefault) emitCacheReset(b []byte, rec func([]byte) []byte, l defLoca
 		b = lset(b, l.n)
 		b = append(b, 0x0B)
 	}
-	b = lget(b, l.n)
-	b = i64c(b, maxB)
 	if d.sweepCells > 0 {
-		// The two parts are each within the budget; the region may be up to
-		// twice it.
-		b = i64c(b, 2)
-		b = append(b, 0x7E)
+		// Each part within the budget on its own, as every stub and the
+		// component test it: the sweep's was added only when it was, so the
+		// cache's decides, and the region may be up to twice the budget. A
+		// test of the SUM against twice the budget took a cache part over it
+		// beside a small sweep part, where every stub declines the cache.
+		b = lget(b, l.n2)
+	} else {
+		b = lget(b, l.n)
 	}
+	b = i64c(b, maxB)
 	b = append(b, 0x57, 0x04, 0x40) // within the budget; if
 	b = d.m.emitRegion(b, rec, sdCache, sdCacheCap, l.n, l)
 	b = append(b, 0x0B)
