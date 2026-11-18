@@ -678,12 +678,16 @@ regexped/
 │   │                          #   largest input that fits per export (a binary search over the
 │   │                          #   same sums). FIXED terms count but are not "growing": a no-Alt
 │   │                          #   Backtracking body's stack (it pushes no frame), a set's buffers
-│   │                          #   (setBufferTerms: tuples, gates, descriptor, bitmap — the JS/TS
-│   │                          #   stub's or the component's). In a component a caller region is a
+│   │                          #   (setBufferTerms: tuples, gates, descriptor, bitmap, split members'
+│   │                          #   search blocks, a component `_all` list — the JS/TS stub's or the
+│   │                          #   component's), a pattern's (patternBufferTerms: groups slots, a
+│   │                          #   batch-find buffer of config.PatternBatchCap, a component
+│   │                          #   resource). In a component a caller region is a
 │   │                          #   cabi_realloc block (componentBlock: pow2 ≥ size + 8). The answer
 │   │                          #   cache is OPTIONAL — refused, the find walks — so it is not in
-│   │                          #   max_input; cacheFit gives the input ranges it fits, by regime
-│   │                          #   (sizingRegime), since its size drops where it checkpoints.
+│   │                          #   max_input; cacheFit gives the input ranges it fits, by SEGMENT
+│   │                          #   (sizingSegment: regime + checkpoint strides), since its size drops
+│   │                          #   where it checkpoints and by a few bytes where a stride steps up.
 │   │                          #   A set's code counts its \x00 companions. JSON `schema` is bumped
 │   │                          #   only on a breaking change; TestReportSchemaFields pins the field set
 │   ├── whole_capture.go       # Single-capture shortcuts: group 1 is group 0, or group 0

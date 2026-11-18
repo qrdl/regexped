@@ -66,6 +66,11 @@ type PatternReport struct {
 	Search SearchSize
 	// bt are the pattern's Backtracking bodies, for their run-time scratch.
 	bt []btBodyReport
+	// groups is the group count the groups exports write (outGroups), and
+	// batch whether find and groups also export a batch entry: together they
+	// size the output buffers beside the input (patternBufferTerms).
+	groups int
+	batch  bool
 	// TableBytes is the bytes of data the module carries in the pattern's
 	// table range [tableStart, tableEnd); CodeBytes its function bodies'
 	// bytes (wrappers excluded). Both are filled once the module is assembled.

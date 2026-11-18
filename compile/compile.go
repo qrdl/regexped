@@ -1571,6 +1571,7 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	// are built).
 	buildOpts.report().searchSize(SearchSize{NotesBytes: int(p.notes.bytesPerPos()), BTBudget: p.btSearch, BTMemoBytes: p.btMemoBytes})
 	buildOpts.report().tableRange(firstTable, p.tableEnd)
+	buildOpts.report().outputs(p.outGroups(), hasBatchHint(re.Hints))
 	p.report, p.reportIdx = buildOpts.report(), buildOpts.report().openIndex()
 	if rep := buildOpts.report(); rep != nil && rep.cur != nil && rep.cur.Find == "" &&
 		(re.FindFunc != "" || re.GroupsFunc != "") {
@@ -2445,6 +2446,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		if needGroups && !needFind {
 			// No find body: the capture body is the whole search.
 			buildOpts.report().findKind(findKindAnchored, "the pattern can only match at 0: the capture body runs there once")
+			buildOpts.report().scan("anchored at 0", "anchored groups search: the capture body runs at the input's start only")
 		}
 	}
 

@@ -680,7 +680,7 @@ export function %s(input) {
 // user-configurable
 // in v1 — see set stubs' batchSize for the analogous, config-driven sizing
 // used by sets.
-const lm2BatchCap = 256
+const lm2BatchCap = config.PatternBatchCap
 
 // genJSFindFunc generates a JS generator for non-anchored find.
 // Yields [start, end] absolute byte positions for each non-overlapping match.

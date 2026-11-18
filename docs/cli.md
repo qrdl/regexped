@@ -1059,7 +1059,10 @@ program with no alternation pushes no frame, so its stack keeps the bytes it
 is given at entry: a fixed size, listed but not counted as growing. A set's
 `set buffers` — the tuples, gate array, scratch descriptor and bitmap a
 standalone stub or a component reserves beside the input, the batch buffer at
-its default size — are fixed too. In a component every `caller` region is a
+its default size, the split members' search blocks and a component `_all`'s id
+list — are fixed too, and so are a pattern's `output buffers`: a groups call's
+slots, a `batch-find` buffer of 256 matches, or a component resource and the
+lists its calls return. In a component every `caller` region is a
 `cabi_realloc` block, the power of two at least its size plus 8 bytes, and its
 values are given as such.
 
@@ -1104,9 +1107,13 @@ instead of reading a field that is no longer there. For example, a CI gate on
 Backtracking:
 
 ```sh
-regexped check --verbose-format=json \
-  | jq -e '.schema == 1 and ([.patterns[] | select(.engine == "Backtracking")] | length == 0)'
+regexped check --verbose-format=json > report.json &&
+  jq -e '.schema == 1 and ([.patterns[] | select(.engine == "Backtracking")] | length == 0)' report.json
 ```
+
+`check` writes the report before it answers, and on a config that fails to
+compile the report is partial, so its exit status is checked first — a plain
+`check | jq` pipeline answers with `jq`'s status alone.
 | `patterns` | One or more patterns to compile — unless every regexp lives in a set's `regexps:`, in which case it may be left out. A file with no regexp anywhere is a load error |
 
 Entries with no `_func` fields produce no individual exports. If such an

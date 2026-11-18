@@ -2061,8 +2061,8 @@ func TestReportMemoryCeilingsHold(t *testing.T) {
 			}
 			res, pages, _ = reportDrive(t, w, strings.Repeat("a", int(n)-1)+"c")
 			t.Logf("max_input %d bytes under %s: answer %d, %d pages", n, memCap, res, pages)
-			if res == abi.BTStackOverflow {
-				t.Errorf("an input of max_input = %d bytes answered BTStackOverflow under %s", n, memCap)
+			if res < 0 {
+				t.Errorf("an input of max_input = %d bytes, which matches, answered %d under %s", n, res, memCap)
 			}
 			if capPages, _ := memCap.Pages(); pages > uint64(capPages) {
 				t.Errorf("memory reached %d pages, past the cap's %d", pages, capPages)

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -319,8 +320,8 @@ func TestReportSearchKindsAndFixedStack(t *testing.T) {
 	for _, p := range reportOf(t, cfg).Patterns {
 		byName[p.Name] = p
 	}
-	if p := byName["date"]; p.Find != findKindAnchored {
-		t.Errorf("date: search %q (%s), want %q", p.Find, p.FindReason, findKindAnchored)
+	if p := byName["date"]; p.Find != findKindAnchored || p.Scan != "anchored at 0" {
+		t.Errorf("date: search %q (%s), scan %q; want %q, anchored at 0", p.Find, p.FindReason, p.Scan, findKindAnchored)
 	}
 	if p := byName["amb"]; p.Find != findKindBacktrack || !strings.Contains(p.FindReason, "ambiguous word-boundary target") ||
 		strings.Contains(p.FindReason, "over the limits") {
@@ -416,6 +417,20 @@ func TestReportSetBuffersAndComponentBlocks(t *testing.T) {
 		bt[0].size(0) != 12+4*3+16+1 {
 		t.Errorf("batched JS buffers %d, %d", bt[0].size(0), bt[1].size(0))
 	}
+	// Split members' search blocks, and a component `_all`'s id list.
+	blocked := setMemReport{find: true, match: true, members: 100, idSpace: 100, blocks: make([]SearchSize, 3)}
+	nb := setBufferTerms(blocked, js)
+	plainSet := setMemReport{find: true, match: true, members: 100, idSpace: 100}
+	if got := nb[1].size(0) - setBufferTerms(plainSet, js)[1].size(0); got != 24+3*abi.SearchBlockBytes {
+		t.Errorf("JS search blocks %d", got)
+	}
+	cb := setBufferTerms(blocked, comp)
+	if got := cb[1].size(0) - setBufferTerms(plainSet, comp)[1].size(0); got != componentBlock(3*abi.SearchBlockBytes) {
+		t.Errorf("component search blocks %d", got)
+	}
+	if got := cb[0].size(0); got != componentBlock(areaSetAll)+componentBlock(16)+componentBlock(400) {
+		t.Errorf("component _all buffers %d", got)
+	}
 	r := &Reporter{}
 	r.NoteCompile(config.BuildConfig{}, nil, true)
 	if !r.mod.component || !r.mod.standalone || r.mod.kind != "component core module" {
@@ -435,6 +450,64 @@ func TestReportSetBuffersAndComponentBlocks(t *testing.T) {
 	c := ceilings([]memTerm{inputTerm([]string{"find"})}, capped)[0]
 	if c.Bytes.KiB1 != 2048 || !strings.Contains(c.Formula, "power of two") {
 		t.Errorf("component input ceiling %+v", c)
+	}
+}
+
+// TestReportPatternBuffers: the buffers a pattern's exports take beside the
+// input count against max_memory — a JS/TS batch buffer of 256 records, a
+// groups call's slots, a component resource and its per-call lists.
+func TestReportPatternBuffers(t *testing.T) {
+	js := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 4 << 20}
+	size := func(p PatternReport, m moduleReport) map[string]int64 {
+		out := map[string]int64{}
+		for _, b := range patternBufferTerms(p, m) {
+			if !b.fixed || len(b.exports) != 1 {
+				t.Fatalf("buffer term %+v", b)
+			}
+			out[b.exports[0]] = b.size(0)
+		}
+		return out
+	}
+	// 41 groups, batched: 256 × (8 + 8 × 41) = 86,016 bytes, over the one
+	// page of slack exportTotal allows.
+	wide := PatternReport{Exports: []string{"find", "groups"}, groups: 41, batch: true}
+	if got := size(wide, js); got["groups"] != 86016 || got["find"] != 256*8 {
+		t.Errorf("batched JS buffers %v", got)
+	}
+	terms := append([]memTerm{inputTerm(wide.Exports)}, patternBufferTerms(wide, js)...)
+	if got := exportTotal("groups", terms, js)(0); got != js.staticBytes+65536+utils.PageAlign(86016) {
+		t.Errorf("groups total at 0 bytes: %d", got)
+	}
+	if got := size(PatternReport{Exports: []string{"find", "groups"}, groups: 3}, js); got["groups"] != 24 || len(got) != 1 {
+		t.Errorf("plain JS buffers %v", got)
+	}
+	if patternBufferTerms(wide, moduleReport{}) != nil {
+		t.Error("an embedded module's buffers are the host's")
+	}
+	comp := moduleReport{standalone: true, component: true, staticBytes: 1 << 16, maxMemory: 4 << 20}
+	plain := PatternReport{Exports: []string{"match", "find", "groups"}, groups: 3, batch: true}
+	got := size(plain, comp)
+	if got["match"] != componentBlock(areaMatch) ||
+		got["find"] != componentBlock(int64(patRepSize(false, 0)))+componentBlock(areaFind) ||
+		got["groups"] != componentBlock(int64(patRepSize(true, 3)))+componentBlock(areaSetAll)+componentBlock(3*groupElemLen) {
+		t.Errorf("component buffers %v", got)
+	}
+	plain.Search = SearchSize{NotesBytes: 1}
+	if got := size(plain, comp)["groups"]; got != componentBlock(int64(patRepBlockOff(3))+abi.SearchBlockBytes)+componentBlock(areaSetAll)+componentBlock(3*groupElemLen) {
+		t.Errorf("component groups with a search block %d", got)
+	}
+
+	// The real compile records the group count and the batch hint.
+	cfg := config.BuildConfig{ImportModule: "m", MaxMemory: mustMemorySize(t, "8MiB"),
+		Patterns: []config.PatternEntry{{Regexp: `(a+)(b)`, GroupsFunc: "g", FindFunc: "f", Hints: []string{"batch-find"}}}}
+	var found bool
+	for _, c := range reportOf(t, cfg).Patterns[0].Ceilings {
+		if c.What == "output buffers (groups)" && c.Formula == "8192 B" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no 8,192-byte groups buffer: %+v", reportOf(t, cfg).Patterns[0].Ceilings)
 	}
 }
 
@@ -483,6 +556,39 @@ func TestReportAnswerCacheFit(t *testing.T) {
 	big := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 1 << 40}
 	if got := cacheFit(sh, setTerms(sm, big), big); len(got.Inputs) != 1 || cacheFitText(got.Inputs) != "every length" {
 		t.Errorf("unbounded cache fit %+v", got.Inputs)
+	}
+	// Inside a checkpointed regime the region shrinks by a few bytes where
+	// the stride steps up: 50,803,198 bytes take a 262,148-byte cache (5
+	// pages), 50,803,199 a 262,132-byte one (4). Under a cap that fits 4
+	// pages there, the ranges are exactly the lengths that fit.
+	edge := int64(50_803_199)
+	if b, _ := sh.Sizing(int(edge)); b != 262_132 {
+		t.Fatalf("the cache at %d is %d bytes; pick the stride step again", edge, b)
+	}
+	tight := moduleReport{standalone: true, staticBytes: 1 << 16}
+	tight.maxMemory = exportTotal("find", setTerms(sm, tight), tight)(edge) + 4*65536
+	tterms := setTerms(sm, tight)
+	tbase := exportTotal("find", tterms, tight)
+	tfits := func(n int64) bool {
+		b, _ := sh.Sizing(int(n))
+		return tbase(n)+utils.PageAlign(int64(b)) <= tight.maxMemory
+	}
+	if !tfits(edge) || tfits(edge-1) {
+		t.Fatalf("the cap does not single out %d", edge)
+	}
+	tfit := cacheFit(sh, tterms, tight)
+	in := func(n int64) bool {
+		for _, r := range tfit.Inputs {
+			if r.From <= n && n <= r.To {
+				return true
+			}
+		}
+		return false
+	}
+	for n := edge - 200_000; n <= edge+200_000; n++ {
+		if in(n) != tfits(n) {
+			t.Fatalf("length %d: reported %v, fits %v (ranges %+v)", n, in(n), tfits(n), tfit.Inputs)
+		}
 	}
 	// A program sweep's part has a regime of its own.
 	sw := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 2, SweepCells: 4, SweepRow: 4}

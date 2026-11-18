@@ -507,6 +507,12 @@ func SetCursorMaxCount(patternCount int) int32 {
 	return int32((uint64(1) << uint(SetCursorCountBits(patternCount))) - 1)
 }
 
+// PatternBatchCap is the matches a generated JS/TS find or groups iterator's
+// batch buffer holds per host call, for a pattern with the "batch-find" hint.
+// One constant, because the stubs size the buffer with it and the --verbose
+// report counts it.
+const PatternBatchCap = 256
+
 // SetDefaultBatchCap is the tuples a generated batch iterator's buffer holds
 // when the caller names no batch size: 256, never below one position's worst
 // case (the pattern count), never above what the cursor's count field holds.

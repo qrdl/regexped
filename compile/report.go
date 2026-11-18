@@ -352,6 +352,14 @@ func (r *Reporter) btBody(b btBodyReport) {
 	r.cur.bt = append(r.cur.bt, b)
 }
 
+// outputs records what sizes the open pattern's output buffers.
+func (r *Reporter) outputs(groups int, batch bool) {
+	if r == nil || r.cur == nil {
+		return
+	}
+	r.cur.groups, r.cur.batch = groups, batch
+}
+
 // tableRange records the open pattern's table range.
 func (r *Reporter) tableRange(start, end int64) {
 	if r == nil || r.cur == nil {
@@ -684,9 +692,73 @@ func patternTerms(p PatternReport, m moduleReport) []memTerm {
 	if len(p.Exports) > 0 && m.standalone {
 		out = append(out, inputTerm(p.Exports))
 	}
+	out = append(out, patternBufferTerms(p, m)...)
 	out = append(out, searchTerms(p.Search, searching, "")...)
 	for _, b := range p.bt {
 		out = append(out, btTerms(b)...)
+	}
+	return out
+}
+
+// patternBufferTerms are the buffers a pattern's exports take beside the
+// input, whose size the input does not change: what the JS/TS stub reserves
+// above it (generate/js_stub.go: a batch entry's buffer of
+// config.PatternBatchCap records, else a groups call's slots), or in a
+// component what the adapters and the find and groups resources allocate,
+// each a cabi_realloc block of its own (component.go). An embedded module's
+// are the host's.
+func patternBufferTerms(p PatternReport, m moduleReport) []memTerm {
+	if !m.standalone {
+		return nil
+	}
+	g := int64(p.groups)
+	// A resource keeps its search block in its representation when it has
+	// notes or a Backtracking search (patternResource).
+	notes := p.Search.NotesBytes > 0 || p.Search.BTBudget
+	var out []memTerm
+	for _, e := range p.Exports {
+		var allocs []int64
+		switch {
+		case m.component && e == "match":
+			allocs = []int64{areaMatch}
+		case m.component && e == "find":
+			rep := int64(patRepSize(false, 0))
+			if notes {
+				rep = int64(patRepBlockOff(0)) + abi.SearchBlockBytes
+			}
+			allocs = []int64{rep, areaFind}
+		case m.component && e == "groups":
+			rep := int64(patRepSize(true, int(g)))
+			if notes {
+				rep = int64(patRepBlockOff(int(g))) + abi.SearchBlockBytes
+			}
+			allocs = []int64{rep, areaSetAll, g * groupElemLen}
+		case m.component:
+		case e == "find" && p.batch:
+			allocs = []int64{config.PatternBatchCap * 8}
+		case e == "groups" && p.batch:
+			allocs = []int64{config.PatternBatchCap * (8 + 8*g)}
+		case e == "groups":
+			allocs = []int64{(8*g + 7) &^ 7}
+		}
+		if len(allocs) == 0 {
+			continue
+		}
+		var sum int64
+		for _, a := range allocs {
+			if m.component {
+				a = componentBlock(a)
+			}
+			sum += a
+		}
+		formula := fmt.Sprintf("%d B", sum)
+		if m.component {
+			formula = fmt.Sprintf("%d B in %d blocks", sum, len(allocs))
+		}
+		out = append(out, memTerm{
+			what: "output buffers (" + e + ")", exports: []string{e}, when: "every call", formula: formula,
+			fixed: true, blocks: true, size: func(int64) int64 { return sum },
+		})
 	}
 	return out
 }
@@ -733,8 +805,9 @@ func setTerms(s setMemReport, m moduleReport) []memTerm {
 // setBufferTerms are the buffers a set's exports take beside the input, whose
 // size the input does not change: what the JS/TS stub reserves above it
 // (generate/js_stub.go: tuples, gate array, scratch descriptor, bitmap — the
-// batch entry's buffer at its default size), or in a component what the
-// adapters and the find resource allocate, each a cabi_realloc block of its
+// batch entry's buffer at its default size — and the split members' search
+// blocks), or in a component what the adapters and the find resource
+// allocate, the `_all` id list included, each a cabi_realloc block of its
 // own. An embedded module's are the host's.
 func setBufferTerms(s setMemReport, m moduleReport) []memTerm {
 	if !m.standalone {
@@ -743,13 +816,20 @@ func setBufferTerms(s setMemReport, m moduleReport) []memTerm {
 	tuples := int64(12 * s.members)
 	gates := int64(4 * s.idSpace)
 	bitmap := int64(s.idSpace+7) / 8
+	// The split members' search blocks: the find resource's own allocation in
+	// a component, the JS/TS stub's second descriptor followed by the blocks.
+	nBlocks := int64(len(s.blocks)) * abi.SearchBlockBytes
 	var all, find []int64
 	if m.component {
 		words := int64(s.idSpace+31) / 32 * 4
-		all = []int64{areaSetAll, words}
+		// `_all` returns its ids as a list, one u32 per member at most.
+		all = []int64{areaSetAll, words, 4 * int64(s.members)}
 		find = []int64{repBytesBlocks, gates, tuples, areaSetAll}
 		if s.cache != nil {
 			find = append(find, config.SetOverlapCheckpointHeaderBytes)
+		}
+		if nBlocks > 0 {
+			find = append(find, nBlocks)
 		}
 	} else {
 		region := gates + abi.FindScratchBytes + bitmap
@@ -766,6 +846,9 @@ func setBufferTerms(s setMemReport, m moduleReport) []memTerm {
 			f += config.SetOverlapCheckpointHeaderBytes
 		}
 		find = []int64{f}
+		if nBlocks > 0 {
+			find = append(find, (abi.FindScratchBlocksBytes+abi.SearchBlockAlign-1)&^(abi.SearchBlockAlign-1)+nBlocks)
+		}
 	}
 	term := func(exports []string, allocs []int64) memTerm {
 		var sum int64
@@ -907,10 +990,12 @@ func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int
 //
 // Not a search for one bound: the cache's region is not monotone in the input
 // — it shrinks to the square root at the length where single-block mode ends
-// (6 cells, 2 patterns: 66,000,092 B at 5.5 MB, 87,076 B at 5.6 MB). Each
-// stretch over which Sizing keeps one formula (sizingRegime) grows with the
-// input, so within it what fits is a prefix, found by bisection — up to the
-// formula's own rounding, a few bytes of stride.
+// (6 cells, 2 patterns: 66,000,092 B at 5.5 MB, 87,076 B at 5.6 MB), and by a
+// few bytes wherever a checkpointed stride steps up, which can cross a page.
+// Each stretch over which the regime and the strides hold (sizingSegment)
+// grows with the input, so within it what fits is a prefix, found by
+// bisection. Tens of thousands of stretches up to 2 GiB: about 0.2 s per set
+// with a cache, paid only when the report is built under max_memory.
 func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCacheFit {
 	if m.maxMemory == 0 {
 		return nil
@@ -920,17 +1005,17 @@ func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCach
 	fits := func(n int64) bool {
 		return base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory
 	}
-	regime := func(n int64) int { return sh.sizingRegime(int(n)) }
+	segment := func(n int64) [3]int { return sh.sizingSegment(int(n)) }
 	out := &ReportCacheFit{Inputs: []ReportRange{}}
 	for from := int64(0); from <= maxInputSearchCap; {
-		// The stretch [from, to] keeps from's regime; each switch it counts
-		// flips once, so the first length past from that differs ends it.
+		// The stretch [from, to] keeps from's segment; each of its fields
+		// only grows, so the first length past from that differs ends it.
 		to := maxInputSearchCap
-		if r := regime(from); regime(to) != r {
-			lo, hi := from, to // regime(lo) == r, regime(hi) != r
+		if r := segment(from); segment(to) != r {
+			lo, hi := from, to // segment(lo) == r, segment(hi) != r
 			for hi-lo > 1 {
 				mid := lo + (hi-lo)/2
-				if regime(mid) == r {
+				if segment(mid) == r {
 					lo = mid
 				} else {
 					hi = mid

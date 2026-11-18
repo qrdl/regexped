@@ -161,7 +161,8 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 // where one of three switches flips — the cache leaving single-block mode, the
 // program sweep's region leaving it, and that region dropping out past the
 // budget — and each flips once as the input grows. Within one regime Sizing
-// grows with the input, up to the rounding of the square-root stride.
+// grows with the input except where a checkpointed stride steps up
+// (sizingSegment).
 func (sh OverlapCacheShape) sizingRegime(inputLen int) int {
 	r := 0
 	if sh.Eligible && config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns) != inputLen+1 {
@@ -177,6 +178,24 @@ func (sh OverlapCacheShape) sizingRegime(inputLen int) int {
 		}
 	}
 	return r
+}
+
+// sizingSegment names the stretch of input lengths over which Sizing is
+// nondecreasing: the regime, and the stride of each part that checkpoints.
+// With its stride fixed a part's region only grows with the input (one more
+// checkpoint every stride bytes), but where the stride steps up it can shrink
+// by a few bytes — 262,148 → 262,132 at 50,803,199 bytes for 6 cells and 2
+// patterns. Each field is nondecreasing in the input, so every segment is one
+// stretch of lengths.
+func (sh OverlapCacheShape) sizingSegment(inputLen int) [3]int {
+	seg := [3]int{sh.sizingRegime(inputLen)}
+	if seg[0]&1 != 0 {
+		seg[1] = config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns)
+	}
+	if seg[0]&2 != 0 && seg[0]&4 == 0 {
+		_, seg[2] = config.SetOverlapCheckpointSizingRow(inputLen, sh.SweepCells, sh.SweepRow)
+	}
+	return seg
 }
 
 // Sizing is SetOverlapCacheSizing for a shape already in hand: a caller that
