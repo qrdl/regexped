@@ -2028,6 +2028,63 @@ sets:
 	}
 }
 
+// TestComponentCacheOnlyWhenTheWholeRegionIsRefused: under a cap the whole
+// region cannot fit beside the input, `next` reserves the cache's own part
+// instead of declining the cache — 72,000,160 bytes take a 128 MiB block, the
+// 48,000,088-byte cache part a 64 MiB one — and the drive answers as before.
+func TestComponentCacheOnlyWhenTheWholeRegionIsRefused(t *testing.T) {
+	const src = `wasm_format: component
+import_module: t
+wit_package: t
+max_memory: 128MiB
+patterns:
+  - regexp: 'foo\w+'
+  - regexp: 'a[a-z]*?z'
+sets:
+  - name: s
+    patterns: all
+    overlapping: true
+    find: scan_it
+`
+	var cfg config.BuildConfig
+	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 6_000_000
+	whole, _ := sh.Sizing(n)
+	only := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+	if whole == only {
+		t.Fatalf("shape %+v: no program sweep part at %d bytes", sh, n)
+	}
+	h := newSetHarness(t, src)
+	p, l := h.writeInput(strings.Repeat("a", n-1) + "z")
+	sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
+	defer h.call(h.pkg+"#[dtor]scan-it", sc)
+	if int(h.u32(sc+28)) != whole || int(h.u32(sc+32)) != only {
+		t.Fatalf("region %d (want %d), cache part %d (want %d)", h.u32(sc+28), whole, h.u32(sc+32), only)
+	}
+	granted := false
+	for i := 0; i < 64 && !granted; i++ {
+		got, _ := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc))
+		if len(got) != 1 || got[0][1] != uint32(i) || got[0][2] != n {
+			t.Fatalf("call %d: %v, want one match [%d, %d)", i, got, i, n)
+		}
+		if cacheLen := int(h.u32(sc + 24)); cacheLen != config.SetOverlapCheckpointHeaderBytes {
+			if cacheLen != only {
+				t.Fatalf("call %d: a %d-byte region handed over, want the cache part's %d", i, cacheLen, only)
+			}
+			granted = true
+		}
+	}
+	if !granted {
+		t.Fatal("no region was handed over: the cache was declined")
+	}
+}
+
 // TestComponentWideOverlapCache is the constructor past 32 members, where a
 // cache row's mask widens (an i64 to 64 members, a bitmap above): the region
 // it reserves must be the one config computes, and a drive over it must give

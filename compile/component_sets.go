@@ -67,13 +67,19 @@ const (
 	// header alone, its lazy word set, and `next` reserves this much when the
 	// module asks for it (abi.OverlapCacheWanted).
 	repCacheFull = 28
+	// repCacheOnly is the cache's own part of that region, below repCacheFull
+	// when a program sweep's part follows it: `next` reserves this much when
+	// the whole region cannot be served (max_memory), keeping the cache — the
+	// module then finds no room for the sweep and runs without it. Every stub
+	// retries the same way.
+	repCacheOnly = 32
 
 	// The SCRATCH DESCRIPTOR the `find` export takes in place of a bare gate
 	// pointer (internal/abi), carried INLINE here rather than allocated
 	// separately: the representation never moves — it is ours, and the handle
 	// holds it — so the gate pointer it contains cannot go stale, and the
 	// constructor can fill it once.
-	repScratch = 32
+	repScratch = 40
 	repBytes   = repScratch + abi.FindScratchBytes
 	// A set whose split members keep search blocks carries the descriptor's
 	// fifth field — the blocks, allocated by the constructor — and is that
@@ -565,6 +571,8 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 	b = storeI32(b, repCacheLen)
 	b = append(b, 0x20, lRep, 0x41, 0x00)
 	b = storeI32(b, repCacheFull)
+	b = append(b, 0x20, lRep, 0x41, 0x00)
+	b = storeI32(b, repCacheOnly)
 
 	if cells > 0 || c.sweepCells > 0 {
 		if c.sweepCells > 0 {
@@ -589,6 +597,8 @@ func buildSetScannerCtorBody(c setScannerCtor) []byte {
 		b = utils.AppendSLEB128_64(b, overlapCacheMaxBytes)
 		b = append(b, 0x58)       // i64.le_u -> within budget
 		b = append(b, 0x04, 0x40) // if
+		b = append(b, 0x20, lRep, 0x20, lBytes, 0xA7)
+		b = storeI32(b, repCacheOnly)
 		if c.sweepCells > 0 {
 			// The region: the cache's part 8-aligned, then the sweep's when it
 			// is within the budget too — each part on its own, the rule every
@@ -905,11 +915,12 @@ func buildSetScannerNextBodyBlocks(reallocIdx, freeIdx, findIdx, patternCount in
 // emitSetScannerGrantCache answers abi.OverlapCacheWanted in `next`, inside
 // the loop around the find call: the module would start using the answer
 // cache now and delivered nothing. The region the constructor sized is
-// reserved — when the allocator can serve it — and detached from the call, the
-// header is copied over with its lazy word cleared, the header block is freed,
-// and the descriptor points at the region; when it cannot be served, the lazy
-// word is cleared in place and the module walks. Either way the loop calls
-// again, and the module never asks twice.
+// reserved — when the allocator can serve it, else the cache's own part alone
+// (repCacheOnly) when a program sweep's part made the whole too large — and
+// detached from the call, the header is copied over with its lazy word
+// cleared, the header block is freed, and the descriptor points at the region;
+// when neither can be served, the lazy word is cleared in place and the module
+// walks. Either way the loop calls again, and the module never asks twice.
 func emitSetScannerGrantCache(b []byte, pRep, lN byte, reallocIdx, freeIdx int, callListGlobal, heapGlobal uint32,
 	classHeadsBase int32, lSz, lP, lChain, lSz64, lNeed byte) []byte {
 	b = append(b, 0x20, lN, 0x41)
@@ -919,7 +930,18 @@ func emitSetScannerGrantCache(b []byte, pRep, lN byte, reallocIdx, freeIdx int, 
 	b = loadI32(b, repCacheFull)
 	b = append(b, 0x22, lSz, 0xAD, 0x21, lSz64) // tee; i64.extend_i32_u
 	b = emitTryReserve(b, heapGlobal, classHeadsBase, lSz64, lNeed)
-	b = append(b, 0x04, 0x40) // if the allocator can serve it
+	b = append(b, 0x45, 0x04, 0x40) // i32.eqz; if the whole cannot be served
+	// The cache's part alone, when it is smaller: a program sweep's part
+	// follows it.
+	b = append(b, 0x20, pRep)
+	b = loadI32(b, repCacheOnly)
+	b = append(b, 0x22, lP, 0x20, lSz, 0x49, 0x04, 0x40) // tee; i32.lt_u; if
+	b = append(b, 0x20, lP, 0x22, lSz, 0xAD, 0x21, lSz64)
+	b = emitTryReserve(b, heapGlobal, classHeadsBase, lSz64, lNeed)
+	b = append(b, 0x45, 0x04, 0x40, 0x41, 0x00, 0x21, lSz, 0x0B) // eqz; if: none
+	b = append(b, 0x05, 0x41, 0x00, 0x21, lSz, 0x0B)             // else: none
+	b = append(b, 0x0B)
+	b = append(b, 0x20, lSz, 0x04, 0x40) // if a region can be served
 	b = append(b, 0x23)
 	b = utils.AppendULEB128(b, callListGlobal)
 	b = append(b, 0x21, lChain)

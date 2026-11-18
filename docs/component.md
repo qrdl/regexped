@@ -497,7 +497,9 @@ abandoned scanner's input stays held until the request ends.
   walks, with identical answers. A set whose split member gets a program sweep
   adds the sweep's part, with a 64 MiB budget of its own, as every stub does
   ([wasm.md](wasm.md)): the region can then reach 128 MiB, which the
-  allocator's power-of-two blocks round to 256 MiB, kept once grown.
+  allocator's power-of-two blocks round to 256 MiB, kept once grown. When that
+  block cannot be had, `next` reserves the cache's part alone, and the split
+  member searches on its own.
 - Every `next` is a cross-component call, but NOT a copy of the input: the input
   crossed once, when the scanner was constructed.
 - The `_all` pair allocates a list of ids per call, bounded by the number of

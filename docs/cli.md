@@ -1070,7 +1070,13 @@ When `max_memory` is set, each export also gets the **largest input that fits
 under it**: the module's static memory, every ceiling that counts for that
 export rounded up to whole pages, and one page for a search's block, summed. An input of that length can never
 need more than the cap; `unlimited` (`-1` in JSON) means nothing that counts
-grows with the input.
+grows with the input. The length is in BYTES as the module receives them: a
+`Uint8Array` (or any input already UTF-8 encoded) of `max_input` bytes fits.
+A JS/TS **string** is encoded while it is staged, and its memory is reserved
+before its exact UTF-8 size is known — one byte per UTF-16 unit, then up to 3
+bytes for each unit that did not fit — so a non-ASCII string whose bytes number
+`max_input` can be refused with a `RangeError`. Encode it first
+(`new TextEncoder().encode(s)`) to get the bound exactly.
 
 The overlapping answer cache is NOT part of it: when memory cannot grow for the
 cache the find walks instead, with the same answers, slower. A set with one
@@ -1104,11 +1110,16 @@ fields left out, so a script written against `brief` works on `full`.
 field renamed or removed, or a field's meaning or values changed — and a new
 field does not change it, so a script can check `.schema == 1` and fail loudly
 instead of reading a field that is no longer there. For example, a CI gate on
-Backtracking:
+Backtracking anywhere in the module — a pattern on it, a find whose switch
+hands over to it, or a set member on it. A pattern's `engine` alone misses the
+last two: a set member's entry says `none`, and its Backtracking body is listed
+under the set. Every Backtracking body has a `Backtracking …` memory ceiling,
+which only the full report carries:
 
 ```sh
-regexped check --verbose-format=json > report.json &&
-  jq -e '.schema == 1 and ([.patterns[] | select(.engine == "Backtracking")] | length == 0)' report.json
+regexped check --verbose=full --verbose-format=json > report.json &&
+  jq -e '.schema == 1 and ([.patterns[], .sets[] | .memory_ceilings[]?
+         | select(.what | startswith("Backtracking"))] | length == 0)' report.json
 ```
 
 `check` writes the report before it answers, and on a config that fails to

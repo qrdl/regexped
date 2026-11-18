@@ -433,6 +433,30 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
 `, consts.Cells, sh.Patterns, consts.Hdr, consts.Max,
 					consts.Row, consts.Cell, config.SetOverlapCheckpointHeaderBytes,
 					config.SetOverlapHdrStrideOff, s.Find, cCachePart(sh, consts), cSweepPart(sh, consts), scannerType)
+				// With a program sweep's part after the cache's, the cache's own
+				// part — from the same cCachePart text — is what a refused
+				// allocation of the whole falls back to.
+				retry := ""
+				if sh.SweepCells > 0 {
+					cacheAPI += fmt.Sprintf(`#if RX_SET_CACHE
+/* The cache's own part of the region rx_%[1]s_cache_plan_ sizes: what is
+   allocated when the whole, with the program sweep's part, cannot be. */
+static size_t rx_%[1]s_cache_only_(size_t len) {
+    unsigned long long m = (unsigned long long)len + 1;
+%[2]s    (void)k;
+    return (size_t)bytes;
+}
+#endif
+
+`, s.Find, cCachePart(sh, consts))
+					retry = fmt.Sprintf(`            if (!c && bytes) {
+                /* The whole cannot be had: the cache's own part alone, and the
+                   module runs without the program sweep. */
+                size_t only = rx_%[1]s_cache_only_(s->len);
+                if (only < bytes && (c = (unsigned *)malloc(only)) != 0) bytes = only;
+            }
+`, s.Find)
+				}
 				// LAZY: _init hands over the header alone, inside the scanner,
 				// its lazy word set, and the module answers
 				// abi.OverlapCacheWanted, delivering nothing, at the call where
@@ -466,7 +490,7 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
             unsigned k;
             size_t bytes = rx_%[1]s_cache_plan_(s->len, &k);
             unsigned *c = bytes ? (unsigned *)malloc(bytes) : 0;
-            if (c) {
+%[5]s            if (c) {
                 for (int w = 0; w < %[4]d; w++) c[w] = s->cache_hdr[w];
                 c[%[3]d] = 0;
                 s->cache = c; s->cache_words = bytes / 4; s->cache_own = 1;
@@ -476,7 +500,7 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
             continue;
         }
 #endif
-`, s.Find, abi.OverlapCacheWanted, config.SetOverlapHdrLazyOff/4, config.SetOverlapCheckpointHeaderBytes/4)
+`, s.Find, abi.OverlapCacheWanted, config.SetOverlapHdrLazyOff/4, config.SetOverlapCheckpointHeaderBytes/4, retry)
 				cacheFree = `#if RX_SET_CACHE
     if (s->cache_own) free(s->cache);
 #endif

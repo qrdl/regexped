@@ -933,7 +933,10 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
 	k := overlapCacheConstsFor(sh)
 	if sh.Eligible {
 		pre = fmt.Sprintf(`    // [stride, bytes] of the answer cache for an input of _len bytes; _open
-    // calls it with the count the input actually took.
+    // calls it with the count the input actually took. _cacheOnly is the
+    // cache's own part when a program sweep's part follows it: _lazy falls
+    // back to it when the whole cannot be had.
+    let _cacheOnly = 0;
     const _cacheFor = (_len) => {
         const _m = _len + 1;
         const _row = %[1]d;
@@ -954,7 +957,10 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
 		// No answer cache, only the program sweep's part: the cache's is its
 		// bare header.
 		pre = fmt.Sprintf(`    // [stride, bytes] of the region for an input of _len bytes; _open calls it
-    // with the count the input actually took.
+    // with the count the input actually took. _cacheOnly is the cache's own
+    // part, the bare header here: _lazy falls back to it when the whole cannot
+    // be had.
+    let _cacheOnly = 0;
     const _cacheFor = (_len) => {
         const _m = _len + 1;
         const _k = 1;
@@ -977,7 +983,9 @@ func jsOverlapCacheBlock(s config.SetConfig, sh cacheShape, gateRegion int) (pre
             if (_sk > _m) _sk = _m;
         }
         const _sb = %[1]d + Math.ceil(_m / _sk) * %[4]d + 4 + _sk * %[3]d;
-        return [_k, _sb <= %[2]d ? Math.ceil(cacheNeeded / 8) * 8 + _sb : cacheNeeded];
+        if (_sb > %[2]d) return [_k, cacheNeeded];
+        _cacheOnly = cacheNeeded;
+        return [_k, Math.ceil(cacheNeeded / 8) * 8 + _sb];
     };
 `, k.Hdr, k.Max, sh.SweepRow, sh.SweepCells*4+4, sh.SweepCells)
 	}
@@ -1017,7 +1025,7 @@ func jsLazyWanted(args, test string) string {
 	return fmt.Sprintf(`        // The module would start using the answer cache now and delivered
         // nothing: hand the region over, or none, and call again. It never
         // asks twice.
-        if (%s) { _cacheAt = _lazy(cacheBase, cacheBytes, scratchBase); continue; }
+        if (%s) { _cacheAt = _lazy(cacheBase, cacheBytes, scratchBase, _cacheOnly); continue; }
 `, test)
 }
 
@@ -1035,22 +1043,36 @@ func jsLazyFinally(args string) string {
 // and the descriptor pointed at it. A grow refused under a memory ceiling
 // clears the lazy word in place instead, and the module walks.
 func jsLazyFunc(ts bool) string {
-	sig, mem := "function _lazy(hdr, bytes, desc) {", "_exp.memory.buffer"
+	sig, mem := "function _lazy(hdr, bytes, desc, only = 0) {", "_exp.memory.buffer"
 	if ts {
-		sig, mem = "function _lazy(hdr: number, bytes: number, desc: number): number {", "(_exp.memory as WebAssembly.Memory).buffer"
+		sig, mem = "function _lazy(hdr: number, bytes: number, desc: number, only: number = 0): number {", "(_exp.memory as WebAssembly.Memory).buffer"
 	}
 	return fmt.Sprintf(`%[1]s
     // The module asks for the answer cache's region: reserve it as a region of
     // its own, copy the header over and point the descriptor at it. A grow
-    // refused under a memory ceiling hands none over — the lazy word is
-    // cleared, and the module walks: the same answers, slower.
+    // refused under a memory ceiling falls back to the cache's own part
+    // (only), when a program sweep's part follows it — the module then runs
+    // without the sweep — and when that is refused too hands none over: the
+    // lazy word is cleared, and the module walks: the same answers, slower.
     const at = _align(_bump);
     try {
         _grow(at + bytes);
     } catch (e) {
         if (!(e instanceof RangeError)) throw e;
-        new Uint32Array(%[2]s, hdr, %[3]d)[%[4]d] = 0;
-        return 0;
+        let had = false;
+        if (only > 0 && only < bytes) {
+            try {
+                _grow(at + only);
+                bytes = only;
+                had = true;
+            } catch (e2) {
+                if (!(e2 instanceof RangeError)) throw e2;
+            }
+        }
+        if (!had) {
+            new Uint32Array(%[2]s, hdr, %[3]d)[%[4]d] = 0;
+            return 0;
+        }
     }
     _bump = at + bytes;
     _regs.push({ at, top: _bump, free: false });

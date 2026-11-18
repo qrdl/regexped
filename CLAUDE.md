@@ -592,7 +592,12 @@ regexped/
 │   │                          #   and returns a HANDLE — returning the representation builds
 │   │                          #   fine and traps with "unknown handle index" — and that
 │   │                          #   import is why a set-bearing component offsets every
-│   │                          #   defined function index
+│   │                          #   defined function index. The answer-cache region adds a
+│   │                          #   program sweep's part whenever EACH part fits 64 MiB (the
+│   │                          #   stubs' rule; the sum test left split members quadratic at
+│   │                          #   5.6-16.8 MB), and `next` falls back to the cache's part alone
+│   │                          #   (repCacheOnly) when the whole cannot be reserved — as the
+│   │                          #   JS/TS, C and Rust stubs do; Go and AS cannot (fatal OOM)
 │   ├── component.go           # Canonical-ABI adapters for `wasm_format: component`: the
 │   │                          #   cabi_realloc (per-size-class FREE LISTS, not a bump
 │   │                          #   pointer: a resource must outlive its call, and the

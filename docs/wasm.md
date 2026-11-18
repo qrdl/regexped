@@ -960,6 +960,14 @@ adds `sbytes`. The sweep runs only where its part clears the cache's layout for
 the stride in the header; otherwise the split member searches on its own,
 which gives the same answer more slowly.
 
+That is also the FALLBACK when the whole region cannot be had: a caller whose
+allocation of cache part + `sbytes` fails hands over the cache's part alone
+(`bytes` before `sbytes` is added), with the same stride, and only declines
+when even that fails. The kept members keep the cache and the split member
+searches on its own. The component and the JS/TS, C and Rust stubs do this;
+the Go and AssemblyScript stubs cannot, since a failed allocation there is a
+fatal out-of-memory error, not a result to retry on.
+
 **The single-block case is the whole-drive cache.** A stride equal to the span
 is one block: the pass records every match on its way through, nothing is ever
 rebuilt, and the drive costs what it did before any of this. Below the 64 MiB
@@ -994,9 +1002,13 @@ The rules:
   overlapping set over 4 KB (45,339 fuel/byte against 621 with a region of the
   right size, and 649 for a standalone module handed no region at all, which
   then uses its own). Size the region from the formula with the compiler's
-  inputs — the sweep column's width and the pattern count a generated stub
-  carries, the full report's `cache_bytes_per_byte` (or its `answer cache` ceiling), or
-  `compile.SetOverlapCacheSizing` — never from a guess.
+  inputs — `CELLS` and `PATTERNS`, and a program sweep's `SWEEP_CELLS` and
+  `SWEPT`, as a generated stub carries them (C exports the result as
+  `<find>_cache_bytes`), or `compile.SetOverlapCacheSizing` from Go — never
+  from a guess. The full report's `cache_bytes_per_byte` is NOT enough: it is
+  the per-byte rate of the single-block region only, without the fixed header
+  and column and without the stride the header must carry, and past 64 MiB the
+  region follows the square-root formula, which needs `CELLS`.
 - **A header that contradicts itself IS an error.** A `cache_len` below the
   48-byte header, a stride below 1 — or, on a
   later call, a header no sweep could have written (a floor past the input, a

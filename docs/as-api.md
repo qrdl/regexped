@@ -306,6 +306,13 @@ The iterator holds the cache's 48-byte header alone until the drive asks for
 the region — at the call where it would sweep, which most drives never reach —
 and allocates it then.
 
+The allocation is infallible here: a region memory cannot grow for is a fatal
+out-of-memory error, not a result the stub sees. So the stub cannot fall back,
+as the C, Rust, JS/TS stubs and the component do, to the cache's part alone
+when a program sweep's part makes the whole region too large for the memory
+left (see [wasm.md](wasm.md)) — this is a LIMITATION of this stub. Set
+`max_memory` with room for the whole region if your sets split a member.
+
 ### The overlapping answer cache's header
 
 An `overlapping: true` set's `find` reads a caller-owned region — the answer

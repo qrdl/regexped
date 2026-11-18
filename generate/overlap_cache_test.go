@@ -941,9 +941,10 @@ func sweepSizingMatchesConfig(t *testing.T, keptPat string, eligible bool) {
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
-		snip := sizingSnippet(t, src, "const _cacheFor = (_len) => {", "return [_k, _sb <= 67108864")
+		snip := sizingSnippet(t, src, "const _cacheFor = (_len) => {", "return [_k, Math.ceil(cacheNeeded / 8) * 8 + _sb];")
 		dir := t.TempDir()
-		js := snip + "    };\nconst out = [];\nfor (const n of [" + joinInts(lens) + "]) { const [k, b] = _cacheFor(n); out.push(k + ',' + b); }\n" +
+		// _cacheOnly, which the sizing records for _lazy, is declared above it.
+		js := "let _cacheOnly = 0;\n" + snip + "    };\nconst out = [];\nfor (const n of [" + joinInts(lens) + "]) { const [k, b] = _cacheFor(n); out.push(k + ',' + b); }\n" +
 			"console.log(out.join('\\n'));\n"
 		if err := os.WriteFile(filepath.Join(dir, "size.js"), []byte(js), 0o644); err != nil {
 			t.Fatal(err)
@@ -1141,6 +1142,90 @@ try {
 	}
 }
 
+// TestJSStubFallsBackToTheCachePart: when the whole region — the answer
+// cache's part and a program sweep's after it — cannot be had under the
+// module's memory maximum, _lazy hands over the cache's part alone rather than
+// declining the cache. The stand-in asks for the region on its first call and
+// answers "finished" on its second only when the descriptor names a region of
+// exactly the cache part's size; anything else answers -2, which the stub
+// throws on.
+func TestJSStubFallsBackToTheCachePart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs node; skipped in -short")
+	}
+	for _, tool := range []string{"node", "wasm-tools"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH; this check is a no-op here", tool)
+		}
+	}
+	cfg := config.BuildConfig{
+		Output:       "merged.wasm",
+		ImportModule: "demo",
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: `foo\w+`}, {Name: "b", Regexp: `a[a-z]*?z`}},
+		Sets: []config.SetConfig{{Name: "ov", Find: "scan_ov",
+			Patterns: config.PatternSelector{All: true}, Overlapping: true}},
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || sh.SweepCells == 0 {
+		t.Fatalf("shape %+v, %v: the set needs a program sweep", sh, err)
+	}
+	const n = 100_000
+	whole, _ := sh.Sizing(n)
+	only := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+	// Two pages to start, the input's own two, the cache part's, one spare:
+	// the whole region is several pages more.
+	maxPages := 2 + 2 + (only+65535)/65536 + 1
+	if (whole-only)/65536 < 3 {
+		t.Fatalf("whole %d, cache part %d: too close to tell apart", whole, only)
+	}
+	dir := t.TempDir()
+	if err := jsStub(cfg, filepath.Join(dir, "stubs.js")); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	writeESMPackageJSON(t, dir)
+	wat := fmt.Sprintf(`(module
+  (memory (export "memory") 2 %d)
+  (global $calls (mut i32) (i32.const 0))
+  (func (export "scan_ov") (param i32 i32 i32 i32 i32 i32) (result i32)
+    (global.set $calls (i32.add (global.get $calls) (i32.const 1)))
+    (if (i32.eq (global.get $calls) (i32.const 1)) (then (return (i32.const -7))))
+    (if (i32.eq (i32.load offset=12 (local.get 3)) (i32.const %d))
+      (then (return (i32.const -1))))
+    i32.const -2))
+`, maxPages, only)
+	if err := os.WriteFile(filepath.Join(dir, "fake.wat"), []byte(wat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("wasm-tools", "parse", filepath.Join(dir, "fake.wat"), "-o",
+		filepath.Join(dir, "fake.wasm")).CombinedOutput(); err != nil {
+		t.Fatalf("wasm-tools parse: %v\n%s", err, out)
+	}
+	driver := fmt.Sprintf(`import { readFileSync } from 'node:fs';
+import { init, scan_ov } from './stubs.js';
+await init(readFileSync('./fake.wasm'));
+try {
+    let k = 0;
+    for (const m of scan_ov('a'.repeat(%d))) k++;
+    console.log('scan: cache part, ' + k);
+} catch (e) {
+    console.log('scan: threw ' + e.name + ': ' + e.message);
+}
+`, n)
+	if err := os.WriteFile(filepath.Join(dir, "drive.mjs"), []byte(driver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("node", "drive.mjs")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+	t.Logf("%s", out)
+	if !strings.Contains(string(out), "scan: cache part, 0") {
+		t.Errorf("the cache part (%d bytes; whole %d) was not handed over under %d pages:\n%s", only, whole, maxPages, out)
+	}
+}
+
 // wasmMergeForTest finds wasm-merge on PATH, else the copy get_wasm_merge.sh
 // leaves in the repository root.
 func wasmMergeForTest(t *testing.T) string {
@@ -1269,6 +1354,254 @@ sets:
 		if got := invoke("declined_ready"); got != map[string]string{"-DRX_SET_CACHE=1": "-1", "-DRX_SET_CACHE=0": "-2"}[tc.flag] {
 			t.Errorf("%s: with the region refused the ready word is %s", tc.flag, got)
 		}
+	}
+}
+
+// TestCStubFallsBackToTheCachePart RUNS the C stub's cache path for a set
+// whose split member gets a program sweep, with a malloc that refuses anything
+// larger than the answer cache's own part: the stub must hand that part over
+// rather than decline the cache, and the drive must still give Go's answer.
+func TestCStubFallsBackToTheCachePart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	clang := wasiClang(t)
+	if clang == "" {
+		t.Skip("no clang that targets wasm32-wasi: the C cache path is not driven here")
+	}
+	for _, tool := range []string{"go", "wasmtime"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH: the C cache path is not driven here", tool)
+		}
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found: the C cache path is not driven here")
+	}
+	cfg := config.BuildConfig{
+		Output:       "merged.wasm",
+		ImportModule: "demo",
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: `foo\w+`}, {Name: "b", Regexp: `a[a-z]*?z`}},
+		Sets: []config.SetConfig{{Name: "ov", Find: "scan_ov",
+			Patterns: config.PatternSelector{All: true}, Overlapping: true}},
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || sh.SweepCells == 0 {
+		t.Fatalf("shape %+v, %v: the set needs a program sweep", sh, err)
+	}
+	const n = 20000
+	whole, _ := sh.Sizing(n)
+	only := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+	if whole <= only {
+		t.Fatalf("whole %d, cache part %d: no sweep part to drop", whole, only)
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `import_module: demo
+wasm_file: re.wasm
+output: merged.wasm
+stub_file: stubs.h
+wasm_merge_path: '`+merge+`'
+patterns:
+  - name: a
+    regexp: 'foo\w+'
+  - name: b
+    regexp: 'a[a-z]*?z'
+sets:
+  - name: ov
+    patterns: all
+    find: scan_ov
+    overlapping: true
+`)
+	write("inc/stdlib.h", "#pragma once\n#include <stddef.h>\nvoid *malloc(size_t);\nvoid *calloc(size_t, size_t);\nvoid free(void *);\n")
+	write("guest.c", fmt.Sprintf(`#include "stubs.h"
+
+static unsigned char arena[8 << 20];
+static size_t used;
+void *malloc(size_t n) {
+    size_t at = (used + 7) & ~(size_t)7;
+    if (n > %[1]dU || at + n > sizeof arena) return 0;
+    used = at + n;
+    return arena + at;
+}
+void *calloc(size_t k, size_t m) {
+    unsigned char *p = malloc(k * m);
+    if (p) for (size_t i = 0; i < k * m; i++) p[i] = 0;
+    return p;
+}
+void free(void *p) { (void)p; }
+
+static char input[%[2]d];
+static rx_ov_scanner_t sc;
+static unsigned granted;
+
+static int drive(void) {
+    for (size_t i = 0; i < sizeof input; i++) input[i] = i + 1 == sizeof input ? 'z' : 'a';
+    used = 0;
+    if (scan_ov_init(&sc, input, sizeof input, 0) != 0) return -100;
+    rx_set_match_t buf[OV_PATTERN_COUNT];
+    int total = 0, got;
+    while ((got = scan_ov(&sc, buf, OV_PATTERN_COUNT)) > 0) total += got;
+    granted = sc.cache ? sc.cache_words * 4 : 0;
+    scan_ov_free(&sc);
+    return got < 0 ? got : total;
+}
+
+__attribute__((export_name("run")))
+int run(void) { return drive(); }
+
+__attribute__((export_name("granted")))
+unsigned granted_bytes(void) { drive(); return granted; }
+`, only, n))
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	run(t, dir, nil, clang, "--target=wasm32-wasi", "-nostdlib", "-Wl,--no-entry",
+		"-DRX_SET_CACHE=1", "-isystem", "inc", "-o", "guest.wasm", "guest.c", "stubs.c")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	invoke := func(export string) string {
+		t.Helper()
+		cmd := exec.Command("wasmtime", "run", "--invoke", export, "merged.wasm")
+		cmd.Dir = dir
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("wasmtime %s: %v\n%s%s", export, err, out, stderr.String())
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got, want := invoke("run"), strconv.Itoa(n-1); got != want {
+		t.Errorf("the C stub reported %s tuples, want %s (one per a, each ending at the z)", got, want)
+	}
+	if got := invoke("granted"); got != strconv.Itoa(only) {
+		t.Errorf("a %s-byte region was handed over, want the cache part's %d (whole %d)", got, only, whole)
+	}
+}
+
+// TestRustStubFallsBackToTheCachePart RUNS the Rust stub's cache path for a
+// set whose split member gets a program sweep, with the whole region's
+// reservation forced to fail in the generated source: the stub must hand the
+// answer cache's own part over rather than decline the cache, and the drive
+// must still give Go's answer.
+func TestRustStubFallsBackToTheCachePart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs a merged module; skipped in -short")
+	}
+	for _, tool := range []string{"wasmtime", "rustc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH", tool)
+		}
+	}
+	if out, err := exec.Command("rustc", "--print", "target-libdir", "--target", "wasm32-wasip1").Output(); err != nil {
+		t.Skip("no wasm32-wasip1 target for rustc")
+	} else if _, err := os.Stat(strings.TrimSpace(string(out))); err != nil {
+		t.Skip("the wasm32-wasip1 target is not installed")
+	}
+	merge := wasmMergeForTest(t)
+	if merge == "" {
+		t.Skip("wasm-merge not found")
+	}
+	cfg := config.BuildConfig{
+		Output:       "merged.wasm",
+		ImportModule: "demo",
+		Patterns:     []config.PatternEntry{{Name: "a", Regexp: `foo\w+`}, {Name: "b", Regexp: `a[a-z]*?z`}},
+		Sets: []config.SetConfig{{Name: "ov", Find: "scan_ov",
+			Patterns: config.PatternSelector{All: true}, Overlapping: true}},
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || sh.SweepCells == 0 {
+		t.Fatalf("shape %+v, %v: the set needs a program sweep", sh, err)
+	}
+	const n = 20000
+	whole, _ := sh.Sizing(n)
+	only := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+	if whole <= only {
+		t.Fatalf("whole %d, cache part %d: no sweep part to drop", whole, only)
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "regexped")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/qrdl/regexped").CombinedOutput(); err != nil {
+		t.Fatalf("build regexped: %v\n%s", err, out)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("regexped.yaml", `import_module: demo
+wasm_file: re.wasm
+output: merged.wasm
+stub_file: stubs.rs
+wasm_merge_path: '`+merge+`'
+patterns:
+  - name: a
+    regexp: 'foo\w+'
+  - name: b
+    regexp: 'a[a-z]*?z'
+sets:
+  - name: ov
+    patterns: all
+    find: scan_ov
+    overlapping: true
+`)
+	run(t, dir, nil, bin, "compile", "--config=regexped.yaml")
+	run(t, dir, nil, bin, "generate", "--config=regexped.yaml")
+	raw, err := os.ReadFile(filepath.Join(dir, "stubs.rs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	for _, p := range [][2]string{
+		{"    cache: Vec<u32>,\n", "    pub cache: Vec<u32>,\n"},
+		// The whole region refused, as an exhausted allocator refuses it.
+		{"let mut had = v.try_reserve_exact(words).is_ok();", "let mut had = false;"},
+	} {
+		if strings.Count(src, p[0]) != 1 {
+			t.Fatalf("the generated stub does not hold %q exactly once", p[0])
+		}
+		src = strings.Replace(src, p[0], p[1], 1)
+	}
+	write("stubs.rs", src)
+	write("main.rs", fmt.Sprintf(`include!("stubs.rs");
+fn main() {
+    let mut s = "a".repeat(%d);
+    s.push('z');
+    let mut it = demo::scan_ov(s.as_bytes(), 0);
+    let mut n = 0;
+    let mut granted = 0;
+    while let Some(m) = it.next() {
+        m.unwrap();
+        n += 1;
+        if it.cache.len() > %d { granted = it.cache.len() * 4; }
+    }
+    println!("{} {}", n, granted);
+}
+`, n-1, config.SetOverlapCheckpointHeaderBytes/4))
+	run(t, dir, nil, "rustc", "--edition=2021", "--target", "wasm32-wasip1", "-O", "-A", "warnings", "-o", "guest.wasm", "main.rs")
+	run(t, dir, nil, bin, "merge", "--config=regexped.yaml", "--main=guest.wasm", "re.wasm")
+	cmd := exec.Command("wasmtime", "run", "merged.wasm")
+	cmd.Dir = dir
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("wasmtime: %v\n%s%s", err, out, stderr.String())
+	}
+	if got, want := strings.TrimSpace(string(out)), fmt.Sprintf("%d %d", n-1, only); got != want {
+		t.Errorf("tuples and region bytes = %q, want %q (the cache part; whole %d)", got, want, whole)
 	}
 }
 
