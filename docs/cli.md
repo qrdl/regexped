@@ -43,8 +43,8 @@ max_dfa_states: 1024       # optional; max states of ANY DFA/TDFA — a single p
                            #   16384 in Unicode mode, see `unicode:`). 0 = always Backtracking.
                            #   See "Limits" below
 max_tdfa_regs:  32         # optional; max TDFA registers before falling back to Backtracking (default 32)
-                           #   `compile --verbose` prints, per pattern, the engine chosen, why, and
-                           #   the DFA/TDFA state and TDFA register counts against these limits
+                           #   `compile --verbose=full` prints, per pattern, the engine chosen, why,
+                           #   and the DFA/TDFA state and TDFA register counts against these limits
 max_bt_instructions: 20000 # optional; max Backtracking program size, in instructions (default 20000).
                            #   0 = never Backtracking: a pattern or set member that needs it fails
 max_set_bucket_size: 2MB   # optional; max table of one SET bucket (default 128 bytes per max_dfa_states
@@ -278,7 +278,9 @@ when such a module has no cap:
 WARN Backtracking engine selected and max_memory is not set: memory is not limited, possible out-of-memory on adversarial input
 ```
 
-`compile --verbose` names the patterns on Backtracking. With a cap, a search
+`compile --verbose` names the patterns on Backtracking, and `--verbose=full`
+gives each one's memory ceilings and the longest input that fits under the cap
+(see [The report](#the-report---verbose-and---verbose-format)). With a cap, a search
 that would need more answers "unknown" (`-2`) instead, and every other search
 is unaffected; `examples/wasmtime/go/sql-injection` sets one. See
 [complexity.md](complexity.md) for every per-input-byte memory cost.
@@ -339,9 +341,9 @@ in byte mode and **16,384 for a set in Unicode mode**. A set past the cap still
 answers correctly, by a slower route: members that are not provably linear are
 split out to searches of their own, and the rest are walked position by
 position (`match_any` / `match_all`: probed bucket by bucket).
-`compile --diag-json` shows which route a set took (`union_scan.used` and
+The full report (`--verbose=full`, and in its JSON `union_scan.used` and
 `anchored_union.used`, with `refused: "construction"` when the cap was the
-reason).
+reason) shows which route a set took.
 
 The cap counts states WHILE the automaton is being built, before duplicate
 states are merged, so a set can need far more than it finally keeps: the set
@@ -495,8 +497,8 @@ On a `sets:` entry the key sets the set's mode, and a set runs in one mode:
 - A pattern's own `match_func` / `find_func` / `groups_func` follow the
   pattern's rule above, whichever mode a set it belongs to runs in.
 
-`compile --verbose` and `--diag-json` report the mode each pattern and set
-was compiled in.
+`compile --verbose=full` reports the mode each pattern and set was compiled
+in.
 
 **`max_dfa_states` is 16,384 by default in Unicode mode** (1,024 in byte
 mode), for a single pattern and a set alike. A Unicode class is decoded byte by
@@ -506,9 +508,8 @@ the class too: `\pL{5}x` needs 1,452 states and measured 39 fuel per byte as a
 DFA against about 26,000 on Backtracking. A DFA table over 256 states takes 512
 bytes per state, so the default allows about 8 MB per automaton. When a pattern
 needs more and its Backtracking program is over `max_bt_instructions`, the
-compile error says which, and `compile --verbose` prints the state count and,
-for a Unicode-mode pattern, the working memory a search keeps per input byte
-(`memory:` lines). `tools/pattest` takes `-max-dfa-states N` to measure what a
+compile error says which, and `compile --verbose=full` prints the state count
+and the working memory a search keeps (`memory:` lines). `tools/pattest` takes `-max-dfa-states N` to measure what a
 different limit does to your pattern.
 
 In a set the same limit decides whether a member keeps its DFA: on a 32-member
@@ -639,7 +640,7 @@ is in fact common makes every hit pay a walk backwards over the part before it.
   hint: a literal the part before it can also hold, where scanning for it could
   answer a later match than the leftmost (`xx(?:a.{0,20}z|b)yy[0-9]` hinted
   `yy` over `xxaxxbyy1zyy2` would answer `[3,9)`, not `[0,13)`) — "the part
-  before it can hold an earlier occurrence of it". In a set, `--diag-json`'s bucket
+  before it can hold an earlier occurrence of it". In a set, the full report's bucket
   `literal` shows it; a set keys a bucket on it only when the part before it
   has a fixed length.
 
@@ -695,7 +696,7 @@ below warning level and prints every record in slog's structured form.
 | Code | Meaning | Examples |
 |---|---|---|
 | `0` | Success. Also returned by `-h` on any subcommand. | |
-| `1` | Usage error — the command line is wrong. | No subcommand, unknown subcommand, unrecognised flag, missing `--main`/`--output`, `--output=-` and `--diag-json=-` both writing to stdout |
+| `1` | Usage error — the command line is wrong. | No subcommand, unknown subcommand, unrecognised flag, missing `--main`/`--output`, `--output=-` with a report (both write to stdout), `--diag-json` (removed), `--verbose full` with a space |
 | `2` | Config or build error — the command line was fine, the work was not. | Malformed YAML, invalid export name, duplicate capture-group name, missing `import_module`, an unknown `wasm_format`, a set with `hints: [batch-find]` under `wasm_format: component`, compile/generate/merge failure |
 | `3` | I/O error — a file could not be read or written. | Config file does not exist, config file not readable, output path not writable |
 
@@ -718,25 +719,20 @@ command's flags — the same as `regexped <command> -h`, on stdout.
 ### `check` — Check a config, writing nothing
 
 ```
-regexped [--debug] check [--config=<file>]
+regexped [--debug] check [--config=<file>] [--verbose[=brief|full]] [--verbose-format=plain|json]
 ```
 
 Runs every test `compile` and `generate` make — the config loaded, every
 pattern and set compiled in memory (for `wasm_format: component`, the core
 module and its WIT, so no `wasm-tools` is needed), the stub generated into a
-temporary directory that is removed — and writes nothing. It prints one line
-per pattern and per set, then what was checked:
+temporary directory that is removed — and writes nothing. It answers by its
+exit code alone: nothing on stdout, and errors and warnings on stderr. Exit
+codes are `compile`'s and `generate`'s: 2 for anything either would refuse.
 
-```
-$ regexped check
-pattern url: Compiled DFA, byte mode
-pattern (\d+)-(\d+): TDFA, byte mode
-set s: find; 1 members; frontend packed-pair
-ok: 2 patterns, 1 set; module 22845 bytes, rust stub; nothing written
-```
-
-Exit codes are `compile`'s and `generate`'s: 2 for anything either would
-refuse. `compile --verbose` gives the full report.
+With `--verbose` or `--verbose-format` it prints exactly the report `compile`
+prints with the same flags ([The report](#the-report---verbose-and---verbose-format)),
+so a config can be inspected without writing a module, or `wasm-tools` for a
+component.
 
 ### `generate` — Generate language stubs
 
@@ -862,7 +858,7 @@ also gives C and AssemblyScript named access, which they never had.
 ### `compile` — Compile patterns to WASM
 
 ```
-regexped [--debug] compile [--config=<file>] [--output=<file>|-] [--verbose] [--diag-json=<file>|-]
+regexped [--debug] compile [--config=<file>] [--output=<file>|-] [--verbose[=brief|full]] [--verbose-format=plain|json]
 ```
 
 Compiles each regexp pattern to a single WASM module, or to a Component Model component. A
@@ -925,14 +921,174 @@ That makes adding, removing or changing it a **breaking change** for anyone who 
 |---|---|---|
 | `--config` | `regexped.yaml` | YAML config file |
 | `--output`, `-o` | config `wasm_file` | Output WASM file; `-` writes to stdout |
-| `--diag-json` | (none) | Write set-composition diagnostics as JSON to this path; `-` for stdout |
-| `--verbose` | off | Report what the compiler decided per pattern and per set, to stderr |
+| `--verbose[=brief\|full]` | off | Write the report to stdout: `brief` (a bare `--verbose`) or `full`. Note the `=`: `--verbose full` is a usage error |
+| `--verbose-format=plain\|json` | `plain` | Write the report as text or JSON; given alone, it implies `--verbose=brief` |
+
+`--output=-` cannot be combined with either report flag: both would write to
+stdout. `--diag-json` was removed; its content is the full report's set
+section (`--verbose=full --verbose-format=json`), and passing it is a usage
+error that says so.
 
 **Required config fields:**
 
 | Field | Notes |
 |---|---|
 | `wasm_file` | Required unless `--output` is given |
+
+### The report: `--verbose` and `--verbose-format`
+
+`compile` and `check` report what the compiler decided — and what each export
+will cost — when asked. Two independent settings choose what is written:
+
+- `--verbose[=brief|full]` — how much. A bare `--verbose` is `brief`.
+- `--verbose-format=plain|json` — how. Omitted is `plain`; given alone it
+  implies `--verbose=brief`.
+
+The report goes to **stdout**; warnings and errors stay on stderr. It is filled
+by the compile that builds the module, so it describes exactly that module —
+the hints a config sets included.
+
+**`brief`** is one line per pattern and per set:
+
+For this config:
+
+```yaml
+import_module: app
+wasm_file: app.wasm
+max_memory: 16MiB
+patterns:
+  - {name: email, regexp: '\w+@example\.com', find_func: email_find}
+  - {name: word,  regexp: '[a-z]+ing\b',       find_func: word_find}
+  - {name: kv,    regexp: '(\w+)=(a+|ab)c',    groups_func: kv_groups}
+sets:
+  - {name: s, find: s_find, patterns: [email, word]}
+```
+
+```
+$ regexped check --verbose
+email  find    Compiled DFA  linear                   scan: SIMD literal                  memory: grows with input: per-search notes
+word   find    Compiled DFA  switch → start-anywhere  scan: Shufti or scalar first bytes  memory: grows with input: per-search notes
+kv     groups  Backtracking  switch → start-anywhere  scan: SIMD literal                  memory: grows with input: per-search notes, Backtracking frame stack, Backtracking fallback memo
+set s  find    2 members     frontend scalar          0 buckets, 2 split out              memory: grows with input: per-search notes
+```
+
+| Column | Pattern | Set |
+|---|---|---|
+| 1 | name (or the regexp, unnamed) | `set` and its name |
+| 2 | exports: `match`, `find`, `groups` | capabilities |
+| 3 | engine, or `specialised body` / `none` | member count |
+| 4 | the search behind `find` and `groups` (below) | literal frontend |
+| 5 | how that search finds candidate starts (`scan:`) | buckets, and members split out to their own search |
+| 6 | `memory: constant`, or what grows with the input | the same |
+
+The search kinds: `linear` (the per-position find, proved linear), `switch`
+(the per-position find with a work counter, handing over to `→ start-anywhere`
+or `→ Backtracking` when it trips), `start-anywhere` (one forward and one
+backward pass), `suffix` (one backward pass from the end), `unswitched` (the
+per-position find with no counter — the switch could not be built),
+`specialised` (a literal-chain body or an Aho-Corasick walk), `Backtracking`
+(the DFA was over the limits). The scan kinds name the prefilter: `SIMD
+literal`, `SIMD pair probe`, `Teddy`, `SIMD first bytes`, `Aho-Corasick`,
+`one forward pass`, `anchored at 0`, … — and `none` when the search tries every
+position.
+
+**`full`** adds, per pattern: the regexp (and what its references expand to),
+the mode, why the engine and the search were chosen, the counts against the
+limits, the optimisations that fired, the bytes of its tables and code — and
+its **memory ceilings**. Per set, everything about its composition: buckets,
+frontend and any downgrade, the union automata, the members split out and the
+search each runs, the answer cache and the work counters. The module itself
+heads the report: its kind, size, the memory its tables take at load, and
+`max_memory`.
+
+The same config, abridged to one pattern and the set:
+
+```
+$ regexped check --verbose=full
+Module: standalone module, 46415 bytes, 512.0 KiB of tables, max_memory 16.0 MiB
+
+Patterns (3)
+  …
+  kv                   (\w+)=(a+|ab)c
+    mode:   byte
+    exports: groups
+    engine: Backtracking — captures present but TDFA-ineligible (non-greedy quantifier, line anchor, word boundary or ambiguous alternation)
+    search: switch → start-anywhere — not provably linear
+    scan:   SIMD literal — prefix scan: hybrid SIMD, 1-byte prefix
+    limit:  DFA states 7 of 1024
+    size:   tables 7259 B, code 6367 B
+    memory: grows with input: per-search notes, Backtracking frame stack, Backtracking fallback memo
+      input copy [groups, caller memory] len B, every call — 1KiB 1.0 KiB, 64KiB 64.0 KiB, 1MiB 1.0 MiB, 16MiB 16.0 MiB
+      per-search notes [groups, caller memory] (len + 1) × 2 B, once a search arms — 1KiB 2.0 KiB, 64KiB 128.0 KiB, 1MiB 2.0 MiB, 16MiB 32.0 MiB
+      Backtracking frame stack (capture) [groups, module memory] max(65536, 2 × (len + 1) × 32) B, during a call — 1KiB 64.1 KiB, 64KiB 4.0 MiB, 1MiB 64.0 MiB, 16MiB 1.0 GiB
+      Backtracking fallback memo (capture) [groups, module memory] (len + 1) × 1 B, once its work budget trips — 1KiB 1.0 KiB, 64KiB 64.0 KiB, 1MiB 1.0 MiB, 16MiB 16.0 MiB
+      largest input under max_memory: groups 231.0 KiB
+    opts:   find: switch — not provably linear, literal-anchored find (SIMD literal scan + backward DFA), u8 state ids
+
+Set "s"
+  members:    2
+  mode:       byte
+  frontend:   scalar
+  capabilities: find
+  buckets:    0
+  id space:   2
+  split out (not provably linear; own linear search): #0 (start-anywhere), #1 (start-anywhere)
+  memory: grows with input: per-search notes
+    input copy [find, caller memory] len B, every call — 1KiB 1.0 KiB, 64KiB 64.0 KiB, 1MiB 1.0 MiB, 16MiB 16.0 MiB
+    per-search notes (block 0) [find, caller memory] (len + 1) × 2 B, once a search arms — 1KiB 2.0 KiB, 64KiB 128.0 KiB, 1MiB 2.0 MiB, 16MiB 32.0 MiB
+    per-search notes (block 1) [find, caller memory] (len + 1) × 1 B, once a search arms — 1KiB 1.0 KiB, 64KiB 64.0 KiB, 1MiB 1.0 MiB, 16MiB 16.0 MiB
+    largest input under max_memory: find 3.8 MiB
+```
+
+**Memory ceilings.** Every region whose size depends on the input is listed
+with the exports that can need it, whose memory it is in (`module`: counts
+against `max_memory`; `caller`: the stub's allocation — in the module's memory
+for a standalone module or a component, in the host's own for an embedded
+one), when it is taken, a formula in the input length, and its value at 1 KiB,
+64 KiB, 1 MiB and 16 MiB of input. These are CEILINGS — the most that length
+can need, not what a given input uses — computed at compile time from the same
+sizing the stubs use; nothing is measured. A Backtracking frame stack's
+ceiling is, per position, one frame for each alternation the longest path
+through the program without consuming a byte passes, doubled for the way the
+stack grows; real inputs usually stay well below it (`(?:(a)|(a?b))*?c` over
+64 KiB of `a`: 2.3 MB taken, 12.8 MB the sum of its ceilings).
+
+When `max_memory` is set, each export also gets the **largest input that fits
+under it**: the module's static memory, every ceiling that counts for that
+export rounded up to whole pages, and one page for a search's block, summed. An input of that length can never
+need more than the cap; `unlimited` (`-1` in JSON) means nothing that counts
+grows with the input.
+
+**JSON.** `--verbose-format=json` writes the same information as one object:
+
+```json
+{
+  "schema": 1,
+  "level": "brief",
+  "patterns": [ { "name": "…", "exports": ["find"], "engine": "…", "find": "…",
+                  "switch_to": "…", "scan": "…", "memory": "…" } ],
+  "sets": [ { "name": "…", "capabilities": ["find"], "members": 2, "frontend": "…",
+              "bucket_count": 0, "split_out": 2, "memory": "…" } ]
+}
+```
+
+At `full`, `module` is added and each pattern and set gains its remaining
+fields — a set every field of its composition (`buckets`, `union_scan`,
+`split_members`, …) — and `memory_ceilings` (`what`, `exports`, `memory`,
+`when`, `formula`, and `bytes` keyed `1KiB`, `64KiB`, `1MiB`, `16MiB`) and
+`max_input` (bytes per export). A brief report is the full one with those
+fields left out, so a script written against `brief` works on `full`.
+
+`schema` is the structure's version. It changes only on a BREAKING change — a
+field renamed or removed, or a field's meaning or values changed — and a new
+field does not change it, so a script can check `.schema == 1` and fail loudly
+instead of reading a field that is no longer there. For example, a CI gate on
+Backtracking:
+
+```sh
+regexped check --verbose-format=json \
+  | jq -e '.schema == 1 and ([.patterns[] | select(.engine == "Backtracking")] | length == 0)'
+```
 | `patterns` | One or more patterns to compile — unless every regexp lives in a set's `regexps:`, in which case it may be left out. A file with no regexp anywhere is a load error |
 
 Entries with no `_func` fields produce no individual exports. If such an

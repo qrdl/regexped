@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 
@@ -49,11 +48,30 @@ type PatternReport struct {
 	Limits []string
 	// Notes are optimisations that fired.
 	Notes []string
-	// Memory is what a search costs PER INPUT BYTE in working memory, for a
-	// Unicode-mode pattern, whose lowered programs make those costs large
-	// enough to matter before they are paid: "per-search notes 13 B per input
-	// byte, once a search arms".
-	Memory []string
+
+	// The structured record behind the brief report (report.go), each field
+	// set where the emitter that decides it runs.
+	//
+	// Exports are the export kinds the entry declares, in the order match,
+	// find, groups.
+	Exports []string
+	// Find is the find kind (findKind*) and FindWhy the reason the classifier
+	// gave; SwitchTo is what a "switch" find hands over to.
+	Find, FindWhy, SwitchTo string
+	// scans are the scan strategies the find bodies recorded, each with the
+	// index of its note so a discarded body's scan is dropped with its note.
+	scans []scanRecord
+	// Search is what one search of the find and groups exports keeps in the
+	// caller's per-search block (search_notes.go).
+	Search SearchSize
+	// bt are the pattern's Backtracking bodies, for their run-time scratch.
+	bt []btBodyReport
+	// TableBytes is the bytes of data the module carries in the pattern's
+	// table range [tableStart, tableEnd); CodeBytes its function bodies'
+	// bytes (wrappers excluded). Both are filled once the module is assembled.
+	TableBytes           int64
+	CodeBytes            int
+	tableStart, tableEnd int64
 }
 
 // Reporter accumulates per-pattern decisions and per-set diagnostics.
@@ -76,6 +94,11 @@ type Reporter struct {
 	// sink is the progress sink of the compile in flight (startProgress),
 	// which resolvePattern hands to the programs that compile builds.
 	sink *progressSink
+
+	// mod is what the report says about the module as a whole (report.go).
+	mod moduleReport
+	// setMem is each set's memory, in r.Sets' order (report.go).
+	setMem map[string]setMemReport
 }
 
 // noteModule records what the assembled module carries that the CLI warns
@@ -151,14 +174,6 @@ func (r *Reporter) Limit(what string, got, limit int) {
 	r.cur.Limits = append(r.cur.Limits, fmt.Sprintf("%s %d of %d", what, got, limit))
 }
 
-// Memory records what one of the pattern's searches costs per input byte.
-func (r *Reporter) Memory(what string, perByte int, when string) {
-	if r == nil || r.cur == nil {
-		return
-	}
-	r.cur.Memory = append(r.cur.Memory, fmt.Sprintf("%s %d B per input byte, %s", what, perByte, when))
-}
-
 // Note records an optimisation that fired.
 func (r *Reporter) Note(note string) {
 	if r == nil || r.cur == nil {
@@ -182,6 +197,13 @@ func (r *Reporter) truncateNotes(mark int) {
 		return
 	}
 	r.cur.Notes = r.cur.Notes[:mark]
+	kept := r.cur.scans[:0]
+	for _, s := range r.cur.scans {
+		if s.note < mark {
+			kept = append(kept, s)
+		}
+	}
+	r.cur.scans = kept
 }
 
 // HasEngine reports whether the open scope already knows its engine.
@@ -221,178 +243,6 @@ func (r *Reporter) End() {
 	}
 	r.Patterns = append(r.Patterns, *r.cur)
 	r.cur = nil
-}
-
-// Summary writes one line per pattern and per set to w — what `regexped
-// check` prints: the engine (or the body that replaced one) and the mode, and
-// a set's capabilities, member count (members, by set name) and literal
-// frontend.
-func (r *Reporter) Summary(w io.Writer, members map[string]int) {
-	if r == nil || w == nil {
-		return
-	}
-	r.End()
-	for _, p := range r.Patterns {
-		name := p.Name
-		if name == "" {
-			name = truncate(p.Pattern, 40)
-		}
-		what := "no export"
-		switch {
-		case p.Engine != 0:
-			what = p.Engine.String()
-		case p.Reason != "":
-			what = p.Reason
-		}
-		mode := ""
-		if p.Mode != "" {
-			mode = ", " + p.Mode + " mode"
-		}
-		fmt.Fprintf(w, "pattern %s: %s%s\n", name, what, mode)
-	}
-	for _, d := range r.Sets {
-		fmt.Fprintf(w, "set %s: %s; %d members; frontend %s\n", d.Name, strings.Join(d.Capabilities, ", "), members[d.Name], d.Frontend)
-	}
-}
-
-// Render writes the human-readable report.
-func (r *Reporter) Render(w io.Writer) {
-	if r == nil || w == nil {
-		return
-	}
-	r.End()
-	if len(r.Patterns) > 0 {
-		fmt.Fprintf(w, "\nPatterns (%d)\n", len(r.Patterns))
-		for _, p := range r.Patterns {
-			name := p.Name
-			if name == "" {
-				name = "(unnamed)"
-			}
-			fmt.Fprintf(w, "  %-20s %s\n", name, truncate(p.Pattern, 60))
-			if p.Expanded != "" {
-				fmt.Fprintln(w, "    expanded: "+p.Expanded)
-			}
-			if p.Mode != "" {
-				fmt.Fprintln(w, "    mode:   "+p.Mode)
-			}
-			if p.Engine == 0 {
-				// No general engine. Either a specialised body was emitted
-				// instead — the literal-chain family never builds one — or the
-				// entry contributes no exported function at all. Reason
-				// distinguishes them; saying the wrong one is exactly the
-				// class of error the SelectEngine fallback made.
-				what := "none"
-				if p.Reason != "" {
-					what = p.Reason
-				}
-				fmt.Fprintln(w, "    engine: "+what)
-			} else {
-				line := "    engine: " + p.Engine.String()
-				if p.Reason != "" {
-					line += " — " + p.Reason
-				}
-				fmt.Fprintln(w, line)
-			}
-			for _, l := range p.Limits {
-				fmt.Fprintf(w, "    limit:  %s\n", l)
-			}
-			for _, m := range p.Memory {
-				fmt.Fprintf(w, "    memory: %s\n", m)
-			}
-			if len(p.Notes) > 0 {
-				sort.Strings(p.Notes)
-				fmt.Fprintf(w, "    opts:   %s\n", strings.Join(p.Notes, ", "))
-			}
-		}
-	}
-	for _, d := range r.Sets {
-		fmt.Fprintf(w, "\nSet %q\n", d.Name)
-		if d.Mode != "" {
-			fmt.Fprintf(w, "  mode:       %s\n", d.Mode)
-		}
-		fmt.Fprintf(w, "  frontend:   %s\n", d.Frontend)
-		if len(d.Capabilities) > 0 {
-			fmt.Fprintf(w, "  capabilities: %s\n", strings.Join(d.Capabilities, ", "))
-		}
-		if d.Overlapping {
-			fmt.Fprintln(w, "  overlapping: true")
-		}
-		fmt.Fprintf(w, "  buckets:    %d\n", len(d.Buckets))
-		for _, b := range d.Buckets {
-			lit := b.Literal
-			if lit == "" {
-				lit = "(fallback — no literal)"
-			}
-			// The engine is printed because a Backtracking bucket otherwise
-			// reads exactly like a DFA fallback bucket here, and the switch is
-			// not free: one such member measured up to 2.2x the fuel of a
-			// 16-pattern set's scan_any, scan_all and find (docs/sets.md). It
-			// also moves the set's _all pair to the out_ptr form.
-			engine := "DFA"
-			if b.Type == "bt-fallback" {
-				engine = "Backtracking"
-			}
-			fmt.Fprintf(w, "    #%-3d %-24s %-8s %-12s %2d pattern(s)  %d states  %d bytes\n",
-				b.ID, truncate(lit, 24), b.AcceptKind, engine, len(b.Patterns), b.SuffixStates, b.TableBytes)
-		}
-		// A member whose anchored pair runs on Backtracking costs every
-		// match_any / match_all call a probe after the DFA part.
-		reportDrops(w, "match_any/match_all on Backtracking (anchored DFA over the limits)",
-			d.AnchoredBacktracking)
-		if d.IDSpaceSize != len(d.Buckets) && d.IDSpaceSize > 0 {
-			fmt.Fprintf(w, "  id space:   %d\n", d.IDSpaceSize)
-		}
-		if d.FrontendDemotion != nil {
-			fmt.Fprintf(w, "  DOWNGRADED frontend: %+v\n", *d.FrontendDemotion)
-		}
-		// Members served outside the buckets, and the work counters: each
-		// changes the set's cost by large factors and shows nowhere else.
-		if len(d.SplitMembers) > 0 {
-			bt := map[int]bool{}
-			for _, id := range d.SplitBacktracking {
-				bt[id] = true
-			}
-			ids := make([]string, len(d.SplitMembers))
-			for i, id := range d.SplitMembers {
-				ids[i] = fmt.Sprintf("#%d", id)
-				if bt[id] {
-					ids[i] += " (Backtracking)"
-				}
-			}
-			fmt.Fprintf(w, "  split out (not provably linear; own linear search): %s\n", strings.Join(ids, ", "))
-		}
-		if u := d.ScanUnion; u != nil {
-			switch {
-			case u.Direct:
-				fmt.Fprintf(w, "  scan pair: one union automaton over every member (%d states)\n", u.States)
-			case u.Counter:
-				fmt.Fprintf(w, "  scan pair: work counter switching to a union automaton (%d states)\n", u.States)
-			}
-		}
-		if d.InCallCounter {
-			fmt.Fprintf(w, "  overlapping find: in-call counter sweeps the answer cache\n")
-		}
-		if s := d.WholeSetSweep; s != nil {
-			fmt.Fprintf(w, "  overlapping find: the answer cache sweeps a whole-set automaton (%d states, %d cells)\n", s.States, s.Cells)
-		}
-		if n := d.CacheBytesPerByte; n > 0 {
-			fmt.Fprintf(w, "  memory:     answer cache %d B per input byte, to 64 MiB; the square root of the input past it\n", n)
-		}
-		if len(d.NoCacheSplitMembers) > 0 {
-			bt := map[int]bool{}
-			for _, id := range d.NoCacheSplitBacktracking {
-				bt[id] = true
-			}
-			ids := make([]string, len(d.NoCacheSplitMembers))
-			for i, id := range d.NoCacheSplitMembers {
-				ids[i] = fmt.Sprintf("#%d", id)
-				if bt[id] {
-					ids[i] += " (Backtracking)"
-				}
-			}
-			fmt.Fprintf(w, "  overlapping find without a usable cache: companion splits out %s\n", strings.Join(ids, ", "))
-		}
-	}
 }
 
 func reportDrops(w io.Writer, label string, refs []PatternRef) {

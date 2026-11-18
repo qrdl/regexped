@@ -28,15 +28,18 @@ Each `_func` key becomes one function: `match_func` tests the whole input,
 capture groups. A regexp is written in Go's syntax (RE2) and matched with its
 leftmost-first rules. [cli.md](cli.md) has every key.
 
-`regexped check` tells you what the compiler will do with each pattern, and
-writes nothing:
+`regexped check` runs every test `compile` and `generate` make and writes
+nothing; it answers by its exit code. With `--verbose` it also tells you what
+the compiler will do with each pattern:
 
 ```
-$ regexped check
-pattern email: Compiled DFA, byte mode
-pattern date: TDFA, byte mode
-ok: 2 patterns, 0 sets; module 21892 bytes, js stub; nothing written
+$ regexped check --verbose
+email  match,find  Compiled DFA  switch → start-anywhere  scan: SIMD literal                     memory: grows with input: per-search notes
+date   groups      TDFA          linear                   scan: SIMD literal, mandatory literal  memory: constant
 ```
+
+[cli.md](cli.md#the-report---verbose-and---verbose-format) explains every
+column, and `--verbose=full` says why.
 
 ## 2. JavaScript
 

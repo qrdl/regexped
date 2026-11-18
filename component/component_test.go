@@ -2,6 +2,7 @@ package component
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -599,7 +600,20 @@ func TestCmdCompileVerboseReportsSets(t *testing.T) {
 			t.Errorf("--verbose output is missing %q:\n%s", want, got)
 		}
 	}
+	// A report that cannot be written fails the command before anything is
+	// written beside it.
+	err := CmdCompileReport(cfg, filepath.Join(dir, "other.wasm"), failingWriter{}, compile.VerboseBrief, compile.VerbosePlain)
+	if err == nil || !strings.Contains(err.Error(), "write the report") {
+		t.Errorf("err = %v, want the write failure", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "other.wasm")); err == nil {
+		t.Error("a component was written although its report failed")
+	}
 }
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
 
 // Core is the seam between the WIT derivation and the compiler, and it is the one
 // place a set-bearing config takes the second assembler. These tests cover both

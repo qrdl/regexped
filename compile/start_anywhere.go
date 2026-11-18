@@ -84,6 +84,19 @@ func (s findStrategy) String() string {
 	return "today"
 }
 
+// kind is the strategy's name in the report (report.go).
+func (s findStrategy) kind() string {
+	switch s {
+	case findNewSearch:
+		return findKindStartAny
+	case findSwitch:
+		return findKindSwitch
+	case findSuffix:
+		return findKindSuffix
+	}
+	return findKindLinear
+}
+
 // defaultSwitchN is the counter's N: the same value serves every shape
 // measured, and 8 and 16 behaved identically at 64 KB.
 const defaultSwitchN = 4

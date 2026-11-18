@@ -1960,3 +1960,113 @@ func TestBTUnicodeModeGroupsMatchGo(t *testing.T) {
 		}
 	}
 }
+
+// reportDrive drives the groups export of a standalone btCapturePattern module
+// the way a JS stub does: the input copied into memory grown above the tables,
+// the slots after it, the scratch base above both. It returns the answer, the
+// memory's size in pages after the call, and before anything was grown.
+func reportDrive(t *testing.T, w []byte, in string) (res int64, pages, static uint64) {
+	t.Helper()
+	store, inst, mem, release, err := instantiate(w)
+	defer release()
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	static = mem.Size(store)
+	need := uint64(len(in)+8*btCaptureGroups+65535) / 65536
+	if _, err := mem.Grow(store, need); err != nil {
+		t.Fatalf("grow for the input: %v", err)
+	}
+	base := int32(static * 65536)
+	out := base + int32(len(in))
+	buf := mem.UnsafeData(store)
+	copy(buf[base:], in)
+	if err := setScratchBase(store, inst, int32((static+need)*65536)); err != nil {
+		t.Fatal(err)
+	}
+	_, wd := sharedEngine()
+	wd.Arm(store)
+	r, err := inst.GetFunc(store, "groups").Call(store, base, int32(len(in)), out, int32(0))
+	wd.Disarm()
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	res = int64(r.(int32))
+	if res >= 0 {
+		loc := regexp.MustCompile(btCapturePattern).FindStringSubmatchIndex(in)
+		buf = mem.UnsafeData(store)
+		for k, want := range loc {
+			if s := int(int32(binary.LittleEndian.Uint32(buf[int(out)+k*4:]))); s != want {
+				t.Fatalf("%d bytes: slot %d = %d, want %d", len(in), k, s, want)
+			}
+		}
+	}
+	return res, mem.Size(store), static
+}
+
+// TestReportMemoryCeilingsHold: the --verbose report's memory ceilings bound
+// what a call really takes, and the largest input it gives under max_memory
+// runs. The rows are a Backtracking capture search — its frame stack and
+// fallback memo are the ceilings DERIVED from the program (one frame per Alt
+// per position, doubled) rather than read off a sizing function the stubs
+// share — over its worst input, a run of `a` that leaves a frame per byte:
+// the body as shipped, the ordinary body alone, and the fallback alone.
+func TestReportMemoryCeilingsHold(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		budget int
+	}{{"as shipped", 0}, {"ordinary body alone", compile.BTWorkBudgetOff}, {"fallback alone", compile.BTWorkBudgetForceFallback}} {
+		t.Run(c.name, func(t *testing.T) {
+			entry := config.PatternEntry{Regexp: btCapturePattern, GroupsFunc: "groups"}
+			build := func(memCap config.MemorySize) ([]byte, compile.ReportPattern) {
+				rep := &compile.Reporter{}
+				w, _, err := compile.Compile([]config.PatternEntry{entry}, 0, true,
+					compile.CompileOptions{BTWorkBudget: c.budget, MaxMemory: memCap, Report: rep})
+				if err != nil {
+					t.Fatalf("compile: %v", err)
+				}
+				rep.NoteCompile(config.BuildConfig{MaxMemory: memCap, Patterns: []config.PatternEntry{entry}}, w, false)
+				return w, rep.Report(compile.VerboseFull).Patterns[0]
+			}
+
+			// The ceilings at 64 KiB bound a 64 KiB call.
+			w, p := build(config.MemorySize{})
+			var ceiling int64
+			for _, cl := range p.Ceilings {
+				ceiling += cl.Bytes.KiB64
+			}
+			if ceiling == 0 {
+				t.Fatalf("no ceilings reported: %+v", p)
+			}
+			in := strings.Repeat("a", 64<<10-1) + "c"
+			res, pages, static := reportDrive(t, w, in)
+			if res < 0 {
+				t.Fatalf("64 KiB with no cap answered %d", res)
+			}
+			// Two pages over the sum: the input copy's own rounding, and
+			// the per-search block the module keeps for a caller that hands
+			// none.
+			used := int64(pages-static) * 65536
+			t.Logf("64 KiB: %d bytes taken above the tables, ceilings %d", used, ceiling)
+			if used > ceiling+2*65536 {
+				t.Errorf("the call took %d bytes above the tables, over the ceilings' %d: %+v", used, ceiling, p.Ceilings)
+			}
+
+			// The largest input under max_memory runs, at its worst.
+			memCap := btCaptureCap(t)
+			w, p = build(memCap)
+			n, ok := p.MaxInput["groups"]
+			if !ok || n <= 0 {
+				t.Fatalf("max_input = %v under %s", p.MaxInput, memCap)
+			}
+			res, pages, _ = reportDrive(t, w, strings.Repeat("a", int(n)-1)+"c")
+			t.Logf("max_input %d bytes under %s: answer %d, %d pages", n, memCap, res, pages)
+			if res == abi.BTStackOverflow {
+				t.Errorf("an input of max_input = %d bytes answered BTStackOverflow under %s", n, memCap)
+			}
+			if capPages, _ := memCap.Pages(); pages > uint64(capPages) {
+				t.Errorf("memory reached %d pages, past the cap's %d", pages, capPages)
+			}
+		})
+	}
+}

@@ -2,6 +2,7 @@ package compile
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/qrdl/regexped/internal/utils"
 )
@@ -634,6 +635,13 @@ type prefixScanParams struct {
 	// Report, when non-nil, receives the strategy this scan actually chose,
 	// for `regexped compile --verbose`. Nil on every path but that flag.
 	Report *Reporter
+	// ReportPattern names the pattern the scan is reported for when the
+	// emitter runs after the pattern's scope closed (at assembly): its index
+	// in Report.Patterns plus one. 0 is the open scope.
+	ReportPattern int
+	// ReportMandatory: the scan looks for a mandatory literal inside the
+	// pattern rather than its prefix, which the report says.
+	ReportMandatory bool
 }
 
 // emitPrefixScan emits the WASM bytes for the prefix/firstByteFlags scan phase.
@@ -657,7 +665,13 @@ func emitPrefixScanInner(b []byte, p prefixScanParams) ([]byte, int) {
 	// The strategy is reported HERE, by the code that chooses it. Deriving it
 	// again at the call site would be a second implementation of this
 	// if/else — the mistake --verbose already made once with SelectEngine.
-	defer func() { p.Report.Note(p.strategyNote()) }()
+	defer func() {
+		kind, note := p.strategyNote()
+		if p.ReportMandatory {
+			kind, note = kind+", mandatory literal", strings.Replace(note, "prefix scan:", "mandatory literal scan:", 1)
+		}
+		p.Report.scanFor(p.ReportPattern, kind, note)
+	}()
 	l := p.Locals
 	ed := p.EngineDepth
 
@@ -1358,39 +1372,39 @@ func (p prefixScanParams) charProbe() bool {
 		p.Prefix[1] >= 0x80 && p.Prefix[1] <= 0xBF
 }
 
-func (p prefixScanParams) strategyNote() string {
+func (p prefixScanParams) strategyNote() (kind, note string) {
 	if pi, pj, ok := prefixProbePair(p.Prefix, p.charProbe()); ok {
-		return fmt.Sprintf("prefix scan: SIMD pair probe of bytes %d and %d, %d-byte prefix", pi, pj, len(p.Prefix))
+		return "SIMD pair probe", fmt.Sprintf("prefix scan: SIMD pair probe of bytes %d and %d, %d-byte prefix", pi, pj, len(p.Prefix))
 	}
 	if len(p.Prefix) == 0 && len(p.FoldPrefix) >= 2 {
-		return fmt.Sprintf("prefix scan: SIMD pair probe of a %d-byte case-insensitive literal", len(p.FoldPrefix))
+		return "SIMD pair probe, case-folded", fmt.Sprintf("prefix scan: SIMD pair probe of a %d-byte case-insensitive literal", len(p.FoldPrefix))
 	}
 	if p.LineStart && len(p.Prefix) == 0 {
-		return "prefix scan: line starts (SIMD '\\n' scan)"
+		return "line starts", "prefix scan: line starts (SIMD '\\n' scan)"
 	}
 	if len(p.Prefix) >= 1 {
 		if len(p.Prefix) <= 16 {
 			if p.charProbe() {
-				return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix, first character checked on a hit", len(p.Prefix))
+				return "SIMD literal", fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix, first character checked on a hit", len(p.Prefix))
 			}
-			return fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix", len(p.Prefix))
+			return "SIMD literal", fmt.Sprintf("prefix scan: hybrid SIMD, %d-byte prefix", len(p.Prefix))
 		}
-		return fmt.Sprintf("prefix scan: scalar (prefix %d bytes, over one chunk)", len(p.Prefix))
+		return "scalar literal", fmt.Sprintf("prefix scan: scalar (prefix %d bytes, over one chunk)", len(p.Prefix))
 	}
 	n := len(p.FirstByteSet)
 	switch {
 	case n == 0:
-		return "prefix scan: none"
+		return "none", "prefix scan: none"
 	case n <= 8 && p.TeddyTwoByte:
-		return "prefix scan: 2-byte Teddy"
+		return "Teddy", "prefix scan: 2-byte Teddy"
 	case n <= 8:
-		return "prefix scan: 1-byte Teddy"
+		return "Teddy", "prefix scan: 1-byte Teddy"
 	case n <= 16:
-		return "prefix scan: multi-eq SIMD"
+		return "SIMD first bytes", "prefix scan: multi-eq SIMD"
 	case n <= 64:
-		return fmt.Sprintf("prefix scan: Shufti or scalar (%d first bytes)", n)
+		return "Shufti or scalar first bytes", fmt.Sprintf("prefix scan: Shufti or scalar (%d first bytes)", n)
 	}
-	return fmt.Sprintf("prefix scan: scalar flag table (%d first bytes)", n)
+	return "first-byte table", fmt.Sprintf("prefix scan: scalar flag table (%d first bytes)", n)
 }
 
 // emitLineStartScan moves attempt_start to the first position at or after it

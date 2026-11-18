@@ -142,7 +142,7 @@ not as the text it expands to.
 
 ## Seeing the expansion
 
-`compile --verbose` prints a pattern written with references as written, then
+`compile --verbose=full` prints a pattern written with references as written, then
 the full expanded text:
 
 ```

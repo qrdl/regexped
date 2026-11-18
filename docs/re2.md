@@ -264,7 +264,7 @@ A pattern the compiler legitimately leaves out of a set's `match_any` /
 no Backtracking path — is excluded from those two capabilities' comparison and
 counted separately in the summary, so a documented exclusion cannot masquerade
 as either a pass or a failure. The exclusion is taken from the compiler's own
-drop WARNING rather than from `--diag-json`, and it is SCOPED by that warning's
+drop WARNING rather than from the compile's report, and it is SCOPED by that warning's
 `where`: only an "anchored bucket" drop is an exclusion. Any other drop is a
 FAILURE, since a member no engine takes for `find` or the scan pair must fail
 the compile rather than be left out — `custom-sets-unicode.txt`'s

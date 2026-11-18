@@ -27,6 +27,12 @@ import (
 // single export; staging is what keeps a half-finished build from shipping a
 // .wit the component beside it does not implement.
 func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
+	return CmdCompileReport(cfg, output, report, compile.VerboseFull, compile.VerbosePlain)
+}
+
+// CmdCompileReport is CmdCompile writing the --verbose report to report (nil:
+// none) at level, in format.
+func CmdCompileReport(cfg config.BuildConfig, output string, report io.Writer, level compile.VerboseLevel, format compile.VerboseFormat) error {
 	if !cfg.Component() {
 		return fmt.Errorf("component.CmdCompile called for wasm_format: %q", cfg.WasmFormat)
 	}
@@ -46,7 +52,9 @@ func CmdCompile(cfg config.BuildConfig, output string, report io.Writer) error {
 		return err
 	}
 	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "sets", len(cfg.Sets), "output", output, "format", "component")
-	rep.Render(report)
+	if err := rep.Write(report, level, format); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
 	compile.WarnUnboundedMemory(cfg, rep)
 
 	if output == "-" {
@@ -143,6 +151,7 @@ func Core(cfg config.BuildConfig, rep *compile.Reporter) (core []byte, witText s
 	if err != nil {
 		return nil, "", fmt.Errorf("compile: %w", err)
 	}
+	rep.NoteCompile(cfg, core, true)
 	return core, witText, nil
 }
 

@@ -2,6 +2,7 @@ package compile
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1139,12 +1140,14 @@ func TestCmdCompile_WithSets(t *testing.T) {
 	}
 }
 
-func TestCmdWriteDiagJSON(t *testing.T) {
+// TestReportJSONCarriesTheSets pins that the JSON report — which replaced
+// --diag-json — carries every set's composition at the full level, the
+// module's counts, and nothing for a set-less config but an empty list.
+func TestReportJSONCarriesTheSets(t *testing.T) {
 	cfg := config.BuildConfig{
 		Patterns: []config.PatternEntry{
 			{Name: "p1", Regexp: `foo\w+`},
 			{Name: "p2", Regexp: `bar\d+`},
-			// Capture-bearing pattern, must be dropped from sets.
 			{Name: "p3", Regexp: `(quux)`, GroupsFunc: "qg"},
 		},
 		Sets: []config.SetConfig{
@@ -1152,67 +1155,44 @@ func TestCmdWriteDiagJSON(t *testing.T) {
 			{Name: "s2", Find: "s2_any", Patterns: config.PatternSelector{Names: []string{"p1", "p2"}}},
 		},
 	}
-
-	t.Run("no_sets_is_an_error", func(t *testing.T) {
-		// It used to return nil: `--diag-json=out.json` on a set-less config
-		// wrote no file and said nothing, leaving the user with a missing
-		// file and no explanation.
-		empty := config.BuildConfig{Patterns: cfg.Patterns}
-		err := CmdWriteDiagJSON(empty, "", "")
-		if err == nil {
-			t.Fatal("expected an error for a config with no sets")
+	report := func(t *testing.T, cfg config.BuildConfig, level VerboseLevel) Report {
+		t.Helper()
+		rep := &Reporter{}
+		if _, err := CompileModule(cfg, rep); err != nil {
+			t.Fatalf("CompileModule: %v", err)
 		}
-		if !strings.Contains(err.Error(), "no sets") {
-			t.Errorf("the error does not say why: %v", err)
+		var b bytes.Buffer
+		if err := rep.Write(&b, level, VerboseJSON); err != nil {
+			t.Fatalf("Write: %v", err)
 		}
-	})
-
-	t.Run("file_output", func(t *testing.T) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "diag.json")
-		if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
-			t.Fatalf("CmdWriteDiagJSON: %v", err)
+		var out Report
+		if err := json.Unmarshal(b.Bytes(), &out); err != nil {
+			t.Fatalf("the report is not JSON: %v\n%s", err, b.Bytes())
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("ReadFile: %v", err)
+		return out
+	}
+	t.Run("full", func(t *testing.T) {
+		r := report(t, cfg, VerboseFull)
+		if r.Schema != ReportSchema || r.Level != VerboseFull || r.Module == nil {
+			t.Fatalf("schema %d, level %q, module %v", r.Schema, r.Level, r.Module)
 		}
-		if !bytes.Contains(data, []byte(`"patterns_total"`)) {
-			t.Errorf("diag JSON missing expected key, got: %s", data)
+		if r.Module.PatternsTotal != 3 || r.Module.InSet != 5 {
+			t.Errorf("patterns_total %d, in_set %d; want 3, 5", r.Module.PatternsTotal, r.Module.InSet)
 		}
-		// A member with groups_func is a set member like any other now, so
-		// the report has no field counting such entries left out.
-		if bytes.Contains(data, []byte(`"capture_bearing`)) {
-			t.Errorf("diag JSON still carries a capture_bearing field: %s", data)
+		if len(r.Sets) != 2 || r.Sets[0].SetDiag == nil || r.Sets[0].Members != 3 || r.Sets[1].Members != 2 {
+			t.Fatalf("sets: %+v", r.Sets)
 		}
 	})
-
-	t.Run("unwritable_path", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "no-such-dir", "diag.json")
-		if err := CmdWriteDiagJSON(cfg, "", path); err == nil {
-			t.Fatalf("CmdWriteDiagJSON(%s): want a write error, got nil", path)
+	t.Run("brief", func(t *testing.T) {
+		r := report(t, cfg, VerboseBrief)
+		if r.Module != nil || len(r.Sets) != 2 || r.Sets[0].SetDiag != nil {
+			t.Errorf("a brief report carries full fields: module %v, sets %+v", r.Module, r.Sets)
 		}
 	})
-
-	t.Run("stdout_output", func(t *testing.T) {
-		r, w, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		orig := os.Stdout
-		os.Stdout = w
-		writeErr := CmdWriteDiagJSON(cfg, "", "-")
-		w.Close()
-		os.Stdout = orig
-		if writeErr != nil {
-			t.Fatalf("CmdWriteDiagJSON(stdout): %v", writeErr)
-		}
-		var buf bytes.Buffer
-		if _, err := buf.ReadFrom(r); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Contains(buf.Bytes(), []byte(`"patterns_total"`)) {
-			t.Errorf("stdout diag missing key: %s", buf.Bytes())
+	t.Run("no sets", func(t *testing.T) {
+		r := report(t, config.BuildConfig{Patterns: cfg.Patterns}, VerboseFull)
+		if r.Sets == nil || len(r.Sets) != 0 {
+			t.Errorf("sets = %v, want an empty list", r.Sets)
 		}
 	})
 }
@@ -1488,71 +1468,29 @@ func TestCmdCompile_ErrorPaths(t *testing.T) {
 	})
 }
 
-// TestCmdWriteDiagJSON_DroppedPatternError exercises the analyzePattern
-// error path in CmdWriteDiagJSON, propagated as `continue` (silently
-// dropping the pattern from the set's diagnostics).
-func TestCmdWriteDiagJSON_DroppedPatternError(t *testing.T) {
-	// This test asserted the DEFECT until 2026-09-09. It required
-	// CmdWriteDiagJSON to skip an unparseable pattern and write a clean
-	// diagnostics file anyway, while CompileFile treats the same pattern as
-	// FATAL — so a config that cannot build produced a diagnostics file
-	// describing a set with the broken pattern quietly missing from it.
-	//
-	// The property is AGREEMENT: whatever the build does with a pattern, the
-	// file describing that build must do the same. Both now fail, with the
-	// same message, because both go through setPatternInfos.
-	t.Run("unbuildable pattern fails BOTH", func(t *testing.T) {
-		cfg := config.BuildConfig{
-			Patterns: []config.PatternEntry{
-				{Name: "bad", Regexp: `[`},
-				{Name: "good", Regexp: `foo`},
-			},
-			Sets: []config.SetConfig{
-				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
-			},
-		}
-		_, _, buildErr := CompileFile(cfg, "")
-		if buildErr == nil {
-			t.Fatal("CompileFile accepted an unparseable set member; " +
-				"this case no longer tests the divergence it is named for")
-		}
-		dir := t.TempDir()
-		diagErr := CmdWriteDiagJSON(cfg, "", filepath.Join(dir, "diag.json"))
-		if diagErr == nil {
-			t.Fatal("CmdWriteDiagJSON succeeded where CompileFile failed: a config " +
-				"that cannot build must not produce a clean diagnostics file")
-		}
-		if diagErr.Error() != buildErr.Error() {
-			t.Errorf("diag error %q differs from build error %q; they share "+
-				"setPatternInfos precisely so they cannot diverge", diagErr, buildErr)
-		}
-	})
-
-	// A pattern legitimately DROPPED from a set — capture-bearing members are
-	// excluded by design — must still produce a diagnostics file, and say so.
-	t.Run("capture-bearing pattern is dropped, not fatal", func(t *testing.T) {
-		cfg := config.BuildConfig{
-			Patterns: []config.PatternEntry{
-				{Name: "caps", Regexp: `(foo)(bar)`, GroupsFunc: "g"},
-				{Name: "good", Regexp: `foo`},
-			},
-			Sets: []config.SetConfig{
-				{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
-			},
-		}
-		dir := t.TempDir()
-		path := filepath.Join(dir, "diag.json")
-		if err := CmdWriteDiagJSON(cfg, "", path); err != nil {
-			t.Fatalf("CmdWriteDiagJSON: %v", err)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("ReadFile: %v", err)
-		}
-		if !bytes.Contains(data, []byte(`"patterns_total": 2`)) {
-			t.Errorf("diag JSON missing expected patterns_total: %s", data)
-		}
-	})
+// TestReportComesFromTheBuild pins that a config the build refuses gets no
+// clean report: the report is filled by that build, so the two cannot
+// disagree (the old --diag-json re-ran the set compile, and once described a
+// set with a broken pattern quietly missing).
+func TestReportComesFromTheBuild(t *testing.T) {
+	cfg := config.BuildConfig{
+		Patterns: []config.PatternEntry{
+			{Name: "bad", Regexp: `[`},
+			{Name: "good", Regexp: `foo`},
+		},
+		Sets: []config.SetConfig{
+			{Name: "s", Find: "f", Patterns: config.PatternSelector{All: true}},
+		},
+	}
+	_, _, buildErr := CompileFile(cfg, "")
+	if buildErr == nil {
+		t.Fatal("CompileFile accepted an unparseable set member")
+	}
+	var b bytes.Buffer
+	err := CmdCompileReport(cfg, filepath.Join(t.TempDir(), "out.wasm"), &b, VerboseFull, VerboseJSON)
+	if err == nil || err.Error() != "compile: "+buildErr.Error() {
+		t.Errorf("CmdCompileReport error %v, want the build's %v", err, buildErr)
+	}
 }
 
 // TestBTWorkBudgetRejectsUnnamedNegative pins that a negative BTWorkBudget
@@ -2413,11 +2351,11 @@ func TestReporterRenderSets(t *testing.T) {
 		"match_any/match_all on Backtracking (anchored DFA over the limits): anch, #8", // #8: the unnamed spelling
 		"id space:   9",
 		"DOWNGRADED frontend:",
-		"split out (not provably linear; own linear search): #3, #4 (Backtracking)",
+		"split out (not provably linear; own linear search): #3 (start-anywhere), #4 (Backtracking)",
 		"scan pair: one union automaton over every member (17 states)",
 		"overlapping find: in-call counter sweeps the answer cache",
 		"overlapping find: the answer cache sweeps a whole-set automaton (40 states, 12 cells)",
-		"overlapping find without a usable cache: companion splits out #5, #6 (Backtracking)",
+		"overlapping find without a usable cache: companion splits out #5 (start-anywhere), #6 (Backtracking)",
 		"scan pair: work counter switching to a union automaton (9 states)",
 	} {
 		if !strings.Contains(out, want) {
@@ -2780,7 +2718,7 @@ func TestVerboseReportsMode(t *testing.T) {
 	if err := CmdCompileVerbose(cfg, out, &report); err != nil {
 		t.Fatalf("CmdCompileVerbose(set): %v", err)
 	}
-	if r := report.String(); !strings.Contains(r, "  mode:       unicode") || !strings.Contains(r, "  memory:     answer cache ") {
+	if r := report.String(); !strings.Contains(r, "  mode:       unicode") || !strings.Contains(r, "    answer cache [find, caller memory] about len × ") {
 		t.Errorf("set report does not name its mode and cache memory:\n%s", r)
 	}
 }
@@ -2964,15 +2902,15 @@ func TestUnicodeModeLimits(t *testing.T) {
 
 	// Non-greedy, so Backtracking takes the captures.
 	r, err = compileReport(config.PatternEntry{Name: "p", Regexp: `(\pL+?)@(\pL+)`, GroupsFunc: "g"}, CompileOptions{})
-	if err != nil || !strings.Contains(r, "memory: Backtracking memo (capture) 7 B per input byte, once its work budget trips") ||
-		!strings.Contains(r, "memory: per-search notes ") {
+	if err != nil || !strings.Contains(r, "Backtracking fallback memo (capture) [groups, module memory] (len + 1) × 7 B, once its work budget trips") ||
+		!strings.Contains(r, "  per-search notes [groups, caller memory] ") {
 		t.Errorf("(\\pL+?)@(\\pL+): err %v, report lacks its memory lines:\n%s", err, r)
 	}
 	r, err = compileReport(config.PatternEntry{Name: "p", Regexp: `\pL+x`, MatchFunc: "m"}, CompileOptions{MaxDFAStates: 1})
-	if err != nil || !strings.Contains(r, "memory: Backtracking memo (match)") {
+	if err != nil || !strings.Contains(r, "Backtracking fallback memo (match) [match, module memory]") {
 		t.Errorf("forced Backtracking match: err %v, report lacks its memo line:\n%s", err, r)
 	}
-	// Byte mode keeps its report as it was: no memory lines.
+	// Byte mode reports its memory too.
 	rep := &Reporter{}
 	if _, _, err := Compile([]config.PatternEntry{{Name: "p", Regexp: `(\w+)@(\w+)`, GroupsFunc: "g"}}, 0, true,
 		CompileOptions{ForceByteMode: true, Report: rep, ForceEngine: EngineBacktrack}); err != nil {
@@ -2980,8 +2918,8 @@ func TestUnicodeModeLimits(t *testing.T) {
 	}
 	var b bytes.Buffer
 	rep.Render(&b)
-	if strings.Contains(b.String(), "memory:") {
-		t.Errorf("byte mode reports memory lines:\n%s", b.String())
+	if !strings.Contains(b.String(), "  per-search notes [groups, caller memory] ") {
+		t.Errorf("byte mode reports no memory lines:\n%s", b.String())
 	}
 
 	r, _ = compileReport(config.PatternEntry{Name: "p", Regexp: `a{2000}`, FindFunc: "f"}, CompileOptions{})
@@ -4559,42 +4497,52 @@ func TestCharLoopPairsDecideTheSkip(t *testing.T) {
 	}
 }
 
-// TestReporterSummary: one line per pattern and set, as `regexped check`
-// prints them.
-func TestReporterSummary(t *testing.T) {
+// TestReporterBrief: the brief report is one line per pattern and per set,
+// and a Reporter with an open scope, or none, still writes one.
+func TestReporterBrief(t *testing.T) {
 	cfg := config.BuildConfig{ImportModule: "m",
 		Patterns: []config.PatternEntry{{Name: "url", Regexp: `https?://[a-z]+`, FindFunc: "f"}, {Regexp: `(\d+)-(\d+)`, GroupsFunc: "g"},
-			{Regexp: `abc`}},
+			{Regexp: `abc`}, {Name: "m", Regexp: `GET /[a-z]+`, MatchFunc: "mm"}},
 		Sets: []config.SetConfig{{Name: "s", Find: "sf", Patterns: config.PatternSelector{Names: []string{"url"}}}}}
 	rep := &Reporter{}
 	if _, err := CompileModule(cfg, rep); err != nil {
 		t.Fatal(err)
 	}
 	var b bytes.Buffer
-	rep.Summary(&b, map[string]int{"s": 1})
-	for _, want := range []string{"pattern url: Compiled DFA, byte mode\n", "pattern (\\d+)-(\\d+): TDFA, byte mode\n",
-		"pattern abc: none — set member only, or declares no *_func, byte mode\n", "set s: find; 1 members; frontend "} {
-		if !strings.Contains(b.String(), want) {
-			t.Errorf("summary missing %q:\n%s", want, b.String())
+	if err := rep.Write(&b, VerboseBrief, VerbosePlain); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("want 5 lines, got %d:\n%s", len(lines), b.String())
+	}
+	for i, want := range [][]string{
+		{"url ", "find", "Compiled DFA", "scan: SIMD pair probe", "memory: "},
+		{`(\d+)-(\d+)`, "groups", "TDFA", "scan: ", "memory: "},
+		{"abc ", " — ", "none", "memory: constant"},
+		{"m ", "match", "Compiled DFA", "memory: constant"},
+		{"set s ", "find", "1 members", "frontend ", "split out", "memory: "},
+	} {
+		for _, w := range want {
+			if !strings.Contains(lines[i], w) {
+				t.Errorf("line %d missing %q: %q", i, w, lines[i])
+			}
 		}
 	}
-	(*Reporter)(nil).Summary(&b, nil)
-	rep.Summary(nil, nil)
+	if err := (*Reporter)(nil).Write(&b, VerboseBrief, VerbosePlain); err != nil {
+		t.Error(err)
+	}
+	if err := rep.Write(nil, VerboseBrief, VerbosePlain); err != nil {
+		t.Error(err)
+	}
 	r := &Reporter{}
 	r.Begin("p", "x")
 	r.setLastMode("unicode")
 	r.Engine(EngineDFA, "")
 	var c bytes.Buffer
-	r.Summary(&c, nil)
-	if c.String() != "pattern p: DFA, unicode mode\n" {
-		t.Errorf("an open scope's mode: %q", c.String())
-	}
-	r = &Reporter{}
-	r.Begin("", "abc")
-	c.Reset()
-	r.Summary(&c, nil)
-	if c.String() != "pattern abc: no export\n" {
-		t.Errorf("an unnamed pattern with no engine: %q", c.String())
+	if err := r.Write(&c, VerboseFull, VerbosePlain); err != nil || !strings.Contains(c.String(), "    mode:   unicode\n") ||
+		!strings.Contains(c.String(), "    engine: DFA\n") {
+		t.Errorf("an open scope's mode: %v %q", err, c.String())
 	}
 }
 

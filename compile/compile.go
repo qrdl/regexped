@@ -1,7 +1,6 @@
 package compile
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -538,6 +537,10 @@ func (o *CompileOptions) btScratch() btScratch {
 // compiledPattern holds the intermediate compilation result for one PatternEntry.
 // All function bodies are size-prefixed (ready for the WASM code section).
 type compiledPattern struct {
+	// report and reportIdx name the pattern's entry in the verbose report,
+	// for the emitters that run at assembly (report.go scanFor).
+	report      *Reporter
+	reportIdx   int
 	matchBody   []byte // (i32,i32)→i32; nil if not requested
 	findBody    []byte // (i32,i32)→i64; nil if not needed. Set via setFind, never directly.
 	captureBody []byte // (i32,i32,i32)→i32; nil if no groups; always internal
@@ -1261,6 +1264,8 @@ type btFindParts struct {
 	search    bool
 	searchG   uint32
 	memoBytes int
+	// report describes the bodies' run-time scratch (report.go).
+	report btBodyReport
 }
 
 // buildBTFindParts builds the Backtracking find for pattern at cur: the find a
@@ -1321,12 +1326,14 @@ func buildBTFindParts(pattern resolvedPattern, table *dfaTable, mandLit *mandato
 		btScanParams.TableMemIdx = o.tableMemIdx
 		btScanParams.LikelyNoMatch = o.LikelyMode == LikelyNoMatch
 	}
+	btScanParams.Report = o.report()
 	parts.data, parts.segs = btScanDataBytes, btScanSegCnt
 	// Nothing is reserved above the scan tables: the ordinary body's frame
 	// stack grows at call time, and the fallback's region is sized then too.
 	btBase := cur + int64(len(btScanDataBytes))
 	plan := planBT(bt, o.BTWorkBudget)
-	reportBTMemo(o.report(), pattern.unicode(), "find", bt, plan)
+	parts.report = newBTBodyReport("find", nil, bt, plan, btNoCaptureFrameSize, int(btStackStart(o.BTStackStart, btNoCaptureFrameSize)))
+	o.report().btBody(parts.report)
 	bt.search = btSearchFor(o)
 	var fallbackMode findFromMode
 	if plan.fallback {
@@ -1522,6 +1529,7 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	// truncates the pattern's data back to a mark) can neither own it nor
 	// take its data along.
 	buildOpts.skipFlag = new(bool)
+	firstTable := tableBase
 	var wt *patternWordTable
 	if (re.FindFunc != "" || re.GroupsFunc != "") && patternHasWordBoundary(re.Regexp) {
 		wt = &patternWordTable{off: int32(tableBase)} //nolint:gosec // a table address
@@ -1558,13 +1566,17 @@ func compilePattern(re config.PatternEntry, tableBase int64, forceGroupsEngine E
 	if re.GroupsFunc != "" {
 		p.declGroups = declaredGroups(re.Regexp)
 	}
-	// What a search of a Unicode-mode pattern keeps per input byte, so the
-	// cost is visible before it is paid (the Backtracking memo is recorded
-	// where its body is built).
-	if rp.unicode() {
-		if n := p.notes.bytesPerPos(); n > 0 {
-			buildOpts.report().Memory("per-search notes", int(n), "once a search arms")
-		}
+	// What a search keeps in the caller's block, and the tables the pattern
+	// takes, for the report (its Backtracking bodies are recorded where they
+	// are built).
+	buildOpts.report().searchSize(SearchSize{NotesBytes: int(p.notes.bytesPerPos()), BTBudget: p.btSearch, BTMemoBytes: p.btMemoBytes})
+	buildOpts.report().tableRange(firstTable, p.tableEnd)
+	p.report, p.reportIdx = buildOpts.report(), buildOpts.report().openIndex()
+	if rep := buildOpts.report(); rep != nil && rep.cur != nil && rep.cur.Find == "" &&
+		(re.FindFunc != "" || re.GroupsFunc != "") {
+		// Every find the classifier, the Backtracking find and the literal
+		// alternation do not name is a literal-chain body.
+		rep.findKind(findKindSpecialised, "a literal-chain body: one pass over the literal's hits")
 	}
 	// minLen: the shortest string this pattern can match, which the exported
 	// find wrapper turns into a one-test early exit.
@@ -1627,6 +1639,7 @@ func compilePatternBody(re config.PatternEntry, tableBase int64, forceGroupsEngi
 		label = re.Label
 	}
 	buildOpts.report().Begin(label, re.Written())
+	buildOpts.report().setExports(re)
 	if re.Expanded != nil {
 		buildOpts.report().Expanded(re.Regexp)
 	}
@@ -1741,6 +1754,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 	if needGroups {
 		// Lit-chain range: single pattern with captures (greedy).
 		if lcp, lcc, ok := analyseLitChainGroupsRange(re.Regexp); ok {
+			lcp.report = buildOpts.report()
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
@@ -1763,6 +1777,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			return p, nil
 		}
 		if lcp, lcc, ok := analyseLitChainGroups(re.Regexp); ok {
+			lcp.report = buildOpts.report()
 			p := &compiledPattern{
 				tableEnd:  tableBase,
 				numGroups: lcc.numGroups,
@@ -1787,6 +1802,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			return p, nil
 		}
 		if altp, branchCaps, ok := analyseLitChainAltGroups(re.Regexp); ok {
+			altp.report = buildOpts.report()
 			if needMatch {
 				// Anchored alt match for the capture path is not specialised
 				// here. Fall through to the standard pipeline.
@@ -1827,6 +1843,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// TDFA-correct capture semantics for DFA branches.
 		if !needMatch {
 			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
+				lenAltp.report = buildOpts.report()
 				pt, perr := rp.parse()
 				parsed := pt.re
 				if perr == nil && parsed.MaxCap() > 0 {
@@ -1904,6 +1921,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 	if !needGroups {
 		// Mixed-prefix shape `<class>{M}<literal><class>{N,N}`.
 		if lcp, ok := analyseLitChainPrefixed(re.Regexp); ok {
+			lcp.report = buildOpts.report()
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
 				findExport:  re.FindFunc,
@@ -1924,6 +1942,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			litChainMinCount = 1
 		}
 		if lcp, ok := analyseLitChain(re.Regexp, litChainMinCount); ok {
+			lcp.report = buildOpts.report()
 			p := &compiledPattern{
 				matchExport: re.MatchFunc,
 				findExport:  re.FindFunc,
@@ -1957,6 +1976,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// equivalent), so a match-only compile keeps the fast path.
 		if lcp, ok := analyseLitChainRange(re.Regexp, litChainMinCount); ok &&
 			(!needFind || !lcp.hasAnchor()) {
+			lcp.report = buildOpts.report()
 			// Greedy and non-greedy paths split by function:
 			//   anchored match: greedy/non-greedy same → range match body
 			//   find/groups greedy: range find/groups body
@@ -1989,6 +2009,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// Anchored match for strict lit-chain alternation.
 		if needMatch && !needFind {
 			if altp, ok := analyseLitChainAlt(re.Regexp); ok {
+				altp.report = buildOpts.report()
 				p := &compiledPattern{
 					matchExport: re.MatchFunc,
 					anchored:    false,
@@ -1999,6 +2020,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			}
 			// Lenient: anchored match for mixed lit-chain + DFA branches.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, false); ok {
+				lenAltp.report = buildOpts.report()
 				layout := planLenAltLayout(lenAltp, tableBase, false, buildOpts.wordTable)
 				pointLenAltSkipsAt(lenAltp, buildOpts.skipFlag)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
@@ -2017,6 +2039,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// Strict alt of mixed-prefix branches.
 		if needFind && !needMatch {
 			if altp, ok := analyseLitChainAltPrefixed(re.Regexp); ok {
+				altp.report = buildOpts.report()
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltPrefixedFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
@@ -2039,6 +2062,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// (`+`/`*`/open `{N,}`) segment; see shouldTryLitChainAlt.
 		if needFind && !needMatch && shouldTryLitChainAlt(re.Regexp) {
 			if altp, ok := analyseLitChainAlt(re.Regexp); ok {
+				altp.report = buildOpts.report()
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				body, ffMode := buildLitChainAltFindBody(altp, layout, buildOpts.tableMemIdx)
@@ -2058,6 +2082,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			}
 			// Strict alt of lit-chain branches with at least one range.
 			if altp, ok := analyseLitChainAltRange(re.Regexp); ok {
+				altp.report = buildOpts.report()
 				layout := planLitChainAltLayout(altp, tableBase)
 				dataBytes, segCount := buildLitChainAltDataSegments(altp, layout)
 				findBody, ffMode := appendLitChainAltRangeFindCodeEntry(nil, altp, layout, buildOpts.tableMemIdx)
@@ -2078,6 +2103,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			// keeps walking without accepting makes it quadratic, so such a
 			// pattern takes the ordinary find, which gets the switch.
 			if lenAltp, ok := analyseLitChainAltLenient(rp, true); ok && lenientAltLinear(rp, buildOpts) {
+				lenAltp.report = buildOpts.report()
 				layout := planLenAltLayout(lenAltp, tableBase, true, buildOpts.wordTable)
 				pointLenAltSkipsAt(lenAltp, buildOpts.skipFlag)
 				dataBytes, segCount := buildLenAltDataSegments(lenAltp, layout)
@@ -2153,7 +2179,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			// time (btGrowth) and the fallback's memo and stack are sized then
 			// too (bt_scratch.go), through the same scratch globals.
 			plan := planBT(bt, buildOpts.BTWorkBudget)
-			reportBTMemo(buildOpts.report(), rp.unicode(), "match", bt, plan)
+			buildOpts.report().btBody(newBTBodyReport("match", []string{"match"}, bt, plan, btNoCaptureFrameSize, int(btStackStart(buildOpts.BTStackStart, btNoCaptureFrameSize))))
 			if plan.force {
 				matchBody, matchFallbackCallOffs = btTailCallBody(2)
 			} else {
@@ -2471,6 +2497,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			p.findFallbackCallOffs = parts.callOffs
 			p.tableEnd = parts.end
 			p.btSearch, p.btSearchG, p.btMemoBytes = parts.search, parts.searchG, parts.memoBytes
+			buildOpts.report().findKind(findKindBacktrack, "the find DFA is over the limits; the Backtracking find serves it")
 		} else {
 			// Where today's literal-anchored tables start: a pattern the
 			// classifier sends to the start-anywhere find drops them again.
@@ -2769,6 +2796,11 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 					p.tableEnd = trial.tableEnd
 					saReplaced = true
 					buildOpts.report().truncateNotes(layoutNotes)
+					if strategy == findSuffix {
+						buildOpts.report().scan("none, backward pass from the end", "suffix find: one backward pass from the input's end")
+					} else {
+						buildOpts.report().scan("one forward pass", "start-anywhere find: one forward pass finds the end, a backward pass the start")
+					}
 				} else {
 					// Today's body with the counter, handing over to the
 					// Backtracking find (buildSwitchHandover) — linear either way.
@@ -2776,6 +2808,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 				}
 			}
 			buildOpts.report().Note("find: " + strategy.String() + " — " + why)
+			buildOpts.report().findKind(strategy.kind(), why)
 			if p.startAnywhere && hint != nil && hint.litAnchor == hintTaken {
 				hint.litAnchor = "the find is the start-anywhere search, which scans for no literal"
 			}
@@ -2965,9 +2998,13 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 					if sw.saBT != nil {
 						buildOpts.report().Note("switch handover: Backtracking — start-anywhere find refused: " +
 							startAnywhereRefusal(rp))
+						buildOpts.report().switchTo(findKindBacktrack)
+					} else {
+						buildOpts.report().switchTo(findKindStartAny)
 					}
 				} else if strategy == findSwitch {
 					buildOpts.report().Note("find: switch unavailable — today's find kept")
+					buildOpts.report().findKind(findKindUnswitched, "the switch could not be built; today's find kept, without a work counter")
 				}
 				if p.notes.altRows() != nil {
 					p.noteAltLitAnchorBranches(buildOpts.tableMemIdx)
@@ -3139,7 +3176,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		frameSize := 4 + numCapLocs*4 + 4 // pos, captures, retryPC
 
 		plan := planBT(bt, buildOpts.BTWorkBudget)
-		reportBTMemo(buildOpts.report(), mp.unicode(), "capture", bt, plan)
+		buildOpts.report().btBody(newBTBodyReport("capture", []string{"groups"}, bt, plan, int(frameSize), int(btStackStart(buildOpts.BTStackStart, int32(frameSize)))))
 
 		// Window mode: patterns whose assertions are defined against the
 		// true input edges (\b/\B, \A, \z, (?m:^), (?m:$)) get the match
@@ -3877,6 +3914,7 @@ func compileAll(patterns []config.PatternEntry, tableBase int64, standalone bool
 	if err := checkFunctionSizes(w, owners); err != nil {
 		return nil, 0, err
 	}
+	opts.Report.noteCode(w, owners)
 	// A table whose int32 address wrapped is a segment at a negative offset;
 	// literal-anchored tables are laid out here, at assembly, so this is the
 	// one place every table's address is known.
@@ -3930,17 +3968,24 @@ func CompileModule(cfg config.BuildConfig, rep *Reporter) ([]byte, error) {
 	if cfg.Output != "" && cfg.ImportModule != "" {
 		wasmBytes = appendImportModuleSection(wasmBytes, cfg.ImportModule)
 	}
+	rep.NoteCompile(cfg, wasmBytes, false)
 	return wasmBytes, nil
 }
 
-// CmdCompileVerbose is CmdCompile that, when report is non-nil, writes a
-// human-readable account of what the compiler decided to it.
+// CmdCompileVerbose is CmdCompile that, when report is non-nil, writes the
+// full report to it as text (CmdCompileReport).
+func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) error {
+	return CmdCompileReport(cfg, output, report, VerboseFull, VerbosePlain)
+}
+
+// CmdCompileReport is CmdCompile that, when report is non-nil, writes the
+// --verbose report to it at level, in format.
 //
 // Separate from --debug on purpose: that flag raises the slog level to diagnose
 // the COMPILER, whereas this reports on the user's PATTERNS. It exists because
 // two outcomes a user must act on are otherwise silent — a pattern demoted to
 // Backtracking by a state limit, and a pattern dropped from a set.
-func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) error {
+func CmdCompileReport(cfg config.BuildConfig, output string, report io.Writer, level VerboseLevel, format VerboseFormat) error {
 	if output != "-" {
 		// As `generate` and a component compile do: a build that names a
 		// directory not made yet should not fail at its last step.
@@ -3952,11 +3997,13 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "output", outPath)
 
 	// Always a Reporter: it only records, and WarnUnboundedMemory reads what
-	// the compile found. It is rendered only under --verbose. Progress lines
+	// the compile found. It is written only under --verbose. Progress lines
 	// from a long construction go to stderr whatever the flags (progress.go).
 	rep := &Reporter{Progress: os.Stderr}
 	wasmBytes, err := CompileModule(cfg, rep)
-	rep.Render(report)
+	if werr := rep.Write(report, level, format); werr != nil && err == nil {
+		err = fmt.Errorf("write the report: %w", werr)
+	}
 	if err != nil {
 		// What was decided before the error — a refused pattern's mode
 		// among it — is worth showing, and was.
@@ -3976,64 +4023,6 @@ func CmdCompileVerbose(cfg config.BuildConfig, output string, report io.Writer) 
 	}
 	ownership.Fix(outPath)
 	slog.Info("Done", "bytes", len(wasmBytes))
-	return nil
-}
-
-// CmdWriteDiagJSON re-runs CompileFile, collects set diagnostics, and writes
-// the Diagnostics structure as JSON to diagPath (or stdout if diagPath == "-").
-// Independent of slog level — the JSON is always complete.
-func CmdWriteDiagJSON(cfg config.BuildConfig, output, diagPath string) error {
-	if len(cfg.Sets) == 0 {
-		// SAY SO. Returning nil wrote no file and printed nothing, so
-		// `--diag-json=out.json` on a set-less config left the user staring at
-		// a missing file with no explanation.
-		return fmt.Errorf("--diag-json: the config declares no sets, and set composition is all this reports")
-	}
-	// Gather diagnostics by re-running CompileFile (it already computed them;
-	// for simplicity we re-run rather than threading Diagnostics through CmdCompile).
-	var prefixPool, suffixPool dfaPool
-	diag := Diagnostics{PatternsTotal: len(cfg.Patterns)}
-	for _, sc := range cfg.Sets {
-		// setPatternInfos, not a second copy of its loop. This used to
-		// `continue` past an analyzePattern error where CompileFile treats the
-		// same error as FATAL, so a config that cannot build could still
-		// produce a clean-looking diagnostics file describing a set with the
-		// broken pattern quietly missing from it.
-		// Sharing the function is what stops the two answers drifting again.
-		infos, globalIDs, err := setPatternInfos(sc, sc.Members(cfg), cfg, &prefixPool, &suffixPool, nil)
-		if err != nil {
-			return err
-		}
-		// THE SAME spec and options the real compile builds, through the same
-		// helper. This function RE-RUNS CompileSet rather than threading the
-		// build's own diagnostics out, so every field it gets wrong describes a
-		// compilation the user is not asking about — and it has: the set's
-		// LikelyMode was omitted, so the frontend, the union-scan body and the
-		// member-skip counts were all reported NEUTRAL whatever `hints:` said,
-		// and this file is the only window onto those.
-		spec, setOpts := setSpecAndOptions(sc, cfg, infos, globalIDs, CompileSetOptions{}, nil)
-		cs := CompileSet(spec, &prefixPool, &suffixPool, setOpts)
-		if cs.err != nil {
-			return fmt.Errorf("set %q: %w", sc.Name, cs.err)
-		}
-		if cs.diag != nil {
-			diag.Sets = append(diag.Sets, *cs.diag)
-		}
-		diag.InSet += len(infos)
-	}
-	diag.PrefixDedupPoolSize = len(prefixPool.tables)
-
-	data, _ := json.MarshalIndent(diag, "", "  ")
-	data = append(data, '\n')
-
-	if diagPath == "-" {
-		_, err := os.Stdout.Write(data)
-		return err
-	}
-	if err := os.WriteFile(diagPath, data, 0o644); err != nil {
-		return err
-	}
-	ownership.Fix(diagPath)
 	return nil
 }
 

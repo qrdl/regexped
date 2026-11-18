@@ -57,7 +57,7 @@ All paths in `regexped.yaml` are resolved relative to the config file, which in 
 
 **You do not need `--user`.** Everything regexped writes into the mounted
 directory — compiled WASM, generated stubs, a component's sibling `.wit`, a
-merged binary, `--diag-json` output — is handed to the user who owns the
+merged binary — is handed to the user who owns the
 directory it lands in, and so are any directories regexped had to create along
 the way (`stub_file: src/generated/stubs.rs` creates `src/` and `src/generated/`
 owned by you, not by root).

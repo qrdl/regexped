@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches:
-      - '**'
+      - main
   pull_request:
 
 permissions:
@@ -50,6 +50,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    defaults:
+      run:
+        working-directory: tools/re2test
     steps:
 
       - uses: actions/checkout@v6
@@ -58,6 +61,53 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run RE2 test suite
-        working-directory: tools/re2test
-        run: make test
+      # One step per target of tools/re2test's `make test`, in its order, so the
+      # run shows its progress. KEEP THIS LIST IN STEP WITH THAT TARGET: a
+      # target added there and not here is not run in CI.
+      - name: exhaustive
+        run: make exhaustive
+
+      - name: unicode
+        run: make unicode
+
+      - name: custom
+        run: make custom
+
+      - name: adjusted
+        run: make adjusted
+
+      - name: high-bytes
+        run: make high-bytes
+
+      - name: force-backtrack
+        run: make force-backtrack
+
+      - name: likelymatch
+        run: make likelymatch
+
+      - name: likelynomatch
+        run: make likelynomatch
+
+      - name: force-backtrack-likelynomatch
+        run: make force-backtrack-likelynomatch
+
+      - name: matchonly
+        run: make matchonly
+
+      - name: findonly
+        run: make findonly
+
+      - name: groupsonly
+        run: make groupsonly
+
+      - name: notes-armed
+        run: make notes-armed
+
+      - name: sets
+        run: make sets
+
+      - name: sets-likely
+        run: make sets-likely
+
+      - name: sets-unicode
+        run: make sets-unicode

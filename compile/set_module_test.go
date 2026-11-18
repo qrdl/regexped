@@ -3,7 +3,6 @@ package compile
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"regexp/syntax"
 	"strings"
 	"testing"
@@ -973,15 +972,16 @@ func TestDiagJSON_Schema(t *testing.T) {
 		t.Fatalf("ValidateSets: %v", err)
 	}
 
-	// Write diag JSON to a temp file and verify required fields are present.
-	tmp := t.TempDir() + "/diag.json"
-	if err := CmdWriteDiagJSON(cfg, "", tmp); err != nil {
-		t.Fatalf("CmdWriteDiagJSON: %v", err)
+	// Write the full JSON report and verify required fields are present.
+	rep := &Reporter{}
+	if _, err := CompileModule(cfg, rep); err != nil {
+		t.Fatalf("CompileModule: %v", err)
 	}
-	data, err := os.ReadFile(tmp)
-	if err != nil {
-		t.Fatalf("read diag JSON: %v", err)
+	var buf bytes.Buffer
+	if err := rep.Write(&buf, VerboseFull, VerboseJSON); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
+	data := buf.Bytes()
 
 	required := []string{`"patterns_total"`, `"sets"`, `"buckets"`, `"frontend"`}
 	for _, field := range required {

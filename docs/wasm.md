@@ -995,7 +995,7 @@ The rules:
   right size, and 649 for a standalone module handed no region at all, which
   then uses its own). Size the region from the formula with the compiler's
   inputs — the sweep column's width and the pattern count a generated stub
-  carries, `--diag-json`'s `cache_bytes_per_byte`, or
+  carries, the full report's `cache_bytes_per_byte` (or its `answer cache` ceiling), or
   `compile.SetOverlapCacheSizing` — never from a guess.
 - **A header that contradicts itself IS an error.** A `cache_len` below the
   48-byte header, a stride below 1 — or, on a
