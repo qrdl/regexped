@@ -157,6 +157,28 @@ func SetOverlapCacheSizingOpts(sc config.SetConfig, cfg config.BuildConfig, inpu
 	return bytes, stride, nil
 }
 
+// sizingRegime numbers the formula Sizing takes for inputLen. It changes only
+// where one of three switches flips — the cache leaving single-block mode, the
+// program sweep's region leaving it, and that region dropping out past the
+// budget — and each flips once as the input grows. Within one regime Sizing
+// grows with the input, up to the rounding of the square-root stride.
+func (sh OverlapCacheShape) sizingRegime(inputLen int) int {
+	r := 0
+	if sh.Eligible && config.SetOverlapCheckpointStride(inputLen, sh.Cells, sh.Patterns) != inputLen+1 {
+		r |= 1
+	}
+	if sh.SweepCells > 0 {
+		sb, k := config.SetOverlapCheckpointSizingRow(inputLen, sh.SweepCells, sh.SweepRow)
+		if k != inputLen+1 {
+			r |= 2
+		}
+		if sb > config.SetOverlapCacheMaxBytes {
+			r |= 4
+		}
+	}
+	return r
+}
+
 // Sizing is SetOverlapCacheSizing for a shape already in hand: a caller that
 // sizes many drives of one set learns the shape once and asks this per input.
 //

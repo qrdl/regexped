@@ -2578,3 +2578,47 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 		h.call(names.Dtor, b)
 	})
 }
+
+// TestComponentMaxInputLowersUnderTheCap: the --verbose report's max_input for
+// a component under max_memory is an input that can be lowered and searched.
+// The input is a cabi_realloc block — the power of two at least its size plus
+// an 8-byte header — so under 2 MiB an input the pages alone would admit
+// (about 1.6 MiB) needs a 2 MiB block and traps while being lowered.
+func TestComponentMaxInputLowersUnderTheCap(t *testing.T) {
+	memCap, err := config.ParseMemorySize("2MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []config.PatternEntry{{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"}}
+	rep := &compile.Reporter{}
+	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxMemory: memCap, Report: rep})
+	rep.NoteCompile(config.BuildConfig{MaxMemory: memCap, Patterns: entries}, w, true)
+	n := rep.Report(compile.VerboseFull).Patterns[0].MaxInput["find"]
+	if n <= 0 || n >= 1<<20 {
+		t.Fatalf("max_input %d under 2 MiB: an input of 1 MiB or more is a 2 MiB block", n)
+	}
+	store, inst, mem := instantiateCore(t, w)
+	call := func(name string, args ...any) int32 {
+		t.Helper()
+		r, err := inst.GetFunc(store, name).Call(store, args...)
+		if err != nil {
+			t.Fatalf("%s at max_input %d: %v", name, n, err)
+		}
+		if r == nil {
+			return 0
+		}
+		return r.(int32)
+	}
+	// Lowered as the canonical ABI lowers a list<u8>: one cabi_realloc.
+	in := strings.Repeat("a", int(n)-8) + "ghp_ab12"
+	ptr := call("cabi_realloc", int32(0), int32(0), int32(1), int32(len(in)))
+	copy(mem.UnsafeData(store)[ptr:], in)
+	f := res["f"]
+	h := call(f.Constructor, ptr, int32(len(in)), int32(0))
+	ret := uint32(call(f.Next, h))
+	b := mem.UnsafeData(store)
+	if b[ret] != 0 || b[ret+4] != 1 || binary.LittleEndian.Uint32(b[ret+8:]) != uint32(n)-8 {
+		t.Errorf("next at max_input %d = %v, want ok(some((%d, %d)))", n, b[ret:ret+16], n-8, n)
+	}
+	call(f.Dtor, h)
+}

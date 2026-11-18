@@ -186,6 +186,11 @@ func TestCmdCompileRejectsUncompilablePattern(t *testing.T) {
 		!strings.Contains(err.Error(), "compile") {
 		t.Errorf("err = %v, want a compile failure", err)
 	}
+	// Under --verbose, what was decided before the error is reported.
+	var b bytes.Buffer
+	if err := CmdCompile(cfg, filepath.Join(t.TempDir(), "o.wasm"), &b); err == nil || !strings.Contains(b.String(), "\u4e2d") {
+		t.Errorf("err = %v, report %q", err, b.String())
+	}
 }
 
 // The end-to-end path: a component on disk, its sibling .wit, and both of them

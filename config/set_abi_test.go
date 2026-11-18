@@ -457,3 +457,17 @@ func TestLoadConfigUnresolvablePath(t *testing.T) {
 		t.Errorf("error = %v, want it to name the path resolution", err)
 	}
 }
+
+// TestSetDefaultBatchCap: 256 tuples, never below the pattern count, never
+// above what the cursor's count field holds.
+func TestSetDefaultBatchCap(t *testing.T) {
+	if got := SetDefaultBatchCap(3); got != 256 {
+		t.Errorf("3 patterns: %d, want 256", got)
+	}
+	if got := SetDefaultBatchCap(1000); got != 1000 {
+		t.Errorf("1000 patterns: %d, want 1000", got)
+	}
+	if got, m := SetDefaultBatchCap(70000), int(SetCursorMaxCount(70000)); got != m {
+		t.Errorf("70000 patterns: %d, want the cursor maximum %d", got, m)
+	}
+}

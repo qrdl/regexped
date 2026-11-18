@@ -28,11 +28,16 @@ var stubExt = map[string]string{"rust": ".rs", "go": ".go", "js": ".js", "ts": "
 // format.
 func Run(cfg config.BuildConfig, w io.Writer, level compile.VerboseLevel, format compile.VerboseFormat) error {
 	rep := &compile.Reporter{Progress: os.Stderr}
+	var err error
 	if cfg.Component() {
-		if _, _, err := component.Core(cfg, rep); err != nil {
-			return err
-		}
-	} else if _, err := compile.CompileModule(cfg, rep); err != nil {
+		_, _, err = component.Core(cfg, rep)
+	} else {
+		_, err = compile.CompileModule(cfg, rep)
+	}
+	if err != nil {
+		// What was decided before the error — a refused pattern's mode among
+		// it — is reported as `compile` reports it; the compile error wins.
+		_ = rep.Write(w, level, format)
 		return err
 	}
 	compile.WarnUnboundedMemory(cfg, rep)

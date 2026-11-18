@@ -2442,6 +2442,10 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 		// p.anchored for the OTHER reason and are ffNative; see
 		// captureFromMode's doc.)
 		p.captureFromMode = ffAnchoredZeroOnly
+		if needGroups && !needFind {
+			// No find body: the capture body is the whole search.
+			buildOpts.report().findKind(findKindAnchored, "the pattern can only match at 0: the capture body runs there once")
+		}
 	}
 
 	if needMatch {
@@ -2469,22 +2473,26 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 				}
 				hint.settle(len(pre) < 2, pre)
 			}
-			if tl := (*btTooLarge)(nil); errors.As(err, &tl) {
-				switch {
-				case dfaStateLimitExceeded || table.numStates > maxStates:
-					n := 0
-					if !dfaStateLimitExceeded {
-						n = table.numStates
-					}
-					tl.why = dfaLimitWhy("find DFA", n, maxStates, dfaStateLimitExceeded)
-				case memLimit > 0 && dfaTableBytes(table) > memLimit:
-					tl.why = fmt.Sprintf("its find DFA table is over the memory bound (%d bytes)", memLimit)
-				case notesOverflow:
-					tl.why = fmt.Sprintf("its find automaton has %d cycle states, more than per-search notes cover (%d)",
-						countCycleStates(table), maxNotesBytesPerPos*8)
-				default:
-					tl.why = "its find DFA has an ambiguous word-boundary target"
+			// Why the DFA find was refused: the refusal message and the report
+			// both name it.
+			var why string
+			switch {
+			case dfaStateLimitExceeded || table.numStates > maxStates:
+				n := 0
+				if !dfaStateLimitExceeded {
+					n = table.numStates
 				}
+				why = dfaLimitWhy("find DFA", n, maxStates, dfaStateLimitExceeded)
+			case memLimit > 0 && dfaTableBytes(table) > memLimit:
+				why = fmt.Sprintf("its find DFA table is over the memory bound (%d bytes)", memLimit)
+			case notesOverflow:
+				why = fmt.Sprintf("its find automaton has %d cycle states, more than per-search notes cover (%d)",
+					countCycleStates(table), maxNotesBytesPerPos*8)
+			default:
+				why = "its find DFA has an ambiguous word-boundary target"
+			}
+			if tl := (*btTooLarge)(nil); errors.As(err, &tl) {
+				tl.why = why
 			}
 			if err != nil {
 				return nil, err
@@ -2497,7 +2505,7 @@ func compilePatternBodies(re config.PatternEntry, rp resolvedPattern, tableBase 
 			p.findFallbackCallOffs = parts.callOffs
 			p.tableEnd = parts.end
 			p.btSearch, p.btSearchG, p.btMemoBytes = parts.search, parts.searchG, parts.memoBytes
-			buildOpts.report().findKind(findKindBacktrack, "the find DFA is over the limits; the Backtracking find serves it")
+			buildOpts.report().findKind(findKindBacktrack, why+"; the Backtracking find serves it")
 		} else {
 			// Where today's literal-anchored tables start: a pattern the
 			// classifier sends to the start-anywhere find drops them again.

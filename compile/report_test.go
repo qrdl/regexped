@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/utils"
 )
 
 // jsonFields lists every JSON field name t marshals to, recursively, as
@@ -59,7 +60,7 @@ func TestReportSchemaFields(t *testing.T) {
 		"ConflictDiag.candidate_bucket", "ConflictDiag.detail", "ConflictDiag.pattern", "ConflictDiag.reason",
 		"FrontendDemotionDiag.detail", "FrontendDemotionDiag.from", "FrontendDemotionDiag.reason", "FrontendDemotionDiag.to",
 		"PatternRef.id", "PatternRef.name",
-		"Report.level", "Report.module", "Report.patterns", "Report.schema", "Report.sets",
+		"Report.level", "Report.module", "Report.patterns", "Report.schema", "Report.sets", "ReportCacheFit.inputs",
 		"ReportCeiling.bytes", "ReportCeiling.exports", "ReportCeiling.formula", "ReportCeiling.memory",
 		"ReportCeiling.what", "ReportCeiling.when",
 		"ReportModule.bytes", "ReportModule.in_set", "ReportModule.kind", "ReportModule.max_memory",
@@ -69,6 +70,7 @@ func TestReportSchemaFields(t *testing.T) {
 		"ReportPattern.max_input", "ReportPattern.memory", "ReportPattern.memory_ceilings", "ReportPattern.mode",
 		"ReportPattern.name", "ReportPattern.opts", "ReportPattern.regexp", "ReportPattern.scan",
 		"ReportPattern.scan_detail", "ReportPattern.switch_to", "ReportPattern.table_bytes",
+		"ReportRange.from", "ReportRange.to", "ReportSet.answer_cache",
 		"ReportSet.bucket_count", "ReportSet.capabilities", "ReportSet.code_bytes", "ReportSet.frontend",
 		"ReportSet.max_input", "ReportSet.memory", "ReportSet.memory_ceilings", "ReportSet.members",
 		"ReportSet.name", "ReportSet.split_out",
@@ -298,5 +300,216 @@ func TestReportWriteFails(t *testing.T) {
 	}
 	if kind, _ := (prefixScanParams{Prefix: []byte("ééééééééé"), UTF8Text: true}).strategyNote(); kind != "scalar literal" {
 		t.Errorf("a 17-byte prefix: %q", kind)
+	}
+}
+
+// TestReportSearchKindsAndFixedStack: a groups-only pattern that can only
+// match at 0 reports the capture body as its whole search, a Backtracking
+// find names the refusal that sent it there, and a Backtracking body with no
+// Alt — which pushes no frame — keeps a fixed stack that neither grows nor
+// bounds max_input.
+func TestReportSearchKindsAndFixedStack(t *testing.T) {
+	cfg := config.BuildConfig{ImportModule: "m", Output: "merged.wasm", MaxMemory: mustMemorySize(t, "8MiB"),
+		Patterns: []config.PatternEntry{
+			{Name: "date", Regexp: `^(\d{4})-(\d{2})`, GroupsFunc: "dg"},
+			{Name: "amb", Regexp: `(\b|0*)0`, FindFunc: "af"},
+			{Name: "time", Regexp: `\b(\d\d):(\d\d)\b`, GroupsFunc: "tg"},
+		}}
+	byName := map[string]ReportPattern{}
+	for _, p := range reportOf(t, cfg).Patterns {
+		byName[p.Name] = p
+	}
+	if p := byName["date"]; p.Find != findKindAnchored {
+		t.Errorf("date: search %q (%s), want %q", p.Find, p.FindReason, findKindAnchored)
+	}
+	if p := byName["amb"]; p.Find != findKindBacktrack || !strings.Contains(p.FindReason, "ambiguous word-boundary target") ||
+		strings.Contains(p.FindReason, "over the limits") {
+		t.Errorf("amb: search %q, reason %q", p.Find, p.FindReason)
+	}
+	p := byName["time"]
+	if p.Engine != "Backtracking" {
+		t.Fatalf("time: engine %q, the test needs Backtracking", p.Engine)
+	}
+	if p.Memory != "constant" || p.MaxInput["groups"] != -1 {
+		t.Errorf("time: memory %q, max_input %v; want constant and -1", p.Memory, p.MaxInput)
+	}
+	for _, c := range p.Ceilings {
+		if strings.HasPrefix(c.What, "Backtracking frame stack") && (c.Bytes.KiB1 != c.Bytes.MiB16 || c.Formula != "65536 B") {
+			t.Errorf("time: the stack grows: %+v", c)
+		}
+	}
+}
+
+// TestReportSetCompanionsAndForwardedScan: a set whose scan pair forwards to
+// a split copy reports max_input for scan, files the copy's Backtracking
+// scratch under scan rather than find, and counts every companion's code as
+// the set's.
+func TestReportSetCompanionsAndForwardedScan(t *testing.T) {
+	cfg := config.BuildConfig{ImportModule: "m", MaxMemory: mustMemorySize(t, "64MiB"),
+		Patterns: []config.PatternEntry{
+			{Name: "a", Regexp: `foo\w+`},
+			{Name: "b", Regexp: `a[ab]{12}c[a-z]*z`},
+			{Name: "c", Regexp: `\bbar\b`},
+		},
+		Sets: []config.SetConfig{{Name: "s", Find: "f", ScanAll: "sa", Overlapping: true,
+			Patterns: config.PatternSelector{All: true}}}}
+	rep := &Reporter{}
+	if _, err := CompileModule(cfg, rep); err != nil {
+		t.Fatal(err)
+	}
+	for name := range rep.mod.setCode {
+		if strings.IndexByte(name, 0) >= 0 {
+			t.Errorf("code counted under the internal name %q", name)
+		}
+	}
+	s := rep.Report(VerboseFull).Sets[0]
+	if _, ok := s.MaxInput["scan"]; !ok {
+		t.Errorf("max_input %v has no scan", s.MaxInput)
+	}
+	if s.CodeBytes != rep.mod.setCode["s"] || s.CodeBytes == 0 {
+		t.Errorf("code_bytes %d, counted %d", s.CodeBytes, rep.mod.setCode["s"])
+	}
+	var scanBT bool
+	for _, c := range s.Ceilings {
+		if strings.Contains(c.What, "split member b") && reflect.DeepEqual(c.Exports, []string{"scan"}) {
+			scanBT = true
+		}
+	}
+	if !scanBT {
+		t.Errorf("the scan copy's Backtracking member is not filed under scan: %+v", s.Ceilings)
+	}
+}
+
+// TestReportSetBuffersAndComponentBlocks: the buffers a set's exports take
+// beside the input count against max_memory, and in a component every
+// caller-memory region is a power-of-two block with an 8-byte header.
+func TestReportSetBuffersAndComponentBlocks(t *testing.T) {
+	// One pattern selected, id 19,999: the gate array alone is 80,000 bytes.
+	sm := setMemReport{find: true, members: 1, idSpace: 20000}
+	js := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 4 << 20}
+	buf := setBufferTerms(sm, js)
+	if len(buf) != 1 || buf[0].size(0) != 12+80000+16+2500 || !buf[0].fixed {
+		t.Fatalf("JS set buffers %+v", buf)
+	}
+	terms := append([]memTerm{inputTerm([]string{"find"})}, buf...)
+	n := maxInputs([]string{"find"}, terms, js)["find"]
+	if js.staticBytes+65536+((n+65535)&^65535)+131072 > js.maxMemory {
+		t.Errorf("max_input %d leaves no room for the buffers", n)
+	}
+	if setBufferTerms(sm, moduleReport{}) != nil {
+		t.Error("an embedded module's set buffers are the host's")
+	}
+	comp := moduleReport{standalone: true, component: true, staticBytes: 1 << 16, maxMemory: 4 << 20}
+	if b := setBufferTerms(sm, comp)[0]; b.size(0) != componentBlock(repBytesBlocks)+componentBlock(80000)+componentBlock(12)+componentBlock(areaSetAll) {
+		t.Errorf("component set buffers %d", b.size(0))
+	}
+	// With an answer cache its header is reserved too; batching widens the
+	// tuple buffer to the default batch, overlapping aligns the gate region.
+	sh := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 2}
+	cached := setMemReport{find: true, members: 1, idSpace: 20000, cache: &sh}
+	if got := setBufferTerms(cached, comp)[0].size(0) - setBufferTerms(sm, comp)[0].size(0); got != componentBlock(config.SetOverlapCheckpointHeaderBytes) {
+		t.Errorf("component cache header %d", got)
+	}
+	batched := setMemReport{find: true, match: true, members: 1, idSpace: 3, batch: 256, overlapping: true, cache: &sh}
+	bt := setBufferTerms(batched, js)
+	if len(bt) != 2 || bt[1].size(0) != 12*256+((4*3+16+1+7)&^7)+config.SetOverlapCheckpointHeaderBytes ||
+		bt[0].size(0) != 12+4*3+16+1 {
+		t.Errorf("batched JS buffers %d, %d", bt[0].size(0), bt[1].size(0))
+	}
+	r := &Reporter{}
+	r.NoteCompile(config.BuildConfig{}, nil, true)
+	if !r.mod.component || !r.mod.standalone || r.mod.kind != "component core module" {
+		t.Errorf("component module %+v", r.mod)
+	}
+
+	for in, want := range map[int64]int64{0: 16, 8: 16, 9: 32, 832 << 10: 1 << 20, 1<<20 - 8: 1 << 20, 1<<20 - 7: 2 << 20} {
+		if got := componentBlock(in); got != want {
+			t.Errorf("componentBlock(%d) = %d, want %d", in, got, want)
+		}
+	}
+	// 832 KiB is a 1 MiB block: under a 1 MiB cap it cannot be lowered.
+	capped := moduleReport{standalone: true, component: true, staticBytes: 1 << 16, maxMemory: 1 << 20}
+	if n := maxInputs([]string{"find"}, []memTerm{inputTerm([]string{"find"})}, capped)["find"]; n >= 832<<10 || n <= 0 {
+		t.Errorf("component max_input %d under 1 MiB", n)
+	}
+	c := ceilings([]memTerm{inputTerm([]string{"find"})}, capped)[0]
+	if c.Bytes.KiB1 != 2048 || !strings.Contains(c.Formula, "power of two") {
+		t.Errorf("component input ceiling %+v", c)
+	}
+}
+
+// TestReportAnswerCacheFit: the answer cache is not part of max_input — the
+// find walks without it — and where it fits is not one range, because its
+// region shrinks where it starts checkpointing.
+func TestReportAnswerCacheFit(t *testing.T) {
+	sh := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 2}
+	m := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 6 << 20}
+	sm := setMemReport{find: true, members: 2, idSpace: 2, cache: &sh}
+	terms := setTerms(sm, m)
+	n := maxInputs([]string{"find"}, terms, m)["find"]
+	if n < 6_000_000 {
+		t.Errorf("max_input %d: the cache bounds it", n)
+	}
+	fit := cacheFit(sh, terms, m)
+	if fit == nil || len(fit.Inputs) != 2 || fit.Inputs[0].From != 0 {
+		t.Fatalf("cache fit %+v", fit)
+	}
+	base := exportTotal("find", terms, m)
+	fits := func(n int64) bool {
+		b, _ := sh.Sizing(int(n))
+		return base(n)+utils.PageAlign(int64(b)) <= m.maxMemory
+	}
+	for _, r := range fit.Inputs {
+		if !fits(r.From) || !fits(r.To) || fits(r.To+1) || r.From > 0 && fits(r.From-1) {
+			t.Errorf("range %+v is not a maximal fitting stretch", r)
+		}
+	}
+	// The checkpointed stretch: 5.8 MB fits with its cache, 1 MB does not.
+	if r := fit.Inputs[1]; r.From > 5_800_000 || r.To < 5_800_000 || fit.Inputs[0].To >= 1_000_000 {
+		t.Errorf("cache fit %+v", fit.Inputs)
+	}
+	if got := cacheFitText(fit.Inputs); !strings.Contains(got, " – ") || !strings.Contains(got, "walks") {
+		t.Errorf("text %q", got)
+	}
+	if cacheFitText(nil) != "never — the find walks at every length" ||
+		cacheFitText([]ReportRange{{0, maxInputSearchCap}}) != "every length" ||
+		!strings.Contains(cacheFitText([]ReportRange{{5, maxInputSearchCap}}), "and longer") {
+		t.Error("cacheFitText edge cases")
+	}
+	if cacheFit(sh, terms, moduleReport{}) != nil {
+		t.Error("no max_memory, still a cache fit")
+	}
+	// Room for everything: the stretches either side of the switch join.
+	big := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 1 << 40}
+	if got := cacheFit(sh, setTerms(sm, big), big); len(got.Inputs) != 1 || cacheFitText(got.Inputs) != "every length" {
+		t.Errorf("unbounded cache fit %+v", got.Inputs)
+	}
+	// A program sweep's part has a regime of its own.
+	sw := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 2, SweepCells: 4, SweepRow: 4}
+	if sw.sizingRegime(0) != 0 || sw.sizingRegime(1<<30)&2 == 0 {
+		t.Errorf("sweep regimes %d, %d", sw.sizingRegime(0), sw.sizingRegime(1<<30))
+	}
+	// A 1 MiB row: at 1 GiB of input even the checkpointed part is over the
+	// budget, and drops out.
+	wide := OverlapCacheShape{SweepCells: 4, SweepRow: 1 << 20}
+	if wide.sizingRegime(0) != 0 || wide.sizingRegime(1<<30) != 2|4 {
+		t.Errorf("wide sweep regimes %d, %d", wide.sizingRegime(0), wide.sizingRegime(1<<30))
+	}
+
+	// The real compile: a batching overlapping set with a cache, rendered.
+	cfg := config.BuildConfig{ImportModule: "m", MaxMemory: mustMemorySize(t, "6MiB"),
+		Patterns: []config.PatternEntry{{Name: "p1", Regexp: `[a-z]+x`}, {Name: "p2", Regexp: `[a-z]*y`}},
+		Sets: []config.SetConfig{{Name: "s", Find: "sf", Overlapping: true, Hints: []string{"batch-find"},
+			Patterns: config.PatternSelector{All: true}}}}
+	rep := &Reporter{}
+	if _, err := CompileModule(cfg, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.setMem["s"].batch != config.SetDefaultBatchCap(2) {
+		t.Errorf("batch %d", rep.setMem["s"].batch)
+	}
+	var b bytes.Buffer
+	if err := rep.Write(&b, VerboseFull, VerbosePlain); err != nil || !strings.Contains(b.String(), "answer cache under max_memory: inputs of 0 B – ") {
+		t.Errorf("err %v, report:\n%s", err, b.String())
 	}
 }

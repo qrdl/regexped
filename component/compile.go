@@ -49,6 +49,9 @@ func CmdCompileReport(cfg config.BuildConfig, output string, report io.Writer, l
 	rep := &compile.Reporter{Progress: os.Stderr}
 	core, witText, err := Core(cfg, rep)
 	if err != nil {
+		// What was decided before the error — a refused pattern's mode among
+		// it — is reported as a module compile reports it; the error wins.
+		_ = rep.Write(report, level, format)
 		return err
 	}
 	slog.Info("Compiling patterns", "count", len(cfg.Patterns), "sets", len(cfg.Sets), "output", output, "format", "component")

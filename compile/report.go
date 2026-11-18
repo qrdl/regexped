@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/qrdl/regexped/config"
+	"github.com/qrdl/regexped/internal/abi"
 	"github.com/qrdl/regexped/internal/utils"
 )
 
@@ -146,6 +147,25 @@ type ReportSet struct {
 	CodeBytes int              `json:"code_bytes,omitempty"`
 	Ceilings  []ReportCeiling  `json:"memory_ceilings,omitempty"`
 	MaxInput  map[string]int64 `json:"max_input,omitempty"`
+	// AnswerCache is where under max_memory the overlapping find gets its
+	// answer cache (full only, with max_memory and a cache). The cache is
+	// not part of MaxInput: without room for it the find walks, with the same
+	// answers, slower.
+	AnswerCache *ReportCacheFit `json:"answer_cache,omitempty"`
+}
+
+// ReportCacheFit is where an answer cache fits.
+type ReportCacheFit struct {
+	// Inputs are the input lengths, in ranges, whose cache fits beside
+	// everything else the find takes. Not one range: the cache's region
+	// shrinks at the length where it starts checkpointing.
+	Inputs []ReportRange `json:"inputs"`
+}
+
+// ReportRange is the input lengths From to To, both included.
+type ReportRange struct {
+	From int64 `json:"from"`
+	To   int64 `json:"to"`
 }
 
 // ReportCeiling is one region whose size depends on the input: the most it
@@ -183,6 +203,7 @@ const (
 	findKindSuffix      = "suffix"
 	findKindUnswitched  = "unswitched"
 	findKindSpecialised = "specialised"
+	findKindAnchored    = "anchored"
 	findKindBacktrack   = "Backtracking"
 )
 
@@ -233,6 +254,11 @@ type setMemReport struct {
 	// bt are the Backtracking bodies one call of the set can run, each with
 	// its own fallback memo (a set member's lasts the host call).
 	bt []btBodyReport
+	// members, idSpace, overlapping and batch (the default batch buffer, in
+	// tuples, 0 without batch-find) size the buffers the set's exports take
+	// beside the input (setBufferTerms).
+	members, idSpace, batch int
+	overlapping             bool
 }
 
 // Exports records the export kinds the open pattern declares.
@@ -471,6 +497,11 @@ func (r *Reporter) noteCode(wasm []byte, owners codeOwners) {
 				set, _ = strconv.Unquote(o.name[i+len(" of set "):])
 			}
 		}
+		// An internal companion (`s\x00no-cache`, `\x00scan`, `\x00kept`,
+		// `\x00sparse`) is part of the set it serves.
+		if i := strings.IndexByte(set, 0); i >= 0 {
+			set = set[:i]
+		}
 		switch {
 		case set != "":
 			r.mod.setCode[set] += perMark[j]
@@ -531,10 +562,44 @@ type memTerm struct {
 	when    string
 	formula string
 	size    func(n int64) int64
+	// fixed: the size does not depend on the input. It counts against
+	// max_memory and is never named as growing.
+	fixed bool
+	// optional: a region a search does without when memory cannot grow for
+	// it — the answer cache, which the stubs and the component decline, and
+	// the drive walks with the same answers. It never bounds max_input;
+	// cacheFit says where it is used.
+	optional bool
+	// blocks: size is already in component allocation blocks (setBufferTerms).
+	blocks bool
 }
 
 // counts reports whether the term counts against max_memory in this module.
 func (t memTerm) counts(m moduleReport) bool { return t.module || m.standalone }
+
+// bytes is what the term takes for an input of n bytes. In a component a
+// caller-memory region is a cabi_realloc block: the power of two at least its
+// size plus the 8-byte header (componentBlock).
+func (t memTerm) bytes(n int64, m moduleReport) int64 {
+	if t.inBlock(m) {
+		return componentBlock(t.size(n))
+	}
+	return t.size(n)
+}
+
+// inBlock reports whether bytes rounds the term to a component block.
+func (t memTerm) inBlock(m moduleReport) bool { return m.component && !t.module && !t.blocks }
+
+// componentBlock is the cabi_realloc block an n-byte request takes: the
+// smallest power of two holding n plus the two header words, 16 at least
+// (buildComponentReallocBody: class = 32 - clz(n + 7)).
+func componentBlock(n int64) int64 {
+	b := int64(1) << minClassShift
+	for b < n+8 {
+		b <<= 1
+	}
+	return b
+}
 
 func perPos(bytes int) func(int64) int64 {
 	return func(n int64) int64 { return (n + 1) * int64(bytes) }
@@ -547,8 +612,17 @@ func perPos(bytes int) func(int64) int64 {
 // b.start.
 func btTerms(b btBodyReport) []memTerm {
 	var out []memTerm
-	depth := int64(max(b.alts, 1)) * int64(b.frame)
 	start := int64(b.start)
+	if b.alts == 0 && !b.force {
+		// No Alt: no frame is ever pushed (planBT), and the stack keeps the
+		// bytes it is given at entry.
+		return []memTerm{{
+			what: "Backtracking frame stack (" + b.body + ")", exports: b.exports, module: true, fixed: true,
+			when: "during a call", formula: fmt.Sprintf("%d B", start),
+			size: func(int64) int64 { return start },
+		}}
+	}
+	depth := int64(max(b.alts, 1)) * int64(b.frame)
 	if b.force {
 		start = int64(b.frame)
 	}
@@ -634,6 +708,7 @@ func setTerms(s setMemReport, m moduleReport) []memTerm {
 	if len(all) > 0 && m.standalone {
 		out = append(out, inputTerm(all))
 	}
+	out = append(out, setBufferTerms(s, m)...)
 	for k, b := range s.blocks {
 		out = append(out, searchTerms(b, find, fmt.Sprintf(" (block %d)", k))...)
 	}
@@ -641,7 +716,7 @@ func setTerms(s setMemReport, m moduleReport) []memTerm {
 		shape := *sh
 		bpb := shape.bytesPerByte()
 		out = append(out, memTerm{
-			what: "answer cache", exports: find, when: "once the overlapping find sweeps",
+			what: "answer cache", exports: find, when: "once the overlapping find sweeps", optional: true,
 			formula: fmt.Sprintf("about len × %d B up to 64 MiB, then a checkpointed region growing with the square root of len", bpb),
 			size: func(n int64) int64 {
 				b, _ := shape.Sizing(int(min(n, 1<<31-1)))
@@ -655,11 +730,85 @@ func setTerms(s setMemReport, m moduleReport) []memTerm {
 	return out
 }
 
+// setBufferTerms are the buffers a set's exports take beside the input, whose
+// size the input does not change: what the JS/TS stub reserves above it
+// (generate/js_stub.go: tuples, gate array, scratch descriptor, bitmap — the
+// batch entry's buffer at its default size), or in a component what the
+// adapters and the find resource allocate, each a cabi_realloc block of its
+// own. An embedded module's are the host's.
+func setBufferTerms(s setMemReport, m moduleReport) []memTerm {
+	if !m.standalone {
+		return nil
+	}
+	tuples := int64(12 * s.members)
+	gates := int64(4 * s.idSpace)
+	bitmap := int64(s.idSpace+7) / 8
+	var all, find []int64
+	if m.component {
+		words := int64(s.idSpace+31) / 32 * 4
+		all = []int64{areaSetAll, words}
+		find = []int64{repBytesBlocks, gates, tuples, areaSetAll}
+		if s.cache != nil {
+			find = append(find, config.SetOverlapCheckpointHeaderBytes)
+		}
+	} else {
+		region := gates + abi.FindScratchBytes + bitmap
+		all = []int64{tuples + region}
+		if s.overlapping {
+			region = (region + 7) &^ 7
+		}
+		out := tuples
+		if s.batch > 0 {
+			out = max(out, 12*int64(s.batch))
+		}
+		f := out + region
+		if s.cache != nil {
+			f += config.SetOverlapCheckpointHeaderBytes
+		}
+		find = []int64{f}
+	}
+	term := func(exports []string, allocs []int64) memTerm {
+		var sum int64
+		for _, a := range allocs {
+			if m.component {
+				a = componentBlock(a)
+			}
+			sum += a
+		}
+		formula := fmt.Sprintf("%d B", sum)
+		if m.component {
+			formula = fmt.Sprintf("%d B in %d blocks", sum, len(allocs))
+		}
+		return memTerm{
+			what: "set buffers", exports: exports, when: "every call", formula: formula,
+			fixed: true, blocks: true, size: func(int64) int64 { return sum },
+		}
+	}
+	var out []memTerm
+	var allExp []string
+	if s.match {
+		allExp = append(allExp, "match")
+	}
+	if s.scan {
+		allExp = append(allExp, "scan")
+	}
+	if len(allExp) > 0 {
+		out = append(out, term(allExp, all))
+	}
+	if s.find {
+		out = append(out, term([]string{"find"}, find))
+	}
+	return out
+}
+
 // grows names what of terms grows with the input, for the brief report.
 func grows(terms []memTerm) string {
 	var what []string
 	seen := map[string]bool{}
 	for _, t := range terms {
+		if t.fixed {
+			continue
+		}
 		w := t.what
 		if i := strings.Index(w, " ("); i >= 0 {
 			w = w[:i]
@@ -685,7 +834,10 @@ func ceilings(terms []memTerm, m moduleReport) []ReportCeiling {
 			whose = "module"
 		}
 		c := ReportCeiling{What: t.what, Exports: t.exports, Memory: whose, When: t.when, Formula: t.formula}
-		c.Bytes = ReportSizes{t.size(1 << 10), t.size(64 << 10), t.size(1 << 20), t.size(16 << 20)}
+		if t.inBlock(m) {
+			c.Formula += ", in a block of the power of two ≥ size + 8 B"
+		}
+		c.Bytes = ReportSizes{t.bytes(1<<10, m), t.bytes(64<<10, m), t.bytes(1<<20, m), t.bytes(16<<20, m)}
 		out = append(out, c)
 	}
 	return out
@@ -695,35 +847,40 @@ func ceilings(terms []memTerm, m moduleReport) []ReportCeiling {
 // an i32 offset.
 const maxInputSearchCap = int64(1)<<31 - 1
 
-// maxInputs is, per export, the longest input whose ceilings — each rounded
-// up to whole pages, plus the module's static memory and one page — fit
-// under max_memory; -1 when no input reaches it (nothing that counts grows),
-// and nil when max_memory is unset.
+// exportTotal is the memory export e takes for an input of n bytes: each
+// region that counts rounded up to whole pages — memory grows by pages, and
+// each is placed and grown on its own — plus the module's static memory and
+// one page for the per-search block a search takes. An optional region is
+// left out.
+func exportTotal(e string, terms []memTerm, m moduleReport) func(n int64) int64 {
+	var mine []memTerm
+	for _, t := range terms {
+		if t.counts(m) && !t.optional && contains(t.exports, e) {
+			mine = append(mine, t)
+		}
+	}
+	return func(n int64) int64 {
+		sum := m.staticBytes
+		if len(mine) > 0 {
+			sum += 65536
+		}
+		for _, t := range mine {
+			sum += utils.PageAlign(t.bytes(n, m))
+		}
+		return sum
+	}
+}
+
+// maxInputs is, per export, the longest input whose ceilings fit under
+// max_memory (exportTotal); -1 when no input reaches it (nothing that counts
+// grows), and nil when max_memory is unset.
 func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int64 {
 	if m.maxMemory == 0 || len(exports) == 0 {
 		return nil
 	}
 	out := map[string]int64{}
 	for _, e := range exports {
-		var mine []memTerm
-		for _, t := range terms {
-			if t.counts(m) && contains(t.exports, e) {
-				mine = append(mine, t)
-			}
-		}
-		// Each region is rounded up to whole pages — memory grows by pages,
-		// and each is placed and grown on its own — plus one page for the
-		// per-search block a search takes.
-		total := func(n int64) int64 {
-			sum := m.staticBytes
-			if len(mine) > 0 {
-				sum += 65536
-			}
-			for _, t := range mine {
-				sum += utils.PageAlign(t.size(n))
-			}
-			return sum
-		}
+		total := exportTotal(e, terms, m)
 		switch {
 		case total(0) > m.maxMemory:
 			out[e] = 0
@@ -741,6 +898,67 @@ func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int
 			}
 			out[e] = lo
 		}
+	}
+	return out
+}
+
+// cacheFit is where under max_memory the find of a set with an answer cache
+// has room for it: the input lengths whose find, cache included, fits.
+//
+// Not a search for one bound: the cache's region is not monotone in the input
+// — it shrinks to the square root at the length where single-block mode ends
+// (6 cells, 2 patterns: 66,000,092 B at 5.5 MB, 87,076 B at 5.6 MB). Each
+// stretch over which Sizing keeps one formula (sizingRegime) grows with the
+// input, so within it what fits is a prefix, found by bisection — up to the
+// formula's own rounding, a few bytes of stride.
+func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCacheFit {
+	if m.maxMemory == 0 {
+		return nil
+	}
+	base := exportTotal("find", terms, m)
+	cache := memTerm{size: func(n int64) int64 { b, _ := sh.Sizing(int(n)); return int64(b) }}
+	fits := func(n int64) bool {
+		return base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory
+	}
+	regime := func(n int64) int { return sh.sizingRegime(int(n)) }
+	out := &ReportCacheFit{Inputs: []ReportRange{}}
+	for from := int64(0); from <= maxInputSearchCap; {
+		// The stretch [from, to] keeps from's regime; each switch it counts
+		// flips once, so the first length past from that differs ends it.
+		to := maxInputSearchCap
+		if r := regime(from); regime(to) != r {
+			lo, hi := from, to // regime(lo) == r, regime(hi) != r
+			for hi-lo > 1 {
+				mid := lo + (hi-lo)/2
+				if regime(mid) == r {
+					lo = mid
+				} else {
+					hi = mid
+				}
+			}
+			to = lo
+		}
+		if fits(from) {
+			last := to
+			if !fits(to) {
+				lo, hi := from, to // fits(lo), !fits(hi)
+				for hi-lo > 1 {
+					mid := lo + (hi-lo)/2
+					if fits(mid) {
+						lo = mid
+					} else {
+						hi = mid
+					}
+				}
+				last = lo
+			}
+			if k := len(out.Inputs); k > 0 && out.Inputs[k-1].To+1 == from {
+				out.Inputs[k-1].To = last
+			} else {
+				out.Inputs = append(out.Inputs, ReportRange{From: from, To: last})
+			}
+		}
+		from = to + 1
 	}
 	return out
 }
@@ -864,6 +1082,9 @@ func buildSetReport(d *SetDiag, sm setMemReport, m moduleReport, full bool) Repo
 		}
 	}
 	out.MaxInput = maxInputs(exports, terms, m)
+	if sm.find && sm.cache != nil {
+		out.AnswerCache = cacheFit(*sm.cache, terms, m)
+	}
 	return out
 }
 
@@ -1163,6 +1384,30 @@ func writeSetFull(w io.Writer, s ReportSet) {
 		fmt.Fprintf(w, "  sparse counter's split copy serves: %s\n", memberSearches(d.SparseSplitMembers, nil))
 	}
 	writeMemory(w, "  ", s.Memory, s.Ceilings, s.MaxInput)
+	if c := s.AnswerCache; c != nil {
+		fmt.Fprintf(w, "    answer cache under max_memory: %s\n", cacheFitText(c.Inputs))
+	}
+}
+
+// cacheFitText renders the input lengths an answer cache fits for; outside
+// them the find walks.
+func cacheFitText(rs []ReportRange) string {
+	if len(rs) == 0 {
+		return "never — the find walks at every length"
+	}
+	if len(rs) == 1 && rs[0].From == 0 && rs[0].To >= maxInputSearchCap {
+		return "every length"
+	}
+	parts := make([]string, len(rs))
+	for i, r := range rs {
+		switch {
+		case r.To >= maxInputSearchCap:
+			parts[i] = humanBytes(r.From) + " and longer"
+		default:
+			parts[i] = humanBytes(r.From) + " – " + humanBytes(r.To)
+		}
+	}
+	return "inputs of " + strings.Join(parts, ", ") + "; the find walks at other lengths"
 }
 
 func wideNote(wide bool) string {
@@ -1201,21 +1446,36 @@ func (r *Reporter) noteSet(sc config.SetConfig, cs *compiledSet, members int) {
 	}
 	r.mod.inSet += members
 	sm := setMemReport{
-		name:  sc.Name,
-		find:  cs.find != "",
-		scan:  cs.scanAny != "" || cs.scanAll != "",
-		match: cs.matchAny != "" || cs.matchAll != "",
+		name: sc.Name,
+		find: cs.find != "",
+		// A scan pair the set forwards to its scan copy (scanSplitOnly) is
+		// still the set's.
+		scan:        cs.scanAny != "" || cs.scanAll != "" || cs.fwdScanAny != "" || cs.fwdScanAll != "",
+		match:       cs.matchAny != "" || cs.matchAll != "",
+		members:     members,
+		idSpace:     cs.idSpaceSize(),
+		overlapping: cs.overlapping,
+	}
+	if cs.batchFind {
+		sm.batch = config.SetDefaultBatchCap(members)
 	}
 	sm.blocks = cs.searchBlocks()
 	if sh := overlapShapeOf(cs); sh.bytesPerByte() > 0 {
 		sm.cache = &sh
 	}
-	var walk []string
-	if sm.scan {
-		walk = append(walk, "scan")
-	}
-	if sm.find {
-		walk = append(walk, "find")
+	// families are the capability families that reach a compiled set's own
+	// bodies: its own exports, and for a companion the exports that forward
+	// to it — a scan copy serves the scan pair alone, the no-cache, kept and
+	// sparse companions `find` alone.
+	families := func(c *compiledSet) []string {
+		var walk []string
+		if c.scanAny != "" || c.scanAll != "" {
+			walk = append(walk, "scan")
+		}
+		if c.find != "" {
+			walk = append(walk, "find")
+		}
+		return walk
 	}
 	seen := map[*compiledSet]bool{}
 	var visit func(c *compiledSet)
@@ -1224,6 +1484,7 @@ func (r *Reporter) noteSet(sc config.SetConfig, cs *compiledSet, members int) {
 			return
 		}
 		seen[c] = true
+		walk := families(c)
 		for _, b := range c.buckets {
 			if b.btFallback != nil {
 				bt := b.btFallback.bt

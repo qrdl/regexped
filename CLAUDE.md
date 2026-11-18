@@ -676,8 +676,16 @@ regexped/
 │   │                          #   memo, answer cache (OverlapCacheShape.Sizing), input copy — as a
 │   │                          #   formula and at 1 KiB/64 KiB/1 MiB/16 MiB, and with max_memory the
 │   │                          #   largest input that fits per export (a binary search over the
-│   │                          #   same sums). JSON `schema` is bumped only on a breaking change;
-│   │                          #   TestReportSchemaFields pins the field set
+│   │                          #   same sums). FIXED terms count but are not "growing": a no-Alt
+│   │                          #   Backtracking body's stack (it pushes no frame), a set's buffers
+│   │                          #   (setBufferTerms: tuples, gates, descriptor, bitmap — the JS/TS
+│   │                          #   stub's or the component's). In a component a caller region is a
+│   │                          #   cabi_realloc block (componentBlock: pow2 ≥ size + 8). The answer
+│   │                          #   cache is OPTIONAL — refused, the find walks — so it is not in
+│   │                          #   max_input; cacheFit gives the input ranges it fits, by regime
+│   │                          #   (sizingRegime), since its size drops where it checkpoints.
+│   │                          #   A set's code counts its \x00 companions. JSON `schema` is bumped
+│   │                          #   only on a breaking change; TestReportSchemaFields pins the field set
 │   ├── whole_capture.go       # Single-capture shortcuts: group 1 is group 0, or group 0
 │   │                          #   less a plain literal prefix/suffix (`([^,]+),`, `<([^>]*)>`)
 │   └── wasm.go                # WASM binary encoding primitives

@@ -986,8 +986,11 @@ The search kinds: `linear` (the per-position find, proved linear), `switch`
 or `→ Backtracking` when it trips), `start-anywhere` (one forward and one
 backward pass), `suffix` (one backward pass from the end), `unswitched` (the
 per-position find with no counter — the switch could not be built),
-`specialised` (a literal-chain body or an Aho-Corasick walk), `Backtracking`
-(the DFA was over the limits). The scan kinds name the prefilter: `SIMD
+`specialised` (a literal-chain body or an Aho-Corasick walk), `anchored`
+(a `groups` with no `find` whose pattern can only match at 0: the capture body
+runs there once), `Backtracking` (the DFA find was refused — over the limits,
+an ambiguous word-boundary target, or more cycle states than per-search notes
+cover; `full` says which). The scan kinds name the prefilter: `SIMD
 literal`, `SIMD pair probe`, `Teddy`, `SIMD first bytes`, `Aho-Corasick`,
 `one forward pass`, `anchored at 0`, … — and `none` when the search tries every
 position.
@@ -1051,13 +1054,28 @@ sizing the stubs use; nothing is measured. A Backtracking frame stack's
 ceiling is, per position, one frame for each alternation the longest path
 through the program without consuming a byte passes, doubled for the way the
 stack grows; real inputs usually stay well below it (`(?:(a)|(a?b))*?c` over
-64 KiB of `a`: 2.3 MB taken, 12.8 MB the sum of its ceilings).
+64 KiB of `a`: 2.3 MB taken, 12.8 MB the sum of its ceilings). A Backtracking
+program with no alternation pushes no frame, so its stack keeps the bytes it
+is given at entry: a fixed size, listed but not counted as growing. A set's
+`set buffers` — the tuples, gate array, scratch descriptor and bitmap a
+standalone stub or a component reserves beside the input, the batch buffer at
+its default size — are fixed too. In a component every `caller` region is a
+`cabi_realloc` block, the power of two at least its size plus 8 bytes, and its
+values are given as such.
 
 When `max_memory` is set, each export also gets the **largest input that fits
 under it**: the module's static memory, every ceiling that counts for that
 export rounded up to whole pages, and one page for a search's block, summed. An input of that length can never
 need more than the cap; `unlimited` (`-1` in JSON) means nothing that counts
 grows with the input.
+
+The overlapping answer cache is NOT part of it: when memory cannot grow for the
+cache the find walks instead, with the same answers, slower. A set with one
+gets `answer cache under max_memory` (`answer_cache.inputs` in JSON, ranges of
+input lengths, `from` and `to` included) — where the cache fits beside
+everything else. It can be more than one range, since the cache's region
+shrinks to the square root of the input where it starts checkpointing: with a
+6-cell column and 2 patterns it is 66 MB at 5.5 MB of input and 87 KB at 5.6 MB.
 
 **JSON.** `--verbose-format=json` writes the same information as one object:
 
@@ -1075,8 +1093,8 @@ grows with the input.
 At `full`, `module` is added and each pattern and set gains its remaining
 fields — a set every field of its composition (`buckets`, `union_scan`,
 `split_members`, …) — and `memory_ceilings` (`what`, `exports`, `memory`,
-`when`, `formula`, and `bytes` keyed `1KiB`, `64KiB`, `1MiB`, `16MiB`) and
-`max_input` (bytes per export). A brief report is the full one with those
+`when`, `formula`, and `bytes` keyed `1KiB`, `64KiB`, `1MiB`, `16MiB`),
+`max_input` (bytes per export) and a set's `answer_cache`. A brief report is the full one with those
 fields left out, so a script written against `brief` works on `full`.
 
 `schema` is the structure's version. It changes only on a BREAKING change — a

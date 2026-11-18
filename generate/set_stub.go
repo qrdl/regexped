@@ -211,14 +211,7 @@ func cursorMaxCount(s config.SetConfig, cfg config.BuildConfig) int64 {
 // It is never below one position's worst case, so a single call always makes
 // progress even on a set whose every pattern matches at one spot.
 func defaultBatchCap(s config.SetConfig, cfg config.BuildConfig) int {
-	n := patternsInSet(s, cfg)
-	if n < 256 {
-		n = 256
-	}
-	if max := int(cursorMaxCount(s, cfg)); n > max {
-		n = max
-	}
-	return n
+	return config.SetDefaultBatchCap(patternsInSet(s, cfg))
 }
 
 // setInlineByteLimit is the byte budget for arrays a generated iterator holds

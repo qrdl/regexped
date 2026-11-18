@@ -86,6 +86,20 @@ func TestRunErrors(t *testing.T) {
 	if err := Run(gen, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("a groups_func with no capture group passed")
 	}
+	// What was decided before a compile error is reported, as compile reports
+	// it, for a module and for a component.
+	for _, format := range []string{"", "wasm_format: component\n"} {
+		refused := load(t, format+"import_module: m\nmax_bt_instructions: 2\npatterns:\n"+
+			"  - {regexp: 'abc', find_func: ok}\n  - {regexp: '(\\b|0*)0', find_func: f}\n")
+		var b bytes.Buffer
+		if err := Run(refused, &b, compile.VerboseBrief, compile.VerbosePlain); err == nil ||
+			!strings.Contains(err.Error(), "max_bt_instructions") {
+			t.Errorf("%q: err = %v", format, err)
+		}
+		if !strings.Contains(b.String(), "abc") || !strings.Contains(b.String(), "(\\b|0*)0") {
+			t.Errorf("%q: no partial report:\n%s", format, b.String())
+		}
+	}
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
 	ok := config.BuildConfig{ImportModule: "m", StubFile: "s.h", Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
 	if err := Run(ok, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
