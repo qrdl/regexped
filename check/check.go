@@ -4,8 +4,8 @@
 // The config is compiled in memory — the module `compile` would write, or a
 // component's core module and its WIT, which needs no wasm-tools — and the
 // stub, when the config names one, is generated into a temporary directory
-// removed afterwards, so the generator's own checks run too. What is printed
-// is one line per pattern and per set, then a line saying what was checked.
+// removed afterwards, so the generator's own checks run too. It answers by its
+// error alone; given a writer, it writes the --verbose report compile would.
 package check
 
 import (
@@ -24,58 +24,49 @@ import (
 // its type and no file.
 var stubExt = map[string]string{"rust": ".rs", "go": ".go", "js": ".js", "ts": ".ts", "c": ".h", "as": ".ts", "wit": ".wit"}
 
-// Run checks cfg and writes its summary to w.
-func Run(cfg config.BuildConfig, w io.Writer) error {
+// Run checks cfg; when w is non-nil it writes the report to w at level, in
+// format.
+func Run(cfg config.BuildConfig, w io.Writer, level compile.VerboseLevel, format compile.VerboseFormat) error {
 	rep := &compile.Reporter{Progress: os.Stderr}
-	kind := "module"
-	var size int
+	var err error
 	if cfg.Component() {
-		kind = "component core module"
-		core, _, err := component.Core(cfg, rep)
-		if err != nil {
-			return err
-		}
-		size = len(core)
+		_, _, err = component.Core(cfg, rep)
 	} else {
-		b, err := compile.CompileModule(cfg, rep)
-		if err != nil {
-			return err
-		}
-		size = len(b)
+		_, err = compile.CompileModule(cfg, rep)
+	}
+	if err != nil {
+		// What was decided before the error — a refused pattern's mode among
+		// it — is reported as `compile` reports it; the compile error wins.
+		_ = rep.Write(w, level, format)
+		return err
 	}
 	compile.WarnUnboundedMemory(cfg, rep)
-	stub := ""
-	if cfg.StubFile != "" || cfg.StubType != "" {
-		typ, err := generate.ResolveStubType(cfg)
-		if err != nil {
-			return err
-		}
-		dir, err := os.MkdirTemp("", "regexped-check-")
-		if err != nil {
-			return fmt.Errorf("check: %w", err)
-		}
-		defer os.RemoveAll(dir)
-		name := filepath.Base(cfg.StubFile)
-		if cfg.StubFile == "" {
-			name = "stub" + stubExt[typ]
-		}
-		if err := generate.CmdGenerateStub(cfg, filepath.Join(dir, name)); err != nil {
-			return err
-		}
-		stub = ", " + typ + " stub"
+	if err := checkStub(cfg); err != nil {
+		// The compile succeeded, so its report is whole; the stub's error wins.
+		_ = rep.Write(w, level, format)
+		return err
 	}
-	members := map[string]int{}
-	for _, s := range cfg.Sets {
-		members[s.Name] = len(s.Members(cfg))
-	}
-	rep.Summary(w, members)
-	fmt.Fprintf(w, "ok: %s, %s; %s %d bytes%s; nothing written\n", count(len(cfg.Patterns), "pattern"), count(len(cfg.Sets), "set"), kind, size, stub)
-	return nil
+	return rep.Write(w, level, format)
 }
 
-func count(n int, what string) string {
-	if n == 1 {
-		return "1 " + what
+// checkStub generates the stub the config names, if any, into a temporary
+// directory removed afterwards.
+func checkStub(cfg config.BuildConfig) error {
+	if cfg.StubFile == "" && cfg.StubType == "" {
+		return nil
 	}
-	return fmt.Sprintf("%d %ss", n, what)
+	typ, err := generate.ResolveStubType(cfg)
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "regexped-check-")
+	if err != nil {
+		return fmt.Errorf("check: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	name := filepath.Base(cfg.StubFile)
+	if cfg.StubFile == "" {
+		name = "stub" + stubExt[typ]
+	}
+	return generate.CmdGenerateStub(cfg, filepath.Join(dir, name))
 }

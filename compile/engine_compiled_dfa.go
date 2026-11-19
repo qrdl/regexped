@@ -346,8 +346,9 @@ func buildHybridAnchoredFindBody(t *dfaTable, l *dfaLayout, tableMemIdx int) []b
 // exists to hand off to (false for the twin itself, which never hands off) and
 // an explicit lnmAction5, so the twin can be built from the SAME layout with
 // the hint un-forced. Ordinary callers pass (false, l.lnmAction5).
-func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin, lnm bool, nc *notesCtx) ([]byte, findFromMode, int) {
+func buildHybridFindBody(t *dfaTable, l *dfaLayout, mandatoryLit *mandatoryLit, tableMemIdx int, hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int) {
 	return buildFindBody(findBodyParams{
+		report:                report,
 		notes:                 nc,
 		startState:            l.wasmStart,
 		midStartState:         l.wasmMidStart,

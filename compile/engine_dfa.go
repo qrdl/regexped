@@ -5,6 +5,7 @@ import (
 	"github.com/qrdl/regexped/internal/abi"
 	"regexp/syntax"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -6892,12 +6893,15 @@ func buildFindCodeEntryInner(l *dfaLayout, t *dfaTable, mandatoryLit *mandatoryL
 	// the wrapper answers -1 without calling the body at all. The claim is
 	// made here, where the predicate is actually evaluated.
 	var build func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int)
+	if isAnchoredFind(t) {
+		l.report.scan("anchored at 0", "anchored find: a match can only start at the input's start")
+	}
 	if l.useHybridDispatch {
 		if isAnchoredFind(t) {
 			body, e.mode = buildHybridAnchoredFindBody(t, l, tableMemIdx), ffAnchoredZeroOnly
 		} else {
-			build = func(hasTwin, lnm bool, nc *notesCtx, _ *Reporter) ([]byte, findFromMode, int) {
-				return buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, lnm, nc)
+			build = func(hasTwin, lnm bool, nc *notesCtx, report *Reporter) ([]byte, findFromMode, int) {
+				return buildHybridFindBody(t, l, mandatoryLit, tableMemIdx, hasTwin, lnm, nc, report)
 			}
 		}
 	} else if isAnchoredFind(t) {
@@ -10339,6 +10343,7 @@ func buildLitAnchorFindBody(t *dfaTable, l *dfaLayout, p *compiledPattern, revFu
 			OnMatch: nil,
 		}
 	}
+	simdParams.Report, simdParams.ReportPattern = p.report, p.reportIdx+1
 	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Scalar literal verification (multi-literal / Teddy only) ─────────────
@@ -11152,6 +11157,7 @@ func buildAltLitAnchorFindBody(p *compiledPattern, branchFuncIdxs []altLitAnchor
 		},
 		OnMatch: nil,
 	}
+	simdParams.Report, simdParams.ReportPattern = p.report, p.reportIdx+1
 	b, _ = emitPrefixScan(b, simdParams)
 
 	// ── Per-branch verify chain ─────────────────────────────────────────────
@@ -12490,9 +12496,11 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 			// Only the scan is capped: a hit is where the literal STARTS, so
 			// minOff/maxOff, which locate that start, stay the whole
 			// literal's, and the automaton verifies the rest.
-			Prefix:      scanPrefixCap(mandatoryLit.bytes, p.utf8Text),
-			UTF8Text:    p.utf8Text,
-			EngineDepth: 2, // loop $lit_outer + block $no_match
+			Report:          p.report,
+			ReportMandatory: true,
+			Prefix:          scanPrefixCap(mandatoryLit.bytes, p.utf8Text),
+			UTF8Text:        p.utf8Text,
+			EngineDepth:     2, // loop $lit_outer + block $no_match
 			// MinPatternLen NOT set: scanStartLocal is a mandatory-lit scan
 			// cursor (not attempt_start), so the tightened check would use
 			// the wrong operand. The follow-up fires only via
@@ -12822,6 +12830,8 @@ func buildFindBody(p findBodyParams) ([]byte, findFromMode, int) {
 
 // litChainPattern is the structural shape recognised by analyseLitChain.
 type litChainPattern struct {
+	// report receives the scan strategy its find bodies choose (report.go).
+	report   *Reporter
 	literal  []byte   // K-byte literal prefix (K >= 1)
 	tlo      [16]byte // nibble table: bit h of Tlo[l] set iff byte (h<<4|l) ∈ class
 	count    int      // N — minimum chain length (N >= 1, K+N >= 16)
@@ -12956,6 +12966,8 @@ type litChainAltBranch struct {
 // analyseLitChainAlt. All branches qualify under analyseLitChainBranch; the
 // per-branch useSIMD bit selects the verify kernel for each branch.
 type litChainAltPattern struct {
+	// report receives the scan strategy its find bodies choose (report.go).
+	report   *Reporter
 	branches []litChainAltBranch
 }
 
@@ -14463,6 +14475,7 @@ func buildLitChainPrefixedFindBody(lcp *litChainPattern, tableMemIdx int) ([]byt
 		},
 		OnMatch: nil,
 	}
+	scan.Report = lcp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds A AND the find-from floor: attempt_start < find_from + M →
@@ -15792,6 +15805,7 @@ func buildLitChainFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, findF
 		},
 		OnMatch: nil,
 	}
+	scan.Report = lcp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds check: attempt_start + K + N > len → $no_match.
@@ -15915,6 +15929,7 @@ func buildLitChainFindGroupsBody(lcp *litChainPattern, lcc *litChainCaptures, ta
 		},
 		OnMatch: nil,
 	}
+	scan.Report = lcp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + N > len → $no_match.
@@ -16048,6 +16063,7 @@ func buildLitChainRangeFindGroupsBody(lcp *litChainPattern, lcc *litChainCapture
 		},
 		OnMatch: nil,
 	}
+	scan.Report = lcp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
@@ -16376,6 +16392,7 @@ func buildLitChainRangeFindBody(lcp *litChainPattern, tableMemIdx int) ([]byte, 
 		},
 		OnMatch: nil,
 	}
+	scan.Report = lcp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// Bounds: attempt_start + K + countMin > len → $no_match.
@@ -16840,6 +16857,7 @@ func buildLitChainAltFindBody(altp *litChainAltPattern, l litChainAltLayout, tab
 		},
 		OnMatch: nil,
 	}
+	scan.Report = altp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	// attempt_start = candidate position. Try each branch in turn.
@@ -16952,6 +16970,7 @@ func buildLitChainAltFindGroupsBody(altp *litChainAltPattern, branchCaps []*litC
 		},
 		OnMatch: nil,
 	}
+	scan.Report = altp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
@@ -17064,6 +17083,7 @@ func buildLitChainAltPrefixedFindBody(altp *litChainAltPattern, l litChainAltLay
 		},
 		OnMatch: nil,
 	}
+	scan.Report = altp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
@@ -17174,6 +17194,7 @@ func buildLitChainAltRangeFindBody(altp *litChainAltPattern, l litChainAltLayout
 		},
 		OnMatch: nil,
 	}
+	scan.Report = altp.report
 	b, _ = emitPrefixScan(b, scan)
 
 	locals := litChainBranchLocals{
@@ -17258,6 +17279,8 @@ type lenAltBranch struct {
 // At least one branch is a DFA branch — otherwise analyseLitChainAlt (strict)
 // would already have matched and lenient should not engage.
 type lenAltPattern struct {
+	// report receives the scan strategy its find body chooses (report.go).
+	report   *Reporter
 	branches []lenAltBranch
 	// unicode: the pattern is in Unicode mode, so the anchored match's
 	// branch walks take the skip over whole characters too.
@@ -17885,6 +17908,7 @@ func buildLitChainAltLenientFindBody(altp *lenAltPattern, l lenAltLayout, tableM
 	// mask = per-lane bitmask of candidate bytes in this chunk (bit k set ⇔
 	// chunk byte k is in firstByteSet). Tables inlined as v128.const —
 	// nothing to pre-load per call, unlike the old Teddy-locals approach.
+	altp.report.scan("SIMD first bytes", "prefix scan: Shufti over the branches' first bytes, each candidate verified per branch ("+strconv.Itoa(len(firstByteSet))+" bytes)")
 	b = emitShuftiPrefixCheck(b, firstByteSet, locChunk)
 	b = append(b, 0x21, locMask)
 

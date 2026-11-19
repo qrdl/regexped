@@ -651,8 +651,11 @@ whether or not a cache is in play. A second `<find>_free` is a no-op.
 With the allocator, the scanner holds the cache's 48-byte header alone — inside
 the struct, `cache_hdr` — until the drive asks for the region, at the call
 where it would sweep, which most drives never reach. `<find>` then `malloc`s it;
-a `malloc` that returns `NULL` leaves the scan walking, with the same answers,
-slower. A buffer handed over with `<find>_set_cache` is whole from the start.
+when a split member's program sweep part makes the region too large and that
+`malloc` returns `NULL`, it retries with the cache's part alone (the split
+member then searches on its own), and a `malloc` that returns `NULL` for that
+too leaves the scan walking, with the same answers, slower. A buffer handed
+over with `<find>_set_cache` is whole from the start.
 
 ### The overlapping answer cache's header
 

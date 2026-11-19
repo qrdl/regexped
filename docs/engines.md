@@ -334,10 +334,10 @@ literal and no `(?m:^)` or `(?m:$)` after it (unless the part before it is
 line-scoped, as above),
 and the split keeps match-start order — a hint can name a literal the part
 before it can also hold. A one-byte hint is not taken; where the one-byte rule
-above already anchors the find on that byte, `--verbose` reports it taken,
+above already anchors the find on that byte, `--verbose=full` reports it taken,
 since the find scans for it. Otherwise the find splits where it would without the
 hint, and the module is the one an unhinted config compiles to. `compile
---verbose` says which: `anchor literal "/api/v1/": taken — the literal-anchored
+--verbose=full` says which: `anchor literal "/api/v1/": taken — the literal-anchored
 find scans for it`, or `not taken — …` with the guard that refused it. On that
 pattern the hint costs −53.3% fuel on input with no `/api/v1/` URL and +7.8%
 on a drive over 28 matches — each hit walks back over the host
@@ -422,7 +422,7 @@ pattern whose DFA is too large gets, whose fallback body memoises every
 (instruction, position) it tries, so it is linear per call too — slower, up to
 236 instructions per byte on the one such corpus shape's worst-case run. The
 start-anywhere find's two automata add their tables to the module, as any DFA's
-do. `--verbose` reports the choice and the reason for every pattern
+do. `--verbose=full` reports the choice and the reason for every pattern
 (`find: switch — not provably linear`, and `switch handover: Backtracking` with
 its reason).
 
@@ -501,7 +501,7 @@ Capture slot values are reconstructed from registers at match acceptance time. T
 
 **TDFA eligibility:** TDFA is used when the pattern has no non-greedy quantifiers, no `(?m)` line anchors and no end-of-text `$`/`\z` (a beginning-of-text `^` is fine), no word boundaries, and no ambiguous alternations — see [Engine Selection](#engine-selection) above for what "ambiguous" actually excludes (it's narrower than "any alternation with overlapping branches"). Patterns that fail any of these checks use the Backtracking engine instead.
 
-**Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), no capture engine runs: the single group's bounds are just the match's own start/end, so the module carries the find and a trivial capture body, and no tag ops or capture-tracking NFA pass at all. `--verbose` reports the find's engine and "one capture, the whole match (no capture pass)".
+**Whole-match single-capture shortcut:** when a pattern's only capture group spans the entire match (e.g. `(foo.*bar)`), no capture engine runs: the single group's bounds are just the match's own start/end, so the module carries the find and a trivial capture body, and no tag ops or capture-tracking NFA pass at all. `--verbose=full` reports the find's engine and "one capture, the whole match (no capture pass)".
 
 **Literal-affix single-capture shortcut:** the same holds when the only capture group is wrapped in plain literals — a literal before it, after it, or both, and nothing else (`([^,]+),`, `<([^>]*)>`, `key=(\w+)`). The literals have a fixed byte length, so group 1 is the match's start plus the prefix's length to its end minus the suffix's length, and the capture pass is skipped. A case-folded literal does not qualify: under `(?i)` a folded character can be a different number of bytes than the one written. In Unicode mode the lengths are the literals' UTF-8 lengths. This matters most where the find pass is cheap and the capture pass is not: over a 487-byte mostly non-ASCII field, `([^,]+),` costs 16,243 fuel against 75,182 with the capture pass.
 
@@ -946,7 +946,7 @@ characters `0x80`-`0xFF` mean raw bytes, and a Unicode class or a character
 above U+00FF stays a compile error. Every other pattern stays in byte mode,
 so no pattern that compiles today changes meaning. Because the trigger is in
 the pattern, `.` means a byte in `a.c` and a character in `a.c\pL`;
-`compile --verbose` and `--diag-json` report each pattern's mode.
+`compile --verbose=full` reports each pattern's and set's mode.
 
 **What changes in Unicode mode.** The input is read as UTF-8. (The ASCII
 examples below need `unicode: true` to be in Unicode mode at all.)
@@ -1006,7 +1006,7 @@ Unicode mode takes the same `max_dfa_states` for its members and buckets, and
 defaults to `max_union_states: 16384` for the automata that scan or match all
 its members in one pass (byte mode: 4,096) and to `max_split_table_size: 64MB`
 for its split members' tables (byte mode: 4 MB). The other limits are
-unchanged; `compile --verbose` names each one a pattern hits and
+unchanged; `compile --verbose=full` names each one a pattern hits and
 the working memory per input byte its search keeps.
 
 **Fast paths that stay ASCII.** Three analysers that speed up a repeated class
@@ -1106,7 +1106,7 @@ long word 31.01 → 5.75, over Russian prose 38.58 → 25.57; `[а-яё]+` 32.66
 Not every find body runs these skips. A literal-anchored find over a 16-bit
 table (`\pL{3,}1`, 39.8 fuel/byte over a Cyrillic run) and the start-anywhere
 find of `(?m:\pL+$)` (53.6) walk the run, against 4.3 for their match bodies;
-`--verbose` reports a skip only where a body emits one.
+`--verbose=full` reports a skip only where a body emits one.
 
 A Unicode find over a 16-bit table skips a run of ASCII letters in an
 accepting state (`\pL+` after `#`, `name=` or `привет\s+`), but that state's

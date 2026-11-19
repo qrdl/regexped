@@ -1985,6 +1985,106 @@ func TestComponentCacheGeometryMatchesConfig(t *testing.T) {
 	}
 }
 
+// TestComponentKeepsTheSweepPartUnderEachBudget: a set whose split member
+// gets a program sweep reserves the cache's part and the sweep's when EACH is
+// within the budget, as every stub does — not only when their sum is. At 6 MB
+// of input the two are each under 64 MiB and together over it, and without the
+// sweep's part the member's drive was quadratic.
+func TestComponentKeepsTheSweepPartUnderEachBudget(t *testing.T) {
+	const src = `wasm_format: component
+import_module: t
+wit_package: t
+patterns:
+  - regexp: 'foo\w+'
+  - regexp: 'a[a-z]*?z'
+sets:
+  - name: s
+    patterns: all
+    overlapping: true
+    find: scan_it
+`
+	var cfg config.BuildConfig
+	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil || !sh.Eligible || sh.SweepCells == 0 {
+		t.Fatalf("shape = %+v, %v: this set must get a cache and a program sweep", sh, err)
+	}
+	h := newSetHarness(t, src)
+	for _, n := range []int{1000, 6_000_000} {
+		cache := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+		sweep, _ := config.SetOverlapCheckpointSizingRow(n, sh.SweepCells, sh.SweepRow)
+		if n > 1000 && (cache > config.SetOverlapCacheMaxBytes || sweep > config.SetOverlapCacheMaxBytes ||
+			(cache+7)&^7+sweep <= config.SetOverlapCacheMaxBytes) {
+			t.Fatalf("len %d: cache %d, sweep %d: not each under the budget and together over it", n, cache, sweep)
+		}
+		p, l := h.writeInput(strings.Repeat("a", n-1) + "z")
+		sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
+		if want, _ := sh.Sizing(int(l)); int(h.u32(sc+28)) != want {
+			t.Errorf("len %d: region is %d bytes, Sizing computes %d (cache part %d)", l, h.u32(sc+28), want, cache)
+		}
+		h.call(h.pkg+"#[dtor]scan-it", sc)
+	}
+}
+
+// TestComponentCacheOnlyWhenTheWholeRegionIsRefused: under a cap the whole
+// region cannot fit beside the input, `next` reserves the cache's own part
+// instead of declining the cache — 72,000,160 bytes take a 128 MiB block, the
+// 48,000,088-byte cache part a 64 MiB one — and the drive answers as before.
+func TestComponentCacheOnlyWhenTheWholeRegionIsRefused(t *testing.T) {
+	const src = `wasm_format: component
+import_module: t
+wit_package: t
+max_memory: 128MiB
+patterns:
+  - regexp: 'foo\w+'
+  - regexp: 'a[a-z]*?z'
+sets:
+  - name: s
+    patterns: all
+    overlapping: true
+    find: scan_it
+`
+	var cfg config.BuildConfig
+	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := compile.SetOverlapCacheShape(cfg.Sets[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 6_000_000
+	whole, _ := sh.Sizing(n)
+	only := config.SetOverlapCheckpointBytes(n, sh.Cells, sh.Patterns)
+	if whole == only {
+		t.Fatalf("shape %+v: no program sweep part at %d bytes", sh, n)
+	}
+	h := newSetHarness(t, src)
+	p, l := h.writeInput(strings.Repeat("a", n-1) + "z")
+	sc := h.call(h.pkg+"#[constructor]scan-it", p, l, int32(0))
+	defer h.call(h.pkg+"#[dtor]scan-it", sc)
+	if int(h.u32(sc+28)) != whole || int(h.u32(sc+32)) != only {
+		t.Fatalf("region %d (want %d), cache part %d (want %d)", h.u32(sc+28), whole, h.u32(sc+32), only)
+	}
+	granted := false
+	for i := 0; i < 64 && !granted; i++ {
+		got, _ := h.matches(h.call(h.pkg+"#[method]scan-it.next", sc))
+		if len(got) != 1 || got[0][1] != uint32(i) || got[0][2] != n {
+			t.Fatalf("call %d: %v, want one match [%d, %d)", i, got, i, n)
+		}
+		if cacheLen := int(h.u32(sc + 24)); cacheLen != config.SetOverlapCheckpointHeaderBytes {
+			if cacheLen != only {
+				t.Fatalf("call %d: a %d-byte region handed over, want the cache part's %d", i, cacheLen, only)
+			}
+			granted = true
+		}
+	}
+	if !granted {
+		t.Fatal("no region was handed over: the cache was declined")
+	}
+}
+
 // TestComponentWideOverlapCache is the constructor past 32 members, where a
 // cache row's mask widens (an i64 to 64 members, a bitmap above): the region
 // it reserves must be the one config computes, and a drive over it must give
@@ -2577,4 +2677,48 @@ func TestComponentDeclinesOptionalMemoryUnderMaxMemory(t *testing.T) {
 		}
 		h.call(names.Dtor, b)
 	})
+}
+
+// TestComponentMaxInputLowersUnderTheCap: the --verbose report's max_input for
+// a component under max_memory is an input that can be lowered and searched.
+// The input is a cabi_realloc block — the power of two at least its size plus
+// an 8-byte header — so under 2 MiB an input the pages alone would admit
+// (about 1.6 MiB) needs a 2 MiB block and traps while being lowered.
+func TestComponentMaxInputLowersUnderTheCap(t *testing.T) {
+	memCap, err := config.ParseMemorySize("2MiB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []config.PatternEntry{{Regexp: `ghp_[A-Za-z0-9]{4}`, FindFunc: "f"}}
+	rep := &compile.Reporter{}
+	w, _, res := componentWasm(t, entries, compile.CompileOptions{MaxMemory: memCap, Report: rep})
+	rep.NoteCompile(config.BuildConfig{MaxMemory: memCap, Patterns: entries}, w, true)
+	n := rep.Report(compile.VerboseFull).Patterns[0].MaxInput["find"]
+	if n <= 0 || n >= 1<<20 {
+		t.Fatalf("max_input %d under 2 MiB: an input of 1 MiB or more is a 2 MiB block", n)
+	}
+	store, inst, mem := instantiateCore(t, w)
+	call := func(name string, args ...any) int32 {
+		t.Helper()
+		r, err := inst.GetFunc(store, name).Call(store, args...)
+		if err != nil {
+			t.Fatalf("%s at max_input %d: %v", name, n, err)
+		}
+		if r == nil {
+			return 0
+		}
+		return r.(int32)
+	}
+	// Lowered as the canonical ABI lowers a list<u8>: one cabi_realloc.
+	in := strings.Repeat("a", int(n)-8) + "ghp_ab12"
+	ptr := call("cabi_realloc", int32(0), int32(0), int32(1), int32(len(in)))
+	copy(mem.UnsafeData(store)[ptr:], in)
+	f := res["f"]
+	h := call(f.Constructor, ptr, int32(len(in)), int32(0))
+	ret := uint32(call(f.Next, h))
+	b := mem.UnsafeData(store)
+	if b[ret] != 0 || b[ret+4] != 1 || binary.LittleEndian.Uint32(b[ret+8:]) != uint32(n)-8 {
+		t.Errorf("next at max_input %d = %v, want ok(some((%d, %d)))", n, b[ret:ret+16], n-8, n)
+	}
+	call(f.Dtor, h)
 }

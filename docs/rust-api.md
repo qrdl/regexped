@@ -363,9 +363,11 @@ This is rare: it needs a pattern that keeps an untried alternation branch live a
 
 The iterator holds the cache's 48-byte header alone until the drive asks for
 the region — at the call where it would sweep, which most drives never reach.
-It then allocates the region with `try_reserve_exact`: an allocation that fails
-leaves the scan walking, with the same answers, slower, instead of aborting the
-program.
+It then allocates the region with `try_reserve_exact`. When a split member's
+program sweep part makes the region too large and that fails, it retries with
+the cache's part alone (the split member then searches on its own); an
+allocation that fails even then leaves the scan walking, with the same answers,
+slower, instead of aborting the program.
 
 ### The overlapping answer cache's header
 

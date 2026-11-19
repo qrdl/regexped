@@ -477,6 +477,12 @@ func compileLitAltACFind(re config.PatternEntry, rp resolvedPattern, a *litAltAC
 	} else {
 		buildOpts.report().Note(note)
 	}
+	buildOpts.report().findKind(findKindSpecialised, "an alternation of literals: one Aho-Corasick walk")
+	if a.teddy != nil {
+		buildOpts.report().scan("Aho-Corasick + Teddy", fmt.Sprintf("Aho-Corasick walk with a Teddy skip at its root (%d literals)", len(a.lits)))
+	} else {
+		buildOpts.report().scan("Aho-Corasick", fmt.Sprintf("Aho-Corasick walk (%d literals)", len(a.lits)))
+	}
 	return p, nil
 }
 

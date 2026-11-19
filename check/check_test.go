@@ -2,11 +2,13 @@ package check
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/qrdl/regexped/compile"
 	"github.com/qrdl/regexped/config"
 )
 
@@ -24,54 +26,89 @@ func load(t *testing.T, src string) config.BuildConfig {
 	return cfg
 }
 
-// TestRun: a module config with a stub, a component config (no wasm-tools
-// needed: only its core module is built), and a config naming a stub type
-// and no file — one line per pattern and set, then the summary, and nothing
+// TestRun: with no writer check prints nothing and answers by its error;
+// with one it writes the report compile writes — for a module config with a
+// stub, a component config (no wasm-tools needed: only its core module is
+// built), and a config naming a stub type and no file — and nothing is
 // written beside the config.
 func TestRun(t *testing.T) {
-	for _, c := range []struct{ src, want string }{
+	for _, c := range []struct{ src, kind string }{
 		{"import_module: m\nstub_file: s.rs\npatterns:\n  - {name: url, regexp: 'https?://[a-z]+', find_func: url_find}\n" +
-			"  - {regexp: '(\\d+)-(\\d+)', groups_func: num}\nsets:\n  - {name: s, find: s_find, patterns: [url]}\n",
-			"pattern url: Compiled DFA, byte mode\npattern (\\d+)-(\\d+): TDFA, byte mode\nset s: find; 1 members; frontend packed-pair\n" +
-				"ok: 2 patterns, 1 set; module "},
-		{"wasm_format: component\nimport_module: m\npatterns:\n  - {regexp: 'abc', match_func: m}\n", "ok: 1 pattern, 0 sets; component core module "},
-		{"import_module: m\nstub_type: c\npatterns:\n  - {regexp: 'abc', find_func: f}\n", ", c stub; nothing written\n"},
+			"  - {regexp: '(\\d+)-(\\d+)', groups_func: num}\nsets:\n  - {name: s, find: s_find, patterns: [url]}\n", "standalone module"},
+		{"wasm_format: component\nimport_module: m\npatterns:\n  - {regexp: 'abc', match_func: m}\n", "component core module"},
+		{"import_module: m\nstub_type: c\npatterns:\n  - {regexp: 'abc', find_func: f}\n", "standalone module"},
 	} {
 		cfg := load(t, c.src)
-		var b bytes.Buffer
-		if err := Run(cfg, &b); err != nil {
+		if err := Run(cfg, nil, compile.VerboseBrief, compile.VerbosePlain); err != nil {
 			t.Fatalf("%q: %v", c.src, err)
 		}
-		if !strings.Contains(b.String(), c.want) {
-			t.Errorf("%q:\n%s\nwant %q", c.src, b.String(), c.want)
+		var b bytes.Buffer
+		if err := Run(cfg, &b, compile.VerboseFull, compile.VerboseJSON); err != nil {
+			t.Fatalf("%q: %v", c.src, err)
+		}
+		var r compile.Report
+		if err := json.Unmarshal(b.Bytes(), &r); err != nil || r.Module == nil || r.Module.Kind != c.kind {
+			t.Errorf("%q: %v\n%s\nwant a report of a %s", c.src, err, b.String(), c.kind)
 		}
 		if _, err := os.Stat(filepath.Join(filepath.Dir(cfg.StubFile), "s.rs")); cfg.StubFile != "" && err == nil {
 			t.Errorf("%q: the stub was written", c.src)
 		}
+	}
+	// The brief report is the one compile prints.
+	cfg := load(t, "import_module: m\npatterns:\n  - {name: url, regexp: 'https?://[a-z]+', find_func: url_find}\n")
+	var got, want bytes.Buffer
+	if err := Run(cfg, &got, compile.VerboseBrief, compile.VerbosePlain); err != nil {
+		t.Fatal(err)
+	}
+	if err := compile.CmdCompileReport(cfg, filepath.Join(t.TempDir(), "o.wasm"), &want, compile.VerboseBrief, compile.VerbosePlain); err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() || got.Len() == 0 {
+		t.Errorf("check's report %q, compile's %q", got.String(), want.String())
 	}
 }
 
 // TestRunErrors: what compile or generate would refuse, check refuses.
 func TestRunErrors(t *testing.T) {
 	cfg := config.BuildConfig{Patterns: []config.PatternEntry{{Regexp: `a{2000}`, FindFunc: "f"}}}
-	if err := Run(cfg, &bytes.Buffer{}); err == nil {
+	if err := Run(cfg, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("an uncompilable module config passed")
 	}
 	comp := config.BuildConfig{WasmFormat: "component", ImportModule: "m", Patterns: []config.PatternEntry{{Regexp: `a{2000}`, FindFunc: "f"}}}
-	if err := Run(comp, &bytes.Buffer{}); err == nil {
+	if err := Run(comp, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("an uncompilable component config passed")
 	}
+	// A stub that cannot be generated still leaves the report of the compile
+	// that succeeded before it.
 	bad := config.BuildConfig{ImportModule: "m", StubFile: "s.txt", Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
-	if err := Run(bad, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "stub type") {
+	var badRep bytes.Buffer
+	if err := Run(bad, &badRep, compile.VerboseBrief, compile.VerbosePlain); err == nil || !strings.Contains(err.Error(), "stub type") {
 		t.Errorf("an unknown stub type: err = %v", err)
 	}
+	if !strings.Contains(badRep.String(), "abc") {
+		t.Errorf("an unknown stub type: no report:\n%s", badRep.String())
+	}
 	gen := config.BuildConfig{ImportModule: "m", StubFile: "s.h", Patterns: []config.PatternEntry{{Regexp: `a*`, GroupsFunc: "g"}}}
-	if err := Run(gen, &bytes.Buffer{}); err == nil {
+	if err := Run(gen, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("a groups_func with no capture group passed")
+	}
+	// What was decided before a compile error is reported, as compile reports
+	// it, for a module and for a component.
+	for _, format := range []string{"", "wasm_format: component\n"} {
+		refused := load(t, format+"import_module: m\nmax_bt_instructions: 2\npatterns:\n"+
+			"  - {regexp: 'abc', find_func: ok}\n  - {regexp: '(\\b|0*)0', find_func: f}\n")
+		var b bytes.Buffer
+		if err := Run(refused, &b, compile.VerboseBrief, compile.VerbosePlain); err == nil ||
+			!strings.Contains(err.Error(), "max_bt_instructions") {
+			t.Errorf("%q: err = %v", format, err)
+		}
+		if !strings.Contains(b.String(), "abc") || !strings.Contains(b.String(), "(\\b|0*)0") {
+			t.Errorf("%q: no partial report:\n%s", format, b.String())
+		}
 	}
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
 	ok := config.BuildConfig{ImportModule: "m", StubFile: "s.h", Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
-	if err := Run(ok, &bytes.Buffer{}); err == nil {
+	if err := Run(ok, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil {
 		t.Error("no temporary directory for the stub, and no error")
 	}
 }
@@ -79,7 +116,7 @@ func TestRunErrors(t *testing.T) {
 // TestRunRefusesWhatGenerateRefuses: a Rust stub with no import_module.
 func TestRunRefusesWhatGenerateRefuses(t *testing.T) {
 	c := config.BuildConfig{StubFile: "s.rs", Patterns: []config.PatternEntry{{Regexp: `abc`, FindFunc: "f"}}}
-	if err := Run(c, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "import_module") {
+	if err := Run(c, &bytes.Buffer{}, compile.VerboseBrief, compile.VerbosePlain); err == nil || !strings.Contains(err.Error(), "import_module") {
 		t.Errorf("err = %v, want the import_module error", err)
 	}
 }

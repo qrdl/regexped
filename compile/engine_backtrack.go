@@ -2568,6 +2568,7 @@ func buildBTFindBody(bt *backtrack, scanParams prefixScanParams, mandLit *mandat
 				return b
 			},
 		}
+		mlScan.Report, mlScan.ReportPattern, mlScan.ReportMandatory = scanParams.Report, scanParams.ReportPattern, true
 		body, _ = emitPrefixScan(body, mlScan)
 
 		// loop $outer: try BT at each position in [attempt_start, lit_pos−minOff].

@@ -265,7 +265,7 @@ The first row is the win: without the hint every URL is a candidate that pays a
 walk over its host before `/api/v1/` fails. The second is what the hint costs
 when the literal does occur: each hit walks back over the scheme and host, which
 the unhinted find walked forward. Both are bounded, and the hint also made this
-find provably linear (`compile --verbose`: `find: today — linear`, against
+find provably linear (`compile --verbose=full`: `find: today — linear`, against
 `find: switch — not provably linear` without it).
 
 Measure it on your own inputs with `tools/pattest`, once without the hint and

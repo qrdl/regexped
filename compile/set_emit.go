@@ -2334,6 +2334,7 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		}
 		compiledSets = append(compiledSets, cs)
 		fillSetSearchSizes(sc, cs, over.searchSizes)
+		rep.noteSet(sc, cs, len(infos))
 		if cs.diag != nil {
 			cs.diag.SearchBlocks, cs.diag.SearchBlocksBTMemo = diagSearchBlocks(cs.searchBlocks())
 			cs.diag.CacheBytesPerByte = overlapShapeOf(cs).bytesPerByte()
@@ -2440,6 +2441,10 @@ func compileFileComponentReport(cfg config.BuildConfig, output string, over Comp
 		return nil, 0, nil, err
 	}
 	rep.noteModule(globals)
+	rep.noteCode(w, owners)
+	if rep != nil {
+		rep.mod.prefixPool = len(prefixPool.tables)
+	}
 	return w, dataTop, diags, nil
 }
 

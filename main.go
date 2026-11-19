@@ -3,9 +3,9 @@
 // Usage:
 //
 //	regexped [--debug] generate [--config=<file>] [--output=<file>|-]
-//	regexped [--debug] compile  [--config=<file>] [--output=<file>|-] [--verbose]
+//	regexped [--debug] compile  [--config=<file>] [--output=<file>|-] [--verbose[=brief|full]] [--verbose-format=plain|json]
 //	regexped [--debug] merge    [--config=<file>] --main=<file> [--output=<file>|-] <regex1.wasm> ...
-//	regexped [--debug] check    [--config=<file>]
+//	regexped [--debug] check    [--config=<file>] [--verbose[=brief|full]] [--verbose-format=plain|json]
 //	regexped help [<command>]
 //	regexped --version
 //
@@ -21,8 +21,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"runtime/debug"
+	"strings"
 
 	"github.com/qrdl/regexped/check"
 	"github.com/qrdl/regexped/compile"
@@ -180,7 +180,7 @@ var commandFlags = map[string]func() *flag.FlagSet{
 	"generate": func() *flag.FlagSet { fs, _, _ := generateFlags(); return fs },
 	"compile":  func() *flag.FlagSet { fs, _ := compileFlags(); return fs },
 	"merge":    func() *flag.FlagSet { fs, _ := mergeFlags(); return fs },
-	"check":    func() *flag.FlagSet { fs, _ := checkFlags(); return fs },
+	"check":    func() *flag.FlagSet { fs, _, _ := checkFlags(); return fs },
 }
 
 // runHelpCmd prints the usage, to stdout: help was asked for.
@@ -206,7 +206,84 @@ func runHelpCmd(args []string) {
 // be ignored, so `regexped compile other.yaml` compiled regexped.yaml.
 func noArgs(fset *flag.FlagSet) {
 	if fset.NArg() > 0 {
+		if a := fset.Arg(0); a == string(compile.VerboseBrief) || a == string(compile.VerboseFull) {
+			failf(exitUsage, "%s: unexpected argument %q (the level goes after an '=': --verbose=%s)", fset.Name(), a, a)
+		}
 		failf(exitUsage, "%s: unexpected argument %q (flags go before arguments; the config is --config=<file>)", fset.Name(), fset.Arg(0))
+	}
+}
+
+// verboseFlag is --verbose[=brief|full]: a bare flag means brief.
+type verboseFlag struct {
+	set   bool
+	level compile.VerboseLevel
+}
+
+func (v *verboseFlag) String() string   { return string(v.level) }
+func (v *verboseFlag) IsBoolFlag() bool { return true }
+func (v *verboseFlag) Set(s string) error {
+	l, err := compile.ParseVerboseLevel(s)
+	if err != nil {
+		return errors.New("want brief or full")
+	}
+	v.set, v.level = true, l
+	return nil
+}
+
+// formatFlag is --verbose-format=plain|json.
+type formatFlag struct {
+	set    bool
+	format compile.VerboseFormat
+}
+
+func (f *formatFlag) String() string { return string(f.format) }
+func (f *formatFlag) Set(s string) error {
+	v, err := compile.ParseVerboseFormat(s)
+	if err != nil {
+		return errors.New("want plain or json")
+	}
+	f.set, f.format = true, v
+	return nil
+}
+
+// reportFlags are the report flags compile and check share.
+type reportFlags struct {
+	verbose verboseFlag
+	format  formatFlag
+}
+
+func (r *reportFlags) register(fset *flag.FlagSet) {
+	fset.Var(&r.verbose, "verbose", "report what the compiler decided per pattern and per set, to stdout: brief (the default) or full")
+	fset.Var(&r.format, "verbose-format", "write the report as plain (the default) or json; implies --verbose=brief when --verbose is not given")
+}
+
+// on reports whether a report was asked for, and at which level and format.
+func (r *reportFlags) on() (bool, compile.VerboseLevel, compile.VerboseFormat) {
+	if !r.verbose.set && !r.format.set {
+		return false, "", ""
+	}
+	level, format := compile.VerboseBrief, compile.VerbosePlain
+	if r.verbose.set {
+		level = r.verbose.level
+	}
+	if r.format.set {
+		format = r.format.format
+	}
+	return true, level, format
+}
+
+// refuseDiagJSON stops a command line that still passes --diag-json, which the
+// report replaced.
+func refuseDiagJSON(cmd string, args []string) {
+	for _, a := range args {
+		if a == "--" {
+			return
+		}
+		for _, f := range []string{"-diag-json", "--diag-json"} {
+			if a == f || strings.HasPrefix(a, f+"=") {
+				failf(exitUsage, "%s: --diag-json was removed; the report carries the set diagnostics: --verbose=full --verbose-format=json", cmd)
+			}
+		}
 	}
 }
 
@@ -250,26 +327,27 @@ func runGenerateCmd(args []string) {
 }
 
 type compileOpts struct {
-	configFile, diagJSON, out *string
-	verbose                   *bool
+	configFile, out *string
+	report          *reportFlags
 }
 
 func compileFlags() (*flag.FlagSet, compileOpts) {
 	fset := flag.NewFlagSet("compile", flag.ContinueOnError)
-	o := compileOpts{out: new(string)}
+	o := compileOpts{out: new(string), report: &reportFlags{}}
 	o.configFile = fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	o.diagJSON = fset.String("diag-json", "", "write set-composition diagnostics as JSON to this path (- for stdout)")
-	o.verbose = fset.Bool("verbose", false, "report what the compiler decided per pattern and per set, to stderr")
+	o.report.register(fset)
 	fset.StringVar(o.out, "output", "", "override wasm_file from config; - writes to stdout")
 	fset.StringVar(o.out, "o", "", "output file (alias for --output)")
 	return fset, o
 }
 
 func runCompileCmd(args []string) {
+	refuseDiagJSON("compile", args)
 	fset, o := compileFlags()
 	parseFlags(fset, args)
 	noArgs(fset)
-	configFile, diagJSON, verbose, out := o.configFile, o.diagJSON, o.verbose, *o.out
+	configFile, out := o.configFile, *o.out
+	report, level, format := o.report.on()
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
@@ -284,38 +362,15 @@ func runCompileCmd(args []string) {
 	if outPath == "" {
 		failf(exitUsage, "compile: --output is required (or set wasm_file in config)")
 	}
-
-	// Validate output conflict before writing any output: refuse to send both
-	// streams to the same destination (stdout/stdout, or the same filesystem
-	// path), which would silently corrupt the WASM with the JSON diagnostics.
-	if *diagJSON != "" {
-		// Set-less configs are refused HERE rather than by CmdWriteDiagJSON,
-		// which runs after the module has already been written. Both report the
-		// same thing, but only this one reports it before the command has had
-		// an effect: `compile --diag-json=x.json` on a config with no sets used
-		// to exit non-zero AND leave a freshly generated .wasm behind, which is
-		// the worst combination for a build script — a failure it must not
-		// ignore, next to output it cannot tell apart from a success.
-		if len(cfg.Sets) == 0 {
-			failf(exitUsage, "compile: --diag-json: the config declares no sets, and set composition is all this reports")
-		}
-		if outPath == "-" && *diagJSON == "-" {
-			failf(exitUsage, "compile: --output=- and --diag-json=- cannot both write to stdout; use a file path for one of them")
-		}
-		if outPath != "-" && *diagJSON != "-" {
-			absOut, err1 := filepath.Abs(outPath)
-			absDiag, err2 := filepath.Abs(*diagJSON)
-			if err1 == nil && err2 == nil && absOut == absDiag {
-				failf(exitUsage, "compile: --output and --diag-json resolve to the same path (%s); use distinct paths", absOut)
-			}
-		}
+	// The report goes to stdout, so the module cannot: refused before
+	// anything is compiled or written.
+	if report && outPath == "-" {
+		failf(exitUsage, "compile: --output=- and the report both write to stdout; write the module to a file, or drop --verbose / --verbose-format")
 	}
 
-	// stderr, never stdout: `--output -` writes the WASM module to stdout, and
-	// interleaving a report with it would corrupt the module.
-	var report io.Writer
-	if *verbose {
-		report = os.Stderr
+	var w io.Writer
+	if report {
+		w = os.Stdout
 	}
 	// `wasm_format: component` is a different output KIND, not a variant of the
 	// module path: it wraps the core module through wasm-tools and writes a
@@ -323,17 +378,11 @@ func runCompileCmd(args []string) {
 	// deliberately no --wasm-format flag, because `generate` must make the same
 	// choice and a flag lets the two diverge.
 	if cfg.Component() {
-		if err := component.CmdCompile(cfg, outPath, report); err != nil {
+		if err := component.CmdCompileReport(cfg, outPath, w, level, format); err != nil {
 			failf(exitCodeFor(err, exitCompile), "%v", err)
 		}
-	} else if err := compile.CmdCompileVerbose(cfg, outPath, report); err != nil {
+	} else if err := compile.CmdCompileReport(cfg, outPath, w, level, format); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
-	}
-
-	if *diagJSON != "" {
-		if err := compile.CmdWriteDiagJSON(cfg, outPath, *diagJSON); err != nil {
-			failf(exitCodeFor(err, exitCompile), "%v", err)
-		}
 	}
 }
 
@@ -382,23 +431,32 @@ func runMergeCmd(args []string) {
 	}
 }
 
-func checkFlags() (*flag.FlagSet, *string) {
+func checkFlags() (*flag.FlagSet, *string, *reportFlags) {
 	fset := flag.NewFlagSet("check", flag.ContinueOnError)
 	configFile := fset.String("config", "", "YAML config file (default: regexped.yaml in cwd)")
-	return fset, configFile
+	rf := &reportFlags{}
+	rf.register(fset)
+	return fset, configFile, rf
 }
 
 // runCheckCmd is `regexped check`: the config loaded, compiled and its stub
-// generated in memory, one summary line per pattern and set, nothing written.
+// generated in memory, nothing written. It answers by its exit code; with a
+// report flag it prints the report compile would print.
 func runCheckCmd(args []string) {
-	fset, configFile := checkFlags()
+	refuseDiagJSON("check", args)
+	fset, configFile, rf := checkFlags()
 	parseFlags(fset, args)
 	noArgs(fset)
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
-	if err := check.Run(cfg, os.Stdout); err != nil {
+	var w io.Writer
+	report, level, format := rf.on()
+	if report {
+		w = os.Stdout
+	}
+	if err := check.Run(cfg, w, level, format); err != nil {
 		failf(exitCodeFor(err, exitCompile), "%v", err)
 	}
 }

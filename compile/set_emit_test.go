@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp/syntax"
 	"strings"
@@ -3706,8 +3707,8 @@ func TestSetNeverDropsAMember(t *testing.T) {
 			t.Errorf("error lacks %q: %v", w, err)
 		}
 	}
-	if err := CmdWriteDiagJSON(cfg, "", filepath.Join(t.TempDir(), "d.json")); !errors.Is(err, ErrSetMemberFitsNoEngine) {
-		t.Errorf("--diag-json on that config: err = %v, want the same refusal", err)
+	if err := CmdCompileReport(cfg, filepath.Join(t.TempDir(), "d.wasm"), io.Discard, VerboseFull, VerboseJSON); !errors.Is(err, ErrSetMemberFitsNoEngine) {
+		t.Errorf("the report on that config: err = %v, want the same refusal", err)
 	}
 	if SetAdmitsBacktracking(cfg.Sets[0], cfg) {
 		t.Error("a set that does not compile was predicted to admit Backtracking")

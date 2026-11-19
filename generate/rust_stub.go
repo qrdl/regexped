@@ -282,6 +282,16 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 					// cache's is its bare header.
 					cacheInit += fmt.Sprintf("            let k: u64 = 1;\n            let bytes: u64 = %d;\n", consts.Hdr)
 				}
+				// The cache's own part, spelled by the text above: what the
+				// grant falls back to when the whole region, with a program
+				// sweep's part, cannot be had.
+				onlyFn := fmt.Sprintf("rx_%s_cache_only_", s.Find)
+				cacheOnly := ""
+				if sh.SweepCells > 0 {
+					cacheOnly = strings.Replace(cacheInit,
+						"fn "+planFn+"(input: &[u8]) -> (u64, u64) {", "fn "+onlyFn+"(input: &[u8]) -> u64 {", 1) +
+						"            let _ = (k, m);\n            bytes\n}\n\n"
+				}
 				fits := fmt.Sprintf("bytes > %d", consts.Max)
 				if sh.SweepCells > 0 {
 					cacheInit += fmt.Sprintf("            let fits = bytes <= %d;\n", consts.Max)
@@ -308,7 +318,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// asks for the region.
 				// Its lines were spelled for the iterator's initialiser, eight
 				// columns deeper than a function body.
-				cachePlan = strings.ReplaceAll(cacheInit, "\n            ", "\n    ")
+				cachePlan = strings.ReplaceAll(cacheInit+cacheOnly, "\n            ", "\n    ")
 				// LAZY: the iterator starts with the header alone, its lazy
 				// word set, and the module answers abi.OverlapCacheWanted, with
 				// nothing delivered, at the call where it would start using the
@@ -332,12 +342,29 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				// then walks — the same answers, slower — where an infallible
 				// allocation aborted the program. Either way the call is made
 				// again, and the module never asks twice.
-				cacheWanted = fmt.Sprintf(`            // %[1]d: the module would start using the answer cache now and
-            // delivered nothing; hand the whole region over, or none.
-            if n == %[1]d {
-                let words = (%[2]s(self.input).0 as usize).div_ceil(4);
+				reserve := `                let words = (%[2]s(self.input).0 as usize).div_ceil(4);
                 let mut v: Vec<u32> = Vec::new();
-                if v.try_reserve_exact(words).is_ok() {
+                if v.try_reserve_exact(words).is_ok() {`
+				if sh.SweepCells > 0 {
+					reserve = `                let mut words = (%[2]s(self.input).0 as usize).div_ceil(4);
+                let mut v: Vec<u32> = Vec::new();
+                let mut had = v.try_reserve_exact(words).is_ok();
+                if !had {
+                    // The whole cannot be had: the cache's own part alone, and
+                    // the module runs without the program sweep.
+                    let only = (%%[4]s(self.input) as usize).div_ceil(4);
+                    if only < words && v.try_reserve_exact(only).is_ok() {
+                        words = only;
+                        had = true;
+                    }
+                }
+                if had {`
+				}
+				cacheWanted = fmt.Sprintf(`            // %[1]d: the module would start using the answer cache now and
+            // delivered nothing; hand the whole region over, the cache's own
+            // part when the whole cannot be had, or none.
+            if n == %[1]d {
+`+reserve+`
                     v.extend_from_slice(&self.cache);
                     v.resize(words, 0);
                     v[%[3]d] = 0;
@@ -348,6 +375,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
                 continue;
             }
 `, abi.OverlapCacheWanted, planFn, config.SetOverlapHdrLazyOff/4)
+				cacheWanted = strings.ReplaceAll(cacheWanted, "%[4]s", onlyFn)
 				cacheArgs = "if self.cache.is_empty() { 0 } else { self.cache.as_mut_ptr() as u32 }, " +
 					"(self.cache.len() * 4) as u32"
 			}

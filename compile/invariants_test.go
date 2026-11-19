@@ -1995,7 +1995,7 @@ func TestPrefixScanCharProbe(t *testing.T) {
 		if got := p.charProbe(); got != c.want {
 			t.Errorf("charProbe(%q, UTF8Text %v) = %v, want %v", c.prefix, c.utf8, got, c.want)
 		}
-		if note := p.strategyNote(); strings.Contains(note, "first character checked") != c.want {
+		if _, note := p.strategyNote(); strings.Contains(note, "first character checked") != c.want {
 			t.Errorf("strategyNote(%q, UTF8Text %v) = %q", c.prefix, c.utf8, note)
 		}
 	}

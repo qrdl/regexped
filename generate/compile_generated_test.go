@@ -379,7 +379,7 @@ func compileRust(t *testing.T, dir, path string) {
 	t.Helper()
 	run(t, dir, nil, "rustc",
 		"--crate-type=lib", "--edition=2021",
-		"-A", "non_upper_case_globals",
+		"-A", "non_upper_case_globals", "-D", "warnings",
 		"--out-dir", dir, path)
 }
 
@@ -432,7 +432,7 @@ func compileC(t *testing.T, dir, path string) {
 	if _, err := os.Stat(cPath); err != nil {
 		t.Fatalf("C generator wrote no .c beside %s: %v", path, err)
 	}
-	run(t, dir, nil, "cc", "-fsyntax-only", "-Wno-attributes", cPath)
+	run(t, dir, nil, "cc", "-fsyntax-only", "-Wall", "-Werror", "-Wno-attributes", cPath)
 }
 
 // compileCModule is compileC plus the RX_SET_CACHE check, which applies to the

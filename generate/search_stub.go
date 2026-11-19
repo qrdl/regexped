@@ -890,7 +890,13 @@ func jsSetWithBlocks(section, find string, blocks []compile.SearchSize, ts bool)
 		}
 		body = body[:e] + setup + pre + body[e:]
 		// The answer cache's region goes into the descriptor the calls carry.
-		body = strings.Replace(body, "_lazy(cacheBase, cacheBytes, scratchBase)", "_lazy(cacheBase, cacheBytes, _sd)", 1)
+		// Not every find carries a cache, so the call may be absent — but one
+		// left naming the ordinary descriptor hands the module a region it
+		// never reads, so a spelling this no longer matches is a build failure.
+		body = strings.Replace(body, "_lazy(cacheBase, cacheBytes, scratchBase, ", "_lazy(cacheBase, cacheBytes, _sd, ", 1)
+		if strings.Contains(body, "_lazy(cacheBase, cacheBytes, scratchBase") {
+			panic("generate: jsSetWithBlocks: the _lazy call in " + fn + " still names the ordinary descriptor")
+		}
 		if batch {
 			// The arguments only: JS calls `_exp['…'](`, TypeScript
 			// `(_exp['…'] as Function)(`.

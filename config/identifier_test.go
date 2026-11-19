@@ -756,6 +756,8 @@ func TestValidateExports_GeneratorHelperCollisions(t *testing.T) {
 		{"x.js", "_u32", nil, set},
 		{"x.rs", "rx_scan_cache_plan_", nil, set},
 		{"x.h", "rx_scan_cache_plan_", nil, set},
+		{"x.rs", "rx_scan_cache_only_", nil, set},
+		{"x.h", "rx_scan_cache_only_", nil, set},
 		{"x.h", "rx_scan_cache_head_", nil, set},
 		{"x.h", "rx_scan_given_at_", nil, set},
 		{"x.h", "scan_init", nil, set},

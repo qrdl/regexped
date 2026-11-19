@@ -601,7 +601,7 @@ all — just the DFA tables, which the cheap bitmask probes share. An
 anchored-only set additionally emits no literal frontend and no scan buckets:
 the anchored pair has a packing of its own, so the packed-pair/Teddy/AC/Shufti
 tables, the skip loop and the buckets' DFA tables could never be read, and
-`--diag-json` reports `"frontend": "none"` and no buckets for it. The
+the full report gives `"frontend": "none"` and no buckets for it. The
 `match_any`-only SQL validator example is 6,204 bytes (40,775 when it still
 carried them).
 
@@ -744,7 +744,7 @@ does not fit what is left of the buffer ends the call, and is split across
 calls only when it does not fit an empty one — and gives its split members the
 program sweep.
 
-`--diag-json` reports all of it: `split_members` (the ids served outside the
+The full report shows all of it: `split_members` (the ids served outside the
 buckets), `split_backtracking` (those of them on the Backtracking find),
 `no_cache_split_members` (the members the no-cache companion splits out),
 `scan_union` (`direct` when it is the scan pair's whole body, `counter` when it
@@ -779,7 +779,7 @@ Two things select the `out_ptr` form, not one. The second is a set containing a
 pattern that fell back to the **Backtracking engine** — see "When a set member
 falls back to Backtracking" below — and it applies at any id space, including a
 two-pattern set. A direct WASM caller cannot assume the form from the pattern
-count alone; the generated stubs work it out for you, and `--diag-json` names
+count alone; the generated stubs work it out for you, and the full report names
 the responsible buckets as `"bt-fallback"`.
 
 ### Pattern ids and the two emitted constants
@@ -821,8 +821,8 @@ carries a per-state representative id and a bitmap row instead, which is a
 different body but the same exports, the same signatures and the same answers.
 Past 256 ids the set keeps the per-position bucket walk, which costs roughly
 seven times as much per byte — so a very wide literal-less set is worth
-splitting into several sets if its scan capabilities are hot. `--diag-json`
-reports which body a set got under `union_scan`; there is no other way to see
+splitting into several sets if its scan capabilities are hot. The full report
+says which body a set got under `union_scan`; there is no other way to see
 it.
 
 `emit_name_map: true` additionally emits the SET's own name lookup, named from
@@ -833,7 +833,7 @@ set's pattern ids to that member's `name:`, and answers `""` for an unnamed
 pattern, an inline regexp, or an id the set does not hold. Each set gets its own
 because inline ids are numbered per set.
 
-### `--diag-json` reports what the compiler chose
+### The report shows what the compiler chose
 
 Several of a set's decisions are invisible in the output and change its cost by
 large factors: which literal frontend shipped, whether the scan pair got the
@@ -842,12 +842,10 @@ bucket's states carry the member self-loop skip (`member_skip_states`), and
 which members are served outside the buckets and which work counters the set
 carries (`split_members`, `scan_union`, `in_call_counter` — see
 [Members that are not provably linear](#members-that-are-not-provably-linear)). If a
-set is slower than you expect, that file is where to look first — there is no
-other window onto any of it.
-
-Note it reports the compilation your `hints:` actually asks for. Before
-2026-09-02 it always reported the unhinted one, which made every hint-dependent
-row above misleading for a hinted set.
+set is slower than you expect, the full report (`--verbose=full`) is where to
+look first — there is no other window onto any of it. It is filled by the
+compile that builds the module, so it describes the compilation your `hints:`
+actually ask for.
 
 ## Bin-packing and merge constraints
 
@@ -880,7 +878,7 @@ packings: patterns sharing a mandatory literal, literal-less patterns in a
 fallback bucket, and the anchored automata behind `match_any` / `match_all`.
 The promotion is conservative and is declined when the merged DFA misses the
 state or byte budget above, when any pattern carries a non-trivial prefix, or
-when any pattern is `\A`- or `(?m:^)`-anchored or carries a word guard (below). `--diag-json` reports such a
+when any pattern is `\A`- or `(?m:^)`-anchored or carries a word guard (below). The full report shows such a
 bucket with `"type": "sparse-set"`, so whether it happened is never a guess.
 
 Patterns that cannot be merged route to fallback buckets that scan every input
@@ -917,7 +915,7 @@ to a fallback bucket. With `user=[0-9]{1,8};role=guest` beside it,
 `user=[a-z]{8};role=admin` hinted `;role=admin` gets a bucket of its own keyed
 on `;role=admin` (both share `user=` without the hint), while
 `user=[a-z]{1,8};role=admin` keeps `user=`, since the part before `;role=admin`
-varies in length. `--diag-json`'s bucket `literal` shows which literal each
+varies in length. the full report's bucket `literal` shows which literal each
 bucket keys on. The hint counts only for a set declaring `find`, `scan_any` or
 `scan_all`: `match_any` and `match_all` walk the whole input from its first
 byte and scan for no literal, so a hinted pattern that only such sets select
@@ -935,7 +933,7 @@ over that limit is not merged but moved onto the Backtracking engine, in a
 bucket of its own — see [When a set member falls back to
 Backtracking](#when-a-set-member-falls-back-to-backtracking). It still matches,
 at Backtracking's cost, and it switches the set's `match_all` and `scan_all` to
-the `out_ptr` form. Check `--diag-json` for `"bt-fallback"` buckets, and raise
+the `out_ptr` form. Check the full report for `"bt-fallback"` buckets, and raise
 `max_dfa_states` to keep such a pattern on a DFA.
 
 **A set never compiles without a member it selected.** A member no engine
@@ -945,28 +943,29 @@ both limits, with the value that would let it compile. It used to be left out
 of `find` and the scan pair with a warning, and the build succeeded: `.{0,870}`
 in a Unicode-mode set (7,832 states, 21,752 Backtracking instructions) was
 dropped that way while the same pattern compiled on its own, and listed in
-`--diag-json`'s `state_limit_dropped`, which is gone with the drops.
+the full report's `state_limit_dropped`, which is gone with the drops.
 
 **The anchored pair follows the same rule.** `match_any` and `match_all` are
 packed separately (see "The anchored capabilities use their own automata"),
 and a member whose anchored DFA is over `max_dfa_states` answers there through
 a Backtracking probe over the whole input, run after the DFA part — with a
-warning, and listed in `--diag-json`'s `anchored_backtracking`. One that
+warning, and listed in the full report's `anchored_backtracking`. One that
 Backtracking cannot take either fails the compile, naming the limits. Until
 2026-10-12 such a member was left out of `match_any` and `match_all` with a
 warning, and the build succeeded.
 
 ## Diagnostics
 
-Use `--diag-json <path>` with `regexped compile` to write a JSON file
-describing how patterns were placed:
+The full report — `regexped compile` or `regexped check` with `--verbose=full`,
+as JSON with `--verbose-format=json` (see [cli.md](cli.md#the-report---verbose-and---verbose-format))
+— describes how patterns were placed:
 
 ```bash
-regexped compile --config=regexped.yaml --diag-json=diag.json
+regexped check --config=regexped.yaml --verbose=full --verbose-format=json > report.json
 ```
 
-The JSON contains `patterns_total`, `in_set` (patterns actually placed into a
-set), `prefix_dedup_pool_size`, and per-set `frontend`
+Its `module` object carries `patterns_total`, `in_set` (patterns actually placed into a
+set) and `prefix_dedup_pool_size`, and each entry of `sets` its `frontend`
 (`"packed-pair"`/`"teddy"`/`"ac"`/`"scalar"`/`"shufti"`), `buckets`,
 `conflicts` and `anchored_backtracking` arrays.
 
@@ -980,7 +979,7 @@ are gone.
 An entry with `groups_func` is a set member like any other: a set reports the
 whole match only, so its capture groups are stripped for the set, and its own
 `groups_func` export is unchanged. (Such entries used to be left out of every
-set that selected them, silently, and `--diag-json` listed them as
+set that selected them, silently, and the old diagnostics file listed them as
 `capture_bearing_dropped`.)
 
 If a set's frontend was **downgraded** from the one its literals selected, the
@@ -1053,7 +1052,7 @@ anywhere in it — and takes the per-byte walk as before.
 | ≤16 distinct literals, with a selective two-byte probe window | **Packed-pair** — two `v128` loads and an `i8x16.eq` chain per 32-byte block, against two columns chosen by byte rarity |
 | ≤64 distinct literals (≤16 when the shortest literal is 1 byte) | **Teddy** — SIMD nibble fingerprint; literals >4 bytes use their first 4 bytes as the probe and verify remaining bytes in dispatch. For 9+ literals it uses two groups of 8 (`TwoGroups=true`), ORing two independent nibble probes per 16-byte chunk |
 | >16 distinct literals with low first-byte diversity | **Aho-Corasick** — byte-at-a-time, O(n) regardless of literal count, with a SIMD first-byte prefilter at the root state |
-| (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in `--diag-json` as `frontend_demotion` |
+| (AC tables exceed 512 KB) | **Scalar** — AC is capped by *table bytes*, not literal count. The budget holds ~1,000 trie nodes uncompressed, and no set of 128 literals tested so far comes close to it; literals sharing no common prefix consume nodes fastest, since each distinct first byte forks the trie at the root. A demotion is always reported in the full report as `frontend_demotion` |
 | High first-byte diversity, or the `prefer-no-match` hint | **Shufti** — a SIMD first-byte prefilter over the scalar body, answering set membership from nibble tables instead of a per-byte compare chain (or, for a union of one or two contiguous byte ranges, two SIMD range compares per range: same answer, half the instructions). First-byte union 17–64, or 17–128 with the hint |
 | No mandatory literal at all | **Scalar** |
 
@@ -1076,7 +1075,7 @@ to the literal's trie node unless another literal ends inside it first. No
 match skips the position. Over 40 KB of text with no match this is 3.5 fuel
 per byte against 28 for the first-byte probe when the text is in the
 keywords' script, and 7% less than the first-byte probe when it is not.
-`--diag-json`'s `ac_table` reports the two columns as `probe_columns` and the
+the full report's `ac_table` reports the two columns as `probe_columns` and the
 verify's as `verify_column`. In byte mode the same holds for `byte_mode`
 literals whose first byte is 0xC2–0xF4 — UTF-8 keywords written as bytes; an
 ASCII keyword set keeps the first-byte probe.
@@ -1213,7 +1212,7 @@ costs what the same pattern costs as a Backtracking `match` on its own
 (`(?:a|b)*a(?:a|b){12}c` over `ab`×N + `x`: 279 fuel per byte alone, 282 in a
 set), linear in the input. Such a member, too, switches `match_all` and
 `scan_all` to the `out_ptr` form, whether or not `find` needs Backtracking.
-`--diag-json` lists it in `anchored_backtracking`, and the compile warns "Set
+The full report lists it in `anchored_backtracking`, and the compile warns "Set
 member runs on Backtracking: its anchored DFA is over the state limit".
 
 A member Backtracking cannot take either — its program over
@@ -1222,9 +1221,9 @@ A member Backtracking cannot take either — its program over
 kind wrong extents), and the set does not compile: the error names the member,
 why no DFA takes it, its program's size, and the limit to raise. With
 `max_dfa_states: 0` every member is put on Backtracking. Buckets that were
-admitted appear in `--diag-json` as `"bt-fallback"`, with
+admitted appear in the full report as `"bt-fallback"`, with
 `suffix_states` and `table_bytes` of 0 — they have no table — and `compile
---verbose` prints their engine as `Backtracking`. Every compile also WARNS,
+--verbose=full` prints their engine as `Backtracking`. Every compile also WARNS,
 once per such member and for every route onto Backtracking: "Set member runs
 on Backtracking: <reason>", with a hint for keeping it on a DFA — except under
 `max_dfa_states: 0`, which asked for it. It is a warning, not a drop — the
