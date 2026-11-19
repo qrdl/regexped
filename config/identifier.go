@@ -1075,11 +1075,12 @@ func derivedHelperNames(field, name, stubType string) []string {
 		case "find":
 			return []string{name + "_init", name + "_free", name + "_notes_bytes", name + "_set_notes",
 				name + "_cache_bytes", name + "_set_cache",
-				"rx_" + name + "_cache_plan_", "rx_" + name + "_cache_head_", "rx_" + name + "_given_at_"}
+				"rx_" + name + "_cache_plan_", "rx_" + name + "_cache_only_", "rx_" + name + "_cache_head_",
+				"rx_" + name + "_given_at_"}
 		}
 	case "rust":
 		if field == "find" {
-			return []string{"rx_" + name + "_cache_plan_"}
+			return []string{"rx_" + name + "_cache_plan_", "rx_" + name + "_cache_only_"}
 		}
 	case "as":
 		switch field {

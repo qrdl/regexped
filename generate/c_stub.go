@@ -443,7 +443,7 @@ int %[9]s_set_cache(%[12]s *s, void *buf, size_t bytes) {
    allocated when the whole, with the program sweep's part, cannot be. */
 static size_t rx_%[1]s_cache_only_(size_t len) {
     unsigned long long m = (unsigned long long)len + 1;
-%[2]s    (void)k;
+%[2]s    (void)k; (void)m;
     return (size_t)bytes;
 }
 #endif

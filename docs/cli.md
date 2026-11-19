@@ -1079,12 +1079,17 @@ bytes for each unit that did not fit — so a non-ASCII string whose bytes numbe
 (`new TextEncoder().encode(s)`) to get the bound exactly.
 
 The overlapping answer cache is NOT part of it: when memory cannot grow for the
-cache the find walks instead, with the same answers, slower. A set with one
-gets `answer cache under max_memory` (`answer_cache.inputs` in JSON, ranges of
+cache the find walks instead, with the same answers, slower. A set with one,
+in a standalone module or a component, gets `answer cache under max_memory` (`answer_cache.inputs` in JSON, ranges of
 input lengths, `from` and `to` included) — where the cache fits beside
-everything else. It can be more than one range, since the cache's region
-shrinks to the square root of the input where it starts checkpointing: with a
-6-cell column and 2 patterns it is 66 MB at 5.5 MB of input and 87 KB at 5.6 MB.
+everything else. A set whose split members get a program sweep counts its
+lengths where only the cache's own part fits, without the sweep's: the C,
+Rust and JS/TS stubs and a component fall back to that part alone. It can be
+more than one range, since the cache's region shrinks to the square root of
+the input where it starts checkpointing: with a 6-cell column and 2 patterns it
+is 66 MB at 5.5 MB of input and 87 KB at 5.6 MB. An embedded module has no
+such line: its cache is allocated in the host's memory, which `max_memory`
+does not cap.
 
 **JSON.** `--verbose-format=json` writes the same information as one object:
 

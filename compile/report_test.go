@@ -552,6 +552,12 @@ func TestReportAnswerCacheFit(t *testing.T) {
 	if cacheFit(sh, terms, moduleReport{}) != nil {
 		t.Error("no max_memory, still a cache fit")
 	}
+	// An embedded module's cache is the host's allocation, outside max_memory:
+	// under a 2 MiB cap the report said the find walks from 166 KB to 16 MB.
+	emb := moduleReport{staticBytes: 1 << 16, maxMemory: 2 << 20}
+	if got := cacheFit(sh, setTerms(sm, emb), emb); got != nil {
+		t.Errorf("embedded: a cache fit %+v, though the cache is in the host's memory", got.Inputs)
+	}
 	// Room for everything: the stretches either side of the switch join.
 	big := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 1 << 40}
 	if got := cacheFit(sh, setTerms(sm, big), big); len(got.Inputs) != 1 || cacheFitText(got.Inputs) != "every length" {
@@ -647,6 +653,57 @@ func TestReportAnswerCacheFit(t *testing.T) {
 			if fitsIn(wf.Inputs, n) != want {
 				t.Fatalf("component %v: length %d reported %v, fits %v (ranges %+v)", comp, n, fitsIn(wf.Inputs, n), want, wf.Inputs)
 			}
+		}
+	}
+	// The whole region over the cap, the cache's own part under it: the
+	// component's `next` and the C, Rust, JS/TS stubs reserve that part alone
+	// and the cache serves. The shape is {foo\w+, a[a-z]*?z}'s, whose drive
+	// tools/fuzz TestComponentCacheOnlyWhenTheWholeRegionIsRefused runs under
+	// 128 MiB: at 6,000,000 bytes the whole is 72,000,160 bytes (a 128 MiB
+	// block), the cache part 48,000,088 (a 64 MiB one).
+	ngSh := OverlapCacheShape{Eligible: true, Cells: 6, Patterns: 1, SweepCells: 3, SweepRow: 4}
+	for _, comp := range []bool{true, false} {
+		gm := moduleReport{standalone: true, component: comp, staticBytes: 1 << 16, maxMemory: 80 << 20}
+		if comp {
+			gm.maxMemory = 128 << 20
+		}
+		gt := setTerms(setMemReport{find: true, members: 2, idSpace: 2, cache: &ngSh}, gm)
+		gb := exportTotal("find", gt, gm)
+		budget := int64(config.SetOverlapCacheMaxBytes)
+		if comp {
+			budget -= 8
+		}
+		whole := memTerm{size: func(n int64) int64 { b, _ := ngSh.Sizing(int(n)); return int64(b) }}
+		part := memTerm{size: func(n int64) int64 { return int64(ngSh.cachePartBytes(int(n))) }}
+		gf := cacheFit(ngSh, gt, gm)
+		gained := 0
+		for n := int64(0); n < maxInputSearchCap; n += 1 + n/256 {
+			wholeFits := gb(n)+utils.PageAlign(whole.bytes(n, gm)) <= gm.maxMemory
+			partFits := part.size(n) < whole.size(n) && gb(n)+utils.PageAlign(part.bytes(n, gm)) <= gm.maxMemory
+			want := part.size(n) <= budget && (wholeFits || partFits)
+			if fitsIn(gf.Inputs, n) != want {
+				t.Fatalf("component %v: length %d reported %v, served %v (ranges %+v)", comp, n, fitsIn(gf.Inputs, n), want, gf.Inputs)
+			}
+			if want && !wholeFits {
+				gained++
+			}
+		}
+		if gained == 0 {
+			t.Errorf("component %v: no length has only the cache's part fit; the case is untested", comp)
+		}
+		if comp && !fitsIn(gf.Inputs, 6_000_000) {
+			t.Errorf("6,000,000 bytes reported without a cache: %+v", gf.Inputs)
+		}
+	}
+	// A set with no cache of its own falls back to a bare header, which
+	// caches nothing: those lengths stay out.
+	swNoCache := moduleReport{standalone: true, staticBytes: 1 << 16, maxMemory: 16 << 20}
+	nc := OverlapCacheShape{SweepCells: 4, SweepRow: 64}
+	ncTerms := setTerms(setMemReport{find: true, members: 2, idSpace: 2, cache: &nc}, swNoCache)
+	ncBase := exportTotal("find", ncTerms, swNoCache)
+	for _, r := range cacheFit(nc, ncTerms, swNoCache).Inputs {
+		if b, _ := nc.Sizing(int(r.To)); ncBase(r.To)+utils.PageAlign(int64(b)) > swNoCache.maxMemory {
+			t.Errorf("sweep only: %d reported with a cache, its region over the cap", r.To)
 		}
 	}
 	// A program sweep's part has a regime of its own.

@@ -290,7 +290,7 @@ pub fn %s(input: &[u8]) -> Result<Option<i32>> {
 				if sh.SweepCells > 0 {
 					cacheOnly = strings.Replace(cacheInit,
 						"fn "+planFn+"(input: &[u8]) -> (u64, u64) {", "fn "+onlyFn+"(input: &[u8]) -> u64 {", 1) +
-						"            let _ = k;\n            bytes\n}\n\n"
+						"            let _ = (k, m);\n            bytes\n}\n\n"
 				}
 				fits := fmt.Sprintf("bytes > %d", consts.Max)
 				if sh.SweepCells > 0 {

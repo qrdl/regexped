@@ -148,7 +148,9 @@ type ReportSet struct {
 	Ceilings  []ReportCeiling  `json:"memory_ceilings,omitempty"`
 	MaxInput  map[string]int64 `json:"max_input,omitempty"`
 	// AnswerCache is where under max_memory the overlapping find gets its
-	// answer cache (full only, with max_memory and a cache). The cache is
+	// answer cache (full only, with max_memory and a cache, in a standalone
+	// module or a component — an embedded module's cache is in the host's
+	// memory, which max_memory does not cap). The cache is
 	// not part of MaxInput: without room for it the find walks, with the same
 	// answers, slower.
 	AnswerCache *ReportCacheFit `json:"answer_cache,omitempty"`
@@ -986,7 +988,9 @@ func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int
 }
 
 // cacheFit is where under max_memory the find of a set with an answer cache
-// has room for it: the input lengths whose find, cache included, fits.
+// has room for it: the input lengths whose find, cache included, fits — the
+// whole region, or the cache's own part alone where a program sweep's part
+// makes the whole too large.
 //
 // Not a search for one bound: the cache's region is not monotone in the input
 // — it shrinks to the square root at the length where single-block mode ends
@@ -999,7 +1003,10 @@ func maxInputs(exports []string, terms []memTerm, m moduleReport) map[string]int
 // widest program sweep (65,535 cells): 40-100 ms per set with a cache, 0.9 s
 // at that width, paid only when the report is built under max_memory.
 func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCacheFit {
-	if m.maxMemory == 0 {
+	// An embedded module's cache is the host's allocation, in the host's
+	// memory, which max_memory does not cap: it is not under max_memory at
+	// any length.
+	if m.maxMemory == 0 || !m.standalone {
 		return nil
 	}
 	base := exportTotal("find", terms, m)
@@ -1011,9 +1018,21 @@ func cacheFit(sh OverlapCacheShape, terms []memTerm, m moduleReport) *ReportCach
 	if m.component {
 		budget -= 8
 	}
+	// When the whole region, a program sweep's part included, does not fit,
+	// a stub that can fall back (C, Rust, JS/TS) and the component's `next`
+	// reserve the cache's own part alone: the cache serves, without the
+	// program sweep. A set with no cache of its own has only a bare header
+	// to fall back to, which caches nothing.
+	only := memTerm{size: func(n int64) int64 { return int64(sh.cachePartBytes(int(n))) }}
 	fits := func(n int64) bool {
-		return int64(sh.cachePartBytes(int(n))) <= budget &&
-			base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory
+		if int64(sh.cachePartBytes(int(n))) > budget {
+			return false
+		}
+		if base(n)+utils.PageAlign(cache.bytes(n, m)) <= m.maxMemory {
+			return true
+		}
+		return sh.Eligible && sh.SweepCells > 0 && only.size(n) < cache.size(n) &&
+			base(n)+utils.PageAlign(only.bytes(n, m)) <= m.maxMemory
 	}
 	segment := func(n int64) [3]int { return sh.sizingSegment(int(n)) }
 	out := &ReportCacheFit{Inputs: []ReportRange{}}
